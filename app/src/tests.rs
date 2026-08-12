@@ -1291,6 +1291,141 @@ fn every_reaction_tap_folds_into_the_timeline_and_the_thread_rail() {
         app.hydration_generation, armed,
         "and an archived room takes no reaction either way"
     );
+    assert!(
+        app.error.contains("archived"),
+        "and it says so — see the refusal test below"
+    );
+}
+
+/// AN ARCHIVED CHANNEL REFUSES A REACTION OUT LOUD. The module refuses it
+/// (`check_post_policy`, reached through `reaction_target`), and the handlers
+/// have always refused it first — silently: no error, no state change, nothing
+/// to tell a dropped press from a landed one. The surface cannot carry that
+/// refusal instead, because the quiet message rows are `lazy` on ONE dependency
+/// and `active_channel_archived` never reaches a chip or a one-tap bar. So the
+/// banner is the affordance, and ♡ must not open a picker whose 32 cells are
+/// all disabled.
+#[test]
+fn an_archived_channel_says_why_it_dropped_the_reaction() {
+    let archived_routes: Vec<(&str, __DucktapeMessage)> = vec![
+        ("one-tap", __DucktapeMessage::AddReactionAt(7, "👍".into())),
+        (
+            "picker cell",
+            __DucktapeMessage::AddReactionSubmit("👍".into()),
+        ),
+        (
+            "chip removal",
+            __DucktapeMessage::RemoveReactionAt(7, "👍".into()),
+        ),
+    ];
+    for (route, press) in archived_routes {
+        let (mut app, _) = Ducktape::__boot();
+        app.connected_rpc = "http://node".into();
+        app.loading = false;
+        app.active_channel = "general".into();
+        app.active_channel_archived = true;
+        app.messages = vec![message(7, "root", false)];
+        app.selected_message_seq = 7;
+        app.selected_message_rev = 1;
+
+        let _ = app.__update(press);
+
+        assert!(
+            app.error.contains("archived"),
+            "the {route} refusal must name the archive"
+        );
+        // No optimistic fold: the refusal is not a half-applied reaction.
+        assert!(app.messages[0].reactions.is_empty(), "{route}");
+    }
+
+    // ♡ OPENS NOTHING ON AN ARCHIVED CHANNEL — in the stream and in the RAIL
+    // alike. The picker it opened was a dead-end overlay of 32 disabled cells
+    // whose only exit was Esc, and the rail mounts the very same one; the ⋯
+    // menu's "Manage reactions" row routes here too, live precisely so its
+    // press reaches this refusal instead of dying on a disabled button.
+    // A ♡ route: what the press is, and which action slot its picker lands in.
+    type PickerRoute = (&'static str, fn() -> __DucktapeMessage, fn(&Ducktape) -> &str);
+    let picker_routes: [PickerRoute; 2] = [
+        (
+            "stream ♡",
+            || __DucktapeMessage::OpenMessageReactions(7, "root".into(), 1),
+            |app| app.message_action.as_str(),
+        ),
+        (
+            "rail ♡",
+            || __DucktapeMessage::OpenThreadMessageReactions(7, "root".into(), 1),
+            |app| app.thread_message_action.as_str(),
+        ),
+    ];
+    for (route, press, opened_action) in picker_routes {
+        let (mut app, _) = Ducktape::__boot();
+        app.connected_rpc = "http://node".into();
+        app.loading = false;
+        app.active_channel = "general".into();
+        app.active_channel_archived = true;
+        app.messages = vec![message(7, "root", false)];
+
+        let _ = app.__update(press());
+
+        assert_eq!(
+            opened_action(&app),
+            "toolbar",
+            "{route}: the picker never opened"
+        );
+        assert!(app.error.contains("archived"), "{route}: and it said why");
+
+        // AND ON A LIVE CHANNEL THE REFUSAL LINE WRITES NOTHING. Opening ♡ is a
+        // READ — it must hand the standing banner back untouched, or reaching
+        // for a reaction becomes the gesture that wipes the failure you had not
+        // read yet. Only the three mutations clear it, on their own line, where
+        // the clear has always been.
+        app.active_channel_archived = false;
+        app.error = "Send failed — the node refused the message.".into();
+        let _ = app.__update(press());
+        assert_eq!(
+            app.error, "Send failed — the node refused the message.",
+            "{route}: opening the picker is a read and must not clear the banner"
+        );
+        assert_eq!(opened_action(&app), "reactions", "{route}: the picker opened");
+
+        // …and the mutation that follows still clears the banner on its own
+        // line. Only the banner is read here: the fold itself needs the
+        // process-wide `cached_user_key`, which is what
+        // `every_reaction_tap_folds_into_the_timeline_and_the_thread_rail`
+        // covers — asserting it from here would make this test depend on
+        // whichever sibling happened to seed that global first.
+        app.selected_message_seq = 7;
+        let _ = app.__update(__DucktapeMessage::AddReactionAt(7, "👍".into()));
+        assert_eq!(
+            app.error, "",
+            "{route}: the mutation clears the banner it replaces"
+        );
+    }
+
+    // AND THE COMMENT OVER `add_reaction_submit` CLAIMS ALL FIVE. Keep the
+    // claim honest: every handler that reaches a reaction op must carry the
+    // refusal line, so a sixth route cannot ship silent.
+    let chat = inlined(include_str!("ui/handlers/chat.ice"));
+    for handler in [
+        "add_reaction_submit(emoji)",
+        "add_reaction_at(seq, emoji)",
+        "remove_reaction_at(seq, emoji)",
+        "open_message_reactions(seq, body, rev)",
+        "open_thread_message_reactions(seq, body, rev)",
+    ] {
+        let body = chat
+            .split_once(&format!("on {handler}\n"))
+            .unwrap_or_else(|| panic!("{handler} is a handler"))
+            .1
+            .split_once("\non ")
+            .expect("a handler ends at the next one")
+            .0;
+        assert!(
+            body.contains("error = reaction_refusal(active_channel_archived, error)")
+                && body.contains("return if active_channel_archived"),
+            "{handler} must answer an archived channel with the banner"
+        );
+    }
 }
 
 #[test]
@@ -2602,6 +2737,38 @@ fn a_landing_in_another_room_retires_the_dm_header() {
         vec![message(1, "hey", false)],
     )));
     assert!(app.active_dm_peer.is_empty());
+}
+
+/// THE DM HEADER IS THE ROW'S FLEXIBLE CHILD, exactly as the channel title is.
+///
+/// `align=center` is CROSS-axis only and iced's Row has no main-axis
+/// justification, so the header's right-hand cluster — the huddle control and
+/// the ⋯ that is the only mouse route to Channel details — sits at the right
+/// edge only while some child takes the row's slack. The channel arm has a
+/// `box w=fill clip=true` around its title for exactly this; the DM arm mounted
+/// `DmHeader` bare, so ⋯ packed against the peer's name and moved with its
+/// length, and a long name pushed the huddle control and ⋯ past the pane's clip.
+///
+/// It also branches on the resolved NAME, not the key: `dm_peer_named` answers
+/// a roster miss with the blank peer while the key stays set, so branching on
+/// the key drew an empty plate with no name — never the fall-through to the
+/// derived two-party title that three comments promise. ONE discriminant for
+/// the whole surface: the thread rail draws the same room's breadcrumb, and a
+/// rail still reading the KEY would print that room without its `#` while the
+/// header above it printed one — two readings of one room, on screen together.
+#[test]
+fn the_dm_header_takes_the_slack_the_channel_title_would() {
+    let screen = inlined(include_str!("ui/screens/chat.ice"));
+    assert!(screen.contains(
+        "if !empty(active_dm.name)\n                    box w=fill clip=true\n                      DmHeader peer=active_dm"
+    ));
+    // The header's two fall-through arms (`#` glyph, channel title) and the
+    // thread rail's breadcrumb, all reading the one derivation.
+    assert_eq!(screen.matches("if empty(active_dm.name)").count(), 3);
+    // No arm anywhere on this screen decides a title from the KEY, which
+    // survives the roster miss the resolved row does not.
+    assert!(!screen.contains("if empty(active_dm_peer)"));
+    assert!(!screen.contains("if !empty(active_dm_peer)"));
 }
 
 /// ONE COMMITTED REPLY, ONE ROW, ONE STEP OF THE CURSOR.
@@ -4134,32 +4301,143 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
         }
     }
 
-    fn assert_controls_inherit_focus(name: &str, source: &str) {
+    /// THE RING HAS TO REACH THE WIDGET — and the syntax that delivers it is
+    /// not the thing to police. `recipe control` ends in `focus:border-ring`,
+    /// but codegen emits that utility FIRST and then replays the authored
+    /// `active` block for EVERY status (`active` is the base of all four, not
+    /// the resting one), so a `border=` on the `active` line lands ON TOP of
+    /// the ring and no chat field showed the caret's seat at all. The lint
+    /// this replaces asserted the opposite — that no `focused` line existed —
+    /// which green-lit the construct that defeats the ring and forbade the fix.
+    ///
+    /// Two spellings pass: leave the border to the recipe, or author the
+    /// focused arm. A field that turned its border off entirely
+    /// (`border-w=0.0`) has no ring to paint — its plate owns that reading.
+    fn assert_controls_paint_a_focus_ring(name: &str, source: &str) {
         let lines: Vec<_> = source.lines().collect();
         for (index, line) in lines.iter().enumerate().filter(|(_, line)| {
             line.trim_start().starts_with("input ") && line.contains("@control")
         }) {
-            let indentation = line.len() - line.trim_start().len();
-            for child in &lines[index + 1..] {
-                let trimmed = child.trim_start();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let child_indentation = child.len() - trimmed.len();
-                if child_indentation <= indentation {
-                    break;
-                }
-                assert!(
-                    !trimmed.starts_with("focused "),
-                    "{name}: @control must inherit focus:border-ring: {child:?}"
-                );
-            }
+            let states = status_lines(&lines, index);
+            let overwrites_the_ring = states.iter().any(|state| {
+                state.starts_with("active ")
+                    && state.contains("border=")
+                    && !state.contains("border-w=0.0")
+            });
+            let paints_its_own_ring = states
+                .iter()
+                .any(|state| state.starts_with("focused ") && state.contains("border=ring"));
+            assert!(
+                !overwrites_the_ring || paints_its_own_ring,
+                "{name}: an `active border=` overwrites @control's focus ring, so this input \
+                 must author `focused … border=ring` (or drop the `border=`): {line:?}"
+            );
         }
+    }
+
+    /// AN ICON-ONLY CONTROL'S GLYPH MUST INHERIT ITS BUTTON'S INK. A button's
+    /// `hovered … text=` reaches its content as an INHERITED text color: a
+    /// `text` child carrying a `@text-*` class emits an explicit color and
+    /// ignores it for every status, and an `Icon` is an svg that reads no text
+    /// color at all. Either way the plate lit under the cursor and the glyph
+    /// stayed muted — in the message hover bar, between a ♡ and a ⋯ that both
+    /// brightened. `IconAction` is the opt-in that hands an svg its own hover
+    /// arm; a plain glyph just leaves the color to the button.
+    ///
+    /// SINGLE-GLYPH BUTTONS ONLY, AND THE EXCLUSION IS DELIBERATE — say what it
+    /// lets through rather than let the `[glyph]` destructure quietly decide.
+    /// Thirteen multi-glyph buttons across these two files light a plate over
+    /// glyphs that all name their own colour: the ⋯ menu's icon+label rows
+    /// (`Icon tone="muted"` beside a `@text-accent_fg` label under
+    /// `hovered … text=fg`), the channel rows, the reaction chips, the search
+    /// hits. They are NOT the defect this hunts. On a row the PLATE is the
+    /// hover affordance and each glyph's colour is its ROLE — a `@text-danger`
+    /// "Delete message…" that brightened to `fg` under the cursor would be the
+    /// bug, and a muted icon beside an accent label is a two-tone hierarchy
+    /// somebody chose. An icon-ONLY control has no plate hierarchy and no
+    /// second glyph: its ink is the whole signal, which is why it is the one
+    /// shape held to inheritance here. (The dead `text=` term such a row
+    /// carries is inert, not wrong — it is the recipe's default reaching
+    /// nothing.)
+    ///
+    /// AND NO `IconAction` SILENCES ITS DISABLED TERM. Its ramp keys on the
+    /// svg's OWN bounds — iced computes `svg::Status::Hovered` in
+    /// `Button::update`, which forwards to its content BEFORE it looks at
+    /// `on_press` — so the button's term is the only thing that knows the
+    /// control is dead, and a mount that hands down `false` brightens the glyph
+    /// of a control nobody can press. (Dropping the prop outright is the Ice
+    /// compiler's error, not this lint's: `E123 missing prop`.)
+    fn assert_icon_controls_inherit_ink(name: &str, source: &str) {
+        let lines: Vec<_> = source.lines().collect();
+        for mount in lines
+            .iter()
+            .map(|line| line.trim_start())
+            .filter(|line| line.starts_with("IconAction "))
+        {
+            assert!(
+                !mount.contains("disabled=false"),
+                "{name}: an `IconAction` hovers on its own bounds, so it must carry its \
+                 button's disabled term, never a literal: {mount:?}"
+            );
+        }
+        for (index, _) in lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.trim_start().starts_with("button"))
+        {
+            let children = block_children(&lines, index);
+            let lights_its_ink = children
+                .iter()
+                .any(|child| child.starts_with("hovered ") && child.contains(" text="));
+            let glyphs: Vec<&&str> = children
+                .iter()
+                .filter(|child| child.starts_with("text ") || child.starts_with("Icon"))
+                .collect();
+            let [glyph] = glyphs[..] else { continue };
+            let names_its_own_color = glyph.contains("@text-") || glyph.starts_with("Icon ");
+            assert!(
+                !lights_its_ink || !names_its_own_color,
+                "{name}: this button's `hovered … text=` cannot reach a glyph that names its \
+                 own colour — drop the `@text-*`, or mount the icon as `IconAction`: {glyph:?}"
+            );
+        }
+    }
+
+    /// The lines of the block a node opens: everything indented deeper than it,
+    /// trimmed, up to the next sibling.
+    fn block_children<'a>(lines: &[&'a str], index: usize) -> Vec<&'a str> {
+        let opener = lines[index];
+        let indentation = opener.len() - opener.trim_start().len();
+        lines[index + 1..]
+            .iter()
+            .map(|line| (line.len() - line.trim_start().len(), line.trim_start()))
+            .take_while(|(child_indentation, trimmed)| {
+                trimmed.is_empty() || *child_indentation > indentation
+            })
+            .map(|(_, trimmed)| trimmed)
+            .collect()
+    }
+
+    /// The status lines a node authors — its own `active`/`hovered`/`focused`/
+    /// `pressed`/`disabled` block, never a nested child's.
+    fn status_lines<'a>(lines: &[&'a str], index: usize) -> Vec<&'a str> {
+        let opener = lines[index];
+        let indentation = opener.len() - opener.trim_start().len();
+        lines[index + 1..]
+            .iter()
+            .map(|line| (line.len() - line.trim_start().len(), line.trim_start()))
+            .take_while(|(child_indentation, trimmed)| {
+                trimmed.is_empty() || *child_indentation > indentation
+            })
+            .filter(|(child_indentation, _)| *child_indentation == indentation + 2)
+            .map(|(_, trimmed)| trimmed)
+            .collect()
     }
 
     let view = inlined(include_str!("ui/view.ice"));
     let shell = inlined(include_str!("ui/components/shell.ice"));
     let chat = inlined(include_str!("ui/components/chat.ice"));
+    let chat_screen = inlined(include_str!("ui/screens/chat.ice"));
     let pages = inlined(include_str!("ui/components/pages.ice"));
     let kit = inlined(include_str!("ui/components/kit.ice"));
     let forge = inlined(include_str!("ui/components/forge.ice"));
@@ -4214,16 +4492,21 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
     // A divider is `---` typed into the document now, not a button.
     assert!(!SCREENS.contains("Insert divider"));
 
-    assert_controls_inherit_focus("screens", &SCREENS);
-    assert_controls_inherit_focus("pages.ice", &pages);
-    // The three composer editors carried ad-hoc `focused border=ring`
-    // status blocks; their focus ring now lives in the rich composer
-    // adapter (`editor::composer_style`). One authored site remains.
+    assert_controls_paint_a_focus_ring("screens", &SCREENS);
+    assert_controls_paint_a_focus_ring("pages.ice", &pages);
+    // The chat surface's own icon controls, both files. The same dead-ink
+    // shape exists on other surfaces, but there `tone=` carries STATE (a muted
+    // mic against a danger one, a checked tab against an idle one), so those
+    // are a design decision rather than a defect and are not swept here.
+    assert_icon_controls_inherit_ink("chat.ice", &chat);
+    assert_icon_controls_inherit_ink("screens/chat.ice", &chat_screen);
+    // The three composer editors carried ad-hoc `focused border=ring` status
+    // blocks; their focus ring now lives in the rich composer adapter
+    // (`editor::composer_style`), and the fs editor is the one authored
+    // `editor` ring left. Inputs author their own — see the lint above.
     assert_eq!(
         SCREENS
-            .lines()
-            .filter(|line| line.trim_start().starts_with("focused ")
-                && line.contains("border=ring"))
+            .matches("focused bg=muted_bg border=ring border-w=1.0")
             .count(),
         1
     );

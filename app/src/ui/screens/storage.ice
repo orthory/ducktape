@@ -81,7 +81,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
             text-size=13.0
             line-h=1.2
             @control
-          active bg=surface border=border value=fg placeholder=hint selection=fg/18 border-w=1.0 r=7.0
+          active bg=surface value=fg placeholder=hint selection=fg/18 border-w=1.0 r=7.0
           hovered bg=muted_bg border=control_line
           disabled bg=muted_bg/54 value=muted
         button "+ Folder" -> emit(fs_mkdir_submit)

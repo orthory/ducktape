@@ -53,6 +53,7 @@ extern crate::backend
   box-style card_style()
   box-style raised_style()
   svg-style icon_tint(tone:str)
+  svg-style icon_action_tint(tone:str, disabled:bool)
   pure icon(name:str) -> bytes
   connect(rpc:str, attempt:i64, generation:i64) -> WorkspaceData ! HydrationError
   stream live_events(rpc:str) -> LiveUpdate
@@ -397,6 +398,7 @@ extern crate::backend
   pure no_dm_peer() -> DmPeer
   open_dm(rpc:str, password:str, peer_key:str, generation:i64) -> ChatData ! HydrationError
   pure post_gate(archived:bool, members_only:bool, members:[ChatMember], me:str) -> str
+  pure reaction_refusal(archived:bool, banner:str) -> str
   send_message(rpc:str, password:str, channel_id:str, message_id:str, body:str, members:[ChatMember]) -> SendReceipt ! OptimisticMutationError
   load_thread(rpc:str, channel_id:str, root_seq:i64, target_seq:i64, through_reply_offset:i64, generation:i64) -> ThreadLoadData ! HydrationError
   load_thread_page(rpc:str, channel_id:str, root_seq:i64, from:i64, generation:i64) -> ThreadPageData ! HydrationError

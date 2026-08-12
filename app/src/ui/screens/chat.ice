@@ -161,7 +161,12 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                 text-size=13.0
                 line-h=1.2
                 @control
-              active bg=surface border=border value=fg placeholder=hint selection=fg/18 border-w=1.0 r=8.0
+              // NO `border=` HERE. `active` is the base for EVERY status, not
+              // just the resting one, so a border color on this line is written
+              // AFTER `@control`'s `focus:border-ring` and the ring never
+              // paints — the field the caret sits in looked exactly like the
+              // four beside it. The recipe already owns the resting border.
+              active bg=surface value=fg placeholder=hint selection=fg/18 border-w=1.0 r=8.0
               hovered bg=muted_bg border=control_line
               disabled bg=transparent value=muted
             if search_phase != "idle"
@@ -182,7 +187,6 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                     with
                       size=13.0
                       wrap=none
-                      @text-muted
                 active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
                 hovered bg=elevated text=fg
                 pressed bg=subtle text=fg
@@ -219,11 +223,17 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                   disabled=(loading || mutation_phase != "idle" || !connected)
                   p=0.0
                   @icon_action
-                Icon
+                // THE SAME TERM TWICE, because an svg hovers on its OWN bounds
+                // and never reads the button's ink: the glyph would brighten
+                // under a cursor that can press nothing. The other three mounts
+                // hand down a `disabled` prop; this button spells its own out,
+                // so this one repeats it rather than inventing a state field.
+                IconAction
                   with
                     name="plus"
                     tone="label"
                     px=16.0
+                    disabled=(loading || mutation_phase != "idle" || !connected)
                 active bg=transparent text=muted border=transparent border-w=1.0 r=5.0
                 hovered bg=separator text=fg
                 pressed bg=subtle text=fg
@@ -247,7 +257,6 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                     with
                       size=13.0
                       wrap=none
-                      @text-muted
                 active bg=separator text=muted border=transparent border-w=1.0 r=5.0
                 hovered bg=subtle text=fg
                 pressed bg=subtle text=fg
@@ -349,10 +358,25 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                   // A DM whose peer has left the identity roster resolves
                   // to the blank row and falls back to the channel title
                   // below, which is the derived two-party name — never a
-                  // blank plate.
-                  if !empty(active_dm_peer)
-                    DmHeader peer=active_dm
-                  if empty(active_dm_peer)
+                  // blank plate. That fall-through reads the resolved
+                  // NAME, not the key: `dm_peer_named` answers a miss with
+                  // the blank peer while the key stays set, so branching on
+                  // the key drew an empty 24px plate with no name at all.
+                  //
+                  // AND IT IS BOUNDED, for the same reason the channel title
+                  // below is: this row has no main-axis justification, so the
+                  // ⋯ that is the only mouse route to Channel details sits at
+                  // the right edge only while SOME child takes the row's
+                  // slack. With the DM header shrink-sized, ⋯ packed against
+                  // the peer's name and moved with its length, and a long
+                  // name pushed the huddle control and ⋯ past the pane's clip.
+                  if !empty(active_dm.name)
+                    box
+                      with
+                        w=fill
+                        clip=true
+                      DmHeader peer=active_dm
+                  if empty(active_dm.name)
                     text "#"
                       with
                         size=14.0
@@ -368,7 +392,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                   // length rendered the live-huddle pill as a BLANK plate you
                   // could still click, and dropped ⋯ entirely. The window's
                   // `min-size` bounds the other axis; this bounds this one.
-                  if empty(active_dm_peer)
+                  if empty(active_dm.name)
                     box
                       with
                         w=fill
@@ -457,7 +481,6 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         with
                           size=14.0
                           wrap=none
-                          @text-muted
                     active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
                     hovered bg=elevated text=fg
                     pressed bg=subtle text=fg
@@ -780,10 +803,16 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                   p=5.0
                                   style=raised_style()
                                 col w=fill gap=1.0
+                                  // LIVE, SO THE PRESS REACHES THE REFUSAL. A
+                                  // disabled row is pixel-identical to a live
+                                  // one here (`@ghost_action` idles at the same
+                                  // ink), so it read as a working row that ate
+                                  // the click; now the press lands in
+                                  // `open_message_reactions`, which answers with
+                                  // the archived banner.
                                   button -> emit(open_message_reactions, selected_message_seq, message_edit_draft, selected_message_rev)
                                     with
                                       label="Manage reactions"
-                                      disabled=active_channel_archived
                                       w=fill
                                       h=30.0
                                       p=0.0
@@ -990,6 +1019,14 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                     @control
                                   active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
                                   hovered bg=fg/4 border=fg/8
+                                  // THE EDITOR IS BORDERLESS AT REST ON PURPOSE, so it
+                                  // cannot inherit `@control`'s ring: `active` runs as the
+                                  // base of every status and its `border=transparent`
+                                  // lands after the recipe's focus color. `begin_message_edit`
+                                  // drops the caret in here by hand, so without this line the
+                                  // user was dropped into an invisible field whose HOVER read
+                                  // stronger than its focus.
+                                  focused bg=fg/4 border=ring
                                   disabled value=muted
                                 button "Save" -> emit(edit_message_submit)
                                   with
@@ -1359,7 +1396,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                           text-size=13.0
                           line-h=1.2
                           @control
-                        active bg=surface border=border value=fg placeholder=muted selection=fg/18 border-w=1.0 r=8.0
+                        active bg=surface value=fg placeholder=muted selection=fg/18 border-w=1.0 r=8.0
                         hovered bg=surface border=control_line
                         disabled value=muted
                       button "Rename" -> emit(rename_channel_submit)
@@ -1402,7 +1439,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                           line-h=1.2
                           font=code
                           @control
-                        active bg=surface border=border value=fg placeholder=muted selection=fg/18 border-w=1.0 r=8.0
+                        active bg=surface value=fg placeholder=muted selection=fg/18 border-w=1.0 r=8.0
                         hovered bg=surface border=control_line
                         disabled value=muted
                       button "Add" -> emit(add_channel_member_submit)
@@ -1516,7 +1553,10 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                             font=display
                             @text-fg
                       row gap=2.0 align=center
-                        if empty(active_dm_peer)
+                        // The same discriminant the main header reads: the
+                        // RESOLVED name, so a roster miss shows `# <channel>`
+                        // in both places instead of two readings of one room.
+                        if empty(active_dm.name)
                           text "#"
                             with
                               size=11.0
@@ -1832,10 +1872,10 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                               p=5.0
                               style=raised_style()
                             col w=fill gap=1.0
+                              // Live for the same reason as the stream's twin.
                               button -> emit(open_thread_message_reactions, thread_selected_seq, thread_edit_draft, thread_selected_rev)
                                 with
                                   label="Manage reactions"
-                                  disabled=active_channel_archived
                                   w=fill
                                   h=30.0
                                   p=0.0
@@ -2004,6 +2044,9 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                 @control
                               active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
                               hovered bg=fg/4 border=fg/8
+                              // Same borderless-at-rest editor as the main stream's, so
+                              // the same authored ring — see `#message-edit` above.
+                              focused bg=fg/4 border=ring
                               disabled value=muted
                             button "Save" -> emit(edit_thread_message_submit)
                               with

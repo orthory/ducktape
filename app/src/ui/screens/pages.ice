@@ -130,6 +130,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                 @control
               active bg=muted_bg border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=8.0
               hovered bg=elevated border=fg/21
+              focused border=ring
               disabled bg=muted_bg/54 value=muted
             button -> emit(create_page_submit)
               with
@@ -222,6 +223,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                     @control
                   active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
                   hovered bg=fg/5 border=fg/8
+                  focused bg=fg/5 border=ring
                   disabled value=muted
                 if !empty(page_search_hits)
                   button -> emit(clear_page_search)
@@ -829,6 +831,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                     @control
                   active bg=transparent border=fg/8 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
                   hovered bg=fg/4 border=fg/11
+                  focused bg=fg/4 border=ring
                   disabled value=muted
                 button "Post" -> emit(post_block_comment_submit)
                   with

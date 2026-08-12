@@ -187,11 +187,15 @@ component ChatMemberRow(member:ChatMember, disabled:bool)
           h=fill
           align-x=center
           align-y=center
+        // NO `@text-*` ON THE GLYPH. A class here emits an explicit color, and
+        // an explicit color ignores the button's own `text=` for every status —
+        // so the plate went red on hover while the × stayed muted, and the
+        // disabled ramp never reached it either. Uncolored, the glyph inherits
+        // the four lines below.
         text "×"
           with
             size=13.0
             wrap=none
-            @text-muted
       active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
       hovered bg=danger_bg text=fg
       pressed bg=danger_line text=fg
@@ -242,6 +246,12 @@ component RichLine(block:ChatBlock)
       // press takes. No plate: brand ink on the row's own ground is what tells
       // it apart from the mention above, and the tint arrives under the cursor
       // as the affordance rather than as a permanent badge.
+      //
+      // NO `@text-brand` ON THE GLYPH — the three status lines below own the
+      // ink. A class here emits an explicit color that ignores the button's
+      // `text=` for every status, which is the same dead-ink construct the
+      // hover toolbar carried; it reads identically today only because all
+      // three arms name `brand`, and it would stop the day one of them didn't.
       if !empty(span.link)
         button -> emit(open_message_link, span.link)
           with
@@ -253,7 +263,6 @@ component RichLine(block:ChatBlock)
               size=13.5
               line-h=1.55
               font=medium
-              @text-brand
           active bg=transparent text=brand border=transparent border-w=0.0 r=4.0
           hovered bg=brand_bg text=brand border=transparent
           pressed bg=brand_bg text=brand border=transparent
@@ -875,11 +884,17 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
                     disabled=disabled
                     p=5.0
                     @icon_action
-                  Icon
+                  // `IconAction`, because ♡ and ⋯ beside it are string labels
+                  // that DO brighten: an svg reads no inherited text color, so
+                  // the one icon in this three-button toolbar was the one glyph
+                  // that stayed grey under the cursor. It takes this button's
+                  // own `disabled` so a dead control does not answer the hand.
+                  IconAction
                     with
                       name="nav-chat"
                       tone="muted"
                       px=15.0
+                      disabled=disabled
                   active bg=transparent text=muted r=6.0
                   hovered bg=elevated text=fg
                   pressed bg=subtle text=fg
@@ -1110,7 +1125,6 @@ component ComposerMarks(disabled:bool)
             size=12.5
             wrap=none
             font=strong
-            @text-muted
       active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
       hovered bg=fg/8 text=fg
       pressed bg=fg/12 text=fg
@@ -1133,7 +1147,6 @@ component ComposerMarks(disabled:bool)
             size=12.5
             wrap=none
             font=italic
-            @text-muted
       active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
       hovered bg=fg/8 text=fg
       pressed bg=fg/12 text=fg
@@ -1157,11 +1170,12 @@ component ComposerMarks(disabled:bool)
           h=fill
           align-x=center
           align-y=center
-        Icon
+        IconAction
           with
             name="code-brackets"
             tone="muted"
             px=13.0
+            disabled=disabled
       active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
       hovered bg=fg/8 text=fg
       pressed bg=fg/12 text=fg
@@ -1179,11 +1193,12 @@ component ComposerMarks(disabled:bool)
           h=fill
           align-x=center
           align-y=center
-        Icon
+        IconAction
           with
             name="quote"
             tone="muted"
             px=13.0
+            disabled=disabled
       active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
       hovered bg=fg/8 text=fg
       pressed bg=fg/12 text=fg

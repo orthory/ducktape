@@ -801,6 +801,11 @@ on open_thread_message_actions(seq, body, rev)
 
 on open_thread_message_reactions(seq, body, rev)
   return if seq <= 0
+  // The rail's ♡ is the stream's ♡ — same dead 32-cell picker on an archived
+  // channel, same refusal. See `open_message_reactions` below for why the read
+  // hands the standing banner back untouched.
+  error = reaction_refusal(active_channel_archived, error)
+  return if active_channel_archived
   thread_menu_y = block_action_menu_y(thread_pointer_y, thread_height)
   thread_selected_seq = seq
   thread_selected_rev = rev
@@ -869,6 +874,12 @@ on open_message_actions(seq, body, rev)
 
 on open_message_reactions(seq, body, rev)
   return if seq <= 0
+  // ♡ ON AN ARCHIVED CHANNEL OPENS NOTHING. Its 32 cells are all disabled
+  // there, so the picker was a dead-end overlay whose only exit was Esc.
+  // Opening it is a READ, so the live arm hands the banner back untouched —
+  // a failed send is not cleared by the reach for a reaction.
+  error = reaction_refusal(active_channel_archived, error)
+  return if active_channel_archived
   message_menu_y = block_action_menu_y(chat_pointer_y, chat_height)
   selected_message_seq = seq
   selected_message_rev = rev
@@ -1094,8 +1105,23 @@ on delete_message_submit
 // bar's one-tap reactions silently no-op'd through the same window. The
 // reactor-set fold is idempotent, so even a double-tap of the same emoji is
 // safe, and the settled delta replays canonically over any interleaving.
+//
+// AND AN ARCHIVED CHANNEL REFUSES OUT LOUD. All five reaction routes answer it
+// with the banner instead of a silent `return` — the three mutations below
+// (`add_reaction_submit`, `add_reaction_at`, `remove_reaction_at`) and both
+// picker openers above (`open_message_reactions` in the stream,
+// `open_thread_message_reactions` in the rail); `tests.rs` walks the five:
+// the module refuses the op (`check_post_policy` via `reaction_target`), but
+// the surface cannot carry that refusal — the quiet message rows are `lazy` on
+// ONE dependency, so `active_channel_archived` never reaches a chip or a
+// one-tap bar, and each of them kept its full hover/press ramp for an act that
+// never happened. `reaction_refusal` hands the banner back on a live channel,
+// so the refusing line changes nothing there and each mutation still clears the
+// banner on its own line, below.
 on add_reaction_submit(emoji)
-  return if loading || empty(active_channel) || active_channel_archived || selected_message_seq <= 0
+  return if loading || empty(active_channel) || selected_message_seq <= 0
+  error = reaction_refusal(active_channel_archived, error)
+  return if active_channel_archived
   live_thread_generation = live_thread_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
@@ -1109,7 +1135,9 @@ on add_reaction_submit(emoji)
 // a leftover highlight (QA). The picker path still selects, because its
 // overlay is anchored to the selection.
 on add_reaction_at(seq, emoji)
-  return if loading || empty(active_channel) || active_channel_archived || seq <= 0
+  return if loading || empty(active_channel) || seq <= 0
+  error = reaction_refusal(active_channel_archived, error)
+  return if active_channel_archived
   live_thread_generation = live_thread_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
@@ -1119,7 +1147,9 @@ on add_reaction_at(seq, emoji)
   run every add_reaction(connected_rpc, password, active_channel, seq, emoji) -> reaction_acked _ | reaction_failed _
 
 on remove_reaction_at(seq, emoji)
-  return if loading || active_channel_archived || seq <= 0
+  return if loading || seq <= 0
+  error = reaction_refusal(active_channel_archived, error)
+  return if active_channel_archived
   live_thread_generation = live_thread_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
