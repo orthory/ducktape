@@ -347,6 +347,7 @@ fn cmd_revoke(
 }
 
 fn cmd_remove(ctx: &VerbCtx, name: String, stdin: &mut impl BufRead) -> CredResult {
+    gateway::validate_credential_name(&name)?;
     let base = ctx.http_base()?;
     let resolved = ctx.workspace()?;
     let user = load_user_signer(&ctx.key_path()?, stdin)?;
@@ -354,7 +355,7 @@ fn cmd_remove(ctx: &VerbCtx, name: String, stdin: &mut impl BufRead) -> CredResu
     let statement = gateway::RemoveCredentialStatement {
         chain_id: resolved.service.chain_id.clone(),
         owner_account,
-        name,
+        name: name.clone(),
     };
     let preimage = gateway::remove_credential_preimage(&statement)?;
     let message = gateway::GatewayMsg::RemoveCredential {
@@ -362,8 +363,23 @@ fn cmd_remove(ctx: &VerbCtx, name: String, stdin: &mut impl BufRead) -> CredResu
         authorization: authorize(&user, &preimage),
     };
     let height = submit_gateway(&base, &message)?;
+    if let Err(error) = remove_local_credential(&resolved.service.storage_dir, &name) {
+        return Err(format!("removed on-chain at height {height}, but {error}").into());
+    }
     println!("removed at height {height}");
     Ok(())
+}
+
+/// Delete exactly one validated credential directory after its consensus
+/// tombstone commits. `seal.key` and sibling credentials live beside it and
+/// must survive. Already absent is the desired postcondition, so it succeeds.
+fn remove_local_credential(storage: &Path, name: &str) -> CredResult {
+    let dir = airlock_service::cred_store_root(storage).join(name);
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("remove local credential {}: {error}", dir.display()).into()),
+    }
 }
 
 // ============================================================================
@@ -880,6 +896,25 @@ mod tests {
             derive_default_name("jess", ProviderArg::Claude, &[]),
             "jess-claude-1"
         );
+    }
+
+    #[test]
+    fn remove_deletes_only_the_named_local_credential() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = airlock_service::cred_store_root(tmp.path());
+        let target = root.join("alice-codex-1");
+        let sibling = root.join("alice-claude-1");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(target.join("auth.json"), "secret").unwrap();
+        std::fs::write(sibling.join(".credentials.json"), "other").unwrap();
+        std::fs::write(root.join("seal.key"), "stable").unwrap();
+
+        remove_local_credential(tmp.path(), "alice-codex-1").unwrap();
+
+        assert!(!target.exists());
+        assert!(sibling.exists());
+        assert!(root.join("seal.key").exists());
     }
 
     /// Claude must log in with `auth login` (writes `.credentials.json`, which

@@ -1204,6 +1204,18 @@ fn nix_uid() -> String {
         .unwrap_or_else(|_| "anon".into())
 }
 
+/// Put the podman child outside the daemon's foreground process group. A
+/// terminal Ctrl-C must stop the daemon first, leaving the socket alive for its
+/// label-scoped container sweep; the daemon then shuts podman down explicitly.
+#[cfg(unix)]
+fn isolate_service_process(command: &mut tokio::process::Command) {
+    use std::os::unix::process::CommandExt as _;
+    command.as_std_mut().process_group(0);
+}
+
+#[cfg(not(unix))]
+fn isolate_service_process(_command: &mut tokio::process::Command) {}
+
 pub struct PodmanService {
     socket: PathBuf,
     child: tokio::process::Child,
@@ -1297,7 +1309,8 @@ impl PodmanService {
         // bind, so clear it now that we know it is nobody's.
         let _ = std::fs::remove_file(&socket);
 
-        let child = tokio::process::Command::new(podman_bin)
+        let mut command = tokio::process::Command::new(podman_bin);
+        command
             .arg("--root")
             .arg(&storage)
             .arg("--runroot")
@@ -1308,16 +1321,21 @@ impl PodmanService {
             .arg("service")
             .arg("--time=0") // never idle-exit; the node owns its lifetime
             .arg(format!("unix://{}", socket.display()))
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("podman service: spawn `{} system service`: {e}", podman_bin.display()))?;
+            .kill_on_drop(true);
+        isolate_service_process(&mut command);
+        let child = command.spawn().map_err(|e| {
+            format!(
+                "podman service: spawn `{} system service`: {e}",
+                podman_bin.display()
+            )
+        })?;
 
         // recorded so a successor can tell "my predecessor's orphan, kill it"
         // from "a live sibling, refuse" — see [`Self::claim`].
         if let Some(pid) = child.id() {
             let _ = std::fs::write(root.join(PODMAN_PID_FILE), pid.to_string());
         }
-        let service = Self {
+        let mut service = Self {
             socket,
             child,
             _root_lock: root_lock,
@@ -1416,7 +1434,7 @@ impl PodmanService {
     /// services sharing one runtime routinely push socket bring-up past the old
     /// 5s budget on a busy box, so 5s FATALed healthy boots. 60s only fires
     /// when podman is stuck outright.
-    async fn await_socket(&self) -> Result<(), String> {
+    async fn await_socket(&mut self) -> Result<(), String> {
         const POLL: std::time::Duration = std::time::Duration::from_millis(50);
         const BUDGET_POLLS: u32 = 1200; // 60s of 50ms polls
         const OLD_BUDGET_POLLS: u32 = 100; // the old 5s budget — warn once when crossed
@@ -1427,6 +1445,18 @@ impl PodmanService {
                 && client.request("GET", "/_ping", None).await.is_ok()
             {
                 return Ok(());
+            }
+            // a child that already died will never answer — report its exit
+            // status now instead of burning the whole budget against a corpse.
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(|error| format!("podman service: inspect child: {error}"))?
+            {
+                return Err(format!(
+                    "podman service exited with {status} before answering on {}",
+                    self.socket.display()
+                ));
             }
             let crossed_old_budget = attempt == OLD_BUDGET_POLLS;
             if crossed_old_budget {
@@ -1520,6 +1550,25 @@ mod tests {
         // cleanup, which is the property the pid check existed to preserve.
         drop(held);
         PodmanService::claim(&root, &socket).expect("a released root is free again");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn service_child_is_outside_the_daemons_process_group() {
+        let sleep = find_system_tool("sleep").expect("sleep is available on a Unix host");
+        let mut command = tokio::process::Command::new(sleep);
+        command.arg("30").kill_on_drop(true);
+        isolate_service_process(&mut command);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id().unwrap();
+
+        // SAFETY: `pid` names the live child this test owns; `getpgid` only
+        // reads kernel process metadata.
+        let process_group = unsafe { libc::getpgid(pid as libc::pid_t) };
+        assert_eq!(process_group, pid as libc::pid_t);
+
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
     }
 
     #[test]
