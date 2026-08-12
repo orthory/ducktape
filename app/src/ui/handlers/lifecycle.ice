@@ -274,6 +274,11 @@ on workspace_connected(next)
   node_peers_generation = node_peers_generation + 1
   node_facts_generation = node_facts_generation + 1
   dm_peers_generation = dm_peers_generation + 1
+  // Shell may have stayed selected while the endpoint reconnected. Refresh
+  // its device-local credential names here; tab selection alone will not fire
+  // again after the console comes back online.
+  shell_credentials_generation = shell_credentials_generation + 1
+  shell_credentials_loading = shell_tab == "shell"
   parallel
     run replace lane=doc_tabs_load load_doc_tabs(connected_rpc) -> doc_tabs_loaded _
     run replace lane=dm_peers_load load_dm_peers(connected_rpc, dm_peers_generation) -> dm_peers_loaded _ | dm_peers_failed _
@@ -288,6 +293,7 @@ on workspace_connected(next)
     run replace lane=agents_load load_agents(connected_rpc, agents_generation) -> agents_loaded _ | agents_failed _
     run replace lane=account_load load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
     run replace lane=forge_load load_forge(connected_rpc, forge_generation) -> forge_loaded _ | forge_list_failed _
+    run replace lane=shell_credentials load_agent_credentials(connected_rpc, keep_i64(shell_tab == "shell", shell_credentials_generation, -1)) -> shell_credentials_loaded _ | shell_credentials_failed _
     // The huddle window mirrors the old popped-card gate: it closes the
     // moment a fold finds `huddle_joined` false. A no-op while still joined.
     task window close target=window_target_unless(huddle_joined, huddle_win)
@@ -723,6 +729,11 @@ on live_thread_refresh_failed(cause)
 
 on select_shell_tab(next)
   shell_tab = next
+  // A credential read belongs to the Shell visit that issued it. Bump on
+  // EVERY move, including the chat/pages early return below, so a late reply
+  // cannot repaint a screen the reader already left.
+  shell_credentials_generation = shell_credentials_generation + 1
+  shell_credentials_loading = connected && shell_tab == "shell"
   // A TAB MOVE UNMOUNTS THE CHAT COMPOSERS, so the caret they claimed is gone
   // — and a `shell_tab == "chat"` term on the chord could only mute it while
   // she is away, then hand the stale claim straight back on the return trip.
@@ -827,6 +838,7 @@ on select_shell_tab(next)
     run replace lane=agents_load load_agents(connected_rpc, keep_i64(tab_reads_plane(shell_tab, "agents"), agents_generation, -1)) -> agents_loaded _ | agents_failed _
     run replace lane=account_load load_account(connected_rpc, keep_i64(tab_reads_plane(shell_tab, "account"), account_generation, -1)) -> account_loaded _ | account_failed _
     run replace lane=forge_load load_forge(connected_rpc, keep_i64(shell_tab == "forge", forge_generation, -1)) -> forge_loaded _ | forge_list_failed _
+    run replace lane=shell_credentials load_agent_credentials(connected_rpc, keep_i64(shell_tab == "shell", shell_credentials_generation, -1)) -> shell_credentials_loaded _ | shell_credentials_failed _
 
 // The huddle's elapsed clock is a LOCAL session fact: one tick per second for
 // as long as SHE is in the huddle, never a chain value. `huddle_joined_at` is
@@ -845,6 +857,7 @@ on wall_tick
 // have taken the log console dark without a word.
 subscribe
   run live_events(connected_rpc) when connected -> live_updated _
+  agent_terminal_events(shell_terminal) when (connected && shell_tab == "shell" && shell_mode == "raw" && shell_terminal_running) -> shell_terminal_notice _
   // THE CALL SESSION IS THIS SUBSCRIPTION. Joining a huddle flips
   // `huddle_joined` and the media leg connects; leaving (or disconnecting)
   // stops the subscription, the stream drops, and the websocket + audio

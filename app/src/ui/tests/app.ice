@@ -36,6 +36,73 @@ preset ui_component_error
   state
     error = "Connection failed"
 
+// A dense, settled turn for the inspector: it exercises the real Shell
+// composition, answer markdown, long transcript spacing, and credential footer
+// without spending a provider credential.
+preset ui_shell_showcase
+  state
+    shell_tab = "shell"
+    connected = false
+    loading = false
+    mutation_phase = "idle"
+    error = ""
+    shell_mode = "chat"
+    shell_provider = "codex"
+    shell_credential = ""
+    shell_chat_entries = agent_chat_finish(agent_chat_push_user([], "Explain the execution path and call out the failure boundaries.", "codex"), "## Execution path\n\nThe request becomes a durable saga, streams provider activity into this view, and commits the final answer before the turn settles.\n\n- **Scheduling** pins work to the selected compute provider.\n- **Live output** stays observational.\n- **Saga state** is the canonical result.", "codex")
+
+test shell_chat_surface_contract
+  preset ui_shell_showcase
+  viewport 1120 720
+  mount
+    ShellScreen draft<->shell_chat_draft #shell
+      with
+        mode=shell_mode
+        provider=shell_provider
+        credential_options=shell_credential_options
+        credential=shell_credential
+        credentials_loading=shell_credentials_loading
+        terminal=shell_terminal
+        terminal_running=shell_terminal_running
+        terminal_busy=shell_terminal_busy
+        terminal_title=shell_terminal_title
+        terminal_error=shell_terminal_error
+        entries=shell_chat_entries
+        activity=shell_chat_activity
+        chat_busy=shell_chat_busy
+        chat_status=shell_chat_status
+        chat_detail=shell_chat_detail
+        live=shell_chat_live
+        chat_error=shell_chat_error
+        saga_id=shell_chat_saga
+        connected=true
+        shift_held
+        dark=false
+      events
+        shell_mode_changed -> shell_mode_changed _
+        shell_provider_changed -> shell_provider_changed _
+        shell_credential_changed -> shell_credential_changed _
+        shell_credentials_refresh -> shell_credentials_refresh
+        shell_terminal_start -> shell_terminal_start
+        shell_terminal_stop -> shell_terminal_stop
+        shell_composer_event -> shell_composer_event _
+        shell_chat_reset -> shell_chat_reset
+        shell_chat_suggest -> shell_chat_suggest _
+        shell_open_link -> open_message_link _
+  target transcript = #shell/root/transcript
+  target composer = #shell/root/draft
+  expect exists transcript
+  expect exists composer
+  expect text "Execution path" within transcript
+  expect transcript.width > 1000.0
+  capture shell_chat_light
+  dispatch shell_mode_changed("raw")
+  expect shell_mode == "raw"
+  expect missing transcript
+  capture shell_raw_light
+  resize 966 500
+  capture shell_raw_min_light
+
 test palette_escape_contract
   preset ui_palette_open
   viewport 1120 720
@@ -71,6 +138,8 @@ test palette_escape_contract
       notice:
         space w=1.0 h=1.0
       chat:
+        space w=1.0 h=1.0
+      shell:
         space w=1.0 h=1.0
       pages:
         space w=1.0 h=1.0
@@ -201,6 +270,8 @@ test minimum_window_layout_contract
       notice:
         space w=1.0 h=1.0
       chat:
+        space w=1.0 h=1.0
+      shell:
         space w=1.0 h=1.0
       pages:
         space w=1.0 h=1.0
@@ -439,6 +510,8 @@ test settings_keyboard_scroll_contract
       notice:
         space w=1.0 h=1.0
       chat:
+        space w=1.0 h=1.0
+      shell:
         space w=1.0 h=1.0
       pages:
         space w=1.0 h=1.0

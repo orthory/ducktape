@@ -73,6 +73,8 @@ theme contract AppTheme
   rail_hover
   window_line
   separator
+  terminal_bg
+  terminal_line
   card_line
   danger_zone_line
   danger_zone_bg
@@ -203,6 +205,8 @@ palette app for AppTheme
   // LINES — window, control, default (`border`), divider, track (`subtle`).
   window_line #d6d4cc
   separator #efeee9
+  terminal_bg #090b0e
+  terminal_line #242a33
   card_line #ece9e1
   danger_zone_line #ecd6d0
   danger_zone_bg #fdf6f4
@@ -379,6 +383,8 @@ palette app_dark for AppTheme
   // LINES
   window_line #0e0d0b
   separator #2c2b26
+  terminal_bg #090b0e
+  terminal_line #242a33
   card_line #302f29
   danger_zone_line #4d2f2c
   danger_zone_bg #2a1d1b

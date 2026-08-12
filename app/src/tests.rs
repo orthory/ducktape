@@ -17,6 +17,7 @@ static SCREENS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         include_str!("ui/screens/pages.ice"),
         include_str!("ui/screens/roster.ice"),
         include_str!("ui/screens/settings.ice"),
+        include_str!("ui/screens/shell.ice"),
         include_str!("ui/screens/storage.ice"),
     ))
 });
@@ -4743,6 +4744,7 @@ fn shell_uses_canonical_glass_and_opaque_content() {
         include_str!("ui/handlers/lifecycle.ice"),
         include_str!("ui/handlers/chat.ice"),
         include_str!("ui/handlers/pages.ice"),
+        include_str!("ui/handlers/shell.ice"),
     ));
     for gradient in ["linear(", "radial(", "conic("] {
         assert!(!ui.contains(gradient), "{gradient}");
@@ -6747,6 +6749,7 @@ fn every_current_row_marker_rests_on_one_selection_token() {
         "ui/screens/pages.ice",
         "ui/screens/roster.ice",
         "ui/screens/settings.ice",
+        "ui/screens/shell.ice",
         "ui/screens/storage.ice",
         "ui/view.ice",
     ];
@@ -6787,6 +6790,7 @@ fn every_current_row_marker_rests_on_one_selection_token() {
             "ui/components/pages.ice",
             "ui/components/shell.ice",
             "ui/screens/roster.ice",
+            "ui/screens/shell.ice",
             "ui/screens/storage.ice",
         ],
         "every surface that marks a current row reads `selected_row`"
@@ -7223,7 +7227,7 @@ fn every_handler_that_moves_the_caret_retires_the_composer_focus() {
 
     // THE RULES. Every handler file, so a focus mover added to a screen nobody
     // is thinking about today still has to answer.
-    const HANDLERS: [(&str, &str); 10] = [
+    const HANDLERS: [(&str, &str); 11] = [
         ("chat", include_str!("ui/handlers/chat.ice")),
         ("files", include_str!("ui/handlers/files.ice")),
         ("forge", include_str!("ui/handlers/forge.ice")),
@@ -7234,6 +7238,7 @@ fn every_handler_that_moves_the_caret_retires_the_composer_focus() {
         ("overlays", include_str!("ui/handlers/overlays.ice")),
         ("pages", include_str!("ui/handlers/pages.ice")),
         ("roster", include_str!("ui/handlers/roster.ice")),
+        ("shell", include_str!("ui/handlers/shell.ice")),
     ];
 
     // `app.ice` is the real registry; the list above is a hand copy of it, and
@@ -8950,6 +8955,7 @@ fn every_data_screen_answers_a_dead_node_with_not_connected() {
             "MembersScreen",
             "PagesScreen",
             "SettingsScreen",
+            "ShellScreen",
         ],
         "a screen appeared or vanished: decide what it says with the node down, \
          then add it here or to EXEMPT with a reason"
@@ -9694,6 +9700,11 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         ),
         ("screens/storage.ice", "for kind_count in kinds"),
         ("screens/storage.ice", "for block in blocks"),
+        // One provider turn, hard-capped to MAX_ACTIVITY_ROWS in the backend.
+        (
+            "screens/shell.ice",
+            "keyed row in activity by=row.id #activity w=fill gap=8.0",
+        ),
         // 3. QUERY-CAPPED — whatever one query answered with. The list is
         //    replaced wholesale by the next query, never appended to.
         ("screens/chat.ice", "for hit in search_hits"),

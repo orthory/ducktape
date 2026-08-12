@@ -594,7 +594,7 @@ component MatrixTick(on:bool)
 // --------------------------------------------------------------------- MODULES
 
 // The fourth tab under `This node`, and only that: the artifact's Modules
-// screen has a rail seat, and the rail has eight seats none of which is this
+// screen once had a rail seat, and the rail has nine seats none of which is this
 // one, so the module set lives beside the node's other facts.
 //
 // This is the INSTALLED half of the artifact's screen and nothing else. What is

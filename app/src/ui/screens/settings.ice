@@ -535,14 +535,14 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                 hovered bg=danger_solid_hover text=brand_fg border=danger_solid_hover
                 pressed bg=danger_solid_hover text=brand_fg
       // ── THIS NODE ──────────────────────────────────────────────────────
-      // The rail has eight seats and none of them is Node: the artifact puts
+      // The rail has nine seats and none of them is Node: the artifact puts
       // the node's own facts under Settings, reached from the rail footer.
       // This is that relocation, kept whole — Overview / Permissions /
       // Activity, with the log console under Activity.
       //
       // MODULES IS A TAB, NOT A SEAT. The artifact's own Modules screen
-      // hangs off a ninth rail capsule; this rail has eight and the
-      // campaign closed that question. The module set is a fact about
+      // once hung off another rail capsule; this rail has nine and Shell owns
+      // the new seat. The module set is a fact about
       // THIS NODE — which code consensus is executing here — so it sits
       // beside the node's other facts and takes no seat from anyone.
       box

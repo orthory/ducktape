@@ -279,6 +279,42 @@ view
               chat_resized -> chat_resized _ _
               thread_resized -> thread_resized _ _
 
+        shell:
+          ShellScreen draft<->shell_chat_draft #shell
+            with
+              mode=shell_mode
+              provider=shell_provider
+              credential_options=shell_credential_options
+              credential=shell_credential
+              credentials_loading=shell_credentials_loading
+              terminal=shell_terminal
+              terminal_running=shell_terminal_running
+              terminal_busy=shell_terminal_busy
+              terminal_title=shell_terminal_title
+              terminal_error=shell_terminal_error
+              entries=shell_chat_entries
+              activity=shell_chat_activity
+              chat_busy=shell_chat_busy
+              chat_status=shell_chat_status
+              chat_detail=shell_chat_detail
+              live=shell_chat_live
+              chat_error=shell_chat_error
+              saga_id=shell_chat_saga
+              connected
+              shift_held
+              dark=(appearance == "dark")
+            events
+              shell_mode_changed -> shell_mode_changed _
+              shell_provider_changed -> shell_provider_changed _
+              shell_credential_changed -> shell_credential_changed _
+              shell_credentials_refresh -> shell_credentials_refresh
+              shell_terminal_start -> shell_terminal_start
+              shell_terminal_stop -> shell_terminal_stop
+              shell_composer_event -> shell_composer_event _
+              shell_chat_reset -> shell_chat_reset
+              shell_chat_suggest -> shell_chat_suggest _
+              shell_open_link -> open_message_link _
+
         pages:
           PagesScreen page_draft<->page_draft page_search_draft<->page_search_draft page_editor<->page_editor block_comment_draft<->block_comment_draft #pages
             with

@@ -2,11 +2,11 @@
 // desk / rail / sidebar / content. iced has no backdrop blur, so every surface
 // here is opaque paper; nothing in this file tints, gradients or floats.
 //
-// THE RAIL DECISION. The console has EXACTLY EIGHT seats — Chat, Pages, Forge,
-// Agents, Files, Explorer, Members, Approvals — and no Node capsule. Node facts
+// THE RAIL DECISION. The console has EXACTLY NINE seats — Chat, Shell, Pages,
+// Forge, Agents, Files, Explorer, Members, Approvals — and no Node capsule. Node facts
 // live in the titlebar's status card (below) and in Settings, reached from the
-// rail's footer button. `shell_nav` returns those eight and nothing else, so
-// WorkspaceTabs routes eight screens plus settings; there is no `node` slot and
+// rail's footer button. `shell_nav` returns those nine and nothing else, so
+// WorkspaceTabs routes nine screens plus settings; there is no `node` slot and
 // no Modules seat (its catalog has no data source at all).
 //
 // TYPE SCALE. The artifact's own values where the scale carries them — the
@@ -909,6 +909,8 @@ component WorkspaceTabs(network:str, status:str, height:i64, sync_line:str, load
               match tab
                 "chat"
                   slot chat
+                "shell"
+                  slot shell
                 "pages"
                   slot pages
                 "files"
