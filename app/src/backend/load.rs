@@ -385,27 +385,47 @@ pub struct HistoryPageData {
     pub messages: Vec<ChatMessage>,
 }
 
+/// The oldest COMMITTED row — the only kind that answers for history.
+///
+/// A pending optimistic row carries `seq == -1`, which sorts ahead of every
+/// real message. Reading `first()` blindly made an in-flight send answer for
+/// the top of the timeline: `history_has_older` saw `-1 > 1` and hid "Load
+/// older" outright, and `oldest_message_seq` handed the loader a `-1` that
+/// `u64::try_from` floors to 0, so the walk never enters its loop and the
+/// button becomes the permanent no-op `walk_roots_back` warns about.
+fn oldest_committed(messages: &[ChatMessage]) -> Option<&ChatMessage> {
+    messages.iter().find(|message| !message.pending)
+}
+
 /// True when the oldest loaded root is not the channel's first message, i.e.
 /// there is older history to page in.
 pub fn history_has_older(messages: Vec<ChatMessage>) -> bool {
-    messages.first().is_some_and(|message| message.seq > 1)
+    oldest_committed(&messages).is_some_and(|message| message.seq > 1)
 }
 
 /// The seq of the oldest loaded root (the ceiling for the next older page).
 pub fn oldest_message_seq(messages: Vec<ChatMessage>) -> i64 {
-    messages.first().map_or(0, |message| message.seq)
+    oldest_committed(&messages).map_or(0, |message| message.seq)
 }
 
 /// Prepend an older page ahead of the current timeline, de-duped by seq, sorted
 /// oldest-first, and re-grouped so the seam between pages regroups correctly.
+///
+/// Pending rows are partitioned out and re-appended at the tail, exactly as
+/// [`merge_message_send_result`] does: they have no seq to sort by, and sorting
+/// them numerically hoisted an in-flight send to the top of a months-old
+/// scrollback.
 pub fn prepend_history(messages: Vec<ChatMessage>, older: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    let known: BTreeSet<i64> = messages.iter().map(|message| message.seq).collect();
+    let (pending, committed): (Vec<ChatMessage>, Vec<ChatMessage>) =
+        messages.into_iter().partition(|message| message.pending);
+    let known: BTreeSet<i64> = committed.iter().map(|message| message.seq).collect();
     let mut merged: Vec<ChatMessage> = older
         .into_iter()
         .filter(|message| !known.contains(&message.seq))
-        .chain(messages)
+        .chain(committed)
         .collect();
     merged.sort_by_key(|message| message.seq);
+    merged.extend(pending);
     mark_message_groups(&mut merged);
     merged
 }

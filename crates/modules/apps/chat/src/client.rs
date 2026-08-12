@@ -751,16 +751,32 @@ pub fn settled_send_id(
 // optimistic sends — client-minted rows and their settle/rollback merges
 // ============================================================================
 
+/// The row a send paints before the block lands.
+///
+/// It is minted through the SAME author/avatar path [`chat_message`] renders a
+/// committed row with, because [`mark_message_groups`] opens a run on an author
+/// change and a hand-written label is always a change: a hard-coded `"You"`
+/// against the canonical `"you"` gave every send of your own a full avatar +
+/// header, which then vanished — shifting the row up by the header's height —
+/// the moment the settle delta replaced it. Without a cached identity there is
+/// no handle to render, so the row stays unattributed and simply opens its own
+/// run, which is what an unknown author means everywhere else.
 pub fn optimistic_message(
     mut messages: Vec<ChatMessage>,
     body: String,
     message_id: String,
+    current_user: Option<&[u8]>,
 ) -> Vec<ChatMessage> {
     let blocks = paragraph_blocks(&body);
+    let handle = current_user.map(|key| format!("user:{}", hex_encode(key)));
+    let (author, initial) = match handle.as_deref() {
+        Some(handle) => (author_display(handle, current_user), avatar_initial(handle)),
+        None => ("you".into(), "•".into()),
+    };
     messages.push(ChatMessage {
         id: message_id,
         seq: -1,
-        author: "You".into(),
+        author,
         meta: "Sending…".into(),
         body,
         blocks,
@@ -771,7 +787,7 @@ pub fn optimistic_message(
         reply_count: 0,
         thread_seq: 0,
         show_author: true,
-        initial: "Y".into(),
+        initial,
         avatar_kind: "human".into(),
         // an optimistic row is this device's own post by construction; it has
         // no block yet, so height/time stay unset until the canonical row lands.
@@ -780,6 +796,7 @@ pub fn optimistic_message(
         time: 0,
         reactions: Vec::new(),
     });
+    mark_message_groups(&mut messages);
     messages
 }
 

@@ -2515,6 +2515,42 @@ fn a_refresh_never_overwrites_a_dirty_buffer_on_the_same_page() {
     assert_eq!(app.buffer_page, "alpha");
 }
 
+// THE SAME GUARD THE CHAT COMPOSER NEVER HAD. `live_resynced` rebuilt
+// `message_editor` from `message_draft` — the SETTLED stash, which reads "" the
+// whole time somebody is typing — so any resync emptied a half-written message:
+// a `files` write in another window, a teammate joining the huddle, any plane
+// op on the chain at all. Nothing writes the composer here now; it owns its own
+// text and no resync produces a new one.
+#[test]
+fn a_resync_never_eats_the_message_being_typed() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.shell_tab = "chat".into();
+    app.active_channel = "general".into();
+    app.hydration_generation = 4;
+    app.message_editor = compose("half a paragraph, mid-word");
+
+    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+        4,
+        "general",
+        vec![message(7, "somebody else posted", false)],
+        "",
+        Vec::new(),
+    )));
+
+    assert_eq!(
+        composer(&app),
+        "half a paragraph, mid-word",
+        "a resync must never eat keystrokes either"
+    );
+    assert_eq!(
+        app.messages.len(),
+        1,
+        "and it still installs the timeline it answered with"
+    );
+}
+
 // Reconnect is the same-endpoint retry now — the picker owns endpoint
 // changes — so typed drafts survive it untouched.
 #[test]
@@ -4862,7 +4898,8 @@ fn every_handler_that_moves_the_caret_retires_the_composer_focus() {
         "and nothing retires the claim on that route — if this ever stops \
          holding, the arm below has gone vacuous and this gate needs a new pin"
     );
-    // The resync rebuilt the stream's box, so both drafts are seated after it.
+    // Both drafts are seated after the resync — this arm is about which box the
+    // chord lands in, not about what a resync leaves in them.
     gone.message_editor = compose("channel draft");
     gone.reply_editor = compose("reply draft");
     gone.reply_editor
@@ -5069,6 +5106,169 @@ fn failed_send_preserves_the_next_and_unsent_drafts() {
     assert_eq!(composer(&app), "first");
     assert_eq!(app.message_draft, "first");
     assert!(app.failed_message_draft.is_empty());
+}
+
+/// A FAILURE THAT ARRIVES AFTER SHE LEFT THE ROOM IS STILL HER TEXT.
+///
+/// The whole handler used to return on the room check, so a send refused while
+/// she was reading another channel left no error, no unsent stash, and no row —
+/// and the last thing she saw was the message sitting in the timeline. The room
+/// check now scopes the timeline surgery only: the stash and the banner are
+/// written above it, and the composer she is typing in NOW is not touched.
+#[test]
+fn a_send_that_fails_after_she_moved_rooms_still_reaches_her() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.active_channel = "general".into();
+    app.message_editor = compose("the deploy is at 4pm");
+
+    let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
+        editor::composer_submit_event(),
+    ));
+    let operation_id = app.messages[0].id.clone();
+
+    // She switches rooms while the write is in flight, and starts a new message
+    // there. `choose_channel` blanks the timeline; the pending row is gone.
+    let _ = app.__update(__DucktapeMessage::ChooseChannel("random".into()));
+    app.message_editor = compose("different thought");
+
+    let _ = app.__update(__DucktapeMessage::MessageSendFailed(
+        backend::OptimisticMutationError {
+            message: "rejected".into(),
+            committed: false,
+            operation_id,
+            scope_id: "general".into(),
+            body: "the deploy is at 4pm".into(),
+        },
+    ));
+
+    assert_eq!(app.error, "rejected", "the refusal must be said out loud");
+    assert_eq!(
+        app.failed_message_draft, "the deploy is at 4pm",
+        "and the body she typed must be recoverable, not gone"
+    );
+    assert_eq!(
+        composer(&app),
+        "different thought",
+        "the composer belongs to the room she is in now — a restore here would \
+         overwrite the message she is writing"
+    );
+
+    // THE SAME HOLE ON THE REPLY PATH, and wider: `close_thread` empties
+    // `thread_messages`, so merely closing the rail under an in-flight reply
+    // made the pending check fail and dropped the failure whole.
+    let (mut rail, _) = Ducktape::__boot();
+    rail.connected = true;
+    rail.loading = false;
+    rail.active_channel = "general".into();
+    rail.active_thread_seq = 7;
+    rail.reply_editor = compose("on it");
+    let _ = rail.__update(__DucktapeMessage::ReplyComposerEvent(
+        editor::composer_submit_event(),
+    ));
+    let reply_id = rail.thread_messages[0].id.clone();
+    let _ = rail.__update(__DucktapeMessage::CloseThread);
+    let _ = rail.__update(__DucktapeMessage::ThreadReplySendFailed(
+        backend::OptimisticMutationError {
+            message: "reply rejected".into(),
+            committed: false,
+            operation_id: reply_id,
+            scope_id: "general".into(),
+            body: "on it".into(),
+        },
+    ));
+
+    assert_eq!(rail.error, "reply rejected");
+    assert_eq!(
+        rail.failed_reply_draft, "on it",
+        "a closed rail is not a reason to throw the reply away"
+    );
+}
+
+/// A PENDING ROW HAS NO SEQ, SO IT CANNOT ANSWER FOR THE TOP OF THE TIMELINE.
+///
+/// `optimistic_message` mints `seq == -1`, which sorts ahead of every real
+/// message. Sorting it numerically into a prepended page put an in-flight send
+/// at the top of months-old scrollback, and then `history_has_older` read
+/// `-1 > 1` and hid "Load older" outright — the pending send locked the reader
+/// out of her own history until it settled.
+#[test]
+fn a_pending_send_survives_a_history_page_without_poisoning_it() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.mutation_phase = "idle".into();
+    app.active_channel = "general".into();
+    app.messages = vec![message(40, "the oldest loaded root", false)];
+    app.has_older_history = true;
+    app.message_editor = compose("still sending");
+
+    let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
+        editor::composer_submit_event(),
+    ));
+    assert!(app.messages[1].pending, "the send is in flight at the tail");
+
+    let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
+    assert!(
+        app.history_loading,
+        "an in-flight send must not block paging"
+    );
+    let in_flight = app.history_generation;
+    let _ = app.__update(__DucktapeMessage::HistoryLoaded(backend::HistoryPageData {
+        generation: in_flight,
+        channel_id: "general".into(),
+        messages: vec![message(20, "older", false)],
+    }));
+
+    let ordering: Vec<i64> = app.messages.iter().map(|message| message.seq).collect();
+    assert_eq!(
+        ordering,
+        vec![20, 40, -1],
+        "the page prepends, the pending row stays at the tail"
+    );
+    assert!(
+        app.has_older_history,
+        "seq 20 is not the channel's first message, so `Load older` stays live"
+    );
+    assert_eq!(
+        backend::oldest_message_seq(app.messages.clone()),
+        20,
+        "and the next page is asked for from the oldest COMMITTED row"
+    );
+}
+
+/// TWO SENDS IN A ROW ARE ONE AUTHOR RUN.
+///
+/// The optimistic row used to be minted with a hand-written `"You"` while every
+/// committed row of the reader's own renders `"you"`, so `mark_message_groups`
+/// opened a run on it: the second send drew a full avatar + header that vanished
+/// — shifting the row up by the header's height — the moment the settle delta
+/// replaced it.
+#[test]
+fn consecutive_sends_stay_in_one_author_run() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.active_channel = "general".into();
+
+    for body in ["first", "second"] {
+        app.message_editor = compose(body);
+        let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
+            editor::composer_submit_event(),
+        ));
+    }
+
+    assert_eq!(app.messages.len(), 2);
+    assert_eq!(
+        app.messages[0].author, app.messages[1].author,
+        "both rows are the reader's own and must carry one author label"
+    );
+    assert!(app.messages[0].show_author, "the first opens the run");
+    assert!(
+        !app.messages[1].show_author,
+        "the second continues it — no header to draw and then take away"
+    );
 }
 
 #[test]

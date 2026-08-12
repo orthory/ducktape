@@ -355,8 +355,15 @@ on live_resynced(next)
   thread_has_more = thread_has_more && active_channel == keep_str(next.chat_loaded, next.active_channel, active_channel) && active_thread_seq > 0
   reply_draft = retain_for_endpoint(reply_draft, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
   pending_reply = retain_for_endpoint(pending_reply, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
+  // `message_draft` is the SETTLED stash (the harvest a reconnect takes, the
+  // body a failed send hands back) — it never tracks keystrokes, so it reads
+  // "" the whole time someone is typing. Rebuilding the composer from it here
+  // emptied a half-written message on every resync: a `files` write in another
+  // window, a teammate joining the huddle, any plane op at all. The composer
+  // owns its own text and no resync produces a new one, so nothing writes it —
+  // the same answer `choose_channel` already gives, and the same one
+  // `refreshed_page_editor` gives the page buffer below.
   message_draft = retain_for_endpoint(message_draft, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
-  message_editor = editor(message_draft)
   pending_message = retain_for_endpoint(pending_message, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
   active_channel = keep_str(next.chat_loaded, next.active_channel, active_channel)
   active_channel_name = keep_str(next.chat_loaded, next.active_channel_name, active_channel_name)
