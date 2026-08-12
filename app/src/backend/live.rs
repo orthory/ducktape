@@ -1157,3 +1157,20 @@ pub fn post_gate(
     }
     String::new()
 }
+
+/// THE BANNER A REFUSED REACTION LEAVES BEHIND — empty when the reaction is
+/// allowed, so one call both writes the refusal and clears the last one.
+///
+/// The reaction handlers refuse an archived channel because the module does
+/// (`check_post_policy`, reached through `reaction_target`), and until now they
+/// refused in silence: no `error`, no state change, no visible difference from
+/// a reaction that landed. The surface cannot carry that refusal instead — the
+/// quiet message rows are `lazy` on ONE dependency, so `active_channel_archived`
+/// never reaches the chips or the one-tap bar, and every row keeps its full
+/// hover/press ramp. So the refusal has to speak.
+pub fn reaction_refusal(archived: bool) -> String {
+    match archived {
+        true => "This channel is archived — reactions are closed. Unarchive it from Channel details to react here again.".into(),
+        false => String::new(),
+    }
+}

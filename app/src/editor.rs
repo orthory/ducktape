@@ -209,7 +209,13 @@ fn composer_style(theme: &iced::Theme, status: text_editor::Status) -> text_edit
         // (the r=12 composer card), and an inner rectangle on focus made the
         // input read as a separate component floating in its card.
         border: Border::default(),
-        placeholder: ink.hint,
+        // THE PLACEHOLDER IS THE ONLY INK AN EMPTY COMPOSER HAS, so it is the
+        // only place a disabled one can say so: `disabled` here is the absence
+        // of `on_action`, the plate around it is unconditional, and an empty
+        // document has no `value` to dim — so a dead composer was pixel-for-
+        // pixel a ready one, and the hover cursor was the whole tell. `muted`
+        // is also the ink the composer's own `⇧↵` hint reads at.
+        placeholder: if disabled { ink.hint } else { ink.muted },
         value: if disabled { ink.muted } else { ink.ink },
         selection: Color { a: 0.18, ..ink.ink },
     }
@@ -401,6 +407,28 @@ mod tests {
                 ("_", Inline::Marker),
             ]
         );
+    }
+
+    /// A DEAD COMPOSER HAS TO LOOK DEAD, AND ON AN EMPTY ONE THE PLACEHOLDER IS
+    /// THE ONLY INK THERE IS. `disabled` here is just the absence of
+    /// `on_action`; the plate, the border and the shadow around it are
+    /// unconditional and there is no `value` to dim — so a composer refusing
+    /// every keystroke (mid channel switch, disconnected, no channel, any post
+    /// refusal) was pixel-identical to a ready one, and the hover cursor was
+    /// the whole tell.
+    #[test]
+    fn a_disabled_composer_reads_dimmer_than_a_ready_one() {
+        for theme in [iced::Theme::Light, iced::Theme::Dark] {
+            let ready = composer_style(&theme, text_editor::Status::Active);
+            let dead = composer_style(&theme, text_editor::Status::Disabled);
+            assert_ne!(
+                ready.placeholder, dead.placeholder,
+                "the invitation must not read the same in both states"
+            );
+            let ink = composer_ink(&theme);
+            assert_eq!(ready.placeholder, ink.muted);
+            assert_eq!(dead.placeholder, ink.hint);
+        }
     }
 
     #[test]

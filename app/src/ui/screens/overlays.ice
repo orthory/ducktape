@@ -307,6 +307,7 @@ component OverlayLayer(create_open:bool, members_only:bool, bind draft:str, busy
                 @control
               active bg=muted_bg border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=9.0
               hovered bg=elevated border=fg/21
+              focused border=ring
             if searching
               text "Searching…" size=12.5 @text-muted
             if !empty(chat_hits) || !empty(page_hits)

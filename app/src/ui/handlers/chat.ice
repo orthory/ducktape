@@ -777,6 +777,10 @@ on open_message_actions(seq, body, rev)
 
 on open_message_reactions(seq, body, rev)
   return if seq <= 0
+  // ♡ ON AN ARCHIVED CHANNEL OPENS NOTHING. Its 32 cells are all disabled
+  // there, so the picker was a dead-end overlay whose only exit was Esc.
+  error = reaction_refusal(active_channel_archived)
+  return if active_channel_archived
   message_menu_y = block_action_menu_y(chat_pointer_y, chat_height)
   selected_message_seq = seq
   selected_message_rev = rev
@@ -992,12 +996,22 @@ on delete_message_submit
 // bar's one-tap reactions silently no-op'd through the same window. The
 // reactor-set fold is idempotent, so even a double-tap of the same emoji is
 // safe, and the settled delta replays canonically over any interleaving.
+//
+// AND AN ARCHIVED CHANNEL REFUSES OUT LOUD. Every reaction route — the three
+// below and ♡ above — answers it with the banner instead of a silent `return`:
+// the module refuses the op (`check_post_policy` via `reaction_target`), but
+// the surface cannot carry that refusal — the quiet message rows are `lazy` on
+// ONE dependency, so `active_channel_archived` never reaches a chip or a
+// one-tap bar, and each of them kept its full hover/press ramp for an act that
+// never happened. `reaction_refusal` is empty when the channel is live, so the
+// same line that speaks the refusal is the one that clears the last one.
 on add_reaction_submit(emoji)
-  return if loading || empty(active_channel) || active_channel_archived || selected_message_seq <= 0
+  return if loading || empty(active_channel) || selected_message_seq <= 0
+  error = reaction_refusal(active_channel_archived)
+  return if active_channel_archived
   live_thread_generation = live_thread_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  error = ""
   messages = reaction_applied(messages, selected_message_seq, emoji, true)
   thread_messages = reaction_applied(thread_messages, selected_message_seq, emoji, true)
   run every add_reaction(connected_rpc, password, active_channel, selected_message_seq, emoji) -> reaction_acked _ | reaction_failed _
@@ -1007,21 +1021,23 @@ on add_reaction_submit(emoji)
 // a leftover highlight (QA). The picker path still selects, because its
 // overlay is anchored to the selection.
 on add_reaction_at(seq, emoji)
-  return if loading || empty(active_channel) || active_channel_archived || seq <= 0
+  return if loading || empty(active_channel) || seq <= 0
+  error = reaction_refusal(active_channel_archived)
+  return if active_channel_archived
   live_thread_generation = live_thread_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  error = ""
   messages = reaction_applied(messages, seq, emoji, true)
   thread_messages = reaction_applied(thread_messages, seq, emoji, true)
   run every add_reaction(connected_rpc, password, active_channel, seq, emoji) -> reaction_acked _ | reaction_failed _
 
 on remove_reaction_at(seq, emoji)
-  return if loading || active_channel_archived || seq <= 0
+  return if loading || seq <= 0
+  error = reaction_refusal(active_channel_archived)
+  return if active_channel_archived
   live_thread_generation = live_thread_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  error = ""
   messages = reaction_applied(messages, seq, emoji, false)
   thread_messages = reaction_applied(thread_messages, seq, emoji, false)
   run every remove_reaction(connected_rpc, password, active_channel, seq, emoji) -> reaction_acked _ | reaction_failed _

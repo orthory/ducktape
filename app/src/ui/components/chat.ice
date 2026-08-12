@@ -187,11 +187,15 @@ component ChatMemberRow(member:ChatMember, disabled:bool)
           h=fill
           align-x=center
           align-y=center
+        // NO `@text-*` ON THE GLYPH. A class here emits an explicit color, and
+        // an explicit color ignores the button's own `text=` for every status —
+        // so the plate went red on hover while the × stayed muted, and the
+        // disabled ramp never reached it either. Uncolored, the glyph inherits
+        // the four lines below.
         text "×"
           with
             size=13.0
             wrap=none
-            @text-muted
       active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
       hovered bg=danger_bg text=fg
       pressed bg=danger_line text=fg
@@ -875,7 +879,11 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
                     disabled=disabled
                     p=5.0
                     @icon_action
-                  Icon
+                  // `IconAction`, because ♡ and ⋯ beside it are string labels
+                  // that DO brighten: an svg reads no inherited text color, so
+                  // the one icon in this three-button toolbar was the one glyph
+                  // that stayed grey under the cursor.
+                  IconAction
                     with
                       name="nav-chat"
                       tone="muted"
@@ -1110,7 +1118,6 @@ component ComposerMarks(disabled:bool)
             size=12.5
             wrap=none
             font=strong
-            @text-muted
       active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
       hovered bg=fg/8 text=fg
       pressed bg=fg/12 text=fg
@@ -1133,7 +1140,6 @@ component ComposerMarks(disabled:bool)
             size=12.5
             wrap=none
             font=italic
-            @text-muted
       active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
       hovered bg=fg/8 text=fg
       pressed bg=fg/12 text=fg
@@ -1157,7 +1163,7 @@ component ComposerMarks(disabled:bool)
           h=fill
           align-x=center
           align-y=center
-        Icon
+        IconAction
           with
             name="code-brackets"
             tone="muted"
@@ -1179,7 +1185,7 @@ component ComposerMarks(disabled:bool)
           h=fill
           align-x=center
           align-y=center
-        Icon
+        IconAction
           with
             name="quote"
             tone="muted"

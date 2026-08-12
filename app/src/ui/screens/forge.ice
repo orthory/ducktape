@@ -643,7 +643,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                             text-size=13.0
                             line-h=1.2
                             @control
-                          active bg=surface border=border value=fg placeholder=hint selection=fg/18 border-w=1.0 r=8.0
+                          active bg=surface value=fg placeholder=hint selection=fg/18 border-w=1.0 r=8.0
                           hovered bg=muted_bg border=control_line
                           disabled bg=muted_bg/54 value=muted
                         button "Add comment" -> emit(forge_comment_stage)
@@ -726,7 +726,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                         text-size=13.0
                         line-h=1.2
                         @control
-                      active bg=surface border=border value=fg placeholder=hint selection=fg/18 border-w=1.0 r=8.0
+                      active bg=surface value=fg placeholder=hint selection=fg/18 border-w=1.0 r=8.0
                       hovered bg=muted_bg border=control_line
                       disabled bg=muted_bg/54 value=muted
                     // The module refuses a review that is empty on BOTH halves,
