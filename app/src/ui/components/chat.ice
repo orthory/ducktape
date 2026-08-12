@@ -1266,3 +1266,19 @@ component ThreadParentBlock(message:ChatMessage)
 // one `Icon name=… tone="muted" px=14.0` added to four buttons in view.ice, in
 // the file that owns them. The artifact's row metrics for that edit: `gap=9.0`,
 // label 12.5 `@text-accent_fg`, `p=8.0`/`pl=9.0`, `r=7.0`, on a 184px plate.
+
+// ONE GHOST ROW, on the real message row's own geometry: a 30px avatar plate,
+// an 11px gap, a name bar and a body bar. Mounted three-up while a room loads
+// and once inside the search float while a query is out, so the layout does
+// not jump when the real rows land on top of it. `subtle` is the palette's own
+// track grey, quiet in both themes. No spinner: `spin` is declared and never
+// driven (`overlay.ice`), so a ring here would paint a frozen arc.
+component SkeletonRow()
+  row w=fill gap=11.0 align=start
+    box w=30.0 h=30.0 bg=subtle r=15.0
+      space w=1.0 h=1.0
+    col w=fill gap=6.0 pt=4.0
+      box w=96.0 h=9.0 bg=subtle r=4.0
+        space w=1.0 h=1.0
+      box w=fill max-w=420.0 h=9.0 bg=subtle r=4.0
+        space w=1.0 h=1.0

@@ -30,14 +30,29 @@ component DmButton(peer:DmPeer, selected:bool, unread:bool, disabled:bool)
             w=fill
             p=0.0
             @icon_action
-          box
-            with
-              w=fill
-              pl=8.0
-              pr=8.0
-              pt=6.0
-              pb=6.0
-            DmRow peer=peer selected=true unread=unread
+          // THE SAME 2.5px BRAND BAR `ChannelButton` WEARS, for the same
+          // reason: an unselected row's `pressed` plate scores 0.00 from
+          // `selected_row` by the repo's own metric, so a grey plate alone
+          // cannot survive a press, and the peer name's ink is the only other
+          // difference. `brand` is 68.00/82.33 from every row plate. The
+          // content box loses 2.5px of its `pl` so the avatar lands on the
+          // unselected row's edge.
+          row gap=0.0
+            box
+              with
+                w=2.5
+                h=fill
+                bg=brand
+                r=1.25
+              space w=1.0 h=1.0
+            box
+              with
+                w=fill
+                pl=5.5
+                pr=8.0
+                pt=6.0
+                pb=6.0
+              DmRow peer=peer selected=true unread=unread
           active bg=selected_row text=fg border=transparent border-w=1.0 r=7.0
           hovered bg=selected_row text=fg
           pressed bg=rail_hover text=fg
@@ -116,7 +131,10 @@ component DmRow(peer:DmPeer, selected:bool, unread:bool)
             wrap=none
             font=code_semibold
             @text-primary_fg
-    if unread
+    // Confined to the UNSELECTED arm, exactly as `ChannelButton` confines its
+    // own: the open row clears its unread the moment it opens, so a dot there
+    // is a claim the next frame contradicts.
+    if unread && !selected
       box
         with
           w=7.0

@@ -19,7 +19,7 @@
 // were briefly caller-filled slots: a sensor's show/resize route used to accept
 // only bare `_` payloads and could not carry a component event (ui-lang#239).
 
-component ChatScreen(network_name:str, status:str, block_height:i64, bind search_draft:str, searching:bool, searched:bool, search_hits:[ChatSearchHit], rooms:[ChatChannel], unread_channel_ids:[str], dm_peers:[DmPeer], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:str, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, send_flash_id:str, send_flash_value:f64, message_action:str, message_menu_y:f64, bind message_action_focus:str, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_menu_y:f64, thread_send_flash_id:str, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor, shift_held:bool)
+component ChatScreen(network_name:str, status:str, block_height:i64, bind search_draft:str, search_phase:str, search_hits:[ChatSearchHit], rooms:[ChatChannel], unread_channel_ids:[str], dm_peers:[DmPeer], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:str, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, send_flash_id:str, send_flash_value:f64, message_action:str, message_menu_y:f64, bind message_action_focus:str, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_menu_y:f64, thread_send_flash_id:str, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor, shift_held:bool)
   emits
     search_chat_submit()
     clear_chat_search()
@@ -147,7 +147,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
               with
                 label="Search messages"
                 hint="Search…"
-                // NOT `|| searching`. The field went dead the instant Enter
+                // NOT `|| search_phase == "searching"`. The field went dead the instant Enter
                 // was pressed and stayed dead for the whole round trip, so the
                 // query could not be refined while waiting — and a disabled
                 // input drops the caret besides. `chat_search_loaded` already
@@ -483,39 +483,13 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                   with
                     title="No messages yet"
                     description="Nobody has posted here. Send the first message below."
-              // THREE SKELETON ROWS, on the real row's own geometry (30px
-              // avatar, an 11px gap, two bars), not a centred sentence — the
-              // layout does not jump when the messages land on top of them.
-              // No spinner: `spin` is declared and never driven
-              // (`overlay.ice`), so a ring here would paint a frozen arc.
-              // `subtle` is the palette's own track grey, a quiet ghost in
-              // both themes.
+              // THREE SKELETON ROWS, not a centred sentence — see
+              // `SkeletonRow` for the geometry they hold to.
               if connected && loading && empty(messages)
                 col w=fill gap=14.0 pt=4.0
-                  row w=fill gap=11.0 align=start
-                    box w=30.0 h=30.0 bg=subtle r=15.0
-                      space w=1.0 h=1.0
-                    col w=fill gap=6.0 pt=4.0
-                      box w=96.0 h=9.0 bg=subtle r=4.0
-                        space w=1.0 h=1.0
-                      box w=fill max-w=420.0 h=9.0 bg=subtle r=4.0
-                        space w=1.0 h=1.0
-                  row w=fill gap=11.0 align=start
-                    box w=30.0 h=30.0 bg=subtle r=15.0
-                      space w=1.0 h=1.0
-                    col w=fill gap=6.0 pt=4.0
-                      box w=96.0 h=9.0 bg=subtle r=4.0
-                        space w=1.0 h=1.0
-                      box w=fill max-w=420.0 h=9.0 bg=subtle r=4.0
-                        space w=1.0 h=1.0
-                  row w=fill gap=11.0 align=start
-                    box w=30.0 h=30.0 bg=subtle r=15.0
-                      space w=1.0 h=1.0
-                    col w=fill gap=6.0 pt=4.0
-                      box w=96.0 h=9.0 bg=subtle r=4.0
-                        space w=1.0 h=1.0
-                      box w=fill max-w=420.0 h=9.0 bg=subtle r=4.0
-                        space w=1.0 h=1.0
+                  SkeletonRow
+                  SkeletonRow
+                  SkeletonRow
               if connected && !empty(messages) && history_view
                 box
                   with
@@ -595,11 +569,11 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         // being linear in how far back she paged.
                         //
                         // 44px is the middle of a real row: a run header (avatar
-                        // + name line + body over 12px of card padding) runs
-                        // ~54, a grouped continuation ~31. Biased low on purpose
-                        // — too small over-mounts for one pass and corrects
-                        // itself, too large leaves a gap at the bottom until the
-                        // next.
+                        // + name line + body over 12px of card padding, plus
+                        // the 14px run-boundary spacer) runs ~68, a grouped
+                        // continuation ~31. Biased low on purpose — too small
+                        // over-mounts for one pass and corrects itself, too
+                        // large leaves a gap at the bottom until the next.
                         //
                         // The scroll above is anchor-y=end, and this needs it:
                         // measuring a never-seen row ABOVE the viewport moves
@@ -1098,7 +1072,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
             // child, so a search reflowed the whole conversation down by
             // 148px; as a stack layer it drops over the stream instead and
             // everything beneath keeps its place.
-            if !empty(search_hits) || searching || (searched && empty(search_hits))
+            if search_phase != "idle"
               box
                 with
                   w=fill
@@ -1120,23 +1094,16 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                     shadow-y=8.0
                     shadow-blur=24.0
                   col w=fill
-                    if searching
+                    if search_phase == "searching"
                       col w=fill gap=14.0 p=8.0
-                        row w=fill gap=11.0 align=start
-                          box w=30.0 h=30.0 bg=subtle r=15.0
-                            space w=1.0 h=1.0
-                          col w=fill gap=6.0 pt=4.0
-                            box w=96.0 h=9.0 bg=subtle r=4.0
-                              space w=1.0 h=1.0
-                            box w=fill max-w=420.0 h=9.0 bg=subtle r=4.0
-                              space w=1.0 h=1.0
-                    if !searching && empty(search_hits)
+                        SkeletonRow
+                    if search_phase == "done" && empty(search_hits)
                       box w=fill p=14.0 align-x=center
                         text "No messages match"
                           with
                             size=12.5
                             @text-muted
-                    if !searching && !empty(search_hits)
+                    if search_phase == "done" && !empty(search_hits)
                       scroll
                         with
                           dir=vertical
@@ -1219,7 +1186,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         size=10.5
                         wrap=none
                         font=code_medium
-                        @text-label
+                        @text-muted
                     space w=8.0
                     button "Send" -> emit(composer_event, composer_submit_event())
                       with

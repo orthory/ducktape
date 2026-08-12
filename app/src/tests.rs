@@ -1549,10 +1549,10 @@ fn ready_events_and_stale_searches_do_not_rehydrate_navigation() {
     let (mut chat, _) = Ducktape::__boot();
     chat.loading = false;
     chat.chat_search_generation = 4;
-    chat.chat_searching = true;
+    chat.chat_search_phase = "searching".into();
     let _ = chat.__update(__DucktapeMessage::ChooseChannel("next".into()));
     assert_eq!(chat.chat_search_generation, 5);
-    assert!(!chat.chat_searching);
+    assert_eq!(chat.chat_search_phase, "idle");
     let _ = chat.__update(__DucktapeMessage::ChatSearchLoaded(
         backend::ChatSearchData {
             generation: 4,
@@ -7187,4 +7187,133 @@ fn a_disconnected_console_reports_no_counts_at_all() {
             "{screen} printed `{meta}` off a node that answered nothing"
         );
     }
+}
+
+/// A SEARCH THAT ERRORED IS NOT A SEARCH THAT FOUND NOTHING. `search_chat_submit`
+/// empties `chat_search_hits` on its way out, so a phase left non-idle by the
+/// failure route floats "No messages match" — a confident zero-result card beside
+/// an error banner saying the request never landed. One discriminant makes that
+/// state unrepresentable: the float reads `search_phase != "idle"` and the miss
+/// reads `== "done"`, so the failure arm closes the float by writing "idle".
+#[test]
+fn a_failed_message_search_closes_the_float_instead_of_claiming_zero_results() {
+    let (mut app, _) = Ducktape::__boot();
+    app.loading = false;
+    app.chat_search_draft = "ledger".into();
+    let _ = app.__update(__DucktapeMessage::SearchChatSubmit);
+    assert_eq!(app.chat_search_phase, "searching");
+
+    let _ = app.__update(__DucktapeMessage::ChatSearchFailed(
+        backend::HydrationError {
+            generation: app.chat_search_generation,
+            message: "rpc unreachable".into(),
+        },
+    ));
+    assert_eq!(
+        app.chat_search_phase, "idle",
+        "the float has nothing honest to say about a search that never ran"
+    );
+    assert!(app.chat_search_hits.is_empty());
+    assert_eq!(app.error, "rpc unreachable");
+
+    // And the empty result IS still reachable — "done" with no hits is the miss.
+    let _ = app.__update(__DucktapeMessage::SearchChatSubmit);
+    let _ = app.__update(__DucktapeMessage::ChatSearchLoaded(
+        backend::ChatSearchData {
+            generation: app.chat_search_generation,
+            hits: Vec::new(),
+        },
+    ));
+    assert_eq!(app.chat_search_phase, "done");
+
+    // A superseded failure cannot reopen or close anything: it is generation-gated.
+    let _ = app.__update(__DucktapeMessage::ChatSearchFailed(
+        backend::HydrationError {
+            generation: app.chat_search_generation - 1,
+            message: "stale".into(),
+        },
+    ));
+    assert_eq!(app.chat_search_phase, "done");
+}
+
+/// THE DESIGN PASS, PINNED. Every one of these is a measurement someone made
+/// against the artifact and a later edit can silently undo: a number in a `with`
+/// block reverts as easily as it landed, and none of them fails a build. The
+/// grouping rhythm, the line measure, the header row, the selection mark and the
+/// loading/failure states are all here so a revert is a red test, not a
+/// screenshot nobody takes.
+#[test]
+fn the_chat_surface_holds_to_its_measured_geometry() {
+    let components = inlined(include_str!("ui/components/chat.ice"));
+    let screen = inlined(include_str!("ui/screens/chat.ice"));
+    let dm = inlined(include_str!("ui/components/dm.ice"));
+
+    // ONE LINE MEASURE. Unbounded, the body ran ~130 characters at the default
+    // window and ~320 maximized — past every readability bound there is.
+    assert!(components.contains("col w=fill max-w=760.0 gap=5.0"));
+
+    // GROUPING RHYTHM: 11px inside an author run, 25px across one (11 + the
+    // 14px spacer). The spacer sits OUTSIDE the hover capsule, so the gap
+    // between runs does not light up as part of the row below it.
+    assert_eq!(
+        components
+            .matches("if message.show_author\n      space w=1.0 h=14.0")
+            .count(),
+        2,
+        "both the message card and the thread card open a run with the spacer"
+    );
+    assert_eq!(
+        components
+            .matches("row w=fill gap=11.0 align=start")
+            .count(),
+        3,
+        "the message row, the thread ROOT and the skeleton row share one 41px \
+         text gutter — the root used to sit 3px off the replies it heads"
+    );
+
+    // ONE HEADER HEIGHT across the four panes, so their hairlines land on one y.
+    assert_eq!(
+        screen.matches("h=50.0").count(),
+        4,
+        "sidebar, message, thread and details headers are one row height"
+    );
+
+    // THE SELECTION MARK IS BRAND, NOT GREY. `pressed` on an unselected row
+    // scores 0.00 from `selected_row` by the repo's own metric, so both sidebar
+    // lists carry the 2.5px bar no press state can imitate.
+    for (name, source) in [("ChannelButton", &components), ("DmButton", &dm)] {
+        let selected = source
+            .split("if !selected")
+            .next()
+            .expect("every row component opens with its selected arm");
+        assert!(
+            selected.contains("box w=2.5 h=fill bg=brand r=1.25"),
+            "{name}'s selected arm needs a mark grey cannot forge"
+        );
+    }
+    // And the unread dot stays on the UNSELECTED arm in both, for the same
+    // reason: the open row clears its unread the moment it opens.
+    assert!(dm.contains("if unread && !selected"));
+
+    // THREE SKELETON ROWS while a room loads, one inside the search float —
+    // one component, four mounts, not four copies of the same eight lines.
+    assert!(components.contains("component SkeletonRow()"));
+    assert_eq!(
+        screen
+            .lines()
+            .filter(|line| line.trim() == "SkeletonRow")
+            .count(),
+        4,
+        "three while a room loads, one inside the search float"
+    );
+
+    // A FAILED SEND WEARS GateNote's REVERSIBLE-DANGER PLATE, not a muted
+    // sentence quieter than the archived-channel notice above it.
+    assert!(screen.contains(
+        "box w=fill px=13.0 py=11.0 bg=danger_zone_bg border=danger_zone_line border-w=1.0 r=9.0"
+    ));
+
+    // THE DM ROW CARRIES THE SAME UNREAD MARK AS A CHANNEL ROW, off the same
+    // mirror — which is what `DmPeer.channel_id` was added to make possible.
+    assert!(screen.contains("unread=is_unread_channel(unread_channel_ids, peer.channel_id)"));
 }
