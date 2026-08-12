@@ -490,6 +490,7 @@ fn console_in_forge_code() -> (Ducktape, iced::window::Id) {
         repo: "probe".into(),
         rev: "dev".into(),
         path: String::new(),
+        born: true,
         entries: vec![backend::TreeEntry {
             name: "probe.rs".into(),
             path: "probe.rs".into(),

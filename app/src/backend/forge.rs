@@ -553,8 +553,25 @@ pub(crate) fn merge_against_mirror(
 /// smart-HTTP remote. The mirror is a persistent per-endpoint cache under the
 /// same root the user key lives in, so two networks' repos never shadow each
 /// other.
+static FORGE_MIRROR_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+
+fn forge_mirror_lock(dir: &Path) -> Result<Arc<Mutex<()>>, String> {
+    let locks = FORGE_MIRROR_LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut locks = locks
+        .lock()
+        .map_err(|_| "forge mirror lock registry is poisoned".to_string())?;
+    Ok(locks
+        .entry(dir.to_path_buf())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone())
+}
+
 fn sync_forge_mirror(endpoint: &str, repo: &str) -> Result<git2::Repository, String> {
     let dir = forge_mirror_dir(endpoint, repo)?;
+    let lock = forge_mirror_lock(&dir)?;
+    let _guard = lock
+        .lock()
+        .map_err(|_| format!("forge mirror lock is poisoned for {repo:?}"))?;
     std::fs::create_dir_all(&dir)
         .map_err(|error| format!("create forge mirror dir {}: {error}", dir.display()))?;
     let mirror = match git2::Repository::open_bare(&dir) {
@@ -570,6 +587,24 @@ fn sync_forge_mirror(endpoint: &str, repo: &str) -> Result<git2::Repository, Str
             .map_err(|error| format!("fetch forge remote for {repo:?}: {error}"))?;
     }
     Ok(mirror)
+}
+
+/// Use the resident mirror when it already carries the exact revision a tree
+/// read pinned. File and nested-directory clicks then stay on that commit and
+/// do not turn every click into another network fetch.
+fn mirror_holding_revision(
+    endpoint: &str,
+    repo: &str,
+    rev: &str,
+) -> Result<git2::Repository, String> {
+    let dir = forge_mirror_dir(endpoint, repo)?;
+    let resident = git2::Repository::open_bare(&dir).ok();
+    let already_holds_revision =
+        resident.filter(|mirror| !rev.is_empty() && mirror.revparse_single(rev).is_ok());
+    match already_holds_revision {
+        Some(mirror) => Ok(mirror),
+        None => sync_forge_mirror(endpoint, repo),
+    }
 }
 
 /// `<key-root>/forge-remote/<endpoint-slug>/<repo>` — the key root is the same
@@ -647,6 +682,10 @@ pub struct ForgeTreeData {
     pub repo: String,
     pub rev: String,
     pub path: String,
+    /// Whether the mirror has at least one branch. An empty `entries` list can
+    /// also be a real empty commit, so the view must not infer "unborn" from
+    /// the list alone.
+    pub born: bool,
     pub entries: Vec<TreeEntry>,
 }
 
@@ -684,6 +723,17 @@ fn default_rev(mirror: &git2::Repository) -> Result<String, String> {
         }
     }
     Err("this repo has no born branch yet".into())
+}
+
+pub(crate) fn mirror_has_born_branch(mirror: &git2::Repository) -> Result<bool, String> {
+    let mut branches = mirror
+        .branches(Some(git2::BranchType::Local))
+        .map_err(git_err)?;
+    branches
+        .next()
+        .transpose()
+        .map(|branch| branch.is_some())
+        .map_err(git_err)
 }
 
 /// Resolve `rev` (a branch name, or empty for the default) to its commit.
@@ -770,13 +820,27 @@ pub async fn forge_tree(
 ) -> Result<ForgeTreeData, HydrationError> {
     async {
         tokio::task::spawn_blocking(move || {
-            let mirror = sync_forge_mirror(&rpc, &repo)?;
-            let entries = read_tree(&mirror, &rev, &path)?;
+            let mirror = mirror_holding_revision(&rpc, &repo, &rev)?;
+            let born = mirror_has_born_branch(&mirror)?;
+            let is_default_root = rev.is_empty() && path.is_empty();
+            if !born && is_default_root {
+                return Ok(ForgeTreeData {
+                    generation,
+                    repo,
+                    rev,
+                    path,
+                    born,
+                    entries: Vec::new(),
+                });
+            }
+            let resolved_rev = mirror_commit_at(&mirror, &rev)?.id().to_string();
+            let entries = read_tree(&mirror, &resolved_rev, &path)?;
             Ok::<_, String>(ForgeTreeData {
                 generation,
                 repo,
-                rev,
+                rev: resolved_rev,
                 path,
+                born,
                 entries,
             })
         })
@@ -851,7 +915,7 @@ pub async fn forge_blob(
 ) -> Result<BlobView, HydrationError> {
     async {
         tokio::task::spawn_blocking(move || {
-            let mirror = sync_forge_mirror(&rpc, &repo)?;
+            let mirror = mirror_holding_revision(&rpc, &repo, &rev)?;
             read_blob(&mirror, repo, rev, path, generation)
         })
         .await

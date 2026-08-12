@@ -2032,6 +2032,7 @@ fn closing_a_repo_or_an_item_retires_the_load_that_would_reopen_it() {
     assert!(merging.forge_merge_busy);
     let _ = merging.__update(__DucktapeMessage::ForgeCloseItem);
     let _ = merging.__update(__DucktapeMessage::ForgeMerged(
+        "http://node".into(),
         "core".into(),
         7,
         backend::ForgeMergeOutcome {
@@ -2050,6 +2051,65 @@ fn closing_a_repo_or_an_item_retires_the_load_that_would_reopen_it() {
 }
 
 #[test]
+fn forge_scoped_reads_do_not_call_loading_or_failure_empty() {
+    let (mut failed_list, _) = Ducktape::__boot();
+    failed_list.forge_generation = 3;
+    let _ = failed_list.__update(__DucktapeMessage::ForgeListFailed(
+        backend::HydrationError {
+            generation: 3,
+            message: "forge unavailable".into(),
+        },
+    ));
+    assert_eq!(failed_list.forge_list_phase, "failed");
+    assert_eq!(failed_list.error, "forge unavailable");
+
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+
+    let _ = app.__update(__DucktapeMessage::ForgeOpenRepo("core".into()));
+    assert_eq!(app.forge_repo_phase, "loading");
+    assert_eq!(app.forge_code_phase, "tree_loading");
+    let generation = app.forge_generation;
+    let code_generation = app.forge_code_generation;
+
+    let _ = app.__update(__DucktapeMessage::ForgeRepoLoaded(backend::ForgeRepoData {
+        generation,
+        repo: "core".into(),
+        branches: Vec::new(),
+        items: Vec::new(),
+    }));
+    assert_eq!(app.forge_repo_phase, "ready");
+
+    let _ = app.__update(__DucktapeMessage::ForgeTreeLoaded(backend::ForgeTreeData {
+        generation: code_generation,
+        repo: "core".into(),
+        rev: "1111111111111111111111111111111111111111".into(),
+        path: String::new(),
+        born: true,
+        entries: Vec::new(),
+    }));
+    assert_eq!(app.forge_code_phase, "ready");
+    assert!(app.forge_tree_born);
+    assert_eq!(
+        app.forge_tree_rev, "1111111111111111111111111111111111111111",
+        "nested tree and file reads stay pinned to the tree's commit"
+    );
+
+    let _ = app.__update(__DucktapeMessage::ForgeOpenItem(7));
+    assert_eq!(app.forge_item_phase, "loading");
+    let generation = app.forge_generation;
+    let _ = app.__update(__DucktapeMessage::ForgeItemFailed(
+        backend::HydrationError {
+            generation,
+            message: "tracker unavailable".into(),
+        },
+    ));
+    assert_eq!(app.forge_item_phase, "failed");
+    assert_eq!(app.error, "tracker unavailable");
+}
+
+#[test]
 fn forge_review_completion_cannot_clear_a_new_items_draft() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
@@ -2064,6 +2124,7 @@ fn forge_review_completion_cannot_clear_a_new_items_draft() {
     app.forge_item_number = 8;
     app.forge_review_draft = "review eight".into();
     let _ = app.__update(__DucktapeMessage::ForgeReviewSubmitted(
+        "http://node".into(),
         "core".into(),
         7,
         true,
@@ -3467,6 +3528,15 @@ fn opening_a_network_clears_the_previous_networks_state() {
     app.block_comment_draft = "node a comment".into();
     app.message_editor = compose("node a message");
     app.page_search_draft = "node a search".into();
+    app.forge_list_phase = "ready".into();
+    app.forge_repo = "same-repo".into();
+    app.forge_repo_phase = "ready".into();
+    app.forge_item_number = 1;
+    app.forge_item_phase = "ready".into();
+    app.forge_review_draft = "node a review".into();
+    app.forge_tree_repo = "same-repo".into();
+    app.forge_tree_born = true;
+    app.forge_code_phase = "ready".into();
     app.huddle_joined = true;
     app.huddle_channel = "chan-a".into();
 
@@ -3487,6 +3557,15 @@ fn opening_a_network_clears_the_previous_networks_state() {
     assert!(app.message_draft.is_empty());
     assert!(composer(&app).is_empty());
     assert!(app.page_search_draft.is_empty());
+    assert_eq!(app.forge_list_phase, "idle");
+    assert!(app.forge_repo.is_empty());
+    assert_eq!(app.forge_repo_phase, "idle");
+    assert_eq!(app.forge_item_number, 0);
+    assert_eq!(app.forge_item_phase, "idle");
+    assert!(app.forge_review_draft.is_empty());
+    assert!(app.forge_tree_repo.is_empty());
+    assert!(!app.forge_tree_born);
+    assert_eq!(app.forge_code_phase, "idle");
     assert!(!app.huddle_joined);
     assert!(app.huddle_channel.is_empty());
 
@@ -5613,17 +5692,20 @@ fn forge_empty_states_name_only_routes_that_exist() {
         "nothing in the shipped surface opens an issue; say so rather than implying a route"
     );
 
-    // AND THE CODE PANE MUST NOT SEND THE READER TO AN EMPTY TREE. The sidebar
-    // says "Nothing committed on this branch yet" while the pane beside it said
-    // "Pick a file from the tree to read it" — two claims about the same tree,
-    // in the same frame.
+    // AND THE CODE PANE MUST NOT CALL A MIRROR FETCH "UNBORN". The first fetch
+    // can take seconds for a real repository; only the loader's born bit may
+    // decide that no branch exists, and an empty born commit is distinct too.
     assert!(
-        forge.contains("if empty(file_path) && empty(tree_entries)"),
-        "the no-file pane splits on whether there is a tree to pick from"
+        forge.contains("if code_phase == \"tree_loading\""),
+        "the in-flight tree has its own visible state"
     );
     assert!(
-        forge.contains("Nothing is committed on this branch yet, so there is no file to read."),
-        "an unborn repo says why there is nothing to read"
+        forge.contains("empty(tree_entries) && !tree_born"),
+        "unborn is driven by branch presence, not an empty listing"
+    );
+    assert!(
+        forge.contains("empty(tree_entries) && tree_born"),
+        "a born empty commit does not get called unborn"
     );
 }
 

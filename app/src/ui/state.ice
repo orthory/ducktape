@@ -220,13 +220,15 @@ state
   explorer_generation:i64 = 0
   explorer_loading = false
   explorer_selected:i64 = 0
-  // ANSWERED = the plane's loader returned at least once (rows or refusal).
-  // The empty plates guard on these: "No members yet" is a lie while the
-  // first load is still in flight. Set by the loaded AND failed arms.
+  // ANSWERED = the plane has an authoritative result. The empty plates guard
+  // on these: "No members yet" is a lie while the first load is still in
+  // flight. Most planes retain their old rows on a failed refresh; Forge also
+  // keeps this false on a failed first read so it never turns refusal into
+  // "0 repositories".
   members_answered = false
   agents_answered = false
   gov_answered = false
-  forge_answered = false
+  forge_list_phase = "idle"
   members_rows:[MemberRow] = []
   members_generation:i64 = 0
   gov_rows:[ProposalRow] = []
@@ -236,9 +238,13 @@ state
   agents_generation:i64 = 0
   forge_repos:[ForgeRepo] = []
   forge_repo = ""
+  // One phase per scoped read. Empty data is only an empty state after the
+  // matching loader says `ready`; until then it is loading or failed.
+  forge_repo_phase = "idle"
   forge_branches:[str] = []
   forge_items:[ForgeItem] = []
   forge_item_number:i64 = 0
+  forge_item_phase = "idle"
   forge_item_title = ""
   forge_item_state = ""
   forge_item_kind = ""

@@ -247,6 +247,7 @@ on workspace_connected(next)
   agents_generation = agents_generation + 1
   account_generation = account_generation + 1
   forge_generation = forge_generation + 1
+  forge_list_phase = keep_str(shell_tab == "forge", "loading", forge_list_phase)
   settings_generation = settings_generation + 1
   node_peers_generation = node_peers_generation + 1
   node_facts_generation = node_facts_generation + 1
@@ -264,7 +265,7 @@ on workspace_connected(next)
     run replace lane=peers_load load_peers(connected_rpc, keep_i64(shell_tab == "settings" && node_tab == "overview", node_peers_generation, -1)) -> peers_loaded _ | peers_failed _
     run replace lane=agents_load load_agents(connected_rpc, agents_generation) -> agents_loaded _ | agents_failed _
     run replace lane=account_load load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
-    run replace lane=forge_load load_forge(connected_rpc, forge_generation) -> forge_loaded _ | forge_failed _
+    run replace lane=forge_load load_forge(connected_rpc, forge_generation) -> forge_loaded _ | forge_list_failed _
     // The huddle window mirrors the old popped-card gate: it closes the
     // moment a fold finds `huddle_joined` false. A no-op while still joined.
     task window close target=window_target_unless(huddle_joined, huddle_win)
@@ -390,7 +391,7 @@ on live_updated(next)
   hydration_retry_attempt = keep_i64(next.load_chat || next.load_pages || huddle_refresh_hits(next.chat, active_channel), 0, hydration_retry_attempt)
   parallel
     run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes((next.load_chat || huddle_refresh_hits(next.chat, active_channel)), next.load_pages), next.debounce, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
-    run replace lane=forge_live forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == "forge"), forge_generation) -> forge_refreshed _ | forge_failed _
+    run replace lane=forge_live forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == "forge"), forge_generation) -> forge_refreshed _ | forge_live_failed _
     // The `keep_i64(plane_live_hit(…), gen, -1)` is the SAME off-screen
     // refusal the tab-switch path uses: the backend refuses a generation of -1
     // and the failed arm's guard drops the refusal unread, so a plane no
@@ -717,6 +718,7 @@ on select_shell_tab(next)
   agents_generation = agents_generation + 1
   account_generation = account_generation + 1
   forge_generation = forge_generation + 1
+  forge_list_phase = keep_str(shell_tab == "forge", "loading", forge_list_phase)
   // THE SETTINGS BUMP IS GATED TOO, AND IT IS THE ONE THAT HAS TO BE. Every
   // other loader here draws only its own tab, so a bump that discards a
   // still-flying CONNECT load is re-earned the moment that tab is opened. The
@@ -779,7 +781,7 @@ on select_shell_tab(next)
     run replace lane=peers_load load_peers(connected_rpc, keep_i64(shell_tab == "settings" && node_tab == "overview", node_peers_generation, -1)) -> peers_loaded _ | peers_failed _
     run replace lane=agents_load load_agents(connected_rpc, keep_i64(tab_reads_plane(shell_tab, "agents"), agents_generation, -1)) -> agents_loaded _ | agents_failed _
     run replace lane=account_load load_account(connected_rpc, keep_i64(tab_reads_plane(shell_tab, "account"), account_generation, -1)) -> account_loaded _ | account_failed _
-    run replace lane=forge_load load_forge(connected_rpc, keep_i64(shell_tab == "forge", forge_generation, -1)) -> forge_loaded _ | forge_failed _
+    run replace lane=forge_load load_forge(connected_rpc, keep_i64(shell_tab == "forge", forge_generation, -1)) -> forge_loaded _ | forge_list_failed _
 
 // The huddle's elapsed clock is a LOCAL session fact: one tick per second for
 // as long as SHE is in the huddle, never a chain value. `huddle_joined_at` is
