@@ -1402,30 +1402,50 @@ fn an_archived_channel_says_why_it_dropped_the_reaction() {
         );
     }
 
-    // AND THE COMMENT OVER `add_reaction_submit` CLAIMS ALL FIVE. Keep the
-    // claim honest: every handler that reaches a reaction op must carry the
-    // refusal line, so a sixth route cannot ship silent.
+    // AND THE COMMENT OVER `add_reaction_submit` CLAIMS ALL FIVE. A hardcoded
+    // list of the five cannot keep that claim honest — it stays green over a
+    // sixth route it does not name, which is the only failure it exists to
+    // catch. So the ROUTES SELECT THEMSELVES: walk every handler and conscript
+    // the ones that reach a reaction op (`run every add_reaction(` /
+    // `remove_reaction(`) or open the picker (`_action = "reactions"`). Those
+    // discriminants are the ACTS, so the landings that merely fold one —
+    // `reaction_acked`, `reaction_failed` — are not swept in, and prose naming
+    // an op does not conscript a handler that never calls it.
     let chat = inlined(include_str!("ui/handlers/chat.ice"));
-    for handler in [
-        "add_reaction_submit(emoji)",
-        "add_reaction_at(seq, emoji)",
-        "remove_reaction_at(seq, emoji)",
-        "open_message_reactions(seq, body, rev)",
-        "open_thread_message_reactions(seq, body, rev)",
-    ] {
-        let body = chat
-            .split_once(&format!("on {handler}\n"))
-            .unwrap_or_else(|| panic!("{handler} is a handler"))
-            .1
-            .split_once("\non ")
-            .expect("a handler ends at the next one")
-            .0;
+    let mut reaction_routes: Vec<&str> = Vec::new();
+    for block in chat.split("\non ").skip(1) {
+        let handler = block.split('(').next().unwrap_or(block).trim();
+        let handler = handler.lines().next().unwrap_or(handler).trim();
+        let reaches_reaction = block.lines().any(|line| {
+            let statement = line.trim_start();
+            let is_comment = statement.starts_with("//");
+            let taps = statement.contains("run every add_reaction(")
+                || statement.contains("run every remove_reaction(");
+            let opens_picker = statement.contains("_action = \"reactions\"");
+            !is_comment && (taps || opens_picker)
+        });
+        if !reaches_reaction {
+            continue;
+        }
+        reaction_routes.push(handler);
         assert!(
-            body.contains("error = reaction_refusal(active_channel_archived, error)")
-                && body.contains("return if active_channel_archived"),
-            "{handler} must answer an archived channel with the banner"
+            block.contains("error = reaction_refusal(active_channel_archived, error)")
+                && block.contains("return if active_channel_archived"),
+            "`on {handler}` reaches a reaction op and must answer an archived \
+             channel with the banner"
         );
     }
+    assert_eq!(
+        reaction_routes,
+        [
+            "open_thread_message_reactions",
+            "open_message_reactions",
+            "add_reaction_submit",
+            "add_reaction_at",
+            "remove_reaction_at",
+        ],
+        "a route started or stopped reaching a reaction op: it owes the refusal"
+    );
 }
 
 #[test]

@@ -419,14 +419,16 @@ on live_resynced(next)
   // NOT reverted with it, so a flat assignment walked a third room's `head_seq`
   // back under a cursor that stayed put: `head_seq > last_read` went false and
   // the badge a mid-flight post lit went out, dark until that room got another
-  // message. `upsert_channel_rows` keeps `head_seq` monotonic and keeps a row
-  // the answer does not carry at all — a channel created while it was in flight.
+  // message. `upsert_channel_rows` — which `keep_channels` runs BEHIND its
+  // loaded pick, so a plane-only resync never pays for the fold — keeps
+  // `head_seq` monotonic and keeps a row the answer does not carry at all: a
+  // channel created while it was in flight.
   //
   // IT IS NOT A FULL MERGE, and the rest of the row is the snapshot's: a rename
   // or an archive folded during the round trip is overwritten here. That one
   // self-heals — the next chat-carrying resync re-reads the renamed row — where
   // the badge did not, which is why only the cursor's invariant is enforced.
-  channels = keep_channels(next.chat_loaded, upsert_channel_rows(channels, next.channels), channels)
+  channels = keep_channels(next.chat_loaded, next.channels, channels)
   channel_reads = initial_channel_reads(channels, channel_reads)
   // SAME FOLD, ONE LINE ABOVE THE BANNER, because it reads `history_view` while
   // it is still the window's own answer. `load_chat_data` replies with the
@@ -622,15 +624,23 @@ on live_resynced(next)
   // it and the `live_resync_failed` retry chain with it. Almost every bumper is
   // behind a `mutation_phase != "idle"` guard "recovering" cannot pass; the ones
   // that are NOT are the two acts that deliberately run outside the lock — a
-  // message send (`message_composer_event`, `reply_composer_event`) and a
+  // message send (`chat_composer_event`, `reply_composer_event`) and a
   // reaction tap (`add_reaction_submit`, `add_reaction_at`,
-  // `remove_reaction_at`) — none of which launch a replacement on the
-  // `live_resync` lane. One of those inside the recovery's round trip leaves the
-  // lock held with no terminal again, and Settings → Reconnect (whitelisted for
-  // "recovering" at the top of this file) is the escape. Closing it means giving
-  // the recovery a generation of its own rather than riding this one, which is a
-  // wider change than the lock is worth today: this is strictly the residue of a
-  // case that used to be unconditional.
+  // `remove_reaction_at`) — plus two LANDINGS rather than acts,
+  // `chat_load_failed` and `failed` (the `load_page` error arm below): their
+  // launchers are all gated on the lock, but a switch already in flight when
+  // `mutation_failed` parked it lands under "recovering", and `mutation_failed`
+  // invalidates neither the `chat_load` nor the `page_load` lane. None of the
+  // seven launch a replacement on the `live_resync` lane, so any of them inside
+  // the recovery's round trip leaves the lock held with no terminal again, and
+  // Settings → Reconnect (whitelisted for "recovering" at the top of this file)
+  // is the escape. `connect_failed` bumps ungated too and is deliberately NOT on
+  // that list: its own forever-retry ends at `workspace_connected`, which writes
+  // `mutation_phase = "idle"` unconditionally, so that chain releases the lock
+  // itself. Closing the rest means giving the recovery a generation of its own
+  // rather than riding this one, which is a wider change than the lock is worth
+  // today: this is strictly the residue of a case that used to be
+  // unconditional.
   mutation_phase = keep_str(mutation_phase == "recovering", "idle", mutation_phase)
   error = ""
   block_comments_generation = block_comments_generation + 1
