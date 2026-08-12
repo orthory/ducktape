@@ -105,4 +105,4 @@ on leave_huddle_here
   // to show. A window task is terminal, so the leave call rides beside it.
   parallel
     task window close target=window_target(huddle_win)
-    run leave_huddle(connected_rpc, password, huddle_channel) -> chat_acked _ | mutation_failed _
+    run every leave_huddle(connected_rpc, password, huddle_channel) -> chat_acked _ | mutation_failed _

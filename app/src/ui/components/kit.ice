@@ -497,7 +497,7 @@ component ProposalCard(proposal:ProposalRow, busy:bool)
               wrap=none
               @text-secondary_fg
         // the contract signed `expires_in(deadline)`; what landed is
-        // `expires_in_blocks(deadline_height, height)`, and this card has no
+        // `expires_in_blocks(deadline_height, height, wall_now)`, and this card has no
         // chain height to feed it. Print the deadline height honestly until
         // the screen threads one in — never a relative phrase we cannot compute.
         text "· expires at h"

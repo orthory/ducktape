@@ -303,7 +303,7 @@ fn the_node_streams_carry_the_gates_their_costs_require() {
     let peers_loads: Vec<_> = lifecycle
         .lines()
         .map(str::trim)
-        .filter(|line| line.starts_with("run load_peers("))
+        .filter(|line| line.starts_with("run replace lane=peers_load load_peers("))
         .collect();
     assert!(
         !peers_loads.is_empty()
@@ -549,6 +549,9 @@ fn assert_no_polling(lifecycle: &str) {
             // the capture cadence. A reintroduced video tick would rebuild
             // EVERY window's view tree per beat — fail the build instead.
             "every 1s when huddle_joined -> tick",
+            // One shared wall reading makes every relative-time renderer pure.
+            // The new runtime's logical clock owns this tick in tests.
+            "every 1s when console_win != none -> wall_tick",
             // the toast's dismissal clock: fine ticks against a per-toast
             // age, so a toast raised late in the old shared 2800ms window
             // no longer flashes and vanishes. Still gated on a visible
@@ -584,14 +587,29 @@ fn assert_no_polling(lifecycle: &str) {
 fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
     let lifecycle = inlined(include_str!("ui/handlers/lifecycle.ice"));
 
-    for (loader, plane, generation) in [
-        ("load_members", "members", "members_generation"),
-        ("load_governance", "governance", "gov_generation"),
-        ("load_agents", "agents", "agents_generation"),
-        ("load_account", "account", "account_generation"),
+    for (loader, lane, plane, generation) in [
+        (
+            "load_members",
+            "members_load",
+            "members",
+            "members_generation",
+        ),
+        (
+            "load_governance",
+            "governance_load",
+            "governance",
+            "gov_generation",
+        ),
+        ("load_agents", "agents_load", "agents", "agents_generation"),
+        (
+            "load_account",
+            "account_load",
+            "account",
+            "account_generation",
+        ),
     ] {
         let wired = format!(
-            "run {loader}(connected_rpc, keep_i64(tab_reads_plane(shell_tab, \"{plane}\"), {generation}, -1))"
+            "run replace lane={lane} {loader}(connected_rpc, keep_i64(tab_reads_plane(shell_tab, \"{plane}\"), {generation}, -1))"
         );
         assert!(
             lifecycle.contains(&wired),
@@ -599,15 +617,35 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
         );
     }
 
-    for (loader, module, generation) in [
-        ("load_members", "valset", "members_generation"),
-        ("load_governance", "governance", "gov_generation"),
-        ("load_account", "identity", "account_generation"),
-        ("load_dm_peers", "identity", "dm_peers_generation"),
-        ("load_agents", "agent", "agents_generation"),
+    for (loader, lane, module, generation) in [
+        (
+            "load_members",
+            "members_load",
+            "valset",
+            "members_generation",
+        ),
+        (
+            "load_governance",
+            "governance_load",
+            "governance",
+            "gov_generation",
+        ),
+        (
+            "load_account",
+            "account_load",
+            "identity",
+            "account_generation",
+        ),
+        (
+            "load_dm_peers",
+            "dm_peers_load",
+            "identity",
+            "dm_peers_generation",
+        ),
+        ("load_agents", "agents_load", "agent", "agents_generation"),
     ] {
         let live = format!(
-            "run {loader}(connected_rpc, keep_i64(plane_live_hit(next.kind, next.module, \"{module}\"), {generation}, -1))"
+            "run replace lane={lane} {loader}(connected_rpc, keep_i64(plane_live_hit(next.kind, next.module, \"{module}\"), {generation}, -1))"
         );
         assert!(
             lifecycle.contains(&live),
@@ -625,13 +663,13 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
     let settings_loads: Vec<_> = lifecycle
         .lines()
         .map(str::trim)
-        .filter(|line| line.starts_with("run load_settings_facts("))
+        .filter(|line| line.starts_with("run replace lane=settings_load load_settings_facts("))
         .collect();
     assert_eq!(
         settings_loads,
         [
-            "run load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _",
-            "run load_settings_facts(connected_rpc, keep_i64(shell_tab == \"settings\", settings_generation, -1)) -> settings_loaded _ | settings_failed _",
+            "run replace lane=settings_load load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _",
+            "run replace lane=settings_load load_settings_facts(connected_rpc, keep_i64(shell_tab == \"settings\", settings_generation, -1)) -> settings_loaded _ | settings_failed _",
         ]
     );
 }
@@ -696,7 +734,7 @@ fn forge_depth_rides_the_established_seams() {
         "forge_discussion = apply_chat_messages(forge_discussion, next.chat, forge_item_channel)"
     ));
     assert!(lifecycle.contains(
-        "run send_message(connected_rpc, password, forge_item_channel, forge_discussion_pending"
+        "run every send_message(connected_rpc, password, forge_item_channel, forge_discussion_pending"
     ));
 
     // a review pins the source head the reviewer saw; the merge CASes
@@ -719,7 +757,7 @@ fn forge_depth_rides_the_established_seams() {
     // surface's own gate: a chain op must not walk every repo's git mirror for
     // a list that is not on screen.
     assert!(lifecycle.contains(
-        "run forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == \"forge\"), forge_generation)"
+        "run replace lane=forge_live forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == \"forge\"), forge_generation)"
     ));
     assert_no_polling(&lifecycle);
 
@@ -795,9 +833,9 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
     assert!(refresh.contains("failed_message_draft = remember_failed_draft("));
     assert!(lifecycle.contains("run live_events(connected_rpc) when connected"));
     assert_no_polling(&lifecycle);
-    assert!(lifecycle.contains("run live_resync_load(connected_rpc"));
-    assert!(lifecycle.contains("run refresh_live_thread(connected_rpc"));
-    assert!(lifecycle.contains("parallel\n    run refresh_live_thread("));
+    assert!(lifecycle.contains("run replace lane=live_resync live_resync_load(connected_rpc"));
+    assert!(lifecycle.contains("run replace lane=live_thread refresh_live_thread(connected_rpc"));
+    assert!(lifecycle.contains("parallel\n    run replace lane=live_thread refresh_live_thread("));
     // Page-scoped state waits for a reply that answers for the page in hand —
     // a resync issued before a mutation moved the selection speaks for a
     // document nobody is on.
@@ -1467,19 +1505,40 @@ on ",
     );
 }
 
-/// CLOSING RETIRES THE LOAD THAT WOULD REOPEN WHAT YOU JUST LEFT. Every forge
-/// loader guards on generation equality alone, so a close that did not bump the
-/// generation answered its own in-flight read: `forge_repo_loaded` re-assigns
+/// CLOSING RETIRES THE LOAD THAT WOULD REOPEN WHAT YOU JUST LEFT. Named request
+/// lanes abort the work immediately, and the generation bump rejects a
+/// completion already queued for delivery: `forge_repo_loaded` re-assigns
 /// `forge_repo` and `forge_item_loaded` re-assigns `forge_item_number`, dropping
 /// the user straight back into the repo or item they had just backed out of.
 ///
-/// `forge_merged` is the one reply NOT keyed on the generation — it is guarded on
-/// repo + number, and `forge_close_item` zeroes the number. It therefore releases
-/// `forge_merge_busy` ABOVE that check: this reply is the only thing that lowers
-/// the flag and `forge_merge_submit` returns early on it, so closing an item
-/// mid-merge left the Merge button disabled for the rest of the session.
+/// Review and merge launches snapshot repo + number into their completion
+/// routes. That identity follows the request without requiring the backend to
+/// echo UI routing state, while the busy flag still comes down before a stale
+/// completion is rejected.
 #[test]
 fn closing_a_repo_or_an_item_retires_the_load_that_would_reopen_it() {
+    let handlers = inlined(include_str!("ui/handlers/forge.ice"));
+    let close_repo = handlers
+        .split_once("on forge_close_repo")
+        .expect("repo close handler")
+        .1
+        .split_once("\non ")
+        .expect("repo close arm")
+        .0;
+    for lane in ["forge_repo", "forge_item", "forge_discussion", "forge_code"] {
+        assert!(close_repo.contains(&format!("invalidate lane={lane}")));
+    }
+    let close_item = handlers
+        .split_once("on forge_close_item")
+        .expect("item close handler")
+        .1
+        .split_once("\n// Held here")
+        .expect("item close arm")
+        .0;
+    for lane in ["forge_item", "forge_discussion"] {
+        assert!(close_item.contains(&format!("invalidate lane={lane}")));
+    }
+
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.connected_rpc = "http://node".into();
@@ -1528,13 +1587,15 @@ fn closing_a_repo_or_an_item_retires_the_load_that_would_reopen_it() {
     let _ = merging.__update(__DucktapeMessage::ForgeMergeSubmit);
     assert!(merging.forge_merge_busy);
     let _ = merging.__update(__DucktapeMessage::ForgeCloseItem);
-    let _ = merging.__update(__DucktapeMessage::ForgeMerged(backend::ForgeMergeOutcome {
-        repo: "core".into(),
-        number: 7,
-        merged: false,
-        merge_oid: String::new(),
-        conflicts: vec!["app/src/main.rs".into()],
-    }));
+    let _ = merging.__update(__DucktapeMessage::ForgeMerged(
+        "core".into(),
+        7,
+        backend::ForgeMergeOutcome {
+            merged: false,
+            merge_oid: String::new(),
+            conflicts: vec!["app/src/main.rs".into()],
+        },
+    ));
     assert!(
         !merging.forge_merge_busy,
         "closing an item mid-merge must not disable Merge for the rest of the session"
@@ -1542,6 +1603,55 @@ fn closing_a_repo_or_an_item_retires_the_load_that_would_reopen_it() {
     // The identity check still guards the BODY: that outcome describes an item
     // nobody has open, so nothing of it is rendered.
     assert!(merging.forge_merge_conflicts.is_empty());
+}
+
+#[test]
+fn forge_review_completion_cannot_clear_a_new_items_draft() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.forge_repo = "core".into();
+    app.forge_item_number = 7;
+    app.forge_review_draft = "review seven".into();
+
+    let _ = app.__update(__DucktapeMessage::ForgeReviewSubmit);
+    assert!(app.forge_review_busy);
+
+    app.forge_item_number = 8;
+    app.forge_review_draft = "review eight".into();
+    let _ = app.__update(__DucktapeMessage::ForgeReviewSubmitted(
+        "core".into(),
+        7,
+        true,
+    ));
+
+    assert!(!app.forge_review_busy);
+    assert_eq!(app.forge_review_draft, "review eight");
+}
+
+#[test]
+fn onboarding_capabilities_are_secret_buffers_cleared_on_navigation() {
+    let (mut app, _) = Ducktape::__boot();
+    let recovery = "duck ".repeat(24);
+    let invite = "duck-capability".to_string();
+
+    let _ = app.__update(__DucktapeMessage::__SecretTyped(
+        "restore_words".into(),
+        recovery.clone(),
+    ));
+    let _ = app.__update(__DucktapeMessage::__SecretTyped(
+        "join_invite".into(),
+        invite.clone(),
+    ));
+    assert_eq!(app.__ice_secrets.text("restore_words"), recovery);
+    assert_eq!(app.__ice_secrets.text("join_invite"), invite);
+    let snapshot = format!("{app:?}");
+    assert!(!snapshot.contains("duck-capability"));
+    assert!(!snapshot.contains("duck duck"));
+
+    let _ = app.__update(__DucktapeMessage::GoNetworks);
+    assert!(app.__ice_secrets.text("restore_words").is_empty());
+    assert!(app.__ice_secrets.text("join_invite").is_empty());
 }
 
 #[test]
@@ -3238,7 +3348,7 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     let shell = inlined(include_str!("ui/components/shell.ice"));
     // the shell is titlebar + optional degradation banner over the panes.
     assert!(shell.contains(
-        "component TitleBar(network:str, height:i64, sync_line:str, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64)"
+        "component TitleBar(network:str, height:i64, sync_line:str, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, wall_now:i64)"
     ));
     // The bar exists only in the console window now — the launch window
     // wears OS chrome — so the chip and the status/bell cluster are
@@ -3786,7 +3896,7 @@ fn block_comments_dock_a_rail_beside_the_document() {
     // A NEW comment anchors on the CARET's block (the thread's own target on
     // a reply) — never blindly on the page.
     assert!(handlers.contains(
-        "run post_block_comment(connected_rpc, password, active_thread_target, active_block_comment_thread"
+        "run every post_block_comment(connected_rpc, password, active_thread_target, active_block_comment_thread"
     ));
     assert!(handlers.contains(
         "let fresh_target = keep_str(!empty(caret_comment_target), caret_comment_target, active_page)"
@@ -7071,7 +7181,7 @@ fn a_failed_connect_retries_instead_of_giving_up() {
     );
     assert!(
         arm.contains(
-            "run connect(connected_rpc, hydration_retry_attempt, connect_generation) -> workspace_connected _ | connect_failed _"
+            "run replace lane=connect connect(connected_rpc, hydration_retry_attempt, connect_generation) -> workspace_connected _ | connect_failed _"
         ),
         "and it goes round again, carrying the attempt into the backoff"
     );
@@ -7482,15 +7592,10 @@ fn every_repeated_component_mount_is_culled_or_argued() {
             "screens/storage.ice",
             "for op in explorer_ops_at(ops, selected)",
         ),
-        ("view.ice", "for item in bell_items"),
         // 4. UNCULLED AND KNOWN — genuinely unbounded, fed by a log, a file or
         //    a thread, and simply not done yet. These are chat's problem on
         //    another surface; each is a `virtual-row=` away. Listed rather
         //    than silently excused so the next perf pass has its worklist.
-        (
-            "screens/settings.ice",
-            "for line in filter_log_lines(node_log_lines, node_log_filter)",
-        ),
         ("screens/forge.ice", "for line in source_lines(file_text)"),
         ("screens/forge.ice", "for message in discussion"),
         ("screens/storage.ice", "for entry in entries"),
@@ -7560,7 +7665,7 @@ fn every_repeated_component_mount_is_culled_or_argued() {
 
 /// EVERY EXTERN ARGUMENT IS BY VALUE, SO A LIST ARGUMENT IS A DEEP CLONE.
 ///
-/// `sync f(rows:[T])` called from a view expression clones the whole list into
+/// `sync`/`pure f(rows:[T])` called from a view expression clones the whole list into
 /// the call, once per frame, per call site — and if the site sits inside a
 /// `for`, once per row per frame. `state.ice` records three fields
 /// (`unread_marker_seq`, `has_older_history`, `rooms`) that exist only because
@@ -7579,7 +7684,10 @@ fn no_view_expression_hands_an_extern_a_list() {
             source
                 .lines()
                 .filter_map(|line| {
-                    let declaration = line.trim().strip_prefix("sync ")?;
+                    let declaration = line
+                        .trim()
+                        .strip_prefix("sync ")
+                        .or_else(|| line.trim().strip_prefix("pure "))?;
                     let (name, rest) = declaration.split_once('(')?;
                     let (args, _) = rest.split_once(')')?;
                     args.contains(":[").then(|| name.to_owned())
@@ -7606,7 +7714,6 @@ fn no_view_expression_hands_an_extern_a_list() {
         ("screens/settings.ice", "member_tier"),
         ("screens/settings.ice", "members_is_admin"),
         ("screens/settings.ice", "members_summary"),
-        ("screens/settings.ice", "filter_log_lines"),
         ("screens/pages.ice", "doc_tab_rows"),
         ("screens/pages.ice", "subpage_blocks"),
         ("screens/pages.ice", "thread_is_resolved"),

@@ -37,12 +37,12 @@ extern crate::backend
   BellItem(seq:i64, kind:str, body:str, source:str, height:i64, read:bool)
   BellDelta(kind:str, item:BellItem, up_to_seq:i64)
   BellData(generation:i64, unread:i64, items:[BellItem])
-  sync apply_bell(items:[BellItem], delta:BellDelta) -> [BellItem]
-  sync bell_unread_after(unread:i64, items:[BellItem], delta:BellDelta) -> i64
-  sync bell_head(items:[BellItem]) -> i64
-  sync bell_severity(kind:str) -> str
-  sync bell_title(kind:str) -> str
-  sync bell_worst_severity(items:[BellItem]) -> str
+  pure apply_bell(items:[BellItem], delta:BellDelta) -> [BellItem]
+  pure bell_unread_after(unread:i64, items:[BellItem], delta:BellDelta) -> i64
+  pure bell_head(items:[BellItem]) -> i64
+  pure bell_severity(kind:str) -> str
+  pure bell_title(kind:str) -> str
+  pure bell_worst_severity(items:[BellItem]) -> str
   load_bell(rpc:str, generation:i64) -> BellData ! HydrationError
   mark_bell_read(rpc:str, password:str, up_to_seq:i64) -> bool ! AppError
   ForgeRefresh(repo:str, number:i64, refs_moved:bool)
@@ -53,44 +53,44 @@ extern crate::backend
   box-style card_style()
   box-style raised_style()
   svg-style icon_tint(tone:str)
-  sync icon(name:str) -> bytes
+  pure icon(name:str) -> bytes
   connect(rpc:str, attempt:i64, generation:i64) -> WorkspaceData ! HydrationError
   stream live_events(rpc:str) -> LiveUpdate
-  sync resync_planes(load_chat:bool, load_pages:bool) -> str
+  pure resync_planes(load_chat:bool, load_pages:bool) -> str
   live_resync_load(rpc:str, channel_id:str, page_id:str, planes:str, debounce:bool, generation:i64, attempt:i64) -> LiveRefresh ! HydrationError
   load_older_messages(rpc:str, channel_id:str, before_seq:i64, generation:i64) -> HistoryPageData ! HydrationError
   sync fresh_operation_id(prefix:str) -> str
-  sync optimistic_message(messages:[ChatMessage], body:str, message_id:str) -> [ChatMessage]
-  sync mark_author_runs(messages:[ChatMessage]) -> [ChatMessage]
-  sync merge_pending_messages(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str, settled_id:str) -> [ChatMessage]
-  sync merge_message_send_result(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str, settled_id:str) -> [ChatMessage]
-  sync rollback_pending_message(messages:[ChatMessage], pending_id:str, committed:bool) -> [ChatMessage]
-  sync contains_pending_message(messages:[ChatMessage], pending_id:str) -> bool
-  sync reaction_applied(messages:[ChatMessage], seq:i64, emoji:str, added:bool) -> [ChatMessage]
+  pure optimistic_message(messages:[ChatMessage], body:str, message_id:str) -> [ChatMessage]
+  pure mark_author_runs(messages:[ChatMessage]) -> [ChatMessage]
+  pure merge_pending_messages(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str, settled_id:str) -> [ChatMessage]
+  pure merge_message_send_result(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str, settled_id:str) -> [ChatMessage]
+  pure rollback_pending_message(messages:[ChatMessage], pending_id:str, committed:bool) -> [ChatMessage]
+  pure contains_pending_message(messages:[ChatMessage], pending_id:str) -> bool
+  pure reaction_applied(messages:[ChatMessage], seq:i64, emoji:str, added:bool) -> [ChatMessage]
   // THE SETTLE ✓, IN ONE CALL. The four scans this replaced each took their
   // list by value, so one incoming message deep-cloned the timeline twice and
   // the open rail twice before a single row was folded.
   ChatSettle(flashed:bool, send_id:str, reply_id:str)
-  sync no_chat_settle() -> ChatSettle
-  sync chat_settle(messages:[ChatMessage], thread:[ChatMessage], delta:ChatDelta, active_channel:str, send_id:str, reply_id:str) -> ChatSettle
-  sync append_thread_page(messages:[ChatMessage], next:[ChatMessage]) -> [ChatMessage]
-  sync merge_thread_reply(messages:[ChatMessage], reply:ChatMessage) -> [ChatMessage]
-  sync history_has_older(messages:[ChatMessage]) -> bool
-  sync oldest_message_seq(messages:[ChatMessage]) -> i64
-  sync prepend_history(messages:[ChatMessage], older:[ChatMessage]) -> [ChatMessage]
-  sync merge_pending_blocks(canonical:[PageBlock], current:[PageBlock], current_page:str, next_page:str, settled_id:str) -> [PageBlock]
-  sync restore_draft(current:str, pending:str, keep_pending:bool) -> str
+  pure no_chat_settle() -> ChatSettle
+  pure chat_settle(messages:[ChatMessage], thread:[ChatMessage], delta:ChatDelta, active_channel:str, send_id:str, reply_id:str) -> ChatSettle
+  pure append_thread_page(messages:[ChatMessage], next:[ChatMessage]) -> [ChatMessage]
+  pure merge_thread_reply(messages:[ChatMessage], reply:ChatMessage) -> [ChatMessage]
+  pure history_has_older(messages:[ChatMessage]) -> bool
+  pure oldest_message_seq(messages:[ChatMessage]) -> i64
+  pure prepend_history(messages:[ChatMessage], older:[ChatMessage]) -> [ChatMessage]
+  pure merge_pending_blocks(canonical:[PageBlock], current:[PageBlock], current_page:str, next_page:str, settled_id:str) -> [PageBlock]
+  pure restore_draft(current:str, pending:str, keep_pending:bool) -> str
   // Chat's message/thread menus still place themselves this way; the name is
   // the pages block menu it was written for, which no longer exists.
-  sync block_action_menu_y(pointer_y:f64, viewport_height:f64) -> f64
-  sync rollback_blocks(blocks:[PageBlock], keep_pending:bool) -> [PageBlock]
-  sync append_page_comment_threads(threads:[PageCommentThread], next:[PageCommentThread]) -> [PageCommentThread]
-  sync append_page_comments(comments:[PageComment], next:[PageComment]) -> [PageComment]
-  sync remember_failed_draft(existing:str, current:str, pending:str, committed:bool) -> str
+  pure block_action_menu_y(pointer_y:f64, viewport_height:f64) -> f64
+  pure rollback_blocks(blocks:[PageBlock], keep_pending:bool) -> [PageBlock]
+  pure append_page_comment_threads(threads:[PageCommentThread], next:[PageCommentThread]) -> [PageCommentThread]
+  pure append_page_comments(comments:[PageComment], next:[PageComment]) -> [PageComment]
+  pure remember_failed_draft(existing:str, current:str, pending:str, committed:bool) -> str
   sync canonical_endpoint(input:str) -> str
-  sync network_slug(name:str) -> str
+  pure network_slug(name:str) -> str
   WorkspaceInit(chain_id:str, workspace:str, rpc:str)
-  join_network(blob:str) -> WorkspaceInit ! AppError
+  join_network(blob:secret) -> WorkspaceInit ! AppError
   mint_invite(workspace:str, role:str, ttl_days:i64) -> str ! AppError
   ProvisionStep(index:i64, label:str, state:str, settled:bool)
   stream provision_progress(workspace:str, rpc:str) -> ProvisionStep
@@ -100,39 +100,39 @@ extern crate::backend
   KeyCreated(words:str, pubkey:str)
   hub_state() -> HubState
   stream probe_known_networks(generation:i64) -> HubProbe
-  sync apply_network_probe(networks:[HubNetwork], probe:HubProbe) -> [HubNetwork]
-  sync network_run_hint(row:HubNetwork) -> str
-  sync hub_entry_step(key_state:str) -> str
-  sync selected_network_endpoint(networks:[HubNetwork], id:str) -> str
-  sync refreshed_hub_selection(networks:[HubNetwork], current:str, preselect:str) -> str
-  sync password_problem(password:str, confirm:str) -> str
-  sync without_window(current:window-id?, closed:window-id) -> window-id?
+  pure apply_network_probe(networks:[HubNetwork], probe:HubProbe) -> [HubNetwork]
+  pure network_run_hint(row:HubNetwork) -> str
+  pure hub_entry_step(key_state:str) -> str
+  pure selected_network_endpoint(networks:[HubNetwork], id:str) -> str
+  pure refreshed_hub_selection(networks:[HubNetwork], current:str, preselect:str) -> str
+  pure password_problem(password:str, confirm:str) -> str
+  pure without_window(current:window-id?, closed:window-id) -> window-id?
   sync window_target(current:window-id?) -> window-id
   sync window_target_unless(keep:bool, current:window-id?) -> window-id
   create_user_key(password:str) -> KeyCreated ! AppError
-  restore_user_key(words:str, password:str) -> str ! AppError
+  restore_user_key(words:secret, password:str) -> str ! AppError
   unlock_user_key(password:str) -> str ! AppError
   lock_signer() -> bool
   remember_network(rpc:str) -> bool
   forget_network(id:str, kind:str) -> bool
   restore_hidden_networks() -> bool
-  sync connection_degraded(status:str) -> bool
-  sync titlebar_inset() -> f64
-  sync palette_key_action(logical:key, physical:physical-key, modifiers:key-modifiers, open:bool) -> str
-  sync topmost_overlay(palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:str, message_action:str, channel_settings_open:bool, forge_repo_menu:bool) -> str
-  sync escape_target(logical:key, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:str, message_action:str, channel_settings_open:bool, forge_repo_menu:bool) -> str
-  sync content_scroll_step(logical:key, modifiers:key-modifiers, overlay:str) -> f64
+  pure connection_degraded(status:str) -> bool
+  pure titlebar_inset() -> f64
+  pure palette_key_action(logical:key, physical:physical-key, modifiers:key-modifiers, open:bool) -> str
+  pure topmost_overlay(palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:str, message_action:str, channel_settings_open:bool, forge_repo_menu:bool) -> str
+  pure escape_target(logical:key, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:str, message_action:str, channel_settings_open:bool, forge_repo_menu:bool) -> str
+  pure content_scroll_step(logical:key, modifiers:key-modifiers, overlay:str) -> f64
   NavItem(id:str, title:str, icon:str, badge:i64, active:bool, live:bool)
   FsEntry(path:str, name:str, kind:str, size:i64, object:str)
   FsSnapshot(id:str, short_id:str, author:str, height:i64, message:str)
   FsListing(generation:i64, path:str, entries:[FsEntry])
   FsPreview(generation:i64, path:str, text:str, truncated:bool, binary:bool)
   FsHistory(generation:i64, snapshots:[FsSnapshot])
-  sync fs_dir_count(entries:[FsEntry]) -> i64
-  sync fs_file_count(entries:[FsEntry]) -> i64
-  sync fs_counts_summary(connected:bool, listed:bool, entries:[FsEntry]) -> str
-  sync fs_parent(path:str) -> str
-  sync fs_child(path:str, name:str) -> str
+  pure fs_dir_count(entries:[FsEntry]) -> i64
+  pure fs_file_count(entries:[FsEntry]) -> i64
+  pure fs_counts_summary(connected:bool, listed:bool, entries:[FsEntry]) -> str
+  pure fs_parent(path:str) -> str
+  pure fs_child(path:str, name:str) -> str
   files_mkdir(rpc:str, path:str) -> bool ! AppError
   files_remove(rpc:str, path:str) -> bool ! AppError
   files_write_text(rpc:str, path:str, text:str) -> bool ! AppError
@@ -146,45 +146,50 @@ extern crate::backend
   files_find(rpc:str, prefix:str, generation:i64) -> FsListing ! HydrationError
   ChangeStamp(generation:i64, path:str, author:str, height:i64)
   last_changed_at_path(rpc:str, path:str, generation:i64) -> ChangeStamp ! HydrationError
-  sync size_label(bytes:i64) -> str
-  sync shell_nav(tab:str, approvals:i64, agent_live:bool) -> [NavItem]
-  sync open_proposals(rows:[ProposalRow]) -> i64
-  sync plural(count:i64, one:str, many:str) -> str
-  sync members_summary(connected:bool, rows:[MemberRow]) -> str
-  sync agents_summary(connected:bool, rows:[AgentRow]) -> str
-  sync proposals_summary(connected:bool, rows:[ProposalRow]) -> str
+  pure size_label(bytes:i64) -> str
+  pure shell_nav(tab:str, approvals:i64, agent_live:bool) -> [NavItem]
+  pure open_proposals(rows:[ProposalRow]) -> i64
+  pure plural(count:i64, one:str, many:str) -> str
+  pure members_summary(connected:bool, rows:[MemberRow]) -> str
+  pure agents_summary(connected:bool, rows:[AgentRow]) -> str
+  pure proposals_summary(connected:bool, rows:[ProposalRow]) -> str
   QuorumSeat(filled:bool)
-  sync quorum_dots(approvals:i64, required:i64) -> [QuorumSeat]
-  sync tally_label(approvals:i64, required:i64) -> str
-  sync reading_pair(left:str, right:str) -> str
-  sync tally_tone(approvals:i64, required:i64) -> str
-  sync tally_note(approvals:i64, required:i64) -> str
-  sync approve_label(approvals:i64, required:i64) -> str
-  sync proposal_kind_tone(action:str) -> str
-  sync settled_proposals(rows:[ProposalRow]) -> [ProposalRow]
-  sync pending_label(rows:[ProposalRow]) -> str
-  sync expires_in_blocks(deadline_height:i64, height:i64) -> str
-  sync relative_time(unix_seconds:i64) -> str
-  sync mmss(seconds:i64) -> str
+  pure quorum_dots(approvals:i64, required:i64) -> [QuorumSeat]
+  pure tally_label(approvals:i64, required:i64) -> str
+  pure reading_pair(left:str, right:str) -> str
+  pure tally_tone(approvals:i64, required:i64) -> str
+  pure tally_note(approvals:i64, required:i64) -> str
+  pure approve_label(approvals:i64, required:i64) -> str
+  pure proposal_kind_tone(action:str) -> str
+  pure settled_proposals(rows:[ProposalRow]) -> [ProposalRow]
+  pure pending_label(rows:[ProposalRow]) -> str
+  pure expires_in_blocks(deadline_height:i64, height:i64, wall_now:i64) -> str
+  pure relative_time(unix_seconds:i64, wall_now:i64) -> str
+  sync current_wall_seconds() -> i64
+  pure mmss(seconds:i64) -> str
   sync network_label(account_name:str, rpc:str) -> str
-  sync height_label(height:i64) -> str
-  sync height_label_short(height:i64) -> str
-  sync height_ago(then_height:i64, now_height:i64) -> str
-  sync doc_tabs_pruned(tabs:[str], pages:[PageItem]) -> [str]
-  sync initial_of(name:str) -> str
-  sync initials_of(name:str) -> str
+  pure height_label(height:i64) -> str
+  pure height_label_short(height:i64) -> str
+  pure height_ago(then_height:i64, now_height:i64, wall_now:i64) -> str
+  pure doc_tabs_pruned(tabs:[str], pages:[PageItem]) -> [str]
+  pure initial_of(name:str) -> str
+  pure initials_of(name:str) -> str
   NodeLogLine(cursor:str, line:str)
-  LogParts(time:str, level:str, message:str)
-  sync split_log_line(line:str) -> LogParts
+  NodeLogTimelineState()
+  NodeLogTimelineEvent()
+  sync node_log_timeline_state() -> NodeLogTimelineState
+  sync node_log_timeline_reset() -> NodeLogTimelineState
+  pure node_log_timeline_push(state:NodeLogTimelineState, line:NodeLogLine) -> NodeLogTimelineState
+  pure node_log_timeline_filter(state:NodeLogTimelineState, filter:str) -> NodeLogTimelineState
+  pure node_log_timeline_apply(state:NodeLogTimelineState, event:NodeLogTimelineEvent) -> NodeLogTimelineState
+  component node_log_timeline(state:&NodeLogTimelineState, source:&str) -> NodeLogTimelineEvent
   NodeFacts(generation:i64, version:str, root_hash:str, view:i64?, quorum:i64?, reachable_validators:i64?, last_finalized_at:i64, checkpoint_height:i64, height:i64, phase:str, phase_since:i64, sync_target:i64, sync_applied:i64, sync_retries:i64, sync_failures:i64, sync_last_error:str)
   load_node_facts(rpc:str, generation:i64) -> NodeFacts ! HydrationError
-  sync optional_number(value:i64?) -> str
+  pure optional_number(value:i64?) -> str
   PeerRow(key:str, role:str, live:bool)
   PeersData(generation:i64, peers:[PeerRow])
-  sync push_log_line(lines:[NodeLogLine], line:NodeLogLine) -> [NodeLogLine]
-  sync filter_log_lines(lines:[NodeLogLine], filter:str) -> [NodeLogLine]
   stream node_logs(rpc:str) -> NodeLogLine
-  sync sync_label(phase:str, applied:i64, target:i64) -> str
+  pure sync_label(phase:str, applied:i64, target:i64) -> str
   stream node_status_live(rpc:str) -> NodeFacts
   stream node_peers_live(rpc:str) -> PeersData
   load_peers(rpc:str, generation:i64) -> PeersData ! HydrationError
@@ -206,7 +211,7 @@ extern crate::backend
   ForgeReview(author:str, author_name:str, verdict:str, body:str, commit:str, outdated:bool, created_at:i64, comments:[ForgeReviewComment])
   ForgeItemData(generation:i64, repo:str, number:i64, title:str, state:str, kind:str, body:str, author_name:str, branches:str, channel_id:str, source_branch:str, source_oid:str, target_oid:str, merge_oid:str, diff:str, diff_truncated:bool, files_changed:i64, additions:i64, deletions:i64, reviews:[ForgeReview], approvals:i64, change_requests:i64)
   ForgeDiscussionData(generation:i64, channel_id:str, messages:[ChatMessage], members:[ChatMember])
-  ForgeMergeOutcome(repo:str, number:i64, merged:bool, merge_oid:str, conflicts:[str])
+  ForgeMergeOutcome(merged:bool, merge_oid:str, conflicts:[str])
   ForgeLiveData(generation:i64, repos_loaded:bool, repos:[ForgeRepo], repo_loaded:bool, branches:[str], items:[ForgeItem], item_loaded:bool, item:ForgeItemData)
   load_forge(rpc:str, generation:i64) -> ForgeData ! HydrationError
   load_forge_repo(rpc:str, repo:str, generation:i64) -> ForgeRepoData ! HydrationError
@@ -218,29 +223,29 @@ extern crate::backend
   forge_tree(rpc:str, repo:str, rev:str, path:str, generation:i64) -> ForgeTreeData ! HydrationError
   forge_blob(rpc:str, repo:str, rev:str, path:str, generation:i64) -> BlobView ! HydrationError
   ForgeDraftComment(anchor:str, path:str, line:str, side:str, body:str)
-  sync stage_forge_comment(staged:[ForgeDraftComment], path:str, line:str, side:str, body:str) -> [ForgeDraftComment]
-  sync drop_forge_comment(staged:[ForgeDraftComment], anchor:str) -> [ForgeDraftComment]
-  sync forge_comment_cap_reached(staged:[ForgeDraftComment]) -> bool
-  sync keep_staged_comments(loaded:bool, next_oid:str, current_oid:str, staged:[ForgeDraftComment]) -> [ForgeDraftComment]
-  sync keep_comment_text(loaded:bool, next_oid:str, current_oid:str, value:str) -> str
-  sync staged_comment_drop_note(loaded:bool, next_oid:str, current_oid:str, staged:[ForgeDraftComment], error:str) -> str
-  sync forge_comment_target(path:str, line:str, side:str) -> str
+  pure stage_forge_comment(staged:[ForgeDraftComment], path:str, line:str, side:str, body:str) -> [ForgeDraftComment]
+  pure drop_forge_comment(staged:[ForgeDraftComment], anchor:str) -> [ForgeDraftComment]
+  pure forge_comment_cap_reached(staged:[ForgeDraftComment]) -> bool
+  pure keep_staged_comments(loaded:bool, next_oid:str, current_oid:str, staged:[ForgeDraftComment]) -> [ForgeDraftComment]
+  pure keep_comment_text(loaded:bool, next_oid:str, current_oid:str, value:str) -> str
+  pure staged_comment_drop_note(loaded:bool, next_oid:str, current_oid:str, staged:[ForgeDraftComment], error:str) -> str
+  pure forge_comment_target(path:str, line:str, side:str) -> str
   submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:str, body:str, commit_oid:str, comments:[ForgeDraftComment]) -> bool ! AppError
   merge_forge_pr(rpc:str, password:str, repo:str, number:i64, source_branch:str, expected_source_oid:str, prev_target_oid:str) -> ForgeMergeOutcome ! AppError
   forge_live_refresh(rpc:str, open_repo:str, open_item:i64, kind:str, module:str, scope:ForgeRefresh, forge_open:bool, generation:i64) -> ForgeLiveData ! HydrationError
-  sync forge_live_hit(kind:str, module:str) -> bool
-  sync forge_repo_row(repos:[ForgeRepo], name:str) -> ForgeRepo
-  sync forge_stats(files:i64, additions:i64, deletions:i64) -> str
+  pure forge_live_hit(kind:str, module:str) -> bool
+  pure forge_repo_row(repos:[ForgeRepo], name:str) -> ForgeRepo
+  pure forge_stats(files:i64, additions:i64, deletions:i64) -> str
   DiffLine(kind:str, old_no:str, new_no:str, sign:str, text:str, path:str, side:str)
-  sync forge_push_command(rpc:str) -> str
-  sync diff_lines(diff:str) -> [DiffLine]
+  pure forge_push_command(rpc:str) -> str
+  pure diff_lines(diff:str) -> [DiffLine]
   SourceLine(number:str, text:str)
-  sync source_lines(text:str) -> [SourceLine]
-  sync filter_forge_items(items:[ForgeItem], kind:str) -> [ForgeItem]
-  sync forge_open_count(items:[ForgeItem], kind:str) -> i64
-  sync forge_merge_note(merge_oid:str, branches:str) -> str
-  sync verdict_label(verdict:str) -> str
-  sync verdict_pick_label(current:str, key:str, label:str) -> str
+  pure source_lines(text:str) -> [SourceLine]
+  pure filter_forge_items(items:[ForgeItem], kind:str) -> [ForgeItem]
+  pure forge_open_count(items:[ForgeItem], kind:str) -> i64
+  pure forge_merge_note(merge_oid:str, branches:str) -> str
+  pure verdict_label(verdict:str) -> str
+  pure verdict_pick_label(current:str, key:str, label:str) -> str
   AgentSkill(name:str, always:bool)
   AgentCap(label:str, arg:str)
   AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_key:str, owner_handle:str, created_at:i64, is_mine:bool, live:bool, tools:i64, secrets:i64, subagent_budget:i64, allowed_actions:[str], skills:[AgentSkill], caps:[AgentCap])
@@ -248,7 +253,7 @@ extern crate::backend
   AgentRunsData(generation:i64, runs:[RunRow])
   AgentsData(generation:i64, agents:[AgentRow])
   load_agents(rpc:str, generation:i64) -> AgentsData ! HydrationError
-  sync any_agent_active(rows:[AgentRow]) -> bool
+  pure any_agent_active(rows:[AgentRow]) -> bool
   load_agent_runs(rpc:str, agent_id:str, generation:i64) -> AgentRunsData ! HydrationError
   set_agent_status(rpc:str, password:str, agent_id:str, paused:bool) -> bool ! AppError
   ProposalRow(id:str, action:str, detail:str, proposer:str, status:str, deadline:i64, approvals:i64, rejections:i64, rule:str, required_yes:i64, electorate:i64, open:bool, settled_height:i64)
@@ -260,107 +265,107 @@ extern crate::backend
   MemberRow(key:str, label:str, role:str, is_this_node:bool, is_agent:bool, model:str, live:bool)
   MembersData(generation:i64, members:[MemberRow])
   load_members(rpc:str, generation:i64) -> MembersData ! HydrationError
-  sync members_is_admin(rows:[MemberRow]) -> bool
-  sync member_tier(rows:[MemberRow]) -> str
-  sync filter_members(rows:[MemberRow], filter:str) -> [MemberRow]
+  pure members_is_admin(rows:[MemberRow]) -> bool
+  pure member_tier(rows:[MemberRow]) -> str
+  pure filter_members(rows:[MemberRow], filter:str) -> [MemberRow]
   ExplorerBlock(height:i64, hash:str, commit:str, op_count:i64)
   ExplorerOp(height:i64, proposer:str, target:str, disposition:str, op_hash:str, payload:str, trace:str)
   ExplorerData(generation:i64, blocks:[ExplorerBlock], ops:[ExplorerOp])
-  sync explorer_ops_at(ops:[ExplorerOp], height:i64) -> [ExplorerOp]
+  pure explorer_ops_at(ops:[ExplorerOp], height:i64) -> [ExplorerOp]
   load_explorer(rpc:str, generation:i64) -> ExplorerData ! HydrationError
   ExplorerHit(kind:str, code:str, title:str, snippet:str, meta:str, target:str)
   KindCount(kind:str, label:str, count:i64)
   ExplorerResults(generation:i64, hits:[ExplorerHit], kinds:[KindCount], partial:str)
   search_workspace(rpc:str, text:str, generation:i64) -> ExplorerResults ! HydrationError
-  sync doc_tabs_with(tabs:[str], page_id:str) -> [str]
-  sync doc_tabs_without(tabs:[str], page_id:str) -> [str]
+  pure doc_tabs_with(tabs:[str], page_id:str) -> [str]
+  pure doc_tabs_without(tabs:[str], page_id:str) -> [str]
   DocTab(id:str, title:str, active:bool)
-  sync retain_doc_tabs(tabs:[str], pages:[PageItem]) -> [str]
-  sync doc_tab_rows(tabs:[str], pages:[PageItem], active:str) -> [DocTab]
-  sync next_doc_tab(tabs:[str], closed:str, active:str) -> str
+  pure retain_doc_tabs(tabs:[str], pages:[PageItem]) -> [str]
+  pure doc_tab_rows(tabs:[str], pages:[PageItem], active:str) -> [DocTab]
+  pure next_doc_tab(tabs:[str], closed:str, active:str) -> str
   load_doc_tabs(rpc:str) -> [str]
   load_appearance() -> str
   save_appearance(mode:str) -> bool
   save_doc_tabs(rpc:str, tabs:[str]) -> bool
-  sync retain_for_endpoint(value:str, current:str, next:str) -> str
-  sync mutation_failure_phase(committed:bool) -> str
-  sync message_seq_after_failure(current:i64, phase:str, committed:bool) -> i64
-  sync message_text_after_failure(current:str, phase:str, committed:bool) -> str
-  sync message_action_after_failure(current:str, phase:str, committed:bool) -> str
-  sync refreshed_required_message_seq(messages:[ChatMessage], current_channel:str, next_channel:str, value:i64) -> i64
-  sync refreshed_known_message_seq(messages:[ChatMessage], current_channel:str, next_channel:str, value:i64) -> i64
-  sync refreshed_channel_value(current_channel:str, next_channel:str, value:i64) -> i64
-  sync channel_last_read(reads:[ChannelRead], channel:str) -> i64
-  sync channel_head_seq(channels:[ChatChannel], channel:str) -> i64
-  sync mark_channel_read(reads:[ChannelRead], channel:str, seq:i64) -> [ChannelRead]
+  pure retain_for_endpoint(value:str, current:str, next:str) -> str
+  pure mutation_failure_phase(committed:bool) -> str
+  pure message_seq_after_failure(current:i64, phase:str, committed:bool) -> i64
+  pure message_text_after_failure(current:str, phase:str, committed:bool) -> str
+  pure message_action_after_failure(current:str, phase:str, committed:bool) -> str
+  pure refreshed_required_message_seq(messages:[ChatMessage], current_channel:str, next_channel:str, value:i64) -> i64
+  pure refreshed_known_message_seq(messages:[ChatMessage], current_channel:str, next_channel:str, value:i64) -> i64
+  pure refreshed_channel_value(current_channel:str, next_channel:str, value:i64) -> i64
+  pure channel_last_read(reads:[ChannelRead], channel:str) -> i64
+  pure channel_head_seq(channels:[ChatChannel], channel:str) -> i64
+  pure mark_channel_read(reads:[ChannelRead], channel:str, seq:i64) -> [ChannelRead]
   // Batched, and mirrored into `unread_channel_ids`: per row this cloned the
   // whole read-cursor list, which is O(channels x reads) allocations a frame.
-  sync unread_channels(reads:[ChannelRead], channels:[ChatChannel]) -> [str]
-  sync is_unread_channel(unread:[str], channel:str) -> bool
-  sync apply_chat_channels(channels:[ChatChannel], delta:ChatDelta) -> [ChatChannel]
-  sync apply_chat_messages(messages:[ChatMessage], delta:ChatDelta, active_channel:str) -> [ChatMessage]
-  sync apply_chat_thread(thread:[ChatMessage], delta:ChatDelta, active_channel:str, root:i64) -> [ChatMessage]
-  sync apply_chat_members(members:[ChatMember], delta:ChatDelta, active_channel:str) -> [ChatMember]
-  sync thread_offset_after_live(offset:i64, has_more:bool, delta:ChatDelta, active_channel:str, root:i64) -> i64
-  sync channel_display_name(channels:[ChatChannel], channel:str, current:str) -> str
+  pure unread_channels(reads:[ChannelRead], channels:[ChatChannel]) -> [str]
+  pure is_unread_channel(unread:[str], channel:str) -> bool
+  pure apply_chat_channels(channels:[ChatChannel], delta:ChatDelta) -> [ChatChannel]
+  pure apply_chat_messages(messages:[ChatMessage], delta:ChatDelta, active_channel:str) -> [ChatMessage]
+  pure apply_chat_thread(thread:[ChatMessage], delta:ChatDelta, active_channel:str, root:i64) -> [ChatMessage]
+  pure apply_chat_members(members:[ChatMember], delta:ChatDelta, active_channel:str) -> [ChatMember]
+  pure thread_offset_after_live(offset:i64, has_more:bool, delta:ChatDelta, active_channel:str, root:i64) -> i64
+  pure channel_display_name(channels:[ChatChannel], channel:str, current:str) -> str
   // A load's rows FOLD into the sidebar list; they do not replace it. The
   // switch loader answers with the one row it refreshed, against a list the
   // live stream is still folding into.
-  sync upsert_channel_rows(channels:[ChatChannel], refreshed:[ChatChannel]) -> [ChatChannel]
-  sync near_scroll_top(relative_offset:f64) -> bool
-  sync channel_is_archived(channels:[ChatChannel], channel:str) -> bool
-  sync channel_is_members_only(channels:[ChatChannel], channel:str) -> bool
+  pure upsert_channel_rows(channels:[ChatChannel], refreshed:[ChatChannel]) -> [ChatChannel]
+  pure near_scroll_top(relative_offset:f64) -> bool
+  pure channel_is_archived(channels:[ChatChannel], channel:str) -> bool
+  pure channel_is_members_only(channels:[ChatChannel], channel:str) -> bool
   // The two-or-three room window cache the channel switch paints from.
-  sync cache_channel_window(cache:[ChannelWindow], channel_id:str, messages:[ChatMessage], members:[ChatMember], history_view:bool) -> [ChannelWindow]
-  sync cached_window_messages(cache:[ChannelWindow], channel_id:str) -> [ChatMessage]
-  sync cached_window_members(cache:[ChannelWindow], channel_id:str) -> [ChatMember]
+  pure cache_channel_window(cache:[ChannelWindow], channel_id:str, messages:[ChatMessage], members:[ChatMember], history_view:bool) -> [ChannelWindow]
+  pure cached_window_messages(cache:[ChannelWindow], channel_id:str) -> [ChatMessage]
+  pure cached_window_members(cache:[ChannelWindow], channel_id:str) -> [ChatMember]
   // The pages twin of `channel_display_name`: the header title of a page that
   // has only just been clicked, read from the list already in hand.
-  sync page_display_title(pages:[PageItem], page:str, current:str) -> str
-  sync channel_flag_archived(channels:[ChatChannel], channel:str, current:bool) -> bool
-  sync channel_flag_members_only(channels:[ChatChannel], channel:str, current:bool) -> bool
-  sync channel_live_huddle_count(channels:[ChatChannel], channel:str, current:i64) -> i64
-  sync keep_channels(loaded:bool, next:[ChatChannel], current:[ChatChannel]) -> [ChatChannel]
-  sync keep_messages(loaded:bool, next:[ChatMessage], current:[ChatMessage]) -> [ChatMessage]
-  sync keep_members(loaded:bool, next:[ChatMember], current:[ChatMember]) -> [ChatMember]
-  sync keep_roster(joined:bool, next:[HuddleParticipant]) -> [HuddleParticipant]
-  sync keep_peers(loaded:bool, next:[PeerRow], current:[PeerRow]) -> [PeerRow]
-  sync keep_pages(loaded:bool, next:[PageItem], current:[PageItem]) -> [PageItem]
-  sync pages_reply_answers_current(pages:[PageItem], replied:str, current:str) -> bool
-  sync keep_blocks(loaded:bool, next:[PageBlock], current:[PageBlock]) -> [PageBlock]
-  sync apply_page_text(blocks:[PageBlock], delta:PagesDelta) -> [PageBlock]
-  sync apply_page_title(title:str, delta:PagesDelta, active_page:str) -> str
-  sync apply_page_rename(pages:[PageItem], delta:PagesDelta) -> [PageItem]
-  sync plane_live_hit(kind:str, module:str, want:str) -> bool
-  sync tab_reads_plane(tab:str, plane:str) -> bool
-  sync keep_str(loaded:bool, next:str, current:str) -> str
-  sync keep_bool(loaded:bool, next:bool, current:bool) -> bool
-  sync keep_i64(loaded:bool, next:i64, current:i64) -> i64
-  sync keep_strs(loaded:bool, next:[str], current:[str]) -> [str]
-  sync commented_targets_of(threads:[PageCommentThread], page_id:str) -> [str]
-  sync thread_is_resolved(threads:[PageCommentThread], id:str) -> bool
-  sync keep_forge_repos(loaded:bool, next:[ForgeRepo], current:[ForgeRepo]) -> [ForgeRepo]
-  sync keep_branches(loaded:bool, next:[str], current:[str]) -> [str]
-  sync keep_forge_items(loaded:bool, next:[ForgeItem], current:[ForgeItem]) -> [ForgeItem]
-  sync keep_forge_reviews(loaded:bool, next:[ForgeReview], current:[ForgeReview]) -> [ForgeReview]
-  sync initial_channel_reads(channels:[ChatChannel], existing:[ChannelRead]) -> [ChannelRead]
-  sync frozen_unread_boundary(reads:[ChannelRead], channels:[ChatChannel], current_channel:str, next_channel:str, current_boundary:i64) -> i64
-  sync first_unread_seq(messages:[ChatMessage], boundary:i64) -> i64
-  sync thread_generation_after_refresh(generation:i64, current_channel:str, next_channel:str, previous_root:i64, next_root:i64) -> i64
-  sync thread_loading_after_refresh(loading:bool, current_channel:str, next_channel:str, previous_root:i64, next_root:i64) -> bool
-  sync retain_thread_messages(messages:[ChatMessage], root_seq:i64) -> [ChatMessage]
-  sync cancel_autosaves(rpc:str, generation:i64) -> i64
-  sync remember_orphaned_comment_drafts(drafts:[str], blocks:[PageBlock], selected_id:str, current:str) -> [str]
-  sync remove_recovered_draft(drafts:[str], recovered:str) -> [str]
-  sync retain_selected_string(value:str, selected_id:str) -> str
-  sync retain_selected_i64(value:i64, selected_id:str) -> i64
-  sync retain_selected_comment_threads(threads:[PageCommentThread], selected_id:str) -> [PageCommentThread]
-  sync retain_selected_comments(comments:[PageComment], selected_id:str) -> [PageComment]
-  sync scope_key(scope:str, id:str) -> str
-  sync reaction_palette() -> [str]
-  sync keep_participants(loaded:bool, next:[HuddleParticipant], current:[HuddleParticipant]) -> [HuddleParticipant]
-  sync huddle_recipient_nodes(roster:[HuddleParticipant]) -> [str]
-  sync huddle_refresh_hits(delta:ChatDelta, active_channel:str) -> bool
+  pure page_display_title(pages:[PageItem], page:str, current:str) -> str
+  pure channel_flag_archived(channels:[ChatChannel], channel:str, current:bool) -> bool
+  pure channel_flag_members_only(channels:[ChatChannel], channel:str, current:bool) -> bool
+  pure channel_live_huddle_count(channels:[ChatChannel], channel:str, current:i64) -> i64
+  pure keep_channels(loaded:bool, next:[ChatChannel], current:[ChatChannel]) -> [ChatChannel]
+  pure keep_messages(loaded:bool, next:[ChatMessage], current:[ChatMessage]) -> [ChatMessage]
+  pure keep_members(loaded:bool, next:[ChatMember], current:[ChatMember]) -> [ChatMember]
+  pure keep_roster(joined:bool, next:[HuddleParticipant]) -> [HuddleParticipant]
+  pure keep_peers(loaded:bool, next:[PeerRow], current:[PeerRow]) -> [PeerRow]
+  pure keep_pages(loaded:bool, next:[PageItem], current:[PageItem]) -> [PageItem]
+  pure pages_reply_answers_current(pages:[PageItem], replied:str, current:str) -> bool
+  pure keep_blocks(loaded:bool, next:[PageBlock], current:[PageBlock]) -> [PageBlock]
+  pure apply_page_text(blocks:[PageBlock], delta:PagesDelta) -> [PageBlock]
+  pure apply_page_title(title:str, delta:PagesDelta, active_page:str) -> str
+  pure apply_page_rename(pages:[PageItem], delta:PagesDelta) -> [PageItem]
+  pure plane_live_hit(kind:str, module:str, want:str) -> bool
+  pure tab_reads_plane(tab:str, plane:str) -> bool
+  pure keep_str(loaded:bool, next:str, current:str) -> str
+  pure keep_bool(loaded:bool, next:bool, current:bool) -> bool
+  pure keep_i64(loaded:bool, next:i64, current:i64) -> i64
+  pure keep_strs(loaded:bool, next:[str], current:[str]) -> [str]
+  pure commented_targets_of(threads:[PageCommentThread], page_id:str) -> [str]
+  pure thread_is_resolved(threads:[PageCommentThread], id:str) -> bool
+  pure keep_forge_repos(loaded:bool, next:[ForgeRepo], current:[ForgeRepo]) -> [ForgeRepo]
+  pure keep_branches(loaded:bool, next:[str], current:[str]) -> [str]
+  pure keep_forge_items(loaded:bool, next:[ForgeItem], current:[ForgeItem]) -> [ForgeItem]
+  pure keep_forge_reviews(loaded:bool, next:[ForgeReview], current:[ForgeReview]) -> [ForgeReview]
+  pure initial_channel_reads(channels:[ChatChannel], existing:[ChannelRead]) -> [ChannelRead]
+  pure frozen_unread_boundary(reads:[ChannelRead], channels:[ChatChannel], current_channel:str, next_channel:str, current_boundary:i64) -> i64
+  pure first_unread_seq(messages:[ChatMessage], boundary:i64) -> i64
+  pure thread_generation_after_refresh(generation:i64, current_channel:str, next_channel:str, previous_root:i64, next_root:i64) -> i64
+  pure thread_loading_after_refresh(loading:bool, current_channel:str, next_channel:str, previous_root:i64, next_root:i64) -> bool
+  pure retain_thread_messages(messages:[ChatMessage], root_seq:i64) -> [ChatMessage]
+  pure cancel_autosaves(rpc:str, generation:i64) -> i64
+  pure remember_orphaned_comment_drafts(drafts:[str], blocks:[PageBlock], selected_id:str, current:str) -> [str]
+  pure remove_recovered_draft(drafts:[str], recovered:str) -> [str]
+  pure retain_selected_string(value:str, selected_id:str) -> str
+  pure retain_selected_i64(value:i64, selected_id:str) -> i64
+  pure retain_selected_comment_threads(threads:[PageCommentThread], selected_id:str) -> [PageCommentThread]
+  pure retain_selected_comments(comments:[PageComment], selected_id:str) -> [PageComment]
+  pure scope_key(scope:str, id:str) -> str
+  pure reaction_palette() -> [str]
+  pure keep_participants(loaded:bool, next:[HuddleParticipant], current:[HuddleParticipant]) -> [HuddleParticipant]
+  pure huddle_recipient_nodes(roster:[HuddleParticipant]) -> [str]
+  pure huddle_refresh_hits(delta:ChatDelta, active_channel:str) -> bool
   // ! HydrationError, not ! AppError: the three room-switch loaders below fail
   // with the generation of the switch they belong to, so `chat_load_failed` can
   // drop a failure the reader has already clicked past. `committed` is what
@@ -375,17 +380,17 @@ extern crate::backend
   remove_channel_member(rpc:str, password:str, channel_id:str, member_key:str) -> bool ! AppError
   join_huddle(rpc:str, password:str, channel_id:str) -> bool ! AppError
   leave_huddle(rpc:str, password:str, channel_id:str) -> bool ! AppError
-  sync huddle_self(roster:[HuddleParticipant]) -> bool
+  pure huddle_self(roster:[HuddleParticipant]) -> bool
   DmPeer(key:str, name:str, initials:str, is_agent:bool, channel_id:str)
   DmPeersData(generation:i64, peers:[DmPeer])
   load_dm_peers(rpc:str, generation:i64) -> DmPeersData ! HydrationError
-  sync dm_channel_id(a:str, b:str) -> str
-  sync dm_peer_of_channel(peer:str, me:str, channel:str) -> str
-  sync rooms_only(channels:[ChatChannel], peers:[DmPeer], me:str) -> [ChatChannel]
-  sync dm_peer_named(peers:[DmPeer], key:str) -> DmPeer
-  sync no_dm_peer() -> DmPeer
+  pure dm_channel_id(a:str, b:str) -> str
+  pure dm_peer_of_channel(peer:str, me:str, channel:str) -> str
+  pure rooms_only(channels:[ChatChannel], peers:[DmPeer], me:str) -> [ChatChannel]
+  pure dm_peer_named(peers:[DmPeer], key:str) -> DmPeer
+  pure no_dm_peer() -> DmPeer
   open_dm(rpc:str, password:str, peer_key:str, generation:i64) -> ChatData ! HydrationError
-  sync post_gate(archived:bool, members_only:bool, members:[ChatMember], me:str) -> str
+  pure post_gate(archived:bool, members_only:bool, members:[ChatMember], me:str) -> str
   send_message(rpc:str, password:str, channel_id:str, message_id:str, body:str, members:[ChatMember]) -> SendReceipt ! OptimisticMutationError
   load_thread(rpc:str, channel_id:str, root_seq:i64, target_seq:i64, through_reply_offset:i64, generation:i64) -> ThreadLoadData ! HydrationError
   load_thread_page(rpc:str, channel_id:str, root_seq:i64, from:i64, generation:i64) -> ThreadPageData ! HydrationError
@@ -408,19 +413,19 @@ extern crate::backend
   // out — see backend/document.rs for the ordering rule and the refusal.
   save_page_document(rpc:str, password:str, page_id:str, text:str, saved:str, generation:i64) -> DocumentSaveResult ! HydrationError
   // The buffer a page opens on: its TITLE as line 0, its blocks under it.
-  sync page_document_text(title:str, blocks:[PageBlock]) -> str
-  sync subpage_blocks(blocks:[PageBlock]) -> [PageBlock]
-  sync count_label(count:i64) -> str
+  pure page_document_text(title:str, blocks:[PageBlock]) -> str
+  pure subpage_blocks(blocks:[PageBlock]) -> [PageBlock]
+  pure count_label(count:i64) -> str
   // A live resync replaces the buffer ONLY when it is clean and the node's
   // text differs; both read the same decision so buffer and baseline move
   // together.
   sync refreshed_page_editor(document:editor, title:str, blocks:[PageBlock], saved:str) -> editor
-  sync refreshed_page_saved(document:editor, title:str, blocks:[PageBlock], saved:str) -> str
-  sync saved_baseline(written:bool, canonical:str, submitted:str) -> str
-  sync baseline_at_submitted_title(canonical:str, submitted:str) -> str
-  sync install_decision(document:editor, current_page:str, next_page:str, saved:str, canonical:str) -> bool
+  pure refreshed_page_saved(document:editor, title:str, blocks:[PageBlock], saved:str) -> str
+  pure saved_baseline(written:bool, canonical:str, submitted:str) -> str
+  pure baseline_at_submitted_title(canonical:str, submitted:str) -> str
+  pure install_decision(document:editor, current_page:str, next_page:str, saved:str, canonical:str) -> bool
   sync installed_page_editor(document:editor, install:bool, canonical:str) -> editor
   sync rolled_back_editor(document:editor, untouched:bool, canonical:str) -> editor
-  sync remember_orphaned_page_comment(drafts:[str], pages:[PageItem], target:str, draft:str) -> [str]
+  pure remember_orphaned_page_comment(drafts:[str], pages:[PageItem], target:str, draft:str) -> [str]
   search_pages(rpc:str, page_id:str, text:str, generation:i64) -> PageSearchData ! HydrationError
   palette_search(rpc:str, text:str, generation:i64) -> PaletteSearchData ! HydrationError

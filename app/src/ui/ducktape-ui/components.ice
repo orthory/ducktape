@@ -566,35 +566,6 @@ component AccordionItem(question:str, answer:str)
             @body
             @text-muted
 
-component Toast(title:str, description:str)
-  box #root
-    with
-      w=fill
-      max-w=360.0
-      px=14.0
-      py=10.0
-      bg=toast_bg
-      r=10.0
-      shadow=shadow_toast
-      shadow-y=6.0
-      shadow-blur=18.0
-    row
-      with
-        w=fill
-        gap=9.0
-        align=center
-      box
-        with
-          w=6.0
-          h=6.0
-          bg=success_dot
-          r=3.0
-        space w=1.0 h=1.0
-      col w=fill gap=2.0
-        text title @list text-toast_fg
-        text description @meta text-toast_fg
-      slot
-
 component Dialog()
   box #root
     with
@@ -628,3 +599,10 @@ component Dialog.Actions()
       gap=8.0
       align=end
     slot
+
+test unmounted_component_coverage
+  mount
+    col gap=8.0
+      Avatar.Agent initials="AI"
+      Typography content="Body copy"
+      Typography.Machine content="MONO-7"

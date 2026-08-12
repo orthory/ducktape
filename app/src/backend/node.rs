@@ -81,6 +81,230 @@ pub struct NodeLogLine {
     pub line: String,
 }
 
+pub type NodeLogTimelineEvent = ducktape_ui::ui::log_timeline::LogTimelineEvent<String>;
+
+/// Retained native timeline state plus the bounded rows it renders.
+///
+/// Clone snapshots the same mounted widget state; the old value is replaced by
+/// the Ice assignment that requested the clone.
+#[derive(Debug)]
+pub struct NodeLogTimelineState {
+    timeline: ducktape_ui::ui::log_timeline::LogTimelineState<String>,
+    lines: Arc<[NodeLogLine]>,
+    visible: Arc<[NodeLogLine]>,
+    filter: String,
+}
+
+impl Clone for NodeLogTimelineState {
+    fn clone(&self) -> Self {
+        Self {
+            timeline: self.timeline.update_snapshot(),
+            lines: Arc::clone(&self.lines),
+            visible: Arc::clone(&self.visible),
+            filter: self.filter.clone(),
+        }
+    }
+}
+
+const NODE_LOG_LIMIT: usize = 4_096;
+const NODE_LOG_TRIM: usize = 1_024;
+
+fn node_log_timeline_config() -> ducktape_ui::ui::log_timeline::VirtualListConfig {
+    ducktape_ui::ui::log_timeline::VirtualListConfig::new(26.0)
+        .expect("node log row geometry is fixed")
+        .overscan(4)
+}
+
+pub fn node_log_timeline_state() -> NodeLogTimelineState {
+    NodeLogTimelineState {
+        timeline: ducktape_ui::ui::log_timeline::LogTimelineState::new(
+            ducktape_ui::ui::log_timeline::VirtualListId::new("node-log-timeline"),
+        ),
+        lines: Arc::from([]),
+        visible: Arc::from([]),
+        filter: String::new(),
+    }
+}
+
+pub fn node_log_timeline_reset() -> NodeLogTimelineState {
+    node_log_timeline_state()
+}
+
+pub fn node_log_timeline_push(
+    mut state: NodeLogTimelineState,
+    line: NodeLogLine,
+) -> NodeLogTimelineState {
+    // ponytail: a bounded linear duplicate guard is smaller than retaining a
+    // second cursor index; revisit only if the 4,096-line ceiling moves.
+    let duplicate = state.lines.iter().any(|held| held.cursor == line.cursor);
+    if duplicate {
+        return state;
+    }
+    let mut lines = Vec::from(state.lines.as_ref());
+    lines.push(line);
+    if lines.len() > NODE_LOG_LIMIT {
+        lines.drain(..NODE_LOG_TRIM);
+    }
+    state.lines = lines.into();
+    node_log_timeline_reconcile(state)
+}
+
+pub fn node_log_timeline_filter(
+    mut state: NodeLogTimelineState,
+    filter: String,
+) -> NodeLogTimelineState {
+    state.filter = filter.trim().to_lowercase();
+    node_log_timeline_reconcile(state)
+}
+
+fn node_log_timeline_reconcile(mut state: NodeLogTimelineState) -> NodeLogTimelineState {
+    let visible: Arc<[NodeLogLine]> = state
+        .lines
+        .iter()
+        .filter(|line| state.filter.is_empty() || line.line.to_lowercase().contains(&state.filter))
+        .cloned()
+        .collect::<Vec<_>>()
+        .into();
+    let config = node_log_timeline_config();
+    let append = state
+        .timeline
+        .reconcile(&visible, |line| line.cursor.clone(), config);
+    if append.is_err() {
+        state
+            .timeline
+            .replace(&visible, |line| line.cursor.clone(), config)
+            .expect("node log cursors are unique");
+    }
+    state.visible = visible;
+    state
+}
+
+pub fn node_log_timeline_apply(
+    mut state: NodeLogTimelineState,
+    event: NodeLogTimelineEvent,
+) -> NodeLogTimelineState {
+    state.timeline.apply(event, node_log_timeline_config());
+    state
+}
+
+pub fn node_log_timeline<'a>(
+    state: &'a NodeLogTimelineState,
+    source: &'a str,
+) -> iced::Element<'a, NodeLogTimelineEvent> {
+    use ducktape_ui::ui::log_timeline::{LogTimelineEvent, log_timeline};
+    use ducktape_ui::ui::theme::DARK;
+    use iced::widget::{Space, button, column, container, row, text};
+    use iced::{Border, Color, Font, Length};
+
+    let inspection = state.timeline.inspect(node_log_timeline_config());
+    let mono = Font {
+        family: iced::font::Family::Name(design::fonts::FAMILY_MONO),
+        ..Font::DEFAULT
+    };
+    let tail: iced::Element<'_, NodeLogTimelineEvent> = if inspection.following_tail {
+        text("LIVE")
+            .size(10)
+            .font(mono)
+            .color(DARK.palette.success)
+            .into()
+    } else {
+        button(
+            text(format!("RESUME · {} NEW", inspection.unread_count))
+                .size(10)
+                .font(mono),
+        )
+        .padding([3, 7])
+        .on_press(LogTimelineEvent::ResumeTail)
+        .into()
+    };
+    let header = row![
+        text("NODE LOG")
+            .size(10)
+            .font(mono)
+            .color(DARK.palette.foreground),
+        text(source)
+            .size(10)
+            .font(mono)
+            .color(DARK.palette.muted_foreground),
+        Space::new().width(Length::Fill),
+        tail,
+    ]
+    .spacing(8)
+    .align_y(iced::Alignment::Center);
+    let body: iced::Element<'_, NodeLogTimelineEvent> = if state.visible.is_empty() {
+        let message = if state.lines.is_empty() {
+            "Waiting for the node's log ring…"
+        } else {
+            "No lines match this filter."
+        };
+        container(
+            text(message)
+                .size(12)
+                .font(mono)
+                .color(DARK.palette.muted_foreground),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_y(Length::Fill)
+        .into()
+    } else {
+        log_timeline(
+            &state.timeline,
+            &state.visible,
+            node_log_timeline_config(),
+            "Node log",
+            |line| line.cursor.clone(),
+            |line| line.line.clone(),
+            |_, line, _selected| {
+                let parts = split_log_line(line.line.clone());
+                let level_color = match parts.level.as_str() {
+                    "ERROR" => DARK.palette.destructive,
+                    "WARN" => DARK.palette.warning,
+                    "INFO" => DARK.palette.success,
+                    "DEBUG" | "TRACE" => DARK.palette.muted_foreground,
+                    _ => Color::TRANSPARENT,
+                };
+                row![
+                    text(parts.time)
+                        .size(11)
+                        .font(mono)
+                        .color(DARK.palette.muted_foreground)
+                        .width(150),
+                    text(parts.level)
+                        .size(11)
+                        .font(mono)
+                        .color(level_color)
+                        .width(48),
+                    text(parts.message)
+                        .size(11)
+                        .font(mono)
+                        .color(DARK.palette.foreground),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center)
+                .into()
+            },
+            |event| event,
+            &DARK,
+        )
+    };
+    container(column![header, body].spacing(10))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(15)
+        .style(|_| container::Style {
+            background: Some(DARK.palette.background.into()),
+            text_color: Some(DARK.palette.foreground),
+            border: Border {
+                color: DARK.palette.border,
+                width: 1.0,
+                radius: 12.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
 /// The node's live log ring as an app stream — reconnects with backoff and
 /// resumes from the last cursor, exactly like the module stream.
 pub fn node_logs(rpc: String) -> iced::futures::stream::BoxStream<'static, NodeLogLine> {
@@ -146,30 +370,6 @@ pub fn node_logs(rpc: String) -> iced::futures::stream::BoxStream<'static, NodeL
     .boxed()
 }
 
-/// Append a log line to the pane's bounded ring (newest last, 500 kept).
-pub fn push_log_line(mut lines: Vec<NodeLogLine>, line: NodeLogLine) -> Vec<NodeLogLine> {
-    let duplicate = lines.last().is_some_and(|last| last.cursor == line.cursor);
-    if duplicate {
-        return lines;
-    }
-    lines.push(line);
-    let excess = lines.len().saturating_sub(500);
-    lines.drain(..excess);
-    lines
-}
-
-/// The pane's visible window: substring-filtered, newest last.
-pub fn filter_log_lines(lines: Vec<NodeLogLine>, filter: String) -> Vec<NodeLogLine> {
-    let needle = filter.trim().to_lowercase();
-    if needle.is_empty() {
-        return lines;
-    }
-    lines
-        .into_iter()
-        .filter(|line| line.line.to_lowercase().contains(&needle))
-        .collect()
-}
-
 /// One tracing line, split for the dark log console's three columns.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct LogParts {
@@ -210,6 +410,60 @@ pub fn split_log_line(line: String) -> LogParts {
         time,
         level: level_field.to_string(),
         message: line[cut..].trim_start().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod log_timeline_tests {
+    use super::*;
+
+    #[test]
+    fn timeline_keeps_unique_history_and_replaces_on_filter_changes() {
+        let mut state = node_log_timeline_state();
+        state = node_log_timeline_push(
+            state,
+            NodeLogLine {
+                cursor: "1".into(),
+                line: "INFO admitted resident".into(),
+            },
+        );
+        state = node_log_timeline_push(
+            state,
+            NodeLogLine {
+                cursor: "1".into(),
+                line: "duplicate cursor".into(),
+            },
+        );
+        state = node_log_timeline_push(
+            state,
+            NodeLogLine {
+                cursor: "2".into(),
+                line: "WARN retrying dial".into(),
+            },
+        );
+
+        assert_eq!(state.lines.len(), 2);
+        assert_eq!(state.visible.len(), 2);
+        assert_eq!(
+            state
+                .timeline
+                .inspect(node_log_timeline_config())
+                .list
+                .logical_items,
+            2
+        );
+
+        state = node_log_timeline_filter(state, " warn ".into());
+        assert_eq!(state.visible.len(), 1);
+        assert_eq!(state.visible[0].cursor, "2");
+        assert_eq!(
+            state
+                .timeline
+                .inspect(node_log_timeline_config())
+                .list
+                .logical_items,
+            1
+        );
     }
 }
 

@@ -29,8 +29,8 @@ state
 on onboarding_opened(id)
   onboarding_win = some(id)
   parallel
-    run load_appearance() -> appearance_loaded _
-    run hub_state() -> hub_booted _
+    run replace lane=appearance_load load_appearance() -> appearance_loaded _
+    run replace lane=hub_state hub_state() -> hub_booted _
 
 // Boot answer: pick the entry step from the key state and start probing the
 // rows. `hub_booted` OWNS the step; the refresh route below never moves it.
@@ -41,7 +41,7 @@ on hub_booted(state)
   hub_selected = state.preselect
   hub_step = hub_entry_step(state.key_state)
   hub_probe_generation = hub_probe_generation + 1
-  stream probe_known_networks(hub_probe_generation) -> network_probed _
+  stream replace lane=network_probes probe_known_networks(hub_probe_generation) -> network_probed _
 
 // A refresh (after forget / after a join) updates the rows where the user
 // already is — the step stays put.
@@ -51,7 +51,7 @@ on hub_refreshed(state)
   hub_networks = state.networks
   hub_selected = refreshed_hub_selection(state.networks, hub_selected, state.preselect)
   hub_probe_generation = hub_probe_generation + 1
-  stream probe_known_networks(hub_probe_generation) -> network_probed _
+  stream replace lane=network_probes probe_known_networks(hub_probe_generation) -> network_probed _
 
 on network_probed(probe)
   return if probe.generation != hub_probe_generation
@@ -64,7 +64,7 @@ on unlock_submit(pw)
   onboarding_error = ""
   password = pw
   mutation_phase = "onboarding"
-  run unlock_user_key(password) -> key_unlocked _ | login_failed _
+  run every unlock_user_key(password) -> key_unlocked _ | login_failed _
 
 on key_unlocked(_pubkey)
   mutation_phase = "idle"
@@ -85,7 +85,7 @@ on create_submit(pw)
   onboarding_error = ""
   password = pw
   mutation_phase = "onboarding"
-  run create_user_key(password) -> key_created _ | login_failed _
+  run every create_user_key(password) -> key_created _ | login_failed _
 
 on key_created(created)
   mutation_phase = "idle"
@@ -100,22 +100,25 @@ on reveal_confirm
 
 on go_restore
   return if mutation_phase != "idle"
+  restore_words = ""
   onboarding_error = ""
   hub_step = "restore"
 
 on go_login
   return if mutation_phase != "idle"
+  restore_words = ""
   onboarding_error = ""
   hub_step = hub_entry_step(hub_key_state)
 
-on restore_submit(words, pw)
-  return if mutation_phase != "idle" || empty(trim(words)) || empty(pw)
+on restore_submit(pw)
+  return if mutation_phase != "idle" || empty(restore_words) || empty(pw)
   onboarding_error = ""
   password = pw
   mutation_phase = "onboarding"
-  run restore_user_key(words, password) -> key_restored _ | login_failed _
+  run every restore_user_key(restore_words, password) -> key_restored _ | login_failed _
 
 on key_restored(_pubkey)
+  restore_words = ""
   mutation_phase = "idle"
   hub_key_state = "encrypted"
   hub_step = "networks"
@@ -158,7 +161,22 @@ on connect_remote_submit(endpoint)
 // other half: an in-flight load from the previous network must land dead.
 // (`reconnect` is the same-endpoint sibling that deliberately KEEPS drafts.)
 on console_opened(id)
+  invalidate lane=chat_search
+  invalidate lane=page_search
+  invalidate lane=palette_search
+  invalidate lane=workspace_search
+  invalidate lane=chat_load
+  invalidate lane=page_load
+  invalidate lane=history
+  invalidate lane=thread
+  invalidate lane=live_thread
+  invalidate lane=block_threads
+  invalidate lane=block_comments
+  invalidate lane=live_resync
+  invalidate lane=forge_code
+  invalidate lane=files_preview
   console_win = some(id)
+  wall_now = current_wall_seconds()
   connected = false
   loading = true
   status = "Connecting…"
@@ -174,10 +192,10 @@ on console_opened(id)
   rooms = []
   unread_channel_ids = []
   messages = []
-  // Same abandoned request, same dead button — see `choose_channel`, and worse
-  // here: this points the app at a DIFFERENT node, so the page requested from
-  // the old `connected_rpc` may never answer and "Load older" would stay dead
-  // in the new network for the rest of the session.
+  node_log_filter = ""
+  node_log_timeline = node_log_timeline_reset()
+  // The old network's history lane was invalidated above, so a socket that
+  // never answers cannot keep "Load older" disabled in the new network.
   history_loading = false
   // Same abandoned reply, same rest of the session — see `chat_window_loading`.
   chat_window_loading = false
@@ -285,46 +303,49 @@ on console_opened(id)
   call_peers = []
   parallel
     task window close target=window_target(onboarding_win)
-    run remember_network(connected_rpc) -> network_remembered _
-    run connect(connected_rpc, 0, connect_generation) -> workspace_connected _ | connect_failed _
+    run every remember_network(connected_rpc) -> network_remembered _
+    run replace lane=connect connect(connected_rpc, 0, connect_generation) -> workspace_connected _ | connect_failed _
 
 on network_remembered(_written)
   error = error
 
 on forget_network_submit(id, kind)
   return if mutation_phase != "idle"
-  run forget_network(id, kind) -> network_forgotten _
+  run every forget_network(id, kind) -> network_forgotten _
 
 on network_forgotten(_written)
-  run hub_state() -> hub_refreshed _
+  run replace lane=hub_state hub_state() -> hub_refreshed _
 
 on restore_hidden_submit
   return if mutation_phase != "idle"
-  run restore_hidden_networks() -> network_forgotten _
+  run every restore_hidden_networks() -> network_forgotten _
 
 // JOIN — unchanged plumbing, new seams: it starts from the network list and
 // settles back into it through the provisioning/live screens.
 on go_join
   return if mutation_phase != "idle"
+  join_invite = ""
   hub_step = "join"
   onboarding_error = ""
 
 on go_networks
   return if mutation_phase != "idle"
+  restore_words = ""
+  join_invite = ""
   onboarding_error = ""
   hub_step = "networks"
-  run hub_state() -> hub_refreshed _
+  run replace lane=hub_state hub_state() -> hub_refreshed _
 
-on join_network_submit(blob)
-  return if mutation_phase != "idle" || empty(trim(blob))
-  onboarding_invite = trim(blob)
+on join_network_submit
+  return if mutation_phase != "idle" || empty(join_invite)
   onboarding_error = ""
   mutation_phase = "onboarding"
-  run join_network(onboarding_invite) -> workspace_materialized _ | onboarding_failed _
+  run every join_network(join_invite) -> workspace_materialized _ | onboarding_failed _
 
 // The workspace now exists on disk. Point the app at its endpoint and start
 // watching for the node that will serve it.
 on workspace_materialized(init)
+  join_invite = ""
   mutation_phase = "idle"
   onboarding_chain = init.chain_id
   onboarding_name = init.chain_id
@@ -335,7 +356,7 @@ on workspace_materialized(init)
   provision_index = 0
   onboarding_error = ""
   hub_step = "provisioning"
-  stream provision_progress(init.chain_id, init.rpc) -> provision_stepped _
+  stream replace lane=provision provision_progress(init.chain_id, init.rpc) -> provision_stepped _
 
 // Every yielded step replaces the reading. The screen only leaves this step
 // when the LAST step actually settled — a blocked or running step keeps it
@@ -349,7 +370,7 @@ on provision_stepped(step)
   provision_steps = [step]
   return if provision_index != 5 || !provision_settled
   hub_step = "live"
-  run mint_invite(onboarding_chain, "resident", 7) -> onboarding_invite_minted _ | onboarding_failed _
+  run every mint_invite(onboarding_chain, "resident", 7) -> onboarding_invite_minted _ | onboarding_failed _
 
 on onboarding_invite_minted(blob)
   invite_link = blob
@@ -393,4 +414,4 @@ on onboarding_reopened(id)
   parallel
     task window close target=window_target(console_win)
     task window close target=window_target(huddle_win)
-    run hub_state() -> hub_refreshed _
+    run replace lane=hub_state hub_state() -> hub_refreshed _

@@ -6,7 +6,7 @@
 // one family, and the guards in main.rs name several of its members verbatim.
 // Everything outside that family drops the redundant `forge_` prefix.
 
-component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[ForgeRepo], open_repo:str, repo_menu:bool, branches:[str], tab:str, items:[ForgeItem], tree_repo:str, tree_path:str, tree_entries:[TreeEntry], file_path:str, file_text:str, file_binary:bool, file_truncated:bool, forge_item_number:i64, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:str, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], answered:bool, discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, connected:bool, loading:bool, shift_held:bool)
+component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[ForgeRepo], open_repo:str, repo_menu:bool, branches:[str], tab:str, items:[ForgeItem], tree_repo:str, tree_path:str, tree_entries:[TreeEntry], file_path:str, file_text:str, file_binary:bool, file_truncated:bool, forge_item_number:i64, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:str, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], answered:bool, discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, connected:bool, loading:bool, shift_held:bool, wall_now:i64)
   emits
     forge_open_repo(str)
     forge_close_repo()
@@ -102,7 +102,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
           if !empty(repos)
             grid min-cell=380.0 gap=13.0
               for repo in repos
-                RepoCard repo=repo
+                RepoCard wall_now=wall_now repo=repo
                   forward
                     forge_open_repo
     if connected && !empty(open_repo)
@@ -123,6 +123,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
               button -> emit(forge_toggle_repo_menu)
                 with
                   label="Switch repository"
+                  expanded=repo_menu
                   w=fill
                   p=0.0
                   @ghost_action
@@ -211,6 +212,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                 button -> emit(select_forge_tab, "code")
                   with
                     label="Browse the code"
+                    checked=(tab == "code")
                     p=0.0
                     @ghost_action
                   TabLabel
@@ -224,6 +226,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                 button -> emit(select_forge_tab, "pulls")
                   with
                     label="Show pull requests"
+                    checked=(tab == "pulls")
                     p=0.0
                     @ghost_action
                   TabLabel
@@ -237,6 +240,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                 button -> emit(select_forge_tab, "issues")
                   with
                     label="Show issues"
+                    checked=(tab == "issues")
                     p=0.0
                     @ghost_action
                   TabLabel
@@ -564,6 +568,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                     button -> emit(forge_review_pick, "comment")
                       with
                         label="Pick comment verdict"
+                        checked=(review_verdict == "comment")
                         h=24.0
                         p=5.0
                         @ghost_action
@@ -574,6 +579,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                     button -> emit(forge_review_pick, "approve")
                       with
                         label="Pick approve verdict"
+                        checked=(review_verdict == "approve")
                         h=24.0
                         p=5.0
                         @ghost_action
@@ -584,6 +590,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                     button -> emit(forge_review_pick, "request_changes")
                       with
                         label="Pick request-changes verdict"
+                        checked=(review_verdict == "request_changes")
                         h=24.0
                         p=5.0
                         @ghost_action

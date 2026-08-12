@@ -2,10 +2,14 @@
 // settings screen behind them, and leaving the workspace.
 
 on node_log_line(line)
-  node_log_lines = push_log_line(node_log_lines, line)
+  node_log_timeline = node_log_timeline_push(node_log_timeline, line)
 
 on node_log_filter_changed(next)
   node_log_filter = next
+  node_log_timeline = node_log_timeline_filter(node_log_timeline, next)
+
+on node_log_timeline_changed(event)
+  node_log_timeline = node_log_timeline_apply(node_log_timeline, event)
 
 on peers_loaded(next)
   return if next.generation != node_peers_generation
@@ -95,7 +99,7 @@ on settings_failed(cause)
 
 on settings_clear_tabs
   doc_tabs = []
-  run clear_doc_tabs(connected_rpc) -> doc_tabs_saved _
+  run every clear_doc_tabs(connected_rpc) -> doc_tabs_saved _
 
 // IDENTITY KEY — the session's signing seat. Unlock VERIFIES the password
 // against user.key before keeping it; the old CONNECTION field stored blind.
@@ -105,7 +109,7 @@ on settings_unlock_submit(pw)
   return if mutation_phase != "idle" || empty(pw)
   error = ""
   password = pw
-  run unlock_user_key(password) -> settings_unlocked _ | settings_unlock_failed _
+  run every unlock_user_key(password) -> settings_unlocked _ | settings_unlock_failed _
 
 on settings_unlocked(_pubkey)
   error = ""
@@ -118,7 +122,7 @@ on settings_unlock_failed(cause)
 // holds the opened user key must not outlive the seat it was opened for.
 on lock_session
   password = ""
-  run lock_signer() -> signer_locked _
+  run every lock_signer() -> signer_locked _
 
 on signer_locked(_retired)
   error = error
@@ -129,7 +133,7 @@ on forget_workspace_submit
   return if !connected || mutation_phase != "idle"
   mutation_phase = "forget-workspace"
   error = ""
-  run forget_workspace(connected_rpc) -> workspace_forgotten _ | mutation_failed _
+  run every forget_workspace(connected_rpc) -> workspace_forgotten _ | mutation_failed _
 
 // `forget_workspace` answers false when the prefs file could not be written.
 // Throwing her out to onboarding on that answer meant the workspace was back in
@@ -178,7 +182,7 @@ on open_node_modules
   node_tab = "modules"
   return if !connected
   module_generation = module_generation + 1
-  run load_modules(connected_rpc, module_generation) -> modules_loaded _ | modules_failed _
+  run replace lane=modules_load load_modules(connected_rpc, module_generation) -> modules_loaded _ | modules_failed _
 
 on modules_loaded(next)
   return if next.generation != module_generation

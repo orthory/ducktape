@@ -8,6 +8,7 @@ state
   appearance = ""
   app_background = "#fdfdfb"
   app_text = "#2c2b27"
+  wall_now:i64 = current_wall_seconds()
   rpc = ""
   connected_rpc = ""
   password = ""
@@ -317,7 +318,7 @@ state
   account_generation:i64 = 0
   account_name_draft = ""
   account_renaming = false
-  node_log_lines:[NodeLogLine] = []
+  node_log_timeline:NodeLogTimelineState = node_log_timeline_state()
   node_log_filter = ""
   node_peers:[PeerRow] = []
   node_peers_generation:i64 = 0
@@ -446,7 +447,6 @@ state
   // them" confirm — never persisted, cleared on leaving the reveal step.
   reveal_words = ""
   onboarding_name = ""
-  onboarding_invite = ""
   onboarding_error = ""
   invite_link = ""
   workspace_slug = ""
@@ -557,3 +557,11 @@ state
   // pixels no view read (`spin`/`overlay_in` were never written, `pulse` was
   // never rendered). Motion returns when the runtime gates frames on
   // animations a view actually consumes.
+
+// Capability-bearing text that is consumed once by Rust. Neither value is
+// application state: presets, snapshots, captures, routes, and accessibility
+// cannot carry its text. Ice can only ask whether it is empty, clear it, or
+// hand one redacted reading to a `secret` extern. Leaving its screen clears
+// the runtime-held buffer.
+secret restore_words
+secret join_invite

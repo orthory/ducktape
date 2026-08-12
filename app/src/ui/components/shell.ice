@@ -164,7 +164,7 @@ component StatusPill(degraded:bool, loading:bool)
 // state field ever held them, and filling them cost `load_node_facts` a second
 // HTTP round trip whose handler re-encodes the WHOLE Prometheus registry
 // uncached. They are gone; a gossip row starts by deciding what it needs.
-component StatusCard(degraded:bool, loading:bool, answered:bool, height:i64, sync_line:str, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64)
+component StatusCard(degraded:bool, loading:bool, answered:bool, height:i64, sync_line:str, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, wall_now:i64)
   box #root
     with
       w=284.0
@@ -338,7 +338,7 @@ component StatusCard(degraded:bool, loading:bool, answered:bool, height:i64, syn
               font=code_medium
               @text-hint
           space w=fill
-          text relative_time(last_finalized)
+          text relative_time(last_finalized, wall_now)
             with
               size=10.5
               wrap=none
@@ -420,7 +420,7 @@ component BellBadge(count:i64, sev:str, plate:f64)
 // 40px: a 39px bar over its 1px rule. This bar exists only in the console
 // window — the launch window wears the OS's own chrome — so the chip and the
 // right cluster are unconditional now.
-component TitleBar(network:str, height:i64, sync_line:str, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64)
+component TitleBar(network:str, height:i64, sync_line:str, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, wall_now:i64)
   emits
     toggle_bell
     switch_network
@@ -463,7 +463,7 @@ component TitleBar(network:str, height:i64, sync_line:str, loading:bool, degrade
               style=transparent
             StatusPill degraded=degraded loading=loading
             box pr=13.0
-              StatusCard
+              StatusCard wall_now=wall_now
                 with
                   degraded
                   loading
@@ -575,6 +575,7 @@ component RailButton(item:NavItem)
       button -> emit(select_shell_tab, item.id)
         with
           label=item.title
+          checked=item.active
           w=58.0
           p=0.0
           @icon_action
@@ -602,6 +603,7 @@ component RailButton(item:NavItem)
       button -> emit(select_shell_tab, item.id)
         with
           label=item.title
+          checked=item.active
           w=58.0
           p=0.0
           @icon_action
@@ -710,6 +712,7 @@ component NavRail(tab:str, approvals:i64, account:str, agent_live:bool)
         button -> emit(select_shell_tab, "settings")
           with
             label="Settings"
+            checked=true
             p=8.0
             @icon_action
           Icon
@@ -724,6 +727,7 @@ component NavRail(tab:str, approvals:i64, account:str, agent_live:bool)
         button -> emit(select_shell_tab, "settings")
           with
             label="Settings"
+            checked=false
             p=8.0
             @icon_action
           Icon
@@ -844,7 +848,7 @@ component ScreenHeader(title:str, meta:str)
         bg=separator
       space w=1.0 h=1.0
 
-component WorkspaceTabs(network:str, status:str, height:i64, sync_line:str, loading:bool, degraded:bool, tab:str, bell_count:i64, bell_sev:str, approvals:i64, account:str, agent_live:bool, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64)
+component WorkspaceTabs(network:str, status:str, height:i64, sync_line:str, loading:bool, degraded:bool, tab:str, bell_count:i64, bell_sev:str, approvals:i64, account:str, agent_live:bool, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, wall_now:i64)
   emits
     select_shell_tab(str)
     toggle_bell
@@ -858,7 +862,7 @@ component WorkspaceTabs(network:str, status:str, height:i64, sync_line:str, load
       px-snap=true
     stack w=fill h=fill
       col w=fill h=fill
-        TitleBar #titlebar
+        TitleBar wall_now=wall_now #titlebar
           with
             network
             height

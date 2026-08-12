@@ -503,6 +503,7 @@ component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant], stat
           button -> emit(toggle_call_mute)
             with
               label="Mute the microphone"
+              checked=muted
               w=32.0
               h=32.0
               @icon_action
@@ -526,6 +527,7 @@ component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant], stat
           button -> emit(toggle_call_mute)
             with
               label="Unmute the microphone"
+              checked=muted
               w=32.0
               h=32.0
               @icon_action
@@ -549,6 +551,7 @@ component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant], stat
           button -> emit(toggle_call_camera)
             with
               label="Turn the camera on"
+              checked=camera
               w=32.0
               h=32.0
               @icon_action
@@ -572,6 +575,7 @@ component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant], stat
           button -> emit(toggle_call_camera)
             with
               label="Turn the camera off"
+              checked=camera
               w=32.0
               h=32.0
               @icon_action

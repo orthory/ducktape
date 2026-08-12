@@ -47,6 +47,7 @@ component MembersScreen(rows:[MemberRow], filter:str, selected:str, admin:bool, 
               button -> emit(pick_members_filter, "all")
                 with
                   label="Show every member"
+                  checked=(filter == "all")
                   p=0.0
                   @ghost_action
                 FilterChip
@@ -60,6 +61,7 @@ component MembersScreen(rows:[MemberRow], filter:str, selected:str, admin:bool, 
               button -> emit(pick_members_filter, "humans")
                 with
                   label="Show people only"
+                  checked=(filter == "humans")
                   p=0.0
                   @ghost_action
                 FilterChip
@@ -73,6 +75,7 @@ component MembersScreen(rows:[MemberRow], filter:str, selected:str, admin:bool, 
               button -> emit(pick_members_filter, "agents")
                 with
                   label="Show agents only"
+                  checked=(filter == "agents")
                   p=0.0
                   @ghost_action
                 FilterChip
@@ -86,6 +89,7 @@ component MembersScreen(rows:[MemberRow], filter:str, selected:str, admin:bool, 
               button -> emit(pick_members_filter, "validators")
                 with
                   label="Show validators only"
+                  checked=(filter == "validators")
                   p=0.0
                   @ghost_action
                 FilterChip

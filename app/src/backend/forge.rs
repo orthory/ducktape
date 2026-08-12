@@ -344,8 +344,6 @@ pub(crate) fn review_comments(
 /// conflicted locally and NOTHING was submitted.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ForgeMergeOutcome {
-    pub repo: String,
-    pub number: i64,
     pub merged: bool,
     pub merge_oid: String,
     pub conflicts: Vec<String>,
@@ -384,8 +382,6 @@ pub async fn merge_forge_pr(
         let (merge_oid, pack) = match build {
             MergeBuild::Conflicts(paths) => {
                 return Ok(ForgeMergeOutcome {
-                    repo,
-                    number,
                     merged: false,
                     merge_oid: String::new(),
                     conflicts: paths,
@@ -410,8 +406,6 @@ pub async fn merge_forge_pr(
         )
         .await?;
         Ok(ForgeMergeOutcome {
-            repo,
-            number,
             merged: true,
             merge_oid,
             conflicts: Vec::new(),

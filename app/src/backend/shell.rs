@@ -377,16 +377,22 @@ pub fn network_slug(name: String) -> String {
 
 /// Materialize this device's workspace from an invite blob:
 /// `ducktape node join <blob>`.
-pub async fn join_network(blob: String) -> Result<WorkspaceInit, AppError> {
+pub async fn join_network(blob: ui_lang_runtime::Secret) -> Result<WorkspaceInit, AppError> {
     async {
-        let blob = bounded_text(blob, "invite", 64 * 1024)?;
+        let blob = blob.expose().trim();
+        let valid = !blob.is_empty()
+            && blob.len() <= 64 * 1024
+            && !blob.chars().any(|character| character == '\0');
+        if !valid {
+            return Err("invite must be between 1 and 65536 bytes".into());
+        }
         // `join` reports progress on stderr, so the workspace it materialized
         // is identified by diffing the registry around the call.
         let before: BTreeSet<String> = registered_workspaces()
             .into_iter()
             .map(|(chain_id, _)| chain_id)
             .collect();
-        ducktape_cli(&["node", "join", &blob]).await?;
+        ducktape_cli(&["node", "join", blob]).await?;
         let chain_id = registered_workspaces()
             .into_iter()
             .map(|(chain_id, _)| chain_id)
@@ -717,14 +723,10 @@ fn wall_clock_seconds(stamp: i64) -> Option<i64> {
 }
 
 /// The titlebar's machine value: `h 84,912`, grouped the way the artifact
-/// writes heights. A height the node has not reported yet reads `h —`; a
-/// unix-millis stamp reads as the wall clock it actually is.
+/// writes heights. A height the node has not reported yet reads `h —`.
 pub fn height_label(height: i64) -> String {
     if height < 0 {
         return "h —".into();
-    }
-    if let Some(seconds) = wall_clock_seconds(height) {
-        return relative_time(seconds);
     }
     format!("h {}", grouped_digits(height))
 }
@@ -739,12 +741,12 @@ pub fn height_label_short(height: i64) -> String {
 /// The honest renderer for a consensus-stamped record time: `412 blocks ago`,
 /// `1 block ago`, `this block` — or, on the unix-millis lane, the real elapsed
 /// wall clock. A record with no stamp prints nothing.
-pub fn height_ago(then_height: i64, now_height: i64) -> String {
+pub fn height_ago(then_height: i64, now_height: i64, wall_now: i64) -> String {
     if then_height <= 0 {
         return String::new();
     }
     if let Some(seconds) = wall_clock_seconds(then_height) {
-        return relative_time(seconds);
+        return relative_time(seconds, wall_now);
     }
     let elapsed = now_height.saturating_sub(then_height);
     match elapsed {
@@ -801,7 +803,7 @@ pub fn initials_of(name: impl AsRef<str>) -> String {
 /// height` (bin/noded/src/index.rs) and a single-writer noded stamps unix
 /// MILLIS, so a record time is a block height, not seconds. Render those with
 /// [`height_ago`] / [`height_label_short`].
-pub fn relative_time(unix_seconds: i64) -> String {
+pub fn relative_time(unix_seconds: i64, wall_now: i64) -> String {
     // [`UNMEASURED`] and "this record carries no stamp" are different facts and
     // print differently: the first is a reading the node never published and
     // owes the reader a `—`, the second is a record that legitimately has no
@@ -812,7 +814,7 @@ pub fn relative_time(unix_seconds: i64) -> String {
     if unix_seconds == 0 {
         return String::new();
     }
-    let elapsed = now_seconds().saturating_sub(unix_seconds);
+    let elapsed = wall_now.saturating_sub(unix_seconds);
     if elapsed < 60 {
         return "just now".into();
     }
@@ -825,9 +827,9 @@ pub fn relative_time(unix_seconds: i64) -> String {
 /// a HEIGHT and the remaining span is counted in blocks — never in hours. On
 /// the unix-millis lane the same field genuinely is a clock, and `height` is
 /// not comparable to it at all, so that lane is counted against the wall.
-pub fn expires_in_blocks(deadline_height: i64, height: i64) -> String {
+pub fn expires_in_blocks(deadline_height: i64, height: i64, wall_now: i64) -> String {
     if let Some(seconds) = wall_clock_seconds(deadline_height) {
-        let remaining = seconds.saturating_sub(now_seconds());
+        let remaining = seconds.saturating_sub(wall_now);
         if remaining <= 0 {
             return "expired".into();
         }
@@ -871,6 +873,10 @@ pub(crate) fn now_seconds() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+pub fn current_wall_seconds() -> i64 {
+    now_seconds()
 }
 
 /// A serde-tagged enum's variant name, whether it rode as a bare string

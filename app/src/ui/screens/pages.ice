@@ -74,6 +74,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
               button -> emit(toggle_page_create)
                 with
                   label="New page"
+                  expanded=page_create_open
                   disabled=(loading || mutation_phase != "idle" || !connected)
                   p=0.0
                   @icon_action
@@ -89,6 +90,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
               button -> emit(toggle_page_create)
                 with
                   label="Close new page"
+                  expanded=page_create_open
                   disabled=(loading || mutation_phase != "idle")
                   w=24.0
                   h=24.0
@@ -249,6 +251,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                 button -> emit(toggle_block_comments)
                   with
                     label="Comments"
+                    expanded=block_comments_open
                     disabled=(mutation_phase != "idle")
                     h=26.0
                     p=5.0
@@ -384,6 +387,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                     button -> emit(choose_page, tab.id)
                       with
                         label="Open page tab"
+                        checked=tab.active
                         h=26.0
                         p=5.0
                         @ghost_action

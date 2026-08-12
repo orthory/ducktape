@@ -126,7 +126,7 @@ component ForgeOrgHeader(org:str, about:str, repos:i64, tier:str, connected:bool
 // resolves no dominant extension draws no language dot, and `updated_at` is
 // rendered with `relative_time` because it is the head commit's UNIX committer
 // time — NOT a block height, and not `height_label_short`.
-component RepoCard(repo:ForgeRepo)
+component RepoCard(repo:ForgeRepo, wall_now:i64)
   emits
     forge_open_repo(str)
   button -> emit(forge_open_repo, repo.name)
@@ -194,7 +194,7 @@ component RepoCard(repo:ForgeRepo)
               font=code_medium
               @text-input
           if repo.updated_at > 0
-            text relative_time(repo.updated_at)
+            text relative_time(repo.updated_at, wall_now)
               with
                 size=10.5
                 wrap=none
@@ -308,6 +308,7 @@ component RepoMenuRow(repo:ForgeRepo, active:bool)
         with
           label="Switch repo"
           description=repo.name
+          checked=active
           w=fill
           p=0.0
           @icon_action
@@ -338,6 +339,7 @@ component RepoMenuRow(repo:ForgeRepo, active:bool)
         with
           label="Switch repo"
           description=repo.name
+          checked=active
           w=fill
           p=0.0
           @icon_action

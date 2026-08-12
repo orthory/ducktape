@@ -5,7 +5,7 @@ on refresh_explorer
   return if !connected || explorer_loading
   explorer_generation = explorer_generation + 1
   explorer_loading = true
-  run load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
+  run replace lane=explorer_load load_explorer(connected_rpc, explorer_generation) -> explorer_loaded _ | explorer_failed _
 
 on explorer_loaded(next)
   return if next.generation != explorer_generation
@@ -22,6 +22,7 @@ on select_explorer_block(height)
   explorer_selected = height
 
 on close_palette
+  invalidate lane=palette_search
   palette_open = false
 
 // Opening the bell only opens it. Marking read is the Mark-all-read button's
@@ -35,7 +36,7 @@ on close_bell
 
 on mark_bell_read_submit
   return if bell_unread <= 0
-  run mark_bell_read(connected_rpc, password, bell_head(bell_items)) -> bell_marked _ | mutation_failed _
+  run every mark_bell_read(connected_rpc, password, bell_head(bell_items)) -> bell_marked _ | mutation_failed _
 
 on bell_loaded(next)
   return if next.generation != bell_generation
@@ -159,7 +160,7 @@ on palette_changed(next)
   palette_generation = palette_generation + 1
   palette_searching = !empty(trim(palette_draft))
   return if empty(trim(palette_draft))
-  run palette_search(connected_rpc, trim(palette_draft), palette_generation) -> palette_results _ | palette_search_failed _
+  run replace lane=palette_search palette_search(connected_rpc, trim(palette_draft), palette_generation) -> palette_results _ | palette_search_failed _
 
 on palette_results(next)
   return if next.generation != palette_generation
@@ -197,7 +198,7 @@ on explorer_search_submit
   explorer_partial = ""
   explorer_kind = "all"
   error = ""
-  run search_workspace(connected_rpc, trim(explorer_query), explorer_search_generation) -> explorer_results_loaded _ | explorer_search_failed _
+  run replace lane=workspace_search search_workspace(connected_rpc, trim(explorer_query), explorer_search_generation) -> explorer_results_loaded _ | explorer_search_failed _
 
 on explorer_results_loaded(next)
   return if next.generation != explorer_search_generation
@@ -213,6 +214,7 @@ on explorer_search_failed(cause)
   error = cause.message
 
 on clear_explorer_search
+  invalidate lane=workspace_search
   explorer_search_generation = explorer_search_generation + 1
   explorer_query = ""
   explorer_hits = []

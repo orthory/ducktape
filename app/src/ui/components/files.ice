@@ -39,6 +39,7 @@ component FsTreeRow(entry:FsEntry, selected:bool, depth:f64)
       button -> emit(fs_open_dir, entry.path)
         with
           label="Open directory"
+          checked=selected
           w=fill
           p=0.0
           @ghost_action
@@ -54,6 +55,7 @@ component FsTreeRow(entry:FsEntry, selected:bool, depth:f64)
       button -> emit(fs_open_dir, entry.path)
         with
           label="Open directory"
+          checked=selected
           w=fill
           p=0.0
           @ghost_action
@@ -257,6 +259,7 @@ component ObjectRow(entry:FsEntry, selected:bool)
       button -> emit(fs_open_file, entry.path)
         with
           label="Show object"
+          checked=selected
           w=fill
           p=0.0
           @ghost_action
@@ -268,6 +271,7 @@ component ObjectRow(entry:FsEntry, selected:bool)
       button -> emit(fs_open_file, entry.path)
         with
           label="Show object"
+          checked=selected
           w=fill
           p=0.0
           @ghost_action

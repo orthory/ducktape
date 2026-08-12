@@ -22,6 +22,8 @@ view
           tier=member_tier(members_rows)
           error=onboarding_error
           busy=(mutation_phase != "idle")
+          restore_empty=empty(restore_words)
+          join_empty=empty(join_invite)
         events
           unlock_submit -> unlock_submit _
           login_skip -> login_skip
@@ -29,17 +31,46 @@ view
           reveal_confirm -> reveal_confirm
           go_restore -> go_restore
           go_login -> go_login
-          restore_submit -> restore_submit _ _
+          restore_submit -> restore_submit _
           pick_network -> pick_network _
           open_network_submit -> open_network_submit
           forget_network_submit -> forget_network_submit _ _
           go_join -> go_join
           go_networks -> go_networks
-          join_network_submit -> join_network_submit _
+          join_network_submit -> join_network_submit
           copy_onboarding_invite -> copy_onboarding_invite
           connect_remote_submit -> connect_remote_submit _
           restore_hidden_submit -> restore_hidden_submit
           enter_console -> enter_console
+        restore_phrase:
+          input "" #restore-words <-> restore_words
+            with
+              label="Recovery phrase"
+              hint="24 words, space-separated"
+              disabled=(mutation_phase != "idle")
+              w=fill
+              p=0.0
+              text-size=12.0
+              line-h=1.2
+              font=code
+              @control
+            active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
+            disabled value=hint
+        join_invite:
+          input "" #join-invite <-> join_invite
+            with
+              label="Invite"
+              hint="🦆AAAA…"
+              disabled=(mutation_phase != "idle")
+              submit=join_network_submit
+              w=fill
+              p=0.0
+              text-size=12.0
+              line-h=1.2
+              font=code
+              @control
+            active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
+            disabled value=hint
     // THE HUDDLE WINDOW — the same panel, now the whole content of a real OS
     // window instead of a card wearing drawn traffic lights. Its close button
     // docks (see `window_was_closed`); leaving the huddle closes it.
@@ -61,7 +92,7 @@ view
           toggle_call_mute -> toggle_call_mute
           toggle_call_camera -> toggle_call_camera
     if console_win == some(window)
-      WorkspaceTabs #workspace-tabs
+      WorkspaceTabs wall_now=wall_now #workspace-tabs
         with
           network=network_name
           status
@@ -360,7 +391,7 @@ view
         agents:
           AgentsScreen rows=agents_rows connected answered=agents_answered #agents
         forge:
-          ForgeScreen review_draft<->forge_review_draft comment_draft<->forge_comment_draft discussion_editor<->forge_discussion_editor
+          ForgeScreen wall_now=wall_now review_draft<->forge_review_draft comment_draft<->forge_comment_draft discussion_editor<->forge_discussion_editor
             with
               org=network_name
               about=account_bio
@@ -438,7 +469,7 @@ view
               gov_vote -> gov_vote _ _
               gov_execute -> gov_execute _
         settings:
-          SettingsScreen account_name_draft<->account_name_draft node_log_filter<->node_log_filter #settings
+          SettingsScreen wall_now=wall_now account_name_draft<->account_name_draft node_log_filter<->node_log_filter #settings
             with
               account_name
               network_name
@@ -477,7 +508,6 @@ view
               node_sync_failures
               node_sync_last_error
               node_peers
-              node_log_lines
             events
               select_shell_tab -> select_shell_tab _
               reconnect -> reconnect
@@ -494,6 +524,8 @@ view
               node_log_filter_changed -> node_log_filter_changed _
               set_appearance_light -> set_appearance_light
               set_appearance_dark -> set_appearance_dark
+            activity_log:
+              extern node_log_timeline(node_log_timeline, settings_endpoint) #node-log-timeline -> node_log_timeline_changed _
         explorer:
           ExplorerScreen query<->explorer_query
             with
@@ -657,10 +689,6 @@ view
                           dir=vertical
                           w=fill
                           h=290.0
-                        col
-                          with
-                            w=fill
-                            p=5.0
-                            gap=1.0
-                          for item in bell_items
-                            BellRow item=item
+                          anchor-y=keep
+                        keyed item in bell_items by=item.seq virtual-row=58.0 w=fill p=5.0 gap=1.0
+                          BellRow item=item
