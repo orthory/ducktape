@@ -7592,15 +7592,10 @@ fn every_repeated_component_mount_is_culled_or_argued() {
             "screens/storage.ice",
             "for op in explorer_ops_at(ops, selected)",
         ),
-        ("view.ice", "for item in bell_items"),
         // 4. UNCULLED AND KNOWN — genuinely unbounded, fed by a log, a file or
         //    a thread, and simply not done yet. These are chat's problem on
         //    another surface; each is a `virtual-row=` away. Listed rather
         //    than silently excused so the next perf pass has its worklist.
-        (
-            "screens/settings.ice",
-            "for line in filter_log_lines(node_log_lines, node_log_filter)",
-        ),
         ("screens/forge.ice", "for line in source_lines(file_text)"),
         ("screens/forge.ice", "for message in discussion"),
         ("screens/storage.ice", "for entry in entries"),
@@ -7670,7 +7665,7 @@ fn every_repeated_component_mount_is_culled_or_argued() {
 
 /// EVERY EXTERN ARGUMENT IS BY VALUE, SO A LIST ARGUMENT IS A DEEP CLONE.
 ///
-/// `sync f(rows:[T])` called from a view expression clones the whole list into
+/// `sync`/`pure f(rows:[T])` called from a view expression clones the whole list into
 /// the call, once per frame, per call site — and if the site sits inside a
 /// `for`, once per row per frame. `state.ice` records three fields
 /// (`unread_marker_seq`, `has_older_history`, `rooms`) that exist only because
@@ -7689,7 +7684,10 @@ fn no_view_expression_hands_an_extern_a_list() {
             source
                 .lines()
                 .filter_map(|line| {
-                    let declaration = line.trim().strip_prefix("sync ")?;
+                    let declaration = line
+                        .trim()
+                        .strip_prefix("sync ")
+                        .or_else(|| line.trim().strip_prefix("pure "))?;
                     let (name, rest) = declaration.split_once('(')?;
                     let (args, _) = rest.split_once(')')?;
                     args.contains(":[").then(|| name.to_owned())
@@ -7716,7 +7714,6 @@ fn no_view_expression_hands_an_extern_a_list() {
         ("screens/settings.ice", "member_tier"),
         ("screens/settings.ice", "members_is_admin"),
         ("screens/settings.ice", "members_summary"),
-        ("screens/settings.ice", "filter_log_lines"),
         ("screens/pages.ice", "doc_tab_rows"),
         ("screens/pages.ice", "subpage_blocks"),
         ("screens/pages.ice", "thread_is_resolved"),

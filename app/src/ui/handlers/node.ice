@@ -122,7 +122,7 @@ on settings_unlock_failed(cause)
 // holds the opened user key must not outlive the seat it was opened for.
 on lock_session
   password = ""
-  run lock_signer() -> signer_locked _
+  run every lock_signer() -> signer_locked _
 
 on signer_locked(_retired)
   error = error

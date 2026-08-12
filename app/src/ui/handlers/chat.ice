@@ -881,7 +881,7 @@ on chat_scrolled(_absolute_x, _absolute_y, _relative_x, relative_y)
   history_generation = history_generation + 1
   history_loading = true
   error = ""
-  run load_older_messages(connected_rpc, active_channel, oldest_message_seq(messages), history_generation) -> history_loaded _ | history_failed _
+  run replace lane=history load_older_messages(connected_rpc, active_channel, oldest_message_seq(messages), history_generation) -> history_loaded _ | history_failed _
 
 // `chat_window_loading` rides with `loading` in BOTH guards, and it is the one
 // term that survived the cache hit: `loading` is false for the whole round trip
