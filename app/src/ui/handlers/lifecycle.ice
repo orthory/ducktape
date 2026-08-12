@@ -414,11 +414,17 @@ on live_resynced(next)
   return if next.generation != hydration_generation
   hydration_retry_attempt = 0
   // FOLD, DO NOT REPLACE — the same rule `chat_updated` states, for the same
-  // reason. This read left the node several queries ago; every delta
-  // `live_updated` folded while it was in flight (a peer's post in a THIRD room
-  // and the badge it lit, a channel created, renamed or archived) is the NEWER
-  // fact, and `channel_reads` is not reverted with it — so a flat assignment
-  // walked `head_seq` back under a cursor that stayed put and put the badge out.
+  // reason. This read left the node several queries ago, and `channel_reads` is
+  // NOT reverted with it, so a flat assignment walked a third room's `head_seq`
+  // back under a cursor that stayed put: `head_seq > last_read` went false and
+  // the badge a mid-flight post lit went out, dark until that room got another
+  // message. `upsert_channel_rows` keeps `head_seq` monotonic and keeps a row
+  // the answer does not carry at all — a channel created while it was in flight.
+  //
+  // IT IS NOT A FULL MERGE, and the rest of the row is the snapshot's: a rename
+  // or an archive folded during the round trip is overwritten here. That one
+  // self-heals — the next chat-carrying resync re-reads the renamed row — where
+  // the badge did not, which is why only the cursor's invariant is enforced.
   channels = keep_channels(next.chat_loaded, upsert_channel_rows(channels, next.channels), channels)
   channel_reads = initial_channel_reads(channels, channel_reads)
   // SAME FOLD, ONE LINE ABOVE THE BANNER, because it reads `history_view` while
@@ -607,6 +613,23 @@ on live_resynced(next)
   // it must NOT become is a lock released twice, so those two pages terminals
   // now take the same `== "recovering"` term rather than flatly writing "idle"
   // over whatever mutation started in the gap.
+  //
+  // AND IT IS STILL ORPHANABLE — the known ceiling, named here because the guard
+  // at the top of this handler is where it bites. `mutation_failed` bumps
+  // `hydration_generation` to launch its recovery, and ANY later bump makes the
+  // answer stale, so `return if next.generation != hydration_generation` drops
+  // it and the `live_resync_failed` retry chain with it. Almost every bumper is
+  // behind a `mutation_phase != "idle"` guard "recovering" cannot pass; the ones
+  // that are NOT are the two acts that deliberately run outside the lock — a
+  // message send (`message_composer_event`, `reply_composer_event`) and a
+  // reaction tap (`add_reaction_submit`, `add_reaction_at`,
+  // `remove_reaction_at`) — none of which launch a replacement on the
+  // `live_resync` lane. One of those inside the recovery's round trip leaves the
+  // lock held with no terminal again, and Settings → Reconnect (whitelisted for
+  // "recovering" at the top of this file) is the escape. Closing it means giving
+  // the recovery a generation of its own rather than riding this one, which is a
+  // wider change than the lock is worth today: this is strictly the residue of a
+  // case that used to be unconditional.
   mutation_phase = keep_str(mutation_phase == "recovering", "idle", mutation_phase)
   error = ""
   block_comments_generation = block_comments_generation + 1

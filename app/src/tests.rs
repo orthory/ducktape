@@ -1195,6 +1195,44 @@ fn a_refused_reaction_is_reverted_by_the_resync_it_launches() {
         app.live_thread_generation, thread_before,
         "and the open rail is re-fetched for its own copy of the row"
     );
+
+    // AND THE CEILING IT REVERTS UNDER, pinned so a later change to the merge
+    // cannot widen it by accident. The refetch answers with the tail; a tap on a
+    // row the reader had paged BACK to is outside that page, so no canonical row
+    // wins on `rev` and the phantom chip rides along until she re-enters the
+    // room. Replacing the whole window here instead would take it back — and
+    // throw away every "Load older" page, which is the trade this seam refuses.
+    let mut paged_back = message(3, "months ago", false);
+    paged_back.reactions = vec![backend::ChatReaction {
+        emoji: "👍".into(),
+        count: 1,
+        reacted_by_me: true,
+        reactors: vec!["user:aa11".into()],
+    }];
+    app.messages = vec![paged_back, message(45, "still on screen", false)];
+    let _ = app.__update(__DucktapeMessage::ReactionFailed(backend::AppError {
+        message: "the chain refused it".into(),
+        committed: false,
+    }));
+    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+        app.hydration_generation,
+        "general",
+        vec![
+            message(45, "still on screen", false),
+            message(50, "the tail", false),
+        ],
+        "",
+        Vec::new(),
+    )));
+    assert_eq!(
+        app.messages.iter().map(|row| row.seq).collect::<Vec<_>>(),
+        vec![3, 45, 50],
+        "her scrollback survives the revert, which is the point of the fold"
+    );
+    assert!(
+        !app.messages[0].reactions.is_empty(),
+        "and the chip on the row the page does not cover is the known residue"
+    );
 }
 
 /// BOTH COPIES OF THE ROW TAKE THE TAP. A message on screen can be the root (or
@@ -4928,6 +4966,26 @@ fn block_comment_recovery_always_unlocks_mutations() {
         overtaken.mutation_phase, "channel-create",
         "a stale recovery does not unlock the mutation that came after it"
     );
+
+    // BOTH ARMS, because both took the term. A failed recovery is no more
+    // entitled to a lock it no longer holds, and its arm would revert to a flat
+    // "idle" with everything above still green.
+    let (mut overtaken_failure, _) = Ducktape::__boot();
+    overtaken_failure.block_comments_open = true;
+    overtaken_failure.block_comments_generation = 8;
+    overtaken_failure.block_comment_threads_loading = true;
+    overtaken_failure.mutation_phase = "channel-create".into();
+    let _ = overtaken_failure.__update(__DucktapeMessage::BlockThreadsRecoveryFailed(
+        backend::HydrationError {
+            generation: 8,
+            message: "recovery read failed".into(),
+        },
+    ));
+    assert_eq!(
+        overtaken_failure.mutation_phase, "channel-create",
+        "and neither does the failure arm"
+    );
+    assert!(!overtaken_failure.block_comment_threads_loading);
 }
 
 #[test]
