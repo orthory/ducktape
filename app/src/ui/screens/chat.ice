@@ -525,18 +525,23 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                       active bg=surface text=fg border=warning_line border-w=1.0 r=7.0
                       hovered bg=warning_bg text=fg
                       pressed bg=accent text=fg
-              // THIS GATE IS THE SCROLL RESET. `choose_channel` clears
-              // `messages` before the fetch, so the whole stack — the
-              // scrollable with it — unmounts, its `scrollable::State` drops,
-              // and the next room mounts a fresh one at offset 0, which under
-              // `anchor-y=end` is the tail. Nothing else resets it: there is no
-              // `scroll-to`, and no per-channel offset memory.
+              // THIS GATE IS NOT THE SCROLL RESET — the SWITCH IS. It used to
+              // be: `choose_channel` emptied `messages` before the fetch, the
+              // stack unmounted, its `scrollable::State` died with it and the
+              // next room mounted a fresh one at the tail. The window cache
+              // ended that. A cache hit goes non-empty → non-empty in one
+              // reducer pass, this `if` never renders false, and iced's
+              // positional diff hands the SURVIVING offset — a distance from
+              // the bottom under `anchor-y=end` — to the room being entered.
               //
-              // So do NOT hoist the scrollable above this gate to share it with
-              // the empty/loading arm. A shared scrollable survives the switch
-              // and hands the new room the offset the old one was left at.
-              // `message_stream_reset_contract` in `tests/app.ice` is the fence:
-              // it asserts `#chat/message-stream` is GONE once `messages` is.
+              // So `choose_channel` and `choose_dm` both end with
+              // `task widget scroll-to … 0.0 0.0` (absolute 0 IS the tail under
+              // this anchor) and the tail is asserted rather than inherited.
+              // Two fences: `message_stream_reset_contract` in `tests/app.ice`
+              // still pins that the stream is GONE once `messages` is, and
+              // `a_room_restored_from_the_cache_asserts_the_streams_tail` in
+              // `tests.rs` pins that every handler painting parked rows carries
+              // the operation.
               if connected && !empty(messages)
                 stack w=fill h=fill
                   sensor show=emit(chat_resized, _, _) resize=emit(chat_resized, _, _)

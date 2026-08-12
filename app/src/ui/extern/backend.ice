@@ -322,8 +322,10 @@ extern crate::backend
   pure channel_is_members_only(channels:[ChatChannel], channel:str) -> bool
   // The two-or-three room window cache the channel switch paints from.
   pure cache_channel_window(cache:[ChannelWindow], channel_id:str, messages:[ChatMessage], members:[ChatMember], history_view:bool) -> [ChannelWindow]
-  pure cached_window_messages(cache:[ChannelWindow], channel_id:str) -> [ChatMessage]
-  pure cached_window_members(cache:[ChannelWindow], channel_id:str) -> [ChatMember]
+  // ONE CALL FOR BOTH ANSWERS — the ABI charges by the argument, and asking
+  // for the rows and the roll separately walked (and deep-cloned) the whole
+  // cache twice per click. Same reason `chat_settle` returns three at once.
+  pure cached_window(cache:[ChannelWindow], channel_id:str) -> ChannelWindow
   // The pages twin of `channel_display_name`: the header title of a page that
   // has only just been clicked, read from the list already in hand.
   pure page_display_title(pages:[PageItem], page:str, current:str) -> str
@@ -358,6 +360,7 @@ extern crate::backend
   pure thread_generation_after_refresh(generation:i64, current_channel:str, next_channel:str, previous_root:i64, next_root:i64) -> i64
   pure thread_loading_after_refresh(loading:bool, current_channel:str, next_channel:str, previous_root:i64, next_root:i64) -> bool
   pure retain_thread_messages(messages:[ChatMessage], root_seq:i64) -> [ChatMessage]
+  pure thread_root_seed(messages:[ChatMessage], thread:[ChatMessage], seq:i64) -> [ChatMessage]
   pure cancel_autosaves(rpc:str, generation:i64) -> i64
   pure remember_orphaned_comment_drafts(drafts:[str], blocks:[PageBlock], selected_id:str, current:str) -> [str]
   pure remove_recovered_draft(drafts:[str], recovered:str) -> [str]
