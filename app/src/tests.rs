@@ -2199,14 +2199,26 @@ fn a_single_failed_load_does_not_report_the_connection_offline() {
     assert!(!app.loading, "and the pane is released either way");
 }
 
+/// THE ONE VIRTUAL LIST IN THIS APP THAT PREPENDS MUST BE KEYED.
+///
+/// `chat_scrolled` fires the older page automatically inside the last tenth of
+/// the scrollback and `prepend_history` merges up to 256 rows AHEAD of the
+/// timeline. An unkeyed virtual column diffs its children by index, so every
+/// one of those rows hands its measured height to its neighbour: the rows below
+/// the viewport are re-estimated at the 44px placeholder, the content height
+/// moves, and an `anchor-y=end` offset — a fixed distance from the BOTTOM —
+/// lands on entirely different messages. The reader gets thrown backwards
+/// mid-sentence, once per page, for as long as she keeps reading upwards.
 #[test]
 fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
     let chat = inlined(include_str!("ui/screens/chat.ice"));
     // Only the rows the viewport can see are laid out, which is what lets the
-    // timeline hold a whole channel without paying a text layout per row.
+    // timeline hold a whole channel without paying a text layout per row — and
+    // `by=message.seq` is what makes per-row state and per-row MEASUREMENT
+    // follow the message instead of the slot it happened to occupy.
     let above = chat
-        .split_once("col w=fill gap=3.0 pr=6.0 virtual-row=44.0")
-        .expect("the message timeline is a virtual-row column")
+        .split_once("keyed message in messages by=message.seq w=fill gap=3.0 virtual-row=44.0")
+        .expect("the message timeline is a KEYED virtual-row column")
         .0;
     // That is only correct under an end-anchored scroll: measuring a row ABOVE
     // the viewport moves everything below it, and a bottom-anchored offset is
@@ -2218,6 +2230,81 @@ fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
         above
             .contains("scroll #message-stream dir=vertical w=fill h=shrink anchor-y=end auto=true")
     );
+    // The page controls stay OUTSIDE the keyed column. A keyed column repeats
+    // one template over one list; a button folded into that list is a row whose
+    // arrival and departure shift every index below it — the same defect one
+    // level up, and `has_older_history` flips on every page.
+    assert!(above.contains("col w=fill gap=3.0 pr=6.0"));
+    assert!(above.contains("button \"Load older messages\""));
+    // A key is only an identity if it is unique: `optimistic_message` mints a
+    // fresh descending seq per in-flight send, so two concurrent sends cannot
+    // share one row's widget state and measured height.
+    let mut pending = vec![message(40, "committed", false)];
+    for id in ["a", "b", "c"] {
+        pending = backend::optimistic_message(pending, id.into(), id.into());
+    }
+    let seqs: Vec<i64> = pending.iter().map(|message| message.seq).collect();
+    assert_eq!(seqs, vec![40, -1, -2, -3], "every pending row keys apart");
+}
+
+/// A LINK IS A DESTINATION, NOT A PERSON — AND IT PRESSES.
+///
+/// The chat module sets `highlight` for a `Link` mark and a `Mention` mark
+/// alike (`highlight = link.is_some() || mention`), so ONE arm painted both:
+/// every URL anyone posted wore the mention's plate, in the mention's ink, and
+/// was dead text — no cursor change, no press, no menu — while `span.link`
+/// carried the destination all the way to the view and no `.ice` file read it.
+/// Sharing a URL in this app meant the reader selected it by hand.
+#[test]
+fn a_posted_url_presses_and_does_not_wear_the_mention_plate() {
+    let components = inlined(include_str!("ui/components/chat.ice"));
+    // The plate is the mention's token, and ONLY the mention's.
+    assert!(components.contains("if span.highlight && empty(span.link)"));
+    assert!(
+        !components.contains("if span.highlight\n"),
+        "an unqualified highlight arm is the mention plate back on every link"
+    );
+    // A link is its own arm, and it is a press.
+    assert!(components.contains("if !empty(span.link)"));
+    assert!(
+        components.contains("button label=span.text p=0.0 -> emit(open_message_link, span.link)")
+    );
+    // It hands off through the SAME external-URL route the page renderer's
+    // link press takes — one mechanism for one act, not a second one here.
+    let handlers = include_str!("ui/handlers/chat.ice");
+    assert!(handlers.contains("on open_message_link(url)"));
+    assert!(handlers.contains(
+        "run every open_external_url(url) -> external_url_opened _ | external_url_failed _"
+    ));
+}
+
+/// `· edited` ANNOTATES A MESSAGE, SO IT RIDES THE MESSAGE.
+///
+/// It lived inside the `show_author` run header, so in a run of five messages
+/// only the first could ever say it had been edited — and runs are most of a
+/// busy channel. A message's text changing under its readers with no mark
+/// anywhere on the row silently spends the one integrity signal this product
+/// has. The thread root drew a header and still never carried it at all.
+#[test]
+fn the_edited_marker_reaches_every_row_it_annotates() {
+    let components = inlined(include_str!("ui/components/chat.ice"));
+    let marker = "text \"· edited\" size=11.0 wrap=none font=code_medium @text-muted";
+    assert_eq!(
+        components.matches(marker).count(),
+        3,
+        "the run header, the continuation row, and the thread root each carry it"
+    );
+    assert!(
+        components.contains(&format!(
+            "if message.edited && !message.show_author\n          {marker}"
+        )),
+        "a continuation row trails its own marker under the body"
+    );
+    let parent = components
+        .split_once("component ThreadParentBlock")
+        .expect("the thread root block")
+        .1;
+    assert!(parent.contains(&format!("if message.edited\n            {marker}")));
 }
 
 /// THE RAIL IS THE SAME LIST WITH THE SAME BILL. A thread pages in at the same
@@ -6005,8 +6092,8 @@ fn a_send_that_fails_after_she_moved_rooms_still_reaches_her() {
 
 /// A PENDING ROW HAS NO SEQ, SO IT CANNOT ANSWER FOR THE TOP OF THE TIMELINE.
 ///
-/// `optimistic_message` mints `seq == -1`, which sorts ahead of every real
-/// message. Sorting it numerically into a prepended page put an in-flight send
+/// `optimistic_message` mints a descending negative seq, which sorts ahead of
+/// every real message. Sorting it numerically into a prepended page put an in-flight send
 /// at the top of months-old scrollback, and then `history_has_older` read
 /// `-1 > 1` and hid "Load older" outright — the pending send locked the reader
 /// out of her own history until it settled.

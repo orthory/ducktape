@@ -759,6 +759,7 @@ test message_stream_reset_contract
         chat_pointer_pressed -> chat_pointer_pressed _ _
         load_more_history -> load_more_history
         chat_scrolled -> chat_scrolled _ _ _ _
+        open_message_link -> open_message_link _
         add_reaction_at -> add_reaction_at _ _
         remove_reaction_at -> remove_reaction_at _ _
         open_thread_for -> open_thread_for _

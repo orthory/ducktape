@@ -740,9 +740,23 @@ pub fn optimistic_message(
         Some(handle) => (author_display(handle, current_user), avatar_initial(handle)),
         None => ("you".into(), "•".into()),
     };
+    // EVERY PENDING ROW GETS ITS OWN SEQ, descending below zero. The timeline
+    // is a keyed virtual column now (`by=message.seq`), so a shared sentinel is
+    // a shared row identity: two sends in flight at once would collide on one
+    // key and share one row's widget state and measured height. Nothing reads a
+    // pending seq numerically — `oldest_committed` skips pending rows entirely,
+    // `first_unread_seq` needs `seq > boundary > 0`, and `prepend_history` and
+    // `merge_message_send_result` both partition pending out before sorting —
+    // so the only thing this number has to be is unique and below every
+    // committed seq.
+    let lowest_seq = messages
+        .iter()
+        .map(|message| message.seq)
+        .min()
+        .unwrap_or_default();
     messages.push(ChatMessage {
         id: message_id,
-        seq: -1,
+        seq: lowest_seq.min(0) - 1,
         author,
         meta: "Sending…".into(),
         body,
@@ -945,6 +959,12 @@ pub fn mark_message_groups(messages: &mut [ChatMessage]) {
     }
 }
 
+/// Flatten wire blocks back into composer text — the seed for an edit draft.
+///
+/// One `\n` per block boundary, because that is what a block boundary now MEANS
+/// in the composer (`parse_message_with_members` makes every typed line its own
+/// block). A `\n\n` here re-parsed to the same blocks, but it handed the editor
+/// a blank line the author never typed, and every edit added another.
 pub fn message_body(blocks: &[Block]) -> String {
     blocks
         .iter()
@@ -958,7 +978,7 @@ pub fn message_body(blocks: &[Block]) -> String {
             Block::Divider => "────────".into(),
         })
         .collect::<Vec<_>>()
-        .join("\n\n")
+        .join("\n")
 }
 
 fn span_text(spans: &[Span]) -> String {
@@ -1184,6 +1204,15 @@ fn count_i64(value: usize) -> i64 {
 /// `>` quotes, `---`/`***` dividers, and paragraphs with inline `**bold**` /
 /// `__bold__`, `*italic*` / `_italic_`, and bare `http(s)` links. Everything the
 /// `chat` wire enums can round-trip — nothing client-only.
+///
+/// A SINGLE NEWLINE IS A HARD BREAK, not CommonMark's soft break. The composer
+/// hint says `⇧↵ newline` and `⇧↵` really does put a `\n` in the buffer, so
+/// folding consecutive lines into one paragraph with a space posted a typed
+/// list as "- apples - bananas - pears" — and the fold happens on the way to
+/// the CHAIN, so no renderer recovers it. Each line is therefore its own block.
+/// A rendered break has to be a block boundary rather than a `\n` inside one:
+/// a marked-up line renders as a wrapping flex of word tokens (`word_spans`),
+/// and a flex cannot force a line break.
 pub fn parse_message(input: &str) -> Vec<Block> {
     parse_message_with_members(input, &[])
 }
@@ -1246,13 +1275,11 @@ fn push_quote_block(
     blocks: &mut Vec<Block>,
 ) -> usize {
     let mut index = start;
-    let mut quoted = Vec::new();
     while index < lines.len() && lines[index].trim().starts_with('>') {
         let stripped = lines[index].trim().trim_start_matches('>').trim_start();
-        quoted.push(stripped.to_string());
+        blocks.push(Block::Quote(inline_spans(stripped, members)));
         index += 1;
     }
-    blocks.push(Block::Quote(inline_spans(&quoted.join(" "), members)));
     index
 }
 
@@ -1263,7 +1290,6 @@ fn push_paragraph_block(
     blocks: &mut Vec<Block>,
 ) -> usize {
     let mut index = start;
-    let mut paragraph = Vec::new();
     while index < lines.len() {
         let trimmed = lines[index].trim();
         let breaks = trimmed.is_empty()
@@ -1274,10 +1300,9 @@ fn push_paragraph_block(
         if breaks {
             break;
         }
-        paragraph.push(trimmed);
+        blocks.push(Block::Paragraph(inline_spans(trimmed, members)));
         index += 1;
     }
-    blocks.push(Block::Paragraph(inline_spans(&paragraph.join(" "), members)));
     index
 }
 
@@ -1551,7 +1576,7 @@ mod tests {
     fn parse_message_maps_markdown_onto_wire_blocks() {
         let input = "Hello **world** and *friends*\n\n> quote me\n> across lines\n\n```rust\nfn main() {}\n```\n\nvisit https://ducktape.example for more";
         let blocks = parse_message(input);
-        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks.len(), 5);
 
         // paragraph 1: plain / bold / plain / italic runs
         let Block::Paragraph(spans) = &blocks[0] else {
@@ -1564,22 +1589,28 @@ mod tests {
         assert_eq!(spans[3].text, "friends");
         assert_eq!(spans[3].marks, vec![Mark::Italic]);
 
-        // quote joins its lines
-        let Block::Quote(quote) = &blocks[1] else {
+        // a quote keeps its lines apart, exactly as a paragraph does — the
+        // `⇧↵ newline` the composer advertises means the same thing inside a
+        // `>` run as outside one.
+        let Block::Quote(first) = &blocks[1] else {
             panic!("second block is a quote");
         };
-        assert_eq!(span_text(quote), "quote me across lines");
+        let Block::Quote(second) = &blocks[2] else {
+            panic!("third block is a quote");
+        };
+        assert_eq!(span_text(first), "quote me");
+        assert_eq!(span_text(second), "across lines");
 
         // fenced code keeps its language + raw text
-        let Block::Code { lang, text } = &blocks[2] else {
-            panic!("third block is code");
+        let Block::Code { lang, text } = &blocks[3] else {
+            panic!("fourth block is code");
         };
         assert_eq!(lang.as_deref(), Some("rust"));
         assert_eq!(text, "fn main() {}");
 
         // bare url becomes a link mark
-        let Block::Paragraph(spans) = &blocks[3] else {
-            panic!("fourth block is a paragraph");
+        let Block::Paragraph(spans) = &blocks[4] else {
+            panic!("fifth block is a paragraph");
         };
         let link = spans
             .iter()
@@ -1597,14 +1628,46 @@ mod tests {
         assert_eq!(view[0].kind, "paragraph");
         assert!(view[0].rich, "formatted paragraph renders as spans");
         assert!(view[0].spans.iter().any(|span| span.bold && span.text == "world"));
-        assert_eq!(view[2].kind, "code");
-        assert_eq!(view[2].text, "fn main() {}");
+        assert_eq!(view[3].kind, "code");
+        assert_eq!(view[3].text, "fn main() {}");
 
         // a plain message stays a single non-rich paragraph
         let plain = blocks_view(&parse_message("just text here"));
         assert_eq!(plain.len(), 1);
         assert!(!plain[0].rich);
         assert_eq!(plain[0].text, "just text here");
+    }
+
+    /// `⇧↵` PUTS A NEWLINE IN THE BUFFER AND THE COMPOSER SAYS SO.
+    ///
+    /// Consecutive lines were folded into one paragraph with a space, so a
+    /// typed list posted as "- apples - bananas - pears" — and the fold happens
+    /// on the way to the CHAIN, so no renderer recovers it. A rendered break
+    /// has to be a block boundary: a marked-up line renders as a wrapping flex
+    /// of word tokens, and a flex cannot force a line break inside one.
+    #[test]
+    fn a_single_newline_survives_the_trip_to_the_wire() {
+        let blocks = parse_message("- apples\n- bananas\n- pears");
+        assert_eq!(blocks.len(), 3, "one block per typed line");
+        let lines: Vec<String> = blocks
+            .iter()
+            .map(|block| match block {
+                Block::Paragraph(spans) => span_text(spans),
+                other => panic!("every line is a paragraph, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(lines, ["- apples", "- bananas", "- pears"]);
+
+        // The break survives inline marks, which is the case the old fold could
+        // not have been fixed for on the render side.
+        let marked = parse_message("**ship it**\nhttps://ducktape.example");
+        assert_eq!(marked.len(), 2);
+        let view = blocks_view(&marked);
+        assert!(view[0].rich && view[1].rich);
+
+        // And the edit draft the reader gets back is the text she typed, not
+        // her text with a blank line inserted between every pair of lines.
+        assert_eq!(message_body(&blocks), "- apples\n- bananas\n- pears");
     }
 
     #[test]

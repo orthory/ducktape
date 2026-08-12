@@ -36,6 +36,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
     chat_pointer_pressed(f64, f64)
     load_more_history()
     chat_scrolled(f64, f64, f64, f64)
+    open_message_link(str)
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
     open_thread_for(i64)
@@ -566,28 +567,17 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                           // published, so this is one message per real scroll
                           // step, not one per wheel event.
                           scroll=emit(chat_scrolled, _, _, _, _)
-                        // VIRTUALIZED. Only the rows the viewport can see are
-                        // laid out, so the timeline no longer shapes text for
-                        // scrollback nobody is looking at — the mount stopped
-                        // being linear in how far back she paged.
-                        //
-                        // 44px is the middle of a real row: a run header (avatar
-                        // + name line + body over 12px of card padding, plus
-                        // the 14px run-boundary spacer) runs ~68, a grouped
-                        // continuation ~31. Biased low on purpose — too small
-                        // over-mounts for one pass and corrects itself, too
-                        // large leaves a gap at the bottom until the next.
-                        //
-                        // The scroll above is anchor-y=end, and this needs it:
-                        // measuring a never-seen row ABOVE the viewport moves
-                        // everything below it, and only a bottom-anchored offset
-                        // carries the visible rows along with it.
+                        // The page controls are the ONE part of the scrollback
+                        // that is not a message, so they sit in a plain wrapper
+                        // above the keyed column rather than inside it — a
+                        // keyed column repeats one template over one list, and
+                        // a button folded into that list is another row whose
+                        // arrival shifts every index below it.
                         col
                           with
                             w=fill
                             gap=3.0
                             pr=6.0
-                            virtual-row=44.0
                           // TWO ARMS, ONE BUTTON. The page is a walk of up to
                           // four sequential round trips and the control carried
                           // no busy reading at all — `disabled` alone is what a
@@ -624,7 +614,43 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                 active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=8.0
                                 hovered bg=fg/10 text=fg border=fg/14
                                 pressed bg=fg/14 text=fg
-                          for message in messages
+                          // VIRTUALIZED, AND KEYED BY SEQ. Only the rows the
+                          // viewport can see are laid out, so the timeline no
+                          // longer shapes text for scrollback nobody is looking
+                          // at — the mount stopped being linear in how far back
+                          // she paged.
+                          //
+                          // THE KEY IS NOT DECORATION HERE. This is the app's
+                          // one virtual list that PREPENDS: `chat_scrolled`
+                          // fires the older page automatically inside the last
+                          // tenth of the scrollback, and `prepend_history`
+                          // merges up to 256 rows ahead of the timeline. Under
+                          // index diffing every one of those rows hands its
+                          // measured height to its neighbour, so the rows below
+                          // the viewport are re-estimated at 44px, and an
+                          // `anchor-y=end` offset — a fixed distance from the
+                          // bottom — lands on entirely different messages. The
+                          // reader gets thrown backwards mid-sentence, once per
+                          // page. Keyed by seq, per-row state and per-row
+                          // measurement follow the message instead of the slot,
+                          // and the prepend moves nothing on screen.
+                          //
+                          // 44px is the middle of a real row: a run header (avatar
+                          // + name line + body over 12px of card padding, plus
+                          // the 14px run-boundary spacer) runs ~68, a grouped
+                          // continuation ~31. Biased low on purpose — too small
+                          // over-mounts for one pass and corrects itself, too
+                          // large leaves a gap at the bottom until the next.
+                          //
+                          // The scroll above is anchor-y=end, and this needs it:
+                          // measuring a never-seen row ABOVE the viewport moves
+                          // everything below it, and only a bottom-anchored offset
+                          // carries the visible rows along with it.
+                          keyed message in messages by=message.seq
+                            with
+                              w=fill
+                              gap=3.0
+                              virtual-row=44.0
                             col w=fill gap=0.0
                               if unread_boundary > 0 && message.seq == unread_marker_seq
                                 row
@@ -681,6 +707,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                       open_thread_for
                                       open_message_reactions
                                       open_message_actions
+                                      open_message_link
                               if message.seq != selected_message_seq && message.id == send_flash_id
                                 stack #message(message.id) w=fill
                                   MessageCard
@@ -696,6 +723,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                       open_thread_for
                                       open_message_reactions
                                       open_message_actions
+                                      open_message_link
                               if message.seq != selected_message_seq && message.id != send_flash_id
                                 lazy message as cached_message
                                   stack #message(cached_message.id) w=fill
@@ -712,6 +740,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                         open_thread_for
                                         open_message_reactions
                                         open_message_actions
+                                        open_message_link
                   overlay
                     with
                       when=(selected_message_seq > 0 && message_action != "toolbar")
@@ -1564,6 +1593,8 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         // is.
                         if thread_message.seq == active_thread_seq
                           ThreadParentBlock message=thread_message
+                            forward
+                              open_message_link
                         // THE REST SPLIT THE WAY THE STREAM'S DO, and for the
                         // same reason: a `lazy` subtree may read nothing but
                         // its dependency, so every row whose card reads SCREEN
@@ -1585,6 +1616,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                               open_thread_for
                               open_thread_message_actions
                               open_thread_message_reactions
+                              open_message_link
                         if thread_message.seq != active_thread_seq && thread_message.seq != thread_target_seq && thread_message.seq != thread_selected_seq && thread_message.id == thread_send_flash_id
                           ThreadMessageCard
                             with
@@ -1599,6 +1631,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                               open_thread_for
                               open_thread_message_actions
                               open_thread_message_reactions
+                              open_message_link
                         // THE QUIET ARM. Virtualization stops an offscreen
                         // reply from being laid out; this stops a VISIBLE one
                         // from being rebuilt — ~60 nodes of a11y keys and
@@ -1621,6 +1654,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                 open_thread_for
                                 open_thread_message_actions
                                 open_thread_message_reactions
+                                open_message_link
                       if thread_has_more && thread_next_reply_offset >= 0 && thread_loading
                         button "Loading replies…" -> emit(load_more_thread)
                           with

@@ -24,6 +24,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
     forge_comment_cancel()
     forge_comment_drop(str)
     note_composer_event(ComposerEvent)
+    open_message_link(str)
   col w=fill h=fill
     // NOT CONNECTED IS NOT EMPTY, and the arm sits ABOVE both seats because
     // both of them read. `connected` already disabled every act here, while the
@@ -768,6 +769,8 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                             @text-meta
                         space w=fill
                       MessageBody message=message
+                        forward
+                          open_message_link
                 flex
                   with
                     w=fill

@@ -241,6 +241,7 @@ view
               chat_pointer_pressed -> chat_pointer_pressed _ _
               load_more_history -> load_more_history
               chat_scrolled -> chat_scrolled _ _ _ _
+              open_message_link -> open_message_link _
               add_reaction_at -> add_reaction_at _ _
               remove_reaction_at -> remove_reaction_at _ _
               open_thread_for -> open_thread_for _
@@ -459,6 +460,7 @@ view
               forge_comment_cancel -> forge_comment_cancel
               forge_comment_drop -> forge_comment_drop _
               note_composer_event -> forge_composer_event _
+              open_message_link -> open_message_link _
         governance:
           GovernanceScreen #governance
             with
