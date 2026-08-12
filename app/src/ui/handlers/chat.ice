@@ -794,6 +794,13 @@ on begin_message_edit(seq, body, rev)
   composer_focus = "none"
   task widget focus #workspace-tabs/content/chat/message-edit
 
+// A LINK PRESS IS A HAND-OFF TO THE OS, and nothing else: no selection, no
+// draft, no rail. Same route the page renderer's link press takes
+// (`handlers/pages.ice`), and it shares that handler's two result arms.
+on open_message_link(url)
+  return if empty(url)
+  run every open_external_url(url) -> external_url_opened _ | external_url_failed _
+
 // THE INSPECTOR IS THE FINALITY MARK'S TARGET. The shield in the hover bar and
 // the settled chip on my own bubble both land here, and both name the same
 // right rail — so opening one closes the other.

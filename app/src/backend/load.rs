@@ -500,7 +500,7 @@ pub struct HistoryPageData {
 
 /// The oldest COMMITTED row — the only kind that answers for history.
 ///
-/// A pending optimistic row carries `seq == -1`, which sorts ahead of every
+/// A pending optimistic row carries a negative seq, which sorts ahead of every
 /// real message. Reading `first()` blindly made an in-flight send answer for
 /// the top of the timeline: `history_has_older` saw `-1 > 1` and hid "Load
 /// older" outright, and `oldest_message_seq` handed the loader a `-1` that

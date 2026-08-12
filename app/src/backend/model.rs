@@ -493,7 +493,7 @@ pub fn frozen_unread_boundary(
 
 /// The `seq` of the first message past `boundary` (messages are seq-ascending),
 /// or 0 when the visit started caught up (`boundary <= 0`) or nothing is unread.
-/// Pending optimistic messages carry `seq == -1`, so they never anchor a divider.
+/// Pending optimistic messages carry a negative seq, so they never anchor a divider.
 pub fn first_unread_seq(messages: Vec<ChatMessage>, boundary: i64) -> i64 {
     if boundary <= 0 {
         return 0;

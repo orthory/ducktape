@@ -197,6 +197,8 @@ component ChatMemberRow(member:ChatMember, disabled:bool)
       pressed bg=danger_line text=fg
 
 component RichLine(block:ChatBlock)
+  emits
+    open_message_link(str)
   flex
     with
       w=fill
@@ -213,7 +215,12 @@ component RichLine(block:ChatBlock)
       // sliding past in a busy channel; the plate makes it an entity you can
       // find at a glance. `brand_bg` is 68.00+/255 from every row plate this
       // span can sit on, so it never collides with `selected_row`.
-      if span.highlight
+      //
+      // ONLY a mention wears it. The module sets `highlight` for a Link mark
+      // too (`highlight = link.is_some() || mention`), so this arm was painting
+      // every posted URL as a person — the same plate, the same ink, and no
+      // way to tell a destination from a human until you read the characters.
+      if span.highlight && empty(span.link)
         box
           with
             px=4.0
@@ -227,6 +234,29 @@ component RichLine(block:ChatBlock)
               line-h=1.55
               font=medium
               @text-brand
+      // A LINK IS A DESTINATION: it presses. Every URL anyone posted was dead
+      // text — no cursor change, no press, no menu — so sharing one meant the
+      // reader selected it by hand and pasted it into a browser, and the app
+      // has carried `span.link` all the way to the view the whole time. It
+      // hands off to the OS through the same `open_external_url` a page's link
+      // press takes. No plate: brand ink on the row's own ground is what tells
+      // it apart from the mention above, and the tint arrives under the cursor
+      // as the affordance rather than as a permanent badge.
+      if !empty(span.link)
+        button -> emit(open_message_link, span.link)
+          with
+            label=span.text
+            p=0.0
+          text span.text
+            with
+              wrap=word-or-glyph
+              size=13.5
+              line-h=1.55
+              font=medium
+              @text-brand
+          active bg=transparent text=brand border=transparent border-w=0.0 r=4.0
+          hovered bg=brand_bg text=brand border=transparent
+          pressed bg=brand_bg text=brand border=transparent
       if !span.highlight && span.bold && span.italic
         text span.text
           with
@@ -268,6 +298,8 @@ component RichLine(block:ChatBlock)
 // inherits the cap through `w=fill`, which is correct: neither belongs 2000px
 // right of the text it is about.
 component MessageBody(message:ChatMessage)
+  emits
+    open_message_link(str)
   col w=fill max-w=760.0 gap=5.0
     for block in message.blocks
       if block.kind == "divider"
@@ -322,6 +354,8 @@ component MessageBody(message:ChatMessage)
               pb=2.0
             if block.rich
               RichLine block=block
+                forward
+                  open_message_link
             // QUIETER THAN THE PROSE QUOTING IT, at the SAME leading the rich
             // arm renders it at — a quote is cited material, and it should
             // recede from the author's own words, not out-darken them. This
@@ -345,6 +379,8 @@ component MessageBody(message:ChatMessage)
       if block.kind == "paragraph"
         if block.rich
           RichLine block=block
+            forward
+              open_message_link
         if !block.rich
           text block.text
             with
@@ -502,6 +538,7 @@ component MessageContents(message:ChatMessage, flash:f64)
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
     open_thread_for(i64)
+    open_message_link(str)
   col w=fill
     row
       with
@@ -564,6 +601,23 @@ component MessageContents(message:ChatMessage, flash:f64)
                   @text-muted
             space w=fill
         MessageBody message=message
+          forward
+            open_message_link
+        // `· edited` ANNOTATES THE MESSAGE, NOT THE RUN. It lived inside the
+        // `show_author` header, so in a run of five messages only the first
+        // could ever say it had been edited — and runs are most of a busy
+        // channel. A message's text changing under its readers with no mark
+        // anywhere on the row is the one integrity signal this product has,
+        // silently suppressed on the majority of rows. The header keeps it
+        // where a header exists; a continuation row trails it under the body
+        // it belongs to, in the same 11px mono muted the header stamps it in.
+        if message.edited && !message.show_author
+          text "· edited"
+            with
+              size=11.0
+              wrap=none
+              font=code_medium
+              @text-muted
         // Reactions and the replies button STACK — the artifact gives each its
         // own line under the body, never one shared row.
         if !empty(message.reactions)
@@ -668,6 +722,7 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
     open_thread_for(i64)
     open_message_reactions(i64, str, i64)
     open_message_actions(i64, str, i64)
+    open_message_link(str)
   col w=fill
     if message.show_author
       space w=1.0 h=14.0
@@ -701,6 +756,7 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
                 add_reaction_at
                 remove_reaction_at
                 open_thread_for
+                open_message_link
         // Selection is a tint, not a ring — see the QA note in the stream. The
         // tint is `selected_row`, the one plate that means "the row you are on":
         // a menu-open or deep-linked message is that row, exactly as a chosen
@@ -723,6 +779,7 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
                 add_reaction_at
                 remove_reaction_at
                 open_thread_for
+                open_message_link
         if !message.deleted && !selected
           box
             with
@@ -740,6 +797,7 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
                 add_reaction_at
                 remove_reaction_at
                 open_thread_for
+                open_message_link
       col w=fill
         if !message.deleted && !message.pending
           box
@@ -863,6 +921,7 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, 
     open_thread_for(i64)
     open_thread_message_actions(i64, str, i64)
     open_thread_message_reactions(i64, str, i64)
+    open_message_link(str)
   col w=fill
     if message.show_author
       space w=1.0 h=14.0
@@ -888,6 +947,7 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, 
                 add_reaction_at
                 remove_reaction_at
                 open_thread_for
+                open_message_link
         // Same `selected_row` tint as the stream — see the note in MessageCard.
         if !message.deleted && selected
           box
@@ -906,6 +966,7 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, 
                 add_reaction_at
                 remove_reaction_at
                 open_thread_for
+                open_message_link
         if !message.deleted && !selected
           box
             with
@@ -923,6 +984,7 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, 
                 add_reaction_at
                 remove_reaction_at
                 open_thread_for
+                open_message_link
       col w=fill
         if !message.deleted && !message.pending
           box
@@ -1187,6 +1249,8 @@ component ComposerGate(reason:str)
 // stream's reply pill already trusts — not `len(thread_messages)` (root
 // included) and not the loaded page (short whenever `thread_has_more` holds).
 component ThreadParentBlock(message:ChatMessage)
+  emits
+    open_message_link(str)
   col #root w=fill
     row
       with
@@ -1226,8 +1290,19 @@ component ThreadParentBlock(message:ChatMessage)
                 wrap=none
                 font=code_medium
                 @text-muted
+          // The root of a thread is edited like any other message, and this
+          // block never said so at all.
+          if message.edited
+            text "· edited"
+              with
+                size=11.0
+                wrap=none
+                font=code_medium
+                @text-muted
           space w=fill
         MessageBody message=message
+          forward
+            open_message_link
     box
       with
         w=fill
