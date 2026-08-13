@@ -247,6 +247,12 @@ pub async fn save_page_document(
         return Err(app_error("choose a page first".into()));
     }
 
+    // THE PLAN IS DIFFED AGAINST THIS, so it must not predate this reader's
+    // own last tick: `load_pages_data` waits for the fold to carry every write
+    // this client has made (`backend/rpc.rs`). A tree missing the line the
+    // previous tick inserted is not merely stale — `document_plan` pairs the
+    // disturbed middle POSITIONALLY, so the line comes back as a second
+    // `InsertBlock` and the document ends up holding it twice.
     let current = load_pages_data(&client, Some(&page_id))
         .await
         .map_err(app_error)?;
@@ -328,11 +334,6 @@ pub async fn save_page_document(
         });
     }
 
-    // The head of the page, for an insert that anchors on nothing. ALWAYS the
-    // page's own record: `blocks` never contains it (`page_blocks` skips the
-    // wire head), so a lookup there could only ever find a SUBPAGE — and a
-    // first-line insert would land inside the child page.
-    let page_head = page_id.clone();
     let mut anchor = String::new();
 
     for (index, op) in ops.iter().enumerate() {
@@ -340,7 +341,7 @@ pub async fn save_page_document(
         // uncommitted failure. Once one write has landed the page has already
         // moved, so the caller must resync either way.
         let committed_so_far = title_moved || index > 0;
-        let message = apply_op(&client, &password, &page_id, &page_head, &mut anchor, op).await;
+        let message = apply_op(&client, &password, &page_id, &mut anchor, op).await;
         if let Err(cause) = message {
             let mark = match committed_so_far {
                 true => committed_error(cause),
@@ -363,11 +364,17 @@ pub async fn save_page_document(
 
 /// One op, awaited. `anchor` carries the id an insert chain hangs off: the
 /// block just inserted becomes the anchor for the next one.
+///
+/// Three of these arms read the live tree before deciding what to write, and
+/// the op before them has already moved it. They read it through
+/// `load_page_blocks`, which waits for the fold to carry every block this
+/// client knows about — including the write this loop made one iteration ago
+/// (`backend/rpc.rs`, `SEEN_BLOCKS`) — so the ordering this loop is awaited
+/// for survives the trip through the index.
 async fn apply_op(
     client: &RpcClient,
     password: &str,
     page_id: &str,
-    page_head: &str,
     anchor: &mut String,
     op: &BlockOp,
 ) -> Result<(), String> {
@@ -416,7 +423,6 @@ async fn apply_op(
                 client,
                 password,
                 page_id,
-                page_head,
                 match after.is_empty() {
                     true => anchor.as_str(),
                     false => after.as_str(),
@@ -457,9 +463,12 @@ async fn apply_op(
     }
 }
 
-/// One signed op onto the pages module. The receipt height is dropped: every
-/// caller here refreshes off the live stream, which reports application rather
-/// than acceptance.
+/// One signed op onto the pages module. The receipt height is not carried by
+/// hand: `signed_write` records it against the module, and every read that
+/// must not answer behind it — this save's own next op, the reload that ends
+/// it, the NEXT tick's plan — waits on that record instead (`backend/rpc.rs`,
+/// `SEEN_BLOCKS`). Threading it by hand reached the first two and never the
+/// third, which is the one that duplicates a line.
 async fn write(client: &RpcClient, password: &str, msg: PageMsg) -> Result<(), String> {
     signed_write(
         client,
@@ -487,11 +496,19 @@ async fn block_kind(
 
 /// Insert one block after `after`, adopting that block's parent — the depth of
 /// a new line is the depth of the line above it, never inferred from the text.
+///
+/// An insert that anchors on nothing lands under the page's own record — and
+/// `after` is never that record's id, which is what the fallback rests on.
+/// `blocks` DOES carry the page head (element 0 of `load_page_blocks`; it is
+/// `page_blocks` that skips it), but the plan only ever anchors on lines
+/// `page_blocks` produced or on ids this save just inserted. Were the head
+/// matched, the parent adopted would be the page's OWN parent and a first-line
+/// insert would land in the enclosing page; failing to find it is exactly what
+/// makes an unanchored insert land under this page.
 async fn insert_block(
     client: &RpcClient,
     password: &str,
     page_id: &str,
-    page_head: &str,
     after: &str,
     kind: &str,
     text: &str,
@@ -502,7 +519,7 @@ async fn insert_block(
     let anchor = blocks.iter().find(|block| block.id == after);
     let parent = anchor
         .and_then(|block| block.parent.clone())
-        .unwrap_or_else(|| page_head.to_string());
+        .unwrap_or_else(|| page_id.to_string());
     let id = fresh_id("block");
     signed_write(
         client,

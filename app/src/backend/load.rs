@@ -768,6 +768,10 @@ pub(crate) async fn load_pages_data(
     rpc: &RpcClient,
     requested: Option<&str>,
 ) -> Result<PagesData, String> {
+    // ONE wait for the whole reload: the page list, the blocks, and the thread
+    // panels are three arms of the same fold, so waiting here covers all of
+    // them and the block read below finds nothing left outstanding to wait for.
+    await_pages_fold(rpc).await;
     let wire_pages = load_page_index(rpc).await?;
     let pages = page_items(wire_pages);
     let active_page = requested
@@ -901,17 +905,42 @@ pub(crate) async fn load_selected_page_data(
     load_pages_data(rpc, Some(page_id)).await
 }
 
+/// Wait, briefly, for the pages fold to carry every pages block this client
+/// already knows about — its own writes and the ops its live stream delivered
+/// (`rpc.rs`, [`SEEN_BLOCKS`]).
+///
+/// Every pages read below goes through the index view, which folds BEHIND the
+/// block loop, so a read fired on the heels of a structural change reads a
+/// page that predates it: the moved block back where it was, the deleted line
+/// still alive, the line just typed missing — and for the autosave, a missing
+/// line is re-INSERTED by the next tick's plan, duplicating it on chain.
+///
+/// The ordinary read — opening a page, hydrating a boot — knows of nothing
+/// outstanding and waits for nothing, so this costs the highest-frequency read
+/// in the app exactly zero requests.
+async fn await_pages_fold(rpc: &RpcClient) {
+    await_seen_fold(rpc, "pages", &empty_pages_probe()).await;
+}
+
+/// Every block of one page in PREORDER, off the INDEX VIEW lane.
+///
+/// This is the app's highest-frequency read — it is what opening a document
+/// costs. On `/v1/query` it went through the node's dispatch actor and so paid
+/// the select-loop/checkpoint tax of issue #1018; `PagesViewQuery::GetPage`
+/// answers the identical `PageBlockPage` off an MVCC snapshot, off-loop
+/// (pages' own `tests/index_parity.rs` is the proof that they are identical).
 pub(crate) async fn load_page_blocks(
     rpc: &RpcClient,
     page_id: &str,
 ) -> Result<Vec<pages::Block>, String> {
+    await_pages_fold(rpc).await;
     let mut blocks = Vec::new();
     let mut after = None;
     loop {
-        let reply: PageReply = rpc
-            .query(
+        let reply: PagesViewReply = rpc
+            .view(
                 "pages",
-                &PageQuery::GetPage {
+                &PagesViewQuery::GetPage {
                     page_id: page_id.to_string(),
                     after: after.clone(),
                     limit: 0,
@@ -919,7 +948,7 @@ pub(crate) async fn load_page_blocks(
             )
             .await?;
         let page = match reply {
-            PageReply::Page(Some(page)) => page,
+            PagesViewReply::Page(Some(page)) => page,
             _ => return Err("page was not found".into()),
         };
         blocks.extend(page.blocks);

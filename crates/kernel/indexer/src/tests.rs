@@ -387,42 +387,195 @@ fn a_batch_cut_mid_block_parks_the_tip_at_the_cut() {
     assert_eq!(store.fold_tip("chat").unwrap(), Some((1, OPS - 1)));
 }
 
-/// A MAPPER SWAP LEAVES THE TIP STANDING — the honest upgrade hazard, and the
-/// opposite of the absent-tip one. `converge_guest` installs the new wasm and
-/// returns: no refold, no `clear_db`. So after an upgrade the tip still reads
-/// the position the PREVIOUS mapper folded to, and still vouches for the rows
-/// that mapper wrote. Reopening with the guest REMOVED is the extreme case of
-/// the same swap, and it is what this drives — the tip survives a change that
-/// tore the fold down entirely.
-///
-/// This is why a mapper whose derived shape changes ships with a boundary
-/// stamp or a chain replay (spec §3.2.4): the tip reports fold PROGRESS over
-/// the op feed, never that the rows match the installed mapper.
+/// A MAPPER ARRIVING OVER AN EXISTING FEED DERIVES IT, NOT JUST WHAT COMES
+/// NEXT. A changes-mode trigger delivers writes committed AFTER registration,
+/// so registering one over a populated `op/` range replays nothing: the rows
+/// already in the feed would stay forever underived while the views claimed to
+/// serve them. `converge_guest` re-writes the feed so the fold consumes it.
 #[test]
-fn a_guest_swap_leaves_the_fold_tip_where_it_stood() {
+fn a_new_mapper_folds_the_op_feed_the_database_already_held() {
     let dir = tempfile::tempdir().unwrap();
+    {
+        // no guest: the feed accumulates with nothing folding behind it.
+        let store = bare_store(dir.path());
+        store.apply_block(&block(1, vec![chat_op(b"one")])).unwrap();
+        store
+            .apply_block(&block(2, vec![chat_op(b"two"), chat_op(b"three")]))
+            .unwrap();
+        assert!(
+            store
+                .scan("chat", b"seen/", None, 10)
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+    }
     let store = mapped_store(dir.path());
-
-    let mut sub = store.subscribe("chat", b"seen/", Some(b"seen0")).unwrap();
-    store.apply_block(&block(1, vec![chat_op(b"one")])).unwrap();
-    wait_for_keys(&mut sub, [seen_key(1, 0)]);
-    assert_eq!(store.fold_tip("chat").unwrap(), Some((1, 0)));
-    drop(sub);
-    drop(store);
-
-    let swapped = bare_store(dir.path());
+    // NO BARRIER HERE, ON PURPOSE. `open` waits the refold out itself, and
+    // that is the property under test: `replay_op_feed` only stages the
+    // re-writes, so an `open` that returned before the runner drained them
+    // would hand a node a read model that is the freshly CLEARED keyspace —
+    // every view answering "no such row" while the feed re-derives behind it.
+    // the last row of the pre-existing feed is (2, 1) — the refold walks the
+    // whole thing in key order, which for op keys IS block-and-drain order.
+    assert_eq!(store.fold_tip("chat").unwrap(), Some((2, 1)));
     assert_eq!(
-        swapped.fold_tip("chat").unwrap(),
-        Some((1, 0)),
-        "converge_guest never wipes the tip — it is stale, not absent"
+        store.view("chat", b"count").unwrap(),
+        3u64.to_be_bytes().to_vec(),
+        "all three pre-existing ops folded"
     );
-    assert!(
-        swapped
-            .get("chat", seen_key(1, 0).as_bytes())
+    for (height, seq) in [(1, 0), (2, 0), (2, 1)] {
+        assert!(
+            store
+                .get("chat", seen_key(height, seq).as_bytes())
+                .unwrap()
+                .is_some(),
+            "row ({height}, {seq}) was derived from the feed already on disk"
+        );
+    }
+    assert_eq!(
+        store.applied_height("chat").unwrap(),
+        2,
+        "the feed watermark is untouched"
+    );
+}
+
+/// A MAPPER SWAP RE-DERIVES ITS ROWS INSTEAD OF INHERITING THE PREVIOUS
+/// MAPPER'S. Derived rows are the OUTPUT of a mapper, so after a swap the ones
+/// on disk are the old mapper's — and the fold tip vouches for them, which is
+/// the hazard `indexable-spec.md` §3.2.4 names. The clear is the half that
+/// makes the replay honest: the fixture's `count` is a read-modify-write, so a
+/// replay onto UNCLEARED rows would double it.
+#[test]
+fn a_mapper_swap_clears_and_refolds_the_read_model() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = mapped_store(dir.path());
+        let mut sub = store
+            .subscribe("chat", FOLD_PREFIX.as_bytes(), Some(b"fold0"))
+            .unwrap();
+        store
+            .apply_block(&block(1, vec![chat_op(b"one"), chat_op(b"two")]))
+            .unwrap();
+        wait_for_tip(&mut sub, (1, 1));
+        assert_eq!(
+            store.view("chat", b"count").unwrap(),
+            2u64.to_be_bytes().to_vec()
+        );
+    }
+    // the SAME mapper carrying one extra custom section: different bytes,
+    // identical behaviour, so what changes across the reopen is the hash the
+    // marker compares — the upgrade signal itself, with the fold's answer held
+    // constant so the assertions below can be exact.
+    let restamped = restamped_testmap();
+    assert_ne!(
+        restamped, TESTMAP,
+        "the swap must actually change the bytes"
+    );
+    let store = IndexStore::open(
+        dir.path(),
+        &[
+            IndexModule {
+                id: "chat",
+                guest: Some(&restamped),
+            },
+            IndexModule::bare("tasks"),
+        ],
+    )
+    .expect("open store");
+
+    // again with no barrier: the swap's replay is finished by the time `open`
+    // answers, or these rows are not there to read.
+    assert_eq!(
+        store.view("chat", b"count").unwrap(),
+        2u64.to_be_bytes().to_vec(),
+        "re-derived from zero: a replay onto uncleared rows would read 4"
+    );
+    let seen = store.scan("chat", b"seen/", None, 10).unwrap();
+    assert_eq!(seen.entries.len(), 2, "every row is back, none duplicated");
+    assert_eq!(
+        store.fold_tip("chat").unwrap(),
+        Some((1, 1)),
+        "the tip is re-established over rows the INSTALLED mapper wrote"
+    );
+    // the feed and its bookkeeping are the host's, and a mapper change says
+    // nothing about them.
+    assert_eq!(store.applied_height("chat").unwrap(), 1);
+    assert_eq!(
+        store
+            .scan("chat", OP_PREFIX.as_bytes(), None, 10)
             .unwrap()
-            .is_some(),
-        "the rows it vouches for are still the old mapper's"
+            .entries
+            .len(),
+        2,
+        "the op feed is what the refold READ — it is never wiped"
     );
+}
+
+/// THE OPEN WAITS THE REFOLD OUT, AND SAYS SO WHEN IT CANNOT FINISH.
+///
+/// `replay_op_feed` only STAGES its re-writes — the engine folds them on a
+/// background runner — so an `open` that returned at that point would publish
+/// a store whose read model is the keyspace `clear_derived` just emptied:
+/// every view answering "no such row" for the length of the whole feed, which
+/// reads as a workspace that lost its contents rather than one still starting.
+///
+/// This is the deterministic half of that wait. The two refold tests above
+/// assert what a DRAINED store holds, and a fast fixture drains before they
+/// can look, so they cannot fail when the wait is missing. A poisoned op can:
+/// the fold refuses it forever, and the only way `open` ever reports it is by
+/// having stopped for the runner. Both halves come out of the same
+/// `drain_fold` call — it returns on an empty queue or on a queue that will
+/// never empty, and on nothing else.
+///
+/// Refusing the open is deliberate, and matches what a broken artifact already
+/// gets one line earlier at `wasm_entries`: a guest that cannot fold its own
+/// feed has no read model to serve.
+#[test]
+fn a_refold_that_cannot_finish_refuses_the_open() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        // no guest, so the feed takes the poison op with nothing folding: the
+        // failure belongs to the REFOLD, not to the write that fed it.
+        let store = bare_store(dir.path());
+        store
+            .apply_block(&block(1, vec![chat_op(b"one"), chat_op(b"boom")]))
+            .unwrap();
+    }
+
+    let opened = IndexStore::open(
+        dir.path(),
+        &[
+            IndexModule {
+                id: "chat",
+                guest: Some(TESTMAP),
+            },
+            IndexModule::bare("tasks"),
+        ],
+    );
+
+    let Err(Error::FoldStuck(cause)) = opened else {
+        panic!("a store whose refold cannot complete must refuse to open");
+    };
+    assert!(
+        cause.starts_with("chat: "),
+        "the refusal names the module that could not fold: {cause}"
+    );
+}
+
+/// The reference mapper with one empty custom section appended: a wasm module
+/// stays valid under any trailing custom section, so this is byte-different
+/// and behaviour-identical — exactly the upgrade shape a swap test needs and
+/// cannot get from a second fixture without also changing what it folds.
+fn restamped_testmap() -> Vec<u8> {
+    const NAME: &[u8] = b"ducktape.refold-test";
+    let mut wasm = TESTMAP.to_vec();
+    let mut section = vec![NAME.len() as u8];
+    section.extend_from_slice(NAME);
+    wasm.push(0); // custom section id
+    wasm.push(section.len() as u8); // section size (a single LEB128 byte)
+    wasm.extend_from_slice(&section);
+    wasm
 }
 
 #[test]
@@ -487,7 +640,10 @@ fn reopen_without_a_guest_converges_the_database() {
         let seen = store.scan("chat", b"seen/", None, 10).unwrap();
         assert_eq!(seen.entries.len(), 1);
     }
-    // and shipping one again re-registers the fold from where the feed is.
+    // and shipping one again REFOLDS: the guest is new to this database, so
+    // the rows the previous one left are cleared and re-derived from the feed
+    // before the next block is ever applied. `count` reads 2 for both ops, not
+    // 3 (a replay onto the surviving row) and not 1 (no replay at all).
     let store = mapped_store(dir.path());
     let mut sub = store.subscribe("chat", b"seen/", Some(b"seen0")).unwrap();
     store.apply_block(&block(2, vec![chat_op(b"two")])).unwrap();

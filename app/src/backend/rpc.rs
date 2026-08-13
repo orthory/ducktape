@@ -7,8 +7,8 @@ use ::chat;
 /// The height is the coordinate a follow-up read waits on: the node answers
 /// acceptance, the derived read models fold behind the block loop, and a
 /// reload in between reads an index that does not have the write yet
-/// (`await_fold`). Most callers ignore it — they refresh on the live stream
-/// instead, which is the same fact arriving by push.
+/// (`await_fold`). Callers that need it by hand still take it; every caller
+/// gets it for free through [`note_module_block`] below.
 pub(crate) async fn signed_write(
     rpc: &RpcClient,
     target: &str,
@@ -21,7 +21,88 @@ pub(crate) async fn signed_write(
         ));
     }
     let frame = sign_frame(target, &payload, password).await?;
-    rpc.submit_frame(frame).await.map_err(Into::into)
+    let height = rpc.submit_frame(frame).await?;
+    note_module_block(rpc, target, height);
+    Ok(height)
+}
+
+/// Every block this client KNOWS a module took and has not yet seen folded.
+///
+/// A view read must never answer behind something this client already knows
+/// happened, and the caller that reads is generally not the one that learned
+/// it: the autosave plans tick N+1 against a tree tick N wrote, a live resync
+/// reloads on behalf of a push three layers up, and a save that fails halfway
+/// leaves committed ops behind with nobody left holding the receipt. So the
+/// height is kept where it is LEARNED — the two funnels every such fact passes
+/// through, [`signed_write`] for this client's writes and `folded_update` for
+/// the stream's — instead of being threaded through each seam in between,
+/// which is one parameter per seam and a stale read wherever one is missed.
+///
+/// Keyed by ORIGIN as well as module because a height is a coordinate on ONE
+/// chain, and this app points at as many chains as the user has networks —
+/// the same reason `rpc_client`'s own cache is keyed that way.
+///
+/// An entry leaves only when a fold is OBSERVED at or past it: the tip is
+/// monotonic, so a read after that can never fall behind it again, which makes
+/// the steady state zero probes rather than one per read.
+// ponytail: entries leave ONLY on an observed fold, so a node whose chain
+// restarts under a running app (dev-box reset — heights come back below the
+// recorded floor) charges each read of that module one bounded, failing wait
+// until the app restarts. Comparing `/v1/status` tips is the upgrade if a
+// reset chain ever stops being a dev-box-only event.
+static SEEN_BLOCKS: Mutex<BTreeMap<(String, String), u64>> = Mutex::new(BTreeMap::new());
+
+fn seen_blocks() -> std::sync::MutexGuard<'static, BTreeMap<(String, String), u64>> {
+    SEEN_BLOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Record that `module` took a block at `height` — a write this client signed,
+/// or an op its live stream delivered.
+pub(crate) fn note_module_block(rpc: &RpcClient, module: &str, height: u64) {
+    let key = (rpc.origin().to_string(), module.to_string());
+    let mut seen = seen_blocks();
+    let known = seen.entry(key).or_default();
+    *known = (*known).max(height);
+}
+
+/// The block a read of `module`'s view owes itself — the newest one this client
+/// knows about and has not seen folded. `None` = nothing outstanding.
+fn unfolded_block(rpc: &RpcClient, module: &str) -> Option<u64> {
+    seen_blocks()
+        .get(&(rpc.origin().to_string(), module.to_string()))
+        .copied()
+}
+
+/// Retire what the fold has now been seen to carry.
+fn note_folded_through(rpc: &RpcClient, module: &str, height: u64) {
+    let mut seen = seen_blocks();
+    let key = (rpc.origin().to_string(), module.to_string());
+    // ONLY if it is still the height that was waited on: a write landing
+    // during the wait raises the floor, and dropping the entry outright would
+    // discard a requirement nobody has met yet.
+    if seen.get(&key).is_some_and(|known| *known <= height) {
+        seen.remove(&key);
+    }
+}
+
+/// Wait, briefly, for `module`'s fold to carry everything this client knows it
+/// took ([`SEEN_BLOCKS`]) — the read-your-own-writes wait, at the READ rather
+/// than at each of the writes.
+///
+/// Answers on the same terms as [`await_fold`]: `true` = the view is not
+/// behind anything this client knows, which includes the ordinary case of
+/// knowing nothing outstanding and waiting for nothing.
+pub(crate) async fn await_seen_fold<Q: serde::Serialize>(
+    rpc: &RpcClient,
+    module: &str,
+    probe: &Q,
+) -> bool {
+    let Some(height) = unfolded_block(rpc, module) else {
+        return true;
+    };
+    await_fold(rpc, module, probe, height).await
 }
 
 /// How many times a post-write reload probes the module's fold before giving
@@ -71,6 +152,7 @@ pub(crate) async fn await_fold<Q: serde::Serialize>(
             return false;
         };
         if folded.reached_block(height) {
+            note_folded_through(rpc, module, height);
             return true;
         }
     }

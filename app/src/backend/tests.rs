@@ -4037,6 +4037,8 @@ fn a_page_search_hit_names_the_page_it_came_from() {
         parent: Some(page_id.into()),
         kind: BlockKind::Paragraph,
         text: text.into(),
+        marks: Vec::new(),
+        checked: false,
         children: Vec::new(),
         height: 1,
         time: 1,
@@ -4263,6 +4265,139 @@ fn chat_reads_never_cross_the_dispatch_query_lane() {
     );
 }
 
+/// THE PAGE READ RIDES THE VIEW LANE, AND WHAT STAYS ON THE OTHER ONE IS
+/// NAMED. Opening a document is the app's highest-frequency read, and on
+/// `/v1/query` every one of them went through the node's dispatch actor —
+/// the select-loop/checkpoint tax of issue #1018, paid per page open, per
+/// autosave tick that reads the tree back, per comment rail.
+///
+/// `PagesViewQuery::GetPage` answers the identical `PageBlockPage` off an MVCC
+/// snapshot (pages' `tests/index_parity.rs` proves the two replies are the
+/// same reply), so what remains is to keep it there. Same source-shape pin as
+/// the chat lane's, for the same reason: both lanes answer the same rows
+/// against a live node, so only the route tells them apart.
+#[test]
+fn the_page_read_never_crosses_the_dispatch_query_lane() {
+    const LOAD: &str = include_str!("load.rs");
+    let load_page_blocks = backend_fn(LOAD, "pub(crate) async fn load_page_blocks(");
+    assert!(
+        load_page_blocks.contains("PagesViewQuery::GetPage {"),
+        "the page read is the index view arm"
+    );
+    assert!(
+        !load_page_blocks.contains(".query("),
+        "a page read on /v1/query pays the node's checkpoint tax"
+    );
+
+    // THE WHOLE MODULE'S LANE, not just this function. `PageQuery` is pages'
+    // DISPATCH read surface, and exactly one arm of it legitimately remains:
+    // `CommentThread`. Two reasons, and both have to stop holding before it
+    // moves — the index guest serves grouped `ThreadRow`s through
+    // `threads_for_targets`, not the `ThreadView` this reply carries; and its
+    // one caller is `add_block_comment`'s read of the comment it JUST posted,
+    // where the canonical lane is read-after-write by construction. Anything
+    // else appearing here is a pages read crawling back onto the select loop.
+    //
+    // WALKED, never listed. A hand-written list of files is a rule carrying its
+    // own escape hatch: `PageQuery` is imported once (`backend/mod.rs`) and
+    // every module here inherits it through `use super::*`, so the next backend
+    // module added is exactly the one a list would not sweep — and a page read
+    // dropped into it would pass this test silently. Only this file is skipped,
+    // and for the reason the chat pin skips its own prose: a sweep over raw
+    // source cannot tell the banned symbol from the string that bans it.
+    const KEPT: &str = "CommentThread";
+    let backend = backend_sources();
+    assert!(
+        backend.iter().any(|(name, _)| name == "load.rs"),
+        "the walk found the backend it is supposed to be sweeping"
+    );
+    let mut arms: Vec<String> = Vec::new();
+    for (name, source) in &backend {
+        for rest in source.split("PageQuery::").skip(1) {
+            let arm: String = rest
+                .chars()
+                .take_while(char::is_ascii_alphanumeric)
+                .collect();
+            assert_eq!(arm, KEPT, "{name} reads pages::{arm} on the dispatch lane");
+            arms.push(arm);
+        }
+    }
+    assert_eq!(
+        arms,
+        [KEPT],
+        "the ONE kept dispatch read, exactly once — a second call site is a \
+         lane decision, not a copy-paste"
+    );
+}
+
+/// AND THE READ ITSELF WAITS. The lane pin above proves the page read left
+/// `/v1/query`; this proves read-after-write did not stay behind with it. The
+/// view lane folds BEHIND the block loop, so both pages reads open with
+/// `await_pages_fold` — the reload that ends a save, the plan the next autosave
+/// tick diffs against, the pane a live push refreshes.
+///
+/// Pinned as a source shape because deleting either call fails NOTHING else in
+/// this suite: the wait costs zero probes when nothing is outstanding, so a
+/// passing test cannot tell it apart from an absent one. It shows up on a live
+/// node instead, as a document that lost the line it just took.
+#[test]
+fn the_pages_reads_wait_for_the_fold_before_they_read() {
+    const LOAD: &str = include_str!("load.rs");
+    for (declaration, read) in [
+        ("pub(crate) async fn load_pages_data(", "load_page_index("),
+        ("pub(crate) async fn load_page_blocks(", ".view("),
+    ] {
+        let body = backend_fn(LOAD, declaration);
+        let wait = body
+            .find("await_pages_fold(rpc).await")
+            .unwrap_or_else(|| panic!("{declaration} waits for the pages fold"));
+        let read = body
+            .find(read)
+            .unwrap_or_else(|| panic!("{declaration} reads the index"));
+        assert!(wait < read, "{declaration} waits BEFORE it reads");
+    }
+}
+
+/// One function's body out of a backend module: from its declaration to the
+/// first closing brace at column zero, which in fmt'd Rust is its own. Sliced
+/// rather than scanned to the next `pub` — `pub(crate)` does not start with
+/// `pub `, so that boundary silently runs a negative assertion over the rest
+/// of the file and fails on some LATER function's read.
+fn backend_fn<'a>(source: &'a str, declaration: &str) -> &'a str {
+    source
+        .split(declaration)
+        .nth(1)
+        .unwrap_or_else(|| panic!("{declaration} is declared"))
+        .split("\n}\n")
+        .next()
+        .unwrap_or_else(|| panic!("{declaration} body"))
+}
+
+/// Every backend module's source, this test file excepted — the lane pins
+/// above sweep the whole crate rather than the handful of files that happen to
+/// hold a read today.
+fn backend_sources() -> Vec<(String, String)> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/backend");
+    let mut out: Vec<(String, String)> = std::fs::read_dir(&dir)
+        .expect("the backend tree is readable")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|kind| kind == "rs"))
+        .filter(|path| path.file_name().is_some_and(|name| name != "tests.rs"))
+        .map(|path| {
+            let source = std::fs::read_to_string(&path).expect("a backend module reads");
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            (name, source)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 /// THE TAB-SWITCH GATE. Four planes used to refetch on every tab move —
 /// members, governance, agents, account — regardless of the destination, so a
 /// click into Files paid four `/v1/query` round trips for rows nothing on
@@ -4446,6 +4581,168 @@ async fn an_unstamped_reply_stops_the_wait_instead_of_spending_it() {
         served.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "an unknown watermark is answered once, never waited on"
+    );
+}
+
+/// A READ WAITS FOR WHAT THIS CLIENT ALREADY KNOWS, AND FOR NOTHING ELSE.
+///
+/// The height a read owes itself is learned by whoever learned it — the write
+/// that was signed, the op the stream delivered — and asked for at the read,
+/// because the two are routinely different callers with several layers between
+/// them. Three facts, and the middle one is the whole mechanism:
+///
+/// - a read with nothing outstanding pays NO probe, which is the ordinary page
+///   open and the reason this costs the app's highest-frequency read nothing;
+/// - a read behind a known block waits for it;
+/// - once the fold is SEEN past that block the requirement is retired, because
+///   the tip is monotonic and a later read cannot fall behind it again.
+#[tokio::test(flavor = "current_thread")]
+async fn a_read_waits_out_a_block_this_client_already_knows_about() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (origin, served) =
+        node_scripting_its_fold_watermark(vec![Some("6:0"), Some("9:0")]).await;
+    let rpc = rpc_client(&origin).expect("stub client");
+
+    assert!(
+        await_seen_fold(&rpc, "pages", &empty_pages_probe()).await,
+        "nothing outstanding is not a stale read — it is nothing to wait for"
+    );
+    assert_eq!(served.load(SeqCst), 0, "and it costs no request at all");
+
+    note_module_block(&rpc, "pages", 9);
+    assert!(await_seen_fold(&rpc, "pages", &empty_pages_probe()).await);
+    assert_eq!(
+        served.load(SeqCst),
+        2,
+        "stale, then caught up: it waited for the fold to carry block 9"
+    );
+
+    assert!(await_seen_fold(&rpc, "pages", &empty_pages_probe()).await);
+    assert_eq!(
+        served.load(SeqCst),
+        2,
+        "the fold was observed past 9 — every later read is free"
+    );
+}
+
+/// A HEIGHT IS RECORDED WHERE IT IS LEARNED, and there are exactly two places
+/// this client ever learns one: the receipt of a write it signed, and an op its
+/// live stream delivered. The stream half is driven end to end below
+/// (`an_op_the_stream_delivered_is_waited_out_by_the_reload_behind_it`); the
+/// write half cannot be, because reaching the recording means signing a real
+/// frame with a real key, so it is pinned as the source shape it is — one call
+/// on the receipt, at the funnel every module's writes already pass through.
+///
+/// Deleting it does not fail a read: it makes every read AFTER a write stop
+/// waiting, which is a stale document nobody notices until a line duplicates.
+#[test]
+fn a_signed_write_records_the_block_that_took_it() {
+    const RPC: &str = include_str!("rpc.rs");
+    let signed_write = RPC
+        .split("pub(crate) async fn signed_write(")
+        .nth(1)
+        .expect("signed_write is declared")
+        .split("\n/// ")
+        .next()
+        .expect("signed_write body");
+    let submit = signed_write
+        .find("submit_frame(")
+        .expect("signed_write submits the frame");
+    let record = signed_write
+        .find("note_module_block(")
+        .expect("signed_write records the block its write landed in");
+    assert!(
+        submit < record,
+        "the height is recorded from the RECEIPT, so there is nothing to \
+         record until the node has answered with one"
+    );
+}
+
+/// A WAIT THAT GAVE UP LEAVES THE NEXT READ STILL OWING IT — the autosave's
+/// duplicate line, pinned.
+///
+/// The document tick reads the tree, diffs the buffer against it, writes, and
+/// reads back. The NEXT tick reads again, and `document_plan` pairs the
+/// disturbed middle POSITIONALLY: a tree still missing the line the previous
+/// tick inserted is not merely stale, it makes the plan emit a second
+/// `InsertBlock` for a line that is already on chain. So the requirement is
+/// retired by an OBSERVED fold and by nothing else — never by the budget
+/// running out, which is precisely the case where the read cannot be trusted.
+#[tokio::test(flavor = "current_thread")]
+async fn a_wait_that_gave_up_leaves_the_next_read_still_owing_it() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (origin, served) = node_scripting_its_fold_watermark(vec![Some("6:0")]).await;
+    let rpc = rpc_client(&origin).expect("stub client");
+    note_module_block(&rpc, "pages", 9);
+
+    assert!(!await_seen_fold(&rpc, "pages", &empty_pages_probe()).await);
+    assert_eq!(served.load(SeqCst), FOLD_WAIT_PROBES as usize);
+
+    assert!(!await_seen_fold(&rpc, "pages", &empty_pages_probe()).await);
+    assert_eq!(
+        served.load(SeqCst),
+        2 * FOLD_WAIT_PROBES as usize,
+        "the next tick owes the same block: a spent budget is not a fold"
+    );
+}
+
+/// AN OP THE STREAM DELIVERED IS WAITED OUT BY THE RELOAD BEHIND IT.
+///
+/// A push reports APPLICATION — the acceptance gap closed, the FOLD gap still
+/// open, since the node's block loop writes the op feed and the index folds
+/// behind it on its own runner. Every structural pages op asks for a reload,
+/// and `LiveRefresh`'s structural half is applied unconditionally, so a reload
+/// that read a snapshot predating the push would install the tree as it was
+/// BEFORE it — the deleted line still there, the inserted one missing — with
+/// no further op coming to correct it.
+///
+/// The height rides in the push, so it is recorded where the push is decoded
+/// rather than threaded down through the update, the handler's debounce and
+/// the resync extern's argument list.
+#[tokio::test(flavor = "current_thread")]
+async fn an_op_the_stream_delivered_is_waited_out_by_the_reload_behind_it() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (origin, served) = node_scripting_its_fold_watermark(vec![Some("12:0")]).await;
+    let rpc = rpc_client(&origin).expect("stub client");
+
+    let moved = folded_update(
+        &origin,
+        "pages",
+        ducktape_rpc::StreamOp {
+            height: 12,
+            seq: 0,
+            time: 0,
+            origin: ducktape_rpc::StreamOrigin {
+                kind: ducktape_rpc::StreamOriginKind::External,
+                id: None,
+            },
+            payload: Some(
+                serde_json::from_slice(&pages::encode_msg(&PageMsg::MoveBlock {
+                    block_id: "b1".into(),
+                    parent: Some("page".into()),
+                    after: None,
+                }))
+                .expect("payload json"),
+            ),
+            payload_hex: None,
+            assigned: None,
+            assigned_hex: None,
+        },
+    )
+    .await
+    .expect("a structural op is visible to the shell");
+    assert!(moved.load_pages, "this is the op that buys a reload");
+    assert_eq!(
+        served.load(SeqCst),
+        0,
+        "recording the height is bookkeeping, not a request"
+    );
+
+    assert!(await_seen_fold(&rpc, "pages", &empty_pages_probe()).await);
+    assert_eq!(
+        served.load(SeqCst),
+        1,
+        "the reload waited for the fold to carry the pushed block"
     );
 }
 

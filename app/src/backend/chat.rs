@@ -911,6 +911,8 @@ pub async fn create_page(
         // answers how far the fold has consumed the op feed, so this waits for
         // it to reach the block that took the write.
         await_fold(&rpc, "pages", &empty_pages_probe(), height).await;
+        // The wait above already covers this reload, so it passes None rather
+        // than paying a second probe for the same watermark.
         let mut data = load_pages_data(&rpc, Some(&page_id))
             .await
             .map_err(committed_error)?;
@@ -959,7 +961,10 @@ pub async fn delete_page(
         )
         .await?;
         await_fold(&rpc, "pages", &empty_pages_probe(), height).await;
-        let mut data = load_pages_data(&rpc, None).await.map_err(committed_error)?;
+        // Same as `create_page`: the wait above covers this reload.
+        let mut data = load_pages_data(&rpc, None)
+            .await
+            .map_err(committed_error)?;
         // DROP WHAT WAS JUST DELETED. Same acceptance-vs-application gap as
         // `create_page`, read the other way round and narrowed by the same
         // wait: this reload can still see the removed page, so it stayed in

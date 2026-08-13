@@ -196,6 +196,23 @@ pub(crate) async fn folded_update(
     op: ducktape_rpc::StreamOp,
 ) -> Option<LiveUpdate> {
     let height = i64::try_from(op.height).unwrap_or(i64::MAX);
+    // WHAT THE STREAM DELIVERED, THE RELOADS BEHIND IT MUST NOT PREDATE.
+    //
+    // A push reports APPLICATION, which is the acceptance gap closed and the
+    // FOLD gap still open: the node's block loop writes the op feed and the
+    // index folds behind it on its own runner (only the sim's
+    // `wait_folds_drained` ever joins the two). Every structural pages op sets
+    // `load_pages` below, and that reload reads the folded view — so without
+    // this the pane installs a tree that predates the very op that prompted
+    // it, with no further op coming to correct it.
+    //
+    // Recorded HERE, once, rather than carried down through the update, the
+    // handler's debounce and the resync extern's argument list: this is where
+    // the height is learned, and `load_pages_data` already waits on the record
+    // (`rpc.rs`, `SEEN_BLOCKS`).
+    if let Ok(client) = rpc_client(rpc) {
+        note_module_block(&client, module, op.height);
+    }
     let Some(payload) = op
         .payload
         .as_ref()
@@ -468,6 +485,12 @@ pub async fn live_resync_load(
             async {
                 match load_pages {
                     true => {
+                        // A LIVE REFRESH FOLLOWS SOMEONE ELSE'S WRITE, and the
+                        // op that prompted it was recorded when it arrived
+                        // (`folded_update`), so this read waits for the fold to
+                        // carry it — the structural half of the reply is
+                        // applied unconditionally, with no later op to correct
+                        // a tree that predates the push.
                         load_pages_data(&rpc, (!page_id.is_empty()).then_some(page_id.as_str()))
                             .await
                             .map(Some)
