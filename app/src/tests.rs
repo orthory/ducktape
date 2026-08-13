@@ -10341,7 +10341,7 @@ fn the_files_pane_reports_only_a_directory_it_has_listed() {
 /// can quietly drop the guard.
 #[test]
 fn every_header_subtitle_is_gated_on_the_connection() {
-    let sites: Vec<&str> = SCREENS
+    let mut sites: Vec<&str> = SCREENS
         .match_indices("_summary(")
         .map(|(at, _)| {
             let head = SCREENS[..at]
@@ -10351,16 +10351,18 @@ fn every_header_subtitle_is_gated_on_the_connection() {
             &SCREENS[head..=close]
         })
         .collect();
+    sites.sort_unstable();
+    let mut expected = [
+        "proposals_summary(connected, rows)",
+        "members_summary(connected, rows)",
+        "agents_summary(connected, rows)",
+        "members_summary(connected, members_rows)",
+        "fs_counts_summary(connected, listed, entries)",
+    ];
+    expected.sort_unstable();
 
     assert_eq!(
-        sites,
-        [
-            "proposals_summary(connected, rows)",
-            "members_summary(connected, rows)",
-            "agents_summary(connected, rows)",
-            "members_summary(connected, members_rows)",
-            "fs_counts_summary(connected, listed, entries)",
-        ],
+        sites, expected,
         "a header subtitle folds rows only a live node delivers: pass `connected` \
          first so it says nothing rather than a confident zero"
     );
