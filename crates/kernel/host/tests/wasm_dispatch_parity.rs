@@ -274,12 +274,11 @@ async fn deliveries(h: &Host, who: &str) -> Vec<(String, Vec<u8>)> {
     serde_json::from_slice(&reply).expect("recorder log decodes")
 }
 
-/// the whole committed read matrix: the recipe enumeration (what the `r#` index
-/// exists for), a hit and an absent point read, both dispatch records, and the
-/// mailbox census the host's delivery injection keys on.
+/// the whole committed read matrix: a recipe hit and an absent point read, both
+/// dispatch records, and the mailbox census the host's delivery injection keys
+/// on.
 async fn replies(h: &Host) -> Vec<Vec<u8>> {
     let queries = [
-        encode_query(&DispatchQuery::Recipes),
         encode_query(&DispatchQuery::Recipe {
             recipe_id: "summarize".into(),
         }),
@@ -685,15 +684,20 @@ async fn same_ops_inner(context: &deterministic::Context) {
     assert_eq!(second.dispatch_id, "d2");
     assert_eq!(second.outcome, Err("cancelled".into()));
 
-    // the removed recipe is gone from BOTH the point read and the enumeration.
+    // the removed recipe is gone from the point read.
     let reply = wasm
-        .query("dispatch", &encode_query(&DispatchQuery::Recipes))
+        .query(
+            "dispatch",
+            &encode_query(&DispatchQuery::Recipe {
+                recipe_id: "summarize".into(),
+            }),
+        )
         .await
         .expect("query");
     assert_eq!(
         decode_reply(&reply).expect("decode"),
-        DispatchReply::Recipes(Vec::new()),
-        "the emptied recipe index answers an empty list"
+        DispatchReply::Recipe(None),
+        "the removed recipe record is gone"
     );
 
     // queries are read-only on the wasm side too: the root is STABLE across the
@@ -770,23 +774,21 @@ async fn rejections_inner(context: &deterministic::Context) {
             "Pinned key",
         ),
         (
-            // the STORE's record cap — the one guard the qmdb port adds. an
-            // op frame carries up to 1 MiB + 16 KiB and `Routing::Pinned` was
-            // checked only for non-emptiness, so a pin this size would have
-            // committed a record the store's codec panics decoding. both ports
-            // must refuse it IDENTICALLY.
+            // the pin cap: a `Routing::Pinned` key is saga's `pinned_assignee`
+            // verbatim, so registration refuses what saga would refuse at
+            // trigger time. both ports must refuse it IDENTICALLY.
             alice.clone(),
             op(&DispatchMsg::RegisterRecipe {
                 recipe_id: "huge-pin".into(),
                 description: String::new(),
                 capability: "alpha".into(),
-                routing: Routing::Pinned(vec![7u8; dispatch::MAX_RECORD_BYTES + 1]),
+                routing: Routing::Pinned(vec![7u8; saga::MAX_ASSIGNEE_BYTES + 1]),
                 output_contract: OutputContract::Text,
                 max_attempts: 1,
                 deadline_views: None,
                 lease_views: None,
             }),
-            "store record cap",
+            "routing Pinned key is",
         ),
         (
             alice.clone(),

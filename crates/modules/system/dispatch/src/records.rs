@@ -7,24 +7,20 @@
 //! | logical key | value |
 //! |---|---|
 //! | `r/{recipe_id}` | one [`Recipe`] record |
-//! | `r#` | the recipe-id enumeration index (a json `BTreeSet<String>`) |
 //! | `d/{receiver}\x1f{dispatch_id}` | one [`DispatchState`] record |
 //! | `q/{seq}` | one mailbox entry: the dispatch key it delivers |
 //! | `q#` | the mailbox cursor `head‖next` (two u64 LE) |
 //!
 //! the store hashes its keys and cannot enumerate, so anything a reader walks
-//! needs an index of its own:
+//! needs an index of its own. exactly one reader does: `DeliverPending` sweeps
+//! the mailbox in FIFO order. entries are only ever APPENDED at `next` and
+//! REMOVED from the front, so the queue is the contiguous range `head..next`
+//! and the cursor record is all the index it needs — a fixed 16 bytes no
+//! traffic can grow. every other read is a POINT read by id, which the store
+//! answers from the hashed key alone.
 //!
-//! * [`crate::DispatchQuery::Recipes`] is an unpaged read of every recipe, so
-//!   the ids live in the `r#` index record.
-//! * `DeliverPending` sweeps the mailbox in FIFO order. entries are only ever
-//!   APPENDED at `next` and REMOVED from the front, so the queue is the
-//!   contiguous range `head..next` and the cursor record is all the index it
-//!   needs — a fixed 16 bytes no traffic can grow.
-//!
-//! an empty collection DROPS its key (`r#` with no recipes, `q#` with a drained
-//! mailbox), so a plane whose mailbox emptied hashes exactly like one that never
-//! enqueued anything.
+//! an empty collection DROPS its key (`q#` with a drained mailbox), so a plane
+//! whose mailbox emptied hashes exactly like one that never enqueued anything.
 //!
 //! the record codec is the length-prefixed [`sdk::codec`] toolkit, NOT json: a
 //! dispatch record carries the raw outcome bytes (up to [`crate::MAX_RESULT_BYTES`],
@@ -33,8 +29,6 @@
 //! store's 1 MiB record cap. the recipe record rides the same codec so a
 //! `Routing::Pinned` key is stored verbatim too.
 
-use std::collections::BTreeSet;
-
 use saga::{put_origin, take_origin};
 use sdk::{Error, StagedStore, codec};
 
@@ -42,16 +36,6 @@ use crate::{DispatchState, OutputContract, Recipe, Routing, Status};
 
 /// one recipe record per id.
 const RECIPE_PREFIX: &[u8] = b"r/";
-/// the recipe-id enumeration index — what [`crate::DispatchQuery::Recipes`]
-/// walks.
-///
-// ponytail: ONE index record holds every recipe id, so a registration is
-// O(all ids) in bytes and the plane stops registering when that record hits
-// MAX_RECORD_BYTES (~8k ids at the MAX_ID_BYTES cap). unlike tasks' `t#`, this
-// ceiling is NOT a one-way door: `RemoveRecipe` frees an owner's bytes back.
-// shard the index by id prefix before a network is expected to carry that many
-// recipes.
-const RECIPE_INDEX_KEY: &[u8] = b"r#";
 /// one dispatch record per composite (receiver, dispatch_id) key.
 const DISPATCH_PREFIX: &[u8] = b"d/";
 /// one mailbox entry per delivery seq.
@@ -75,10 +59,6 @@ pub(crate) fn dispatch_key_of(key: &str) -> Vec<u8> {
 
 pub(crate) fn mailbox_key(seq: u64) -> Vec<u8> {
     prefixed(MAILBOX_PREFIX, &seq.to_le_bytes())
-}
-
-pub(crate) fn recipe_index_key() -> Vec<u8> {
-    RECIPE_INDEX_KEY.to_vec()
 }
 
 // ---- record codecs ---------------------------------------------------------
@@ -315,30 +295,6 @@ pub(crate) async fn committed_dispatch(
         staged.get_committed(&dispatch_key_of(key)).await?,
         decode_dispatch,
     )
-}
-
-/// the recipe-id index through the staged overlay. absent reads as the empty
-/// set; `BTreeSet` serializes ASCENDING, so the record bytes are canonical and
-/// `Recipes` answers in the same order the old `BTreeMap` walk did.
-pub(crate) async fn staged_recipe_index(staged: &StagedStore) -> Result<BTreeSet<String>, Error> {
-    decode_recipe_index(staged.get(RECIPE_INDEX_KEY).await?)
-}
-
-pub(crate) async fn committed_recipe_index(
-    staged: &StagedStore,
-) -> Result<BTreeSet<String>, Error> {
-    decode_recipe_index(staged.get_committed(RECIPE_INDEX_KEY).await?)
-}
-
-fn decode_recipe_index(raw: Option<Vec<u8>>) -> Result<BTreeSet<String>, Error> {
-    let Some(bytes) = raw else {
-        return Ok(BTreeSet::new());
-    };
-    sdk::wire::decode(&bytes).map_err(|e| Error::Module(format!("recipe index decode: {e}")))
-}
-
-pub(crate) fn encode_recipe_index(ids: &BTreeSet<String>) -> Vec<u8> {
-    sdk::wire::encode(ids)
 }
 
 pub(crate) async fn staged_mailbox(staged: &StagedStore) -> Result<Mailbox, Error> {

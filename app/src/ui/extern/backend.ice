@@ -372,6 +372,7 @@ extern crate::backend
   pure keep_folded_page_titles(fold_outran_reply:bool, next:[PageItem], current:[PageItem]) -> [PageItem]
   pure keep_folded_block_texts(fold_outran_reply:bool, next:[PageBlock], current:[PageBlock]) -> [PageBlock]
   pure plane_live_hit(kind:str, module:str, want:str) -> bool
+  pure agents_plane_hit(kind:str, module:str) -> bool
   pure tab_reads_plane(tab:ShellTab, plane:str) -> bool
   pure keep_str(loaded:bool, next:str, current:str) -> str
   pure keep_bool(loaded:bool, next:bool, current:bool) -> bool

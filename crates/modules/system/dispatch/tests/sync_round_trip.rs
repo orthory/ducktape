@@ -95,14 +95,16 @@ fn dispatch_op(dispatch_id: &str) -> Vec<u8> {
     })
 }
 
-async fn recipes(module: &DispatchModule) -> Vec<Recipe> {
+async fn recipe(module: &DispatchModule, recipe_id: &str) -> Option<Recipe> {
     let reply = module
-        .query(&encode_query(&DispatchQuery::Recipes))
+        .query(&encode_query(&DispatchQuery::Recipe {
+            recipe_id: recipe_id.into(),
+        }))
         .await
-        .expect("recipes");
+        .expect("recipe");
     match decode_reply(&reply).expect("decode") {
-        DispatchReply::Recipes(r) => r,
-        other => panic!("expected Recipes, got {other:?}"),
+        DispatchReply::Recipe(r) => r,
+        other => panic!("expected Recipe, got {other:?}"),
     }
 }
 
@@ -142,8 +144,8 @@ fn synced_store_reconstructs_source_root_and_every_read() {
         let owner = Origin::External(b"owner".to_vec());
         let caller = Origin::Module("caller".into());
 
-        // recipes: two registrations (the `r#` index grows), one update that
-        // OVERWRITES a record, one removal that DELETES one.
+        // recipes: two registrations, one update that OVERWRITES a record, one
+        // removal that DELETES one.
         apply(&mut src, 1, owner.clone(), register("summarize", "alpha")).await;
         apply(&mut src, 2, owner.clone(), register("classify", "beta")).await;
         apply(
@@ -205,7 +207,10 @@ fn synced_store_reconstructs_source_root_and_every_read() {
         }
         let src_root = src.root();
         assert_ne!(src_root, StateRoot::ZERO, "source must have a real root");
-        let src_recipes = recipes(&src).await;
+        let src_summarize = recipe(&src, "summarize").await.expect("the kept recipe");
+        assert_eq!(src_summarize.description, "updated");
+        assert_eq!(src_summarize.max_attempts, 5);
+        assert_eq!(recipe(&src, "classify").await, None, "removed at height 4");
         let src_done = view(&src, "done").await.expect("the receipt survives");
         let src_live = view(&src, "live").await.expect("the pending delivery");
         assert_eq!(pending(&src).await, 1);
@@ -237,12 +242,14 @@ fn synced_store_reconstructs_source_root_and_every_read() {
             "synced store root must equal the source root"
         );
 
-        // and every read answers exactly like the source.
-        assert_eq!(recipes(&synced).await, src_recipes);
-        assert_eq!(src_recipes.len(), 1, "the removed recipe is gone");
-        assert_eq!(src_recipes[0].recipe_id, "summarize");
-        assert_eq!(src_recipes[0].description, "updated");
-        assert_eq!(src_recipes[0].max_attempts, 5);
+        // and every read answers exactly like the source: the updated record
+        // rode the sync verbatim, the removed one is still gone.
+        assert_eq!(recipe(&synced, "summarize").await, Some(src_summarize));
+        assert_eq!(
+            recipe(&synced, "classify").await,
+            None,
+            "the removed recipe is gone"
+        );
 
         // the DELIVERED receipt rode the sync with its payload dropped...
         assert_eq!(view(&synced, "done").await, Some(src_done.clone()));
