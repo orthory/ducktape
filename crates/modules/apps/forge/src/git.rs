@@ -141,11 +141,12 @@ pub fn list_branches(repo: &Repository) -> Result<Vec<(String, Oid)>, git2::Erro
 }
 
 /// pack the FULL object closure reachable from EVERY head into one
-/// self-contained packfile — the multi-ref snapshot pack. same determinism
-/// posture as [`pack_closure`]: single-threaded, revwalk-inserted, deduped.
+/// self-contained packfile — the multi-ref snapshot/fetch pack. Git object
+/// ids and the installed state are deterministic; pack byte layout is
+/// node-local transport data, so libgit2 may use every available worker.
 pub fn pack_closure_many(repo: &Repository, heads: &[Oid]) -> Result<Vec<u8>, git2::Error> {
     let mut pb = repo.packbuilder()?;
-    pb.set_threads(1);
+    pb.set_threads(0);
     let mut walk = repo.revwalk()?;
     for head in heads {
         walk.push(*head)?;
@@ -162,11 +163,11 @@ pub fn pack_closure_many(repo: &Repository, heads: &[Oid]) -> Result<Vec<u8>, gi
 /// the fetch lane's INCREMENTAL pack. hidden commits mark their trees
 /// uninteresting, so unchanged trees/blobs never re-cross the wire. every
 /// `bases` oid must be a commit present in this repo (the caller filters the
-/// client's haves down to what the repo knows). same determinism posture as
-/// [`pack_closure_many`]: single-threaded, revwalk-driven, deduped.
+/// client's haves down to what the repo knows). Pack bytes are transport-only,
+/// so large refreshes use libgit2's available workers too.
 pub fn pack_delta(repo: &Repository, heads: &[Oid], bases: &[Oid]) -> Result<Vec<u8>, git2::Error> {
     let mut pb = repo.packbuilder()?;
-    pb.set_threads(1);
+    pb.set_threads(0);
     let mut walk = repo.revwalk()?;
     for head in heads {
         walk.push(*head)?;
