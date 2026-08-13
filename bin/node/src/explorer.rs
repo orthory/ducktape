@@ -248,9 +248,8 @@ pub(crate) async fn heal_and_backfill_index<C: statesync::SyncClient>(
         // is expected of it.
         let folds = index.fold_status(&module).ok().flatten().is_some();
         let derived = !folds
-            || last_row.is_none_or(|last| {
-                matches!(index.fold_tip(&module), Ok(Some(tip)) if tip >= last)
-            });
+            || last_row
+                .is_none_or(|last| matches!(index.fold_tip(&module), Ok(Some(tip)) if tip >= last));
         if !derived {
             tracing::warn!(
                 target: "ducktape::statesync",
@@ -304,7 +303,9 @@ async fn backfill_module<C: statesync::SyncClient>(
         })?;
         rows += page.len();
         bytes += page.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
-        last = page.last().and_then(|(key, _)| indexer::parse_op_key(key.as_bytes()));
+        last = page
+            .last()
+            .and_then(|(key, _)| indexer::parse_op_key(key.as_bytes()));
         tracing::debug!(
             target: "ducktape::statesync",
             node = %label,

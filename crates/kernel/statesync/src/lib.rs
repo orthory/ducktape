@@ -1855,14 +1855,18 @@ where
             last = Some(pos);
         }
         write(&rows).map_err(refuse)?;
-        // a cursor with no rows behind it would walk forever; the server sets
-        // `next_after` only when it cut a NON-EMPTY page short.
         let Some(next) = next_after else {
             return Ok(floor);
         };
-        if last != Some(next) {
+        // A CURSOR MUST MEAN PROGRESS. `next_after` has to be the last row
+        // actually served, and an empty page carrying one would re-ask the
+        // same cursor forever — the walk's only unbounded shape. Both are
+        // closed here: rows ascend strictly past `cursor` above, so a
+        // non-empty page's last position is strictly greater than it.
+        if rows.is_empty() || last != Some(next) {
             return Err(refuse(format!(
-                "page cursor {next:?} is not the last row served ({last:?})"
+                "page cursor {next:?} is not the last of {} rows served ({last:?})",
+                rows.len()
             )));
         }
         cursor = Some(next);

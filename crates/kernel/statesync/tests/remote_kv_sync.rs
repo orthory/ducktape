@@ -380,9 +380,7 @@ fn serve_index_ops(
         .entries
         .iter()
         .map(|(k, v)| (String::from_utf8(k.clone()).unwrap(), v.clone()))
-        .filter(|(k, _)| {
-            indexer::parse_op_key(k.as_bytes()).is_some_and(|(h, _)| h <= boundary)
-        })
+        .filter(|(k, _)| indexer::parse_op_key(k.as_bytes()).is_some_and(|(h, _)| h <= boundary))
         .collect();
     let has_more = rows.len() == page.entries.len() && page.has_more;
     if corrupt && let Some((_, value)) = rows.last_mut() {
@@ -390,7 +388,10 @@ fn serve_index_ops(
     }
     SyncResponse::IndexOps {
         next_after: has_more
-            .then(|| rows.last().and_then(|(k, _)| indexer::parse_op_key(k.as_bytes())))
+            .then(|| {
+                rows.last()
+                    .and_then(|(k, _)| indexer::parse_op_key(k.as_bytes()))
+            })
             .flatten(),
         rows,
         source_floor: source.backfill_height(module).expect("floor"),
@@ -426,7 +427,9 @@ impl SyncClient for IndexOpsClient {
                 after,
             } = decoded
             else {
-                return Ok(SyncResponse::Error("only the IndexOps lane is served".into()));
+                return Ok(SyncResponse::Error(
+                    "only the IndexOps lane is served".into(),
+                ));
             };
             let resp = serve_index_ops(&source, &module, after, boundary, page_len, corrupt);
             Ok(decode_response(&statesync::encode_response(&resp))?)
@@ -493,7 +496,11 @@ fn a_stamped_joiner_backfills_the_sources_op_rows_over_the_wire() {
     let joiner = store(dst_dir.path());
     joiner.mark_backfilled("chat", 9).expect("stamp");
     assert_eq!(
-        joiner.scan("chat", indexer::OP_PREFIX.as_bytes(), None, 100).unwrap().entries.len(),
+        joiner
+            .scan("chat", indexer::OP_PREFIX.as_bytes(), None, 100)
+            .unwrap()
+            .entries
+            .len(),
         0,
         "the stamp is what leaves a joiner's views empty"
     );
@@ -544,7 +551,11 @@ fn the_sources_floor_composes_into_the_joiners() {
     joiner.set_backfill_floor("chat", floor).expect("floor");
     assert_eq!(joiner.backfill_height("chat").unwrap(), Some(4));
     assert_eq!(
-        joiner.scan("chat", indexer::OP_PREFIX.as_bytes(), None, 100).unwrap().entries.len(),
+        joiner
+            .scan("chat", indexer::OP_PREFIX.as_bytes(), None, 100)
+            .unwrap()
+            .entries
+            .len(),
         5,
         "exactly the rows the source actually held"
     );
@@ -601,4 +612,57 @@ fn a_source_behind_the_boundary_is_refused_before_a_hole_can_form() {
         "want the hole refusal, got {err}"
     );
     assert_eq!(joiner.backfill_height("chat").unwrap(), Some(9));
+}
+
+/// A CURSOR WITHOUT ROWS BEHIND IT IS THE WALK'S ONLY UNBOUNDED SHAPE, and it
+/// has to be refused rather than re-asked. A source that serves a page, then
+/// answers "no rows, but ask again from the same place", would otherwise spin
+/// a joining node forever — inside the join seam, before it ever serves.
+#[test]
+fn an_empty_page_re_offering_its_cursor_is_refused_not_re_asked() {
+    /// serves ONE real row, then empty pages that keep re-offering the cursor
+    /// it already handed out.
+    #[derive(Clone)]
+    struct StuckSource;
+    impl SyncClient for StuckSource {
+        fn request(
+            &self,
+            req: SyncRequest,
+        ) -> impl std::future::Future<Output = Result<SyncResponse, SyncError>> + Send {
+            let SyncRequest::IndexOps { after, .. } = req else {
+                unreachable!("only the IndexOps lane is asked")
+            };
+            async move {
+                let row = borsh::to_vec(&indexer::OpRow {
+                    height: 1,
+                    seq: 0,
+                    time: 1_001,
+                    origin: indexer::OriginTag::external("jess"),
+                    payload: b"{}".to_vec(),
+                    assigned: Vec::new(),
+                })
+                .expect("row encodes");
+                Ok(SyncResponse::IndexOps {
+                    // the FIRST ask gets the row; every ask from its cursor
+                    // gets nothing but the same cursor back.
+                    rows: match after {
+                        None => vec![(indexer::op_key(1, 0), row)],
+                        Some(_) => Vec::new(),
+                    },
+                    next_after: Some((1, 0)),
+                    source_floor: None,
+                    applied_height: 9,
+                })
+            }
+        }
+    }
+    let err =
+        futures::executor::block_on(statesync::fetch_index_ops(&StuckSource, "chat", 9, |_| {
+            Ok(())
+        }))
+        .expect_err("an empty page re-offering its cursor must refuse");
+    assert!(
+        matches!(&err, SyncError::Module { reason, .. } if reason.contains("0 rows served")),
+        "want the no-progress refusal, got {err}"
+    );
 }

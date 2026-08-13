@@ -499,7 +499,10 @@ fn bounded_index_ops_response(page: SyncIndexOps) -> statesync::SyncResponse {
         rows.truncate(fitting);
     }
     let next_after = has_more
-        .then(|| rows.last().and_then(|(key, _)| indexer::parse_op_key(key.as_bytes())))
+        .then(|| {
+            rows.last()
+                .and_then(|(key, _)| indexer::parse_op_key(key.as_bytes()))
+        })
         .flatten();
     statesync::SyncResponse::IndexOps {
         rows,

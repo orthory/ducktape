@@ -164,7 +164,9 @@ fn canned_response(req: &SyncRequest) -> SyncResponse {
                 root_hash: StateRoot([6u8; 32]),
             }],
         },
-        SyncRequest::IndexOps { boundary, after, .. } => SyncResponse::IndexOps {
+        SyncRequest::IndexOps {
+            boundary, after, ..
+        } => SyncResponse::IndexOps {
             rows: vec![(statesync_op_key(*boundary), vec![7u8; 3])],
             next_after: *after,
             source_floor: Some(4),

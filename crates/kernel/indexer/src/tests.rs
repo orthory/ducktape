@@ -780,7 +780,14 @@ fn a_backfilled_store_matches_a_store_that_saw_the_blocks() {
     // the joiner's join seam: canonical state jumped to the boundary, so the
     // heal stamps — feed and views begin empty at BOUNDARY.
     joiner.mark_backfilled("chat", BOUNDARY).unwrap();
-    assert_eq!(joiner.scan("chat", b"seen/", None, 100).unwrap().entries.len(), 0);
+    assert_eq!(
+        joiner
+            .scan("chat", b"seen/", None, 100)
+            .unwrap()
+            .entries
+            .len(),
+        0
+    );
 
     // ...then the source's rows land below it, ascending, one page at a time.
     let rows = live.scan("chat", OP_PREFIX.as_bytes(), None, 100).unwrap();
@@ -811,9 +818,16 @@ fn a_backfilled_store_matches_a_store_that_saw_the_blocks() {
         joiner.view("chat", b"count").unwrap(),
         live.view("chat", b"count").unwrap()
     );
-    assert_eq!(joiner.fold_tip("chat").unwrap(), live.fold_tip("chat").unwrap());
+    assert_eq!(
+        joiner.fold_tip("chat").unwrap(),
+        live.fold_tip("chat").unwrap()
+    );
     assert_eq!(joiner.fold_tip("chat").unwrap(), Some((BOUNDARY, 0)));
-    assert_eq!(joiner.backfill_height("chat").unwrap(), None, "floor cleared");
+    assert_eq!(
+        joiner.backfill_height("chat").unwrap(),
+        None,
+        "floor cleared"
+    );
 }
 
 /// THE FLOOR IS THE ONLY THING A BACKFILL MOVES. `write_backfill_rows` must
@@ -845,7 +859,14 @@ fn backfill_writes_leave_the_watermark_and_only_the_floor_moves() {
         9,
         "a backfill write never moves the watermark"
     );
-    assert_eq!(store.scan("chat", OP_PREFIX.as_bytes(), None, 10).unwrap().entries.len(), 1);
+    assert_eq!(
+        store
+            .scan("chat", OP_PREFIX.as_bytes(), None, 10)
+            .unwrap()
+            .entries
+            .len(),
+        1
+    );
 
     // compose a late-joined source's own truncation, then clear it.
     store.set_backfill_floor("chat", Some(2)).unwrap();
