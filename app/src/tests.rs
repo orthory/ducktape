@@ -427,6 +427,7 @@ fn live_refresh(
 ) -> backend::LiveRefresh {
     backend::LiveRefresh {
         generation,
+        fold_serial: 0,
         chat_loaded: true,
         channels: Vec::new(),
         messages,
@@ -963,15 +964,30 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
     assert!(lifecycle.contains("parallel\n    run replace lane=live_thread refresh_live_thread("));
     // Page-scoped state waits for a reply that answers for the page in hand —
     // a resync issued before a mutation moved the selection speaks for a
-    // document nobody is on.
+    // document nobody is on. And the fold-owned fields (#1041) additionally
+    // wait for a reply no text fold outran: the title and the row titles keep
+    // the fold's value when the serial moved, while the structural half still
+    // lands from the reply.
     assert!(lifecycle.contains(
-        "active_page_title = keep_str(pages_answer_is_current, next.active_page_title, active_page_title)"
+        "active_page_title = keep_str(pages_answer_is_current && !pages_fold_outran_reply, next.active_page_title, active_page_title)"
     ));
     assert!(lifecycle.contains(
         "pages_answer_is_current = next.pages_loaded && pages_reply_answers_current(next.pages, next.active_page, active_page)"
     ));
-    // The page LIST is never stale — it is the whole index either way.
-    assert!(lifecycle.contains("pages = keep_pages(next.pages_loaded, next.pages, pages)"));
+    assert!(lifecycle.contains("pages_fold_outran_reply = next.fold_serial != pages_fold_serial"));
+    // The fold site is the ONE writer of the serial: a text fold bumps it, and
+    // every resync request snapshots it, or the token guards nothing.
+    assert!(lifecycle.contains(
+        "pages_fold_serial = keep_i64(pages_delta_folds(next.pages), pages_fold_serial + 1, pages_fold_serial)"
+    ));
+    // The page LIST's structure is never stale — it is the whole index either
+    // way — but shared rows keep their folded titles.
+    assert!(lifecycle.contains(
+        "pages = keep_pages(next.pages_loaded, keep_folded_page_titles(pages_fold_outran_reply, next.pages, pages), pages)"
+    ));
+    assert!(lifecycle.contains(
+        "blocks = keep_blocks(pages_answer_is_current, merge_pending_blocks(keep_folded_block_texts(pages_fold_outran_reply, next.blocks, blocks), blocks, buffer_page, next.active_page, \"\"), blocks)"
+    ));
     // A live resync must never install remote text over a buffer the user is
     // still typing in; the buffer and its dirty baseline move on ONE decision.
     assert!(lifecycle.contains("page_editor = refreshed_page_editor("));
@@ -5782,6 +5798,354 @@ fn a_folded_text_edit_updates_the_block_and_fetches_nothing() {
     }));
     assert_eq!(app.blocks[0].text, "typed");
     assert_eq!(app.hydration_generation, before);
+}
+
+/// THE RACE #1041 RECORDS: a fold is not reverted by a reload that was
+/// already in flight when it landed.
+///
+/// A fold does not bump `hydration_generation` — folding instead of reloading
+/// is its whole point — so a `live_resync_load` issued BEFORE the fold still
+/// passes `live_resynced`'s generation guard when it answers AFTER it,
+/// carrying a pre-fold snapshot: the sidebar row, the header title and line 0
+/// all reverted, and stayed reverted until the next structural op on the page
+/// happened to buy a fresh read. The fold serial is the ordering token the
+/// reply must clear — and it gates ONLY the fold-owned fields, so the reply
+/// still delivers the structural change it was issued for. Neither staleness
+/// is traded for the other.
+#[test]
+fn a_fold_landing_during_a_resync_flight_is_not_reverted_by_the_reply() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.active_page = "page".into();
+    app.buffer_page = "page".into();
+    app.active_page_title = "Old Name".into();
+    app.pages = vec![page_item("page", "Old Name"), page_item("other", "Other")];
+    app.blocks = vec![page_block("b1", "page", "body")];
+    app.page_editor = compose("Old Name\nbody");
+    app.page_saved_text = "Old Name\nbody".into();
+
+    // Someone inserts a block: the structural delta buys the debounced resync.
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+        kind: "pages".into(),
+        status: "Live".into(),
+        height: 20,
+        module: "pages".into(),
+        load_pages: true,
+        debounce: true,
+        pages: backend::PagesDelta {
+            kind: "touched".into(),
+            ..backend::PagesDelta::default()
+        },
+        ..backend::LiveUpdate::default()
+    }));
+    let resync_generation = app.hydration_generation;
+    let request_fold_serial = app.pages_fold_serial;
+
+    // A rename folds while the resync's three reads are still executing.
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+        kind: "pages".into(),
+        status: "Live".into(),
+        height: 21,
+        module: "pages".into(),
+        pages: backend::PagesDelta {
+            kind: "text".into(),
+            block_id: "page".into(),
+            text: "New Name".into(),
+        },
+        ..backend::LiveUpdate::default()
+    }));
+    assert_eq!(app.active_page_title, "New Name");
+    assert_eq!(
+        app.hydration_generation, resync_generation,
+        "a fold buys no reload — which is exactly why the in-flight reply stays current"
+    );
+    assert_ne!(
+        app.pages_fold_serial, request_fold_serial,
+        "the fold moved the serial the in-flight request snapshotted"
+    );
+
+    // The reply lands afterwards, built from the PRE-fold snapshot — but
+    // carrying the inserted block, the very thing it was issued to fetch.
+    let _ = app.__update(__DucktapeMessage::LiveResynced(backend::LiveRefresh {
+        pages: vec![page_item("page", "Old Name"), page_item("other", "Other")],
+        active_page_title: "Old Name".into(),
+        fold_serial: request_fold_serial,
+        ..live_refresh(
+            resync_generation,
+            "",
+            Vec::new(),
+            "page",
+            vec![
+                page_block("b1", "page", "body"),
+                page_block("b2", "page", "inserted"),
+            ],
+        )
+    }));
+
+    assert_eq!(
+        app.active_page_title, "New Name",
+        "the fold owns the header — the pre-fold reply must not revert it"
+    );
+    assert_eq!(app.pages[0].title, "New Name", "and the sidebar row");
+    assert_eq!(
+        app.pages[1].title, "Other",
+        "and only the folded row's title"
+    );
+    assert_eq!(
+        app.blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["body", "inserted"],
+        "while the reply still delivers the structural half it was issued for"
+    );
+    assert_eq!(
+        page_document_text(&app),
+        "New Name\nbody\ninserted",
+        "line 0 is rebuilt from the KEPT title, so header, row and editor agree"
+    );
+    assert_eq!(app.page_saved_text, "New Name\nbody\ninserted");
+}
+
+/// THE HALF BOTH OF #1041's REJECTED DESIGNS LOST: the reply is NOT discarded
+/// wholesale. A generation bump on the fold — or a serial gating the whole
+/// pages half — would throw away the structural data the read was issued for,
+/// trading one staleness for another. Only the fold-owned fields (titles,
+/// block texts) are kept; every reply-owned field still lands.
+#[test]
+fn a_fold_in_the_window_does_not_discard_the_replys_pages_half() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.active_page = "page".into();
+    app.buffer_page = "page".into();
+    app.active_page_title = "Old Name".into();
+    app.pages = vec![page_item("page", "Old Name")];
+    app.blocks = vec![page_block("b1", "page", "body")];
+    app.page_editor = compose("Old Name\nbody");
+    app.page_saved_text = "Old Name\nbody".into();
+
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+        kind: "pages".into(),
+        status: "Live".into(),
+        height: 30,
+        module: "pages".into(),
+        load_pages: true,
+        debounce: true,
+        pages: backend::PagesDelta {
+            kind: "touched".into(),
+            ..backend::PagesDelta::default()
+        },
+        ..backend::LiveUpdate::default()
+    }));
+    let resync_generation = app.hydration_generation;
+    let request_fold_serial = app.pages_fold_serial;
+
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+        kind: "pages".into(),
+        status: "Live".into(),
+        height: 31,
+        module: "pages".into(),
+        pages: backend::PagesDelta {
+            kind: "text".into(),
+            block_id: "page".into(),
+            text: "New Name".into(),
+        },
+        ..backend::LiveUpdate::default()
+    }));
+
+    // The pre-fold reply carries page-list structure (a row state has never
+    // seen), a fresh comment census and a parent — all reply-owned.
+    let _ = app.__update(__DucktapeMessage::LiveResynced(backend::LiveRefresh {
+        pages: vec![
+            page_item("page", "Old Name"),
+            page_item("brand-new", "Brand New"),
+        ],
+        active_page_title: "Old Name".into(),
+        active_page_parent: "parent-page".into(),
+        comment_thread_total: 4,
+        commented_block_hits: vec!["b1".into()],
+        fold_serial: request_fold_serial,
+        ..live_refresh(
+            resync_generation,
+            "",
+            Vec::new(),
+            "page",
+            vec![page_block("b1", "page", "body")],
+        )
+    }));
+
+    assert_eq!(app.active_page_title, "New Name", "the folded title holds");
+    assert_eq!(
+        app.pages
+            .iter()
+            .map(|page| (page.id.as_str(), page.title.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("page", "New Name"), ("brand-new", "Brand New")],
+        "the list takes the reply's structure and the fold's title"
+    );
+    assert_eq!(
+        app.active_page_parent, "parent-page",
+        "no fold writes a parent, so the reply's lands"
+    );
+    assert_eq!(app.block_comment_thread_total, 4);
+    assert_eq!(app.commented_block_hits, vec!["b1".to_string()]);
+}
+
+/// THE OWNERSHIP CALL #1041 LEFT OPEN, PINNED: block STRUCTURE is the
+/// reply's, block TEXT is the fold's.
+///
+/// `apply_page_text` folds body edits exactly as the rename folds the title
+/// (#1027), so a body edit landing in the resync window is clobbered the same
+/// way — and not merely on screen: a clean buffer rebuilt from the reply's
+/// pre-fold text makes the reader's next keystroke plan the OLD text back
+/// onto the chain (`document_plan` is a two-way diff, and body lines have no
+/// authorship guard the way the title has `title_write_owed`). The LIST is
+/// still the reply's: keeping current blocks wholesale would discard the
+/// inserted block the read was issued for.
+#[test]
+fn a_body_text_fold_keeps_its_text_and_takes_the_replys_structure() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.active_page = "page".into();
+    app.buffer_page = "page".into();
+    app.active_page_title = "Doc".into();
+    app.pages = vec![page_item("page", "Doc")];
+    app.blocks = vec![page_block("b1", "page", "body")];
+    app.page_editor = compose("Doc\nbody");
+    app.page_saved_text = "Doc\nbody".into();
+
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+        kind: "pages".into(),
+        status: "Live".into(),
+        height: 40,
+        module: "pages".into(),
+        load_pages: true,
+        debounce: true,
+        pages: backend::PagesDelta {
+            kind: "touched".into(),
+            ..backend::PagesDelta::default()
+        },
+        ..backend::LiveUpdate::default()
+    }));
+    let resync_generation = app.hydration_generation;
+    let request_fold_serial = app.pages_fold_serial;
+
+    // A peer's body edit folds into b1 while the reads are executing.
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+        kind: "pages".into(),
+        status: "Live".into(),
+        height: 41,
+        module: "pages".into(),
+        pages: backend::PagesDelta {
+            kind: "text".into(),
+            block_id: "b1".into(),
+            text: "peer edit".into(),
+        },
+        ..backend::LiveUpdate::default()
+    }));
+    assert_eq!(app.blocks[0].text, "peer edit");
+
+    let _ = app.__update(__DucktapeMessage::LiveResynced(backend::LiveRefresh {
+        pages: vec![page_item("page", "Doc")],
+        active_page_title: "Doc".into(),
+        fold_serial: request_fold_serial,
+        ..live_refresh(
+            resync_generation,
+            "",
+            Vec::new(),
+            "page",
+            vec![
+                page_block("b1", "page", "body"),
+                page_block("b2", "page", "inserted"),
+            ],
+        )
+    }));
+
+    assert_eq!(
+        app.blocks
+            .iter()
+            .map(|block| (block.id.as_str(), block.text.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("b1", "peer edit"), ("b2", "inserted")],
+        "the fold owns b1's text, the reply owns the list — including b2"
+    );
+    assert_eq!(
+        page_document_text(&app),
+        "Doc\npeer edit\ninserted",
+        "a buffer rebuilt from the reply's pre-fold text would write it back \
+         on the next keystroke — body lines have no title_write_owed"
+    );
+    assert_eq!(app.page_saved_text, "Doc\npeer edit\ninserted");
+}
+
+/// The gate RELEASES: a request issued after the fold snapshots the moved
+/// serial, so its reply — which carries the fold's own values — lands
+/// wholesale. The keep is scoped to replies the fold actually outran, not a
+/// permanent title freeze.
+#[test]
+fn a_request_issued_after_the_fold_lands_its_title_normally() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.active_page = "page".into();
+    app.buffer_page = "page".into();
+    app.active_page_title = "Old Name".into();
+    app.pages = vec![page_item("page", "Old Name")];
+    app.blocks = vec![page_block("b1", "page", "body")];
+    app.page_editor = compose("Old Name\nbody");
+    app.page_saved_text = "Old Name\nbody".into();
+
+    // The rename folds FIRST, then a structural delta buys the resync: the
+    // request snapshots the post-fold serial.
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+        kind: "pages".into(),
+        status: "Live".into(),
+        height: 50,
+        module: "pages".into(),
+        pages: backend::PagesDelta {
+            kind: "text".into(),
+            block_id: "page".into(),
+            text: "New Name".into(),
+        },
+        ..backend::LiveUpdate::default()
+    }));
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+        kind: "pages".into(),
+        status: "Live".into(),
+        height: 51,
+        module: "pages".into(),
+        load_pages: true,
+        debounce: true,
+        pages: backend::PagesDelta {
+            kind: "touched".into(),
+            ..backend::PagesDelta::default()
+        },
+        ..backend::LiveUpdate::default()
+    }));
+
+    // Its reply reads post-fold state — including a SECOND rename the stream
+    // has not delivered yet. Serials match, so the reply's title lands.
+    let _ = app.__update(__DucktapeMessage::LiveResynced(backend::LiveRefresh {
+        pages: vec![page_item("page", "Renamed Again")],
+        active_page_title: "Renamed Again".into(),
+        fold_serial: app.pages_fold_serial,
+        ..live_refresh(
+            app.hydration_generation,
+            "",
+            Vec::new(),
+            "page",
+            vec![page_block("b1", "page", "body")],
+        )
+    }));
+
+    assert_eq!(
+        app.active_page_title, "Renamed Again",
+        "no fold outran this reply — its title is the freshest reading"
+    );
+    assert_eq!(app.pages[0].title, "Renamed Again");
 }
 
 #[test]

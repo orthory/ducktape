@@ -3013,11 +3013,16 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
         "both".into(),
         false,
         7,
+        3,
         0,
     )
     .await
     .unwrap();
     assert_eq!(refreshed.generation, 7);
+    assert_eq!(
+        refreshed.fold_serial, 3,
+        "the reply echoes the fold serial the request snapshotted (#1041)"
+    );
     assert!(refreshed.chat_loaded && refreshed.pages_loaded);
     assert_eq!(refreshed.messages[1].body, "arrived on the next block");
     assert_eq!(refreshed.active_page, "welcome");

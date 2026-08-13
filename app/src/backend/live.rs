@@ -368,6 +368,11 @@ pub(crate) async fn load_channel_row(rpc: &str, channel_id: &str) -> Result<Chat
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct LiveRefresh {
     pub generation: i64,
+    /// The `pages_fold_serial` the request snapshotted, echoed back so
+    /// `live_resynced` can tell whether a text fold landed while this reply
+    /// was in flight (#1041). A mismatch gates ONLY the fold-owned fields —
+    /// page titles and block texts — never the structural pages half.
+    pub fold_serial: i64,
     pub chat_loaded: bool,
     pub channels: Vec<ChatChannel>,
     pub messages: Vec<ChatMessage>,
@@ -390,6 +395,9 @@ pub struct LiveRefresh {
 
 /// `planes` is `chat` | `pages` | `both` — the flat Ice surface's
 /// discriminant for which slices to load ([`resync_planes`] builds it).
+// the Ice extern boundary is a flat parameter list by construction — the
+// same allowance every other wide extern in this module carries.
+#[allow(clippy::too_many_arguments)]
 pub async fn live_resync_load(
     rpc: String,
     channel_id: String,
@@ -397,6 +405,7 @@ pub async fn live_resync_load(
     planes: String,
     debounce: bool,
     generation: i64,
+    fold_serial: i64,
     attempt: i64,
 ) -> Result<LiveRefresh, HydrationError> {
     if debounce {
@@ -409,6 +418,7 @@ pub async fn live_resync_load(
         let rpc = rpc_client(&rpc)?;
         let mut refresh = LiveRefresh {
             generation,
+            fold_serial,
             chat_loaded: false,
             channels: Vec::new(),
             messages: Vec::new(),
@@ -741,6 +751,84 @@ pub fn apply_page_rename(mut pages: Vec<PageItem>, delta: PagesDelta) -> Vec<Pag
         false => delta.text,
     };
     pages
+}
+
+/// Did this delta FOLD into pages state rather than buy a reload?
+///
+/// The stream decoder's own classification (`load_pages: !folded` above): a
+/// `text` delta — a body edit or a rename — lands through `apply_page_text` /
+/// `apply_page_title` / `apply_page_rename` and fetches nothing. Everything
+/// else sets `load_pages`, which bumps the hydration generation and orphans
+/// any resync reply in flight. That asymmetry is what makes one serial
+/// sufficient for #1041: text folds are the ONLY pages writes that can land
+/// inside a still-current reply window, so a moved serial names exactly the
+/// folded fields as the divergence.
+pub fn pages_delta_folds(delta: PagesDelta) -> bool {
+    delta.kind == "text"
+}
+
+/// The row-title half of #1041's selective merge.
+///
+/// A reply the fold outran takes its page LIST from the reply — the list is
+/// the whole index, and a row the reply carries that state does not is
+/// structural news the read was issued for — but every shared row keeps the
+/// title STATE holds: inside a still-current window the only way the two can
+/// disagree is a rename that folded after the reply's reads executed. When
+/// the reads DID see the rename the two titles agree, so over-keeping (the
+/// serial cannot tell those orderings apart) costs nothing.
+pub fn keep_folded_page_titles(
+    fold_outran_reply: bool,
+    next: Vec<PageItem>,
+    current: Vec<PageItem>,
+) -> Vec<PageItem> {
+    if !fold_outran_reply {
+        return next;
+    }
+    let folded_titles: BTreeMap<&str, &str> = current
+        .iter()
+        .map(|page| (page.id.as_str(), page.title.as_str()))
+        .collect();
+    next.into_iter()
+        .map(|mut page| {
+            if let Some(title) = folded_titles.get(page.id.as_str()) {
+                page.title = (*title).to_string();
+            }
+            page
+        })
+        .collect()
+}
+
+/// The block-TEXT half of the same merge. Structure — which blocks exist,
+/// their order, kind, depth — is the reply's: it is what the read was issued
+/// for, and no structural delta can land inside a still-current window
+/// without orphaning the reply. Text is the fold's: `apply_page_text` writes
+/// nothing else, and a folded text lost to a pre-fold reply is not merely
+/// stale on screen — a clean buffer rebuilt from it makes the reader's next
+/// keystroke plan the OLD text back onto the chain (`document_plan` is a
+/// two-way diff, and body lines have no authorship guard the way the title
+/// has `title_write_owed`). Pending optimistic blocks are no fold, so they
+/// are not an overlay source; `merge_pending_blocks` re-seats them.
+pub fn keep_folded_block_texts(
+    fold_outran_reply: bool,
+    next: Vec<PageBlock>,
+    current: Vec<PageBlock>,
+) -> Vec<PageBlock> {
+    if !fold_outran_reply {
+        return next;
+    }
+    let folded_texts: BTreeMap<&str, &str> = current
+        .iter()
+        .filter(|block| !block.pending)
+        .map(|block| (block.id.as_str(), block.text.as_str()))
+        .collect();
+    next.into_iter()
+        .map(|mut block| {
+            if let Some(text) = folded_texts.get(block.id.as_str()) {
+                block.text = (*text).to_string();
+            }
+            block
+        })
+        .collect()
 }
 
 pub fn keep_str(loaded: bool, next: String, current: String) -> String {

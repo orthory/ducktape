@@ -384,6 +384,15 @@ on live_updated(next)
   // nothing else on this path would have moved the title. Both writes sit
   // ABOVE the buffer rebuild for the reason the resync path states below —
   // the title is line 0, so it has to land before the text is rebuilt from it.
+  //
+  // THE FOLD MOVES A CLOCK THE RESYNC REPLY MUST READ (#1041). A text fold
+  // bumps no generation, so a `live_resync_load` reply already in flight
+  // still passes `live_resynced`'s guard — carrying a pre-fold snapshot. The
+  // serial is the fold's own ordering token: snapshotted into every resync
+  // request, echoed back on the reply, and a mismatch gates ONLY the
+  // fold-owned fields (titles and block texts), never the structural half
+  // the read was issued for.
+  pages_fold_serial = keep_i64(pages_delta_folds(next.pages), pages_fold_serial + 1, pages_fold_serial)
   pages = apply_page_rename(pages, next.pages)
   active_page_title = apply_page_title(active_page_title, next.pages, active_page)
   blocks = apply_page_text(blocks, next.pages)
@@ -412,7 +421,7 @@ on live_updated(next)
   hydration_generation = keep_i64(next.load_chat || next.load_pages || huddle_refresh_hits(next.chat, active_channel), hydration_generation + 1, hydration_generation)
   hydration_retry_attempt = keep_i64(next.load_chat || next.load_pages || huddle_refresh_hits(next.chat, active_channel), 0, hydration_retry_attempt)
   parallel
-    run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes((next.load_chat || huddle_refresh_hits(next.chat, active_channel)), next.load_pages), next.debounce, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
+    run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes((next.load_chat || huddle_refresh_hits(next.chat, active_channel)), next.load_pages), next.debounce, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
     run replace lane=forge_live forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == "forge"), forge_generation) -> forge_refreshed _ | forge_live_failed _
     // The `keep_i64(plane_live_hit(…), gen, -1)` is the SAME off-screen
     // refusal the tab-switch path uses: the backend refuses a generation of -1
@@ -576,12 +585,24 @@ on live_resynced(next)
   // A resync carries whatever page was active WHEN IT WAS ISSUED and takes
   // several queries to answer, so a mutation landing in between leaves it
   // speaking for a document nobody is on — measured on a page create. The page
-  // LIST is never stale (it is the whole index either way) and still lands
-  // unconditionally; everything scoped to ONE page waits for a reply that
+  // LIST's structure is never stale (it is the whole index either way) and
+  // still lands; everything scoped to ONE page waits for a reply that
   // answers for the page in hand.
   pages_answer_is_current = next.pages_loaded && pages_reply_answers_current(next.pages, next.active_page, active_page)
-  pages = keep_pages(next.pages_loaded, next.pages, pages)
-  blocks = keep_blocks(pages_answer_is_current, merge_pending_blocks(next.blocks, blocks, buffer_page, next.active_page, ""), blocks)
+  // A TEXT FOLD THAT LANDED WHILE THIS REPLY WAS IN FLIGHT OWNS WHAT IT WROTE
+  // (#1041). The serial the request snapshotted no longer matching means a
+  // rename or a body edit folded after the reply's reads left — and text
+  // folds are the ONLY pages writes that can land inside a still-current
+  // window, because every structural delta sets `load_pages`, bumps the
+  // generation, and orphans this very reply at the guard above. So the
+  // divergence is exactly the folded titles and block texts: those keep the
+  // fold's value, while the structure the read was issued for still lands
+  // from the reply. Discarding the pages half wholesale here would trade one
+  // staleness for the other — the defect both of #1041's rejected designs
+  // shared.
+  pages_fold_outran_reply = next.fold_serial != pages_fold_serial
+  pages = keep_pages(next.pages_loaded, keep_folded_page_titles(pages_fold_outran_reply, next.pages, pages), pages)
+  blocks = keep_blocks(pages_answer_is_current, merge_pending_blocks(keep_folded_block_texts(pages_fold_outran_reply, next.blocks, blocks), blocks, buffer_page, next.active_page, ""), blocks)
   orphaned_comment_drafts = remember_orphaned_page_comment(orphaned_comment_drafts, pages, block_comments_target, block_comment_draft)
   // THE COMMENTS RAIL IS DOCUMENT-SCOPED (handlers/pages.ice:300). Its anchor is
   // the PAGE it was opened on, never a block selection — keyed on
@@ -609,7 +630,11 @@ on live_resynced(next)
   active_page = keep_str(pages_answer_is_current, next.active_page, active_page)
   block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
   active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
-  active_page_title = keep_str(pages_answer_is_current, next.active_page_title, active_page_title)
+  // The header title is fold-owned too — same #1041 rule as the row above,
+  // and it must hold HERE because the editor rebuild below reads it as line 0.
+  // `active_page_parent` is not: no fold writes a parent, so it stays the
+  // reply's.
+  active_page_title = keep_str(pages_answer_is_current && !pages_fold_outran_reply, next.active_page_title, active_page_title)
   active_page_parent = keep_str(pages_answer_is_current, next.active_page_parent, active_page_parent)
   // AFTER the title lands, because the title is line 0 of the buffer. The
   // canonical text only replaces the buffer when the editor is CLEAN and the
@@ -707,7 +732,7 @@ on live_resync_failed(cause)
   status = "Sync delayed"
   error = "Live sync interrupted. Retrying…"
   hydration_retry_attempt = hydration_retry_attempt + 1
-  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, "both", false, hydration_generation, hydration_retry_attempt) -> live_resynced _ | live_resync_failed _
+  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, "both", false, hydration_generation, pages_fold_serial, hydration_retry_attempt) -> live_resynced _ | live_resync_failed _
 
 on live_thread_refreshed(next)
   return if next.generation != live_thread_generation
@@ -973,7 +998,7 @@ on mutation_failed(cause)
   block_autosave_status = "idle"
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, "both", false, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
+  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, "both", false, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
 
 on dismiss_error
   error = ""
