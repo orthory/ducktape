@@ -258,11 +258,13 @@ pub fn node_log_timeline<'a>(
                     _ => Color::TRANSPARENT,
                 };
                 row![
+                    // 24 mono chars at size 11 (Geist Mono, 0.6 em advance)
+                    // need ~158 px; 150 let the tail paint over the level.
                     text(parts.time)
                         .size(11)
                         .font(mono)
                         .color(DARK.palette.muted_foreground)
-                        .width(150),
+                        .width(170),
                     text(parts.level)
                         .size(11)
                         .font(mono)
@@ -371,6 +373,24 @@ pub struct LogParts {
     pub message: String,
 }
 
+/// The ring's tracing timer prints microseconds (`…T09:12:44.918273Z`, 27
+/// chars) but the console column is sized for milliseconds — an iced text
+/// widget never clips itself, so the extra digits paint over the level
+/// column. Trim the fraction to three digits; any other shape passes through.
+fn trim_time_to_millis(time: &str) -> String {
+    let Some((secs, frac)) = time.rsplit_once('.') else {
+        return time.to_string();
+    };
+    let Some(digits) = frac.strip_suffix('Z') else {
+        return time.to_string();
+    };
+    let trimmable = digits.len() > 3 && digits.bytes().all(|b| b.is_ascii_digit());
+    if !trimmable {
+        return time.to_string();
+    }
+    format!("{secs}.{}Z", &digits[..3])
+}
+
 /// Split `2026-07-27T09:12:44.918Z  INFO ducktape::join: admitted` into its
 /// three columns. A line that does not carry a level is all message.
 pub fn split_log_line(line: String) -> LogParts {
@@ -386,7 +406,7 @@ pub fn split_log_line(line: String) -> LogParts {
     let timestamped =
         first.contains(':') && first.chars().next().is_some_and(|c| c.is_ascii_digit());
     let (time, level_field) = match timestamped {
-        true => (first.to_string(), fields.next().unwrap_or_default()),
+        true => (trim_time_to_millis(first), fields.next().unwrap_or_default()),
         false => (String::new(), first),
     };
     if !LEVELS.contains(&level_field) {

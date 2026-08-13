@@ -773,6 +773,15 @@ fn a_log_line_splits_into_time_level_and_message() {
     assert_eq!(parts.level, "INFO");
     assert_eq!(parts.message, "ducktape::join: admitted resident");
 
+    let micro = split_log_line(
+        "2026-08-14T01:02:03.918273Z DEBUG ducktape::files: staged chunk".into(),
+    );
+    assert_eq!(
+        micro.time, "2026-08-14T01:02:03.918Z",
+        "the ring's microsecond timer is trimmed to the column's millisecond width"
+    );
+    assert_eq!(micro.level, "DEBUG");
+
     let prose = split_log_line("no level here".into());
     assert_eq!(prose.level, "");
     assert_eq!(prose.message, "no level here");
