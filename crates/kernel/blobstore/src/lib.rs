@@ -22,11 +22,20 @@
 mod staging;
 pub use staging::{LARGE_BLOB_CACHE_BYTES, StageError, StagedBlob};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use sha2::{Digest as _, Sha256};
+
+/// total resident bytes the memory map may hold for DISK-BACKED blobs. the
+/// map used to never evict, so every ≤[`LARGE_BLOB_CACHE_BYTES`] put stayed
+/// resident for the process lifetime — and the explorer projection puts one
+/// op payload per op per block, so a stream of 1 MiB file chunks (a photo
+/// dropped on the Files tab) grew node RSS without bound. eviction is safe
+/// exactly because these blobs live on disk: a miss re-reads and re-verifies
+/// the file.
+const CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 /// the node-local blob store contract: the content-addressed put/get surface
 /// consumers (statesync blob serve, the resident/validator relays, the
@@ -53,6 +62,13 @@ pub trait Blobs: Send + Sync + 'static {
 #[derive(Default)]
 pub(crate) struct BlobStore {
     chunks: HashMap<[u8; 32], Vec<u8>>,
+    /// insertion order of the DISK-BACKED entries in `chunks` — the eviction
+    /// queue. entries whose only copy is memory (pure in-memory stores, or a
+    /// failed write-through) are deliberately absent: evicting one would lose
+    /// the blob.
+    cache_order: VecDeque<[u8; 32]>,
+    /// total bytes of the entries in `cache_order`.
+    cache_bytes: usize,
     /// write-through persistence root; `None` = pure in-memory.
     root: Option<PathBuf>,
 }
@@ -65,8 +81,8 @@ impl BlobStore {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
         Ok(Self {
-            chunks: HashMap::new(),
             root: Some(root),
+            ..Self::default()
         })
     }
 
@@ -79,9 +95,13 @@ impl BlobStore {
             match write_through(root, &digest, &bytes) {
                 // a persisted LARGE blob lives on disk only: parking it in the
                 // map would grow resident memory by the blob size for the
-                // process lifetime (the map never evicts).
+                // process lifetime.
                 Ok(()) if bytes.len() > LARGE_BLOB_CACHE_BYTES => return digest,
-                Ok(()) => {}
+                // disk holds the truth — memory is a bounded read cache.
+                Ok(()) => {
+                    self.cache(digest, bytes);
+                    return digest;
+                }
                 Err(why) => eprintln!(
                     "[blobstore] cannot persist blob {} under {}: {why}; kept in memory only",
                     hex(&digest),
@@ -89,22 +109,50 @@ impl BlobStore {
                 ),
             }
         }
+        // no disk copy exists (pure in-memory store, or the write just
+        // failed): the map IS the store for this blob, never evicted.
         self.chunks.insert(digest, bytes);
         digest
     }
 
     /// memory first, then the persistence root. a verified disk hit is cached
-    /// back into memory only when small — the map never evicts, so a large
-    /// blob would otherwise stay resident for the process lifetime.
+    /// back into memory only when small, through the same bounded cache the
+    /// put path fills.
     pub fn get_chunk(&mut self, digest: &[u8; 32]) -> Option<Vec<u8>> {
         if let Some(bytes) = self.chunks.get(digest) {
             return Some(bytes.clone());
         }
         let bytes = self.disk_chunk(digest)?;
         if bytes.len() <= LARGE_BLOB_CACHE_BYTES {
-            self.chunks.insert(*digest, bytes.clone());
+            self.cache(*digest, bytes.clone());
         }
         Some(bytes)
+    }
+
+    /// park a DISK-BACKED blob in the memory map and keep the cache's total
+    /// resident bytes under [`CACHE_BUDGET_BYTES`], evicting oldest-in first.
+    /// only blobs that verifiably live on disk enter here, so eviction can
+    /// never lose data — a miss re-reads and re-verifies the file.
+    // ponytail: FIFO, not LRU — a get does not refresh recency. the cache
+    // exists to stop unbounded growth; switch to LRU if repeated hot-blob
+    // reads ever measure as a problem.
+    fn cache(&mut self, digest: [u8; 32], bytes: Vec<u8>) {
+        // content-addressed: same digest = same bytes, already resident (and
+        // possibly pinned as memory-only) — nothing to add or re-queue.
+        if self.chunks.contains_key(&digest) {
+            return;
+        }
+        self.cache_bytes += bytes.len();
+        self.cache_order.push_back(digest);
+        self.chunks.insert(digest, bytes);
+        while self.cache_bytes > CACHE_BUDGET_BYTES {
+            let Some(oldest) = self.cache_order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = self.chunks.remove(&oldest) {
+                self.cache_bytes -= evicted.len();
+            }
+        }
     }
 
     /// the blob's total length: memory hit, else the published file's size.
@@ -433,6 +481,49 @@ mod tests {
             fresh.get_chunk(&digest).as_deref(),
             Some(b"warm me".as_ref())
         );
+    }
+
+    #[test]
+    fn the_disk_backed_memory_cache_stays_under_budget_and_loses_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let store = BlobHandle::persistent(root.path()).unwrap();
+        let payload = |seed: u8| vec![seed; 1024 * 1024];
+        // 65 distinct 1 MiB puts against a 64 MiB budget: the oldest evicts.
+        let first = store.put_chunk(payload(0));
+        for seed in 1..=64u8 {
+            store.put_chunk(payload(seed));
+        }
+        {
+            let inner = store.0.lock().unwrap();
+            assert!(
+                inner.cache_bytes <= CACHE_BUDGET_BYTES,
+                "resident cache bytes stay under budget"
+            );
+            assert!(
+                !inner.chunks.contains_key(&first),
+                "the oldest cached blob was evicted from memory"
+            );
+        }
+        // eviction lost nothing: the disk copy re-serves (re-verified).
+        assert_eq!(
+            store.get_chunk(&first).as_deref(),
+            Some(payload(0).as_slice())
+        );
+    }
+
+    #[test]
+    fn a_memory_only_store_never_evicts() {
+        // no root: the map IS the store, so the cache budget must not apply —
+        // every blob stays readable no matter how many follow it.
+        let store = BlobHandle::default();
+        let payload = |seed: u8| vec![seed; 1024 * 1024];
+        let digests: Vec<_> = (0..=64u8).map(|seed| store.put_chunk(payload(seed))).collect();
+        for (seed, digest) in digests.iter().enumerate() {
+            assert_eq!(
+                store.get_chunk(digest).as_deref(),
+                Some(payload(seed as u8).as_slice())
+            );
+        }
     }
 
     #[test]
