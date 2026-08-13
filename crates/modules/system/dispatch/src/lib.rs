@@ -66,10 +66,9 @@ use std::collections::BTreeMap;
 
 use capability::{validate_resources, validate_tag};
 use records::{
-    Mailbox, committed_dispatch, committed_mailbox, committed_recipe, committed_recipe_index,
-    dispatch_key_of, encode_dispatch, encode_recipe, encode_recipe_index, mailbox_key,
-    recipe_index_key, recipe_key, stage_mailbox, staged_dispatch, staged_mailbox, staged_recipe,
-    staged_recipe_index,
+    Mailbox, committed_dispatch, committed_mailbox, committed_recipe, dispatch_key_of,
+    encode_dispatch, encode_recipe, mailbox_key, recipe_key, stage_mailbox, staged_dispatch,
+    staged_mailbox, staged_recipe,
 };
 use saga::{
     SagaCallback, SagaMsg, SagaOrigin, SagaOutcome, decode_callback, encode_msg as saga_encode_msg,
@@ -122,8 +121,8 @@ fn saga_id_for(key: &str) -> String {
 /// dispatch and flushes its overlay only on a SUCCESSFUL execute. so a path
 /// that stages a write and then returns `Err` leaves residue on one side and
 /// none on the other, and the two ports diverge on the root. no path does that
-/// today (`RegisterRecipe` checks both records before staging either, and every
-/// other transition stages last); keep it that way when adding one.
+/// today (every transition checks first and stages last); keep it that way when
+/// adding one.
 fn check_record(value: &[u8], what: &str) -> Result<(), Error> {
     if value.len() > MAX_RECORD_BYTES {
         return Err(Error::Module(format!(
@@ -591,35 +590,18 @@ impl DispatchModule {
             created_at: now,
             updated_at: now,
         });
-        let mut index = staged_recipe_index(&self.staged).await?;
-        index.insert(recipe_id.clone());
-        let index_record = encode_recipe_index(&index);
-        // a registration writes TWO records; check both BEFORE staging either,
-        // so a refusal leaves the overlay untouched (never an index entry
-        // naming a recipe whose record was refused).
-        check_record(&record, "recipe record")?;
-        check_record(&index_record, "recipe index")?;
-        self.staged.stage(recipe_key(&recipe_id), record);
-        self.staged.stage(recipe_index_key(), index_record);
-        Ok(())
+        stage_record(
+            &mut self.staged,
+            recipe_key(&recipe_id),
+            record,
+            "recipe record",
+        )
     }
 
     async fn on_remove_recipe(&mut self, ctx: &dyn Ctx, recipe_id: String) -> Result<(), Error> {
         self.owned_recipe(ctx, &recipe_id).await?;
-        let mut index = staged_recipe_index(&self.staged).await?;
-        index.remove(&recipe_id);
-        if index.is_empty() {
-            // an empty index DROPS its key, so a plane whose recipes were all
-            // removed hashes exactly like one that never registered any.
-            self.staged.delete(recipe_index_key());
-        } else {
-            stage_record(
-                &mut self.staged,
-                recipe_index_key(),
-                encode_recipe_index(&index),
-                "recipe index",
-            )?;
-        }
+        // the record is the recipe's whole footprint, so removing every recipe
+        // returns the plane to the root it had before any registration.
         self.staged.delete(recipe_key(&recipe_id));
         Ok(())
     }
@@ -727,22 +709,6 @@ impl DispatchModule {
             updated_at: d.updated_at,
         }
     }
-
-    /// every committed recipe, ascending by id — the enumeration the `r#` index
-    /// exists for.
-    async fn committed_recipes(&self) -> Result<Vec<Recipe>, Error> {
-        let index = committed_recipe_index(&self.staged).await?;
-        let mut recipes = Vec::with_capacity(index.len());
-        for recipe_id in &index {
-            let recipe = committed_recipe(&self.staged, recipe_id)
-                .await?
-                .ok_or_else(|| {
-                    Error::Module(format!("recipe index names a missing recipe: {recipe_id}"))
-                })?;
-            recipes.push(recipe);
-        }
-        Ok(recipes)
-    }
 }
 
 /// the [`DispatchMsg::RegisterRecipe`] payload minus its id — one named value
@@ -800,9 +766,6 @@ impl Module for DispatchModule {
         // PendingDeliveries between blocks, and a staged overlay must never
         // leak into that decision.
         match decode_query(req).map_err(Error::Module)? {
-            DispatchQuery::Recipes => Ok(encode_reply(&DispatchReply::Recipes(
-                self.committed_recipes().await?,
-            ))),
             DispatchQuery::Recipe { recipe_id } => Ok(encode_reply(&DispatchReply::Recipe(
                 committed_recipe(&self.staged, &recipe_id).await?,
             ))),

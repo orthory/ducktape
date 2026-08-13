@@ -267,7 +267,6 @@ pub enum DispatchMsg {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchQuery {
-    Recipes,
     Recipe {
         recipe_id: String,
     },
@@ -284,7 +283,6 @@ pub enum DispatchQuery {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchReply {
-    Recipes(Vec<Recipe>),
     Recipe(Option<Recipe>),
     Dispatch(Option<DispatchView>),
     PendingDeliveries(u64),

@@ -110,11 +110,14 @@ fn pending_deliveries(m: &DispatchModule) -> u64 {
         other => panic!("expected PendingDeliveries reply, got {other:?}"),
     }
 }
-fn recipes(m: &DispatchModule) -> Vec<Recipe> {
-    let reply = block_on(m.query(&crate::encode_query(&DispatchQuery::Recipes))).unwrap();
+fn recipe(m: &DispatchModule, recipe_id: &str) -> Option<Recipe> {
+    let reply = block_on(m.query(&crate::encode_query(&DispatchQuery::Recipe {
+        recipe_id: recipe_id.into(),
+    })))
+    .unwrap();
     match crate::decode_reply(&reply).unwrap() {
-        DispatchReply::Recipes(r) => r,
-        other => panic!("expected Recipes reply, got {other:?}"),
+        DispatchReply::Recipe(r) => r,
+        other => panic!("expected Recipe reply, got {other:?}"),
     }
 }
 /// the committed byte size of one dispatch record — what the retention pin
@@ -232,22 +235,16 @@ fn recipe_registration_validates_and_gates_mutation_by_owner() {
     )
     .unwrap();
     commit(&mut m);
-    let reply = block_on(m.query(&crate::encode_query(&DispatchQuery::Recipe {
-        recipe_id: "summarize".into(),
-    })))
-    .unwrap();
-    let DispatchReply::Recipe(Some(recipe)) = crate::decode_reply(&reply).unwrap() else {
-        panic!("recipe committed");
-    };
-    assert_eq!(recipe.capability, "beta");
-    assert_eq!(recipe.max_attempts, 3);
+    let committed = recipe(&m, "summarize").expect("recipe committed");
+    assert_eq!(committed.capability, "beta");
+    assert_eq!(committed.max_attempts, 3);
 }
 
 #[test]
-fn the_recipe_index_enumerates_ascending_and_a_removal_frees_its_key() {
-    // the `r#` enumeration index: the store cannot walk keys, so `Recipes`
-    // reads this record. it must answer ascending by id, and an emptied index
-    // must DROP its key so the root returns to the never-registered value.
+fn removing_every_recipe_returns_the_root_to_its_never_registered_value() {
+    // a recipe's whole footprint is its own `r/{id}` record, so removing every
+    // recipe must leave the plane hashing exactly like one that never
+    // registered any — no residue key surviving the removals.
     let mut m = module();
     let empty_root = m.root();
     let mut ctx = mk_ctx(0, owner());
@@ -269,8 +266,8 @@ fn the_recipe_index_enumerates_ascending_and_a_removal_frees_its_key() {
         .unwrap();
     }
     commit(&mut m);
-    let ids: Vec<String> = recipes(&m).into_iter().map(|r| r.recipe_id).collect();
-    assert_eq!(ids, vec!["alpha".to_string(), "zeta".to_string()]);
+    assert!(recipe(&m, "alpha").is_some());
+    assert!(recipe(&m, "zeta").is_some());
 
     for recipe_id in ["alpha", "zeta"] {
         exec(
@@ -283,11 +280,12 @@ fn the_recipe_index_enumerates_ascending_and_a_removal_frees_its_key() {
         .unwrap();
     }
     commit(&mut m);
-    assert!(recipes(&m).is_empty());
+    assert!(recipe(&m, "alpha").is_none());
+    assert!(recipe(&m, "zeta").is_none());
     assert_eq!(
         m.root(),
         empty_root,
-        "an emptied recipe index must drop its key, not commit an empty set"
+        "a removed recipe must leave no residue key behind"
     );
 }
 
@@ -314,9 +312,9 @@ fn an_oversized_recipe_record_is_refused() {
     )
     .unwrap_err();
     assert!(err.to_string().contains("store record cap"), "got {err}");
-    // and the refusal left NOTHING staged: not the record, not the index.
+    // and the refusal left NOTHING staged.
     commit(&mut m);
-    assert!(recipes(&m).is_empty());
+    assert!(recipe(&m, "huge").is_none());
 }
 
 #[test]
@@ -867,5 +865,5 @@ fn sustained_dispatch_traffic_keeps_the_state_bounded_but_never_forgets_a_run() 
     );
 
     // the recipe is untouched.
-    assert_eq!(recipes(&m).len(), 1);
+    assert!(recipe(&m, "summarize").is_some());
 }

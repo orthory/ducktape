@@ -274,12 +274,11 @@ async fn deliveries(h: &Host, who: &str) -> Vec<(String, Vec<u8>)> {
     serde_json::from_slice(&reply).expect("recorder log decodes")
 }
 
-/// the whole committed read matrix: the recipe enumeration (what the `r#` index
-/// exists for), a hit and an absent point read, both dispatch records, and the
-/// mailbox census the host's delivery injection keys on.
+/// the whole committed read matrix: a recipe hit and an absent point read, both
+/// dispatch records, and the mailbox census the host's delivery injection keys
+/// on.
 async fn replies(h: &Host) -> Vec<Vec<u8>> {
     let queries = [
-        encode_query(&DispatchQuery::Recipes),
         encode_query(&DispatchQuery::Recipe {
             recipe_id: "summarize".into(),
         }),
@@ -685,15 +684,20 @@ async fn same_ops_inner(context: &deterministic::Context) {
     assert_eq!(second.dispatch_id, "d2");
     assert_eq!(second.outcome, Err("cancelled".into()));
 
-    // the removed recipe is gone from BOTH the point read and the enumeration.
+    // the removed recipe is gone from the point read.
     let reply = wasm
-        .query("dispatch", &encode_query(&DispatchQuery::Recipes))
+        .query(
+            "dispatch",
+            &encode_query(&DispatchQuery::Recipe {
+                recipe_id: "summarize".into(),
+            }),
+        )
         .await
         .expect("query");
     assert_eq!(
         decode_reply(&reply).expect("decode"),
-        DispatchReply::Recipes(Vec::new()),
-        "the emptied recipe index answers an empty list"
+        DispatchReply::Recipe(None),
+        "the removed recipe record is gone"
     );
 
     // queries are read-only on the wasm side too: the root is STABLE across the
