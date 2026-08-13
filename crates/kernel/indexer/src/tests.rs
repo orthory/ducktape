@@ -314,7 +314,9 @@ fn the_fold_tip_records_the_last_op_row_consumed() {
     // a database that never folded reports UNKNOWN, never a zero position.
     assert_eq!(store.fold_tip("chat").unwrap(), None);
 
-    let mut sub = store.subscribe("chat", b"fold/", Some(b"fold0")).unwrap();
+    let mut sub = store
+        .subscribe("chat", FOLD_PREFIX.as_bytes(), Some(b"fold0"))
+        .unwrap();
     // the block's LAST dispatch is tasks', so chat's tip must be chat's own
     // last row (1, 2) — the block-wide seq, kept exactly as the feed spells it.
     store
@@ -350,7 +352,9 @@ fn a_batch_cut_mid_block_parks_the_tip_at_the_cut() {
 
     let dir = tempfile::tempdir().unwrap();
     let store = mapped_store(dir.path());
-    let mut sub = store.subscribe("chat", b"fold/", Some(b"fold0")).unwrap();
+    let mut sub = store
+        .subscribe("chat", FOLD_PREFIX.as_bytes(), Some(b"fold0"))
+        .unwrap();
 
     let ops = (0..OPS).map(|n| chat_op(format!("op{n}").as_bytes()));
     store.apply_block(&block(1, ops.collect())).unwrap();
@@ -369,7 +373,10 @@ fn a_batch_cut_mid_block_parks_the_tip_at_the_cut() {
     // rows it had not folded yet.
     let cut = tips[0];
     assert_eq!(cut.0, 1);
-    assert!(cut.1 < OPS - 1, "the first invocation stopped short: {cut:?}");
+    assert!(
+        cut.1 < OPS - 1,
+        "the first invocation stopped short: {cut:?}"
+    );
     assert!(
         store
             .get("chat", seen_key(cut.0, cut.1).as_bytes())
@@ -378,6 +385,44 @@ fn a_batch_cut_mid_block_parks_the_tip_at_the_cut() {
         "the tip names a row whose derived write is committed"
     );
     assert_eq!(store.fold_tip("chat").unwrap(), Some((1, OPS - 1)));
+}
+
+/// A MAPPER SWAP LEAVES THE TIP STANDING — the honest upgrade hazard, and the
+/// opposite of the absent-tip one. `converge_guest` installs the new wasm and
+/// returns: no refold, no `clear_db`. So after an upgrade the tip still reads
+/// the position the PREVIOUS mapper folded to, and still vouches for the rows
+/// that mapper wrote. Reopening with the guest REMOVED is the extreme case of
+/// the same swap, and it is what this drives — the tip survives a change that
+/// tore the fold down entirely.
+///
+/// This is why a mapper whose derived shape changes ships with a boundary
+/// stamp or a chain replay (spec §3.2.4): the tip reports fold PROGRESS over
+/// the op feed, never that the rows match the installed mapper.
+#[test]
+fn a_guest_swap_leaves_the_fold_tip_where_it_stood() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = mapped_store(dir.path());
+
+    let mut sub = store.subscribe("chat", b"seen/", Some(b"seen0")).unwrap();
+    store.apply_block(&block(1, vec![chat_op(b"one")])).unwrap();
+    wait_for_keys(&mut sub, [seen_key(1, 0)]);
+    assert_eq!(store.fold_tip("chat").unwrap(), Some((1, 0)));
+    drop(sub);
+    drop(store);
+
+    let swapped = bare_store(dir.path());
+    assert_eq!(
+        swapped.fold_tip("chat").unwrap(),
+        Some((1, 0)),
+        "converge_guest never wipes the tip — it is stale, not absent"
+    );
+    assert!(
+        swapped
+            .get("chat", seen_key(1, 0).as_bytes())
+            .unwrap()
+            .is_some(),
+        "the rows it vouches for are still the old mapper's"
+    );
 }
 
 #[test]
