@@ -443,6 +443,34 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
         }
     };
 
+    // A DIRECTORY WRITE BEFORE ANYONE JOINS: the resident below never sees
+    // this block as a frame — it arrives inside the synced boundary, with the
+    // op feed that carried it long gone. The join-seam op-row backfill (spec
+    // §7) is the only reason it can ever be in the resident's own feed.
+    cluster.submit(
+        0,
+        "directory",
+        &directory::encode_msg(&DirMsg::Set {
+            key: "pre-join".into(),
+            value: "written".into(),
+        }),
+    );
+    poll(
+        "the pre-join write to finalize on the founder",
+        Box::new(|| {
+            cluster
+                .query(
+                    0,
+                    "directory",
+                    &directory::encode_query(&DirQuery::Get {
+                        key: "pre-join".into(),
+                    }),
+                )
+                .and_then(|raw| directory::decode_reply(&raw).ok())
+                .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "written"))
+        }),
+    );
+
     // ---- invite → park → resident grant ------------------------------------
     let invite = cluster.invite();
     let friend_key = cluster.join_friend_manual(&invite);
@@ -604,26 +632,48 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
             })
         }),
     );
-    //     …and /v1/index/* answers from healthy read models. under the
-    //     replica pipeline the resident FOLDS blocks, so watermarks advance
-    //     per block PAST the ascension heal's backfill floor (the old
-    //     boundary-healed model pinned them equal — that trailing-watermark
-    //     era is exactly what the fold retired). polled: a heal drops the
-    //     watermark FIRST (crash-safety by re-trigger), so a read racing an
-    //     in-flight heal legitimately sees 0 for a moment.
+    //     …and /v1/index/* answers from healthy read models WITH pre-join
+    //     history. the ascension heal still stamps a floor at the boundary,
+    //     but the op-row backfill then walks the source's rows below it and
+    //     CLEARS that floor (indexable spec §7) — so the honest end state is
+    //     no floor at all, or the SOURCE's own floor inherited when the
+    //     source itself joined late. what must never happen again is a floor
+    //     sitting at the joiner's own boundary with an empty feed beneath it.
+    //     polled: a heal drops the watermark FIRST (crash-safety by
+    //     re-trigger), so a read racing an in-flight heal legitimately sees 0
+    //     for a moment, and the floor clears only after the fold drains.
     poll(
-        "the resident index to report folding watermarks",
+        "the resident index to report folding watermarks over a backfilled feed",
         Box::new(|| {
         let (status, index_status) =
             common::http_request(cluster.http_ports[1], "GET", "/v1/index/status", None);
         let watermark = index_status["modules"]["directory"].as_u64().unwrap_or(0);
+        let floor = index_status["backfilled"]["directory"].as_u64();
+        // the founder is the sync source and has folded from genesis, so it
+        // has no floor of its own to compose in: the joiner's clears outright.
         status == 200
             && index_status["poisoned"] == serde_json::json!(false)
             && watermark > 0
-            && index_status["backfilled"]["directory"]
-                .as_u64()
-                .is_some_and(|floor| floor <= watermark)
+            && floor.is_none()
         }),
+    );
+    //     and the op feed BELOW that boundary is really there — the whole
+    //     point of clearing the floor. The pre-join write finalized before
+    //     this node existed, so nothing but the backfill can have put it in
+    //     THIS node's `/v1/index/directory/ops`.
+    let (status, ops) = common::http_request(
+        cluster.http_ports[1],
+        "GET",
+        "/v1/index/directory/ops?limit=100",
+        None,
+    );
+    assert_eq!(status, 200, "resident op feed: {ops}");
+    assert!(
+        ops["ops"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|r| r["payload"]["set"]["key"]
+                == serde_json::json!("pre-join"))),
+        "a cleared floor promises pre-boundary rows are really there: {ops}"
     );
 
     // (3) quorum untouched: kill the resident; the founder keeps finalizing.

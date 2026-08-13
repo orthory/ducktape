@@ -43,6 +43,11 @@ use statesync::{
 // the shared protocol fixture — one canned responder, one request suite.
 // ============================================================================
 
+/// a canned op-row key at `height` — the responder's stand-in row.
+fn statesync_op_key(height: u64) -> String {
+    format!("op/{height:016x}/0000")
+}
+
 fn boundary() -> BoundaryId {
     BoundaryId {
         height: 42,
@@ -51,7 +56,7 @@ fn boundary() -> BoundaryId {
 }
 
 /// every [`SyncRequest`] variant as it exists today (`Manifest`, `Chunk`,
-/// `Module`, `Frames`, `IndexModules`, `IndexChunk`, `TipCoords`, `Blob`,
+/// `Module`, `Frames`, `IndexOps`, `TipCoords`, `Blob`,
 /// `BlobInfo`, `BlobRange`),
 /// each with field values that would expose a codec bug (non-zero offsets,
 /// a non-trivial body, a non-empty digest), plus one deliberate
@@ -85,17 +90,11 @@ fn full_suite() -> Vec<(&'static str, SyncRequest)> {
             },
         ),
         (
-            "IndexModules",
-            SyncRequest::IndexModules {
-                boundary: boundary(),
-            },
-        ),
-        (
-            "IndexChunk",
-            SyncRequest::IndexChunk {
-                boundary: boundary(),
-                db: "chat".into(),
-                offset: 64,
+            "IndexOps",
+            SyncRequest::IndexOps {
+                boundary: 64,
+                module: "chat".into(),
+                after: Some((12, 3)),
             },
         ),
         ("TipCoords", SyncRequest::TipCoords),
@@ -165,12 +164,13 @@ fn canned_response(req: &SyncRequest) -> SyncResponse {
                 root_hash: StateRoot([6u8; 32]),
             }],
         },
-        SyncRequest::IndexModules { .. } => SyncResponse::IndexModules {
-            entries: vec![("chat".to_string(), 128)],
-        },
-        SyncRequest::IndexChunk { offset, .. } => SyncResponse::Chunk {
-            total: 500,
-            bytes: vec![*offset as u8; 2],
+        SyncRequest::IndexOps {
+            boundary, after, ..
+        } => SyncResponse::IndexOps {
+            rows: vec![(statesync_op_key(*boundary), vec![7u8; 3])],
+            next_after: *after,
+            source_floor: Some(4),
+            applied_height: *boundary,
         },
         SyncRequest::TipCoords => SyncResponse::TipCoords(TipCoords {
             height: 100,

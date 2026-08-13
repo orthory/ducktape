@@ -752,202 +752,132 @@ fn prefix_successor_edges() {
 }
 
 // ----------------------------------------------------------------------------
-// the shipping lane
+// the joiner's op-row backfill
 // ----------------------------------------------------------------------------
 
+/// THE BACKFILL IS INDISTINGUISHABLE FROM HAVING SEEN THE BLOCKS. A store
+/// stamped at a boundary and then fed the source's op rows in ASCENDING key
+/// order must land on the same views, the same fold tip, and the same rows as
+/// a twin that watched every block go by through `apply_block`.
+///
+/// The order is the whole argument: the fold trigger is changes-mode, so it
+/// folds in COMMIT order — writing ascending makes commit order key order,
+/// which is exactly block-and-drain order. Nothing here refolds.
 #[test]
-fn checkpoint_ships_and_staged_install_opens_identically() {
-    let src_dir = tempfile::tempdir().unwrap();
-    let dest_dir = tempfile::tempdir().unwrap();
-    let source = mapped_store(src_dir.path());
+fn a_backfilled_store_matches_a_store_that_saw_the_blocks() {
+    let live_dir = tempfile::tempdir().unwrap();
+    let joiner_dir = tempfile::tempdir().unwrap();
+    let live = mapped_store(live_dir.path());
+    let joiner = mapped_store(joiner_dir.path());
 
-    let mut sub = source.subscribe("chat", b"seen/", Some(b"seen0")).unwrap();
-    source
-        .apply_block(&block_with_record(1, vec![chat_op(b"payload")]))
-        .unwrap();
-    wait_for_keys(&mut sub, [seen_key(1, 0)]);
-
-    // ship every database: modules + blocks.
-    let dest_base = dest_dir.path().join("index");
-    for db in ["chat", "tasks", BLOCKS_DB_ID] {
-        let files = source.checkpoint_files(db).expect("cut archive");
-        assert!(!files.is_empty(), "an archive is never empty");
-        stage_shipped_db(&DiskFs, &dest_base, db, &files).expect("stage");
+    const BOUNDARY: u64 = 6;
+    for h in 1..=BOUNDARY {
+        live.apply_block(&block(h, vec![chat_op(b"payload"), tasks_op()]))
+            .unwrap();
     }
-    commit_staged(&DiskFs, &dest_base).expect("commit");
+    live.wait_folds_drained().unwrap();
 
-    let shipped = mapped_store(&dest_base);
-    // feed, derived rows, watermark, explorer rows — all travelled.
-    assert_eq!(shipped.applied_height("chat").unwrap(), 1);
-    let ops = shipped
-        .scan("chat", OP_PREFIX.as_bytes(), None, 10)
-        .unwrap();
-    assert_eq!(ops.entries.len(), 1);
-    let seen = shipped.scan("chat", b"seen/", None, 10).unwrap();
-    assert_eq!(seen.entries.len(), 1);
+    // the joiner's join seam: canonical state jumped to the boundary, so the
+    // heal stamps — feed and views begin empty at BOUNDARY.
+    joiner.mark_backfilled("chat", BOUNDARY).unwrap();
     assert_eq!(
-        shipped.view("chat", b"count").unwrap(),
-        1u64.to_be_bytes().to_vec()
+        joiner
+            .scan("chat", b"seen/", None, 100)
+            .unwrap()
+            .entries
+            .len(),
+        0
     );
-    assert_eq!(shipped.recent_block_rows(10).unwrap().len(), 1);
 
-    // the shipped copy keeps folding: it is a live store, not a snapshot.
-    let mut sub = shipped.subscribe("chat", b"seen/", Some(b"seen0")).unwrap();
-    shipped
-        .apply_block(&block(2, vec![chat_op(b"more")]))
-        .unwrap();
-    wait_for_keys(&mut sub, [seen_key(2, 0)]);
-    assert_eq!(
-        shipped.view("chat", b"count").unwrap(),
-        2u64.to_be_bytes().to_vec()
-    );
-}
-
-#[test]
-fn unmarked_staging_is_discarded_marked_staging_replaces() {
-    let dir = tempfile::tempdir().unwrap();
-    let base = dir.path().join("index");
-
-    // seed a live store with one applied block, then close it.
-    {
-        let store = bare_store(&base);
-        store.apply_block(&block(1, vec![chat_op(b"{}")])).unwrap();
+    // ...then the source's rows land below it, ascending, one page at a time.
+    let rows = live.scan("chat", OP_PREFIX.as_bytes(), None, 100).unwrap();
+    assert_eq!(rows.entries.len(), BOUNDARY as usize);
+    for page in rows.entries.chunks(2) {
+        let page: Vec<(String, Vec<u8>)> = page
+            .iter()
+            .map(|(k, v)| (String::from_utf8(k.clone()).unwrap(), v.clone()))
+            .collect();
+        joiner.write_backfill_rows("chat", &page).unwrap();
     }
+    joiner.wait_folds_drained().unwrap();
+    joiner.set_backfill_floor("chat", None).unwrap();
 
-    // a torn fetch (no marker) must be discarded, keeping the live data.
-    stage_shipped_db(&DiskFs, &base, "chat", &[("garbage".into(), vec![1, 2, 3])]).unwrap();
-    {
-        let store = bare_store(&base);
-        assert_eq!(
-            store.applied_height("chat").unwrap(),
-            1,
-            "torn staging discarded"
-        );
-    }
-
-    // a marked install replaces: ship the current chat db, wipe, restage.
-    let files = {
-        let store = bare_store(&base);
-        store.checkpoint_files("chat").unwrap()
+    // parity: rows, derived views, and the fold tip. `meta/` is deliberately
+    // out — it is host bookkeeping about the FEED, and the boundary stamp
+    // already reset it (`meta/guest` included, so the next open re-converges).
+    let derived = |s: &IndexStore| {
+        s.scan("chat", b"", None, 1024)
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter(|(k, _)| !k.starts_with(META_PREFIX.as_bytes()))
+            .collect::<Vec<_>>()
     };
-    stage_shipped_db(&DiskFs, &base, "chat", &files).unwrap();
-    commit_staged(&DiskFs, &base).unwrap();
-    let store = bare_store(&base);
+    assert_eq!(derived(&live), derived(&joiner), "every key byte-identical");
     assert_eq!(
-        store.applied_height("chat").unwrap(),
-        1,
-        "staged copy adopted"
+        joiner.view("chat", b"count").unwrap(),
+        live.view("chat", b"count").unwrap()
+    );
+    assert_eq!(
+        joiner.fold_tip("chat").unwrap(),
+        live.fold_tip("chat").unwrap()
+    );
+    assert_eq!(joiner.fold_tip("chat").unwrap(), Some((BOUNDARY, 0)));
+    assert_eq!(
+        joiner.backfill_height("chat").unwrap(),
+        None,
+        "floor cleared"
     );
 }
 
+/// THE FLOOR IS THE ONLY THING A BACKFILL MOVES. `write_backfill_rows` must
+/// never touch the watermark (the heal already stamped it at the boundary, and
+/// it vouches for feed contiguity from the floor up), and the floor setter
+/// must both compose a source's own truncation and clear it outright.
 #[test]
-fn stage_refuses_hostile_names() {
-    let dir = tempfile::tempdir().unwrap();
-    let base = dir.path().join("index");
-    let files = [("f".to_string(), vec![0u8])];
-
-    for bad in ["", ".", "..", "a/b", "a\\b", ".hidden", "LOCK", STAGING_DIR] {
-        assert!(
-            matches!(
-                stage_shipped_db(&DiskFs, &base, bad, &files),
-                Err(Error::Shipping(_))
-            ),
-            "db name {bad:?} must refuse"
-        );
-    }
-    for bad in ["", "..", "a/b", ".hidden", "LOCK"] {
-        assert!(
-            matches!(
-                stage_shipped_db(&DiskFs, &base, "chat", &[(bad.to_string(), vec![0u8])]),
-                Err(Error::Shipping(_))
-            ),
-            "file name {bad:?} must refuse"
-        );
-    }
-}
-
-#[test]
-fn checkpoint_files_sweeps_its_stale_archive_and_refuses_poisoned() {
+fn backfill_writes_leave_the_watermark_and_only_the_floor_moves() {
     let dir = tempfile::tempdir().unwrap();
     let store = bare_store(dir.path());
-    store.apply_block(&block(1, vec![chat_op(b"{}")])).unwrap();
+    store.mark_backfilled("chat", 9).unwrap();
+    assert_eq!(store.applied_height("chat").unwrap(), 9);
+    assert_eq!(store.backfill_height("chat").unwrap(), Some(9));
 
-    // twice in a row: the second cut must sweep nothing stale (the first
-    // deleted its fork) and still succeed.
-    let first = store.checkpoint_files("chat").unwrap();
-    let second = store.checkpoint_files("chat").unwrap();
-    assert_eq!(
-        first.iter().map(|(n, _)| n).collect::<Vec<_>>(),
-        second.iter().map(|(n, _)| n).collect::<Vec<_>>()
-    );
-
-    // poison the store; cuts must refuse rather than ship a torn model.
+    let row = borsh::to_vec(&OpRow {
+        height: 3,
+        seq: 0,
+        time: 1_003,
+        origin: OriginTag::external("jess"),
+        payload: b"{}".to_vec(),
+        assigned: Vec::new(),
+    })
+    .unwrap();
     store
-        .apply_block(&block(
-            2,
-            vec![AppliedOp {
-                module: "ghost".into(),
-                origin: OriginTag::system(),
-                payload: vec![],
-                assigned: Vec::new(),
-            }],
-        ))
-        .unwrap_err();
-    assert!(matches!(
-        store.checkpoint_files("chat"),
-        Err(Error::Poisoned)
-    ));
-}
-
-// ----------------------------------------------------------------------------
-// staging on the mem disk
-// ----------------------------------------------------------------------------
-
-#[test]
-fn staging_round_trips_on_the_mem_disk() {
-    let disk = MemDisk::default();
-    let base = Path::new("/index");
-    let files = [
-        ("CURRENT".to_string(), b"manifest".to_vec()),
-        ("table-1".to_string(), vec![1, 2, 3]),
-    ];
-    stage_shipped_db(&disk, base, "chat", &files).unwrap();
-    commit_staged(&disk, base).unwrap();
-    adopt_staged(&disk, base).unwrap();
-
-    assert!(disk.exists(&base.join("chat").join("CURRENT")));
-    assert!(disk.exists(&base.join("chat").join("table-1")));
-    assert!(!disk.exists(&base.join(STAGING_DIR)), "staging root swept");
-}
-
-#[test]
-fn torn_staging_is_discarded_on_the_mem_disk() {
-    let disk = MemDisk::default();
-    let base = Path::new("/index");
-    stage_shipped_db(&disk, base, "chat", &[("f".to_string(), vec![1])]).unwrap();
-    // no commit marker: adoption must discard, not adopt.
-    adopt_staged(&disk, base).unwrap();
-    assert!(!disk.exists(&base.join("chat")));
-    assert!(!disk.exists(&base.join(STAGING_DIR)));
-}
-
-#[test]
-fn committed_staging_replaces_an_existing_dir_on_the_mem_disk() {
-    let disk = MemDisk::default();
-    let base = Path::new("/index");
-    disk.create_dir_all(&base.join("chat")).unwrap();
-    disk.write(&base.join("chat").join("stale"), b"old")
+        .write_backfill_rows("chat", &[(op_key(3, 0), row)])
         .unwrap();
-
-    stage_shipped_db(&disk, base, "chat", &[("fresh".to_string(), vec![1])]).unwrap();
-    commit_staged(&disk, base).unwrap();
-    adopt_staged(&disk, base).unwrap();
-
-    assert!(
-        !disk.exists(&base.join("chat").join("stale")),
-        "old dir replaced"
+    assert_eq!(
+        store.applied_height("chat").unwrap(),
+        9,
+        "a backfill write never moves the watermark"
     );
-    assert!(disk.exists(&base.join("chat").join("fresh")));
+    assert_eq!(
+        store
+            .scan("chat", OP_PREFIX.as_bytes(), None, 10)
+            .unwrap()
+            .entries
+            .len(),
+        1
+    );
+
+    // compose a late-joined source's own truncation, then clear it.
+    store.set_backfill_floor("chat", Some(2)).unwrap();
+    assert_eq!(store.backfill_height("chat").unwrap(), Some(2));
+    store.set_backfill_floor("chat", None).unwrap();
+    assert_eq!(store.backfill_height("chat").unwrap(), None);
+    assert_eq!(
+        store.applied_height("chat").unwrap(),
+        9,
+        "clearing the floor never moves the watermark either"
+    );
 }
 
 // ----------------------------------------------------------------------------

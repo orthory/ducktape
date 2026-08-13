@@ -1115,8 +1115,7 @@ mod tests {
              gateway_listen = \"127.0.0.1:0\"\nrpc_listen = \"127.0.0.1:0\"\n\
              wireguard_listen = \"0.0.0.0:51820\"\ninvite_listen = \"0.0.0.0:51821\"\n\
              wireguard_advertised = \"auto\"\nprimary_coordinator = \"none\"\n\
-             coordinator_relay = \"none\"\ncheckpoint_blocks = 32\n\
-             sync_index = false\n"
+             coordinator_relay = \"none\"\ncheckpoint_blocks = 32\n"
         );
         std::fs::write(dir.join("node.toml"), node_toml).expect("write node.toml");
         dir

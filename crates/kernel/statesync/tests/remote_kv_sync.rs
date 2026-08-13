@@ -353,133 +353,457 @@ fn byzantine_op_batches_fail_verification_not_installation() {
 }
 
 // ============================================================================
-// the shipped-index lane: real fluent31 databases round-trip the wire.
+// the index backfill lane: real fluent31 databases round-trip the wire.
 // ============================================================================
 
-/// the crate-level proof of indexable spec §7 lane 2: a source's derived
-/// index databases — cut as fluent31 checkpoints from a LIVE store — cross
-/// the wire as archive blobs, stage on the joiner, and adopt at the next
-/// open as byte-identical read models that keep folding. the server side
-/// mirrors bin/node's pump exactly: the FIRST IndexModules request for a
-/// boundary cuts and attaches lazily.
-#[test]
-fn shipped_index_round_trips_over_the_wire_protocol() {
-    // no runtime context: the index store is plain-fs, the wire is a channel.
-    futures::executor::block_on(async {
-        let src_dir = tempfile::tempdir().expect("src dir");
-        let source = indexer::IndexStore::open(
-            src_dir.path(),
-            &[
-                indexer::IndexModule::bare("chat"),
-                indexer::IndexModule::bare("tasks"),
-            ],
+/// serve `IndexOps` off a real source store, everything else off the host.
+/// mirrors bin/node's split exactly: the serve step names the state touch, the
+/// state owner (here, the store) answers it.
+fn serve_index_ops(
+    source: &indexer::IndexStore,
+    module: &str,
+    after: Option<(u64, u32)>,
+    boundary: u64,
+    page_len: usize,
+    corrupt: bool,
+) -> SyncResponse {
+    let cursor = after.map(|(h, s)| indexer::op_key(h, s));
+    let page = source
+        .scan(
+            module,
+            indexer::OP_PREFIX.as_bytes(),
+            cursor.as_deref().map(str::as_bytes),
+            page_len,
         )
-        .expect("open source");
-        for h in 1..=4u64 {
-            source
-                .apply_block(&indexer::BlockOps {
-                    height: h,
-                    time: 1_000 + h,
-                    ops: vec![indexer::AppliedOp {
-                        module: "chat".into(),
-                        origin: indexer::OriginTag::external("jess"),
-                        payload: br#"{"post":"hi"}"#.to_vec(),
-                        assigned: Vec::new(),
-                    }],
-                    record: Some(format!(r#"{{"height":{h}}}"#).into_bytes()),
-                })
-                .expect("fold");
-        }
-
-        let host = Host::genesis(vec![]).expect("genesis");
-        let finalized = FinalizedBlock {
-            height: 4,
-            root_hash: host.root_hash(),
-        };
-        let (tx, rx) = mpsc::channel::<RpcPair>(16);
-        let client = ChannelClient { tx };
-        let mut server = SyncServer::new();
-
-        let client_for_join = client.clone();
-        let join_side = async move {
-            let manifest = fetch_manifest(&client_for_join).await.expect("manifest");
-            let boundary = manifest.boundary_id();
-            let entries = statesync::fetch_index_modules(&client_for_join, boundary)
-                .await
-                .expect("index modules");
-            assert_eq!(
-                entries
-                    .iter()
-                    .map(|(db, _)| db.as_str())
-                    .collect::<Vec<_>>(),
-                vec!["_blocks", "chat", "tasks"],
-            );
-            // the joiner's exact sequence: fetch, decode, stage, commit.
-            let dest_dir = tempfile::tempdir().expect("dest dir");
-            let dest_base = dest_dir.path().join("index");
-            for (db, len) in &entries {
-                let blob = statesync::fetch_index_db(&client_for_join, boundary, db)
-                    .await
-                    .expect("index blob");
-                assert_eq!(blob.len() as u64, *len, "{db} blob length matches");
-                let files = statesync::decode_index_archive(&blob).expect("archive decodes");
-                indexer::stage_shipped_db(&indexer::DiskFs, &dest_base, db, &files).expect("stage");
-            }
-            indexer::commit_staged(&indexer::DiskFs, &dest_base).expect("commit");
-            dest_dir
-        };
-
-        let source_for_serve = &source;
-        let server_side = async {
-            let coords = statesync::BoundaryCoords::default();
-            let mut rx = rx;
-            while let Some((frame, reply)) = rx.next().await {
-                if let Ok(SyncRequest::IndexModules { boundary }) =
-                    statesync::decode_request(&frame)
-                    && !server.index_attached(boundary)
-                {
-                    let mut blobs = std::collections::BTreeMap::new();
-                    for db in ["chat", "tasks", indexer::BLOCKS_DB_ID] {
-                        let files = source_for_serve.checkpoint_files(db).expect("cut");
-                        blobs.insert(db.to_string(), statesync::encode_index_archive(&files));
-                    }
-                    server.attach_index(boundary, blobs).expect("attach");
-                }
-                let resp = server
-                    .handle_frame(&host, Some(finalized), &coords, &frame)
-                    .await;
-                let _ = reply.send(resp);
-            }
-        };
-        drop(client);
-        let (dest_dir, ()) = futures::join!(join_side, server_side);
-
-        // adoption at open: the shipped store equals the source and folds on.
-        let shipped = indexer::IndexStore::open(
-            dest_dir.path().join("index"),
-            &[
-                indexer::IndexModule::bare("chat"),
-                indexer::IndexModule::bare("tasks"),
-            ],
-        )
-        .expect("open adopted store");
-        assert_eq!(shipped.applied_height("chat").expect("chat wm"), 4);
-        assert_eq!(shipped.applied_height("tasks").expect("tasks wm"), 4);
-        assert_eq!(shipped.blocks_height().expect("blocks wm"), 4);
-        let rows = |s: &indexer::IndexStore| s.scan("chat", b"", None, 1024).expect("scan").entries;
-        assert_eq!(rows(&source), rows(&shipped), "chat keys byte-identical");
-        assert_eq!(
-            source.recent_block_rows(10).expect("source rows"),
-            shipped.recent_block_rows(10).expect("shipped rows"),
-        );
-        shipped
-            .apply_block(&indexer::BlockOps {
-                height: 5,
-                time: 1_005,
-                ops: vec![],
-                record: None,
+        .expect("scan");
+    let mut rows: Vec<(String, Vec<u8>)> = page
+        .entries
+        .iter()
+        .map(|(k, v)| (String::from_utf8(k.clone()).unwrap(), v.clone()))
+        .filter(|(k, _)| indexer::parse_op_key(k.as_bytes()).is_some_and(|(h, _)| h <= boundary))
+        .collect();
+    let has_more = rows.len() == page.entries.len() && page.has_more;
+    if corrupt && let Some((_, value)) = rows.last_mut() {
+        value.truncate(1); // a row that no longer borsh-decodes
+    }
+    SyncResponse::IndexOps {
+        next_after: has_more
+            .then(|| {
+                rows.last()
+                    .and_then(|(k, _)| indexer::parse_op_key(k.as_bytes()))
             })
-            .expect("fold continues above the shipped watermark");
-        assert_eq!(shipped.applied_height("chat").expect("chat wm"), 5);
-    });
+            .flatten(),
+        rows,
+        source_floor: source.backfill_height(module).expect("floor"),
+        applied_height: source.applied_height(module).expect("watermark"),
+    }
+}
+
+/// a client that answers `IndexOps` straight off a source store and refuses
+/// everything else — the whole wire under test here is the one lane.
+#[derive(Clone)]
+struct IndexOpsClient {
+    source: std::sync::Arc<indexer::IndexStore>,
+    page_len: usize,
+    /// corrupt the last row of every page: the byzantine-source arm.
+    corrupt: bool,
+}
+
+impl SyncClient for IndexOpsClient {
+    fn request(
+        &self,
+        req: SyncRequest,
+    ) -> impl std::future::Future<Output = Result<SyncResponse, SyncError>> + Send {
+        // the REAL codec on both sides: the page crosses as bytes, exactly as
+        // a mesh frame would carry it.
+        let source = self.source.clone();
+        let (page_len, corrupt) = (self.page_len, self.corrupt);
+        async move {
+            let framed = statesync::encode_request(&req);
+            let decoded = statesync::decode_request(&framed)?;
+            let SyncRequest::IndexOps {
+                boundary,
+                module,
+                after,
+            } = decoded
+            else {
+                return Ok(SyncResponse::Error(
+                    "only the IndexOps lane is served".into(),
+                ));
+            };
+            let resp = serve_index_ops(&source, &module, after, boundary, page_len, corrupt);
+            Ok(decode_response(&statesync::encode_response(&resp))?)
+        }
+    }
+}
+
+/// the reference mapper (crates/kernel/index-guest/testmap, refreshed by `make
+/// wasm-modules`). the wire lane has to be proven against a REAL FOLD, not
+/// just raw rows: paging, key order and folding are one mechanism, and a test
+/// that only diffs `op/` bytes would pass with the trigger never firing —
+/// while the user-visible symptom this whole lane exists to fix is an empty
+/// DERIVED view.
+const TESTMAP: &[u8] = include_bytes!("../../index-guest/testmap/index.wasm");
+
+fn store(dir: &std::path::Path) -> indexer::IndexStore {
+    indexer::IndexStore::open(
+        dir,
+        &[
+            indexer::IndexModule {
+                id: "chat",
+                guest: Some(TESTMAP),
+            },
+            indexer::IndexModule::bare("tasks"),
+        ],
+    )
+    .expect("open store")
+}
+
+fn feed(store: &indexer::IndexStore, heights: std::ops::RangeInclusive<u64>) {
+    for h in heights {
+        store
+            .apply_block(&indexer::BlockOps {
+                height: h,
+                time: 1_000 + h,
+                ops: vec![indexer::AppliedOp {
+                    module: "chat".into(),
+                    origin: indexer::OriginTag::external("jess"),
+                    payload: format!(r#"{{"post":"hi {h}"}}"#).into_bytes(),
+                    assigned: Vec::new(),
+                }],
+                record: Some(format!(r#"{{"height":{h}}}"#).into_bytes()),
+            })
+            .expect("fold");
+    }
+}
+
+/// walk the wire into a joiner store, exactly as the node's join seam does.
+fn backfill(
+    client: &IndexOpsClient,
+    joiner: &indexer::IndexStore,
+    boundary: u64,
+) -> Result<Option<u64>, SyncError> {
+    futures::executor::block_on(statesync::fetch_index_ops(
+        client,
+        "chat",
+        boundary,
+        |page| {
+            joiner
+                .write_backfill_rows("chat", page)
+                .map_err(|e| e.to_string())
+        },
+    ))
+}
+
+/// THE CRATE-LEVEL PROOF OF SPEC §7: a joiner stamped at a boundary pulls the
+/// source's op rows below it OVER THE WIRE, page by page, and ends up with the
+/// source's rows — feed and watermark included — instead of an empty view.
+#[test]
+fn a_stamped_joiner_backfills_the_sources_op_rows_over_the_wire() {
+    let src_dir = tempfile::tempdir().expect("src dir");
+    let dst_dir = tempfile::tempdir().expect("dst dir");
+    let source = std::sync::Arc::new(store(src_dir.path()));
+    feed(&source, 1..=9);
+    let joiner = store(dst_dir.path());
+    joiner.mark_backfilled("chat", 9).expect("stamp");
+    assert_eq!(
+        joiner
+            .scan("chat", indexer::OP_PREFIX.as_bytes(), None, 100)
+            .unwrap()
+            .entries
+            .len(),
+        0,
+        "the stamp is what leaves a joiner's views empty"
+    );
+
+    // page size 2: the cursor walk takes five round trips, so an off-by-one
+    // in either the cursor or the ordering check shows up as a gap.
+    let client = IndexOpsClient {
+        source: source.clone(),
+        page_len: 2,
+        corrupt: false,
+    };
+    let floor = backfill(&client, &joiner, 9).expect("backfill");
+    assert_eq!(floor, None, "a source that reaches genesis has no floor");
+    // the join seam's closing move, in its order: drain the fold the writes
+    // triggered, THEN lower the floor over rows that are actually derived.
+    joiner.wait_folds_drained().expect("joiner folds drain");
+    source.wait_folds_drained().expect("source folds drain");
+    joiner.set_backfill_floor("chat", floor).expect("floor");
+
+    let rows = |s: &indexer::IndexStore| {
+        s.scan("chat", indexer::OP_PREFIX.as_bytes(), None, 1024)
+            .expect("scan")
+            .entries
+    };
+    assert_eq!(rows(&source), rows(&joiner), "op rows byte-identical");
+    assert_eq!(joiner.applied_height("chat").unwrap(), 9);
+    assert_eq!(joiner.backfill_height("chat").unwrap(), None);
+
+    // THE POINT OF THE LANE: the rows that crossed the wire were FOLDED, so
+    // the joiner's derived view answers for pre-boundary history exactly as
+    // the source's does. `count` and the per-op `seen/` rows are the testmap's
+    // derived key space; the tip is the fold's own progress mark, and it only
+    // reaches (9, 0) if every page landed in ascending order.
+    let derived = |s: &indexer::IndexStore| {
+        s.scan("chat", b"seen/", None, 1024)
+            .expect("scan")
+            .entries
+            .len()
+    };
+    assert_eq!(
+        derived(&joiner),
+        9,
+        "every backfilled op derived a view row"
+    );
+    assert_eq!(derived(&source), derived(&joiner), "same derived rows");
+    assert_eq!(
+        joiner.view("chat", b"count").unwrap(),
+        source.view("chat", b"count").unwrap(),
+        "the derived view matches the source's"
+    );
+    assert_eq!(
+        joiner.fold_tip("chat").unwrap(),
+        source.fold_tip("chat").unwrap()
+    );
+    assert_eq!(joiner.fold_tip("chat").unwrap(), Some((9, 0)));
+}
+
+/// A SOURCE'S OWN TRUNCATION COMPOSES INTO THE JOINER'S. The source joined
+/// late too, so it has no rows below ITS floor — inheriting that floor is the
+/// only honest answer, and claiming genesis would be a lie the joiner told
+/// about content nobody has.
+#[test]
+fn the_sources_floor_composes_into_the_joiners() {
+    let src_dir = tempfile::tempdir().expect("src dir");
+    let dst_dir = tempfile::tempdir().expect("dst dir");
+    let source = std::sync::Arc::new(store(src_dir.path()));
+    // the source itself joined at 4, then folded 5..=9.
+    source.mark_backfilled("chat", 4).expect("source stamp");
+    feed(&source, 5..=9);
+    let joiner = store(dst_dir.path());
+    joiner.mark_backfilled("chat", 9).expect("stamp");
+
+    let client = IndexOpsClient {
+        source: source.clone(),
+        page_len: 3,
+        corrupt: false,
+    };
+    let floor = backfill(&client, &joiner, 9).expect("backfill");
+    assert_eq!(floor, Some(4), "the source's truncation travels");
+    joiner.set_backfill_floor("chat", floor).expect("floor");
+    assert_eq!(joiner.backfill_height("chat").unwrap(), Some(4));
+    assert_eq!(
+        joiner
+            .scan("chat", indexer::OP_PREFIX.as_bytes(), None, 100)
+            .unwrap()
+            .entries
+            .len(),
+        5,
+        "exactly the rows the source actually held"
+    );
+}
+
+/// A PAGE THAT FAILS STRUCTURAL VALIDATION ABORTS THE MODULE, AND THE
+/// BOUNDARY FLOOR STANDS. These rows are unverifiable by design, so the one
+/// thing the trust boundary can still refuse is garbage — and refusing it has
+/// to leave the joiner exactly as honest as it was before it asked.
+#[test]
+fn a_corrupt_page_aborts_the_backfill_and_keeps_the_boundary_floor() {
+    let src_dir = tempfile::tempdir().expect("src dir");
+    let dst_dir = tempfile::tempdir().expect("dst dir");
+    let source = std::sync::Arc::new(store(src_dir.path()));
+    feed(&source, 1..=9);
+    let joiner = store(dst_dir.path());
+    joiner.mark_backfilled("chat", 9).expect("stamp");
+
+    let client = IndexOpsClient {
+        source,
+        page_len: 4,
+        corrupt: true,
+    };
+    let err = backfill(&client, &joiner, 9).expect_err("a corrupt row must refuse");
+    assert!(
+        matches!(&err, SyncError::Module { reason, .. } if reason.contains("borsh")),
+        "want a structural refusal, got {err}"
+    );
+    // the floor setter is never reached, so the stamp stands — the joiner
+    // still says, honestly, that everything below 9 is absent.
+    assert_eq!(joiner.backfill_height("chat").unwrap(), Some(9));
+}
+
+/// A SOURCE THAT FOLDED LESS THAN IT IS ASKED FOR IS REFUSED. Writing its rows
+/// anyway would leave the joiner with a HOLE between the source's watermark
+/// and its own boundary — rows below a floor that claims they are all there.
+#[test]
+fn a_source_behind_the_boundary_is_refused_before_a_hole_can_form() {
+    let src_dir = tempfile::tempdir().expect("src dir");
+    let dst_dir = tempfile::tempdir().expect("dst dir");
+    let source = std::sync::Arc::new(store(src_dir.path()));
+    feed(&source, 1..=4);
+    let joiner = store(dst_dir.path());
+    joiner.mark_backfilled("chat", 9).expect("stamp");
+
+    let client = IndexOpsClient {
+        source,
+        page_len: 8,
+        corrupt: false,
+    };
+    let err = backfill(&client, &joiner, 9).expect_err("a lagging source must refuse");
+    assert!(
+        matches!(&err, SyncError::Module { reason, .. } if reason.contains("hole")),
+        "want the hole refusal, got {err}"
+    );
+    assert_eq!(joiner.backfill_height("chat").unwrap(), Some(9));
+}
+
+/// A SOURCE WHOSE FLOOR ROSE ABOVE THE BOUNDARY IS REFUSED, NOT COMPOSED. It
+/// state-synced forward past the range it is being asked for, so it holds none
+/// of it — and inheriting a floor of 20 under a watermark of 9 would leave the
+/// joiner claiming more missing than it has. The stamp is the honest answer.
+#[test]
+fn a_source_that_restamped_past_the_boundary_is_refused_not_composed() {
+    let src_dir = tempfile::tempdir().expect("src dir");
+    let dst_dir = tempfile::tempdir().expect("dst dir");
+    let source = std::sync::Arc::new(store(src_dir.path()));
+    feed(&source, 1..=9);
+    // the source jumped to a boundary ABOVE the one the joiner is asking about,
+    // which wiped every row the joiner wants.
+    source.mark_backfilled("chat", 20).expect("source restamp");
+    feed(&source, 21..=22);
+    let joiner = store(dst_dir.path());
+    joiner.mark_backfilled("chat", 9).expect("stamp");
+
+    let client = IndexOpsClient {
+        source,
+        page_len: 8,
+        corrupt: false,
+    };
+    let err = backfill(&client, &joiner, 9).expect_err("a re-stamped source must refuse");
+    assert!(
+        matches!(&err, SyncError::Module { reason, .. } if reason.contains("rose above")),
+        "want the risen-floor refusal, got {err}"
+    );
+    assert_eq!(joiner.backfill_height("chat").unwrap(), Some(9));
+}
+
+/// A CURSOR WITHOUT ROWS BEHIND IT IS THE WALK'S ONLY UNBOUNDED SHAPE, and it
+/// has to be refused rather than re-asked. A source that serves a page, then
+/// answers "no rows, but ask again from the same place", would otherwise spin
+/// a joining node forever — inside the join seam, before it ever serves.
+#[test]
+fn an_empty_page_re_offering_its_cursor_is_refused_not_re_asked() {
+    /// serves ONE real row, then empty pages that keep re-offering the cursor
+    /// it already handed out.
+    #[derive(Clone)]
+    struct StuckSource;
+    impl SyncClient for StuckSource {
+        fn request(
+            &self,
+            req: SyncRequest,
+        ) -> impl std::future::Future<Output = Result<SyncResponse, SyncError>> + Send {
+            let SyncRequest::IndexOps { after, .. } = req else {
+                unreachable!("only the IndexOps lane is asked")
+            };
+            async move {
+                let row = borsh::to_vec(&indexer::OpRow {
+                    height: 1,
+                    seq: 0,
+                    time: 1_001,
+                    origin: indexer::OriginTag::external("jess"),
+                    payload: b"{}".to_vec(),
+                    assigned: Vec::new(),
+                })
+                .expect("row encodes");
+                Ok(SyncResponse::IndexOps {
+                    // the FIRST ask gets the row; every ask from its cursor
+                    // gets nothing but the same cursor back.
+                    rows: match after {
+                        None => vec![(indexer::op_key(1, 0), row)],
+                        Some(_) => Vec::new(),
+                    },
+                    next_after: Some((1, 0)),
+                    source_floor: None,
+                    applied_height: 9,
+                })
+            }
+        }
+    }
+    let err =
+        futures::executor::block_on(statesync::fetch_index_ops(&StuckSource, "chat", 9, |_| {
+            Ok(())
+        }))
+        .expect_err("an empty page re-offering its cursor must refuse");
+    assert!(
+        matches!(&err, SyncError::Module { reason, .. } if reason.contains("0 rows served")),
+        "want the no-progress refusal, got {err}"
+    );
+}
+
+/// A KEY THAT PARSES IS NOT A KEY THAT SORTS. `op/2/0` decodes to `(2, 0)` —
+/// `from_str_radix` neither demands the canonical width nor rejects a leading
+/// `+` — so a source can pass every ascent check while handing the joiner a
+/// key that lands AFTER `op/0000000000000009/0000` in the store. Key order is
+/// the one invariant this whole lane rests on: the next `converge_guest`
+/// refold replays `op/` in KEY order, so a mis-sorted row means every derived
+/// view is rebuilt from history running backwards, silently. The boundary
+/// therefore demands the byte-exact canonical rendering, not a parse.
+#[test]
+fn a_non_canonical_op_key_is_refused_even_though_it_parses_and_ascends() {
+    /// one page, two rows, ASCENDING BY PARSED POSITION — and the first key is
+    /// short-form, so its bytes sort after the second's.
+    #[derive(Clone)]
+    struct WidthLiar;
+    impl SyncClient for WidthLiar {
+        fn request(
+            &self,
+            req: SyncRequest,
+        ) -> impl std::future::Future<Output = Result<SyncResponse, SyncError>> + Send {
+            let SyncRequest::IndexOps { .. } = req else {
+                unreachable!("only the IndexOps lane is asked")
+            };
+            async move {
+                let row = |height: u64| {
+                    borsh::to_vec(&indexer::OpRow {
+                        height,
+                        seq: 0,
+                        time: 1_000 + height,
+                        origin: indexer::OriginTag::external("jess"),
+                        payload: b"{}".to_vec(),
+                        assigned: Vec::new(),
+                    })
+                    .expect("row encodes")
+                };
+                Ok(SyncResponse::IndexOps {
+                    rows: vec![
+                        ("op/2/0".to_string(), row(2)),
+                        (indexer::op_key(9, 0), row(9)),
+                    ],
+                    next_after: None,
+                    source_floor: None,
+                    applied_height: 9,
+                })
+            }
+        }
+    }
+    // proof the row is otherwise impeccable: it parses, it ascends, its height
+    // is under the boundary, and it borsh-decodes agreeing with its own key.
+    assert_eq!(indexer::parse_op_key(b"op/2/0"), Some((2, 0)));
+    assert!(
+        "op/2/0" > indexer::op_key(9, 0).as_str(),
+        "and it MIS-SORTS"
+    );
+
+    let mut written = 0usize;
+    let err =
+        futures::executor::block_on(statesync::fetch_index_ops(&WidthLiar, "chat", 9, |page| {
+            written += page.len();
+            Ok(())
+        }))
+        .expect_err("a non-canonical op key must refuse");
+    assert!(
+        matches!(&err, SyncError::Module { reason, .. } if reason.contains("canonical")),
+        "want the canonical-shape refusal, got {err}"
+    );
+    assert_eq!(written, 0, "nothing from a lying page may reach the store");
 }
