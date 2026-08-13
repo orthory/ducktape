@@ -1,5 +1,16 @@
 // Ice owns UI discriminants as closed types. A new phase or destination must
 // update every exhaustive match instead of silently becoming another string.
+enum LiveKind
+  retry
+  tip
+  ready
+  chat
+  bell
+  pages
+  forge
+  plane
+  resync
+
 enum SearchPhase
   idle
   searching

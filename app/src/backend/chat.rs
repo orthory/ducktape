@@ -28,12 +28,28 @@ pub fn optimistic_message(
     body: String,
     message_id: String,
 ) -> Vec<ChatMessage> {
-    chat::client::optimistic_message(
+    bounded_chat_window(chat::client::optimistic_message(
         messages,
         body,
         message_id,
         rpc::cached_user_key().as_deref(),
-    )
+    ))
+}
+
+/// The thread rail owns a root plus one sliding reply page. The server cursor
+/// remains authoritative for older/newer pages; mounted rich rows stay bounded
+/// while a hot thread keeps receiving replies.
+pub fn optimistic_thread_message(
+    messages: Vec<ChatMessage>,
+    body: String,
+    message_id: String,
+) -> Vec<ChatMessage> {
+    bounded_thread_window(chat::client::optimistic_message(
+        messages,
+        body,
+        message_id,
+        rpc::cached_user_key().as_deref(),
+    ))
 }
 
 /// [`chat::client::mark_message_groups`] as a value fold, for the reducer.
@@ -350,18 +366,16 @@ pub async fn load_thread(
     channel_id: String,
     root_seq: i64,
     target_seq: i64,
-    through_reply_offset: i64,
     generation: i64,
 ) -> Result<ThreadLoadData, HydrationError> {
-    let result =
-        load_thread_window(rpc, channel_id, root_seq, target_seq, through_reply_offset).await;
+    let result = load_thread_window(rpc, channel_id, root_seq, target_seq).await;
     result
         .map(|thread| ThreadLoadData {
             generation,
             root_seq: thread.root_seq,
             target_seq: thread.target_seq,
             messages: thread.messages,
-            next_reply_offset: thread.next_reply_offset,
+            next_reply_seq: thread.next_reply_seq,
             has_more: thread.has_more,
         })
         .map_err(|message| HydrationError {
@@ -375,62 +389,40 @@ async fn load_thread_window(
     channel_id: String,
     root_seq: i64,
     target_seq: i64,
-    through_reply_offset: i64,
 ) -> Result<ThreadData, String> {
     let root_seq = positive_sequence(root_seq)?;
     let target_seq = u64::try_from(target_seq).unwrap_or(0);
-    let is_sparse_target = through_reply_offset < 0 && target_seq > 0;
-    let through_reply_offset = u64::try_from(through_reply_offset)
-        .unwrap_or(0)
-        .min(chat::MAX_THREAD_REPLIES as u64);
     let rpc = rpc_client(&rpc)?;
-    if is_sparse_target {
+    if target_seq > 0 {
         return load_sparse_thread_data(&rpc, &channel_id, root_seq, target_seq).await;
     }
-    let mut thread = load_thread_data(&rpc, &channel_id, root_seq, through_reply_offset).await?;
-    let target_is_loaded = target_seq > 0
-        && thread
-            .messages
-            .iter()
-            .any(|message| message.seq == number_i64(target_seq));
-    if target_is_loaded {
-        thread.target_seq = number_i64(target_seq);
-    }
-    Ok(thread)
+    load_thread_data(&rpc, &channel_id, root_seq).await
 }
 
 pub async fn load_thread_page(
     rpc: String,
     channel_id: String,
     root_seq: i64,
-    from: i64,
+    after_reply_seq: i64,
     generation: i64,
 ) -> Result<ThreadPageData, HydrationError> {
     let result = async {
         let root_seq = positive_sequence(root_seq)?;
-        let from = u64::try_from(from).map_err(|_| "invalid thread offset".to_string())?;
+        let after_reply_seq = u64::try_from(after_reply_seq).ok().filter(|seq| *seq > 0);
         let rpc = rpc_client(&rpc)?;
-        let thread = query_thread_page(&rpc, &channel_id, root_seq).await?;
-        let total = thread.replies.len() as u64;
-        let start = from.min(total);
-        let page_len = CHAT_VIEW_PAGE_LIMIT.min(total - start);
-        let next_reply_offset = start + page_len;
-        let page_is_full = page_len == CHAT_VIEW_PAGE_LIMIT;
-        let thread_cap_reached = next_reply_offset >= chat::MAX_THREAD_REPLIES as u64;
-        let has_more = page_is_full && !thread_cap_reached;
+        let thread = query_thread_page(&rpc, &channel_id, root_seq, after_reply_seq).await?;
+        let next_reply_seq = number_i64(thread.next_reply_seq.unwrap_or(0));
         let current_user = local_user_key().await;
         let messages = thread
             .replies
             .into_iter()
-            .skip(start as usize)
-            .take(page_len as usize)
             .map(|row| chat_message(row, current_user.as_deref()))
             .collect();
         Ok(ThreadPageData {
             generation,
             messages,
-            next_reply_offset: number_i64(next_reply_offset),
-            has_more,
+            next_reply_seq,
+            has_more: thread.has_more,
         })
     }
     .await;
@@ -444,36 +436,24 @@ pub async fn refresh_live_thread(
     rpc: String,
     channel_id: String,
     root_seq: i64,
-    target_seq: i64,
-    through_reply_offset: i64,
 ) -> Result<LiveThreadData, AppError> {
     if channel_id.is_empty() || root_seq <= 0 {
         return Ok(LiveThreadData {
             channel_id,
             root_seq: 0,
-            target_seq: 0,
             messages: Vec::new(),
-            next_reply_offset: 0,
-            has_more: false,
         });
     }
-    load_thread_window(
-        rpc,
-        channel_id.clone(),
-        root_seq,
-        target_seq,
-        through_reply_offset,
-    )
-    .await
-    .map(|thread| LiveThreadData {
-        channel_id,
-        root_seq: thread.root_seq,
-        target_seq: thread.target_seq,
-        messages: thread.messages,
-        next_reply_offset: thread.next_reply_offset,
-        has_more: thread.has_more,
-    })
-    .map_err(app_error)
+    let root_seq = positive_sequence(root_seq).map_err(app_error)?;
+    let rpc = rpc_client(&rpc).map_err(app_error)?;
+    load_thread_data(&rpc, &channel_id, root_seq)
+        .await
+        .map(|thread| LiveThreadData {
+            channel_id,
+            root_seq: thread.root_seq,
+            messages: thread.messages,
+        })
+        .map_err(app_error)
 }
 
 pub async fn send_reply(

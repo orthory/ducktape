@@ -21,6 +21,9 @@
 //!   ([`MsgRow`]): structured blocks, flattened search text, authorship,
 //!   edit/thread summaries, and reaction state. edits rewrite it, deletes
 //!   tombstone it, reactions update it in place.
+//! - `root/{channel}/{u64::MAX-seq:016x}` — one marker per timeline root,
+//!   newest first. timeline paging scans this keyspace directly, so replies
+//!   never make opening a channel or loading history more expensive.
 //! - `msgid/{message_id}`               — global id → (channel, seq) pointer.
 //! - `rev/{channel}/{seq:016x}/{rev:08x}` — the immutable prior head a
 //!   revision replaced, ascending by revision.
@@ -189,7 +192,7 @@ struct TokRef {
 /// `Serialize` too: typed clients (the app's `RpcClient::view`) build
 /// requests from this same enum, so the wire has one definition site.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ChatViewQuery {
     /// the channel list, ascending by id, cursor-paged.
     Channels {
@@ -200,17 +203,13 @@ pub enum ChatViewQuery {
     },
     /// one channel joined with its head-seq mirror.
     Channel { channel_id: String },
-    /// the newest `limit` messages, ascending by sequence — computed off the
-    /// `seq/` mirror, tombstones included, so pagination stays gap-free.
-    MessagesLatest {
+    /// One page of timeline roots older than `before_seq`, returned oldest
+    /// first. `None` opens the live tail. The numeric cursor is the oldest
+    /// root sequence in the page; storage keys never cross this boundary.
+    Roots {
         channel_id: String,
         #[serde(default)]
-        limit: Option<usize>,
-    },
-    /// `limit` messages starting at `from_seq`, ascending.
-    MessagesRange {
-        channel_id: String,
-        from_seq: u64,
+        before_seq: Option<u64>,
         #[serde(default)]
         limit: Option<usize>,
     },
@@ -231,7 +230,7 @@ pub enum ChatViewQuery {
         channel_id: String,
         root_seq: u64,
         #[serde(default)]
-        after: Option<String>,
+        after_reply_seq: Option<u64>,
         #[serde(default)]
         limit: Option<usize>,
     },
@@ -273,7 +272,7 @@ pub enum ChatViewQuery {
 
 /// chat's view replies, externally tagged like the requests.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ChatViewReply {
     /// one cursor page of channels, ascending by id.
     Channels {
@@ -283,8 +282,15 @@ pub enum ChatViewReply {
         next_after: Option<String>,
     },
     Channel(Option<ChannelInfo>),
-    /// message rows ascending by sequence (pages) — absent rows below a
-    /// backfill floor are skipped, never errored.
+    /// One numeric-cursor page of timeline roots, oldest first.
+    Roots {
+        roots: Vec<MsgRow>,
+        has_more: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_before_seq: Option<u64>,
+    },
+    /// message rows ascending by sequence for a jump window — absent rows
+    /// below a backfill floor are skipped, never errored.
     Messages(Vec<MsgRow>),
     Message(Option<MsgRow>),
     /// prior heads ascending by revision.
@@ -296,7 +302,7 @@ pub enum ChatViewReply {
         replies: Vec<MsgRow>,
         has_more: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
-        next_after: Option<String>,
+        next_reply_seq: Option<u64>,
     },
     Reactions(Vec<ReactionRow>),
     /// one cursor page of the member roster.
@@ -321,6 +327,11 @@ fn channel_row_key(channel: &str) -> String {
 
 fn msg_key(channel: &str, seq: u64) -> String {
     format!("msg/{channel}/{seq:016x}")
+}
+
+fn root_marker_key(channel: &str, seq: u64) -> String {
+    let reverse_seq = u64::MAX - seq;
+    format!("root/{channel}/{reverse_seq:016x}")
 }
 
 fn msgid_key(message_id: &str) -> String {
@@ -546,19 +557,27 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                 msgid_key(&message_id),
                 encode_json(&(channel_id.clone(), seq))?,
             );
-            if let Some(root_seq) = thread {
-                index_guest::put(
-                    &mut out,
-                    thread_marker_key(&channel_id, root_seq, seq),
-                    seq.to_be_bytes().to_vec(),
-                );
-                // the root carries the reply summary; a pre-index root skips
-                // it (its marker still lands, so the page stays complete).
-                if let Some(mut root) = read_row(read, &msg_key(&channel_id, root_seq))? {
-                    root.reply_count += 1;
-                    root.last_reply_seq = Some(seq);
-                    put_row(&mut out, &root)?;
+            match thread {
+                Some(root_seq) => {
+                    index_guest::put(
+                        &mut out,
+                        thread_marker_key(&channel_id, root_seq, seq),
+                        seq.to_be_bytes().to_vec(),
+                    );
+                    // the root carries the reply summary; a pre-index root
+                    // skips it (its marker still lands, so the page stays
+                    // complete).
+                    if let Some(mut root) = read_row(read, &msg_key(&channel_id, root_seq))? {
+                        root.reply_count += 1;
+                        root.last_reply_seq = Some(seq);
+                        put_row(&mut out, &root)?;
+                    }
                 }
+                None => index_guest::put(
+                    &mut out,
+                    root_marker_key(&channel_id, seq),
+                    seq.to_be_bytes().to_vec(),
+                ),
             }
             let text = plain_text(&blocks);
             let tag_labels = tags::labels(&blocks);
@@ -854,28 +873,37 @@ pub fn serve_view(read: &impl StateRead, req: &[u8]) -> Result<Vec<u8>, Fail> {
             let info = read_channel(read, &channel_id)?.map(|row| channel_info(read, row));
             reply_json(&ChatViewReply::Channel(info))
         }
-        ChatViewQuery::MessagesLatest { channel_id, limit } => {
-            let head = read_u64(read, &seq_key(&channel_id));
-            if head == 0 {
-                return reply_messages(Vec::new());
-            }
-            let limit = clamp_page(limit) as u64;
-            let from = head.saturating_sub(limit - 1).max(1);
-            reply_messages(messages_run(read, &channel_id, from, head)?)
-        }
-        ChatViewQuery::MessagesRange {
+        ChatViewQuery::Roots {
             channel_id,
-            from_seq,
+            before_seq,
             limit,
         } => {
-            let head = read_u64(read, &seq_key(&channel_id));
-            let from = from_seq.max(1);
-            if from > head {
-                return reply_messages(Vec::new());
+            let prefix = format!("root/{channel_id}/");
+            let after = before_seq.map(|seq| root_marker_key(&channel_id, seq));
+            let page = read.scan_page(
+                prefix.as_bytes(),
+                after.as_deref().map(str::as_bytes),
+                clamp_page(limit),
+            );
+            let mut roots = Vec::with_capacity(page.entries.len());
+            for (_key, value) in &page.entries {
+                let seq = <[u8; 8]>::try_from(value.as_slice())
+                    .map(u64::from_be_bytes)
+                    .map_err(|_| Fail::new(FAIL_ROW_DECODE, "root marker is not a u64"))?;
+                let row = read_row(read, &msg_key(&channel_id, seq))?
+                    .ok_or_else(|| Fail::new(FAIL_ROW_DECODE, "root marker has no message"))?;
+                if row.thread.is_some() {
+                    return Err(Fail::new(FAIL_ROW_DECODE, "root marker points at a reply"));
+                }
+                roots.push(row);
             }
-            let limit = clamp_page(limit) as u64;
-            let to = head.min(from.saturating_add(limit - 1));
-            reply_messages(messages_run(read, &channel_id, from, to)?)
+            roots.reverse();
+            let next_before_seq = (page.has_more && !roots.is_empty()).then(|| roots[0].seq);
+            reply_json(&ChatViewReply::Roots {
+                roots,
+                has_more: page.has_more,
+                next_before_seq,
+            })
         }
         ChatViewQuery::MessagesAround {
             channel_id,
@@ -921,7 +949,7 @@ pub fn serve_view(read: &impl StateRead, req: &[u8]) -> Result<Vec<u8>, Fail> {
         ChatViewQuery::Thread {
             channel_id,
             root_seq,
-            after,
+            after_reply_seq,
             limit,
         } => {
             let is_root = |row: &MsgRow| row.thread.is_none();
@@ -931,10 +959,12 @@ pub fn serve_view(read: &impl StateRead, req: &[u8]) -> Result<Vec<u8>, Fail> {
                     root: None,
                     replies: Vec::new(),
                     has_more: false,
-                    next_after: None,
+                    next_reply_seq: None,
                 });
             }
             let prefix = format!("thread/{channel_id}/{root_seq:016x}/");
+            let after = after_reply_seq
+                .map(|reply_seq| thread_marker_key(&channel_id, root_seq, reply_seq));
             let page = read.scan_page(
                 prefix.as_bytes(),
                 after.as_deref().map(str::as_bytes),
@@ -945,15 +975,22 @@ pub fn serve_view(read: &impl StateRead, req: &[u8]) -> Result<Vec<u8>, Fail> {
                 let reply_seq = <[u8; 8]>::try_from(value.as_slice())
                     .map(u64::from_be_bytes)
                     .map_err(|_| Fail::new(FAIL_ROW_DECODE, "thread marker is not a u64"))?;
-                if let Some(row) = read_row(read, &msg_key(&channel_id, reply_seq))? {
-                    replies.push(row);
+                let row = read_row(read, &msg_key(&channel_id, reply_seq))?
+                    .ok_or_else(|| Fail::new(FAIL_ROW_DECODE, "thread marker has no message"))?;
+                if row.thread != Some(root_seq) {
+                    return Err(Fail::new(
+                        FAIL_ROW_DECODE,
+                        "thread marker points outside its thread",
+                    ));
                 }
+                replies.push(row);
             }
             reply_json(&ChatViewReply::Thread {
                 root,
+                next_reply_seq: (page.has_more && !replies.is_empty())
+                    .then(|| replies[replies.len() - 1].seq),
                 replies,
                 has_more: page.has_more,
-                next_after: page.next_after,
             })
         }
         ChatViewQuery::Reactions { channel_id, seq } => {
@@ -1057,11 +1094,9 @@ mod tests {
     /// explicit stamp through [`op_with`] instead.
     fn assigned_for(map: &Map, msg: &ChatMsg) -> Vec<u8> {
         match msg {
-            ChatMsg::PostMessage { channel_id, .. } => {
-                encode_assigned(&ChatAssigned::Posted {
-                    seq: read_u64(map, &seq_key(channel_id)) + 1,
-                })
-            }
+            ChatMsg::PostMessage { channel_id, .. } => encode_assigned(&ChatAssigned::Posted {
+                seq: read_u64(map, &seq_key(channel_id)) + 1,
+            }),
             ChatMsg::EditMessage {
                 channel_id, seq, ..
             } => {
@@ -1274,6 +1309,27 @@ mod tests {
             serve_view(&map, br#"{"search": {"text": "!!!"}}"#).is_err(),
             "no tokens is a view error"
         );
+        assert!(
+            serve_view(
+                &map,
+                br#"{"thread":{"channel_id":"g","root_seq":1,"after":"old-key"}}"#,
+            )
+            .is_err(),
+            "the deleted storage-key cursor is not tolerated"
+        );
+        assert!(
+            serde_json::from_value::<ChatViewReply>(serde_json::json!({
+                "thread": {
+                    "root": null,
+                    "replies": [],
+                    "has_more": false,
+                    "next_reply_seq": null,
+                    "next_after": "old-key"
+                }
+            }))
+            .is_err(),
+            "reply decoders reject fields from the deleted wire"
+        );
     }
 
     // ---- the read model --------------------------------------------------
@@ -1298,8 +1354,9 @@ mod tests {
         fold(&mut map, 2, &create("random", "Random"));
         fold(&mut map, 3, &post("general", "m1", "hello"));
 
-        let ChatViewReply::Channels { channels, has_more, .. } =
-            view(&map, serde_json::json!({"channels": {}}))
+        let ChatViewReply::Channels {
+            channels, has_more, ..
+        } = view(&map, serde_json::json!({"channels": {}}))
         else {
             panic!("wrong reply shape")
         };
@@ -1326,9 +1383,10 @@ mod tests {
                 archived: true,
             },
         );
-        let ChatViewReply::Channel(Some(info)) =
-            view(&map, serde_json::json!({"channel": {"channel_id": "random"}}))
-        else {
+        let ChatViewReply::Channel(Some(info)) = view(
+            &map,
+            serde_json::json!({"channel": {"channel_id": "random"}}),
+        ) else {
             panic!("random exists")
         };
         assert_eq!(info.channel.name, "Water Cooler");
@@ -1336,31 +1394,86 @@ mod tests {
     }
 
     #[test]
-    fn message_pages_range_latest_around() {
+    fn root_pages_skip_reply_traffic_and_use_numeric_cursors() {
         let mut map = Map::new();
-        for i in 1..=7 {
-            fold(&mut map, i, &post("g", &format!("m{i}"), &format!("msg {i}")));
+        fold(&mut map, 1, &post("g", "root-1", "root 1"));
+        fold(&mut map, 2, &post("g", "root-2", "root 2"));
+        fold(&mut map, 3, &post("g", "root-3", "root 3"));
+        for i in 0..300 {
+            fold(
+                &mut map,
+                4 + i,
+                &ChatMsg::PostMessage {
+                    channel_id: "g".into(),
+                    message_id: format!("reply-{i}"),
+                    blocks: vec![Block::paragraph(format!("reply {i}"))],
+                    thread: Some(3),
+                    as_agent: None,
+                },
+            );
         }
+        fold(
+            &mut map,
+            400,
+            &ChatMsg::DeleteMessage {
+                channel_id: "g".into(),
+                seq: 2,
+            },
+        );
 
-        let ChatViewReply::Messages(rows) = view(
+        let ChatViewReply::Roots {
+            roots,
+            has_more,
+            next_before_seq,
+        } = view(
             &map,
-            serde_json::json!({"messages_latest": {"channel_id": "g", "limit": 3}}),
-        ) else {
+            serde_json::json!({"roots": {"channel_id": "g", "limit": 2}}),
+        )
+        else {
             panic!("wrong reply shape")
         };
         assert_eq!(
-            rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
-            vec![5, 6, 7]
+            roots.iter().map(|row| row.seq).collect::<Vec<_>>(),
+            vec![2, 3],
+            "300 newer replies do not consume the root page"
         );
-        assert_eq!(rows[0].blocks, vec![Block::paragraph("msg 5")]);
+        assert!(has_more);
+        assert_eq!(next_before_seq, Some(2));
+        assert!(roots[0].deleted, "a tombstoned root keeps its page marker");
 
-        let ChatViewReply::Messages(rows) = view(
+        let ChatViewReply::Roots {
+            roots,
+            has_more,
+            next_before_seq,
+        } = view(
             &map,
-            serde_json::json!({"messages_range": {"channel_id": "g", "from_seq": 2, "limit": 2}}),
-        ) else {
+            serde_json::json!({"roots": {"channel_id": "g", "before_seq": 2, "limit": 2}}),
+        )
+        else {
             panic!("wrong reply shape")
         };
-        assert_eq!(rows.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(roots.iter().map(|row| row.seq).collect::<Vec<_>>(), vec![1]);
+        assert!(!has_more);
+        assert_eq!(next_before_seq, None);
+
+        let ChatViewReply::Roots { roots, .. } =
+            view(&map, serde_json::json!({"roots": {"channel_id": "nope"}}))
+        else {
+            panic!("wrong reply shape")
+        };
+        assert!(roots.is_empty());
+    }
+
+    #[test]
+    fn messages_around_centers_a_jump_window() {
+        let mut map = Map::new();
+        for i in 1..=7 {
+            fold(
+                &mut map,
+                i,
+                &post("g", &format!("m{i}"), &format!("msg {i}")),
+            );
+        }
 
         let ChatViewReply::Messages(rows) = view(
             &map,
@@ -1372,15 +1485,6 @@ mod tests {
             rows.iter().map(|r| r.seq).collect::<Vec<_>>(),
             vec![3, 4, 5]
         );
-
-        // an empty channel pages empty, never errors.
-        let ChatViewReply::Messages(rows) = view(
-            &map,
-            serde_json::json!({"messages_latest": {"channel_id": "nope"}}),
-        ) else {
-            panic!("wrong reply shape")
-        };
-        assert!(rows.is_empty());
     }
 
     #[test]
@@ -1469,23 +1573,35 @@ mod tests {
             );
         }
 
-        let ChatViewReply::Thread { root, replies, has_more, next_after } = view(
+        let ChatViewReply::Thread {
+            root,
+            replies,
+            has_more,
+            next_reply_seq,
+        } = view(
             &map,
             serde_json::json!({"thread": {"channel_id": "g", "root_seq": 1, "limit": 2}}),
-        ) else {
+        )
+        else {
             panic!("wrong reply shape")
         };
         let root = root.expect("root indexed");
         assert_eq!(root.reply_count, 3);
         assert_eq!(root.last_reply_seq, Some(5));
-        assert_eq!(replies.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![3, 4]);
+        assert_eq!(
+            replies.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
         assert!(has_more);
 
-        let ChatViewReply::Thread { replies, has_more, .. } = view(
+        let ChatViewReply::Thread {
+            replies, has_more, ..
+        } = view(
             &map,
             serde_json::json!({"thread": {"channel_id": "g", "root_seq": 1,
-                "after": next_after.unwrap(), "limit": 2}}),
-        ) else {
+                "after_reply_seq": next_reply_seq.unwrap(), "limit": 2}}),
+        )
+        else {
             panic!("wrong reply shape")
         };
         assert_eq!(replies.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![5]);
@@ -1521,9 +1637,16 @@ mod tests {
             panic!("wrong reply shape")
         };
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows.iter().map(|r| r.emoji.as_str()).collect::<Vec<_>>(),
-            vec!["🎉", "🚀"], "emoji-sorted");
-        assert_eq!(rows[0].reactors, vec!["user:jess"], "duplicate add collapsed");
+        assert_eq!(
+            rows.iter().map(|r| r.emoji.as_str()).collect::<Vec<_>>(),
+            vec!["🎉", "🚀"],
+            "emoji-sorted"
+        );
+        assert_eq!(
+            rows[0].reactors,
+            vec!["user:jess"],
+            "duplicate add collapsed"
+        );
 
         fold(
             &mut map,
@@ -1572,10 +1695,9 @@ mod tests {
         fold(&mut map, 3, &membership("bob", true));
         fold(&mut map, 4, &membership("alice", false));
 
-        let ChatViewReply::Members { members, .. } = view(
-            &map,
-            serde_json::json!({"members": {"channel_id": "g"}}),
-        ) else {
+        let ChatViewReply::Members { members, .. } =
+            view(&map, serde_json::json!({"members": {"channel_id": "g"}}))
+        else {
             panic!("wrong reply shape")
         };
         assert_eq!(members.len(), 1);
