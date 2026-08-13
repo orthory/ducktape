@@ -934,7 +934,6 @@ subscribe
   // launch and huddle windows mount no content pane, and a scroll operation
   // whose target is not on screen is a no-op.
   keyboard press status=ignored -> content_scroll_key _
-  keyboard modifiers -> modifiers_changed _
   window file-dropped -> fs_file_dropped _
   // A daemon outlives its windows, so process exit is an explicit decision:
   // when the LAST tracked window closes, leave.
@@ -970,9 +969,6 @@ subscribe
   // handler, so the gate IS the dirty test — the tick only exists while the
   // buffer has drifted from the last text known written.
   every 900ms when (connected && !empty(active_page) && page_text(page_editor) != page_saved_text) -> page_autosave_tick
-
-on modifiers_changed(value)
-  shift_held = value.shift
 
 // The daemon's exit rule: closing a window unregisters it, and the process
 // leaves with the last one. The handoff paths (`console_opened`,

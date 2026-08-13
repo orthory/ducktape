@@ -4906,13 +4906,8 @@ fn compact_controls_share_a_single_geometry_and_type_scale() {
     // The composer geometry moved into the `rich_composer` extern args
     // (min_h, max_h, pad); type scale (13.5/1.3) is owned by the adapter.
     // Both chat composers share one plate; the forge note runs compact.
-    assert_eq!(
-        SCREENS
-            .matches(", shift_held, 44.0, 150.0, 10.0) #")
-            .count(),
-        2
-    );
-    assert!(SCREENS.contains(", shift_held, 38.0, 120.0, 6.0) #forge-note"));
+    assert_eq!(SCREENS.matches(", 44.0, 150.0, 10.0) #").count(), 2);
+    assert!(SCREENS.contains(", 38.0, 120.0, 6.0) #forge-note"));
     assert!(SCREENS.contains("button \"Send\" disabled="));
     assert!(SCREENS.contains(
         "h=29.0 @primary_action @px-12px @py-7px -> emit(composer_event, composer_submit_event())"
@@ -5228,6 +5223,14 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
 fn control_focus_ring_survives_the_active_base() {
     let generated_dir = std::path::Path::new(env!("OUT_DIR")).join("ui-lang-generated");
     let entries = std::fs::read_dir(&generated_dir).expect("generated ui-lang dir");
+    // TWO closures answer to `/palette-input`: the overlay's real input, and
+    // the ice-test fixture's plain stub (`ui/tests/app.ice`), which authors no
+    // `active` base. The fragment files are named by content hash, so read_dir
+    // order reshuffles on any source change — the probe must select the
+    // closure that CARRIES the authored base, not whichever file lands first.
+    // The regression this probe exists for is an ORDER flip, which keeps the
+    // write present, so the selection cannot mask it; only deleting the
+    // authored base itself trips the expect below.
     let palette_input = entries
         .filter_map(|entry| std::fs::read_to_string(entry.expect("dir entry").path()).ok())
         .flat_map(|source| {
@@ -5237,13 +5240,13 @@ fn control_focus_ring_survives_the_active_base() {
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
         })
-        .next()
-        .expect("the command palette input renders somewhere in the generated code");
+        .find(|line| line.contains("__color.a = 0.160000"))
+        .expect("the authored `active border=fg/16` base write in the palette input's closure");
     // `active … border=fg/16` is the only alpha-0.16 write in this closure;
     // the ring is the recipe's `focus:border-ring` conditional.
     let active_base = palette_input
         .find("__color.a = 0.160000")
-        .expect("the authored `active border=fg/16` base write");
+        .expect("just selected on this marker");
     let focus_ring = palette_input
         .find("Status::Focused")
         .expect("the recipe's `focus:border-ring` conditional");

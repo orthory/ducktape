@@ -15,22 +15,6 @@ state
   status = "Connecting…"
   connected = false
   loading = false
-  // A LAGGED MIRROR of the shift key, not live state, and the rich composer
-  // classifies Enter with it (plain Enter sends, ⇧↵ breaks a line). It is
-  // written by the `keyboard modifiers` SUBSCRIPTION, whose message leaves
-  // through the event-loop proxy and returns a full turn later — so the closure
-  // walking a key press was built from the previous turn's reading, and a ⇧↵
-  // chord whose two downs land in one drain classifies as Submit and POSTS the
-  // half-written message. Widening the window is a defect; narrowing it
-  // app-side is not possible.
-  //
-  // ponytail: the real fix is upstream and is a net deletion here — a public
-  // `RichTextEditor::key_binding(impl Fn(&KeyPress) -> Option<Binding<Edit>>)`
-  // (iced's stock `text_editor` already ships one; ducktape-ui's own
-  // `editor_binding` is one line from it) lets `rich_composer` decide from
-  // `press.modifiers.shift()` at the press, and this field, its subscription
-  // and `classify`'s bool argument all go away. Filed beside the #1058 ask.
-  shift_held = false
   block_height:i64 = -1
   hydration_generation:i64 = 0
   // THE CONNECT'S OWN GENERATION, and it must not be `hydration_generation`:
