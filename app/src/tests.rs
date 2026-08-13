@@ -4997,40 +4997,6 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
         }
     }
 
-    /// THE RING HAS TO REACH THE WIDGET — and the syntax that delivers it is
-    /// not the thing to police. `recipe control` ends in `focus:border-ring`,
-    /// but codegen emits that utility FIRST and then replays the authored
-    /// `active` block for EVERY status (`active` is the base of all four, not
-    /// the resting one), so a `border=` on the `active` line lands ON TOP of
-    /// the ring and no chat field showed the caret's seat at all. The lint
-    /// this replaces asserted the opposite — that no `focused` line existed —
-    /// which green-lit the construct that defeats the ring and forbade the fix.
-    ///
-    /// Two spellings pass: leave the border to the recipe, or author the
-    /// focused arm. A field that turned its border off entirely
-    /// (`border-w=0.0`) has no ring to paint — its plate owns that reading.
-    fn assert_controls_paint_a_focus_ring(name: &str, source: &str) {
-        let lines: Vec<_> = source.lines().collect();
-        for (index, line) in lines.iter().enumerate().filter(|(_, line)| {
-            line.trim_start().starts_with("input ") && line.contains("@control")
-        }) {
-            let states = status_lines(&lines, index);
-            let overwrites_the_ring = states.iter().any(|state| {
-                state.starts_with("active ")
-                    && state.contains("border=")
-                    && !state.contains("border-w=0.0")
-            });
-            let paints_its_own_ring = states
-                .iter()
-                .any(|state| state.starts_with("focused ") && state.contains("border=ring"));
-            assert!(
-                !overwrites_the_ring || paints_its_own_ring,
-                "{name}: an `active border=` overwrites @control's focus ring, so this input \
-                 must author `focused … border=ring` (or drop the `border=`): {line:?}"
-            );
-        }
-    }
-
     /// AN ICON-ONLY CONTROL'S GLYPH MUST INHERIT ITS BUTTON'S INK. A button's
     /// `hovered … text=` reaches its content as an INHERITED text color: a
     /// `text` child carrying a `@text-*` class emits an explicit color and
@@ -5114,22 +5080,6 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
             .collect()
     }
 
-    /// The status lines a node authors — its own `active`/`hovered`/`focused`/
-    /// `pressed`/`disabled` block, never a nested child's.
-    fn status_lines<'a>(lines: &[&'a str], index: usize) -> Vec<&'a str> {
-        let opener = lines[index];
-        let indentation = opener.len() - opener.trim_start().len();
-        lines[index + 1..]
-            .iter()
-            .map(|line| (line.len() - line.trim_start().len(), line.trim_start()))
-            .take_while(|(child_indentation, trimmed)| {
-                trimmed.is_empty() || *child_indentation > indentation
-            })
-            .filter(|(child_indentation, _)| *child_indentation == indentation + 2)
-            .map(|(_, trimmed)| trimmed)
-            .collect()
-    }
-
     let view = inlined(include_str!("ui/view.ice"));
     let shell = inlined(include_str!("ui/components/shell.ice"));
     let chat = inlined(include_str!("ui/components/chat.ice"));
@@ -5188,8 +5138,6 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
     // A divider is `---` typed into the document now, not a button.
     assert!(!SCREENS.contains("Insert divider"));
 
-    assert_controls_paint_a_focus_ring("screens", &SCREENS);
-    assert_controls_paint_a_focus_ring("pages.ice", &pages);
     // The chat surface's own icon controls, both files. The same dead-ink
     // shape exists on other surfaces, but there `tone=` carries STATE (a muted
     // mic against a danger one, a checked tab against an idle one), so those
@@ -5199,7 +5147,8 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
     // The three composer editors carried ad-hoc `focused border=ring` status
     // blocks; their focus ring now lives in the rich composer adapter
     // (`editor::composer_style`), and the fs editor is the one authored
-    // `editor` ring left. Inputs author their own — see the lint above.
+    // `editor` ring left. Inputs inherit `@control`'s ring — see
+    // `control_focus_ring_survives_the_active_base`.
     assert_eq!(
         SCREENS
             .matches("focused bg=muted_bg border=ring border-w=1.0")
@@ -5255,6 +5204,55 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
         assert!(!source.contains("bg=success/"));
         assert!(!source.contains("border=success/"));
     }
+}
+
+/// THE RING HAS TO REACH THE WIDGET — asserted against the GENERATED code,
+/// because the hazard lives in codegen, not in our sources. `recipe control`
+/// ends in `focus:border-ring`, and `active` is the base of every status;
+/// until ducktape-ui#600 the focus conditional was emitted BEFORE the authored
+/// `active` base, so any input declaring `active border=` overwrote the ring
+/// and no field showed the caret's seat. #1072's workaround (an authored
+/// `focused … border=ring` on every such input, plus a lint requiring it) is
+/// deleted; this probe is what remains.
+///
+/// The probe reads the palette input's generated style closure — an input with
+/// an authored `active border=fg/16` base and no authored `focused` arm — and
+/// pins the emission ORDER: the base's alpha write must precede the
+/// `Status::Focused` conditional. Emission order is a property of ui-lang's
+/// `input.rs` codegen, not of any one input, so one probe covers every
+/// `@control` field; if a pin bump regresses the ordering, this fails. It does
+/// NOT catch an input authoring a NEW `focused border=<not ring>` arm that
+/// deliberately repaints the focused border — that is a design choice, not a
+/// regression.
+#[test]
+fn control_focus_ring_survives_the_active_base() {
+    let generated_dir = std::path::Path::new(env!("OUT_DIR")).join("ui-lang-generated");
+    let entries = std::fs::read_dir(&generated_dir).expect("generated ui-lang dir");
+    let palette_input = entries
+        .filter_map(|entry| std::fs::read_to_string(entry.expect("dir entry").path()).ok())
+        .flat_map(|source| {
+            source
+                .lines()
+                .filter(|line| line.contains("/palette-input") && line.contains("text_input("))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .next()
+        .expect("the command palette input renders somewhere in the generated code");
+    // `active … border=fg/16` is the only alpha-0.16 write in this closure;
+    // the ring is the recipe's `focus:border-ring` conditional.
+    let active_base = palette_input
+        .find("__color.a = 0.160000")
+        .expect("the authored `active border=fg/16` base write");
+    let focus_ring = palette_input
+        .find("Status::Focused")
+        .expect("the recipe's `focus:border-ring` conditional");
+    assert!(
+        active_base < focus_ring,
+        "the authored `active` base is emitted AFTER `focus:border-ring`, so the base \
+         border overwrites the ring on every focused @control input (ducktape-ui#600 \
+         regressed — see orthory#1089)"
+    );
 }
 
 /// App-authored text sizes stay on the app design scale, while the shared

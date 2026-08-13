@@ -130,7 +130,6 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                 @control
               active bg=muted_bg border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=8.0
               hovered bg=elevated border=fg/21
-              focused border=ring
               disabled bg=muted_bg/54 value=muted
             button -> emit(create_page_submit)
               with
