@@ -774,23 +774,21 @@ async fn rejections_inner(context: &deterministic::Context) {
             "Pinned key",
         ),
         (
-            // the STORE's record cap — the one guard the qmdb port adds. an
-            // op frame carries up to 1 MiB + 16 KiB and `Routing::Pinned` was
-            // checked only for non-emptiness, so a pin this size would have
-            // committed a record the store's codec panics decoding. both ports
-            // must refuse it IDENTICALLY.
+            // the pin cap: a `Routing::Pinned` key is saga's `pinned_assignee`
+            // verbatim, so registration refuses what saga would refuse at
+            // trigger time. both ports must refuse it IDENTICALLY.
             alice.clone(),
             op(&DispatchMsg::RegisterRecipe {
                 recipe_id: "huge-pin".into(),
                 description: String::new(),
                 capability: "alpha".into(),
-                routing: Routing::Pinned(vec![7u8; dispatch::MAX_RECORD_BYTES + 1]),
+                routing: Routing::Pinned(vec![7u8; saga::MAX_ASSIGNEE_BYTES + 1]),
                 output_contract: OutputContract::Text,
                 max_attempts: 1,
                 deadline_views: None,
                 lease_views: None,
             }),
-            "store record cap",
+            "routing Pinned key is",
         ),
         (
             alice.clone(),

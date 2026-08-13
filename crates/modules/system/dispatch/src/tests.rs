@@ -290,10 +290,11 @@ fn removing_every_recipe_returns_the_root_to_its_never_registered_value() {
 }
 
 #[test]
-fn an_oversized_recipe_record_is_refused() {
-    // the ONE cap the storage engine forces: `Routing::Pinned` was checked for
-    // non-emptiness alone, so an op frame could carry a ~1 MiB pin into a
-    // committed record the store's codec would then panic decoding.
+fn a_routing_pin_over_saga_s_assignee_cap_is_refused_at_registration() {
+    // saga refuses a `pinned_assignee` over MAX_ASSIGNEE_BYTES at trigger
+    // time, so a recipe admitted with a bigger pin would register fine and
+    // then fail EVERY dispatch under it. registration is where the pin is
+    // admitted, so registration is where it is capped.
     let mut m = module();
     let mut ctx = mk_ctx(0, owner());
     let err = exec(
@@ -303,7 +304,7 @@ fn an_oversized_recipe_record_is_refused() {
             recipe_id: "huge".into(),
             description: String::new(),
             capability: "alpha".into(),
-            routing: Routing::Pinned(vec![7u8; MAX_RECORD_BYTES + 1]),
+            routing: Routing::Pinned(vec![7u8; 300]),
             output_contract: OutputContract::Text,
             max_attempts: 1,
             deadline_views: None,
@@ -311,10 +312,43 @@ fn an_oversized_recipe_record_is_refused() {
         },
     )
     .unwrap_err();
-    assert!(err.to_string().contains("store record cap"), "got {err}");
+    assert!(
+        err.to_string()
+            .contains(&format!("the cap is {MAX_ASSIGNEE_BYTES}")),
+        "the refusal must name the cap; got {err}"
+    );
     // and the refusal left NOTHING staged.
     commit(&mut m);
     assert!(recipe(&m, "huge").is_none());
+}
+
+#[test]
+fn a_pin_at_the_cap_registers_and_its_trigger_carries_it() {
+    // the boundary the other side of the refusal: a pin exactly at the cap is
+    // admitted, and the dispatch it drives emits a trigger saga's own gate
+    // accepts — the two caps are the same number, so this can never be
+    // register-ok-then-dispatch-refused.
+    let mut m = module();
+    let pin = vec![7u8; MAX_ASSIGNEE_BYTES];
+    let mut ctx = mk_ctx(0, owner());
+    exec(
+        &mut m,
+        &mut ctx,
+        &register(OutputContract::Text, Routing::Pinned(pin.clone())),
+    )
+    .unwrap();
+    commit(&mut m);
+
+    let mut caller = mk_ctx(5, Origin::Module("caller".into()));
+    exec(&mut m, &mut caller, &dispatch_op("d1", b"input")).unwrap();
+    assert_eq!(caller.msgs().len(), 1);
+    let SagaMsg::Trigger {
+        pinned_assignee, ..
+    } = saga_decode_msg(&caller.msgs()[0].payload).unwrap()
+    else {
+        panic!("expected a trigger");
+    };
+    assert_eq!(pinned_assignee, Some(pin));
 }
 
 #[test]

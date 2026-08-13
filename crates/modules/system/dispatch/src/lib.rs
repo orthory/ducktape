@@ -71,7 +71,8 @@ use records::{
     staged_mailbox, staged_recipe,
 };
 use saga::{
-    SagaCallback, SagaMsg, SagaOrigin, SagaOutcome, decode_callback, encode_msg as saga_encode_msg,
+    MAX_ASSIGNEE_BYTES, SagaCallback, SagaMsg, SagaOrigin, SagaOutcome, decode_callback,
+    encode_msg as saga_encode_msg,
 };
 use sdk::{
     Ctx, Error, Event, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
@@ -90,13 +91,15 @@ const SEP: char = sdk::KEY_SEP;
 /// serialized operation's framing (32-byte hashed key, varint length prefix,
 /// operation tag), exactly as `kv::MAX_VALUE_LEN` reasons.
 ///
-/// this is the ONE guard the storage swap adds, and exactly one field made it
-/// reachable: `Routing::Pinned(key)` was checked for non-emptiness and nothing
-/// else, so a ~1 MiB pin off a single op frame (`node::MAX_FRAME_BYTES` is
-/// 1 MiB + 16 KiB) would have poisoned that recipe's record. every other field
-/// is already capped upstream — ids by [`MAX_ID_BYTES`], `description` by
-/// [`MAX_DESCRIPTION_BYTES`], `capability` by `capability::MAX_TAG_LEN`, and an
-/// outcome by saga's own `MAX_RESULT_BYTES` / `MAX_ERROR_BYTES`.
+/// this is the BACKSTOP the storage swap adds: every wire-supplied field that
+/// reaches a record is bounded by its own named cap first — ids by
+/// [`MAX_ID_BYTES`], `description` by [`MAX_DESCRIPTION_BYTES`], `capability`
+/// by `capability::MAX_TAG_LEN`, a `Routing::Pinned` key by saga's
+/// [`MAX_ASSIGNEE_BYTES`], an outcome by saga's `MAX_RESULT_BYTES` /
+/// `MAX_ERROR_BYTES` — so no path reaches this bound today. it stays because a
+/// field added without its own cap would otherwise commit a record every later
+/// read panics on, and an op frame carries up to `node::MAX_FRAME_BYTES`
+/// (1 MiB + 16 KiB) to build one from.
 pub const MAX_RECORD_BYTES: usize = (1 << 20) - 4 * 1024;
 
 /// the composite state key: dispatches are namespaced PER RECEIVER, so two
@@ -207,10 +210,20 @@ impl DispatchModule {
         description: &str,
     ) -> Result<(), Error> {
         validate_tag(capability).map_err(Error::Module)?;
-        if let Routing::Pinned(key) = routing
-            && key.is_empty()
-        {
-            return Err(Error::Module("routing Pinned key must be non-empty".into()));
+        // a pin is saga's `pinned_assignee` verbatim, and saga refuses one over
+        // [`MAX_ASSIGNEE_BYTES`] at TRIGGER time — so an over-long pin admitted
+        // here would register fine and then fail every single dispatch under
+        // the recipe. the cap belongs where the recipe is admitted.
+        if let Routing::Pinned(key) = routing {
+            if key.is_empty() {
+                return Err(Error::Module("routing Pinned key must be non-empty".into()));
+            }
+            if key.len() > MAX_ASSIGNEE_BYTES {
+                return Err(Error::Module(format!(
+                    "routing Pinned key is {} bytes; the cap is {MAX_ASSIGNEE_BYTES}",
+                    key.len()
+                )));
+            }
         }
         if max_attempts == 0 {
             return Err(Error::Module("max_attempts must be >= 1".into()));
