@@ -384,6 +384,23 @@ const RENDEZVOUS_FALLBACK_BACKOFF: Duration = Duration::from_secs(
 /// resets `rendezvous_attempted` and grants a new budget.
 const RENDEZVOUS_FALLBACK_MAX_ATTEMPTS: u32 = 3;
 
+/// The epoch's record-nonce seed: unix time in MILLISECONDS. Wall-clock for
+/// the same reason the rendezvous readvertise nonce is (see
+/// `rendezvous_keepalive`): a REBOOTED node re-signs the SAME epoch tuple,
+/// and its previous life's nonces are already burnt into every peer's dedup
+/// gates (`prewarm_nonces`, the phase-A record map) — a fixed seed would
+/// replay-drop the reboot's re-introduction for the rest of the epoch
+/// (#1102). Milliseconds so even a sub-second orchestrator relaunch still
+/// climbs. A broken clock degrades to 0 exactly like
+/// `nat_traversal::now_secs`: the node then re-advertises as a stale life
+/// and heals at the next cutover.
+fn epoch_nonce_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
 /// Pure backoff/budget decision: attempt iff never attempted this epoch, or
 /// the backoff window has elapsed AND the per-epoch attempt budget remains.
 /// `previous` = `(elapsed since the last attempt, attempts made so far)`;
@@ -1080,7 +1097,10 @@ struct EpochState {
     routes: HashMap<ValidatorIdentity, ed25519::PublicKey>,
     /// One strictly-monotonic counter for EVERYTHING this identity signs in
     /// the epoch — replay keys are `(identity, epoch, nonce)`, and the
-    /// advert duplicate rule wants strictly-increasing nonces too.
+    /// advert duplicate rule wants strictly-increasing nonces too. Seeded
+    /// from wall clock (`epoch_nonce_seed`), never a constant, so a reboot's
+    /// fresh counter still supersedes everything the previous life signed
+    /// for this same epoch tuple.
     nonce: u64,
     /// This node's own signed record for the epoch — what the nudge
     /// re-offers. In the member role it also lives in `records`; in the
@@ -1375,6 +1395,10 @@ where
             .copied()
             .filter(|id| *id != self.me)
             .collect();
+        // the epoch's first signed nonce — wall-clock-seeded so a reboot's
+        // re-signed record strictly supersedes its previous life's (#1102,
+        // see `epoch_nonce_seed`); the counter below starts past it.
+        let epoch_nonce = epoch_nonce_seed();
         let own = SignedEndpointRecord::sign(
             EndpointRecord {
                 namespace: self.config.chain_id.clone(),
@@ -1385,9 +1409,7 @@ where
                 wireguard_public_key: self.keypair.public_key(),
                 control_endpoint: self.config.control_endpoint,
                 wireguard_endpoint: self.config.wireguard_advertised,
-                // the epoch's first signed nonce; the counter below starts
-                // past it.
-                nonce: 1,
+                nonce: epoch_nonce,
             },
             &self.config.signer,
         );
@@ -1402,7 +1424,7 @@ where
             standby_records: BTreeMap::new(),
             prewarm_peers: BTreeMap::new(),
             routes: HashMap::new(),
-            nonce: 1,
+            nonce: epoch_nonce,
             own_record: own.clone(),
             records: BTreeMap::new(),
             adverts: BTreeMap::new(),

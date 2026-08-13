@@ -1838,11 +1838,20 @@ async fn standby_readvertisement_updates_the_endpoint_live() {
                     &nodes[2].signer,
                 )
             };
+            // the live record's nonce is wall-clock-seeded (issue #1102), so
+            // "higher" means "later than the standby signed at retarget" — a
+            // rebind minutes in the future — and "stale" is anything at or
+            // below the seed's floor.
+            let later = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0)
+                + 60_000;
             nodes[0]
                 .cmd
                 .send(ReachabilityCommand::Deliver {
                     from: nodes[2].signer.public_key(),
-                    bytes: ReachabilityMsg::Record(rebind(5, 42)).encode(),
+                    bytes: ReachabilityMsg::Record(rebind(later, 42)).encode(),
                 })
                 .await
                 .unwrap();
@@ -1872,7 +1881,7 @@ async fn standby_readvertisement_updates_the_endpoint_live() {
                 .cmd
                 .send(ReachabilityCommand::Deliver {
                     from: nodes[2].signer.public_key(),
-                    bytes: ReachabilityMsg::Record(rebind(3, 77)).encode(),
+                    bytes: ReachabilityMsg::Record(rebind(1, 77)).encode(),
                 })
                 .await
                 .unwrap();
@@ -1886,6 +1895,147 @@ async fn standby_readvertisement_updates_the_endpoint_live() {
                 .find(|p| p.allowed_ips == vec![ula(nodes[2].identity)])
                 .expect("standby entry present");
             assert_eq!(entry.endpoint, Some(moved), "the stale replay was ignored");
+        })
+        .await;
+}
+
+/// Issue #1102 — the REBOOT form of the re-advertisement above: a standby
+/// that restarts mid-epoch re-signs its record for the SAME epoch tuple in a
+/// fresh orchestrator life, so whatever nonce `retarget` REALLY signs is
+/// what the members judge (no hand-minted nonce here). The previous life's
+/// nonce is already burnt into every member's pre-warm gate; a fixed nonce
+/// seed replay-drops the reboot's re-introduction for the rest of the epoch
+/// and the members keep dialing the dead pre-reboot address. The record
+/// nonce is wall-clock-seeded precisely so the reboot supersedes in place.
+#[tokio::test]
+async fn standby_reboot_supersedes_its_previous_life_in_place() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            let (nodes, mut collected) = spawn_mesh(&local, dir.path(), &[1, 2, 3], vec![]);
+            retarget_all(&nodes, &[0, 1], &[2], 1, 10).await;
+            spawn_nudgers(&local, &nodes);
+            await_prewarmed(&mut collected, &[0, 1], &[(0, 1), (1, 1), (2, 2)], 1).await;
+
+            // both members hold the standby at its life-1 address.
+            let life1: SocketAddr = "8.8.8.30:51820".parse().unwrap();
+            for i in [0usize, 1] {
+                assert!(
+                    latest_config(&nodes[i])
+                        .peers
+                        .iter()
+                        .any(|p| p.endpoint == Some(life1)),
+                    "member {i}: the life-1 standby endpoint installed"
+                );
+            }
+
+            // the standby's process dies. an orderly Shutdown stands in for
+            // the crash — its run() exits, its interface with it — while the
+            // members keep their in-memory epoch state untouched, which is
+            // the point: nothing re-targeted THERE, so their dedup gates
+            // still carry the previous life's nonce.
+            nodes[2]
+                .cmd
+                .send(ReachabilityCommand::Shutdown)
+                .await
+                .unwrap();
+
+            // life 2: the same identity, keystore, and persist file, back
+            // behind a DIFFERENT address (the NAT-remap restart shape).
+            let policy = PortPolicy::production();
+            let reborn_effect = SharedFake::default();
+            let (reborn_cmd, reborn_cmd_rx) = mpsc::channel(256);
+            let (reborn_ev_tx, mut reborn_ev_rx) = mpsc::channel(256);
+            let config = ReachabilityConfig {
+                chain_id: CHAIN.into(),
+                signer: nodes[2].signer.clone(),
+                wireguard_key_file: dir.path().join("wg-2.key"),
+                wireguard_port: 51820,
+                wireguard_advertised: Some(endpoint(&policy, 40, 51820, Transport::Udp)),
+                control_endpoint: endpoint(&policy, 40, 443, Transport::Tcp),
+                coordinators: vec![],
+                port_policy: policy.clone(),
+                persist_file: Some(dir.path().join("mesh-2.json")),
+                gossip_ingress: None,
+            };
+            local.spawn_local(reachability::run(
+                config,
+                reborn_effect.clone(),
+                StaticResolver::default(),
+                reborn_cmd_rx,
+                reborn_ev_tx,
+            ));
+            // the reborn side's router: its record offers reach the members
+            // exactly like the harness's own wiring; everything else drains.
+            {
+                let member_cmds = [nodes[0].cmd.clone(), nodes[1].cmd.clone()];
+                let member_pks = [nodes[0].signer.public_key(), nodes[1].signer.public_key()];
+                let from = nodes[2].signer.public_key();
+                local.spawn_local(async move {
+                    while let Some(event) = reborn_ev_rx.recv().await {
+                        let ReachabilityEvent::Send { to, bytes } = event else {
+                            continue;
+                        };
+                        let Some(j) = member_pks.iter().position(|pk| *pk == to) else {
+                            continue;
+                        };
+                        let _ = member_cmds[j]
+                            .send(ReachabilityCommand::Deliver {
+                                from: from.clone(),
+                                bytes,
+                            })
+                            .await;
+                    }
+                });
+            }
+            let members: Vec<_> = [0usize, 1]
+                .iter()
+                .map(|i| nodes[*i].signer.public_key())
+                .collect();
+            reborn_cmd
+                .send(ReachabilityCommand::Retarget(MeshEpochEvent {
+                    epoch: 1,
+                    members,
+                    standbys: vec![nodes[2].signer.public_key()],
+                    current_view: 12,
+                }))
+                .await
+                .unwrap();
+            // the reborn nudger: re-offering its record is the standby's
+            // whole job.
+            {
+                let cmd = reborn_cmd.clone();
+                local.spawn_local(async move {
+                    let mut tick = tokio::time::interval(Duration::from_millis(50));
+                    loop {
+                        tick.tick().await;
+                        if cmd.send(ReachabilityCommand::Nudge).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+
+            // both members adopt the reboot's address IN PLACE — the
+            // re-signed record supersedes the previous life's.
+            let life2: SocketAddr = "8.8.8.40:51820".parse().unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let both = [0usize, 1].iter().all(|i| {
+                        latest_config(&nodes[*i])
+                            .peers
+                            .iter()
+                            .any(|p| p.endpoint == Some(life2))
+                    });
+                    if both {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("members adopted the reboot's re-advertised address");
         })
         .await;
 }
