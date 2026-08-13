@@ -18,6 +18,10 @@ version.workspace = true
 [dependencies]
 sdk = { workspace = true }
 host = { workspace = true }
+# the index op-row envelope + key grammar, for the joiner-side structural
+# validation of a backfill page. types-only surface (never the `guest` feature).
+index_guest = { workspace = true }
+borsh = { workspace = true }
 thiserror = { workspace = true }
 # QmdbStore implements the object-safe `sdk::MerkleStore` (async methods boxed).
 async-trait = { workspace = true }
@@ -46,8 +50,8 @@ duckfs-core = { workspace = true }
 base64 = { workspace = true }
 futures = "0.3"
 async-trait = { workspace = true }
-# the shipped-index lane's end-to-end proof: real fluent31 databases cut,
-# framed, fetched, staged, and adopted through this crate's wire.
+# the index backfill lane's end-to-end proof: real fluent31 databases feed op
+# rows through this crate's wire into a joiner store that folds them.
 indexer = { workspace = true }
 tempfile = "3"
 # the sim transport arm: the dataplane binding's round-trip proof runs two

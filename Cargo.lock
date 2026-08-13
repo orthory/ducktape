@@ -9372,6 +9372,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
+ "borsh",
  "commonware-codec",
  "commonware-cryptography",
  "commonware-p2p",
@@ -9384,6 +9385,7 @@ dependencies = [
  "files",
  "futures",
  "host",
+ "index-guest",
  "indexer",
  "kv",
  "sdk",
