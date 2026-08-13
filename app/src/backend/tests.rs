@@ -2765,7 +2765,7 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
     let chat = load_chat_data(&rpc, Some("general")).await.unwrap();
     assert_eq!(chat.channels[0].name, "General");
     assert_eq!(chat.messages[0].body, "hello from the app");
-    let pages = load_pages_data(&rpc, Some("welcome")).await.unwrap();
+    let pages = load_pages_data(&rpc, Some("welcome"), None).await.unwrap();
     assert_eq!(pages.active_page_title, "Welcome");
     assert_eq!(pages.blocks[0].text, "A signed page block");
 
@@ -2804,7 +2804,7 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
         refusal.message, "page was not found",
         "the save must refuse on the page it cannot find, before it plans or signs anything"
     );
-    let after = load_pages_data(&rpc, Some("welcome")).await.unwrap();
+    let after = load_pages_data(&rpc, Some("welcome"), None).await.unwrap();
     assert_eq!(
         after.blocks[0].text, "A signed page block",
         "the refused save must not have touched the page it fell back to"
@@ -2982,7 +2982,7 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
     .await;
 
     wait_for_block(&mut live, base_height + 7).await;
-    let pages = load_pages_data(&rpc, Some("welcome")).await.unwrap();
+    let pages = load_pages_data(&rpc, Some("welcome"), None).await.unwrap();
     assert_eq!(pages.pages[0].id, "welcome");
     assert_eq!(pages.pages[1].id, "child");
     assert_eq!(pages.pages[1].prefix, "  ");
@@ -4037,6 +4037,8 @@ fn a_page_search_hit_names_the_page_it_came_from() {
         parent: Some(page_id.into()),
         kind: BlockKind::Paragraph,
         text: text.into(),
+        marks: Vec::new(),
+        checked: false,
         children: Vec::new(),
         height: 1,
         time: 1,
@@ -4260,6 +4262,72 @@ fn chat_reads_never_cross_the_dispatch_query_lane() {
     assert!(
         imports.iter().any(|line| line.contains("ChatViewQuery")),
         "the view lane's types are the ones the backend imports"
+    );
+}
+
+/// THE PAGE READ RIDES THE VIEW LANE, AND WHAT STAYS ON THE OTHER ONE IS
+/// NAMED. Opening a document is the app's highest-frequency read, and on
+/// `/v1/query` every one of them went through the node's dispatch actor —
+/// the select-loop/checkpoint tax of issue #1018, paid per page open, per
+/// autosave tick that reads the tree back, per comment rail.
+///
+/// `PagesViewQuery::GetPage` answers the identical `PageBlockPage` off an MVCC
+/// snapshot (pages' `tests/index_parity.rs` proves the two replies are the
+/// same reply), so what remains is to keep it there. Same source-shape pin as
+/// the chat lane's, for the same reason: both lanes answer the same rows
+/// against a live node, so only the route tells them apart.
+#[test]
+fn the_page_read_never_crosses_the_dispatch_query_lane() {
+    const LOAD: &str = include_str!("load.rs");
+    let load_page_blocks = LOAD
+        .split("pub(crate) async fn load_page_blocks(")
+        .nth(1)
+        .expect("load_page_blocks is declared")
+        .split("\npub ")
+        .next()
+        .expect("load_page_blocks body");
+    assert!(
+        load_page_blocks.contains("PagesViewQuery::GetPage {"),
+        "the page read is the index view arm"
+    );
+    assert!(
+        !load_page_blocks.contains(".query("),
+        "a page read on /v1/query pays the node's checkpoint tax"
+    );
+
+    // THE WHOLE MODULE'S LANE, not just this function. `PageQuery` is pages'
+    // DISPATCH read surface, and exactly one arm of it legitimately remains:
+    // `CommentThread`. Two reasons, and both have to stop holding before it
+    // moves — the index guest serves grouped `ThreadRow`s through
+    // `threads_for_targets`, not the `ThreadView` this reply carries; and its
+    // one caller is `add_block_comment`'s read of the comment it JUST posted,
+    // where the canonical lane is read-after-write by construction. Anything
+    // else appearing here is a pages read crawling back onto the select loop.
+    const KEPT: &str = "CommentThread";
+    let backend: Vec<(&str, &str)> = vec![
+        ("chat.rs", include_str!("chat.rs")),
+        ("document.rs", include_str!("document.rs")),
+        ("live.rs", include_str!("live.rs")),
+        ("load.rs", LOAD),
+        ("search.rs", include_str!("search.rs")),
+        ("shell.rs", include_str!("shell.rs")),
+    ];
+    let mut arms: Vec<String> = Vec::new();
+    for (name, source) in &backend {
+        for rest in source.split("PageQuery::").skip(1) {
+            let arm: String = rest
+                .chars()
+                .take_while(char::is_ascii_alphanumeric)
+                .collect();
+            assert_eq!(arm, KEPT, "{name} reads pages::{arm} on the dispatch lane");
+            arms.push(arm);
+        }
+    }
+    assert_eq!(
+        arms,
+        [KEPT],
+        "the ONE kept dispatch read, exactly once — a second call site is a \
+         lane decision, not a copy-paste"
     );
 }
 

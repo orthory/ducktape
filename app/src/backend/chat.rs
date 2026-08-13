@@ -696,7 +696,7 @@ pub async fn search_chat(
 pub async fn load_page(rpc: String, page_id: String) -> Result<PagesData, AppError> {
     async {
         let rpc = rpc_client(&rpc)?;
-        load_pages_data(&rpc, Some(&page_id)).await
+        load_pages_data(&rpc, Some(&page_id), None).await
     }
     .await
     .map_err(app_error)
@@ -727,7 +727,7 @@ pub async fn load_page_threads(
         }
         let page_id = required_id(page_id, "page")?;
         let rpc = rpc_client(&rpc)?;
-        let blocks = load_page_blocks(&rpc, &page_id).await?;
+        let blocks = load_page_blocks(&rpc, &page_id, None).await?;
         let block_ids: Vec<String> = blocks.into_iter().map(|block| block.id).collect();
         let threads: Vec<PageCommentThread> = query_page_thread_rows(&rpc, &page_id, &block_ids)
             .await?
@@ -911,7 +911,9 @@ pub async fn create_page(
         // answers how far the fold has consumed the op feed, so this waits for
         // it to reach the block that took the write.
         await_fold(&rpc, "pages", &empty_pages_probe(), height).await;
-        let mut data = load_pages_data(&rpc, Some(&page_id))
+        // The wait above already covers this reload, so it passes None rather
+        // than paying a second probe for the same watermark.
+        let mut data = load_pages_data(&rpc, Some(&page_id), None)
             .await
             .map_err(committed_error)?;
         // LAND ON THE PAGE THAT WAS JUST MADE. The wait above narrows the
@@ -959,7 +961,10 @@ pub async fn delete_page(
         )
         .await?;
         await_fold(&rpc, "pages", &empty_pages_probe(), height).await;
-        let mut data = load_pages_data(&rpc, None).await.map_err(committed_error)?;
+        // Same as `create_page`: the wait above covers this reload.
+        let mut data = load_pages_data(&rpc, None, None)
+            .await
+            .map_err(committed_error)?;
         // DROP WHAT WAS JUST DELETED. Same acceptance-vs-application gap as
         // `create_page`, read the other way round and narrowed by the same
         // wait: this reload can still see the removed page, so it stayed in

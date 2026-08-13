@@ -468,9 +468,16 @@ pub async fn live_resync_load(
             async {
                 match load_pages {
                     true => {
-                        load_pages_data(&rpc, (!page_id.is_empty()).then_some(page_id.as_str()))
-                            .await
-                            .map(Some)
+                        // A LIVE REFRESH FOLLOWS NOBODY'S WRITE. The push that
+                        // prompted it already reports APPLICATION, so there is
+                        // no acceptance gap to wait out.
+                        load_pages_data(
+                            &rpc,
+                            (!page_id.is_empty()).then_some(page_id.as_str()),
+                            None,
+                        )
+                        .await
+                        .map(Some)
                     }
                     false => Ok(None),
                 }

@@ -247,7 +247,7 @@ pub async fn save_page_document(
         return Err(app_error("choose a page first".into()));
     }
 
-    let current = load_pages_data(&client, Some(&page_id))
+    let current = load_pages_data(&client, Some(&page_id), None)
         .await
         .map_err(app_error)?;
     // A SAVE MUST PLAN AGAINST THE PAGE ITS CALLER NAMED.
@@ -294,19 +294,27 @@ pub async fn save_page_document(
     // does not read the bool.
     let title = document_title(&text);
     let title_moved = title_write_owed(&title, &saved, &current.active_page_title);
+    // THE HEIGHT OF THIS SAVE'S LAST WRITE, carried forward. Every read below
+    // is a read of a page this save has already changed, and the pages view is
+    // folded behind the block loop — so each one waits for the fold to reach
+    // the block that took the previous write before trusting what it reads.
+    // `None` until the first write lands.
+    let mut written_at: Option<u64> = None;
     if title_moved {
         let bounded = bounded_exact_text(title, "page title", 512).map_err(app_error)?;
-        write(
-            &client,
-            &password,
-            PageMsg::UpdateText {
-                block_id: page_id.clone(),
-                text: bounded,
-                marks: None,
-            },
-        )
-        .await
-        .map_err(app_error)?;
+        written_at = Some(
+            write(
+                &client,
+                &password,
+                PageMsg::UpdateText {
+                    block_id: page_id.clone(),
+                    text: bounded,
+                    marks: None,
+                },
+            )
+            .await
+            .map_err(app_error)?,
+        );
     }
     if ops.is_empty() && !title_moved {
         return Ok(DocumentSaveResult {
@@ -317,7 +325,7 @@ pub async fn save_page_document(
         });
     }
     if ops.is_empty() {
-        let data = load_selected_page_data(&client, &page_id)
+        let data = load_selected_page_data(&client, &page_id, written_at)
             .await
             .map_err(committed_error)?;
         return Ok(DocumentSaveResult {
@@ -328,11 +336,6 @@ pub async fn save_page_document(
         });
     }
 
-    // The head of the page, for an insert that anchors on nothing. ALWAYS the
-    // page's own record: `blocks` never contains it (`page_blocks` skips the
-    // wire head), so a lookup there could only ever find a SUBPAGE — and a
-    // first-line insert would land inside the child page.
-    let page_head = page_id.clone();
     let mut anchor = String::new();
 
     for (index, op) in ops.iter().enumerate() {
@@ -340,17 +343,20 @@ pub async fn save_page_document(
         // uncommitted failure. Once one write has landed the page has already
         // moved, so the caller must resync either way.
         let committed_so_far = title_moved || index > 0;
-        let message = apply_op(&client, &password, &page_id, &page_head, &mut anchor, op).await;
-        if let Err(cause) = message {
-            let mark = match committed_so_far {
-                true => committed_error(cause),
-                false => app_error(cause),
-            };
-            return Err(mark);
+        let message = apply_op(&client, &password, &page_id, &mut anchor, written_at, op).await;
+        match message {
+            Ok(height) => written_at = Some(height),
+            Err(cause) => {
+                let mark = match committed_so_far {
+                    true => committed_error(cause),
+                    false => app_error(cause),
+                };
+                return Err(mark);
+            }
         }
     }
 
-    let data = load_selected_page_data(&client, &page_id)
+    let data = load_selected_page_data(&client, &page_id, written_at)
         .await
         .map_err(committed_error)?;
     Ok(DocumentSaveResult {
@@ -361,21 +367,26 @@ pub async fn save_page_document(
     })
 }
 
-/// One op, awaited. `anchor` carries the id an insert chain hangs off: the
-/// block just inserted becomes the anchor for the next one.
+/// One op, awaited, answering the height of the block that took it — the
+/// coordinate the NEXT op's read waits on.
+///
+/// `anchor` carries the id an insert chain hangs off: the block just inserted
+/// becomes the anchor for the next one. `written_at` is the height of the op
+/// BEFORE this one, for the arms that read the live tree before deciding what
+/// to write.
 async fn apply_op(
     client: &RpcClient,
     password: &str,
     page_id: &str,
-    page_head: &str,
     anchor: &mut String,
+    written_at: Option<u64>,
     op: &BlockOp,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     match op {
         BlockOp::SetText { id, text } => {
             // The module bounds text per KIND; the plan never changes both in
             // the same op, so the stored kind is the one to bound against.
-            let stored = block_kind(client, page_id, id).await?;
+            let stored = block_kind(client, page_id, id, written_at).await?;
             let text = bounded_updated_block_text(stored, text.clone())?;
             write(
                 client,
@@ -412,26 +423,26 @@ async fn apply_op(
             .await
         }
         BlockOp::Insert { after, kind, text } => {
-            let landed = insert_block(
+            let (landed, height) = insert_block(
                 client,
                 password,
                 page_id,
-                page_head,
                 match after.is_empty() {
                     true => anchor.as_str(),
                     false => after.as_str(),
                 },
                 kind,
                 text,
+                written_at,
             )
             .await?;
             *anchor = landed;
-            Ok(())
+            Ok(height)
         }
         BlockOp::Nest { id, direction } => {
             // `block_move` resolves the direction against the LIVE tree and
             // carries the divider-parent guard; the plan never names a parent.
-            let blocks = load_page_blocks(client, page_id).await?;
+            let blocks = load_page_blocks(client, page_id, written_at).await?;
             let (parent, after) = block_move(&blocks, id, direction)?;
             write(
                 client,
@@ -457,10 +468,11 @@ async fn apply_op(
     }
 }
 
-/// One signed op onto the pages module. The receipt height is dropped: every
-/// caller here refreshes off the live stream, which reports application rather
-/// than acceptance.
-async fn write(client: &RpcClient, password: &str, msg: PageMsg) -> Result<(), String> {
+/// One signed op onto the pages module, answering the height of the block that
+/// ACCEPTED it. A save reads its own writes back — the next op's text bound,
+/// insert anchor, or move target all come off the live tree — so this height
+/// is what those reads wait on rather than reading a page that predates them.
+async fn write(client: &RpcClient, password: &str, msg: PageMsg) -> Result<u64, String> {
     signed_write(
         client,
         "pages",
@@ -468,7 +480,6 @@ async fn write(client: &RpcClient, password: &str, msg: PageMsg) -> Result<(), S
         password.to_string(),
     )
     .await
-    .map(|_height| ())
 }
 
 /// The kind a block currently wears, for the module's per-kind text bound.
@@ -476,8 +487,9 @@ async fn block_kind(
     client: &RpcClient,
     page_id: &str,
     block_id: &str,
+    written_at: Option<u64>,
 ) -> Result<BlockKind, String> {
-    let blocks = load_page_blocks(client, page_id).await?;
+    let blocks = load_page_blocks(client, page_id, written_at).await?;
     blocks
         .iter()
         .find(|block| block.id == block_id)
@@ -487,22 +499,27 @@ async fn block_kind(
 
 /// Insert one block after `after`, adopting that block's parent — the depth of
 /// a new line is the depth of the line above it, never inferred from the text.
+///
+/// An insert that anchors on nothing lands under the page's own record.
+/// ALWAYS that, never a lookup in `blocks`: the wire head is not in there
+/// (`page_blocks` skips it), so a lookup could only ever find a SUBPAGE — and
+/// a first-line insert would land inside the child page.
 async fn insert_block(
     client: &RpcClient,
     password: &str,
     page_id: &str,
-    page_head: &str,
     after: &str,
     kind: &str,
     text: &str,
-) -> Result<String, String> {
+    written_at: Option<u64>,
+) -> Result<(String, u64), String> {
     let kind = parse_block_kind(kind)?;
     let text = bounded_new_block_text(kind, text.to_string())?;
-    let blocks = load_page_blocks(client, page_id).await?;
+    let blocks = load_page_blocks(client, page_id, written_at).await?;
     let anchor = blocks.iter().find(|block| block.id == after);
     let parent = anchor
         .and_then(|block| block.parent.clone())
-        .unwrap_or_else(|| page_head.to_string());
+        .unwrap_or_else(|| page_id.to_string());
     let id = fresh_id("block");
     signed_write(
         client,
@@ -519,6 +536,6 @@ async fn insert_block(
         }),
         password.to_string(),
     )
-    .await?;
-    Ok(id)
+    .await
+    .map(|height| (id, height))
 }

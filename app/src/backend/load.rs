@@ -14,7 +14,7 @@ pub(crate) async fn load_workspace(
     let (status, chat, pages) = tokio::try_join!(
         async { rpc.status().await.map_err(String::from) },
         load_chat_data(rpc, channel_id),
-        load_pages_data(rpc, page_id)
+        load_pages_data(rpc, page_id, None)
     )?;
     let tip = tip_from_status(status)?;
     Ok(WorkspaceData {
@@ -767,7 +767,12 @@ fn page_author_name(author: &pages::AuthorRef) -> String {
 pub(crate) async fn load_pages_data(
     rpc: &RpcClient,
     requested: Option<&str>,
+    after_write: Option<u64>,
 ) -> Result<PagesData, String> {
+    // ONE wait for the whole reload: the page list, the blocks, and the thread
+    // panels are three arms of the same fold, so waiting here covers all of
+    // them and the block read below has nothing left to wait for.
+    await_pages_fold(rpc, after_write).await;
     let wire_pages = load_page_index(rpc).await?;
     let pages = page_items(wire_pages);
     let active_page = requested
@@ -791,7 +796,7 @@ pub(crate) async fn load_pages_data(
             commented_block_hits: Vec::new(),
         });
     }
-    let wire_blocks = load_page_blocks(rpc, &active_page).await?;
+    let wire_blocks = load_page_blocks(rpc, &active_page, None).await?;
     let active_page_title = wire_blocks
         .first()
         .map(|block| block.text.clone())
@@ -897,21 +902,47 @@ pub(crate) fn stable_view_key(identity: &str) -> i64 {
 pub(crate) async fn load_selected_page_data(
     rpc: &RpcClient,
     page_id: &str,
+    after_write: Option<u64>,
 ) -> Result<PagesData, String> {
-    load_pages_data(rpc, Some(page_id)).await
+    load_pages_data(rpc, Some(page_id), after_write).await
 }
 
+/// Wait, briefly, for the pages fold to carry a write the CALLER just made.
+///
+/// `after_write` is that write's receipt height, and `None` means the read
+/// follows nobody's write — an initial open, a live-stream refresh — where
+/// there is nothing to wait for and waiting would spend the budget for
+/// nothing. Every pages read below goes through the index view, which folds
+/// behind the block loop: a reload fired straight after a structural write
+/// reads a page that predates it (the moved block back where it was, the
+/// deleted line still alive).
+async fn await_pages_fold(rpc: &RpcClient, after_write: Option<u64>) {
+    let Some(height) = after_write else {
+        return;
+    };
+    await_fold(rpc, "pages", &empty_pages_probe(), height).await;
+}
+
+/// Every block of one page in PREORDER, off the INDEX VIEW lane.
+///
+/// This is the app's highest-frequency read — it is what opening a document
+/// costs. On `/v1/query` it went through the node's dispatch actor and so paid
+/// the select-loop/checkpoint tax of issue #1018; `PagesViewQuery::GetPage`
+/// answers the identical `PageBlockPage` off an MVCC snapshot, off-loop
+/// (pages' own `tests/index_parity.rs` is the proof that they are identical).
 pub(crate) async fn load_page_blocks(
     rpc: &RpcClient,
     page_id: &str,
+    after_write: Option<u64>,
 ) -> Result<Vec<pages::Block>, String> {
+    await_pages_fold(rpc, after_write).await;
     let mut blocks = Vec::new();
     let mut after = None;
     loop {
-        let reply: PageReply = rpc
-            .query(
+        let reply: PagesViewReply = rpc
+            .view(
                 "pages",
-                &PageQuery::GetPage {
+                &PagesViewQuery::GetPage {
                     page_id: page_id.to_string(),
                     after: after.clone(),
                     limit: 0,
@@ -919,7 +950,7 @@ pub(crate) async fn load_page_blocks(
             )
             .await?;
         let page = match reply {
-            PageReply::Page(Some(page)) => page,
+            PagesViewReply::Page(Some(page)) => page,
             _ => return Err("page was not found".into()),
         };
         blocks.extend(page.blocks);
