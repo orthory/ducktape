@@ -437,11 +437,22 @@ impl SyncClient for IndexOpsClient {
     }
 }
 
+/// the reference mapper (crates/kernel/index-guest/testmap, refreshed by `make
+/// wasm-modules`). the wire lane has to be proven against a REAL FOLD, not
+/// just raw rows: paging, key order and folding are one mechanism, and a test
+/// that only diffs `op/` bytes would pass with the trigger never firing —
+/// while the user-visible symptom this whole lane exists to fix is an empty
+/// DERIVED view.
+const TESTMAP: &[u8] = include_bytes!("../../index-guest/testmap/index.wasm");
+
 fn store(dir: &std::path::Path) -> indexer::IndexStore {
     indexer::IndexStore::open(
         dir,
         &[
-            indexer::IndexModule::bare("chat"),
+            indexer::IndexModule {
+                id: "chat",
+                guest: Some(TESTMAP),
+            },
             indexer::IndexModule::bare("tasks"),
         ],
     )
@@ -514,6 +525,10 @@ fn a_stamped_joiner_backfills_the_sources_op_rows_over_the_wire() {
     };
     let floor = backfill(&client, &joiner, 9).expect("backfill");
     assert_eq!(floor, None, "a source that reaches genesis has no floor");
+    // the join seam's closing move, in its order: drain the fold the writes
+    // triggered, THEN lower the floor over rows that are actually derived.
+    joiner.wait_folds_drained().expect("joiner folds drain");
+    source.wait_folds_drained().expect("source folds drain");
     joiner.set_backfill_floor("chat", floor).expect("floor");
 
     let rows = |s: &indexer::IndexStore| {
@@ -524,6 +539,34 @@ fn a_stamped_joiner_backfills_the_sources_op_rows_over_the_wire() {
     assert_eq!(rows(&source), rows(&joiner), "op rows byte-identical");
     assert_eq!(joiner.applied_height("chat").unwrap(), 9);
     assert_eq!(joiner.backfill_height("chat").unwrap(), None);
+
+    // THE POINT OF THE LANE: the rows that crossed the wire were FOLDED, so
+    // the joiner's derived view answers for pre-boundary history exactly as
+    // the source's does. `count` and the per-op `seen/` rows are the testmap's
+    // derived key space; the tip is the fold's own progress mark, and it only
+    // reaches (9, 0) if every page landed in ascending order.
+    let derived = |s: &indexer::IndexStore| {
+        s.scan("chat", b"seen/", None, 1024)
+            .expect("scan")
+            .entries
+            .len()
+    };
+    assert_eq!(
+        derived(&joiner),
+        9,
+        "every backfilled op derived a view row"
+    );
+    assert_eq!(derived(&source), derived(&joiner), "same derived rows");
+    assert_eq!(
+        joiner.view("chat", b"count").unwrap(),
+        source.view("chat", b"count").unwrap(),
+        "the derived view matches the source's"
+    );
+    assert_eq!(
+        joiner.fold_tip("chat").unwrap(),
+        source.fold_tip("chat").unwrap()
+    );
+    assert_eq!(joiner.fold_tip("chat").unwrap(), Some((9, 0)));
 }
 
 /// A SOURCE'S OWN TRUNCATION COMPOSES INTO THE JOINER'S. The source joined
@@ -665,4 +708,72 @@ fn an_empty_page_re_offering_its_cursor_is_refused_not_re_asked() {
         matches!(&err, SyncError::Module { reason, .. } if reason.contains("0 rows served")),
         "want the no-progress refusal, got {err}"
     );
+}
+
+/// A KEY THAT PARSES IS NOT A KEY THAT SORTS. `op/2/0` decodes to `(2, 0)` —
+/// `from_str_radix` neither demands the canonical width nor rejects a leading
+/// `+` — so a source can pass every ascent check while handing the joiner a
+/// key that lands AFTER `op/0000000000000009/0000` in the store. Key order is
+/// the one invariant this whole lane rests on: the next `converge_guest`
+/// refold replays `op/` in KEY order, so a mis-sorted row means every derived
+/// view is rebuilt from history running backwards, silently. The boundary
+/// therefore demands the byte-exact canonical rendering, not a parse.
+#[test]
+fn a_non_canonical_op_key_is_refused_even_though_it_parses_and_ascends() {
+    /// one page, two rows, ASCENDING BY PARSED POSITION — and the first key is
+    /// short-form, so its bytes sort after the second's.
+    #[derive(Clone)]
+    struct WidthLiar;
+    impl SyncClient for WidthLiar {
+        fn request(
+            &self,
+            req: SyncRequest,
+        ) -> impl std::future::Future<Output = Result<SyncResponse, SyncError>> + Send {
+            let SyncRequest::IndexOps { .. } = req else {
+                unreachable!("only the IndexOps lane is asked")
+            };
+            async move {
+                let row = |height: u64| {
+                    borsh::to_vec(&indexer::OpRow {
+                        height,
+                        seq: 0,
+                        time: 1_000 + height,
+                        origin: indexer::OriginTag::external("jess"),
+                        payload: b"{}".to_vec(),
+                        assigned: Vec::new(),
+                    })
+                    .expect("row encodes")
+                };
+                Ok(SyncResponse::IndexOps {
+                    rows: vec![
+                        ("op/2/0".to_string(), row(2)),
+                        (indexer::op_key(9, 0), row(9)),
+                    ],
+                    next_after: None,
+                    source_floor: None,
+                    applied_height: 9,
+                })
+            }
+        }
+    }
+    // proof the row is otherwise impeccable: it parses, it ascends, its height
+    // is under the boundary, and it borsh-decodes agreeing with its own key.
+    assert_eq!(indexer::parse_op_key(b"op/2/0"), Some((2, 0)));
+    assert!(
+        "op/2/0" > indexer::op_key(9, 0).as_str(),
+        "and it MIS-SORTS"
+    );
+
+    let mut written = 0usize;
+    let err =
+        futures::executor::block_on(statesync::fetch_index_ops(&WidthLiar, "chat", 9, |page| {
+            written += page.len();
+            Ok(())
+        }))
+        .expect_err("a non-canonical op key must refuse");
+    assert!(
+        matches!(&err, SyncError::Module { reason, .. } if reason.contains("canonical")),
+        "want the canonical-shape refusal, got {err}"
+    );
+    assert_eq!(written, 0, "nothing from a lying page may reach the store");
 }

@@ -1605,7 +1605,8 @@ impl SyncServer {
             }
             ServeStep::NeedIndexOps { .. } => {
                 // this owner holds no index store — an EMPTY page at floor 0,
-                // not an error, matching what NeedIndexCut always did here.
+                // not an error: a state owner without a derived tier has
+                // nothing to say about it, and refusing would read as a fault.
                 // `applied_height: 0` is below any boundary a joiner asks for,
                 // so the fetcher refuses to lower its floor on this answer.
                 Ok(SyncResponse::IndexOps {
@@ -1775,7 +1776,13 @@ pub async fn fetch_snapshot<C: SyncClient>(
 /// this node when it accepted canonical state from it: your own sync source.
 /// what IS enforced here, once, at the trust boundary:
 ///
-/// * every key parses as `op/{height:016x}/{seq:04x}`;
+/// * every key is BYTE-EXACTLY `op/{height:016x}/{seq:04x}` — not merely
+///   parseable as one. [`index_guest::parse_op_key`] reads hex with
+///   `from_str_radix`, which accepts any width and a leading `+`, so `op/2/0`
+///   parses to `(2, 0)` while sorting AFTER `op/0000000000000009/0000`. a
+///   non-canonical key would pass every ascent check here and then break key
+///   order in the store — which the next refold replays as history running
+///   backwards. the fixed width IS the ordering, so it is checked as bytes;
 /// * `(height, seq)` ascends STRICTLY across the whole walk (the caller's
 ///   commit order is key order — the invariant the fold depends on);
 /// * every height is at or below `boundary`;
@@ -1833,6 +1840,14 @@ where
         for (key, value) in &rows {
             let pos = index_guest::parse_op_key(key.as_bytes())
                 .ok_or_else(|| refuse(format!("row key {key:?} is not an op-row key")))?;
+            // PARSING IS NOT ENOUGH: only the canonical fixed-width rendering
+            // sorts where its position says it does, and key order is what the
+            // whole lane rests on. round-tripping the parse is the check.
+            if *key != index_guest::op_key(pos.0, pos.1) {
+                return Err(refuse(format!(
+                    "row key {key:?} is not the canonical rendering of {pos:?}"
+                )));
+            }
             if Some(pos) <= last {
                 return Err(refuse(format!(
                     "row key {key:?} does not ascend past {last:?}"

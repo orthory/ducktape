@@ -308,11 +308,21 @@ Contents are NOT root-verifiable (the derived tier has no root by design), so
 the lane trusts the serving node — accepted, because the read model is how a
 node renders at all, and the joiner already trusted this exact node enough to
 accept canonical state from it. What is still enforced, once, at the trust
-boundary (`statesync::fetch_index_ops`): every key parses as an op-row key,
+boundary (`statesync::fetch_index_ops`): every key is byte-exactly the
+canonical `op/{height:016x}/{seq:04x}` rendering of its own position,
 `(height, seq)` ascends strictly across the whole walk, every height is at or
 below the boundary, every row borsh-decodes as an `OpRow` agreeing with its own
 key, and the source's watermark covers the requested boundary (a source that
-folded less would leave a HOLE above the joiner's floor). Any violation aborts
+folded less would leave a HOLE above the joiner's floor).
+
+The key check is byte equality, not a successful parse, and the difference is
+load-bearing. `parse_op_key` reads hex with `from_str_radix`, which accepts any
+width and a leading `+`: `op/2/0` parses to `(2, 0)` while sorting AFTER
+`op/0000000000000009/0000`. Such a key would satisfy every other check above
+and still break the one invariant this lane rests on — and the damage is
+durable and silent, because the next `converge_guest` refold replays `op/` in
+KEY order and would rebuild every derived view from history running backwards.
+The FIXED WIDTH IS THE ORDERING, so it is verified as bytes. Any violation aborts
 that module's backfill; its stamped floor stands, which is honest. Per-module
 failure — network, validation, a source that re-stamped past the boundary —
 never aborts the join: it warns once with a stable reason token and the rest of
