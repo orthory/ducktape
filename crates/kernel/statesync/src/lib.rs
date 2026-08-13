@@ -1843,7 +1843,9 @@ where
         // source that no longer holds the range at all (it re-stamped past the
         // caller's boundary mid-walk). composing it would hand the caller a
         // floor above its own watermark — more missing than it has.
-        if let Some(risen) = source_floor.filter(|floor| *floor > boundary) {
+        if let Some(risen) = source_floor
+            && risen > boundary
+        {
             return Err(refuse(format!(
                 "source index floor {risen} rose above the requested boundary \
                  {boundary}; it no longer holds the range"
