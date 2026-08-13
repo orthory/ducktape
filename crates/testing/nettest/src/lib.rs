@@ -65,6 +65,22 @@ pub fn try_http_bytes_with(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> std::io::Result<(u16, Vec<u8>)> {
+    let (status, _head, body) = try_http_headed(port, method, path, content_type, headers, body)?;
+    Ok((status, body))
+}
+
+/// [`try_http_bytes_with`] keeping the response HEAD as well — for a route
+/// whose contract is partly in a response header (`/v1/index/{module}/view`
+/// answers its fold watermark in `x-ducktape-folded`). Pair it with
+/// [`header_of`]; everything else drops the head.
+pub fn try_http_headed(
+    port: u16,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> std::io::Result<(u16, String, Vec<u8>)> {
     let mut stream = TcpStream::connect(("127.0.0.1", port))?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     let extra: String = headers
@@ -85,12 +101,25 @@ pub fn try_http_bytes_with(
     let split = raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "no http header terminator")
     })?;
-    let status = String::from_utf8_lossy(&raw[..split])
+    let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+    let status = head
         .split_whitespace()
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    Ok((status, raw[split + 4..].to_vec()))
+    Ok((status, head, raw[split + 4..].to_vec()))
+}
+
+/// one response header's value out of a raw head, matched case-insensitively
+/// (http/1.1 header names are). `None` = the server did not send it.
+pub fn header_of(head: &str, name: &str) -> Option<String> {
+    head.lines().find_map(|line| {
+        let (field, value) = line.split_once(':')?;
+        field
+            .trim()
+            .eq_ignore_ascii_case(name)
+            .then(|| value.trim().to_string())
+    })
 }
 
 /// a json request/response against a loopback app surface: serialize `body` (if
