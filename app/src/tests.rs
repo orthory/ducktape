@@ -7383,6 +7383,18 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
 
     let root_state = inlined(&ice_sources_in("state"));
     let root_view = inlined(include_str!("ui/view.ice"));
+    for (path, source) in ice_sources() {
+        let in_state_directory = std::path::Path::new(&path)
+            .parent()
+            .is_some_and(|parent| parent.ends_with("src/ui/state"));
+        let owns_app_state = source
+            .lines()
+            .any(|line| matches!(line, "state" | "derived"));
+        assert!(
+            in_state_directory || !owns_app_state,
+            "{path}: top-level app state belongs under ui/state"
+        );
+    }
     for field in [
         "members_filter",
         "members_selected",
