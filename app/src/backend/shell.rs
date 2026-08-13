@@ -168,10 +168,9 @@ pub fn open_proposals(rows: Vec<ProposalRow>) -> i64 {
     rows.iter().filter(|row| row.open).count() as i64
 }
 
-/// The rail's module navigation: NINE seats, in the artifact's order, the
-/// active pane flagged. Modules join the shell by joining this list. `settings`
-/// is not here (the rail pins it to its own footer beside the account avatar),
-/// and neither is `node` — the node surface lives under Settings.
+/// The rail's navigation: nine collaboration surfaces plus the node operator
+/// surface, with the active pane flagged. `settings` is not here because the
+/// rail pins it to its own footer beside the account avatar.
 pub fn shell_nav(tab: crate::ShellTab, approvals: i64, agent_live: bool) -> Vec<NavItem> {
     [
         (crate::ShellTab::Chat, "Chat", "nav-chat"),
@@ -181,6 +180,7 @@ pub fn shell_nav(tab: crate::ShellTab, approvals: i64, agent_live: bool) -> Vec<
         (crate::ShellTab::Agents, "Agents", "nav-agents"),
         (crate::ShellTab::Files, "Files", "nav-files"),
         (crate::ShellTab::Explorer, "Explorer", "nav-explorer"),
+        (crate::ShellTab::Node, "Node", "node"),
         (crate::ShellTab::Members, "Members", "nav-members"),
         (crate::ShellTab::Governance, "Approvals", "shield-check"),
     ]
@@ -215,12 +215,13 @@ pub fn shell_nav(tab: crate::ShellTab, approvals: i64, agent_live: bool) -> Vec<
 pub fn tab_reads_plane(tab: crate::ShellTab, plane: String) -> bool {
     match plane.as_str() {
         // the tier badge, the admin gate and the forge write gate all read the
-        // roster, so four panes draw it.
+        // roster, so five panes draw it.
         "members" => matches!(
             tab,
             crate::ShellTab::Members
                 | crate::ShellTab::Governance
                 | crate::ShellTab::Forge
+                | crate::ShellTab::Node
                 | crate::ShellTab::Settings
         ),
         "governance" => tab == crate::ShellTab::Governance,

@@ -1,29 +1,10 @@
-// SETTINGS — the workspace's own facts and the two acts that change them
-// (reconnect, rename), plus THIS NODE, which the rail has no seat for. See
+// SETTINGS — this device's preferences, account custody and workspace
+// lifecycle. Node operations have their own rail surface; the workspace card
+// links there instead of duplicating its facts here. See
 // `screens/roster.ice` for the screen contract: no app state is reachable from
 // here, so every reading is a prop and every act leaves as a named event that
 // `view.ice` routes back to the handler of the same name.
-//
-// The `settings_*` / `node_*` / `account_*` / `members_*` prefixes are KEPT.
-// They are not redundant with the screen name — this one surface carries four
-// fact families, and the prefix is what says which loader a reading came from.
-// THIS IS THE ONE SEAT THAT PRINTS A HEAD BESIDE A CHECKPOINT, so it is the one
-// seat that must draw both from a SINGLE `/v1/status` read: `node_height` and
-// `node_checkpoint` are two fields of one `load_node_facts` document. A
-// checkpoint says nothing on its own — it is only ever "how far the durable
-// snapshot trails the head" — so the moment its head comes from a different
-// read, the pair can print an order no node is ever in. It did: this screen
-// held THREE heights (`settings_height`, the live `block_height` register, and
-// the checkpoint's own document) and rendered CHECKPOINT h 422,563 above
-// HEIGHT h 422,553.
-//
-// The live `block_height` register is deliberately NOT read here. It is the
-// titlebar's, whose job is liveness and which now prints no checkpoint at all
-// (see `StatusCard` in components/shell.ice). The cost of that split is stated
-// rather than hidden: this pair refreshes together on connect and shell-tab
-// change, so it is a coherent sample, not a live one, and reads `h —` until
-// the first one lands.
-component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, settings_endpoint:str, settings_node_key:str, settings_data_dir:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_answered:bool, account_id:str, bind account_name_draft:str, account_renaming:bool, account_bound:bool, account_members:i64, account_nodes:i64, appearance:str, password:str, status:str, loading:bool, connected:bool, mutation_phase:MutationPhase, node_tab:NodeTab, module_rows:[ModuleRow], node_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:str, node_quorum_label:str, node_version:str, node_root_hash:str, sync_line:str, node_phase_since:i64, node_sync_retries:i64, node_sync_failures:i64, node_sync_last_error:str, node_peers:[PeerRow], bind node_log_filter:str, wall_now:i64)
+component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, settings_endpoint:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_answered:bool, account_id:str, bind account_name_draft:str, account_renaming:bool, account_bound:bool, account_members:i64, account_nodes:i64, appearance:str, password:str, status:str, loading:bool, connected:bool, mutation_phase:MutationPhase)
   emits
     select_shell_tab(ShellTab)
     reconnect()
@@ -35,9 +16,6 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
     copy_to_clipboard(str, str)
     settings_clear_tabs()
     forget_workspace_submit()
-    select_node_tab(NodeTab)
-    open_node_modules()
-    node_log_filter_changed(str)
     set_appearance_light()
     set_appearance_dark()
   state
@@ -79,21 +57,6 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                   label="Endpoint"
                   value=keep_str(!empty(settings_endpoint), settings_endpoint, connected_rpc)
                   last=false
-              KeyValueRow
-                with
-                  label="Node key"
-                  value=settings_node_key
-                  last=false
-              KeyValueRow
-                with
-                  label="Block height"
-                  value=height_label(node_height)
-                  last=false
-              KeyValueRow
-                with
-                  label="Data directory"
-                  value=settings_data_dir
-                  last=false
               // The artifact's last NETWORK row: the roster reading with an
               // inline accent link onto the Members screen.
               box
@@ -119,6 +82,36 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                       font=code_medium
                       @text-secondary_fg
                   button "manage" -> emit(select_shell_tab, ShellTab.members)
+                    with
+                      h=22.0
+                      p=0.0
+                      @ghost_action
+                    active bg=transparent text=brand border=transparent border-w=1.0 r=6.0
+                    hovered bg=elevated text=brand
+                    pressed bg=subtle text=brand
+              box
+                with
+                  w=fill
+                  px=15.0
+                  py=13.0
+                row
+                  with
+                    w=fill
+                    gap=10.0
+                    align=center
+                  text "Node"
+                    with
+                      size=12.5
+                      wrap=none
+                      @text-accent_fg
+                  space w=fill
+                  text status
+                    with
+                      size=12.0
+                      wrap=none
+                      font=code_medium
+                      @text-secondary_fg
+                  button "view" -> emit(select_shell_tab, ShellTab.node)
                     with
                       h=22.0
                       p=0.0
@@ -532,226 +525,3 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                 active bg=danger_solid text=brand_fg border=danger_solid border-w=1.0 r=8.0
                 hovered bg=danger_solid_hover text=brand_fg border=danger_solid_hover
                 pressed bg=danger_solid_hover text=brand_fg
-      // ── THIS NODE ──────────────────────────────────────────────────────
-      // The rail has nine seats and none of them is Node: the artifact puts
-      // the node's own facts under Settings, reached from the rail footer.
-      // This is that relocation, kept whole — Overview / Permissions /
-      // Activity, with the log console under Activity.
-      //
-      // MODULES IS A TAB, NOT A SEAT. The artifact's own Modules screen
-      // once hung off another rail capsule; this rail has nine and Shell owns
-      // the new seat. The module set is a fact about
-      // THIS NODE — which code consensus is executing here — so it sits
-      // beside the node's other facts and takes no seat from anyone.
-      box
-        with
-          w=fill
-          h=1.0
-          bg=separator
-        space w=1.0 h=1.0
-      col w=fill gap=13.0
-        row
-          with
-            w=fill
-            gap=10.0
-            align=center
-          text "This node"
-            with
-              size=16.0
-              wrap=none
-              font=display
-              @text-primary
-          StatusPill degraded=connection_degraded(status) loading=loading
-          space w=fill
-        row gap=3.0 align=center
-          button #node-overview-tab -> emit(select_node_tab, NodeTab.overview)
-            with
-              label="Node overview"
-              checked=(node_tab == NodeTab.overview)
-              p=0.0
-              @ghost_action
-            box px=15.0 py=0.0
-              TabLabel
-                with
-                  label="Overview"
-                  count=0
-                  active=(node_tab == NodeTab.overview)
-            active bg=transparent text=muted border=transparent border-w=1.0 r=8.0
-            hovered bg=row_hover text=fg
-            pressed bg=elevated text=fg
-          button #node-permissions-tab -> emit(select_node_tab, NodeTab.permissions)
-            with
-              label="Node permissions"
-              checked=(node_tab == NodeTab.permissions)
-              p=0.0
-              @ghost_action
-            box px=15.0 py=0.0
-              TabLabel
-                with
-                  label="Permissions"
-                  count=0
-                  active=(node_tab == NodeTab.permissions)
-            active bg=transparent text=muted border=transparent border-w=1.0 r=8.0
-            hovered bg=row_hover text=fg
-            pressed bg=elevated text=fg
-          button #node-activity-tab -> emit(select_node_tab, NodeTab.activity)
-            with
-              label="Node activity"
-              checked=(node_tab == NodeTab.activity)
-              p=0.0
-              @ghost_action
-            box px=15.0 py=0.0
-              TabLabel
-                with
-                  label="Activity"
-                  count=0
-                  active=(node_tab == NodeTab.activity)
-            active bg=transparent text=muted border=transparent border-w=1.0 r=8.0
-            hovered bg=row_hover text=fg
-            pressed bg=elevated text=fg
-          button #node-modules-tab -> emit(open_node_modules)
-            with
-              label="Node modules"
-              checked=(node_tab == NodeTab.modules)
-              p=0.0
-              @ghost_action
-            box px=15.0 py=0.0
-              TabLabel
-                with
-                  label="Modules"
-                  count=len(module_rows)
-                  active=(node_tab == NodeTab.modules)
-            active bg=transparent text=muted border=transparent border-w=1.0 r=8.0
-            hovered bg=row_hover text=fg
-            pressed bg=elevated text=fg
-        match node_tab
-          NodeTab.modules
-            ModulesPanel rows=module_rows
-          NodeTab.permissions
-            col w=fill gap=18.0
-              NodeAccessCard tier=member_tier(members_rows) admin=members_is_admin(members_rows)
-              PermissionMatrix tier=member_tier(members_rows)
-          NodeTab.activity
-            LogTimeline.Frame
-              with
-                title="Log ring"
-                description="Live node events retained in the in-memory ring."
-              col w=fill gap=9.0
-                row
-                  with
-                    w=fill
-                    align=end
-                  input "" #log-filter <-> node_log_filter
-                    with
-                      label="Filter logs"
-                      change=emit(node_log_filter_changed, _)
-                      hint="filter logs…"
-                      w=200.0
-                      p=6.2
-                      text-size=13.0
-                      line-h=1.2
-                      @control
-                    active bg=surface value=fg placeholder=hint selection=fg/18 border-w=1.0 r=8.0
-                    hovered bg=muted_bg border=control_line
-                box w=fill h=420.0
-                  slot activity_log
-          NodeTab.overview
-            col w=fill gap=13.0
-              GroupLabel label="NETWORK"
-              // Three readings this node can actually prove. The artifact's
-              // FINALITY (ms) and ROUND cards are omitted: /v1/status
-              // publishes neither, and `view`/`quorum` are absent on a
-              // non-validator rather than filled with a misleading zero.
-              grid min-cell=170.0 gap=10.0
-                StatCard
-                  with
-                    label="HEIGHT"
-                    value=height_label_short(node_height)
-                    note=""
-                StatCard
-                  with
-                    label="CHECKPOINT"
-                    value=height_label_short(node_checkpoint)
-                    note=""
-                StatCard
-                  with
-                    label="LAST FINALIZED"
-                    value=relative_time(node_last_finalized, wall_now)
-                    note=""
-              if members_is_admin(members_rows)
-                grid min-cell=170.0 gap=10.0
-                  StatCard
-                    with
-                      label="VALIDATORS REACHED"
-                      value=reading_pair(node_reachable_label, node_quorum_label)
-                      note="of quorum"
-              GroupCard
-                col w=fill
-                  NodeBuildRow version=node_version last=false
-                  KeyValueRow
-                    with
-                      label="Phase"
-                      value=reading_pair(sync_line, relative_time(node_phase_since, wall_now))
-                      last=false
-                  // CUMULATIVE, and labelled so. These two only ever climb —
-                  // nothing in the node resets them — so a nonzero total is
-                  // history, not a fault happening now. The row above says
-                  // what is happening now.
-                  KeyValueRow
-                    with
-                      label="Sync retries / failures, cumulative"
-                      value=reading_pair(count_label(node_sync_retries), count_label(node_sync_failures))
-                      last=empty(node_sync_last_error)
-                  // The error SELF-CLEARS on the node the moment sync advances,
-                  // so its presence is a fact about now: the last attempt
-                  // failed and nothing has moved since.
-                  if !empty(node_sync_last_error)
-                    KeyValueRow
-                      with
-                        label="Last sync error"
-                        value=node_sync_last_error
-                        last=false
-                  KeyValueRow
-                    with
-                      label="App hash"
-                      value=node_root_hash
-                      last=true
-              if !empty(node_peers)
-                col w=fill gap=9.0
-                  GroupLabel label="PEERS"
-                  GroupCard
-                    col w=fill
-                      for peer in node_peers
-                        box
-                          with
-                            w=fill
-                            px=15.0
-                            py=11.0
-                          row
-                            with
-                              w=fill
-                              gap=8.0
-                              align=center
-                            if peer.live
-                              Dot plate=7.0
-                            if !peer.live
-                              box
-                                with
-                                  w=7.0
-                                  h=7.0
-                                  bg=presence_off
-                                  r=3.5
-                                space w=1.0 h=1.0
-                            text peer.key
-                              with
-                                w=fill
-                                size=12.0
-                                wrap=none
-                                font=code
-                                @text-fg
-                            text peer.role
-                              with
-                                size=12.0
-                                wrap=none
-                                font=code
-                                @text-muted

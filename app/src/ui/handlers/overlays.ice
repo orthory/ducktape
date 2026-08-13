@@ -145,6 +145,7 @@ on content_scroll_key(event)
   return if content_scroll == 0.0
   parallel
     task widget scroll-by #workspace-tabs/content/settings/settings-body 0.0 content_scroll
+    task widget scroll-by #workspace-tabs/content/node/node-body 0.0 content_scroll
     task widget scroll-by #workspace-tabs/content/governance/approvals-body 0.0 content_scroll
     task widget scroll-by #workspace-tabs/content/members/members-body 0.0 content_scroll
     task widget scroll-by #workspace-tabs/content/agents/agents-body 0.0 content_scroll

@@ -9,7 +9,7 @@ use super::*;
 use crate::{ForgeTab, MembersFilter, MessageAction, ShellTab};
 
 #[test]
-fn the_rail_seats_exactly_the_nine_module_screens() {
+fn the_rail_seats_collaboration_and_node_operations_separately() {
     let nav = shell_nav(ShellTab::Chat, 3, true);
     let ids: Vec<ShellTab> = nav.iter().map(|item| item.id).collect();
     assert_eq!(
@@ -22,12 +22,20 @@ fn the_rail_seats_exactly_the_nine_module_screens() {
             ShellTab::Agents,
             ShellTab::Files,
             ShellTab::Explorer,
+            ShellTab::Node,
             ShellTab::Members,
             ShellTab::Governance
         ]
     );
     let forge = nav.iter().find(|item| item.id == ShellTab::Forge).unwrap();
     assert!(forge.live, "an engaged agent pulses the forge seat");
+    assert_eq!(
+        nav.iter()
+            .find(|item| item.id == ShellTab::Node)
+            .unwrap()
+            .title,
+        "Node"
+    );
     assert_eq!(
         nav.iter()
             .find(|item| item.id == ShellTab::Governance)
@@ -1821,10 +1829,8 @@ fn a_search_hit_names_its_room_exactly_once() {
     );
 }
 
-/// AN UNREAD HEIGHT SAYS SO. Settings' node block leaves every string reading
-/// blank at its default — node key, data directory, key state, key path — and
-/// then printed `h 0` for the block height, a measured zero for a chain sitting
-/// at ~398,000. Driven with the node down.
+/// AN UNREAD HEIGHT SAYS SO. The Node overview must not print `h 0` before a
+/// status document lands — a measured zero for a chain sitting at ~398,000.
 ///
 /// `height_label` already had the vocabulary: a negative height is `h —`. The
 /// field simply defaulted to 0, which is a reading rather than the absence of
@@ -1838,7 +1844,7 @@ fn an_unread_block_height_is_not_reported_as_zero() {
         "zero is a real height and must keep reading as one"
     );
 
-    // The state default is what Settings shows before any node fact lands.
+    // The state default is what Node shows before any node fact lands.
     // This is the RENDERER's contract and it is unchanged: `0` still reads as a
     // real height here. What changed is upstream — `served_height` decides that
     // a `0` on the wire was never a measurement, so no zero reaches this label
@@ -1910,7 +1916,7 @@ async fn node_that_serves_its_status_once(status_body: &'static str) -> String {
 ///
 /// A checkpoint carries no meaning alone; it only ever says how far the durable
 /// snapshot trails the head. So the head printed beside it has to come from the
-/// same read, or the pair can render an order no node is ever in. Settings did
+/// same read, or the pair can render an order no node is ever in. The app did
 /// exactly that: `HEIGHT h 422,553` under `CHECKPOINT h 422,563`, from a live
 /// register and a facts document sampled seconds apart on a chain moving
 /// several blocks a second.
@@ -1930,6 +1936,7 @@ async fn the_node_tile_prints_a_head_and_a_checkpoint_from_one_status_read() {
 
     assert_eq!(facts.height, 426_099);
     assert_eq!(facts.checkpoint_height, 425_981);
+    assert_eq!(facts.public_key, "ab");
     assert!(
         facts.checkpoint_height <= facts.height,
         "a durable snapshot cannot be ahead of the head it was taken from"
@@ -4195,15 +4202,17 @@ fn a_tab_move_only_refetches_what_its_destination_draws() {
         .collect();
     tabs.push(ShellTab::Settings);
 
-    // the roster is drawn by four panes: its own, the admin gate under
-    // Approvals, the forge write gate, and the Settings standing card. The
-    // rest are narrow: Settings draws the account card, Forge the org "about",
-    // and proposals and agent rows belong to one pane each.
+    // the roster is drawn by five panes: its own, the admin gate under
+    // Approvals, the forge write gate, the Node permissions, and the Settings
+    // standing card. The rest are narrow: Settings draws the account card,
+    // Forge the org "about", and proposals and agent rows belong to one pane
+    // each.
     for (plane, drawn) in [
         (
             "members",
             &[
                 ShellTab::Forge,
+                ShellTab::Node,
                 ShellTab::Members,
                 ShellTab::Governance,
                 ShellTab::Settings,

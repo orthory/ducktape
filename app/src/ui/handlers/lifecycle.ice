@@ -252,7 +252,7 @@ on workspace_connected(next)
     run replace lane=governance_load load_governance(connected_rpc, gov_generation) -> governance_loaded _ | governance_failed _
     run replace lane=settings_load load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _
     flow
-      from done load_request(shell_tab == ShellTab.settings && node_tab == NodeTab.overview, connected_rpc, "", node_peers_generation)
+      from done load_request(shell_tab == ShellTab.node && node_tab == NodeTab.overview, connected_rpc, "", node_peers_generation)
       try request -> done request
       done -> peers_load_selected _
     run replace lane=agents_load load_agents(connected_rpc, agents_generation) -> agents_loaded _ | agents_failed _
@@ -815,7 +815,7 @@ on select_shell_tab(next)
       try request -> done request
       done -> settings_load_selected _
     flow
-      from done load_request(shell_tab == ShellTab.settings && node_tab == NodeTab.overview, connected_rpc, "", node_peers_generation)
+      from done load_request(shell_tab == ShellTab.node && node_tab == NodeTab.overview, connected_rpc, "", node_peers_generation)
       try request -> done request
       done -> peers_load_selected _
     flow
@@ -875,7 +875,7 @@ on settings_load_selected(request)
 
 on peers_load_selected(request)
   let obsolete_request = request.rpc != connected_rpc || request.generation != node_peers_generation
-  let unmounted = shell_tab != ShellTab.settings || node_tab != NodeTab.overview
+  let unmounted = shell_tab != ShellTab.node || node_tab != NodeTab.overview
   return if obsolete_request || unmounted
   run replace lane=peers_load load_peers(request.rpc, request.generation) -> peers_loaded _ | peers_failed _
 
@@ -918,9 +918,7 @@ on wall_tick
 // The app has exactly ONE subscribe block. Component handler files may not
 // declare another, so every new subscription lands here.
 //
-// The node log stream follows the node body into Settings — the rail seat it
-// used to key on is gone, and a predicate that can never be true again would
-// have taken the log console dark without a word.
+// Node's expensive streams stay scoped to the operator pane that renders them.
 subscribe
   run live_events(connected_rpc) when connected -> live_updated _
   agent_terminal_events(shell_terminal) when (connected && shell_tab == ShellTab.shell && shell_mode == ShellMode.raw && shell_terminal_running) -> shell_terminal_notice _
@@ -976,7 +974,7 @@ subscribe
   // A daemon outlives its windows, so process exit is an explicit decision:
   // when the LAST tracked window closes, leave.
   window closed with-id -> window_was_closed _
-  run node_logs(connected_rpc) when (connected && shell_tab == ShellTab.settings && node_tab == NodeTab.activity) -> node_log_line _
+  run node_logs(connected_rpc) when (connected && shell_tab == ShellTab.node && node_tab == NodeTab.activity) -> node_log_line _
   // THE NODE'S OWN TWO PLANES. Peers and the consensus facts have no op behind
   // them — nothing in the index names a mesh connection or a checkpoint height
   // — so no module topic can carry them, which is why they were the last two
@@ -994,7 +992,7 @@ subscribe
   run node_status_live(connected_rpc) when connected -> node_status_pushed _
   // PEERS DOES NOT. Each sample encodes the whole metrics registry, so this
   // gate is the budget: leaving the tab stops the encode at the source.
-  run node_peers_live(connected_rpc) when (connected && shell_tab == ShellTab.settings && node_tab == NodeTab.overview) -> node_peers_pushed _
+  run node_peers_live(connected_rpc) when (connected && shell_tab == ShellTab.node && node_tab == NodeTab.overview) -> node_peers_pushed _
   every 1s when huddle_joined -> tick
   every 1s when console_win != none -> wall_tick
   every 300ms when !empty(toast) -> toast_tick

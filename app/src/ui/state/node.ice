@@ -1,7 +1,7 @@
 state
   settings_endpoint = ""
-  settings_node_key = ""
-  settings_data_dir = ""
+  node_key = ""
+  node_data_dir = ""
   settings_key_path = ""
   settings_key_state = ""
   // Full local user key used by the channel membership post gate.

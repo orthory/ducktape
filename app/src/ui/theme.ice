@@ -16,7 +16,7 @@ font code_semibold family="Geist Mono" weight=semibold stretch=normal style=norm
 // Icon actions take their size from the caller. Internal padding would collapse
 // a fixed-size button's direct SVG child to a hairline.
 recipe icon_action for button
-  @p-0px bg-transparent text-fg rounded-7px hover:bg-accent pressed:bg-border disabled:opacity-50
+  @p-0px bg-transparent text-fg rounded-7px hover:bg-accent pressed:bg-border disabled:opacity-50 focus-visible:border-ring
 
 theme contract AppTheme
   bg

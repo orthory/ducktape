@@ -1,5 +1,5 @@
-// THIS NODE — the facts /v1/status publishes, its peers, its log stream, the
-// settings screen behind them, and leaving the workspace.
+// THIS NODE — the facts /v1/status publishes, its peers, its log stream, and
+// the dedicated operator screen that draws them.
 
 on node_log_line(line)
   node_log_timeline = node_log_timeline_push(node_log_timeline, line)
@@ -27,6 +27,7 @@ on peers_failed(cause)
 // node genuinely has no reading, so the console prints an absence as an absence
 // instead of as a measured zero.
 on node_facts_loaded(next)
+  node_key = next.public_key
   node_version = next.version
   node_root_hash = next.root_hash
   node_last_finalized = next.last_finalized_at
@@ -48,6 +49,7 @@ on node_facts_failed(_cause)
 // A PUSHED status document (lifecycle.ice's ungated subscription). It answers
 // no request, so the freshest sample simply wins in the node's stream order.
 on node_status_pushed(next)
+  node_key = next.public_key
   node_version = next.version
   node_root_hash = next.root_hash
   node_last_finalized = next.last_finalized_at
@@ -68,16 +70,15 @@ on node_status_pushed(next)
 on node_peers_pushed(next)
   node_peers = next.peers
 
-// Overview | Permissions | Activity, inside Settings now that the Node rail
-// seat is gone. The log stream below subscribes on this tab.
+// Overview | Permissions | Activity | Modules on the Node rail surface. The
+// log stream subscribes only while its tab is visible.
 on select_node_tab(tab)
   node_tab = tab
 
 on settings_loaded(next)
   return if next.generation != settings_generation
   settings_endpoint = next.endpoint
-  settings_node_key = next.node_key
-  settings_data_dir = next.data_dir
+  node_data_dir = next.data_dir
   settings_key_path = next.key_path
   settings_key_state = next.key_state
   settings_user_key = next.user_key

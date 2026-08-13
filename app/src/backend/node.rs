@@ -1,15 +1,14 @@
 use super::*;
 
-/// The settings pane's facts: where this app points and what identity it
-/// holds locally.
+/// The device-local settings facts: where this app points and what identity it
+/// holds locally. Node status belongs to [`NodeFacts`].
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct SettingsFacts {
     pub generation: i64,
     pub endpoint: String,
-    pub node_key: String,
     pub key_path: String,
     pub key_state: String,
-    /// this workspace's directory on this device — the NETWORK card's Data dir.
+    /// This workspace's directory on this device — the Node overview's data dir.
     pub data_dir: String,
     pub open_tabs: i64,
     /// THE VIEWER'S OWN KEY, full hex — the `me` every membership test needs.
@@ -22,15 +21,13 @@ pub struct SettingsFacts {
 }
 
 /// The NETWORK card's Data dir row.
-/// Load the settings facts: node identity from /v1/status, the local user
-/// key's location and state, and the persisted tab count.
+/// Load the settings facts: the local user key's location and state, the
+/// workspace directory, and the persisted tab count.
 pub async fn load_settings_facts(
     rpc: String,
     generation: i64,
 ) -> Result<SettingsFacts, HydrationError> {
     async {
-        let client = rpc_client(&rpc)?;
-        let status = client.status().await?;
         let (key_path, key_state) = match user_key_path() {
             Err(_) => ("(unset)".to_string(), "unlocatable".to_string()),
             Ok(path) => {
@@ -47,10 +44,9 @@ pub async fn load_settings_facts(
             .map(|(_, dir)| dir.display().to_string())
             .or_else(|| ducktape_home().map(|home| home.display().to_string()))
             .unwrap_or_default();
-        Ok(SettingsFacts {
+        Ok::<_, String>(SettingsFacts {
             generation,
             endpoint: rpc,
-            node_key: short_label(&status.public_key),
             key_path,
             key_state,
             data_dir,
@@ -470,6 +466,9 @@ mod log_timeline_tests {
 /// the two-field `Status` type drops, plus the mesh sample's live/total.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct NodeFacts {
+    /// The daemon identity, full hex so the operator surface can copy the key
+    /// that membership and peer records actually carry.
+    pub public_key: String,
     /// The daemon's build version, verbatim off `/v1/status` (its own
     /// `CARGO_PKG_VERSION`). A build/commit SHA is NOT published anywhere, so
     /// the version line carries the version alone.
@@ -534,6 +533,7 @@ pub struct NodeFacts {
 impl Default for NodeFacts {
     fn default() -> Self {
         Self {
+            public_key: String::new(),
             version: String::new(),
             root_hash: String::new(),
             view: None,
@@ -564,6 +564,10 @@ pub(crate) fn node_facts(status: &serde_json::Value) -> NodeFacts {
     let consensus = &operations["consensus"];
     let sync = &operations["sync"];
     NodeFacts {
+        public_key: status["public_key"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
         version: status["version"].as_str().unwrap_or_default().to_string(),
         root_hash: status["root_hash"].as_str().unwrap_or_default().to_string(),
         view: consensus["view"].as_i64(),

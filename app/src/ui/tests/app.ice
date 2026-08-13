@@ -152,6 +152,8 @@ test palette_escape_contract
         space w=1.0 h=1.0
       governance:
         space w=1.0 h=1.0
+      node:
+        space w=1.0 h=1.0
       settings:
         space w=1.0 h=1.0
       explorer:
@@ -308,6 +310,8 @@ test minimum_window_layout_contract
       forge:
         space w=1.0 h=1.0
       governance:
+        space w=1.0 h=1.0
+      node:
         space w=1.0 h=1.0
       settings:
         space w=1.0 h=1.0
@@ -549,16 +553,15 @@ test settings_keyboard_scroll_contract
         space w=1.0 h=1.0
       governance:
         space w=1.0 h=1.0
+      node:
+        space w=1.0 h=1.0
       settings:
-        SettingsScreen wall_now=wall_now account_name_draft<->account_name_draft node_log_filter<->node_log_filter #settings
+        SettingsScreen account_name_draft<->account_name_draft #settings
           with
             account_name
             network_name
             connected_rpc
             settings_endpoint
-            settings_node_key
-            node_height
-            settings_data_dir
             settings_key_state
             settings_key_path
             settings_open_tabs
@@ -575,20 +578,6 @@ test settings_keyboard_scroll_contract
             loading
             connected
             mutation_phase
-            node_tab
-            module_rows
-            node_checkpoint
-            node_last_finalized
-            node_reachable_label
-            node_quorum_label
-            node_version
-            node_root_hash
-            sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
-            node_phase_since
-            node_sync_retries
-            node_sync_failures
-            node_sync_last_error
-            node_peers
           events
             select_shell_tab -> select_shell_tab _
             reconnect -> reconnect
@@ -600,13 +589,8 @@ test settings_keyboard_scroll_contract
             settings_unlock_submit -> settings_unlock_submit _
             lock_session -> lock_session
             forget_workspace_submit -> forget_workspace_submit
-            select_node_tab -> select_node_tab _
-            open_node_modules -> open_node_modules
-            node_log_filter_changed -> node_log_filter_changed _
             set_appearance_light -> set_appearance_light
             set_appearance_dark -> set_appearance_dark
-          activity_log:
-            extern node_log_timeline(node_log_timeline, settings_endpoint) #node-log-timeline -> node_log_timeline_changed _
       explorer:
         space w=1.0 h=1.0
       palette:
@@ -614,11 +598,7 @@ test settings_keyboard_scroll_contract
       bell:
         space w=1.0 h=1.0
   target body = #workspace-tabs/content/settings/settings-body
-  target overview_tab = #workspace-tabs/content/settings/settings-body/node-overview-tab
-  target activity_tab = #workspace-tabs/content/settings/settings-body/node-activity-tab
   expect body.content_height > body.visible_height
-  expect a11y overview_tab checked true
-  expect a11y activity_tab checked false
   expect body.scroll_y ~= 0.0
   key escape
   expect body.scroll_y ~= 0.0

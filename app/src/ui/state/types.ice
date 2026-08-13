@@ -62,6 +62,7 @@ enum ShellTab
   agents
   files
   explorer
+  node
   members
   governance
   settings
