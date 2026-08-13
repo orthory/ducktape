@@ -213,6 +213,38 @@ async fn drive_and_observe_echo(
     false
 }
 
+/// Wait for the guest node's own `term:<id>` topic to report the session OVER.
+///
+/// This is the frame `agent pty` breaks its attach loop on, and the guest node
+/// can only send it once ITS ring is flagged ended — which happens only if the
+/// host forwarded the terminal grain across the mesh. A subscriber arriving
+/// after the close drains the ring and then receives it, so this needs no
+/// timing: it waits on the frame itself.
+async fn await_term_ended(port: u16, topic: &str, secret: &str) -> bool {
+    let url = format!("ws://127.0.0.1:{port}/v1/ws");
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("guest ws connect");
+    let subscribe =
+        json!({ "op": "subscribe", "topics": [topic], "token": secret }).to_string();
+    ws.send(Message::Text(subscribe)).await.expect("ws subscribe");
+
+    while let Some(frame) = ws.next().await {
+        let Ok(Message::Text(text)) = frame else {
+            continue;
+        };
+        let value: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let is_our_terminator = value["type"] == "term_ended" && value["topic"] == topic;
+        if is_our_terminator {
+            return true;
+        }
+    }
+    false
+}
+
 /// The whole Phase 2 data + control path on two real nodes: directed create from
 /// the guest to the host, a scripted child on the host's sandbox, a keystroke
 /// forwarded over the INPUT lane, the echo fanned back to the guest's own term
@@ -406,6 +438,24 @@ fn guest_drives_a_scripted_child_on_the_host_over_the_forwarded_lane() {
     assert!(
         ended.contains(&session_id),
         "the host reaps the closed session {session_id}: {ended:?}"
+    );
+
+    // ...and the END has to reach the GUEST, which is a different claim: the
+    // client that blocks on this topic runs here, not on the host. Without the
+    // forwarded terminal grain the host reaps cleanly (asserted above) while
+    // every cross-node `agent pty` stays attached to a dead session forever.
+    let guest_saw_the_end = rt.block_on(async {
+        tokio::time::timeout(
+            ECHO,
+            await_term_ended(cluster.http_ports[0], &topic, &secret),
+        )
+        .await
+        .unwrap_or(false)
+    });
+    assert!(
+        guest_saw_the_end,
+        "the guest's term topic must report the session over;\n{}",
+        cluster.all_log_tails(60)
     );
 }
 
