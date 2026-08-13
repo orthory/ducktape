@@ -136,8 +136,20 @@ the module's state machinery, never `sdk`/`host`/`indexer`.
    continue instead. Choose per mapper; write it down.
 4. **Reserved namespaces.** `op/` and `meta/` are host-written; the trigger
    range spans `op/` alone, so bookkeeping writes never reach the guest.
-   Guests must not write into either (nothing enforces it engine-side — the
-   prefixes are ordinary user keys there; the contract is this spec).
+   `fold/` is the SHELL's, written by `index_guest::guest::fold_batch` inside
+   the fold transaction — today `fold/tip`, the `(height, seq)` of the last op
+   row consumed, 12 bytes big-endian. A mapper's decision core must not write
+   into any of the three (nothing enforces it engine-side — the prefixes are
+   ordinary user keys there; the contract is this spec).
+
+   `fold/tip` answers ONE question honestly: *has the fold consumed my op at
+   `(H, seq)`* — read-after-your-own-write. It is not general freshness: it
+   advances only on op traffic, so a quiet module's tip is arbitrarily old
+   while its view is perfectly current (unlike `meta/height`, which bumps on
+   every block). A boundary stamp (§6) wipes it with the rest of the derived
+   state, and `converge_guest` reinstalls a mapper without refolding, so
+   ABSENT is normal and means *unknown* — a client waiting on the tip must
+   escape by timeout, never block on it.
 5. **Pre-index history is out of scope.** An op referencing state the feed
    never carried (enabled mid-life, boundary stamp) folds to a no-op. The
    honest fix is replaying the chain through the feed, not a guessed

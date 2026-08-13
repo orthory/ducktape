@@ -93,6 +93,30 @@ fn seen_key(height: u64, seq: u32) -> String {
     format!("seen/{height:016x}/{seq:04x}")
 }
 
+/// block on a `fold/` subscription until the tip reaches `target`, returning
+/// every tip position that streamed by. one entry per fold INVOCATION, so the
+/// list is also the transcript of how the engine cut the batch.
+fn wait_for_tip(sub: &mut fluent31::Subscription, target: (u64, u32)) -> Vec<(u64, u32)> {
+    let mut seen = Vec::new();
+    loop {
+        let event = sub
+            .recv_timeout(RECV_DEADLINE)
+            .expect("subscription stream healthy")
+            .expect("the fold tip never streamed — the fold is stuck");
+        let StreamEvent::Batch(entries) = event else {
+            panic!("subscription lagged mid-test");
+        };
+        for entry in entries {
+            assert_eq!(entry.key, FOLD_TIP.as_bytes(), "only the tip lives here");
+            let value = entry.value.expect("a tip write always carries its value");
+            seen.push(index_guest::decode_fold_tip(&value).expect("a well-formed tip"));
+        }
+        if seen.last() == Some(&target) {
+            return seen;
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 // the host feed
 // ----------------------------------------------------------------------------
@@ -278,6 +302,84 @@ fn guest_folds_ops_and_serves_the_view() {
     assert!(store.fold_status("tasks").unwrap().is_none());
 }
 
+/// THE TIP IS A ROW POSITION, NOT A BLOCK NUMBER. The shared shell records
+/// `(height, seq)` of the last op row it CONSUMED, which is what makes
+/// "is my op in the view yet" answerable: a height alone cannot tell a block
+/// that folded whole from one the engine is halfway through.
+#[test]
+fn the_fold_tip_records_the_last_op_row_consumed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = mapped_store(dir.path());
+
+    // a database that never folded reports UNKNOWN, never a zero position.
+    assert_eq!(store.fold_tip("chat").unwrap(), None);
+
+    let mut sub = store.subscribe("chat", b"fold/", Some(b"fold0")).unwrap();
+    // the block's LAST dispatch is tasks', so chat's tip must be chat's own
+    // last row (1, 2) — the block-wide seq, kept exactly as the feed spells it.
+    store
+        .apply_block(&block(
+            1,
+            vec![chat_op(b"one"), tasks_op(), chat_op(b"two")],
+        ))
+        .unwrap();
+    assert_eq!(wait_for_tip(&mut sub, (1, 2)), vec![(1, 2)]);
+    assert_eq!(store.fold_tip("chat").unwrap(), Some((1, 2)));
+
+    // a module with no folding guest has no tip to report — absent, and the
+    // op FEED watermark says nothing about it either way.
+    assert_eq!(store.fold_tip("tasks").unwrap(), None);
+    assert_eq!(store.applied_height("tasks").unwrap(), 1);
+
+    // a quiet block advances the feed watermark and leaves the tip alone —
+    // the honest shape: the tip vouches for folded ROWS, not for blocks.
+    store.apply_block(&block(2, vec![tasks_op()])).unwrap();
+    assert_eq!(store.applied_height("chat").unwrap(), 2);
+    assert_eq!(store.fold_tip("chat").unwrap(), Some((1, 2)));
+}
+
+/// A BLOCK THE ENGINE CUTS MID-BATCH NEVER OVER-CLAIMS. fluent31's
+/// `trigger_batch` hands a fold at most 512 events per invocation, so a block
+/// past that folds in several transactions — and the tip after each one has to
+/// name where the cut FELL, not where the block ends. This is the whole reason
+/// the record is `(height, seq)`.
+#[test]
+fn a_batch_cut_mid_block_parks_the_tip_at_the_cut() {
+    /// past fluent31's `trigger_batch` (512), so the engine must cut.
+    const OPS: u32 = 600;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = mapped_store(dir.path());
+    let mut sub = store.subscribe("chat", b"fold/", Some(b"fold0")).unwrap();
+
+    let ops = (0..OPS).map(|n| chat_op(format!("op{n}").as_bytes()));
+    store.apply_block(&block(1, ops.collect())).unwrap();
+
+    let tips = wait_for_tip(&mut sub, (1, OPS - 1));
+    assert!(
+        tips.len() > 1,
+        "{OPS} ops cannot fit one invocation — the cut is what this pins: {tips:?}"
+    );
+    assert!(
+        tips.windows(2).all(|pair| pair[0] < pair[1]),
+        "the tip only ever moves forward: {tips:?}"
+    );
+    // the intermediate tip is a REAL row of this block, strictly inside it: a
+    // shell that stamped the block's end at the first invocation would claim
+    // rows it had not folded yet.
+    let cut = tips[0];
+    assert_eq!(cut.0, 1);
+    assert!(cut.1 < OPS - 1, "the first invocation stopped short: {cut:?}");
+    assert!(
+        store
+            .get("chat", seen_key(cut.0, cut.1).as_bytes())
+            .unwrap()
+            .is_some(),
+        "the tip names a row whose derived write is committed"
+    );
+    assert_eq!(store.fold_tip("chat").unwrap(), Some((1, OPS - 1)));
+}
+
 #[test]
 fn backfill_wipes_derived_state_and_recreates_the_fold() {
     let dir = tempfile::tempdir().unwrap();
@@ -286,10 +388,16 @@ fn backfill_wipes_derived_state_and_recreates_the_fold() {
     let mut sub = store.subscribe("chat", b"seen/", Some(b"seen0")).unwrap();
     store.apply_block(&block(1, vec![chat_op(b"one")])).unwrap();
     wait_for_keys(&mut sub, [seen_key(1, 0)]);
+    assert_eq!(store.fold_tip("chat").unwrap(), Some((1, 0)));
 
     store.mark_backfilled("chat", 5).unwrap();
     assert_eq!(store.applied_height("chat").unwrap(), 5);
     assert_eq!(store.backfill_height("chat").unwrap(), Some(5));
+    // THE TIP GOES WITH THE ROWS IT VOUCHED FOR. `clear_db` wipes it like any
+    // other derived key, so a boundary stamp reports UNKNOWN rather than a
+    // position whose derived state no longer exists — which is exactly why a
+    // client waiting on the tip must escape by timeout instead of blocking.
+    assert_eq!(store.fold_tip("chat").unwrap(), None);
     let seen = store.scan("chat", b"seen/", None, 10).unwrap();
     assert!(seen.entries.is_empty(), "derived rows wiped");
     let ops = store.scan("chat", OP_PREFIX.as_bytes(), None, 10).unwrap();
