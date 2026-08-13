@@ -1802,35 +1802,78 @@ where
         for (peer, msg) in sends.into_iter().chain(prewarm_sends) {
             self.send_msg(peer, &msg).await?;
         }
-        // change 2 / issue #331: retry the by-identity rendezvous fallback
-        // for any MEMBER peer that is still endpoint-less and still missing
-        // a punched override. `resolve_peer`'s single attempt at handshake
-        // time can lose the race against the peer's own coordinator
-        // registration (both sides often boot together); `resolve_peer`'s
-        // own backoff + bounded per-epoch budget
-        // (`should_attempt_rendezvous_fallback` /
-        // `RENDEZVOUS_FALLBACK_MAX_ATTEMPTS`) keeps this from hammering the
-        // coordinator on every 2s `Nudge` and from sweeping an unpunchable
-        // peer forever — the sweep goes quiet once the budget is spent and
-        // re-arms only at the next epoch's `Retarget`.
-        let retry_targets: Vec<ValidatorIdentity> = match &self.state {
-            Some(state) if state.role == Role::Member => state
+        // the endpoint-less rendezvous sweep, one per role: change 2 /
+        // issue #331 for a member's phase-A peers, issue #1104 for a
+        // standby's pre-warm members. Both ride the same backoff + bounded
+        // per-epoch budget (`should_attempt_rendezvous_fallback` /
+        // `RENDEZVOUS_FALLBACK_MAX_ATTEMPTS`), which keeps the 2s `Nudge`
+        // cadence from hammering the coordinator and from sweeping an
+        // unpunchable peer forever — a sweep goes quiet once the budget is
+        // spent and re-arms only at the next epoch's `Retarget`.
+        match self.state.as_ref().map(|state| state.role) {
+            Some(Role::Member) => self.sweep_member_rendezvous_fallback().await,
+            Some(Role::Standby) => self.sweep_standby_rendezvous_fallback().await,
+            None => Ok(()),
+        }
+    }
+
+    /// change 2 / issue #331: retry the by-identity rendezvous fallback for
+    /// any MEMBER peer that is still endpoint-less and still missing a
+    /// punched override — `resolve_peer`'s single attempt at handshake time
+    /// can lose the race against the peer's own coordinator registration
+    /// (both sides often boot together).
+    async fn sweep_member_rendezvous_fallback(&mut self) -> Result<(), ReachabilityError> {
+        let state = self.state.as_ref().expect("sweep inside an epoch");
+        let retry_targets: Vec<ValidatorIdentity> = state
+            .peers
+            .iter()
+            .copied()
+            .filter(|peer| {
+                !state.overrides.contains_key(peer)
+                    && state
+                        .view_state
+                        .as_ref()
+                        .and_then(|view| view.record(*peer))
+                        .is_some_and(|record| record.wireguard_endpoint.is_none())
+            })
+            .collect();
+        for peer in retry_targets {
+            self.resolve_peer(peer).await?;
+        }
+        Ok(())
+    }
+
+    /// issue #1104: the standby's half of the sweep — rendezvous any member
+    /// whose EFFECTIVE pre-warm entry (the pre-warm layer merged over the
+    /// restored base, `sync_prewarm`'s own layering) is endpoint-less. After
+    /// a reboot that is every fully-NATed member: `restore()` reinstalls
+    /// them endpoint-less from the persisted mesh, and their live records
+    /// cannot arrive to replace them — plane gossip rides the very tunnels
+    /// the missing endpoints keep down. A member with no entry in either
+    /// layer is NOT swept: with no record there is no WireGuard key to
+    /// install, and live assembly still owes us the record itself.
+    async fn sweep_standby_rendezvous_fallback(&mut self) -> Result<(), ReachabilityError> {
+        let targets: Vec<ValidatorIdentity> = {
+            let state = self.state.as_ref().expect("sweep inside an epoch");
+            state
                 .peers
                 .iter()
                 .copied()
                 .filter(|peer| {
-                    !state.overrides.contains_key(peer)
-                        && state
-                            .view_state
-                            .as_ref()
-                            .and_then(|view| view.record(*peer))
-                            .is_some_and(|record| record.wireguard_endpoint.is_none())
+                    let effective = state
+                        .prewarm_peers
+                        .get(peer)
+                        .or_else(|| self.base_peers.as_ref().and_then(|base| base.get(peer)));
+                    effective.is_some_and(|config| config.endpoint.is_none())
                 })
-                .collect(),
-            _ => Vec::new(),
+                .collect()
         };
-        for peer in retry_targets {
-            self.resolve_peer(peer).await?;
+        let mut healed = false;
+        for peer in targets {
+            healed |= self.resolve_standby_prewarm_via_rendezvous(peer).await?;
+        }
+        if healed {
+            self.sync_prewarm().await?;
         }
         Ok(())
     }
@@ -2649,13 +2692,70 @@ where
         if state.overrides.contains_key(&peer) {
             return Ok(()); // already resolved this epoch.
         }
+        let Some(addr) = self.attempt_rendezvous_by_identity(peer).await? else {
+            return Ok(());
+        };
+        let state = self.state.as_mut().expect("still in epoch");
+        state.overrides.insert(peer, addr);
+        Ok(())
+    }
+
+    /// The standby twin of `resolve_peer_via_rendezvous_fallback`
+    /// (issue #1104): same coordinator gate, same shared per-epoch budget —
+    /// but the source of truth and the write target are the pre-warm layer,
+    /// not the phase-A view/overrides a standby never assembles. The
+    /// resolved address lands as a pre-warm entry cloned from the effective
+    /// config (the WireGuard key and allowed-ips carry over); the sweep
+    /// batches one `sync_prewarm` for all of them. Returns whether an
+    /// endpoint was written.
+    async fn resolve_standby_prewarm_via_rendezvous(
+        &mut self,
+        peer: ValidatorIdentity,
+    ) -> Result<bool, ReachabilityError> {
+        if self.config.coordinators.is_empty() {
+            return Ok(false);
+        }
+        let effective = {
+            let state = self.state.as_ref().expect("resolving inside an epoch");
+            state
+                .prewarm_peers
+                .get(&peer)
+                .or_else(|| self.base_peers.as_ref().and_then(|base| base.get(&peer)))
+                .cloned()
+        };
+        let Some(mut config) = effective else {
+            return Ok(false);
+        };
+        if config.endpoint.is_some() {
+            return Ok(false); // already dialable.
+        }
+        let Some(addr) = self.attempt_rendezvous_by_identity(peer).await? else {
+            return Ok(false);
+        };
+        config.endpoint = Some(addr);
+        let state = self.state.as_mut().expect("still in epoch");
+        state.prewarm_peers.insert(peer, config);
+        Ok(true)
+    }
+
+    /// The by-identity rendezvous attempt both role sweeps share: burn one
+    /// unit of the per-epoch budget (`should_attempt_rendezvous_fallback` /
+    /// `rendezvous_attempted`), resolve through the coordinator, surface a
+    /// failed resolve as `PeerFailed`. `None` means no address this round —
+    /// the budget refused the attempt, or the resolve failed (already
+    /// reported); both non-fatal, a later `Nudge` retries.
+    async fn attempt_rendezvous_by_identity(
+        &mut self,
+        peer: ValidatorIdentity,
+    ) -> Result<Option<SocketAddr>, ReachabilityError> {
+        let state = self.state.as_ref().expect("resolving inside an epoch");
         let now = Instant::now();
         let previous = state
             .rendezvous_attempted
             .get(&peer)
             .map(|(last, attempts)| (now.saturating_duration_since(*last), *attempts));
         if !should_attempt_rendezvous_fallback(previous) {
-            return Ok(());
+            return Ok(None);
         }
         let pk = state.pk_of.get(&peer).cloned();
         let state = self.state.as_mut().expect("still in epoch");
@@ -2666,11 +2766,7 @@ where
             .resolve_rendezvous_endpoint(binding::node_key(peer))
             .await
         {
-            Ok(addr) => {
-                let state = self.state.as_mut().expect("still in epoch");
-                state.overrides.insert(peer, addr);
-                Ok(())
-            }
+            Ok(addr) => Ok(Some(addr)),
             Err(reason) => {
                 if let Some(pk) = pk {
                     self.emit(ReachabilityEvent::PeerFailed {
@@ -2679,7 +2775,7 @@ where
                     })
                     .await?;
                 }
-                Ok(())
+                Ok(None)
             }
         }
     }
