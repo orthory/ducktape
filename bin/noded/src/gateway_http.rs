@@ -438,6 +438,75 @@ fn gateway_request_headers(headers: &HeaderMap) -> Result<Vec<gateway::ProxyHead
     Ok(forwarded)
 }
 
+/// Relay states for [`HeadCommitFence`]: chunks flow through untouched; a
+/// failure is stashed for one poll so Hyper flushes the committed head first.
+enum FenceState {
+    Relaying,
+    FailureAfterFlush(GatewayFailure),
+    Finished,
+}
+
+/// The browser door's truncation contract: the response head (and every chunk
+/// already relayed) must reach the client socket BEFORE a mid-stream failure
+/// aborts the connection.
+///
+/// Hyper buffers the head and body frames inside one `poll_write` loop and
+/// only flushes once the body yields `Pending` — a failure item already queued
+/// behind a chunk is observed in the same loop and aborts the connection with
+/// the head still unflushed, so the client sees a dead connection
+/// (`IncompleteMessage` at `send()`) instead of the promised `200` + truncated
+/// body (issue #1030). The fence stashes the failure and yields one `Pending`
+/// with an immediate wake: Hyper flushes everything committed, then the
+/// re-poll surfaces the failure and the abort truncates the body — never the
+/// head.
+struct HeadCommitFence {
+    body: GatewayBody,
+    state: FenceState,
+}
+
+impl HeadCommitFence {
+    fn new(body: GatewayBody) -> Self {
+        Self {
+            body,
+            state: FenceState::Relaying,
+        }
+    }
+}
+
+impl futures::Stream for HeadCommitFence {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        match std::mem::replace(&mut this.state, FenceState::Finished) {
+            FenceState::Relaying => match this.body.poll_recv(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    this.state = FenceState::Relaying;
+                    Poll::Ready(Some(Ok(chunk)))
+                }
+                Poll::Ready(Some(Err(failure))) => {
+                    this.state = FenceState::FailureAfterFlush(failure);
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => {
+                    this.state = FenceState::Relaying;
+                    Poll::Pending
+                }
+            },
+            FenceState::FailureAfterFlush(failure) => Poll::Ready(Some(Err(
+                std::io::Error::other(format!("{failure:?}")),
+            ))),
+            FenceState::Finished => Poll::Ready(None),
+        }
+    }
+}
+
 async fn gateway_browser_proxy(
     State(handle): State<NodeHandle>,
     method: Method,
@@ -564,13 +633,9 @@ async fn gateway_browser_proxy(
         Body::empty()
     } else {
         // Streamed relay: chunks flow to the browser as the publisher sends
-        // them; a mid-stream failure aborts the response body (truncation),
-        // which is the standard proxy contract once the head is committed.
-        use futures::StreamExt as _;
-        Body::from_stream(
-            tokio_stream::wrappers::ReceiverStream::new(response.body)
-                .map(|item| item.map_err(|failure| std::io::Error::other(format!("{failure:?}")))),
-        )
+        // them; a mid-stream failure aborts the response body (truncation) —
+        // but only after the fence has let Hyper flush the committed head.
+        Body::from_stream(HeadCommitFence::new(response.body))
     };
     builder
         .body(body)
@@ -744,4 +809,100 @@ pub async fn serve_browser_gateway(
     axum::serve(listener, gateway_browser_router(handle))
         .with_graceful_shutdown(async move { shutdown.shutdown_requested().await })
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::routing::get;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    /// Serve ONE `200` response whose body is the fenced relay over `rx`, do a
+    /// raw HTTP/1.1 GET against it, and return every byte the socket delivered
+    /// before the server hung up. EOF is the synchronization event: Hyper
+    /// closes the connection on the abort (and on `connection: close` for a
+    /// clean end), so the read completes without any time-based waiting.
+    async fn raw_get_fenced(rx: GatewayBody) -> Vec<u8> {
+        let body = Arc::new(std::sync::Mutex::new(Some(rx)));
+        let app = Router::new().route(
+            "/",
+            get(move || {
+                let body = Arc::clone(&body);
+                async move {
+                    let body = body.lock().unwrap().take().expect("one request per test");
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(Body::from_stream(HeadCommitFence::new(body)))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+        socket
+            .write_all(b"GET / HTTP/1.1\r\nhost: fence\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut wire = Vec::new();
+        socket.read_to_end(&mut wire).await.unwrap();
+        wire
+    }
+
+    fn assert_head_committed(wire: &[u8]) {
+        let prefix = String::from_utf8_lossy(&wire[..wire.len().min(64)]).into_owned();
+        assert!(
+            prefix.starts_with("HTTP/1.1 200 "),
+            "the head must reach the wire before the abort: {prefix:?}"
+        );
+    }
+
+    /// Issue #1030's interleaving, forced: a body chunk AND the running-cap
+    /// failure are both queued before Hyper ever polls the body — the ordering
+    /// the loaded box produced nondeterministically. The head and the relayed
+    /// prefix must reach the wire; the chunked body must end WITHOUT its
+    /// `0\r\n\r\n` terminator (fail-closed truncation).
+    #[tokio::test]
+    async fn head_commits_before_a_queued_body_failure_aborts() {
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        tx.send(Ok(Bytes::from(vec![b'c'; 64 * 1024]))).await.unwrap();
+        tx.send(Err(GatewayFailure::Unavailable("cap".into())))
+            .await
+            .unwrap();
+        drop(tx);
+        let wire = raw_get_fenced(rx).await;
+        assert_head_committed(&wire);
+        let relayed_prefix_arrived = wire.windows(8).any(|window| window == b"cccccccc");
+        assert!(
+            relayed_prefix_arrived,
+            "the chunk relayed before the failure must follow the head"
+        );
+        let cleanly_terminated = wire.ends_with(b"0\r\n\r\n");
+        assert!(
+            !cleanly_terminated,
+            "an aborted chunked body must not carry the success terminator"
+        );
+    }
+
+    /// A cap so small it trips before the FIRST body byte still commits the
+    /// head: the client observes `200` with an immediately truncated body,
+    /// never a dead connection.
+    #[tokio::test]
+    async fn head_commits_when_the_failure_precedes_any_body_byte() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(Err(GatewayFailure::Unavailable("cap".into())))
+            .await
+            .unwrap();
+        drop(tx);
+        let wire = raw_get_fenced(rx).await;
+        assert_head_committed(&wire);
+        let cleanly_terminated = wire.ends_with(b"0\r\n\r\n");
+        assert!(
+            !cleanly_terminated,
+            "an aborted chunked body must not carry the success terminator"
+        );
+    }
 }
