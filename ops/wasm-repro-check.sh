@@ -29,23 +29,31 @@ repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 work="$repo/target/wasm-repro"
 rm -rf "$work"
 
-# the copy is a DIFFERENT absolute path, which is the whole point; target/ and
-# .git are build output and history, neither of which a build reads. The
-# patterns are UNANCHORED (no `./`) so nested build output — the ~145 MB
-# crates/guests/*-wasm/target dirs — is skipped too, not just the top level.
+# the copy is a DIFFERENT absolute path, which is the whole point. It carries
+# the TRACKED file set — exactly what guest-builder snapshots (`snapshot` in
+# bin/guest-builder/src/main.rs), so the two builds see the same source and the
+# gitignored bulk of a working checkout (docs/node_modules is 834 MB after
+# `bun install`) costs nothing here.
 copy="$work/checkout-at-another-path"
 mkdir -p "$copy"
-tar -cf - -C "$repo" --exclude=target --exclude=.git --exclude=.worktree . |
-  tar -xf - -C "$copy"
+git -C "$repo" ls-files -z | tar -cf - -C "$repo" --null -T - | tar -xf - -C "$copy"
 
-# a re-anchored pattern costs 15x and fails nothing else here, so the size IS
-# the assertion. Source tree is ~42 MB; anchored it was 624 MB.
+# the tracked tree is ~45 MB, so the ceiling carries 4x of headroom and the size
+# IS the assertion: nothing but the tracked set may reach a snapshot.
 copied_mb=$(du -sm "$copy" | cut -f1)
 if [ "$copied_mb" -gt 200 ]; then
-  echo "wasm-repro-check: tree copy is ${copied_mb} MB — build output leaked in." >&2
-  echo "  the --exclude patterns must stay UNANCHORED (no leading './')." >&2
+  echo "wasm-repro-check: the TRACKED tree is ${copied_mb} MB, over the 200 MB ceiling." >&2
+  echo "  either build output got committed, or the source outgrew it. Find the bulk:" >&2
+  echo "    git ls-files -z | du -ch --files0-from=- | sort -h | tail -20" >&2
   exit 1
 fi
+
+# the builder lists the tracked files of whatever --platform-root it is given,
+# so the copy needs an index of its own. `add -N` records the names without
+# hashing a single byte of content, and `-f` keeps a force-added ignored file
+# (should one ever be committed) in the set.
+git -C "$copy" init -q
+git -C "$copy" add -A -f -N .
 
 cargo build -q -p guest-builder
 builder="${CARGO_TARGET_DIR:-$repo/target}/debug/guest-builder"
