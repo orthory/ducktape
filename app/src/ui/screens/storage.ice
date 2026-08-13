@@ -490,6 +490,7 @@ component ExplorerScreen(connected_rpc:str, connected:bool, loading:bool, blocks
   lifetime retained
   emits
     refresh_explorer()
+    copy_to_clipboard(str, str)
   state
     query = ""
     kind = "all"
@@ -859,41 +860,58 @@ component ExplorerScreen(connected_rpc:str, connected:bool, loading:bool, blocks
                                 @text-fg
                             StatusBadge label=op.disposition
                             space w=fill
-                            // TWO HASHES, ONE SCREEN, NEITHER NAMED. The list
-                            // on the left prints `block.hash` (the frame id);
-                            // this prints `op.op_hash` (the sha256 of the op
-                            // payload — `project_root_op` keys it by
-                            // `put_chunk`, which is also the `GET
-                            // /v1/files/blob/{op_hash}` key). They never match,
-                            // and an unlabelled hex that changes when you open
-                            // a row reads as a contradiction. The label form is
-                            // the `by` beside the proposer, one row down.
-                            //
-                            // `hash`, not `op`: this pane sits beside a list
-                            // whose third column counts `1 op` / `3 ops`, and
-                            // one screen must not spend the same word on a
-                            // count noun and a field name. Inside an op card
-                            // `hash` can only mean this op's, and the block
-                            // hash it could be confused with carries no label
-                            // to collide with. The row costs 14px more than
-                            // `op` did and has room: at the 1040 minimum the
-                            // pane is 1040 − 74 rail − 48 screen padding − 340
-                            // list − 10 gap − 18 box − 18 card = 532px, against
-                            // ~293px of `wrap=none` intrinsics (target, badge,
-                            // label, 13-char digest, four 8px gaps). Arithmetic,
-                            // not a screenshot — this branch was not run.
+                          // TWO HASHES, ONE SCREEN, NEITHER NAMED. The list
+                          // on the left prints `block.hash` (the frame id);
+                          // this prints `op.op_hash` (the sha256 of the op
+                          // payload — `project_root_op` keys it by
+                          // `put_chunk`, which is also the `GET
+                          // /v1/files/blob/{op_hash}` key). They never match,
+                          // and an unlabelled hex that changes when you open
+                          // a row reads as a contradiction. The label form is
+                          // the `by` beside the proposer, one row down.
+                          //
+                          // `hash`, not `op`: this pane sits beside a list
+                          // whose third column counts `1 op` / `3 ops`, and
+                          // one screen must not spend the same word on a
+                          // count noun and a field name. Inside an op card
+                          // `hash` can only mean this op's, and the block
+                          // hash it could be confused with carries no label
+                          // to collide with.
+                          //
+                          // The hash is FULL and lives on its OWN row: it is
+                          // the blob key (QA: the explorer never exposed the
+                          // whole thing), and 64 code chars at 12.0 are
+                          // ~461px against the pane's 532px minimum (1040 −
+                          // 74 rail − 48 screen padding − 340 list − 10 gap
+                          // − 18 box − 18 card) — too wide to share a row
+                          // with the target, wide enough to own one.
+                          // `word-or-glyph` wraps rather than clips anything
+                          // narrower. Clicking it copies the key whole.
+                          row
+                            with
+                              w=fill
+                              gap=8.0
+                              align=center
                             text "hash"
                               with
                                 size=11.0
                                 wrap=none
                                 font=code_medium
                                 @text-muted
-                            text op.op_hash
+                            button -> emit(copy_to_clipboard, op.op_hash, "Op hash copied")
                               with
-                                size=12.0
-                                wrap=none
-                                font=code
-                                @text-muted
+                                label="Copy op hash"
+                                p=2.0
+                                @ghost_action
+                              text op.op_hash
+                                with
+                                  size=12.0
+                                  wrap=word-or-glyph
+                                  font=code
+                                  @text-muted
+                              active bg=transparent text=fg border=transparent border-w=1.0 r=5.0
+                              hovered bg=row_hover text=fg
+                              pressed bg=accent
                           row
                             with
                               w=fill
@@ -935,7 +953,17 @@ component ExplorerScreen(connected_rpc:str, connected:bool, loading:bool, blocks
                                   size=12.0
                                   font=code
                                   @text-muted
-                          text op.payload size=13.5 @text-fg
+                          // Pretty-printed JSON (or verbatim text) from
+                          // `explorer_payload` — a code plane, so it reads in
+                          // the code face, whole, wrapping instead of
+                          // clipping.
+                          text op.payload
+                            with
+                              w=fill
+                              size=12.0
+                              wrap=word-or-glyph
+                              font=code
+                              @text-fg
 
 // ONE BLOCK IN THE CHAIN LIST, AND WHETHER IT IS THE ONE YOU OPENED. The row
 // carried no selected state at all: clicking filled the detail pane on the
