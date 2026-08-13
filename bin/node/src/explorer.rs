@@ -243,9 +243,19 @@ pub(crate) async fn heal_and_backfill_index<C: statesync::SyncClient>(
     }
     // ONE drain for the whole set: the trigger runner folds on a background
     // thread, and the floor must not drop until the rows it vouches for are
-    // derived. this BLOCKS the calling thread by design — acceptable only
-    // because we are pre-serving: nothing else on this node is folding,
-    // reading, or waiting on a view while it runs.
+    // derived.
+    //
+    // this BLOCKS a runtime worker, and the honest scope of that is narrower
+    // than "we are pre-serving". PRE-SERVING covers the correctness argument
+    // only — no live folds, no view readers, no ws subscribers on THIS node,
+    // so nothing observes a half-drained index. it does NOT cover the
+    // scheduler: the mesh, sync-serve and reachability tasks share this
+    // runtime's two workers and stay live throughout. the whole seam is
+    // already synchronous disk work (the heal's wipe, every batch write), so
+    // the drain adds no new class of stall — but it is bounded on progress
+    // rather than trusted to end (`indexer::drain_fold`), because an
+    // unbounded spin here would hang the join and hold half the runtime with
+    // it.
     if let Err(err) = index.wait_folds_drained() {
         tracing::warn!(
             target: "ducktape::statesync",
