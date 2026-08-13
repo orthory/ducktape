@@ -920,12 +920,12 @@ subscribe
   // `connected` in `overlays.ice`, as are the mark and page chords, and the
   // chord keys bubble anyway so they arrive on the IGNORED half.
   //
-  // ponytail: this is a layer-level gate standing in for a key-level one. While
-  // a layer IS open, typing into its search field still pays the extra rebuild.
-  // The upgrade path is upstream — a `keyboard press key=escape` filter in the
-  // subscription grammar (`ui-lang-core`), filed beside the #1058 ask — after
-  // which this becomes one unconditional Escape-only subscription.
-  keyboard press status=captured when !empty(topmost_overlay(palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, forge_repo_menu)) -> global_key_pressed _
+  // `key=escape` (ducktape-ui#602) is the key-level gate the layer-level one
+  // stood in for: this half now fires for ONE key, so typing into an open
+  // layer's own search field no longer buys the extra rebuild per keystroke.
+  // The `when` stays — with no layer up a captured Escape has nothing to
+  // dismiss, and an inactive subscription is cheaper than a no-op handler run.
+  keyboard press key=escape status=captured when !empty(topmost_overlay(palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, forge_repo_menu)) -> global_key_pressed _
   // THE PANE SCROLL'S KEYS ARE THE LEFTOVERS. `status=ignored` drops every key
   // a focused widget CONSUMED — Home in a text field, an arrow in an open
   // list — but it is only half the arbitration: iced's single-line input drops
