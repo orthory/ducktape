@@ -696,7 +696,7 @@ pub async fn search_chat(
 pub async fn load_page(rpc: String, page_id: String) -> Result<PagesData, AppError> {
     async {
         let rpc = rpc_client(&rpc)?;
-        load_pages_data(&rpc, Some(&page_id), None).await
+        load_pages_data(&rpc, Some(&page_id)).await
     }
     .await
     .map_err(app_error)
@@ -727,7 +727,7 @@ pub async fn load_page_threads(
         }
         let page_id = required_id(page_id, "page")?;
         let rpc = rpc_client(&rpc)?;
-        let blocks = load_page_blocks(&rpc, &page_id, None).await?;
+        let blocks = load_page_blocks(&rpc, &page_id).await?;
         let block_ids: Vec<String> = blocks.into_iter().map(|block| block.id).collect();
         let threads: Vec<PageCommentThread> = query_page_thread_rows(&rpc, &page_id, &block_ids)
             .await?
@@ -913,7 +913,7 @@ pub async fn create_page(
         await_fold(&rpc, "pages", &empty_pages_probe(), height).await;
         // The wait above already covers this reload, so it passes None rather
         // than paying a second probe for the same watermark.
-        let mut data = load_pages_data(&rpc, Some(&page_id), None)
+        let mut data = load_pages_data(&rpc, Some(&page_id))
             .await
             .map_err(committed_error)?;
         // LAND ON THE PAGE THAT WAS JUST MADE. The wait above narrows the
@@ -962,7 +962,7 @@ pub async fn delete_page(
         .await?;
         await_fold(&rpc, "pages", &empty_pages_probe(), height).await;
         // Same as `create_page`: the wait above covers this reload.
-        let mut data = load_pages_data(&rpc, None, None)
+        let mut data = load_pages_data(&rpc, None)
             .await
             .map_err(committed_error)?;
         // DROP WHAT WAS JUST DELETED. Same acceptance-vs-application gap as

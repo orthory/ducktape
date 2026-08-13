@@ -2765,7 +2765,7 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
     let chat = load_chat_data(&rpc, Some("general")).await.unwrap();
     assert_eq!(chat.channels[0].name, "General");
     assert_eq!(chat.messages[0].body, "hello from the app");
-    let pages = load_pages_data(&rpc, Some("welcome"), None).await.unwrap();
+    let pages = load_pages_data(&rpc, Some("welcome")).await.unwrap();
     assert_eq!(pages.active_page_title, "Welcome");
     assert_eq!(pages.blocks[0].text, "A signed page block");
 
@@ -2804,7 +2804,7 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
         refusal.message, "page was not found",
         "the save must refuse on the page it cannot find, before it plans or signs anything"
     );
-    let after = load_pages_data(&rpc, Some("welcome"), None).await.unwrap();
+    let after = load_pages_data(&rpc, Some("welcome")).await.unwrap();
     assert_eq!(
         after.blocks[0].text, "A signed page block",
         "the refused save must not have touched the page it fell back to"
@@ -2982,7 +2982,7 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
     .await;
 
     wait_for_block(&mut live, base_height + 7).await;
-    let pages = load_pages_data(&rpc, Some("welcome"), None).await.unwrap();
+    let pages = load_pages_data(&rpc, Some("welcome")).await.unwrap();
     assert_eq!(pages.pages[0].id, "welcome");
     assert_eq!(pages.pages[1].id, "child");
     assert_eq!(pages.pages[1].prefix, "  ");
@@ -4514,6 +4514,168 @@ async fn an_unstamped_reply_stops_the_wait_instead_of_spending_it() {
         served.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "an unknown watermark is answered once, never waited on"
+    );
+}
+
+/// A READ WAITS FOR WHAT THIS CLIENT ALREADY KNOWS, AND FOR NOTHING ELSE.
+///
+/// The height a read owes itself is learned by whoever learned it — the write
+/// that was signed, the op the stream delivered — and asked for at the read,
+/// because the two are routinely different callers with several layers between
+/// them. Three facts, and the middle one is the whole mechanism:
+///
+/// - a read with nothing outstanding pays NO probe, which is the ordinary page
+///   open and the reason this costs the app's highest-frequency read nothing;
+/// - a read behind a known block waits for it;
+/// - once the fold is SEEN past that block the requirement is retired, because
+///   the tip is monotonic and a later read cannot fall behind it again.
+#[tokio::test(flavor = "current_thread")]
+async fn a_read_waits_out_a_block_this_client_already_knows_about() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (origin, served) =
+        node_scripting_its_fold_watermark(vec![Some("6:0"), Some("9:0")]).await;
+    let rpc = rpc_client(&origin).expect("stub client");
+
+    assert!(
+        await_seen_fold(&rpc, "pages", &empty_pages_probe()).await,
+        "nothing outstanding is not a stale read — it is nothing to wait for"
+    );
+    assert_eq!(served.load(SeqCst), 0, "and it costs no request at all");
+
+    note_module_block(&rpc, "pages", 9);
+    assert!(await_seen_fold(&rpc, "pages", &empty_pages_probe()).await);
+    assert_eq!(
+        served.load(SeqCst),
+        2,
+        "stale, then caught up: it waited for the fold to carry block 9"
+    );
+
+    assert!(await_seen_fold(&rpc, "pages", &empty_pages_probe()).await);
+    assert_eq!(
+        served.load(SeqCst),
+        2,
+        "the fold was observed past 9 — every later read is free"
+    );
+}
+
+/// A HEIGHT IS RECORDED WHERE IT IS LEARNED, and there are exactly two places
+/// this client ever learns one: the receipt of a write it signed, and an op its
+/// live stream delivered. The stream half is driven end to end below
+/// (`an_op_the_stream_delivered_is_waited_out_by_the_reload_behind_it`); the
+/// write half cannot be, because reaching the recording means signing a real
+/// frame with a real key, so it is pinned as the source shape it is — one call
+/// on the receipt, at the funnel every module's writes already pass through.
+///
+/// Deleting it does not fail a read: it makes every read AFTER a write stop
+/// waiting, which is a stale document nobody notices until a line duplicates.
+#[test]
+fn a_signed_write_records_the_block_that_took_it() {
+    const RPC: &str = include_str!("rpc.rs");
+    let signed_write = RPC
+        .split("pub(crate) async fn signed_write(")
+        .nth(1)
+        .expect("signed_write is declared")
+        .split("\n/// ")
+        .next()
+        .expect("signed_write body");
+    let submit = signed_write
+        .find("submit_frame(")
+        .expect("signed_write submits the frame");
+    let record = signed_write
+        .find("note_module_block(")
+        .expect("signed_write records the block its write landed in");
+    assert!(
+        submit < record,
+        "the height is recorded from the RECEIPT, so there is nothing to \
+         record until the node has answered with one"
+    );
+}
+
+/// A WAIT THAT GAVE UP LEAVES THE NEXT READ STILL OWING IT — the autosave's
+/// duplicate line, pinned.
+///
+/// The document tick reads the tree, diffs the buffer against it, writes, and
+/// reads back. The NEXT tick reads again, and `document_plan` pairs the
+/// disturbed middle POSITIONALLY: a tree still missing the line the previous
+/// tick inserted is not merely stale, it makes the plan emit a second
+/// `InsertBlock` for a line that is already on chain. So the requirement is
+/// retired by an OBSERVED fold and by nothing else — never by the budget
+/// running out, which is precisely the case where the read cannot be trusted.
+#[tokio::test(flavor = "current_thread")]
+async fn a_wait_that_gave_up_leaves_the_next_read_still_owing_it() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (origin, served) = node_scripting_its_fold_watermark(vec![Some("6:0")]).await;
+    let rpc = rpc_client(&origin).expect("stub client");
+    note_module_block(&rpc, "pages", 9);
+
+    assert!(!await_seen_fold(&rpc, "pages", &empty_pages_probe()).await);
+    assert_eq!(served.load(SeqCst), FOLD_WAIT_PROBES as usize);
+
+    assert!(!await_seen_fold(&rpc, "pages", &empty_pages_probe()).await);
+    assert_eq!(
+        served.load(SeqCst),
+        2 * FOLD_WAIT_PROBES as usize,
+        "the next tick owes the same block: a spent budget is not a fold"
+    );
+}
+
+/// AN OP THE STREAM DELIVERED IS WAITED OUT BY THE RELOAD BEHIND IT.
+///
+/// A push reports APPLICATION — the acceptance gap closed, the FOLD gap still
+/// open, since the node's block loop writes the op feed and the index folds
+/// behind it on its own runner. Every structural pages op asks for a reload,
+/// and `LiveRefresh`'s structural half is applied unconditionally, so a reload
+/// that read a snapshot predating the push would install the tree as it was
+/// BEFORE it — the deleted line still there, the inserted one missing — with
+/// no further op coming to correct it.
+///
+/// The height rides in the push, so it is recorded where the push is decoded
+/// rather than threaded down through the update, the handler's debounce and
+/// the resync extern's argument list.
+#[tokio::test(flavor = "current_thread")]
+async fn an_op_the_stream_delivered_is_waited_out_by_the_reload_behind_it() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (origin, served) = node_scripting_its_fold_watermark(vec![Some("12:0")]).await;
+    let rpc = rpc_client(&origin).expect("stub client");
+
+    let moved = folded_update(
+        &origin,
+        "pages",
+        ducktape_rpc::StreamOp {
+            height: 12,
+            seq: 0,
+            time: 0,
+            origin: ducktape_rpc::StreamOrigin {
+                kind: ducktape_rpc::StreamOriginKind::External,
+                id: None,
+            },
+            payload: Some(
+                serde_json::from_slice(&pages::encode_msg(&PageMsg::MoveBlock {
+                    block_id: "b1".into(),
+                    parent: Some("page".into()),
+                    after: None,
+                }))
+                .expect("payload json"),
+            ),
+            payload_hex: None,
+            assigned: None,
+            assigned_hex: None,
+        },
+    )
+    .await
+    .expect("a structural op is visible to the shell");
+    assert!(moved.load_pages, "this is the op that buys a reload");
+    assert_eq!(
+        served.load(SeqCst),
+        0,
+        "recording the height is bookkeeping, not a request"
+    );
+
+    assert!(await_seen_fold(&rpc, "pages", &empty_pages_probe()).await);
+    assert_eq!(
+        served.load(SeqCst),
+        1,
+        "the reload waited for the fold to carry the pushed block"
     );
 }
 
