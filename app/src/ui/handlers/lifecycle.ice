@@ -61,13 +61,11 @@ on reconnect
   rooms = []
   dm_rows = []
   messages = []
+  messages_revision = messages_revision + 1
   has_older_history = false
   // The history lane was invalidated above, so its old socket and button state
   // end together even when that socket would never have answered.
   history_loading = false
-  // And the window load with it: same dropped socket, and the reply that would
-  // lower this term may never come — see `chat_window_loading`.
-  chat_window_loading = false
   channel_reads = []
   unread_boundary = 0
   // A RECONNECT IS A ROOM SWITCH SPREAD OVER TWO HANDLERS, so it parks like the
@@ -104,7 +102,8 @@ on reconnect
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
-  thread_next_reply_offset = 0
+  thread_messages_revision = thread_messages_revision + 1
+  thread_next_reply_seq = 0
   thread_has_more = false
   thread_generation = thread_generation + 1
   invalidate lane=live_thread
@@ -177,8 +176,9 @@ on workspace_connected(next)
   // whatever window a search hit had put on screen is gone — see
   // `chat_hit_loaded`.
   history_view = false
-  messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel)
-  has_older_history = history_has_older(messages)
+  messages = merge_landing_messages(next.messages, messages, active_channel, next.active_channel)
+  messages_revision = messages_revision + 1
+  has_older_history = next.has_older_history || history_has_older(messages)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   active_channel = next.active_channel
   // AND THE LANDING ROOM'S COMPOSER IS THE LANDING ROOM'S — the restore half of
@@ -264,159 +264,113 @@ on workspace_connected(next)
 
 on live_updated(next)
   status = next.status
-  // THE HEAD IS ASSIGNED ABOVE THE GUARD BECAUSE THE TIP STOPS AT IT.
-  //
-  // A tip carries a height and an EMPTY delta, and it arrives once per block —
-  // on `bin/node` that is 1 Hz of nop fillers plus the 3s idle beat, forever,
-  // on a chain where nothing happened. Every `apply_*` below takes its list BY
-  // VALUE (`extern/backend.ice`), so letting a tip walk down to the `return if`
-  // at the bottom clones `messages`, `channels` and `thread_messages` a dozen
-  // times over to fold a delta that is empty by construction — then rebuilds
-  // the view. Per second. Idle.
-  //
-  return if next.kind == "retry"
   block_height = keep_i64(next.height >= 0, next.height, block_height)
-  return if next.kind == "tip"
-  channels = apply_chat_channels(channels, next.chat)
-  // Read against the PRE-fold rows: the verdict lets a history window accept
-  // the canonical row that replaces its own optimistic placeholder.
-  //
-  // ONE CALL FOR ONE ANSWER, because the ABI charges by the argument: separate
-  // main/thread checks would each take both lists by value before either row
-  // was folded.
-  let live_settled = chat_settle(messages, thread_messages, next.chat, active_channel)
-  // A HISTORY WINDOW IS A SNAPSHOT, NOT A LIVE TAIL. The rows in hand are a
-  // window around one old message, so a new post's seq is past every one of
-  // them and `insert_committed_root` puts it at the END of the window — a
-  // message from today drawn directly under one from six months ago, folded
-  // into the same author run, with no gap marker and nothing in "Load older"
-  // that would say the middle is missing. Marking the channel read from that
-  // window is the same lie in the sidebar: the reader is not caught up.
-  //
-  // Naming the channel is what gates both — the folds are already inert for a
-  // delta belonging to another room, so a window that belongs to no room takes
-  // no live rows and no read cursor. "Jump to latest" is the way back to the
-  // tail, and it reloads canonically.
-  //
-  // HER OWN SETTLE IS THE ONE DELTA THE WINDOW STILL TAKES. The composer posts
-  // from a history window too, and its optimistic row is spliced in there
-  // regardless (`chat_composer_event`) — so refusing that row's settle strands
-  // it `pending: true` forever. `live_settled` identifies that exact delta,
-  // already computed above: no second pass over the timeline by value. A settling
-  // delta carries exactly the one row it settles, so nothing else rides in.
-  //
-  // Everything else the window misses — edits, deletes, reactions and
-  // reply-count bumps on rows that ARE on screen — waits for "Jump to latest",
-  // which the banner is offering one click away.
-  //
-  // The READ CURSOR takes the strict gate either way: posting into a room you
-  // are reading backwards is not being caught up on it.
-  //
-  // AND NOBODY READS A PANE THAT IS NOT MOUNTED. The live feed is subscribed on
-  // `connected`, not on the tab, so an arrival while the reader is in Settings
-  // or Files used to mark the last-opened room read on the spot: she came back
-  // to no divider, and every OTHER room badged while that one stayed dark. The
-  // rows still fold in (`live_fold_channel` below is untouched) — only the
-  // cursor waits, and `select_shell_tab` moves it when she actually returns.
-  let live_tail_channel = keep_str(!history_view && shell_tab == ShellTab.chat, active_channel, "")
-  let live_fold_channel = keep_str(!history_view || live_settled, active_channel, "")
-  messages = apply_chat_messages(messages, next.chat, live_fold_channel)
-  unread_marker_seq = first_unread_seq(messages, unread_boundary)
-  thread_messages = apply_chat_thread(thread_messages, next.chat, active_channel, active_thread_seq)
-  channel_members = apply_chat_members(channel_members, next.chat, active_channel)
-  thread_next_reply_offset = thread_offset_after_live(thread_next_reply_offset, thread_has_more, next.chat, active_channel, active_thread_seq)
-  active_channel_name = channel_display_name(channels, active_channel, active_channel_name)
-  active_channel_archived = channel_flag_archived(channels, active_channel, active_channel_archived)
-  active_channel_members_only = channel_flag_members_only(channels, active_channel, active_channel_members_only)
-  post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
-  channel_reads = mark_channel_read(channel_reads, live_tail_channel, channel_head_seq(channels, live_tail_channel))
-  rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
-  dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
-  // THE PAGES FOLD. A committed text edit lands in the open document's blocks
-  // with no query at all — the autosave commits one per tick while a reader
-  // types, and each used to buy three sequential reads of the very document
-  // being typed into. A delta for a block this list does not hold is a no-op.
-  //
-  // The buffer moves on the SAME shared decision the resync path uses below:
-  // the canonical text replaces it only when the editor is CLEAN and actually
-  // differs, so a reader mid-sentence keeps their words and their caret, and
-  // their own settled echo is a no-op because the baseline already matches.
-  // A RENAME IS AN `UpdateText` TOO — on the page's own block, which is the
-  // only rename op pages has. It folds here and NOT in `apply_page_text`: the
-  // block list drops the page head, so the block fold can never see it, and
-  // nothing else on this path would have moved the title. Both writes sit
-  // ABOVE the buffer rebuild for the reason the resync path states below —
-  // the title is line 0, so it has to land before the text is rebuilt from it.
-  //
-  // THE FOLD MOVES A CLOCK THE RESYNC REPLY MUST READ (#1041). A text fold
-  // bumps no generation, so a `live_resync_load` reply already in flight
-  // still passes `live_resynced`'s guard — carrying a pre-fold snapshot. The
-  // serial is the fold's own ordering token: snapshotted into every resync
-  // request, echoed back on the reply, and a mismatch gates ONLY the
-  // fold-owned fields (titles and block texts), never the structural half
-  // the read was issued for.
-  pages_fold_serial = keep_i64(pages_delta_folds(next.pages), pages_fold_serial + 1, pages_fold_serial)
-  pages = apply_page_rename(pages, next.pages)
-  active_page_title = apply_page_title(active_page_title, next.pages, active_page)
-  blocks = apply_page_text(blocks, next.pages)
-  block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
-  active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
-  let folded_saved = refreshed_page_saved(page_editor, active_page_title, blocks, page_saved_text)
-  page_editor = refreshed_page_editor(page_editor, active_page_title, blocks, page_saved_text)
-  page_saved_text = folded_saved
-  bell_unread = bell_unread_after(bell_unread, bell_items, next.bell)
-  bell_items = apply_bell(bell_items, next.bell)
-  forge_discussion = apply_chat_messages(forge_discussion, next.chat, forge_item_channel)
-  // A huddle change on the ACTIVE channel forces the chat resync the delta
-  // path cannot carry: `huddle_joined`/`huddle_roster` are answered only by
-  // a full chat load (see `huddle_refresh_hits`).
-  // ONE PLANE WENT STALE AND THE OP SAID WHICH. `plane_live_hit` is an extern
-  // for the same reason `forge_live_hit` is: the Ice checker cannot type a
-  // subscription payload's field inside a `let` (see handlers/overlays.ice).
-  return if next.kind != "plane" && !forge_live_hit(next.kind, next.module) && !next.load_chat && !next.load_pages && !huddle_refresh_hits(next.chat, active_channel)
-  members_generation = keep_i64(plane_live_hit(next.kind, next.module, "valset"), members_generation + 1, members_generation)
-  gov_generation = keep_i64(plane_live_hit(next.kind, next.module, "governance"), gov_generation + 1, gov_generation)
-  account_generation = keep_i64(plane_live_hit(next.kind, next.module, "identity"), account_generation + 1, account_generation)
-  dm_peers_generation = keep_i64(plane_live_hit(next.kind, next.module, "identity"), dm_peers_generation + 1, dm_peers_generation)
-  // THE AGENTS ROW IS JOINED FROM TWO MODULES, so it is the one plane that
-  // does not ride `plane_live_hit`: `agent` commits the registration and
-  // `runs` commits the liveness `AgentRow.live` is read from. `agents_plane_hit`
-  // is the extern that answers for both (backend/live.rs).
-  agents_generation = keep_i64(agents_plane_hit(next.kind, next.module), agents_generation + 1, agents_generation)
-  fs_generation = keep_i64(plane_live_hit(next.kind, next.module, "files"), fs_generation + 1, fs_generation)
-  forge_generation = keep_i64(forge_live_hit(next.kind, next.module), forge_generation + 1, forge_generation)
-  hydration_generation = keep_i64(next.load_chat || next.load_pages || huddle_refresh_hits(next.chat, active_channel), hydration_generation + 1, hydration_generation)
-  hydration_retry_attempt = keep_i64(next.load_chat || next.load_pages || huddle_refresh_hits(next.chat, active_channel), 0, hydration_retry_attempt)
-  parallel
-    run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes((next.load_chat || huddle_refresh_hits(next.chat, active_channel)), next.load_pages), next.debounce, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
-    run replace lane=forge_live forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == ShellTab.forge), forge_generation) -> forge_refreshed _ | forge_live_failed _
-    // A task-flow `try` turns an unselected optional request into Task::none.
-    // No refused request is launched, so an unrelated in-flight replace lane
-    // is not aborted. Chip planes refresh off-tab; Files remains tab-owned.
-    flow
-      from done load_request(plane_live_hit(next.kind, next.module, "valset"), connected_rpc, "", members_generation)
-      try request -> done request
-      done -> members_load_selected _
-    flow
-      from done load_request(plane_live_hit(next.kind, next.module, "governance"), connected_rpc, "", gov_generation)
-      try request -> done request
-      done -> governance_load_selected _
-    flow
-      from done load_request(plane_live_hit(next.kind, next.module, "identity"), connected_rpc, "", account_generation)
-      try request -> done request
-      done -> account_load_selected _
-    flow
-      from done load_request(plane_live_hit(next.kind, next.module, "identity"), connected_rpc, "", dm_peers_generation)
-      try request -> done request
-      done -> dm_peers_load_selected _
-    flow
-      from done load_request(agents_plane_hit(next.kind, next.module), connected_rpc, "", agents_generation)
-      try request -> done request
-      done -> agents_load_selected _
-    flow
-      from done load_request(plane_live_hit(next.kind, next.module, "files") && shell_tab == ShellTab.files, connected_rpc, fs_path, fs_generation)
-      try request -> done request
-      done -> files_list_selected _
+  // A publication has one closed kind and runs one arm. In particular, only
+  // the chat arm even evaluates the wide, by-value chat fold arguments.
+  match next.kind
+    LiveKind.retry
+      return if true
+    LiveKind.tip
+      return if true
+    LiveKind.ready
+      hydration_generation = hydration_generation + 1
+      hydration_retry_attempt = 0
+      forge_generation = forge_generation + 1
+      parallel
+        run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(next.load_chat, next.load_pages), next.debounce, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
+        run replace lane=forge_live forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == ShellTab.forge), forge_generation) -> forge_refreshed _ | forge_live_failed _
+    LiveKind.chat
+      let folded_chat = fold_live_chat(next.chat, channels, messages, thread_messages, channel_members, channel_reads, dm_peers, settings_user_key, active_channel, active_thread_seq, history_view, shell_tab == ShellTab.chat, unread_boundary, active_channel_name, active_channel_archived, active_channel_members_only, forge_discussion, forge_item_channel, selected_message_seq, selected_message_rev, message_action, message_edit_draft, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
+      channels = folded_chat.channels
+      messages = folded_chat.messages
+      messages_revision = keep_i64(folded_chat.messages_changed, messages_revision + 1, messages_revision)
+      has_older_history = folded_chat.has_older_history
+      selected_message_seq = folded_chat.selected_message_seq
+      selected_message_rev = folded_chat.selected_message_rev
+      message_action = folded_chat.message_action
+      message_edit_draft = folded_chat.message_edit_draft
+      thread_messages = folded_chat.thread_messages
+      thread_messages_revision = keep_i64(folded_chat.thread_messages_changed, thread_messages_revision + 1, thread_messages_revision)
+      thread_selected_seq = folded_chat.thread_selected_seq
+      thread_selected_rev = folded_chat.thread_selected_rev
+      thread_message_action = folded_chat.thread_message_action
+      thread_edit_draft = folded_chat.thread_edit_draft
+      channel_members = folded_chat.channel_members
+      channel_reads = folded_chat.channel_reads
+      rooms = folded_chat.rooms
+      dm_rows = folded_chat.dm_rows
+      unread_marker_seq = folded_chat.unread_marker_seq
+      active_channel_name = folded_chat.active_channel_name
+      active_channel_archived = folded_chat.active_channel_archived
+      active_channel_members_only = folded_chat.active_channel_members_only
+      post_refusal = folded_chat.post_refusal
+      forge_discussion = folded_chat.forge_discussion
+      return if !folded_chat.refresh_chat
+      hydration_generation = hydration_generation + 1
+      hydration_retry_attempt = 0
+      run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(true, false), false, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
+    LiveKind.bell
+      bell_unread = bell_unread_after(bell_unread, bell_items, next.bell)
+      bell_items = apply_bell(bell_items, next.bell)
+    LiveKind.pages
+      // Text deltas fold locally. Structural deltas fold what they can, then
+      // resync Pages once; no chat, bell, forge, or plane reducer participates.
+      pages_fold_serial = keep_i64(pages_delta_folds(next.pages), pages_fold_serial + 1, pages_fold_serial)
+      pages = apply_page_rename(pages, next.pages)
+      active_page_title = apply_page_title(active_page_title, next.pages, active_page)
+      blocks = apply_page_text(blocks, next.pages)
+      block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
+      active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
+      let folded_saved = refreshed_page_saved(page_editor, active_page_title, blocks, page_saved_text)
+      page_editor = refreshed_page_editor(page_editor, active_page_title, blocks, page_saved_text)
+      page_saved_text = folded_saved
+      return if !next.load_pages
+      hydration_generation = hydration_generation + 1
+      hydration_retry_attempt = 0
+      run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(false, true), next.debounce, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
+    LiveKind.forge
+      forge_generation = forge_generation + 1
+      run replace lane=forge_live forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == ShellTab.forge), forge_generation) -> forge_refreshed _ | forge_live_failed _
+    LiveKind.plane
+      members_generation = keep_i64(plane_live_hit(next.kind, next.module, "valset"), members_generation + 1, members_generation)
+      gov_generation = keep_i64(plane_live_hit(next.kind, next.module, "governance"), gov_generation + 1, gov_generation)
+      account_generation = keep_i64(plane_live_hit(next.kind, next.module, "identity"), account_generation + 1, account_generation)
+      dm_peers_generation = keep_i64(plane_live_hit(next.kind, next.module, "identity"), dm_peers_generation + 1, dm_peers_generation)
+      agents_generation = keep_i64(agents_plane_hit(next.kind, next.module), agents_generation + 1, agents_generation)
+      fs_generation = keep_i64(plane_live_hit(next.kind, next.module, "files"), fs_generation + 1, fs_generation)
+      parallel
+        flow
+          from done load_request(plane_live_hit(next.kind, next.module, "valset"), connected_rpc, "", members_generation)
+          try request -> done request
+          done -> members_load_selected _
+        flow
+          from done load_request(plane_live_hit(next.kind, next.module, "governance"), connected_rpc, "", gov_generation)
+          try request -> done request
+          done -> governance_load_selected _
+        flow
+          from done load_request(plane_live_hit(next.kind, next.module, "identity"), connected_rpc, "", account_generation)
+          try request -> done request
+          done -> account_load_selected _
+        flow
+          from done load_request(plane_live_hit(next.kind, next.module, "identity"), connected_rpc, "", dm_peers_generation)
+          try request -> done request
+          done -> dm_peers_load_selected _
+        flow
+          from done load_request(agents_plane_hit(next.kind, next.module), connected_rpc, "", agents_generation)
+          try request -> done request
+          done -> agents_load_selected _
+        flow
+          from done load_request(plane_live_hit(next.kind, next.module, "files") && shell_tab == ShellTab.files, connected_rpc, fs_path, fs_generation)
+          try request -> done request
+          done -> files_list_selected _
+    LiveKind.resync
+      return if !next.load_chat && !next.load_pages && !forge_live_hit(next.kind, next.module)
+      hydration_generation = keep_i64(next.load_chat || next.load_pages, hydration_generation + 1, hydration_generation)
+      hydration_retry_attempt = keep_i64(next.load_chat || next.load_pages, 0, hydration_retry_attempt)
+      forge_generation = keep_i64(forge_live_hit(next.kind, next.module), forge_generation + 1, forge_generation)
+      parallel
+        run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(next.load_chat, next.load_pages), next.debounce, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
+        run replace lane=forge_live forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == ShellTab.forge), forge_generation) -> forge_refreshed _ | forge_live_failed _
 
 on live_resynced(next)
   return if next.generation != hydration_generation
@@ -439,21 +393,23 @@ on live_resynced(next)
   channel_reads = initial_channel_reads(channels, channel_reads)
   // SAME FOLD, ONE LINE ABOVE THE BANNER, because it reads `history_view` while
   // it is still the window's own answer. `load_chat_data` replies with the
-  // LATEST page however far back the reader has paged, so assigning it back
+  // latest root-index page however far back the reader has paged, so assigning
+  // it back
   // dropped every "Load older" page she had loaded — on a huddle join in the
   // room on screen, a ws reconnect, or any chat op the delta path cannot fold.
   // `resynced_messages` splices the fresh tail onto the rows she is looking at,
-  // and falls back to the replace whenever the two do not overlap — a history
-  // window, or a tail the client lagged too far behind to still reach — because
+  // and falls back to the replace whenever the two do not overlap — a search
+  // window or a tail the client lagged too far behind to still reach — because
   // a merge across a gap leaves a hole nothing can page in. It takes
   // `chat_loaded` itself rather than sitting under an outer loaded-pick: most
   // resyncs are plane-only, and the merge is a full copy of the window.
-  messages = resynced_messages(next.chat_loaded, next.messages, messages, active_channel, next.active_channel, history_view)
+  messages = resynced_messages(next.chat_loaded, next.messages, messages, active_channel, next.active_channel)
+  messages_revision = keep_i64(next.chat_loaded, messages_revision + 1, messages_revision)
   // A resync that replaced the window left the banner describing rows that are
   // no longer on screen — see `chat_hit_loaded`. One that carried no chat kept
   // the window and keeps the banner with it.
   history_view = history_view && !next.chat_loaded
-  has_older_history = history_has_older(messages)
+  has_older_history = keep_bool(next.chat_loaded, next.has_older_history || history_has_older(messages), has_older_history)
   // A resync can move the room WITHOUT a launch that abandoned the request, so
   // this is the one dropper that must ask. Conditional, not a flat clear: a
   // same-channel resync leaves a legitimate page in flight, and `history_loaded`
@@ -489,8 +445,9 @@ on live_resynced(next)
   // already on — where `reply_editor` is untouched and the live buffer is the
   // truth — or closes it, and a closed rail has no composer to fill.
   thread_target_seq = refreshed_channel_value(active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), thread_target_seq)
-  thread_next_reply_offset = refreshed_channel_value(active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), thread_next_reply_offset)
+  thread_next_reply_seq = refreshed_channel_value(active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), thread_next_reply_seq)
   thread_messages = retain_thread_messages(thread_messages, active_thread_seq)
+  thread_messages_revision = keep_i64(next.chat_loaded, thread_messages_revision + 1, thread_messages_revision)
   thread_has_more = thread_has_more && active_channel == keep_str(next.chat_loaded, next.active_channel, active_channel) && active_thread_seq > 0
   // `message_draft` is the SETTLED stash (the body a failed send hands back) —
   // it never tracks keystrokes, so it reads
@@ -692,7 +649,7 @@ on live_resynced(next)
   // over the rail every time anyone edits the page. Replies still arrive on post
   // and on reopen; a page-scoped comment refresh in backend.rs closes the gap.
   parallel
-    run replace lane=live_thread refresh_live_thread(connected_rpc, active_channel, active_thread_seq, thread_target_seq, thread_next_reply_offset) -> live_thread_refreshed _ | live_thread_refresh_failed _
+    run replace lane=live_thread refresh_live_thread(connected_rpc, active_channel, active_thread_seq) -> live_thread_refreshed _ | live_thread_refresh_failed _
     run replace lane=block_threads load_page_threads(connected_rpc, block_comments_target, block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
     // Same close-if-ended mirror as `workspace_connected` — this is the fold
     // the steady state pays (a roster change forces a chat resync into here).
@@ -708,10 +665,13 @@ on live_resync_failed(cause)
 on live_thread_refreshed(next)
   return if next.channel_id != active_channel || next.root_seq != active_thread_seq
   return if thread_loading || mutation_phase != MutationPhase.idle
-  thread_target_seq = next.target_seq
-  thread_messages = merge_pending_messages(next.messages, thread_messages, active_channel, next.channel_id)
-  thread_next_reply_offset = next.next_reply_offset
-  thread_has_more = next.has_more
+  thread_messages = merge_thread_refresh(next.messages, thread_messages, active_channel, next.channel_id)
+  thread_messages_revision = thread_messages_revision + 1
+  let selection = message_selection_after_window(thread_messages, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
+  thread_selected_seq = selection.seq
+  thread_selected_rev = selection.rev
+  thread_message_action = selection.action
+  thread_edit_draft = selection.draft
 
 on live_thread_refresh_failed(_cause)
 

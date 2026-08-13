@@ -77,8 +77,9 @@ pub(super) fn tools() -> Vec<Tool> {
         },
         Tool {
             name: "ducktape_chat_messages",
-            description: "Read the most recent messages of a chat channel, oldest first. Use \
-                          this to catch up on a conversation you were not anchored in.",
+            description: "Read the most recent top-level messages of a chat channel, oldest \
+                          first. Each root carries its thread summary. Use this to catch up on a \
+                          conversation you were not anchored in.",
             schema: || {
                 schema(&[
                     ("channel_id", "string", true, "The channel to read."),
@@ -86,7 +87,7 @@ pub(super) fn tools() -> Vec<Tool> {
                         "limit",
                         "integer",
                         false,
-                        "How many of the newest messages to return (default 50, max 200).",
+                        "How many of the newest roots to return (default 50, max 200).",
                     ),
                 ])
             },
@@ -253,7 +254,7 @@ fn chat_messages(run: &Run, args: &Value) -> Result<Value> {
     let limit = opt_u64(args, "limit")
         .unwrap_or(DEFAULT_READ_LIMIT)
         .min(MAX_READ_LIMIT);
-    let query = json!({"messages_latest": {
+    let query = json!({"roots": {
         "channel_id": arg_str(args, "channel_id")?,
         "limit": limit,
     }});
@@ -491,9 +492,9 @@ mod tests {
         serde_json::from_value::<chat::index::ChatViewQuery>(json!({"channels": {}}))
             .expect("the channels view literal is chat's view wire");
         serde_json::from_value::<chat::index::ChatViewQuery>(
-            json!({"messages_latest": {"channel_id": "c", "limit": 5}}),
+            json!({"roots": {"channel_id": "c", "limit": 5}}),
         )
-        .expect("the messages_latest view literal is chat's view wire");
+        .expect("the roots view literal is chat's view wire");
         assert_eq!(encode(&AgentQuery::Agents).unwrap(), json!("agents"));
         assert_eq!(
             encode(&RunsQuery::PendingRuns).unwrap(),

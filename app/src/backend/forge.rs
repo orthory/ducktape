@@ -217,14 +217,14 @@ pub async fn load_forge_discussion(
     channel_id: String,
 ) -> Result<ForgeDiscussionData, AppError> {
     async {
-        let channel = load_channel_row(&rpc, &channel_id).await?;
         let rpc = rpc_client(&rpc)?;
-        let head = u64::try_from(channel.head_seq).unwrap_or(0);
-        let messages = load_messages(&rpc, &channel_id, head).await?;
-        let members = load_channel_members(&rpc, &channel_id).await?;
+        let (message_page, members) = tokio::try_join!(
+            load_messages(&rpc, &channel_id),
+            load_channel_members(&rpc, &channel_id)
+        )?;
         Ok(ForgeDiscussionData {
             channel_id,
-            messages,
+            messages: message_page.messages,
             members,
         })
     }
@@ -723,11 +723,17 @@ pub async fn forge_blob(
 /// True when one live update invalidates forge state: a folded forge op, a
 /// forge replay the stream could not fold (`resync`), or the stream (re)
 /// subscribing (`ready` — anything may have landed while it was down).
-pub fn forge_live_hit(kind: String, module: String) -> bool {
-    let folded_forge_op = kind == "forge";
-    let unfoldable_forge_replay = kind == "resync" && module == "forge";
-    let stream_caught_up = kind == "ready";
-    folded_forge_op || unfoldable_forge_replay || stream_caught_up
+pub fn forge_live_hit(kind: crate::LiveKind, module: String) -> bool {
+    match kind {
+        crate::LiveKind::Forge | crate::LiveKind::Ready => true,
+        crate::LiveKind::Resync => module == "forge",
+        crate::LiveKind::Retry
+        | crate::LiveKind::Tip
+        | crate::LiveKind::Chat
+        | crate::LiveKind::Bell
+        | crate::LiveKind::Pages
+        | crate::LiveKind::Plane => false,
+    }
 }
 
 /// One scoped forge catch-up, flag-selected per slice like [`LiveRefresh`]:
@@ -765,7 +771,7 @@ pub async fn forge_live_refresh(
     rpc: String,
     open_repo: String,
     open_item: i64,
-    kind: String,
+    kind: crate::LiveKind,
     module: String,
     refresh: ForgeRefresh,
     forge_open: bool,

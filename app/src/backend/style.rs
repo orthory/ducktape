@@ -1,29 +1,34 @@
 use super::*;
 
-pub(crate) fn live_update(kind: &str, status: &str, height: i64) -> LiveUpdate {
+pub(crate) fn live_update(kind: crate::LiveKind, status: &str, height: i64) -> LiveUpdate {
     LiveUpdate {
-        kind: kind.into(),
+        kind,
         status: status.into(),
         height,
         module: String::new(),
-        load_chat: kind == "ready",
-        load_pages: kind == "ready",
+        load_chat: kind == crate::LiveKind::Ready,
+        load_pages: kind == crate::LiveKind::Ready,
         debounce: false,
-        chat: ChatDelta::default(),
+        chat: Vec::new(),
         pages: PagesDelta::default(),
         bell: BellDelta::default(),
         forge: ForgeRefresh::default(),
+        permit: LivePermit::default(),
     }
 }
 
 pub(crate) fn live_retry(_message: String) -> LiveUpdate {
-    live_update("retry", "Reconnecting…", -1)
+    live_update(crate::LiveKind::Retry, "Reconnecting…", -1)
 }
 
 /// One plane's module committed something. The handler refetches that plane and
 /// nothing else — `module` is the whole payload.
 pub(crate) fn live_plane(module: &str, height: i64) -> LiveUpdate {
-    let mut update = live_update("plane", &format!("Live · block {height}"), height);
+    let mut update = live_update(
+        crate::LiveKind::Plane,
+        &format!("Live · block {height}"),
+        height,
+    );
     update.module = module.to_string();
     update
 }
@@ -31,7 +36,7 @@ pub(crate) fn live_plane(module: &str, height: i64) -> LiveUpdate {
 /// A module's replay is unavailable or unfoldable — the handler reloads that
 /// module's slices instead of folding.
 pub(crate) fn live_resync(module: &str, height: i64) -> LiveUpdate {
-    let mut update = live_update("resync", "Live · resyncing", height);
+    let mut update = live_update(crate::LiveKind::Resync, "Live · resyncing", height);
     update.module = module.to_string();
     update.load_chat = module == "chat";
     update.load_pages = module == "pages";

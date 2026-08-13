@@ -82,6 +82,52 @@ fn ice_sources_in(directory: &str) -> String {
         .join("\n")
 }
 
+#[test]
+fn every_timeline_writer_advances_its_render_revision() {
+    let mut writers = 0;
+    for (path, source) in ice_sources() {
+        if !path.contains("/handlers/") {
+            continue;
+        }
+        let source = format!("\n{source}");
+        for handler in source.split("\non ").skip(1) {
+            let body = handler.split("\non ").next().unwrap_or(handler);
+            let name = body.lines().next().unwrap_or("<unknown handler>");
+            for (state, revision) in [
+                ("messages", "messages_revision"),
+                ("thread_messages", "thread_messages_revision"),
+            ] {
+                let writes_state = body.lines().any(|line| {
+                    line.split("//")
+                        .next()
+                        .unwrap_or_default()
+                        .trim_start()
+                        .starts_with(&format!("{state} = "))
+                });
+                if !writes_state {
+                    continue;
+                }
+                writers += 1;
+                let advances_revision = body.lines().any(|line| {
+                    line.split("//")
+                        .next()
+                        .unwrap_or_default()
+                        .trim_start()
+                        .starts_with(&format!("{revision} = "))
+                });
+                assert!(
+                    advances_revision,
+                    "{path}: `{name}` writes `{state}` without advancing `{revision}`; the whole-list lazy would keep stale pixels"
+                );
+            }
+        }
+    }
+    assert!(
+        writers >= 20,
+        "the ratchet found the production timeline writers"
+    );
+}
+
 /// A SEAT THAT PRINTS A CHECKPOINT MUST OWN THE HEAD IT IS COMPARED AGAINST.
 ///
 /// A checkpoint height is meaningless on its own: it says how far the durable
@@ -431,6 +477,7 @@ fn live_refresh(
         chat_loaded: true,
         channels: Vec::new(),
         messages,
+        has_older_history: false,
         active_channel: active_channel.into(),
         active_channel_name: active_channel.into(),
         active_channel_archived: false,
@@ -450,16 +497,14 @@ fn live_refresh(
 
 fn posted_delta(channel: &str, row: backend::ChatMessage) -> backend::LiveUpdate {
     backend::LiveUpdate {
-        kind: "chat".into(),
+        kind: LiveKind::Chat,
         status: "Live".into(),
         height: row.seq.max(1),
-        chat: backend::ChatDelta {
-            kind: "posted".into(),
+        chat: vec![backend::ChatDelta::Posted {
             channel_id: channel.into(),
             seq: row.seq,
             message: row,
-            ..backend::ChatDelta::default()
-        },
+        }],
         ..backend::LiveUpdate::default()
     }
 }
@@ -469,6 +514,7 @@ fn chat_data(active_channel: &str, messages: Vec<backend::ChatMessage>) -> backe
         generation: 0,
         channels: Vec::new(),
         messages,
+        has_older_history: false,
         active_channel: active_channel.into(),
         active_channel_name: active_channel.into(),
         active_channel_archived: false,
@@ -481,7 +527,6 @@ fn chat_data(active_channel: &str, messages: Vec<backend::ChatMessage>) -> backe
         active_thread_seq: 0,
         thread_target_seq: 0,
         thread_messages: Vec::new(),
-        thread_next_reply_offset: 0,
         thread_has_more: false,
     }
 }
@@ -494,6 +539,7 @@ fn workspace(active_channel: &str) -> backend::WorkspaceData {
         height: 1,
         channels: Vec::new(),
         messages: Vec::new(),
+        has_older_history: false,
         active_channel: active_channel.into(),
         active_channel_name: active_channel.into(),
         active_channel_archived: false,
@@ -752,7 +798,7 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
         ),
     ] {
         let live = format!(
-            "from done load_request(plane_live_hit(next.kind, next.module, \"{module}\"), connected_rpc, \"\", {generation})\n      try request -> done request\n      done -> {selected} _"
+            "from done load_request(plane_live_hit(next.kind, next.module, \"{module}\"), connected_rpc, \"\", {generation})\n          try request -> done request\n          done -> {selected} _"
         );
         assert!(
             lifecycle.contains(&live),
@@ -769,7 +815,7 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
     // `"agent"` and the Forge seat's dot goes dark for the length of a run.
     for line in [
         "agents_generation = keep_i64(agents_plane_hit(next.kind, next.module), agents_generation + 1, agents_generation)",
-        "from done load_request(agents_plane_hit(next.kind, next.module), connected_rpc, \"\", agents_generation)\n      try request -> done request\n      done -> agents_load_selected _",
+        "from done load_request(agents_plane_hit(next.kind, next.module), connected_rpc, \"\", agents_generation)\n          try request -> done request\n          done -> agents_load_selected _",
     ] {
         assert!(
             lifecycle.contains(line),
@@ -908,7 +954,7 @@ fn a_move_off_the_agents_tab_keeps_a_live_load_that_already_answered() {
     // the run's own commit is what asks for the rows; its generation is the
     // one the reply below carries.
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: "plane".into(),
+        kind: LiveKind::Plane,
         status: "Live".into(),
         height: 12,
         module: "runs".into(),
@@ -960,9 +1006,8 @@ fn forge_depth_rides_the_established_seams() {
     // the item discussion IS a chat surface: hydrated through the chat
     // lanes and spliced by the SAME fold the chat pane uses, scoped to
     // the item's hidden channel — never a forge-private message path.
-    assert!(lifecycle.contains(
-        "forge_discussion = apply_chat_messages(forge_discussion, next.chat, forge_item_channel)"
-    ));
+    assert!(lifecycle.contains("forge_discussion = folded_chat.forge_discussion"));
+    assert!(lifecycle.contains("fold_live_chat(next.chat"));
     assert!(lifecycle.contains(
         "run every send_message(connected_rpc, password, forge_item_channel, forge_discussion_pending"
     ));
@@ -1471,7 +1516,7 @@ fn resyncs_cannot_retarget_drafts_to_fallback_contexts() {
     app.thread_generation = 4;
     app.thread_target_seq = 9;
     app.thread_messages = vec![message(7, "old thread", false)];
-    app.thread_next_reply_offset = 4;
+    app.thread_next_reply_seq = 4;
     app.thread_has_more = true;
     app.thread_loading = true;
     app.reply_editor = compose("thread reply");
@@ -1497,7 +1542,7 @@ fn resyncs_cannot_retarget_drafts_to_fallback_contexts() {
     assert_eq!(app.thread_generation, 5);
     assert_eq!(app.thread_target_seq, 0);
     assert!(app.thread_messages.is_empty());
-    assert_eq!(app.thread_next_reply_offset, 0);
+    assert_eq!(app.thread_next_reply_seq, 0);
     assert!(!app.thread_has_more);
     assert!(!app.thread_loading);
     assert_eq!(
@@ -1519,7 +1564,7 @@ fn mutation_acks_preserve_open_editors_and_thread_state() {
     app.active_thread_seq = 9;
     app.thread_target_seq = 10;
     app.thread_messages = vec![message(9, "thread root", false)];
-    app.thread_next_reply_offset = 3;
+    app.thread_next_reply_seq = 3;
     app.thread_has_more = true;
     app.reply_editor = compose("reply in progress");
     app.message_editor = compose("next message");
@@ -1536,7 +1581,7 @@ fn mutation_acks_preserve_open_editors_and_thread_state() {
     assert_eq!(app.active_thread_seq, 9);
     assert_eq!(app.thread_target_seq, 10);
     assert_eq!(app.thread_messages.len(), 1);
-    assert_eq!(app.thread_next_reply_offset, 3);
+    assert_eq!(app.thread_next_reply_seq, 3);
     assert!(app.thread_has_more);
     assert_eq!(reply_composer(&app), "reply in progress");
     assert_eq!(composer(&app), "next message");
@@ -1914,15 +1959,13 @@ fn a_tombstoned_thread_root_renders_deleted_in_place() {
     // in place; the open thread stays open showing the tombstone (the
     // module allows replying to a tombstoned root).
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: "chat".into(),
+        kind: LiveKind::Chat,
         status: "Live".into(),
         height: 5,
-        chat: backend::ChatDelta {
-            kind: "deleted".into(),
+        chat: vec![backend::ChatDelta::Deleted {
             channel_id: "general".into(),
             seq: 9,
-            ..backend::ChatDelta::default()
-        },
+        }],
         ..backend::LiveUpdate::default()
     }));
 
@@ -1963,8 +2006,8 @@ fn unrelated_resyncs_keep_an_initial_thread_load_alive() {
         root_seq: 7,
         target_seq: 7,
         messages: vec![message(7, "root", false)],
-        next_reply_offset: 1,
-        has_more: true,
+        next_reply_seq: 0,
+        has_more: false,
     }));
     assert_eq!(refresh.active_thread_seq, 7);
     assert_eq!(refresh.thread_messages.len(), 1);
@@ -1996,6 +2039,7 @@ fn a_history_page_prepends_only_into_the_channel_that_asked_for_it() {
     let _ = app.__update(__DucktapeMessage::HistoryLoaded(backend::HistoryPageData {
         channel_id: "a".into(),
         messages: vec![message(1, "a-one", false)],
+        has_more: false,
     }));
     assert_eq!(
         app.messages.len(),
@@ -2013,6 +2057,7 @@ fn a_history_page_prepends_only_into_the_channel_that_asked_for_it() {
     let _ = app.__update(__DucktapeMessage::HistoryLoaded(backend::HistoryPageData {
         channel_id: "b".into(),
         messages: vec![message(1, "b-one", false)],
+        has_more: false,
     }));
     assert_eq!(app.messages.len(), 2);
     assert_eq!(app.messages[0].body, "b-one");
@@ -2141,20 +2186,13 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
 
     // And the launches genuinely carry the clear — a mover list alone would pass
     // with every clear deleted.
-    //
-    // THE SECOND TERM RIDES THE SAME LIST. `chat_window_loading` is the "a chat
-    // load is in flight" reading the history routes gained when a cache hit
-    // stopped raising `loading`, and it splits this list in two: the three
-    // routes that LAUNCH a window load raise it, and the three that abandon one
-    // without starting another lower it — a launch that raised it with no
-    // landing left to lower it refuses "Load older" for the rest of the session.
-    for (launch, window_term) in [
-        ("choose_channel", "chat_window_loading = true"),
-        ("choose_dm", "chat_window_loading = true"),
-        ("open_chat_search_hit", "chat_window_loading = true"),
-        ("create_channel_submit", "chat_window_loading = false"),
-        ("reconnect", "chat_window_loading = false"),
-        ("console_opened", "chat_window_loading = false"),
+    for launch in [
+        "choose_channel",
+        "choose_dm",
+        "open_chat_search_hit",
+        "create_channel_submit",
+        "reconnect",
+        "console_opened",
     ] {
         let body = HANDLERS
             .split(&format!("\non {launch}"))
@@ -2166,35 +2204,6 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
         assert!(
             body.contains("history_loading = false"),
             "{launch} abandons a history request and must release the flag"
-        );
-        assert!(
-            body.contains(window_term),
-            "{launch} must write `{window_term}`"
-        );
-    }
-
-    // The landings lower it, and each is generation-guarded: a superseded reply
-    // must not open the history routes against rows the winning load is still
-    // about to replace.
-    for landing in ["chat_updated", "chat_hit_loaded", "chat_load_failed"] {
-        let body = HANDLERS
-            .split(&format!("\non {landing}"))
-            .nth(1)
-            .unwrap_or_else(|| panic!("{landing} is a handler"))
-            .split("\non ")
-            .next()
-            .expect("handler body");
-        let guard = body
-            .lines()
-            .position(|line| line.trim_start().starts_with("return if "))
-            .expect("a generation guard");
-        let release = body
-            .lines()
-            .position(|line| line.trim() == "chat_window_loading = false")
-            .expect("the window term is released");
-        assert!(
-            guard < release,
-            "{landing} must release `chat_window_loading` BELOW its generation guard"
         );
     }
 
@@ -2383,66 +2392,6 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
             );
         }
     }
-}
-
-/// THE STREAM'S TAIL IS ASSERTED BY THE SWITCH, NOT INHERITED FROM THE LAST ROOM.
-///
-/// The scroll reset used to be a side effect of the timeline going empty: the
-/// `if connected && !empty(messages)` gate around the stack dropped, the
-/// scrollable unmounted, and its `scrollable::State` — the offset with it —
-/// died. The window cache ended that. A handler that paints PARKED rows takes
-/// `messages` non-empty → non-empty in one reducer pass, the gate never renders
-/// false, and iced's positional `Tree::diff` hands the surviving offset to the
-/// room being entered — a distance from the BOTTOM under `anchor-y=end`, so an
-/// 800px scroll-up in #general opens #design 800px above its own tail.
-///
-/// So the rule is mechanical: a handler that restores a window from the cache
-/// asserts the tail explicitly. Absolute `0.0` IS the tail under this anchor
-/// (`snap-end`'s relative 1.0 would be the TOP of scrollback). The lint keys on
-/// `cached_window(` rather than a hardcoded handler list, so the next picker
-/// that gains a cache restore fails here until it carries the operation too.
-#[test]
-fn a_room_restored_from_the_cache_asserts_the_streams_tail() {
-    const HANDLERS: &str = include_str!("ui/handlers/chat.ice");
-    const TAIL: &str = "task widget scroll-to #workspace-tabs/content/chat/message-stream 0.0 0.0";
-
-    let mut restorers: Vec<&str> = Vec::new();
-    for block in HANDLERS.split("\non ").skip(1) {
-        let handler = block.split('(').next().unwrap_or(block).trim();
-        let handler = handler.lines().next().unwrap_or(handler).trim();
-        // ANY CALL, NOT JUST A `let`-BOUND ONE. Keying on the `let ` prefix let
-        // a restore written as `messages = cached_window(…).messages` slip the
-        // fence entirely — the operation is what matters, not how its answer is
-        // spelled. Comment lines are skipped so naming the function in prose
-        // does not conscript a handler that never calls it.
-        let restores = block
-            .lines()
-            .any(|line| !line.trim_start().starts_with("//") && line.contains("cached_window("));
-        if !restores {
-            continue;
-        }
-        restorers.push(handler);
-        assert!(
-            block.lines().any(|line| line.trim() == TAIL),
-            "`on {handler}` paints parked rows into a scrollable that survives \
-             the switch, so it must end with `{TAIL}` — the unmount is no longer \
-             the reset"
-        );
-    }
-    assert_eq!(
-        restorers,
-        ["choose_channel", "choose_dm"],
-        "a handler started or stopped restoring a parked window: it owes the \
-         stream its tail"
-    );
-
-    // And the screen no longer claims the gate is the reset — that comment sent
-    // the last reader looking for a reset that #1059 had already deleted.
-    const SCREEN: &str = include_str!("ui/screens/chat.ice");
-    assert!(
-        !SCREEN.contains("THIS GATE IS THE SCROLL RESET"),
-        "the stream's gate stopped being the scroll reset when the cache landed"
-    );
 }
 
 /// A MIRRORED VIEW READING IS ONLY AS GOOD AS ITS WRITERS, SO THE WRITERS ARE
@@ -2910,7 +2859,7 @@ fn ready_events_rehydrate_without_rewinding_the_tip() {
     live.block_height = 41;
     live.hydration_generation = 2;
     let _ = live.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: "ready".into(),
+        kind: LiveKind::Ready,
         status: "Live".into(),
         height: -1,
         load_chat: true,
@@ -3161,14 +3110,19 @@ fn a_chat_resync_keeps_the_pages_the_reader_paged_in() {
     let _ = app.__update(__DucktapeMessage::HistoryLoaded(backend::HistoryPageData {
         channel_id: "general".into(),
         messages: vec![message(20, "older", false)],
+        has_more: true,
     }));
     let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
     let _ = app.__update(__DucktapeMessage::HistoryLoaded(backend::HistoryPageData {
         channel_id: "general".into(),
         messages: vec![message(2, "older still", false)],
+        has_more: true,
     }));
     assert_eq!(backend::oldest_message_seq(app.messages.clone()), 2);
-    assert!(!app.history_view, "back-paging is not a history window");
+    assert!(
+        app.history_view,
+        "back-paging enters the bounded history window until Jump to latest"
+    );
 
     // someone joins the huddle in this room, and the resync it forces answers
     // with the latest page alone
@@ -3195,6 +3149,11 @@ fn a_chat_resync_keeps_the_pages_the_reader_paged_in() {
 
     // A HISTORY WINDOW IS STILL REPLACED: it is not contiguous with the tail,
     // so merging the two would leave a hole in the middle that nothing pages in.
+    // The real search-hit launch clears the old presentation window before
+    // this response can land; mirror that launch boundary in the direct
+    // reducer fixture so post-launch live rows, not pre-launch history, are
+    // the only rows the landing merge may preserve.
+    app.messages.clear();
     let _ = app.__update(__DucktapeMessage::ChatHitLoaded(chat_data(
         "general",
         vec![message(7, "six months ago", false)],
@@ -3431,6 +3390,11 @@ fn a_live_post_does_not_splice_itself_into_a_history_window() {
     );
 
     // Jump to latest, and the tail is live again.
+    // `choose_channel` clears the history window before starting this load.
+    // This fixture delivers the response directly, so apply the launch-side
+    // clear explicitly; a same-room committed row after this point would be a
+    // live RTT arrival and must be retained by the landing merge.
+    app.messages.clear();
     let _ = app.__update(__DucktapeMessage::ChatUpdated(chat_data(
         "general",
         vec![message(499, "the latest", false)],
@@ -3585,70 +3549,65 @@ fn the_dm_header_takes_the_slack_the_channel_title_would() {
     assert!(!screen.contains("if !empty(active_dm_peer)"));
 }
 
-/// ONE COMMITTED REPLY, ONE ROW, ONE STEP OF THE CURSOR.
-///
-/// `thread_reply_send_failed` bumped the reply cursor for a reply that had
-/// committed, and then the SAME reply's delta arrived on the live stream and
-/// bumped it again — two observers of one row. The cursor then pointed one
-/// reply past the loaded run, so the next "Load more replies" started late and
-/// the skipped reply was never rendered at all.
+/// Live delivery does not own the server's page cursor. A reply may arrive on
+/// the stream while the page that contains it is in flight; the page replaces
+/// the cursor and the row merge deduplicates their overlap.
 #[test]
-fn a_committed_reply_moves_the_thread_cursor_exactly_once() {
+fn live_reply_overlapping_a_page_keeps_one_row_and_the_server_cursor() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
     app.active_channel = "general".into();
     app.active_thread_seq = 1;
-    app.thread_messages = vec![message(1, "the root", false), message(2, "a reply", false)];
-    app.thread_next_reply_offset = 1;
-    app.thread_has_more = false;
-    app.reply_editor = compose("mine");
+    let mut first_reply = message(2, "first reply", false);
+    first_reply.thread_seq = 1;
+    app.thread_messages = vec![message(1, "the root", false), first_reply];
+    app.thread_next_reply_seq = 2;
+    app.thread_has_more = true;
+    app.thread_generation = 7;
+    app.thread_loading = true;
 
-    let _ = app.__update(__DucktapeMessage::ReplyComposerEvent(
-        editor::composer_submit_event(),
-    ));
-    let operation_id = app.thread_messages[2].id.clone();
-
-    // the write committed, but the read after it failed
-    let _ = app.__update(__DucktapeMessage::ThreadReplySendFailed(
-        backend::OptimisticMutationError {
-            message: "read failed after commit".into(),
-            committed: true,
-            operation_id: operation_id.clone(),
-            scope_id: "general".into(),
-            body: "mine".into(),
-        },
-    ));
-    assert_eq!(
-        app.thread_next_reply_offset, 1,
-        "the failure counts nothing — the reply's own delta is the observer"
-    );
-
-    // …and here is that delta, settling the pending row in place
-    let mut settled = message(3, "mine", false);
-    settled.id = operation_id;
-    settled.thread_seq = 1;
+    let mut streamed = message(3, "streamed reply", false);
+    streamed.thread_seq = 1;
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: "chat".into(),
+        kind: LiveKind::Chat,
         status: "Live".into(),
         height: 3,
-        chat: backend::ChatDelta {
-            kind: "reply".into(),
+        chat: vec![backend::ChatDelta::Reply {
             channel_id: "general".into(),
             seq: 3,
             root_seq: 1,
-            message: settled,
-            ..backend::ChatDelta::default()
-        },
+            message: streamed,
+        }],
         ..backend::LiveUpdate::default()
     }));
-    assert_eq!(app.thread_messages.len(), 3, "root plus two replies");
-    assert!(app.thread_messages.iter().all(|reply| !reply.pending));
+    assert_eq!(app.thread_next_reply_seq, 2);
+    assert!(app.thread_has_more);
+
+    let mut overlap = message(3, "streamed reply", false);
+    overlap.thread_seq = 1;
+    let mut next = message(4, "next reply", false);
+    next.thread_seq = 1;
+    let _ = app.__update(__DucktapeMessage::ThreadPageLoaded(
+        backend::ThreadPageData {
+            generation: 7,
+            messages: vec![overlap, next],
+            next_reply_seq: 4,
+            has_more: true,
+        },
+    ));
+
     assert_eq!(
-        app.thread_next_reply_offset,
-        app.thread_messages.len() as i64 - 1,
-        "the cursor is where the loaded run ends, not one past it"
+        app.thread_messages
+            .iter()
+            .filter(|message| message.seq == 3)
+            .count(),
+        1
     );
+    assert!(app.thread_messages.iter().any(|message| message.seq == 4));
+    assert_eq!(app.thread_next_reply_seq, 4);
+    assert!(app.thread_has_more);
+    assert_eq!(app.thread_messages.len(), 4, "root plus three replies");
 }
 
 /// A LOAD FAILED; THE CONNECTION SAID NOTHING.
@@ -3695,10 +3654,12 @@ fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
     // `by=message.view_key` is what makes per-row state and per-row MEASUREMENT
     // follow the message through prepends AND optimistic confirmation instead
     // of following the slot it happened to occupy.
-    let above = chat
+    let timeline = chat
+        .split_once("component MessageTimeline")
+        .expect("the message timeline component")
+        .1
         .split_once("keyed message in messages by=message.view_key w=fill gap=3.0 virtual-row=44.0")
-        .expect("the message timeline is a KEYED virtual-row column")
-        .0;
+        .expect("the message timeline is a KEYED virtual-row column");
     // That is only correct under an end-anchored scroll: measuring a row ABOVE
     // the viewport moves everything below it, and a bottom-anchored offset is
     // what carries the visible rows along with it. The two travel together —
@@ -3706,15 +3667,15 @@ fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
     // `h=shrink` is the composer-anchored height: the virtual column reports a
     // whole-list estimate, so a long timeline still hits the box's cap.
     assert!(
-        above
-            .contains("scroll #message-stream dir=vertical w=fill h=shrink anchor-y=end auto=true")
+        chat.contains("scroll #message-stream dir=vertical w=fill h=shrink anchor-y=end auto=true")
     );
     // The page controls stay OUTSIDE the keyed column. A keyed column repeats
     // one template over one list; a button folded into that list is a row whose
     // arrival and departure shift every index below it — the same defect one
     // level up, and `has_older_history` flips on every page.
-    assert!(above.contains("col w=fill gap=3.0 pr=6.0"));
-    assert!(above.contains("button \"Load older messages\""));
+    assert!(chat.contains("col w=fill gap=3.0 pr=6.0"));
+    assert!(chat.contains("button \"Load older messages\""));
+    assert!(timeline.1.contains("lazy message as cached_message"));
     // A key is only an identity if it is unique. The allocator gives every
     // concurrent pending row its own widget state and measurement.
     let mut pending = Vec::new();
@@ -3817,11 +3778,13 @@ fn the_edited_marker_reaches_every_row_it_annotates() {
 #[test]
 fn the_thread_rail_virtualizes_and_caches_its_quiet_replies() {
     let chat = inlined(include_str!("ui/screens/chat.ice"));
-    let above = chat
-        .split_once("col w=fill gap=3.0 pl=16.0 pr=16.0 pt=12.0 pb=8.0 virtual-row=44.0")
-        .expect("the thread rail is a virtual-row column")
-        .0;
-    assert!(above.contains("scroll dir=vertical w=fill h=fill anchor-y=end auto=true"));
+    assert!(chat.contains("scroll dir=vertical w=fill h=fill anchor-y=end auto=true"));
+    assert!(chat.contains(
+        "keyed thread_message in messages by=thread_message.view_key w=fill gap=3.0 virtual-row=44.0"
+    ));
+    assert!(chat.contains(
+        "lazy thread_messages by thread_messages_revision, active_channel, active_thread_seq, thread_target_seq, thread_selected_seq, loading as cached_thread_messages"
+    ));
     // A `lazy` subtree reads nothing but its dependency, so the quiet arm can
     // only exist because the rows that read SCREEN state — the search target
     // and the open action menu — were split off into live arms. Confirmation
@@ -3829,9 +3792,7 @@ fn the_thread_rail_virtualizes_and_caches_its_quiet_replies() {
     // The KEYED form is pinned too:
     // dropping `by (seq, render_rev)` silently reverts every visible reply to
     // a full row clone + hash per frame — the #1058 residue this collects.
-    assert!(chat.contains(
-        "lazy thread_message by thread_message.seq, thread_message.render_rev as cached_reply"
-    ));
+    assert!(chat.contains("lazy thread_message as cached_reply"));
     for live in [
         "thread_message.seq == thread_target_seq",
         "thread_message.seq == thread_selected_seq",
@@ -4222,7 +4183,7 @@ fn opening_another_thread_invalidates_the_pending_thread() {
         root_seq: 1,
         target_seq: 0,
         messages: Vec::new(),
-        next_reply_offset: 0,
+        next_reply_seq: 0,
         has_more: false,
     }));
     assert_eq!(app.active_thread_seq, 2);
@@ -4509,13 +4470,13 @@ fn thread_pagination_preserves_multiple_pending_replies() {
         backend::ThreadPageData {
             generation: 7,
             messages: vec![message(3, 1, "second")],
-            next_reply_offset: 2,
+            next_reply_seq: 0,
             has_more: false,
         },
     ));
     assert_eq!(app.thread_messages.len(), 5);
     assert_eq!(app.thread_messages[1].body, "first");
-    assert_eq!(app.thread_next_reply_offset, 2);
+    assert_eq!(app.thread_next_reply_seq, 0);
     assert!(
         app.thread_messages
             .iter()
@@ -6188,7 +6149,7 @@ fn a_plane_op_refetches_only_the_plane_it_names() {
 
     let plane = |app: &mut Ducktape, module: &str| {
         let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-            kind: "plane".into(),
+            kind: LiveKind::Plane,
             status: "Live".into(),
             height: 12,
             module: module.into(),
@@ -6275,7 +6236,7 @@ fn a_folded_rename_moves_the_title_the_page_row_and_line_zero() {
     let before = app.hydration_generation;
 
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: "pages".into(),
+        kind: LiveKind::Pages,
         status: "Live".into(),
         height: 11,
         module: "pages".into(),
@@ -6323,7 +6284,7 @@ fn a_folded_rename_never_overwrites_a_dirty_buffer() {
     app.page_saved_text = "Old Name\nbody".into();
 
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: "pages".into(),
+        kind: LiveKind::Pages,
         status: "Live".into(),
         height: 12,
         module: "pages".into(),
@@ -6376,7 +6337,7 @@ fn a_folded_text_edit_updates_the_block_and_fetches_nothing() {
     let before = app.hydration_generation;
 
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: "pages".into(),
+        kind: LiveKind::Pages,
         status: "Live".into(),
         height: 9,
         module: "pages".into(),
@@ -6405,7 +6366,7 @@ fn a_folded_text_edit_updates_the_block_and_fetches_nothing() {
     // A block this document does not hold belongs to another page. Fold
     // nothing, fetch nothing.
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: "pages".into(),
+        kind: LiveKind::Pages,
         status: "Live".into(),
         height: 10,
         module: "pages".into(),
@@ -6447,7 +6408,7 @@ fn a_fold_landing_during_a_resync_flight_is_not_reverted_by_the_reply() {
 
     // Someone inserts a block: the structural delta buys the debounced resync.
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: "pages".into(),
+        kind: LiveKind::Pages,
         status: "Live".into(),
         height: 20,
         module: "pages".into(),
@@ -6464,7 +6425,7 @@ fn a_fold_landing_during_a_resync_flight_is_not_reverted_by_the_reply() {
 
     // A rename folds while the resync's three reads are still executing.
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: "pages".into(),
+        kind: LiveKind::Pages,
         status: "Live".into(),
         height: 21,
         module: "pages".into(),
@@ -6547,7 +6508,7 @@ fn a_fold_in_the_window_does_not_discard_the_replys_pages_half() {
     app.page_saved_text = "Old Name\nbody".into();
 
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: "pages".into(),
+        kind: LiveKind::Pages,
         status: "Live".into(),
         height: 30,
         module: "pages".into(),
@@ -6563,7 +6524,7 @@ fn a_fold_in_the_window_does_not_discard_the_replys_pages_half() {
     let request_fold_serial = app.pages_fold_serial;
 
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: "pages".into(),
+        kind: LiveKind::Pages,
         status: "Live".into(),
         height: 31,
         module: "pages".into(),
@@ -6638,7 +6599,7 @@ fn a_body_text_fold_keeps_its_text_and_takes_the_replys_structure() {
     app.page_saved_text = "Doc\nbody".into();
 
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: "pages".into(),
+        kind: LiveKind::Pages,
         status: "Live".into(),
         height: 40,
         module: "pages".into(),
@@ -6655,7 +6616,7 @@ fn a_body_text_fold_keeps_its_text_and_takes_the_replys_structure() {
 
     // A peer's body edit folds into b1 while the reads are executing.
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: "pages".into(),
+        kind: LiveKind::Pages,
         status: "Live".into(),
         height: 41,
         module: "pages".into(),
@@ -6721,7 +6682,7 @@ fn a_request_issued_after_the_fold_lands_its_title_normally() {
     // The rename folds FIRST, then a structural delta buys the resync: the
     // request snapshots the post-fold serial.
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: "pages".into(),
+        kind: LiveKind::Pages,
         status: "Live".into(),
         height: 50,
         module: "pages".into(),
@@ -6733,7 +6694,7 @@ fn a_request_issued_after_the_fold_lands_its_title_normally() {
         ..backend::LiveUpdate::default()
     }));
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: "pages".into(),
+        kind: LiveKind::Pages,
         status: "Live".into(),
         height: 51,
         module: "pages".into(),
@@ -6792,7 +6753,7 @@ fn live_comment_refresh_updates_threads_without_touching_the_draft() {
 
     // a pages comment op arrives: the delta starts the debounced reload
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: "pages".into(),
+        kind: LiveKind::Pages,
         status: "Live".into(),
         height: 8,
         load_pages: true,
@@ -6902,7 +6863,7 @@ fn deltas_fold_during_thread_pagination_without_disturbing_it() {
         backend::ThreadPageData {
             generation: 4,
             messages: Vec::new(),
-            next_reply_offset: 0,
+            next_reply_seq: 0,
             has_more: false,
         },
     ));
@@ -7003,6 +6964,8 @@ fn live_thread_refresh_preserves_the_reply_draft_and_rejects_other_scopes() {
     app.active_channel = "general".into();
     app.active_thread_seq = 7;
     app.thread_target_seq = 9;
+    app.thread_next_reply_seq = 5;
+    app.thread_has_more = true;
     app.reply_editor = compose("typing");
     app.thread_messages = backend::optimistic_message(
         backend::optimistic_message(Vec::new(), "pending first".into(), "pending-first".into()),
@@ -7014,27 +6977,21 @@ fn live_thread_refresh_preserves_the_reply_draft_and_rejects_other_scopes() {
         backend::LiveThreadData {
             channel_id: "other".into(),
             root_seq: 7,
-            target_seq: 0,
             messages: Vec::new(),
-            next_reply_offset: 99,
-            has_more: true,
         },
     ));
-    assert_eq!(app.thread_next_reply_offset, 0);
+    assert_eq!(app.thread_next_reply_seq, 5);
 
     let _ = app.__update(__DucktapeMessage::LiveThreadRefreshed(
         backend::LiveThreadData {
             channel_id: "general".into(),
             root_seq: 7,
-            target_seq: 0,
             messages: Vec::new(),
-            next_reply_offset: 5,
-            has_more: true,
         },
     ));
     assert_eq!(reply_composer(&app), "typing");
-    assert_eq!(app.thread_target_seq, 0);
-    assert_eq!(app.thread_next_reply_offset, 5);
+    assert_eq!(app.thread_target_seq, 9);
+    assert_eq!(app.thread_next_reply_seq, 5);
     assert!(app.thread_has_more);
     assert!(
         app.thread_messages
@@ -7052,13 +7009,10 @@ fn live_thread_refresh_preserves_the_reply_draft_and_rejects_other_scopes() {
         backend::LiveThreadData {
             channel_id: "general".into(),
             root_seq: 7,
-            target_seq: 9,
             messages: Vec::new(),
-            next_reply_offset: 99,
-            has_more: true,
         },
     ));
-    assert_eq!(app.thread_next_reply_offset, 0);
+    assert_eq!(app.thread_next_reply_seq, 0);
     assert!(!app.thread_has_more);
 }
 
@@ -8797,6 +8751,7 @@ fn a_pending_send_survives_a_history_page_without_poisoning_it() {
     let _ = app.__update(__DucktapeMessage::HistoryLoaded(backend::HistoryPageData {
         channel_id: "general".into(),
         messages: vec![message(20, "older", false)],
+        has_more: true,
     }));
 
     let ordering: Vec<i64> = app.messages.iter().map(|message| message.seq).collect();
@@ -8814,6 +8769,78 @@ fn a_pending_send_survives_a_history_page_without_poisoning_it() {
         20,
         "and the next page is asked for from the oldest COMMITTED row"
     );
+}
+
+#[test]
+fn a_bounded_window_never_leaves_actions_targeting_an_evicted_row() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.mutation_phase = MutationPhase::Idle;
+    app.active_channel = "general".into();
+    app.messages = (1..=backend::CHAT_HOT_WINDOW_LIMIT as i64)
+        .map(|seq| message(seq, &format!("message {seq}"), false))
+        .collect();
+    app.selected_message_seq = 1;
+    app.selected_message_rev = 7;
+    app.message_action = MessageAction::Delete;
+    app.message_edit_draft = "stale edit".into();
+    app.message_editor = compose("new tail");
+
+    let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
+        editor::composer_submit_event(),
+    ));
+    assert_eq!(app.messages.first().map(|row| row.seq), Some(2));
+    assert_eq!(app.selected_message_seq, 0);
+    assert_eq!(app.selected_message_rev, 0);
+    assert_eq!(app.message_action, MessageAction::Toolbar);
+    assert!(app.message_edit_draft.is_empty());
+
+    app.messages = (100..356)
+        .map(|seq| message(seq, &format!("message {seq}"), false))
+        .collect();
+    app.selected_message_seq = 355;
+    app.selected_message_rev = 9;
+    app.message_action = MessageAction::Editing;
+    app.message_edit_draft = "also stale".into();
+    app.has_older_history = true;
+    let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
+    let _ = app.__update(__DucktapeMessage::HistoryLoaded(backend::HistoryPageData {
+        channel_id: "general".into(),
+        messages: (1..100)
+            .map(|seq| message(seq, &format!("older {seq}"), false))
+            .collect(),
+        has_more: false,
+    }));
+    assert!(!app.messages.iter().any(|row| row.seq == 355));
+    assert_eq!(app.selected_message_seq, 0);
+    assert_eq!(app.selected_message_rev, 0);
+    assert_eq!(app.message_action, MessageAction::Toolbar);
+    assert!(app.message_edit_draft.is_empty());
+
+    let root = message(1, "thread root", false);
+    let mut replies: Vec<_> = (2..=backend::THREAD_HOT_WINDOW_LIMIT as i64)
+        .map(|seq| {
+            let mut reply = message(seq, &format!("reply {seq}"), false);
+            reply.thread_seq = 1;
+            reply
+        })
+        .collect();
+    app.thread_messages = std::iter::once(root).chain(replies.drain(..)).collect();
+    app.active_thread_seq = 1;
+    app.thread_selected_seq = 2;
+    app.thread_selected_rev = 3;
+    app.thread_message_action = MessageAction::Delete;
+    app.thread_edit_draft = "evicted reply".into();
+    app.reply_editor = compose("new reply at the tail");
+    let _ = app.__update(__DucktapeMessage::ReplyComposerEvent(
+        editor::composer_submit_event(),
+    ));
+    assert!(!app.thread_messages.iter().any(|row| row.seq == 2));
+    assert_eq!(app.thread_selected_seq, 0);
+    assert_eq!(app.thread_selected_rev, 0);
+    assert_eq!(app.thread_message_action, MessageAction::Toolbar);
+    assert!(app.thread_edit_draft.is_empty());
 }
 
 /// A SEND CONTINUES THE READER'S OWN RUN.
@@ -9049,17 +9076,15 @@ fn optimistic_thread_replies_settle_independently_out_of_order() {
     second.id = second_id.clone();
     second.thread_seq = 1;
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: "chat".into(),
+        kind: LiveKind::Chat,
         status: "Live".into(),
         height: 3,
-        chat: backend::ChatDelta {
-            kind: "reply".into(),
+        chat: vec![backend::ChatDelta::Reply {
             channel_id: "general".into(),
             seq: 3,
             root_seq: 1,
             message: second,
-            ..backend::ChatDelta::default()
-        },
+        }],
         ..backend::LiveUpdate::default()
     }));
     assert_eq!(app.thread_messages.len(), 2);
@@ -9078,17 +9103,15 @@ fn optimistic_thread_replies_settle_independently_out_of_order() {
     first.id = first_id.clone();
     first.thread_seq = 1;
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: "chat".into(),
+        kind: LiveKind::Chat,
         status: "Live".into(),
         height: 4,
-        chat: backend::ChatDelta {
-            kind: "reply".into(),
+        chat: vec![backend::ChatDelta::Reply {
             channel_id: "general".into(),
             seq: 2,
             root_seq: 1,
             message: first,
-            ..backend::ChatDelta::default()
-        },
+        }],
         ..backend::LiveUpdate::default()
     }));
     assert_eq!(app.thread_messages.len(), 2);
@@ -9314,7 +9337,7 @@ fn a_burst_of_channel_clicks_lands_on_the_last_one_and_drops_the_replies_it_pass
 /// DURING the round trip has to survive the reply: a peer's post in a THIRD
 /// room and the unread badge it lit, and a channel someone created while she
 /// waited. Nothing re-pages the list afterwards — `load_chat` is raised only
-/// for `kind == "ready"`, i.e. a websocket reconnect — so a revert here is not
+/// for `kind == LiveKind::Ready`, i.e. a websocket reconnect — so a revert here is not
 /// a frame of staleness, it is permanent.
 #[test]
 fn a_switch_reply_keeps_what_the_live_stream_folded_while_it_was_in_flight() {
@@ -9334,14 +9357,12 @@ fn a_switch_reply_keeps_what_the_live_stream_folded_while_it_was_in_flight() {
         message(41, "from a peer", false),
     )));
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: "chat".into(),
+        kind: LiveKind::Chat,
         status: "Live".into(),
         height: 1,
-        chat: backend::ChatDelta {
-            kind: "channel-created".into(),
+        chat: vec![backend::ChatDelta::ChannelCreated {
             channel: room("brand-new", 0),
-            ..backend::ChatDelta::default()
-        },
+        }],
         ..backend::LiveUpdate::default()
     }));
     assert!(
@@ -9400,14 +9421,12 @@ fn a_resync_keeps_the_badge_the_live_stream_lit_while_it_was_in_flight() {
         message(41, "from a peer", false),
     )));
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: "chat".into(),
+        kind: LiveKind::Chat,
         status: "Live".into(),
         height: 1,
-        chat: backend::ChatDelta {
-            kind: "channel-created".into(),
+        chat: vec![backend::ChatDelta::ChannelCreated {
             channel: room("brand-new", 0),
-            ..backend::ChatDelta::default()
-        },
+        }],
         ..backend::LiveUpdate::default()
     }));
     assert!(
@@ -9559,12 +9578,11 @@ fn a_failed_switch_the_reader_clicked_past_does_not_land_on_the_room_she_is_in()
     assert_eq!(app.error, "c is unreachable too");
 }
 
-/// A→B→A PAINTS IN ONE FRAME. The room being left is parked with its member
-/// roll; the room being entered is restored from that park with `loading`
-/// false, so the switch back costs no round trip to become readable — and the
-/// composer's gate comes back with it rather than reading the room she left.
+/// A ROOM SWITCH DROPS THE OLD WINDOW BEFORE IT STARTS THE SELECTED ROOM'S
+/// ROOT-WINDOW READ. Keeping several rich windows in state made the synchronous
+/// click cost proportional to every retained row through the by-value UI ABI.
 #[test]
-fn switching_back_to_a_parked_room_paints_its_rows_without_waiting_on_the_node() {
+fn switching_channels_paints_an_empty_loading_state_until_the_root_window_lands() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.connected_rpc = "http://node".into();
@@ -9578,14 +9596,17 @@ fn switching_back_to_a_parked_room_paints_its_rows_without_waiting_on_the_node()
     }];
 
     let _ = app.__update(__DucktapeMessage::ChooseChannel("b".into()));
-    assert!(app.messages.is_empty(), "#b has never been read");
-    assert!(app.loading);
-
-    let _ = app.__update(__DucktapeMessage::ChooseChannel("a".into()));
-    assert_eq!(app.messages.len(), 2, "#a came back from the park");
-    assert!(!app.loading, "a parked room is not a loading one");
-    assert_eq!(app.channel_members.len(), 1, "its member roll came with it");
-    assert!(app.has_older_history, "derived from the restored rows");
+    assert_eq!(app.active_channel, "b");
+    assert!(
+        app.messages.is_empty(),
+        "the old room's rows leave immediately"
+    );
+    assert!(app.channel_members.is_empty(), "so does its member roll");
+    assert!(
+        !app.has_older_history,
+        "there is no page cursor before the load"
+    );
+    assert!(app.loading, "the selected room is fetching one root window");
     assert!(app.post_refusal.is_empty());
 }
 
@@ -9694,7 +9715,8 @@ fn creating_a_channel_leaves_the_old_rooms_draft_in_the_old_room() {
 /// membership seats on a first open — the peer's name sat beside the ARCHIVED
 /// badge, the "· N added" count and the composer refusal of the room she left.
 /// The id is derivable here (`dm_channel_id` is the same deterministic hash
-/// `open_dm` resolves), which also makes a re-opened DM eligible for the park.
+/// `open_dm` resolves), so the empty loading state can still take the right room
+/// identity on the click.
 #[test]
 fn a_dm_click_takes_the_room_with_it_instead_of_wearing_the_last_ones_badges() {
     let (mut app, _) = Ducktape::__boot();
@@ -9730,14 +9752,17 @@ fn a_dm_click_takes_the_room_with_it_instead_of_wearing_the_last_ones_badges() {
     assert!(!app.history_view, "a DM open is a live tail");
     assert!(app.loading, "this peer has never been read");
 
-    // And back out and in again: the DM is an ordinary room in the park now.
+    // A re-open follows the same no-window-cache path as every channel switch.
     let mut landed = chat_data(&dm, vec![message(30, "from the peer", false)]);
     landed.generation = app.chat_generation;
     let _ = app.__update(__DucktapeMessage::ChatUpdated(landed));
     let _ = app.__update(__DucktapeMessage::ChooseChannel("locked".into()));
     let _ = app.__update(__DucktapeMessage::ChooseDm("peer".into()));
-    assert_eq!(app.messages.len(), 1, "the DM came back from the park");
-    assert!(!app.loading, "a parked DM is not a loading one");
+    assert!(
+        app.messages.is_empty(),
+        "the stale DM window is not restored"
+    );
+    assert!(app.loading, "the DM's root window is fetched again");
 }
 
 /// A SEARCH HIT PAINTS THE ROOM IT IS JUMPING TO, NOT THE ROOM IT LEFT.
@@ -9746,8 +9771,8 @@ fn a_dm_click_takes_the_room_with_it_instead_of_wearing_the_last_ones_badges() {
 /// lives in another room kept that room's header, rows and sidebar highlight
 /// for the whole walk — the one navigation whose entire purpose is to jump
 /// somewhere else, and the only one still showing the "did my click land?" void
-/// #1059 removed from the pickers. The park is deliberately NOT restored: a hit
-/// is a history window, and an empty timeline under the skeleton is honest.
+/// #1059 removed from the pickers. A hit is a history window, and an empty
+/// timeline under the skeleton is honest until that window arrives.
 #[test]
 fn opening_a_search_hit_moves_the_room_on_the_click() {
     let (mut app, _) = Ducktape::__boot();
@@ -9779,10 +9804,6 @@ fn opening_a_search_hit_moves_the_room_on_the_click() {
         "so the skeleton draws for the room being entered"
     );
     assert!(app.history_view, "a hit is a window around one old message");
-
-    // Leaving parks general, so the way back out of the hit is one frame.
-    let parked = backend::cached_window(app.message_cache.clone(), "general".into());
-    assert_eq!(parked.messages.len(), 1);
 }
 
 /// THE THREAD RAIL OPENS ON THE MESSAGE IT IS ABOUT.
@@ -9834,7 +9855,7 @@ fn opening_a_thread_seeds_its_root_row_instead_of_a_blank_rail() {
         root_seq: 7,
         target_seq: 0,
         messages: vec![message(7, "root", false), message(9, "a reply", false)],
-        next_reply_offset: 0,
+        next_reply_seq: 0,
         has_more: false,
     };
     let _ = app.__update(__DucktapeMessage::OpenThreadFor(7));
@@ -9848,113 +9869,6 @@ fn opening_a_thread_seeds_its_root_row_instead_of_a_blank_rail() {
             .collect::<Vec<_>>(),
         vec![9],
         "the reply the reader re-rooted on is the new rail's root"
-    );
-}
-
-/// A PARKED WINDOW IS NOT A SETTLED ONE, AND HISTORY MAY NOT PAGE FROM IT. The
-/// cache hit paints the rows she left behind with `loading` false, so `loading`
-/// — the only in-flight term the two history routes had — stopped covering the
-/// round trip the switch is still inside. #a grew while she was away, so the
-/// walk answers with a LATER window: a page requested from the PARKED window's
-/// oldest seq lands after that replacement and prepends under rows it does not
-/// touch, deleting the seqs between them from the MIDDLE of the timeline with no
-/// gap marker, and `has_older_history` then walks backwards past the hole
-/// forever. `chat_window_loading` is the term that covers it.
-#[test]
-fn a_switch_still_in_flight_refuses_the_history_page_its_parked_rows_would_ask_for() {
-    let (mut app, _) = Ducktape::__boot();
-    app.connected = true;
-    app.connected_rpc = "http://node".into();
-    app.mutation_phase = MutationPhase::Idle;
-    app.active_channel = "a".into();
-    app.channels = vec![room("a", 100), room("b", 20)];
-    app.messages = vec![
-        message(50, "a-fifty", false),
-        message(100, "a-hundred", false),
-    ];
-
-    // Away and back: #a comes off the park in one frame, and its refetch is out.
-    let _ = app.__update(__DucktapeMessage::ChooseChannel("b".into()));
-    let _ = app.__update(__DucktapeMessage::ChooseChannel("a".into()));
-    assert_eq!(app.messages.len(), 2, "the parked window is on screen");
-    assert!(!app.loading, "a parked room is not a loading one");
-    assert!(app.has_older_history, "so the paging routes are live");
-
-    // Neither route may spend a request on seqs the walk is about to replace —
-    // the scroll prefetch and the button both.
-    let _ = app.__update(__DucktapeMessage::ChatScrolled(0.0, 900.0, 0.0, 0.95));
-    let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
-    assert!(
-        !app.history_loading,
-        "no page may be requested from a window a switch is still replacing"
-    );
-
-    // The walk answers, and it answers with a window that starts LATER than the
-    // parked one — the whole reason its seqs could not be paged from.
-    let mut fresh = chat_data(
-        "a",
-        vec![
-            message(90, "a-ninety", false),
-            message(140, "a-head", false),
-        ],
-    );
-    fresh.channels = vec![room("a", 140)];
-    fresh.generation = app.chat_generation;
-    let _ = app.__update(__DucktapeMessage::ChatUpdated(fresh));
-    assert_eq!(app.messages.first().map(|row| row.seq), Some(90));
-
-    // Now the button is honest work again, and the page joins the window it was
-    // actually requested from.
-    let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
-    assert!(app.history_loading, "the settled window pages normally");
-    let _ = app.__update(__DucktapeMessage::HistoryLoaded(backend::HistoryPageData {
-        channel_id: "a".into(),
-        messages: vec![
-            message(88, "a-eightyeight", false),
-            message(89, "a-eightynine", false),
-        ],
-    }));
-    let seqs: Vec<i64> = app.messages.iter().map(|row| row.seq).collect();
-    assert_eq!(
-        seqs,
-        vec![88, 89, 90, 140],
-        "the timeline is continuous — no seq vanished from its middle"
-    );
-}
-
-/// A PENDING SEND IS NOT PARKED. Its settle handlers only touch the timeline of
-/// the room the reader is IN, so a parked pending row would have no writer left
-/// to retire it and would come back as a permanent "Sending…".
-#[test]
-fn the_parked_window_keeps_only_committed_rows() {
-    let parked = backend::cache_channel_window(
-        Vec::new(),
-        "a".into(),
-        vec![message(10, "committed", false), {
-            let mut row = message(-1, "in flight", false);
-            row.pending = true;
-            row
-        }],
-        Vec::new(),
-        false,
-    );
-    let rows = backend::cached_window(parked.clone(), "a".into()).messages;
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].seq, 10);
-
-    // A history window is a page around one old message, not the tail: parking
-    // it would repaint months-old scrollback as the live conversation.
-    let refused = backend::cache_channel_window(
-        Vec::new(),
-        "a".into(),
-        vec![message(10, "committed", false)],
-        Vec::new(),
-        true,
-    );
-    assert!(
-        backend::cached_window(refused, "a".into())
-            .messages
-            .is_empty()
     );
 }
 
@@ -10033,10 +9947,10 @@ fn unread_indicators_are_wired_client_local_only() {
     // the resync path freezes against the possibly-unchanged channel.
     let chat = inlined(include_str!("ui/handlers/chat.ice"));
     assert!(chat.contains(
-        "unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)"
+        "unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)"
     ));
     assert!(chat.contains(
-        "channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))"
+        "channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(channels, next.active_channel))"
     ));
     assert!(lifecycle.contains(
         "unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, active_channel, unread_boundary)"
@@ -10047,19 +9961,21 @@ fn unread_indicators_are_wired_client_local_only() {
     // (every files/agent/identity op) and an off-tab arrival both reach these
     // lines, and `mark_channel_read` refuses an empty channel.
     for gated in [
-        "channel_reads = mark_channel_read(channel_reads, live_tail_channel, channel_head_seq(channels, live_tail_channel))",
         "channel_reads = mark_channel_read(channel_reads, resync_tail_channel, channel_head_seq(channels, resync_tail_channel))",
         "channel_reads = mark_channel_read(channel_reads, chat_tab_channel, channel_head_seq(channels, chat_tab_channel))",
     ] {
         assert!(lifecycle.contains(gated), "{gated}");
     }
     for gate in [
-        "let live_tail_channel = keep_str(!history_view && shell_tab == ShellTab.chat, active_channel, \"\")",
         "let resync_tail_channel = keep_str(!history_view && shell_tab == ShellTab.chat, active_channel, \"\")",
         "let chat_tab_channel = keep_str(shell_tab == ShellTab.chat && !history_view, active_channel, \"\")",
     ] {
         assert!(lifecycle.contains(gate), "{gate}");
     }
+    let live = inlined(include_str!("backend/live.rs"));
+    assert!(lifecycle.contains("history_view, shell_tab == ShellTab.chat, unread_boundary"));
+    assert!(live.contains("let reads_live_tail = !history_view && chat_visible"));
+    assert!(live.contains("if reads_live_tail"));
 
     // Client-local only: no wire read-cursor leaked into the module surface.
     let backend_ice = inlined(include_str!("ui/extern/backend.ice"));

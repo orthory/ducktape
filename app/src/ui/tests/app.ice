@@ -712,23 +712,12 @@ preset ui_chat_stream
     active_channel = "channel-a"
     active_channel_name = "general"
     messages = optimistic_message(messages, "The room she is looking at.", "pending-1")
+    messages_revision = messages_revision + 1
 
-// THE GATE IS THE STREAM'S LIFETIME — IT IS NO LONGER THE SCROLL RESET. It was
-// both until the window cache landed: `choose_channel` emptied `messages`, the
-// `!empty(messages)` gate around the stack went false, the scrollable unmounted
-// and its offset died with it. A cache hit now goes non-empty → non-empty in
-// one reducer pass, the gate never renders false, and iced's positional diff
-// hands the surviving offset to the room being entered — so `choose_channel`
-// and `choose_dm` each end with `task widget scroll-to … 0.0 0.0` and ASSERT
-// the tail. `a_room_restored_from_the_cache_asserts_the_streams_tail` in
-// `tests.rs` is the fence over that half: every handler painting parked rows
-// must carry the operation.
-//
-// This is the other half, and it is still load-bearing: on a MISS the room goes
-// empty and the stream must actually be gone, or the app paints a live pane
-// around no rows. So it asserts the lifetime — `#chat/message-stream` exists
-// with rows and is GONE without them — which a later "stop remounting the
-// scrollable" cleanup would delete without noticing. (Virtualization note:
+// THE GATE IS THE STREAM RESET. Every room switch paints an empty loading state,
+// so the old scrollable and its offset must disappear before the selected room's
+// root window arrives. This asserts that `#chat/message-stream` exists with rows
+// and is GONE without them. (Virtualization note:
 // offscreen rows leave the a11y tree, so a test that wants a message ROW has to
 // scroll it in first. This one only wants the scrollable, which is always
 // mounted when it exists at all.)
@@ -765,6 +754,7 @@ test message_stream_reset_contract
         call_muted
         huddle_popped=false
         messages
+        messages_revision
         has_older_history
         history_view
         history_loading
@@ -778,11 +768,12 @@ test message_stream_reset_contract
         active_thread_seq
         thread_target_seq
         thread_messages
+        thread_messages_revision
         thread_selected_seq
         thread_selected_rev
         thread_message_action
         thread_has_more
-        thread_next_reply_offset
+        thread_next_reply_seq
         thread_loading
         failed_reply_draft
       events

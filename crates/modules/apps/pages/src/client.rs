@@ -1,10 +1,10 @@
 //! pages' CLIENT view model — one applied op, classified for the shell.
 //!
 //! Beside chat's `client` and pure, so the module-bundled-UI lane compiles it
-//! unchanged. The delta is FLAT with a `kind` discriminant because the Ice
-//! extern boundary carries records, not sum types (`ChatDelta` is the
-//! precedent); the exhaustiveness that matters lives in the `match` below,
-//! which names every variant so a new one fails the build here first.
+//! unchanged. This delta stays flat because Ice reads its fields directly;
+//! chat's payload enum crosses that boundary opaquely and is dispatched in
+//! Rust. The exhaustiveness that matters here lives in the `match` below,
+//! which names every wire variant so a new one fails the build here first.
 
 use crate::{PageMsg, decode_msg};
 

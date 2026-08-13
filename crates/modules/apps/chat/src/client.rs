@@ -22,6 +22,15 @@ use crate::{AuthorRef, Block, ChatAssigned, ChatMsg, Mark, PostPolicy, Span, dec
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
+/// Maximum number of roots materialized in one desktop chat window. The
+/// archive remains cursor-queryable; this bounds only the hot read model that
+/// every update and view build touches.
+pub const CHAT_HOT_WINDOW_LIMIT: usize = 256;
+/// One canonical root plus one reply page. Older replies remain queryable by
+/// sequence cursor; keeping every page mounted made each live reply rebuild up
+/// to 4,097 rich rows on the UI thread.
+pub const THREAD_HOT_WINDOW_LIMIT: usize = CHAT_HOT_WINDOW_LIMIT + 1;
+
 // ============================================================================
 // rendered row types — what a chat view iterates over
 // ============================================================================
@@ -226,38 +235,64 @@ pub struct ChatSpan {
 // the op-delta — one folded applied op, pre-rendered for state splicing
 // ============================================================================
 
-/// One folded chat op. `kind` picks the arm; unrelated fields sit at their
-/// empty defaults. Rows are built by the SAME renderers hydration uses
-/// ([`chat_message`] over a [`MsgRow`]), so a folded row and a fetched row
-/// are indistinguishable.
-#[derive(Clone, Debug, Hash, PartialEq, Default)]
-pub struct ChatDelta {
-    /// `posted` | `reply` | `edited` | `deleted` | `reaction` |
-    /// `channel-created` | `channel-renamed` | `channel-archived` |
-    /// `membership` | `channel-refresh` (huddle changed — the shell reloads
-    /// the one channel row and re-emits it as `channel-updated`) |
-    /// `channel-updated`.
-    pub kind: String,
-    pub channel_id: String,
-    /// the target message (edited/deleted/reaction) or the new row's seq.
-    pub seq: i64,
-    /// the thread root (`reply`).
-    pub root_seq: i64,
-    /// the rendered row: full for `posted`/`reply`; content carrier
-    /// (body/blocks/rev/meta) for `edited`.
-    pub message: ChatMessage,
-    /// the full channel row (`channel-created` / `channel-updated`).
-    pub channel: ChatChannel,
-    pub name: String,
-    pub archived: bool,
-    pub emoji: String,
-    /// reaction/membership direction: added vs removed.
-    pub added: bool,
-    /// the reacting author's rendered handle (set-semantics dedupe).
-    pub reactor: String,
-    /// the reactor is this device's user.
-    pub by_me: bool,
-    pub member: ChatMember,
+/// One folded chat op with exactly the payload its transition consumes. Rows
+/// are built by the SAME renderers hydration uses ([`chat_message`] over a
+/// [`MsgRow`]), so a folded row and a fetched row are indistinguishable.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub enum ChatDelta {
+    ChannelCreated {
+        channel: ChatChannel,
+    },
+    ChannelRenamed {
+        channel_id: String,
+        name: String,
+    },
+    ChannelArchived {
+        channel_id: String,
+        archived: bool,
+    },
+    Posted {
+        channel_id: String,
+        seq: i64,
+        message: ChatMessage,
+    },
+    Reply {
+        channel_id: String,
+        seq: i64,
+        root_seq: i64,
+        message: ChatMessage,
+    },
+    Edited {
+        channel_id: String,
+        seq: i64,
+        message: ChatMessage,
+    },
+    Deleted {
+        channel_id: String,
+        seq: i64,
+    },
+    Reaction {
+        channel_id: String,
+        seq: i64,
+        emoji: String,
+        added: bool,
+        reactor: String,
+        by_me: bool,
+    },
+    Membership {
+        channel_id: String,
+        added: bool,
+        member: ChatMember,
+    },
+    /// A huddle change first produces this directive; the shell reloads the
+    /// canonical row and replaces it with `ChannelUpdated` before publishing.
+    ChannelRefresh {
+        channel_id: String,
+    },
+    ChannelUpdated {
+        channel_id: String,
+        channel: ChatChannel,
+    },
 }
 
 /// Translate one applied chat op (its feed-row parts) into a [`ChatDelta`].
@@ -288,9 +323,7 @@ pub fn delta_from_op(
             channel_id,
             name,
             post_policy,
-        } => ChatDelta {
-            kind: "channel-created".into(),
-            channel_id: channel_id.clone(),
+        } => ChatDelta::ChannelCreated {
             channel: ChatChannel {
                 id: channel_id,
                 name,
@@ -299,22 +332,16 @@ pub fn delta_from_op(
                 huddle_count: 0,
                 head_seq: 0,
             },
-            ..ChatDelta::default()
         },
-        ChatMsg::RenameChannel { channel_id, name } => ChatDelta {
-            kind: "channel-renamed".into(),
-            channel_id,
-            name,
-            ..ChatDelta::default()
-        },
+        ChatMsg::RenameChannel { channel_id, name } => {
+            ChatDelta::ChannelRenamed { channel_id, name }
+        }
         ChatMsg::SetChannelArchived {
             channel_id,
             archived,
-        } => ChatDelta {
-            kind: "channel-archived".into(),
+        } => ChatDelta::ChannelArchived {
             channel_id,
             archived,
-            ..ChatDelta::default()
         },
         ChatMsg::PostMessage {
             channel_id,
@@ -346,17 +373,19 @@ pub fn delta_from_op(
                 reactions: Vec::new(),
                 tags: Vec::new(),
             };
-            let kind = match thread {
-                Some(_) => "reply",
-                None => "posted",
-            };
-            ChatDelta {
-                kind: kind.into(),
-                channel_id,
-                seq: number_i64(seq),
-                root_seq: number_i64(thread.unwrap_or(0)),
-                message: chat_message(row, current_user),
-                ..ChatDelta::default()
+            let message = chat_message(row, current_user);
+            match thread {
+                Some(root_seq) => ChatDelta::Reply {
+                    channel_id,
+                    seq: number_i64(seq),
+                    root_seq: number_i64(root_seq),
+                    message,
+                },
+                None => ChatDelta::Posted {
+                    channel_id,
+                    seq: number_i64(seq),
+                    message,
+                },
             }
         }
         ChatMsg::EditMessage {
@@ -374,7 +403,7 @@ pub fn delta_from_op(
                 message_id: String::new(),
                 author: index::author(&origin, None),
                 // An edit's stamp is the ORIGINAL post's block, never the
-                // edit's — and `apply_edit_content` copies only body/blocks/
+                // edit's — and `merge_message_edit` copies only body/blocks/
                 // rev/edited/meta off this carrier, so the row on screen keeps
                 // the height it was posted at. Left 0 deliberately.
                 height: 0,
@@ -392,19 +421,15 @@ pub fn delta_from_op(
                 reactions: Vec::new(),
                 tags: Vec::new(),
             };
-            ChatDelta {
-                kind: "edited".into(),
+            ChatDelta::Edited {
                 channel_id,
                 seq: number_i64(seq),
                 message: chat_message(carrier, current_user),
-                ..ChatDelta::default()
             }
         }
-        ChatMsg::DeleteMessage { channel_id, seq } => ChatDelta {
-            kind: "deleted".into(),
+        ChatMsg::DeleteMessage { channel_id, seq } => ChatDelta::Deleted {
             channel_id,
             seq: number_i64(seq),
-            ..ChatDelta::default()
         },
         ChatMsg::AddReaction {
             channel_id,
@@ -423,24 +448,18 @@ pub fn delta_from_op(
             member,
         } => {
             let id = user_handle(&user);
-            ChatDelta {
-                kind: "membership".into(),
+            ChatDelta::Membership {
                 channel_id,
                 added: member,
                 member: ChatMember {
                     label: short_label(&id),
                     key: id,
                 },
-                ..ChatDelta::default()
             }
         }
         ChatMsg::JoinHuddle { channel_id, .. }
         | ChatMsg::LeaveHuddle { channel_id }
-        | ChatMsg::SweepHuddle { channel_id, .. } => ChatDelta {
-            kind: "channel-refresh".into(),
-            channel_id,
-            ..ChatDelta::default()
-        },
+        | ChatMsg::SweepHuddle { channel_id, .. } => ChatDelta::ChannelRefresh { channel_id },
     };
     Ok(Some(delta))
 }
@@ -455,15 +474,13 @@ fn reaction_delta(
 ) -> ChatDelta {
     let reactor = index::author(origin, None);
     let by_me = current_user.is_some_and(|key| reactor == format!("user:{}", hex_encode(key)));
-    ChatDelta {
-        kind: "reaction".into(),
+    ChatDelta::Reaction {
         channel_id,
         seq: number_i64(seq),
         emoji,
         added,
         reactor,
         by_me,
-        ..ChatDelta::default()
     }
 }
 
@@ -486,98 +503,67 @@ fn decode_stamp(assigned: Option<&serde_json::Value>) -> Result<ChatAssigned, St
 // delta that raced a resync applies as a no-op instead of double-counting.
 // ============================================================================
 
-/// Fold one chat delta into the channel list.
-pub fn apply_chat_channels(mut channels: Vec<ChatChannel>, delta: ChatDelta) -> Vec<ChatChannel> {
-    match delta.kind.as_str() {
-        "channel-created" => {
-            let exists = channels.iter().any(|channel| channel.id == delta.channel.id);
-            if !exists {
-                channels.push(delta.channel);
-            }
-        }
-        "channel-updated" => match channels
-            .iter_mut()
-            .find(|channel| channel.id == delta.channel.id)
-        {
-            Some(channel) => *channel = delta.channel,
-            None => channels.push(delta.channel),
-        },
-        "channel-renamed" => {
-            if let Some(channel) = channels.iter_mut().find(|c| c.id == delta.channel_id) {
-                channel.name = delta.name;
-            }
-        }
-        "channel-archived" => {
-            if let Some(channel) = channels.iter_mut().find(|c| c.id == delta.channel_id) {
-                channel.archived = delta.archived;
-            }
-        }
-        "posted" | "reply" => {
-            if let Some(channel) = channels.iter_mut().find(|c| c.id == delta.channel_id) {
-                channel.head_seq = channel.head_seq.max(delta.seq);
-            }
-        }
-        _ => {}
+pub fn insert_channel(mut channels: Vec<ChatChannel>, channel: ChatChannel) -> Vec<ChatChannel> {
+    let exists = channels.iter().any(|current| current.id == channel.id);
+    if !exists {
+        channels.push(channel);
     }
     channels
 }
 
-/// Fold one chat delta into the ACTIVE channel's root timeline.
-pub fn apply_chat_messages(
-    messages: Vec<ChatMessage>,
-    delta: ChatDelta,
-    active_channel: String,
-) -> Vec<ChatMessage> {
-    if delta.channel_id != active_channel {
-        return messages;
+pub fn replace_channel(
+    mut channels: Vec<ChatChannel>,
+    channel_id: &str,
+    channel: ChatChannel,
+) -> Vec<ChatChannel> {
+    match channels.iter_mut().find(|current| current.id == channel_id) {
+        Some(current) => *current = channel,
+        None => channels.push(channel),
     }
-    match delta.kind.as_str() {
-        "posted" => insert_committed_root(messages, delta.message),
-        "reply" => bump_reply_summary(messages, delta.root_seq),
-        "edited" => apply_edit_content(messages, delta.seq, &delta.message),
-        "deleted" => apply_tombstone(messages, delta.seq),
-        "reaction" => apply_reaction(messages, &delta),
-        _ => messages,
-    }
+    channels
 }
 
-/// Fold one chat delta into the OPEN thread panel (root + loaded replies).
-pub fn apply_chat_thread(
-    thread: Vec<ChatMessage>,
-    delta: ChatDelta,
-    active_channel: String,
-    active_thread_seq: i64,
-) -> Vec<ChatMessage> {
-    if delta.channel_id != active_channel || active_thread_seq <= 0 {
-        return thread;
+pub fn rename_channel(
+    mut channels: Vec<ChatChannel>,
+    channel_id: &str,
+    name: String,
+) -> Vec<ChatChannel> {
+    if let Some(channel) = channels.iter_mut().find(|channel| channel.id == channel_id) {
+        channel.name = name;
     }
-    match delta.kind.as_str() {
-        // the rail's root carries the reply summary its replies rule draws —
-        // bump it here exactly as the stream's timeline arm does, then merge
-        // the reply row itself.
-        "reply" if delta.root_seq == active_thread_seq => {
-            merge_thread_reply(bump_reply_summary(thread, delta.root_seq), delta.message)
-        }
-        "edited" => apply_edit_content(thread, delta.seq, &delta.message),
-        "deleted" => apply_tombstone(thread, delta.seq),
-        "reaction" => apply_reaction(thread, &delta),
-        _ => thread,
-    }
+    channels
 }
 
-/// Fold one chat delta into the ACTIVE channel's member panel.
-pub fn apply_chat_members(
+pub fn archive_channel(
+    mut channels: Vec<ChatChannel>,
+    channel_id: &str,
+    archived: bool,
+) -> Vec<ChatChannel> {
+    if let Some(channel) = channels.iter_mut().find(|channel| channel.id == channel_id) {
+        channel.archived = archived;
+    }
+    channels
+}
+
+pub fn advance_channel_head(
+    mut channels: Vec<ChatChannel>,
+    channel_id: &str,
+    seq: i64,
+) -> Vec<ChatChannel> {
+    if let Some(channel) = channels.iter_mut().find(|channel| channel.id == channel_id) {
+        channel.head_seq = channel.head_seq.max(seq);
+    }
+    channels
+}
+
+pub fn apply_membership(
     mut members: Vec<ChatMember>,
-    delta: ChatDelta,
-    active_channel: String,
+    added: bool,
+    member: ChatMember,
 ) -> Vec<ChatMember> {
-    let is_membership = delta.kind == "membership" && delta.channel_id == active_channel;
-    if !is_membership {
-        return members;
-    }
-    members.retain(|member| member.key != delta.member.key);
-    if delta.added {
-        members.push(delta.member);
+    members.retain(|current| current.key != member.key);
+    if added {
+        members.push(member);
     }
     members
 }
@@ -585,7 +571,7 @@ pub fn apply_chat_members(
 /// A committed root row lands: remove its matching pending placeholder, then
 /// insert it in canonical seq order while preserving the placeholder's stable
 /// virtual key. Skips replies (the timeline is roots-only) and duplicate rows.
-fn insert_committed_root(mut messages: Vec<ChatMessage>, row: ChatMessage) -> Vec<ChatMessage> {
+pub fn merge_posted_message(mut messages: Vec<ChatMessage>, row: ChatMessage) -> Vec<ChatMessage> {
     if row.thread_seq > 0 {
         return messages;
     }
@@ -613,10 +599,10 @@ fn insert_committed_root(mut messages: Vec<ChatMessage>, row: ChatMessage) -> Ve
         .unwrap_or(messages.len());
     messages.insert(insert_at, row);
     mark_message_groups(&mut messages);
-    messages
+    bounded_chat_window(messages)
 }
 
-fn bump_reply_summary(mut messages: Vec<ChatMessage>, root_seq: i64) -> Vec<ChatMessage> {
+pub fn bump_reply_summary(mut messages: Vec<ChatMessage>, root_seq: i64) -> Vec<ChatMessage> {
     if let Some(root) = messages
         .iter_mut()
         .find(|message| !message.pending && message.seq == root_seq)
@@ -633,7 +619,7 @@ fn bump_reply_summary(mut messages: Vec<ChatMessage>, root_seq: i64) -> Vec<Chat
 /// Copy an edit's content fields onto the target row, keeping identity fields
 /// (author, reactions, reply summary) intact. An older or replayed revision
 /// applies as a no-op.
-fn apply_edit_content(
+pub fn merge_message_edit(
     mut messages: Vec<ChatMessage>,
     seq: i64,
     content: &ChatMessage,
@@ -656,7 +642,7 @@ fn apply_edit_content(
 }
 
 /// The canonical tombstone shape, exactly as a hydrated deleted row renders.
-fn apply_tombstone(mut messages: Vec<ChatMessage>, seq: i64) -> Vec<ChatMessage> {
+pub fn tombstone_message(mut messages: Vec<ChatMessage>, seq: i64) -> Vec<ChatMessage> {
     if let Some(row) = messages
         .iter_mut()
         .find(|message| !message.pending && message.seq == seq)
@@ -674,10 +660,17 @@ fn apply_tombstone(mut messages: Vec<ChatMessage>, seq: i64) -> Vec<ChatMessage>
 /// Reactor-set semantics, mirroring the index fold: a reactor appears at most
 /// once per emoji, so replayed or double-submitted reactions cannot drift the
 /// count.
-fn apply_reaction(mut messages: Vec<ChatMessage>, delta: &ChatDelta) -> Vec<ChatMessage> {
+pub fn merge_message_reaction(
+    mut messages: Vec<ChatMessage>,
+    seq: i64,
+    emoji: &str,
+    added: bool,
+    reactor: &str,
+    by_me: bool,
+) -> Vec<ChatMessage> {
     let Some(row) = messages
         .iter_mut()
-        .find(|message| !message.pending && message.seq == delta.seq)
+        .find(|message| !message.pending && message.seq == seq)
     else {
         return messages;
     };
@@ -687,24 +680,24 @@ fn apply_reaction(mut messages: Vec<ChatMessage>, delta: &ChatDelta) -> Vec<Chat
     match row
         .reactions
         .iter_mut()
-        .find(|reaction| reaction.emoji == delta.emoji)
+        .find(|reaction| reaction.emoji == emoji)
     {
         Some(reaction) => {
-            reaction.reactors.retain(|reactor| *reactor != delta.reactor);
-            if delta.added {
-                reaction.reactors.push(delta.reactor.clone());
+            reaction.reactors.retain(|current| current != reactor);
+            if added {
+                reaction.reactors.push(reactor.into());
             }
             reaction.count = count_i64(reaction.reactors.len());
-            reaction.reacted_by_me = match delta.by_me {
-                true => delta.added,
+            reaction.reacted_by_me = match by_me {
+                true => added,
                 false => reaction.reacted_by_me,
             };
         }
-        None if delta.added => row.reactions.push(ChatReaction {
-            emoji: delta.emoji.clone(),
+        None if added => row.reactions.push(ChatReaction {
+            emoji: emoji.into(),
             count: 1,
-            reacted_by_me: delta.by_me,
-            reactors: vec![delta.reactor.clone()],
+            reacted_by_me: by_me,
+            reactors: vec![reactor.into()],
         }),
         // a remove of an emoji the row never had touched nothing: no rescan,
         // no bump.
@@ -726,42 +719,7 @@ pub fn optimistic_reaction(
     added: bool,
     reactor: String,
 ) -> Vec<ChatMessage> {
-    let delta = ChatDelta {
-        kind: "reaction".into(),
-        seq,
-        emoji,
-        added,
-        reactor,
-        by_me: true,
-        ..ChatDelta::default()
-    };
-    apply_reaction(messages, &delta)
-}
-
-/// True when this delta settles one of OUR optimistic rows. Read BEFORE the
-/// delta is folded in: the match is the pending row the canonical row is about
-/// to replace.
-///
-/// Borrowed, not owned: this is no longer an Ice extern (the app calls it
-/// through the fused `chat_settle`, which owns its arguments once), so nothing
-/// here has to pay the by-value boundary.
-pub fn send_settled_by(messages: &[ChatMessage], delta: &ChatDelta, active_channel: &str) -> bool {
-    delta.kind == "posted"
-        && delta.channel_id == active_channel
-        && messages
-            .iter()
-            .any(|message| message.pending && message.id == delta.message.id)
-}
-
-/// [`send_settled_by`] for the OPEN thread rail: a settling reply arrives as
-/// a `reply` delta, not a `posted` one, and its pending row lives in
-/// `thread_messages`. Read BEFORE `apply_chat_thread` folds the delta in.
-pub fn reply_settled_by(thread: &[ChatMessage], delta: &ChatDelta, active_channel: &str) -> bool {
-    delta.kind == "reply"
-        && delta.channel_id == active_channel
-        && thread
-            .iter()
-            .any(|message| message.pending && message.id == delta.message.id)
+    merge_message_reaction(messages, seq, &emoji, added, &reactor, true)
 }
 
 // ============================================================================
@@ -835,7 +793,61 @@ pub fn optimistic_message(
     messages
 }
 
-pub fn merge_pending_messages(
+/// Keep one bounded, ordered render window. Committed roots are evicted from
+/// the oldest edge first; optimistic rows stay at the tail and are evicted
+/// only in the degenerate case where more than the whole window is in flight.
+/// A later canonical settle still enters by seq even when its placeholder was
+/// outside the retained window.
+pub fn bounded_chat_window(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    if messages.len() <= CHAT_HOT_WINDOW_LIMIT {
+        return messages;
+    }
+    let (mut pending, mut committed): (Vec<_>, Vec<_>) =
+        messages.into_iter().partition(|message| message.pending);
+    let pending_limit = if committed.is_empty() {
+        CHAT_HOT_WINDOW_LIMIT
+    } else {
+        CHAT_HOT_WINDOW_LIMIT - 1
+    };
+    if pending.len() > pending_limit {
+        pending.drain(..pending.len() - pending_limit);
+    }
+    let committed_limit = CHAT_HOT_WINDOW_LIMIT - pending.len();
+    if committed.len() > committed_limit {
+        committed.drain(..committed.len() - committed_limit);
+    }
+    committed.extend(pending);
+    mark_message_groups(&mut committed);
+    committed
+}
+
+/// Keep the thread root and one sliding reply page. Pending replies live at
+/// the newest edge and displace the oldest committed replies before they are
+/// ever discarded themselves.
+pub fn bounded_thread_window(mut messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    if messages.len() <= THREAD_HOT_WINDOW_LIMIT {
+        return messages;
+    }
+    let root_index = messages
+        .iter()
+        .position(|message| !message.pending && message.seq > 0 && message.thread_seq == 0);
+    let root = root_index.map(|index| messages.remove(index));
+    let reply_limit = THREAD_HOT_WINDOW_LIMIT - usize::from(root.is_some());
+    let (mut pending, mut committed): (Vec<_>, Vec<_>) =
+        messages.into_iter().partition(|message| message.pending);
+    if pending.len() > reply_limit {
+        pending.drain(..pending.len() - reply_limit);
+    }
+    let committed_limit = reply_limit - pending.len();
+    if committed.len() > committed_limit {
+        committed.drain(..committed.len() - committed_limit);
+    }
+    committed.extend(pending);
+    mark_message_groups(&mut committed);
+    root.into_iter().chain(committed).collect()
+}
+
+fn merge_pending_rows(
     mut canonical: Vec<ChatMessage>,
     current: Vec<ChatMessage>,
     current_channel: String,
@@ -857,6 +869,53 @@ pub fn merge_pending_messages(
     canonical
 }
 
+/// Install one root timeline snapshot and keep its render window bounded.
+pub fn merge_pending_messages(
+    canonical: Vec<ChatMessage>,
+    current: Vec<ChatMessage>,
+    current_channel: String,
+    next_channel: String,
+) -> Vec<ChatMessage> {
+    bounded_chat_window(merge_pending_rows(
+        canonical,
+        current,
+        current_channel,
+        next_channel,
+    ))
+}
+
+/// Install a room window without losing committed rows that arrived after the
+/// read began. Navigation clears the previous room before launching the read,
+/// so any same-room committed row in `current` is newer live traffic, not
+/// stale cache state.
+pub fn merge_landing_messages(
+    canonical: Vec<ChatMessage>,
+    current: Vec<ChatMessage>,
+    current_channel: String,
+    next_channel: String,
+) -> Vec<ChatMessage> {
+    let mut merged = merge_message_send_result(canonical, current, current_channel, next_channel);
+    mark_message_groups(&mut merged);
+    bounded_chat_window(merged)
+}
+
+/// Refresh the canonical prefix of an open thread without discarding pages the
+/// reader already loaded. The refresh query returns one page; the pagination
+/// cursor and the rest of the mounted rail remain owned by the UI state.
+pub fn merge_thread_refresh(
+    canonical: Vec<ChatMessage>,
+    current: Vec<ChatMessage>,
+    current_channel: String,
+    next_channel: String,
+) -> Vec<ChatMessage> {
+    bounded_thread_window(merge_message_send_result(
+        canonical,
+        current,
+        current_channel,
+        next_channel,
+    ))
+}
+
 pub fn merge_message_send_result(
     mut canonical: Vec<ChatMessage>,
     current: Vec<ChatMessage>,
@@ -871,10 +930,12 @@ pub fn merge_message_send_result(
         .iter()
         .map(|message| message.id.clone())
         .collect::<BTreeSet<_>>();
-    let mut committed = current
-        .iter()
-        .filter(|message| !message.pending && message.seq > 0)
-        .map(|message| (message.seq, message.clone()))
+    let (pending, committed): (Vec<_>, Vec<_>) = current
+        .into_iter()
+        .partition(|message| message.pending || message.seq <= 0);
+    let mut committed = committed
+        .into_iter()
+        .map(|message| (message.seq, message))
         .collect::<BTreeMap<_, _>>();
     for message in canonical {
         let replace = committed
@@ -886,9 +947,9 @@ pub fn merge_message_send_result(
     }
     let mut merged = committed.into_values().collect::<Vec<_>>();
     merged.extend(
-        current
+        pending
             .into_iter()
-            .filter(|message| message.pending && !canonical_ids.contains(&message.id)),
+            .filter(|message| !canonical_ids.contains(&message.id)),
     );
     merged
 }
@@ -924,19 +985,44 @@ pub fn contains_pending_message(messages: Vec<ChatMessage>, pending_id: String) 
 }
 
 pub fn append_thread_page(messages: Vec<ChatMessage>, next: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    merge_message_send_result(next, messages, String::new(), String::new())
+    bounded_thread_window(merge_message_send_result(
+        next,
+        messages,
+        String::new(),
+        String::new(),
+    ))
 }
 
-pub fn merge_thread_reply(messages: Vec<ChatMessage>, reply: ChatMessage) -> Vec<ChatMessage> {
-    merge_message_send_result(vec![reply], messages, String::new(), String::new())
-}
-
-pub fn thread_offset_after_reply(offset: i64, has_more: bool, committed: bool) -> i64 {
-    if !committed || offset < 0 || has_more {
-        offset
-    } else {
-        offset.saturating_add(1)
+pub fn merge_thread_reply(
+    mut messages: Vec<ChatMessage>,
+    mut reply: ChatMessage,
+) -> Vec<ChatMessage> {
+    let pending_key = messages
+        .iter()
+        .find(|message| message.pending && message.id == reply.id)
+        .map(|message| message.view_key);
+    if pending_key.is_some() {
+        messages.retain(|message| !message.pending || message.id != reply.id);
     }
+    let existing = messages
+        .iter()
+        .position(|message| !message.pending && message.seq == reply.seq);
+    if let Some(index) = existing {
+        if messages[index].rev <= reply.rev {
+            reply.view_key = messages[index].view_key;
+            messages[index] = reply;
+        }
+        return messages;
+    }
+    if let Some(view_key) = pending_key {
+        reply.view_key = view_key;
+    }
+    let insert_at = messages
+        .iter()
+        .position(|message| message.pending || message.seq > reply.seq)
+        .unwrap_or(messages.len());
+    messages.insert(insert_at, reply);
+    bounded_thread_window(messages)
 }
 
 // ============================================================================
@@ -1121,7 +1207,11 @@ fn rich_block(kind: &str, spans: &[Span]) -> ChatBlock {
         text: span_text(spans),
         lang: String::new(),
         rich: marked,
-        spans: if marked { word_spans(spans) } else { Vec::new() },
+        spans: if marked {
+            word_spans(spans)
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -1487,8 +1577,9 @@ fn mention_at(chars: &[char], at: usize, members: &[ChatMember]) -> Option<(Chat
 /// anything else is the identity's own bytes.
 fn member_key_bytes(member: &ChatMember) -> Vec<u8> {
     let key = &member.key;
-    let looks_hex =
-        !key.is_empty() && key.len().is_multiple_of(2) && key.bytes().all(|b| b.is_ascii_hexdigit());
+    let looks_hex = !key.is_empty()
+        && key.len().is_multiple_of(2)
+        && key.bytes().all(|b| b.is_ascii_hexdigit());
     if looks_hex {
         let decode = |range: &str| u8::from_str_radix(range, 16).ok();
         let bytes: Option<Vec<u8>> = (0..key.len())
@@ -1566,6 +1657,76 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_thread_window_keeps_its_root_pending_tail_and_one_reply_page() {
+        let root = committed(1, "alice");
+        let replies = (2..=300).map(|seq| ChatMessage {
+            thread_seq: 1,
+            ..committed(seq, "alice")
+        });
+        let pending = ChatMessage {
+            id: "pending".into(),
+            seq: -1,
+            pending: true,
+            thread_seq: 0,
+            author: "alice".into(),
+            ..ChatMessage::default()
+        };
+        let window = bounded_thread_window(
+            std::iter::once(root)
+                .chain(replies)
+                .chain(std::iter::once(pending))
+                .collect(),
+        );
+
+        assert_eq!(window.len(), THREAD_HOT_WINDOW_LIMIT);
+        assert_eq!(window[0].seq, 1, "the thread root never leaves the rail");
+        assert_eq!(window[1].seq, 46, "the oldest reply edge slides forward");
+        assert!(
+            window[1].show_author,
+            "the new visible edge opens an author run"
+        );
+        assert!(window.last().is_some_and(|message| message.pending));
+    }
+
+    #[test]
+    fn a_room_landing_keeps_commits_that_arrived_after_its_snapshot() {
+        let canonical = (1..=20).map(|seq| committed(seq, "alice")).collect();
+        let current = vec![committed(21, "bob")];
+
+        let landed = merge_landing_messages(canonical, current, "general".into(), "general".into());
+
+        assert_eq!(
+            landed.iter().map(|message| message.seq).collect::<Vec<_>>(),
+            (1..=21).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_initial_thread_landing_keeps_replies_that_arrived_during_its_read() {
+        let canonical = vec![
+            committed(1, "alice"),
+            ChatMessage {
+                thread_seq: 1,
+                ..committed(2, "alice")
+            },
+        ];
+        let current = vec![
+            committed(1, "alice"),
+            ChatMessage {
+                thread_seq: 1,
+                ..committed(3, "bob")
+            },
+        ];
+
+        let landed = merge_thread_refresh(canonical, current, "general".into(), "general".into());
+
+        assert_eq!(
+            landed.iter().map(|message| message.seq).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+    }
+
     /// Every in-place row mutation is a render-key move — the view's keyed
     /// lazy (`by message.seq, message.render_rev`) repaints a row ONLY when a
     /// key changes, so a path missing its bump is a stale row on screen.
@@ -1579,9 +1740,9 @@ mod tests {
             body: "new".into(),
             ..ChatMessage::default()
         };
-        let edited = apply_edit_content(messages, 1, &content);
+        let edited = merge_message_edit(messages, 1, &content);
         assert_ne!(edited[0].render_rev, before, "an edit bumps");
-        let replayed = apply_edit_content(edited.clone(), 1, &content);
+        let replayed = merge_message_edit(edited.clone(), 1, &content);
         assert_eq!(
             replayed[0].render_rev, edited[0].render_rev,
             "a stale edit replay is a no-op"
@@ -1590,7 +1751,7 @@ mod tests {
         // a tombstone bumps.
         let messages = vec![committed(2, "a")];
         let before = messages[0].render_rev;
-        let deleted = apply_tombstone(messages, 2);
+        let deleted = tombstone_message(messages, 2);
         assert_ne!(deleted[0].render_rev, before, "a tombstone bumps");
 
         // a reaction add bumps, its remove bumps again, and a remove of an
@@ -1692,7 +1853,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reply_delta_bumps_the_open_thread_roots_summary() {
+    fn reply_writers_bump_the_root_and_insert_the_reply() {
         let root = ChatMessage {
             seq: 1,
             id: "g1".into(),
@@ -1705,16 +1866,11 @@ mod tests {
             thread_seq: 1,
             ..ChatMessage::default()
         };
-        let delta = ChatDelta {
-            kind: "reply".into(),
-            channel_id: "general".into(),
-            seq: 3,
-            root_seq: 1,
-            message: reply,
-            ..ChatDelta::default()
-        };
-        let thread = apply_chat_thread(vec![root], delta, "general".into(), 1);
-        assert_eq!(thread[0].reply_count, 2, "the rail's replies rule reads this");
+        let thread = merge_thread_reply(bump_reply_summary(vec![root], 1), reply);
+        assert_eq!(
+            thread[0].reply_count, 2,
+            "the rail's replies rule reads this"
+        );
         assert!(thread.iter().any(|message| message.seq == 3));
     }
 
@@ -1766,8 +1922,10 @@ mod tests {
         .expect("a well-formed op folds")
         .expect("a post is visible to the UI");
 
-        assert_eq!(delta.kind, "posted");
-        assert_eq!(delta.message.height, 276_199);
+        let ChatDelta::Posted { message, .. } = delta else {
+            panic!("a post must decode to the posted transition")
+        };
+        assert_eq!(message.height, 276_199);
     }
 
     #[test]
@@ -1839,7 +1997,12 @@ mod tests {
         let view = blocks_view(&blocks);
         assert_eq!(view[0].kind, "paragraph");
         assert!(view[0].rich, "formatted paragraph renders as spans");
-        assert!(view[0].spans.iter().any(|span| span.bold && span.text == "world"));
+        assert!(
+            view[0]
+                .spans
+                .iter()
+                .any(|span| span.bold && span.text == "world")
+        );
         assert_eq!(view[3].kind, "code");
         assert_eq!(view[3].text, "fn main() {}");
 

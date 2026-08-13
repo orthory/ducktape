@@ -855,7 +855,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                   // A note is a pure function of its message, so the whole row
                   // caches under the same (seq, render_rev) key the chat
                   // stream's quiet arm uses — the live delta fold
-                  // (`apply_chat_messages` in lifecycle.ice) bumps `render_rev`
+                  // (`fold_live_chat` in lifecycle.ice) bumps `render_rev`
                   // on every in-place mutation, and a resync's replacement rows
                   // arrive content-seeded.
                   lazy message by message.seq, message.render_rev as cached_note

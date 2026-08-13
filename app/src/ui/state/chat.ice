@@ -2,13 +2,14 @@ state
   channels:[ChatChannel] = []
   rooms:[ChatSidebarRow] = []
   messages:[ChatMessage] = []
-  // Recent room windows and both composer drafts are keyed by their owning
-  // room/thread so navigation never paints or posts another room's text.
-  message_cache:[ChannelWindow] = []
+  // Renderer invalidation for the whole-timeline lazy island. Domain handlers
+  // advance it only when the corresponding owned window changes.
+  messages_revision:i64 = 0
+  // Composer drafts are keyed by their owning room/thread so navigation never
+  // posts another room's text.
   message_drafts:[ChannelDraft] = []
   reply_drafts:[ChannelDraft] = []
   chat_generation:i64 = 0
-  chat_window_loading = false
   channel_reads:[ChannelRead] = []
   unread_boundary:i64 = 0
   unread_marker_seq:i64 = 0
@@ -30,7 +31,8 @@ state
   active_thread_seq:i64 = 0
   thread_target_seq:i64 = 0
   thread_messages:[ChatMessage] = []
-  thread_next_reply_offset:i64 = 0
+  thread_messages_revision:i64 = 0
+  thread_next_reply_seq:i64 = 0
   thread_has_more = false
   thread_loading = false
   thread_generation:i64 = 0

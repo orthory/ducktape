@@ -187,6 +187,7 @@ on console_opened(id)
   rooms = []
   dm_rows = []
   messages = []
+  messages_revision = messages_revision + 1
   node_log_filter = ""
   node_log_timeline = node_log_timeline_reset()
   shell_credentials_generation = shell_credentials_generation + 1
@@ -211,8 +212,6 @@ on console_opened(id)
   // The old network's history lane was invalidated above, so a socket that
   // never answers cannot keep "Load older" disabled in the new network.
   history_loading = false
-  // Same abandoned reply, same rest of the session — see `chat_window_loading`.
-  chat_window_loading = false
   channel_reads = []
   unread_boundary = 0
   unread_marker_seq = 0
@@ -248,7 +247,8 @@ on console_opened(id)
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
-  thread_next_reply_offset = 0
+  thread_messages_revision = thread_messages_revision + 1
+  thread_next_reply_seq = 0
   thread_has_more = false
   thread_generation = thread_generation + 1
   invalidate lane=live_thread

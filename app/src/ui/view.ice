@@ -194,14 +194,10 @@ view
               call_muted
               huddle_popped
               messages
+              messages_revision
               has_older_history
               history_view
-              // THE BUTTON TELLS THE TRUTH ABOUT BOTH REFUSALS. `load_more_history`
-              // refuses on `chat_window_loading` as well, and a cache-hit switch
-              // paints the parked rows — button included — with `loading` false,
-              // so without this the one control on screen during that round trip
-              // is a live-looking button that swallows the press.
-              history_loading=(history_loading || chat_window_loading)
+              history_loading
               unread_boundary
               unread_marker_seq
               selected_message_seq
@@ -212,11 +208,12 @@ view
               active_thread_seq
               thread_target_seq
               thread_messages
+              thread_messages_revision
               thread_selected_seq
               thread_selected_rev
               thread_message_action
               thread_has_more
-              thread_next_reply_offset
+              thread_next_reply_seq
               thread_loading
               failed_reply_draft
             events
