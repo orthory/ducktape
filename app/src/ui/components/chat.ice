@@ -888,17 +888,14 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
                     disabled=disabled
                     p=5.0
                     @icon_action
-                  // `IconAction`, because ♡ and ⋯ beside it are string labels
-                  // that DO brighten: an svg reads no inherited text color, so
-                  // the one icon in this three-button toolbar was the one glyph
-                  // that stayed grey under the cursor. It takes this button's
-                  // own `disabled` so a dead control does not answer the hand.
-                  IconAction
+                  // `color=inherit` (ducktape-ui#606): the glyph reads the
+                  // same status-resolved ink the ♡ and ⋯ string labels beside
+                  // it inherit, so all three brighten and dim together — on
+                  // the button's bounds and the button's disabled status.
+                  svg icon("nav-chat") memory color=inherit
                     with
-                      name="nav-chat"
-                      tone="muted"
-                      px=15.0
-                      disabled=disabled
+                      w=15.0
+                      h=15.0
                   active bg=transparent text=muted r=6.0
                   hovered bg=elevated text=fg
                   pressed bg=subtle text=fg
@@ -1160,7 +1157,7 @@ component ComposerMarks(disabled:bool)
         h=14.0
         bg=separator
       space w=1.0 h=1.0
-    button -> emit(mark, "code")
+    button #code -> emit(mark, "code")
       with
         label="Code block"
         disabled=disabled
@@ -1174,12 +1171,10 @@ component ComposerMarks(disabled:bool)
           h=fill
           align-x=center
           align-y=center
-        IconAction
+        svg icon("code-brackets") #glyph memory color=inherit
           with
-            name="code-brackets"
-            tone="muted"
-            px=13.0
-            disabled=disabled
+            w=13.0
+            h=13.0
       active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
       hovered bg=fg/8 text=fg
       pressed bg=fg/12 text=fg
@@ -1197,12 +1192,10 @@ component ComposerMarks(disabled:bool)
           h=fill
           align-x=center
           align-y=center
-        IconAction
+        svg icon("quote") memory color=inherit
           with
-            name="quote"
-            tone="muted"
-            px=13.0
-            disabled=disabled
+            w=13.0
+            h=13.0
       active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
       hovered bg=fg/8 text=fg
       pressed bg=fg/12 text=fg

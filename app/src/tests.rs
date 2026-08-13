@@ -5014,13 +5014,15 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
     }
 
     /// AN ICON-ONLY CONTROL'S GLYPH MUST INHERIT ITS BUTTON'S INK. A button's
-    /// `hovered … text=` reaches its content as an INHERITED text color: a
+    /// status styling reaches its content as an INHERITED text color: a
     /// `text` child carrying a `@text-*` class emits an explicit color and
-    /// ignores it for every status, and an `Icon` is an svg that reads no text
-    /// color at all. Either way the plate lit under the cursor and the glyph
-    /// stayed muted — in the message hover bar, between a ♡ and a ⋯ that both
-    /// brightened. `IconAction` is the opt-in that hands an svg its own hover
-    /// arm; a plain glyph just leaves the color to the button.
+    /// ignores it for every status, and an svg opts into the channel with
+    /// `color=inherit` (ducktape-ui#606) — the glyph then draws the button's
+    /// status-resolved text color, written AFTER the disabled pass, so its
+    /// hover ink keys on the BUTTON's bounds and its disabled ink on the
+    /// status ladder. A glyph outside the channel is the #1072 defect: the
+    /// plate lit under the cursor and the glyph stayed muted — in the message
+    /// hover bar, between a ♡ and a ⋯ that both brightened.
     ///
     /// SINGLE-GLYPH BUTTONS ONLY, AND THE EXCLUSION IS DELIBERATE — say what it
     /// lets through rather than let the `[glyph]` destructure quietly decide.
@@ -5038,26 +5040,22 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
     /// carries is inert, not wrong — it is the recipe's default reaching
     /// nothing.)
     ///
-    /// AND NO `IconAction` SILENCES ITS DISABLED TERM. Its ramp keys on the
-    /// svg's OWN bounds — iced computes `svg::Status::Hovered` in
-    /// `Button::update`, which forwards to its content BEFORE it looks at
-    /// `on_press` — so the button's term is the only thing that knows the
-    /// control is dead, and a mount that hands down `false` brightens the glyph
-    /// of a control nobody can press. (Dropping the prop outright is the Ice
-    /// compiler's error, not this lint's: `E123 missing prop`.)
+    /// AND THE RAMP MACHINERY STAYS DELETED. The old app-side `IconAction`
+    /// component carried an opt-in hover ramp whose known ceiling was
+    /// structural: `svg::Status::Hovered` keys on the svg's OWN bounds, so the
+    /// glyph brightened over the icon instead of the plate, and `disabled` had
+    /// to be a mount parameter instead of a status arm. ducktape-ui#606's
+    /// inherit channel supersedes the whole path; a returning `IconAction`
+    /// mount, or an svg glyph carrying `style=`/`hover=` ink of its own, is a
+    /// second owner of ink the button already resolves.
     fn assert_icon_controls_inherit_ink(name: &str, source: &str) {
+        assert!(
+            !source.contains("IconAction"),
+            "{name}: the IconAction ramp is deleted — a button's glyph is a direct \
+             `svg … color=inherit` child drawing the button's status ink \
+             (ducktape-ui#606), never a ramp of its own"
+        );
         let lines: Vec<_> = source.lines().collect();
-        for mount in lines
-            .iter()
-            .map(|line| line.trim_start())
-            .filter(|line| line.starts_with("IconAction "))
-        {
-            assert!(
-                !mount.contains("disabled=false"),
-                "{name}: an `IconAction` hovers on its own bounds, so it must carry its \
-                 button's disabled term, never a literal: {mount:?}"
-            );
-        }
         for (index, _) in lines
             .iter()
             .enumerate()
@@ -5069,14 +5067,28 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
                 .any(|child| child.starts_with("hovered ") && child.contains(" text="));
             let glyphs: Vec<&&str> = children
                 .iter()
-                .filter(|child| child.starts_with("text ") || child.starts_with("Icon"))
+                .filter(|child| {
+                    child.starts_with("text ")
+                        || child.starts_with("Icon")
+                        || child.starts_with("svg ")
+                })
                 .collect();
             let [glyph] = glyphs[..] else { continue };
+            if glyph.starts_with("svg ") {
+                assert!(
+                    glyph.contains("color=inherit"),
+                    "{name}: a button's one svg glyph draws the button's status ink — \
+                     declare `color=inherit` on the mount line, never a `style=` tint or \
+                     `hover=` arm of its own: {glyph:?}"
+                );
+                continue;
+            }
             let names_its_own_color = glyph.contains("@text-") || glyph.starts_with("Icon ");
             assert!(
                 !lights_its_ink || !names_its_own_color,
                 "{name}: this button's `hovered … text=` cannot reach a glyph that names its \
-                 own colour — drop the `@text-*`, or mount the icon as `IconAction`: {glyph:?}"
+                 own colour — drop the `@text-*`, or inline the icon as \
+                 `svg … color=inherit`: {glyph:?}"
             );
         }
     }
@@ -5158,8 +5170,14 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
     // shape exists on other surfaces, but there `tone=` carries STATE (a muted
     // mic against a danger one, a checked tab against an idle one), so those
     // are a design decision rather than a defect and are not swept here.
+    // icon.ice is swept so the deleted `IconAction` ramp component itself
+    // cannot quietly return.
     assert_icon_controls_inherit_ink("chat.ice", &chat);
     assert_icon_controls_inherit_ink("screens/chat.ice", &chat_screen);
+    assert_icon_controls_inherit_ink(
+        "components/icon.ice",
+        &inlined(include_str!("ui/components/icon.ice")),
+    );
     // The three composer editors carried ad-hoc `focused border=ring` status
     // blocks; their focus ring now lives in the rich composer adapter
     // (`editor::composer_style`), and the fs editor is the one authored
