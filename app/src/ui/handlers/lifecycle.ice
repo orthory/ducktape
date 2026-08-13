@@ -871,7 +871,9 @@ on shell_credentials_load_selected(request)
   let obsolete_request = request.rpc != connected_rpc || request.generation != shell_credentials_generation
   let unmounted = shell_tab != ShellTab.shell
   return if obsolete_request || unmounted
-  run replace lane=shell_credentials load_agent_credentials(request.rpc, request.generation) -> shell_credentials_loaded _ | shell_credentials_failed _
+  parallel
+    run replace lane=shell_credentials load_agent_credentials(request.rpc, request.generation) -> shell_credentials_loaded _ | shell_credentials_failed _
+    run replace lane=shell_host_nodes load_agent_host_nodes(request.rpc, request.generation) -> shell_host_nodes_loaded _ | shell_host_nodes_failed _
 
 // The huddle's elapsed clock is a LOCAL session fact: one tick per second for
 // as long as SHE is in the huddle, never a chain value. `huddle_joined_at` is

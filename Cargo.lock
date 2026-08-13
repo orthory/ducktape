@@ -3348,6 +3348,7 @@ dependencies = [
 name = "ducktape-app"
 version = "0.1.0"
 dependencies = [
+ "capability",
  "chat",
  "commonware-cryptography",
  "cpal",

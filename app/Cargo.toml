@@ -14,6 +14,9 @@ category = "public.app-category.productivity"
 ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "78b9838a68ff471fc6c1eb072542ca8b255f838e", version = "=0.1.0" }
 
 [dependencies]
+# the network's node -> announced-provider registry, behind the Shell's host
+# picker: which peers can actually run an agent.
+capability.workspace = true
 chat.workspace = true
 design.workspace = true
 ducktape-rpc.workspace = true

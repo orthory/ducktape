@@ -21,12 +21,24 @@ on shell_credential_changed(next)
   shell_terminal_error = ""
   shell_chat_error = ""
 
+on shell_host_node_changed(next)
+  return if shell_terminal_busy || shell_terminal_running || shell_chat_busy
+  shell_host_node = next
+  shell_host_node_key = agent_host_node_key(shell_host_nodes, next)
+  shell_terminal_error = ""
+  shell_chat_error = ""
+
+// The COMPUTE band asks two questions of the same visit — which credential
+// signs the run, and which peer executes it — so both reads are issued
+// together and share the visit's generation.
 on shell_credentials_refresh
   return if !connected || shell_credentials_loading || shell_terminal_busy || shell_chat_busy
   shell_credentials_generation = shell_credentials_generation + 1
   shell_credentials_loading = true
   error = ""
-  run replace lane=shell_credentials load_agent_credentials(connected_rpc, shell_credentials_generation) -> shell_credentials_loaded _ | shell_credentials_failed _
+  parallel
+    run replace lane=shell_credentials load_agent_credentials(connected_rpc, shell_credentials_generation) -> shell_credentials_loaded _ | shell_credentials_failed _
+    run replace lane=shell_host_nodes load_agent_host_nodes(connected_rpc, shell_credentials_generation) -> shell_host_nodes_loaded _ | shell_host_nodes_failed _
 
 on shell_credentials_loaded(next)
   return if next.generation != shell_credentials_generation
@@ -40,11 +52,24 @@ on shell_credentials_failed(cause)
   shell_credentials_loading = false
   error = cause.message
 
+// A registry that dropped the picked peer must not keep sending work to it:
+// the key is re-derived from the fresh rows, and an absent row resolves to ""
+// — the connected node.
+on shell_host_nodes_loaded(next)
+  return if next.generation != shell_credentials_generation
+  shell_host_nodes = next.rows
+  shell_host_node_options = agent_host_node_options(shell_host_nodes)
+  shell_host_node_key = agent_host_node_key(shell_host_nodes, shell_host_node)
+
+on shell_host_nodes_failed(cause)
+  return if cause.generation != shell_credentials_generation
+  error = cause.message
+
 on shell_terminal_start
   return if !connected || shell_terminal_busy || shell_terminal_running
   shell_terminal_busy = true
   shell_terminal_error = ""
-  run replace lane=shell_terminal start_agent_terminal(connected_rpc, shell_provider, shell_credential) -> shell_terminal_started _ | shell_terminal_failed _
+  run replace lane=shell_terminal start_agent_terminal(connected_rpc, shell_provider, shell_credential, shell_host_node_key) -> shell_terminal_started _ | shell_terminal_failed _
 
 on shell_terminal_started(next)
   shell_terminal = next.session
@@ -87,7 +112,7 @@ on shell_composer_event(event)
   shell_chat_detail = "Preparing the durable run"
   shell_chat_busy = true
   parallel
-    stream replace lane=shell_chat agent_chat_turn(connected_rpc, shell_provider, shell_credential, shell_chat_entries) -> shell_chat_event _
+    stream replace lane=shell_chat agent_chat_turn(connected_rpc, shell_provider, shell_credential, shell_host_node_key, shell_chat_entries) -> shell_chat_event _
     // `snap … 0.0`, not `snap-end`: the transcript is `anchor-y=end`, where
     // relative 0.0 IS the tail — `snap-end` (relative 1.0) lands at the TOP.
     task widget snap #workspace-tabs/content/shell/root/transcript 0.0 0.0 window=window_target(console_win)
