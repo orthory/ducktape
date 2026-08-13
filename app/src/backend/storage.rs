@@ -336,6 +336,11 @@ pub async fn files_write_text(rpc: String, path: String, text: String) -> Result
 /// small files ride inline; larger ones stage 1 MiB chunks then commit a
 /// chunk list. The dropped path never leaves this device — only bytes do.
 pub async fn files_upload(rpc: String, dir: String, dropped: String) -> Result<bool, AppError> {
+    // the node refuses to serve back any object larger than files_http's
+    // MAX_OBJECT_BYTES, and every staged MiB is a consensus block — a cap
+    // HERE turns "drop a video, drive 300 blocks, node RSS grows by 300 MB"
+    // into one refusal toast.
+    const MAX_DROP_BYTES: u64 = 64 * 1024 * 1024;
     async {
         let source = PathBuf::from(&dropped);
         let name = source
@@ -343,8 +348,22 @@ pub async fn files_upload(rpc: String, dir: String, dropped: String) -> Result<b
             .and_then(|name| name.to_str())
             .ok_or_else(|| "dropped path has no file name".to_string())?
             .to_string();
-        let bytes =
-            std::fs::read(&source).map_err(|error| format!("cannot read {dropped}: {error}"))?;
+        let size = std::fs::metadata(&source)
+            .map_err(|error| format!("cannot read {dropped}: {error}"))?
+            .len();
+        if size > MAX_DROP_BYTES {
+            return Err(format!(
+                "{name} is {} MiB — the node stores files up to {} MiB",
+                size / (1024 * 1024),
+                MAX_DROP_BYTES / (1024 * 1024)
+            ));
+        }
+        // off the render runtime: a multi-MB read is a blocking call.
+        let read = tokio::task::spawn_blocking(move || std::fs::read(&source));
+        let bytes = read
+            .await
+            .map_err(|error| format!("file read task failed: {error}"))?
+            .map_err(|error| format!("cannot read {dropped}: {error}"))?;
         let rpc = rpc_client(&rpc)?;
         let target = fs_child(dir, name.clone());
         let content = match bytes.len() as u64 <= 256 * 1024 {
