@@ -421,7 +421,11 @@ on live_updated(next)
   gov_generation = keep_i64(plane_live_hit(next.kind, next.module, "governance"), gov_generation + 1, gov_generation)
   account_generation = keep_i64(plane_live_hit(next.kind, next.module, "identity"), account_generation + 1, account_generation)
   dm_peers_generation = keep_i64(plane_live_hit(next.kind, next.module, "identity"), dm_peers_generation + 1, dm_peers_generation)
-  agents_generation = keep_i64(plane_live_hit(next.kind, next.module, "agent"), agents_generation + 1, agents_generation)
+  // THE AGENTS ROW IS JOINED FROM TWO MODULES, so it is the one plane that
+  // does not ride `plane_live_hit`: `agent` commits the registration and
+  // `runs` commits the liveness `AgentRow.live` is read from. `agents_plane_hit`
+  // is the extern that answers for both (backend/live.rs).
+  agents_generation = keep_i64(agents_plane_hit(next.kind, next.module), agents_generation + 1, agents_generation)
   fs_generation = keep_i64(plane_live_hit(next.kind, next.module, "files"), fs_generation + 1, fs_generation)
   forge_generation = keep_i64(forge_live_hit(next.kind, next.module), forge_generation + 1, forge_generation)
   hydration_generation = keep_i64(next.load_chat || next.load_pages || huddle_refresh_hits(next.chat, active_channel), hydration_generation + 1, hydration_generation)
@@ -445,7 +449,7 @@ on live_updated(next)
     run replace lane=governance_load load_governance(connected_rpc, keep_i64(plane_live_hit(next.kind, next.module, "governance"), gov_generation, -1)) -> governance_loaded _ | governance_failed _
     run replace lane=account_load load_account(connected_rpc, keep_i64(plane_live_hit(next.kind, next.module, "identity"), account_generation, -1)) -> account_loaded _ | account_failed _
     run replace lane=dm_peers_load load_dm_peers(connected_rpc, keep_i64(plane_live_hit(next.kind, next.module, "identity"), dm_peers_generation, -1)) -> dm_peers_loaded _ | dm_peers_failed _
-    run replace lane=agents_load load_agents(connected_rpc, keep_i64(plane_live_hit(next.kind, next.module, "agent"), agents_generation, -1)) -> agents_loaded _ | agents_failed _
+    run replace lane=agents_load load_agents(connected_rpc, keep_i64(agents_plane_hit(next.kind, next.module), agents_generation, -1)) -> agents_loaded _ | agents_failed _
     run replace lane=files_list files_ls(connected_rpc, fs_path, keep_i64(plane_live_hit(next.kind, next.module, "files") && shell_tab == "files", fs_generation, -1)) -> fs_listed _ | fs_failed _
 
 on live_resynced(next)
@@ -798,7 +802,15 @@ on select_shell_tab(next)
   fs_generation = fs_generation + 1
   members_generation = members_generation + 1
   gov_generation = gov_generation + 1
-  agents_generation = agents_generation + 1
+  // THE AGENTS BUMP IS GATED FOR THE SAME REASON THE SETTINGS ONE BELOW IS.
+  // `run replace lane=agents_load` aborts work still running on the lane, but
+  // it cannot retract a completion the runtime has ALREADY queued — and an
+  // unconditional bump here is what makes `agents_loaded` reject exactly that
+  // completion, throwing away a live-plane read that had already answered. The
+  // Forge seat's dot is drawn off those rows on EVERY tab, so opening the
+  // destination pane does not pay the loss back: it waits for the next `agent`
+  // or `runs` op, which for a run that just started is the moment it ends.
+  agents_generation = keep_i64(tab_reads_plane(shell_tab, "agents"), agents_generation + 1, agents_generation)
   account_generation = account_generation + 1
   forge_generation = forge_generation + 1
   forge_list_phase = keep_str(shell_tab == "forge", "loading", forge_list_phase)

@@ -3640,6 +3640,109 @@ async fn a_pages_text_op_folds_and_a_structural_one_reloads() {
     );
 }
 
+/// A `runs` OP IS A SIGNAL, NOT A FOLD. Nothing on screen draws a run row: the
+/// fact that module feeds is `AgentRow.live`, joined into the AGENTS
+/// projection out of another module's state (`agents_with_a_run_in_flight`).
+/// So there is nothing local to fold into, and the only useful shape is a
+/// plane update naming `runs` — which the handler answers by refetching that
+/// projection, the Forge seat's live dot with it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_runs_op_asks_the_agents_projection_to_refetch() {
+    let update = folded_update(
+        "",
+        "runs",
+        ducktape_rpc::StreamOp {
+            height: 7,
+            seq: 0,
+            time: 0,
+            origin: ducktape_rpc::StreamOrigin {
+                kind: ducktape_rpc::StreamOriginKind::Module,
+                id: Some("runs".into()),
+            },
+            payload: Some(serde_json::json!({"claim_job": {"run_id": "run-1"}})),
+            payload_hex: None,
+            assigned: None,
+            assigned_hex: None,
+        },
+    )
+    .await
+    .expect("a runs op is visible to the shell");
+    assert_eq!(update.kind, "plane");
+    assert_eq!(update.module, "runs", "the module IS the whole payload");
+    assert_eq!(update.height, 7);
+    assert!(
+        !update.load_chat && !update.load_pages,
+        "the signal buys the agents projection, not a chat or pages slice"
+    );
+}
+
+/// A PLANE WITH NO SUBSCRIPTION IS A DEAD ARM, and a silent one. `folded_update`
+/// can only route an op the stream was asked to deliver, so the subscribe list
+/// and its match arms are one contract kept in two places. `runs` is the case
+/// that proved it: `AgentRow.live` is read from that module, the Forge seat
+/// draws a live dot off the joined row, and nothing ever said the module
+/// changed — so the dot stayed dark for the length of a run. The EXACT list is
+/// the pin, because a topic dropped here fails nothing else.
+#[test]
+fn the_live_stream_subscribes_to_every_plane_the_console_reads() {
+    const LIVE: &str = include_str!("live.rs");
+    let list = LIVE
+        .split_once("rpc.module_events(")
+        .expect("the subscribe call")
+        .1
+        .split_once("],")
+        .expect("the topic list")
+        .0;
+    let topics: Vec<&str> = list
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix('"')?
+                .split_once("\".to_string(),")
+                .map(|(topic, _)| topic)
+        })
+        .collect();
+    assert_eq!(
+        topics,
+        [
+            "chat",
+            "pages",
+            "inbox",
+            "forge",
+            "valset",
+            "governance",
+            "identity",
+            "agent",
+            "runs",
+            "files",
+        ]
+    );
+}
+
+/// TWO MODULES, ONE PROJECTION — every quadrant. `agent` commits an agent's
+/// registration and `runs` commits its liveness, so this is the only plane
+/// predicate that answers for a pair; `plane_live_hit`'s single `want` cannot
+/// express it and the Ice checker will not let the handler spell the pair
+/// inline. A non-plane kind must stay false whatever module it names, or a
+/// chat fold's module string starts issuing agent queries.
+#[test]
+fn the_agents_plane_hit_answers_for_both_of_its_modules_and_nothing_else() {
+    for (kind, module, want) in [
+        ("plane", "agent", true),
+        ("plane", "runs", true),
+        ("plane", "valset", false),
+        ("chat", "agent", false),
+        ("chat", "runs", false),
+        ("resync", "runs", false),
+    ] {
+        assert_eq!(
+            agents_plane_hit(kind.into(), module.into()),
+            want,
+            "{kind} / {module}"
+        );
+    }
+}
+
 /// A TIP MOVES THE HEAD AND MUST FETCH NOTHING.
 ///
 /// The heartbeat rides every block, and an idle chain nop-fills once per
