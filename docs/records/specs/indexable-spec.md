@@ -146,10 +146,19 @@ the module's state machinery, never `sdk`/`host`/`indexer`.
    `(H, seq)`* — read-after-your-own-write. It is not general freshness: it
    advances only on op traffic, so a quiet module's tip is arbitrarily old
    while its view is perfectly current (unlike `meta/height`, which bumps on
-   every block). A boundary stamp (§6) wipes it with the rest of the derived
-   state, and `converge_guest` reinstalls a mapper without refolding, so
-   ABSENT is normal and means *unknown* — a client waiting on the tip must
-   escape by timeout, never block on it.
+   every block). ABSENT is normal and means *unknown*, never height 0: a
+   boundary stamp (§6) wipes it with the rest of the derived state, a fresh
+   database has none, and a module that just gained its first index guest has
+   folded nothing yet. So a client waiting on the tip must escape by timeout,
+   never block on it.
+
+   A mapper UPGRADE is the other way round, and is the hazard worth naming:
+   `converge_guest` swaps the wasm and returns — no refold, no clear — so the
+   tip stays PRESENT and keeps vouching for rows the previous mapper wrote. A
+   new mapper whose derived shape differs has to be shipped with a boundary
+   stamp (§6) or a chain replay, exactly as it always did; the tip reports
+   fold progress over the op feed and never claims the rows are the shape the
+   installed mapper would produce.
 5. **Pre-index history is out of scope.** An op referencing state the feed
    never carried (enabled mid-life, boundary stamp) folds to a no-op. The
    honest fix is replaying the chain through the feed, not a guessed
