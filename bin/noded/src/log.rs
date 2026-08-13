@@ -25,10 +25,11 @@ use tracing_subscriber::{EnvFilter, Layer as _, reload};
 /// node with NO environment beyond PATH (`daemon.rs::prepare_node_command_env`),
 /// so anything that needs an env var to be visible is, in practice, invisible.
 ///
-/// commonware's discovery dialer reports connection failures at `debug`, but a
-/// node that cannot reach its peers is operationally broken. admit that narrow
-/// target by default; enabling all of `commonware_p2p=debug` would also admit
-/// unrelated routing chatter.
+/// commonware keeps several node-health failures at `debug`. admit only the
+/// operational scopes: discovery owns dial/listen/handshake/peer-set health,
+/// the p2p resolver owns finalized-payload fetch timeouts, and the simplex
+/// engine names the child actor whose exit stopped consensus. broader crate
+/// filters would also admit per-view and per-request chatter.
 ///
 /// defguard_boringtun is pinned off: its rekey timers WARN every ~5 s per
 /// unreachable peer — with no peer field, so the lines diagnose nothing while
@@ -37,8 +38,13 @@ use tracing_subscriber::{EnvFilter, Layer as _, reload};
 /// `ConnectionExpired` return values, where the peer IS known). RUST_LOG
 /// appends after this, so `RUST_LOG=defguard_boringtun=warn` re-arms the raw
 /// crate lines.
-const DEFAULT_FILTER: &str =
-    "info,defguard_boringtun=off,commonware_p2p::authenticated::discovery::actors::dialer=debug";
+const DEFAULT_FILTER: &str = concat!(
+    "info,",
+    "defguard_boringtun=off,",
+    "commonware_p2p::authenticated::discovery=debug,",
+    "commonware_resolver::p2p=debug,",
+    "commonware_consensus::simplex::engine=debug",
+);
 
 /// parse a directive list STRICTLY.
 ///
@@ -354,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn commonware_dial_failures_reach_the_ring_by_default() {
+    fn critical_dependency_events_reach_the_ring_by_default() {
         let logs = crate::LogRing::default();
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
@@ -370,14 +376,46 @@ mod tests {
                 "failed to dial peer"
             );
             tracing::debug!(
-                target: "commonware_p2p::authenticated::discovery::actors::peer::actor",
-                "unrelated p2p debug noise"
+                target: "commonware_p2p::authenticated::discovery::actors::tracker::directory",
+                expected = 3,
+                actual = 2,
+                "bit vector length mismatch"
+            );
+            tracing::debug!(
+                target: "commonware_resolver::p2p::engine",
+                key = "payload",
+                "requester timeout"
+            );
+            tracing::debug!(
+                target: "commonware_consensus::simplex::engine",
+                "voter stopped, shutting down engine"
+            );
+            tracing::debug!(
+                target: "commonware_consensus::simplex::actors::voter::actor",
+                "routine per-view noise"
+            );
+            tracing::debug!(
+                target: "commonware_p2p::authenticated::lookup::actors::peer::actor",
+                "unused p2p implementation noise"
             );
         });
 
         let (rows, _) = logs.read_after(0, 10);
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].1.contains("failed to dial peer"));
+        let output = rows
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "failed to dial peer",
+            "bit vector length mismatch",
+            "requester timeout",
+            "voter stopped, shutting down engine",
+        ] {
+            assert!(output.contains(expected), "missing {expected}: {output}");
+        }
+        assert!(!output.contains("routine per-view noise"));
+        assert!(!output.contains("unused p2p implementation noise"));
     }
 
     #[test]
