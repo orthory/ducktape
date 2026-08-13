@@ -4303,15 +4303,20 @@ fn the_page_read_never_crosses_the_dispatch_query_lane() {
     // one caller is `add_block_comment`'s read of the comment it JUST posted,
     // where the canonical lane is read-after-write by construction. Anything
     // else appearing here is a pages read crawling back onto the select loop.
+    //
+    // WALKED, never listed. A hand-written list of files is a rule carrying its
+    // own escape hatch: `PageQuery` is imported once (`backend/mod.rs`) and
+    // every module here inherits it through `use super::*`, so the next backend
+    // module added is exactly the one a list would not sweep — and a page read
+    // dropped into it would pass this test silently. Only this file is skipped,
+    // and for the reason the chat pin skips its own prose: a sweep over raw
+    // source cannot tell the banned symbol from the string that bans it.
     const KEPT: &str = "CommentThread";
-    let backend: Vec<(&str, &str)> = vec![
-        ("chat.rs", include_str!("chat.rs")),
-        ("document.rs", include_str!("document.rs")),
-        ("live.rs", include_str!("live.rs")),
-        ("load.rs", LOAD),
-        ("search.rs", include_str!("search.rs")),
-        ("shell.rs", include_str!("shell.rs")),
-    ];
+    let backend = backend_sources();
+    assert!(
+        backend.iter().any(|(name, _)| name == "load.rs"),
+        "the walk found the backend it is supposed to be sweeping"
+    );
     let mut arms: Vec<String> = Vec::new();
     for (name, source) in &backend {
         for rest in source.split("PageQuery::").skip(1) {
@@ -4329,6 +4334,31 @@ fn the_page_read_never_crosses_the_dispatch_query_lane() {
         "the ONE kept dispatch read, exactly once — a second call site is a \
          lane decision, not a copy-paste"
     );
+}
+
+/// Every backend module's source, this test file excepted — the lane pins
+/// above sweep the whole crate rather than the handful of files that happen to
+/// hold a read today.
+fn backend_sources() -> Vec<(String, String)> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/backend");
+    let mut out: Vec<(String, String)> = std::fs::read_dir(&dir)
+        .expect("the backend tree is readable")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|kind| kind == "rs"))
+        .filter(|path| path.file_name().is_some_and(|name| name != "tests.rs"))
+        .map(|path| {
+            let source = std::fs::read_to_string(&path).expect("a backend module reads");
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            (name, source)
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 /// THE TAB-SWITCH GATE. Four planes used to refetch on every tab move —
