@@ -819,7 +819,7 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
         ("settings_load_selected", "shell_tab != ShellTab.settings"),
         (
             "peers_load_selected",
-            "shell_tab != ShellTab.settings || node_tab != NodeTab.overview",
+            "shell_tab != ShellTab.node || node_tab != NodeTab.overview",
         ),
         ("forge_load_selected", "shell_tab != ShellTab.forge"),
         (
