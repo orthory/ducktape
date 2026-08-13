@@ -6333,7 +6333,6 @@ dependencies = [
  "tasks",
  "tempfile",
  "tokio",
- "tokio-stream",
  "tokio-tungstenite 0.24.0",
  "tower",
  "tower-http",

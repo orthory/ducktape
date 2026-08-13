@@ -1408,11 +1408,12 @@ fn spawn_body_pump<S: AsyncRead + Unpin + Send + 'static>(
     mut buf: Vec<u8>,
     max_response_bytes: u64,
 ) -> noded::GatewayBody {
-    // One slot is load-bearing: after a normal body chunk, the pump cannot
-    // enqueue a terminal Failure until Hyper has consumed that chunk. Hyper
-    // therefore observes Pending before the error, commits the response head,
-    // and surfaces a deterministic mid-body truncation instead of occasionally
-    // collapsing the whole request into `IncompleteMessage` at `.send()`.
+    // One slot: at most one chunk is in flight to the consumer, so a paced
+    // reader backpressures the frame wire chunk by chunk. This alone cannot
+    // order a terminal Failure after the head reaches the client — the pump
+    // can enqueue the Failure between the consumer's recv of a chunk and its
+    // next poll — so the browser door's `HeadCommitFence` owns the
+    // head-commits-before-abort guarantee (issue #1030).
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, GatewayFailure>>(1);
     tokio::spawn(async move {
         let mut total: u64 = 0;
