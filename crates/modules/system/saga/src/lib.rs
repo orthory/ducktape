@@ -62,8 +62,9 @@
 //! |---|---|
 //! | `saga\0{id}` | one [`Saga`] record (borsh) — every field EXCEPT the spec bytes |
 //! | `spec\0{id}{n:u64-le}` | chunk `n` of that saga's spec, raw bytes |
-//! | `pending{shard:u8}` | one of [`PENDING_SHARDS`] LIVE id shards: a borsh `BTreeSet<String>` of non-terminal ids that hash to it |
+//! | `pending{shard:u8}` | one of [`PENDING_SHARDS`] LIVE id shards: a borsh [`PendingIndex`] of the non-terminal ids that hash to it, each carrying its [`PendingMeta`] |
 //! | `terminal` | the terminal receipt index: a borsh `BTreeMap<String, TerminalEntry>` |
+//! | `quota\0{origin}` | one origin's LIVE saga count: a borsh `u32`, capped at [`PER_ORIGIN_LIVE_SAGAS`] |
 //!
 //! ### why the spec is chunked
 //!
@@ -82,17 +83,59 @@
 //!
 //! ### why there are two id indexes
 //!
-//! the store hashes its keys and CANNOT enumerate, but four surfaces are
-//! whole-map reads: `Crank`, `NextExpiry`, `AssignedPending` and
-//! `UnassignedPending` all iterate the live sagas in id order, and the
-//! retention trim ranks every TERMINAL saga. so the two domains are split
-//! into two sentinel key spaces. the live one is SHARDED by `sha256(id)` over
-//! [`PENDING_SHARDS`] records, so one saga's write touches exactly one of them
-//! and the readers merge them back into a single sorted sequence. the terminal
-//! one stays small by the trim itself: it is bounded by
-//! [`MAX_RETAINED_TERMINAL`] plus one block's arrivals, and each entry carries
-//! the `(updated_at, bytes)` the ranking needs so the trim never reads a saga
-//! record it does not evict.
+//! the store hashes its keys and CANNOT enumerate, but four surfaces range
+//! over the live sagas — `Crank`, `NextExpiry`, `AssignedPending` and
+//! `UnassignedPending` — and the retention trim ranks every TERMINAL saga. so
+//! the two domains are split into two sentinel key spaces. the live one is
+//! SHARDED by `sha256(id)` over [`PENDING_SHARDS`] records, so one saga's
+//! write touches exactly one of them and the readers merge them back into a
+//! single sorted sequence. the terminal one stays small by the trim itself: it
+//! is bounded by [`MAX_RETAINED_TERMINAL`] plus one block's arrivals, and each
+//! entry carries the `(updated_at, bytes)` the ranking needs so the trim never
+//! reads a saga record it does not evict.
+//!
+//! ### why the live index carries meta, and why every surface is BOUNDED
+//!
+//! both indexes therefore answer their surface from the index ALONE. the live
+//! one does it with [`PendingMeta`] — the `(due, assigned)` pair each of those
+//! four decides on — written in lockstep with the record inside
+//! [`SagaModule::put`]. that is what turns "one distinct store read per
+//! pending saga" into a constant: `NextExpiry` folds the 16 shard reads and
+//! stops, `Crank` reads only the records it actually transitions
+//! ([`CRANK_BUDGET`] of them, oldest `due` first), and the two pending
+//! projections read only their own lane's page ([`PENDING_PAGE`] candidates,
+//! walked by an `after` cursor).
+//!
+//! this is not a nicety: the wasm host budgets DISTINCT store reads per
+//! dispatch (`wasm_host::MAX_STORE_READS`, 4096) and replays the guest once
+//! per unresolved read. a per-saga scan therefore made the component runtime
+//! REJECT — quadratically, then absolutely — ops and queries the native module
+//! still accepted, which is a consensus divergence and, since the compute
+//! daemon's readiness probe is `NextExpiry`, a self-sustaining wedge.
+//!
+//! ## the live quota
+//!
+//! retention bounds the TERMINAL tail; nothing bounded the LIVE one. a saga
+//! triggered with neither a deadline nor a lease never expires, and `Cancel`
+//! is gated to the trigger origin — so one principal could accumulate live
+//! sagas without limit, at everyone else's expense, until a `pending` shard
+//! record hit its cap and started refusing unrelated triggers.
+//!
+//! so each origin carries a live count, keyed by the SAME subject `owns_id`
+//! and `Cancel` already gate on. a trigger at the cap is refused with the
+//! `origin_live_saga_cap` reason token; an accepted one claims a slot, and the
+//! `put` that makes a saga terminal returns it — exactly once, because every
+//! handler refuses a terminal saga before it writes, so that `put` happens
+//! once per saga (an underflow is therefore a module bug and is REFUSED, never
+//! clamped). `Prune` and the retention trim are terminal-only and never touch
+//! the count: the slot came back when the saga ENDED, not when its receipt was
+//! collected.
+//!
+//! the ceiling depends on what kind of subject that is. an external key is a
+//! principal, so [`PER_ORIGIN_LIVE_SAGAS`] is a real per-submitter budget. a
+//! module origin is the EMITTING module — every dispatch-created saga shares
+//! one counter — so [`PER_MODULE_LIVE_SAGAS`] is an aggregate in-flight bound
+//! on that module's whole fan-out, not an attribution of abuse.
 //!
 //! ## GC
 //!
@@ -130,7 +173,8 @@ pub mod index;
 #[cfg(feature = "index-guest")]
 mod index_guest;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::ops::Bound;
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use capability::{
@@ -150,6 +194,85 @@ use valset::{
 /// hard cap on state transitions per `Crank` op — a consensus constant, so a
 /// backlog of expired sagas is worked off in deterministic, bounded slices.
 pub const CRANK_BUDGET: u32 = 32;
+
+/// how many live-index entries one `AssignedPending`/`UnassignedPending` page
+/// EXAMINES — a consensus constant, since it decides where the reply's `next`
+/// cursor falls and two nodes running different values answer differently.
+///
+/// it bounds the CANDIDATES, not the results: `UnassignedPending`'s predicate
+/// is the meta's own `assigned` bit, so its page is exactly this many
+/// requests, while `AssignedPending` must read each assigned candidate's
+/// record to compare the key and may return fewer. either way one query reads
+/// at most `PENDING_SHARDS + PENDING_PAGE` records plus the returned page's
+/// spec chunks, so a caller walks the whole projection in bounded slices
+/// instead of one unbounded scan.
+///
+/// what it does NOT bound is what a page WEIGHS — see [`PENDING_PAGE_BYTES`].
+///
+// ponytail: the bound is on one page's READS, not on a full walk's CPU. every
+// page re-reads and re-decodes all PENDING_SHARDS records (`load_pending`)
+// before it ranges from the cursor, so a caller that walks a lane to the end
+// decodes the whole live index ceil(N / PENDING_PAGE) times and pays that many
+// `/v1/query` round trips: ~250k entry decodes over 63 requests at N = 4000.
+// that is the price of a hash-sharded index — a range query would need the
+// shards keyed by id prefix, which buys worse write locality. measure here
+// before blaming a slow pump on the node.
+pub const PENDING_PAGE: usize = 64;
+
+/// how many bytes of SPEC one `AssignedPending`/`UnassignedPending` page may
+/// carry — a consensus constant for the same reason [`PENDING_PAGE`] is: it
+/// decides where the reply's `next` cursor falls.
+///
+/// [`PENDING_PAGE`] bounds a page's request COUNT, and count alone is not a
+/// bound: one request carries a reassembled spec of up to [`MAX_SPEC_BYTES`],
+/// so 64 of them is ~768 MiB in a single reply that a wasm32 guest must
+/// materialise in linear memory while the native module answers off the heap.
+/// that is the same runtime-divergence axis the read budget closes, so the page
+/// stops filling once the accumulated spec length would cross this — after at
+/// least one candidate, so a spec larger than the whole budget still moves the
+/// walk forward instead of stalling the cursor on it forever.
+pub const PENDING_PAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// how many LIVE (non-terminal) sagas one EXTERNAL origin may hold at once —
+/// a consensus constant, enforced at trigger time.
+///
+/// the live half of the growth bound. the terminal tail is trimmed
+/// ([`MAX_RETAINED_TERMINAL`]) but a pending saga is never retention's to
+/// take, and one with neither a deadline nor a lease never expires on its own,
+/// so without this a single principal could pin unbounded state — and, once
+/// its ids filled a `pending` shard record, refuse OTHER principals' triggers.
+///
+/// an external key IS a principal, so this is the real per-submitter budget:
+/// well above any honest submitter, far below the shard record's own ceiling.
+pub const PER_ORIGIN_LIVE_SAGAS: u32 = 256;
+
+/// the same ceiling for a MODULE (or system) origin — deliberately far larger,
+/// because a module origin is not a principal.
+///
+/// a quota's subject is whatever `owns_id` gates the id namespace on, and for a
+/// module-triggered saga that is the EMITTING module: the host stamps a
+/// follow-up msg with `Origin::Module(<emitter>)`, so EVERY dispatch-created
+/// saga in the ledger — every agent turn, from every requester — shares the one
+/// `Module("dispatch")` counter. so this number bounds one module's whole
+/// aggregate fan-out; it is NOT an abuse bound attributable to whoever fills
+/// it, because this crate cannot see past the emitter to charge anyone else —
+/// the module's own admission is what gates who may trigger through it.
+///
+/// sizing it like a principal's budget was the trap: at 256 the network's TOTAL
+/// in-flight dispatch would stop there, and the 257th `Dispatch` op from any
+/// module would be refused (a cascaded trigger's `Err` rejects the whole op), so
+/// the few-thousand-pending scale the bounded reads above exist to serve would
+/// be unreachable. even a handful of module producers at this ceiling stays well
+/// inside the shard records' own capacity.
+pub const PER_MODULE_LIVE_SAGAS: u32 = 4096;
+
+/// the live ceiling one origin is held to — see the two constants above.
+fn live_saga_cap(origin: &SagaOrigin) -> u32 {
+    match origin {
+        SagaOrigin::External(_) => PER_ORIGIN_LIVE_SAGAS,
+        SagaOrigin::Module(_) | SagaOrigin::System => PER_MODULE_LIVE_SAGAS,
+    }
+}
 
 /// how many TERMINAL sagas stay in the ledger. a terminal saga has already
 /// fired its callback (P6, in the block it landed) — what remains is a
@@ -256,14 +379,17 @@ const PENDING_SHARDS: u8 = 16;
 ///
 // ponytail: the ceiling moves, it does not vanish. each shard is its own
 // MAX_RECORD_BYTES record, so the ledger refuses a trigger once ITS shard
-// fills — ~60k concurrent pending sagas at realistic ~250-byte ids, ~30k at
-// the MAX_SAGA_ID_BYTES cap (16x the one record this replaced). unlike the
-// terminal index, nothing trims this one: it drains only as sagas terminate,
-// and a saga triggered with neither a deadline nor a lease never expires. a
-// squatter who grinds ids into ONE shard can still fill it — but that refuses
-// only the 1/16 of later triggers hashing there, not every trigger for every
-// principal. a per-origin live quota is the real fix, and it is a WIRE change
-// that belongs to a separate decision.
+// fills. an entry is now the id plus its PendingMeta (a `due` option and the
+// assigned flag: 2-10 bytes), so the ceiling drops from ~66k concurrent
+// pending sagas to ~63k at realistic ~250-byte ids, and from ~32k to ~31k at
+// the MAX_SAGA_ID_BYTES cap — a few percent under what the bare id set held,
+// and still 16x the one record the sharding replaced. nothing trims this
+// index: it drains only as sagas terminate, and a saga triggered with neither
+// a deadline nor a lease never expires. the live quota (PER_ORIGIN_LIVE_SAGAS
+// / PER_MODULE_LIVE_SAGAS) is what now stops one origin from getting anywhere
+// near it; the shard cap is the second-order bound behind that quota, and a
+// squatter who grinds ids into ONE shard still refuses only the 1/16 of later
+// triggers hashing there.
 const PENDING_INDEX_PREFIX: &[u8] = b"pending";
 
 /// which shard record one id's row lives in: `sha256(id)`'s first byte modulo
@@ -287,6 +413,48 @@ fn pending_shard_key(shard: u8) -> Vec<u8> {
 
 /// the terminal receipt index — the retention trim's whole input.
 const TERMINAL_INDEX_KEY: &[u8] = b"terminal";
+
+/// one origin's live-saga count key: prefix + 0 + the origin's canonical byte
+/// form ([`put_origin`], the same encoding every module folds a `SagaOrigin`
+/// into its root preimage with). that form is injective and self-delimiting,
+/// so two origins can never share a counter.
+fn quota_key(origin: &SagaOrigin) -> Vec<u8> {
+    let mut key = b"quota".to_vec();
+    key.push(0);
+    put_origin(&mut key, origin);
+    key
+}
+
+/// which live-index lane a pending projection walks. ONE discriminant: the two
+/// projections differ only in the entries they admit, and the meta's `assigned`
+/// bit is what picks the CANDIDATES so neither reads the other's records.
+#[derive(Clone, Copy)]
+enum Lane<'a> {
+    /// attempts leased to exactly this key — `AssignedPending`.
+    LeasedTo(&'a [u8]),
+    /// announcements no node holds a lease on — `UnassignedPending`.
+    Unclaimed,
+}
+
+impl Lane<'_> {
+    /// does this entry's meta make it a candidate? decided WITHOUT reading the
+    /// saga record.
+    fn admits_meta(&self, meta: &PendingMeta) -> bool {
+        match self {
+            Lane::LeasedTo(_) => meta.assigned,
+            Lane::Unclaimed => !meta.assigned,
+        }
+    }
+
+    /// and does the record itself belong to this lane? `Unclaimed` is already
+    /// settled by the meta; `LeasedTo` needs the key the one bit cannot carry.
+    fn admits(&self, saga: &Saga) -> bool {
+        match self {
+            Lane::LeasedTo(key) => saga.assignee.as_deref() == Some(*key),
+            Lane::Unclaimed => saga.assignee.is_none(),
+        }
+    }
+}
 
 /// who may complete an assigned attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -363,6 +531,48 @@ impl Saga {
             + self.error.as_ref().map_or(0, String::len) as u64
     }
 }
+
+/// one LIVE saga's row in a `pending` shard: everything `Crank`, `NextExpiry`
+/// and the two pending projections decide on, so none of them reads a saga
+/// record it does not act on.
+///
+/// derived from the record by [`PendingMeta::of`] and staged in the SAME batch
+/// as it ([`SagaModule::put`]), so meta and record move in lockstep or not at
+/// all — every reader below treats this as the truth about a saga it has not
+/// read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+struct PendingMeta {
+    /// the next instant this saga can expire BY TIME: the earlier of the
+    /// whole-saga `deadline` and the current attempt's `lease_expires_at`.
+    /// `None` when it carries neither — such a saga can never be transitioned
+    /// by a `Crank` at all, and leaves the live index only through a result, a
+    /// cancel, or a claim.
+    due: Option<u64>,
+    /// whether the current attempt has a lease holder. the CANDIDATE filter
+    /// both pending projections use, so neither reads a record outside its own
+    /// lane; `AssignedPending` still compares the key on the record itself,
+    /// which one bit cannot carry.
+    assigned: bool,
+}
+
+impl PendingMeta {
+    /// the ONE derivation from a record — called only by [`SagaModule::put`].
+    fn of(saga: &Saga) -> Self {
+        let due = match (saga.deadline, saga.lease_expires_at) {
+            (Some(deadline), Some(lease)) => Some(deadline.min(lease)),
+            (deadline, lease) => deadline.or(lease),
+        };
+        Self {
+            due,
+            assigned: saga.assignee.is_some(),
+        }
+    }
+}
+
+/// one shard's decoded payload: the live ids that hash to it, each with the
+/// meta its readers decide on. sorted by id, so borsh writes it canonically
+/// and the merge of all [`PENDING_SHARDS`] shards is the one global id order.
+type PendingIndex = BTreeMap<String, PendingMeta>;
 
 /// one terminal saga's row in the retention index: everything
 /// [`terminal_evictions`] ranks on, so the trim reads ONE small record instead
@@ -573,25 +783,38 @@ impl SagaModule {
         Ok(spec)
     }
 
-    /// one shard of the live id index; absent reads as the empty set.
-    /// `BTreeSet` serializes ASCENDING, so the bytes are canonical.
-    async fn load_pending_shard(&self, shard: u8) -> Result<BTreeSet<String>, Error> {
+    /// one shard of the live id index; absent reads as the empty map.
+    /// `BTreeMap` serializes in ASCENDING key order, so the bytes are
+    /// canonical.
+    async fn load_pending_shard(&self, shard: u8) -> Result<PendingIndex, Error> {
         let Some(bytes) = self.staged.get(&pending_shard_key(shard)).await? else {
-            return Ok(BTreeSet::new());
+            return Ok(PendingIndex::new());
         };
         borsh::from_slice(&bytes).map_err(|e| Error::Module(format!("pending index decode: {e}")))
     }
 
-    /// every live id as ONE sorted sequence — the iteration order `Crank`,
-    /// `NextExpiry`, `AssignedPending` and `UnassignedPending` all promise.
-    /// the shards are hash-assigned, so this merge is what restores the id
-    /// order; iterating them shard by shard would NOT be sorted.
-    async fn load_pending(&self) -> Result<BTreeSet<String>, Error> {
-        let mut merged = BTreeSet::new();
+    /// every live id and its meta as ONE sorted sequence — the iteration order
+    /// `Crank`, `NextExpiry`, `AssignedPending` and `UnassignedPending` all
+    /// promise. the shards are hash-assigned, so this merge is what restores
+    /// the id order; iterating them shard by shard would NOT be sorted.
+    ///
+    /// EXACTLY [`PENDING_SHARDS`] distinct store reads, whatever the ledger
+    /// holds — and it is the ONLY read those four surfaces make before they
+    /// know which saga records they need.
+    async fn load_pending(&self) -> Result<PendingIndex, Error> {
+        let mut merged = PendingIndex::new();
         for shard in 0..PENDING_SHARDS {
             merged.extend(self.load_pending_shard(shard).await?);
         }
         Ok(merged)
+    }
+
+    /// how many LIVE sagas one origin currently holds; absent reads as zero.
+    async fn live_sagas(&self, origin: &SagaOrigin) -> Result<u32, Error> {
+        let Some(bytes) = self.staged.get(&quota_key(origin)).await? else {
+            return Ok(0);
+        };
+        borsh::from_slice(&bytes).map_err(|e| Error::Module(format!("live saga count decode: {e}")))
     }
 
     /// the terminal receipt index; absent reads as empty.
@@ -628,7 +851,43 @@ impl SagaModule {
         Ok(())
     }
 
-    /// the ONE record writer: stage a saga and keep both id indexes in lockstep
+    /// stage one origin's live count. a count of ZERO drops its key, so an
+    /// origin that settles everything it triggered hashes like one that never
+    /// triggered anything.
+    ///
+    /// the record is a fixed 4 bytes, so it has no check that can fail — which
+    /// is why both callers stage it after their own checks have passed.
+    async fn stage_live_count(&mut self, origin: &SagaOrigin, live: u32) -> Result<(), Error> {
+        let record = (live > 0).then(|| borsh::to_vec(&live).expect("a u32 is serializable"));
+        self.stage_if_changed(&quota_key(origin), record).await
+    }
+
+    /// take one of `origin`'s [`live_saga_cap`] slots — the accepted trigger's
+    /// claim, made only after the record that occupies it is staged.
+    async fn claim_live_slot(&mut self, origin: &SagaOrigin) -> Result<(), Error> {
+        let live = self.live_sagas(origin).await?;
+        self.stage_live_count(origin, live.saturating_add(1)).await
+    }
+
+    /// the count `origin` is left with once one of its sagas ENDS — read by the
+    /// `put` that ends it, and by nothing else.
+    ///
+    /// an underflow is REFUSED, not clamped. exactly-once release is the
+    /// invariant the whole quota rests on, and every other invariant in this
+    /// module fails loudly; a clamp here would swallow the breakage and
+    /// resurface it as its opposite — an origin triggering past its cap — with
+    /// nothing pointing back at the missing claim or the double decrement.
+    async fn live_count_after_release(&self, origin: &SagaOrigin) -> Result<u32, Error> {
+        let live = self.live_sagas(origin).await?;
+        live.checked_sub(1).ok_or_else(|| {
+            Error::Module(format!(
+                "live_saga_count_underflow: {origin:?} ended a saga it never claimed"
+            ))
+        })
+    }
+
+    /// the ONE record writer: stage a saga and keep both id indexes — and, on
+    /// a terminal transition, the trigger origin's live count — in lockstep
     /// with its status. every record it will write is encoded and checked
     /// BEFORE any of them is staged, so a refused write leaves the overlay
     /// untouched.
@@ -654,16 +913,36 @@ impl SagaModule {
         } else {
             // an evicted id that is triggered again comes back through here.
             terminal.remove(saga_id);
-            pending.insert(saga_id.to_string());
+            // the LOCKSTEP: the meta is derived from the very record staged
+            // below, in the same batch, so no transition can move a deadline,
+            // an assignee or a lease without the index that indexes them.
+            pending.insert(saga_id.to_string(), PendingMeta::of(saga));
         }
         let pending_record = encode_pending(&pending)?;
         let terminal_record = encode_terminal(&terminal)?;
+        // the last thing that can refuse, so it is DECIDED before anything is
+        // staged: an ending saga hands its slot back, and a count that cannot
+        // absorb the decrement is a module bug rather than a clamp.
+        let released = if saga.status.is_terminal() {
+            Some(self.live_count_after_release(&saga.origin).await?)
+        } else {
+            None
+        };
 
         self.staged.stage(record_key(saga_id), record);
         self.stage_if_changed(&pending_shard_key(shard), pending_record)
             .await?;
         self.stage_if_changed(TERMINAL_INDEX_KEY, terminal_record)
-            .await
+            .await?;
+        // the slot comes back HERE, and exactly once: every handler refuses a
+        // saga that is already terminal before it writes anything, so this is
+        // the one `put` in a saga's life that carries a terminal status.
+        // `Prune` and the retention trim run later, on an already-counted-down
+        // saga, and deliberately leave the count alone.
+        let Some(live) = released else {
+            return Ok(());
+        };
+        self.stage_live_count(&saga.origin, live).await
     }
 
     /// drop a saga entirely — its record, its spec chunks, and its index row.
@@ -725,6 +1004,77 @@ impl SagaModule {
             deadline: saga.deadline,
             assignee: saga.assignee.clone(),
         }
+    }
+
+    /// ONE page of a pending projection: the live entries after `after` whose
+    /// meta admits `lane`, at most [`PENDING_PAGE`] of them, each read back as
+    /// the [`WorkerRequest`] the effect lane carried.
+    ///
+    /// the page bounds the CANDIDATES examined, not the requests returned, and
+    /// that is the whole read bound: `PENDING_SHARDS` shard reads, then at most
+    /// `PENDING_PAGE` saga records plus the spec chunks of the ones that
+    /// matched. it is bounded in BYTES too ([`PENDING_PAGE_BYTES`]), so a page
+    /// of maximal specs cannot become a reply no wasm guest can hold. `next` is
+    /// the last candidate this page examined — pass it back as `after` — and
+    /// `None` means the walk reached the end of the index.
+    async fn pending_page(
+        &self,
+        lane: Lane<'_>,
+        after: Option<&str>,
+    ) -> Result<PendingPage, Error> {
+        let pending = self.load_pending().await?;
+        let start = match after {
+            Some(cursor) => Bound::Excluded(cursor),
+            None => Bound::Unbounded,
+        };
+        // one past the page, so a full page that happens to END the index
+        // reports no cursor instead of costing the caller an empty round trip.
+        // it is a range over the already-read shard records, not a store read.
+        let candidates: Vec<String> = pending
+            .range::<str, _>((start, Bound::Unbounded))
+            .filter(|(_, meta)| lane.admits_meta(meta))
+            .map(|(saga_id, _)| saga_id.clone())
+            .take(PENDING_PAGE + 1)
+            .collect();
+
+        let mut requests = Vec::new();
+        let mut spec_bytes = 0usize;
+        // how many candidates this page CONSUMED — the cursor's whole basis, and
+        // what makes the walk monotone: a page that stops early still leaves it
+        // above zero, so the next `after` is strictly ahead of this one's.
+        let mut examined = 0usize;
+        for saga_id in candidates.iter().take(PENDING_PAGE) {
+            let saga = self.require(saga_id).await?;
+            // the meta carries one bit; `LeasedTo` still has to compare the
+            // key on the record, so an assigned lane may return fewer requests
+            // than it examined candidates.
+            let admitted = lane.admits(&saga);
+            let weight = spec_bytes.saturating_add(saga.spec_len as usize);
+            // the first candidate is exempt: a spec larger than the whole
+            // budget must still move the walk forward, or the cursor stalls on
+            // it forever.
+            let would_ship_alone = examined == 0;
+            let over_budget = admitted && !would_ship_alone && weight > PENDING_PAGE_BYTES;
+            if over_budget {
+                break;
+            }
+            examined += 1;
+            if !admitted {
+                continue;
+            }
+            spec_bytes = weight;
+            let spec = self.load_spec(saga_id, saga.spec_len).await?;
+            requests.push(Self::worker_request(saga_id.clone(), &saga, spec));
+        }
+        // `None` ONLY when this page consumed every candidate the index had
+        // left — a page cut short by either bound hands its last one back, and
+        // it always has one to hand back because the byte bound never cuts
+        // before the first candidate is consumed.
+        let cut_short = examined < candidates.len();
+        let next = cut_short
+            .then(|| candidates[..examined].last().cloned())
+            .flatten();
+        Ok(PendingPage { requests, next })
     }
 
     /// the candidate pool one attempt is assigned from. a saga that names a
@@ -1048,9 +1398,21 @@ impl SagaModule {
                         )));
                     }
                 }
+                // the LIVE quota, and the last check before anything is staged
+                // (it is the only one that reads the store). the subject is the
+                // trigger's own origin — the same one `owns_id` just admitted
+                // the id under and `Cancel` will gate on.
+                let origin = saga_origin(&ctx.env().origin);
+                let cap = live_saga_cap(&origin);
+                let live = self.live_sagas(&origin).await?;
+                if live >= cap {
+                    return Err(Error::Module(format!(
+                        "origin_live_saga_cap: {live} live sagas is this origin's {cap} cap"
+                    )));
+                }
                 let now = ctx.env().consensus_time;
                 let saga = Saga {
-                    origin: saga_origin(&ctx.env().origin),
+                    origin: origin.clone(),
                     reply_to,
                     reply_payload,
                     spec_len: spec.len() as u64,
@@ -1076,6 +1438,9 @@ impl SagaModule {
                 // chunk can cross the record cap.
                 self.lease_and_request(ctx, saga_id.clone(), saga, &spec)
                     .await?;
+                // the slot is claimed only once the record that occupies it is
+                // staged — the last write of an op that can no longer refuse.
+                self.claim_live_slot(&origin).await?;
                 for (chunk, bytes) in spec.chunks(SPEC_CHUNK_BYTES).enumerate() {
                     self.staged
                         .stage(spec_chunk_key(&saga_id, chunk as u64), bytes.to_vec());
@@ -1283,48 +1648,82 @@ impl SagaModule {
             SagaMsg::Crank {} => {
                 // PERMISSIONLESS: any origin may crank — P7's liveness comes
                 // from anyone submitting this op, and its safety from every
-                // check reading only agreed values. bounded sweep in id order
-                // over the LIVE index (a terminal saga was never crank's
-                // business, and is not in it); when nothing has expired,
-                // nothing is staged and the root is untouched.
+                // check reading only agreed values. a terminal saga was never
+                // crank's business and is not in the live index at all; when
+                // nothing has expired, nothing is staged and the root is
+                // untouched.
+                //
+                // the candidates come from the SHARD METAS alone, so the sweep
+                // reads only the saga records it is about to transition:
+                // PENDING_SHARDS + CRANK_BUDGET reads, whatever the backlog.
+                // oldest `due` first (the id breaks ties, so the order is
+                // total), which is also what makes the bounded slice fair —
+                // the next crank resumes at the next-oldest expiry instead of
+                // re-walking the same id prefix.
                 let now = ctx.env().consensus_time;
-                let mut transitions: u32 = 0;
-                for saga_id in self.load_pending().await? {
-                    if transitions == CRANK_BUDGET {
-                        break;
-                    }
+                let mut expired: Vec<(u64, String)> = self
+                    .load_pending()
+                    .await?
+                    .into_iter()
+                    .filter_map(|(saga_id, meta)| {
+                        let due = meta.due?;
+                        (now >= due).then_some((due, saga_id))
+                    })
+                    .collect();
+                expired.sort_unstable();
+                for (_, saga_id) in expired.into_iter().take(CRANK_BUDGET as usize) {
                     let current = self.require(&saga_id).await?;
+                    // the record is NOT re-checked against `now`: the meta
+                    // already named this saga due, and `due` is the minimum of
+                    // the two instants, so at least one of them has passed. the
+                    // pair below only says WHICH — a `deadline_hit` of false
+                    // therefore means the lease is what expired.
                     let deadline_hit = current.deadline.is_some_and(|d| now >= d);
-                    let lease_hit = current.lease_expires_at.is_some_and(|l| now >= l);
-                    if !deadline_hit && !lease_hit {
-                        continue;
-                    }
+                    let attempts_remain = current.attempt + 1 < current.max_attempts;
                     let mut saga = current;
                     saga.updated_at = now;
                     let old_attempt = saga.attempt;
                     let old_assignee = saga.assignee.clone();
-                    if deadline_hit {
+                    match (deadline_hit, attempts_remain) {
                         // the whole-saga deadline dominates the lease: no
                         // retry may outlive it.
-                        self.cancel_attempt(ctx, &saga_id, old_attempt, old_assignee.as_deref());
-                        saga.status = SagaStatus::TimedOut;
-                        Self::emit_callback(ctx, &saga_id, &saga, SagaOutcome::TimedOut);
-                        self.put(&saga_id, &saga).await?;
-                    } else if saga.attempt + 1 < saga.max_attempts {
+                        (true, _) => {
+                            self.cancel_attempt(
+                                ctx,
+                                &saga_id,
+                                old_attempt,
+                                old_assignee.as_deref(),
+                            );
+                            saga.status = SagaStatus::TimedOut;
+                            Self::emit_callback(ctx, &saga_id, &saga, SagaOutcome::TimedOut);
+                            self.put(&saga_id, &saga).await?;
+                        }
                         // an expired lease consumes the attempt and re-leases.
-                        let spec = self.load_spec(&saga_id, saga.spec_len).await?;
-                        self.cancel_attempt(ctx, &saga_id, old_attempt, old_assignee.as_deref());
-                        saga.attempt += 1;
-                        self.lease_and_request(ctx, saga_id, saga, &spec).await?;
-                    } else {
-                        let error = "lease attempts exhausted".to_string();
-                        self.cancel_attempt(ctx, &saga_id, old_attempt, old_assignee.as_deref());
-                        saga.status = SagaStatus::Failed;
-                        saga.error = Some(error.clone());
-                        Self::emit_callback(ctx, &saga_id, &saga, SagaOutcome::Failed(error));
-                        self.put(&saga_id, &saga).await?;
+                        (false, true) => {
+                            let spec = self.load_spec(&saga_id, saga.spec_len).await?;
+                            self.cancel_attempt(
+                                ctx,
+                                &saga_id,
+                                old_attempt,
+                                old_assignee.as_deref(),
+                            );
+                            saga.attempt += 1;
+                            self.lease_and_request(ctx, saga_id, saga, &spec).await?;
+                        }
+                        (false, false) => {
+                            let error = "lease attempts exhausted".to_string();
+                            self.cancel_attempt(
+                                ctx,
+                                &saga_id,
+                                old_attempt,
+                                old_assignee.as_deref(),
+                            );
+                            saga.status = SagaStatus::Failed;
+                            saga.error = Some(error.clone());
+                            Self::emit_callback(ctx, &saga_id, &saga, SagaOutcome::Failed(error));
+                            self.put(&saga_id, &saga).await?;
+                        }
                     }
-                    transitions += 1;
                 }
             }
             SagaMsg::Cancel { saga_id } => {
@@ -1371,7 +1770,7 @@ impl SagaModule {
 /// one live shard's record form. an EMPTY shard DROPS its key — per shard, so
 /// a ledger pruned back to nothing holds NO pending key at all and hashes to
 /// the same root a never-used one does.
-fn encode_pending(pending: &BTreeSet<String>) -> Result<Option<Vec<u8>>, Error> {
+fn encode_pending(pending: &PendingIndex) -> Result<Option<Vec<u8>>, Error> {
     if pending.is_empty() {
         return Ok(None);
     }
@@ -1443,51 +1842,38 @@ impl Module for SagaModule {
             SagaQuery::NextExpiry => {
                 // the crank pump's read: the earliest lease-expiry or
                 // deadline over PENDING sagas — once the current view reaches
-                // it, a Crank is guaranteed to transition something.
-                let mut next: Option<u64> = None;
-                for saga_id in self.load_pending().await? {
-                    let saga = self.require(&saga_id).await?;
-                    for candidate in [saga.lease_expires_at, saga.deadline].into_iter().flatten() {
-                        next = Some(next.map_or(candidate, |n: u64| n.min(candidate)));
-                    }
-                }
+                // it, a Crank is guaranteed to transition something. that IS
+                // the minimum `due` over the live index, so the 16 shard reads
+                // answer it and no saga record is touched at all.
+                let next = self
+                    .load_pending()
+                    .await?
+                    .into_values()
+                    .filter_map(|meta| meta.due)
+                    .min();
                 Ok(encode_reply(&SagaReply::NextExpiry(next)))
             }
-            SagaQuery::AssignedPending { assignee } => {
+            SagaQuery::AssignedPending { assignee, after } => {
                 // the resident worker pump's read: reconstruct exactly the
                 // WorkerRequest the effect lane carried for every pending
                 // attempt leased to `assignee`. a node that installs synced
                 // boundaries (and so never observes effects) discovers its
                 // own assigned work here; the index is sorted, so the
                 // projection is deterministic.
-                let mut requests = Vec::new();
-                for saga_id in self.load_pending().await? {
-                    let saga = self.require(&saga_id).await?;
-                    if saga.assignee.as_deref() != Some(assignee.as_slice()) {
-                        continue;
-                    }
-                    let spec = self.load_spec(&saga_id, saga.spec_len).await?;
-                    requests.push(Self::worker_request(saga_id, &saga, spec));
-                }
-                Ok(encode_reply(&SagaReply::AssignedPending(requests)))
+                let page = self
+                    .pending_page(Lane::LeasedTo(&assignee), after.as_deref())
+                    .await?;
+                Ok(encode_reply(&SagaReply::AssignedPending(page)))
             }
-            SagaQuery::UnassignedPending => {
+            SagaQuery::UnassignedPending { after } => {
                 // the claim lane's read: the announcement requests, which no
                 // node holds a lease on yet. Same projection shape as
                 // `AssignedPending` (and the same index ordering, so it is
-                // deterministic) — only the assignee predicate differs, and
-                // `assignee` rides through as `None` so the worker gate sees
-                // exactly the announcement the effect lane carried.
-                let mut requests = Vec::new();
-                for saga_id in self.load_pending().await? {
-                    let saga = self.require(&saga_id).await?;
-                    if saga.assignee.is_some() {
-                        continue;
-                    }
-                    let spec = self.load_spec(&saga_id, saga.spec_len).await?;
-                    requests.push(Self::worker_request(saga_id, &saga, spec));
-                }
-                Ok(encode_reply(&SagaReply::UnassignedPending(requests)))
+                // deterministic) — only the lane differs, and `assignee` rides
+                // through as `None` so the worker gate sees exactly the
+                // announcement the effect lane carried.
+                let page = self.pending_page(Lane::Unclaimed, after.as_deref()).await?;
+                Ok(encode_reply(&SagaReply::UnassignedPending(page)))
             }
         }
     }
@@ -1515,7 +1901,9 @@ mod tests {
     use futures::executor::block_on;
     use sdk::{Env, Event};
     use sdk_testkit::MemStore;
+    use std::cell::RefCell;
     use std::collections::BTreeSet;
+    use std::rc::Rc;
 
     /// a minimal `Ctx` that captures emitted msgs/effects and serves a canned
     /// valset — enough to unit-test `execute` in isolation (the host provides
@@ -1703,22 +2091,46 @@ mod tests {
             other => panic!("expected NextExpiry reply, got {other:?}"),
         }
     }
-    fn assigned_pending(m: &SagaModule, assignee: &[u8]) -> Vec<WorkerRequest> {
+    fn assigned_page(m: &SagaModule, assignee: &[u8], after: Option<&str>) -> PendingPage {
         let reply = block_on(m.query(&encode_query(&SagaQuery::AssignedPending {
             assignee: assignee.to_vec(),
+            after: after.map(String::from),
         })))
         .unwrap();
         match decode_reply(&reply).unwrap() {
-            SagaReply::AssignedPending(v) => v,
+            SagaReply::AssignedPending(page) => page,
             other => panic!("expected AssignedPending reply, got {other:?}"),
         }
     }
-    fn unassigned_pending(m: &SagaModule) -> Vec<WorkerRequest> {
-        let reply = block_on(m.query(&encode_query(&SagaQuery::UnassignedPending))).unwrap();
+    fn unassigned_page(m: &SagaModule, after: Option<&str>) -> PendingPage {
+        let reply = block_on(m.query(&encode_query(&SagaQuery::UnassignedPending {
+            after: after.map(String::from),
+        })))
+        .unwrap();
         match decode_reply(&reply).unwrap() {
-            SagaReply::UnassignedPending(v) => v,
+            SagaReply::UnassignedPending(page) => page,
             other => panic!("expected UnassignedPending reply, got {other:?}"),
         }
+    }
+    /// the WHOLE projection, walked page by page exactly as a caller must —
+    /// so every scenario below still reads one flat list.
+    fn walk(mut page: impl FnMut(Option<&str>) -> PendingPage) -> Vec<WorkerRequest> {
+        let mut all = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let next = page(after.as_deref());
+            all.extend(next.requests);
+            match next.next {
+                Some(cursor) => after = Some(cursor),
+                None => return all,
+            }
+        }
+    }
+    fn assigned_pending(m: &SagaModule, assignee: &[u8]) -> Vec<WorkerRequest> {
+        walk(|after| assigned_page(m, assignee, after))
+    }
+    fn unassigned_pending(m: &SagaModule) -> Vec<WorkerRequest> {
+        walk(|after| unassigned_page(m, after))
     }
     fn exec(m: &mut SagaModule, ctx: &mut CaptureCtx, op: &Msg) -> Result<(), Error> {
         block_on(m.execute(ctx, op))
@@ -4067,8 +4479,16 @@ mod tests {
         for id in &ids {
             assert_eq!(
                 block_on(m.load_pending_shard(pending_shard(id))).unwrap(),
-                BTreeSet::from([id.clone()]),
-                "each id must sit ALONE in the shard its hash names"
+                PendingIndex::from([(
+                    id.clone(),
+                    // fire-and-forget and unassigned: nothing to expire by, so
+                    // no crank can ever pick it up.
+                    PendingMeta {
+                        due: None,
+                        assigned: false
+                    }
+                )]),
+                "each id must sit ALONE in the shard its hash names, with its meta"
             );
         }
     }
@@ -4335,6 +4755,824 @@ mod tests {
         .unwrap();
         commit(&mut m);
         assert_eq!(get(&m, &newest), None, "explicit prune still removes it");
+    }
+
+    // ---- the bounded-scan contract ----------------------------------------
+    //
+    // the live index answers `Crank`, `NextExpiry` and both pending
+    // projections from the shard records alone, so every one of them costs a
+    // CONSTANT number of distinct store reads. two things have to hold for
+    // that, and each is pinned below: the meta never drifts from its record,
+    // and the readers really do stop.
+
+    /// a [`MerkleStore`] that remembers which DISTINCT keys were read off
+    /// COMMITTED state — exactly the quantity the wasm host budgets per
+    /// dispatch (`wasm_host::MAX_STORE_READS`, 4096), since every miss of the
+    /// staged overlay is one memoized host read that replays the guest.
+    ///
+    /// the module owns its store, so the counter is shared by handle.
+    struct CountingStore {
+        inner: MemStore,
+        reads: Rc<RefCell<BTreeSet<[u8; sdk::ROOT_LEN]>>>,
+    }
+
+    /// the read counter, held by the test while the module holds the store.
+    #[derive(Clone)]
+    struct ReadCounter(Rc<RefCell<BTreeSet<[u8; sdk::ROOT_LEN]>>>);
+
+    impl ReadCounter {
+        fn store(&self) -> Box<dyn MerkleStore> {
+            Box::new(CountingStore {
+                inner: MemStore::new(),
+                reads: self.0.clone(),
+            })
+        }
+        /// start counting a fresh surface.
+        fn reset(&self) {
+            self.0.borrow_mut().clear();
+        }
+        fn distinct(&self) -> usize {
+            self.0.borrow().len()
+        }
+    }
+
+    fn counted() -> ReadCounter {
+        ReadCounter(Rc::new(RefCell::new(BTreeSet::new())))
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl MerkleStore for CountingStore {
+        async fn get(&self, key: &[u8; sdk::ROOT_LEN]) -> Result<Option<Vec<u8>>, Error> {
+            self.reads.borrow_mut().insert(*key);
+            self.inner.get(key).await
+        }
+        async fn commit_batch(
+            &mut self,
+            writes: Vec<([u8; sdk::ROOT_LEN], Option<Vec<u8>>)>,
+        ) -> Result<(), Error> {
+            self.inner.commit_batch(writes).await
+        }
+        fn root(&self) -> StateRoot {
+            self.inner.root()
+        }
+        async fn sync_target(&self) -> Result<ResolverSyncTarget, Error> {
+            self.inner.sync_target().await
+        }
+        async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+            self.inner.serve_sync(req).await
+        }
+    }
+
+    /// the live-index entry the ledger actually holds for `id`.
+    fn pending_meta(m: &SagaModule, id: &str) -> Option<PendingMeta> {
+        block_on(m.load_pending_shard(pending_shard(id)))
+            .unwrap()
+            .get(id)
+            .copied()
+    }
+
+    /// the ONE invariant every reader leans on: the shard meta says exactly
+    /// what the record says. recomputed from the record's own fields here —
+    /// never through `PendingMeta::of`, which is the writer's own arithmetic
+    /// and would make this tautological.
+    fn assert_lockstep(m: &SagaModule, id: &str, step: &str) {
+        let meta = pending_meta(m, id);
+        let Some(saga) = load(m, id) else {
+            assert_eq!(meta, None, "{step}: an absent saga must leave no {id} row");
+            return;
+        };
+        if saga.status.is_terminal() {
+            assert_eq!(
+                meta, None,
+                "{step}: a {:?} saga must leave the live index ({id})",
+                saga.status
+            );
+            return;
+        }
+        let due = match (saga.deadline, saga.lease_expires_at) {
+            (Some(deadline), Some(lease)) => Some(deadline.min(lease)),
+            (deadline, lease) => deadline.or(lease),
+        };
+        assert_eq!(
+            meta,
+            Some(PendingMeta {
+                due,
+                assigned: saga.assignee.is_some(),
+            }),
+            "{step}: {id}'s meta drifted from its record {saga:?}"
+        );
+    }
+
+    #[test]
+    fn the_shard_meta_moves_in_lockstep_with_the_record_through_every_status() {
+        // one scripted lifecycle over all three origin shapes, every terminal
+        // status, and the three transitions that move the meta WITHOUT moving
+        // the status: a retry (new lease), a renewal (later lease), and a
+        // claim (unassigned -> assigned). after EVERY op, every id's index row
+        // must still describe its record — a reader that trusts a stale row
+        // cranks the wrong saga, or never cranks the right one.
+        let alice = Origin::External(b"alice".to_vec());
+        let alice_id = |id: &str| namespaced_id(&alice, id);
+        let agent_id = |id: &str| namespaced_id(&Origin::Module("agent".into()), id);
+        let node = b"node-a".to_vec();
+        let claimer = b"node-b".to_vec();
+
+        let mut m = SagaModule::with_valset(
+            "saga",
+            Box::new(MemStore::new()),
+            "valset",
+            LeasePolicy::Open,
+        );
+        let ids = [
+            alice_id("done"),
+            agent_id("failed"),
+            sid("timedout"),
+            alice_id("cancelled"),
+            sid("pending"),
+            alice_id("claimed"),
+        ];
+        let ctx_at = |height: u64, origin: Origin| {
+            CaptureCtx::new()
+                .at(height)
+                .with_origin(origin)
+                .with_validators(vec![node.clone()])
+        };
+        let step = |m: &mut SagaModule, ctx: &mut CaptureCtx, op: &Msg, what: &str| {
+            exec(m, ctx, op).unwrap();
+            for id in &ids {
+                assert_lockstep(m, id, what);
+            }
+        };
+
+        // a capability with no registry configured assigns NOBODY, so that is
+        // how this script gets an announcement into the unassigned lane.
+        let leased =
+            |id: &str, deadline: Option<u64>, max_attempts: u32, capability: Option<&str>| {
+                SagaMsg::Trigger {
+                    pinned_assignee: None,
+                    saga_id: id.into(),
+                    spec: b"w".to_vec(),
+                    reply_to: None,
+                    reply_payload: Vec::new(),
+                    deadline,
+                    max_attempts,
+                    lease_views: Some(6),
+                    capability: capability.map(String::from),
+                    demands: Default::default(),
+                }
+            };
+
+        let mut ctx = ctx_at(1, alice.clone());
+        step(
+            &mut m,
+            &mut ctx,
+            &msg(&leased(&ids[0], None, 1, None)),
+            "trigger",
+        );
+        step(
+            &mut m,
+            &mut ctx,
+            &msg(&leased(&ids[5], None, 1, Some("alpha"))),
+            "trigger announcement",
+        );
+        let mut ctx = ctx_at(1, Origin::Module("agent".into()));
+        step(
+            &mut m,
+            &mut ctx,
+            &msg(&leased(&ids[1], None, 2, None)),
+            "trigger",
+        );
+        let mut ctx = ctx_at(1, Origin::System);
+        step(
+            &mut m,
+            &mut ctx,
+            &msg(&leased(&ids[2], Some(4), 1, None)),
+            "trigger with a deadline",
+        );
+        step(
+            &mut m,
+            &mut ctx,
+            &msg(&leased(&ids[4], Some(900), 3, None)),
+            "trigger",
+        );
+        let mut ctx = ctx_at(1, alice.clone());
+        step(
+            &mut m,
+            &mut ctx,
+            &msg(&leased(&ids[3], None, 1, None)),
+            "trigger",
+        );
+        commit(&mut m);
+        assert!(
+            pending_meta(&m, &ids[4]).unwrap().due.unwrap() < 900,
+            "the lease is earlier than the deadline, so it is the due instant"
+        );
+        assert!(
+            !pending_meta(&m, &ids[5]).unwrap().assigned,
+            "an announcement nobody holds is the unassigned lane"
+        );
+
+        // the claim: unassigned -> assigned, plus a lease where there was none.
+        let mut ctx = ctx_at(2, Origin::External(claimer.clone()));
+        step(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Accept {
+                saga_id: ids[5].clone(),
+                attempt: 0,
+            }),
+            "accept",
+        );
+        assert!(pending_meta(&m, &ids[5]).unwrap().assigned);
+
+        // the renewal: a later lease on an unchanged status.
+        let mut ctx = ctx_at(4, Origin::External(node.clone()));
+        step(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::RenewLease {
+                saga_id: ids[4].clone(),
+                attempt: 0,
+            }),
+            "renew",
+        );
+
+        // the retry: a consumed attempt and a fresh lease.
+        let mut ctx = ctx_at(4, Origin::External(b"oracle".to_vec()));
+        step(
+            &mut m,
+            &mut ctx,
+            &oracle(&ids[1], 0, Err("first attempt died".into())),
+            "retry",
+        );
+        step(
+            &mut m,
+            &mut ctx,
+            &oracle(&ids[0], 0, Ok(b"r".to_vec())),
+            "done",
+        );
+        step(
+            &mut m,
+            &mut ctx,
+            &oracle(&ids[1], 1, Err("second attempt died".into())),
+            "failed",
+        );
+        let mut ctx = ctx_at(4, alice.clone());
+        step(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Cancel {
+                saga_id: ids[3].clone(),
+            }),
+            "cancelled",
+        );
+        let mut ctx = ctx_at(5, Origin::External(b"cranker".to_vec()));
+        step(&mut m, &mut ctx, &crank(), "crank");
+        commit(&mut m);
+
+        // the script really covered the space it claims to.
+        let statuses: Vec<SagaStatus> =
+            ids.iter().map(|id| get(&m, id).expect(id).status).collect();
+        assert_eq!(
+            statuses,
+            vec![
+                SagaStatus::Done,
+                SagaStatus::Failed,
+                SagaStatus::TimedOut,
+                SagaStatus::Cancelled,
+                SagaStatus::Pending,
+                SagaStatus::Pending,
+            ]
+        );
+    }
+
+    /// `count` pending sagas spread over the shards by their ids, with the
+    /// given deadline — the backlog the ceiling pins measure against.
+    fn backlog(m: &mut SagaModule, count: usize, deadline: Option<u64>) {
+        let mut ctx = CaptureCtx::new().at(1);
+        for i in 0..count {
+            exec(
+                m,
+                &mut ctx,
+                &msg(&SagaMsg::Trigger {
+                    pinned_assignee: None,
+                    saga_id: sid(&format!("s{i:04}")),
+                    // one chunk each: the page's spec reads are part of the
+                    // ceiling, so they must not be zero.
+                    spec: b"w".to_vec(),
+                    reply_to: None,
+                    reply_payload: Vec::new(),
+                    deadline,
+                    max_attempts: 1,
+                    lease_views: None,
+                    capability: None,
+                    demands: Default::default(),
+                }),
+            )
+            .unwrap();
+        }
+        commit(m);
+    }
+
+    /// the backlog every ceiling below is measured against: far more pending
+    /// sagas than any of the bounds, so a scan that walks them all cannot pass.
+    const BACKLOG: usize = 120;
+
+    #[test]
+    fn next_expiry_reads_the_shard_records_and_nothing_else() {
+        let reads = counted();
+        let mut m = SagaModule::with_valset("saga", reads.store(), "valset", LeasePolicy::Open);
+        backlog(&mut m, BACKLOG, Some(500));
+
+        reads.reset();
+        assert_eq!(next_expiry(&m), Some(500));
+        assert!(
+            reads.distinct() <= PENDING_SHARDS as usize,
+            "NextExpiry must fold the {PENDING_SHARDS} shard records alone, read {} keys for \
+             {BACKLOG} pending sagas",
+            reads.distinct()
+        );
+    }
+
+    #[test]
+    fn one_crank_reads_the_shards_plus_only_the_sagas_it_transitions() {
+        let reads = counted();
+        let mut m = SagaModule::new("saga", reads.store());
+        // the fixture that tells the two sweeps apart: the sagas that are DUE
+        // sort AFTER the ones that are not, so a sweep that walks the live ids
+        // reads 80 records before it finds any work — while the meta names the
+        // 40 due ones without reading one. and 40 is more than one budget, so
+        // the ceiling is not just "everything expired fits".
+        const DUE_FROM: usize = 80;
+        let mut ctx = CaptureCtx::new().at(1);
+        for i in 0..BACKLOG {
+            let due_already = i >= DUE_FROM;
+            exec(
+                &mut m,
+                &mut ctx,
+                &msg(&SagaMsg::Trigger {
+                    pinned_assignee: None,
+                    saga_id: sid(&format!("s{i:04}")),
+                    spec: b"w".to_vec(),
+                    reply_to: None,
+                    reply_payload: Vec::new(),
+                    deadline: Some(if due_already { 4 } else { 500 }),
+                    max_attempts: 1,
+                    lease_views: None,
+                    capability: None,
+                    demands: Default::default(),
+                }),
+            )
+            .unwrap();
+        }
+        commit(&mut m);
+
+        reads.reset();
+        let mut ctx = CaptureCtx::new().at(9);
+        exec(&mut m, &mut ctx, &crank()).unwrap();
+        // the shards, the CRANK_BUDGET records it timed out, the terminal
+        // receipt index those transitions write through, and the ONE origin's
+        // live count they hand a slot back to (in general one key per distinct
+        // origin transitioned, so at most another CRANK_BUDGET).
+        let ceiling = PENDING_SHARDS as usize + CRANK_BUDGET as usize + 1 + 1;
+        assert!(
+            reads.distinct() <= ceiling,
+            "a crank over {BACKLOG} pending sagas read {} keys, over the {ceiling} ceiling",
+            reads.distinct()
+        );
+        commit(&mut m);
+        let timed_out: Vec<String> = (0..BACKLOG)
+            .map(|i| sid(&format!("s{i:04}")))
+            .filter(|id| get(&m, id).unwrap().status == SagaStatus::TimedOut)
+            .collect();
+        let expected: Vec<String> = (DUE_FROM..DUE_FROM + CRANK_BUDGET as usize)
+            .map(|i| sid(&format!("s{i:04}")))
+            .collect();
+        assert_eq!(
+            timed_out, expected,
+            "one whole budget, spent on the oldest `due` (the id breaks the tie)"
+        );
+    }
+
+    #[test]
+    fn one_pending_page_reads_the_shards_plus_its_own_page() {
+        let reads = counted();
+        let mut m = SagaModule::new("saga", reads.store());
+        backlog(&mut m, BACKLOG, None);
+
+        reads.reset();
+        let page = unassigned_page(&m, None);
+        // the shards, the page's own records, and the one spec chunk each of
+        // them carries. checked BEFORE the page's size, so an unbounded scan
+        // is reported as the read blowout it is.
+        let ceiling = PENDING_SHARDS as usize + PENDING_PAGE + PENDING_PAGE;
+        assert!(
+            reads.distinct() <= ceiling,
+            "one page over {BACKLOG} pending sagas read {} keys, over the {ceiling} ceiling",
+            reads.distinct()
+        );
+        assert_eq!(page.requests.len(), PENDING_PAGE, "a full page");
+    }
+
+    #[test]
+    fn the_cursor_walks_the_whole_projection_exactly_once_in_id_order() {
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
+        backlog(&mut m, BACKLOG, None);
+        let all: Vec<String> = (0..BACKLOG).map(|i| sid(&format!("s{i:04}"))).collect();
+
+        // page by page, exactly as a caller must walk it.
+        let first = unassigned_page(&m, None);
+        assert_eq!(first.requests.len(), PENDING_PAGE);
+        assert_eq!(
+            first.next.as_deref(),
+            Some(all[PENDING_PAGE - 1].as_str()),
+            "the cursor is the last entry the page examined"
+        );
+        let second = unassigned_page(&m, first.next.as_deref());
+        assert_eq!(second.requests.len(), BACKLOG - PENDING_PAGE);
+        assert_eq!(second.next, None, "the walk ended without an empty page");
+
+        let seen: Vec<String> = first
+            .requests
+            .into_iter()
+            .chain(second.requests)
+            .map(|request| request.saga_id)
+            .collect();
+        assert_eq!(seen, all, "every live saga, in id order, exactly once");
+    }
+
+    #[test]
+    fn an_assigned_page_returns_a_subset_of_the_candidates_it_examined() {
+        // the asymmetry the cursor exists for: the meta carries ONE assigned
+        // bit, so `AssignedPending` reads every assigned candidate and returns
+        // only the ones its key holds. a page can therefore be short — or
+        // empty — and still have more of the index behind it, which is why the
+        // caller stops on the cursor and never on an empty page.
+        let pool = vec![b"node-a".to_vec(), b"node-b".to_vec()];
+        let mut m = SagaModule::with_valset(
+            "saga",
+            Box::new(MemStore::new()),
+            "valset",
+            LeasePolicy::Open,
+        );
+        let mut ctx = CaptureCtx::new().at(1).with_validators(pool.clone());
+        for i in 0..BACKLOG {
+            exec(&mut m, &mut ctx, &trigger(&sid(&format!("s{i:04}")), b"w")).unwrap();
+        }
+        commit(&mut m);
+
+        let first = assigned_page(&m, &pool[0], None);
+        assert!(
+            first.requests.len() < PENDING_PAGE,
+            "rendezvous split the backlog, so one key holds part of the page"
+        );
+        // BOTH keys' first pages examined the same 64 candidates, so both must
+        // resume at the same place: the cursor is about the INDEX, not about
+        // what matched. a cursor taken from the last MATCH would differ here —
+        // and would end the walk early on a page that matched nothing.
+        let boundary = sid(&format!("s{:04}", PENDING_PAGE - 1));
+        assert_eq!(first.next.as_deref(), Some(boundary.as_str()));
+        assert_eq!(
+            assigned_page(&m, &pool[1], None).next.as_deref(),
+            Some(boundary.as_str())
+        );
+        // and the walk still sees each of that key's sagas exactly once.
+        let mine = assigned_pending(&m, &pool[0]);
+        let theirs = assigned_pending(&m, &pool[1]);
+        assert_eq!(mine.len() + theirs.len(), BACKLOG, "every saga, once");
+        assert!(
+            mine.windows(2)
+                .all(|pair| pair[0].saga_id < pair[1].saga_id),
+            "ascending by id across the page boundary"
+        );
+    }
+
+    // ---- the per-origin live quota ----------------------------------------
+
+    /// one origin's live count, straight out of the store view.
+    fn live(m: &SagaModule, origin: &Origin) -> u32 {
+        block_on(m.live_sagas(&saga_origin(origin))).unwrap()
+    }
+
+    /// whether the ledger holds a count record for `origin` at all — the
+    /// empty-collection-drops-its-key half of the rule.
+    fn has_quota_key(m: &SagaModule, origin: &Origin) -> bool {
+        block_on(m.staged.get(&quota_key(&saga_origin(origin))))
+            .unwrap()
+            .is_some()
+    }
+
+    #[test]
+    fn the_live_cap_refuses_by_name_and_leaves_other_origins_alone() {
+        let alice = Origin::External(b"alice".to_vec());
+        let alice_id = |id: &str| namespaced_id(&alice, id);
+        let bob = Origin::External(b"bob".to_vec());
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
+
+        let mut ctx = CaptureCtx::new().at(1).with_origin(alice.clone());
+        for i in 0..PER_ORIGIN_LIVE_SAGAS {
+            exec(
+                &mut m,
+                &mut ctx,
+                &trigger(&alice_id(&format!("s{i:04}")), b"w"),
+            )
+            .unwrap();
+        }
+        commit(&mut m);
+        assert_eq!(live(&m, &alice), PER_ORIGIN_LIVE_SAGAS);
+
+        let before = m.root();
+        let err = exec(&mut m, &mut ctx, &trigger(&alice_id("over"), b"w")).unwrap_err();
+        assert!(
+            err.to_string().contains("origin_live_saga_cap"),
+            "the refusal must carry the stable reason token, got: {err}"
+        );
+        commit(&mut m);
+        assert_eq!(get(&m, &alice_id("over")), None, "and it staged nothing");
+        assert_eq!(m.root(), before);
+
+        // the cap is PER ORIGIN: bob's ledger is untouched by alice's flood.
+        let mut bob_ctx = CaptureCtx::new().at(1).with_origin(bob.clone());
+        exec(
+            &mut m,
+            &mut bob_ctx,
+            &trigger(&namespaced_id(&bob, "s0000"), b"w"),
+        )
+        .unwrap();
+        commit(&mut m);
+        assert_eq!(live(&m, &bob), 1);
+        assert_eq!(live(&m, &alice), PER_ORIGIN_LIVE_SAGAS);
+
+        // and a settled saga really frees the slot it held.
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Cancel {
+                saga_id: alice_id("s0000"),
+            }),
+        )
+        .unwrap();
+        exec(&mut m, &mut ctx, &trigger(&alice_id("over"), b"w")).unwrap();
+        commit(&mut m);
+        assert_eq!(live(&m, &alice), PER_ORIGIN_LIVE_SAGAS);
+        assert!(get(&m, &alice_id("over")).is_some());
+    }
+
+    #[test]
+    fn every_terminal_path_returns_one_slot_and_a_retry_returns_none() {
+        // all five terminal transitions, plus the retry that must NOT look
+        // like one: a re-leased saga is still live work holding its slot.
+        let mut m = SagaModule::with_valset(
+            "saga",
+            Box::new(MemStore::new()),
+            "valset",
+            LeasePolicy::Open,
+        );
+        let validators = vec![b"node-a".to_vec()];
+        let settle = |id: &str, deadline: Option<u64>, max_attempts: u32| SagaMsg::Trigger {
+            pinned_assignee: None,
+            saga_id: sid(id),
+            spec: b"w".to_vec(),
+            reply_to: None,
+            reply_payload: Vec::new(),
+            deadline,
+            max_attempts,
+            lease_views: Some(2),
+            capability: None,
+            demands: Default::default(),
+        };
+        let mut ctx = CaptureCtx::new().at(1).with_validators(validators.clone());
+        for op in [
+            settle("done", None, 1),
+            settle("failed", None, 1),
+            settle("cancelled", None, 1),
+            settle("timedout", Some(4), 1),
+            settle("exhausted", None, 1),
+            settle("retrying", None, 3),
+        ] {
+            exec(&mut m, &mut ctx, &msg(&op)).unwrap();
+        }
+        commit(&mut m);
+        assert_eq!(live(&m, &Origin::System), 6);
+
+        let mut ctx = CaptureCtx::new()
+            .at(2)
+            .with_origin(Origin::External(b"node-a".to_vec()))
+            .with_validators(validators.clone());
+        exec(
+            &mut m,
+            &mut ctx,
+            &oracle(&sid("done"), 0, Ok(b"r".to_vec())),
+        )
+        .unwrap();
+        assert_eq!(live(&m, &Origin::System), 5, "Done returns one slot");
+        exec(
+            &mut m,
+            &mut ctx,
+            &oracle(&sid("failed"), 0, Err("boom".into())),
+        )
+        .unwrap();
+        assert_eq!(live(&m, &Origin::System), 4, "Failed returns one slot");
+        let mut ctx = CaptureCtx::new().at(2).with_validators(validators.clone());
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Cancel {
+                saga_id: sid("cancelled"),
+            }),
+        )
+        .unwrap();
+        assert_eq!(live(&m, &Origin::System), 3, "Cancelled returns one slot");
+        commit(&mut m);
+
+        // one crank: a deadline timeout, a lease with no attempts left, and a
+        // lease WITH one — the third stays live.
+        let mut ctx = CaptureCtx::new().at(9).with_validators(validators);
+        exec(&mut m, &mut ctx, &crank()).unwrap();
+        commit(&mut m);
+        assert_eq!(
+            get(&m, &sid("timedout")).unwrap().status,
+            SagaStatus::TimedOut
+        );
+        assert_eq!(
+            get(&m, &sid("exhausted")).unwrap().status,
+            SagaStatus::Failed
+        );
+        let retrying = get(&m, &sid("retrying")).unwrap();
+        assert_eq!(retrying.status, SagaStatus::Pending);
+        assert_eq!(retrying.attempt, 1, "the retry consumed an attempt");
+        assert_eq!(
+            live(&m, &Origin::System),
+            1,
+            "TimedOut and Failed returned theirs; the re-leased saga still holds its own"
+        );
+
+        let mut ctx = CaptureCtx::new()
+            .at(10)
+            .with_origin(Origin::External(b"node-a".to_vec()));
+        exec(
+            &mut m,
+            &mut ctx,
+            &oracle(&sid("retrying"), 1, Ok(b"r".to_vec())),
+        )
+        .unwrap();
+        commit(&mut m);
+        assert_eq!(live(&m, &Origin::System), 0);
+        assert!(
+            !has_quota_key(&m, &Origin::System),
+            "a count of zero drops its key — an origin that settled everything \
+             must hash like one that triggered nothing"
+        );
+    }
+
+    #[test]
+    fn prune_leaves_the_live_count_alone() {
+        // the slot came back when the saga ENDED, not when its receipt was
+        // collected — so the eager GC must not return it a second time.
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
+        let mut ctx = CaptureCtx::new().at(1);
+        for id in ["a", "b", "c"] {
+            exec(&mut m, &mut ctx, &trigger(&sid(id), b"w")).unwrap();
+        }
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Cancel { saga_id: sid("a") }),
+        )
+        .unwrap();
+        commit(&mut m);
+        assert_eq!(live(&m, &Origin::System), 2);
+
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Prune {
+                saga_ids: vec![sid("a")],
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        assert_eq!(get(&m, &sid("a")), None, "the receipt is gone");
+        assert_eq!(
+            live(&m, &Origin::System),
+            2,
+            "and the count is exactly what the two LIVE sagas hold"
+        );
+    }
+
+    #[test]
+    fn a_module_origin_is_not_capped_like_a_principal() {
+        // a module-origin saga's subject is the EMITTING module, so EVERY
+        // dispatch-created saga in the ledger shares one counter. capping that
+        // at a principal's budget would have made it a network-wide in-flight
+        // ceiling: the 257th Dispatch op from ANY module refused, and the whole
+        // op with it, since the trigger is a cascaded msg.
+        let dispatch = Origin::Module("dispatch".into());
+        let alice = Origin::External(b"alice".to_vec());
+        assert_eq!(
+            live_saga_cap(&saga_origin(&alice)),
+            PER_ORIGIN_LIVE_SAGAS,
+            "a key IS a principal"
+        );
+        assert_eq!(
+            live_saga_cap(&saga_origin(&dispatch)),
+            PER_MODULE_LIVE_SAGAS,
+            "a module id is an aggregate producer"
+        );
+
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
+        let mut ctx = CaptureCtx::new().at(1).with_origin(dispatch.clone());
+        let past_a_principals_budget = PER_ORIGIN_LIVE_SAGAS + 1;
+        for i in 0..past_a_principals_budget {
+            let id = namespaced_id(&dispatch, &format!("s{i:05}"));
+            exec(&mut m, &mut ctx, &trigger(&id, b"w")).unwrap();
+        }
+        commit(&mut m);
+        assert_eq!(live(&m, &dispatch), past_a_principals_budget);
+    }
+
+    #[test]
+    fn a_terminal_put_refuses_to_release_a_slot_that_was_never_claimed() {
+        // exactly-once release is what the whole quota rests on, so a count
+        // that cannot absorb the decrement must SAY so. clamping would swallow
+        // it and resurface the breakage as its opposite — an origin triggering
+        // past its cap — with nothing pointing back at the missing claim.
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
+        let mut ctx = CaptureCtx::new().at(1);
+        exec(&mut m, &mut ctx, &trigger(&sid("a"), b"w")).unwrap();
+        commit(&mut m);
+        assert_eq!(live(&m, &Origin::System), 1);
+
+        // the breakage the guard is for: the count loses the claim its still
+        // live saga holds.
+        block_on(m.stage_live_count(&SagaOrigin::System, 0)).unwrap();
+        commit(&mut m);
+
+        let before = m.root();
+        let err = exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Cancel { saga_id: sid("a") }),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("live_saga_count_underflow"),
+            "the refusal must carry the stable reason token, got: {err}"
+        );
+        commit(&mut m);
+        assert_eq!(
+            m.root(),
+            before,
+            "and it refused BEFORE staging — the record is still pending"
+        );
+        assert_eq!(load(&m, &sid("a")).unwrap().status, SagaStatus::Pending);
+    }
+
+    #[test]
+    fn a_page_stops_at_its_byte_budget_and_the_cursor_carries_on() {
+        // PENDING_PAGE bounds the request COUNT, and count alone is not a
+        // bound: one request carries a whole reassembled spec, so a full page
+        // of maximal ones is a reply no wasm32 guest could materialise.
+        let mut m = SagaModule::new("saga", Box::new(MemStore::new()));
+        let mut ctx = CaptureCtx::new().at(1);
+        for (id, spec_len) in [
+            ("a", PENDING_PAGE_BYTES + 1),
+            ("b", PENDING_PAGE_BYTES / 2),
+            ("c", PENDING_PAGE_BYTES / 4),
+        ] {
+            exec(&mut m, &mut ctx, &trigger(&sid(id), &vec![7u8; spec_len])).unwrap();
+        }
+        commit(&mut m);
+
+        let ids = |page: &[WorkerRequest]| -> Vec<String> {
+            page.iter().map(|r| r.saga_id.clone()).collect()
+        };
+        let first = unassigned_page(&m, None);
+        assert_eq!(
+            ids(&first.requests),
+            vec![sid("a")],
+            "a spec over the whole budget still ships — ALONE, or the cursor \
+             would stall on it forever"
+        );
+        assert_eq!(
+            first.next.as_deref(),
+            Some(sid("a").as_str()),
+            "and the page cut short by the budget hands its cursor back"
+        );
+
+        let second = unassigned_page(&m, first.next.as_deref());
+        assert_eq!(
+            ids(&second.requests),
+            vec![sid("b"), sid("c")],
+            "the two that fit one budget together ride one page"
+        );
+        assert_eq!(second.next, None, "which also reached the end of the index");
+
+        assert_eq!(
+            ids(&unassigned_pending(&m)),
+            vec![sid("a"), sid("b"), sid("c")],
+            "so the walk still sees every saga exactly once, in id order"
+        );
     }
 }
 
