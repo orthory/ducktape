@@ -11,7 +11,7 @@ icon = "assets/icon.svg"
 category = "public.app-category.productivity"
 
 [build-dependencies]
-ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "6a9d2d6c", version = "=0.1.0" }
+ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "c8a552ee", version = "=0.1.0" }
 
 [dependencies]
 chat.workspace = true
@@ -46,19 +46,20 @@ jpeg-encoder = "0.6"
 zune-jpeg = "0.4"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 zeroize.workspace = true
-iced = { version = "=0.14.0", default-features = false, features = ["advanced", "canvas", "image-without-codecs", "lazy", "markdown", "svg", "tokio", "wgpu", "x11"] }
+iced = { version = "=0.14.0", default-features = false, features = ["advanced", "image-without-codecs", "lazy", "markdown", "svg", "tokio", "wgpu", "x11"] }
 iced_term = "=0.8.0"
-ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "6a9d2d6c", default-features = false, features = ["full"] }
-ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "6a9d2d6c" }
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "6a9d2d6c", version = "=0.1.0" }
+ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "c8a552ee", default-features = false, features = ["log-timeline"] }
+ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "c8a552ee" }
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "c8a552ee", version = "=0.1.0", default-features = false, features = ["full-runtime"] }
 
 [dev-dependencies]
 commonware-cryptography.workspace = true
 # `src/frame_probe.rs` needs a headless `UserInterface` to measure a whole
 # frame (build + layout + event walk + draw), and iced does not re-export
-# `iced_runtime`. Nothing new is compiled: ui-lang-runtime's default
-# `test-runtime` feature already pulls this exact version into the graph.
+# `iced_runtime`. The explicit test-only ui-lang runtime feature below keeps
+# that renderer out of the product dependency surface.
 iced_test = "=0.14.0"
 node.workspace = true
 simnode = { path = "../bin/simnode" }
 tempfile.workspace = true
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "c8a552ee", version = "=0.1.0", default-features = false, features = ["test-runtime"] }

@@ -1,25 +1,27 @@
 extern crate::backend
+  LoadRequest(rpc:str, key:str, generation:i64)
+  pure load_request(condition:bool, rpc:str, key:str, generation:i64) -> LoadRequest?
   ChatChannel(id:str, name:str, archived:bool, members_only:bool, huddle_count:i64, head_seq:i64)
   ChatReaction(emoji:str, count:i64, reacted_by_me:bool)
   ChatMember(key:str, label:str)
   ChannelRead(channel:str, seq:i64)
   ChatSpan(text:str, bold:bool, italic:bool, highlight:bool, link:str)
   ChatBlock(kind:str, text:str, lang:str, rich:bool, spans:[ChatSpan])
-  ChatMessage(id:str, seq:i64, author:str, meta:str, body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_kind:str, height:i64, time:i64, reactions:[ChatReaction], render_rev:i64)
+  ChatMessage(id:str, view_key:i64, seq:i64, author:str, meta:str, body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_kind:str, height:i64, time:i64, reactions:[ChatReaction], render_rev:i64)
   HuddleParticipant(key:str, label:str, initials:str, is_agent:bool, is_you:bool, joined_at:i64, node:str)
   ChannelWindow(channel_id:str, messages:[ChatMessage], members:[ChatMember])
   ChannelDraft(channel_id:str, text:str)
-  ChatData(generation:i64, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], selected_message_seq:i64, selected_message_rev:i64, selected_message_body:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_next_reply_offset:i64, thread_has_more:bool)
+  ChatData(generation:i64, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], selected_message_seq:i64, selected_message_rev:i64, selected_message_body:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_next_reply_offset:i64, thread_has_more:bool)
   SendReceipt(operation_id:str, channel_id:str)
   ChatDelta(kind:str, channel_id:str, seq:i64, root_seq:i64, message:ChatMessage, channel:ChatChannel, name:str, archived:bool, emoji:str, added:bool, reactor:str, by_me:bool, member:ChatMember)
   PagesDelta(kind:str, block_id:str, text:str)
-  LiveRefresh(generation:i64, fold_serial:i64, chat_loaded:bool, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], pages_loaded:bool, pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str, comment_thread_total:i64, commented_block_hits:[str])
+  LiveRefresh(generation:i64, fold_serial:i64, chat_loaded:bool, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], pages_loaded:bool, pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str, comment_thread_total:i64, commented_block_hits:[str])
   ThreadLoadData(generation:i64, root_seq:i64, target_seq:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
   ThreadPageData(generation:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
-  LiveThreadData(generation:i64, channel_id:str, root_seq:i64, target_seq:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
-  HistoryPageData(generation:i64, channel_id:str, messages:[ChatMessage])
+  LiveThreadData(channel_id:str, root_seq:i64, target_seq:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
+  HistoryPageData(channel_id:str, messages:[ChatMessage])
   ChatSearchHit(channel_id:str, seq:i64, root_seq:i64, author:str, text:str, meta:str)
-  ChatSearchData(generation:i64, hits:[ChatSearchHit])
+  ChatSearchData(hits:[ChatSearchHit])
   PageItem(id:str, title:str, parent:str, prefix:str, child_count:i64)
   PageBlock(key:i64, id:str, parent:str, kind:str, text:str, pending:bool, checked:bool, prefix:str, child_count:i64)
   PagesData(pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str, comment_thread_total:i64, commented_block_hits:[str])
@@ -28,23 +30,23 @@ extern crate::backend
   BlockThreadListData(generation:i64, target:str, from:i64, threads:[PageCommentThread], total:i64, next_from:i64, has_more:bool)
   BlockCommentData(generation:i64, target:str, thread_id:str, from:i64, comments:[PageComment], next_from:i64, has_more:bool)
   PageSearchHit(page_id:str, page_title:str, block_id:str, kind:str, text:str)
-  PageSearchData(generation:i64, hits:[PageSearchHit])
-  PaletteSearchData(generation:i64, chat_hits:[ChatSearchHit], page_hits:[PageSearchHit])
+  PageSearchData(hits:[PageSearchHit])
+  PaletteSearchData(chat_hits:[ChatSearchHit], page_hits:[PageSearchHit])
   // `refusal` is not a failure: the write was NOT attempted because carrying it
   // out would have destroyed records. `document` is the canonical text either
   // way — the buffer takes it, which is what rolls an illegal edit back.
-  DocumentSaveResult(generation:i64, written:bool, refusal:str, data:PagesData, document:str)
-  WorkspaceData(generation:i64, rpc:str, status:str, height:i64, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str, comment_thread_total:i64, commented_block_hits:[str])
+  DocumentSaveResult(written:bool, refusal:str, data:PagesData, document:str)
+  WorkspaceData(generation:i64, rpc:str, status:str, height:i64, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str, comment_thread_total:i64, commented_block_hits:[str])
   BellItem(seq:i64, kind:str, body:str, source:str, height:i64, read:bool)
   BellDelta(kind:str, item:BellItem, up_to_seq:i64)
-  BellData(generation:i64, unread:i64, items:[BellItem])
+  BellData(unread:i64, items:[BellItem])
   pure apply_bell(items:[BellItem], delta:BellDelta) -> [BellItem]
   pure bell_unread_after(unread:i64, items:[BellItem], delta:BellDelta) -> i64
   pure bell_head(items:[BellItem]) -> i64
   pure bell_severity(kind:str) -> str
   pure bell_title(kind:str) -> str
   pure bell_worst_severity(items:[BellItem]) -> str
-  load_bell(rpc:str, generation:i64) -> BellData ! HydrationError
+  load_bell(rpc:str) -> BellData ! AppError
   mark_bell_read(rpc:str, password:str, up_to_seq:i64) -> bool ! AppError
   ForgeRefresh(repo:str, number:i64, refs_moved:bool)
   LiveUpdate(kind:str, status:str, height:i64, module:str, load_chat:bool, load_pages:bool, debounce:bool, chat:ChatDelta, pages:PagesDelta, bell:BellDelta, forge:ForgeRefresh)
@@ -81,11 +83,9 @@ extern crate::backend
   pure agent_event_error(current:str, event:AgentChatEvent) -> str
   pure agent_event_busy(event:AgentChatEvent) -> bool
   pure agent_event_entries(entries:[AgentChatEntry], event:AgentChatEvent, provider:str) -> [AgentChatEntry]
-  pure agent_chat_prompt(entries:[AgentChatEntry]) -> str
   stream agent_chat_turn(rpc:str, provider:str, credential:str, entries:[AgentChatEntry]) -> AgentChatEvent
   OptimisticMutationError(message:str, committed:bool, operation_id:str, scope_id:str, body:str)
   HydrationError(generation:i64, message:str)
-  box-style card_style()
   box-style raised_style()
   svg-style icon_tint(tone:str)
   pure icon(name:str) -> bytes
@@ -93,25 +93,19 @@ extern crate::backend
   stream live_events(rpc:str) -> LiveUpdate
   pure resync_planes(load_chat:bool, load_pages:bool) -> str
   live_resync_load(rpc:str, channel_id:str, page_id:str, planes:str, debounce:bool, generation:i64, fold_serial:i64, attempt:i64) -> LiveRefresh ! HydrationError
-  load_older_messages(rpc:str, channel_id:str, before_seq:i64, generation:i64) -> HistoryPageData ! HydrationError
+  load_older_messages(rpc:str, channel_id:str, before_seq:i64) -> HistoryPageData ! AppError
   sync fresh_operation_id(prefix:str) -> str
-  pure optimistic_message(messages:[ChatMessage], body:str, message_id:str) -> [ChatMessage]
+  sync optimistic_message(messages:[ChatMessage], body:str, message_id:str) -> [ChatMessage]
   pure mark_author_runs(messages:[ChatMessage]) -> [ChatMessage]
-  pure merge_pending_messages(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str, settled_id:str) -> [ChatMessage]
-  pure merge_message_send_result(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str, settled_id:str) -> [ChatMessage]
+  pure merge_pending_messages(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str) -> [ChatMessage]
   pure resynced_messages(loaded:bool, next:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str, history_view:bool) -> [ChatMessage]
   pure rollback_pending_message(messages:[ChatMessage], pending_id:str, committed:bool) -> [ChatMessage]
   pure contains_pending_message(messages:[ChatMessage], pending_id:str) -> bool
   pure reaction_applied(messages:[ChatMessage], seq:i64, emoji:str, added:bool) -> [ChatMessage]
-  // THE SETTLE ✓, IN ONE CALL. The four scans this replaced each took their
-  // list by value, so one incoming message deep-cloned the timeline twice and
-  // the open rail twice before a single row was folded.
-  ChatSettle(flashed:bool, send_ids:str, reply_ids:str)
-  pure no_chat_settle() -> ChatSettle
-  pure chat_settle(messages:[ChatMessage], thread:[ChatMessage], delta:ChatDelta, active_channel:str, send_ids:str, reply_ids:str) -> ChatSettle
-  pure has_flash_id(ids:str, id:str) -> bool
+  // THE SETTLE, IN ONE CALL. The two scans this replaced each took both lists
+  // by value. The verdict lets a history window accept its own canonical row.
+  pure chat_settle(messages:[ChatMessage], thread:[ChatMessage], delta:ChatDelta, active_channel:str) -> bool
   pure append_thread_page(messages:[ChatMessage], next:[ChatMessage]) -> [ChatMessage]
-  pure merge_thread_reply(messages:[ChatMessage], reply:ChatMessage) -> [ChatMessage]
   pure history_has_older(messages:[ChatMessage]) -> bool
   pure oldest_message_seq(messages:[ChatMessage]) -> i64
   pure prepend_history(messages:[ChatMessage], older:[ChatMessage]) -> [ChatMessage]
@@ -120,26 +114,24 @@ extern crate::backend
   // Chat's message/thread menus still place themselves this way; the name is
   // the pages block menu it was written for, which no longer exists.
   pure block_action_menu_y(pointer_y:f64, viewport_height:f64) -> f64
-  pure rollback_blocks(blocks:[PageBlock], keep_pending:bool) -> [PageBlock]
   pure append_page_comment_threads(threads:[PageCommentThread], next:[PageCommentThread]) -> [PageCommentThread]
   pure append_page_comments(comments:[PageComment], next:[PageComment]) -> [PageComment]
   pure remember_failed_draft(existing:str, current:str, pending:str, committed:bool) -> str
   sync canonical_endpoint(input:str) -> str
-  pure network_slug(name:str) -> str
   WorkspaceInit(chain_id:str, workspace:str, rpc:str)
   join_network(blob:secret) -> WorkspaceInit ! AppError
   mint_invite(workspace:str, ttl_days:i64) -> str ! AppError
   ProvisionStep(index:i64, label:str, state:str, settled:bool)
   stream provision_progress(workspace:str, rpc:str) -> ProvisionStep
   HubNetwork(id:str, chain_id:str, name:str, endpoint:str, kind:str, last_used:i64, probed:bool, live:bool, height:i64)
-  HubProbe(generation:i64, id:str, live:bool, height:i64)
+  HubProbe(id:str, live:bool, height:i64)
   HubState(key_state:str, networks:[HubNetwork], preselect:str, hidden:i64)
   KeyCreated(words:str, pubkey:str)
   hub_state() -> HubState
-  stream probe_known_networks(generation:i64) -> HubProbe
+  stream probe_known_networks() -> HubProbe
   pure apply_network_probe(networks:[HubNetwork], probe:HubProbe) -> [HubNetwork]
   pure network_run_hint(row:HubNetwork) -> str
-  pure hub_entry_step(key_state:str) -> str
+  pure hub_entry_step(key_state:str) -> HubStep
   pure selected_network_endpoint(networks:[HubNetwork], id:str) -> str
   pure refreshed_hub_selection(networks:[HubNetwork], current:str, preselect:str) -> str
   pure password_problem(password:str, confirm:str) -> str
@@ -156,10 +148,11 @@ extern crate::backend
   pure connection_degraded(status:str) -> bool
   pure titlebar_inset() -> f64
   pure palette_key_action(logical:key, physical:physical-key, modifiers:key-modifiers, open:bool) -> str
-  pure topmost_overlay(palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:str, message_action:str, channel_settings_open:bool, forge_repo_menu:bool) -> str
-  pure escape_target(logical:key, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:str, message_action:str, channel_settings_open:bool, forge_repo_menu:bool) -> str
+  pure topmost_overlay(palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, forge_repo_menu:bool) -> str
+  pure escape_target(logical:key, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, forge_repo_menu:bool) -> str
+  pure close_message_action(close:bool, current:MessageAction) -> MessageAction
   pure content_scroll_step(logical:key, modifiers:key-modifiers, overlay:str) -> f64
-  NavItem(id:str, title:str, icon:str, badge:i64, active:bool, live:bool)
+  NavItem(id:ShellTab, title:str, icon:str, badge:i64, active:bool, live:bool)
   FsEntry(key:i64, path:str, name:str, kind:str, size:i64, object:str)
   FsSnapshot(id:str, short_id:str, author:str, height:i64, message:str)
   FsListing(generation:i64, path:str, entries:[FsEntry])
@@ -168,8 +161,6 @@ extern crate::backend
   pure no_fs_entry() -> FsEntry
   pure fs_entry_named(entries:[FsEntry], path:str) -> FsEntry
   pure fs_directories(entries:[FsEntry]) -> [FsEntry]
-  pure fs_dir_count(entries:[FsEntry]) -> i64
-  pure fs_file_count(entries:[FsEntry]) -> i64
   pure fs_counts_summary(connected:bool, listed:bool, entries:[FsEntry]) -> str
   pure fs_parent(path:str) -> str
   pure fs_child(path:str, name:str) -> str
@@ -183,11 +174,8 @@ extern crate::backend
   files_ls(rpc:str, path:str, generation:i64) -> FsListing ! HydrationError
   files_preview(rpc:str, path:str, generation:i64) -> FsPreview ! HydrationError
   files_history(rpc:str, generation:i64) -> FsHistory ! HydrationError
-  files_find(rpc:str, prefix:str, generation:i64) -> FsListing ! HydrationError
-  ChangeStamp(generation:i64, path:str, author:str, height:i64)
-  last_changed_at_path(rpc:str, path:str, generation:i64) -> ChangeStamp ! HydrationError
   pure size_label(bytes:i64) -> str
-  pure shell_nav(tab:str, approvals:i64, agent_live:bool) -> [NavItem]
+  pure shell_nav(tab:ShellTab, approvals:i64, agent_live:bool) -> [NavItem]
   pure open_proposals(rows:[ProposalRow]) -> i64
   pure plural(count:i64, one:str, many:str) -> str
   pure members_summary(connected:bool, rows:[MemberRow]) -> str
@@ -223,8 +211,8 @@ extern crate::backend
   pure node_log_timeline_filter(state:NodeLogTimelineState, filter:str) -> NodeLogTimelineState
   pure node_log_timeline_apply(state:NodeLogTimelineState, event:NodeLogTimelineEvent) -> NodeLogTimelineState
   component node_log_timeline(state:&NodeLogTimelineState, source:&str) -> NodeLogTimelineEvent
-  NodeFacts(generation:i64, public_key:str, version:str, root_hash:str, view:i64?, quorum:i64?, reachable_validators:i64?, last_finalized_at:i64, checkpoint_height:i64, height:i64, phase:str, phase_since:i64, sync_target:i64, sync_applied:i64, sync_retries:i64, sync_failures:i64, sync_last_error:str)
-  load_node_facts(rpc:str, generation:i64) -> NodeFacts ! HydrationError
+  NodeFacts(public_key:str, version:str, root_hash:str, view:i64?, quorum:i64?, reachable_validators:i64?, last_finalized_at:i64, checkpoint_height:i64, height:i64, phase:str, phase_since:i64, sync_target:i64, sync_applied:i64, sync_retries:i64, sync_failures:i64, sync_last_error:str)
+  load_node_facts(rpc:str) -> NodeFacts ! AppError
   pure optional_number(value:i64?) -> str
   PeerRow(key:str, role:str, live:bool)
   PeersData(generation:i64, peers:[PeerRow])
@@ -234,12 +222,12 @@ extern crate::backend
   stream node_peers_live(rpc:str) -> PeersData
   load_peers(rpc:str, generation:i64) -> PeersData ! HydrationError
   ModuleRow(id:str, category:str, root:str, code_hash:str, pending_hash:str, activation_height:i64, readiness:i64, ready:bool)
-  ModulesData(generation:i64, rows:[ModuleRow])
-  load_modules(rpc:str, generation:i64) -> ModulesData ! HydrationError
+  ModulesData(rows:[ModuleRow])
+  load_modules(rpc:str) -> ModulesData ! AppError
   AccountData(generation:i64, bound:bool, account_id:str, display_name:str, bio:str, members:i64, nodes:i64)
   load_account(rpc:str, generation:i64) -> AccountData ! HydrationError
   set_account_name(rpc:str, password:str, display_name:str) -> bool ! AppError
-  SettingsFacts(generation:i64, endpoint:str, key_path:str, key_state:str, data_dir:str, open_tabs:i64, user_key:str)
+  SettingsFacts(generation:i64, key_path:str, key_state:str, data_dir:str, open_tabs:i64, user_key:str)
   load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
   clear_doc_tabs(rpc:str) -> bool
   forget_workspace(rpc:str) -> bool ! AppError
@@ -250,18 +238,18 @@ extern crate::backend
   ForgeReviewComment(anchor:str, body:str)
   ForgeReview(author:str, author_name:str, verdict:str, body:str, commit:str, outdated:bool, created_at:i64, comments:[ForgeReviewComment])
   ForgeItemData(generation:i64, repo:str, number:i64, title:str, state:str, kind:str, body:str, author_name:str, branches:str, channel_id:str, source_branch:str, source_oid:str, target_oid:str, merge_oid:str, diff:str, diff_truncated:bool, files_changed:i64, additions:i64, deletions:i64, reviews:[ForgeReview], approvals:i64, change_requests:i64)
-  ForgeDiscussionData(generation:i64, channel_id:str, messages:[ChatMessage], members:[ChatMember])
+  ForgeDiscussionData(channel_id:str, messages:[ChatMessage], members:[ChatMember])
   ForgeMergeOutcome(merged:bool, merge_oid:str, conflicts:[str])
   ForgeLiveData(generation:i64, repos_loaded:bool, repos:[ForgeRepo], repo_loaded:bool, branches:[str], items:[ForgeItem], item_loaded:bool, item:ForgeItemData)
   load_forge(rpc:str, generation:i64) -> ForgeData ! HydrationError
   load_forge_repo(rpc:str, repo:str, generation:i64) -> ForgeRepoData ! HydrationError
   load_forge_item(rpc:str, repo:str, number:i64, generation:i64) -> ForgeItemData ! HydrationError
-  load_forge_discussion(rpc:str, channel_id:str, generation:i64) -> ForgeDiscussionData ! HydrationError
+  load_forge_discussion(rpc:str, channel_id:str) -> ForgeDiscussionData ! AppError
   TreeEntry(name:str, path:str, kind:str)
-  ForgeTreeData(generation:i64, repo:str, rev:str, path:str, born:bool, entries:[TreeEntry], truncated:bool)
-  BlobView(generation:i64, repo:str, rev:str, path:str, text:str, truncated:bool, binary:bool, lines:i64)
-  forge_tree(rpc:str, repo:str, rev:str, path:str, generation:i64) -> ForgeTreeData ! HydrationError
-  forge_blob(rpc:str, repo:str, rev:str, path:str, generation:i64) -> BlobView ! HydrationError
+  ForgeTreeData(repo:str, rev:str, path:str, born:bool, entries:[TreeEntry], truncated:bool)
+  BlobView(repo:str, rev:str, path:str, text:str, truncated:bool, binary:bool, lines:i64)
+  forge_tree(rpc:str, repo:str, rev:str, path:str) -> ForgeTreeData ! AppError
+  forge_blob(rpc:str, repo:str, rev:str, path:str) -> BlobView ! AppError
   ForgeDraftComment(anchor:str, path:str, line:str, side:str, body:str)
   pure stage_forge_comment(staged:[ForgeDraftComment], path:str, line:str, side:str, body:str) -> [ForgeDraftComment]
   pure drop_forge_comment(staged:[ForgeDraftComment], anchor:str) -> [ForgeDraftComment]
@@ -270,7 +258,7 @@ extern crate::backend
   pure keep_comment_text(loaded:bool, next_oid:str, current_oid:str, value:str) -> str
   pure staged_comment_drop_note(loaded:bool, next_oid:str, current_oid:str, staged:[ForgeDraftComment], error:str) -> str
   pure forge_comment_target(path:str, line:str, side:str) -> str
-  submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:str, body:str, commit_oid:str, comments:[ForgeDraftComment]) -> bool ! AppError
+  submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:ForgeReviewVerdict, body:str, commit_oid:str, comments:[ForgeDraftComment]) -> bool ! AppError
   merge_forge_pr(rpc:str, password:str, repo:str, number:i64, source_branch:str, expected_source_oid:str, prev_target_oid:str) -> ForgeMergeOutcome ! AppError
   forge_live_refresh(rpc:str, open_repo:str, open_item:i64, kind:str, module:str, scope:ForgeRefresh, forge_open:bool, generation:i64) -> ForgeLiveData ! HydrationError
   pure forge_live_hit(kind:str, module:str) -> bool
@@ -280,20 +268,15 @@ extern crate::backend
   pure diff_lines(diff:str) -> [DiffLine]
   SourceLine(number:str, text:str)
   pure source_lines(text:str) -> [SourceLine]
-  pure filter_forge_items(items:[ForgeItem], kind:str) -> [ForgeItem]
+  pure filter_forge_items(items:[ForgeItem], tab:ForgeTab) -> [ForgeItem]
   pure forge_open_count(items:[ForgeItem], kind:str) -> i64
   pure forge_merge_note(merge_oid:str, branches:str) -> str
   pure verdict_label(verdict:str) -> str
-  pure verdict_pick_label(current:str, key:str, label:str) -> str
-  AgentSkill(name:str, always:bool)
-  AgentCap(label:str, arg:str)
-  AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_key:str, owner_handle:str, created_at:i64, is_mine:bool, live:bool, tools:i64, secrets:i64, subagent_budget:i64, allowed_actions:[str], skills:[AgentSkill], caps:[AgentCap])
-  RunRow(run_id:str, agent_id:str, outcome:str, running:bool, created_at:i64, summary:str)
-  AgentRunsData(generation:i64, runs:[RunRow])
+  pure verdict_pick_label(current:ForgeReviewVerdict, key:ForgeReviewVerdict, label:str) -> str
+  AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_handle:str, live:bool, skill_count:i64, cap_count:i64)
   AgentsData(generation:i64, agents:[AgentRow])
   load_agents(rpc:str, generation:i64) -> AgentsData ! HydrationError
   pure any_agent_active(rows:[AgentRow]) -> bool
-  load_agent_runs(rpc:str, agent_id:str, generation:i64) -> AgentRunsData ! HydrationError
   set_agent_status(rpc:str, password:str, agent_id:str, paused:bool) -> bool ! AppError
   ProposalRow(id:str, action:str, detail:str, proposer:str, status:str, deadline:i64, approvals:i64, rejections:i64, rule:str, required_yes:i64, electorate:i64, open:bool, settled_height:i64)
   GovernanceData(generation:i64, proposals:[ProposalRow])
@@ -306,7 +289,7 @@ extern crate::backend
   load_members(rpc:str, generation:i64) -> MembersData ! HydrationError
   pure members_is_admin(rows:[MemberRow]) -> bool
   pure member_tier(rows:[MemberRow]) -> str
-  pure filter_members(rows:[MemberRow], filter:str) -> [MemberRow]
+  pure filter_members(rows:[MemberRow], filter:MembersFilter) -> [MemberRow]
   ExplorerBlock(height:i64, hash:str, commit:str, op_count:i64)
   ExplorerOp(height:i64, proposer:str, target:str, disposition:str, op_hash:str, payload:str, trace:str)
   ExplorerData(generation:i64, blocks:[ExplorerBlock], ops:[ExplorerOp])
@@ -314,23 +297,24 @@ extern crate::backend
   load_explorer(rpc:str, generation:i64) -> ExplorerData ! HydrationError
   ExplorerHit(kind:str, code:str, title:str, snippet:str, meta:str, target:str)
   KindCount(kind:str, label:str, count:i64)
-  ExplorerResults(generation:i64, hits:[ExplorerHit], kinds:[KindCount], partial:str)
-  search_workspace(rpc:str, text:str, generation:i64) -> ExplorerResults ! HydrationError
+  ExplorerResults(hits:[ExplorerHit], kinds:[KindCount], partial:str)
+  search_workspace(rpc:str, text:str) -> ExplorerResults
   pure doc_tabs_with(tabs:[str], page_id:str) -> [str]
   pure doc_tabs_without(tabs:[str], page_id:str) -> [str]
   DocTab(id:str, title:str, active:bool)
-  pure retain_doc_tabs(tabs:[str], pages:[PageItem]) -> [str]
   pure doc_tab_rows(tabs:[str], pages:[PageItem], active:str) -> [DocTab]
   pure next_doc_tab(tabs:[str], closed:str, active:str) -> str
   load_doc_tabs(rpc:str) -> [str]
-  load_appearance() -> str
-  save_appearance(mode:str) -> bool
+  load_appearance() -> Appearance
+  save_appearance(mode:Appearance) -> bool
   save_doc_tabs(rpc:str, tabs:[str]) -> bool
   pure retain_for_endpoint(value:str, current:str, next:str) -> str
-  pure mutation_failure_phase(committed:bool) -> str
-  pure message_seq_after_failure(current:i64, phase:str, committed:bool) -> i64
-  pure message_text_after_failure(current:str, phase:str, committed:bool) -> str
-  pure message_action_after_failure(current:str, phase:str, committed:bool) -> str
+  pure mutation_failure_phase(committed:bool) -> MutationPhase
+  pure mutation_phase_after_recovery(current:MutationPhase) -> MutationPhase
+  pure message_seq_after_failure(current:i64, phase:MutationPhase, committed:bool) -> i64
+  pure message_text_after_failure(current:str, phase:MutationPhase, committed:bool) -> str
+  pure message_action_after_failure(current:MessageAction, phase:MutationPhase, committed:bool) -> MessageAction
+  pure keep_forge_phase(loaded:bool, next:ForgePhase, current:ForgePhase) -> ForgePhase
   pure refreshed_required_message_seq(messages:[ChatMessage], current_channel:str, next_channel:str, value:i64) -> i64
   pure refreshed_known_message_seq(messages:[ChatMessage], current_channel:str, next_channel:str, value:i64) -> i64
   pure refreshed_channel_value(current_channel:str, next_channel:str, value:i64) -> i64
@@ -358,7 +342,7 @@ extern crate::backend
   pure cache_channel_window(cache:[ChannelWindow], channel_id:str, messages:[ChatMessage], members:[ChatMember], history_view:bool) -> [ChannelWindow]
   // ONE CALL FOR BOTH ANSWERS — the ABI charges by the argument, and asking
   // for the rows and the roll separately walked (and deep-cloned) the whole
-  // cache twice per click. Same reason `chat_settle` returns three at once.
+  // cache twice per click. Same reason `chat_settle` checks both lanes once.
   pure cached_window(cache:[ChannelWindow], channel_id:str) -> ChannelWindow
   // The composer's own park. NOT a field on `ChannelWindow`: that cache refuses
   // empty and history windows and evicts past three rooms, and each of those
@@ -375,11 +359,9 @@ extern crate::backend
   pure page_display_title(pages:[PageItem], page:str, current:str) -> str
   pure channel_flag_archived(channels:[ChatChannel], channel:str, current:bool) -> bool
   pure channel_flag_members_only(channels:[ChatChannel], channel:str, current:bool) -> bool
-  pure channel_live_huddle_count(channels:[ChatChannel], channel:str, current:i64) -> i64
   pure keep_channels(loaded:bool, next:[ChatChannel], current:[ChatChannel]) -> [ChatChannel]
   pure keep_members(loaded:bool, next:[ChatMember], current:[ChatMember]) -> [ChatMember]
   pure keep_roster(joined:bool, next:[HuddleParticipant]) -> [HuddleParticipant]
-  pure keep_peers(loaded:bool, next:[PeerRow], current:[PeerRow]) -> [PeerRow]
   pure keep_pages(loaded:bool, next:[PageItem], current:[PageItem]) -> [PageItem]
   pure pages_reply_answers_current(pages:[PageItem], replied:str, current:str) -> bool
   pure keep_blocks(loaded:bool, next:[PageBlock], current:[PageBlock]) -> [PageBlock]
@@ -391,7 +373,7 @@ extern crate::backend
   pure keep_folded_block_texts(fold_outran_reply:bool, next:[PageBlock], current:[PageBlock]) -> [PageBlock]
   pure plane_live_hit(kind:str, module:str, want:str) -> bool
   pure agents_plane_hit(kind:str, module:str) -> bool
-  pure tab_reads_plane(tab:str, plane:str) -> bool
+  pure tab_reads_plane(tab:ShellTab, plane:str) -> bool
   pure keep_str(loaded:bool, next:str, current:str) -> str
   pure keep_bool(loaded:bool, next:bool, current:bool) -> bool
   pure keep_i64(loaded:bool, next:i64, current:i64) -> i64
@@ -409,7 +391,6 @@ extern crate::backend
   pure thread_loading_after_refresh(loading:bool, current_channel:str, next_channel:str, previous_root:i64, next_root:i64) -> bool
   pure retain_thread_messages(messages:[ChatMessage], root_seq:i64) -> [ChatMessage]
   pure thread_root_seed(messages:[ChatMessage], thread:[ChatMessage], seq:i64) -> [ChatMessage]
-  pure cancel_autosaves(rpc:str, generation:i64) -> i64
   pure remember_orphaned_comment_drafts(drafts:[str], blocks:[PageBlock], selected_id:str, current:str) -> [str]
   pure remove_recovered_draft(drafts:[str], recovered:str) -> [str]
   pure retain_selected_string(value:str, selected_id:str) -> str
@@ -449,13 +430,13 @@ extern crate::backend
   send_message(rpc:str, password:str, channel_id:str, message_id:str, body:str, members:[ChatMember]) -> SendReceipt ! OptimisticMutationError
   load_thread(rpc:str, channel_id:str, root_seq:i64, target_seq:i64, through_reply_offset:i64, generation:i64) -> ThreadLoadData ! HydrationError
   load_thread_page(rpc:str, channel_id:str, root_seq:i64, from:i64, generation:i64) -> ThreadPageData ! HydrationError
-  refresh_live_thread(rpc:str, channel_id:str, root_seq:i64, target_seq:i64, through_reply_offset:i64, generation:i64) -> LiveThreadData ! HydrationError
+  refresh_live_thread(rpc:str, channel_id:str, root_seq:i64, target_seq:i64, through_reply_offset:i64) -> LiveThreadData ! AppError
   send_reply(rpc:str, password:str, channel_id:str, root_seq:i64, message_id:str, body:str, members:[ChatMember]) -> SendReceipt ! OptimisticMutationError
   edit_message(rpc:str, password:str, channel_id:str, seq:i64, base_rev:i64, body:str, members:[ChatMember]) -> bool ! AppError
   delete_message(rpc:str, password:str, channel_id:str, seq:i64) -> bool ! AppError
   add_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> bool ! AppError
   remove_reaction(rpc:str, password:str, channel_id:str, seq:i64, emoji:str) -> bool ! AppError
-  search_chat(rpc:str, channel_id:str, text:str, generation:i64) -> ChatSearchData ! HydrationError
+  search_chat(rpc:str, channel_id:str, text:str) -> ChatSearchData ! AppError
   load_page(rpc:str, page_id:str) -> PagesData ! AppError
   load_page_threads(rpc:str, page_id:str, generation:i64) -> BlockThreadListData ! HydrationError
   load_block_comment_page(rpc:str, target:str, thread_id:str, from:i64, generation:i64) -> BlockCommentData ! HydrationError
@@ -466,7 +447,7 @@ extern crate::backend
   delete_page(rpc:str, password:str, page_id:str) -> PagesData ! AppError
   // THE PAGE'S ONE WRITE PATH. The edited buffer in, the module's own ops
   // out — see backend/document.rs for the ordering rule and the refusal.
-  save_page_document(rpc:str, password:str, page_id:str, text:str, saved:str, generation:i64) -> DocumentSaveResult ! HydrationError
+  save_page_document(rpc:str, password:str, page_id:str, text:str, saved:str) -> DocumentSaveResult ! AppError
   // The buffer a page opens on: its TITLE as line 0, its blocks under it.
   pure page_document_text(title:str, blocks:[PageBlock]) -> str
   pure subpage_blocks(blocks:[PageBlock]) -> [PageBlock]
@@ -482,5 +463,5 @@ extern crate::backend
   sync installed_page_editor(document:editor, install:bool, canonical:str) -> editor
   sync rolled_back_editor(document:editor, untouched:bool, canonical:str) -> editor
   pure remember_orphaned_page_comment(drafts:[str], pages:[PageItem], target:str, draft:str) -> [str]
-  search_pages(rpc:str, page_id:str, text:str, generation:i64) -> PageSearchData ! HydrationError
-  palette_search(rpc:str, text:str, generation:i64) -> PaletteSearchData ! HydrationError
+  search_pages(rpc:str, page_id:str, text:str) -> PageSearchData ! AppError
+  palette_search(rpc:str, text:str) -> PaletteSearchData ! AppError

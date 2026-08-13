@@ -24,7 +24,7 @@ use iced::{Event, Point, Size, Theme};
 use iced_test::runtime::user_interface::{self, UserInterface};
 
 use super::backend;
-use super::{__DucktapeMessage, Ducktape};
+use super::{__DucktapeMessage, Ducktape, ShellTab};
 
 /// One synthetic channel's worth of scrollback — `CHAT_VIEW_PAGE_LIMIT`, the
 /// page the timeline walk asks for, so the probe measures the widest window a
@@ -48,10 +48,10 @@ const FRAMES: usize = 12;
 /// ALLOCATIONS PER KEYSTROKE, AND NOTHING ELSE IS ASSERTED.
 ///
 /// Measured on `dev` after the QA sweep landed: about **16 700** allocations;
-/// the ducktape-ui a099fa6b pin's borrow-aware `for` rows brought the same
-/// fixture to **15 982**, and the 690b84d9 keyed lazy (`by message.seq,
-/// message.render_rev` over by-reference keyed rows) to **11 377** — each
-/// ceiling move locks the win. The count is stable inside one process but can
+/// borrow-aware `for` rows brought the same fixture to **15 982**, and keyed
+/// lazy (`by message.seq, message.render_rev` over by-reference keyed rows) to
+/// **11 377**. Each ceiling move locks the win. The count is stable inside one
+/// process but can
 /// move slightly with global font/cache initialization, so the ceiling leaves
 /// broad headroom. Deleting the stream's `virtual-row=` alone takes it above
 /// 27 000, still well beyond the budget.
@@ -219,6 +219,9 @@ fn probe_message(seq: i64) -> backend::ChatMessage {
     );
     backend::ChatMessage {
         id: format!("probe-message-{seq}"),
+        // Synthetic rows stay in a namespace disjoint from production keys
+        // allocated for optimistic rows in this same process.
+        view_key: -seq,
         seq,
         author: format!("user-{}", seq % 7),
         meta: format!("#{seq}"),
@@ -263,7 +266,6 @@ fn probe_chat_data(channel: &str, generation: i64) -> backend::ChatData {
         active_channel_name: channel.into(),
         active_channel_archived: false,
         active_channel_members_only: false,
-        active_channel_huddle_count: 0,
         huddle_roster: Vec::new(),
         channel_members: Vec::new(),
         selected_message_seq: 0,
@@ -349,13 +351,13 @@ fn console_in_chat_with_thread(
     (app, console)
 }
 
-fn console_on(tab: &str) -> (Ducktape, iced::window::Id) {
+fn console_on(tab: ShellTab) -> (Ducktape, iced::window::Id) {
     let (mut app, _) = Ducktape::__boot();
     let console = iced::window::Id::unique();
     app.console_win = Some(console);
     app.connected = true;
     app.connected_rpc = "http://node".into();
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(tab.into()));
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(tab));
     assert_eq!(app.shell_tab, tab, "the probe mounts the requested screen");
     (app, console)
 }
@@ -377,7 +379,7 @@ fn probe_page_block(index: usize) -> backend::PageBlock {
 }
 
 fn console_in_page_comments() -> (Ducktape, iced::window::Id) {
-    let (mut app, console) = console_on("pages");
+    let (mut app, console) = console_on(ShellTab::Pages);
     let blocks: Vec<_> = (0..PAGE_ROWS).map(probe_page_block).collect();
     let _ = app.__update(__DucktapeMessage::PagesUpdated(backend::PagesData {
         pages: vec![backend::PageItem {
@@ -448,7 +450,6 @@ fn console_in_huddle() -> (Ducktape, iced::window::Id) {
         active_channel_name: "channel-0".into(),
         active_channel_archived: false,
         active_channel_members_only: false,
-        active_channel_huddle_count: HUDDLE_ROWS as i64,
         huddle_roster: (0..HUDDLE_ROWS).map(probe_huddle_participant).collect(),
         channel_members: Vec::new(),
         selected_message_seq: 0,
@@ -482,7 +483,7 @@ fn forge_source() -> String {
 }
 
 fn console_in_forge_code() -> (Ducktape, iced::window::Id) {
-    let (mut app, console) = console_on("forge");
+    let (mut app, console) = console_on(ShellTab::Forge);
     let _ = app.__update(__DucktapeMessage::ForgeOpenRepo("probe".into()));
     let _ = app.__update(__DucktapeMessage::ForgeRepoLoaded(backend::ForgeRepoData {
         generation: app.forge_generation,
@@ -491,7 +492,6 @@ fn console_in_forge_code() -> (Ducktape, iced::window::Id) {
         items: Vec::new(),
     }));
     let _ = app.__update(__DucktapeMessage::ForgeTreeLoaded(backend::ForgeTreeData {
-        generation: app.forge_code_generation,
         repo: "probe".into(),
         rev: "1111111111111111111111111111111111111111".into(),
         path: String::new(),
@@ -507,7 +507,6 @@ fn console_in_forge_code() -> (Ducktape, iced::window::Id) {
     let source = forge_source();
     assert!(source.len() < 64 * 1024);
     let _ = app.__update(__DucktapeMessage::ForgeBlobLoaded(backend::BlobView {
-        generation: app.forge_code_generation,
         repo: "probe".into(),
         rev: "1111111111111111111111111111111111111111".into(),
         path: "probe.rs".into(),
@@ -533,7 +532,7 @@ fn forge_diff() -> String {
 }
 
 fn console_in_forge_pr() -> (Ducktape, iced::window::Id) {
-    let (mut app, console) = console_on("forge");
+    let (mut app, console) = console_on(ShellTab::Forge);
     let _ = app.__update(__DucktapeMessage::ForgeOpenRepo("probe".into()));
     let _ = app.__update(__DucktapeMessage::ForgeRepoLoaded(backend::ForgeRepoData {
         generation: app.forge_generation,
@@ -564,7 +563,6 @@ fn console_in_forge_pr() -> (Ducktape, iced::window::Id) {
     }));
     let _ = app.__update(__DucktapeMessage::ForgeDiscussionLoaded(
         backend::ForgeDiscussionData {
-            generation: app.forge_discussion_generation,
             channel_id: "forge:probe:7".into(),
             messages: (1..=DISCUSSION_ROWS as i64).map(probe_message).collect(),
             members: Vec::new(),
@@ -595,7 +593,7 @@ fn probe_fs_entry(index: usize) -> backend::FsEntry {
 }
 
 fn console_in_files() -> (Ducktape, iced::window::Id) {
-    let (mut app, console) = console_on("files");
+    let (mut app, console) = console_on(ShellTab::Files);
     let entries: Vec<_> = (0..FILE_ROWS).map(probe_fs_entry).collect();
     let selected = entries
         .last()
@@ -799,6 +797,74 @@ fn drawn_frame(
     (cache, pixels)
 }
 
+/// A settled optimistic row keeps the identity already mounted in the keyed
+/// virtual timeline. Replacing its client identity with the canonical sequence
+/// used to wedge the main stream while the unkeyed thread rail kept working.
+#[test]
+fn an_optimistic_confirmation_keeps_its_virtual_row_alive() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(probe_optimistic_confirmation)
+        .expect("the confirmation probe thread spawns")
+        .join()
+        .expect("the confirmation probe thread finishes");
+}
+
+fn probe_optimistic_confirmation() {
+    const OPERATION_ID: &str = "probe-optimistic-confirmation";
+
+    let (mut app, console) = console_in_chat();
+    app.messages = backend::mark_author_runs(backend::optimistic_message(
+        app.messages,
+        "confirmation probe".into(),
+        OPERATION_ID.into(),
+    ));
+    assert_eq!(app.messages.len(), ROWS as usize + 1);
+    let pending_view_key = app.messages.last().expect("the optimistic row").view_key;
+
+    let mut renderer = headless_renderer();
+    let (cache, pending_frame) = drawn_frame(
+        &mut app,
+        console,
+        &mut renderer,
+        user_interface::Cache::default(),
+    );
+
+    let canonical = backend::ChatMessage {
+        id: OPERATION_ID.into(),
+        view_key: pending_view_key,
+        seq: ROWS + 1,
+        body: "confirmation probe".into(),
+        blocks: backend::paragraph_blocks("confirmation probe"),
+        ..probe_message(ROWS + 1)
+    };
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+        kind: "chat".into(),
+        chat: backend::ChatDelta {
+            kind: "posted".into(),
+            channel_id: "channel-0".into(),
+            seq: canonical.seq,
+            message: canonical,
+            ..backend::ChatDelta::default()
+        },
+        ..backend::LiveUpdate::default()
+    }));
+
+    let confirmed = app
+        .messages
+        .iter()
+        .find(|message| message.id == OPERATION_ID)
+        .expect("the canonical row replaces its optimistic row");
+    assert_eq!(confirmed.view_key, pending_view_key);
+    assert!(!confirmed.pending);
+
+    let (_, confirmed_frame) = drawn_frame(&mut app, console, &mut renderer, cache);
+    assert_ne!(
+        pending_frame, confirmed_frame,
+        "the pending dot must disappear when the row becomes canonical"
+    );
+}
+
 /// THE STALENESS GUARD. Under the keyed lazy a quiet row repaints ONLY when
 /// (seq, render_rev) moves, so a mutation path that misses its `render_rev`
 /// bump is not a perf regression but a WRONG FRAME — the reader keeps looking
@@ -830,7 +896,7 @@ fn probe_row_repaint() {
     );
 
     // A reaction lands on the BOTTOM row — visible under `anchor-y=end`, and
-    // in the quiet arm (nothing selected, nothing flashing), so the repaint
+    // in the quiet arm (nothing selected), so the repaint
     // must come through the keyed lazy's (seq, render_rev) move.
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
         kind: "chat".into(),
@@ -948,10 +1014,10 @@ fn probe() {
 
         // Leaving chat unmounts the stream (parking every lazy row) and
         // trims the scrollback; coming back is the cold return.
-        let _ = app.__update(__DucktapeMessage::SelectShellTab("pages".into()));
+        let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Pages));
         let ui = UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer);
         cache = ui.into_cache();
-        let _ = app.__update(__DucktapeMessage::SelectShellTab("chat".into()));
+        let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Chat));
         cache = screen_switch
             .sample(|| UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer))
             .into_cache();

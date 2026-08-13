@@ -10,7 +10,7 @@ extern crate::call
   CallEvent(kind:str, message:str, peer:str, muted:bool, camera_on:bool, sharing:bool)
   stream call_session(rpc:str, channel_id:str) -> CallEvent
   sync call_set_muted(muted:bool) -> bool
-  sync call_recipients(nodes:[str]) -> bool
+  task call_recipients(nodes:[str]) -> unit
   pure call_status_after(current:str, event:CallEvent) -> str
   pure apply_call_peer(peers:[CallEvent], event:CallEvent) -> [CallEvent]
   HuddleTileRow(person:HuddleParticipant, muted:bool)

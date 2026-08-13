@@ -55,6 +55,10 @@ pub struct ChatMember {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChatMessage {
     pub id: String,
+    /// Numeric identity for Ice's keyed virtual timeline. The language cannot
+    /// key this column by the string message ID, so merges carry this value
+    /// forward when a row with the same ID is replaced.
+    pub view_key: i64,
     pub seq: i64,
     pub author: String,
     pub meta: String,
@@ -98,6 +102,7 @@ impl std::hash::Hash for ChatMessage {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         let Self {
             id,
+            view_key: _,
             seq,
             author,
             meta,
@@ -141,6 +146,7 @@ impl Default for ChatMessage {
     fn default() -> Self {
         Self {
             id: String::new(),
+            view_key: 0,
             seq: 0,
             author: String::new(),
             meta: String::new(),
@@ -181,6 +187,16 @@ impl ChatMessage {
     fn bump_render_rev(&mut self) {
         self.render_rev = self.render_rev.wrapping_add(1);
     }
+}
+
+fn next_message_view_key() -> i64 {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    static NEXT: AtomicI64 = AtomicI64::new(1);
+    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |key| {
+        key.checked_add(1)
+    })
+    .expect("a process cannot render more than i64::MAX rows")
 }
 
 /// One rendered block of a message body. `kind` is `paragraph` | `code` |
@@ -566,26 +582,29 @@ pub fn apply_chat_members(
     members
 }
 
-/// A committed root row lands: settle the matching pending row in place, or
-/// append in seq order. Skips replies (the timeline is roots-only) and rows
-/// already present.
+/// A committed root row lands: remove its matching pending placeholder, then
+/// insert it in canonical seq order while preserving the placeholder's stable
+/// virtual key. Skips replies (the timeline is roots-only) and duplicate rows.
 fn insert_committed_root(mut messages: Vec<ChatMessage>, row: ChatMessage) -> Vec<ChatMessage> {
     if row.thread_seq > 0 {
         return messages;
     }
-    if let Some(pending) = messages
-        .iter_mut()
+    let pending_key = messages
+        .iter()
         .find(|message| message.pending && message.id == row.id)
-    {
-        *pending = row;
-        mark_message_groups(&mut messages);
-        return messages;
+        .map(|message| message.view_key);
+    if pending_key.is_some() {
+        messages.retain(|message| !message.pending || message.id != row.id);
     }
     let already_present = messages
         .iter()
         .any(|message| !message.pending && message.seq == row.seq);
     if already_present {
         return messages;
+    }
+    let mut row = row;
+    if let Some(view_key) = pending_key {
+        row.view_key = view_key;
     }
     // committed rows stay seq-sorted; pending rows tail the list.
     let insert_at = messages
@@ -719,9 +738,9 @@ pub fn optimistic_reaction(
     apply_reaction(messages, &delta)
 }
 
-/// True when this delta settles one of OUR optimistic rows — the pop edge of
-/// the timeline's transient ✓. Read BEFORE the delta is folded in: the match
-/// is the pending row the canonical row is about to replace.
+/// True when this delta settles one of OUR optimistic rows. Read BEFORE the
+/// delta is folded in: the match is the pending row the canonical row is about
+/// to replace.
 ///
 /// Borrowed, not owned: this is no longer an Ice extern (the app calls it
 /// through the fused `chat_settle`, which owns its arguments once), so nothing
@@ -777,24 +796,22 @@ pub fn optimistic_message(
         Some(handle) => (author_display(handle, current_user), avatar_initial(handle)),
         None => ("you".into(), "•".into()),
     };
-    // EVERY PENDING ROW GETS ITS OWN SEQ, descending below zero. The timeline
-    // is a keyed virtual column now (`by=message.seq`), so a shared sentinel is
-    // a shared row identity: two sends in flight at once would collide on one
-    // key and share one row's widget state and measured height. Nothing reads a
-    // pending seq numerically — `oldest_committed` skips pending rows entirely,
-    // `first_unread_seq` needs `seq > boundary > 0`, and `prepend_history` and
-    // `merge_message_send_result` both partition pending out before sorting —
-    // so the only thing this number has to be is unique and below every
-    // committed seq.
-    let lowest_seq = messages
+    // Pending sequences remain descending negatives for the existing numeric
+    // guards and ordering. Each concurrent placeholder must be unique inside
+    // the keyed virtual timeline.
+    let next_pending_seq = messages
         .iter()
         .map(|message| message.seq)
         .min()
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .min(0)
+        .saturating_sub(1);
+    let view_key = next_message_view_key();
     messages.push(
         ChatMessage {
             id: message_id,
-            seq: lowest_seq.min(0) - 1,
+            view_key,
+            seq: next_pending_seq,
             author,
             meta: "Sending…".into(),
             body,
@@ -823,31 +840,33 @@ pub fn merge_pending_messages(
     current: Vec<ChatMessage>,
     current_channel: String,
     next_channel: String,
-    settled_id: String,
 ) -> Vec<ChatMessage> {
     if current_channel != next_channel {
         return canonical;
     }
+    retain_client_row_identity(&mut canonical, &current);
     let canonical_ids = canonical
         .iter()
         .map(|message| message.id.clone())
         .collect::<BTreeSet<_>>();
-    canonical.extend(current.into_iter().filter(|message| {
-        message.pending && message.id != settled_id && !canonical_ids.contains(&message.id)
-    }));
+    canonical.extend(
+        current
+            .into_iter()
+            .filter(|message| message.pending && !canonical_ids.contains(&message.id)),
+    );
     canonical
 }
 
 pub fn merge_message_send_result(
-    canonical: Vec<ChatMessage>,
+    mut canonical: Vec<ChatMessage>,
     current: Vec<ChatMessage>,
     current_channel: String,
     next_channel: String,
-    settled_id: String,
 ) -> Vec<ChatMessage> {
     if current_channel != next_channel {
         return canonical;
     }
+    retain_client_row_identity(&mut canonical, &current);
     let canonical_ids = canonical
         .iter()
         .map(|message| message.id.clone())
@@ -866,10 +885,25 @@ pub fn merge_message_send_result(
         }
     }
     let mut merged = committed.into_values().collect::<Vec<_>>();
-    merged.extend(current.into_iter().filter(|message| {
-        message.pending && message.id != settled_id && !canonical_ids.contains(&message.id)
-    }));
+    merged.extend(
+        current
+            .into_iter()
+            .filter(|message| message.pending && !canonical_ids.contains(&message.id)),
+    );
     merged
+}
+
+fn retain_client_row_identity(canonical: &mut [ChatMessage], current: &[ChatMessage]) {
+    let current_by_id = current
+        .iter()
+        .map(|message| (message.id.as_str(), message.view_key))
+        .collect::<BTreeMap<_, _>>();
+    for message in canonical {
+        let Some(view_key) = current_by_id.get(message.id.as_str()) else {
+            continue;
+        };
+        message.view_key = *view_key;
+    }
 }
 
 pub fn rollback_pending_message(
@@ -890,18 +924,11 @@ pub fn contains_pending_message(messages: Vec<ChatMessage>, pending_id: String) 
 }
 
 pub fn append_thread_page(messages: Vec<ChatMessage>, next: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    merge_message_send_result(next, messages, String::new(), String::new(), String::new())
+    merge_message_send_result(next, messages, String::new(), String::new())
 }
 
 pub fn merge_thread_reply(messages: Vec<ChatMessage>, reply: ChatMessage) -> Vec<ChatMessage> {
-    let settled_id = reply.id.clone();
-    merge_message_send_result(
-        vec![reply],
-        messages,
-        String::new(),
-        String::new(),
-        settled_id,
-    )
+    merge_message_send_result(vec![reply], messages, String::new(), String::new())
 }
 
 pub fn thread_offset_after_reply(offset: i64, has_more: bool, committed: bool) -> i64 {
@@ -928,8 +955,10 @@ pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>) -> ChatMessage {
     } else {
         blocks_view(&row.blocks)
     };
+    let view_key = next_message_view_key();
     ChatMessage {
         id: row.message_id,
+        view_key,
         seq: number_i64(row.seq),
         author: author_display(&row.author, current_user),
         meta,

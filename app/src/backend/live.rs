@@ -392,7 +392,6 @@ pub struct LiveRefresh {
     pub active_channel_name: String,
     pub active_channel_archived: bool,
     pub active_channel_members_only: bool,
-    pub active_channel_huddle_count: i64,
     pub huddle_roster: Vec<HuddleParticipant>,
     pub channel_members: Vec<ChatMember>,
     pub pages_loaded: bool,
@@ -438,7 +437,6 @@ pub async fn live_resync_load(
             active_channel_name: String::new(),
             active_channel_archived: false,
             active_channel_members_only: false,
-            active_channel_huddle_count: 0,
             huddle_roster: Vec::new(),
             channel_members: Vec::new(),
             pages_loaded: false,
@@ -486,7 +484,6 @@ pub async fn live_resync_load(
             refresh.active_channel_name = chat.active_channel_name;
             refresh.active_channel_archived = chat.active_channel_archived;
             refresh.active_channel_members_only = chat.active_channel_members_only;
-            refresh.active_channel_huddle_count = chat.active_channel_huddle_count;
             refresh.huddle_roster = chat.huddle_roster;
             refresh.channel_members = chat.channel_members;
         }
@@ -624,10 +621,9 @@ pub fn resynced_messages(
     };
     let splice_is_continuous = !history_view && pages_overlap;
     if !splice_is_continuous {
-        return merge_pending_messages(next, current, current_channel, next_channel, String::new());
+        return merge_pending_messages(next, current, current_channel, next_channel);
     }
-    let mut merged =
-        merge_message_send_result(next, current, current_channel, next_channel, String::new());
+    let mut merged = merge_message_send_result(next, current, current_channel, next_channel);
     mark_message_groups(&mut merged);
     merged
 }
@@ -665,12 +661,6 @@ pub fn keep_participants(
     next: Vec<HuddleParticipant>,
     current: Vec<HuddleParticipant>,
 ) -> Vec<HuddleParticipant> {
-    if loaded { next } else { current }
-}
-
-/// The peers table's own keep: a pushed overview frame answers ONE of the two
-/// snapshot topics, so the half it did not carry must survive it.
-pub fn keep_peers(loaded: bool, next: Vec<PeerRow>, current: Vec<PeerRow>) -> Vec<PeerRow> {
     if loaded { next } else { current }
 }
 
@@ -862,6 +852,14 @@ pub fn keep_str(loaded: bool, next: String, current: String) -> String {
     if loaded { next } else { current }
 }
 
+pub fn keep_forge_phase(
+    loaded: bool,
+    next: crate::ForgePhase,
+    current: crate::ForgePhase,
+) -> crate::ForgePhase {
+    if loaded { next } else { current }
+}
+
 pub fn keep_bool(loaded: bool, next: bool, current: bool) -> bool {
     if loaded { next } else { current }
 }
@@ -998,7 +996,6 @@ fn landed_on_channel(
     data.active_channel_name = name;
     data.active_channel_archived = false;
     data.active_channel_members_only = members_only;
-    data.active_channel_huddle_count = 0;
     data.huddle_roster = Vec::new();
     data.channel_members = members;
     data.messages = Vec::new();
@@ -1085,7 +1082,6 @@ pub struct DmPeersData {
 /// key, so a multi-device account is reachable only at that key. Pair-wide DMs
 /// need account-keyed membership in the chat module itself.
 pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, HydrationError> {
-    offscreen_guard(generation)?;
     async {
         let client = rpc_client(&rpc)?;
         let me = local_user_key().await.map(|key| hex_encode(&key));

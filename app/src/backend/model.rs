@@ -1,5 +1,29 @@
 use super::*;
 
+/// A selected loader call. Ice task-flow transforms may read only their input,
+/// so the optional carries every argument the chosen effect needs.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct LoadRequest {
+    pub rpc: String,
+    pub key: String,
+    pub generation: i64,
+}
+
+/// Select a loader without launching an offscreen refusal. `try` turns
+/// `None` into `Task::none`, leaving any unrelated in-flight lane untouched.
+pub fn load_request(
+    condition: bool,
+    rpc: String,
+    key: String,
+    generation: i64,
+) -> Option<LoadRequest> {
+    condition.then_some(LoadRequest {
+        rpc,
+        key,
+        generation,
+    })
+}
+
 pub fn fresh_operation_id(prefix: String) -> String {
     fresh_id(&prefix)
 }
@@ -41,14 +65,6 @@ pub fn merge_pending_blocks(
     }
     merged.extend(pending_by_anchor.into_values().flatten());
     merged
-}
-
-pub fn rollback_blocks(mut blocks: Vec<PageBlock>, keep_pending: bool) -> Vec<PageBlock> {
-    if keep_pending {
-        return blocks;
-    }
-    blocks.retain(|block| !block.pending);
-    blocks
 }
 
 pub fn append_page_comment_threads(
@@ -107,33 +123,76 @@ pub fn retain_for_endpoint(value: String, current: String, next: String) -> Stri
     }
 }
 
-pub fn mutation_failure_phase(committed: bool) -> String {
-    if committed { "recovering" } else { "idle" }.into()
+pub fn mutation_failure_phase(committed: bool) -> crate::MutationPhase {
+    if committed {
+        crate::MutationPhase::Recovering
+    } else {
+        crate::MutationPhase::Idle
+    }
 }
 
-fn committed_message_change(phase: &str, committed: bool) -> bool {
-    committed && matches!(phase, "message-edit" | "message-delete")
+pub fn mutation_phase_after_recovery(current: crate::MutationPhase) -> crate::MutationPhase {
+    if current == crate::MutationPhase::Recovering {
+        crate::MutationPhase::Idle
+    } else {
+        current
+    }
 }
 
-pub fn message_seq_after_failure(current: i64, phase: String, committed: bool) -> i64 {
-    if committed_message_change(&phase, committed) {
+fn committed_message_change(phase: crate::MutationPhase, committed: bool) -> bool {
+    if !committed {
+        return false;
+    }
+    match phase {
+        crate::MutationPhase::MessageDelete | crate::MutationPhase::MessageEdit => true,
+        crate::MutationPhase::Idle
+        | crate::MutationPhase::Recovering
+        | crate::MutationPhase::BlockComment
+        | crate::MutationPhase::Channel
+        | crate::MutationPhase::ChannelArchive
+        | crate::MutationPhase::ChannelMember
+        | crate::MutationPhase::ChannelRename
+        | crate::MutationPhase::ChannelUnarchive
+        | crate::MutationPhase::CommentResolve
+        | crate::MutationPhase::ForgetWorkspace
+        | crate::MutationPhase::Huddle
+        | crate::MutationPhase::Onboarding
+        | crate::MutationPhase::Page
+        | crate::MutationPhase::PageDelete => false,
+    }
+}
+
+pub fn message_seq_after_failure(
+    current: i64,
+    phase: crate::MutationPhase,
+    committed: bool,
+) -> i64 {
+    if committed_message_change(phase, committed) {
         0
     } else {
         current
     }
 }
 
-pub fn message_text_after_failure(current: String, phase: String, committed: bool) -> String {
-    if committed_message_change(&phase, committed) {
+pub fn message_text_after_failure(
+    current: String,
+    phase: crate::MutationPhase,
+    committed: bool,
+) -> String {
+    if committed_message_change(phase, committed) {
         String::new()
     } else {
         current
     }
 }
 
-pub fn message_action_after_failure(current: String, phase: String, committed: bool) -> String {
-    if committed_message_change(&phase, committed) {
-        "toolbar".into()
+pub fn message_action_after_failure(
+    current: crate::MessageAction,
+    phase: crate::MutationPhase,
+    committed: bool,
+) -> crate::MessageAction {
+    if committed_message_change(phase, committed) {
+        crate::MessageAction::Toolbar
     } else {
         current
     }
@@ -454,13 +513,6 @@ pub fn channel_flag_members_only(
         .iter()
         .find(|row| row.id == channel)
         .map_or(current, |row| row.members_only)
-}
-
-pub fn channel_live_huddle_count(channels: Vec<ChatChannel>, channel: String, current: i64) -> i64 {
-    channels
-        .iter()
-        .find(|row| row.id == channel)
-        .map_or(current, |row| row.huddle_count)
 }
 
 /// Advance the open thread's next-reply offset when a reply delta for THAT

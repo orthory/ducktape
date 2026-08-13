@@ -27,49 +27,28 @@ pub struct KindCount {
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct PaletteSearchData {
-    pub generation: i64,
     pub chat_hits: Vec<ChatSearchHit>,
     pub page_hits: Vec<PageSearchHit>,
 }
 
-/// The ticket the palette's keystroke lane supersedes itself with. The
-/// handler's generation guard already discards a stale REPLY; this is what
-/// stops the superseded REQUEST from ever reaching the node.
-static PALETTE_TICKET: AtomicU64 = AtomicU64::new(0);
-
 /// The command palette's per-keystroke search: one debounced call covering
 /// chat and pages together. Typing a word used to issue two RPC round trips
-/// per keystroke with nothing coalescing them.
-pub async fn palette_search(
-    rpc: String,
-    text: String,
-    generation: i64,
-) -> Result<PaletteSearchData, HydrationError> {
-    let ticket = PALETTE_TICKET.fetch_add(1, Ordering::SeqCst) + 1;
+/// per keystroke. The Ice `replace` lane owns cancellation and stale delivery;
+/// dropping a superseded task during this sleep prevents its RPCs from firing.
+pub async fn palette_search(rpc: String, text: String) -> Result<PaletteSearchData, AppError> {
     tokio::time::sleep(Duration::from_millis(250)).await;
-    let superseded = PALETTE_TICKET.load(Ordering::SeqCst) != ticket;
-    if superseded {
-        // A newer keystroke owns the palette; this reply's stale generation
-        // makes the handler drop it unread.
-        return Ok(PaletteSearchData {
-            generation: -1,
-            chat_hits: Vec::new(),
-            page_hits: Vec::new(),
-        });
-    }
     let (chat, pages) = tokio::join!(
-        search_chat(rpc.clone(), String::new(), text.clone(), generation),
-        search_pages(rpc, String::new(), text, generation)
+        search_chat(rpc.clone(), String::new(), text.clone()),
+        search_pages(rpc, String::new(), text)
     );
     let both_failed = chat.is_err() && pages.is_err();
     if both_failed {
-        return Err(HydrationError {
-            generation,
+        return Err(AppError {
             message: "Search did not reach the node. Retry in a moment.".into(),
+            committed: false,
         });
     }
     Ok(PaletteSearchData {
-        generation,
         chat_hits: chat.map(|data| data.hits).unwrap_or_default(),
         page_hits: pages.map(|data| data.hits).unwrap_or_default(),
     })
@@ -77,7 +56,6 @@ pub async fn palette_search(
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ExplorerResults {
-    pub generation: i64,
     pub hits: Vec<ExplorerHit>,
     /// One chip per source that ANSWERED. A source that refused or timed out
     /// keeps no chip — see `partial`.
@@ -90,19 +68,14 @@ pub struct ExplorerResults {
 
 /// Search the whole workspace: chat, pages, the forge trackers, duckfs paths,
 /// tasks and agent runs.
-pub async fn search_workspace(
-    rpc: String,
-    text: String,
-    generation: i64,
-) -> Result<ExplorerResults, HydrationError> {
+pub async fn search_workspace(rpc: String, text: String) -> ExplorerResults {
     let needle = text.trim().to_lowercase();
     if needle.is_empty() {
-        return Ok(ExplorerResults {
-            generation,
+        return ExplorerResults {
             hits: Vec::new(),
             kinds: Vec::new(),
             partial: String::new(),
-        });
+        };
     }
     // SIX INDEPENDENT SOURCES, ONE WAIT. They were awaited one after another, so
     // a search cost their SUM. Nothing here reads anything another leg produces,
@@ -123,12 +96,12 @@ pub async fn search_workspace(
     //
     // The extend order below is the ORDER ON SCREEN.
     let (chat, pages, forge, files, tasks, runs) = tokio::join!(
-        search_chat(rpc.clone(), String::new(), text.clone(), generation),
-        search_pages(rpc.clone(), String::new(), text.clone(), generation),
+        search_chat(rpc.clone(), String::new(), text.clone()),
+        search_pages(rpc.clone(), String::new(), text.clone()),
         search_forge_items(&rpc, &needle),
         search_files(&rpc, text.trim()),
         search_tasks(&rpc, &needle),
-        load_agent_runs(rpc.clone(), String::new(), generation),
+        load_agent_runs(rpc.clone()),
     );
     // A SOURCE THAT DID NOT ANSWER IS NOT A SOURCE WITH NOTHING TO SAY. Every
     // leg fails silently — `if let Ok(..)` on two, an empty vector on the rest —
@@ -192,8 +165,7 @@ pub async fn search_workspace(
     match runs {
         Err(_) => silent.push("Runs"),
         Ok(runs) => hits.extend(
-            runs.runs
-                .into_iter()
+            runs.into_iter()
                 .filter(|run| {
                     run.run_id.to_lowercase().contains(&needle)
                         || run.agent_id.to_lowercase().contains(&needle)
@@ -239,12 +211,11 @@ pub async fn search_workspace(
             silent.join(", ")
         ),
     };
-    Ok(ExplorerResults {
-        generation,
+    ExplorerResults {
         hits,
         kinds,
         partial,
-    })
+    }
 }
 
 /// The duckfs half of the workspace search: `GET /v1/files/grep`, the node's

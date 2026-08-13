@@ -1,44 +1,39 @@
 // NO `chat_search_phase` TERM, for the same reason the field no longer disables
 // on it: a refined query pressed while the first one is still out must run, not be
-// swallowed. `chat_search_loaded`/`chat_search_failed` both guard on
-// `chat_search_generation`, which this bumps, so the superseded reply is what
-// gets dropped — the last Enter wins, exactly as the last click does.
+// swallowed. The `chat_search` replace lane drops superseded replies, so the
+// last Enter wins exactly as the last click does.
 on search_chat_submit
   return if empty(trim(chat_search_draft))
-  chat_search_generation = chat_search_generation + 1
-  chat_search_phase = "searching"
+  chat_search_phase = SearchPhase.searching
   chat_search_hits = []
   error = ""
-  run replace lane=chat_search search_chat(connected_rpc, "", trim(chat_search_draft), chat_search_generation) -> chat_search_loaded _ | chat_search_failed _
+  run replace lane=chat_search search_chat(connected_rpc, "", trim(chat_search_draft)) -> chat_search_loaded _ | chat_search_failed _
 
 on chat_search_loaded(next)
-  return if next.generation != chat_search_generation
   chat_search_hits = next.hits
-  chat_search_phase = "done"
+  chat_search_phase = SearchPhase.done
   error = ""
 
 on chat_search_failed(cause)
-  return if cause.generation != chat_search_generation
   // BACK TO "idle", NOT "done". `search_chat_submit` already emptied the hits,
   // so a phase that stayed non-idle here floats "No messages match" over a
   // search that never ran — a confident zero-result card beside the error
   // banner that says the opposite.
-  chat_search_phase = "idle"
+  chat_search_phase = SearchPhase.idle
   error = cause.message
 
 on clear_chat_search
   invalidate lane=chat_search
-  chat_search_generation = chat_search_generation + 1
   chat_search_draft = ""
   chat_search_hits = []
-  chat_search_phase = "idle"
+  chat_search_phase = SearchPhase.idle
 
 on open_chat_search_hit(channel_id, root_seq, target_seq)
   // NO `loading` TERM. A hit clicked while another room is still loading used
   // to be discarded outright — see `choose_channel`. The load this launches
   // carries `chat_generation`, so the one it supersedes is dropped on arrival
   // instead of this click being dropped on the way out.
-  return if mutation_phase != "idle"
+  return if mutation_phase != MutationPhase.idle
   invalidate lane=chat_search
   invalidate lane=history
   invalidate lane=thread
@@ -83,11 +78,9 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   has_older_history = false
   unread_marker_seq = 0
   palette_open = false
-  shell_tab = "chat"
+  shell_tab = ShellTab.chat
   invalidate lane=forge_code
-  forge_code_generation = forge_code_generation + 1
-  chat_search_generation = chat_search_generation + 1
-  chat_search_phase = "idle"
+  chat_search_phase = SearchPhase.idle
   // Same abandoned request, same dead button — see `choose_channel`. This route
   // lands in a DIFFERENT channel via `chat_hit_loaded`, so the page still in
   // flight belongs to the room she jumped out of.
@@ -100,7 +93,7 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   chat_search_hits = []
   selected_message_seq = 0
   selected_message_rev = 0
-  message_action = "toolbar"
+  message_action = MessageAction.toolbar
   message_edit_draft = ""
   channel_settings_open = false
   channel_name_draft = ""
@@ -111,17 +104,15 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   thread_next_reply_offset = 0
   thread_has_more = false
   thread_generation = thread_generation + 1
-  live_thread_generation = live_thread_generation + 1
+  invalidate lane=live_thread
   thread_loading = false
-  reply_draft = ""
   reply_editor = editor("")
-  pending_reply = ""
   // AND THE MESSAGE COMPOSER COMES OFF ITS OWN PARK — the line that made this
   // comment true. It said "both composers are rebuilt" while only the rail's
   // was, so the stream's draft walked into the hit's room armed to send there.
   message_editor = editor(parked_message_draft(message_drafts, active_channel))
   // Both composers are rebuilt under the caret and the tab moved besides.
-  composer_focus = "none"
+  composer_focus = ComposerFocus.unfocused
   error = ""
   chat_generation = chat_generation + 1
   // Reads the room back from state, like `choose_dm` does: `active_channel =
@@ -132,15 +123,15 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
 // true for the entire switch it starts — so the second click of a fast A→B→C
 // was discarded with no sidebar move, no header change and no busy affordance
 // anywhere, and the reader clicked again into the same void. The click is taken
-// unconditionally now and the SUPERSEDED LOAD is what gets dropped, on
-// `chat_generation` — the guard `thread_loaded`, `history_loaded` and
-// `chat_search_loaded` have always used.
+// unconditionally now and the superseded room load is rejected by
+// `chat_generation`; thread, history, and search reads have their own compiler
+// delivery lanes.
 //
 // `mutation_phase` stays: it is a mutation lock, not a load, and
 // `channel_created` lands the reader in the room it just made. The sidebar rows
 // disable on exactly that term, so the guard and the affordance agree.
 on choose_channel(id)
-  return if mutation_phase != "idle"
+  return if mutation_phase != MutationPhase.idle
   invalidate lane=chat_search
   invalidate lane=history
   invalidate lane=thread
@@ -196,8 +187,7 @@ on choose_channel(id)
   // routes read it: the switch handlers stay unswallowed.
   chat_window_loading = true
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
-  chat_search_generation = chat_search_generation + 1
-  chat_search_phase = "idle"
+  chat_search_phase = SearchPhase.idle
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   // A CACHE HIT IS NOT LOADING. The plate is `loading && empty(messages)`, so
@@ -208,7 +198,7 @@ on choose_channel(id)
   chat_search_hits = []
   selected_message_seq = 0
   selected_message_rev = 0
-  message_action = "toolbar"
+  message_action = MessageAction.toolbar
   message_edit_draft = ""
   channel_settings_open = false
   channel_name_draft = ""
@@ -219,16 +209,14 @@ on choose_channel(id)
   thread_next_reply_offset = 0
   thread_has_more = false
   thread_generation = thread_generation + 1
-  live_thread_generation = live_thread_generation + 1
+  invalidate lane=live_thread
   thread_loading = false
-  reply_draft = ""
   reply_editor = editor("")
-  pending_reply = ""
   // A NEW ROOM'S COMPOSER IS THAT ROOM'S COMPOSER. Its own parked words, or an
   // empty box — never the ones she was writing next door.
   message_editor = editor(parked_message_draft(message_drafts, active_channel))
   // A new room's composer is a new box: the caret does not come with it.
-  composer_focus = "none"
+  composer_focus = ComposerFocus.unfocused
   error = ""
   chat_generation = chat_generation + 1
   // THE CHANNEL LIST GOES DOWN, IT DOES NOT COME BACK. `load_chat_data`
@@ -255,7 +243,7 @@ on choose_channel(id)
 // downstream of `chat_updated` is the ordinary channel path.
 on choose_dm(peer_key)
   // Same last-click-wins rule as `choose_channel`, and the same reason.
-  return if mutation_phase != "idle" || empty(peer_key)
+  return if mutation_phase != MutationPhase.idle || empty(peer_key)
   invalidate lane=chat_search
   invalidate lane=history
   invalidate lane=thread
@@ -311,8 +299,7 @@ on choose_dm(peer_key)
   history_loading = false
   // Same window still out — see `chat_window_loading`.
   chat_window_loading = true
-  chat_search_generation = chat_search_generation + 1
-  chat_search_phase = "idle"
+  chat_search_phase = SearchPhase.idle
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   // A CACHE HIT IS NOT LOADING — see `choose_channel`.
@@ -320,7 +307,7 @@ on choose_dm(peer_key)
   chat_search_hits = []
   selected_message_seq = 0
   selected_message_rev = 0
-  message_action = "toolbar"
+  message_action = MessageAction.toolbar
   message_edit_draft = ""
   channel_settings_open = false
   channel_name_draft = ""
@@ -331,16 +318,14 @@ on choose_dm(peer_key)
   thread_next_reply_offset = 0
   thread_has_more = false
   thread_generation = thread_generation + 1
-  live_thread_generation = live_thread_generation + 1
+  invalidate lane=live_thread
   thread_loading = false
-  reply_draft = ""
   reply_editor = editor("")
-  pending_reply = ""
   // Same per-room composer as `choose_channel`. A DM is an ordinary channel and
   // its draft parks under `dm_room` like any other.
   message_editor = editor(parked_message_draft(message_drafts, active_channel))
   // Same new box as `choose_channel`.
-  composer_focus = "none"
+  composer_focus = ComposerFocus.unfocused
   error = ""
   // Reads the peer back from state: `active_dm_peer = peer_key` above already
   // moved the payload, so passing `peer_key` here would be a use after move.
@@ -358,10 +343,10 @@ on choose_dm(peer_key)
     task widget scroll-to #workspace-tabs/content/chat/message-stream 0.0 0.0
 
 on create_channel_submit
-  return if loading || mutation_phase != "idle" || empty(trim(channel_draft))
+  return if loading || mutation_phase != MutationPhase.idle || empty(trim(channel_draft))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  mutation_phase = "channel"
+  mutation_phase = MutationPhase.channel
   // Creating lands you IN the new channel (`channel_created` moves
   // `active_channel`), so the page in flight for the room you were reading is
   // abandoned here. `mutation_phase` masks the dead button only until the
@@ -393,7 +378,7 @@ on toggle_channel_create
   // composer, which stays mounted underneath. The press that got here was on
   // the New-channel button, and the next one goes into the modal's field — the
   // caret is in no composer either way, opening or cancelling.
-  composer_focus = "none"
+  composer_focus = ComposerFocus.unfocused
 
 on toggle_channel_settings
   return if empty(active_channel)
@@ -403,7 +388,7 @@ on toggle_channel_settings
   // caret retires whether the panel is opening or closing. This handler is on
   // the NAMED list for that reason — it no longer writes `active_thread_seq = 0`
   // and so the rail rule cannot derive it.
-  composer_focus = "none"
+  composer_focus = ComposerFocus.unfocused
   channel_name_draft = active_channel_name
   // AND IT DOES NOT TEAR THE RAIL DOWN. It used to clear the thread, its
   // messages and `reply_editor` — so opening this drawer DISCARDED a reply you
@@ -420,42 +405,42 @@ on toggle_channel_settings
   // letting a transition eat it.
 
 on rename_channel_submit
-  return if loading || mutation_phase != "idle" || empty(active_channel) || empty(trim(channel_name_draft))
+  return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || empty(trim(channel_name_draft))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  mutation_phase = "channel-rename"
+  mutation_phase = MutationPhase.channel_rename
   error = ""
   run every rename_channel(connected_rpc, password, active_channel, trim(channel_name_draft)) -> chat_acked _ | mutation_failed _
 
 on archive_channel_submit
-  return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived
+  return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || active_channel_archived
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  mutation_phase = "channel-archive"
+  mutation_phase = MutationPhase.channel_archive
   error = ""
   run every archive_channel(connected_rpc, password, active_channel) -> chat_acked _ | mutation_failed _
 
 on unarchive_channel_submit
-  return if loading || mutation_phase != "idle" || empty(active_channel) || !active_channel_archived
+  return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || !active_channel_archived
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  mutation_phase = "channel-unarchive"
+  mutation_phase = MutationPhase.channel_unarchive
   error = ""
   run every unarchive_channel(connected_rpc, password, active_channel) -> chat_acked _ | mutation_failed _
 
 on add_channel_member_submit
-  return if loading || mutation_phase != "idle" || empty(active_channel) || empty(trim(member_key_draft))
+  return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || empty(trim(member_key_draft))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  mutation_phase = "channel-member"
+  mutation_phase = MutationPhase.channel_member
   error = ""
   run every add_channel_member(connected_rpc, password, active_channel, trim(member_key_draft)) -> chat_acked _ | mutation_failed _
 
 on remove_channel_member_submit(key)
-  return if loading || mutation_phase != "idle" || empty(active_channel)
+  return if loading || mutation_phase != MutationPhase.idle || empty(active_channel)
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  mutation_phase = "channel-member"
+  mutation_phase = MutationPhase.channel_member
   error = ""
   run every remove_channel_member(connected_rpc, password, active_channel, key) -> chat_acked _ | mutation_failed _
 
@@ -470,10 +455,10 @@ on remove_channel_member_submit(key)
 // in some OTHER channel. So the docked titlebar pill and the "live elsewhere"
 // affordance stay dark rather than guess (see the report).
 on join_huddle_submit
-  return if loading || mutation_phase != "idle" || empty(active_channel) || active_channel_archived
+  return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || active_channel_archived
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  mutation_phase = "huddle"
+  mutation_phase = MutationPhase.huddle
   error = ""
   run every join_huddle(connected_rpc, password, active_channel) -> chat_acked _ | mutation_failed _
 
@@ -508,10 +493,10 @@ on chat_composer_event(event)
   // one of these two handlers, so they are the only two things that may say
   // the caret is in a composer; the chord arrives on the app's ONE keyboard
   // subscription, which cannot see widget focus. A claim lasts until a handler
-  // that moves the caret RETIRES it (grep `composer_focus = "none"`), because
+  // that moves the caret RETIRES it (grep `composer_focus = ComposerFocus.unfocused`), because
   // the editor widget drops its own focus on any press landing outside it and
   // publishes nothing when it does.
-  composer_focus = "message"
+  composer_focus = ComposerFocus.message
   message_editor = apply_composer_event(message_editor, event)
   return if !composer_submits(event)
   // Same apply-time re-read as `reply_composer_event` below: the composer's
@@ -521,8 +506,8 @@ on chat_composer_event(event)
   return if loading || !connected || empty(active_channel) || !empty(post_refusal) || empty(trim(editor_text(message_editor)))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  pending_message = trim(editor_text(message_editor))
-  pending_message_id = fresh_operation_id("message")
+  let pending_message = trim(editor_text(message_editor))
+  let pending_message_id = fresh_operation_id("message")
   message_draft = ""
   message_editor = editor("")
   // The mint does not re-mark the runs — the rail mints through the same call
@@ -579,7 +564,7 @@ on chat_updated(next)
   // a peer's post in a third room and the badge it lit, a channel created,
   // renamed or archived — and nothing re-pages the list to heal it.
   channels = upsert_channel_rows(channels, next.channels)
-  messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
+  messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel)
   has_older_history = history_has_older(messages)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
@@ -595,7 +580,6 @@ on chat_updated(next)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
-  active_channel_huddle_count = next.active_channel_huddle_count
   // Am I in it — see `join_huddle_submit` above. Stamp first: it reads the
   // PREVIOUS `huddle_joined`, so a refresh that finds her still in keeps the
   // clock and one that finds her out re-takes it for the next join.
@@ -609,7 +593,7 @@ on chat_updated(next)
   post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   selected_message_seq = next.selected_message_seq
   selected_message_rev = next.selected_message_rev
-  message_action = "toolbar"
+  message_action = MessageAction.toolbar
   message_edit_draft = next.selected_message_body
   active_thread_seq = next.active_thread_seq
   // AND THE THREAD'S OWN COMPOSER COMES WITH IT — see `reply_drafts`. The
@@ -623,7 +607,7 @@ on chat_updated(next)
   thread_next_reply_offset = next.thread_next_reply_offset
   thread_has_more = next.thread_has_more
   thread_generation = thread_generation + 1
-  live_thread_generation = live_thread_generation + 1
+  invalidate lane=live_thread
   thread_loading = false
   loading = false
   // THE WINDOW ON SCREEN IS THE ANSWER NOW, so history may page against its
@@ -648,7 +632,7 @@ on chat_hit_loaded(next)
   history_view = true
   // Same fold as `chat_updated`, same loader, same reason.
   channels = upsert_channel_rows(channels, next.channels)
-  messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
+  messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel)
   has_older_history = history_has_older(messages)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
@@ -673,7 +657,6 @@ on chat_hit_loaded(next)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
-  active_channel_huddle_count = next.active_channel_huddle_count
   // Am I in it — see `join_huddle_submit` above. Stamp first: it reads the
   // PREVIOUS `huddle_joined`, so a refresh that finds her still in keeps the
   // clock and one that finds her out re-takes it for the next join.
@@ -687,7 +670,7 @@ on chat_hit_loaded(next)
   post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   selected_message_seq = next.selected_message_seq
   selected_message_rev = next.selected_message_rev
-  message_action = "toolbar"
+  message_action = MessageAction.toolbar
   message_edit_draft = next.selected_message_body
   active_thread_seq = next.active_thread_seq
   // AND THE THREAD'S OWN COMPOSER COMES WITH IT — see `reply_drafts`. This is
@@ -701,7 +684,7 @@ on chat_hit_loaded(next)
   thread_next_reply_offset = next.thread_next_reply_offset
   thread_has_more = next.thread_has_more
   thread_generation = thread_generation + 1
-  live_thread_generation = live_thread_generation + 1
+  invalidate lane=live_thread
   thread_loading = false
   loading = false
   // THE WINDOW ON SCREEN IS THE ANSWER NOW, so history may page against its
@@ -738,7 +721,7 @@ on channel_created(next)
   pending_channel = ""
   channel_create_open = false
   channel_create_members_only = false
-  mutation_phase = "idle"
+  mutation_phase = MutationPhase.idle
   // Superseded by a later switch — see `chat_updated`. The channel is still
   // created; it arrives in the list on the next fold.
   return if next.generation != chat_generation
@@ -746,7 +729,7 @@ on channel_created(next)
   // `chat_hit_loaded`.
   history_view = false
   channels = next.channels
-  messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
+  messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel)
   has_older_history = history_has_older(messages)
   unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
@@ -771,7 +754,6 @@ on channel_created(next)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
-  active_channel_huddle_count = next.active_channel_huddle_count
   // Am I in it — see `join_huddle_submit` above. Stamp first: it reads the
   // PREVIOUS `huddle_joined`, so a refresh that finds her still in keeps the
   // clock and one that finds her out re-takes it for the next join.
@@ -785,7 +767,7 @@ on channel_created(next)
   post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   selected_message_seq = next.selected_message_seq
   selected_message_rev = next.selected_message_rev
-  message_action = "toolbar"
+  message_action = MessageAction.toolbar
   message_edit_draft = next.selected_message_body
   active_thread_seq = next.active_thread_seq
   // AND THE THREAD'S OWN COMPOSER COMES WITH IT — see `reply_drafts`. A create
@@ -799,7 +781,7 @@ on channel_created(next)
   thread_next_reply_offset = next.thread_next_reply_offset
   thread_has_more = next.thread_has_more
   thread_generation = thread_generation + 1
-  live_thread_generation = live_thread_generation + 1
+  invalidate lane=live_thread
   thread_loading = false
   error = ""
   // Same close-if-ended mirror as `chat_updated` above.
@@ -816,39 +798,19 @@ on chat_acked(_result)
   thread_edit_draft = message_text_after_failure(thread_edit_draft, mutation_phase, true)
   pending_channel = ""
   channel_create_open = false
-  mutation_phase = "idle"
+  mutation_phase = MutationPhase.idle
   error = ""
-// PRESSES, NOT MOVES. The pointer y is read exactly once — when an action
-// menu opens, to anchor its float — so it is captured per left press by
-// `press-at`, which reports through a captured press (the ⋯ button's own
-// press-down lands here first, then its click opens the menu one event
-// later). The old `move=` stream republished on every cursor pixel and
-// rebuilt the whole view each time; hovering a busy channel was a rebuild
-// storm.
-on chat_pointer_pressed(_x, y)
-  chat_pointer_y = y
-
-on chat_resized(_width, height)
-  chat_height = height
-
-on thread_pointer_pressed(_x, y)
-  thread_pointer_y = y
-
-on thread_resized(_width, height)
-  thread_height = height
-
 on open_thread_message_actions(seq, body, rev)
   return if seq <= 0
-  thread_menu_y = block_action_menu_y(thread_pointer_y, thread_height)
   thread_selected_seq = seq
   thread_selected_rev = rev
-  thread_message_action = "more"
+  thread_message_action = MessageAction.more
   thread_edit_draft = body
   // THE MENU TAKES THE CARET — the focus task below is the app moving it by
   // hand, and dismissing the menu does not move it back. Every handler with a
   // `task widget focus` retires the discriminant for exactly this reason;
   // `tests.rs` lints the rule so a ninth one cannot forget it.
-  composer_focus = "none"
+  composer_focus = ComposerFocus.unfocused
   sequential
     task widget focus #workspace-tabs/content/chat/thread-action-focus
     task widget focus-next
@@ -860,12 +822,11 @@ on open_thread_message_reactions(seq, body, rev)
   // hands the standing banner back untouched.
   error = reaction_refusal(active_channel_archived, error)
   return if active_channel_archived
-  thread_menu_y = block_action_menu_y(thread_pointer_y, thread_height)
   thread_selected_seq = seq
   thread_selected_rev = rev
-  thread_message_action = "reactions"
+  thread_message_action = MessageAction.reactions
   thread_edit_draft = body
-  composer_focus = "none"
+  composer_focus = ComposerFocus.unfocused
   sequential
     task widget focus #workspace-tabs/content/chat/thread-reaction-focus
     task widget focus-next
@@ -874,9 +835,9 @@ on arm_thread_message_delete(seq, body, rev)
   return if seq <= 0
   thread_selected_seq = seq
   thread_selected_rev = rev
-  thread_message_action = "delete"
+  thread_message_action = MessageAction.delete
   thread_edit_draft = body
-  composer_focus = "none"
+  composer_focus = ComposerFocus.unfocused
   sequential
     task widget focus #workspace-tabs/content/chat/thread-delete-focus
     task widget focus-next
@@ -885,43 +846,42 @@ on begin_thread_message_edit(seq, body, rev)
   return if seq <= 0
   thread_selected_seq = seq
   thread_selected_rev = rev
-  thread_message_action = "editing"
+  thread_message_action = MessageAction.editing
   thread_edit_draft = body
-  composer_focus = "none"
+  composer_focus = ComposerFocus.unfocused
   task widget focus #workspace-tabs/content/chat/thread-edit
 
 on clear_thread_message_selection
   thread_selected_seq = 0
   thread_selected_rev = 0
-  thread_message_action = "toolbar"
+  thread_message_action = MessageAction.toolbar
   thread_edit_draft = ""
 
 on edit_thread_message_submit
-  return if loading || mutation_phase != "idle" || empty(active_channel) || thread_selected_seq <= 0 || empty(trim(thread_edit_draft))
-  live_thread_generation = live_thread_generation + 1
+  return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || thread_selected_seq <= 0 || empty(trim(thread_edit_draft))
+  invalidate lane=live_thread
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  mutation_phase = "message-edit"
+  mutation_phase = MutationPhase.message_edit
   error = ""
   run every edit_message(connected_rpc, password, active_channel, thread_selected_seq, thread_selected_rev, trim(thread_edit_draft), channel_members) -> chat_acked _ | mutation_failed _
 
 on delete_thread_message_submit
-  return if loading || mutation_phase != "idle" || empty(active_channel) || thread_selected_seq <= 0 || thread_message_action != "delete"
-  live_thread_generation = live_thread_generation + 1
+  return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || thread_selected_seq <= 0 || thread_message_action != MessageAction.delete
+  invalidate lane=live_thread
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  mutation_phase = "message-delete"
+  mutation_phase = MutationPhase.message_delete
   error = ""
   run every delete_message(connected_rpc, password, active_channel, thread_selected_seq) -> chat_acked _ | mutation_failed _
 
 on open_message_actions(seq, body, rev)
   return if seq <= 0
-  message_menu_y = block_action_menu_y(chat_pointer_y, chat_height)
   selected_message_seq = seq
   selected_message_rev = rev
-  message_action = "more"
+  message_action = MessageAction.more
   message_edit_draft = body
-  composer_focus = "none"
+  composer_focus = ComposerFocus.unfocused
   sequential
     task widget focus #workspace-tabs/content/chat/message-action-focus
     task widget focus-next
@@ -934,12 +894,11 @@ on open_message_reactions(seq, body, rev)
   // a failed send is not cleared by the reach for a reaction.
   error = reaction_refusal(active_channel_archived, error)
   return if active_channel_archived
-  message_menu_y = block_action_menu_y(chat_pointer_y, chat_height)
   selected_message_seq = seq
   selected_message_rev = rev
-  message_action = "reactions"
+  message_action = MessageAction.reactions
   message_edit_draft = body
-  composer_focus = "none"
+  composer_focus = ComposerFocus.unfocused
   sequential
     task widget focus #workspace-tabs/content/chat/message-reaction-focus
     task widget focus-next
@@ -948,9 +907,9 @@ on arm_message_delete(seq, body, rev)
   return if seq <= 0
   selected_message_seq = seq
   selected_message_rev = rev
-  message_action = "delete"
+  message_action = MessageAction.delete
   message_edit_draft = body
-  composer_focus = "none"
+  composer_focus = ComposerFocus.unfocused
   sequential
     task widget focus #workspace-tabs/content/chat/message-delete-focus
     task widget focus-next
@@ -959,9 +918,9 @@ on begin_message_edit(seq, body, rev)
   return if seq <= 0
   selected_message_seq = seq
   selected_message_rev = rev
-  message_action = "editing"
+  message_action = MessageAction.editing
   message_edit_draft = body
-  composer_focus = "none"
+  composer_focus = ComposerFocus.unfocused
   task widget focus #workspace-tabs/content/chat/message-edit
 
 // A LINK PRESS IS A HAND-OFF TO THE OS, and nothing else: no selection, no
@@ -984,14 +943,14 @@ on open_thread_for(seq)
   channel_settings_open = false
   selected_message_seq = 0
   selected_message_rev = 0
-  message_action = "toolbar"
+  message_action = MessageAction.toolbar
   message_edit_draft = ""
   thread_selected_seq = 0
   thread_selected_rev = 0
-  thread_message_action = "toolbar"
+  thread_message_action = MessageAction.toolbar
   thread_edit_draft = ""
   thread_generation = thread_generation + 1
-  live_thread_generation = live_thread_generation + 1
+  invalidate lane=live_thread
   thread_loading = true
   active_thread_seq = seq
   thread_target_seq = 0
@@ -1016,21 +975,19 @@ on open_thread_for(seq)
   // left holding, which is the only thread those words can be posted in.
   // `close_thread` stays the one route that discards a reply, because that one
   // is a request to.
-  reply_draft = ""
   reply_editor = editor(parked_reply_draft(reply_drafts, active_channel, active_thread_seq))
-  pending_reply = ""
   // A rail that just opened has an UNTOUCHED reply composer, and the click
   // that opened it was on a message row, not on either editor — so the caret
   // is in NEITHER. Without this the previous thread's "reply" outlives it and
   // steers the first Cmd+B into an empty box.
-  composer_focus = "none"
+  composer_focus = ComposerFocus.unfocused
   error = ""
   run replace lane=thread load_thread(connected_rpc, active_channel, seq, 0, 0, thread_generation) -> thread_loaded _ | thread_failed _
 
 on clear_message_selection
   selected_message_seq = 0
   selected_message_rev = 0
-  message_action = "toolbar"
+  message_action = MessageAction.toolbar
   message_edit_draft = ""
 
 on thread_loaded(next)
@@ -1044,9 +1001,9 @@ on thread_loaded(next)
   error = ""
 
 on load_more_thread
-  return if thread_loading || mutation_phase != "idle" || active_thread_seq <= 0 || thread_next_reply_offset < 0 || !thread_has_more
+  return if thread_loading || mutation_phase != MutationPhase.idle || active_thread_seq <= 0 || thread_next_reply_offset < 0 || !thread_has_more
   thread_generation = thread_generation + 1
-  live_thread_generation = live_thread_generation + 1
+  invalidate lane=live_thread
   thread_loading = true
   error = ""
   run replace lane=thread load_thread_page(connected_rpc, active_channel, active_thread_seq, thread_next_reply_offset, thread_generation) -> thread_page_loaded _ | thread_page_failed _
@@ -1076,11 +1033,10 @@ on thread_page_failed(cause)
 // scroll step, and the extern takes the timeline BY VALUE. The mirror in state
 // is written by every handler that moves `messages` for exactly this reason.
 on chat_scrolled(_absolute_x, _absolute_y, _relative_x, relative_y)
-  return if !near_scroll_top(relative_y) || history_loading || loading || chat_window_loading || mutation_phase != "idle" || empty(active_channel) || !has_older_history
-  history_generation = history_generation + 1
+  return if !near_scroll_top(relative_y) || history_loading || loading || chat_window_loading || mutation_phase != MutationPhase.idle || empty(active_channel) || !has_older_history
   history_loading = true
   error = ""
-  run replace lane=history load_older_messages(connected_rpc, active_channel, oldest_message_seq(messages), history_generation) -> history_loaded _ | history_failed _
+  run replace lane=history load_older_messages(connected_rpc, active_channel, oldest_message_seq(messages)) -> history_loaded _ | history_failed _
 
 // `chat_window_loading` rides with `loading` in BOTH guards, and it is the one
 // term that survived the cache hit: `loading` is false for the whole round trip
@@ -1091,18 +1047,16 @@ on chat_scrolled(_absolute_x, _absolute_y, _relative_x, relative_y)
 // walking backwards past the hole. It gates the two history routes and nothing
 // else: the switch handlers themselves take every click.
 on load_more_history
-  return if history_loading || loading || chat_window_loading || mutation_phase != "idle" || empty(active_channel) || empty(messages) || !history_has_older(messages)
-  history_generation = history_generation + 1
+  return if history_loading || loading || chat_window_loading || mutation_phase != MutationPhase.idle || empty(active_channel) || empty(messages) || !history_has_older(messages)
   history_loading = true
   error = ""
-  run replace lane=history load_older_messages(connected_rpc, active_channel, oldest_message_seq(messages), history_generation) -> history_loaded _ | history_failed _
+  run replace lane=history load_older_messages(connected_rpc, active_channel, oldest_message_seq(messages)) -> history_loaded _ | history_failed _
 
 on history_loaded(next)
-  return if next.generation != history_generation || !history_loading
-  // A page belongs to the channel that asked for it. Only `load_more_history`
-  // bumps `history_generation` — switching channels does not — so the
-  // generation guard alone lets a page still in flight for #a prepend into #b's
-  // timeline. Same channel check `message_sent` makes on its own late arrival.
+  return if !history_loading
+  // A page belongs to the channel that asked for it. The compiler drops a
+  // superseded history run, while this identity check also covers a room move
+  // that starts no replacement page. Same check `message_sent` makes.
   // The flag is released ABOVE that guard: a page dropped for landing in the
   // wrong room must still free the button, or "Load older" stays dead in the
   // room she switched to.
@@ -1114,7 +1068,6 @@ on history_loaded(next)
   error = ""
 
 on history_failed(cause)
-  return if cause.generation != history_generation
   history_loading = false
   error = cause.message
 
@@ -1127,7 +1080,6 @@ on close_thread
   invalidate lane=thread
   invalidate lane=live_thread
   thread_generation = thread_generation + 1
-  live_thread_generation = live_thread_generation + 1
   // CLOSE IS A REQUEST TO DISCARD, and the park has to hear it: an empty park
   // DROPS the entry, so the reply she closed away does not come back the next
   // time she opens that thread. Read while `active_thread_seq` still names it.
@@ -1140,29 +1092,27 @@ on close_thread
   thread_loading = false
   thread_selected_seq = 0
   thread_selected_rev = 0
-  thread_message_action = "toolbar"
+  thread_message_action = MessageAction.toolbar
   thread_edit_draft = ""
-  reply_draft = ""
   reply_editor = editor("")
-  pending_reply = ""
   // The composer the caret may have been in is gone from the tree.
-  composer_focus = "none"
+  composer_focus = ComposerFocus.unfocused
 
 on edit_message_submit
-  return if loading || mutation_phase != "idle" || empty(active_channel) || selected_message_seq <= 0 || empty(trim(message_edit_draft))
-  live_thread_generation = live_thread_generation + 1
+  return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || selected_message_seq <= 0 || empty(trim(message_edit_draft))
+  invalidate lane=live_thread
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  mutation_phase = "message-edit"
+  mutation_phase = MutationPhase.message_edit
   error = ""
   run every edit_message(connected_rpc, password, active_channel, selected_message_seq, selected_message_rev, trim(message_edit_draft), channel_members) -> chat_acked _ | mutation_failed _
 
 on delete_message_submit
-  return if loading || mutation_phase != "idle" || empty(active_channel) || selected_message_seq <= 0 || message_action != "delete"
-  live_thread_generation = live_thread_generation + 1
+  return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || selected_message_seq <= 0 || message_action != MessageAction.delete
+  invalidate lane=live_thread
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  mutation_phase = "message-delete"
+  mutation_phase = MutationPhase.message_delete
   error = ""
   run every delete_message(connected_rpc, password, active_channel, selected_message_seq) -> chat_acked _ | mutation_failed _
 
@@ -1192,7 +1142,7 @@ on add_reaction_submit(emoji)
   return if loading || empty(active_channel) || selected_message_seq <= 0
   error = reaction_refusal(active_channel_archived, error)
   return if active_channel_archived
-  live_thread_generation = live_thread_generation + 1
+  invalidate lane=live_thread
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   error = ""
@@ -1208,7 +1158,7 @@ on add_reaction_at(seq, emoji)
   return if loading || empty(active_channel) || seq <= 0
   error = reaction_refusal(active_channel_archived, error)
   return if active_channel_archived
-  live_thread_generation = live_thread_generation + 1
+  invalidate lane=live_thread
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   error = ""
@@ -1220,22 +1170,13 @@ on remove_reaction_at(seq, emoji)
   return if loading || seq <= 0
   error = reaction_refusal(active_channel_archived, error)
   return if active_channel_archived
-  live_thread_generation = live_thread_generation + 1
+  invalidate lane=live_thread
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   error = ""
   messages = reaction_applied(messages, seq, emoji, false)
   thread_messages = reaction_applied(thread_messages, seq, emoji, false)
   run every remove_reaction(connected_rpc, password, active_channel, seq, emoji) -> reaction_acked _ | reaction_failed _
-
-// The settle-✓'s two-beat teardown. Beat one reads the animation still
-// aimed at visible, keeps its anchor and flips the fade; beat two reads it
-// aimed at hidden and drops the anchor, unmounting the ✓ (the 400ms fade
-// always finishes inside one 1200ms beat).
-on send_flash_tick
-  send_flash_ids = keep_str(animation.value(send_flash), send_flash_ids, "")
-  thread_send_flash_ids = keep_str(animation.value(send_flash), thread_send_flash_ids, "")
-  send_flash = false
 
 // A reaction's ack has nothing to restore: the optimistic fold is already on
 // screen and the settled delta replays over it. Reactions never touch
@@ -1280,16 +1221,15 @@ on reaction_failed(cause)
 // during which a reply is perfectly valid. `thread_loading` is the rail's own
 // readiness, and it is what the button wears.
 on reply_composer_event(event)
-  composer_focus = "reply"
+  composer_focus = ComposerFocus.reply
   reply_editor = apply_composer_event(reply_editor, event)
   return if !composer_submits(event)
   return if thread_loading || !connected || empty(active_channel) || active_thread_seq <= 0 || !empty(post_refusal) || empty(trim(editor_text(reply_editor)))
-  live_thread_generation = live_thread_generation + 1
+  invalidate lane=live_thread
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  pending_reply = trim(editor_text(reply_editor))
-  pending_reply_id = fresh_operation_id("reply")
-  reply_draft = ""
+  let pending_reply = trim(editor_text(reply_editor))
+  let pending_reply_id = fresh_operation_id("reply")
   reply_editor = editor("")
   thread_messages = optimistic_message(thread_messages, pending_reply, pending_reply_id)
   error = ""
@@ -1304,8 +1244,8 @@ on thread_reply_send_failed(cause)
   return if active_channel != cause.scope_id
   return if !contains_pending_message(thread_messages, cause.operation_id)
   thread_messages = rollback_pending_message(thread_messages, cause.operation_id, cause.committed)
-  reply_draft = restore_draft(trim(editor_text(reply_editor)), cause.body, cause.committed)
-  reply_editor = editor(reply_draft)
+  let restored_reply = restore_draft(trim(editor_text(reply_editor)), cause.body, cause.committed)
+  reply_editor = editor(restored_reply)
   // AND IT DOES NOT MOVE THE REPLY CURSOR. A committed reply grows the loaded
   // run by exactly one row, and `live_updated`'s `thread_offset_after_live`
   // already counts it when that reply's delta lands — which it does for every

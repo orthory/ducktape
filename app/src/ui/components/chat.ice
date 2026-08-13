@@ -546,7 +546,7 @@ component ReactionChip(reaction:ChatReaction, seq:i64)
         hovered bg=muted_bg text=fg border=brand_line
         pressed bg=muted_bg text=fg border=brand
 
-component MessageContents(message:ChatMessage, flash:f64)
+component MessageContents(message:ChatMessage)
   emits
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
@@ -697,14 +697,12 @@ component MessageContents(message:ChatMessage, flash:f64)
               hovered bg=surface text=brand border=brand_line
               pressed bg=surface text=brand border=brand
       // The quiet send-state lane at the row's right edge: an in-flight row
-      // carries a small dot, the settle swaps it for a ✓ that fades out (the
-      // `flash` prop is the animation's opacity — nonzero only on the row the
-      // stream's flash arm anchors). Replaces the old "finalizing…" chip line
-      // that restyled the whole message.
+      // carries a small dot. Canonical confirmation removes it immediately;
+      // no timer, animation, or second collection shadows the row state.
       //
       // The pr=7 inset is load-bearing: it tucks the indicator fully inside
       // the hover toolbar's opaque plate (which ends 8px in from the card
-      // edge, rounded r=9), so hovering OCCLUDES the ✓ instead of leaving a
+      // edge, rounded r=9), so hovering OCCLUDES the dot instead of leaving a
       // sliver poking past the plate. The indicator is transient decoration;
       // the toolbar wins the corner while the cursor is on the row.
       // FULL OPACITY ON `muted`, not a recede step dimmed further: `hint` at
@@ -719,16 +717,7 @@ component MessageContents(message:ChatMessage, flash:f64)
               h=6.0
               style=icon_tint("muted")
               opacity=1.0
-      if !message.pending && flash > 0.0
-        box pr=7.0
-          svg icon("check") memory
-            with
-              w=13.0
-              h=13.0
-              style=icon_tint("success-tick")
-              opacity=flash
-
-component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabled:bool, flash:f64)
+component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabled:bool)
   emits
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
@@ -764,7 +753,7 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
               border=transparent
               border-w=1.0
               r=9.0
-            MessageContents message=message flash=flash
+            MessageContents message=message
               forward
                 add_reaction_at
                 remove_reaction_at
@@ -787,7 +776,7 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
               border=transparent
               border-w=1.0
               r=9.0
-            MessageContents message=message flash=flash
+            MessageContents message=message
               forward
                 add_reaction_at
                 remove_reaction_at
@@ -805,7 +794,7 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
               border=transparent
               border-w=1.0
               r=9.0
-            MessageContents message=message flash=flash
+            MessageContents message=message
               forward
                 add_reaction_at
                 remove_reaction_at
@@ -925,12 +914,10 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
 // already reading the thread. The card padding matches MessageCard's so the
 // pr=7 indicator inset still tucks under the pr=8 toolbar plate (#926).
 //
-// `flash` — the rail's own settle ✓: `thread_send_flash_ids` anchors it to the
-// reply whose optimistic send just landed, on the stream's shared fade.
 // `open_thread_for` is forwarded only because `MessageContents` declares it:
 // it fires from the reply pill, and a reply carries no replies
 // (`reply_count` only ever climbs on a root), so the pill never renders here.
-component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabled:bool, flash:f64)
+component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabled:bool)
   emits
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
@@ -958,7 +945,7 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, 
               border=transparent
               border-w=1.0
               r=9.0
-            MessageContents message=message flash=flash
+            MessageContents message=message
               forward
                 add_reaction_at
                 remove_reaction_at
@@ -977,7 +964,7 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, 
               border=transparent
               border-w=1.0
               r=9.0
-            MessageContents message=message flash=flash
+            MessageContents message=message
               forward
                 add_reaction_at
                 remove_reaction_at
@@ -995,7 +982,7 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, 
               border=transparent
               border-w=1.0
               r=9.0
-            MessageContents message=message flash=flash
+            MessageContents message=message
               forward
                 add_reaction_at
                 remove_reaction_at

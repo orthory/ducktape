@@ -6,9 +6,9 @@
 // titlebar's liveness reading and carries no checkpoint. This screen's head and
 // checkpoint come from one `NodeFacts` document so they can never describe two
 // different instants.
-component NodeScreen(node_key:str, node_data_dir:str, members_rows:[MemberRow], status:str, loading:bool, node_tab:str, module_rows:[ModuleRow], node_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:str, node_quorum_label:str, node_version:str, node_root_hash:str, sync_line:str, node_phase_since:i64, node_sync_retries:i64, node_sync_failures:i64, node_sync_last_error:str, node_peers:[PeerRow], bind node_log_filter:str, wall_now:i64)
+component NodeScreen(node_key:str, node_data_dir:str, members_rows:[MemberRow], status:str, loading:bool, node_tab:NodeTab, module_rows:[ModuleRow], node_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:str, node_quorum_label:str, node_version:str, node_root_hash:str, sync_line:str, node_phase_since:i64, node_sync_retries:i64, node_sync_failures:i64, node_sync_last_error:str, node_peers:[PeerRow], bind node_log_filter:str, wall_now:i64)
   emits
-    select_node_tab(str)
+    select_node_tab(NodeTab)
     open_node_modules()
     node_log_filter_changed(str)
     copy_to_clipboard(str, str)
@@ -37,10 +37,10 @@ component NodeScreen(node_key:str, node_data_dir:str, members_rows:[MemberRow], 
           StatusPill degraded=connection_degraded(status) loading=loading
           space w=fill
         row gap=3.0 align=center
-          button #node-overview-tab -> emit(select_node_tab, "overview")
+          button #node-overview-tab -> emit(select_node_tab, NodeTab.overview)
             with
               label="Node overview"
-              checked=(node_tab == "overview")
+              checked=(node_tab == NodeTab.overview)
               p=0.0
               @ghost_action
             box px=15.0 py=0.0
@@ -48,14 +48,14 @@ component NodeScreen(node_key:str, node_data_dir:str, members_rows:[MemberRow], 
                 with
                   label="Overview"
                   count=0
-                  active=(node_tab == "overview")
+                  active=(node_tab == NodeTab.overview)
             active bg=transparent text=muted border=transparent border-w=1.0 r=8.0
             hovered bg=row_hover text=fg
             pressed bg=elevated text=fg
-          button #node-permissions-tab -> emit(select_node_tab, "permissions")
+          button #node-permissions-tab -> emit(select_node_tab, NodeTab.permissions)
             with
               label="Node permissions"
-              checked=(node_tab == "permissions")
+              checked=(node_tab == NodeTab.permissions)
               p=0.0
               @ghost_action
             box px=15.0 py=0.0
@@ -63,14 +63,14 @@ component NodeScreen(node_key:str, node_data_dir:str, members_rows:[MemberRow], 
                 with
                   label="Permissions"
                   count=0
-                  active=(node_tab == "permissions")
+                  active=(node_tab == NodeTab.permissions)
             active bg=transparent text=muted border=transparent border-w=1.0 r=8.0
             hovered bg=row_hover text=fg
             pressed bg=elevated text=fg
-          button #node-activity-tab -> emit(select_node_tab, "activity")
+          button #node-activity-tab -> emit(select_node_tab, NodeTab.activity)
             with
               label="Node activity"
-              checked=(node_tab == "activity")
+              checked=(node_tab == NodeTab.activity)
               p=0.0
               @ghost_action
             box px=15.0 py=0.0
@@ -78,14 +78,14 @@ component NodeScreen(node_key:str, node_data_dir:str, members_rows:[MemberRow], 
                 with
                   label="Activity"
                   count=0
-                  active=(node_tab == "activity")
+                  active=(node_tab == NodeTab.activity)
             active bg=transparent text=muted border=transparent border-w=1.0 r=8.0
             hovered bg=row_hover text=fg
             pressed bg=elevated text=fg
           button #node-modules-tab -> emit(open_node_modules)
             with
               label="Node modules"
-              checked=(node_tab == "modules")
+              checked=(node_tab == NodeTab.modules)
               p=0.0
               @ghost_action
             box px=15.0 py=0.0
@@ -93,18 +93,18 @@ component NodeScreen(node_key:str, node_data_dir:str, members_rows:[MemberRow], 
                 with
                   label="Modules"
                   count=len(module_rows)
-                  active=(node_tab == "modules")
+                  active=(node_tab == NodeTab.modules)
             active bg=transparent text=muted border=transparent border-w=1.0 r=8.0
             hovered bg=row_hover text=fg
             pressed bg=elevated text=fg
         match node_tab
-          "modules"
+          NodeTab.modules
             ModulesPanel rows=module_rows
-          "permissions"
+          NodeTab.permissions
             col w=fill gap=18.0
               NodeAccessCard tier=member_tier(members_rows) admin=members_is_admin(members_rows)
               PermissionMatrix tier=member_tier(members_rows)
-          "activity"
+          NodeTab.activity
             LogTimeline.Frame
               with
                 title="Log ring"
@@ -128,7 +128,7 @@ component NodeScreen(node_key:str, node_data_dir:str, members_rows:[MemberRow], 
                     hovered bg=muted_bg border=control_line
                 box w=fill h=420.0
                   slot activity_log
-          _
+          NodeTab.overview
             col w=fill gap=13.0
               GroupLabel label="NODE"
               MemberFactRow label="public key" value=keep_str(!empty(node_key), node_key, "—")

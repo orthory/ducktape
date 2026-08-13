@@ -1,9 +1,9 @@
 use super::*;
 
 /// One shell navigation entry. `live` is the capsule's pulse dot.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct NavItem {
-    pub id: String,
+    pub id: crate::ShellTab,
     pub title: String,
     pub icon: String,
     pub badge: i64,
@@ -171,27 +171,31 @@ pub fn open_proposals(rows: Vec<ProposalRow>) -> i64 {
 /// The rail's navigation: nine collaboration surfaces plus the node operator
 /// surface, with the active pane flagged. `settings` is not here because the
 /// rail pins it to its own footer beside the account avatar.
-pub fn shell_nav(tab: String, approvals: i64, agent_live: bool) -> Vec<NavItem> {
+pub fn shell_nav(tab: crate::ShellTab, approvals: i64, agent_live: bool) -> Vec<NavItem> {
     [
-        ("chat", "Chat", "nav-chat"),
-        ("shell", "Shell", "code-slash"),
-        ("pages", "Pages", "nav-pages"),
-        ("forge", "Forge", "nav-forge"),
-        ("agents", "Agents", "nav-agents"),
-        ("files", "Files", "nav-files"),
-        ("explorer", "Explorer", "nav-explorer"),
-        ("node", "Node", "node"),
-        ("members", "Members", "nav-members"),
-        ("governance", "Approvals", "shield-check"),
+        (crate::ShellTab::Chat, "Chat", "nav-chat"),
+        (crate::ShellTab::Shell, "Shell", "code-slash"),
+        (crate::ShellTab::Pages, "Pages", "nav-pages"),
+        (crate::ShellTab::Forge, "Forge", "nav-forge"),
+        (crate::ShellTab::Agents, "Agents", "nav-agents"),
+        (crate::ShellTab::Files, "Files", "nav-files"),
+        (crate::ShellTab::Explorer, "Explorer", "nav-explorer"),
+        (crate::ShellTab::Node, "Node", "node"),
+        (crate::ShellTab::Members, "Members", "nav-members"),
+        (crate::ShellTab::Governance, "Approvals", "shield-check"),
     ]
     .into_iter()
     .map(|(id, title, icon)| NavItem {
-        id: id.into(),
+        id,
         title: title.into(),
         icon: icon.into(),
-        badge: if id == "governance" { approvals } else { 0 },
+        badge: if id == crate::ShellTab::Governance {
+            approvals
+        } else {
+            0
+        },
         active: id == tab,
-        live: id == "forge" && agent_live,
+        live: id == crate::ShellTab::Forge && agent_live,
     })
     .collect()
 }
@@ -208,18 +212,24 @@ pub fn shell_nav(tab: String, approvals: i64, agent_live: bool) -> Vec<NavItem> 
 /// The titlebar chips (tier, approvals, agent dot, account name) read all four
 /// from state, and state is what the connect load and the live-plane lane fill
 /// — no chip depends on a tab click.
-pub fn tab_reads_plane(tab: String, plane: String) -> bool {
-    let tabs: &[&str] = match plane.as_str() {
+pub fn tab_reads_plane(tab: crate::ShellTab, plane: String) -> bool {
+    match plane.as_str() {
         // the tier badge, the admin gate and the forge write gate all read the
         // roster, so five panes draw it.
-        "members" => &["members", "governance", "forge", "node", "settings"],
-        "governance" => &["governance"],
-        "agents" => &["agents"],
+        "members" => matches!(
+            tab,
+            crate::ShellTab::Members
+                | crate::ShellTab::Governance
+                | crate::ShellTab::Forge
+                | crate::ShellTab::Node
+                | crate::ShellTab::Settings
+        ),
+        "governance" => tab == crate::ShellTab::Governance,
+        "agents" => tab == crate::ShellTab::Agents,
         // Settings draws the account card; Forge draws the org "about".
-        "account" => &["settings", "forge"],
-        _ => &[],
-    };
-    tabs.contains(&tab.as_str())
+        "account" => matches!(tab, crate::ShellTab::Settings | crate::ShellTab::Forge),
+        _ => false,
+    }
 }
 
 /// The demo registry, when this machine has one (`ops/demo-seed.sh` is its
@@ -360,20 +370,6 @@ pub struct WorkspaceInit {
     pub chain_id: String,
     pub workspace: String,
     pub rpc: String,
-}
-
-/// A workspace name as its directory slug: lowercase, anything outside
-/// `[a-z0-9-]` folded to `-`, trimmed.
-pub fn network_slug(name: String) -> String {
-    let folded: String = name
-        .to_lowercase()
-        .chars()
-        .map(|character| match character.is_ascii_alphanumeric() {
-            true => character,
-            false => '-',
-        })
-        .collect();
-    folded.trim_matches('-').to_string()
 }
 
 /// Materialize this device's workspace from an invite blob:

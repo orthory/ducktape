@@ -27,7 +27,6 @@ on peers_failed(cause)
 // node genuinely has no reading, so the console prints an absence as an absence
 // instead of as a measured zero.
 on node_facts_loaded(next)
-  return if next.generation != node_facts_generation
   node_key = next.public_key
   node_version = next.version
   node_root_hash = next.root_hash
@@ -45,14 +44,10 @@ on node_facts_loaded(next)
   node_sync_failures = next.sync_failures
   node_sync_last_error = next.sync_last_error
 
-on node_facts_failed(cause)
-  return if cause.generation != node_facts_generation
+on node_facts_failed(_cause)
 
-// A PUSHED status document (lifecycle.ice's ungated subscription).
-//
-// NO GENERATION GUARD, and that is not an omission: a generation retires a
-// stale REPLY to a request this app made, and a push answers no request. The
-// freshest sample simply wins, which is the order the node already gives.
+// A PUSHED status document (lifecycle.ice's ungated subscription). It answers
+// no request, so the freshest sample simply wins in the node's stream order.
 on node_status_pushed(next)
   node_key = next.public_key
   node_version = next.version
@@ -82,7 +77,6 @@ on select_node_tab(tab)
 
 on settings_loaded(next)
   return if next.generation != settings_generation
-  settings_endpoint = next.endpoint
   node_data_dir = next.data_dir
   settings_key_path = next.key_path
   settings_key_state = next.key_state
@@ -108,7 +102,7 @@ on settings_clear_tabs
 // Optimistically stored, cleared by the failure arm — the launch window's
 // unlock uses the same shape.
 on settings_unlock_submit(pw)
-  return if mutation_phase != "idle" || empty(pw)
+  return if mutation_phase != MutationPhase.idle || empty(pw)
   error = ""
   password = pw
   run every unlock_user_key(password) -> settings_unlocked _ | settings_unlock_failed _
@@ -124,16 +118,15 @@ on settings_unlock_failed(cause)
 // holds the opened user key must not outlive the seat it was opened for.
 on lock_session
   password = ""
-  run every lock_signer() -> signer_locked _
-
-on signer_locked(_retired)
-  error = error
+  flow
+    from run lock_signer()
+    discard
 
 // PREFERENCES — device-local, one endpoint at a time.
 // DANGER ZONE — forget this workspace on THIS DEVICE and go back to onboarding.
 on forget_workspace_submit
-  return if !connected || mutation_phase != "idle"
-  mutation_phase = "forget-workspace"
+  return if !connected || mutation_phase != MutationPhase.idle
+  mutation_phase = MutationPhase.forget_workspace
   error = ""
   run every forget_workspace(connected_rpc) -> workspace_forgotten _ | mutation_failed _
 
@@ -143,7 +136,7 @@ on forget_workspace_submit
 // On success the launch window reopens; `onboarding_reopened`
 // (handlers/onboarding.ice) closes the console once it is registered.
 on workspace_forgotten(forgotten)
-  mutation_phase = "idle"
+  mutation_phase = MutationPhase.idle
   error = "This device could not forget the workspace."
   return if !forgotten
   connected = false
@@ -155,7 +148,6 @@ on workspace_forgotten(forgotten)
 // copy lives at the call site and the write itself stays native.
 on copy_to_clipboard(text, label)
   toast = label
-  toast_tone = "info"
   toast_age = 0
   task clipboard write text
 
@@ -173,24 +165,16 @@ on toast_tick
   toast = ""
   toast_age = 0
 
-// Held here beside the loaders that fill them.
-state
-  module_rows:[ModuleRow] = []
-  module_generation:i64 = 0
-
 // The Modules tab picks its own seat AND fetches its own reading — a tab whose
 // list is only filled by a refresh somewhere else opens empty on first click.
 on open_node_modules
-  node_tab = "modules"
+  node_tab = NodeTab.modules
   return if !connected
-  module_generation = module_generation + 1
-  run replace lane=modules_load load_modules(connected_rpc, module_generation) -> modules_loaded _ | modules_failed _
+  run replace lane=modules_load load_modules(connected_rpc) -> modules_loaded _ | modules_failed _
 
 on modules_loaded(next)
-  return if next.generation != module_generation
   module_rows = next.rows
   error = ""
 
 on modules_failed(cause)
-  return if cause.generation != module_generation
   error = cause.message

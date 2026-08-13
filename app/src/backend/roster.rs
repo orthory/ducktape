@@ -27,7 +27,6 @@ pub struct MembersData {
 /// Load the roster: validators, then residents, then the registered agents —
 /// one list, this node marked, liveness folded in from the mesh sample.
 pub async fn load_members(rpc: String, generation: i64) -> Result<MembersData, HydrationError> {
-    offscreen_guard(generation)?;
     async {
         let client = rpc_client(&rpc)?;
         let node_key = client.status().await?.public_key;
@@ -132,13 +131,13 @@ pub fn member_tier(rows: Vec<MemberRow>) -> String {
 }
 
 /// The All / Humans / Agents / Validators strip.
-pub fn filter_members(rows: Vec<MemberRow>, filter: String) -> Vec<MemberRow> {
+pub fn filter_members(rows: Vec<MemberRow>, filter: crate::MembersFilter) -> Vec<MemberRow> {
     rows.into_iter()
-        .filter(|row| match filter.as_str() {
-            "humans" => !row.is_agent,
-            "agents" => row.is_agent,
-            "validators" => row.role == "validator",
-            _ => true,
+        .filter(|row| match filter {
+            crate::MembersFilter::All => true,
+            crate::MembersFilter::Humans => !row.is_agent,
+            crate::MembersFilter::Agents => row.is_agent,
+            crate::MembersFilter::Validators => row.role == "validator",
         })
         .collect()
 }
@@ -184,7 +183,6 @@ pub async fn load_governance(
     rpc: String,
     generation: i64,
 ) -> Result<GovernanceData, HydrationError> {
-    offscreen_guard(generation)?;
     async {
         let rpc = rpc_client(&rpc)?;
         let reply: serde_json::Value = rpc

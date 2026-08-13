@@ -21,7 +21,7 @@ view
           height=block_height
           tier=member_tier(members_rows)
           error=onboarding_error
-          busy=(mutation_phase != "idle")
+          busy=mutation_busy
           restore_empty=empty(restore_words)
           join_empty=empty(join_invite)
         events
@@ -47,7 +47,7 @@ view
             with
               label="Recovery phrase"
               hint="24 words, space-separated"
-              disabled=(mutation_phase != "idle")
+              disabled=mutation_busy
               w=fill
               p=0.0
               text-size=12.0
@@ -61,7 +61,7 @@ view
             with
               label="Invite"
               hint="🦆AAAA…"
-              disabled=(mutation_phase != "idle")
+              disabled=mutation_busy
               submit=join_network_submit
               w=fill
               p=0.0
@@ -97,7 +97,7 @@ view
           status
           height=block_height
           sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
-          loading=(loading || mutation_phase != "idle")
+          loading=(loading || mutation_busy)
           degraded=connection_degraded(status)
           tab=shell_tab
           bell_count=bell_unread
@@ -118,7 +118,7 @@ view
           switch_network -> switch_network
         notice:
           col w=fill
-            if error != ""
+            if has_error
               box
                 with
                   w=fill
@@ -165,7 +165,7 @@ view
                       hovered bg=fg/9 text=fg
                       pressed bg=fg/14
         chat:
-          ChatScreen search_draft<->chat_search_draft message_action_focus<->message_action_focus message_edit_draft<->message_edit_draft message_editor<->message_editor channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft thread_edit_draft<->thread_edit_draft reply_editor<->reply_editor #chat
+          ChatScreen search_draft<->chat_search_draft message_edit_draft<->message_edit_draft message_editor<->message_editor channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft thread_edit_draft<->thread_edit_draft reply_editor<->reply_editor #chat
             with
               network_name
               status
@@ -192,7 +192,7 @@ view
               huddle_joined_at
               huddle_now
               call_muted
-              huddle_popped=(huddle_win != none)
+              huddle_popped
               messages
               has_older_history
               history_view
@@ -206,10 +206,7 @@ view
               unread_marker_seq
               selected_message_seq
               selected_message_rev
-              send_flash_ids
-              send_flash_value=animation.interpolate(send_flash, 0.0, 1.0)
               message_action
-              message_menu_y
               failed_message_draft
               channel_settings_open
               active_thread_seq
@@ -218,8 +215,6 @@ view
               thread_selected_seq
               thread_selected_rev
               thread_message_action
-              thread_menu_y
-              thread_send_flash_ids
               thread_has_more
               thread_next_reply_offset
               thread_loading
@@ -237,7 +232,6 @@ view
               leave_huddle_here -> leave_huddle_here
               huddle_go_channel -> huddle_go_channel
               join_huddle_submit -> join_huddle_submit
-              chat_pointer_pressed -> chat_pointer_pressed _ _
               load_more_history -> load_more_history
               chat_scrolled -> chat_scrolled _ _ _ _
               open_message_link -> open_message_link _
@@ -261,7 +255,6 @@ view
               unarchive_channel_submit -> unarchive_channel_submit
               add_channel_member_submit -> add_channel_member_submit
               remove_channel_member_submit -> remove_channel_member_submit _
-              thread_pointer_pressed -> thread_pointer_pressed _ _
               close_thread -> close_thread
               open_thread_message_actions -> open_thread_message_actions _ _ _
               open_thread_message_reactions -> open_thread_message_reactions _ _ _
@@ -275,8 +268,6 @@ view
               dismiss_failed_reply -> dismiss_failed_reply
               reply_composer_event -> reply_composer_event _
               reply_composer_mark -> reply_composer_mark _
-              chat_resized -> chat_resized _ _
-              thread_resized -> thread_resized _ _
 
         shell:
           ShellScreen draft<->shell_chat_draft #shell
@@ -300,7 +291,7 @@ view
               chat_error=shell_chat_error
               saga_id=shell_chat_saga
               connected
-              dark=(appearance == "dark")
+              dark
             events
               shell_mode_changed -> shell_mode_changed _
               shell_provider_changed -> shell_provider_changed _
@@ -323,7 +314,7 @@ view
               connected
               connected_rpc
               password
-              dark=(appearance == "dark")
+              dark
               active_page
               active_page_title
               active_page_parent
@@ -380,13 +371,12 @@ view
               // reading of `entries` on that screen is gated on this.
               listed=(fs_listed_path == fs_path)
               entries=fs_entries
-              directories=fs_dirs
+              directories=fs_directories(fs_entries)
               connected
               loading=fs_loading
               preview_path=fs_preview_path
               preview_entry=fs_preview_entry
               delete_target=fs_delete_target
-              history_open=fs_history_open
               diff_from=fs_diff_from
               diff=fs_diff
               history=fs_history
@@ -404,7 +394,6 @@ view
               fs_arm_delete -> fs_arm_delete _
               fs_disarm_delete -> fs_disarm_delete
               fs_delete_submit -> fs_delete_submit
-              fs_toggle_history -> fs_toggle_history
               fs_close_diff -> fs_close_diff
               fs_show_diff -> fs_show_diff _
               fs_begin_edit -> fs_begin_edit
@@ -414,14 +403,10 @@ view
           MembersScreen #members
             with
               rows=members_rows
-              filter=members_filter
-              selected=members_selected
               admin=members_is_admin(members_rows)
               connected
               answered=members_answered
             events
-              pick_members_filter -> pick_members_filter _
-              open_member -> open_member _
               copy_to_clipboard -> copy_to_clipboard _ _
               agent_set_status -> agent_set_status _ _
               gov_propose -> gov_propose _ _
@@ -546,7 +531,6 @@ view
               account_name
               network_name
               connected_rpc
-              settings_endpoint
               settings_key_state
               settings_key_path
               settings_open_tabs
@@ -577,26 +561,17 @@ view
               set_appearance_light -> set_appearance_light
               set_appearance_dark -> set_appearance_dark
         explorer:
-          ExplorerScreen query<->explorer_query
+          ExplorerScreen #explorer(connected_rpc)
             with
+              connected_rpc
               connected
-              searching=explorer_searching
               loading=explorer_loading
-              kinds=explorer_kinds
-              kind=explorer_kind
-              partial=explorer_partial
-              hits=explorer_hits
               blocks=explorer_blocks
-              selected=explorer_selected
               ops=explorer_ops
               head=block_height
               sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
             events
-              explorer_search_submit -> explorer_search_submit
-              clear_explorer_search -> clear_explorer_search
               refresh_explorer -> refresh_explorer
-              pick_explorer_kind -> pick_explorer_kind _
-              select_explorer_block -> select_explorer_block _
         huddle:
           box
             with
@@ -613,7 +588,7 @@ view
               // huddle's own channel. On every OTHER screen it must show even
               // when that channel is the selected one, which the missing
               // `shell_tab` term used to suppress.
-              if huddle_joined && (huddle_win == none) && (shell_tab != "chat" || huddle_channel != active_channel)
+              if huddle_joined && !huddle_popped && (shell_tab != ShellTab.chat || huddle_channel != active_channel)
                 HuddleDockedPill
                   with
                     channel=huddle_channel_name
@@ -625,11 +600,11 @@ view
             with
               create_open=channel_create_open
               members_only=channel_create_members_only
-              busy=(mutation_phase != "idle")
+              busy=mutation_busy
               connected
               loading
               toast
-              tone=toast_tone
+              tone="info"
               open=palette_open
               searching=palette_searching
               chat_hits=palette_chat_hits

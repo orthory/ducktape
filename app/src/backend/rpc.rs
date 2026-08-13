@@ -276,22 +276,22 @@ pub(crate) fn write_prefs(prefs: &serde_json::Value) -> bool {
     std::fs::write(&path, bytes).is_ok()
 }
 
-/// The persisted appearance override — `"light"` / `"dark"`, or empty when
-/// this device follows the OS. DEVICE-global, not per-endpoint: appearance is
-/// a property of the person's eyes and room, not of a workspace.
-pub async fn load_appearance() -> String {
+/// The persisted appearance override. DEVICE-global, not per-endpoint:
+/// appearance is a property of the person's eyes and room, not of a workspace.
+pub async fn load_appearance() -> crate::Appearance {
     match read_prefs()["appearance"].as_str() {
-        Some("light") => "light".into(),
-        Some("dark") => "dark".into(),
-        _ => String::new(),
+        Some("light") => crate::Appearance::Light,
+        Some("dark") => crate::Appearance::Dark,
+        _ => crate::Appearance::System,
     }
 }
 
-pub async fn save_appearance(mode: String) -> bool {
-    let known = mode == "light" || mode == "dark";
-    if !known {
-        return false;
-    }
+pub async fn save_appearance(mode: crate::Appearance) -> bool {
+    let mode = match mode {
+        crate::Appearance::System => return false,
+        crate::Appearance::Light => "light",
+        crate::Appearance::Dark => "dark",
+    };
     let mut prefs = read_prefs();
     prefs["appearance"] = serde_json::json!(mode);
     write_prefs(&prefs)
@@ -331,14 +331,6 @@ pub fn doc_tabs_with(mut tabs: Vec<String>, page_id: String) -> Vec<String> {
 pub fn doc_tabs_without(mut tabs: Vec<String>, page_id: String) -> Vec<String> {
     tabs.retain(|tab| *tab != page_id);
     tabs
-}
-
-/// The tabs that still exist in the page list — deleted pages drop at render
-/// time and self-heal in the persisted list on the next save.
-pub fn retain_doc_tabs(tabs: Vec<String>, pages: Vec<PageItem>) -> Vec<String> {
-    tabs.into_iter()
-        .filter(|tab| pages.iter().any(|page| page.id == *tab))
-        .collect()
 }
 
 /// One rendered doc tab.
@@ -507,19 +499,6 @@ pub(crate) fn user_error(message: String) -> String {
         return "The node sent a reply this app could not read. Reload and retry.".into();
     }
     message
-}
-
-/// A loader handed a NEGATIVE generation is being told its screen is
-/// off-screen: refuse before any I/O. The refusal's impossible generation
-/// makes the failed arm's guard drop it unread — nothing surfaces.
-pub(crate) fn offscreen_guard(generation: i64) -> Result<(), HydrationError> {
-    if generation < 0 {
-        return Err(HydrationError {
-            generation,
-            message: "skipped_offscreen".into(),
-        });
-    }
-    Ok(())
 }
 
 pub(crate) fn app_error(message: String) -> AppError {

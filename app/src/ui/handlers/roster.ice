@@ -93,7 +93,7 @@ on dm_peers_loaded(next)
   return if next.generation != dm_peers_generation
   dm_peers = next.peers
   // The directory decides which channels are DMs and who the header names, so
-  // both mirrors move with it — see state.ice's `rooms` note.
+  // both mirrors move with it — see state/chat.ice's `rooms` note.
   rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
@@ -101,19 +101,12 @@ on dm_peers_loaded(next)
 on dm_peers_failed(cause)
   return if cause.generation != dm_peers_generation
 
-// ROSTER — one screen, one filter, one detail panel. An empty key closes it.
-on open_member(key)
-  members_selected = key
-
-on pick_members_filter(filter)
-  members_filter = filter
-
 // The invite modal is pure view state — minting is a separate, explicit act.
 // Pause or resume an agent. The payload is the DESIRED state and it is named
 // for the backend parameter it becomes: `true` PAUSES, `false` resumes. The
 // roster's Pause control passes `true` and its Resume control passes `false`;
-// a row wired from `agent.status` would have to invert. Only its owner may ask:
-// the view offers this on `is_mine` rows, and the node refuses anyone else.
+// a row wired from `agent.status` would have to invert. The registry is the
+// authority on whether the signing owner may apply the requested state.
 on agent_set_status(agent_id, paused)
   return if !connected
   run every set_agent_status(connected_rpc, password, agent_id, paused) -> agent_status_set _ | mutation_failed _

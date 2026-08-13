@@ -102,20 +102,6 @@ fn app_tokens(theme: &iced::Theme) -> ui_lang_components::ui::theme::Theme {
     }
 }
 
-/// Flat paper card derived from the shared design tokens.
-pub fn card_style(theme: &iced::Theme) -> iced::widget::container::Style {
-    let tokens = app_tokens(theme);
-    iced::widget::container::Style {
-        background: Some(iced::Background::Color(tokens.palette.card)),
-        border: iced::Border {
-            color: tokens.palette.border,
-            width: 1.0,
-            radius: tokens.radius.card.into(),
-        },
-        ..Default::default()
-    }
-}
-
 /// Floating menu/popover surface, derived from the shared design tokens.
 ///
 /// `popover`, not `glass.regular`: glass is a TRANSLUCENT role that only reads
@@ -220,13 +206,6 @@ pub(crate) fn bounded_updated_block_text(kind: BlockKind, text: String) -> Resul
         return bounded_exact_text(text, "page title", 512);
     }
     bounded_exact_text(text, "block text", 64 * 1024)
-}
-
-/// Bump the autosave generation so any in-flight save's reply is discarded.
-/// The debounce ticket map this once also swept died with
-/// `debounced_page_text` — the generation check is the whole mechanism now.
-pub fn cancel_autosaves(_rpc: String, generation: i64) -> i64 {
-    generation.saturating_add(1)
 }
 
 pub(crate) fn block_move(

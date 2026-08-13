@@ -68,7 +68,9 @@ impl CallEvent {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientControl {
-    Recipients { peers: Vec<String> },
+    Recipients {
+        peers: Vec<String>,
+    },
     Beacon {
         muted: bool,
         camera_on: bool,
@@ -132,17 +134,17 @@ pub(crate) fn beacon_state() {
 }
 
 /// Steer the fan-out set to the huddle roster's peer NODE keys (self
-/// excluded). Called wherever the roster refreshes; a no-session call is a
-/// no-op `false`.
-pub fn call_recipients(nodes: Vec<String>) -> bool {
+/// excluded). Called wherever the roster refreshes; a missing session is a
+/// no-op.
+pub fn call_recipients(nodes: Vec<String>) -> iced::Task<()> {
     let guard = handles().lock().expect("call handles");
     let Some(handles) = guard.as_ref() else {
-        return false;
+        return iced::Task::none();
     };
-    handles
+    let _ = handles
         .control
-        .send(ClientControl::Recipients { peers: nodes })
-        .is_ok()
+        .send(ClientControl::Recipients { peers: nodes });
+    iced::Task::none()
 }
 
 /// The session stream: connect, pump, and yield state the handlers fold. The
@@ -183,7 +185,10 @@ async fn run_session(
         }
         Err(_) => {
             let _ = events
-                .send(CallEvent::failed("error", "call socket: connection timed out"))
+                .send(CallEvent::failed(
+                    "error",
+                    "call socket: connection timed out",
+                ))
                 .await;
             return;
         }
@@ -407,8 +412,8 @@ impl Resampler {
         for sample in input {
             // Emit every 48 kHz tick that lands before this input sample.
             while self.phase < 1.0 {
-                let mixed = f64::from(self.last) * (1.0 - self.phase)
-                    + f64::from(*sample) * self.phase;
+                let mixed =
+                    f64::from(self.last) * (1.0 - self.phase) + f64::from(*sample) * self.phase;
                 output.push(mixed as i16);
                 self.phase += self.step;
             }
@@ -725,10 +730,7 @@ mod tests {
         assert_eq!(call_status_after("x".into(), CallEvent::of("live")), "live");
         let mut live = CallEvent::of("live");
         live.message = "no microphone".into();
-        assert_eq!(
-            call_status_after("x".into(), live),
-            "live · no microphone"
-        );
+        assert_eq!(call_status_after("x".into(), live), "live · no microphone");
         assert_eq!(
             call_status_after("live".into(), CallEvent::failed("refused", "nope")),
             "nope"
@@ -794,7 +796,10 @@ mod tests {
         .unwrap();
         assert!(matches!(
             beacon,
-            ServerControl::PeerBeacon { camera_on: true, .. }
+            ServerControl::PeerBeacon {
+                camera_on: true,
+                ..
+            }
         ));
         assert!(matches!(
             serde_json::from_str::<ServerControl>(r#"{"type":"rate_hint","max_kbps":900}"#)

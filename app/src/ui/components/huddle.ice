@@ -187,7 +187,7 @@ component HuddleStart()
 // above the whole console, so it needs no signature change. The slot anchors
 // bottom-right; this component draws no offset of its own.
 // The visibility rule is `huddle_joined && huddle_win == none &&
-// !(shell_tab == "chat" && huddle_channel == active_channel)` — the pill is
+// !(shell_tab == ShellTab.chat && huddle_channel == active_channel)` — the pill is
 // what the huddle docks BACK into when its window closes.
 component HuddleDockedPill(channel:str, elapsed:str)
   emits

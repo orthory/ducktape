@@ -11,8 +11,8 @@
 // THE FINALITY STAMP. `✓ finalized · h N` is the only wording that may claim
 // proof — no ✓ without a height behind it. An IN-FLIGHT write is not a phase
 // on this chip anymore: the chat timeline shows it as a quiet right-edge dot
-// (MessageContents) and settles into a transient ✓, so an unsettled row reads
-// as a normal message, not a restyled one.
+// (MessageContents), so an unsettled row reads as a normal message, not a
+// restyled one.
 component FinalityChip(height:i64)
   col #root
     box
@@ -247,24 +247,6 @@ component AgentSquare(initials:str, plate:f64, ink:f64, radius:f64)
 // in kit.ice, and the same word in dm.ice and chat.ice) says a principal IS a
 // machine, which is identity; this says what that machine is DOING, which is
 // activity. Both appear on the artifact's agent row, together.
-//
-// `AgentChip` (a pulse dot + the run's own summary, on the agent row) was built
-// here and is DELETED. It was waiting on a join the product does not have: the
-// label is the artifact's `#142 reanalyzing`, which names a RUN, and `AgentRow`
-// carries no run. `load_agent_runs` -> `[RunRow{agent_id, running, summary}]` is
-// declared in backend.ice and is `run` from nowhere; the Agents screen loops
-// `agents_rows` straight into `AgentCard` with no selection and no detail pane,
-// so there is no surface holding one agent's runs to hang it from, and the
-// loader is per-agent — a list of N agents would need N calls.
-// It could NOT honestly be fed from what the row does carry: `AgentRow.status`
-// is already painted by the StatusBadge active/paused mapping, so a chip over
-// it would be the same fact twice, and `AgentRow.live` with a constant label is
-// a liveness signal with nothing behind it.
-// The values to keep for whoever lands the join: a 10px `card_wash` chip on a
-// `separator` hairline, r7, the label at 10.5 `font=code_medium`
-// `@text-secondary_fg`, and the pulse dot ONLY while the run is running.
-// Its dot survives below — `PulseDot` is the console's one breathing mark and
-// three live surfaces draw it.
 
 // The one dot the console breathes with — w4-motion-kit binds it to `pulse`.
 // The same severity ladder as PulseDot, held still — for a row that has been

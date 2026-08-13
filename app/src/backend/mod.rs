@@ -26,7 +26,7 @@ pub use ::chat::client::{
     ChatBlock, ChatChannel, ChatDelta, ChatMember, ChatMessage, ChatReaction, ChatSpan,
     append_thread_page, apply_chat_channels, apply_chat_members, apply_chat_messages,
     apply_chat_thread, author_display, author_name, chat_message, contains_pending_message,
-    mark_message_groups, merge_message_send_result, merge_pending_messages, merge_thread_reply,
+    mark_message_groups, merge_message_send_result, merge_pending_messages,
     parse_message_with_members, reply_settled_by, rollback_pending_message, send_settled_by,
     short_label, thread_offset_after_reply,
 };
@@ -89,76 +89,26 @@ pub struct ChannelRead {
     pub seq: i64,
 }
 
-/// THE SETTLE ✓, ANSWERED ONCE PER DELTA. `send_settled_by`,
-/// `settled_send_id`, `reply_settled_by` and `settled_reply_id` were four Ice
-/// externs, and the extern ABI hands every list over BY VALUE — so one incoming
-/// message deep-cloned the timeline twice and the open rail twice (plus the
-/// delta four times) before a single row was folded, on the UI thread, in a
-/// handler whose own comment already calls that cost out for the `tip` beat.
-/// One extern, one clone of each list, three answers.
-#[derive(Clone, Debug, Default, Hash, PartialEq)]
-pub struct ChatSettle {
-    /// Whether this delta settles one of OUR optimistic rows, in either lane.
-    pub flashed: bool,
-    /// Timeline rows whose ✓ is still inside the shared fade window.
-    pub send_ids: String,
-    /// Their thread-rail twins.
-    pub reply_ids: String,
-}
-
-/// The blank verdict — the scratch field's own default.
-pub fn no_chat_settle() -> ChatSettle {
-    ChatSettle::default()
-}
-
-fn with_settled_id(mut ids: String, settled: bool, id: String) -> String {
-    // A scalar bag keeps the view's by-value extern ABI from cloning a list
-    // for every visible row. These are our own `fresh_id` values, so newline
-    // is an exact, collision-free separator.
-    // ponytail: linear scan over human-scale IDs during the short fade; use a
-    // borrowed collection only when the Ice extern ABI can pass one.
-    let missing = !ids.lines().any(|current| current == id.as_str());
-    let new_settle = settled && missing;
-    if new_settle {
-        if !ids.is_empty() {
-            ids.push('\n');
-        }
-        ids.push_str(&id);
-    }
-    ids
-}
-
-/// Read BEFORE the delta is folded in — the match is the pending row the
-/// canonical row is about to replace.
+/// Whether a delta settles one of this window's optimistic rows. The main and
+/// thread checks share one by-value extern call so neither list is cloned
+/// twice before the canonical fold.
 pub fn chat_settle(
     messages: Vec<ChatMessage>,
     thread: Vec<ChatMessage>,
     delta: ChatDelta,
     active_channel: String,
-    mut send_ids: String,
-    mut reply_ids: String,
-) -> ChatSettle {
+) -> bool {
     let sent = send_settled_by(&messages, &delta, &active_channel);
     let replied = reply_settled_by(&thread, &delta, &active_channel);
-    send_ids = with_settled_id(send_ids, sent, delta.message.id.clone());
-    reply_ids = with_settled_id(reply_ids, replied, delta.message.id);
-    ChatSettle {
-        flashed: sent || replied,
-        send_ids,
-        reply_ids,
-    }
-}
-
-pub fn has_flash_id(ids: String, id: String) -> bool {
-    ids.lines().any(|current| current == id.as_str())
+    sent || replied
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ChatData {
     /// The switch this window answers for. Every route that moves the reader
     /// bumps `chat_generation` and stamps it here, so a room she has already
-    /// clicked past cannot land on top of the one she is looking at — the same
-    /// supersede-by-generation the thread, history and search loaders use.
+    /// clicked past cannot land on top of the one she is looking at. Thread,
+    /// history, and search reads own separate compiler delivery lanes.
     pub generation: i64,
     pub channels: Vec<ChatChannel>,
     pub messages: Vec<ChatMessage>,
@@ -166,7 +116,6 @@ pub struct ChatData {
     pub active_channel_name: String,
     pub active_channel_archived: bool,
     pub active_channel_members_only: bool,
-    pub active_channel_huddle_count: i64,
     /// the huddle's roster, not just its length — the faces and the tiles.
     pub huddle_roster: Vec<HuddleParticipant>,
     pub channel_members: Vec<ChatMember>,
@@ -218,7 +167,6 @@ pub struct ThreadPageData {
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct LiveThreadData {
-    pub generation: i64,
     pub channel_id: String,
     pub root_seq: i64,
     pub target_seq: i64,
@@ -239,7 +187,6 @@ pub struct ChatSearchHit {
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ChatSearchData {
-    pub generation: i64,
     pub hits: Vec<ChatSearchHit>,
 }
 
@@ -337,7 +284,6 @@ pub struct PageSearchHit {
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct PageSearchData {
-    pub generation: i64,
     pub hits: Vec<PageSearchHit>,
 }
 
@@ -353,7 +299,6 @@ pub struct WorkspaceData {
     pub active_channel_name: String,
     pub active_channel_archived: bool,
     pub active_channel_members_only: bool,
-    pub active_channel_huddle_count: i64,
     pub huddle_roster: Vec<HuddleParticipant>,
     pub channel_members: Vec<ChatMember>,
     pub pages: Vec<PageItem>,

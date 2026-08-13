@@ -10,9 +10,14 @@ font code_semibold family="Geist Mono" weight=semibold stretch=normal style=norm
 
 // ONE contract, TWO palettes: the kit's 49 semantic roles and the 74 steps the
 // canonical artifact names live together here, in the app's own theme file,
-// with a light and a dark reading of every token. `ducktape-ui/default.ice`
-// stays a verbatim vendor copy with its own theme deleted — a UI kit has no
-// business naming `desk`, `rail`, or `diff_hunk_bg`.
+// with a light and a dark reading of every token. The generic upstream recipes
+// and log timeline are the only vendored Ice sources; app styling stays here.
+
+// Icon actions take their size from the caller. Internal padding would collapse
+// a fixed-size button's direct SVG child to a hairline.
+recipe icon_action for button
+  @p-0px bg-transparent text-fg rounded-7px hover:bg-accent pressed:bg-border disabled:opacity-50 focus-visible:border-ring
+
 theme contract AppTheme
   bg
   surface

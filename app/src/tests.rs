@@ -8,20 +8,8 @@ use super::*;
 /// markup, so they must read where that markup now lives. `view.ice` keeps
 /// only the mounts, and asserting a widget shape against it now would pass
 /// vacuously — the worst kind of green.
-static SCREENS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    inlined(concat!(
-        include_str!("ui/screens/chat.ice"),
-        include_str!("ui/screens/forge.ice"),
-        include_str!("ui/screens/governance.ice"),
-        include_str!("ui/screens/overlays.ice"),
-        include_str!("ui/screens/pages.ice"),
-        include_str!("ui/screens/roster.ice"),
-        include_str!("ui/screens/node.ice"),
-        include_str!("ui/screens/settings.ice"),
-        include_str!("ui/screens/shell.ice"),
-        include_str!("ui/screens/storage.ice"),
-    ))
-});
+static SCREENS: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| inlined(&ice_sources_in("screens")));
 
 /// Fold `with` blocks back onto their node line, so the source sweeps keep
 /// pinning a node and its props as ONE readable line no matter how
@@ -80,6 +68,20 @@ fn ice_sources() -> Vec<(String, String)> {
     out
 }
 
+fn ice_sources_in(directory: &str) -> String {
+    let suffix = std::path::Path::new("src/ui").join(directory);
+    ice_sources()
+        .into_iter()
+        .filter(|(path, _)| {
+            std::path::Path::new(path)
+                .parent()
+                .is_some_and(|parent| parent.ends_with(&suffix))
+        })
+        .map(|(_, source)| source)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// A SEAT THAT PRINTS A CHECKPOINT MUST OWN THE HEAD IT IS COMPARED AGAINST.
 ///
 /// A checkpoint height is meaningless on its own: it says how far the durable
@@ -132,6 +134,7 @@ fn no_seat_prints_a_checkpoint_beside_the_live_head() {
 fn message(seq: i64, body: &str, deleted: bool) -> backend::ChatMessage {
     backend::ChatMessage {
         id: format!("message-{seq}"),
+        view_key: seq,
         seq,
         author: "user".into(),
         meta: format!("#{seq}"),
@@ -182,7 +185,6 @@ fn a_pushed_status_moves_the_facts_and_leaves_the_table() {
     }];
 
     let _ = app.__update(__DucktapeMessage::NodeStatusPushed(backend::NodeFacts {
-        generation: -1,
         public_key: "node-key".into(),
         version: "0.2.0".into(),
         root_hash: "hash-new".into(),
@@ -343,24 +345,17 @@ fn the_node_streams_carry_the_gates_their_costs_require() {
     assert_eq!(
         peers,
         [
-            "run node_peers_live(connected_rpc) when (connected && shell_tab == \"node\" && node_tab == \"overview\") -> node_peers_pushed _"
+            "run node_peers_live(connected_rpc) when (connected && shell_tab == ShellTab.node && node_tab == NodeTab.overview) -> node_peers_pushed _"
         ],
         "every peers sample encodes the whole metrics registry; this gate is the budget"
     );
 
-    // and the peers HTTP load stays gated to the same tab for the same reason.
-    let peers_loads: Vec<_> = lifecycle
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("run replace lane=peers_load load_peers("))
-        .collect();
-    assert!(
-        !peers_loads.is_empty()
-            && peers_loads.iter().all(|line| line.contains(
-                "keep_i64(shell_tab == \"node\" && node_tab == \"overview\", node_peers_generation, -1)"
-            )),
-        "every load_peers must be gated to the tab that draws it: {peers_loads:?}"
-    );
+    assert!(lifecycle.contains(
+        "from done load_request(shell_tab == ShellTab.node && node_tab == NodeTab.overview, connected_rpc, \"\", node_peers_generation)\n      try request -> done request\n      done -> peers_load_selected _"
+    ));
+    assert!(lifecycle.contains(
+        "on peers_load_selected(request)\n  let obsolete_request = request.rpc != connected_rpc || request.generation != node_peers_generation\n  let unmounted = shell_tab != ShellTab.node || node_tab != NodeTab.overview\n  return if obsolete_request || unmounted\n  run replace lane=peers_load load_peers(request.rpc, request.generation)"
+    ));
     assert_no_polling(&lifecycle);
 }
 
@@ -380,7 +375,7 @@ fn full_view_fits_the_default_test_stack() {
             let _ = app.__view(console);
             let onboarding = iced::window::Id::unique();
             app.onboarding_win = Some(onboarding);
-            app.hub_step = "networks".into();
+            app.hub_step = HubStep::Networks;
             let _ = app.__view(onboarding);
             let huddle = iced::window::Id::unique();
             app.huddle_win = Some(huddle);
@@ -440,7 +435,6 @@ fn live_refresh(
         active_channel_name: active_channel.into(),
         active_channel_archived: false,
         active_channel_members_only: false,
-        active_channel_huddle_count: 0,
         huddle_roster: Vec::new(),
         channel_members: Vec::new(),
         pages_loaded: true,
@@ -479,7 +473,6 @@ fn chat_data(active_channel: &str, messages: Vec<backend::ChatMessage>) -> backe
         active_channel_name: active_channel.into(),
         active_channel_archived: false,
         active_channel_members_only: false,
-        active_channel_huddle_count: 0,
         huddle_roster: Vec::new(),
         channel_members: Vec::new(),
         selected_message_seq: 0,
@@ -505,7 +498,6 @@ fn workspace(active_channel: &str) -> backend::WorkspaceData {
         active_channel_name: active_channel.into(),
         active_channel_archived: false,
         active_channel_members_only: false,
-        active_channel_huddle_count: 0,
         huddle_roster: Vec::new(),
         channel_members: Vec::new(),
         pages: Vec::new(),
@@ -521,18 +513,18 @@ fn workspace(active_channel: &str) -> backend::WorkspaceData {
 #[test]
 fn shell_tab_is_app_state_and_palette_hits_switch_panes() {
     let (mut app, _) = Ducktape::__boot();
-    assert_eq!(app.shell_tab, "chat");
-    let _ = app.__update(__DucktapeMessage::SelectShellTab("pages".into()));
-    assert_eq!(app.shell_tab, "pages");
+    assert_eq!(app.shell_tab, ShellTab::Chat);
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Pages));
+    assert_eq!(app.shell_tab, ShellTab::Pages);
 
     // a palette chat hit closes the palette and lands on the chat pane
     app.loading = false;
-    app.mutation_phase = "idle".into();
+    app.mutation_phase = MutationPhase::Idle;
     app.connected_rpc = "http://node".into();
     app.palette_open = true;
     let _ = app.__update(__DucktapeMessage::OpenChatSearchHit("general".into(), 7, 7));
     assert!(!app.palette_open);
-    assert_eq!(app.shell_tab, "chat");
+    assert_eq!(app.shell_tab, ShellTab::Chat);
 }
 
 /// Node operations are an operator surface, not a tail appended to device
@@ -544,7 +536,7 @@ fn node_operations_are_a_first_class_screen() {
     let node = include_str!("ui/screens/node.ice");
     assert!(settings.contains("component SettingsScreen("));
     assert!(node.contains("component NodeScreen("));
-    assert!(settings.contains("emit(select_shell_tab, \"node\")"));
+    assert!(settings.contains("emit(select_shell_tab, ShellTab.node)"));
     for node_detail in [
         "node-overview-tab",
         "node-permissions-tab",
@@ -559,7 +551,7 @@ fn node_operations_are_a_first_class_screen() {
     }
 
     let shell = include_str!("ui/components/shell.ice");
-    assert!(shell.contains("\"node\"\n                  slot node"));
+    assert!(shell.contains("ShellTab.node\n                  slot node"));
     let view = include_str!("ui/view.ice");
     assert!(view.contains("node:\n          NodeScreen"));
     assert!(view.contains("settings:\n          SettingsScreen"));
@@ -578,7 +570,7 @@ fn switching_panes_retires_a_stale_error_banner_on_every_tab() {
     // the disconnected path returns first, and must still clear.
     let (mut app, _) = Ducktape::__boot();
     app.error = "could not reach the node".into();
-    let _ = app.__update(__DucktapeMessage::SelectShellTab("files".into()));
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Files));
     assert_eq!(
         app.error, "",
         "the !connected early return must still clear"
@@ -588,7 +580,7 @@ fn switching_panes_retires_a_stale_error_banner_on_every_tab() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.error = "files: path not found".into();
-    let _ = app.__update(__DucktapeMessage::SelectShellTab("pages".into()));
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Pages));
     assert_eq!(
         app.error, "",
         "the chat/pages early return must still clear"
@@ -598,9 +590,9 @@ fn switching_panes_retires_a_stale_error_banner_on_every_tab() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.error = "explorer hydration failed".into();
-    let _ = app.__update(__DucktapeMessage::SelectShellTab("members".into()));
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Members));
     assert_eq!(app.error, "");
-    assert_eq!(app.shell_tab, "members");
+    assert_eq!(app.shell_tab, ShellTab::Members);
 }
 
 /// EVERY READER OF `/v1/peers` USES THE NAMES `PeerView` SERIALIZES.
@@ -662,10 +654,6 @@ fn assert_no_polling(lifecycle: &str) {
             // no longer flashes and vanishes. Still gated on a visible
             // toast — it costs nothing at rest.
             "every 300ms when !empty(toast) -> toast_tick",
-            // the settle-✓'s dismissal clock: two beats — hold + fade, then
-            // unmount. Gated on the flash anchor, so it exists only for the
-            // seconds after one of OUR sends settles.
-            "every 1200ms when (!empty(send_flash_ids)) || (!empty(thread_send_flash_ids)) -> send_flash_tick",
             // the block editor's autosave clock: the stock editor's edits
             // never pass through a handler, so a dirty buffer is the only
             // signal there is — and the gate IS the dirty test, so the tick
@@ -679,10 +667,9 @@ fn assert_no_polling(lifecycle: &str) {
     );
 }
 
-/// THE TAB GATE IS WIRING, NOT A PREDICATE. `tab_reads_plane` being correct in
-/// isolation buys nothing if `lifecycle.ice` still calls the loaders
-/// unconditionally — a declared-and-unrun extern is exactly how a dead loader
-/// sat in `backend.ice` until this branch swept it. This pins the call shapes.
+/// THE TAB GATE IS WIRING, NOT A PREDICATE. The optional request must be the
+/// task-flow input: an unselected `try` becomes Task::none and cannot supersede
+/// an already-running replace lane.
 ///
 /// It pins the OTHER half too: the `plane` arm is the chips' only off-tab
 /// writer, so its governance/agents runs must NOT carry a second
@@ -692,64 +679,80 @@ fn assert_no_polling(lifecycle: &str) {
 fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
     let lifecycle = inlined(include_str!("ui/handlers/lifecycle.ice"));
 
-    for (loader, lane, plane, generation) in [
+    for (loader, lane, selected, plane, generation) in [
         (
             "load_members",
             "members_load",
+            "members_load_selected",
             "members",
             "members_generation",
         ),
         (
             "load_governance",
             "governance_load",
+            "governance_load_selected",
             "governance",
             "gov_generation",
         ),
-        ("load_agents", "agents_load", "agents", "agents_generation"),
+        (
+            "load_agents",
+            "agents_load",
+            "agents_load_selected",
+            "agents",
+            "agents_generation",
+        ),
         (
             "load_account",
             "account_load",
+            "account_load_selected",
             "account",
             "account_generation",
         ),
     ] {
         let wired = format!(
-            "run replace lane={lane} {loader}(connected_rpc, keep_i64(tab_reads_plane(shell_tab, \"{plane}\"), {generation}, -1))"
+            "from done load_request(tab_reads_plane(shell_tab, \"{plane}\"), connected_rpc, \"\", {generation})\n      try request -> done request\n      done -> {selected} _"
         );
         assert!(
             lifecycle.contains(&wired),
             "the tab switch must gate {loader}: {wired}"
         );
+        let launch = format!(
+            "on {selected}(request)\n  let obsolete_request = request.rpc != connected_rpc || request.generation != {generation}\n  return if obsolete_request\n  run replace lane={lane} {loader}(request.rpc, request.generation)"
+        );
+        assert!(
+            lifecycle.contains(&launch),
+            "selected load lost its compiler lane: {launch}"
+        );
     }
 
-    for (loader, lane, module, generation) in [
+    for (loader, selected, module, generation) in [
         (
             "load_members",
-            "members_load",
+            "members_load_selected",
             "valset",
             "members_generation",
         ),
         (
             "load_governance",
-            "governance_load",
+            "governance_load_selected",
             "governance",
             "gov_generation",
         ),
         (
             "load_account",
-            "account_load",
+            "account_load_selected",
             "identity",
             "account_generation",
         ),
         (
             "load_dm_peers",
-            "dm_peers_load",
+            "dm_peers_load_selected",
             "identity",
             "dm_peers_generation",
         ),
     ] {
         let live = format!(
-            "run replace lane={lane} {loader}(connected_rpc, keep_i64(plane_live_hit(next.kind, next.module, \"{module}\"), {generation}, -1))"
+            "from done load_request(plane_live_hit(next.kind, next.module, \"{module}\"), connected_rpc, \"\", {generation})\n      try request -> done request\n      done -> {selected} _"
         );
         assert!(
             lifecycle.contains(&live),
@@ -766,7 +769,7 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
     // `"agent"` and the Forge seat's dot goes dark for the length of a run.
     for line in [
         "agents_generation = keep_i64(agents_plane_hit(next.kind, next.module), agents_generation + 1, agents_generation)",
-        "run replace lane=agents_load load_agents(connected_rpc, keep_i64(agents_plane_hit(next.kind, next.module), agents_generation, -1))",
+        "from done load_request(agents_plane_hit(next.kind, next.module), connected_rpc, \"\", agents_generation)\n      try request -> done request\n      done -> agents_load_selected _",
     ] {
         assert!(
             lifecycle.contains(line),
@@ -781,24 +784,77 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
     // ungated (it is what fills chat's `user_key`, which chat cannot refetch
     // for itself — a move into chat returns above the tab block), and the tab
     // move must carry the gate.
-    let settings_loads: Vec<_> = lifecycle
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("run replace lane=settings_load load_settings_facts("))
-        .collect();
-    assert_eq!(
-        settings_loads,
-        [
-            "run replace lane=settings_load load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _",
-            "run replace lane=settings_load load_settings_facts(connected_rpc, keep_i64(shell_tab == \"settings\", settings_generation, -1)) -> settings_loaded _ | settings_failed _",
-        ]
-    );
+    assert!(lifecycle.contains(
+        "run replace lane=settings_load load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _"
+    ));
+    assert!(lifecycle.contains(
+        "from done load_request(shell_tab == ShellTab.settings, connected_rpc, \"\", settings_generation)\n      try request -> done request\n      done -> settings_load_selected _"
+    ));
+    assert!(lifecycle.contains(
+        "on settings_load_selected(request)\n  let obsolete_request = request.rpc != connected_rpc || request.generation != settings_generation\n  let unmounted = shell_tab != ShellTab.settings\n  return if obsolete_request || unmounted\n  run replace lane=settings_load load_settings_facts(request.rpc, request.generation)"
+    ));
+
+    // A selector is a queued message. If an older one lands after a newer
+    // intent, it must not start and replace the newer lane.
+    for (selected, generation) in [
+        ("explorer_load_selected", "explorer_generation"),
+        ("files_list_selected", "fs_generation"),
+        ("files_history_selected", "fs_generation"),
+        ("members_load_selected", "members_generation"),
+        ("governance_load_selected", "gov_generation"),
+        ("settings_load_selected", "settings_generation"),
+        ("peers_load_selected", "node_peers_generation"),
+        ("agents_load_selected", "agents_generation"),
+        ("account_load_selected", "account_generation"),
+        ("dm_peers_load_selected", "dm_peers_generation"),
+        ("forge_load_selected", "forge_generation"),
+        (
+            "shell_credentials_load_selected",
+            "shell_credentials_generation",
+        ),
+    ] {
+        let guarded = format!(
+            "on {selected}(request)\n  let obsolete_request = request.rpc != connected_rpc || request.generation != {generation}"
+        );
+        assert!(
+            lifecycle.contains(&guarded),
+            "queued selector lacks an endpoint-and-generation launch guard: {guarded}"
+        );
+    }
+
+    for (selected, unmounted) in [
+        ("explorer_load_selected", "shell_tab != ShellTab.explorer"),
+        ("files_list_selected", "shell_tab != ShellTab.files"),
+        ("files_history_selected", "shell_tab != ShellTab.files"),
+        ("settings_load_selected", "shell_tab != ShellTab.settings"),
+        (
+            "peers_load_selected",
+            "shell_tab != ShellTab.node || node_tab != NodeTab.overview",
+        ),
+        ("forge_load_selected", "shell_tab != ShellTab.forge"),
+        (
+            "shell_credentials_load_selected",
+            "shell_tab != ShellTab.shell",
+        ),
+    ] {
+        let handler = lifecycle
+            .split_once(&format!("on {selected}(request)"))
+            .unwrap_or_else(|| panic!("missing selected handler {selected}"))
+            .1
+            .split("\non ")
+            .next()
+            .expect("selected handler body");
+        assert!(
+            handler.contains(&format!("let unmounted = {unmounted}")),
+            "{selected}: tab-owned selector lacks its current-mount guard: {unmounted}"
+        );
+        assert!(handler.contains("return if obsolete_request || unmounted"));
+    }
 }
 
-/// THE GATE'S OTHER HALF IS THE BUMP, and it is the half the `-1` cannot do
-/// alone. `settings_loaded` is dropped when its generation is stale, so a tab
-/// move that bumps unconditionally REVOKES the connect load still in flight
-/// and puts only a refused `-1` in its place. Every other generation on that
+/// THE GATE'S OTHER HALF IS THE BUMP. `settings_loaded` is dropped when its
+/// generation is stale, so a tab move that bumps unconditionally revokes the
+/// connect load still in flight. Every other generation on that
 /// block may bump freely — their loaders draw one tab, so opening it re-earns
 /// the read. The settings facts are the exception: `settings_user_key` is
 /// chat's `me`, chat returns above the tab block, and nothing chat does ever
@@ -811,11 +867,10 @@ fn a_move_to_a_pane_that_does_not_draw_the_settings_facts_keeps_the_connect_load
     app.connected = true;
     let in_flight = app.settings_generation;
 
-    let _ = app.__update(__DucktapeMessage::SelectShellTab("members".into()));
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Members));
     let _ = app.__update(__DucktapeMessage::SettingsLoaded(
         crate::backend::SettingsFacts {
             generation: in_flight,
-            endpoint: "http://127.0.0.1:7100".into(),
             key_path: "/w/user.key".into(),
             key_state: "encrypted".into(),
             data_dir: "/w".into(),
@@ -829,7 +884,7 @@ fn a_move_to_a_pane_that_does_not_draw_the_settings_facts_keeps_the_connect_load
     );
 
     // and the tab that DOES draw them still re-reads on entry.
-    let _ = app.__update(__DucktapeMessage::SelectShellTab("settings".into()));
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Settings));
     assert_ne!(
         app.settings_generation, in_flight,
         "entering Settings must issue a fresh read"
@@ -861,7 +916,7 @@ fn a_move_off_the_agents_tab_keeps_a_live_load_that_already_answered() {
     }));
     let in_flight = app.agents_generation;
 
-    let _ = app.__update(__DucktapeMessage::SelectShellTab("members".into()));
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Members));
     let _ = app.__update(__DucktapeMessage::AgentsLoaded(backend::AgentsData {
         generation: in_flight,
         agents: vec![backend::AgentRow {
@@ -870,17 +925,10 @@ fn a_move_off_the_agents_tab_keeps_a_live_load_that_already_answered() {
             initials: "QU".into(),
             capability: "mock-llm-1".into(),
             status: "active".into(),
-            owner_key: String::new(),
             owner_handle: String::new(),
-            created_at: 0,
-            is_mine: false,
             live: true,
-            tools: 0,
-            secrets: 0,
-            subagent_budget: 0,
-            allowed_actions: Vec::new(),
-            skills: Vec::new(),
-            caps: Vec::new(),
+            skill_count: 0,
+            cap_count: 0,
         }],
     }));
     assert!(
@@ -889,7 +937,7 @@ fn a_move_off_the_agents_tab_keeps_a_live_load_that_already_answered() {
     );
 
     // and the tab that DOES draw the rows still re-reads on entry.
-    let _ = app.__update(__DucktapeMessage::SelectShellTab("agents".into()));
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Agents));
     assert_ne!(
         app.agents_generation, in_flight,
         "entering Agents must issue a fresh read"
@@ -906,6 +954,8 @@ fn forge_depth_rides_the_established_seams() {
     ));
     let forge = inlined(include_str!("ui/components/forge.ice"));
     let backend = inlined(include_str!("ui/extern/backend.ice"));
+    let forge_state = inlined(include_str!("ui/state/forge.ice"));
+    let onboarding = inlined(include_str!("ui/handlers/onboarding.ice"));
 
     // the item discussion IS a chat surface: hydrated through the chat
     // lanes and spliced by the SAME fold the chat pane uses, scoped to
@@ -917,6 +967,46 @@ fn forge_depth_rides_the_established_seams() {
         "run every send_message(connected_rpc, password, forge_item_channel, forge_discussion_pending"
     ));
 
+    // Replace lanes own request freshness. Their payloads keep only the
+    // semantic scope needed when the selected repo/item moves without a new
+    // request: channel for discussion, and repo/revision/path for code.
+    assert!(lifecycle.contains(
+        "run replace lane=forge_discussion load_forge_discussion(connected_rpc, forge_item_channel)"
+    ));
+    assert!(lifecycle.contains("return if next.channel_id != forge_item_channel"));
+    assert!(lifecycle.contains("let same_repo = next.repo == forge_repo"));
+    assert!(
+        lifecycle.contains("let same_rev = empty(forge_tree_rev) || next.rev == forge_tree_rev")
+    );
+    assert!(lifecycle.contains("let same_path = next.path == forge_file_path"));
+    assert!(backend.contains(
+        "load_forge_discussion(rpc:str, channel_id:str) -> ForgeDiscussionData ! AppError"
+    ));
+    assert!(
+        backend.contains(
+            "forge_tree(rpc:str, repo:str, rev:str, path:str) -> ForgeTreeData ! AppError"
+        )
+    );
+    assert!(
+        backend.contains("forge_blob(rpc:str, repo:str, rev:str, path:str) -> BlobView ! AppError")
+    );
+    for deleted in [
+        concat!("forge_", "discussion_generation"),
+        concat!("forge_", "code_generation"),
+    ] {
+        for (path, source) in [
+            ("state/forge.ice", forge_state.as_str()),
+            ("handlers/forge.ice", lifecycle.as_str()),
+            ("handlers/onboarding.ice", onboarding.as_str()),
+            ("extern/backend.ice", backend.as_str()),
+        ] {
+            assert!(
+                !source.contains(deleted),
+                "{path} still carries deleted request token `{deleted}`"
+            );
+        }
+    }
+
     // a review pins the source head the reviewer saw; the merge CASes
     // BOTH heads (recompute on a moved branch, never a blind retry).
     //
@@ -925,7 +1015,7 @@ fn forge_depth_rides_the_established_seams() {
     // verdict it was written under, and it cannot outlive the diff it
     // anchors to (`keep_staged_comments` drops them when the head moves).
     assert!(backend.contains(
-        "submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:str, body:str, commit_oid:str, comments:[ForgeDraftComment])"
+        "submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:ForgeReviewVerdict, body:str, commit_oid:str, comments:[ForgeDraftComment])"
     ));
     assert!(backend.contains(
         "merge_forge_pr(rpc:str, password:str, repo:str, number:i64, source_branch:str, expected_source_oid:str, prev_target_oid:str)"
@@ -937,7 +1027,7 @@ fn forge_depth_rides_the_established_seams() {
     // surface's own gate: a chain op must not query a list that is not on
     // screen.
     assert!(lifecycle.contains(
-        "run replace lane=forge_live forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == \"forge\"), forge_generation)"
+        "run replace lane=forge_live forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == ShellTab.forge), forge_generation)"
     ));
     assert_no_polling(&lifecycle);
 
@@ -1067,7 +1157,11 @@ fn forge_code_loaders_query_only_the_requested_tree_or_blob() {
             assert!(loader.contains(field));
         }
         assert!(loader.contains("client.query(\"forge\", &query).await?"));
-        for full_repo_work in ["sync_forge_mirror", "mirror_holding_revision", "spawn_blocking"] {
+        for full_repo_work in [
+            "sync_forge_mirror",
+            "mirror_holding_revision",
+            "spawn_blocking",
+        ] {
             assert!(
                 !loader.contains(full_repo_work),
                 "Code loader must not start {full_repo_work}"
@@ -1076,15 +1170,18 @@ fn forge_code_loaders_query_only_the_requested_tree_or_blob() {
     }
 
     let handlers = include_str!("ui/handlers/forge.ice");
+    assert!(
+        handlers.contains(
+            "run replace lane=forge_code forge_tree(connected_rpc, forge_repo, \"\", \"\")"
+        )
+    );
     assert!(handlers.contains(
-        "forge_tree(connected_rpc, forge_repo, \"\", \"\", forge_code_generation)"
+        "run replace lane=forge_code forge_tree(connected_rpc, forge_repo, forge_tree_rev, path)"
     ));
     assert!(handlers.contains(
-        "forge_tree(connected_rpc, forge_repo, forge_tree_rev, path, forge_code_generation)"
+        "run replace lane=forge_code forge_blob(connected_rpc, forge_repo, forge_tree_rev, path)"
     ));
-    assert!(handlers.contains(
-        "forge_blob(connected_rpc, forge_repo, forge_tree_rev, path, forge_code_generation)"
-    ));
+    assert!(!handlers.contains("forge_code_generation"));
 }
 
 /// Forge's repo chrome used to stack three independent rows — crumb, every
@@ -1103,9 +1200,11 @@ fn forge_layout_keeps_repo_navigation_compact() {
         .expect("repo navigation boundary")
         .0;
     let tabs_end = repo_body
-        .find("emit(select_forge_tab, \"issues\")")
+        .find("emit(select_forge_tab, ForgeTab.issues)")
         .expect("issues tab");
-    let branches = repo_body.find("for branch in branches").expect("branch strip");
+    let branches = repo_body
+        .find("for branch in branches")
+        .expect("branch strip");
     assert!(
         tabs_end < branches,
         "branch context follows the tabs in their shared navigation row"
@@ -1113,7 +1212,7 @@ fn forge_layout_keeps_repo_navigation_compact() {
     assert_eq!(repo_body.matches("for branch in branches").count(), 1);
 
     let item_body = screen
-        .split_once("if forge_item_number > 0 && item_phase == \"ready\"")
+        .split_once("if forge_item_number > 0 && item_phase == ForgePhase.ready")
         .expect("detail back control")
         .1;
     assert!(item_body.starts_with("\n                BackToList"));
@@ -1197,12 +1296,7 @@ fn background_refresh_preserves_editing_state() {
             .any(|name| line.trim_start().starts_with(&format!("{name} =")))
     });
     assert!(!overwrites_editable);
-    for scoped in [
-        "channel_name_draft",
-        "member_key_draft",
-        "message_draft",
-        "reply_draft",
-    ] {
+    for scoped in ["channel_name_draft", "member_key_draft", "message_draft"] {
         assert!(refresh.contains(&format!(
             "{scoped} = retain_for_endpoint({scoped}, active_channel, \
 keep_str(next.chat_loaded, next.active_channel, active_channel))"
@@ -1225,9 +1319,11 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         "active_page_title = keep_str(pages_answer_is_current && !pages_fold_outran_reply, next.active_page_title, active_page_title)"
     ));
     assert!(lifecycle.contains(
-        "pages_answer_is_current = next.pages_loaded && pages_reply_answers_current(next.pages, next.active_page, active_page)"
+        "let pages_answer_is_current = next.pages_loaded && pages_reply_answers_current(next.pages, next.active_page, active_page)"
     ));
-    assert!(lifecycle.contains("pages_fold_outran_reply = next.fold_serial != pages_fold_serial"));
+    assert!(
+        lifecycle.contains("let pages_fold_outran_reply = next.fold_serial != pages_fold_serial")
+    );
     // The fold site is the ONE writer of the serial: a text fold bumps it, and
     // every resync request snapshots it, or the token guards nothing.
     assert!(lifecycle.contains(
@@ -1366,7 +1462,7 @@ fn resyncs_cannot_retarget_drafts_to_fallback_contexts() {
     app.message_draft = "channel draft".into();
     app.selected_message_seq = 7;
     app.selected_message_rev = 2;
-    app.message_action = "editing".into();
+    app.message_action = MessageAction::Editing;
     app.message_edit_draft = "message edit".into();
     app.channel_settings_open = true;
     app.channel_name_draft = "channel rename".into();
@@ -1378,8 +1474,7 @@ fn resyncs_cannot_retarget_drafts_to_fallback_contexts() {
     app.thread_next_reply_offset = 4;
     app.thread_has_more = true;
     app.thread_loading = true;
-    app.reply_draft = "thread reply".into();
-    app.pending_reply = "pending thread reply".into();
+    app.reply_editor = compose("thread reply");
     app.active_page = "deleted-page".into();
 
     let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
@@ -1393,7 +1488,7 @@ fn resyncs_cannot_retarget_drafts_to_fallback_contexts() {
     assert_eq!(app.active_channel, "fallback-channel");
     assert_eq!(app.selected_message_seq, 0);
     assert_eq!(app.selected_message_rev, 0);
-    assert_eq!(app.message_action, "toolbar");
+    assert_eq!(app.message_action, MessageAction::Toolbar);
     assert!(app.message_edit_draft.is_empty());
     assert!(!app.channel_settings_open);
     assert!(app.channel_name_draft.is_empty());
@@ -1405,8 +1500,10 @@ fn resyncs_cannot_retarget_drafts_to_fallback_contexts() {
     assert_eq!(app.thread_next_reply_offset, 0);
     assert!(!app.thread_has_more);
     assert!(!app.thread_loading);
-    assert!(app.reply_draft.is_empty());
-    assert!(app.pending_reply.is_empty());
+    assert_eq!(
+        backend::parked_reply_draft(app.reply_drafts.clone(), "deleted-channel".into(), 7,),
+        "thread reply"
+    );
     assert!(app.message_draft.is_empty());
     assert_eq!(app.active_page, "fallback-page");
 }
@@ -1417,7 +1514,7 @@ fn mutation_acks_preserve_open_editors_and_thread_state() {
     app.active_channel = "general".into();
     app.selected_message_seq = 7;
     app.selected_message_rev = 2;
-    app.message_action = "editing".into();
+    app.message_action = MessageAction::Editing;
     app.message_edit_draft = "edit in progress".into();
     app.active_thread_seq = 9;
     app.thread_target_seq = 10;
@@ -1426,8 +1523,7 @@ fn mutation_acks_preserve_open_editors_and_thread_state() {
     app.thread_has_more = true;
     app.reply_editor = compose("reply in progress");
     app.message_editor = compose("next message");
-    app.mutation_phase = "channel".into();
-    app.pending_message = "sent message".into();
+    app.mutation_phase = MutationPhase::Channel;
 
     // an unrelated mutation's ack carries no snapshot — nothing to stomp
     // (reactions no longer route through ChatAcked at all; a channel op is
@@ -1435,7 +1531,7 @@ fn mutation_acks_preserve_open_editors_and_thread_state() {
     let _ = app.__update(__DucktapeMessage::ChatAcked(true));
 
     assert_eq!(app.selected_message_seq, 7);
-    assert_eq!(app.message_action, "editing");
+    assert_eq!(app.message_action, MessageAction::Editing);
     assert_eq!(app.message_edit_draft, "edit in progress");
     assert_eq!(app.active_thread_seq, 9);
     assert_eq!(app.thread_target_seq, 10);
@@ -1444,7 +1540,7 @@ fn mutation_acks_preserve_open_editors_and_thread_state() {
     assert!(app.thread_has_more);
     assert_eq!(reply_composer(&app), "reply in progress");
     assert_eq!(composer(&app), "next message");
-    assert_eq!(app.mutation_phase, "idle");
+    assert_eq!(app.mutation_phase, MutationPhase::Idle);
 }
 
 /// The picker-dismissal bug in one contract: an in-flight reaction must not
@@ -1461,19 +1557,27 @@ fn reactions_run_outside_the_mutation_lock() {
     app.messages = vec![message(7, "root", false)];
     app.selected_message_seq = 7;
     app.selected_message_rev = 1;
-    app.message_action = "reactions".into();
+    app.message_action = MessageAction::Reactions;
 
     let _ = app.__update(__DucktapeMessage::AddReactionSubmit("👍".into()));
 
-    assert_eq!(app.mutation_phase, "idle", "reactions never take the lock");
+    assert_eq!(
+        app.mutation_phase,
+        MutationPhase::Idle,
+        "reactions never take the lock"
+    );
     assert_eq!(app.selected_message_seq, 7);
-    assert_eq!(app.message_action, "reactions", "the picker stays open");
+    assert_eq!(
+        app.message_action,
+        MessageAction::Reactions,
+        "the picker stays open"
+    );
 
     // the ack leaves the picker exactly where it was — multi-pick works
     let _ = app.__update(__DucktapeMessage::ReactionAcked(true));
     assert_eq!(app.selected_message_seq, 7);
-    assert_eq!(app.message_action, "reactions");
-    assert_eq!(app.mutation_phase, "idle");
+    assert_eq!(app.message_action, MessageAction::Reactions);
+    assert_eq!(app.mutation_phase, MutationPhase::Idle);
 }
 
 /// THE CANONICAL REFETCH *IS* THE REVERT. A reaction fold is not invertible
@@ -1502,7 +1606,6 @@ fn a_refused_reaction_is_reverted_by_the_resync_it_launches() {
     app.thread_messages = vec![tapped];
     app.active_thread_seq = 7;
     let resync_before = app.hydration_generation;
-    let thread_before = app.live_thread_generation;
 
     let _ = app.__update(__DucktapeMessage::ReactionFailed(backend::AppError {
         message: "the chain refused it".into(),
@@ -1514,7 +1617,8 @@ fn a_refused_reaction_is_reverted_by_the_resync_it_launches() {
         "a fresh resync is issued to fetch what is actually there"
     );
     assert_eq!(
-        app.mutation_phase, "idle",
+        app.mutation_phase,
+        MutationPhase::Idle,
         "and it never took the mutation lock to do it"
     );
 
@@ -1529,9 +1633,9 @@ fn a_refused_reaction_is_reverted_by_the_resync_it_launches() {
         app.messages[0].reactions.is_empty(),
         "the canonical page takes the chip back off the timeline"
     );
-    assert_ne!(
-        app.live_thread_generation, thread_before,
-        "and the open rail is re-fetched for its own copy of the row"
+    assert_eq!(
+        app.active_thread_seq, 7,
+        "the open rail remains its own scope"
     );
 
     // AND THE CEILING IT REVERTS UNDER, pinned so a later change to the merge
@@ -1615,7 +1719,7 @@ fn every_reaction_tap_folds_into_the_timeline_and_the_thread_rail() {
     let _ = app.__update(__DucktapeMessage::RemoveReactionAt(7, "👍".into()));
     assert!(app.error.is_empty());
     assert_ne!(app.hydration_generation, before);
-    assert_eq!(app.mutation_phase, "idle");
+    assert_eq!(app.mutation_phase, MutationPhase::Idle);
 
     let armed = app.hydration_generation;
     let _ = app.__update(__DucktapeMessage::RemoveReactionAt(0, "👍".into()));
@@ -1682,17 +1786,21 @@ fn an_archived_channel_says_why_it_dropped_the_reaction() {
     // menu's "Manage reactions" row routes here too, live precisely so its
     // press reaches this refusal instead of dying on a disabled button.
     // A ♡ route: what the press is, and which action slot its picker lands in.
-    type PickerRoute = (&'static str, fn() -> __DucktapeMessage, fn(&Ducktape) -> &str);
+    type PickerRoute = (
+        &'static str,
+        fn() -> __DucktapeMessage,
+        fn(&Ducktape) -> MessageAction,
+    );
     let picker_routes: [PickerRoute; 2] = [
         (
             "stream ♡",
             || __DucktapeMessage::OpenMessageReactions(7, "root".into(), 1),
-            |app| app.message_action.as_str(),
+            |app| app.message_action,
         ),
         (
             "rail ♡",
             || __DucktapeMessage::OpenThreadMessageReactions(7, "root".into(), 1),
-            |app| app.thread_message_action.as_str(),
+            |app| app.thread_message_action,
         ),
     ];
     for (route, press, opened_action) in picker_routes {
@@ -1707,7 +1815,7 @@ fn an_archived_channel_says_why_it_dropped_the_reaction() {
 
         assert_eq!(
             opened_action(&app),
-            "toolbar",
+            MessageAction::Toolbar,
             "{route}: the picker never opened"
         );
         assert!(app.error.contains("archived"), "{route}: and it said why");
@@ -1724,7 +1832,11 @@ fn an_archived_channel_says_why_it_dropped_the_reaction() {
             app.error, "Send failed — the node refused the message.",
             "{route}: opening the picker is a read and must not clear the banner"
         );
-        assert_eq!(opened_action(&app), "reactions", "{route}: the picker opened");
+        assert_eq!(
+            opened_action(&app),
+            MessageAction::Reactions,
+            "{route}: the picker opened"
+        );
 
         // …and the mutation that follows still clears the banner on its own
         // line. Only the banner is read here: the fold itself needs the
@@ -1745,7 +1857,7 @@ fn an_archived_channel_says_why_it_dropped_the_reaction() {
     // sixth route it does not name, which is the only failure it exists to
     // catch. So the ROUTES SELECT THEMSELVES: walk every handler and conscript
     // the ones that reach a reaction op (`run every add_reaction(` /
-    // `remove_reaction(`) or open the picker (`_action = "reactions"`). Those
+    // `remove_reaction(`) or open the picker (`_action = MessageAction.reactions`). Those
     // discriminants are the ACTS, so the landings that merely fold one —
     // `reaction_acked`, `reaction_failed` — are not swept in, and prose naming
     // an op does not conscript a handler that never calls it.
@@ -1759,7 +1871,7 @@ fn an_archived_channel_says_why_it_dropped_the_reaction() {
             let is_comment = statement.starts_with("//");
             let taps = statement.contains("run every add_reaction(")
                 || statement.contains("run every remove_reaction(");
-            let opens_picker = statement.contains("_action = \"reactions\"");
+            let opens_picker = statement.contains("_action = MessageAction.reactions");
             !is_comment && (taps || opens_picker)
         });
         if !reaches_reaction {
@@ -1796,7 +1908,7 @@ fn a_tombstoned_thread_root_renders_deleted_in_place() {
     app.active_thread_seq = 9;
     app.thread_target_seq = 10;
     app.thread_messages = vec![message(9, "thread root", false)];
-    app.reply_draft = "unsent reply".into();
+    app.reply_editor = compose("unsent reply");
 
     // the root's delete arrives as a delta: both lists tombstone the row
     // in place; the open thread stays open showing the tombstone (the
@@ -1818,7 +1930,7 @@ fn a_tombstoned_thread_root_renders_deleted_in_place() {
     assert!(app.thread_messages[0].deleted);
     assert_eq!(app.thread_messages[0].body, "Message deleted");
     assert_eq!(app.active_thread_seq, 9, "the panel stays open");
-    assert_eq!(app.reply_draft, "unsent reply");
+    assert_eq!(reply_composer(&app), "unsent reply");
 }
 
 #[test]
@@ -1827,7 +1939,7 @@ fn unrelated_resyncs_keep_an_initial_thread_load_alive() {
     refresh.connected_rpc = "http://node".into();
     refresh.active_channel = "general".into();
     refresh.loading = false;
-    refresh.mutation_phase = "idle".into();
+    refresh.mutation_phase = MutationPhase::Idle;
     refresh.thread_generation = 6;
     let _ = refresh.__update(__DucktapeMessage::OpenThreadFor(7));
     assert_eq!(refresh.active_thread_seq, 7);
@@ -1859,12 +1971,9 @@ fn unrelated_resyncs_keep_an_initial_thread_load_alive() {
     assert!(!refresh.thread_loading);
 }
 
-/// A HISTORY PAGE BELONGS TO THE CHANNEL THAT ASKED FOR IT. Only
-/// `load_more_history` bumps `history_generation` — nothing that moves
-/// `active_channel` does — so the generation guard ALONE let a page still in
-/// flight for #a prepend into #b's timeline, merging one room's scrollback into
-/// another's with no error and no way to tell. `HistoryPageData` carries the
-/// channel it was requested for and the reducer checks it.
+/// A HISTORY PAGE BELONGS TO THE CHANNEL THAT ASKED FOR IT. The compiler drops
+/// a superseded `history` run, while `HistoryPageData` carries the channel for
+/// room movement that starts no replacement history request.
 ///
 /// The flag is released ABOVE that check: a page dropped for landing in the
 /// wrong room must still free "Load older", which `load_more_history` refuses
@@ -1873,20 +1982,18 @@ fn unrelated_resyncs_keep_an_initial_thread_load_alive() {
 fn a_history_page_prepends_only_into_the_channel_that_asked_for_it() {
     let (mut app, _) = Ducktape::__boot();
     app.loading = false;
-    app.mutation_phase = "idle".into();
+    app.mutation_phase = MutationPhase::Idle;
     app.active_channel = "a".into();
     app.messages = vec![message(10, "a-ten", false)];
     let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
     assert!(app.history_loading);
-    let in_flight = app.history_generation;
 
     // The reader is on #b by the time the page lands. `active_channel` moves
     // under an open request on the resync, the search-hit and the create routes
-    // too, and NONE of them bump `history_generation`.
+    // too, without necessarily starting another history request.
     app.active_channel = "b".into();
     app.messages = vec![message(10, "b-ten", false)];
     let _ = app.__update(__DucktapeMessage::HistoryLoaded(backend::HistoryPageData {
-        generation: in_flight,
         channel_id: "a".into(),
         messages: vec![message(1, "a-one", false)],
     }));
@@ -1903,9 +2010,7 @@ fn a_history_page_prepends_only_into_the_channel_that_asked_for_it() {
 
     // The same page stamped for #b IS #b's history, and prepends.
     let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
-    let in_flight = app.history_generation;
     let _ = app.__update(__DucktapeMessage::HistoryLoaded(backend::HistoryPageData {
-        generation: in_flight,
         channel_id: "b".into(),
         messages: vec![message(1, "b-one", false)],
     }));
@@ -1930,7 +2035,7 @@ fn a_history_page_prepends_only_into_the_channel_that_asked_for_it() {
     ] {
         let (mut app, _) = Ducktape::__boot();
         app.loading = false;
-        app.mutation_phase = "idle".into();
+        app.mutation_phase = MutationPhase::Idle;
         app.active_channel = "a".into();
         app.messages = vec![message(10, "a-ten", false)];
         // `create_channel_submit` refuses an empty draft; the rest ignore it.
@@ -1960,7 +2065,7 @@ fn a_resync_releases_load_older_only_when_it_moves_the_room() {
     for (landing, expected) in [("a", true), ("b", false)] {
         let (mut app, _) = Ducktape::__boot();
         app.loading = false;
-        app.mutation_phase = "idle".into();
+        app.mutation_phase = MutationPhase::Idle;
         app.active_channel = "a".into();
         app.messages = vec![message(10, "a-ten", false)];
         let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
@@ -2360,7 +2465,7 @@ fn every_writer_of_a_mirrored_view_reading_refreshes_its_mirror() {
     // (mirror, the sources whose movement invalidates it). `settings_user_key`
     // is in two of them because THIS DEVICE'S KEY decides both which channels
     // are its own DMs and whether it is seated in a members-only room.
-    const MIRRORS: [(&str, &[&str]); 9] = [
+    const MIRRORS: [(&str, &[&str]); 8] = [
         (
             "rooms",
             &["channels", "dm_peers", "settings_user_key", "channel_reads"],
@@ -2379,7 +2484,6 @@ fn every_writer_of_a_mirrored_view_reading_refreshes_its_mirror() {
             &["huddle_roster", "call_peers", "call_muted"],
         ),
         ("fs_preview_entry", &["fs_entries", "fs_preview_path"]),
-        ("fs_dirs", &["fs_entries"]),
         (
             "post_refusal",
             &[
@@ -2435,7 +2539,7 @@ on ",
                 checked += 1;
                 assert!(
                     assigns(block, mirror),
-                    "{path}: `on {handler}` assigns `{moved}`, so it must also                      assign `{mirror}` — the view reads the mirror and never                      recomputes it (see state.ice)"
+                    "{path}: `on {handler}` assigns `{moved}`, so it must also                      assign `{mirror}` — the view reads the mirror and never                      recomputes it (see state/chat.ice)"
                 );
             }
         }
@@ -2457,9 +2561,9 @@ fn a_failed_huddle_leave_keeps_the_retained_roster_visible() {
         .1;
 
     assert!(leave.contains("call_peers = []"));
-    assert!(leave.contains(
-        "huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)"
-    ));
+    assert!(
+        leave.contains("huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)")
+    );
     assert!(
         !leave.contains("huddle_rows = []"),
         "an uncommitted leave failure retains the roster, so blanking its mirror is permanent"
@@ -2493,7 +2597,7 @@ fn closing_a_repo_or_an_item_retires_the_load_that_would_reopen_it() {
         .split_once("on forge_close_item")
         .expect("item close handler")
         .1
-        .split_once("\n// Held here")
+        .split_once("\non ")
         .expect("item close arm")
         .0;
     for lane in ["forge_item", "forge_discussion"] {
@@ -2568,73 +2672,22 @@ fn closing_a_repo_or_an_item_retires_the_load_that_would_reopen_it() {
 }
 
 #[test]
-fn leaving_forge_code_retires_late_successes_and_failures() {
-    let handlers = [
-        ("chat", inlined(include_str!("ui/handlers/chat.ice"))),
-        ("forge", inlined(include_str!("ui/handlers/forge.ice"))),
-        ("huddle", inlined(include_str!("ui/handlers/huddle.ice"))),
-        (
-            "lifecycle",
-            inlined(include_str!("ui/handlers/lifecycle.ice")),
-        ),
-        ("pages", inlined(include_str!("ui/handlers/pages.ice"))),
-    ];
-    let mut shell_routes = 0usize;
-    for (path, source) in handlers {
-        for block in source.split("\non ").skip(1) {
-            let moves_shell = block
-                .lines()
-                .any(|line| line.trim_start().starts_with("shell_tab = "));
-            if !moves_shell {
-                continue;
-            }
-            shell_routes += 1;
-            assert!(
-                block.contains("forge_code_generation = "),
-                "{path}: every direct shell navigation must retire Forge Code work"
-            );
-        }
+fn forge_code_reads_are_compiler_replaced_without_ui_generations() {
+    let handlers = inlined(include_str!("ui/handlers/forge.ice"));
+    for launch in [
+        "forge_tree(connected_rpc, forge_repo, \"\", \"\")",
+        "forge_tree(connected_rpc, forge_repo, forge_tree_rev, path)",
+        "forge_blob(connected_rpc, forge_repo, forge_tree_rev, path)",
+    ] {
+        assert!(
+            handlers.contains(&format!("run replace lane=forge_code {launch}")),
+            "{launch} must supersede the previous code read"
+        );
     }
-    assert_eq!(shell_routes, 4, "the four direct shell routes stay covered");
+    assert!(!handlers.contains("forge_code_generation"));
 
-    let (mut app, _) = Ducktape::__boot();
-    app.connected = true;
-    app.connected_rpc = "http://node".into();
-    app.shell_tab = "forge".into();
-    let _ = app.__update(__DucktapeMessage::ForgeOpenRepo("core".into()));
-
-    let tree_generation = app.forge_code_generation;
-    let _ = app.__update(__DucktapeMessage::SelectForgeTab("pulls".into()));
-    assert!(app.forge_code_generation > tree_generation);
-    let _ = app.__update(__DucktapeMessage::ForgeTreeLoaded(backend::ForgeTreeData {
-        generation: tree_generation,
-        repo: "core".into(),
-        rev: "1111111111111111111111111111111111111111".into(),
-        path: String::new(),
-        born: true,
-        entries: Vec::new(),
-        truncated: false,
-    }));
-    assert!(
-        app.forge_tree_rev.is_empty(),
-        "a late tree success cannot repaint the Pulls tab"
-    );
-
-    let _ = app.__update(__DucktapeMessage::SelectForgeTab("code".into()));
-    let _ = app.__update(__DucktapeMessage::ForgeOpenFile("README.md".into()));
-    let file_generation = app.forge_code_generation;
-    let _ = app.__update(__DucktapeMessage::SelectShellTab("settings".into()));
-    assert!(app.forge_code_generation > file_generation);
-    let _ = app.__update(__DucktapeMessage::ForgeFileFailed(
-        backend::HydrationError {
-            generation: file_generation,
-            message: "late code failure".into(),
-        },
-    ));
-    assert!(
-        app.error.is_empty(),
-        "a late blob failure cannot paint another shell tab's error banner"
-    );
+    let backend = include_str!("backend/forge.rs");
+    assert!(backend.contains("item: item_slice.unwrap_or(noop.item)"));
 }
 
 #[test]
@@ -2647,7 +2700,7 @@ fn forge_scoped_reads_do_not_call_loading_or_failure_empty() {
             message: "forge unavailable".into(),
         },
     ));
-    assert_eq!(failed_list.forge_list_phase, "failed");
+    assert_eq!(failed_list.forge_list_phase, ForgePhase::Failed);
     assert_eq!(failed_list.error, "forge unavailable");
 
     let (mut app, _) = Ducktape::__boot();
@@ -2655,10 +2708,9 @@ fn forge_scoped_reads_do_not_call_loading_or_failure_empty() {
     app.connected_rpc = "http://node".into();
 
     let _ = app.__update(__DucktapeMessage::ForgeOpenRepo("core".into()));
-    assert_eq!(app.forge_repo_phase, "loading");
-    assert_eq!(app.forge_code_phase, "tree_loading");
+    assert_eq!(app.forge_repo_phase, ForgePhase::Loading);
+    assert_eq!(app.forge_code_phase, ForgeCodePhase::TreeLoading);
     let generation = app.forge_generation;
-    let code_generation = app.forge_code_generation;
 
     let _ = app.__update(__DucktapeMessage::ForgeRepoLoaded(backend::ForgeRepoData {
         generation,
@@ -2666,10 +2718,20 @@ fn forge_scoped_reads_do_not_call_loading_or_failure_empty() {
         branches: Vec::new(),
         items: Vec::new(),
     }));
-    assert_eq!(app.forge_repo_phase, "ready");
+    assert_eq!(app.forge_repo_phase, ForgePhase::Ready);
 
     let _ = app.__update(__DucktapeMessage::ForgeTreeLoaded(backend::ForgeTreeData {
-        generation: code_generation,
+        repo: "other".into(),
+        rev: "2222222222222222222222222222222222222222".into(),
+        path: String::new(),
+        born: true,
+        entries: Vec::new(),
+        truncated: false,
+    }));
+    assert_eq!(app.forge_code_phase, ForgeCodePhase::TreeLoading);
+    assert!(!app.forge_tree_born, "another repo's tree must not paint");
+
+    let _ = app.__update(__DucktapeMessage::ForgeTreeLoaded(backend::ForgeTreeData {
         repo: "core".into(),
         rev: "1111111111111111111111111111111111111111".into(),
         path: String::new(),
@@ -2677,7 +2739,7 @@ fn forge_scoped_reads_do_not_call_loading_or_failure_empty() {
         entries: Vec::new(),
         truncated: true,
     }));
-    assert_eq!(app.forge_code_phase, "ready");
+    assert_eq!(app.forge_code_phase, ForgeCodePhase::Ready);
     assert!(app.forge_tree_born);
     assert!(app.forge_tree_truncated);
     assert_eq!(
@@ -2685,8 +2747,79 @@ fn forge_scoped_reads_do_not_call_loading_or_failure_empty() {
         "nested tree and file reads stay pinned to the tree's commit"
     );
 
+    let _ = app.__update(__DucktapeMessage::ForgeOpenDir("src".into()));
+    let _ = app.__update(__DucktapeMessage::ForgeTreeLoaded(backend::ForgeTreeData {
+        repo: "core".into(),
+        rev: "2222222222222222222222222222222222222222".into(),
+        path: "src".into(),
+        born: true,
+        entries: Vec::new(),
+        truncated: false,
+    }));
+    assert_eq!(app.forge_code_phase, ForgeCodePhase::TreeLoading);
+    assert!(
+        app.forge_tree_entries.is_empty(),
+        "a tree from another revision must not paint"
+    );
+
+    let _ = app.__update(__DucktapeMessage::ForgeTreeLoaded(backend::ForgeTreeData {
+        repo: "core".into(),
+        rev: "1111111111111111111111111111111111111111".into(),
+        path: "src".into(),
+        born: true,
+        entries: Vec::new(),
+        truncated: false,
+    }));
+    assert_eq!(app.forge_code_phase, ForgeCodePhase::Ready);
+
+    let _ = app.__update(__DucktapeMessage::ForgeOpenFile("src/lib.rs".into()));
+    let _ = app.__update(__DucktapeMessage::ForgeBlobLoaded(backend::BlobView {
+        repo: "core".into(),
+        rev: "1111111111111111111111111111111111111111".into(),
+        path: "src/other.rs".into(),
+        text: "wrong file".into(),
+        truncated: false,
+        binary: false,
+        lines: 1,
+    }));
+    assert_eq!(app.forge_code_phase, ForgeCodePhase::FileLoading);
+    assert!(app.forge_file_text.is_empty());
+
+    let _ = app.__update(__DucktapeMessage::ForgeBlobLoaded(backend::BlobView {
+        repo: "core".into(),
+        rev: "1111111111111111111111111111111111111111".into(),
+        path: "src/lib.rs".into(),
+        text: "pub fn main() {}".into(),
+        truncated: false,
+        binary: false,
+        lines: 1,
+    }));
+    assert_eq!(app.forge_code_phase, ForgeCodePhase::Ready);
+    assert_eq!(app.forge_file_text, "pub fn main() {}");
+
+    app.forge_item_channel = "forge:core:7".into();
+    let _ = app.__update(__DucktapeMessage::ForgeDiscussionLoaded(
+        backend::ForgeDiscussionData {
+            channel_id: "forge:core:8".into(),
+            messages: vec![message(1, "wrong item", false)],
+            members: Vec::new(),
+        },
+    ));
+    assert!(
+        app.forge_discussion.is_empty(),
+        "another item's discussion must not paint"
+    );
+    let _ = app.__update(__DucktapeMessage::ForgeDiscussionLoaded(
+        backend::ForgeDiscussionData {
+            channel_id: "forge:core:7".into(),
+            messages: vec![message(1, "right item", false)],
+            members: Vec::new(),
+        },
+    ));
+    assert_eq!(app.forge_discussion[0].body, "right item");
+
     let _ = app.__update(__DucktapeMessage::ForgeOpenItem(7));
-    assert_eq!(app.forge_item_phase, "loading");
+    assert_eq!(app.forge_item_phase, ForgePhase::Loading);
     let generation = app.forge_generation;
     let _ = app.__update(__DucktapeMessage::ForgeItemFailed(
         backend::HydrationError {
@@ -2694,7 +2827,7 @@ fn forge_scoped_reads_do_not_call_loading_or_failure_empty() {
             message: "tracker unavailable".into(),
         },
     ));
-    assert_eq!(app.forge_item_phase, "failed");
+    assert_eq!(app.forge_item_phase, ForgePhase::Failed);
     assert_eq!(app.error, "tracker unavailable");
 }
 
@@ -2713,7 +2846,7 @@ fn forge_directory_navigation_clears_the_previous_file_preview() {
     let _ = app.__update(__DucktapeMessage::ForgeOpenDir("src".into()));
 
     assert_eq!(app.forge_tree_path, "src");
-    assert_eq!(app.forge_code_phase, "tree_loading");
+    assert_eq!(app.forge_code_phase, ForgeCodePhase::TreeLoading);
     assert!(app.forge_file_path.is_empty());
     assert!(app.forge_file_text.is_empty());
     assert!(!app.forge_file_binary);
@@ -2771,50 +2904,7 @@ fn onboarding_capabilities_are_secret_buffers_cleared_on_navigation() {
 }
 
 #[test]
-fn ready_events_and_stale_searches_do_not_rehydrate_navigation() {
-    let (mut chat, _) = Ducktape::__boot();
-    chat.loading = false;
-    chat.chat_search_generation = 4;
-    chat.chat_search_phase = "searching".into();
-    let _ = chat.__update(__DucktapeMessage::ChooseChannel("next".into()));
-    assert_eq!(chat.chat_search_generation, 5);
-    assert_eq!(chat.chat_search_phase, "idle");
-    let _ = chat.__update(__DucktapeMessage::ChatSearchLoaded(
-        backend::ChatSearchData {
-            generation: 4,
-            hits: vec![backend::ChatSearchHit {
-                channel_id: "old".into(),
-                seq: 1,
-                root_seq: 1,
-                author: "user".into(),
-                text: "stale".into(),
-                meta: "#1".into(),
-            }],
-        },
-    ));
-    assert!(chat.chat_search_hits.is_empty());
-
-    let (mut pages, _) = Ducktape::__boot();
-    pages.loading = false;
-    pages.page_search_generation = 8;
-    pages.page_searching = true;
-    let _ = pages.__update(__DucktapeMessage::ChoosePage("next".into()));
-    assert_eq!(pages.page_search_generation, 9);
-    assert!(!pages.page_searching);
-    let _ = pages.__update(__DucktapeMessage::PageSearchLoaded(
-        backend::PageSearchData {
-            generation: 8,
-            hits: vec![backend::PageSearchHit {
-                page_id: "old".into(),
-                page_title: "Old page".into(),
-                block_id: "old-block".into(),
-                kind: "Text".into(),
-                text: "stale".into(),
-            }],
-        },
-    ));
-    assert!(pages.page_search_hits.is_empty());
-
+fn ready_events_rehydrate_without_rewinding_the_tip() {
     let (mut live, _) = Ducktape::__boot();
     live.loading = false;
     live.block_height = 41;
@@ -2858,7 +2948,8 @@ fn optimistic_sends_are_independent_and_never_erase_the_next_draft() {
         editor::composer_submit_event(),
     ));
     let first_id = app.messages[0].id.clone();
-    assert_eq!(app.mutation_phase, "idle");
+    let first_view_key = app.messages[0].view_key;
+    assert_eq!(app.mutation_phase, MutationPhase::Idle);
     assert!(app.message_draft.is_empty());
     assert!(composer(&app).is_empty());
     assert_eq!(app.messages.len(), 1);
@@ -2869,6 +2960,7 @@ fn optimistic_sends_are_independent_and_never_erase_the_next_draft() {
         editor::composer_submit_event(),
     ));
     let second_id = app.messages[1].id.clone();
+    let second_view_key = app.messages[1].view_key;
     assert_ne!(first_id, second_id);
     assert_eq!(app.messages.len(), 2);
     assert!(app.messages.iter().all(|message| message.pending));
@@ -2882,38 +2974,73 @@ fn optimistic_sends_are_independent_and_never_erase_the_next_draft() {
     assert_eq!(app.messages.len(), 2);
     assert!(app.messages.iter().all(|message| message.pending));
 
-    // …the committed row arrives as a delta and settles ONLY its pending
-    let mut committed = message(1, "first", false);
-    committed.id = first_id.clone();
-    let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
-        "general", committed,
-    )));
-    assert_eq!(composer(&app), "third");
-    assert_eq!(app.mutation_phase, "idle");
-    assert!(!app.messages[0].pending);
-    assert_eq!(app.messages[0].seq, 1);
-    assert_eq!(app.messages[1].id, second_id);
-    assert!(app.messages[1].pending);
-    assert!(backend::has_flash_id(
-        app.send_flash_ids.clone(),
-        first_id.clone()
-    ));
-
-    // A second settle inside the fade window ADDS its confirmation. The old
-    // scalar anchor moved the ✓ from the first row to this one, which is the
-    // visible blip rapid sends exposed.
-    let mut second = message(2, "second", false);
+    // The SECOND send commits first. Root confirmation must sort by canonical
+    // seq just like the thread rail while keeping that row's virtual identity.
+    let mut second = message(1, "second", false);
     second.id = second_id.clone();
     let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
         "general", second,
     )));
+    assert_eq!(composer(&app), "third");
+    assert_eq!(app.mutation_phase, MutationPhase::Idle);
+    assert!(!app.messages[0].pending);
+    assert_eq!(app.messages[0].seq, 1);
+    assert_eq!(app.messages[0].id, second_id);
+    assert_eq!(app.messages[0].view_key, second_view_key);
+    assert_eq!(app.messages[1].id, first_id);
+    assert_eq!(app.messages[1].view_key, first_view_key);
+    assert!(app.messages[1].pending);
+
+    // Then the first send lands at seq 2. Committed rows stay ordered, and
+    // neither virtual key is replaced.
+    let mut first = message(2, "first", false);
+    first.id = first_id.clone();
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
+        "general", first,
+    )));
     assert!(app.messages.iter().all(|message| !message.pending));
-    assert!(backend::has_flash_id(app.send_flash_ids.clone(), first_id));
-    assert!(backend::has_flash_id(app.send_flash_ids.clone(), second_id));
+    assert_eq!(
+        app.messages
+            .iter()
+            .map(|message| (message.id.as_str(), message.seq, message.view_key))
+            .collect::<Vec<_>>(),
+        [
+            (second_id.as_str(), 1, second_view_key),
+            (first_id.as_str(), 2, first_view_key),
+        ]
+    );
+
+    // A canonical reload is allowed to replace rendered content, but not the
+    // client-only identity of the same IDs.
+    let reloaded = backend::merge_pending_messages(
+        vec![message(1, "second", false), message(2, "first", false)]
+            .into_iter()
+            .zip([second_id.clone(), first_id.clone()])
+            .map(|(mut message, id)| {
+                message.id = id;
+                message
+            })
+            .collect(),
+        app.messages.clone(),
+        "general".into(),
+        "general".into(),
+    );
+    assert_eq!(
+        reloaded
+            .iter()
+            .map(|message| message.view_key)
+            .collect::<Vec<_>>(),
+        [second_view_key, first_view_key]
+    );
 
     let chat = inlined(include_str!("ui/screens/chat.ice"));
+    assert!(chat.contains("keyed message in messages by=message.view_key"));
+    assert!(!chat.contains("keyed message in messages by=message.seq"));
     assert!(chat.contains("stack #message(message.id) w=fill"));
     assert!(!chat.contains("#message(message.seq)"));
+    let externs = inlined(include_str!("ui/extern/backend.ice"));
+    assert!(externs.contains("sync optimistic_message("));
+    assert!(!externs.contains("pure optimistic_message("));
 }
 
 #[test]
@@ -3032,13 +3159,11 @@ fn a_chat_resync_keeps_the_pages_the_reader_paged_in() {
     )));
     let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
     let _ = app.__update(__DucktapeMessage::HistoryLoaded(backend::HistoryPageData {
-        generation: app.history_generation,
         channel_id: "general".into(),
         messages: vec![message(20, "older", false)],
     }));
     let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
     let _ = app.__update(__DucktapeMessage::HistoryLoaded(backend::HistoryPageData {
-        generation: app.history_generation,
         channel_id: "general".into(),
         messages: vec![message(2, "older still", false)],
     }));
@@ -3114,6 +3239,7 @@ fn a_resync_the_window_cannot_reach_replaces_it_rather_than_leaving_a_hole() {
     ];
     // an in-flight send of her own is still on screen, seq -1 and no page
     app.messages.push(backend::ChatMessage {
+        view_key: -1,
         seq: -1,
         pending: true,
         ..message(0, "mine, still sending", false)
@@ -3284,7 +3410,7 @@ fn a_live_post_does_not_splice_itself_into_a_history_window() {
 
     // HER OWN SEND IS THE EXCEPTION. The composer posts from a window too and
     // splices the optimistic row in unconditionally, so a refused settle would
-    // strand it `pending` forever while `send_flash` pops a ✓ over it.
+    // strand it `pending` forever.
     app.message_editor = compose("mine, from the window");
     let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
         editor::composer_submit_event(),
@@ -3297,7 +3423,7 @@ fn a_live_post_does_not_splice_itself_into_a_history_window() {
         "general", settled,
     )));
     assert_eq!(app.messages.len(), 2, "her row settled in place, not twice");
-    assert!(!app.messages[1].pending, "and the ✓ is over a settled row");
+    assert!(!app.messages[1].pending, "and the row becomes canonical");
     assert_eq!(
         cursor(&app),
         None,
@@ -3566,10 +3692,11 @@ fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
     let chat = inlined(include_str!("ui/screens/chat.ice"));
     // Only the rows the viewport can see are laid out, which is what lets the
     // timeline hold a whole channel without paying a text layout per row — and
-    // `by=message.seq` is what makes per-row state and per-row MEASUREMENT
-    // follow the message instead of the slot it happened to occupy.
+    // `by=message.view_key` is what makes per-row state and per-row MEASUREMENT
+    // follow the message through prepends AND optimistic confirmation instead
+    // of following the slot it happened to occupy.
     let above = chat
-        .split_once("keyed message in messages by=message.seq w=fill gap=3.0 virtual-row=44.0")
+        .split_once("keyed message in messages by=message.view_key w=fill gap=3.0 virtual-row=44.0")
         .expect("the message timeline is a KEYED virtual-row column")
         .0;
     // That is only correct under an end-anchored scroll: measuring a row ABOVE
@@ -3588,15 +3715,17 @@ fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
     // level up, and `has_older_history` flips on every page.
     assert!(above.contains("col w=fill gap=3.0 pr=6.0"));
     assert!(above.contains("button \"Load older messages\""));
-    // A key is only an identity if it is unique: `optimistic_message` mints a
-    // fresh descending seq per in-flight send, so two concurrent sends cannot
-    // share one row's widget state and measured height.
-    let mut pending = vec![message(40, "committed", false)];
+    // A key is only an identity if it is unique. The allocator gives every
+    // concurrent pending row its own widget state and measurement.
+    let mut pending = Vec::new();
     for id in ["a", "b", "c"] {
         pending = backend::optimistic_message(pending, id.into(), id.into());
     }
-    let seqs: Vec<i64> = pending.iter().map(|message| message.seq).collect();
-    assert_eq!(seqs, vec![40, -1, -2, -3], "every pending row keys apart");
+    let keys = pending
+        .iter()
+        .map(|message| message.view_key)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(keys.len(), pending.len(), "every pending row keys apart");
 }
 
 /// A LINK IS A DESTINATION, NOT A PERSON — AND IT PRESSES.
@@ -3694,10 +3823,10 @@ fn the_thread_rail_virtualizes_and_caches_its_quiet_replies() {
         .0;
     assert!(above.contains("scroll dir=vertical w=fill h=fill anchor-y=end auto=true"));
     // A `lazy` subtree reads nothing but its dependency, so the quiet arm can
-    // only exist because the rows that read SCREEN state — the search target,
-    // the open action menu, the settling ✓ — were split off into live arms.
-    // Fold any of them back in and the reply that is selected, or flashing,
-    // renders from a cache that cannot see it. The KEYED form is pinned too:
+    // only exist because the rows that read SCREEN state — the search target
+    // and the open action menu — were split off into live arms. Confirmation
+    // is row state and moves `render_rev`, so it belongs inside the lazy arm.
+    // The KEYED form is pinned too:
     // dropping `by (seq, render_rev)` silently reverts every visible reply to
     // a full row clone + hash per frame — the #1058 residue this collects.
     assert!(chat.contains(
@@ -3706,7 +3835,6 @@ fn the_thread_rail_virtualizes_and_caches_its_quiet_replies() {
     for live in [
         "thread_message.seq == thread_target_seq",
         "thread_message.seq == thread_selected_seq",
-        "has_flash_id(thread_send_flash_ids, thread_message.id)",
     ] {
         assert!(chat.contains(live), "the live arm on {live} is gone");
     }
@@ -3715,31 +3843,28 @@ fn the_thread_rail_virtualizes_and_caches_its_quiet_replies() {
 #[test]
 fn message_actions_require_explicit_intent() {
     let (mut app, _) = Ducktape::__boot();
-    app.mutation_phase = "idle".into();
+    app.mutation_phase = MutationPhase::Idle;
 
-    app.chat_pointer_y = 450.0;
-    app.chat_height = 500.0;
     let _ = app.__update(__DucktapeMessage::OpenMessageActions(7, "hello".into(), 2));
-    assert_eq!(app.message_menu_y, 260.0);
     assert_eq!(app.selected_message_seq, 7);
-    assert_eq!(app.message_action, "more");
+    assert_eq!(app.message_action, MessageAction::More);
     let _ = app.__update(__DucktapeMessage::BeginMessageEdit(7, "hello".into(), 2));
-    assert_eq!(app.message_action, "editing");
+    assert_eq!(app.message_action, MessageAction::Editing);
     // Every cancel affordance in the view routes `clear_message_selection`
     // (view.ice:441, :467, :511, :523, :538), so that is the transition
     // under test — it drops to the toolbar AND drops the selection.
     let _ = app.__update(__DucktapeMessage::ClearMessageSelection);
-    assert_eq!(app.message_action, "toolbar");
+    assert_eq!(app.message_action, MessageAction::Toolbar);
     assert_eq!(app.selected_message_seq, 0);
     let _ = app.__update(__DucktapeMessage::OpenMessageReactions(
         7,
         "hello".into(),
         2,
     ));
-    assert_eq!(app.message_action, "reactions");
+    assert_eq!(app.message_action, MessageAction::Reactions);
     let _ = app.__update(__DucktapeMessage::ClearMessageSelection);
     let _ = app.__update(__DucktapeMessage::ArmMessageDelete(7, "hello".into(), 2));
-    assert_eq!(app.message_action, "delete");
+    assert_eq!(app.message_action, MessageAction::Delete);
 }
 
 #[test]
@@ -3810,14 +3935,16 @@ fn message_action_toolbar_stays_compact_and_accessible() {
     ));
 
     let chat = inlined(include_str!("ui/screens/chat.ice"));
-    assert!(
-        chat.contains("overlay when=(selected_message_seq > 0 && message_action != \"toolbar\")")
-    );
+    assert!(chat.contains(
+        "overlay when=(selected_message_seq > 0 && message_action != MessageAction.toolbar)"
+    ));
     assert!(chat.contains("dismiss=emit(clear_message_selection) backdrop=transparent"));
-    assert!(chat.contains("mouse press-at=emit(chat_pointer_pressed, _, _)"));
+    assert!(chat.contains("mouse press-at=chat_pointer_pressed"));
     // per-press, never per-move: a move= stream here rebuilds the view per pixel
     assert!(!chat.contains("mouse move="));
-    assert!(chat.contains("float x=0.0 y=message_menu_y"));
+    assert!(chat.contains(
+        "box w=fill h=fill pt=block_action_menu_y(chat_pointer_y, chat_height) align-x=end align-y=start"
+    ));
     // the pointer sensor is the MESSAGE-LIST stack's first child, so it
     // measures the message list itself and not whatever an overlay happens
     // to cover. The anchor names that stack by its exact indentation: the
@@ -3830,7 +3957,7 @@ fn message_action_toolbar_stays_compact_and_accessible() {
     assert!(
         sensor
             .trim_start()
-            .starts_with("sensor show=emit(chat_resized, _, _)")
+            .starts_with("sensor show=chat_resized resize=chat_resized")
     );
     let overlay_content = chat
         .split_once("                  content\n")
@@ -3842,10 +3969,10 @@ fn message_action_toolbar_stays_compact_and_accessible() {
     assert!(overlay_content.contains("space w=fill h=fill"));
     assert!(!overlay_content.contains("message_action =="));
     let more = chat
-        .split_once("message_action == \"more\"")
+        .split_once("message_action == MessageAction.more")
         .unwrap()
         .1
-        .split_once("message_action == \"reactions\"")
+        .split_once("message_action == MessageAction.reactions")
         .unwrap()
         .0;
     // Icon + sentence rows on one raised plate; Esc and the backdrop dismiss,
@@ -3865,10 +3992,10 @@ fn message_action_toolbar_stays_compact_and_accessible() {
     // The reactions arm is the shared ADD grid — removal rides the message's
     // own reaction chips, which already toggle off for `reacted_by_me`.
     let picker = chat
-        .split_once("message_action == \"reactions\"")
+        .split_once("message_action == MessageAction.reactions")
         .unwrap()
         .1
-        .split_once("message_action == \"editing\"")
+        .split_once("message_action == MessageAction.editing")
         .unwrap()
         .0;
     assert!(picker.contains("for emoji in reaction_palette()"));
@@ -3932,13 +4059,13 @@ fn thread_messages_mirror_the_main_action_system() {
     // A reply is the SAME message block as a timeline row — the rail mounts
     // the shared contents rather than a second spelling of them, so the
     // message redesign lands in both lanes at once.
-    assert!(card.contains("MessageContents message=message flash=flash"));
-    // The rail's settle ✓ is real now: the card takes the fade as a prop and
-    // `thread_send_flash_ids` anchors it from the screen's flash arm. (`card`
-    // starts right after the component name, so the signature is its head.)
-    assert!(card.starts_with(
-        "(message:ChatMessage, selected:bool, menu_open:bool, disabled:bool, flash:f64)"
-    ));
+    assert!(card.contains("MessageContents message=message"));
+    // Confirmation is the pending dot disappearing, so the card needs no
+    // timer or animation prop. (`card` starts right after the component name,
+    // so the signature is its head.)
+    assert!(
+        card.starts_with("(message:ChatMessage, selected:bool, menu_open:bool, disabled:bool)")
+    );
     // `menu_open` cannot be `selected` here: in the rail `selected` marks the
     // deep-link TARGET reply, not the row whose action card is open.
     let chat_screen_rail = inlined(include_str!("ui/screens/chat.ice"));
@@ -3956,32 +4083,34 @@ fn thread_messages_mirror_the_main_action_system() {
         .1;
     // A SECOND overlay, keyed on thread-scoped state, independent of the main one.
     assert!(thread.contains(
-        "overlay when=(thread_selected_seq > 0 && thread_message_action != \"toolbar\")"
+        "overlay when=(thread_selected_seq > 0 && thread_message_action != MessageAction.toolbar)"
     ));
     assert!(thread.contains("dismiss=emit(clear_thread_message_selection) backdrop=transparent"));
-    assert!(thread.contains("float x=0.0 y=thread_menu_y"));
-    assert!(thread.contains("mouse press-at=emit(thread_pointer_pressed, _, _)"));
+    assert!(thread.contains(
+        "box w=fill h=fill pt=block_action_menu_y(thread_pointer_y, thread_height) align-x=end align-y=start"
+    ));
+    assert!(thread.contains("mouse press-at=thread_pointer_pressed"));
     // same seat as the message list — the rail measures itself
-    assert!(thread.contains("sensor show=emit(thread_resized, _, _)"));
+    assert!(thread.contains("sensor show=thread_resized resize=thread_resized"));
     // The picker is the shared ADD grid targeting the thread selection;
     // removal rides the reply's own reaction chips.
     assert!(thread.contains("for emoji in reaction_palette()"));
     assert!(thread.contains("-> emit(add_reaction_at, thread_selected_seq, emoji)"));
     // Same pressable-while-in-flight contract as the stream picker.
     let thread_picker = thread
-        .split_once("thread_message_action == \"reactions\"")
+        .split_once("thread_message_action == MessageAction.reactions")
         .unwrap()
         .1
-        .split_once("thread_message_action == \"editing\"")
+        .split_once("thread_message_action == MessageAction.editing")
         .unwrap()
         .0;
     assert!(!thread_picker.contains("mutation_phase"));
     // More-menu omits Reply in thread (already inside the thread) and Close.
     let more = thread
-        .split_once("thread_message_action == \"more\"")
+        .split_once("thread_message_action == MessageAction.more")
         .unwrap()
         .1
-        .split_once("thread_message_action == \"reactions\"")
+        .split_once("thread_message_action == MessageAction.reactions")
         .unwrap()
         .0;
     for label in [
@@ -4034,42 +4163,39 @@ fn thread_messages_mirror_the_main_action_system() {
 #[test]
 fn thread_action_state_is_independent_of_the_main_message_menu() {
     let (mut app, _) = Ducktape::__boot();
-    app.mutation_phase = "idle".into();
+    app.mutation_phase = MutationPhase::Idle;
     app.active_channel = "general".into();
     app.active_thread_seq = 1;
 
     // Opening a thread action must not touch the main message menu.
-    app.thread_pointer_y = 400.0;
-    app.thread_height = 500.0;
     let _ = app.__update(__DucktapeMessage::OpenThreadMessageActions(
         2,
         "reply".into(),
         3,
     ));
     assert_eq!(app.thread_selected_seq, 2);
-    assert_eq!(app.thread_message_action, "more");
-    assert_eq!(app.thread_menu_y, 210.0);
+    assert_eq!(app.thread_message_action, MessageAction::More);
     assert_eq!(app.selected_message_seq, 0);
-    assert_eq!(app.message_action, "toolbar");
+    assert_eq!(app.message_action, MessageAction::Toolbar);
 
     // And a main message action must not touch the thread menu.
     let _ = app.__update(__DucktapeMessage::OpenMessageActions(5, "root".into(), 1));
     assert_eq!(app.selected_message_seq, 5);
-    assert_eq!(app.message_action, "more");
+    assert_eq!(app.message_action, MessageAction::More);
     assert_eq!(app.thread_selected_seq, 2);
-    assert_eq!(app.thread_message_action, "more");
+    assert_eq!(app.thread_message_action, MessageAction::More);
 
     let _ = app.__update(__DucktapeMessage::ClearThreadMessageSelection);
     assert_eq!(app.thread_selected_seq, 0);
-    assert_eq!(app.thread_message_action, "toolbar");
+    assert_eq!(app.thread_message_action, MessageAction::Toolbar);
     assert_eq!(app.selected_message_seq, 5);
-    assert_eq!(app.message_action, "more");
+    assert_eq!(app.message_action, MessageAction::More);
 }
 
 #[test]
 fn opening_another_thread_invalidates_the_pending_thread() {
     let (mut app, _) = Ducktape::__boot();
-    app.mutation_phase = "idle".into();
+    app.mutation_phase = MutationPhase::Idle;
     app.active_channel = "general".into();
     app.selected_message_seq = 1;
     app.thread_generation = 4;
@@ -4153,7 +4279,7 @@ fn opening_another_thread_parks_the_reply_in_the_thread_it_belongs_to() {
     // than the entry `open_thread_for` filed above.
     app.reply_editor = compose("and then the pager went off");
     app.channels = vec![room("general", 10), room("random", 20)];
-    app.mutation_phase = "idle".into();
+    app.mutation_phase = MutationPhase::Idle;
     let _ = app.__update(__DucktapeMessage::ChooseChannel("random".into()));
     assert_eq!(app.active_thread_seq, 0, "the rail closes with the room");
     assert!(reply_composer(&app).is_empty());
@@ -4345,6 +4471,7 @@ fn the_reply_send_refuses_only_on_what_its_button_shows() {
 fn thread_pagination_preserves_multiple_pending_replies() {
     let message = |seq: i64, thread_seq: i64, body: &str| backend::ChatMessage {
         id: format!("message-{seq}"),
+        view_key: seq,
         seq,
         author: "user".into(),
         meta: format!("#{seq}"),
@@ -4413,7 +4540,7 @@ fn opening_a_network_clears_the_previous_networks_state() {
     app.rpc = "http://node-b".into();
     app.password = "device-key-password".into();
     app.selected_message_seq = 1;
-    app.message_action = "editing".into();
+    app.message_action = MessageAction::Editing;
     app.message_edit_draft = "node a edit".into();
     app.active_thread_seq = 1;
     app.reply_editor = compose("node a reply");
@@ -4424,16 +4551,16 @@ fn opening_a_network_clears_the_previous_networks_state() {
     app.block_comment_draft = "node a comment".into();
     app.message_editor = compose("node a message");
     app.page_search_draft = "node a search".into();
-    app.forge_list_phase = "ready".into();
+    app.forge_list_phase = ForgePhase::Ready;
     app.forge_repo = "same-repo".into();
-    app.forge_repo_phase = "ready".into();
+    app.forge_repo_phase = ForgePhase::Ready;
     app.forge_item_number = 1;
-    app.forge_item_phase = "ready".into();
+    app.forge_item_phase = ForgePhase::Ready;
     app.forge_review_draft = "node a review".into();
     app.forge_tree_repo = "same-repo".into();
     app.forge_tree_born = true;
     app.forge_tree_truncated = true;
-    app.forge_code_phase = "ready".into();
+    app.forge_code_phase = ForgeCodePhase::Ready;
     app.huddle_joined = true;
     app.huddle_channel = "chan-a".into();
     // AND THE PARKS, which the by-name clears around them would otherwise miss.
@@ -4449,7 +4576,7 @@ fn opening_a_network_clears_the_previous_networks_state() {
     assert_eq!(app.connected_rpc, "http://node-b");
     assert_eq!(app.password, "device-key-password");
     assert_eq!(app.selected_message_seq, 0);
-    assert_eq!(app.message_action, "toolbar");
+    assert_eq!(app.message_action, MessageAction::Toolbar);
     assert!(app.message_edit_draft.is_empty());
     assert_eq!(app.active_thread_seq, 0);
     assert!(reply_composer(&app).is_empty());
@@ -4465,16 +4592,16 @@ fn opening_a_network_clears_the_previous_networks_state() {
         "a draft parked on node A is not node B's to hand back"
     );
     assert!(app.page_search_draft.is_empty());
-    assert_eq!(app.forge_list_phase, "idle");
+    assert_eq!(app.forge_list_phase, ForgePhase::Idle);
     assert!(app.forge_repo.is_empty());
-    assert_eq!(app.forge_repo_phase, "idle");
+    assert_eq!(app.forge_repo_phase, ForgePhase::Idle);
     assert_eq!(app.forge_item_number, 0);
-    assert_eq!(app.forge_item_phase, "idle");
+    assert_eq!(app.forge_item_phase, ForgePhase::Idle);
     assert!(app.forge_review_draft.is_empty());
     assert!(app.forge_tree_repo.is_empty());
     assert!(!app.forge_tree_born);
     assert!(!app.forge_tree_truncated);
-    assert_eq!(app.forge_code_phase, "idle");
+    assert_eq!(app.forge_code_phase, ForgeCodePhase::Idle);
     assert!(!app.huddle_joined);
     assert!(app.huddle_channel.is_empty());
 
@@ -4500,25 +4627,48 @@ fn the_save_tick_waits_for_inflight_saves_and_open_fences() {
     app.buffer_page = "page".into();
     app.page_editor = compose("Title\nfresh body");
     app.page_saved_text = "Title\nstale".into();
-    app.block_autosave_status = "saving".into();
-    let generation = app.block_autosave_generation;
+    app.block_autosave_status = AutosaveStatus::Saving;
 
     let _ = app.__update(__DucktapeMessage::PageAutosaveTick);
-    assert_eq!(app.block_autosave_generation, generation, "inflight guard");
+    assert_eq!(
+        app.block_autosave_status,
+        AutosaveStatus::Saving,
+        "inflight guard"
+    );
 
-    app.block_autosave_status = "idle".into();
+    app.block_autosave_status = AutosaveStatus::Idle;
     app.page_editor = compose("Title\n```\nstill typing");
     let _ = app.__update(__DucktapeMessage::PageAutosaveTick);
-    assert_eq!(app.block_autosave_generation, generation, "fence guard");
+    assert_eq!(
+        app.block_autosave_status,
+        AutosaveStatus::Idle,
+        "fence guard"
+    );
 
     app.page_editor = compose("Title\n```\ndone\n```");
     let _ = app.__update(__DucktapeMessage::PageAutosaveTick);
+    assert_eq!(app.block_autosave_status, AutosaveStatus::Saving);
+}
+
+#[test]
+fn page_autosave_freshness_is_compiler_owned_without_aborting_writes() {
+    let pages = inlined(include_str!("ui/handlers/pages.ice"));
+    assert!(pages.contains(
+        "run latest lane=page_autosave save_page_document(connected_rpc, password, active_page, text, page_saved_text) -> page_document_saved _ | page_document_save_failed _"
+    ));
+    assert!(!pages.contains("run replace lane=page_autosave"));
+    assert_eq!(pages.matches("invalidate lane=page_autosave").count(), 5);
+
+    let lifecycle = inlined(include_str!("ui/handlers/lifecycle.ice"));
     assert_eq!(
-        app.block_autosave_generation,
-        generation + 1,
-        "a closed fence saves"
+        lifecycle.matches("invalidate lane=page_autosave").count(),
+        2
     );
-    assert_eq!(app.block_autosave_status, "saving");
+    let onboarding = inlined(include_str!("ui/handlers/onboarding.ice"));
+    assert_eq!(
+        onboarding.matches("invalidate lane=page_autosave").count(),
+        2
+    );
 }
 
 /// TICK TWO MUST NOT REVERT WHAT TICK ONE CORRECTLY LEFT ALONE.
@@ -4544,13 +4694,11 @@ fn a_save_that_lands_body_ops_does_not_manufacture_a_rename_next_tick() {
     // buffer, so leaving it at its default empty string would hand the baseline
     // an empty title and prove nothing about the case under test.
     app.page_inflight_text = "Old Name\nbody mid-sentence".into();
-    let generation = app.block_autosave_generation;
 
     // the save landed her body edit. The node's canonical text carries the
     // other person's rename, which her buffer has never shown.
     let _ = app.__update(__DucktapeMessage::PageDocumentSaved(
         backend::DocumentSaveResult {
-            generation,
             written: true,
             refusal: String::new(),
             document: "New Name\nbody mid-sentence".into(),
@@ -4583,7 +4731,8 @@ fn a_save_that_lands_body_ops_does_not_manufacture_a_rename_next_tick() {
     );
     let _ = app.__update(__DucktapeMessage::PageAutosaveTick);
     assert_eq!(
-        app.block_autosave_generation, generation,
+        app.block_autosave_status,
+        AutosaveStatus::Saved,
         "tick two must plan nothing — there is nothing of hers left unsaved"
     );
 }
@@ -4607,7 +4756,6 @@ fn a_title_typed_during_the_round_trip_is_not_swallowed_by_the_baseline() {
 
     // the tick submits what it can see.
     app.page_inflight_text = "Notes \nhello".into();
-    let generation = app.block_autosave_generation;
 
     // SHE FINISHES THE WORD while the save is in flight.
     app.page_editor = compose("Notes A\nhello");
@@ -4615,7 +4763,6 @@ fn a_title_typed_during_the_round_trip_is_not_swallowed_by_the_baseline() {
     // the save was a no-op — the trimmed title still matched the node.
     let _ = app.__update(__DucktapeMessage::PageDocumentSaved(
         backend::DocumentSaveResult {
-            generation,
             written: false,
             refusal: String::new(),
             document: "Notes\nhello".into(),
@@ -4639,8 +4786,8 @@ fn a_title_typed_during_the_round_trip_is_not_swallowed_by_the_baseline() {
     );
     let _ = app.__update(__DucktapeMessage::PageAutosaveTick);
     assert_eq!(
-        app.block_autosave_generation,
-        generation + 1,
+        app.block_autosave_status,
+        AutosaveStatus::Saving,
         "the next tick must plan her rename"
     );
 }
@@ -4657,12 +4804,10 @@ fn a_refused_write_does_not_hand_the_baseline_someone_elses_title() {
     app.page_editor = compose("Old Name\nbody typed on");
     app.page_saved_text = "Old Name\nbody".into();
     app.page_inflight_text = "Old Name\nbody typed".into();
-    let generation = app.block_autosave_generation;
 
     // the node refused the body op, and its text carries someone else's rename.
     let _ = app.__update(__DucktapeMessage::PageDocumentSaved(
         backend::DocumentSaveResult {
-            generation,
             written: false,
             refusal: "that edit would destroy comments".into(),
             document: "New Name\nbody".into(),
@@ -4804,7 +4949,8 @@ fn a_chat_only_resync_does_not_claim_the_page_it_never_loaded() {
     app.page_editor = compose("h");
     let _ = app.__update(__DucktapeMessage::PageAutosaveTick);
     assert_eq!(
-        app.block_autosave_status, "idle",
+        app.block_autosave_status,
+        AutosaveStatus::Idle,
         "a fabricated buffer must never be saved into a real page"
     );
 }
@@ -4845,7 +4991,8 @@ fn a_failed_page_load_cannot_save_the_blank_pane_over_the_page() {
 
     // The tick must refuse: the buffer is not Beta's.
     assert_eq!(
-        app.block_autosave_status, "idle",
+        app.block_autosave_status,
+        AutosaveStatus::Idle,
         "a buffer that belongs to no page must never be saved into one"
     );
     assert!(app.pending_page.is_empty());
@@ -4952,7 +5099,7 @@ fn a_resync_never_eats_the_message_being_typed() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
-    app.shell_tab = "chat".into();
+    app.shell_tab = ShellTab::Chat;
     app.active_channel = "general".into();
     app.hydration_generation = 4;
     app.message_editor = compose("half a paragraph, mid-word");
@@ -5021,14 +5168,17 @@ fn a_reconnect_lands_each_composer_in_the_room_it_was_typed_in() {
     landed.channels = vec![room("private-ops", 10), room("general", 20)];
     let _ = app.__update(__DucktapeMessage::WorkspaceConnected(landed));
 
-    assert_eq!(app.active_channel, "general", "the connect picks the landing");
+    assert_eq!(
+        app.active_channel, "general",
+        "the connect picks the landing"
+    );
     assert!(
         composer(&app).is_empty(),
         "#general's composer is #general's — the note she was writing next door \
          is not armed to send here"
     );
 
-    app.mutation_phase = "idle".into();
+    app.mutation_phase = MutationPhase::Idle;
     let _ = app.__update(__DucktapeMessage::ChooseChannel("private-ops".into()));
     assert_eq!(
         composer(&app),
@@ -5124,7 +5274,20 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     let ui = inlined(concat!(
         include_str!("ui/app.ice"),
         include_str!("ui/extern/backend.ice"),
-        include_str!("ui/state.ice"),
+        include_str!("ui/state/types.ice"),
+        include_str!("ui/state/core.ice"),
+        include_str!("ui/state/chat.ice"),
+        include_str!("ui/state/shell.ice"),
+        include_str!("ui/state/explorer.ice"),
+        include_str!("ui/state/roster.ice"),
+        include_str!("ui/state/forge.ice"),
+        include_str!("ui/state/node.ice"),
+        include_str!("ui/state/files.ice"),
+        include_str!("ui/state/overlays.ice"),
+        include_str!("ui/state/pages.ice"),
+        include_str!("ui/state/onboarding.ice"),
+        include_str!("ui/state/huddle.ice"),
+        include_str!("ui/state/derived.ice"),
         include_str!("ui/theme.ice"),
         include_str!("ui/view.ice"),
         include_str!("ui/components/chat.ice"),
@@ -5157,6 +5320,24 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     assert!(!app.contains("\n    transparent true"));
     assert!(!app.contains("\n    blur true"));
     assert!(app.contains("\n  bg app_background"));
+    assert!(app.contains("\n  fg app_text"));
+    let core_state = inlined(include_str!("ui/state/core.ice"));
+    assert!(!core_state.contains("app_background"));
+    assert!(!core_state.contains("app_text"));
+    assert!(core_state.contains("appearance:Appearance = Appearance.system"));
+    let derived = inlined(include_str!("ui/state/derived.ice"));
+    assert!(derived.contains(
+        "app_background = keep_str(appearance == Appearance.dark, \"#1b1a16\", \"#fdfdfb\")"
+    ));
+    assert!(
+        derived.contains(
+            "app_text = keep_str(appearance == Appearance.dark, \"#e8e6df\", \"#2c2b27\")"
+        )
+    );
+    let lifecycle = inlined(include_str!("ui/handlers/lifecycle.ice"));
+    assert!(!lifecycle.contains("app_background ="));
+    assert!(!lifecycle.contains("app_text ="));
+    assert!(!lifecycle.contains("appearance = \""));
     assert!(app.contains("titlebar-transparent true"));
     assert!(app.contains("fullsize-content-view true"));
     assert!(app.contains("font \"../../../crates/design/assets/fonts/Geist[wght].ttf\""));
@@ -5608,7 +5789,11 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
     // mouse click on a nav item no longer wears it — orthory#804's cosmetic
     // item. Swept over every `for button` recipe rather than a name list, so
     // the next action recipe added without the arm fails here.
-    let recipes = include_str!("ui/ducktape-ui/recipes.ice");
+    let recipes = [
+        include_str!("ui/ducktape-ui/recipes.ice"),
+        include_str!("ui/theme.ice"),
+    ]
+    .join("\n");
     let button_recipes: Vec<_> = recipes
         .lines()
         .zip(recipes.lines().skip(1))
@@ -6588,7 +6773,7 @@ fn live_comment_refresh_updates_threads_without_touching_the_draft() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
-    app.mutation_phase = "idle".into();
+    app.mutation_phase = MutationPhase::Idle;
     app.active_page = "page".into();
     app.block_comments_open = true;
     // the rail is DOCUMENT-scoped: its anchor is the page it was opened
@@ -6731,14 +6916,14 @@ fn block_comment_recovery_always_unlocks_mutations() {
     failed.block_comments_open = true;
     failed.block_comments_generation = 7;
     failed.block_comment_threads_loading = true;
-    failed.mutation_phase = "recovering".into();
+    failed.mutation_phase = MutationPhase::Recovering;
     let _ = failed.__update(__DucktapeMessage::BlockThreadsRecoveryFailed(
         backend::HydrationError {
             generation: 7,
             message: "recovery read failed".into(),
         },
     ));
-    assert_eq!(failed.mutation_phase, "idle");
+    assert_eq!(failed.mutation_phase, MutationPhase::Idle);
     assert!(!failed.block_comment_threads_loading);
 
     let (mut recovered, _) = Ducktape::__boot();
@@ -6746,7 +6931,7 @@ fn block_comment_recovery_always_unlocks_mutations() {
     recovered.block_comments_target = "block-1".into();
     recovered.block_comments_generation = 8;
     recovered.block_comment_threads_loading = true;
-    recovered.mutation_phase = "recovering".into();
+    recovered.mutation_phase = MutationPhase::Recovering;
     recovered.error = "write result was uncertain".into();
     let _ = recovered.__update(__DucktapeMessage::BlockThreadsRecovered(
         backend::BlockThreadListData {
@@ -6759,7 +6944,7 @@ fn block_comment_recovery_always_unlocks_mutations() {
             has_more: false,
         },
     ));
-    assert_eq!(recovered.mutation_phase, "idle");
+    assert_eq!(recovered.mutation_phase, MutationPhase::Idle);
     assert!(recovered.error.is_empty());
 
     // AND IT UNLOCKS ONLY WHAT IT LOCKED. "recovering" has a second terminal —
@@ -6772,7 +6957,7 @@ fn block_comment_recovery_always_unlocks_mutations() {
     overtaken.block_comments_open = true;
     overtaken.block_comments_target = "block-1".into();
     overtaken.block_comments_generation = 8;
-    overtaken.mutation_phase = "channel-create".into();
+    overtaken.mutation_phase = MutationPhase::Channel;
     let _ = overtaken.__update(__DucktapeMessage::BlockThreadsRecovered(
         backend::BlockThreadListData {
             generation: 8,
@@ -6785,7 +6970,8 @@ fn block_comment_recovery_always_unlocks_mutations() {
         },
     ));
     assert_eq!(
-        overtaken.mutation_phase, "channel-create",
+        overtaken.mutation_phase,
+        MutationPhase::Channel,
         "a stale recovery does not unlock the mutation that came after it"
     );
 
@@ -6796,7 +6982,7 @@ fn block_comment_recovery_always_unlocks_mutations() {
     overtaken_failure.block_comments_open = true;
     overtaken_failure.block_comments_generation = 8;
     overtaken_failure.block_comment_threads_loading = true;
-    overtaken_failure.mutation_phase = "channel-create".into();
+    overtaken_failure.mutation_phase = MutationPhase::Channel;
     let _ = overtaken_failure.__update(__DucktapeMessage::BlockThreadsRecoveryFailed(
         backend::HydrationError {
             generation: 8,
@@ -6804,19 +6990,19 @@ fn block_comment_recovery_always_unlocks_mutations() {
         },
     ));
     assert_eq!(
-        overtaken_failure.mutation_phase, "channel-create",
+        overtaken_failure.mutation_phase,
+        MutationPhase::Channel,
         "and neither does the failure arm"
     );
     assert!(!overtaken_failure.block_comment_threads_loading);
 }
 
 #[test]
-fn live_thread_refresh_preserves_the_reply_draft_and_rejects_stale_results() {
+fn live_thread_refresh_preserves_the_reply_draft_and_rejects_other_scopes() {
     let (mut app, _) = Ducktape::__boot();
     app.active_channel = "general".into();
     app.active_thread_seq = 7;
     app.thread_target_seq = 9;
-    app.live_thread_generation = 3;
     app.reply_editor = compose("typing");
     app.thread_messages = backend::optimistic_message(
         backend::optimistic_message(Vec::new(), "pending first".into(), "pending-first".into()),
@@ -6826,7 +7012,6 @@ fn live_thread_refresh_preserves_the_reply_draft_and_rejects_stale_results() {
 
     let _ = app.__update(__DucktapeMessage::LiveThreadRefreshed(
         backend::LiveThreadData {
-            generation: 3,
             channel_id: "other".into(),
             root_seq: 7,
             target_seq: 0,
@@ -6839,7 +7024,6 @@ fn live_thread_refresh_preserves_the_reply_draft_and_rejects_stale_results() {
 
     let _ = app.__update(__DucktapeMessage::LiveThreadRefreshed(
         backend::LiveThreadData {
-            generation: 3,
             channel_id: "general".into(),
             root_seq: 7,
             target_seq: 0,
@@ -6866,7 +7050,6 @@ fn live_thread_refresh_preserves_the_reply_draft_and_rejects_stale_results() {
     let _ = app.__update(__DucktapeMessage::CloseThread);
     let _ = app.__update(__DucktapeMessage::LiveThreadRefreshed(
         backend::LiveThreadData {
-            generation: 3,
             channel_id: "general".into(),
             root_seq: 7,
             target_seq: 9,
@@ -7094,7 +7277,7 @@ fn forge_empty_states_name_only_routes_that_exist() {
     // can take seconds for a real repository; only the loader's born bit may
     // decide that no branch exists, and an empty born commit is distinct too.
     assert!(
-        forge.contains("if code_phase == \"tree_loading\""),
+        forge.contains("if code_phase == ForgeCodePhase.tree_loading"),
         "the in-flight tree has its own visible state"
     );
     assert!(
@@ -7105,6 +7288,218 @@ fn forge_empty_states_name_only_routes_that_exist() {
         forge.contains("empty(tree_entries) && tree_born"),
         "a born empty commit does not get called unborn"
     );
+}
+
+#[test]
+fn interaction_state_stays_with_the_screen_that_owns_it() {
+    fn component<'a>(source: &'a str, name: &str) -> &'a str {
+        let opener = format!("component {name}(");
+        let tail = source
+            .split_once(&opener)
+            .unwrap_or_else(|| panic!("{name} exists"))
+            .1;
+        tail.split_once("\ncomponent ")
+            .map_or(tail, |(body, _)| body)
+    }
+
+    fn local_state(component: &str) -> Vec<&str> {
+        component
+            .lines()
+            .skip_while(|line| line.trim() != "state")
+            .skip(1)
+            .take_while(|line| line.trim().is_empty() || line.starts_with("    "))
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    let members = component(SCREENS.as_str(), "MembersScreen");
+    let members_state = local_state(members);
+    for field in [
+        "filter:MembersFilter = MembersFilter.all",
+        "selected = \"\"",
+    ] {
+        assert!(
+            members_state.contains(&field),
+            "MembersScreen owns `{field}`"
+        );
+    }
+    for handler in ["on pick_members_filter(next)", "on open_member(key)"] {
+        assert!(members.contains(handler), "MembersScreen owns `{handler}`");
+    }
+
+    let explorer = component(SCREENS.as_str(), "ExplorerScreen");
+    let explorer_state = local_state(explorer);
+    for field in [
+        "query = \"\"",
+        "kind = \"all\"",
+        "hits:[ExplorerHit] = []",
+        "kinds:[KindCount] = []",
+        "partial = \"\"",
+        "searching = false",
+        "selected:i64 = 0",
+    ] {
+        assert!(
+            explorer_state.contains(&field),
+            "ExplorerScreen owns `{field}`"
+        );
+    }
+    for handler in [
+        "on explorer_search_submit(rpc, online)",
+        "on explorer_results_loaded(next)",
+        "on clear_explorer_search",
+        "on pick_explorer_kind(next)",
+        "on select_explorer_block(height)",
+    ] {
+        assert!(
+            explorer.contains(handler),
+            "ExplorerScreen owns `{handler}`"
+        );
+    }
+
+    let chat = component(SCREENS.as_str(), "ChatScreen");
+    let chat_state = local_state(chat);
+    for field in [
+        "message_action_focus = \"\"",
+        "chat_pointer_y = 0.0",
+        "chat_height = 720.0",
+        "thread_pointer_y = 0.0",
+        "thread_height = 720.0",
+    ] {
+        assert!(chat_state.contains(&field), "ChatScreen owns `{field}`");
+    }
+    for handler in [
+        "on chat_pointer_pressed(_x, y)",
+        "on chat_resized(_width, height)",
+        "on thread_pointer_pressed(_x, y)",
+        "on thread_resized(_width, height)",
+    ] {
+        assert!(chat.contains(handler), "ChatScreen owns `{handler}`");
+    }
+
+    let files = component(SCREENS.as_str(), "FilesScreen");
+    assert!(local_state(files).contains(&"history_open = false"));
+    assert!(files.contains("on fs_toggle_history"));
+
+    let root_state = inlined(&ice_sources_in("state"));
+    let root_view = inlined(include_str!("ui/view.ice"));
+    for (path, source) in ice_sources() {
+        let in_state_directory = std::path::Path::new(&path)
+            .parent()
+            .is_some_and(|parent| parent.ends_with("src/ui/state"));
+        let owns_app_state = source
+            .lines()
+            .any(|line| matches!(line, "state" | "derived"));
+        assert!(
+            in_state_directory || !owns_app_state,
+            "{path}: top-level app state belongs under ui/state"
+        );
+    }
+    for field in [
+        "members_filter",
+        "members_selected",
+        "explorer_query",
+        "explorer_kind",
+        "explorer_hits",
+        "explorer_kinds",
+        "explorer_partial",
+        "explorer_searching",
+        "explorer_selected",
+        "message_action_focus",
+        "chat_pointer_y",
+        "chat_height",
+        "message_menu_y",
+        "thread_pointer_y",
+        "thread_height",
+        "thread_menu_y",
+        "fs_history_open",
+        "pending_message",
+        "pending_reply",
+        "live_settle",
+        "page_landing",
+        "page_install",
+        "pages_answer_is_current",
+        "pages_fold_outran_reply",
+        "escape_key",
+        "content_scroll",
+        "palette_key",
+        "settings_endpoint",
+    ] {
+        assert!(
+            !root_state.contains(field),
+            "root state reclaimed `{field}`"
+        );
+        assert!(!root_view.contains(field), "root view plumbs `{field}`");
+    }
+    for route in [
+        "pick_members_filter ->",
+        "open_member ->",
+        "explorer_search_submit ->",
+        "clear_explorer_search ->",
+        "pick_explorer_kind ->",
+        "select_explorer_block ->",
+        "fs_toggle_history ->",
+        "chat_pointer_pressed ->",
+        "chat_resized ->",
+        "thread_pointer_pressed ->",
+        "thread_resized ->",
+    ] {
+        assert!(
+            !root_view.contains(route),
+            "root view still routes `{route}`"
+        );
+    }
+
+    // These fields only name values used during one handler invocation.
+    let chat_handlers = inlined(include_str!("ui/handlers/chat.ice"));
+    for handler in [
+        "on chat_pointer_pressed",
+        "on chat_resized",
+        "on thread_pointer_pressed",
+        "on thread_resized",
+    ] {
+        assert!(
+            !chat_handlers.contains(handler),
+            "app handler reclaimed component geometry route `{handler}`"
+        );
+    }
+    for local in ["pending_message_id", "pending_reply_id"] {
+        assert!(!root_state.contains(local), "root state holds `{local}`");
+        assert!(
+            chat_handlers.contains(&format!("let {local} =")),
+            "`{local}` is minted as a handler local"
+        );
+    }
+    assert!(
+        !inlined(include_str!("ui/state/chat.ice"))
+            .lines()
+            .any(|line| line.trim_start().starts_with("reply_draft =")),
+        "root state reclaimed `reply_draft`"
+    );
+    let page_handlers = inlined(include_str!("ui/handlers/pages.ice"));
+    assert!(!root_state.contains("closing_doc_tab"));
+    assert!(page_handlers.contains("on close_doc_tab(id)"));
+    assert!(page_handlers.contains("doc_tabs = doc_tabs_without(doc_tabs, id)"));
+    assert!(!root_state.contains("page_link"));
+    assert!(page_handlers.contains("let page_link = page_link_of(event)"));
+
+    let native_surfaces = concat!(
+        include_str!("backend/live.rs"),
+        include_str!("backend/load.rs"),
+        include_str!("backend/mod.rs"),
+        include_str!("backend/model.rs"),
+        include_str!("backend/storage.rs"),
+        include_str!("frame_probe.rs"),
+    );
+    for removed in ["files_tree", "active_channel_huddle_count"] {
+        for (path, source) in ice_sources() {
+            assert!(!source.contains(removed), "{path} restored `{removed}`");
+        }
+        assert!(
+            !native_surfaces.contains(removed),
+            "native app code restored `{removed}`"
+        );
+    }
 }
 
 /// THE EXPLORER NAMES WHAT IT SHOWS. Several defects on one screen, all the
@@ -7134,14 +7529,9 @@ fn forge_empty_states_name_only_routes_that_exist() {
 /// value must carry its name, one set must not have two names on one screen,
 /// and no row may contradict the name the screen prints over it.
 ///
-/// AND WHAT THE SCREEN SHOWS MUST REACH IT. The same class one layer out: a
-/// `search_workspace` reply reaches this screen through two ice seams — the
-/// handler that lands it in state and the mount that hands it down — and
-/// neither is visible to an ice screen contract, because a contract MOUNTS
-/// `ExplorerScreen` itself against a preset. So it pins the component while the
-/// app's wiring to it stays severable: deleting `explorer_partial = next.partial`
-/// and passing `partial=""` at the mount left the whole suite green with the
-/// banner gone and the false empty plate back.
+/// AND WHAT THE SCREEN LOADS MUST LAND IN ITS OWN STATE. Search is interaction
+/// state owned by `ExplorerScreen`; its reply and both reset paths must still
+/// carry every field the view reads.
 #[test]
 fn the_explorer_names_what_it_shows() {
     // The dispatch trace, fed the `operations` shape `bin/noded`'s projection
@@ -7260,61 +7650,38 @@ fn the_explorer_names_what_it_shows() {
     }
 
     // EVERY FIELD OF THE REPLY IS CARRIED, OR THE SCREEN SHOWS A DEFAULT AND
-    // CALLS IT AN ANSWER. `generation` is the only one that is not carried —
-    // the handler's first line compares it and returns — so the three that ARE
-    // walk both seams here. `partial` is the field this rule was written for:
+    // CALLS IT AN ANSWER. `partial` is the field this rule was written for:
     // without it the strip's kinds and the hit count are still rendered, so the
     // screen goes back to presenting whatever survived as the whole truth.
-    let loaded = inlined(include_str!("ui/handlers/overlays.ice"));
-    let loaded = loaded
+    let loaded = explorer
         .split_once("on explorer_results_loaded(next)")
         .expect("the Explorer's results handler")
         .1
-        .split_once("\non ")
+        .split_once("\n  on ")
         .expect("the next handler closes it")
-        .0;
-    // `inlined` folds the mount's `with` block back onto its node line, so the
-    // props ARE the rest of that line — anything below it is the event wiring.
-    let mount = inlined(include_str!("ui/view.ice"));
-    let mount = mount
-        .split_once("ExplorerScreen query<->explorer_query")
-        .expect("the app mounts the Explorer")
-        .1
-        .split_once('\n')
-        .expect("the props line ends")
         .0;
     // AND A FACT ABOUT THE LAST SEARCH DIES WITH IT. Both resets already clear
     // the hits and the strip; a `partial` left standing keeps naming a source
     // that failed to answer a query the reader has since cleared or replaced.
-    let handlers = inlined(include_str!("ui/handlers/overlays.ice"));
     let resets = ["on explorer_search_submit", "on clear_explorer_search"].map(|opener| {
-        handlers
+        explorer
             .split_once(opener)
             .unwrap_or_else(|| panic!("`{opener}` is where it was"))
             .1
-            .split_once("\non ")
+            .split_once("\n  on ")
             .expect("the next handler closes it")
             .0
     });
-    for (field, held, cleared) in [
-        ("hits", "explorer_hits", "[]"),
-        ("kinds", "explorer_kinds", "[]"),
-        ("partial", "explorer_partial", r#""""#),
-    ] {
+    for (field, cleared) in [("hits", "[]"), ("kinds", "[]"), ("partial", r#""""#)] {
         assert!(
-            loaded.contains(&format!("{held} = next.{field}")),
+            loaded.contains(&format!("{field} = next.{field}")),
             "`{field}` comes back from the search and nothing lands it in \
-             `{held}`, so the screen renders the state default"
-        );
-        assert!(
-            mount.contains(&format!("{field}={held}")),
-            "the Explorer mount passes something other than `{held}` for \
-             `{field}`, so what the loader read never reaches the screen"
+             the screen's local state"
         );
         for reset in &resets {
             assert!(
-                reset.contains(&format!("{held} = {cleared}")),
-                "a reset that leaves `{held}` standing shows the last search's \
+                reset.contains(&format!("{field} = {cleared}")),
+                "a reset that leaves `{field}` standing shows the last search's \
                  answer over the next one"
             );
         }
@@ -7636,7 +8003,6 @@ fn neither_composer_sends_into_a_channel_that_refuses_the_post() {
             app.messages.is_empty(),
             "the main composer must refuse a {reason} channel at apply time"
         );
-        assert!(app.pending_message.is_empty());
         // The words are still hers — a refusal is not a discard.
         assert_eq!(composer(&app), "into the void");
 
@@ -7649,7 +8015,6 @@ fn neither_composer_sends_into_a_channel_that_refuses_the_post() {
             app.thread_messages.is_empty(),
             "the reply composer must refuse a {reason} channel at apply time"
         );
-        assert!(app.pending_reply.is_empty());
         assert_eq!(reply_composer(&app), "into the void");
     }
 
@@ -7720,7 +8085,7 @@ fn a_thread_reply_takes_marks_from_its_own_toolbar_and_the_chord() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
-    app.shell_tab = "chat".into();
+    app.shell_tab = ShellTab::Chat;
     app.active_channel = "general".into();
     app.active_thread_seq = 7;
     app.message_editor = compose("channel draft");
@@ -7741,7 +8106,7 @@ fn a_thread_reply_takes_marks_from_its_own_toolbar_and_the_chord() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
-    app.shell_tab = "chat".into();
+    app.shell_tab = ShellTab::Chat;
     app.active_channel = "general".into();
     app.active_thread_seq = 7;
     let _ = app.__update(__DucktapeMessage::ReplyComposerEvent(
@@ -7835,7 +8200,7 @@ fn the_channel_drawer_does_not_eat_a_reply_you_are_typing() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
-    app.shell_tab = "chat".into();
+    app.shell_tab = ShellTab::Chat;
     app.active_channel = "general".into();
     app.active_thread_seq = 7;
     app.thread_messages = vec![message(7, "the root", false)];
@@ -7885,7 +8250,7 @@ fn the_channel_drawer_does_not_eat_a_reply_you_are_typing() {
         .map(str::trim)
         .filter(|line| !line.starts_with("//"))
         .collect();
-    assert!(statements.contains(&"composer_focus = \"none\""));
+    assert!(statements.contains(&"composer_focus = ComposerFocus.unfocused"));
     assert!(
         !statements.contains(&"active_thread_seq = 0"),
         "the drawer must not tear the rail down"
@@ -7901,7 +8266,7 @@ fn every_handler_that_moves_the_caret_retires_the_composer_focus() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
-    app.shell_tab = "chat".into();
+    app.shell_tab = ShellTab::Chat;
     app.active_channel = "general".into();
     app.active_thread_seq = 7;
     let _ = app.__update(__DucktapeMessage::ReplyComposerEvent(
@@ -7938,7 +8303,7 @@ fn every_handler_that_moves_the_caret_retires_the_composer_focus() {
     let (mut rail, _) = Ducktape::__boot();
     rail.connected = true;
     rail.loading = false;
-    rail.shell_tab = "chat".into();
+    rail.shell_tab = ShellTab::Chat;
     rail.active_channel = "general".into();
     let _ = rail.__update(__DucktapeMessage::ChatComposerEvent(
         editor::ComposerEvent::Apply(editor::RichAction::Edit(
@@ -7977,7 +8342,7 @@ fn every_handler_that_moves_the_caret_retires_the_composer_focus() {
     let (mut gone, _) = Ducktape::__boot();
     gone.connected = true;
     gone.loading = false;
-    gone.shell_tab = "chat".into();
+    gone.shell_tab = ShellTab::Chat;
     gone.active_channel = "general".into();
     gone.hydration_generation = 4;
     gone.active_thread_seq = 7;
@@ -7998,7 +8363,8 @@ fn every_handler_that_moves_the_caret_retires_the_composer_focus() {
         "a deleted root closes the rail under the caret"
     );
     assert_eq!(
-        gone.composer_focus, "reply",
+        gone.composer_focus,
+        ComposerFocus::Reply,
         "and nothing retires the claim on that route — if this ever stops \
          holding, the arm below has gone vacuous and this gate needs a new pin"
     );
@@ -8039,7 +8405,7 @@ fn every_handler_that_moves_the_caret_retires_the_composer_focus() {
     ];
 
     // `app.ice` is the real registry; the list above is a hand copy of it, and
-    // an eleventh handler file would otherwise ship unscanned.
+    // a twelfth handler file would otherwise ship unscanned.
     for line in include_str!("ui/app.ice").lines() {
         let Some(rest) = line.trim_start().strip_prefix("use \"handlers/") else {
             continue;
@@ -8056,7 +8422,7 @@ fn every_handler_that_moves_the_caret_retires_the_composer_focus() {
     }
 
     let mut moves_the_caret: Vec<String> = Vec::new();
-    // Handler AND value: `composer_focus = "message"` in a retire is the defect
+    // Handler AND value: `composer_focus = ComposerFocus.message` in a retire is the defect
     // itself, so recording only the handler name pins nothing worth pinning.
     let mut writes_the_focus: Vec<String> = Vec::new();
     for (file, source) in HANDLERS {
@@ -8091,14 +8457,14 @@ fn every_handler_that_moves_the_caret_retires_the_composer_focus() {
 
     let silent: Vec<&String> = moves_the_caret
         .iter()
-        .filter(|mover| !writes_the_focus.contains(&format!("{mover} = \"none\"")))
+        .filter(|mover| !writes_the_focus.contains(&format!("{mover} = ComposerFocus.unfocused")))
         .collect();
     assert!(
         silent.is_empty(),
         "these handlers move the caret (`task widget focus`), unmount the \
          composer under it (`shell_tab = `), or tear the thread rail out from \
          under it (`active_thread_seq = 0`) without RETIRING the claim on it — \
-         each needs `composer_focus = \"none\"`, and \"none\" is the only \
+         each needs `composer_focus = ComposerFocus.unfocused`, and `unfocused` is the only \
          honest value: a mover took the caret somewhere that is not a chat \
          composer: {silent:?}"
     );
@@ -8106,35 +8472,35 @@ fn every_handler_that_moves_the_caret_retires_the_composer_focus() {
     assert_eq!(
         writes_the_focus,
         [
-            "chat::arm_message_delete = \"none\"",
-            "chat::arm_thread_message_delete = \"none\"",
-            "chat::begin_message_edit = \"none\"",
-            "chat::begin_thread_message_edit = \"none\"",
-            "chat::chat_composer_event = \"message\"",
-            "chat::choose_channel = \"none\"",
-            "chat::choose_dm = \"none\"",
-            "chat::close_thread = \"none\"",
-            "chat::open_chat_search_hit = \"none\"",
-            "chat::open_message_actions = \"none\"",
-            "chat::open_message_reactions = \"none\"",
-            "chat::open_thread_for = \"none\"",
-            "chat::open_thread_message_actions = \"none\"",
-            "chat::open_thread_message_reactions = \"none\"",
-            "chat::reply_composer_event = \"reply\"",
-            "chat::toggle_channel_create = \"none\"",
-            "chat::toggle_channel_settings = \"none\"",
-            "huddle::huddle_go_channel = \"none\"",
-            "lifecycle::reconnect = \"none\"",
-            "lifecycle::select_shell_tab = \"none\"",
-            "onboarding::console_opened = \"none\"",
-            "overlays::global_key_pressed = \"none\"",
-            "pages::open_page_search_hit = \"none\"",
-            "pages::toggle_page_create = \"none\"",
+            "chat::arm_message_delete = ComposerFocus.unfocused",
+            "chat::arm_thread_message_delete = ComposerFocus.unfocused",
+            "chat::begin_message_edit = ComposerFocus.unfocused",
+            "chat::begin_thread_message_edit = ComposerFocus.unfocused",
+            "chat::chat_composer_event = ComposerFocus.message",
+            "chat::choose_channel = ComposerFocus.unfocused",
+            "chat::choose_dm = ComposerFocus.unfocused",
+            "chat::close_thread = ComposerFocus.unfocused",
+            "chat::open_chat_search_hit = ComposerFocus.unfocused",
+            "chat::open_message_actions = ComposerFocus.unfocused",
+            "chat::open_message_reactions = ComposerFocus.unfocused",
+            "chat::open_thread_for = ComposerFocus.unfocused",
+            "chat::open_thread_message_actions = ComposerFocus.unfocused",
+            "chat::open_thread_message_reactions = ComposerFocus.unfocused",
+            "chat::reply_composer_event = ComposerFocus.reply",
+            "chat::toggle_channel_create = ComposerFocus.unfocused",
+            "chat::toggle_channel_settings = ComposerFocus.unfocused",
+            "huddle::huddle_go_channel = ComposerFocus.unfocused",
+            "lifecycle::reconnect = ComposerFocus.unfocused",
+            "lifecycle::select_shell_tab = ComposerFocus.unfocused",
+            "onboarding::console_opened = ComposerFocus.unfocused",
+            "overlays::global_key_pressed = ComposerFocus.unfocused",
+            "pages::open_page_search_hit = ComposerFocus.unfocused",
+            "pages::toggle_page_create = ComposerFocus.unfocused",
         ],
         "a handler started, stopped, or CHANGED what it says about the caret: \
          exactly two may CLAIM it (the two composer-event handlers, and only \
          with their own composer's name), everyone else here RETIRES it to \
-         \"none\" — decide which yours is, then update this list"
+         `unfocused` — decide which yours is, then update this list"
     );
 }
 
@@ -8196,7 +8562,7 @@ fn an_inert_key_press_leaves_the_handler_before_it_rebuilds_an_editor() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
-    app.shell_tab = "chat".into();
+    app.shell_tab = ShellTab::Chat;
     app.active_channel = "general".into();
     let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
         editor::ComposerEvent::Apply(editor::RichAction::Edit(
@@ -8234,7 +8600,7 @@ fn an_inert_key_press_leaves_the_handler_before_it_rebuilds_an_editor() {
     );
 
     // The pages chord is the third take, so it is driven too.
-    app.shell_tab = "pages".into();
+    app.shell_tab = ShellTab::Pages;
     app.page_editor = iced::widget::text_editor::Content::with_text("one");
     pages::history::record(|| ("".to_owned(), app.page_editor.cursor()));
     let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
@@ -8287,7 +8653,7 @@ fn failed_optimistic_send_rolls_back_and_restores_the_draft() {
     assert!(app.failed_message_draft.is_empty());
     assert!(app.messages.is_empty());
     assert_eq!(app.error, "rejected");
-    assert_eq!(app.mutation_phase, "idle");
+    assert_eq!(app.mutation_phase, MutationPhase::Idle);
 }
 
 #[test]
@@ -8412,7 +8778,7 @@ fn a_pending_send_survives_a_history_page_without_poisoning_it() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
-    app.mutation_phase = "idle".into();
+    app.mutation_phase = MutationPhase::Idle;
     app.active_channel = "general".into();
     app.messages = vec![message(40, "the oldest loaded root", false)];
     app.has_older_history = true;
@@ -8428,9 +8794,7 @@ fn a_pending_send_survives_a_history_page_without_poisoning_it() {
         app.history_loading,
         "an in-flight send must not block paging"
     );
-    let in_flight = app.history_generation;
     let _ = app.__update(__DucktapeMessage::HistoryLoaded(backend::HistoryPageData {
-        generation: in_flight,
         channel_id: "general".into(),
         messages: vec![message(20, "older", false)],
     }));
@@ -8570,14 +8934,14 @@ fn committed_mutation_keeps_optimistic_state_until_refresh() {
     assert!(app.message_draft.is_empty());
     assert_eq!(app.messages.len(), 1);
     assert!(app.messages[0].pending);
-    assert_eq!(app.mutation_phase, "idle");
+    assert_eq!(app.mutation_phase, MutationPhase::Idle);
 
     app.message_editor = compose("still available");
     let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
         editor::composer_submit_event(),
     ));
     assert_eq!(app.messages.len(), 2);
-    assert_eq!(app.mutation_phase, "idle");
+    assert_eq!(app.mutation_phase, MutationPhase::Idle);
 }
 
 #[test]
@@ -8587,9 +8951,9 @@ fn committed_message_change_cannot_be_submitted_twice() {
     app.active_channel = "general".into();
     app.selected_message_seq = 7;
     app.selected_message_rev = 2;
-    app.message_action = "editing".into();
+    app.message_action = MessageAction::Editing;
     app.message_edit_draft = "committed edit".into();
-    app.mutation_phase = "message-edit".into();
+    app.mutation_phase = MutationPhase::MessageEdit;
 
     let _ = app.__update(__DucktapeMessage::MutationFailed(backend::AppError {
         message: "read failed after commit".into(),
@@ -8598,16 +8962,16 @@ fn committed_message_change_cannot_be_submitted_twice() {
 
     assert_eq!(app.selected_message_seq, 0);
     assert_eq!(app.selected_message_rev, 0);
-    assert_eq!(app.message_action, "toolbar");
+    assert_eq!(app.message_action, MessageAction::Toolbar);
     assert!(app.message_edit_draft.is_empty());
-    assert_eq!(app.mutation_phase, "recovering");
+    assert_eq!(app.mutation_phase, MutationPhase::Recovering);
 }
 
 /// AND "recovering" HAS A TERMINAL. It is the phase a write the node COMMITTED
 /// but could not read back parks in — ordinary enough, a `/v1/query` can block
 /// past the RPC timeout (#1018) — and the resync `mutation_failed` launches is
 /// the recovery. Nothing released it: every other writer of "idle" sits behind
-/// a `mutation_phase != "idle"` guard it can no longer pass, so the sidebar went
+/// a `mutation_phase != MutationPhase.idle` guard it can no longer pass, so the sidebar went
 /// dead (no room click, no DM, no search hit, no scrollback, no edit or delete)
 /// under a titlebar stuck on "Syncing…", with Settings → Reconnect the only way
 /// out and no reason for anyone to guess at it.
@@ -8618,13 +8982,13 @@ fn a_committed_mutation_failure_unlocks_when_its_recovery_lands() {
     app.connected_rpc = "http://node".into();
     app.loading = false;
     app.active_channel = "general".into();
-    app.mutation_phase = "channel-create".into();
+    app.mutation_phase = MutationPhase::Channel;
 
     let _ = app.__update(__DucktapeMessage::MutationFailed(backend::AppError {
         message: "read failed after commit".into(),
         committed: true,
     }));
-    assert_eq!(app.mutation_phase, "recovering");
+    assert_eq!(app.mutation_phase, MutationPhase::Recovering);
 
     // a resync belonging to an abandoned chain answers for nothing
     let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
@@ -8634,7 +8998,11 @@ fn a_committed_mutation_failure_unlocks_when_its_recovery_lands() {
         "",
         Vec::new(),
     )));
-    assert_eq!(app.mutation_phase, "recovering", "a stale answer is not it");
+    assert_eq!(
+        app.mutation_phase,
+        MutationPhase::Recovering,
+        "a stale answer is not it"
+    );
 
     let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
         app.hydration_generation,
@@ -8644,7 +9012,8 @@ fn a_committed_mutation_failure_unlocks_when_its_recovery_lands() {
         Vec::new(),
     )));
     assert_eq!(
-        app.mutation_phase, "idle",
+        app.mutation_phase,
+        MutationPhase::Idle,
         "the state the lock protected is known good now"
     );
     assert!(app.error.is_empty());
@@ -8663,7 +9032,7 @@ fn optimistic_thread_replies_settle_independently_out_of_order() {
         editor::composer_submit_event(),
     ));
     let first_id = app.thread_messages[0].id.clone();
-    assert_eq!(app.mutation_phase, "idle");
+    assert_eq!(app.mutation_phase, MutationPhase::Idle);
     assert!(reply_composer(&app).is_empty());
     assert!(app.thread_messages[0].pending);
 
@@ -8762,7 +9131,7 @@ fn failed_thread_reply_rolls_back_only_itself_and_preserves_the_newer_draft() {
     assert_eq!(app.thread_messages.len(), 1);
     assert_eq!(app.thread_messages[0].id, second_id);
     assert!(app.thread_messages[0].pending);
-    assert_eq!(app.mutation_phase, "idle");
+    assert_eq!(app.mutation_phase, MutationPhase::Idle);
     assert!(!app.thread_loading);
 
     let _ = app.__update(__DucktapeMessage::RestoreFailedReply);
@@ -8801,7 +9170,7 @@ fn committed_thread_reply_refreshes_without_blocking_the_composer() {
     assert!(app.thread_messages[0].pending);
     assert!(reply_composer(&app).is_empty());
     assert!(app.failed_reply_draft.is_empty());
-    assert_eq!(app.mutation_phase, "idle");
+    assert_eq!(app.mutation_phase, MutationPhase::Idle);
     assert!(!app.thread_loading);
 
     app.reply_editor = compose("still available");
@@ -9092,7 +9461,7 @@ fn messages_that_arrive_off_tab_wait_for_the_reader_to_come_back() {
     app.channel_reads = backend::initial_channel_reads(app.channels.clone(), Vec::new());
     app.messages = vec![message(10, "the last thing she read", false)];
 
-    let _ = app.__update(__DucktapeMessage::SelectShellTab("settings".into()));
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Settings));
     let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
         "general",
         message(11, "while she was away", false),
@@ -9140,7 +9509,7 @@ fn messages_that_arrive_off_tab_wait_for_the_reader_to_come_back() {
         "and it does not catch her up on a room she is not on the tab for"
     );
 
-    let _ = app.__update(__DucktapeMessage::SelectShellTab("chat".into()));
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Chat));
     assert_eq!(
         app.unread_marker_seq, 11,
         "coming back freezes the divider on what arrived while she was gone"
@@ -9153,8 +9522,8 @@ fn messages_that_arrive_off_tab_wait_for_the_reader_to_come_back() {
     );
 
     // a tab round trip with nothing new must not throw the divider away
-    let _ = app.__update(__DucktapeMessage::SelectShellTab("files".into()));
-    let _ = app.__update(__DucktapeMessage::SelectShellTab("chat".into()));
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Files));
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Chat));
     assert_eq!(app.unread_marker_seq, 11);
 }
 
@@ -9238,7 +9607,7 @@ fn the_composer_belongs_to_the_room_she_is_in_and_waits_in_the_one_she_left() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.connected_rpc = "http://node".into();
-    app.mutation_phase = "idle".into();
+    app.mutation_phase = MutationPhase::Idle;
     app.active_channel = "private-ops".into();
     app.channels = vec![room("private-ops", 10), room("general", 20)];
     app.message_editor = compose("the incident started at");
@@ -9290,7 +9659,7 @@ fn creating_a_channel_leaves_the_old_rooms_draft_in_the_old_room() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.connected_rpc = "http://node".into();
-    app.mutation_phase = "idle".into();
+    app.mutation_phase = MutationPhase::Idle;
     app.active_channel = "private-ops".into();
     app.channels = vec![room("private-ops", 10)];
     app.message_editor = compose("the incident started at");
@@ -9496,7 +9865,7 @@ fn a_switch_still_in_flight_refuses_the_history_page_its_parked_rows_would_ask_f
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.connected_rpc = "http://node".into();
-    app.mutation_phase = "idle".into();
+    app.mutation_phase = MutationPhase::Idle;
     app.active_channel = "a".into();
     app.channels = vec![room("a", 100), room("b", 20)];
     app.messages = vec![
@@ -9510,7 +9879,6 @@ fn a_switch_still_in_flight_refuses_the_history_page_its_parked_rows_would_ask_f
     assert_eq!(app.messages.len(), 2, "the parked window is on screen");
     assert!(!app.loading, "a parked room is not a loading one");
     assert!(app.has_older_history, "so the paging routes are live");
-    let idle = app.history_generation;
 
     // Neither route may spend a request on seqs the walk is about to replace —
     // the scroll prefetch and the button both.
@@ -9520,7 +9888,6 @@ fn a_switch_still_in_flight_refuses_the_history_page_its_parked_rows_would_ask_f
         !app.history_loading,
         "no page may be requested from a window a switch is still replacing"
     );
-    assert_eq!(app.history_generation, idle, "nothing went out");
 
     // The walk answers, and it answers with a window that starts LATER than the
     // parked one — the whole reason its seqs could not be paged from.
@@ -9540,9 +9907,7 @@ fn a_switch_still_in_flight_refuses_the_history_page_its_parked_rows_would_ask_f
     // actually requested from.
     let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
     assert!(app.history_loading, "the settled window pages normally");
-    let in_flight = app.history_generation;
     let _ = app.__update(__DucktapeMessage::HistoryLoaded(backend::HistoryPageData {
-        generation: in_flight,
         channel_id: "a".into(),
         messages: vec![
             message(88, "a-eightyeight", false),
@@ -9615,11 +9980,9 @@ fn approaching_the_top_of_the_scrollback_prefetches_the_older_page() {
 
     let _ = app.__update(__DucktapeMessage::ChatScrolled(0.0, 900.0, 0.0, 0.95));
     assert!(app.history_loading, "the older page is already on its way");
-    let started = app.history_generation;
-
     // And it does not fan out: the in-flight page holds the next steps off.
     let _ = app.__update(__DucktapeMessage::ChatScrolled(0.0, 950.0, 0.0, 0.98));
-    assert_eq!(app.history_generation, started);
+    assert!(app.history_loading);
 }
 
 #[test]
@@ -9691,9 +10054,9 @@ fn unread_indicators_are_wired_client_local_only() {
         assert!(lifecycle.contains(gated), "{gated}");
     }
     for gate in [
-        "let live_tail_channel = keep_str(!history_view && shell_tab == \"chat\", active_channel, \"\")",
-        "let resync_tail_channel = keep_str(!history_view && shell_tab == \"chat\", active_channel, \"\")",
-        "let chat_tab_channel = keep_str(shell_tab == \"chat\" && !history_view, active_channel, \"\")",
+        "let live_tail_channel = keep_str(!history_view && shell_tab == ShellTab.chat, active_channel, \"\")",
+        "let resync_tail_channel = keep_str(!history_view && shell_tab == ShellTab.chat, active_channel, \"\")",
+        "let chat_tab_channel = keep_str(shell_tab == ShellTab.chat && !history_view, active_channel, \"\")",
     ] {
         assert!(lifecycle.contains(gate), "{gate}");
     }
@@ -9993,7 +10356,7 @@ fn the_files_pane_reports_only_a_directory_it_has_listed() {
 /// can quietly drop the guard.
 #[test]
 fn every_header_subtitle_is_gated_on_the_connection() {
-    let sites: Vec<&str> = SCREENS
+    let mut sites: Vec<&str> = SCREENS
         .match_indices("_summary(")
         .map(|(at, _)| {
             let head = SCREENS[..at]
@@ -10003,16 +10366,18 @@ fn every_header_subtitle_is_gated_on_the_connection() {
             &SCREENS[head..=close]
         })
         .collect();
+    sites.sort_unstable();
+    let mut expected = [
+        "proposals_summary(connected, rows)",
+        "members_summary(connected, rows)",
+        "agents_summary(connected, rows)",
+        "members_summary(connected, members_rows)",
+        "fs_counts_summary(connected, listed, entries)",
+    ];
+    expected.sort_unstable();
 
     assert_eq!(
-        sites,
-        [
-            "proposals_summary(connected, rows)",
-            "members_summary(connected, rows)",
-            "agents_summary(connected, rows)",
-            "members_summary(connected, members_rows)",
-            "fs_counts_summary(connected, listed, entries)",
-        ],
+        sites, expected,
         "a header subtitle folds rows only a live node delivers: pass `connected` \
          first so it says nothing rather than a confident zero"
     );
@@ -10227,24 +10592,23 @@ fn a_disconnected_console_reports_no_counts_at_all() {
 /// empties `chat_search_hits` on its way out, so a phase left non-idle by the
 /// failure route floats "No messages match" — a confident zero-result card beside
 /// an error banner saying the request never landed. One discriminant makes that
-/// state unrepresentable: the float reads `search_phase != "idle"` and the miss
-/// reads `== "done"`, so the failure arm closes the float by writing "idle".
+/// state unrepresentable: the float reads `SearchPhase`, so the failure arm
+/// returns it to `Idle` instead of claiming a completed empty result.
 #[test]
 fn a_failed_message_search_closes_the_float_instead_of_claiming_zero_results() {
     let (mut app, _) = Ducktape::__boot();
     app.loading = false;
     app.chat_search_draft = "ledger".into();
     let _ = app.__update(__DucktapeMessage::SearchChatSubmit);
-    assert_eq!(app.chat_search_phase, "searching");
+    assert_eq!(app.chat_search_phase, SearchPhase::Searching);
 
-    let _ = app.__update(__DucktapeMessage::ChatSearchFailed(
-        backend::HydrationError {
-            generation: app.chat_search_generation,
-            message: "rpc unreachable".into(),
-        },
-    ));
+    let _ = app.__update(__DucktapeMessage::ChatSearchFailed(backend::AppError {
+        message: "rpc unreachable".into(),
+        committed: false,
+    }));
     assert_eq!(
-        app.chat_search_phase, "idle",
+        app.chat_search_phase,
+        SearchPhase::Idle,
         "the float has nothing honest to say about a search that never ran"
     );
     assert!(app.chat_search_hits.is_empty());
@@ -10253,21 +10617,9 @@ fn a_failed_message_search_closes_the_float_instead_of_claiming_zero_results() {
     // And the empty result IS still reachable — "done" with no hits is the miss.
     let _ = app.__update(__DucktapeMessage::SearchChatSubmit);
     let _ = app.__update(__DucktapeMessage::ChatSearchLoaded(
-        backend::ChatSearchData {
-            generation: app.chat_search_generation,
-            hits: Vec::new(),
-        },
+        backend::ChatSearchData { hits: Vec::new() },
     ));
-    assert_eq!(app.chat_search_phase, "done");
-
-    // A superseded failure cannot reopen or close anything: it is generation-gated.
-    let _ = app.__update(__DucktapeMessage::ChatSearchFailed(
-        backend::HydrationError {
-            generation: app.chat_search_generation - 1,
-            message: "stale".into(),
-        },
-    ));
-    assert_eq!(app.chat_search_phase, "done");
+    assert_eq!(app.chat_search_phase, SearchPhase::Done);
 }
 
 /// THE DESIGN PASS, PINNED. Every one of these is a measurement someone made
@@ -10353,7 +10705,7 @@ fn the_chat_surface_holds_to_its_measured_geometry() {
 
 /// THE ZERO-HIT SEARCH CARD MUST STAY DISMISSABLE. The Clear-search × used to
 /// gate on `!empty(search_hits)`, but the float itself opens on
-/// `search_phase != "idle"` — so a `done && empty(search_hits)` search drew
+/// `search_phase != SearchPhase.idle` — so a `done && empty(search_hits)` search drew
 /// "No messages match" with no way to close it: not the × (hidden), not
 /// Escape (`chat-search` carries no `escape_target` layer), not re-pressing
 /// Enter (lands `done`+empty again), not clearing the field (the submit
@@ -10364,7 +10716,7 @@ fn the_chat_surface_holds_to_its_measured_geometry() {
 fn the_clear_search_button_survives_a_zero_hit_result() {
     let screen = inlined(include_str!("ui/screens/chat.ice"));
     assert!(
-        screen.contains("if search_phase != \"idle\"\n") ,
+        screen.contains("if search_phase != SearchPhase.idle\n"),
         "the float and the clear button read the same discriminant"
     );
     assert!(
@@ -10584,7 +10936,7 @@ fn every_repeated_component_mount_is_culled_or_argued() {
 ///
 /// `sync`/`pure f(rows:[T])` called from a view expression clones the whole list into
 /// the call, once per frame, per call site — and if the site sits inside a
-/// `for`, once per row per frame. `state.ice` records three fields
+/// `for`, once per row per frame. Feature state records three fields
 /// (`unread_marker_seq`, `has_older_history`, `rooms`) that exist only because
 /// this was measured and paid for; the fix is always the same, mirror the
 /// answer into state where the list is written.
@@ -10676,7 +11028,7 @@ fn no_view_expression_hands_an_extern_a_list() {
         cloned.is_empty(),
         "a view expression handed a list to an extern — the ABI is by value, so \
          that is a deep clone of the whole list on every frame. Mirror the answer \
-         into a `state.ice` field written where the list is written:\n{}",
+         into a feature-state field written where the list is written:\n{}",
         cloned.join("\n")
     );
     for entry in ARGUED {

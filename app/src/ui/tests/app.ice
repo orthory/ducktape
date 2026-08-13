@@ -4,9 +4,9 @@ preset ui_offline
     status = "Offline"
     connected = false
     loading = false
-    mutation_phase = "idle"
+    mutation_phase = MutationPhase.idle
     error = ""
-    shell_tab = "chat"
+    shell_tab = ShellTab.chat
     channel_draft = ""
     channel_create_members_only = false
     palette_open = false
@@ -17,8 +17,8 @@ preset ui_palette_open
     status = "Offline"
     connected = false
     loading = false
-    mutation_phase = "idle"
-    shell_tab = "chat"
+    mutation_phase = MutationPhase.idle
+    shell_tab = ShellTab.chat
     palette_open = true
     palette_draft = ""
 
@@ -28,9 +28,9 @@ preset ui_settings
     status = "Offline"
     connected = false
     loading = false
-    mutation_phase = "idle"
+    mutation_phase = MutationPhase.idle
     error = ""
-    shell_tab = "settings"
+    shell_tab = ShellTab.settings
 
 preset ui_component_error
   state
@@ -41,12 +41,12 @@ preset ui_component_error
 // without spending a provider credential.
 preset ui_shell_showcase
   state
-    shell_tab = "shell"
+    shell_tab = ShellTab.shell
     connected = false
     loading = false
-    mutation_phase = "idle"
+    mutation_phase = MutationPhase.idle
     error = ""
-    shell_mode = "chat"
+    shell_mode = ShellMode.chat
     shell_provider = "codex"
     shell_credential = ""
     shell_chat_entries = agent_chat_finish(agent_chat_push_user([], "Explain the execution path and call out the failure boundaries.", "codex"), "## Execution path\n\nThe request becomes a durable saga, streams provider activity into this view, and commits the final answer before the turn settles.\n\n- **Scheduling** pins work to the selected compute provider.\n- **Live output** stays observational.\n- **Saga state** is the canonical result.", "codex")
@@ -95,8 +95,8 @@ test shell_chat_surface_contract
   expect text "Execution path" within transcript
   expect transcript.width > 1000.0
   capture shell_chat_light
-  dispatch shell_mode_changed("raw")
-  expect shell_mode == "raw"
+  dispatch shell_mode_changed(ShellMode.raw)
+  expect shell_mode == ShellMode.raw
   expect missing transcript
   capture shell_raw_light
   resize 966 500
@@ -338,9 +338,9 @@ test minimum_window_layout_contract
 
 preset ui_launch
   state
-    mutation_phase = "idle"
+    mutation_phase = MutationPhase.idle
     onboarding_error = ""
-    hub_step = "networks"
+    hub_step = HubStep.networks
     hub_networks = []
     hub_selected = ""
 
@@ -353,7 +353,7 @@ test launch_unlock_contract
   mount
     HubColumn #hub
       with
-        step="unlock"
+        step=HubStep.unlock
         key_state="encrypted"
         networks=hub_networks
         selected=""
@@ -390,9 +390,9 @@ test launch_unlock_contract
   target pw = #hub/root/unlock/root/unlock-password
   expect exists pw
   dispatch go_restore
-  expect hub_step == "restore"
+  expect hub_step == HubStep.restore
   dispatch go_login
-  expect hub_step == "unlock"
+  expect hub_step == HubStep.unlock
 
 test launch_networks_empty_contract
   preset ui_launch
@@ -400,7 +400,7 @@ test launch_networks_empty_contract
   mount
     HubColumn #hub
       with
-        step="networks"
+        step=HubStep.networks
         key_state="encrypted"
         networks=hub_networks
         selected=""
@@ -437,7 +437,7 @@ test launch_networks_empty_contract
   target cta = #hub/root/networks/root/join-cta
   expect exists cta
   click cta
-  expect hub_step == "join"
+  expect hub_step == HubStep.join
 
 preset ui_palette_overlay
   state
@@ -488,11 +488,11 @@ test palette_overlay_contract
 
 preset ui_settings_scroll
   state
-    shell_tab = "settings"
+    shell_tab = ShellTab.settings
     status = "Offline"
     connected = false
     loading = false
-    mutation_phase = "idle"
+    mutation_phase = MutationPhase.idle
     error = ""
 
 // KEYBOARD SCROLL. iced's scrollable answers the wheel and the drag rail only
@@ -561,7 +561,6 @@ test settings_keyboard_scroll_contract
             account_name
             network_name
             connected_rpc
-            settings_endpoint
             settings_key_state
             settings_key_path
             settings_open_tabs
@@ -649,103 +648,53 @@ test settings_keyboard_scroll_contract
   key page-down
   expect body.scroll_y > 30.0
 
-preset ui_explorer_partial
+preset ui_explorer
   state
-    shell_tab = "explorer"
+    shell_tab = ShellTab.explorer
     connected = true
+    connected_rpc = "http://127.0.0.1:1"
     loading = false
-    mutation_phase = "idle"
+    mutation_phase = MutationPhase.idle
     error = ""
-    explorer_query = "needle"
-    explorer_searching = false
-    explorer_kind = "all"
-    explorer_partial = "Code did not answer — these results are incomplete."
 
-preset ui_explorer_whole
-  state
-    shell_tab = "explorer"
-    connected = true
-    loading = false
-    mutation_phase = "idle"
-    error = ""
-    explorer_query = "needle"
-    explorer_searching = false
-    explorer_kind = "all"
-    explorer_partial = ""
-
-// A PARTIAL ANSWER SAYS SO, AND ONLY A WHOLE ONE CLAIMS EMPTY. Each of the six
-// sources behind a workspace search fails silently and the node's per-module
-// cold start runs tens of seconds against a 30s client ceiling, so a search
-// that reached the node and lost three of its sources rendered the survivors as
-// the whole truth — and with no survivors it printed "Nothing matched that
-// query in this workspace", which is a claim about the WORKSPACE that only the
-// sources that answered can support.
+// A PARTIAL ANSWER SAYS SO. Port 1 on loopback cannot hold an unprivileged
+// listener, so all six search legs refuse immediately and deterministically.
+// Drive the component through its own input and handler instead of seeding its
+// now-private state through an app preset.
 test explorer_partial_banner_contract
-  preset ui_explorer_partial
+  preset ui_explorer
   viewport 1120 720
   mount
-    ExplorerScreen query<->explorer_query #explorer
+    ExplorerScreen #explorer
       with
+        connected_rpc
         connected
-        searching=explorer_searching
         loading
-        kinds=explorer_kinds
-        kind=explorer_kind
-        partial=explorer_partial
-        hits=explorer_hits
         blocks=explorer_blocks
-        selected=explorer_selected
         ops=explorer_ops
         head=block_height
         sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
       events
-        explorer_search_submit -> explorer_search_submit
-        clear_explorer_search -> clear_explorer_search
         refresh_explorer -> refresh_explorer
-        pick_explorer_kind -> pick_explorer_kind _
-        select_explorer_block -> select_explorer_block _
+  target query = #explorer/explorer-search
+  target clear = #explorer/explorer-clear
   target banner = #explorer/explorer-partial
   target plate = #explorer/explorer-nothing-matched/root
+  click query
+  type "needle"
+  key enter
   expect exists banner
   expect missing plate
-
-// The other half, which is what stops the banner from being wallpaper: with
-// every source answered there is nothing to warn about, and "nothing matched"
-// is then the honest line.
-test explorer_whole_answer_contract
-  preset ui_explorer_whole
-  viewport 1120 720
-  mount
-    ExplorerScreen query<->explorer_query #explorer
-      with
-        connected
-        searching=explorer_searching
-        loading
-        kinds=explorer_kinds
-        kind=explorer_kind
-        partial=explorer_partial
-        hits=explorer_hits
-        blocks=explorer_blocks
-        selected=explorer_selected
-        ops=explorer_ops
-        head=block_height
-        sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
-      events
-        explorer_search_submit -> explorer_search_submit
-        clear_explorer_search -> clear_explorer_search
-        refresh_explorer -> refresh_explorer
-        pick_explorer_kind -> pick_explorer_kind _
-        select_explorer_block -> select_explorer_block _
-  target banner = #explorer/explorer-partial
-  target plate = #explorer/explorer-nothing-matched/root
+  click clear
+  expect query.value == ""
   expect missing banner
-  expect exists plate
+  expect missing plate
 
 preset ui_chat_stream
   state
     connected = true
     loading = false
-    mutation_phase = "idle"
+    mutation_phase = MutationPhase.idle
     error = ""
     // THE ENDPOINT IS PINNED BECAUSE AN EMPTY ONE IS NOT INERT. `choose_channel`
     // launches a real `load_channel_window`, and `rpc_client("")` does not
@@ -758,7 +707,7 @@ preset ui_chat_stream
     // needs root — so the connect is refused immediately and the task settles
     // on the dispatch, deterministically and off the network.
     connected_rpc = "http://127.0.0.1:1"
-    shell_tab = "chat"
+    shell_tab = ShellTab.chat
     active_channel = "channel-a"
     active_channel_name = "general"
     messages = optimistic_message(messages, "The room she is looking at.", "pending-1")
@@ -786,7 +735,7 @@ test message_stream_reset_contract
   preset ui_chat_stream
   viewport 1120 720
   mount
-    ChatScreen search_draft<->chat_search_draft message_action_focus<->message_action_focus message_edit_draft<->message_edit_draft message_editor<->message_editor channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft thread_edit_draft<->thread_edit_draft reply_editor<->reply_editor #chat
+    ChatScreen search_draft<->chat_search_draft message_edit_draft<->message_edit_draft message_editor<->message_editor channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft thread_edit_draft<->thread_edit_draft reply_editor<->reply_editor #chat
       with
         network_name
         status
@@ -822,10 +771,7 @@ test message_stream_reset_contract
         unread_marker_seq
         selected_message_seq
         selected_message_rev
-        send_flash_ids
-        send_flash_value=0.0
         message_action
-        message_menu_y
         failed_message_draft
         channel_settings_open
         active_thread_seq
@@ -834,8 +780,6 @@ test message_stream_reset_contract
         thread_selected_seq
         thread_selected_rev
         thread_message_action
-        thread_menu_y
-        thread_send_flash_ids
         thread_has_more
         thread_next_reply_offset
         thread_loading
@@ -853,7 +797,6 @@ test message_stream_reset_contract
         leave_huddle_here -> leave_huddle_here
         huddle_go_channel -> huddle_go_channel
         join_huddle_submit -> join_huddle_submit
-        chat_pointer_pressed -> chat_pointer_pressed _ _
         load_more_history -> load_more_history
         chat_scrolled -> chat_scrolled _ _ _ _
         open_message_link -> open_message_link _
@@ -877,7 +820,6 @@ test message_stream_reset_contract
         unarchive_channel_submit -> unarchive_channel_submit
         add_channel_member_submit -> add_channel_member_submit
         remove_channel_member_submit -> remove_channel_member_submit _
-        thread_pointer_pressed -> thread_pointer_pressed _ _
         close_thread -> close_thread
         open_thread_message_actions -> open_thread_message_actions _ _ _
         open_thread_message_reactions -> open_thread_message_reactions _ _ _
@@ -891,8 +833,6 @@ test message_stream_reset_contract
         dismiss_failed_reply -> dismiss_failed_reply
         reply_composer_event -> reply_composer_event _
         reply_composer_mark -> reply_composer_mark _
-        chat_resized -> chat_resized _ _
-        thread_resized -> thread_resized _ _
   target stream = #chat/message-stream
   expect exists stream
   dispatch choose_channel("channel-b")

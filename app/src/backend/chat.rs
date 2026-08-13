@@ -353,30 +353,8 @@ pub async fn load_thread(
     through_reply_offset: i64,
     generation: i64,
 ) -> Result<ThreadLoadData, HydrationError> {
-    let result = async {
-        let root_seq = positive_sequence(root_seq)?;
-        let target_seq = u64::try_from(target_seq).unwrap_or(0);
-        let is_sparse_target = through_reply_offset < 0 && target_seq > 0;
-        let through_reply_offset = u64::try_from(through_reply_offset)
-            .unwrap_or(0)
-            .min(chat::MAX_THREAD_REPLIES as u64);
-        let rpc = rpc_client(&rpc)?;
-        if is_sparse_target {
-            return load_sparse_thread_data(&rpc, &channel_id, root_seq, target_seq).await;
-        }
-        let mut thread =
-            load_thread_data(&rpc, &channel_id, root_seq, through_reply_offset).await?;
-        let target_is_loaded = target_seq > 0
-            && thread
-                .messages
-                .iter()
-                .any(|message| message.seq == number_i64(target_seq));
-        if target_is_loaded {
-            thread.target_seq = number_i64(target_seq);
-        }
-        Ok(thread)
-    }
-    .await;
+    let result =
+        load_thread_window(rpc, channel_id, root_seq, target_seq, through_reply_offset).await;
     result
         .map(|thread| ThreadLoadData {
             generation,
@@ -390,6 +368,35 @@ pub async fn load_thread(
             generation,
             message: user_error(message),
         })
+}
+
+async fn load_thread_window(
+    rpc: String,
+    channel_id: String,
+    root_seq: i64,
+    target_seq: i64,
+    through_reply_offset: i64,
+) -> Result<ThreadData, String> {
+    let root_seq = positive_sequence(root_seq)?;
+    let target_seq = u64::try_from(target_seq).unwrap_or(0);
+    let is_sparse_target = through_reply_offset < 0 && target_seq > 0;
+    let through_reply_offset = u64::try_from(through_reply_offset)
+        .unwrap_or(0)
+        .min(chat::MAX_THREAD_REPLIES as u64);
+    let rpc = rpc_client(&rpc)?;
+    if is_sparse_target {
+        return load_sparse_thread_data(&rpc, &channel_id, root_seq, target_seq).await;
+    }
+    let mut thread = load_thread_data(&rpc, &channel_id, root_seq, through_reply_offset).await?;
+    let target_is_loaded = target_seq > 0
+        && thread
+            .messages
+            .iter()
+            .any(|message| message.seq == number_i64(target_seq));
+    if target_is_loaded {
+        thread.target_seq = number_i64(target_seq);
+    }
+    Ok(thread)
 }
 
 pub async fn load_thread_page(
@@ -439,11 +446,9 @@ pub async fn refresh_live_thread(
     root_seq: i64,
     target_seq: i64,
     through_reply_offset: i64,
-    generation: i64,
-) -> Result<LiveThreadData, HydrationError> {
+) -> Result<LiveThreadData, AppError> {
     if channel_id.is_empty() || root_seq <= 0 {
         return Ok(LiveThreadData {
-            generation,
             channel_id,
             root_seq: 0,
             target_seq: 0,
@@ -452,17 +457,15 @@ pub async fn refresh_live_thread(
             has_more: false,
         });
     }
-    load_thread(
+    load_thread_window(
         rpc,
         channel_id.clone(),
         root_seq,
         target_seq,
         through_reply_offset,
-        generation,
     )
     .await
     .map(|thread| LiveThreadData {
-        generation: thread.generation,
         channel_id,
         root_seq: thread.root_seq,
         target_seq: thread.target_seq,
@@ -470,6 +473,7 @@ pub async fn refresh_live_thread(
         next_reply_offset: thread.next_reply_offset,
         has_more: thread.has_more,
     })
+    .map_err(app_error)
 }
 
 pub async fn send_reply(
@@ -633,8 +637,7 @@ pub async fn search_chat(
     rpc: String,
     channel_id: String,
     text: String,
-    generation: i64,
-) -> Result<ChatSearchData, HydrationError> {
+) -> Result<ChatSearchData, AppError> {
     // The reader, for the same `you` rendering the timeline does — a search hit
     // was showing the RAW wire author (`user:3f8dc8…773`, the full 64-hex key
     // with its prefix) as the row's headline, above the text it matched.
@@ -665,7 +668,6 @@ pub async fn search_chat(
             return Err("chat search returned an invalid reply".into());
         };
         Ok(ChatSearchData {
-            generation,
             hits: hits
                 .into_iter()
                 .map(|hit| ChatSearchHit {
@@ -688,10 +690,7 @@ pub async fn search_chat(
         })
     }
     .await;
-    result.map_err(|message| HydrationError {
-        generation,
-        message: user_error(message),
-    })
+    result.map_err(app_error)
 }
 
 pub async fn load_page(rpc: String, page_id: String) -> Result<PagesData, AppError> {
@@ -941,9 +940,7 @@ pub async fn delete_page(
             password,
         )
         .await?;
-        let mut data = load_pages_data(&rpc, None)
-            .await
-            .map_err(committed_error)?;
+        let mut data = load_pages_data(&rpc, None).await.map_err(committed_error)?;
         // DROP WHAT WAS JUST DELETED. Same acceptance-vs-application gap as
         // `create_page`, read the other way round: this reload can still see
         // the removed page, so it stayed in the sidebar, stayed selectable,
@@ -956,7 +953,11 @@ pub async fn delete_page(
         if doomed.contains(&data.active_page) {
             // Re-resolve exactly as `load_pages_data` would have, had the index
             // already caught up: the first surviving page, or nothing.
-            data.active_page = data.pages.first().map(|page| page.id.clone()).unwrap_or_default();
+            data.active_page = data
+                .pages
+                .first()
+                .map(|page| page.id.clone())
+                .unwrap_or_default();
             data.active_page_title = String::new();
             data.active_page_parent = String::new();
             data.blocks = Vec::new();
@@ -1024,8 +1025,7 @@ pub async fn search_pages(
     rpc: String,
     page_id: String,
     text: String,
-    generation: i64,
-) -> Result<PageSearchData, HydrationError> {
+) -> Result<PageSearchData, AppError> {
     let result = async {
         let text = bounded_text(text, "search", 512)?;
         let rpc = rpc_client(&rpc)?;
@@ -1045,10 +1045,7 @@ pub async fn search_pages(
             return Err("page search returned an invalid reply".into());
         };
         if hits.is_empty() {
-            return Ok(PageSearchData {
-                generation,
-                hits: Vec::new(),
-            });
+            return Ok(PageSearchData { hits: Vec::new() });
         }
         // The titles live one view over, in the same index — this is the very
         // call the pages sidebar makes. Paid once per search that matched
@@ -1065,13 +1062,9 @@ pub async fn search_pages(
         // fallback `titled_page_hits` already takes for an unknown page id.
         let index = load_page_index(&rpc).await.unwrap_or_default();
         Ok(PageSearchData {
-            generation,
             hits: titled_page_hits(hits, index),
         })
     }
     .await;
-    result.map_err(|message| HydrationError {
-        generation,
-        message: user_error(message),
-    })
+    result.map_err(app_error)
 }

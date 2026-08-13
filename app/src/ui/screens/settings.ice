@@ -4,9 +4,9 @@
 // `screens/roster.ice` for the screen contract: no app state is reachable from
 // here, so every reading is a prop and every act leaves as a named event that
 // `view.ice` routes back to the handler of the same name.
-component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, settings_endpoint:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_answered:bool, account_id:str, bind account_name_draft:str, account_renaming:bool, account_bound:bool, account_members:i64, account_nodes:i64, appearance:str, password:str, status:str, loading:bool, connected:bool, mutation_phase:str)
+component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_answered:bool, account_id:str, bind account_name_draft:str, account_renaming:bool, account_bound:bool, account_members:i64, account_nodes:i64, appearance:Appearance, password:str, status:str, loading:bool, connected:bool, mutation_phase:MutationPhase)
   emits
-    select_shell_tab(str)
+    select_shell_tab(ShellTab)
     reconnect()
     switch_network
     settings_unlock_submit(str)
@@ -46,16 +46,10 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                   label="Workspace"
                   value=network_name
                   last=false
-              // FALL BACK TO THE ENDPOINT WE TRIED. `settings_endpoint` arrives
-              // with `settings_loaded`, which never fires when the node is not
-              // there — so a failed connection left this row EMPTY while the
-              // banner over it said "Check the endpoint and node". The one
-              // screen that exists to say what this client is attached to
-              // withheld the only fact worth having.
               KeyValueRow
                 with
                   label="Endpoint"
-                  value=keep_str(!empty(settings_endpoint), settings_endpoint, connected_rpc)
+                  value=connected_rpc
                   last=false
               // The artifact's last NETWORK row: the roster reading with an
               // inline accent link onto the Members screen.
@@ -81,7 +75,7 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                       wrap=none
                       font=code_medium
                       @text-secondary_fg
-                  button "manage" -> emit(select_shell_tab, "members")
+                  button "manage" -> emit(select_shell_tab, ShellTab.members)
                     with
                       h=22.0
                       p=0.0
@@ -111,7 +105,7 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                       wrap=none
                       font=code_medium
                       @text-secondary_fg
-                  button "view" -> emit(select_shell_tab, "node")
+                  button "view" -> emit(select_shell_tab, ShellTab.node)
                     with
                       h=22.0
                       p=0.0
@@ -139,13 +133,13 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                   space w=fill
                   button "Reconnect" -> emit(reconnect)
                     with
-                      disabled=(loading || (mutation_phase != "idle" && mutation_phase != "recovering"))
+                      disabled=(loading || (mutation_phase != MutationPhase.idle && mutation_phase != MutationPhase.recovering))
                       h=28.0
                       p=6.0
                       @secondary_action
                   button "Switch network" -> emit(switch_network)
                     with
-                      disabled=(mutation_phase != "idle")
+                      disabled=(mutation_phase != MutationPhase.idle)
                       h=28.0
                       p=6.0
                       @secondary_action
@@ -170,33 +164,36 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                     size=12.5
                     wrap=none
                     @text-fg
-                if empty(appearance)
-                  text "Following the system appearance." size=11.0 @text-caption
-                if !empty(appearance)
-                  text "Pinned for this device." size=11.0 @text-caption
+                match appearance
+                  Appearance.system
+                    text "Following the system appearance." size=11.0 @text-caption
+                  Appearance.light
+                    text "Pinned for this device." size=11.0 @text-caption
+                  Appearance.dark
+                    text "Pinned for this device." size=11.0 @text-caption
               space w=fill
-              if appearance == "light"
+              if appearance == Appearance.light
                 button "Light" -> emit(set_appearance_light)
                   with
                     checked=true
                     h=28.0
                     p=6.0
                     @primary_action
-              if appearance != "light"
+              if appearance != Appearance.light
                 button "Light" -> emit(set_appearance_light)
                   with
                     checked=false
                     h=28.0
                     p=6.0
                     @secondary_action
-              if appearance == "dark"
+              if appearance == Appearance.dark
                 button "Dark" -> emit(set_appearance_dark)
                   with
                     checked=true
                     h=28.0
                     p=6.0
                     @primary_action
-              if appearance != "dark"
+              if appearance != Appearance.dark
                 button "Dark" -> emit(set_appearance_dark)
                   with
                     checked=false
@@ -406,7 +403,7 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                           label="Key password"
                           secure=true
                           hint="unlock signing…"
-                          disabled=(mutation_phase != "idle")
+                          disabled=(mutation_phase != MutationPhase.idle)
                           submit=emit(settings_unlock_submit, key_pw)
                           w=fill
                           p=6.2
@@ -418,7 +415,7 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                         disabled bg=muted_bg/54 value=muted
                       button "Unlock" -> emit(settings_unlock_submit, key_pw)
                         with
-                          disabled=(mutation_phase != "idle" || empty(key_pw))
+                          disabled=(mutation_phase != MutationPhase.idle || empty(key_pw))
                           h=28.0
                           p=6.0
                           @secondary_action
@@ -518,7 +515,7 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                     @text-meta
               button "Forget network" -> emit(forget_workspace_submit)
                 with
-                  disabled=(!connected || mutation_phase != "idle")
+                  disabled=(!connected || mutation_phase != MutationPhase.idle)
                   h=32.0
                   p=8.0
                   @icon_action

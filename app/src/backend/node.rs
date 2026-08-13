@@ -5,7 +5,6 @@ use super::*;
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct SettingsFacts {
     pub generation: i64,
-    pub endpoint: String,
     pub key_path: String,
     pub key_state: String,
     /// This workspace's directory on this device — the Node overview's data dir.
@@ -27,7 +26,6 @@ pub async fn load_settings_facts(
     rpc: String,
     generation: i64,
 ) -> Result<SettingsFacts, HydrationError> {
-    offscreen_guard(generation)?;
     async {
         let (key_path, key_state) = match user_key_path() {
             Err(_) => ("(unset)".to_string(), "unlocatable".to_string()),
@@ -47,7 +45,6 @@ pub async fn load_settings_facts(
             .unwrap_or_default();
         Ok::<_, String>(SettingsFacts {
             generation,
-            endpoint: rpc,
             key_path,
             key_state,
             data_dir,
@@ -187,10 +184,10 @@ pub fn node_log_timeline<'a>(
     state: &'a NodeLogTimelineState,
     source: &'a str,
 ) -> iced::Element<'a, NodeLogTimelineEvent> {
-    use ui_lang_components::ui::log_timeline::{LogTimelineEvent, log_timeline};
-    use ui_lang_components::ui::theme::DARK;
     use iced::widget::{Space, button, column, container, row, text};
     use iced::{Border, Color, Font, Length};
+    use ui_lang_components::ui::log_timeline::{LogTimelineEvent, log_timeline};
+    use ui_lang_components::ui::theme::DARK;
 
     let inspection = state.timeline.inspect(node_log_timeline_config());
     let mono = Font {
@@ -467,7 +464,6 @@ mod log_timeline_tests {
 /// the two-field `Status` type drops, plus the mesh sample's live/total.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct NodeFacts {
-    pub generation: i64,
     /// The daemon identity, full hex so the operator surface can copy the key
     /// that membership and peer records actually carry.
     pub public_key: String,
@@ -535,7 +531,6 @@ pub struct NodeFacts {
 impl Default for NodeFacts {
     fn default() -> Self {
         Self {
-            generation: 0,
             public_key: String::new(),
             version: String::new(),
             root_hash: String::new(),
@@ -562,12 +557,11 @@ impl Default for NodeFacts {
 /// The facts a `/v1/status` document carries — the ONE reader, shared by the
 /// HTTP load and the pushed `status` snapshot, for the same reason
 /// [`peer_rows`] is shared.
-pub(crate) fn node_facts(status: &serde_json::Value, generation: i64) -> NodeFacts {
+pub(crate) fn node_facts(status: &serde_json::Value) -> NodeFacts {
     let operations = &status["operations"];
     let consensus = &operations["consensus"];
     let sync = &operations["sync"];
     NodeFacts {
-        generation,
         public_key: status["public_key"]
             .as_str()
             .unwrap_or_default()
@@ -632,17 +626,14 @@ pub(crate) fn sync_in_progress(phase: &str) -> bool {
     phase == "syncing"
 }
 
-pub async fn load_node_facts(rpc: String, generation: i64) -> Result<NodeFacts, HydrationError> {
+pub async fn load_node_facts(rpc: String) -> Result<NodeFacts, AppError> {
     async {
         let client = rpc_client(&rpc)?;
         let status = client.status_json().await?;
-        Ok(node_facts(&status, generation))
+        Ok(node_facts(&status))
     }
     .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
+    .map_err(app_error)
 }
 
 /// The head a status document actually serves, or [`UNMEASURED`] when it
@@ -673,7 +664,7 @@ fn served_height(height: &serde_json::Value) -> i64 {
 /// What an `operations` reading the node did not publish carries.
 ///
 /// The rule is already written twice — `NodeFacts`'s consensus trio is
-/// `Option` "rather than being filled with misleading zeroes", and `state.ice`
+/// `Option` "rather than being filled with misleading zeroes", and `state/node.ice`
 /// says an absent reading "must print `—`, never a measured `0`". The two
 /// `i64` fields beside them had no way to say it, because `0` is a legal
 /// height and a legal timestamp.
@@ -818,10 +809,8 @@ trait SnapshotReader<T> {
 }
 
 impl SnapshotReader<NodeFacts> for Snapshot {
-    /// The generation is the HTTP loads' stale-reply guard; a PUSH answers no
-    /// request, so `-1` is the app's own "not a reply" reading.
     fn read(&self, document: &serde_json::Value) -> NodeFacts {
-        node_facts(document, -1)
+        node_facts(document)
     }
 }
 
@@ -901,7 +890,6 @@ pub struct ModuleRow {
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ModulesData {
-    pub generation: i64,
     pub rows: Vec<ModuleRow>,
 }
 
@@ -912,7 +900,7 @@ pub struct ModulesData {
 /// The lifecycle half is BEST EFFORT on purpose — the daemon's default module
 /// set has no `lifecycle`, and a network without one still has a real,
 /// complete registered set to show.
-pub async fn load_modules(rpc: String, generation: i64) -> Result<ModulesData, HydrationError> {
+pub async fn load_modules(rpc: String) -> Result<ModulesData, AppError> {
     async {
         let client = rpc_client(&rpc)?;
         let status = client.status_json().await?;
@@ -947,13 +935,10 @@ pub async fn load_modules(rpc: String, generation: i64) -> Result<ModulesData, H
                 }
             })
             .collect();
-        Ok(ModulesData { generation, rows })
+        Ok(ModulesData { rows })
     }
     .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
+    .map_err(app_error)
 }
 
 /// `LifecycleQuery::ModuleStatus` keyed by module id, empty when this network
@@ -977,24 +962,7 @@ async fn module_code_by_id(client: &RpcClient) -> BTreeMap<String, serde_json::V
         .collect()
 }
 
-/// One curated skill of an agent: the ref's name and whether it loads as
-/// persona (`LoadMode::Always`) or on demand.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct AgentSkill {
-    pub name: String,
-    pub always: bool,
-}
-
-/// One granted capability, in the `CapRequest` vocabulary: the request name
-/// and the resource it names (empty for the argument-less grants).
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct AgentCap {
-    pub label: String,
-    pub arg: String,
-}
-
-/// One registered agent, rendered. Everything here already rides
-/// `AgentRecord` — the registry reply carries the whole record.
+/// One registered agent, rendered from its registry record and live-run fact.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct AgentRow {
     pub id: String,
@@ -1002,22 +970,14 @@ pub struct AgentRow {
     pub initials: String,
     pub capability: String,
     pub status: String,
-    /// the decoded `SagaOrigin::External` key hex, empty for module/system owners.
-    pub owner_key: String,
-    /// that key resolved against the member roster, else the origin's variant tag.
+    /// the external key shortened for display, else the origin's variant tag.
     pub owner_handle: String,
-    pub created_at: i64,
-    pub is_mine: bool,
     /// this agent holds a RUN in flight right now — the runs module's pending
     /// register, NOT `status`. `AgentStatus` is only Active|Paused and Active
     /// is the registration default, so it says "not paused", never "working".
     pub live: bool,
-    pub tools: i64,
-    pub secrets: i64,
-    pub subagent_budget: i64,
-    pub allowed_actions: Vec<String>,
-    pub skills: Vec<AgentSkill>,
-    pub caps: Vec<AgentCap>,
+    pub skill_count: i64,
+    pub cap_count: i64,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -1026,61 +986,25 @@ pub struct AgentsData {
     pub agents: Vec<AgentRow>,
 }
 
-/// The owner origin, decoded: `("<key hex>", "<handle>")`. An external origin
-/// carries raw key bytes; a module/system origin has no key at all and reads
-/// as its own name.
-fn agent_owner(owner: &serde_json::Value) -> (String, String) {
+/// The owner origin rendered as a handle. An external origin carries raw key
+/// bytes; a module/system origin reads as its own name.
+fn agent_owner_handle(owner: &serde_json::Value) -> String {
     let Some(tagged) = owner.as_object() else {
-        let name = owner.as_str().unwrap_or_default().to_string();
-        return (String::new(), name);
+        return owner.as_str().unwrap_or_default().to_string();
     };
     let Some((variant, payload)) = tagged.iter().next() else {
-        return (String::new(), String::new());
+        return String::new();
     };
     if variant != "external" {
-        let name = payload.as_str().unwrap_or(variant.as_str()).to_string();
-        return (String::new(), name);
+        return payload.as_str().unwrap_or(variant.as_str()).to_string();
     }
-    let key = hex_encode(&json_bytes(payload));
-    let handle = short_label(&key);
-    (key, handle)
+    short_label(&hex_encode(&json_bytes(payload)))
 }
 
-/// `ResourceCaps` flattened into the `CapRequest` names the console chips.
-fn agent_caps(caps: &serde_json::Value) -> Vec<AgentCap> {
-    let mut chips = Vec::new();
-    for (field, label) in [
-        ("forge_read", "ForgeRead"),
-        ("forge_push", "ForgePush"),
-        ("duckfs_read", "DuckfsRead"),
-        ("duckfs_write", "DuckfsWrite"),
-        ("tools", "Tool"),
-        ("secrets", "Secret"),
-        ("pages_write", "PagesWrite"),
-    ] {
-        for value in caps[field].as_array().cloned().unwrap_or_default() {
-            chips.push(AgentCap {
-                label: label.into(),
-                arg: value.as_str().unwrap_or_default().to_string(),
-            });
-        }
-    }
-    if caps["subagent_budget"].as_i64().unwrap_or(0) > 0 {
-        chips.push(AgentCap {
-            label: "SpawnSubagent".into(),
-            arg: String::new(),
-        });
-    }
-    chips
-}
-
-/// Load the agent roster from the canonical registry, each row marked with
-/// whether THIS device's user key is its owner.
+/// Load the agent roster from the canonical registry.
 pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, HydrationError> {
-    offscreen_guard(generation)?;
     async {
         let client = rpc_client(&rpc)?;
-        let local = local_user_key().await.map(|key| hex_encode(&key));
         let reply: serde_json::Value = client.query("agent", &serde_json::json!("agents")).await?;
         let working = agents_with_a_run_in_flight(&client).await;
         let agents = reply["agents"]
@@ -1090,12 +1014,26 @@ pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, Hyd
             .into_iter()
             .map(|record| {
                 let status = tagged_name(&record["status"]);
-                let (owner_key, owner_handle) = agent_owner(&record["owner"]);
+                let owner_handle = agent_owner_handle(&record["owner"]);
                 let name = record["display_name"]
                     .as_str()
                     .unwrap_or_default()
                     .to_string();
                 let caps = &record["caps"];
+                let has_subagent_grant = caps["subagent_budget"].as_i64().unwrap_or(0) > 0;
+                let cap_count = [
+                    "forge_read",
+                    "forge_push",
+                    "duckfs_read",
+                    "duckfs_write",
+                    "tools",
+                    "secrets",
+                    "pages_write",
+                ]
+                .into_iter()
+                .map(|field| caps[field].as_array().map_or(0, Vec::len))
+                .sum::<usize>()
+                    + usize::from(has_subagent_grant);
                 let id = record["agent_id"].as_str().unwrap_or_default().to_string();
                 AgentRow {
                     live: working.contains(&id),
@@ -1104,33 +1042,11 @@ pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, Hyd
                         .as_str()
                         .unwrap_or_default()
                         .to_string(),
-                    created_at: record["created_at"].as_i64().unwrap_or(0),
-                    is_mine: local.as_deref().is_some_and(|key| key == owner_key),
-                    tools: count_i64(caps["tools"].as_array().map_or(0, Vec::len)),
-                    secrets: count_i64(caps["secrets"].as_array().map_or(0, Vec::len)),
-                    subagent_budget: caps["subagent_budget"].as_i64().unwrap_or(0),
-                    allowed_actions: record["allowed_actions"]
-                        .as_array()
-                        .cloned()
-                        .unwrap_or_default()
-                        .iter()
-                        .filter_map(|action| action.as_str().map(str::to_string))
-                        .collect(),
-                    skills: record["skills"]
-                        .as_array()
-                        .cloned()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|skill| AgentSkill {
-                            name: skill["name"].as_str().unwrap_or_default().to_string(),
-                            always: skill["load"].as_str() == Some("always"),
-                        })
-                        .collect(),
-                    caps: agent_caps(caps),
+                    skill_count: count_i64(record["skills"].as_array().map_or(0, Vec::len)),
+                    cap_count: count_i64(cap_count),
                     id,
                     name,
                     status,
-                    owner_key,
                     owner_handle,
                 }
             })
@@ -1168,49 +1084,20 @@ pub fn any_agent_active(rows: Vec<AgentRow>) -> bool {
     rows.iter().any(|row| row.live)
 }
 
-/// One run of one agent: the RECENT RUNS card, the agent live chip and the
-/// Explorer RUN hit all read this row.
+/// One agent run indexed by workspace search.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct RunRow {
     pub run_id: String,
     pub agent_id: String,
     pub outcome: String,
-    pub running: bool,
     /// A consensus counter (the creation block), NOT a unix stamp — render it
     /// with `height_ago`/`height_label_short`, never with `relative_time`.
     pub created_at: i64,
-    /// what the run PRODUCED, in one line: `RunRecord` carries `pr_number` and
-    /// `output_ref` and this is the only surface that reads them.
-    pub summary: String,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct AgentRunsData {
-    pub generation: i64,
-    pub runs: Vec<RunRow>,
-}
-
-/// What a settled run produced, in one line: the forge PR it moved, else the
-/// output ref it wrote, else how it ended. Both fields ride `RunRecord`
-/// (crates/modules/apps/runs/src/interface.rs) — nothing here is invented.
-fn run_summary(record: &serde_json::Value, outcome: &str) -> String {
-    if let Some(number) = record["pr_number"].as_u64() {
-        return format!("pr #{number}");
-    }
-    match record["output_ref"].as_str() {
-        Some(output) if !output.is_empty() => output.to_string(),
-        _ => outcome.to_string(),
-    }
-}
-
-/// This agent's runs: the pending (RUNNING) entries first, then the delivered
-/// ring newest-first. Two queries because the runs module keeps in-flight
-/// correlation and settled history in two separate projections.
-pub async fn load_agent_runs(
-    rpc: String,
-    agent_id: String,
-    generation: i64,
-) -> Result<AgentRunsData, HydrationError> {
+/// Pending runs first, then the delivered ring newest-first. Two queries because
+/// the runs module keeps in-flight correlation and settled history separate.
+pub async fn load_agent_runs(rpc: String) -> Result<Vec<RunRow>, AppError> {
     async {
         let client = rpc_client(&rpc)?;
         // Two independent reads of one module, awaited one after the other. On a
@@ -1224,25 +1111,16 @@ pub async fn load_agent_runs(
         );
         let pending = pending?;
         let recent = recent?;
-        let wanted = |record: &serde_json::Value| {
-            agent_id.is_empty() || record["agent_id"].as_str() == Some(agent_id.as_str())
-        };
         let mut runs: Vec<RunRow> = pending["pending_runs"]
             .as_array()
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .filter(wanted)
             .map(|record| RunRow {
                 run_id: record["run_id"].as_str().unwrap_or_default().to_string(),
                 agent_id: record["agent_id"].as_str().unwrap_or_default().to_string(),
                 outcome: "running".into(),
-                running: true,
                 created_at: record["created_at"].as_i64().unwrap_or(0),
-                summary: record["channel_id"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string(),
             })
             .collect();
         runs.extend(
@@ -1251,26 +1129,20 @@ pub async fn load_agent_runs(
                 .cloned()
                 .unwrap_or_default()
                 .into_iter()
-                .filter(wanted)
                 .map(|record| {
                     let outcome = tagged_name(&record["outcome"]);
                     RunRow {
                         run_id: record["run_id"].as_str().unwrap_or_default().to_string(),
                         agent_id: record["agent_id"].as_str().unwrap_or_default().to_string(),
-                        running: false,
                         created_at: record["created_at"].as_i64().unwrap_or(0),
-                        summary: run_summary(&record, &outcome),
                         outcome,
                     }
                 }),
         );
-        Ok(AgentRunsData { generation, runs })
+        Ok(runs)
     }
     .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
+    .map_err(app_error)
 }
 
 /// Pause or resume one agent — owner-gated at the module, not quorum-gated.
@@ -1313,7 +1185,6 @@ pub struct AccountData {
 
 /// Load the account this node is bound to (via the canonical resolver).
 pub async fn load_account(rpc: String, generation: i64) -> Result<AccountData, HydrationError> {
-    offscreen_guard(generation)?;
     async {
         let client = rpc_client(&rpc)?;
         let node_key_hex = client.status().await?.public_key;

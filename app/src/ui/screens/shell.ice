@@ -2,7 +2,7 @@
 // provider owns every byte and key. Chat is the durable headless lane: prompts
 // become sagas, while their work and final answer read like the ai-chat app.
 
-component ShellModeButton(label:str, value:str, selected:bool, disabled:bool) -> str
+component ShellModeButton(label:str, value:ShellMode, selected:bool, disabled:bool) -> ShellMode
   col #root
     if selected
       button -> emit(value)
@@ -173,9 +173,9 @@ component ShellWelcome(provider:str) -> str
       button "Explain this system" @secondary_action -> emit("Explain this system's architecture and the most important execution path.")
       button "Inspect a failure" @secondary_action -> emit("Help me diagnose the most likely cause of the current failure.")
 
-component ShellScreen(mode:str, provider:str, credential_options:[str], credential:str, credentials_loading:bool, terminal:AgentTerminalSession, terminal_running:bool, terminal_busy:bool, terminal_title:str, terminal_error:str, entries:[AgentChatEntry], activity:[AgentActivity], bind draft:editor, chat_busy:bool, chat_status:str, chat_detail:str, live:str, chat_error:str, saga_id:str, connected:bool, dark:bool)
+component ShellScreen(mode:ShellMode, provider:str, credential_options:[str], credential:str, credentials_loading:bool, terminal:AgentTerminalSession, terminal_running:bool, terminal_busy:bool, terminal_title:str, terminal_error:str, entries:[AgentChatEntry], activity:[AgentActivity], bind draft:editor, chat_busy:bool, chat_status:str, chat_detail:str, live:str, chat_error:str, saga_id:str, connected:bool, dark:bool)
   emits
-    shell_mode_changed(str)
+    shell_mode_changed(ShellMode)
     shell_provider_changed(str)
     shell_credential_changed(str)
     shell_credentials_refresh()
@@ -211,14 +211,14 @@ component ShellScreen(mode:str, provider:str, credential_options:[str], credenti
             ShellModeButton #raw-mode -> emit(shell_mode_changed, _)
               with
                 label="Raw shell"
-                value="raw"
-                selected=(mode == "raw")
+                value=ShellMode.raw
+                selected=(mode == ShellMode.raw)
                 disabled=(terminal_busy || terminal_running || chat_busy)
             ShellModeButton #chat-mode -> emit(shell_mode_changed, _)
               with
                 label="Agent chat"
-                value="chat"
-                selected=(mode == "chat")
+                value=ShellMode.chat
+                selected=(mode == ShellMode.chat)
                 disabled=(terminal_busy || terminal_running || chat_busy)
     box w=fill h=1.0 bg=separator
       space w=1.0 h=1.0
@@ -275,7 +275,7 @@ component ShellScreen(mode:str, provider:str, credential_options:[str], credenti
       box w=fill h=fill align-x=center align-y=center
         EmptyState title="Not connected" description="Click the network name in the titlebar to pick or reconnect a network."
 
-    if connected && mode == "raw"
+    if connected && mode == ShellMode.raw
       col w=fill h=fill
         box
           with
@@ -334,7 +334,7 @@ component ShellScreen(mode:str, provider:str, credential_options:[str], credenti
                   text "Start a session to use the provider's native terminal experience." size=12.0 @text-muted
                   space w=1.0 h=fill
 
-    if connected && mode == "chat"
+    if connected && mode == ShellMode.chat
       col w=fill h=fill
         if !empty(chat_error)
           box w=fill px=22.0 pt=12.0
