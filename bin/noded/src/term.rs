@@ -103,6 +103,36 @@ pub struct TermChunkEvent {
     pub chunk_b64: String,
 }
 
+/// one grain of a forwarded session's output feed — what `term_plane` writes on
+/// its peer stream, and the only thing a peer node learns about a session it
+/// does not host.
+///
+/// [`Self::Ended`] is why this is an enum rather than the bare chunk it used to
+/// be. A peer-attached session's `agent pty` client subscribes on ITS OWN node
+/// and blocks until that node's ring reports the session over; the host marking
+/// its own ring ended told the guest nothing, so a cross-node pty stayed
+/// attached to a dead session forever — the exact wedge the node-local
+/// `TermEnded` frame exists to prevent, reachable again one hop away. Riding the
+/// SAME ordered stream as the chunks is what keeps the end LAST: the terminal
+/// grain can never overtake output the client has not seen.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "grain", rename_all = "snake_case")]
+pub enum TermFeedEvent {
+    Chunk(TermChunkEvent),
+    Ended { session: String },
+}
+
+impl TermFeedEvent {
+    /// the session every grain names — the id both the fan-out gate and the
+    /// receiving ring key on.
+    pub fn session(&self) -> &str {
+        match self {
+            Self::Chunk(chunk) => &chunk.session,
+            Self::Ended { session } => session,
+        }
+    }
+}
+
 /// one entry of a session's ordered, attributed command log, as its serial
 /// consumer stamped it — the wire grain `term_plane` forwards to peer nodes.
 /// Unlike [`TermChunkEvent`] it carries `seq`: that is the AUTHORITATIVE total
@@ -133,8 +163,9 @@ pub struct TermRing {
     /// the peer-forwarder feed: a LOCAL append (the pump) publishes here so
     /// `bin/node`'s `term_plane` forwards it to peers; a `append_remote`
     /// (a peer's chunk arriving) does NOT, which breaks the fan-out loop. Twin
-    /// of [`crate::stream::RunOutputRegistry`]'s `appends`.
-    appends: broadcast::Sender<TermChunkEvent>,
+    /// of [`crate::stream::RunOutputRegistry`]'s `appends`. Carries the
+    /// session's END as well as its bytes — see [`TermFeedEvent`].
+    appends: broadcast::Sender<TermFeedEvent>,
 }
 
 #[derive(Default)]
@@ -195,6 +226,23 @@ impl TermRing {
         self.push(session, chunk_b64, false);
     }
 
+    /// end a FORWARDED session: flag the ring, wake this node's subscribers, AND
+    /// publish the terminal grain so `term_plane` carries it to the peers that
+    /// have been streaming this session. The peer half of the wedge fix — a
+    /// guest node's `agent pty` client learns the session is over from nothing
+    /// else. Twin of [`Self::append`].
+    pub fn mark_ended(&self, session: &str) {
+        self.end(session, true);
+    }
+
+    /// end a session whose output never left this node — a solo local terminal,
+    /// or a peer's session this node is only mirroring (its end arrived FROM the
+    /// host, so re-publishing it would fan the grain back out). Twin of
+    /// [`Self::append_local_only`] and [`Self::append_remote`].
+    pub fn mark_ended_local_only(&self, session: &str) {
+        self.end(session, false);
+    }
+
     /// flag a session's ring as ended (the pump reached EOF) and wake its ws
     /// subscribers so the catch-up path can emit the terminal frame. CREATES the
     /// ring entry if absent: a session that dies before printing a single byte
@@ -202,7 +250,7 @@ impl TermRing {
     /// and its end MUST still reach the `agent pty` client waiting on the topic —
     /// otherwise that no-output session is exactly the one that wedges. Bumps
     /// `version` so `term:<id>` `watch` fires exactly as an append would.
-    pub fn mark_ended(&self, session: &str) {
+    fn end(&self, session: &str, publish: bool) {
         let mut inner = self.inner.lock().expect("term ring lock poisoned");
         let touch = inner.touch + 1;
         let version = inner.version + 1;
@@ -218,6 +266,13 @@ impl TermRing {
         inner.version = version;
         drop(inner);
         let _ = self.watch.send(version);
+        // AFTER the local flag and the watch: a peer learning of the end before
+        // this node's own subscribers would invert the order for no reason.
+        if publish {
+            let _ = self.appends.send(TermFeedEvent::Ended {
+                session: session.to_string(),
+            });
+        }
     }
 
     /// whether the session's pump has reached EOF. `false` for an unknown or
@@ -264,16 +319,16 @@ impl TermRing {
         drop(inner);
         let _ = self.watch.send(version);
         if let Some(chunk_b64) = forwarded {
-            let _ = self.appends.send(TermChunkEvent {
+            let _ = self.appends.send(TermFeedEvent::Chunk(TermChunkEvent {
                 session: session.to_string(),
                 chunk_b64,
-            });
+            }));
         }
     }
 
     /// subscribe the peer-forwarder feed: every LOCAL append (never a remote
     /// one) arrives here, so `bin/node`'s `term_plane` can forward it to peers.
-    pub fn subscribe_appends(&self) -> broadcast::Receiver<TermChunkEvent> {
+    pub fn subscribe_appends(&self) -> broadcast::Receiver<TermFeedEvent> {
         self.appends.subscribe()
     }
 
@@ -749,8 +804,15 @@ impl TerminalSessions {
         for (id, session) in live {
             // the terminator every `term:<id>` subscriber is blocked on. The
             // ring creates the entry if the session never produced a byte, so a
-            // session that died before its first output still unblocks.
-            self.0.ring.mark_ended(&id);
+            // session that died before its first output still unblocks. A
+            // peer-attached session's subscriber is on ANOTHER node, so the end
+            // takes the same route its output did — `session.forward` is the
+            // same stored discriminant the output path branches on.
+            if session.forward {
+                self.0.ring.mark_ended(&id);
+            } else {
+                self.0.ring.mark_ended_local_only(&id);
+            }
             answer(session.reply, TermError::NoSandbox);
         }
         tracing::info!(target: "ducktape::term", "agent service detached");
@@ -852,8 +914,21 @@ impl TerminalSessions {
     /// subscriber even for a session that never produced a byte (`mark_ended`
     /// creates the ring entry). An `agent pty` client blocks on this topic and
     /// only unblocks when it sees the session is over.
+    ///
+    /// Read `forward` BEFORE the removal below, for the same reason [`Self::output`]
+    /// reads it: a peer-attached session's client waits on ITS OWN node, so the
+    /// end has to be published on the peer feed, and the record that says so is
+    /// about to be dropped. An unknown session (already removed) is treated as
+    /// forwarded: a redundant terminal grain on the peer stream is idempotent
+    /// (`mark_ended_local_only` no-ops on an ended ring), while a missed one
+    /// strands a client forever.
     fn ended(&self, id: &str) {
-        self.0.ring.mark_ended(id);
+        let node_local = self.with_session(id, |live| !live.forward).unwrap_or(false);
+        if node_local {
+            self.0.ring.mark_ended_local_only(id);
+        } else {
+            self.0.ring.mark_ended(id);
+        }
         let removed = self
             .0
             .sessions
@@ -1395,6 +1470,48 @@ mod tests {
         assert!(ring.is_ended("silent"), "a no-output session still signals end");
     }
 
+    /// THE CROSS-NODE WEDGE: a peer-attached session's `agent pty` client waits
+    /// on ITS OWN node's `term:<id>` topic, which only ends when the guest node's
+    /// ring is flagged — and the guest node learns nothing except what
+    /// `term_plane` forwards. So the END has to ride the peer feed, exactly like
+    /// the bytes, or the client stays attached to a dead session forever.
+    #[test]
+    fn a_forwarded_session_publishes_its_end_on_the_peer_feed() {
+        let ring = TermRing::default();
+        let mut feed = ring.subscribe_appends();
+
+        ring.append("00000000deadbeef", STANDARD.encode(b"hi"));
+        let chunk = feed.try_recv().expect("the chunk reaches the peer feed");
+        assert!(matches!(chunk, TermFeedEvent::Chunk(_)));
+
+        ring.mark_ended("00000000deadbeef");
+        assert_eq!(
+            feed.try_recv().expect("the END reaches the peer feed"),
+            TermFeedEvent::Ended {
+                session: "00000000deadbeef".into()
+            },
+            "the terminal grain must follow the bytes to the guest node"
+        );
+    }
+
+    /// The other half: a solo local terminal, and a session this node is only
+    /// MIRRORING, must not put anything on the peer feed — the first has no peer
+    /// audience, and the second would fan a grain that arrived from a peer right
+    /// back out.
+    #[test]
+    fn a_local_only_end_stays_off_the_peer_feed() {
+        let ring = TermRing::default();
+        let mut feed = ring.subscribe_appends();
+
+        ring.append_local_only("00000000deadbeef", STANDARD.encode(b"hi"));
+        ring.mark_ended_local_only("00000000deadbeef");
+        assert!(ring.is_ended("00000000deadbeef"), "the local ring still ends");
+        assert!(
+            feed.try_recv().is_err(),
+            "a node-local session owes its peers nothing"
+        );
+    }
+
     #[test]
     fn ring_evicts_oldest_bytes_and_reports_floor() {
         let ring = TermRing::default();
@@ -1477,8 +1594,11 @@ mod tests {
         // a LOCAL append (the pump) publishes to the forwarder feed.
         ring.append("00000000deadbeef", STANDARD.encode(b"hi"));
         let event = appends.try_recv().expect("a local append publishes");
-        assert_eq!(event.session, "00000000deadbeef");
-        assert_eq!(STANDARD.decode(&event.chunk_b64).unwrap(), b"hi");
+        assert_eq!(event.session(), "00000000deadbeef");
+        let TermFeedEvent::Chunk(chunk) = event else {
+            panic!("a local append publishes bytes, not a terminal grain");
+        };
+        assert_eq!(STANDARD.decode(&chunk.chunk_b64).unwrap(), b"hi");
         // a peer's chunk enters the ring WITHOUT re-publishing — breaks the loop.
         ring.append_remote(TermChunkEvent {
             session: "00000000deadbeef".into(),
