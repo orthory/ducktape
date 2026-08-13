@@ -2,12 +2,11 @@
 // desk / rail / sidebar / content. iced has no backdrop blur, so every surface
 // here is opaque paper; nothing in this file tints, gradients or floats.
 //
-// THE RAIL DECISION. The console has EXACTLY NINE seats — Chat, Shell, Pages,
-// Forge, Agents, Files, Explorer, Members, Approvals — and no Node capsule. Node facts
-// live in the titlebar's status card (below) and in Settings, reached from the
-// rail's footer button. `shell_nav` returns those nine and nothing else, so
-// WorkspaceTabs routes nine screens plus settings; there is no `node` slot and
-// no Modules seat (its catalog has no data source at all).
+// THE RAIL DECISION. Collaboration modules and this daemon's operator surface
+// are peers here: Node owns status, standing, peers, logs and the code registry.
+// Settings stays in the footer because it owns device preferences and workspace
+// lifecycle. Modules remains a tab inside Node because its catalog describes
+// code this daemon executes rather than a separate collaboration surface.
 //
 // TYPE SCALE. The artifact's own values where the scale carries them — the
 // network name is 11.5 and the chip mark 7 (nearest step 7.5). The scale was
@@ -923,6 +922,8 @@ component WorkspaceTabs(network:str, status:str, height:i64, sync_line:str, load
                   slot forge
                 "governance"
                   slot governance
+                "node"
+                  slot node
                 "settings"
                   slot settings
                 _

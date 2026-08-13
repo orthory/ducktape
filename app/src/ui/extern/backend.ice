@@ -223,7 +223,7 @@ extern crate::backend
   pure node_log_timeline_filter(state:NodeLogTimelineState, filter:str) -> NodeLogTimelineState
   pure node_log_timeline_apply(state:NodeLogTimelineState, event:NodeLogTimelineEvent) -> NodeLogTimelineState
   component node_log_timeline(state:&NodeLogTimelineState, source:&str) -> NodeLogTimelineEvent
-  NodeFacts(generation:i64, version:str, root_hash:str, view:i64?, quorum:i64?, reachable_validators:i64?, last_finalized_at:i64, checkpoint_height:i64, height:i64, phase:str, phase_since:i64, sync_target:i64, sync_applied:i64, sync_retries:i64, sync_failures:i64, sync_last_error:str)
+  NodeFacts(generation:i64, public_key:str, version:str, root_hash:str, view:i64?, quorum:i64?, reachable_validators:i64?, last_finalized_at:i64, checkpoint_height:i64, height:i64, phase:str, phase_since:i64, sync_target:i64, sync_applied:i64, sync_retries:i64, sync_failures:i64, sync_last_error:str)
   load_node_facts(rpc:str, generation:i64) -> NodeFacts ! HydrationError
   pure optional_number(value:i64?) -> str
   PeerRow(key:str, role:str, live:bool)
@@ -239,7 +239,7 @@ extern crate::backend
   AccountData(generation:i64, bound:bool, account_id:str, display_name:str, bio:str, members:i64, nodes:i64)
   load_account(rpc:str, generation:i64) -> AccountData ! HydrationError
   set_account_name(rpc:str, password:str, display_name:str) -> bool ! AppError
-  SettingsFacts(generation:i64, endpoint:str, node_key:str, key_path:str, key_state:str, data_dir:str, open_tabs:i64, user_key:str)
+  SettingsFacts(generation:i64, endpoint:str, key_path:str, key_state:str, data_dir:str, open_tabs:i64, user_key:str)
   load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
   clear_doc_tabs(rpc:str) -> bool
   forget_workspace(rpc:str) -> bool ! AppError

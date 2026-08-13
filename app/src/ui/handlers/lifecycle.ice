@@ -289,7 +289,7 @@ on workspace_connected(next)
     run replace lane=members_load load_members(connected_rpc, members_generation) -> members_loaded _ | members_failed _
     run replace lane=governance_load load_governance(connected_rpc, gov_generation) -> governance_loaded _ | governance_failed _
     run replace lane=settings_load load_settings_facts(connected_rpc, settings_generation) -> settings_loaded _ | settings_failed _
-    run replace lane=peers_load load_peers(connected_rpc, keep_i64(shell_tab == "settings" && node_tab == "overview", node_peers_generation, -1)) -> peers_loaded _ | peers_failed _
+    run replace lane=peers_load load_peers(connected_rpc, keep_i64(shell_tab == "node" && node_tab == "overview", node_peers_generation, -1)) -> peers_loaded _ | peers_failed _
     run replace lane=agents_load load_agents(connected_rpc, agents_generation) -> agents_loaded _ | agents_failed _
     run replace lane=account_load load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
     run replace lane=forge_load load_forge(connected_rpc, forge_generation) -> forge_loaded _ | forge_list_failed _
@@ -846,14 +846,10 @@ on select_shell_tab(next)
     run replace lane=members_load load_members(connected_rpc, keep_i64(tab_reads_plane(shell_tab, "members"), members_generation, -1)) -> members_loaded _ | members_failed _
     run replace lane=governance_load load_governance(connected_rpc, keep_i64(tab_reads_plane(shell_tab, "governance"), gov_generation, -1)) -> governance_loaded _ | governance_failed _
     // SETTINGS FACTS ARE NOT A CHAIN PLANE, so they take the inline gate and
-    // no `tab_reads_plane` row: the loader reads `/v1/status`, this device's
-    // key file, its prefs and its workspace dir — nothing a module commits, so
-    // no live arm can refresh them and no table can say which panes "draw" a
-    // device fact. Only the settings screen draws them; chat reads `user_key`
-    // off the same load, but chat returns above this block, so the trip into
-    // Members or Files was never what kept it fresh — the CONNECT load is, and
-    // the key is a boot-stable file reading (`user key status` answers for an
-    // encrypted key too).
+    // no `tab_reads_plane` row: the loader reads this device's key file, prefs
+    // and workspace directory — nothing a module commits. Settings refreshes
+    // them on entry; the ungated CONNECT load supplies chat's `user_key` and
+    // Node's endpoint-stable data directory for the whole session.
     run replace lane=settings_load load_settings_facts(connected_rpc, keep_i64(shell_tab == "settings", settings_generation, -1)) -> settings_loaded _ | settings_failed _
     // PEERS IS A HEAVY LOADER AND WAS FILED WITH THE LIGHT ONES. `/v1/peers`
     // encodes the node's whole metrics registry per call (485 KB, ~10 ms), so
@@ -861,7 +857,7 @@ on select_shell_tab(next)
     // of which draw a peer — was the single most expensive unread call the
     // console made. The overview tab now gets its rows pushed, so gating this
     // to that tab costs nothing there and stops the encode everywhere else.
-    run replace lane=peers_load load_peers(connected_rpc, keep_i64(shell_tab == "settings" && node_tab == "overview", node_peers_generation, -1)) -> peers_loaded _ | peers_failed _
+    run replace lane=peers_load load_peers(connected_rpc, keep_i64(shell_tab == "node" && node_tab == "overview", node_peers_generation, -1)) -> peers_loaded _ | peers_failed _
     run replace lane=agents_load load_agents(connected_rpc, keep_i64(tab_reads_plane(shell_tab, "agents"), agents_generation, -1)) -> agents_loaded _ | agents_failed _
     run replace lane=account_load load_account(connected_rpc, keep_i64(tab_reads_plane(shell_tab, "account"), account_generation, -1)) -> account_loaded _ | account_failed _
     run replace lane=forge_load load_forge(connected_rpc, keep_i64(shell_tab == "forge", forge_generation, -1)) -> forge_loaded _ | forge_list_failed _
@@ -940,7 +936,7 @@ subscribe
   // A daemon outlives its windows, so process exit is an explicit decision:
   // when the LAST tracked window closes, leave.
   window closed with-id -> window_was_closed _
-  run node_logs(connected_rpc) when (connected && shell_tab == "settings" && node_tab == "activity") -> node_log_line _
+  run node_logs(connected_rpc) when (connected && shell_tab == "node" && node_tab == "activity") -> node_log_line _
   // THE NODE'S OWN TWO PLANES. Peers and the consensus facts have no op behind
   // them — nothing in the index names a mesh connection or a checkpoint height
   // — so no module topic can carry them, which is why they were the last two
@@ -958,7 +954,7 @@ subscribe
   run node_status_live(connected_rpc) when connected -> node_status_pushed _
   // PEERS DOES NOT. Each sample encodes the whole metrics registry, so this
   // gate is the budget: leaving the tab stops the encode at the source.
-  run node_peers_live(connected_rpc) when (connected && shell_tab == "settings" && node_tab == "overview") -> node_peers_pushed _
+  run node_peers_live(connected_rpc) when (connected && shell_tab == "node" && node_tab == "overview") -> node_peers_pushed _
   every 1s when huddle_joined -> tick
   every 1s when console_win != none -> wall_tick
   every 300ms when !empty(toast) -> toast_tick
