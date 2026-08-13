@@ -3094,18 +3094,14 @@ async fn composer_markdown_round_trips_rich_spans() {
     let message = &chat.messages[0];
     let block = &message.blocks[0];
     assert!(block.rich, "marked text lands as a rich paragraph");
-    let bold = block
-        .spans
-        .iter()
-        .find(|span| span.text.contains("hi"))
-        .expect("the bold run survives the round trip");
-    assert!(bold.bold && !bold.italic);
-    let italic = block
-        .spans
-        .iter()
-        .find(|span| span.text.contains("all"))
-        .expect("the italic run survives the round trip");
-    assert!(italic.italic && !italic.bold);
+    assert!(
+        block.spans.iter().any(|span| span.bold == "hi"),
+        "the bold run survives the round trip"
+    );
+    assert!(
+        block.spans.iter().any(|span| span.italic == "all"),
+        "the italic run survives the round trip"
+    );
     sim.shutdown();
 }
 

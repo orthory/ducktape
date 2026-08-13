@@ -126,13 +126,19 @@ const SCREEN_PROBES: &[ScreenProbe] = &[
         fixture: console_in_forge_pr,
         allocation_ceiling: 325_000,
     },
-    // 60,437 vs 61,979 for restoring the selected-entry scan; removing the
-    // directory-row virtualization reaches 61,993.
+    // Re-derived at ducktape-ui af77d53e (#668). Baseline 62,167: dev-side
+    // drift unrelated to that pin had already moved it 60,437 -> 61,019, and
+    // #668's per-row reconciliation identity adds ~3 allocations per
+    // lazy-free component row (384 rows here, +1,148) — the honest price of
+    // rows that park per-row instead of sharing one scope. The controls
+    // flipped order at this pin: removing the directory-row virtualization
+    // is now the smallest at 63,729; restoring the selected-entry scan
+    // reaches 73,453 (the per-rebuild list clone grew with the rows).
     ScreenProbe {
         label: "files build+layout",
         size: WINDOW,
         fixture: console_in_files,
-        allocation_ceiling: 61_200,
+        allocation_ceiling: 62_900,
     },
 ];
 

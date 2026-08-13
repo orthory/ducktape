@@ -200,107 +200,36 @@ component ChatMemberRow(member:ChatMember, disabled:bool)
       hovered bg=danger_bg text=fg
       pressed bg=danger_line text=fg
 
+// ONE PARAGRAPH, NOT A FLEX OF TOKENS (ducktape-ui#639 collected by #1096).
+// The whole span list lowers into a single native rich-text widget: real word
+// wrapping (`word-or-glyph` still, so an unbroken hash or invite one run wide
+// breaks instead of clipping), native selection across the line, and `link=`
+// handled by the widget's own route instead of a per-token button.
+//
+// THE ARM CHOICE IS DATA. A rich-text `for` expands a fixed span template per
+// item with no conditionals, so the module files every run under exactly one
+// `ChatSpan` text field (`span_arm` in chat's client) and this template emits
+// every arm for every run — an empty span draws no glyphs, so the five silent
+// arms of each run cost nothing.
+//
+// A MENTION IS A TOKEN, NOT JUST A TINT: the `brand_bg` plate (68.00+/255
+// from every row plate it can sit on) makes it an entity you can find at a
+// glance, and ONLY a mention wears it — a posted URL is a destination, not a
+// person. A LINK wears the underline instead, the one convention every reader
+// already knows, and ONLY the link arm draws that rule: it marks a
+// destination, not an emphasis. Both keep brand ink; the plate versus the
+// rule is what tells a human from a destination.
 component RichLine(block:ChatBlock)
   emits
     open_message_link(str)
-  flex
-    with
-      w=fill
-      wrap=wrap
-      gap-x=0.0
-      gap-y=4.0
-      items=start
+  rich-text w=fill size=13.5 line-h=1.55 wrap=word-or-glyph color=accent_fg -> emit(open_message_link, _)
     for span in block.spans
-      // `word-or-glyph` on every run: a flex wraps BETWEEN spans, so a single
-      // unbroken token — a hash, a base64 invite, a long URL — is one span
-      // wider than the column, and word wrapping cannot break it. It ran off
-      // the message column and the pane clipped the tail away.
-      // A MENTION IS A TOKEN, NOT JUST A TINT. Ink alone reads as a warm word
-      // sliding past in a busy channel; the plate makes it an entity you can
-      // find at a glance. `brand_bg` is 68.00+/255 from every row plate this
-      // span can sit on, so it never collides with `selected_row`.
-      //
-      // ONLY a mention wears it. The module sets `highlight` for a Link mark
-      // too (`highlight = link.is_some() || mention`), so this arm was painting
-      // every posted URL as a person — the same plate, the same ink, and no
-      // way to tell a destination from a human until you read the characters.
-      if span.highlight && empty(span.link)
-        box
-          with
-            px=4.0
-            py=0.0
-            bg=brand_bg
-            r=4.0
-          text span.text
-            with
-              wrap=word-or-glyph
-              size=13.5
-              line-h=1.55
-              font=medium
-              @text-brand
-      // A LINK IS A DESTINATION: it presses. Every URL anyone posted was dead
-      // text — no cursor change, no press, no menu — so sharing one meant the
-      // reader selected it by hand and pasted it into a browser, and the app
-      // has carried `span.link` all the way to the view the whole time. It
-      // hands off to the OS through the same `open_external_url` a page's link
-      // press takes. No plate: brand ink on the row's own ground is what tells
-      // it apart from the mention above, and the tint arrives under the cursor
-      // as the affordance rather than as a permanent badge. `underline` is the
-      // one convention every reader already knows (ducktape-ui#604 grew it on
-      // plain `text`), and ONLY the link token wears it — the rule marks a
-      // destination, not an emphasis.
-      //
-      // NO `@text-brand` ON THE GLYPH — the three status lines below own the
-      // ink. A class here emits an explicit color that ignores the button's
-      // `text=` for every status, which is the same dead-ink construct the
-      // hover toolbar carried; it reads identically today only because all
-      // three arms name `brand`, and it would stop the day one of them didn't.
-      if !empty(span.link)
-        button -> emit(open_message_link, span.link)
-          with
-            label=span.text
-            p=0.0
-          text span.text
-            with
-              wrap=word-or-glyph
-              size=13.5
-              line-h=1.55
-              font=medium
-              underline
-          active bg=transparent text=brand border=transparent border-w=0.0 r=4.0
-          hovered bg=brand_bg text=brand border=transparent
-          pressed bg=brand_bg text=brand border=transparent
-      if !span.highlight && span.bold && span.italic
-        text span.text
-          with
-            wrap=word-or-glyph
-            size=13.5
-            line-h=1.55
-            font=strongitalic
-            @text-accent_fg
-      if !span.highlight && span.bold && !span.italic
-        text span.text
-          with
-            wrap=word-or-glyph
-            size=13.5
-            line-h=1.55
-            font=strong
-            @text-accent_fg
-      if !span.highlight && !span.bold && span.italic
-        text span.text
-          with
-            wrap=word-or-glyph
-            size=13.5
-            line-h=1.55
-            font=italic
-            @text-accent_fg
-      if !span.highlight && !span.bold && !span.italic
-        text span.text
-          with
-            wrap=word-or-glyph
-            size=13.5
-            line-h=1.55
-            @text-accent_fg
+      span span.mention bg=brand_bg px=4.0 r=4.0 font=medium color=brand
+      span span.link_text link=span.link underline font=medium color=brand
+      span span.bold_italic font=strongitalic
+      span span.bold font=strong
+      span span.italic font=italic
+      span span.plain
 
 // max-w=760.0 STOPS THE LINE, not the pane. Nothing here bounded a line's
 // measure at all — the default window ran ~130 characters a line and a

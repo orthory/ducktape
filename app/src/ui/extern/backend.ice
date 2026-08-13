@@ -6,7 +6,7 @@ extern crate::backend
   ChatMember(key:str, label:str)
   ChannelRead(channel:str, seq:i64)
   ChannelSwitchFacts(unread_boundary:i64, name:str, archived:bool, members_only:bool)
-  ChatSpan(text:str, bold:bool, italic:bool, highlight:bool, link:str)
+  ChatSpan(mention:str, link_text:str, link:str, bold_italic:str, bold:str, italic:str, plain:str)
   ChatBlock(kind:str, text:str, lang:str, rich:bool, spans:[ChatSpan])
   ChatMessage(id:str, view_key:i64, seq:i64, author:str, meta:str, body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_kind:str, height:i64, time:i64, reactions:[ChatReaction], render_rev:i64)
   MessageSelection(seq:i64, rev:i64, action:MessageAction, draft:str)
