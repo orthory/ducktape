@@ -76,7 +76,6 @@ test shell_chat_surface_contract
         chat_error=shell_chat_error
         saga_id=shell_chat_saga
         connected=true
-        shift_held
         dark=false
       events
         shell_mode_changed -> shell_mode_changed _
@@ -836,7 +835,6 @@ test message_stream_reset_contract
         thread_next_reply_offset
         thread_loading
         failed_reply_draft
-        shift_held
       events
         search_chat_submit -> search_chat_submit
         clear_chat_search -> clear_chat_search

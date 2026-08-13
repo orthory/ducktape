@@ -245,7 +245,10 @@ component RichLine(block:ChatBlock)
       // hands off to the OS through the same `open_external_url` a page's link
       // press takes. No plate: brand ink on the row's own ground is what tells
       // it apart from the mention above, and the tint arrives under the cursor
-      // as the affordance rather than as a permanent badge.
+      // as the affordance rather than as a permanent badge. `underline` is the
+      // one convention every reader already knows (ducktape-ui#604 grew it on
+      // plain `text`), and ONLY the link token wears it — the rule marks a
+      // destination, not an emphasis.
       //
       // NO `@text-brand` ON THE GLYPH — the three status lines below own the
       // ink. A class here emits an explicit color that ignores the button's
@@ -263,6 +266,7 @@ component RichLine(block:ChatBlock)
               size=13.5
               line-h=1.55
               font=medium
+              underline
           active bg=transparent text=brand border=transparent border-w=0.0 r=4.0
           hovered bg=brand_bg text=brand border=transparent
           pressed bg=brand_bg text=brand border=transparent

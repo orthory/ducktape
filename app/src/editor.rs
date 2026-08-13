@@ -13,11 +13,14 @@
 
 use iced::advanced::text::{self, Highlighter};
 use iced::font::{Style as FontStyle, Weight};
-use iced::widget::text_editor::{self, Content};
+use iced::keyboard::{Key, key::Named};
+use iced::widget::text_editor::{self, Binding, Content, Edit, KeyPress};
 use iced::{Border, Color, Element, Font};
 use std::hash::{Hash as _, Hasher as _};
 use std::ops::Range;
-use ui_lang_runtime::rich_text_editor::{ContentVersion, Format, RichTextEditor};
+use ui_lang_runtime::rich_text_editor::{
+    ContentVersion, Format, RichTextEditor, default_key_binding,
+};
 
 pub use ui_lang_runtime::rich_text_editor::Action as RichAction;
 
@@ -69,7 +72,7 @@ fn composer_ink(theme: &iced::Theme) -> &'static ComposerInk {
 const MARK_DIM: Color = rgb8(0x8a, 0x88, 0x7e);
 const MARK_LINK: Color = rgb8(0x6f, 0x8a, 0xab);
 
-/// One composer interaction, classified where the modifiers are still known.
+/// One composer interaction, classified at the widget's own key binding.
 /// `Submit` is plain Enter (and the Send button, via
 /// [`composer_submit_event`]); everything else is an edit to apply.
 #[derive(Clone, Debug, PartialEq)]
@@ -152,7 +155,6 @@ pub fn rich_composer(
     document: &Content,
     hint: String,
     disabled: bool,
-    shift: bool,
     min_h: f64,
     max_h: f64,
     pad: f64,
@@ -169,13 +171,12 @@ pub fn rich_composer(
         .padding(pad as f32)
         // format_key 0: the format table is static — no theme or mode inputs.
         .highlight_with::<InlineMarkdownHighlighter>((), 0, inline_format)
-        .style(composer_style);
+        .style(composer_style)
+        .key_binding(composer_key_binding);
     if disabled {
         return editor.into();
     }
-    editor
-        .on_action(move |action| classify(action, shift))
-        .into()
+    editor.on_action(classify).into()
 }
 
 /// The widget's change-detection key: equal versions promise equal text
@@ -189,15 +190,33 @@ fn content_version(document: &Content) -> ContentVersion {
     ContentVersion::new(0, hasher.finish())
 }
 
-/// Enter or newline, decided from a mirror of the shift key that lags the press
-/// by an event-loop turn — see `shift_held` in `ui/state.ice` for the mechanism
-/// and the upstream hook that retires this argument.
-fn classify(action: RichAction, shift: bool) -> ComposerEvent {
+/// Enter or newline, decided AT THE PRESS from its live modifiers — the
+/// widget's `key_binding` seam (ducktape-ui#601), which retired the lagged
+/// `shift_held` mirror and the `keyboard modifiers` subscription that fed it.
+/// ⇧↵ becomes a newline paste HERE, so the only press that can reach
+/// [`classify`] as `Edit::Enter` is a plain Enter — the submit.
+fn composer_key_binding(press: &KeyPress) -> Option<Binding<Edit>> {
+    let enter = matches!(press.key, Key::Named(Named::Enter));
+    if !enter {
+        return default_key_binding(press);
+    }
+    if press.modifiers.shift() {
+        return Some(Binding::Custom(Edit::Paste(std::sync::Arc::new(
+            "\n".to_owned(),
+        ))));
+    }
+    Some(Binding::Enter)
+}
+
+/// Plain Enter is the submit; every other action is an edit to apply.
+/// Sound without a modifier argument because [`composer_key_binding`] already
+/// rewrote ⇧↵ into a newline paste at the press.
+fn classify(action: RichAction) -> ComposerEvent {
     let plain_enter = matches!(
         action,
         RichAction::Edit(text_editor::Action::Edit(text_editor::Edit::Enter))
     );
-    if plain_enter && !shift {
+    if plain_enter {
         return ComposerEvent::Submit;
     }
     ComposerEvent::Apply(action)
@@ -434,13 +453,51 @@ mod tests {
         }
     }
 
+    /// THE ENTER DECISION READS THE PRESS, NOT A MIRROR. `shift_held` lagged
+    /// the key by a full event-loop turn, so a ⇧↵ chord whose two downs landed
+    /// in one drain classified as Submit and POSTED the half-written message.
+    /// `composer_key_binding` sees `press.modifiers` on the press itself:
+    /// plain Enter stays the stock newline binding (which [`classify`] reads
+    /// as Submit), ⇧↵ is rewritten into a newline paste at the widget, and
+    /// every other key delegates to the editor's stock table.
     #[test]
     fn plain_enter_submits_and_shift_enter_edits() {
+        let enter_press = |modifiers: iced::keyboard::Modifiers| KeyPress {
+            key: Key::Named(Named::Enter),
+            modified_key: Key::Named(Named::Enter),
+            physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::Enter),
+            modifiers,
+            text: None,
+            status: text_editor::Status::Focused { is_hovered: false },
+        };
+
+        // Plain Enter keeps the stock binding, and classify reads it as the
+        // submit — the widget publishes `Edit::Enter` for no other press.
+        let plain = composer_key_binding(&enter_press(iced::keyboard::Modifiers::empty()));
+        assert!(matches!(plain, Some(Binding::Enter)));
         let enter = RichAction::Edit(text_editor::Action::Edit(text_editor::Edit::Enter));
-        assert_eq!(classify(enter.clone(), false), ComposerEvent::Submit);
-        assert_eq!(classify(enter.clone(), true), ComposerEvent::Apply(enter));
+        assert_eq!(classify(enter), ComposerEvent::Submit);
+
+        // ⇧↵ becomes a newline PASTE at the press, so it reaches classify as
+        // an ordinary edit and breaks the line instead of posting.
+        let shifted = composer_key_binding(&enter_press(iced::keyboard::Modifiers::SHIFT))
+            .expect("shift+enter binds");
+        let Binding::Custom(edit) = shifted else {
+            panic!("shift+enter must rewrite into a custom edit, got {shifted:?}");
+        };
+        let newline = RichAction::Edit(text_editor::Action::Edit(edit));
+        let event = classify(newline);
+        let ComposerEvent::Apply(_) = &event else {
+            panic!("shift+enter must apply, not submit");
+        };
+        let mut document = Content::with_text("draft");
+        document.perform(text_editor::Action::Move(text_editor::Motion::End));
+        let document = apply_composer_event(document, event);
+        assert_eq!(document.line_count(), 2, "⇧↵ breaks the line");
+
+        // Any other key falls through to the editor's stock table.
         let typed = RichAction::Edit(text_editor::Action::Edit(text_editor::Edit::Insert('x')));
-        assert_eq!(classify(typed.clone(), false), ComposerEvent::Apply(typed));
+        assert_eq!(classify(typed.clone()), ComposerEvent::Apply(typed));
     }
 
     #[test]

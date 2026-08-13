@@ -224,7 +224,6 @@ view
               thread_next_reply_offset
               thread_loading
               failed_reply_draft
-              shift_held
             events
               search_chat_submit -> search_chat_submit
               clear_chat_search -> clear_chat_search
@@ -301,7 +300,6 @@ view
               chat_error=shell_chat_error
               saga_id=shell_chat_saga
               connected
-              shift_held
               dark=(appearance == "dark")
             events
               shell_mode_changed -> shell_mode_changed _
@@ -482,7 +480,6 @@ view
               discussion_pending=forge_discussion_pending
               connected
               loading
-              shift_held
             events
               forge_open_repo -> forge_open_repo _
               forge_close_repo -> forge_close_repo

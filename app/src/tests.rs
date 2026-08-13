@@ -304,13 +304,14 @@ fn no_keyboard_subscription_charges_a_captured_key_to_a_bare_composer() {
         presses,
         [
             "keyboard press status=ignored when (connected || palette_open) -> global_key_pressed _",
-            "keyboard press status=captured when !empty(topmost_overlay(palette_open, bell_open, \
-             channel_create_open, thread_message_action, message_action, channel_settings_open, \
-             forge_repo_menu)) -> global_key_pressed _",
+            "keyboard press key=escape status=captured when !empty(topmost_overlay(palette_open, \
+             bell_open, channel_create_open, thread_message_action, message_action, \
+             channel_settings_open, forge_repo_menu)) -> global_key_pressed _",
             "keyboard press status=ignored -> content_scroll_key _",
         ],
         "a `keyboard press` without `status=` bills every captured key a whole \
-         extra view rebuild, and the captured half must stay gated on an open layer"
+         extra view rebuild; the captured half is Escape-only (ducktape-ui#602) \
+         and stays gated on an open layer"
     );
 }
 
@@ -3259,6 +3260,26 @@ fn a_posted_url_presses_and_does_not_wear_the_mention_plate() {
     assert!(
         components.contains("button label=span.text p=0.0 -> emit(open_message_link, span.link)")
     );
+    // AND IT DRAWS THE UNDERLINE — the one link convention every reader
+    // already knows (ducktape-ui#604 grew `underline` on plain `text`). The
+    // rule marks a destination: of RichLine's per-token arms, the link's text
+    // ALONE wears it, and the exact-line equality also proves the ruled text
+    // carries no `tracking=`/`shape=` — the E174 pair a one-span paragraph
+    // cannot express.
+    let rich_line = components
+        .split_once("component RichLine")
+        .expect("the per-token flex")
+        .1;
+    let underlined: Vec<&str> = rich_line
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("text span.text") && line.contains(" underline"))
+        .collect();
+    assert_eq!(
+        underlined,
+        ["text span.text wrap=word-or-glyph size=13.5 line-h=1.55 font=medium underline"],
+        "the link token alone draws the rule"
+    );
     // It hands off through the SAME external-URL route the page renderer's
     // link press takes — one mechanism for one act, not a second one here.
     let handlers = include_str!("ui/handlers/chat.ice");
@@ -4906,13 +4927,8 @@ fn compact_controls_share_a_single_geometry_and_type_scale() {
     // The composer geometry moved into the `rich_composer` extern args
     // (min_h, max_h, pad); type scale (13.5/1.3) is owned by the adapter.
     // Both chat composers share one plate; the forge note runs compact.
-    assert_eq!(
-        SCREENS
-            .matches(", shift_held, 44.0, 150.0, 10.0) #")
-            .count(),
-        2
-    );
-    assert!(SCREENS.contains(", shift_held, 38.0, 120.0, 6.0) #forge-note"));
+    assert_eq!(SCREENS.matches(", 44.0, 150.0, 10.0) #").count(), 2);
+    assert!(SCREENS.contains(", 38.0, 120.0, 6.0) #forge-note"));
     assert!(SCREENS.contains("button \"Send\" disabled="));
     assert!(SCREENS.contains(
         "h=29.0 @primary_action @px-12px @py-7px -> emit(composer_event, composer_submit_event())"
@@ -5228,6 +5244,14 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
 fn control_focus_ring_survives_the_active_base() {
     let generated_dir = std::path::Path::new(env!("OUT_DIR")).join("ui-lang-generated");
     let entries = std::fs::read_dir(&generated_dir).expect("generated ui-lang dir");
+    // TWO closures answer to `/palette-input`: the overlay's real input, and
+    // the ice-test fixture's plain stub (`ui/tests/app.ice`), which authors no
+    // `active` base. The fragment files are named by content hash, so read_dir
+    // order reshuffles on any source change — the probe must select the
+    // closure that CARRIES the authored base, not whichever file lands first.
+    // The regression this probe exists for is an ORDER flip, which keeps the
+    // write present, so the selection cannot mask it; only deleting the
+    // authored base itself trips the expect below.
     let palette_input = entries
         .filter_map(|entry| std::fs::read_to_string(entry.expect("dir entry").path()).ok())
         .flat_map(|source| {
@@ -5237,13 +5261,13 @@ fn control_focus_ring_survives_the_active_base() {
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
         })
-        .next()
-        .expect("the command palette input renders somewhere in the generated code");
+        .find(|line| line.contains("__color.a = 0.160000"))
+        .expect("the authored `active border=fg/16` base write in the palette input's closure");
     // `active … border=fg/16` is the only alpha-0.16 write in this closure;
     // the ring is the recipe's `focus:border-ring` conditional.
     let active_base = palette_input
         .find("__color.a = 0.160000")
-        .expect("the authored `active border=fg/16` base write");
+        .expect("just selected on this marker");
     let focus_ring = palette_input
         .find("Status::Focused")
         .expect("the recipe's `focus:border-ring` conditional");

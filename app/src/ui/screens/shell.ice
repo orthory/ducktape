@@ -173,7 +173,7 @@ component ShellWelcome(provider:str) -> str
       button "Explain this system" @secondary_action -> emit("Explain this system's architecture and the most important execution path.")
       button "Inspect a failure" @secondary_action -> emit("Help me diagnose the most likely cause of the current failure.")
 
-component ShellScreen(mode:str, provider:str, credential_options:[str], credential:str, credentials_loading:bool, terminal:AgentTerminalSession, terminal_running:bool, terminal_busy:bool, terminal_title:str, terminal_error:str, entries:[AgentChatEntry], activity:[AgentActivity], bind draft:editor, chat_busy:bool, chat_status:str, chat_detail:str, live:str, chat_error:str, saga_id:str, connected:bool, shift_held:bool, dark:bool)
+component ShellScreen(mode:str, provider:str, credential_options:[str], credential:str, credentials_loading:bool, terminal:AgentTerminalSession, terminal_running:bool, terminal_busy:bool, terminal_title:str, terminal_error:str, entries:[AgentChatEntry], activity:[AgentActivity], bind draft:editor, chat_busy:bool, chat_status:str, chat_detail:str, live:str, chat_error:str, saga_id:str, connected:bool, dark:bool)
   emits
     shell_mode_changed(str)
     shell_provider_changed(str)
@@ -407,7 +407,7 @@ component ShellScreen(mode:str, provider:str, credential_options:[str], credenti
                     border-w=1.0
                     r=15.0
                   row w=fill gap=6.0 align=center
-                    extern rich_composer(draft, agent_composer_hint(provider), (!connected || chat_busy || empty(credential)), shift_held, 40.0, 150.0, 8.0) #draft -> emit(shell_composer_event, _)
+                    extern rich_composer(draft, agent_composer_hint(provider), (!connected || chat_busy || empty(credential)), 40.0, 150.0, 8.0) #draft -> emit(shell_composer_event, _)
                     button "↑" #send -> emit(shell_composer_event, composer_submit_event())
                       with
                         label="Send"
