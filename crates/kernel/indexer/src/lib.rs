@@ -130,6 +130,10 @@ const CLEAR_FLUSH_EVERY: usize = 1024;
 /// bounds memory the way [`CLEAR_FLUSH_EVERY`] does, by SIZE because a replay
 /// stages whole op payloads rather than bare keys.
 const REPLAY_FLUSH_BYTES: usize = 4 * 1024 * 1024;
+/// how long a fold drain may sit at the SAME pending count before it is called
+/// stuck. not a total budget — a long backlog drains as long as it needs, as
+/// long as it keeps shrinking (see [`drain_fold`]).
+const FOLD_DRAIN_STALL: Duration = Duration::from_secs(60);
 /// hard cap on one scan page; larger asks are clamped, mirroring the module
 /// query convention (chat's MAX_QUERY_LIMIT) rather than erroring.
 pub const MAX_SCAN_LIMIT: usize = 1024;
@@ -296,6 +300,11 @@ impl IndexStore {
     /// converge each onto its declared index guest: install (or replace) the
     /// mapper bytes, register the fold trigger when the guest folds, tear
     /// both down when a module no longer ships a guest.
+    ///
+    /// only the declared module ids (plus `_blocks`) are opened. a
+    /// `<base>/_staging` directory left by an older build is INERT GARBAGE —
+    /// the shipped-index lane that wrote it is gone, nothing adopts or
+    /// enumerates it, and it is safe to delete by hand.
     pub fn open(base: impl AsRef<Path>, modules: &[IndexModule]) -> Result<Self> {
         let base = base.as_ref().to_path_buf();
         let opts = Options {
@@ -844,9 +853,18 @@ fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
 /// block until one module's fold trigger has nothing queued: fluent31 drains
 /// folds on a background runner, so both the sim's commit barrier and the
 /// refold above have to join it rather than assume it. a module with no
-/// trigger has nothing to wait for. `Err` = the fold FAILED with a backlog
-/// still pending, which no amount of waiting fixes.
+/// trigger has nothing to wait for. `Err` = the fold cannot finish, either
+/// because it FAILED with a backlog still pending or because it stopped making
+/// progress — neither of which more waiting fixes.
+///
+/// the wait is bounded on PROGRESS, never on total time: a backfill of a whole
+/// chain's history is a legitimately long drain, so the only honest stall
+/// signal is a backlog that stops shrinking. a wedged fold that never records
+/// an error would otherwise spin here forever — and this now runs inside a
+/// joining node's seam, not just a sim.
 fn drain_fold(db: &Db, module: &str) -> Result<()> {
+    let mut floor = u64::MAX;
+    let mut since_progress = std::time::Instant::now();
     loop {
         let trigger = db
             .list_triggers()?
@@ -860,6 +878,16 @@ fn drain_fold(db: &Db, module: &str) -> Result<()> {
         }
         if let Some(err) = trigger.last_error {
             return Err(Error::FoldStuck(format!("{module}: {err}")));
+        }
+        if trigger.pending < floor {
+            floor = trigger.pending;
+            since_progress = std::time::Instant::now();
+        } else if since_progress.elapsed() >= FOLD_DRAIN_STALL {
+            return Err(Error::FoldStuck(format!(
+                "{module}: {} events pending, no progress for {}s",
+                trigger.pending,
+                FOLD_DRAIN_STALL.as_secs()
+            )));
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
