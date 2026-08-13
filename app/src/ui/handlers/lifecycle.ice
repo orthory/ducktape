@@ -65,7 +65,7 @@ on appearance_saved(_written)
 // A SAME-ENDPOINT retry: the launch window's picker owns which network, so
 // reconnect no longer changes endpoints — the per-endpoint draft retention
 // that lived here collapsed to identity calls and is gone. Typed drafts
-// deliberately survive (the editor harvest + orphan lines); the network
+// deliberately survive (the park below + orphan lines); the network
 // lists are re-fetched.
 on reconnect
   return if loading || (mutation_phase != "idle" && mutation_phase != "recovering")
@@ -84,8 +84,6 @@ on reconnect
   invalidate lane=forge_code
   invalidate lane=files_preview
   block_autosave_generation = cancel_autosaves(connected_rpc, block_autosave_generation)
-  message_draft = trim(editor_text(message_editor))
-  message_editor = editor(message_draft)
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
@@ -110,10 +108,12 @@ on reconnect
   // name the room and thread she is in — and `workspace_connected` restores
   // below its own landing write. The line below blanks the key, so a park under
   // it would file both composers under "" and drop them. Without this the live
-  // composer carried across by the harvest above landed in
-  // `landing_channel(channels)` — the first room with traffic, not the one she
-  // left — armed to send there, and the next pick parked her words under THAT
-  // room's id.
+  // composer rode the reconnect into `landing_channel(channels)` — the first
+  // room with traffic, not the one she left — armed to send there, and the
+  // next pick parked her words under THAT room's id. The park reads the live
+  // editor directly: the `message_draft` harvest that used to sit above it was
+  // this park's predecessor, and its leftover stash is what `live_resynced`'s
+  // failed-draft plate later offered to a room she never typed it in.
   message_drafts = park_message_draft(message_drafts, active_channel, trim(editor_text(message_editor)))
   reply_drafts = park_reply_draft(reply_drafts, active_channel, active_thread_seq, trim(editor_text(reply_editor)))
   active_channel = ""
@@ -509,8 +509,8 @@ on live_resynced(next)
   thread_has_more = thread_has_more && active_channel == keep_str(next.chat_loaded, next.active_channel, active_channel) && active_thread_seq > 0
   reply_draft = retain_for_endpoint(reply_draft, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
   pending_reply = retain_for_endpoint(pending_reply, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
-  // `message_draft` is the SETTLED stash (the harvest a reconnect takes, the
-  // body a failed send hands back) — it never tracks keystrokes, so it reads
+  // `message_draft` is the SETTLED stash (the body a failed send hands back) —
+  // it never tracks keystrokes, so it reads
   // "" the whole time someone is typing. Rebuilding the composer from it here
   // emptied a half-written message on every resync: a `files` write in another
   // window, a teammate joining the huddle, any plane op at all. The composer

@@ -413,8 +413,9 @@ on toggle_channel_settings
   // drawer covers it either way. `close_thread` stays the one route that
   // discards a reply, because that one is a request to.
   //
-  // The app's own rule, from the other direction: `reconnect` harvests the
-  // composer draft and puts it back rather than letting a transition eat it.
+  // The app's own rule, from the other direction: `reconnect` parks the
+  // composer draft and `workspace_connected` hands it back rather than
+  // letting a transition eat it.
 
 on rename_channel_submit
   return if loading || mutation_phase != "idle" || empty(active_channel) || empty(trim(channel_name_draft))

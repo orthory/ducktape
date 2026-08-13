@@ -1918,19 +1918,50 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
     // the first character typed into it parked OVER them under the same key —
     // silent overwrite, not just loss of a live buffer. `chat_hit_loaded` is the
     // reachable one (`load_chat_hit` answers with `root.seq` for a reply hit);
-    // the other two answer 0 today and ride the same rule so a payload that
-    // starts seating a thread cannot forget it.
+    // `chat_updated` and `channel_created` answer 0 today and ride the same
+    // rule so a payload that starts seating a thread cannot forget it.
     //
-    // `thread_loaded` IS DELIBERATELY NOT HERE. It lands under an OPEN rail that
-    // `open_thread_for` already restored, so a second restore would overwrite
-    // whatever was typed during the round trip — the live buffer is the truth
-    // there, exactly as it is across a resync.
-    for landing in [
-        "open_thread_for",
-        "chat_updated",
-        "chat_hit_loaded",
-        "channel_created",
-    ] {
+    // THE SEATERS ARE DERIVED, NOT LISTED, exactly as the movers above are. A
+    // literal `active_thread_seq = 0` RETIRES the rail rather than seating one,
+    // so the zero writers stay off this list; every other writer lands on it,
+    // and a new one fails the pin below until its restore decision is made.
+    let mut handler = "";
+    let mut seaters: Vec<&str> = Vec::new();
+    for line in HANDLERS.lines() {
+        if let Some(rest) = line.strip_prefix("on ") {
+            handler = rest.split('(').next().unwrap_or(rest).trim();
+        }
+        let writes = line.trim_start().starts_with("active_thread_seq = ");
+        let retires = line.trim() == "active_thread_seq = 0";
+        if writes && !retires {
+            seaters.push(handler);
+        }
+    }
+    seaters.sort_unstable();
+    seaters.dedup();
+
+    assert_eq!(
+        seaters,
+        [
+            "channel_created",
+            "chat_hit_loaded",
+            "chat_updated",
+            "live_resynced",
+            "open_thread_for",
+            "thread_loaded",
+        ],
+        "a handler started or stopped seating `active_thread_seq`: decide \
+         whether it restores the parked reply beside the write, then update \
+         this list"
+    );
+
+    for landing in &seaters {
+        // Two seaters land under a rail whose LIVE buffer is the truth, so
+        // they must NOT restore — each is pinned to that refusal below.
+        let live_buffer_is_the_truth = matches!(*landing, "live_resynced" | "thread_loaded");
+        if live_buffer_is_the_truth {
+            continue;
+        }
         let body = body_of(landing);
         let moved = at(landing, body, "active_thread_seq = ");
         let restore = at(landing, body, "reply_editor = editor(parked_reply_draft(");
@@ -1944,6 +1975,12 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
         !body_of("thread_loaded").contains("parked_reply_draft("),
         "thread_loaded lands under a rail that is already open and typeable — a \
          restore there overwrites the keystrokes the round trip collected"
+    );
+    assert!(
+        !body_of("live_resynced").contains("parked_reply_draft("),
+        "live_resynced either leaves the rail on the thread it was already on — \
+         where the live buffer is the truth — or closes it, and a closed rail \
+         has no composer to fill"
     );
 
     // TWO READINGS OF THE ROOM RIDE WITH IT. `active_dm_peer` decides whether
@@ -4606,6 +4643,47 @@ fn a_reconnect_lands_each_composer_in_the_room_it_was_typed_in() {
     );
 }
 
+/// AND THE ROOM SHE LEFT DOES NOT HAUNT THE NEXT ONE AS AN "UNSENT MESSAGE".
+///
+/// `reconnect`'s editor harvest predated the park and left `message_draft` —
+/// the settled stash — holding the LEFT room's text after the landing. Its one
+/// consumer, `live_resynced`'s `remember_failed_draft(…, "channel",
+/// message_draft, …)`, fires when a chat-carrying resync lands on a different
+/// room, so opening a DM after reconnecting out of a room raised the
+/// failed-draft plate offering to restore the old room's words into the DM
+/// composer. The park owns the trip now; the stash stays empty across it.
+#[test]
+fn a_reconnect_does_not_leak_the_left_rooms_draft_into_the_failed_plate() {
+    let (mut app, _) = Ducktape::__boot();
+    app.loading = false;
+    app.connected_rpc = "http://node".into();
+    app.active_channel = "private-ops".into();
+    app.message_editor = compose("the incident started at");
+
+    let _ = app.__update(__DucktapeMessage::Reconnect);
+    let mut landed = workspace("general");
+    landed.generation = app.connect_generation;
+    landed.channels = vec![room("private-ops", 10), room("general", 20)];
+    let _ = app.__update(__DucktapeMessage::WorkspaceConnected(landed));
+
+    // A chat-carrying resync lands on another room — the exact trip that used
+    // to stash the harvest into `failed_message_draft`.
+    let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
+        app.hydration_generation,
+        "dm-with-alice",
+        Vec::new(),
+        "",
+        Vec::new(),
+    )));
+
+    assert_eq!(app.active_channel, "dm-with-alice");
+    assert!(
+        app.failed_message_draft.is_empty(),
+        "the room she left is parked under its own id, not offered to the room \
+         she is in"
+    );
+}
+
 #[test]
 fn the_page_surface_is_one_editor_with_no_click_to_edit_left() {
     let components = inlined(include_str!("ui/components/pages.ice"));
@@ -6937,7 +7015,7 @@ fn a_thread_reply_takes_marks_from_its_own_toolbar_and_the_chord() {
 /// `toggle_channel_settings` cleared `active_thread_seq`, the thread's messages
 /// and `reply_editor` on the way in, so a part-typed reply was gone and closing
 /// the drawer gave back an empty one. The main composer's draft survives the
-/// same trip, which is the app's own standard — `reconnect` harvests it
+/// same trip, which is the app's own standard — `reconnect` parks it
 /// deliberately rather than letting a transition eat it.
 ///
 /// A NOTE ON HOW THIS WAS FOUND, because the first account of it was wrong.
