@@ -6,7 +6,7 @@
 // one family, and the guards in main.rs name several of its members verbatim.
 // Everything outside that family drops the redundant `forge_` prefix.
 
-component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[ForgeRepo], list_phase:str, open_repo:str, repo_menu:bool, repo_phase:str, branches:[str], tab:str, items:[ForgeItem], tree_repo:str, tree_path:str, tree_born:bool, tree_entries:[TreeEntry], code_phase:str, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, forge_item_number:i64, item_phase:str, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:str, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, connected:bool, loading:bool, wall_now:i64)
+component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[ForgeRepo], list_phase:str, open_repo:str, repo_menu:bool, repo_phase:str, branches:[str], tab:str, items:[ForgeItem], tree_repo:str, tree_path:str, tree_born:bool, tree_entries:[TreeEntry], code_phase:str, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, forge_item_number:i64, item_phase:str, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:str, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, connected:bool, loading:bool)
   emits
     forge_open_repo(str)
     forge_close_repo()
@@ -53,8 +53,8 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
         col
           with
             w=fill
-            p=22.0
-            gap=18.0
+            p=16.0
+            gap=14.0
           ForgeOrgHeader
             with
               org
@@ -107,9 +107,9 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                       font=code
                       @text-accent_fg
           if !empty(repos)
-            grid min-cell=380.0 gap=13.0
+            grid min-cell=320.0 gap=10.0
               for repo in repos
-                RepoCard wall_now=wall_now repo=repo
+                RepoCard repo=repo
                   forward
                     forge_open_repo
     if connected && !empty(open_repo)
@@ -117,39 +117,56 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
         box
           with
             w=fill
-            pl=22.0
-            pr=22.0
-            pt=14.0
-            pb=12.0
+            pl=16.0
+            pr=16.0
+            pt=8.0
+            pb=8.0
           stack w=fill
             row
               with
                 w=fill
                 gap=9.0
                 align=center
-              button -> emit(forge_toggle_repo_menu)
+              box
                 with
-                  label="Switch repository"
-                  expanded=repo_menu
                   w=fill
-                  p=0.0
-                  @ghost_action
-                RepoCrumb
+                  clip=true
+                button -> emit(forge_toggle_repo_menu)
                   with
-                    org
-                    repo=open_repo
-                    branch=""
-                    open=repo_menu
-                active bg=transparent text=fg border=transparent border-w=1.0 r=9.0
-                hovered bg=row_hover text=fg
-                pressed bg=elevated text=fg
+                    label="Switch repository"
+                    expanded=repo_menu
+                    w=fill
+                    p=0.0
+                    @ghost_action
+                  RepoCrumb
+                    with
+                      org
+                      repo=open_repo
+                      branch=""
+                      open=repo_menu
+                  active bg=transparent text=fg border=transparent border-w=1.0 r=9.0
+                  hovered bg=row_hover text=fg
+                  pressed bg=elevated text=fg
+              // Detail navigation belongs in the persistent repo bar. Keeping
+              // it in the scrolling body spent a whole row on a control that
+              // should remain available while a long diff is being read.
+              if forge_item_number > 0 && item_phase == "ready"
+                BackToList kind=forge_item_kind
+                  forward
+                    forge_close_item
+              if forge_item_number > 0 && item_phase != "ready"
+                button "Back to tracker" -> emit(forge_close_item)
+                  with
+                    h=28.0
+                    p=6.0
+                    @secondary_action
               button "All repos" -> emit(forge_close_repo)
                 with
                   h=28.0
                   p=6.0
                   @secondary_action
             if repo_menu
-              pin x=0.0 y=38.0
+              pin x=0.0 y=36.0
                 Popover width=290.0
                   col w=fill gap=1.0
                     for repo in repos
@@ -164,42 +181,6 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
           space w=1.0 h=1.0
         if forge_item_number <= 0
           col w=fill h=fill
-            if !empty(branches)
-              box
-                with
-                  w=fill
-                  pl=22.0
-                  pr=22.0
-                  pt=10.0
-                  pb=10.0
-                scroll
-                  with
-                    dir=horizontal
-                    w=fill
-                    h=22.0
-                    bar=hidden
-                  row
-                    with
-                      h=fill
-                      gap=4.0
-                      align=center
-                    for branch in branches
-                      box
-                        with
-                          h=20.0
-                          pl=7.0
-                          pr=7.0
-                          align-y=center
-                          bg=surface
-                          border=border
-                          border-w=1.0
-                          r=10.0
-                        text branch
-                          with
-                            size=9.0
-                            wrap=none
-                            font=code_semibold
-                            @text-meta
             // THE TAB BAR THE TRACKER NEVER GOT. `forge_tab` has sat in
             // state.ice and `filter_forge_items`/`forge_open_count` in
             // backend.ice since wave 1 with no call site at all, so the
@@ -209,12 +190,12 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
             box
               with
                 w=fill
-                pl=22.0
-                pr=22.0
+                pl=16.0
+                pr=16.0
               row
                 with
                   w=fill
-                  gap=22.0
+                  gap=18.0
                   align=center
                 button -> emit(select_forge_tab, "code")
                   with
@@ -258,7 +239,46 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                   active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
                   hovered bg=transparent text=fg
                   pressed bg=transparent text=fg
-                space w=fill
+                // Branches are context for every repo seat, not a separate
+                // destination. Let them spend the remaining tab-bar width and
+                // scroll horizontally instead of charging the content a row.
+                if !empty(branches)
+                  box
+                    with
+                      w=1.0
+                      h=18.0
+                      bg=separator
+                    space w=1.0 h=1.0
+                  scroll
+                    with
+                      dir=horizontal
+                      w=fill
+                      h=22.0
+                      bar=hidden
+                    row
+                      with
+                        h=fill
+                        gap=4.0
+                        align=center
+                      for branch in branches
+                        box
+                          with
+                            h=20.0
+                            pl=7.0
+                            pr=7.0
+                            align-y=center
+                            bg=surface
+                            border=border
+                            border-w=1.0
+                            r=10.0
+                          text branch
+                            with
+                              size=9.0
+                              wrap=none
+                              font=code_semibold
+                              @text-meta
+                if empty(branches)
+                  space w=fill
             box
               with
                 w=fill
@@ -448,20 +468,10 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
             // The one true sentence about it lives beside the merge
             // button, where the decision is made.
         if forge_item_number > 0 && item_phase == "loading"
-          col w=fill h=fill p=22.0 gap=14.0
-            button "Back to tracker" -> emit(forge_close_item)
-              with
-                h=28.0
-                p=6.0
-                @secondary_action
+          box w=fill h=fill p=16.0
             EmptyPlate message="Loading tracker item…"
         if forge_item_number > 0 && item_phase == "failed"
-          col w=fill h=fill p=22.0 gap=14.0
-            button "Back to tracker" -> emit(forge_close_item)
-              with
-                h=28.0
-                p=6.0
-                @secondary_action
+          box w=fill h=fill p=16.0
             EmptyPlate message="Could not load this item. Go back and open it again to retry."
         if forge_item_number > 0 && item_phase == "ready"
           scroll
@@ -472,23 +482,26 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
             col
               with
                 w=fill
-                p=22.0
-                gap=14.0
-              BackToList kind=forge_item_kind
-                forward
-                  forge_close_item
+                pl=18.0
+                pr=18.0
+                pt=14.0
+                pb=18.0
+                gap=12.0
               row
                 with
                   w=fill
                   gap=9.0
                   align=center
-                text forge_item_title
+                box
                   with
                     w=fill
-                    size=16.0
-                    wrap=none
-                    font=display
-                    @text-primary
+                    clip=true
+                  text forge_item_title
+                    with
+                      size=16.0
+                      wrap=none
+                      font=display
+                      @text-primary
                 if forge_item_kind == "pr"
                   PrStatePill state=forge_item_state
                 if forge_item_kind != "pr"
@@ -499,26 +512,35 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                   gap=10.0
                   align=center
                 if !empty(forge_item_author)
-                  text forge_item_author
+                  box
                     with
-                      size=11.0
-                      wrap=none
-                      font=code_medium
-                      @text-meta
+                      max-w=160.0
+                      clip=true
+                    text forge_item_author
+                      with
+                        size=11.0
+                        wrap=none
+                        font=code_medium
+                        @text-meta
                 if !empty(forge_item_branches)
-                  text forge_item_branches
+                  box
                     with
-                      size=12.0
-                      wrap=none
-                      font=code
-                      @text-meta
+                      w=fill
+                      clip=true
+                    text forge_item_branches
+                      with
+                        size=12.0
+                        wrap=none
+                        font=code
+                        @text-meta
+                if empty(forge_item_branches)
+                  space w=fill
                 if forge_item_files_changed > 0
                   DiffCount
                     with
                       additions=forge_item_additions
                       deletions=forge_item_deletions
                       files=forge_item_files_changed
-                space w=fill
               if !empty(forge_item_body)
                 IssueBodyCard author=forge_item_author body=forge_item_body
               if !empty(forge_item_diff)

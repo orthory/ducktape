@@ -181,6 +181,12 @@ const TRACKER_FILE: &str = ".tracker.bin";
 /// rewritten atomically at every commit, removed once nothing is outstanding.
 const PENDING_FILE: &str = ".pending.bin";
 
+/// the node-local snapshot memo. recovery checkpoints already persist the
+/// same bytes elsewhere; this copy exists only so reopening the git substrate
+/// does not re-pack an unchanged object closure on the validator's command
+/// loop before it can answer reads.
+const SNAPSHOT_CACHE_FILE: &str = ".snapshot-cache.bin";
+
 /// the 4-byte magic the pending file leads with.
 const FORGE_PENDING_MAGIC: &[u8; 4] = b"FGP1";
 
@@ -440,7 +446,7 @@ pub struct Forge {
     /// where issue/PR discussion-channel follow-ups go (`emit_msg` target).
     /// `None` (tests / minimal deployments without chat) emits nothing.
     chat_target: Option<String>,
-    /// the last snapshot bytes, keyed on the committed state they encode.
+    /// the expensive per-repo pack payloads used to assemble snapshots.
     ///
     /// `snapshot()` packs the object closure of every branch head, and the
     /// node checkpoints by calling it every `checkpoint_blocks` blocks. On the
@@ -450,23 +456,31 @@ pub struct Forge {
     /// `/v1/query` went unserviced and even SIGTERM waited (issue #1018). An
     /// idle forge was re-packing a byte-identical 61 MB repo every 32 blocks.
     ///
-    /// The key is total. The bytes are a pure function of the committed refs,
-    /// the tracker and the pending map: `root()` covers the first two, and the
-    /// objects behind an unchanged head oid cannot change, because git is
-    /// content-addressed — the one case where they legitimately arrive later is
-    /// a MISSING closure, which is exactly what `pending` records.
+    /// Each pack is keyed only by that repo's committed refs + pending map.
+    /// Tracker-only writes then reserialize the cheap tracker tail around the
+    /// resident packs instead of re-packing every Git object. Objects behind an
+    /// unchanged head oid cannot change because Git is content-addressed; the
+    /// one case where they arrive later is a missing closure, which is exactly
+    /// what `pending` records in the key.
     ///
-    /// ponytail: holds one snapshot resident (repo-sized — 61 MB here). Swap
-    /// for a digest + on-disk container if a node's repos outgrow its memory.
+    /// ponytail: holds one pack per born repo resident (61 MB total here). Swap
+    /// for memory-mapped pack slices if a node's repos outgrow its memory.
     snapshot_cache: std::cell::RefCell<Option<SnapshotCache>>,
 }
 
-/// [`Forge::snapshot`]'s memo, and the committed state it was built from.
+/// [`Forge::snapshot`]'s expensive per-repo payload memo.
+#[derive(Default)]
 pub(crate) struct SnapshotCache {
-    pub(crate) root: StateRoot,
-    /// per repo, the branches whose objects have not arrived — node-local, so
-    /// NOT covered by the root, and it changes the container's pending section.
-    pub(crate) pending: Vec<(String, crate::refs::PendingMap)>,
+    pub(crate) packs: BTreeMap<String, CachedPack>,
+    /// Keys known to be present in the atomically-published cache file. This
+    /// advances only after a successful rename, so a failed rewrite remains
+    /// dirty and the next checkpoint retries it.
+    pub(crate) persisted_keys: Option<Vec<(String, [u8; 32])>>,
+}
+
+pub(crate) struct CachedPack {
+    /// sha256 of this repo's committed refs + node-local pending map.
+    pub(crate) key: [u8; 32],
     pub(crate) bytes: Vec<u8>,
 }
 
@@ -547,7 +561,7 @@ impl Forge {
             Tracker::default()
         };
 
-        Ok(Self {
+        let forge = Self {
             id: id.into(),
             base,
             blobs,
@@ -556,7 +570,10 @@ impl Forge {
             staged_tracker: None,
             chat_target: None,
             snapshot_cache: std::cell::RefCell::new(None),
-        })
+        };
+        let restored_cache = forge.restore_snapshot_cache();
+        *forge.snapshot_cache.borrow_mut() = restored_cache;
+        Ok(forge)
     }
 
     /// route issue/PR discussion follow-ups at the given chat module. the node
@@ -2215,41 +2232,138 @@ mod tests {
         let _ = std::fs::remove_dir_all(&rt);
     }
 
-    /// AN UNCHANGED FORGE MUST NOT RE-PACK, AND A CHANGED ONE MUST.
-    ///
-    /// The checkpoint calls `snapshot()` every `checkpoint_blocks` blocks on the
-    /// validator's select loop — 60.2 s of a 60.5 s capture on the demo
-    /// workspace, during which nothing else on that loop was serviced (#1018).
-    ///
-    /// The assertion POISONS the memo rather than timing the call: a re-pack
-    /// overwrites the poison with real container bytes, a cache hit hands it
-    /// back. Timing would only say "fast", which is what a warm page cache says
-    /// too.
     #[test]
-    fn an_unchanged_forge_serves_its_snapshot_from_the_memo() {
-        let base = tmp_base("snap-memo");
+    fn snapshot_cache_reuses_a_valid_pack_after_restart() {
+        let base = tmp_base("snapshot-cache-restart");
         let mut forge = Forge::init("forge", base.clone()).unwrap();
         seed_materialized_commit(&mut forge, 1, "demo", "a.txt", "hello", "c1");
 
+        let builds_before = snapshot::snapshot_pack_builds();
         let first = forge.snapshot().unwrap();
-        assert!(first.starts_with(FORGE_SNAPSHOT_MAGIC.as_slice()));
+        let builds_after_seed = snapshot::snapshot_pack_builds();
+        assert_eq!(builds_after_seed, builds_before + 1);
+        assert!(base.join(SNAPSHOT_CACHE_FILE).is_file());
+        drop(forge);
 
-        let poison = b"POISONED".to_vec();
-        forge.snapshot_cache.borrow_mut().as_mut().unwrap().bytes = poison.clone();
+        let reopened = Forge::init("forge", base.clone()).unwrap();
+        let second = reopened.snapshot().unwrap();
+        assert_eq!(second, first, "restart changed an unchanged snapshot");
         assert_eq!(
-            forge.snapshot().unwrap(),
-            poison,
-            "an unchanged forge re-packed its whole object closure instead of serving the memo"
+            snapshot::snapshot_pack_builds(),
+            builds_after_seed,
+            "restart rebuilt a pack already persisted by snapshot()"
         );
 
-        // A COMMITTED CHANGE MOVES THE ROOT, so the key misses and it re-packs.
-        seed_materialized_commit(&mut forge, 2, "demo", "b.txt", "world", "c2");
-        let after = forge.snapshot().unwrap();
-        assert_ne!(
-            after, poison,
-            "a forge whose committed state moved must re-pack, not serve a stale snapshot"
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn snapshot_cache_reserializes_tracker_without_repacking() {
+        let base = tmp_base("snapshot-cache-tracker");
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+        seed_materialized_commit(&mut forge, 1, "demo", "a.txt", "hello", "c1");
+        let first = forge.snapshot().unwrap();
+        let builds_after_seed = snapshot::snapshot_pack_builds();
+
+        let mut ctx = ctx_with_origin(2, user_origin(7));
+        exec_commit(
+            &mut forge,
+            &mut ctx,
+            &ForgeMsg::OpenIssue {
+                repo: "demo".into(),
+                title: "fresh tracker tail".into(),
+                body: "carried by the next snapshot".into(),
+            },
         );
-        assert!(after.starts_with(FORGE_SNAPSHOT_MAGIC.as_slice()));
+        let root = forge.root();
+        let updated = forge.snapshot().unwrap();
+        assert_ne!(updated, first, "tracker mutation was not serialized");
+        assert_eq!(
+            snapshot::snapshot_pack_builds(),
+            builds_after_seed,
+            "tracker-only state rebuilt an unchanged Git pack"
+        );
+
+        let roundtrip = tmp_base("snapshot-cache-tracker-roundtrip");
+        let mut installed = Forge::init("forge", roundtrip.clone()).unwrap();
+        installed.install(&updated, root).unwrap();
+        let reply =
+            futures::executor::block_on(installed.query(&encode_query(&ForgeQuery::ListItems {
+                repo: "demo".into(),
+            })))
+            .unwrap();
+        let ForgeReply::Items(items) = decode_reply(&reply).unwrap() else {
+            panic!("wrong reply")
+        };
+        assert_eq!(items[0].title, "fresh tracker tail");
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&roundtrip);
+    }
+
+    #[test]
+    fn snapshot_cache_invalidates_changed_refs_and_pending() {
+        let base = tmp_base("snapshot-cache-keys");
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+        seed_materialized_commit(&mut forge, 1, "demo", "a.txt", "hello", "c1");
+        forge.snapshot().unwrap();
+        let builds_after_seed = snapshot::snapshot_pack_builds();
+
+        seed_materialized_commit(&mut forge, 2, "demo", "b.txt", "world", "c2");
+        drop(forge);
+        let mut reopened = Forge::init("forge", base.clone()).unwrap();
+        reopened.snapshot().unwrap();
+        let builds_after_ref = snapshot::snapshot_pack_builds();
+        assert_eq!(
+            builds_after_ref,
+            builds_after_seed + 1,
+            "a changed committed ref reused the prior pack"
+        );
+
+        reopened.repos.get_mut("demo").unwrap().adopt_pending(
+            [("feature".to_string(), (oid('f'), [9; 32]))]
+                .into_iter()
+                .collect(),
+        );
+        reopened.persist_pending().unwrap();
+        drop(reopened);
+        let reopened = Forge::init("forge", base.clone()).unwrap();
+        reopened.snapshot().unwrap();
+        assert_eq!(
+            snapshot::snapshot_pack_builds(),
+            builds_after_ref + 1,
+            "a changed pending set reused the prior pack"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn snapshot_cache_digest_rejects_a_damaged_valid_file() {
+        let base = tmp_base("snapshot-cache-digest");
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+        seed_materialized_commit(&mut forge, 1, "demo", "a.txt", "hello", "c1");
+        forge.snapshot().unwrap();
+        let builds_after_seed = snapshot::snapshot_pack_builds();
+
+        let path = base.join(SNAPSHOT_CACHE_FILE);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        drop(forge);
+
+        let reopened = Forge::init("forge", base.clone()).unwrap();
+        assert!(
+            reopened.snapshot_cache.borrow().is_none(),
+            "a cache with a damaged digest was adopted"
+        );
+        reopened.snapshot().unwrap();
+        assert_eq!(
+            snapshot::snapshot_pack_builds(),
+            builds_after_seed + 1,
+            "a cache with a damaged digest avoided a required rebuild"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

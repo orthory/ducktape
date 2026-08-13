@@ -3886,73 +3886,6 @@ fn blob_read_counts_lines_and_names_binary_content() {
 }
 
 #[test]
-fn about_skips_headings_and_badges_and_names_the_language() {
-    let dir = tempfile::tempdir().unwrap();
-    let mirror = browsable_mirror(
-        &dir,
-        &[
-            (
-                "README.md",
-                "# ducktape\n\n[![badge](x)](y)\n\nThe consensus core.\nMore prose.\n\nA second paragraph.\n",
-            ),
-            ("a.rs", "fn a() {}\n"),
-            ("b.rs", "fn b() {}\n"),
-            ("c.rs", "fn c() {}\n"),
-        ],
-    );
-    let commit = mirror_commit_at(&mirror, "").unwrap();
-
-    // The whole first paragraph, rejoined — a README is hard wrapped, and
-    // taking one physical line ended this repo's own card mid-clause with no
-    // ellipsis to say it had been cut. The blank line still ends it.
-    assert_eq!(
-        readme_about(&mirror, &commit),
-        "The consensus core. More prose."
-    );
-    assert_eq!(dominant_language(&commit), "Rust");
-}
-
-/// The card's about line is capped at 200 characters and says so with an
-/// ellipsis. Rejoining a wrapped paragraph is what makes the cap reachable —
-/// this repo's own opening paragraph is 202 characters across three lines, and
-/// before the rejoin no card could ever have shown the mark.
-#[test]
-fn a_long_about_line_is_cut_at_two_hundred_and_says_so() {
-    let dir = tempfile::tempdir().unwrap();
-    let wrapped = "A consensus-based workplace super-app: one BFT-replicated state machine that\nhosts isolated product modules - pages, forge, chat, agent workflows - the\nway CosmWasm isolates contracts, but in native Rust.\n";
-    let mirror = browsable_mirror(&dir, &[("README.md", wrapped), ("a.rs", "fn a() {}\n")]);
-    let commit = mirror_commit_at(&mirror, "").unwrap();
-
-    let about = readme_about(&mirror, &commit);
-    assert_eq!(about.chars().count(), 201, "200 characters plus the mark");
-    assert!(about.ends_with('…'), "a cut line says it was cut");
-    assert!(
-        about.starts_with("A consensus-based workplace super-app: one BFT-replicated state machine that hosts isolated"),
-        "the wrap is rejoined with a single space, not a newline: {about}"
-    );
-}
-
-// An unborn repo has no head oid to resolve, so the card gets nothing —
-// never a fabricated about line, language or stamp. The guard fires before
-// any mirror is opened, so the unreachable endpoint below is never dialled.
-#[test]
-fn an_unborn_head_derives_no_card_facts() {
-    assert_eq!(
-        repo_card_facts("http://127.0.0.1:1", "core", "(unborn)"),
-        (String::new(), String::new(), 0)
-    );
-}
-
-#[test]
-fn about_is_empty_without_a_readme_rather_than_invented() {
-    let dir = tempfile::tempdir().unwrap();
-    let mirror = browsable_mirror(&dir, &[("a.rs", "fn a() {}\n")]);
-    let commit = mirror_commit_at(&mirror, "").unwrap();
-
-    assert!(readme_about(&mirror, &commit).is_empty());
-}
-
-#[test]
 fn bell_severity_projects_the_kind_and_defaults_to_info() {
     assert_eq!(bell_severity("run_failed".into()), "danger");
     assert_eq!(bell_severity("review_requested".into()), "warning");
@@ -4322,12 +4255,10 @@ async fn an_off_screen_plane_is_refused_before_it_touches_the_node() {
 }
 
 /// THE FORGE REPO LIST IS THE ONE UNSCOPED SLICE. Every other slice here is
-/// keyed on what the forge pane has open, but the list reloaded on EVERY forge
-/// chain op — a git-mirror walk per repo — while any other tab was on screen.
-/// Off the forge tab this reloads nothing, and reaching the (unreachable) node
-/// is what a lost gate would look like.
+/// keyed on what the forge pane has open. Off the forge tab this reloads
+/// nothing, and reaching the (unreachable) node is what a lost gate looks like.
 #[tokio::test(flavor = "current_thread")]
-async fn a_forge_op_does_not_walk_the_repo_mirrors_for_a_closed_pane() {
+async fn a_forge_op_does_not_load_the_repo_list_for_a_closed_pane() {
     let data = forge_live_refresh(
         "http://127.0.0.1:9".into(),
         String::new(),

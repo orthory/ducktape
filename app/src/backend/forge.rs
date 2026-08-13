@@ -1,22 +1,11 @@
 use super::*;
 use ::forge;
 
-/// One forge repo row: the module's committed head, plus the card facts
-/// derived from the local mirror at that head.
+/// One forge repo row: the module's committed name and head.
 #[derive(Clone, Debug, Default, Hash, PartialEq)]
 pub struct ForgeRepo {
     pub name: String,
     pub head: String,
-    /// The README's opening prose. Empty when the repo has none — the card
-    /// keeps its min-height rather than inventing a description.
-    pub about: String,
-    /// The extension that owns the most files at the head revision.
-    pub language: String,
-    /// The head commit's committer time in UNIX SECONDS — a real wall clock,
-    /// because a forge commit is stamped by a git client, not by consensus.
-    /// Render it with `relative_time`, NOT with `height_label_short`. 0 when
-    /// the repo has no born head.
-    pub updated_at: i64,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -75,8 +64,7 @@ fn listed_forge_repo(repo: &serde_json::Value) -> (String, String) {
     )
 }
 
-/// The repo namespace with committed heads. This is the screen's fast answer:
-/// card facts come from [`load_forge_details`] after these rows are visible.
+/// The repo namespace with committed heads.
 pub async fn load_forge(rpc: String, generation: i64) -> Result<ForgeData, HydrationError> {
     offscreen_guard(generation)?;
     async {
@@ -88,48 +76,9 @@ pub async fn load_forge(rpc: String, generation: i64) -> Result<ForgeData, Hydra
                 ForgeRepo {
                     name,
                     head: short_digest(&head),
-                    ..ForgeRepo::default()
                 }
             })
             .collect();
-        Ok(ForgeData { generation, repos })
-    }
-    .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
-}
-
-/// Fill the optional repo-card facts from local mirrors after the committed
-/// repo rows have landed. Re-listing is a small consensus query and keeps this
-/// work self-contained without carrying full object IDs through the UI.
-pub async fn load_forge_details(rpc: String, generation: i64) -> Result<ForgeData, HydrationError> {
-    offscreen_guard(generation)?;
-    async {
-        let listed = list_forge_repos(&rpc).await?;
-        let mut deriving = Vec::with_capacity(listed.len());
-        for repo in listed {
-            let (name, head) = listed_forge_repo(&repo);
-            let endpoint = rpc.clone();
-            deriving.push(tokio::task::spawn_blocking(move || {
-                let (about, language, updated_at) = repo_card_facts(&endpoint, &name, &head);
-                ForgeRepo {
-                    head: short_digest(&head),
-                    name,
-                    about,
-                    language,
-                    updated_at,
-                }
-            }));
-        }
-        let mut repos = Vec::with_capacity(deriving.len());
-        for task in deriving {
-            let row = task
-                .await
-                .map_err(|error| format!("forge card-details task failed: {error}"))?;
-            repos.push(row);
-        }
         Ok(ForgeData { generation, repos })
     }
     .await
@@ -147,18 +96,15 @@ pub async fn load_forge_repo(
 ) -> Result<ForgeRepoData, HydrationError> {
     async {
         let rpc = rpc_client(&rpc)?;
-        let refs: serde_json::Value = rpc
-            .query(
-                "forge",
-                &serde_json::json!({ "list_refs": { "repo": repo } }),
-            )
-            .await?;
-        let items: serde_json::Value = rpc
-            .query(
-                "forge",
-                &serde_json::json!({ "list_items": { "repo": repo } }),
-            )
-            .await?;
+        // Branches and tracker summaries are independent committed reads. The
+        // repo seat needs both, but neither is a reason to queue behind the
+        // other on the node's query lane.
+        let refs_query = serde_json::json!({ "list_refs": { "repo": &repo } });
+        let items_query = serde_json::json!({ "list_items": { "repo": &repo } });
+        let (refs, items): (serde_json::Value, serde_json::Value) = tokio::try_join!(
+            rpc.query("forge", &refs_query),
+            rpc.query("forge", &items_query)
+        )?;
         let branches = refs["refs"]
             .as_array()
             .cloned()
@@ -928,150 +874,6 @@ pub async fn forge_blob(
     })
 }
 
-/// The README names a repo browse recognizes, in preference order.
-const README_NAMES: &[&str] = &["README.md", "README", "readme.md", "README.txt"];
-
-/// The repo "about" line: the README's first prose paragraph, headings and
-/// badges skipped. Empty when there is no README — the card keeps its
-/// min-height rather than inventing a description.
-pub(crate) fn readme_about(mirror: &git2::Repository, commit: &git2::Commit) -> String {
-    let Ok(tree) = commit.tree() else {
-        return String::new();
-    };
-    let found = README_NAMES.iter().find_map(|name| {
-        let entry = tree.get_name(name)?;
-        let blob = entry.to_object(mirror).ok()?.into_blob().ok()?;
-        String::from_utf8(blob.content().to_vec()).ok()
-    });
-    let Some(text) = found else {
-        return String::new();
-    };
-    let lines = text.lines().map(str::trim).collect::<Vec<_>>();
-    let opens_prose = |line: &&&str| {
-        let empty = line.is_empty();
-        let heading = line.starts_with('#');
-        let badge = line.starts_with('[') || line.starts_with('!');
-        !empty && !heading && !badge
-    };
-    let Some(start) = lines.iter().position(|line| opens_prose(&line)) else {
-        return String::new();
-    };
-    // The whole paragraph, not its first physical line. A README is hard
-    // wrapped, so taking one line ended this repo's own card mid-clause —
-    // "…one BFT-replicated state machine that" — which reads as a UI
-    // truncation and carries no ellipsis to say so. A blank line ends the
-    // paragraph, which is what a paragraph IS; a wrapped continuation may
-    // legitimately begin with a bracket, so only the OPENING line is screened
-    // for headings and badges.
-    let prose = lines[start..]
-        .iter()
-        .take_while(|line| !line.is_empty())
-        .copied()
-        .collect::<Vec<_>>()
-        .join(" ");
-    match prose.char_indices().nth(200) {
-        Some((cut, _)) => format!("{}…", &prose[..cut]),
-        None => prose,
-    }
-}
-
-/// The repo's language, by which source extension owns the most files at the
-/// head revision.
-//
-// ponytail: a file-count heuristic over a bounded walk, not linguist's
-// byte-weighted classifier — upgrade to bytes-per-extension if a repo of
-// generated files starts reading wrong.
-pub(crate) fn dominant_language(commit: &git2::Commit) -> String {
-    const MAX_WALKED_ENTRIES: usize = 4096;
-    const LANGUAGES: &[(&str, &str)] = &[
-        ("rs", "Rust"),
-        ("ts", "TypeScript"),
-        ("tsx", "TypeScript"),
-        ("js", "JavaScript"),
-        ("py", "Python"),
-        ("go", "Go"),
-        ("swift", "Swift"),
-        ("kt", "Kotlin"),
-        ("java", "Java"),
-        ("c", "C"),
-        ("h", "C"),
-        ("cpp", "C++"),
-        ("rb", "Ruby"),
-        ("sh", "Shell"),
-        ("ice", "Ice"),
-        ("md", "Markdown"),
-    ];
-    let Ok(tree) = commit.tree() else {
-        return String::new();
-    };
-    let mut walked = 0usize;
-    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-    let _ = tree.walk(git2::TreeWalkMode::PreOrder, |_, entry| {
-        walked += 1;
-        if walked > MAX_WALKED_ENTRIES {
-            return git2::TreeWalkResult::Abort;
-        }
-        let name = entry.name().unwrap_or_default();
-        let extension = name.rsplit_once('.').map(|(_, tail)| tail).unwrap_or("");
-        if let Some((_, language)) = LANGUAGES.iter().find(|(suffix, _)| *suffix == extension) {
-            *counts.entry(*language).or_default() += 1;
-        }
-        git2::TreeWalkResult::Ok
-    });
-    counts
-        .into_iter()
-        .max_by_key(|(_, count)| *count)
-        .map(|(language, _)| language.to_string())
-        .unwrap_or_default()
-}
-
-/// One repo's card facts — about line, language, head committer time — read
-/// off the local mirror at the module's committed head. A repo whose head the
-/// mirror cannot produce renders blank rather than a guess.
-///
-/// BLOCKING: git2 walks a tree and may fetch. Callers run it on the blocking
-/// pool.
-pub(crate) fn repo_card_facts(endpoint: &str, repo: &str, head_oid: &str) -> (String, String, i64) {
-    const BLANK: (String, String, i64) = (String::new(), String::new(), 0);
-    let Ok(head) = git2::Oid::from_str(head_oid) else {
-        return BLANK;
-    };
-    let Ok(mirror) = mirror_holding(endpoint, repo, head) else {
-        return BLANK;
-    };
-    let Ok(commit) = mirror.find_commit(head) else {
-        return BLANK;
-    };
-    (
-        readme_about(&mirror, &commit),
-        dominant_language(&commit),
-        commit.time().seconds(),
-    )
-}
-
-/// The mirror holding `head`. The mirror IS the cache: a head the resident
-/// clone already carries costs no network, so re-listing the repos after every
-/// forge event never refetches a repo whose head has not moved.
-fn mirror_holding(endpoint: &str, repo: &str, head: git2::Oid) -> Result<git2::Repository, String> {
-    let dir = forge_mirror_dir(endpoint, repo)?;
-    let resident = git2::Repository::open_bare(&dir).ok();
-    let already_holds_head = resident.filter(|mirror| mirror.find_commit(head).is_ok());
-    match already_holds_head {
-        Some(mirror) => Ok(mirror),
-        None => sync_forge_mirror(endpoint, repo),
-    }
-}
-
-/// The listed row for `name`, so the open repo's body reads its about line,
-/// language and updated stamp out of the resident list instead of re-deriving
-/// them. An unknown name yields a blank row.
-pub fn forge_repo_row(repos: Vec<ForgeRepo>, name: String) -> ForgeRepo {
-    repos
-        .into_iter()
-        .find(|repo| repo.name == name)
-        .unwrap_or_default()
-}
-
 /// True when one live update invalidates forge state: a folded forge op, a
 /// forge replay the stream could not fold (`resync`), or the stream (re)
 /// subscribing (`ready` — anything may have landed while it was down).
@@ -1102,10 +904,10 @@ pub struct ForgeLiveData {
 /// keeps leave state untouched); an empty op scope means the scope is
 /// unknown — reload every open slice.
 ///
-/// `forge_open` is the repo LIST's surface gate. That one load was the only
-/// unscoped slice here — a git-mirror walk per repo, on every forge op, for a
-/// list no other tab draws. The repo and item slices keep running off-tab on
-/// purpose: they are already scoped to what the forge pane has open, and
+/// `forge_open` is the repo LIST's surface gate. That one load is the only
+/// unscoped slice here, and no other tab draws it. The repo and item slices
+/// keep running off-tab on purpose: they are already scoped to what the forge
+/// pane has open, and
 /// dropping them would hand a stale PR back on the return trip (the tab-switch
 /// handler's `load_forge` refills the list, and nothing else).
 // Eight arguments, and none of them can be folded away: this is one Ice extern

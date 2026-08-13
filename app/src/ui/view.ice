@@ -428,7 +428,7 @@ view
         agents:
           AgentsScreen rows=agents_rows connected answered=agents_answered #agents
         forge:
-          ForgeScreen wall_now=wall_now review_draft<->forge_review_draft comment_draft<->forge_comment_draft discussion_editor<->forge_discussion_editor
+          ForgeScreen review_draft<->forge_review_draft comment_draft<->forge_comment_draft discussion_editor<->forge_discussion_editor
             with
               org=network_name
               about=account_bio

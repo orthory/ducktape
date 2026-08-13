@@ -1,29 +1,13 @@
 // FORGE — repos, the tracker, one item with its reviews, its merge and its
 // discussion. Every loader keys on `forge_generation`.
 
-// Every row lands as soon as the committed namespace answers. Its about line,
-// language and `updated_at` arrive later from the optional mirror-details lane.
-// `updated_at` is UNIX SECONDS off the head commit's git committer time, so it
-// renders with `relative_time(...)` — NOT with `height_label_short()` like the
-// rest of this app. Every other record time here is a consensus stamp (the
-// validator sets consensus_time = height), which is why heights print
-// everywhere else; a git client wrote this one against a real wall clock.
+// The committed namespace is the whole repo-card answer: name and head. Code
+// browsing and merge fetch their own selected repo only when those acts need it.
 on forge_loaded(next)
   return if next.generation != forge_generation
   forge_list_phase = "ready"
   forge_repos = next.repos
   error = ""
-  return if shell_tab != "forge" || !empty(forge_repo)
-  run replace lane=forge_details load_forge_details(connected_rpc, forge_generation) -> forge_details_loaded _ | forge_details_failed _
-
-on forge_details_loaded(next)
-  return if next.generation != forge_generation
-  forge_repos = next.repos
-
-// Card facts are optional. The committed repo rows remain the authoritative
-// answer when a mirror cannot be fetched or inspected.
-on forge_details_failed(cause)
-  return if cause.generation != forge_generation
 
 on forge_list_failed(cause)
   return if cause.generation != forge_generation
@@ -279,8 +263,6 @@ on forge_refreshed(next)
   forge_item_approvals = keep_i64(next.item_loaded, next.item.approvals, forge_item_approvals)
   forge_item_change_requests = keep_i64(next.item_loaded, next.item.change_requests, forge_item_change_requests)
   forge_item_phase = keep_str(next.item_loaded, "ready", forge_item_phase)
-  return if !next.repos_loaded || !empty(forge_repo)
-  run replace lane=forge_details load_forge_details(connected_rpc, forge_generation) -> forge_details_loaded _ | forge_details_failed _
 
 // The breadcrumb home. Nothing else clears `forge_repo`, so without this the
 // repo grid is unreachable for the rest of the session once a repo is opened.

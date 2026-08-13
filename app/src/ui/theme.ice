@@ -115,6 +115,7 @@ theme contract AppTheme
   avatar_bg_sm
   avatar_fg_sm
   agent_live
+  forge_gutter_ink
   merged
   merged_bg
   merged_line
@@ -277,7 +278,7 @@ palette app for AppTheme
   // step a control's border takes under the cursor.
   pending_line #d9d8d0
   control_line_hover #d5d3ca
-  // Ink for the marks that are not text: chevrons and the diff gutter.
+  // Ink for quiet marks: chevrons and compact table headings.
   ink_soft #b6b4a8
   chevron_idle #c8c6bc
   gutter_ink #c2c0b6
@@ -286,7 +287,9 @@ palette app for AppTheme
   avatar_bg_sm #dcdbd4
   avatar_fg_sm #7a7872
   agent_live #7e9e88
-  // FORGE — merged wears its own violet; finalized wears the success plate.
+  // FORGE — the small mono gutter clears AA against every code/diff plate;
+  // merged wears its own violet, and finalized wears the success plate.
+  forge_gutter_ink #66645e
   merged #7a6f9e
   merged_bg #f1edf5
   merged_line #ddd2e6
@@ -429,6 +432,7 @@ palette app_dark for AppTheme
   avatar_fg_sm #a3a198
   agent_live #7e9e88
   // FORGE
+  forge_gutter_ink #9d9b92
   merged #a89ac9
   merged_bg #2a2633
   merged_line #443c57

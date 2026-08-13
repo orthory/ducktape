@@ -243,7 +243,7 @@ extern crate::backend
   load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
   clear_doc_tabs(rpc:str) -> bool
   forget_workspace(rpc:str) -> bool ! AppError
-  ForgeRepo(name:str, head:str, about:str, language:str, updated_at:i64)
+  ForgeRepo(name:str, head:str)
   ForgeItem(number:i64, kind:str, state:str, title:str, author:str, author_name:str)
   ForgeData(generation:i64, repos:[ForgeRepo])
   ForgeRepoData(generation:i64, repo:str, branches:[str], items:[ForgeItem])
@@ -254,7 +254,6 @@ extern crate::backend
   ForgeMergeOutcome(merged:bool, merge_oid:str, conflicts:[str])
   ForgeLiveData(generation:i64, repos_loaded:bool, repos:[ForgeRepo], repo_loaded:bool, branches:[str], items:[ForgeItem], item_loaded:bool, item:ForgeItemData)
   load_forge(rpc:str, generation:i64) -> ForgeData ! HydrationError
-  load_forge_details(rpc:str, generation:i64) -> ForgeData ! HydrationError
   load_forge_repo(rpc:str, repo:str, generation:i64) -> ForgeRepoData ! HydrationError
   load_forge_item(rpc:str, repo:str, number:i64, generation:i64) -> ForgeItemData ! HydrationError
   load_forge_discussion(rpc:str, channel_id:str, generation:i64) -> ForgeDiscussionData ! HydrationError
@@ -275,7 +274,6 @@ extern crate::backend
   merge_forge_pr(rpc:str, password:str, repo:str, number:i64, source_branch:str, expected_source_oid:str, prev_target_oid:str) -> ForgeMergeOutcome ! AppError
   forge_live_refresh(rpc:str, open_repo:str, open_item:i64, kind:str, module:str, scope:ForgeRefresh, forge_open:bool, generation:i64) -> ForgeLiveData ! HydrationError
   pure forge_live_hit(kind:str, module:str) -> bool
-  pure forge_repo_row(repos:[ForgeRepo], name:str) -> ForgeRepo
   pure forge_stats(files:i64, additions:i64, deletions:i64) -> str
   DiffLine(key:i64, kind:str, old_no:str, new_no:str, sign:str, text:str, path:str, side:str)
   pure forge_push_command(rpc:str) -> str

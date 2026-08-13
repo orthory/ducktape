@@ -174,7 +174,6 @@ on console_opened(id)
   invalidate lane=block_comments
   invalidate lane=live_resync
   invalidate lane=forge_load
-  invalidate lane=forge_details
   invalidate lane=forge_live
   invalidate lane=forge_repo
   invalidate lane=forge_item

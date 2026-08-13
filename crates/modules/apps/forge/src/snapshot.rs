@@ -29,16 +29,48 @@
 //! root legitimately produce different container bytes; nothing compares them
 //! (statesync verifies the ROOT, which covers refs + tracker only).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
+use std::io::Write as _;
 
 use git2::Oid;
 use sdk::{Error, StateRoot};
+use sha2::{Digest as _, Sha256};
 
 use crate::codec::{self, Reader};
-use crate::refs::{full_ref, norm_branch, open_or_init_repo, RepoState};
-use crate::tracker::Tracker;
-use crate::{compose_state_root, norm_repo, Forge, FORGE_SNAPSHOT_MAGIC};
 use crate::git;
+use crate::refs::{RepoState, full_ref, norm_branch, open_or_init_repo};
+use crate::tracker::Tracker;
+use crate::{
+    CachedPack, FORGE_SNAPSHOT_MAGIC, Forge, SNAPSHOT_CACHE_FILE, SnapshotCache,
+    compose_state_root, norm_repo,
+};
+
+/// Latest-only node-local pack memo:
+/// `FGC1 ++ repo-count ++ (name, refs/pending-key, pack)* ++ sha256(preceding)`.
+const SNAPSHOT_CACHE_MAGIC: &[u8; 4] = b"FGC1";
+const SNAPSHOT_CACHE_DIGEST_LEN: usize = 32;
+const MAX_CACHED_REPOS: u32 = 4096;
+
+#[cfg(test)]
+std::thread_local! {
+    static SNAPSHOT_PACK_BUILDS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn snapshot_pack_builds() -> usize {
+    SNAPSHOT_PACK_BUILDS.with(std::cell::Cell::get)
+}
+
+impl SnapshotCache {
+    fn keys(&self) -> Vec<(String, [u8; 32])> {
+        self.packs
+            .iter()
+            .map(|(name, pack)| (name.clone(), pack.key))
+            .collect()
+    }
+}
 
 impl Forge {
     /// serialize the COMMITTED state into self-contained snapshot bytes (see
@@ -49,25 +81,16 @@ impl Forge {
         // PACKING IS THE EXPENSIVE PART AND THE CALLER IS A CLOCK. The node's
         // checkpoint calls this every `checkpoint_blocks` blocks on its select
         // loop; see [`SnapshotCache`] for the measurement and what it starved.
-        let root = <Self as sdk::Module>::root(self);
-        let pending = self.pending_key();
-        let cached = self
-            .snapshot_cache
-            .borrow()
-            .as_ref()
-            .filter(|hit| hit.root == root && hit.pending == pending)
-            .map(|hit| hit.bytes.clone());
-        if let Some(bytes) = cached {
-            return Ok(bytes);
-        }
-
-        let mut out = FORGE_SNAPSHOT_MAGIC.to_vec();
         let born: Vec<(&str, &RepoState)> = self
             .repos
             .iter()
             .filter(|(_, s)| !s.refs.is_empty())
             .map(|(n, s)| (n.as_str(), s))
             .collect();
+        let mut cache_slot = self.snapshot_cache.borrow_mut();
+        let cache = cache_slot.get_or_insert_with(SnapshotCache::default);
+
+        let mut out = FORGE_SNAPSHOT_MAGIC.to_vec();
 
         codec::put_u32(&mut out, born.len() as u32);
         for (name, state) in born {
@@ -78,15 +101,21 @@ impl Forge {
             // failure used to abort the whole host capture (killing this
             // node's checkpointing and its ability to admit joiners) over
             // state forge is designed to tolerate.
-            let repo = open_or_init_repo(&self.base, name)?;
-            let heads: Vec<Oid> = state
-                .refs
-                .iter()
-                .filter(|(branch, _)| !state.pending().contains_key(*branch))
-                .map(|(_, oid)| *oid)
-                .collect();
-            let pack =
-                git::pack_closure_many(&repo, &heads).map_err(|e| Error::Module(e.to_string()))?;
+            let key = Self::repo_pack_key(state);
+            let pack = match cache.packs.entry(name.to_string()) {
+                Entry::Occupied(entry) if entry.get().key == key => entry.into_mut(),
+                Entry::Occupied(mut entry) => {
+                    entry.insert(CachedPack {
+                        key,
+                        bytes: self.build_snapshot_pack(name, state)?,
+                    });
+                    entry.into_mut()
+                }
+                Entry::Vacant(entry) => entry.insert(CachedPack {
+                    key,
+                    bytes: self.build_snapshot_pack(name, state)?,
+                }),
+            };
             codec::put_str(&mut out, name);
             codec::put_u32(&mut out, state.refs.len() as u32);
             for (branch, oid) in &state.refs {
@@ -94,26 +123,156 @@ impl Forge {
                 out.extend_from_slice(oid.as_bytes());
             }
             crate::refs::put_pending(&mut out, state.pending());
-            codec::put_bytes(&mut out, &pack);
+            codec::put_bytes(&mut out, &pack.bytes);
         }
-        codec::put_bytes(&mut out, &self.tracker.canonical_bytes());
-        *self.snapshot_cache.borrow_mut() = Some(crate::SnapshotCache {
-            root,
-            pending,
-            bytes: out.clone(),
+        cache.packs.retain(|name, _| {
+            self.repos
+                .get(name)
+                .is_some_and(|state| !state.refs.is_empty())
         });
+        codec::put_bytes(&mut out, &self.tracker.canonical_bytes());
+
+        let current_keys = cache.keys();
+        let disk_has_current_keys = cache.persisted_keys.as_ref() == Some(&current_keys);
+        let cache_file_missing = !self.base.join(SNAPSHOT_CACHE_FILE).exists();
+        let needs_persist = !disk_has_current_keys || cache_file_missing;
+        if needs_persist {
+            match self.persist_snapshot_cache(cache) {
+                Ok(()) => cache.persisted_keys = Some(current_keys),
+                Err(error) => tracing::debug!(
+                    target: "ducktape::forge",
+                    reason = "snapshot_cache_write_failed",
+                    error = %error,
+                    "snapshot memo stays memory-only"
+                ),
+            }
+        }
         Ok(out)
     }
 
-    /// the node-local half of [`SnapshotCache`]'s key: which branches are still
-    /// waiting on their objects, per repo. `root()` cannot carry this — the
-    /// pending set is deliberately not consensus state — but it does change the
-    /// container, so it has to be compared beside the root.
-    fn pending_key(&self) -> Vec<(String, crate::refs::PendingMap)> {
-        self.repos
+    /// Key one pack on exactly what decides its closure: the committed refs and
+    /// which of those heads this node is still waiting to materialize.
+    fn repo_pack_key(state: &RepoState) -> [u8; 32] {
+        let mut encoded = Vec::new();
+        codec::put_u32(&mut encoded, state.refs.len() as u32);
+        for (branch, oid) in &state.refs {
+            codec::put_str(&mut encoded, branch);
+            encoded.extend_from_slice(oid.as_bytes());
+        }
+        crate::refs::put_pending(&mut encoded, state.pending());
+        Sha256::digest(encoded).into()
+    }
+
+    fn build_snapshot_pack(&self, name: &str, state: &RepoState) -> Result<Vec<u8>, Error> {
+        #[cfg(test)]
+        SNAPSHOT_PACK_BUILDS.with(|builds| builds.set(builds.get() + 1));
+
+        let repo = open_or_init_repo(&self.base, name)?;
+        let heads: Vec<Oid> = state
+            .refs
             .iter()
-            .map(|(name, state)| (name.clone(), state.pending().clone()))
-            .collect()
+            .filter(|(branch, _)| !state.pending().contains_key(*branch))
+            .map(|(_, oid)| *oid)
+            .collect();
+        git::pack_closure_many(&repo, &heads).map_err(|error| Error::Module(error.to_string()))
+    }
+
+    /// Re-adopt one cache file written by [`Self::persist_snapshot_cache`].
+    /// The cache is never authority: malformed bytes or a failed integrity
+    /// digest mean a clean miss, while stale per-repo entries are discarded.
+    pub(crate) fn restore_snapshot_cache(&self) -> Option<SnapshotCache> {
+        let bytes = std::fs::read(self.base.join(SNAPSHOT_CACHE_FILE)).ok()?;
+        let digest_at = bytes.len().checked_sub(SNAPSHOT_CACHE_DIGEST_LEN)?;
+        let (payload, stored_digest) = bytes.split_at(digest_at);
+        let payload_digest: [u8; 32] = Sha256::digest(payload).into();
+        if stored_digest != payload_digest.as_slice() {
+            return None;
+        }
+
+        let body = payload.strip_prefix(SNAPSHOT_CACHE_MAGIC.as_slice())?;
+        let mut reader = Reader::new(body);
+        let count = reader.u32().ok()?;
+        if count > MAX_CACHED_REPOS {
+            return None;
+        }
+        let mut names = BTreeSet::new();
+        let mut disk_keys = Vec::with_capacity(count as usize);
+        let mut packs = BTreeMap::new();
+        for _ in 0..count {
+            let name = norm_repo(&reader.str_().ok()?).ok()?;
+            if !names.insert(name.clone()) {
+                return None;
+            }
+            let key: [u8; 32] = reader.take(32).ok()?.try_into().ok()?;
+            let pack_len = usize::try_from(reader.u64().ok()?).ok()?;
+            let pack = reader.take(pack_len).ok()?;
+            disk_keys.push((name.clone(), key));
+            let current_key = self
+                .repos
+                .get(&name)
+                .filter(|state| !state.refs.is_empty())
+                .map(Self::repo_pack_key);
+            if current_key != Some(key) {
+                continue;
+            }
+            packs.insert(
+                name,
+                CachedPack {
+                    key,
+                    bytes: pack.to_vec(),
+                },
+            );
+        }
+        if !reader.done() {
+            return None;
+        }
+        let current_keys: Vec<_> = self
+            .repos
+            .iter()
+            .filter(|(_, state)| !state.refs.is_empty())
+            .map(|(name, state)| (name.clone(), Self::repo_pack_key(state)))
+            .collect();
+        let persisted_keys = (disk_keys == current_keys).then_some(disk_keys);
+        Some(SnapshotCache {
+            packs,
+            persisted_keys,
+        })
+    }
+
+    /// Publish the memo in one rename. A power loss may lose this optional
+    /// cache, but can never publish a partial file; the digest rejects storage
+    /// damage on the next boot.
+    pub(crate) fn persist_snapshot_cache(&self, cache: &SnapshotCache) -> std::io::Result<()> {
+        let path = self.base.join(SNAPSHOT_CACHE_FILE);
+        let tmp = self.base.join(".snapshot-cache.bin.tmp");
+        let write = (|| {
+            let mut file = std::fs::File::create(&tmp)?;
+            let mut digest = Sha256::new();
+            {
+                let mut write_part = |bytes: &[u8]| -> std::io::Result<()> {
+                    file.write_all(bytes)?;
+                    digest.update(bytes);
+                    Ok(())
+                };
+                write_part(SNAPSHOT_CACHE_MAGIC)?;
+                write_part(&(cache.packs.len() as u32).to_le_bytes())?;
+                for (name, pack) in &cache.packs {
+                    write_part(&(name.len() as u32).to_le_bytes())?;
+                    write_part(name.as_bytes())?;
+                    write_part(&pack.key)?;
+                    write_part(&(pack.bytes.len() as u64).to_le_bytes())?;
+                    write_part(&pack.bytes)?;
+                }
+            }
+            file.write_all(&digest.finalize())?;
+            file.flush()?;
+            drop(file);
+            std::fs::rename(&tmp, path)
+        })();
+        if write.is_err() {
+            let _ = std::fs::remove_file(tmp);
+        }
+        write
     }
 
     /// replace this module's WHOLE state with snapshot bytes, gated on
