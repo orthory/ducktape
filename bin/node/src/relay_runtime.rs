@@ -144,6 +144,9 @@ impl ResidentRelay {
             if let Err(detail) = send_blob(relay_tx, targets, &frame, digest, &bytes) {
                 return Err((hold, detail));
             }
+            // the pack has to cross the wire before anyone can ack it — the
+            // fanout hold earns the transfer allowance on top of the base.
+            let deadline = deadline + relay::blob_transfer_allowance(bytes.len() as u64);
             self.fanouts.insert(
                 frame_id,
                 ResidentFanout {
@@ -241,6 +244,16 @@ impl ResidentRelay {
             .collect();
         for id in expired_fanouts {
             if let Some(fanout) = self.fanouts.remove(&id) {
+                // once per failed push, and the QA daemon.log for a failed
+                // push was otherwise EMPTY — this line is the server-side
+                // evidence.
+                tracing::warn!(
+                    target: "ducktape::forge",
+                    digest = %relay::encode_hex(&fanout.digest),
+                    awaiting = fanout.awaiting.len(),
+                    reason = "forge_pack_fanout_expired",
+                    "forge pack fanout expired before every validator acked; the push fails and can be retried"
+                );
                 fanout
                     .hold
                     .fail("timed out distributing the forge pack to validators".into());
@@ -397,6 +410,9 @@ impl ValidatorRelay {
         if let Err(detail) = send_blob(relay_tx, &peers, &frame, digest, &pack) {
             return Err((reply, detail));
         }
+        // the pack has to cross the wire before every peer can ack it — the
+        // fanout hold earns the transfer allowance on top of the base.
+        let deadline = deadline + relay::blob_transfer_allowance(pack.len() as u64);
         self.local_fanouts.insert(
             frame_id,
             LocalFanout {
@@ -451,13 +467,18 @@ impl ValidatorRelay {
                 }
                 match relay::BlobAssembly::new(digest, total) {
                     Ok(assembly) => {
+                        // the chunks are still crossing the wire — the
+                        // assembly hold earns the transfer allowance on top
+                        // of the base, sized by the offered total.
+                        let deadline =
+                            now + SUBMIT_HOLD + relay::blob_transfer_allowance(total);
                         self.incoming.insert(
                             frame_id,
                             IncomingBlob {
                                 peer,
                                 digest,
                                 assembly,
-                                deadline: now + SUBMIT_HOLD,
+                                deadline,
                             },
                         );
                     }
@@ -582,6 +603,13 @@ impl ValidatorRelay {
             .collect();
         for id in expired_local {
             if let Some(fanout) = self.local_fanouts.remove(&id) {
+                tracing::warn!(
+                    target: "ducktape::forge",
+                    digest = %relay::encode_hex(&fanout.digest),
+                    awaiting = fanout.awaiting.len(),
+                    reason = "forge_pack_fanout_expired",
+                    "forge pack fanout expired before every peer acked; the push fails and can be retried"
+                );
                 let _ = fanout.reply.send(Err(
                     "timed out distributing the forge pack to validators".into(),
                 ));
@@ -596,6 +624,15 @@ impl ValidatorRelay {
             .collect();
         for id in expired_incoming {
             if let Some(incoming) = self.incoming.remove(&id) {
+                // chunk loss, not slowness, is the usual cause here: chunks
+                // ride the p2p channel with no retransmit, so a tunnel that
+                // drops mid-transfer can never complete this assembly.
+                tracing::warn!(
+                    target: "ducktape::forge",
+                    digest = %relay::encode_hex(&incoming.digest),
+                    reason = "forge_pack_receive_expired",
+                    "forge pack receive expired mid-transfer; refusing so the pusher sees the timeout"
+                );
                 send_blob_result(
                     relay_tx,
                     &incoming.peer,

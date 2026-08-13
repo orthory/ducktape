@@ -40,6 +40,17 @@ pub const MAX_RELAY_BLOB_BYTES: usize = 64 * 1024 * 1024;
 /// 86 chunk messages (under the channel's 128-message inbound backlog).
 pub const RELAY_BLOB_CHUNK_BYTES: usize = 768 * 1024;
 
+/// The extra hold a forge pack transfer earns on top of `SUBMIT_HOLD`,
+/// budgeted at a 1 MiB/s payload floor. The base hold alone assumed the pack
+/// lands within an app-submit budget — structurally impossible for a multi-MB
+/// pack crossing a WAN validator link (chunks ride hex-encoded, doubling the
+/// wire bytes), so every such push died as "timed out receiving the forge
+/// pack" at 10s. `MAX_RELAY_BLOB_BYTES` bounds the whole allowance at 64s.
+pub fn blob_transfer_allowance(total: u64) -> std::time::Duration {
+    const FLOOR_BYTES_PER_SEC: u64 = 1024 * 1024;
+    std::time::Duration::from_secs(total.div_ceil(FLOOR_BYTES_PER_SEC))
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum RelayOutcome {
@@ -249,6 +260,22 @@ mod tests {
             target: "kv".into(),
             payload: b"{}".to_vec(),
         }
+    }
+
+    #[test]
+    fn a_pack_transfer_earns_hold_proportional_to_its_size() {
+        use std::time::Duration;
+        assert_eq!(blob_transfer_allowance(1), Duration::from_secs(1));
+        assert_eq!(
+            blob_transfer_allowance(4 * 1024 * 1024),
+            Duration::from_secs(4),
+            "a 4 MiB pack earns 4s of transfer on top of the base hold"
+        );
+        assert_eq!(
+            blob_transfer_allowance(MAX_RELAY_BLOB_BYTES as u64),
+            Duration::from_secs(64),
+            "the relay cap bounds the allowance"
+        );
     }
 
     #[test]
