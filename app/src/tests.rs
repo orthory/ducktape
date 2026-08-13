@@ -3714,10 +3714,7 @@ fn message_actions_require_explicit_intent() {
     let (mut app, _) = Ducktape::__boot();
     app.mutation_phase = MutationPhase::Idle;
 
-    app.chat_pointer_y = 450.0;
-    app.chat_height = 500.0;
     let _ = app.__update(__DucktapeMessage::OpenMessageActions(7, "hello".into(), 2));
-    assert_eq!(app.message_menu_y, 260.0);
     assert_eq!(app.selected_message_seq, 7);
     assert_eq!(app.message_action, MessageAction::More);
     let _ = app.__update(__DucktapeMessage::BeginMessageEdit(7, "hello".into(), 2));
@@ -3811,10 +3808,12 @@ fn message_action_toolbar_stays_compact_and_accessible() {
         "overlay when=(selected_message_seq > 0 && message_action != MessageAction.toolbar)"
     ));
     assert!(chat.contains("dismiss=emit(clear_message_selection) backdrop=transparent"));
-    assert!(chat.contains("mouse press-at=emit(chat_pointer_pressed, _, _)"));
+    assert!(chat.contains("mouse press-at=chat_pointer_pressed"));
     // per-press, never per-move: a move= stream here rebuilds the view per pixel
     assert!(!chat.contains("mouse move="));
-    assert!(chat.contains("float x=0.0 y=message_menu_y"));
+    assert!(chat.contains(
+        "box w=fill h=fill pt=block_action_menu_y(chat_pointer_y, chat_height) align-x=end align-y=start"
+    ));
     // the pointer sensor is the MESSAGE-LIST stack's first child, so it
     // measures the message list itself and not whatever an overlay happens
     // to cover. The anchor names that stack by its exact indentation: the
@@ -3827,7 +3826,7 @@ fn message_action_toolbar_stays_compact_and_accessible() {
     assert!(
         sensor
             .trim_start()
-            .starts_with("sensor show=emit(chat_resized, _, _)")
+            .starts_with("sensor show=chat_resized resize=chat_resized")
     );
     let overlay_content = chat
         .split_once("                  content\n")
@@ -3956,10 +3955,12 @@ fn thread_messages_mirror_the_main_action_system() {
         "overlay when=(thread_selected_seq > 0 && thread_message_action != MessageAction.toolbar)"
     ));
     assert!(thread.contains("dismiss=emit(clear_thread_message_selection) backdrop=transparent"));
-    assert!(thread.contains("float x=0.0 y=thread_menu_y"));
-    assert!(thread.contains("mouse press-at=emit(thread_pointer_pressed, _, _)"));
+    assert!(thread.contains(
+        "box w=fill h=fill pt=block_action_menu_y(thread_pointer_y, thread_height) align-x=end align-y=start"
+    ));
+    assert!(thread.contains("mouse press-at=thread_pointer_pressed"));
     // same seat as the message list — the rail measures itself
-    assert!(thread.contains("sensor show=emit(thread_resized, _, _)"));
+    assert!(thread.contains("sensor show=thread_resized resize=thread_resized"));
     // The picker is the shared ADD grid targeting the thread selection;
     // removal rides the reply's own reaction chips.
     assert!(thread.contains("for emoji in reaction_palette()"));
@@ -4036,8 +4037,6 @@ fn thread_action_state_is_independent_of_the_main_message_menu() {
     app.active_thread_seq = 1;
 
     // Opening a thread action must not touch the main message menu.
-    app.thread_pointer_y = 400.0;
-    app.thread_height = 500.0;
     let _ = app.__update(__DucktapeMessage::OpenThreadMessageActions(
         2,
         "reply".into(),
@@ -4045,7 +4044,6 @@ fn thread_action_state_is_independent_of_the_main_message_menu() {
     ));
     assert_eq!(app.thread_selected_seq, 2);
     assert_eq!(app.thread_message_action, MessageAction::More);
-    assert_eq!(app.thread_menu_y, 210.0);
     assert_eq!(app.selected_message_seq, 0);
     assert_eq!(app.message_action, MessageAction::Toolbar);
 
@@ -5190,6 +5188,22 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     assert!(!app.contains("\n    transparent true"));
     assert!(!app.contains("\n    blur true"));
     assert!(app.contains("\n  bg app_background"));
+    assert!(app.contains("\n  fg app_text"));
+    let core_state = inlined(include_str!("ui/state/core.ice"));
+    assert!(!core_state.contains("app_background"));
+    assert!(!core_state.contains("app_text"));
+    let derived = inlined(include_str!("ui/state/derived.ice"));
+    assert!(
+        derived.contains(
+            "app_background = keep_str(appearance == \"dark\", \"#1b1a16\", \"#fdfdfb\")"
+        )
+    );
+    assert!(
+        derived.contains("app_text = keep_str(appearance == \"dark\", \"#e8e6df\", \"#2c2b27\")")
+    );
+    let lifecycle = inlined(include_str!("ui/handlers/lifecycle.ice"));
+    assert!(!lifecycle.contains("app_background ="));
+    assert!(!lifecycle.contains("app_text ="));
     assert!(app.contains("titlebar-transparent true"));
     assert!(app.contains("fullsize-content-view true"));
     assert!(app.contains("font \"../../../crates/design/assets/fonts/Geist[wght].ttf\""));
@@ -7175,8 +7189,25 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
         );
     }
 
-    let chat_state = local_state(component(SCREENS.as_str(), "ChatScreen"));
-    assert!(chat_state.contains(&"message_action_focus = \"\""));
+    let chat = component(SCREENS.as_str(), "ChatScreen");
+    let chat_state = local_state(chat);
+    for field in [
+        "message_action_focus = \"\"",
+        "chat_pointer_y = 0.0",
+        "chat_height = 720.0",
+        "thread_pointer_y = 0.0",
+        "thread_height = 720.0",
+    ] {
+        assert!(chat_state.contains(&field), "ChatScreen owns `{field}`");
+    }
+    for handler in [
+        "on chat_pointer_pressed(_x, y)",
+        "on chat_resized(_width, height)",
+        "on thread_pointer_pressed(_x, y)",
+        "on thread_resized(_width, height)",
+    ] {
+        assert!(chat.contains(handler), "ChatScreen owns `{handler}`");
+    }
 
     let files = component(SCREENS.as_str(), "FilesScreen");
     assert!(local_state(files).contains(&"history_open = false"));
@@ -7210,6 +7241,12 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
         "explorer_searching",
         "explorer_selected",
         "message_action_focus",
+        "chat_pointer_y",
+        "chat_height",
+        "message_menu_y",
+        "thread_pointer_y",
+        "thread_height",
+        "thread_menu_y",
         "fs_history_open",
     ] {
         assert!(
@@ -7226,6 +7263,10 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
         "pick_explorer_kind ->",
         "select_explorer_block ->",
         "fs_toggle_history ->",
+        "chat_pointer_pressed ->",
+        "chat_resized ->",
+        "thread_pointer_pressed ->",
+        "thread_resized ->",
     ] {
         assert!(
             !root_view.contains(route),
@@ -7235,6 +7276,17 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
 
     // These fields only name values used during one handler invocation.
     let chat_handlers = inlined(include_str!("ui/handlers/chat.ice"));
+    for handler in [
+        "on chat_pointer_pressed",
+        "on chat_resized",
+        "on thread_pointer_pressed",
+        "on thread_resized",
+    ] {
+        assert!(
+            !chat_handlers.contains(handler),
+            "app handler reclaimed component geometry route `{handler}`"
+        );
+    }
     for local in ["pending_message_id", "pending_reply_id"] {
         assert!(!root_state.contains(local), "root state holds `{local}`");
         assert!(

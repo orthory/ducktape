@@ -24,9 +24,6 @@ state
   channel_name_draft = ""
   member_key_draft = ""
   selected_message_seq:i64 = 0
-  chat_pointer_y = 0.0
-  chat_height = 720.0
-  message_menu_y = 0.0
   selected_message_rev:i64 = 0
   message_action:MessageAction = MessageAction.toolbar
   message_edit_draft = ""
@@ -41,9 +38,6 @@ state
   thread_selected_rev:i64 = 0
   thread_message_action:MessageAction = MessageAction.toolbar
   thread_edit_draft = ""
-  thread_pointer_y = 0.0
-  thread_height = 720.0
-  thread_menu_y = 0.0
   history_loading = false
   reply_draft = ""
   pending_reply = ""

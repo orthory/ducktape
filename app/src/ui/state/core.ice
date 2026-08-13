@@ -1,8 +1,6 @@
 state
   app_palette:palette[AppTheme] = AppTheme.app
   appearance = ""
-  app_background = "#fdfdfb"
-  app_text = "#2c2b27"
   wall_now:i64 = current_wall_seconds()
   rpc = ""
   connected_rpc = ""

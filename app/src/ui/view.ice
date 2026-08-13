@@ -209,7 +209,6 @@ view
               send_flash_ids
               send_flash_value=animation.interpolate(send_flash, 0.0, 1.0)
               message_action
-              message_menu_y
               failed_message_draft
               channel_settings_open
               active_thread_seq
@@ -218,7 +217,6 @@ view
               thread_selected_seq
               thread_selected_rev
               thread_message_action
-              thread_menu_y
               thread_send_flash_ids
               thread_has_more
               thread_next_reply_offset
@@ -237,7 +235,6 @@ view
               leave_huddle_here -> leave_huddle_here
               huddle_go_channel -> huddle_go_channel
               join_huddle_submit -> join_huddle_submit
-              chat_pointer_pressed -> chat_pointer_pressed _ _
               load_more_history -> load_more_history
               chat_scrolled -> chat_scrolled _ _ _ _
               open_message_link -> open_message_link _
@@ -261,7 +258,6 @@ view
               unarchive_channel_submit -> unarchive_channel_submit
               add_channel_member_submit -> add_channel_member_submit
               remove_channel_member_submit -> remove_channel_member_submit _
-              thread_pointer_pressed -> thread_pointer_pressed _ _
               close_thread -> close_thread
               open_thread_message_actions -> open_thread_message_actions _ _ _
               open_thread_message_reactions -> open_thread_message_reactions _ _ _
@@ -275,8 +271,6 @@ view
               dismiss_failed_reply -> dismiss_failed_reply
               reply_composer_event -> reply_composer_event _
               reply_composer_mark -> reply_composer_mark _
-              chat_resized -> chat_resized _ _
-              thread_resized -> thread_resized _ _
 
         shell:
           ShellScreen draft<->shell_chat_draft #shell

@@ -806,28 +806,8 @@ on chat_acked(_result)
   channel_create_open = false
   mutation_phase = MutationPhase.idle
   error = ""
-// PRESSES, NOT MOVES. The pointer y is read exactly once — when an action
-// menu opens, to anchor its float — so it is captured per left press by
-// `press-at`, which reports through a captured press (the ⋯ button's own
-// press-down lands here first, then its click opens the menu one event
-// later). The old `move=` stream republished on every cursor pixel and
-// rebuilt the whole view each time; hovering a busy channel was a rebuild
-// storm.
-on chat_pointer_pressed(_x, y)
-  chat_pointer_y = y
-
-on chat_resized(_width, height)
-  chat_height = height
-
-on thread_pointer_pressed(_x, y)
-  thread_pointer_y = y
-
-on thread_resized(_width, height)
-  thread_height = height
-
 on open_thread_message_actions(seq, body, rev)
   return if seq <= 0
-  thread_menu_y = block_action_menu_y(thread_pointer_y, thread_height)
   thread_selected_seq = seq
   thread_selected_rev = rev
   thread_message_action = MessageAction.more
@@ -848,7 +828,6 @@ on open_thread_message_reactions(seq, body, rev)
   // hands the standing banner back untouched.
   error = reaction_refusal(active_channel_archived, error)
   return if active_channel_archived
-  thread_menu_y = block_action_menu_y(thread_pointer_y, thread_height)
   thread_selected_seq = seq
   thread_selected_rev = rev
   thread_message_action = MessageAction.reactions
@@ -904,7 +883,6 @@ on delete_thread_message_submit
 
 on open_message_actions(seq, body, rev)
   return if seq <= 0
-  message_menu_y = block_action_menu_y(chat_pointer_y, chat_height)
   selected_message_seq = seq
   selected_message_rev = rev
   message_action = MessageAction.more
@@ -922,7 +900,6 @@ on open_message_reactions(seq, body, rev)
   // a failed send is not cleared by the reach for a reaction.
   error = reaction_refusal(active_channel_archived, error)
   return if active_channel_archived
-  message_menu_y = block_action_menu_y(chat_pointer_y, chat_height)
   selected_message_seq = seq
   selected_message_rev = rev
   message_action = MessageAction.reactions

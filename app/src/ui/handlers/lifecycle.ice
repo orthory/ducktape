@@ -12,12 +12,8 @@ on appearance_loaded(mode)
   return if empty(mode)
   appearance = mode
   app_palette = AppTheme.app
-  app_background = "#fdfdfb"
-  app_text = "#2c2b27"
   return if appearance != "dark"
   app_palette = AppTheme.app_dark
-  app_background = "#1b1a16"
-  app_text = "#e8e6df"
 
 // The Settings toggle: pin a reading and persist it — one event per button,
 // so each handler is linear and its persistence run sits last (E141).
@@ -26,15 +22,11 @@ on appearance_loaded(mode)
 on set_appearance_light
   appearance = "light"
   app_palette = AppTheme.app
-  app_background = "#fdfdfb"
-  app_text = "#2c2b27"
   run replace lane=appearance_save save_appearance(appearance) -> appearance_saved _
 
 on set_appearance_dark
   appearance = "dark"
   app_palette = AppTheme.app_dark
-  app_background = "#1b1a16"
-  app_text = "#e8e6df"
   run replace lane=appearance_save save_appearance(appearance) -> appearance_saved _
 
 on appearance_saved(_written)

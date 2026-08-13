@@ -15,11 +15,7 @@
 // this root deliberately carries NO `#root`: that would push every id down one
 // more segment for nothing.
 //
-// Both `sensor`s live here and report through the screen's own events. They
-// were briefly caller-filled slots: a sensor's show/resize route used to accept
-// only bare `_` payloads and could not carry a component event (ui-lang#239).
-
-component ChatScreen(network_name:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, send_flash_ids:str, send_flash_value:f64, message_action:MessageAction, message_menu_y:f64, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, thread_menu_y:f64, thread_send_flash_ids:str, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor)
+component ChatScreen(network_name:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, send_flash_ids:str, send_flash_value:f64, message_action:MessageAction, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, thread_send_flash_ids:str, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor)
   lifetime retained
   emits
     search_chat_submit()
@@ -34,7 +30,6 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
     leave_huddle_here()
     huddle_go_channel()
     join_huddle_submit()
-    chat_pointer_pressed(f64, f64)
     load_more_history()
     chat_scrolled(f64, f64, f64, f64)
     open_message_link(str)
@@ -58,7 +53,6 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
     unarchive_channel_submit()
     add_channel_member_submit()
     remove_channel_member_submit(str)
-    thread_pointer_pressed(f64, f64)
     close_thread()
     open_thread_message_actions(i64, str, i64)
     open_thread_message_reactions(i64, str, i64)
@@ -72,10 +66,23 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
     dismiss_failed_reply()
     reply_composer_event(ComposerEvent)
     reply_composer_mark(str)
-    chat_resized(f64, f64)
-    thread_resized(f64, f64)
   state
     message_action_focus = ""
+    chat_pointer_y = 0.0
+    chat_height = 720.0
+    thread_pointer_y = 0.0
+    thread_height = 720.0
+  // PRESSES, NOT MOVES. Geometry belongs to this screen instance: the pointer
+  // y is read exactly once when an action menu opens, and its computed anchor
+  // stays in the view; only the selected message crosses into app state.
+  on chat_pointer_pressed(_x, y)
+    chat_pointer_y = y
+  on chat_resized(_width, height)
+    chat_height = height
+  on thread_pointer_pressed(_x, y)
+    thread_pointer_y = y
+  on thread_resized(_width, height)
+    thread_height = height
   row w=fill h=fill
     box
       with
@@ -564,9 +571,9 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
               // the operation.
               if connected && !empty(messages)
                 stack w=fill h=fill
-                  sensor show=emit(chat_resized, _, _) resize=emit(chat_resized, _, _)
+                  sensor show=chat_resized resize=chat_resized
                     space w=fill h=fill
-                  mouse press-at=emit(chat_pointer_pressed, _, _)
+                  mouse press-at=chat_pointer_pressed
                     // A CONVERSATION GROWS UP FROM THE COMPOSER. `anchor-y=end`
                     // pins the scroll OFFSET, which does nothing until there is
                     // something to scroll — a channel with four messages in it
@@ -784,7 +791,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                     content
                       space w=fill h=fill
                     layer
-                      float x=0.0 y=message_menu_y
+                      box w=fill h=fill pt=block_action_menu_y(chat_pointer_y, chat_height) align-x=end align-y=start
                         col
                           if message_action == MessageAction.more
                             stack
@@ -1520,9 +1527,9 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
               h=fill
               bg=sidebar
             stack w=fill h=fill
-              sensor show=emit(thread_resized, _, _) resize=emit(thread_resized, _, _)
+              sensor show=thread_resized resize=thread_resized
                 space w=fill h=fill
-              mouse press-at=emit(thread_pointer_pressed, _, _)
+              mouse press-at=thread_pointer_pressed
                 col w=fill h=fill
                   // The header carries the CHANNEL as its caption, not a reply
                   // count — `len(thread_messages)` counts the root too, and the
@@ -1861,7 +1868,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                 content
                   space w=fill h=fill
                 layer
-                  float x=0.0 y=thread_menu_y
+                  box w=fill h=fill pt=block_action_menu_y(thread_pointer_y, thread_height) align-x=end align-y=start
                     col
                       if thread_message_action == MessageAction.more
                         stack
