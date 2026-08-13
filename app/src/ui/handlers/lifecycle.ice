@@ -754,6 +754,8 @@ on live_thread_refresh_failed(cause)
 
 on select_shell_tab(next)
   shell_tab = next
+  let destination_is_not_forge = shell_tab != "forge"
+  forge_code_generation = keep_i64(destination_is_not_forge, forge_code_generation + 1, forge_code_generation)
   // A credential read belongs to the Shell visit that issued it. Bump on
   // EVERY move, including the chat/pages early return below, so a late reply
   // cannot repaint a screen the reader already left.

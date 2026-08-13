@@ -84,6 +84,8 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   unread_marker_seq = 0
   palette_open = false
   shell_tab = "chat"
+  invalidate lane=forge_code
+  forge_code_generation = forge_code_generation + 1
   chat_search_generation = chat_search_generation + 1
   chat_search_phase = "idle"
   // Same abandoned request, same dead button — see `choose_channel`. This route

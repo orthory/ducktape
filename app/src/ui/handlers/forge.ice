@@ -71,7 +71,9 @@ on forge_repo_failed(cause)
 
 on forge_open_item(number)
   return if !connected || empty(forge_repo)
+  invalidate lane=forge_code
   invalidate lane=forge_discussion
+  forge_code_generation = forge_code_generation + 1
   forge_item_number = number
   error = ""
   forge_item_phase = "loading"
@@ -276,6 +278,7 @@ on forge_close_repo
   invalidate lane=forge_discussion
   invalidate lane=forge_code
   forge_generation = forge_generation + 1
+  forge_code_generation = forge_code_generation + 1
   forge_repo = ""
   forge_repo_phase = "idle"
   forge_branches = []
@@ -345,9 +348,10 @@ state
 // repo currently open, and a tree left over from the previous repo can never
 // paint.
 on select_forge_tab(tab)
+  invalidate lane=forge_code
+  forge_code_generation = forge_code_generation + 1
   forge_tab = tab
   return if tab != "code" || !connected || empty(forge_repo)
-  forge_code_generation = forge_code_generation + 1
   forge_tree_path = ""
   forge_tree_rev = ""
   forge_tree_entries = []

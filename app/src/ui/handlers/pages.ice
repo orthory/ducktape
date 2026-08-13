@@ -31,6 +31,8 @@ on open_page_search_hit(page_id, _block_id)
   invalidate lane=block_comments
   palette_open = false
   shell_tab = "pages"
+  invalidate lane=forge_code
+  forge_code_generation = forge_code_generation + 1
   // Same tab-move rule as `select_shell_tab`.
   composer_focus = "none"
   page_search_generation = page_search_generation + 1

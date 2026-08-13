@@ -2460,6 +2460,76 @@ fn closing_a_repo_or_an_item_retires_the_load_that_would_reopen_it() {
 }
 
 #[test]
+fn leaving_forge_code_retires_late_successes_and_failures() {
+    let handlers = [
+        ("chat", inlined(include_str!("ui/handlers/chat.ice"))),
+        ("forge", inlined(include_str!("ui/handlers/forge.ice"))),
+        ("huddle", inlined(include_str!("ui/handlers/huddle.ice"))),
+        (
+            "lifecycle",
+            inlined(include_str!("ui/handlers/lifecycle.ice")),
+        ),
+        ("pages", inlined(include_str!("ui/handlers/pages.ice"))),
+    ];
+    let mut shell_routes = 0usize;
+    for (path, source) in handlers {
+        for block in source.split("\non ").skip(1) {
+            let moves_shell = block
+                .lines()
+                .any(|line| line.trim_start().starts_with("shell_tab = "));
+            if !moves_shell {
+                continue;
+            }
+            shell_routes += 1;
+            assert!(
+                block.contains("forge_code_generation = "),
+                "{path}: every direct shell navigation must retire Forge Code work"
+            );
+        }
+    }
+    assert_eq!(shell_routes, 4, "the four direct shell routes stay covered");
+
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.shell_tab = "forge".into();
+    let _ = app.__update(__DucktapeMessage::ForgeOpenRepo("core".into()));
+
+    let tree_generation = app.forge_code_generation;
+    let _ = app.__update(__DucktapeMessage::SelectForgeTab("pulls".into()));
+    assert!(app.forge_code_generation > tree_generation);
+    let _ = app.__update(__DucktapeMessage::ForgeTreeLoaded(backend::ForgeTreeData {
+        generation: tree_generation,
+        repo: "core".into(),
+        rev: "1111111111111111111111111111111111111111".into(),
+        path: String::new(),
+        born: true,
+        entries: Vec::new(),
+        truncated: false,
+    }));
+    assert!(
+        app.forge_tree_rev.is_empty(),
+        "a late tree success cannot repaint the Pulls tab"
+    );
+
+    let _ = app.__update(__DucktapeMessage::SelectForgeTab("code".into()));
+    let _ = app.__update(__DucktapeMessage::ForgeOpenFile("README.md".into()));
+    let file_generation = app.forge_code_generation;
+    let _ = app.__update(__DucktapeMessage::SelectShellTab("settings".into()));
+    assert!(app.forge_code_generation > file_generation);
+    let _ = app.__update(__DucktapeMessage::ForgeFileFailed(
+        backend::HydrationError {
+            generation: file_generation,
+            message: "late code failure".into(),
+        },
+    ));
+    assert!(
+        app.error.is_empty(),
+        "a late blob failure cannot paint another shell tab's error banner"
+    );
+}
+
+#[test]
 fn forge_scoped_reads_do_not_call_loading_or_failure_empty() {
     let (mut failed_list, _) = Ducktape::__boot();
     failed_list.forge_generation = 3;
