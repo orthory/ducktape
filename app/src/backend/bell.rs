@@ -75,6 +75,7 @@ pub async fn mark_bell_read(
             password,
         )
         .await
+        .map(|_height| ())
     }
     .await
     .map_err(app_error)?;

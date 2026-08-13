@@ -457,7 +457,9 @@ async fn apply_op(
     }
 }
 
-/// One signed op onto the pages module.
+/// One signed op onto the pages module. The receipt height is dropped: every
+/// caller here refreshes off the live stream, which reports application rather
+/// than acceptance.
 async fn write(client: &RpcClient, password: &str, msg: PageMsg) -> Result<(), String> {
     signed_write(
         client,
@@ -466,6 +468,7 @@ async fn write(client: &RpcClient, password: &str, msg: PageMsg) -> Result<(), S
         password.to_string(),
     )
     .await
+    .map(|_height| ())
 }
 
 /// The kind a block currently wears, for the module's per-kind text bound.

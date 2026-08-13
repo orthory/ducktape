@@ -1,12 +1,20 @@
 use super::*;
 use ::chat;
 
+/// Sign and submit one module op, answering the height of the block that
+/// INCLUDED it.
+///
+/// The height is the coordinate a follow-up read waits on: the node answers
+/// acceptance, the derived read models fold behind the block loop, and a
+/// reload in between reads an index that does not have the write yet
+/// (`await_fold`). Most callers ignore it — they refresh on the live stream
+/// instead, which is the same fact arriving by push.
 pub(crate) async fn signed_write(
     rpc: &RpcClient,
     target: &str,
     payload: Vec<u8>,
     password: String,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     if payload.is_empty() || payload.len() > MAX_SIGNED_PAYLOAD_BYTES {
         return Err(format!(
             "{target} transaction exceeds the signed payload limit"
@@ -14,6 +22,59 @@ pub(crate) async fn signed_write(
     }
     let frame = sign_frame(target, &payload, password).await?;
     rpc.submit_frame(frame).await.map_err(Into::into)
+}
+
+/// How many times a post-write reload probes the module's fold before giving
+/// up, and how long it waits between probes.
+///
+/// Bounded on purpose and short: the watermark can legitimately never arrive
+/// (a boundary stamp wipes the tip, a module with no index guest never has
+/// one), so this narrows the stale-read window — it never guarantees closing
+/// it, and the caller's own correction stays the guarantee.
+pub(crate) const FOLD_WAIT_PROBES: u32 = 5;
+const FOLD_WAIT_STEP: Duration = Duration::from_millis(60);
+
+/// Wait, briefly, for `module`'s fold to reach block `height` — the block that
+/// accepted the caller's own write — so the reload that follows reads a view
+/// containing it instead of one that predates it.
+///
+/// `submit_frame` answers ACCEPTANCE; the derived read models fold behind the
+/// block loop. Everything upstream of this reload used to paper over that gap
+/// by hand, and the hand-patch could only fix the one field it knew about.
+///
+/// `probe` is the module's cheapest view request: this reads the reply's fold
+/// watermark and throws the body away, so the smallest arm is the right one.
+///
+/// Answers whether the fold got there. `false` covers three different facts —
+/// the budget ran out, the node refused, or the module reports no tip at all
+/// (no index guest, a fresh database, a boundary stamp wiped it) — and they
+/// all mean the same thing to a caller: do not trust the reload, apply your own
+/// correction. Unknown is never "not yet": waiting on it would spend the whole
+/// budget for nothing.
+pub(crate) async fn await_fold<Q: serde::Serialize>(
+    rpc: &RpcClient,
+    module: &str,
+    probe: &Q,
+    height: u64,
+) -> bool {
+    for probe_number in 0..FOLD_WAIT_PROBES {
+        if probe_number > 0 {
+            tokio::time::sleep(FOLD_WAIT_STEP).await;
+        }
+        let Ok((_reply, folded)) = rpc
+            .view_folded::<Q, serde::de::IgnoredAny>(module, probe)
+            .await
+        else {
+            return false;
+        };
+        let Some(folded) = folded else {
+            return false;
+        };
+        if folded.reached_block(height) {
+            return true;
+        }
+    }
+    false
 }
 
 /// THE session signer: one `ducktape user sign-frame` child, unlocked once,

@@ -4335,3 +4335,150 @@ async fn a_forge_op_does_not_load_the_repo_list_for_a_closed_pane() {
     );
     assert!(data.repos.is_empty());
 }
+
+
+/// A stub node whose `/v1/index/pages/view` replies carry a SCRIPTED fold
+/// watermark: one entry per request, the last one repeating forever. Returns
+/// its origin plus the live request count, which is how the bound on
+/// `await_fold` is observed rather than assumed.
+///
+/// One request per connection, then close — the same discipline as
+/// `node_with_a_broken_page_list`, so no probe can share a socket with the
+/// next and read a stale header off it.
+async fn node_scripting_its_fold_watermark(
+    script: Vec<Option<&'static str>>,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let served = std::sync::Arc::new(AtomicUsize::new(0));
+    let counter = served.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the stub node");
+    let origin = format!("http://{}", listener.local_addr().expect("stub address"));
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 2048];
+            while let Ok(read) = stream.read(&mut chunk).await {
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if String::from_utf8_lossy(&request).contains("\r\n\r\n") {
+                    break;
+                }
+            }
+            let nth = counter.fetch_add(1, Ordering::SeqCst);
+            let folded = script[nth.min(script.len() - 1)];
+            let body = r#"{"threads":[]}"#;
+            let watermark = folded
+                .map(|tip| format!("x-ducktape-folded: {tip}\r\n"))
+                .unwrap_or_default();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n{watermark}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    (origin, served)
+}
+
+/// A WRITE'S OWN RELOAD WAITS FOR THE FOLD THAT CARRIES IT. `submit_frame`
+/// answers ACCEPTANCE; the pages read model is folded behind the block loop,
+/// so the reload `create_page`/`delete_page` fire immediately afterwards used
+/// to read an index that predated the write — the new page absent from the
+/// list it was supposed to land on, the deleted one still sitting in the
+/// sidebar. The view lane now answers how far the fold has consumed the op
+/// feed, and this is the wait that reads it: stale, stale, then caught up.
+#[tokio::test(flavor = "current_thread")]
+async fn a_post_write_reload_waits_for_the_fold_to_reach_its_block() {
+    let (origin, served) =
+        node_scripting_its_fold_watermark(vec![Some("6:0"), Some("6:3"), Some("9:0")]).await;
+    let rpc = rpc_client(&origin).expect("stub client");
+
+    let arrived = await_fold(&rpc, "pages", &empty_pages_probe(), 9).await;
+
+    assert!(arrived, "the third probe's watermark reaches block 9");
+    assert_eq!(
+        served.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "it stops at the probe that answered, not at the budget"
+    );
+}
+
+/// THE WAIT IS BOUNDED, AND ITS FALLBACK IS THE CALLER'S OWN CORRECTION. A
+/// fold that never reaches the block — a wedged guest, a module whose feed
+/// went quiet below the write, a node that is simply slow — must not hold a
+/// page create open. The budget runs out and the answer is "no", which is what
+/// puts `create_page`/`delete_page` back on the hand-correction they have
+/// always carried.
+#[tokio::test(flavor = "current_thread")]
+async fn a_fold_that_never_arrives_gives_up_inside_its_budget() {
+    let (origin, served) = node_scripting_its_fold_watermark(vec![Some("6:0")]).await;
+    let rpc = rpc_client(&origin).expect("stub client");
+
+    let arrived = await_fold(&rpc, "pages", &empty_pages_probe(), 9).await;
+
+    assert!(!arrived, "the fold never reached block 9");
+    assert_eq!(
+        served.load(std::sync::atomic::Ordering::SeqCst),
+        FOLD_WAIT_PROBES as usize,
+        "bounded: it probes its budget and stops, never forever"
+    );
+}
+
+/// ABSENT IS UNKNOWN, NOT "NOT YET". A module with no index guest, a fresh
+/// database, or one a boundary stamp wiped reports no watermark at all —
+/// forever. Reading that as "still folding" would spend the whole budget on
+/// every write against such a module, so it stops on the FIRST reply.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unstamped_reply_stops_the_wait_instead_of_spending_it() {
+    let (origin, served) = node_scripting_its_fold_watermark(vec![None]).await;
+    let rpc = rpc_client(&origin).expect("stub client");
+
+    let arrived = await_fold(&rpc, "pages", &empty_pages_probe(), 9).await;
+
+    assert!(!arrived);
+    assert_eq!(
+        served.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "an unknown watermark is answered once, never waited on"
+    );
+}
+
+/// THE WAIT SITS BETWEEN THE WRITE AND THE RELOAD, AND THE CORRECTION SURVIVES
+/// IT. Both facts are source shapes: a wait placed after the reload would read
+/// the same stale index it was meant to outlast, and a correction deleted on
+/// the strength of the wait would take the fallback with it — the watermark is
+/// bounded and can be absent, so it narrows the window rather than closing it.
+#[test]
+fn the_pages_write_reloads_wait_first_and_keep_their_correction() {
+    const CHAT: &str = include_str!("chat.rs");
+    for (name, correction) in [
+        ("create_page", "data.active_page = page_id"),
+        ("delete_page", "data.pages.retain("),
+    ] {
+        let body = CHAT
+            .split(&format!("pub async fn {name}("))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{name} is declared"))
+            .split("\npub ")
+            .next()
+            .unwrap_or_else(|| panic!("{name} body"));
+        let wait = body
+            .find("await_fold(")
+            .unwrap_or_else(|| panic!("{name} waits for the fold that carries its write"));
+        let reload = body
+            .find("load_pages_data(")
+            .unwrap_or_else(|| panic!("{name} reloads"));
+        assert!(wait < reload, "{name} waits BEFORE it reloads");
+        assert!(
+            body.contains(correction),
+            "{name} keeps its correction — the wait is bounded, not a guarantee"
+        );
+    }
+}
