@@ -134,6 +134,9 @@ const REPLAY_FLUSH_BYTES: usize = 4 * 1024 * 1024;
 /// stuck. not a total budget — a long backlog drains as long as it needs, as
 /// long as it keeps shrinking (see [`drain_fold`]).
 const FOLD_DRAIN_STALL: Duration = Duration::from_secs(60);
+/// ceiling on [`drain_fold`]'s poll backoff. every poll costs a queue count,
+/// so a long drain must not ask a thousand times a second.
+const FOLD_DRAIN_POLL_MAX: Duration = Duration::from_millis(50);
 /// hard cap on one scan page; larger asks are clamped, mirroring the module
 /// query convention (chat's MAX_QUERY_LIMIT) rather than erroring.
 pub const MAX_SCAN_LIMIT: usize = 1024;
@@ -866,6 +869,12 @@ fn drain_fold(db: &Db, module: &str) -> Result<()> {
     // what "still shrinking" is measured against.
     let mut fewest_pending = u64::MAX;
     let mut since_progress = std::time::Instant::now();
+    // ASKING IS NOT FREE: `list_triggers` counts the queue by iterating it, so
+    // a poll costs O(pending). At a flat 1ms that burns a core and contends
+    // with the runner exactly when the backlog is biggest — a whole chain's
+    // op rows landing at a join seam. Start tight so a sim's commit barrier
+    // still returns in a millisecond, then back off.
+    let mut poll = Duration::from_millis(1);
     loop {
         let trigger = db
             .list_triggers()?
@@ -890,7 +899,8 @@ fn drain_fold(db: &Db, module: &str) -> Result<()> {
                 FOLD_DRAIN_STALL.as_secs()
             )));
         }
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        std::thread::sleep(poll);
+        poll = (poll * 2).min(FOLD_DRAIN_POLL_MAX);
     }
 }
 
