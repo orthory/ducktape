@@ -850,6 +850,7 @@ preset ui_rich_paragraph
     // rows carry real rich spans — bold, italic, and bare-url link runs —
     // into the paragraph's `for`.
     messages = mark_author_runs(optimistic_message(optimistic_message(messages, "ship the **fix** at https://duck.example/x", "pending-rich"), "and the _second_ line lands", "pending-second"))
+    messages_revision = messages_revision + 1
 
 // A MESSAGE BODY IS ONE PARAGRAPH (ducktape-ui#639, collected by #1096). The
 // span list — plain runs, bold runs, italic runs, links — feeds ONE rich-text
@@ -896,6 +897,7 @@ test message_body_renders_as_one_rich_paragraph
         call_muted
         huddle_popped=false
         messages
+        messages_revision
         has_older_history
         history_view
         history_loading
@@ -909,11 +911,12 @@ test message_body_renders_as_one_rich_paragraph
         active_thread_seq
         thread_target_seq
         thread_messages
+        thread_messages_revision
         thread_selected_seq
         thread_selected_rev
         thread_message_action
         thread_has_more
-        thread_next_reply_offset
+        thread_next_reply_seq
         thread_loading
         failed_reply_draft
       events
