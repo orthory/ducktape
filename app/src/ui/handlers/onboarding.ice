@@ -253,9 +253,7 @@ on console_opened(id)
   thread_generation = thread_generation + 1
   invalidate lane=live_thread
   thread_loading = false
-  reply_draft = ""
   reply_editor = editor("")
-  pending_reply = ""
   // Both composers above are new empty boxes now, and the click that got here
   // was on the titlebar's network chip or Settings' "Switch network" — not on
   // an editor. `shell_tab` SURVIVES the switch, so without this a stale
@@ -265,7 +263,6 @@ on console_opened(id)
   // here (no focus task, no `shell_tab` write); the pinned list does.
   composer_focus = ComposerFocus.unfocused
   pending_channel = ""
-  pending_message = ""
   chat_search_draft = ""
   chat_search_hits = []
   chat_search_phase = SearchPhase.idle

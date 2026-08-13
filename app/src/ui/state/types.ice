@@ -5,6 +5,11 @@ enum SearchPhase
   searching
   done
 
+enum Appearance
+  system
+  light
+  dark
+
 enum ComposerFocus
   unfocused
   message
@@ -75,6 +80,11 @@ enum ForgeTab
   code
   pulls
   issues
+
+enum ForgeReviewVerdict
+  comment
+  approve
+  request_changes
 
 enum MembersFilter
   all

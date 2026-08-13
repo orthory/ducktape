@@ -15,7 +15,7 @@
 // this root deliberately carries NO `#root`: that would push every id down one
 // more segment for nothing.
 //
-component ChatScreen(network_name:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, send_flash_ids:str, send_flash_value:f64, message_action:MessageAction, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, thread_send_flash_ids:str, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor)
+component ChatScreen(network_name:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor)
   lifetime retained
   emits
     search_chat_submit()
@@ -646,7 +646,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                 active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=8.0
                                 hovered bg=fg/10 text=fg border=fg/14
                                 pressed bg=fg/14 text=fg
-                          // VIRTUALIZED, AND KEYED BY SEQ. Only the rows the
+                          // VIRTUALIZED, AND KEYED BY STABLE VIEW IDENTITY. Only the rows the
                           // viewport can see are laid out, so the timeline no
                           // longer shapes text for scrollback nobody is looking
                           // at — the mount stopped being linear in how far back
@@ -663,9 +663,10 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                           // `anchor-y=end` offset — a fixed distance from the
                           // bottom — lands on entirely different messages. The
                           // reader gets thrown backwards mid-sentence, once per
-                          // page. Keyed by seq, per-row state and per-row
-                          // measurement follow the message instead of the slot,
-                          // and the prepend moves nothing on screen.
+                          // page. Every row gets a numeric client identity which
+                          // same-ID merges carry forward, so per-row state and
+                          // measurement follow the message through both prepend
+                          // and confirmation instead of following a slot.
                           //
                           // 44px is the middle of a real row: a run header (avatar
                           // + name line + body over 12px of card padding, plus
@@ -678,7 +679,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                           // measuring a never-seen row ABOVE the viewport moves
                           // everything below it, and only a bottom-anchored offset
                           // carries the visible rows along with it.
-                          keyed message in messages by=message.seq
+                          keyed message in messages by=message.view_key
                             with
                               w=fill
                               gap=3.0
@@ -719,11 +720,10 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                               // it at native latency.
                               //
                               // A message in flight LOOKS like a message: no
-                              // dashed frame, no restyle — send-state lives in
-                              // MessageContents' right-edge lane (pending dot,
-                              // then the settle ✓ fading out). The flash arm is
-                              // the one live mount that carries the animated
-                              // opacity; every other unselected row stays lazy.
+                              // dashed frame, no restyle — send-state lives on
+                              // the message itself: confirmation removes its
+                              // pending dot. `render_rev` moves with canonical
+                              // content, so an unselected row stays lazy.
                               if message.seq == selected_message_seq
                                 stack #message(message.id) w=fill
                                   MessageCard
@@ -732,23 +732,6 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                       selected=true
                                       menu_open=true
                                       disabled=loading
-                                      flash=0.0
-                                    forward
-                                      add_reaction_at
-                                      remove_reaction_at
-                                      open_thread_for
-                                      open_message_reactions
-                                      open_message_actions
-                                      open_message_link
-                              if message.seq != selected_message_seq && has_flash_id(send_flash_ids, message.id)
-                                stack #message(message.id) w=fill
-                                  MessageCard
-                                    with
-                                      message
-                                      selected=false
-                                      menu_open=false
-                                      disabled=false
-                                      flash=send_flash_value
                                     forward
                                       add_reaction_at
                                       remove_reaction_at
@@ -763,7 +746,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                               // mutation and seeds it from the content hash at
                               // construction, so every repaint a reader can see
                               // moves a key.
-                              if message.seq != selected_message_seq && !has_flash_id(send_flash_ids, message.id)
+                              if message.seq != selected_message_seq
                                 lazy message by message.seq, message.render_rev as cached_message
                                   stack #message(cached_message.id) w=fill
                                     MessageCard
@@ -772,7 +755,6 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                         selected=false
                                         menu_open=false
                                         disabled=false
-                                        flash=0.0
                                       forward
                                         add_reaction_at
                                         remove_reaction_at
@@ -1653,10 +1635,9 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         // THE REST SPLIT THE WAY THE STREAM'S DO, and for the
                         // same reason: a `lazy` subtree may read nothing but
                         // its dependency, so every row whose card reads SCREEN
-                        // state — the search target, the open action menu, the
-                        // settling ✓ — has to be its own live arm, and what is
-                        // left is a pure function of the reply. Selection wins
-                        // over the flash here exactly as it does in the stream.
+                        // state — the search target and the open action menu —
+                        // has to be its own live arm. Confirmation lives on the
+                        // message and bumps `render_rev`, so it stays cached.
                         if thread_message.seq != active_thread_seq && (thread_message.seq == thread_target_seq || thread_message.seq == thread_selected_seq)
                           ThreadMessageCard
                             with
@@ -1664,22 +1645,6 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                               selected=(thread_message.seq == thread_target_seq)
                               menu_open=(thread_message.seq == thread_selected_seq)
                               disabled=loading
-                              flash=0.0
-                            forward
-                              add_reaction_at
-                              remove_reaction_at
-                              open_thread_for
-                              open_thread_message_actions
-                              open_thread_message_reactions
-                              open_message_link
-                        if thread_message.seq != active_thread_seq && thread_message.seq != thread_target_seq && thread_message.seq != thread_selected_seq && has_flash_id(thread_send_flash_ids, thread_message.id)
-                          ThreadMessageCard
-                            with
-                              message=thread_message
-                              selected=false
-                              menu_open=false
-                              disabled=loading
-                              flash=send_flash_value
                             forward
                               add_reaction_at
                               remove_reaction_at
@@ -1696,7 +1661,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         // hovering has no button to disable.
                         // Keyed by (seq, render_rev) exactly as the stream's
                         // quiet arm is — see the note there.
-                        if thread_message.seq != active_thread_seq && thread_message.seq != thread_target_seq && thread_message.seq != thread_selected_seq && !has_flash_id(thread_send_flash_ids, thread_message.id)
+                        if thread_message.seq != active_thread_seq && thread_message.seq != thread_target_seq && thread_message.seq != thread_selected_seq
                           lazy thread_message by thread_message.seq, thread_message.render_rev as cached_reply
                             ThreadMessageCard
                               with
@@ -1704,7 +1669,6 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                 selected=false
                                 menu_open=false
                                 disabled=false
-                                flash=0.0
                               forward
                                 add_reaction_at
                                 remove_reaction_at

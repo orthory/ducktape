@@ -65,7 +65,7 @@ on global_key_pressed(event)
   // every closable flag self-selects against the verdict: the handler
   // grammar has no branches, so the keepers ARE the routing. Sits before
   // the palette block, whose open path must end in its focus task.
-  escape_key = escape_target(event.key, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, forge_repo_menu)
+  let escape_key = escape_target(event.key, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, forge_repo_menu)
   // The composer's formatting chords (Cmd/Ctrl+B/I, +Shift+C, +Shift+9). The
   // editor lets command-letter presses bubble on purpose, so its focus is
   // still on the draft when the mark lands; an empty verdict is a no-op.
@@ -88,7 +88,7 @@ on global_key_pressed(event)
   // The page document's undo/redo (Cmd/Ctrl+Z, +Shift+Z) — the editor
   // bubbles command-letter chords on purpose; an off-pages press names no move.
   let pages_ready = connected && shell_tab == ShellTab.pages && !palette_open
-  palette_key = palette_key_action(event.key, event.physical_key, event.modifiers, palette_open)
+  let palette_key = palette_key_action(event.key, event.physical_key, event.modifiers, palette_open)
   return if empty(escape_key) && palette_key == "none" && empty(composer_mark_shortcut(event.key, event.physical_key, event.modifiers, message_chord || reply_chord)) && empty(page_history_shortcut(event.key, event.physical_key, event.modifiers, pages_ready))
   bell_open = bell_open && escape_key != "bell"
   channel_create_open = channel_create_open && escape_key != "channel_create"
@@ -109,7 +109,6 @@ on global_key_pressed(event)
   return if palette_key == "open" && !connected
   invalidate lane=palette_search
   palette_open = palette_key == "open"
-  palette_key = ""
   palette_draft = ""
   palette_chat_hits = []
   palette_page_hits = []
@@ -141,7 +140,7 @@ on global_key_pressed(event)
 // say which one the reader means. Giving them a keyboard scroll is a focus
 // design, not a bug fix, and guessing a pane would move the wrong one.
 on content_scroll_key(event)
-  content_scroll = content_scroll_step(event.key, event.modifiers, topmost_overlay(palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, forge_repo_menu))
+  let content_scroll = content_scroll_step(event.key, event.modifiers, topmost_overlay(palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, forge_repo_menu))
   return if content_scroll == 0.0
   parallel
     task widget scroll-by #workspace-tabs/content/settings/settings-body 0.0 content_scroll

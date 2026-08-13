@@ -101,7 +101,7 @@ pub async fn search_workspace(rpc: String, text: String) -> ExplorerResults {
         search_forge_items(&rpc, &needle),
         search_files(&rpc, text.trim()),
         search_tasks(&rpc, &needle),
-        load_agent_runs(rpc.clone(), String::new()),
+        load_agent_runs(rpc.clone()),
     );
     // A SOURCE THAT DID NOT ANSWER IS NOT A SOURCE WITH NOTHING TO SAY. Every
     // leg fails silently — `if let Ok(..)` on two, an empty vector on the rest —

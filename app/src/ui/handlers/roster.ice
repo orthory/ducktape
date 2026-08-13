@@ -105,8 +105,8 @@ on dm_peers_failed(cause)
 // Pause or resume an agent. The payload is the DESIRED state and it is named
 // for the backend parameter it becomes: `true` PAUSES, `false` resumes. The
 // roster's Pause control passes `true` and its Resume control passes `false`;
-// a row wired from `agent.status` would have to invert. Only its owner may ask:
-// the view offers this on `is_mine` rows, and the node refuses anyone else.
+// a row wired from `agent.status` would have to invert. The registry is the
+// authority on whether the signing owner may apply the requested state.
 on agent_set_status(agent_id, paused)
   return if !connected
   run every set_agent_status(connected_rpc, password, agent_id, paused) -> agent_status_set _ | mutation_failed _

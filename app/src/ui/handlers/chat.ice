@@ -106,9 +106,7 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   thread_generation = thread_generation + 1
   invalidate lane=live_thread
   thread_loading = false
-  reply_draft = ""
   reply_editor = editor("")
-  pending_reply = ""
   // AND THE MESSAGE COMPOSER COMES OFF ITS OWN PARK — the line that made this
   // comment true. It said "both composers are rebuilt" while only the rail's
   // was, so the stream's draft walked into the hit's room armed to send there.
@@ -213,9 +211,7 @@ on choose_channel(id)
   thread_generation = thread_generation + 1
   invalidate lane=live_thread
   thread_loading = false
-  reply_draft = ""
   reply_editor = editor("")
-  pending_reply = ""
   // A NEW ROOM'S COMPOSER IS THAT ROOM'S COMPOSER. Its own parked words, or an
   // empty box — never the ones she was writing next door.
   message_editor = editor(parked_message_draft(message_drafts, active_channel))
@@ -324,9 +320,7 @@ on choose_dm(peer_key)
   thread_generation = thread_generation + 1
   invalidate lane=live_thread
   thread_loading = false
-  reply_draft = ""
   reply_editor = editor("")
-  pending_reply = ""
   // Same per-room composer as `choose_channel`. A DM is an ordinary channel and
   // its draft parks under `dm_room` like any other.
   message_editor = editor(parked_message_draft(message_drafts, active_channel))
@@ -512,7 +506,7 @@ on chat_composer_event(event)
   return if loading || !connected || empty(active_channel) || !empty(post_refusal) || empty(trim(editor_text(message_editor)))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  pending_message = trim(editor_text(message_editor))
+  let pending_message = trim(editor_text(message_editor))
   let pending_message_id = fresh_operation_id("message")
   message_draft = ""
   message_editor = editor("")
@@ -570,7 +564,7 @@ on chat_updated(next)
   // a peer's post in a third room and the badge it lit, a channel created,
   // renamed or archived — and nothing re-pages the list to heal it.
   channels = upsert_channel_rows(channels, next.channels)
-  messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
+  messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel)
   has_older_history = history_has_older(messages)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
@@ -638,7 +632,7 @@ on chat_hit_loaded(next)
   history_view = true
   // Same fold as `chat_updated`, same loader, same reason.
   channels = upsert_channel_rows(channels, next.channels)
-  messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
+  messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel)
   has_older_history = history_has_older(messages)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
@@ -735,7 +729,7 @@ on channel_created(next)
   // `chat_hit_loaded`.
   history_view = false
   channels = next.channels
-  messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
+  messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel)
   has_older_history = history_has_older(messages)
   unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
@@ -981,9 +975,7 @@ on open_thread_for(seq)
   // left holding, which is the only thread those words can be posted in.
   // `close_thread` stays the one route that discards a reply, because that one
   // is a request to.
-  reply_draft = ""
   reply_editor = editor(parked_reply_draft(reply_drafts, active_channel, active_thread_seq))
-  pending_reply = ""
   // A rail that just opened has an UNTOUCHED reply composer, and the click
   // that opened it was on a message row, not on either editor — so the caret
   // is in NEITHER. Without this the previous thread's "reply" outlives it and
@@ -1102,9 +1094,7 @@ on close_thread
   thread_selected_rev = 0
   thread_message_action = MessageAction.toolbar
   thread_edit_draft = ""
-  reply_draft = ""
   reply_editor = editor("")
-  pending_reply = ""
   // The composer the caret may have been in is gone from the tree.
   composer_focus = ComposerFocus.unfocused
 
@@ -1188,15 +1178,6 @@ on remove_reaction_at(seq, emoji)
   thread_messages = reaction_applied(thread_messages, seq, emoji, false)
   run every remove_reaction(connected_rpc, password, active_channel, seq, emoji) -> reaction_acked _ | reaction_failed _
 
-// The settle-✓'s two-beat teardown. Beat one reads the animation still
-// aimed at visible, keeps its anchor and flips the fade; beat two reads it
-// aimed at hidden and drops the anchor, unmounting the ✓ (the 400ms fade
-// always finishes inside one 1200ms beat).
-on send_flash_tick
-  send_flash_ids = keep_str(animation.value(send_flash), send_flash_ids, "")
-  thread_send_flash_ids = keep_str(animation.value(send_flash), thread_send_flash_ids, "")
-  send_flash = false
-
 // A reaction's ack has nothing to restore: the optimistic fold is already on
 // screen and the settled delta replays over it. Reactions never touch
 // `mutation_phase` (see `add_reaction_submit`), so the shared `chat_acked`
@@ -1247,9 +1228,8 @@ on reply_composer_event(event)
   invalidate lane=live_thread
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  pending_reply = trim(editor_text(reply_editor))
+  let pending_reply = trim(editor_text(reply_editor))
   let pending_reply_id = fresh_operation_id("reply")
-  reply_draft = ""
   reply_editor = editor("")
   thread_messages = optimistic_message(thread_messages, pending_reply, pending_reply_id)
   error = ""
@@ -1264,8 +1244,8 @@ on thread_reply_send_failed(cause)
   return if active_channel != cause.scope_id
   return if !contains_pending_message(thread_messages, cause.operation_id)
   thread_messages = rollback_pending_message(thread_messages, cause.operation_id, cause.committed)
-  reply_draft = restore_draft(trim(editor_text(reply_editor)), cause.body, cause.committed)
-  reply_editor = editor(reply_draft)
+  let restored_reply = restore_draft(trim(editor_text(reply_editor)), cause.body, cause.committed)
+  reply_editor = editor(restored_reply)
   // AND IT DOES NOT MOVE THE REPLY CURSOR. A committed reply grows the loaded
   // run by exactly one row, and `live_updated`'s `thread_offset_after_live`
   // already counts it when that reply's delta lands — which it does for every

@@ -192,17 +192,10 @@ fn a_subtitle_that_is_all_zeros_says_nothing_at_all() {
         initials: "QU".into(),
         capability: "mock-llm-1".into(),
         status: "active".into(),
-        owner_key: String::new(),
         owner_handle: String::new(),
-        created_at: 0,
-        is_mine: false,
         live,
-        tools: 0,
-        secrets: 0,
-        subagent_budget: 0,
-        allowed_actions: Vec::new(),
-        skills: Vec::new(),
-        caps: Vec::new(),
+        skill_count: 0,
+        cap_count: 0,
     };
     let proposal = |open: bool| ProposalRow {
         id: "proposal-1".into(),
@@ -2365,7 +2358,7 @@ fn optimistic_reaction_survives_the_canonical_replay() {
 }
 
 #[test]
-fn reply_settle_flash_mirrors_the_stream_for_the_thread_rail() {
+fn reply_settle_verdict_mirrors_the_stream_for_the_thread_rail() {
     let pending = optimistic_message(Vec::new(), "a reply".into(), "reply-a".into());
     let mut settled_row = pending[0].clone();
     settled_row.pending = false;
@@ -2379,19 +2372,13 @@ fn reply_settle_flash_mirrors_the_stream_for_the_thread_rail() {
         ..ChatDelta::default()
     };
     assert!(reply_settled_by(&pending, &settle, "general"));
-    // The fused verdict answers both lanes off one pass: a `reply` settle
-    // anchors the rail's ✓ and leaves the stream's anchor alone.
-    let verdict = chat_settle(
+    // The fused verdict answers both lanes off one call.
+    assert!(chat_settle(
         Vec::new(),
         pending.clone(),
         settle.clone(),
         "general".into(),
-        with_settled_id(String::new(), true, "kept".into()),
-        String::new(),
-    );
-    assert!(verdict.flashed);
-    assert!(has_flash_id(verdict.reply_ids, "reply-a".into()));
-    assert!(has_flash_id(verdict.send_ids, "kept".into()));
+    ));
     // Each lane fires only on its own delta kind: a `reply` is the rail's
     // edge and never the stream's, and a `posted` is the reverse.
     assert!(!send_settled_by(&pending, &settle, "general"));
@@ -2402,7 +2389,7 @@ fn reply_settle_flash_mirrors_the_stream_for_the_thread_rail() {
 }
 
 #[test]
-fn send_settle_flash_fires_only_for_own_pending_rows() {
+fn send_settle_verdict_fires_only_for_own_pending_rows() {
     let pending = optimistic_message(Vec::new(), "hello".into(), "message-a".into());
     let mut settled_row = pending[0].clone();
     settled_row.pending = false;
@@ -2416,36 +2403,21 @@ fn send_settle_flash_fires_only_for_own_pending_rows() {
     };
 
     assert!(send_settled_by(&pending, &settle, "general"));
-    let verdict = chat_settle(
+    assert!(chat_settle(
         pending.clone(),
         Vec::new(),
         settle.clone(),
         "general".into(),
-        String::new(),
-        with_settled_id(String::new(), true, "kept".into()),
-    );
-    assert!(verdict.flashed);
-    assert!(has_flash_id(verdict.send_ids, "message-a".into()));
-    assert!(has_flash_id(verdict.reply_ids, "kept".into()));
-    // Wrong channel, someone else's post, and a non-post delta all keep the
-    // current anchor instead of flashing.
+    ));
+    // Wrong channel, someone else's post, and a non-post delta are unrelated.
     assert!(!send_settled_by(&pending, &settle, "other"));
     let mut foreign = settle.clone();
     foreign.message.id = "someone-else".into();
     assert!(!send_settled_by(&pending, &foreign, "general"));
     let mut reaction = settle;
     reaction.kind = "reaction".into();
-    let unrelated = chat_settle(
-        pending,
-        Vec::new(),
-        reaction,
-        "general".into(),
-        with_settled_id(String::new(), true, "kept".into()),
-        with_settled_id(String::new(), true, "kept-reply".into()),
-    );
-    assert!(!unrelated.flashed);
-    assert!(has_flash_id(unrelated.send_ids, "kept".into()));
-    assert!(has_flash_id(unrelated.reply_ids, "kept-reply".into()));
+    let unrelated = chat_settle(pending, Vec::new(), reaction, "general".into());
+    assert!(!unrelated);
 }
 
 #[test]
@@ -2465,6 +2437,7 @@ fn concurrent_optimistic_messages_settle_independently() {
 
     let canonical = |id: &str, seq: i64, body: &str| ChatMessage {
         id: id.into(),
+        view_key: seq,
         seq,
         author: "You".into(),
         meta: format!("#{seq}"),
@@ -2489,7 +2462,6 @@ fn concurrent_optimistic_messages_settle_independently() {
         pending,
         "general".into(),
         "general".into(),
-        "message-b".into(),
     );
     assert_eq!(after_second.len(), 2);
     assert!(!after_second[0].pending);
@@ -2504,7 +2476,6 @@ fn concurrent_optimistic_messages_settle_independently() {
         after_second,
         "general".into(),
         "general".into(),
-        "message-a".into(),
     );
     assert_eq!(
         settled
@@ -2520,7 +2491,6 @@ fn concurrent_optimistic_messages_settle_independently() {
         settled,
         "general".into(),
         "general".into(),
-        "message-b".into(),
     );
     assert_eq!(
         after_stale_response
@@ -2535,6 +2505,7 @@ fn concurrent_optimistic_messages_settle_independently() {
 fn message_groups_collapse_consecutive_authors() {
     let msg = |seq: i64, author: &str, deleted: bool| ChatMessage {
         id: format!("m{seq}"),
+        view_key: seq,
         seq,
         author: author.into(),
         meta: format!("#{seq}"),
@@ -2572,6 +2543,7 @@ fn message_groups_collapse_consecutive_authors() {
 fn history_pagination_prepends_older_and_flags_more() {
     let msg = |seq: i64| ChatMessage {
         id: format!("m{seq}"),
+        view_key: seq,
         seq,
         author: "alice".into(),
         meta: format!("#{seq}"),
@@ -3479,6 +3451,7 @@ fn client_local_unread_tracking_seeds_marks_and_places_the_divider() {
     };
     let message = |seq: i64, pending: bool| ChatMessage {
         id: format!("m{seq}"),
+        view_key: if pending { -1 } else { seq },
         seq: if pending { -1 } else { seq },
         author: "u".into(),
         meta: String::new(),

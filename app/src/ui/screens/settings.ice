@@ -4,7 +4,7 @@
 // `screens/roster.ice` for the screen contract: no app state is reachable from
 // here, so every reading is a prop and every act leaves as a named event that
 // `view.ice` routes back to the handler of the same name.
-component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, settings_endpoint:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_answered:bool, account_id:str, bind account_name_draft:str, account_renaming:bool, account_bound:bool, account_members:i64, account_nodes:i64, appearance:str, password:str, status:str, loading:bool, connected:bool, mutation_phase:MutationPhase)
+component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_answered:bool, account_id:str, bind account_name_draft:str, account_renaming:bool, account_bound:bool, account_members:i64, account_nodes:i64, appearance:Appearance, password:str, status:str, loading:bool, connected:bool, mutation_phase:MutationPhase)
   emits
     select_shell_tab(ShellTab)
     reconnect()
@@ -46,16 +46,10 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                   label="Workspace"
                   value=network_name
                   last=false
-              // FALL BACK TO THE ENDPOINT WE TRIED. `settings_endpoint` arrives
-              // with `settings_loaded`, which never fires when the node is not
-              // there — so a failed connection left this row EMPTY while the
-              // banner over it said "Check the endpoint and node". The one
-              // screen that exists to say what this client is attached to
-              // withheld the only fact worth having.
               KeyValueRow
                 with
                   label="Endpoint"
-                  value=keep_str(!empty(settings_endpoint), settings_endpoint, connected_rpc)
+                  value=connected_rpc
                   last=false
               // The artifact's last NETWORK row: the roster reading with an
               // inline accent link onto the Members screen.
@@ -170,33 +164,36 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                     size=12.5
                     wrap=none
                     @text-fg
-                if empty(appearance)
-                  text "Following the system appearance." size=11.0 @text-caption
-                if !empty(appearance)
-                  text "Pinned for this device." size=11.0 @text-caption
+                match appearance
+                  Appearance.system
+                    text "Following the system appearance." size=11.0 @text-caption
+                  Appearance.light
+                    text "Pinned for this device." size=11.0 @text-caption
+                  Appearance.dark
+                    text "Pinned for this device." size=11.0 @text-caption
               space w=fill
-              if appearance == "light"
+              if appearance == Appearance.light
                 button "Light" -> emit(set_appearance_light)
                   with
                     checked=true
                     h=28.0
                     p=6.0
                     @primary_action
-              if appearance != "light"
+              if appearance != Appearance.light
                 button "Light" -> emit(set_appearance_light)
                   with
                     checked=false
                     h=28.0
                     p=6.0
                     @secondary_action
-              if appearance == "dark"
+              if appearance == Appearance.dark
                 button "Dark" -> emit(set_appearance_dark)
                   with
                     checked=true
                     h=28.0
                     p=6.0
                     @primary_action
-              if appearance != "dark"
+              if appearance != Appearance.dark
                 button "Dark" -> emit(set_appearance_dark)
                   with
                     checked=false

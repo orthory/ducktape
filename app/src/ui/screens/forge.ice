@@ -6,7 +6,7 @@
 // one family, and the guards in main.rs name several of its members verbatim.
 // Everything outside that family drops the redundant `forge_` prefix.
 
-component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[ForgeRepo], list_phase:ForgePhase, open_repo:str, repo_menu:bool, repo_phase:ForgePhase, branches:[str], tab:ForgeTab, items:[ForgeItem], tree_repo:str, tree_path:str, tree_born:bool, tree_entries:[TreeEntry], tree_truncated:bool, code_phase:ForgeCodePhase, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, forge_item_number:i64, item_phase:ForgePhase, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:str, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, connected:bool, loading:bool)
+component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[ForgeRepo], list_phase:ForgePhase, open_repo:str, repo_menu:bool, repo_phase:ForgePhase, branches:[str], tab:ForgeTab, items:[ForgeItem], tree_repo:str, tree_path:str, tree_born:bool, tree_entries:[TreeEntry], tree_truncated:bool, code_phase:ForgeCodePhase, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, forge_item_number:i64, item_phase:ForgePhase, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:ForgeReviewVerdict, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, connected:bool, loading:bool)
   emits
     forge_open_repo(str)
     forge_close_repo()
@@ -17,7 +17,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
     forge_open_item(i64)
     forge_close_item()
     forge_merge_submit()
-    forge_review_pick(str)
+    forge_review_pick(ForgeReviewVerdict)
     forge_review_submit()
     forge_comment_open(str, str, str)
     forge_comment_stage()
@@ -182,7 +182,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
         if forge_item_number <= 0
           col w=fill h=fill
             // THE TAB BAR THE TRACKER NEVER GOT. `forge_tab` has sat in
-            // state.ice and `filter_forge_items`/`forge_open_count` in
+            // state/forge.ice and `filter_forge_items`/`forge_open_count` in
             // backend.ice since wave 1 with no call site at all, so the
             // screen piled merged PRs and closed issues into one flat
             // list. The counts are OPEN work — a PR counts until it
@@ -650,36 +650,36 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                       w=fill
                       gap=6.0
                       align=center
-                    button -> emit(forge_review_pick, "comment")
+                    button -> emit(forge_review_pick, ForgeReviewVerdict.comment)
                       with
                         label="Pick comment verdict"
-                        checked=(review_verdict == "comment")
+                        checked=(review_verdict == ForgeReviewVerdict.comment)
                         h=24.0
                         p=5.0
                         @ghost_action
-                      text verdict_pick_label(review_verdict, "comment", "Comment") size=13.0
+                      text verdict_pick_label(review_verdict, ForgeReviewVerdict.comment, "Comment") size=13.0
                       active bg=surface text=fg border=card_line border-w=1.0 r=7.0
                       hovered bg=elevated text=fg
                       pressed bg=subtle text=fg
-                    button -> emit(forge_review_pick, "approve")
+                    button -> emit(forge_review_pick, ForgeReviewVerdict.approve)
                       with
                         label="Pick approve verdict"
-                        checked=(review_verdict == "approve")
+                        checked=(review_verdict == ForgeReviewVerdict.approve)
                         h=24.0
                         p=5.0
                         @ghost_action
-                      text verdict_pick_label(review_verdict, "approve", "Approve") size=13.0
+                      text verdict_pick_label(review_verdict, ForgeReviewVerdict.approve, "Approve") size=13.0
                       active bg=final_bg text=fg border=final_line border-w=1.0 r=7.0
                       hovered bg=success_bg text=fg
                       pressed bg=success_bg text=fg
-                    button -> emit(forge_review_pick, "request_changes")
+                    button -> emit(forge_review_pick, ForgeReviewVerdict.request_changes)
                       with
                         label="Pick request-changes verdict"
-                        checked=(review_verdict == "request_changes")
+                        checked=(review_verdict == ForgeReviewVerdict.request_changes)
                         h=24.0
                         p=5.0
                         @ghost_action
-                      text verdict_pick_label(review_verdict, "request_changes", "Request changes")
+                      text verdict_pick_label(review_verdict, ForgeReviewVerdict.request_changes, "Request changes")
                         with
                           size=13.0
                       active bg=alert_bg text=fg border=alert_line border-w=1.0 r=7.0

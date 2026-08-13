@@ -39,8 +39,6 @@ state
   thread_message_action:MessageAction = MessageAction.toolbar
   thread_edit_draft = ""
   history_loading = false
-  reply_draft = ""
-  pending_reply = ""
   channel_draft = ""
   channel_create_open = false
   channel_create_members_only = false
@@ -49,15 +47,6 @@ state
   message_editor:editor = ""
   reply_editor:editor = ""
   composer_focus:ComposerFocus = ComposerFocus.unfocused
-  pending_message = ""
-  // Every optimistic send settling inside one fade keeps its own row anchor.
-  send_flash_ids = ""
-  thread_send_flash_ids = ""
-  // Handler scratch: Ice cannot type fields of a routed payload inside `let`.
-  live_settle:ChatSettle = no_chat_settle()
-  send_flash:animation[bool] = false
-    easing ease-in-out
-    duration 400ms
   failed_message_draft = ""
   failed_reply_draft = ""
   chat_search_draft = ""

@@ -8,20 +8,8 @@ use super::*;
 /// markup, so they must read where that markup now lives. `view.ice` keeps
 /// only the mounts, and asserting a widget shape against it now would pass
 /// vacuously — the worst kind of green.
-static SCREENS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    inlined(concat!(
-        include_str!("ui/screens/chat.ice"),
-        include_str!("ui/screens/forge.ice"),
-        include_str!("ui/screens/governance.ice"),
-        include_str!("ui/screens/overlays.ice"),
-        include_str!("ui/screens/pages.ice"),
-        include_str!("ui/screens/roster.ice"),
-        include_str!("ui/screens/node.ice"),
-        include_str!("ui/screens/settings.ice"),
-        include_str!("ui/screens/shell.ice"),
-        include_str!("ui/screens/storage.ice"),
-    ))
-});
+static SCREENS: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| inlined(&ice_sources_in("screens")));
 
 /// Fold `with` blocks back onto their node line, so the source sweeps keep
 /// pinning a node and its props as ONE readable line no matter how
@@ -80,6 +68,20 @@ fn ice_sources() -> Vec<(String, String)> {
     out
 }
 
+fn ice_sources_in(directory: &str) -> String {
+    let suffix = std::path::Path::new("src/ui").join(directory);
+    ice_sources()
+        .into_iter()
+        .filter(|(path, _)| {
+            std::path::Path::new(path)
+                .parent()
+                .is_some_and(|parent| parent.ends_with(&suffix))
+        })
+        .map(|(_, source)| source)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// A SEAT THAT PRINTS A CHECKPOINT MUST OWN THE HEAD IT IS COMPARED AGAINST.
 ///
 /// A checkpoint height is meaningless on its own: it says how far the durable
@@ -132,6 +134,7 @@ fn no_seat_prints_a_checkpoint_beside_the_live_head() {
 fn message(seq: i64, body: &str, deleted: bool) -> backend::ChatMessage {
     backend::ChatMessage {
         id: format!("message-{seq}"),
+        view_key: seq,
         seq,
         author: "user".into(),
         meta: format!("#{seq}"),
@@ -651,10 +654,6 @@ fn assert_no_polling(lifecycle: &str) {
             // no longer flashes and vanishes. Still gated on a visible
             // toast — it costs nothing at rest.
             "every 300ms when !empty(toast) -> toast_tick",
-            // the settle-✓'s dismissal clock: two beats — hold + fade, then
-            // unmount. Gated on the flash anchor, so it exists only for the
-            // seconds after one of OUR sends settles.
-            "every 1200ms when (!empty(send_flash_ids)) || (!empty(thread_send_flash_ids)) -> send_flash_tick",
             // the block editor's autosave clock: the stock editor's edits
             // never pass through a handler, so a dirty buffer is the only
             // signal there is — and the gate IS the dirty test, so the tick
@@ -861,7 +860,6 @@ fn a_move_to_a_pane_that_does_not_draw_the_settings_facts_keeps_the_connect_load
     let _ = app.__update(__DucktapeMessage::SettingsLoaded(
         crate::backend::SettingsFacts {
             generation: in_flight,
-            endpoint: "http://127.0.0.1:7100".into(),
             key_path: "/w/user.key".into(),
             key_state: "encrypted".into(),
             data_dir: "/w".into(),
@@ -953,7 +951,7 @@ fn forge_depth_rides_the_established_seams() {
     // verdict it was written under, and it cannot outlive the diff it
     // anchors to (`keep_staged_comments` drops them when the head moves).
     assert!(backend.contains(
-        "submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:str, body:str, commit_oid:str, comments:[ForgeDraftComment])"
+        "submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:ForgeReviewVerdict, body:str, commit_oid:str, comments:[ForgeDraftComment])"
     ));
     assert!(backend.contains(
         "merge_forge_pr(rpc:str, password:str, repo:str, number:i64, source_branch:str, expected_source_oid:str, prev_target_oid:str)"
@@ -1234,12 +1232,7 @@ fn background_refresh_preserves_editing_state() {
             .any(|name| line.trim_start().starts_with(&format!("{name} =")))
     });
     assert!(!overwrites_editable);
-    for scoped in [
-        "channel_name_draft",
-        "member_key_draft",
-        "message_draft",
-        "reply_draft",
-    ] {
+    for scoped in ["channel_name_draft", "member_key_draft", "message_draft"] {
         assert!(refresh.contains(&format!(
             "{scoped} = retain_for_endpoint({scoped}, active_channel, \
 keep_str(next.chat_loaded, next.active_channel, active_channel))"
@@ -1262,9 +1255,11 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         "active_page_title = keep_str(pages_answer_is_current && !pages_fold_outran_reply, next.active_page_title, active_page_title)"
     ));
     assert!(lifecycle.contains(
-        "pages_answer_is_current = next.pages_loaded && pages_reply_answers_current(next.pages, next.active_page, active_page)"
+        "let pages_answer_is_current = next.pages_loaded && pages_reply_answers_current(next.pages, next.active_page, active_page)"
     ));
-    assert!(lifecycle.contains("pages_fold_outran_reply = next.fold_serial != pages_fold_serial"));
+    assert!(
+        lifecycle.contains("let pages_fold_outran_reply = next.fold_serial != pages_fold_serial")
+    );
     // The fold site is the ONE writer of the serial: a text fold bumps it, and
     // every resync request snapshots it, or the token guards nothing.
     assert!(lifecycle.contains(
@@ -1415,8 +1410,7 @@ fn resyncs_cannot_retarget_drafts_to_fallback_contexts() {
     app.thread_next_reply_offset = 4;
     app.thread_has_more = true;
     app.thread_loading = true;
-    app.reply_draft = "thread reply".into();
-    app.pending_reply = "pending thread reply".into();
+    app.reply_editor = compose("thread reply");
     app.active_page = "deleted-page".into();
 
     let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
@@ -1442,8 +1436,10 @@ fn resyncs_cannot_retarget_drafts_to_fallback_contexts() {
     assert_eq!(app.thread_next_reply_offset, 0);
     assert!(!app.thread_has_more);
     assert!(!app.thread_loading);
-    assert!(app.reply_draft.is_empty());
-    assert!(app.pending_reply.is_empty());
+    assert_eq!(
+        backend::parked_reply_draft(app.reply_drafts.clone(), "deleted-channel".into(), 7,),
+        "thread reply"
+    );
     assert!(app.message_draft.is_empty());
     assert_eq!(app.active_page, "fallback-page");
 }
@@ -1464,7 +1460,6 @@ fn mutation_acks_preserve_open_editors_and_thread_state() {
     app.reply_editor = compose("reply in progress");
     app.message_editor = compose("next message");
     app.mutation_phase = MutationPhase::Channel;
-    app.pending_message = "sent message".into();
 
     // an unrelated mutation's ack carries no snapshot — nothing to stomp
     // (reactions no longer route through ChatAcked at all; a channel op is
@@ -1849,7 +1844,7 @@ fn a_tombstoned_thread_root_renders_deleted_in_place() {
     app.active_thread_seq = 9;
     app.thread_target_seq = 10;
     app.thread_messages = vec![message(9, "thread root", false)];
-    app.reply_draft = "unsent reply".into();
+    app.reply_editor = compose("unsent reply");
 
     // the root's delete arrives as a delta: both lists tombstone the row
     // in place; the open thread stays open showing the tombstone (the
@@ -1871,7 +1866,7 @@ fn a_tombstoned_thread_root_renders_deleted_in_place() {
     assert!(app.thread_messages[0].deleted);
     assert_eq!(app.thread_messages[0].body, "Message deleted");
     assert_eq!(app.active_thread_seq, 9, "the panel stays open");
-    assert_eq!(app.reply_draft, "unsent reply");
+    assert_eq!(reply_composer(&app), "unsent reply");
 }
 
 #[test]
@@ -2889,6 +2884,7 @@ fn optimistic_sends_are_independent_and_never_erase_the_next_draft() {
         editor::composer_submit_event(),
     ));
     let first_id = app.messages[0].id.clone();
+    let first_view_key = app.messages[0].view_key;
     assert_eq!(app.mutation_phase, MutationPhase::Idle);
     assert!(app.message_draft.is_empty());
     assert!(composer(&app).is_empty());
@@ -2900,6 +2896,7 @@ fn optimistic_sends_are_independent_and_never_erase_the_next_draft() {
         editor::composer_submit_event(),
     ));
     let second_id = app.messages[1].id.clone();
+    let second_view_key = app.messages[1].view_key;
     assert_ne!(first_id, second_id);
     assert_eq!(app.messages.len(), 2);
     assert!(app.messages.iter().all(|message| message.pending));
@@ -2913,36 +2910,68 @@ fn optimistic_sends_are_independent_and_never_erase_the_next_draft() {
     assert_eq!(app.messages.len(), 2);
     assert!(app.messages.iter().all(|message| message.pending));
 
-    // …the committed row arrives as a delta and settles ONLY its pending
-    let mut committed = message(1, "first", false);
-    committed.id = first_id.clone();
+    // The SECOND send commits first. Root confirmation must sort by canonical
+    // seq just like the thread rail while keeping that row's virtual identity.
+    let mut second = message(1, "second", false);
+    second.id = second_id.clone();
     let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
-        "general", committed,
+        "general", second,
     )));
     assert_eq!(composer(&app), "third");
     assert_eq!(app.mutation_phase, MutationPhase::Idle);
     assert!(!app.messages[0].pending);
     assert_eq!(app.messages[0].seq, 1);
-    assert_eq!(app.messages[1].id, second_id);
+    assert_eq!(app.messages[0].id, second_id);
+    assert_eq!(app.messages[0].view_key, second_view_key);
+    assert_eq!(app.messages[1].id, first_id);
+    assert_eq!(app.messages[1].view_key, first_view_key);
     assert!(app.messages[1].pending);
-    assert!(backend::has_flash_id(
-        app.send_flash_ids.clone(),
-        first_id.clone()
-    ));
 
-    // A second settle inside the fade window ADDS its confirmation. The old
-    // scalar anchor moved the ✓ from the first row to this one, which is the
-    // visible blip rapid sends exposed.
-    let mut second = message(2, "second", false);
-    second.id = second_id.clone();
+    // Then the first send lands at seq 2. Committed rows stay ordered, and
+    // neither virtual key is replaced.
+    let mut first = message(2, "first", false);
+    first.id = first_id.clone();
     let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
-        "general", second,
+        "general", first,
     )));
     assert!(app.messages.iter().all(|message| !message.pending));
-    assert!(backend::has_flash_id(app.send_flash_ids.clone(), first_id));
-    assert!(backend::has_flash_id(app.send_flash_ids.clone(), second_id));
+    assert_eq!(
+        app.messages
+            .iter()
+            .map(|message| (message.id.as_str(), message.seq, message.view_key))
+            .collect::<Vec<_>>(),
+        [
+            (second_id.as_str(), 1, second_view_key),
+            (first_id.as_str(), 2, first_view_key),
+        ]
+    );
+
+    // A canonical reload is allowed to replace rendered content, but not the
+    // client-only identity of the same IDs.
+    let reloaded = backend::merge_pending_messages(
+        vec![message(1, "second", false), message(2, "first", false)]
+            .into_iter()
+            .zip([second_id.clone(), first_id.clone()])
+            .map(|(mut message, id)| {
+                message.id = id;
+                message
+            })
+            .collect(),
+        app.messages.clone(),
+        "general".into(),
+        "general".into(),
+    );
+    assert_eq!(
+        reloaded
+            .iter()
+            .map(|message| message.view_key)
+            .collect::<Vec<_>>(),
+        [second_view_key, first_view_key]
+    );
 
     let chat = inlined(include_str!("ui/screens/chat.ice"));
+    assert!(chat.contains("keyed message in messages by=message.view_key"));
+    assert!(!chat.contains("keyed message in messages by=message.seq"));
     assert!(chat.contains("stack #message(message.id) w=fill"));
     assert!(!chat.contains("#message(message.seq)"));
 }
@@ -3143,6 +3172,7 @@ fn a_resync_the_window_cannot_reach_replaces_it_rather_than_leaving_a_hole() {
     ];
     // an in-flight send of her own is still on screen, seq -1 and no page
     app.messages.push(backend::ChatMessage {
+        view_key: -1,
         seq: -1,
         pending: true,
         ..message(0, "mine, still sending", false)
@@ -3313,7 +3343,7 @@ fn a_live_post_does_not_splice_itself_into_a_history_window() {
 
     // HER OWN SEND IS THE EXCEPTION. The composer posts from a window too and
     // splices the optimistic row in unconditionally, so a refused settle would
-    // strand it `pending` forever while `send_flash` pops a ✓ over it.
+    // strand it `pending` forever.
     app.message_editor = compose("mine, from the window");
     let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
         editor::composer_submit_event(),
@@ -3326,7 +3356,7 @@ fn a_live_post_does_not_splice_itself_into_a_history_window() {
         "general", settled,
     )));
     assert_eq!(app.messages.len(), 2, "her row settled in place, not twice");
-    assert!(!app.messages[1].pending, "and the ✓ is over a settled row");
+    assert!(!app.messages[1].pending, "and the row becomes canonical");
     assert_eq!(
         cursor(&app),
         None,
@@ -3595,10 +3625,11 @@ fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
     let chat = inlined(include_str!("ui/screens/chat.ice"));
     // Only the rows the viewport can see are laid out, which is what lets the
     // timeline hold a whole channel without paying a text layout per row — and
-    // `by=message.seq` is what makes per-row state and per-row MEASUREMENT
-    // follow the message instead of the slot it happened to occupy.
+    // `by=message.view_key` is what makes per-row state and per-row MEASUREMENT
+    // follow the message through prepends AND optimistic confirmation instead
+    // of following the slot it happened to occupy.
     let above = chat
-        .split_once("keyed message in messages by=message.seq w=fill gap=3.0 virtual-row=44.0")
+        .split_once("keyed message in messages by=message.view_key w=fill gap=3.0 virtual-row=44.0")
         .expect("the message timeline is a KEYED virtual-row column")
         .0;
     // That is only correct under an end-anchored scroll: measuring a row ABOVE
@@ -3617,15 +3648,17 @@ fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
     // level up, and `has_older_history` flips on every page.
     assert!(above.contains("col w=fill gap=3.0 pr=6.0"));
     assert!(above.contains("button \"Load older messages\""));
-    // A key is only an identity if it is unique: `optimistic_message` mints a
-    // fresh descending seq per in-flight send, so two concurrent sends cannot
-    // share one row's widget state and measured height.
-    let mut pending = vec![message(40, "committed", false)];
+    // A key is only an identity if it is unique. The allocator gives every
+    // concurrent pending row its own widget state and measurement.
+    let mut pending = Vec::new();
     for id in ["a", "b", "c"] {
         pending = backend::optimistic_message(pending, id.into(), id.into());
     }
-    let seqs: Vec<i64> = pending.iter().map(|message| message.seq).collect();
-    assert_eq!(seqs, vec![40, -1, -2, -3], "every pending row keys apart");
+    let keys = pending
+        .iter()
+        .map(|message| message.view_key)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(keys.len(), pending.len(), "every pending row keys apart");
 }
 
 /// A LINK IS A DESTINATION, NOT A PERSON — AND IT PRESSES.
@@ -3723,10 +3756,10 @@ fn the_thread_rail_virtualizes_and_caches_its_quiet_replies() {
         .0;
     assert!(above.contains("scroll dir=vertical w=fill h=fill anchor-y=end auto=true"));
     // A `lazy` subtree reads nothing but its dependency, so the quiet arm can
-    // only exist because the rows that read SCREEN state — the search target,
-    // the open action menu, the settling ✓ — were split off into live arms.
-    // Fold any of them back in and the reply that is selected, or flashing,
-    // renders from a cache that cannot see it. The KEYED form is pinned too:
+    // only exist because the rows that read SCREEN state — the search target
+    // and the open action menu — were split off into live arms. Confirmation
+    // is row state and moves `render_rev`, so it belongs inside the lazy arm.
+    // The KEYED form is pinned too:
     // dropping `by (seq, render_rev)` silently reverts every visible reply to
     // a full row clone + hash per frame — the #1058 residue this collects.
     assert!(chat.contains(
@@ -3735,7 +3768,6 @@ fn the_thread_rail_virtualizes_and_caches_its_quiet_replies() {
     for live in [
         "thread_message.seq == thread_target_seq",
         "thread_message.seq == thread_selected_seq",
-        "has_flash_id(thread_send_flash_ids, thread_message.id)",
     ] {
         assert!(chat.contains(live), "the live arm on {live} is gone");
     }
@@ -3960,13 +3992,13 @@ fn thread_messages_mirror_the_main_action_system() {
     // A reply is the SAME message block as a timeline row — the rail mounts
     // the shared contents rather than a second spelling of them, so the
     // message redesign lands in both lanes at once.
-    assert!(card.contains("MessageContents message=message flash=flash"));
-    // The rail's settle ✓ is real now: the card takes the fade as a prop and
-    // `thread_send_flash_ids` anchors it from the screen's flash arm. (`card`
-    // starts right after the component name, so the signature is its head.)
-    assert!(card.starts_with(
-        "(message:ChatMessage, selected:bool, menu_open:bool, disabled:bool, flash:f64)"
-    ));
+    assert!(card.contains("MessageContents message=message"));
+    // Confirmation is the pending dot disappearing, so the card needs no
+    // timer or animation prop. (`card` starts right after the component name,
+    // so the signature is its head.)
+    assert!(
+        card.starts_with("(message:ChatMessage, selected:bool, menu_open:bool, disabled:bool)")
+    );
     // `menu_open` cannot be `selected` here: in the rail `selected` marks the
     // deep-link TARGET reply, not the row whose action card is open.
     let chat_screen_rail = inlined(include_str!("ui/screens/chat.ice"));
@@ -4372,6 +4404,7 @@ fn the_reply_send_refuses_only_on_what_its_button_shows() {
 fn thread_pagination_preserves_multiple_pending_replies() {
     let message = |seq: i64, thread_seq: i64, body: &str| backend::ChatMessage {
         id: format!("message-{seq}"),
+        view_key: seq,
         seq,
         author: "user".into(),
         meta: format!("#{seq}"),
@@ -5224,18 +5257,20 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     let core_state = inlined(include_str!("ui/state/core.ice"));
     assert!(!core_state.contains("app_background"));
     assert!(!core_state.contains("app_text"));
+    assert!(core_state.contains("appearance:Appearance = Appearance.system"));
     let derived = inlined(include_str!("ui/state/derived.ice"));
+    assert!(derived.contains(
+        "app_background = keep_str(appearance == Appearance.dark, \"#1b1a16\", \"#fdfdfb\")"
+    ));
     assert!(
         derived.contains(
-            "app_background = keep_str(appearance == \"dark\", \"#1b1a16\", \"#fdfdfb\")"
+            "app_text = keep_str(appearance == Appearance.dark, \"#e8e6df\", \"#2c2b27\")"
         )
-    );
-    assert!(
-        derived.contains("app_text = keep_str(appearance == \"dark\", \"#e8e6df\", \"#2c2b27\")")
     );
     let lifecycle = inlined(include_str!("ui/handlers/lifecycle.ice"));
     assert!(!lifecycle.contains("app_background ="));
     assert!(!lifecycle.contains("app_text ="));
+    assert!(!lifecycle.contains("appearance = \""));
     assert!(app.contains("titlebar-transparent true"));
     assert!(app.contains("fullsize-content-view true"));
     assert!(app.contains("font \"../../../crates/design/assets/fonts/Geist[wght].ttf\""));
@@ -7271,22 +7306,7 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
     assert!(local_state(files).contains(&"history_open = false"));
     assert!(files.contains("on fs_toggle_history"));
 
-    let root_state = inlined(concat!(
-        include_str!("ui/state/types.ice"),
-        include_str!("ui/state/core.ice"),
-        include_str!("ui/state/chat.ice"),
-        include_str!("ui/state/shell.ice"),
-        include_str!("ui/state/explorer.ice"),
-        include_str!("ui/state/roster.ice"),
-        include_str!("ui/state/forge.ice"),
-        include_str!("ui/state/node.ice"),
-        include_str!("ui/state/files.ice"),
-        include_str!("ui/state/overlays.ice"),
-        include_str!("ui/state/pages.ice"),
-        include_str!("ui/state/onboarding.ice"),
-        include_str!("ui/state/huddle.ice"),
-        include_str!("ui/state/derived.ice"),
-    ));
+    let root_state = inlined(&ice_sources_in("state"));
     let root_view = inlined(include_str!("ui/view.ice"));
     for field in [
         "members_filter",
@@ -7306,6 +7326,17 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
         "thread_height",
         "thread_menu_y",
         "fs_history_open",
+        "pending_message",
+        "pending_reply",
+        "live_settle",
+        "page_landing",
+        "page_install",
+        "pages_answer_is_current",
+        "pages_fold_outran_reply",
+        "escape_key",
+        "content_scroll",
+        "palette_key",
+        "settings_endpoint",
     ] {
         assert!(
             !root_state.contains(field),
@@ -7352,6 +7383,12 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
             "`{local}` is minted as a handler local"
         );
     }
+    assert!(
+        !inlined(include_str!("ui/state/chat.ice"))
+            .lines()
+            .any(|line| line.trim_start().starts_with("reply_draft =")),
+        "root state reclaimed `reply_draft`"
+    );
     let page_handlers = inlined(include_str!("ui/handlers/pages.ice"));
     assert!(!root_state.contains("closing_doc_tab"));
     assert!(page_handlers.contains("on close_doc_tab(id)"));
@@ -7879,7 +7916,6 @@ fn neither_composer_sends_into_a_channel_that_refuses_the_post() {
             app.messages.is_empty(),
             "the main composer must refuse a {reason} channel at apply time"
         );
-        assert!(app.pending_message.is_empty());
         // The words are still hers — a refusal is not a discard.
         assert_eq!(composer(&app), "into the void");
 
@@ -7892,7 +7928,6 @@ fn neither_composer_sends_into_a_channel_that_refuses_the_post() {
             app.thread_messages.is_empty(),
             "the reply composer must refuse a {reason} channel at apply time"
         );
-        assert!(app.pending_reply.is_empty());
         assert_eq!(reply_composer(&app), "into the void");
     }
 

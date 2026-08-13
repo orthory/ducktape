@@ -7,7 +7,7 @@ extern crate::backend
   ChannelRead(channel:str, seq:i64)
   ChatSpan(text:str, bold:bool, italic:bool, highlight:bool, link:str)
   ChatBlock(kind:str, text:str, lang:str, rich:bool, spans:[ChatSpan])
-  ChatMessage(id:str, seq:i64, author:str, meta:str, body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_kind:str, height:i64, time:i64, reactions:[ChatReaction], render_rev:i64)
+  ChatMessage(id:str, view_key:i64, seq:i64, author:str, meta:str, body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_kind:str, height:i64, time:i64, reactions:[ChatReaction], render_rev:i64)
   HuddleParticipant(key:str, label:str, initials:str, is_agent:bool, is_you:bool, joined_at:i64, node:str)
   ChannelWindow(channel_id:str, messages:[ChatMessage], members:[ChatMember])
   ChannelDraft(channel_id:str, text:str)
@@ -97,18 +97,14 @@ extern crate::backend
   sync fresh_operation_id(prefix:str) -> str
   pure optimistic_message(messages:[ChatMessage], body:str, message_id:str) -> [ChatMessage]
   pure mark_author_runs(messages:[ChatMessage]) -> [ChatMessage]
-  pure merge_pending_messages(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str, settled_id:str) -> [ChatMessage]
+  pure merge_pending_messages(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str) -> [ChatMessage]
   pure resynced_messages(loaded:bool, next:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str, history_view:bool) -> [ChatMessage]
   pure rollback_pending_message(messages:[ChatMessage], pending_id:str, committed:bool) -> [ChatMessage]
   pure contains_pending_message(messages:[ChatMessage], pending_id:str) -> bool
   pure reaction_applied(messages:[ChatMessage], seq:i64, emoji:str, added:bool) -> [ChatMessage]
-  // THE SETTLE ✓, IN ONE CALL. The four scans this replaced each took their
-  // list by value, so one incoming message deep-cloned the timeline twice and
-  // the open rail twice before a single row was folded.
-  ChatSettle(flashed:bool, send_ids:str, reply_ids:str)
-  pure no_chat_settle() -> ChatSettle
-  pure chat_settle(messages:[ChatMessage], thread:[ChatMessage], delta:ChatDelta, active_channel:str, send_ids:str, reply_ids:str) -> ChatSettle
-  pure has_flash_id(ids:str, id:str) -> bool
+  // THE SETTLE, IN ONE CALL. The two scans this replaced each took both lists
+  // by value. The verdict lets a history window accept its own canonical row.
+  pure chat_settle(messages:[ChatMessage], thread:[ChatMessage], delta:ChatDelta, active_channel:str) -> bool
   pure append_thread_page(messages:[ChatMessage], next:[ChatMessage]) -> [ChatMessage]
   pure history_has_older(messages:[ChatMessage]) -> bool
   pure oldest_message_seq(messages:[ChatMessage]) -> i64
@@ -231,7 +227,7 @@ extern crate::backend
   AccountData(generation:i64, bound:bool, account_id:str, display_name:str, bio:str, members:i64, nodes:i64)
   load_account(rpc:str, generation:i64) -> AccountData ! HydrationError
   set_account_name(rpc:str, password:str, display_name:str) -> bool ! AppError
-  SettingsFacts(generation:i64, endpoint:str, key_path:str, key_state:str, data_dir:str, open_tabs:i64, user_key:str)
+  SettingsFacts(generation:i64, key_path:str, key_state:str, data_dir:str, open_tabs:i64, user_key:str)
   load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
   clear_doc_tabs(rpc:str) -> bool
   forget_workspace(rpc:str) -> bool ! AppError
@@ -262,7 +258,7 @@ extern crate::backend
   pure keep_comment_text(loaded:bool, next_oid:str, current_oid:str, value:str) -> str
   pure staged_comment_drop_note(loaded:bool, next_oid:str, current_oid:str, staged:[ForgeDraftComment], error:str) -> str
   pure forge_comment_target(path:str, line:str, side:str) -> str
-  submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:str, body:str, commit_oid:str, comments:[ForgeDraftComment]) -> bool ! AppError
+  submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:ForgeReviewVerdict, body:str, commit_oid:str, comments:[ForgeDraftComment]) -> bool ! AppError
   merge_forge_pr(rpc:str, password:str, repo:str, number:i64, source_branch:str, expected_source_oid:str, prev_target_oid:str) -> ForgeMergeOutcome ! AppError
   forge_live_refresh(rpc:str, open_repo:str, open_item:i64, kind:str, module:str, scope:ForgeRefresh, forge_open:bool, generation:i64) -> ForgeLiveData ! HydrationError
   pure forge_live_hit(kind:str, module:str) -> bool
@@ -276,10 +272,8 @@ extern crate::backend
   pure forge_open_count(items:[ForgeItem], kind:str) -> i64
   pure forge_merge_note(merge_oid:str, branches:str) -> str
   pure verdict_label(verdict:str) -> str
-  pure verdict_pick_label(current:str, key:str, label:str) -> str
-  AgentSkill(name:str, always:bool)
-  AgentCap(label:str, arg:str)
-  AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_key:str, owner_handle:str, created_at:i64, is_mine:bool, live:bool, tools:i64, secrets:i64, subagent_budget:i64, allowed_actions:[str], skills:[AgentSkill], caps:[AgentCap])
+  pure verdict_pick_label(current:ForgeReviewVerdict, key:ForgeReviewVerdict, label:str) -> str
+  AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_handle:str, live:bool, skill_count:i64, cap_count:i64)
   AgentsData(generation:i64, agents:[AgentRow])
   load_agents(rpc:str, generation:i64) -> AgentsData ! HydrationError
   pure any_agent_active(rows:[AgentRow]) -> bool
@@ -311,8 +305,8 @@ extern crate::backend
   pure doc_tab_rows(tabs:[str], pages:[PageItem], active:str) -> [DocTab]
   pure next_doc_tab(tabs:[str], closed:str, active:str) -> str
   load_doc_tabs(rpc:str) -> [str]
-  load_appearance() -> str
-  save_appearance(mode:str) -> bool
+  load_appearance() -> Appearance
+  save_appearance(mode:Appearance) -> bool
   save_doc_tabs(rpc:str, tabs:[str]) -> bool
   pure retain_for_endpoint(value:str, current:str, next:str) -> str
   pure mutation_failure_phase(committed:bool) -> MutationPhase
@@ -348,7 +342,7 @@ extern crate::backend
   pure cache_channel_window(cache:[ChannelWindow], channel_id:str, messages:[ChatMessage], members:[ChatMember], history_view:bool) -> [ChannelWindow]
   // ONE CALL FOR BOTH ANSWERS — the ABI charges by the argument, and asking
   // for the rows and the roll separately walked (and deep-cloned) the whole
-  // cache twice per click. Same reason `chat_settle` returns three at once.
+  // cache twice per click. Same reason `chat_settle` checks both lanes once.
   pure cached_window(cache:[ChannelWindow], channel_id:str) -> ChannelWindow
   // The composer's own park. NOT a field on `ChannelWindow`: that cache refuses
   // empty and history windows and evicts past three rooms, and each of those

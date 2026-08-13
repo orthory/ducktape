@@ -76,7 +76,7 @@ on forge_open_item(number)
   forge_item_number = number
   error = ""
   forge_item_phase = ForgePhase.loading
-  forge_review_verdict = "comment"
+  forge_review_verdict = ForgeReviewVerdict.comment
   forge_review_draft = ""
   // A staged comment anchors to THIS item's diff. Carrying one across items
   // would post it against a patch it was never written about.
@@ -177,7 +177,7 @@ on forge_review_submitted(started_rpc, started_repo, started_number, _result)
   forge_review_busy = false
   return if started_rpc != connected_rpc || started_repo != forge_repo || started_number != forge_item_number
   forge_review_draft = ""
-  forge_review_verdict = "comment"
+  forge_review_verdict = ForgeReviewVerdict.comment
   forge_comment_staged = []
   forge_comment_path = ""
   forge_comment_line = ""

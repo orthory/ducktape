@@ -561,7 +561,6 @@ test settings_keyboard_scroll_contract
             account_name
             network_name
             connected_rpc
-            settings_endpoint
             settings_key_state
             settings_key_path
             settings_open_tabs
@@ -772,8 +771,6 @@ test message_stream_reset_contract
         unread_marker_seq
         selected_message_seq
         selected_message_rev
-        send_flash_ids
-        send_flash_value=0.0
         message_action
         failed_message_draft
         channel_settings_open
@@ -783,7 +780,6 @@ test message_stream_reset_contract
         thread_selected_seq
         thread_selected_rev
         thread_message_action
-        thread_send_flash_ids
         thread_has_more
         thread_next_reply_offset
         thread_loading

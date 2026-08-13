@@ -416,8 +416,8 @@ on pages_updated(next)
   // text lands when the page MOVED or a clean buffer actually differs; a dirty
   // buffer on the SAME page is the user mid-typing through a reload, and a
   // reload must never eat keystrokes.
-  page_landing = page_document_text(next.active_page_title, next.blocks)
-  page_install = install_decision(page_editor, buffer_page, next.active_page, page_saved_text, page_landing)
+  let page_landing = page_document_text(next.active_page_title, next.blocks)
+  let page_install = install_decision(page_editor, buffer_page, next.active_page, page_saved_text, page_landing)
   blocks = merge_pending_blocks(next.blocks, blocks, buffer_page, next.active_page, "")
   active_page = next.active_page
   active_page_title = next.active_page_title
@@ -446,8 +446,8 @@ on pages_mutated(next)
   // that stays on this page must not eat mid-flight keystrokes. Computed
   // BEFORE the assignments so both reads see the pre-move state (the pair
   // must move on one shared decision).
-  page_landing = page_document_text(next.active_page_title, next.blocks)
-  page_install = install_decision(page_editor, buffer_page, next.active_page, page_saved_text, page_landing)
+  let page_landing = page_document_text(next.active_page_title, next.blocks)
+  let page_install = install_decision(page_editor, buffer_page, next.active_page, page_saved_text, page_landing)
   blocks = merge_pending_blocks(next.blocks, blocks, buffer_page, next.active_page, "")
   active_page = next.active_page
   active_page_title = next.active_page_title

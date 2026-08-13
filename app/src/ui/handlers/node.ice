@@ -77,7 +77,6 @@ on select_node_tab(tab)
 
 on settings_loaded(next)
   return if next.generation != settings_generation
-  settings_endpoint = next.endpoint
   node_data_dir = next.data_dir
   settings_key_path = next.key_path
   settings_key_state = next.key_state

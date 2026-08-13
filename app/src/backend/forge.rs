@@ -243,18 +243,17 @@ pub async fn submit_forge_review(
     password: String,
     repo: String,
     number: i64,
-    verdict: String,
+    verdict: crate::ForgeReviewVerdict,
     body: String,
     commit_oid: String,
     comments: Vec<ForgeDraftComment>,
 ) -> Result<bool, AppError> {
     async {
         let number = u64::try_from(number).map_err(|_| "invalid item number".to_string())?;
-        let verdict = match verdict.as_str() {
-            "approve" => forge::ReviewVerdict::Approve,
-            "request_changes" => forge::ReviewVerdict::RequestChanges,
-            "comment" => forge::ReviewVerdict::Comment,
-            other => return Err(format!("unknown review verdict {other:?}")),
+        let verdict = match verdict {
+            crate::ForgeReviewVerdict::Comment => forge::ReviewVerdict::Comment,
+            crate::ForgeReviewVerdict::Approve => forge::ReviewVerdict::Approve,
+            crate::ForgeReviewVerdict::RequestChanges => forge::ReviewVerdict::RequestChanges,
         };
         let body = bounded_exact_text(body, "review body", forge::MAX_BODY_BYTES)?;
         let comments = review_comments(comments)?;
@@ -1287,7 +1286,11 @@ pub fn verdict_label(verdict: String) -> String {
 }
 
 /// A verdict picker label, dotted when it is the current pick.
-pub fn verdict_pick_label(current: String, key: String, label: String) -> String {
+pub fn verdict_pick_label(
+    current: crate::ForgeReviewVerdict,
+    key: crate::ForgeReviewVerdict,
+    label: String,
+) -> String {
     match current == key {
         true => format!("● {label}"),
         false => label,

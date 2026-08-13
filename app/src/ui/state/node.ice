@@ -1,5 +1,4 @@
 state
-  settings_endpoint = ""
   node_key = ""
   node_data_dir = ""
   settings_key_path = ""

@@ -1,6 +1,6 @@
 state
   app_palette:palette[AppTheme] = AppTheme.app
-  appearance = ""
+  appearance:Appearance = Appearance.system
   wall_now:i64 = current_wall_seconds()
   rpc = ""
   connected_rpc = ""

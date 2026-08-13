@@ -26,7 +26,7 @@ state
   forge_item_reviews:[ForgeReview] = []
   forge_item_approvals:i64 = 0
   forge_item_change_requests:i64 = 0
-  forge_review_verdict = "comment"
+  forge_review_verdict:ForgeReviewVerdict = ForgeReviewVerdict.comment
   forge_review_draft = ""
   forge_review_busy:bool = false
   forge_comment_path = ""

@@ -11,8 +11,8 @@
 // THE FINALITY STAMP. `✓ finalized · h N` is the only wording that may claim
 // proof — no ✓ without a height behind it. An IN-FLIGHT write is not a phase
 // on this chip anymore: the chat timeline shows it as a quiet right-edge dot
-// (MessageContents) and settles into a transient ✓, so an unsettled row reads
-// as a normal message, not a restyled one.
+// (MessageContents), so an unsettled row reads as a normal message, not a
+// restyled one.
 component FinalityChip(height:i64)
   col #root
     box

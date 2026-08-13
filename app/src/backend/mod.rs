@@ -89,68 +89,18 @@ pub struct ChannelRead {
     pub seq: i64,
 }
 
-/// THE SETTLE ✓, ANSWERED ONCE PER DELTA. `send_settled_by`,
-/// `settled_send_id`, `reply_settled_by` and `settled_reply_id` were four Ice
-/// externs, and the extern ABI hands every list over BY VALUE — so one incoming
-/// message deep-cloned the timeline twice and the open rail twice (plus the
-/// delta four times) before a single row was folded, on the UI thread, in a
-/// handler whose own comment already calls that cost out for the `tip` beat.
-/// One extern, one clone of each list, three answers.
-#[derive(Clone, Debug, Default, Hash, PartialEq)]
-pub struct ChatSettle {
-    /// Whether this delta settles one of OUR optimistic rows, in either lane.
-    pub flashed: bool,
-    /// Timeline rows whose ✓ is still inside the shared fade window.
-    pub send_ids: String,
-    /// Their thread-rail twins.
-    pub reply_ids: String,
-}
-
-/// The blank verdict — the scratch field's own default.
-pub fn no_chat_settle() -> ChatSettle {
-    ChatSettle::default()
-}
-
-fn with_settled_id(mut ids: String, settled: bool, id: String) -> String {
-    // A scalar bag keeps the view's by-value extern ABI from cloning a list
-    // for every visible row. These are our own `fresh_id` values, so newline
-    // is an exact, collision-free separator.
-    // ponytail: linear scan over human-scale IDs during the short fade; use a
-    // borrowed collection only when the Ice extern ABI can pass one.
-    let missing = !ids.lines().any(|current| current == id.as_str());
-    let new_settle = settled && missing;
-    if new_settle {
-        if !ids.is_empty() {
-            ids.push('\n');
-        }
-        ids.push_str(&id);
-    }
-    ids
-}
-
-/// Read BEFORE the delta is folded in — the match is the pending row the
-/// canonical row is about to replace.
+/// Whether a delta settles one of this window's optimistic rows. The main and
+/// thread checks share one by-value extern call so neither list is cloned
+/// twice before the canonical fold.
 pub fn chat_settle(
     messages: Vec<ChatMessage>,
     thread: Vec<ChatMessage>,
     delta: ChatDelta,
     active_channel: String,
-    mut send_ids: String,
-    mut reply_ids: String,
-) -> ChatSettle {
+) -> bool {
     let sent = send_settled_by(&messages, &delta, &active_channel);
     let replied = reply_settled_by(&thread, &delta, &active_channel);
-    send_ids = with_settled_id(send_ids, sent, delta.message.id.clone());
-    reply_ids = with_settled_id(reply_ids, replied, delta.message.id);
-    ChatSettle {
-        flashed: sent || replied,
-        send_ids,
-        reply_ids,
-    }
-}
-
-pub fn has_flash_id(ids: String, id: String) -> bool {
-    ids.lines().any(|current| current == id.as_str())
+    sent || replied
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]

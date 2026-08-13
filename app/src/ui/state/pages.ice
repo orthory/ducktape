@@ -31,9 +31,6 @@ state
   page_editor:editor = ""
   page_saved_text = ""
   buffer_page = ""
-  // Handler scratch required because routed payload fields do not type in let.
-  page_landing = ""
-  page_install = false
   commented_block_hits:[str] = []
   caret_comment_target = ""
   active_thread_target = ""
@@ -43,10 +40,8 @@ state
   block_autosave_status:AutosaveStatus = AutosaveStatus.idle
   orphaned_comment_drafts:[str] = []
   page_delete_armed = false
-  pages_answer_is_current = false
   // Domain revision for text folds, independent of structural hydration.
   pages_fold_serial:i64 = 0
-  pages_fold_outran_reply = false
   page_search_draft = ""
   page_search_hits:[PageSearchHit] = []
   page_searching = false

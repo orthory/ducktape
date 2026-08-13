@@ -9,10 +9,9 @@ on mount
 // dark block reverses it — the handler grammar has no branches, so the
 // terminal-case return IS the branch.
 on appearance_loaded(mode)
-  return if empty(mode)
   appearance = mode
   app_palette = AppTheme.app
-  return if appearance != "dark"
+  return if appearance != Appearance.dark
   app_palette = AppTheme.app_dark
 
 // The Settings toggle: pin a reading and persist it — one event per button,
@@ -20,12 +19,12 @@ on appearance_loaded(mode)
 // `save_appearance` is fire-and-forget: a failed write costs the NEXT boot's
 // default, nothing this session shows.
 on set_appearance_light
-  appearance = "light"
+  appearance = Appearance.light
   app_palette = AppTheme.app
   run replace lane=appearance_save save_appearance(appearance) -> appearance_saved _
 
 on set_appearance_dark
-  appearance = "dark"
+  appearance = Appearance.dark
   app_palette = AppTheme.app_dark
   run replace lane=appearance_save save_appearance(appearance) -> appearance_saved _
 
@@ -110,20 +109,17 @@ on reconnect
   thread_generation = thread_generation + 1
   invalidate lane=live_thread
   thread_loading = false
-  reply_draft = ""
   // THE RAIL CLOSES AND ITS WORDS DO NOT GO WITH IT. This blank used to be the
   // one composer a reconnect still ate, two dozen lines below a handler that
   // goes out of its way to carry the stream's — the park above holds it under
   // `channel#seq`, and the next `open_thread_for` on that thread hands it back.
   reply_editor = editor("")
-  pending_reply = ""
   // Both composers above are new empty boxes and the rail is gone. `connected`
   // goes false here, which only MUTES the chord — the stale claim would ride
   // straight through the reconnect and mark a rebuilt draft on the first
   // Cmd+B after it lands.
   composer_focus = ComposerFocus.unfocused
   pending_channel = ""
-  pending_message = ""
   chat_search_hits = []
   chat_search_phase = SearchPhase.idle
   pages = []
@@ -181,7 +177,7 @@ on workspace_connected(next)
   // whatever window a search hit had put on screen is gone — see
   // `chat_hit_loaded`.
   history_view = false
-  messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel, "")
+  messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel)
   has_older_history = history_has_older(messages)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   active_channel = next.active_channel
@@ -282,18 +278,13 @@ on live_updated(next)
   block_height = keep_i64(next.height >= 0, next.height, block_height)
   return if next.kind == "tip"
   channels = apply_chat_channels(channels, next.chat)
-  // Settle-✓ choreography, read against the PRE-fold rows: the settle delta
-  // pops the tick (true), any later live event — the next block at the
-  // latest — starts its fade (false). Same-value writes are no-ops.
+  // Read against the PRE-fold rows: the verdict lets a history window accept
+  // the canonical row that replaces its own optimistic placeholder.
   //
-  // ONE CALL FOR THREE ANSWERS, because the ABI charges by the argument: the
-  // four scans this replaced took `messages` and `thread_messages` by value
-  // twice each, so a busy channel deep-cloned the timeline and the open rail
-  // twice per incoming message before a single row was folded.
-  live_settle = chat_settle(messages, thread_messages, next.chat, active_channel, send_flash_ids, thread_send_flash_ids)
-  send_flash = live_settle.flashed
-  send_flash_ids = live_settle.send_ids
-  thread_send_flash_ids = live_settle.reply_ids
+  // ONE CALL FOR ONE ANSWER, because the ABI charges by the argument: separate
+  // main/thread checks would each take both lists by value before either row
+  // was folded.
+  let live_settled = chat_settle(messages, thread_messages, next.chat, active_channel)
   // A HISTORY WINDOW IS A SNAPSHOT, NOT A LIVE TAIL. The rows in hand are a
   // window around one old message, so a new post's seq is past every one of
   // them and `insert_committed_root` puts it at the END of the window — a
@@ -310,9 +301,8 @@ on live_updated(next)
   // HER OWN SETTLE IS THE ONE DELTA THE WINDOW STILL TAKES. The composer posts
   // from a history window too, and its optimistic row is spliced in there
   // regardless (`chat_composer_event`) — so refusing that row's settle strands
-  // it `pending: true` forever, under a ✓ that `send_flash` pops on the very
-  // delta the fold just dropped. `send_flash` IS that answer, already computed
-  // one line above: no second pass over the timeline by value. A settling
+  // it `pending: true` forever. `live_settled` identifies that exact delta,
+  // already computed above: no second pass over the timeline by value. A settling
   // delta carries exactly the one row it settles, so nothing else rides in.
   //
   // Everything else the window misses — edits, deletes, reactions and
@@ -329,7 +319,7 @@ on live_updated(next)
   // rows still fold in (`live_fold_channel` below is untouched) — only the
   // cursor waits, and `select_shell_tab` moves it when she actually returns.
   let live_tail_channel = keep_str(!history_view && shell_tab == ShellTab.chat, active_channel, "")
-  let live_fold_channel = keep_str(!history_view || animation.value(send_flash), active_channel, "")
+  let live_fold_channel = keep_str(!history_view || live_settled, active_channel, "")
   messages = apply_chat_messages(messages, next.chat, live_fold_channel)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   thread_messages = apply_chat_thread(thread_messages, next.chat, active_channel, active_thread_seq)
@@ -484,10 +474,10 @@ on live_resynced(next)
   // zeroes the seq when the root was deleted or the room moved under her — and
   // a park read AFTER it is `thread_seq <= 0`, which `park_reply_draft` refuses
   // outright, so the next `open_thread_for` cannot harvest what is no longer
-  // addressable. The stash this replaced took `reply_draft`, the SETTLED mirror
-  // that reads "" the whole time someone is typing, into a plate mounted INSIDE
-  // the rail: it captured nothing and had nowhere to render it. Idempotent on
-  // the ordinary resync that leaves the rail alone — same key, same text, and
+  // addressable. The retired settled mirror read "" the whole time someone was
+  // typing; the plate mounted INSIDE the rail captured nothing and had nowhere
+  // to render it. Idempotent on the ordinary resync that leaves the rail alone
+  // — same key, same text, and
   // the entry drops itself once the box is empty.
   reply_drafts = park_reply_draft(reply_drafts, active_channel, active_thread_seq, trim(editor_text(reply_editor)))
   active_thread_seq = refreshed_known_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq)
@@ -498,8 +488,6 @@ on live_resynced(next)
   thread_next_reply_offset = refreshed_channel_value(active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), thread_next_reply_offset)
   thread_messages = retain_thread_messages(thread_messages, active_thread_seq)
   thread_has_more = thread_has_more && active_channel == keep_str(next.chat_loaded, next.active_channel, active_channel) && active_thread_seq > 0
-  reply_draft = retain_for_endpoint(reply_draft, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
-  pending_reply = retain_for_endpoint(pending_reply, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
   // `message_draft` is the SETTLED stash (the body a failed send hands back) —
   // it never tracks keystrokes, so it reads
   // "" the whole time someone is typing. Rebuilding the composer from it here
@@ -509,7 +497,6 @@ on live_resynced(next)
   // the same answer `choose_channel` already gives, and the same one
   // `refreshed_page_editor` gives the page buffer below.
   message_draft = retain_for_endpoint(message_draft, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
-  pending_message = retain_for_endpoint(pending_message, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
   active_channel = keep_str(next.chat_loaded, next.active_channel, active_channel)
   // The one landing with NO launch behind it, so it is the one that could move
   // the room under a DM header nobody cleared — see `dm_peer_of_channel`.
@@ -569,7 +556,7 @@ on live_resynced(next)
   // LIST's structure is never stale (it is the whole index either way) and
   // still lands; everything scoped to ONE page waits for a reply that
   // answers for the page in hand.
-  pages_answer_is_current = next.pages_loaded && pages_reply_answers_current(next.pages, next.active_page, active_page)
+  let pages_answer_is_current = next.pages_loaded && pages_reply_answers_current(next.pages, next.active_page, active_page)
   // A TEXT FOLD THAT LANDED WHILE THIS REPLY WAS IN FLIGHT OWNS WHAT IT WROTE
   // (#1041). The serial the request snapshotted no longer matching means a
   // rename or a body edit folded after the reply's reads left — and text
@@ -581,7 +568,7 @@ on live_resynced(next)
   // from the reply. Discarding the pages half wholesale here would trade one
   // staleness for the other — the defect both of #1041's rejected designs
   // shared.
-  pages_fold_outran_reply = next.fold_serial != pages_fold_serial
+  let pages_fold_outran_reply = next.fold_serial != pages_fold_serial
   pages = keep_pages(next.pages_loaded, keep_folded_page_titles(pages_fold_outran_reply, next.pages, pages), pages)
   blocks = keep_blocks(pages_answer_is_current, merge_pending_blocks(keep_folded_block_texts(pages_fold_outran_reply, next.blocks, blocks), blocks, buffer_page, next.active_page, ""), blocks)
   orphaned_comment_drafts = remember_orphaned_page_comment(orphaned_comment_drafts, pages, block_comments_target, block_comment_draft)
@@ -718,7 +705,7 @@ on live_thread_refreshed(next)
   return if next.channel_id != active_channel || next.root_seq != active_thread_seq
   return if thread_loading || mutation_phase != MutationPhase.idle
   thread_target_seq = next.target_seq
-  thread_messages = merge_pending_messages(next.messages, thread_messages, active_channel, next.channel_id, "")
+  thread_messages = merge_pending_messages(next.messages, thread_messages, active_channel, next.channel_id)
   thread_next_reply_offset = next.next_reply_offset
   thread_has_more = next.has_more
 
@@ -789,7 +776,6 @@ on select_shell_tab(next)
   // lowers an unselected request to Task::none, so changing tabs cannot abort
   // an unrelated replace lane with a synthetic refusal.
   parallel
-    run replace lane=node_facts_load load_node_facts(connected_rpc) -> node_facts_loaded _ | node_facts_failed _
     flow
       from done load_request(shell_tab == ShellTab.explorer, connected_rpc, "", explorer_generation)
       try request -> done request
@@ -996,11 +982,6 @@ subscribe
   every 1s when huddle_joined -> tick
   every 1s when console_win != none -> wall_tick
   every 300ms when !empty(toast) -> toast_tick
-  // The settle-✓'s dismissal clock: tick one holds the tick on screen and
-  // starts its fade, tick two unmounts it. Gated on an anchored ✓ — it costs
-  // nothing outside the seconds after a send settles. A live delta may start
-  // the fade earlier; this clock is the floor a quiet network needs.
-  every 1200ms when (!empty(send_flash_ids)) || (!empty(thread_send_flash_ids)) -> send_flash_tick
   // The page document's autosave: the editor's edits never pass through a
   // handler, so the gate IS the dirty test — the tick only exists while the
   // buffer has drifted from the last text known written.
@@ -1059,8 +1040,8 @@ on dismiss_failed_message
 
 on restore_failed_reply
   return if empty(failed_reply_draft) || !empty(trim(editor_text(reply_editor)))
-  reply_draft = failed_reply_draft
-  reply_editor = editor(reply_draft)
+  let restored_reply = failed_reply_draft
+  reply_editor = editor(restored_reply)
   failed_reply_draft = ""
   // The reply composer is an extern `rich_composer` mount now, and `task
   // widget focus` cannot target an extern component — restoring no longer

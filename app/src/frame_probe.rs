@@ -219,6 +219,9 @@ fn probe_message(seq: i64) -> backend::ChatMessage {
     );
     backend::ChatMessage {
         id: format!("probe-message-{seq}"),
+        // Synthetic rows stay in a namespace disjoint from production keys
+        // allocated for optimistic rows in this same process.
+        view_key: -seq,
         seq,
         author: format!("user-{}", seq % 7),
         meta: format!("#{seq}"),
@@ -794,6 +797,74 @@ fn drawn_frame(
     (cache, pixels)
 }
 
+/// A settled optimistic row keeps the identity already mounted in the keyed
+/// virtual timeline. Replacing its client identity with the canonical sequence
+/// used to wedge the main stream while the unkeyed thread rail kept working.
+#[test]
+fn an_optimistic_confirmation_keeps_its_virtual_row_alive() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(probe_optimistic_confirmation)
+        .expect("the confirmation probe thread spawns")
+        .join()
+        .expect("the confirmation probe thread finishes");
+}
+
+fn probe_optimistic_confirmation() {
+    const OPERATION_ID: &str = "probe-optimistic-confirmation";
+
+    let (mut app, console) = console_in_chat();
+    app.messages = backend::mark_author_runs(backend::optimistic_message(
+        app.messages,
+        "confirmation probe".into(),
+        OPERATION_ID.into(),
+    ));
+    assert_eq!(app.messages.len(), ROWS as usize + 1);
+    let pending_view_key = app.messages.last().expect("the optimistic row").view_key;
+
+    let mut renderer = headless_renderer();
+    let (cache, pending_frame) = drawn_frame(
+        &mut app,
+        console,
+        &mut renderer,
+        user_interface::Cache::default(),
+    );
+
+    let canonical = backend::ChatMessage {
+        id: OPERATION_ID.into(),
+        view_key: pending_view_key,
+        seq: ROWS + 1,
+        body: "confirmation probe".into(),
+        blocks: backend::paragraph_blocks("confirmation probe"),
+        ..probe_message(ROWS + 1)
+    };
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+        kind: "chat".into(),
+        chat: backend::ChatDelta {
+            kind: "posted".into(),
+            channel_id: "channel-0".into(),
+            seq: canonical.seq,
+            message: canonical,
+            ..backend::ChatDelta::default()
+        },
+        ..backend::LiveUpdate::default()
+    }));
+
+    let confirmed = app
+        .messages
+        .iter()
+        .find(|message| message.id == OPERATION_ID)
+        .expect("the canonical row replaces its optimistic row");
+    assert_eq!(confirmed.view_key, pending_view_key);
+    assert!(!confirmed.pending);
+
+    let (_, confirmed_frame) = drawn_frame(&mut app, console, &mut renderer, cache);
+    assert_ne!(
+        pending_frame, confirmed_frame,
+        "the pending dot must disappear when the row becomes canonical"
+    );
+}
+
 /// THE STALENESS GUARD. Under the keyed lazy a quiet row repaints ONLY when
 /// (seq, render_rev) moves, so a mutation path that misses its `render_rev`
 /// bump is not a perf regression but a WRONG FRAME — the reader keeps looking
@@ -825,7 +896,7 @@ fn probe_row_repaint() {
     );
 
     // A reaction lands on the BOTTOM row — visible under `anchor-y=end`, and
-    // in the quiet arm (nothing selected, nothing flashing), so the repaint
+    // in the quiet arm (nothing selected), so the repaint
     // must come through the keyed lazy's (seq, render_rev) move.
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
         kind: "chat".into(),

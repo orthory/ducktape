@@ -498,7 +498,7 @@ component AgentCard(agent:AgentRow)
               w=fill
               gap=5.0
               align=center
-            text len(agent.skills)
+            text agent.skill_count
               with
                 size=10.5
                 wrap=none
@@ -510,7 +510,7 @@ component AgentCard(agent:AgentRow)
                 wrap=none
                 font=code_medium
                 @text-meta
-            text len(agent.caps)
+            text agent.cap_count
               with
                 size=10.5
                 wrap=none

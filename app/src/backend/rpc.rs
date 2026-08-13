@@ -276,22 +276,22 @@ pub(crate) fn write_prefs(prefs: &serde_json::Value) -> bool {
     std::fs::write(&path, bytes).is_ok()
 }
 
-/// The persisted appearance override — `"light"` / `"dark"`, or empty when
-/// this device follows the OS. DEVICE-global, not per-endpoint: appearance is
-/// a property of the person's eyes and room, not of a workspace.
-pub async fn load_appearance() -> String {
+/// The persisted appearance override. DEVICE-global, not per-endpoint:
+/// appearance is a property of the person's eyes and room, not of a workspace.
+pub async fn load_appearance() -> crate::Appearance {
     match read_prefs()["appearance"].as_str() {
-        Some("light") => "light".into(),
-        Some("dark") => "dark".into(),
-        _ => String::new(),
+        Some("light") => crate::Appearance::Light,
+        Some("dark") => crate::Appearance::Dark,
+        _ => crate::Appearance::System,
     }
 }
 
-pub async fn save_appearance(mode: String) -> bool {
-    let known = mode == "light" || mode == "dark";
-    if !known {
-        return false;
-    }
+pub async fn save_appearance(mode: crate::Appearance) -> bool {
+    let mode = match mode {
+        crate::Appearance::System => return false,
+        crate::Appearance::Light => "light",
+        crate::Appearance::Dark => "dark",
+    };
     let mut prefs = read_prefs();
     prefs["appearance"] = serde_json::json!(mode);
     write_prefs(&prefs)

@@ -594,10 +594,9 @@ pub fn resynced_messages(
     };
     let splice_is_continuous = !history_view && pages_overlap;
     if !splice_is_continuous {
-        return merge_pending_messages(next, current, current_channel, next_channel, String::new());
+        return merge_pending_messages(next, current, current_channel, next_channel);
     }
-    let mut merged =
-        merge_message_send_result(next, current, current_channel, next_channel, String::new());
+    let mut merged = merge_message_send_result(next, current, current_channel, next_channel);
     mark_message_groups(&mut merged);
     merged
 }
