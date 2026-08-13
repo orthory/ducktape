@@ -181,6 +181,9 @@ on console_opened(id)
   invalidate lane=forge_discussion
   invalidate lane=forge_code
   invalidate lane=files_preview
+  invalidate lane=shell_credentials
+  invalidate lane=shell_terminal
+  invalidate lane=shell_chat
   console_win = some(id)
   wall_now = current_wall_seconds()
   connected = false
@@ -200,6 +203,25 @@ on console_opened(id)
   messages = []
   node_log_filter = ""
   node_log_timeline = node_log_timeline_reset()
+  shell_credentials_generation = shell_credentials_generation + 1
+  shell_credentials = []
+  shell_credential_options = []
+  shell_credential = ""
+  shell_credentials_loading = false
+  shell_terminal = idle_agent_terminal()
+  shell_terminal_running = false
+  shell_terminal_busy = false
+  shell_terminal_title = ""
+  shell_terminal_error = ""
+  shell_chat_entries = []
+  shell_chat_activity = []
+  shell_chat_draft = editor("")
+  shell_chat_busy = false
+  shell_chat_status = ""
+  shell_chat_detail = ""
+  shell_chat_live = ""
+  shell_chat_error = ""
+  shell_chat_saga = ""
   // The old network's history lane was invalidated above, so a socket that
   // never answers cannot keep "Load older" disabled in the new network.
   history_loading = false
@@ -459,6 +481,19 @@ on onboarding_failed(cause)
 // deliberate read-only skip) survives a network switch.
 on switch_network
   return if mutation_phase != "idle"
+  invalidate lane=shell_credentials
+  invalidate lane=shell_terminal
+  invalidate lane=shell_chat
+  shell_credentials_generation = shell_credentials_generation + 1
+  shell_credentials_loading = false
+  shell_terminal = idle_agent_terminal()
+  shell_terminal_running = false
+  shell_terminal_busy = false
+  shell_terminal_title = ""
+  shell_chat_busy = false
+  shell_chat_status = ""
+  shell_chat_detail = ""
+  shell_chat_live = ""
   task window open onboarding -> onboarding_reopened _
 
 on onboarding_reopened(id)

@@ -400,6 +400,7 @@ pub struct LiveUpdate {
     pub forge: ForgeRefresh,
 }
 
+mod agent;
 mod bell;
 mod chat;
 mod document;
@@ -417,6 +418,7 @@ mod shell;
 mod storage;
 mod style;
 
+pub use agent::*;
 pub use bell::*;
 pub use chat::*;
 pub use document::*;

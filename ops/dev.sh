@@ -4,9 +4,10 @@
 # Ensures the "demo" workspace exists (first run seeds it via ops/demo-seed.sh;
 # DEV_RESEED=1 forces a fresh seed), starts its node when nothing is serving
 # the workspace's http endpoint, initializes its forge with ducktape's own
-# repository (ops/dogfood-forge.sh), then runs the desktop app in the foreground.
-# Ctrl-C quits the app and LEAVES THE NODE RUNNING for the next iteration —
-# `make demo-clear` is the teardown.
+# repository (ops/dogfood-forge.sh), starts the three local agent services, then
+# runs the desktop app in the foreground. Ctrl-C quits the app and LEAVES the
+# node and services running for the next iteration — `make demo-clear` is the
+# teardown.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -56,6 +57,54 @@ else
   log "node up (pid $NODE_PID, log $WSDIR/dev-node.log)"
 fi
 
+# Shell needs all three local planes: compute owns durable runs, agent owns raw
+# PTYs, and airlock lends the credential selected in the app. A warm dev loop
+# keeps them beside the node; demo-clear's workspace-verified pid sweep stops
+# the whole set. The service catalog is the readiness event, so do not guess
+# from stale pidfiles or fixed startup time.
+service_state(){
+  "$NODE_BIN" service list "$1" --workspace "$WSDIR" --json 2>/dev/null |
+    bun -e 'const rows = await Bun.stdin.json(); console.log(rows[0]?.state ?? "")' 2>/dev/null
+}
+
+ensure_service(){
+  local kind="$1" state pid
+  state="$(service_state "$kind")"
+  if [ "$state" = "enabled" ]; then
+    log "$kind service already running"
+    return
+  fi
+  if [ "$state" = "signaling" ]; then
+    log "$kind service is signaling but not enabled — restart it with --enable to use Shell"
+    return
+  fi
+
+  log "starting $kind service…"
+  "$NODE_BIN" service run "$kind" --enable --workspace "$WSDIR" >>"$WSDIR/dev-$kind.log" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 80); do
+    state="$(service_state "$kind")"
+    [ "$state" = "enabled" ] && break
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.25
+  done
+  if [ "$state" = "enabled" ]; then
+    disown "$pid"
+    log "$kind service up (pid $pid, log $WSDIR/dev-$kind.log)"
+  else
+    if kill -0 "$pid" 2>/dev/null; then
+      disown "$pid"
+    else
+      wait "$pid" 2>/dev/null
+    fi
+    log "$kind service did not become ready — Shell may be unavailable; see $WSDIR/dev-$kind.log"
+  fi
+}
+
+ensure_service compute
+ensure_service agent
+ensure_service airlock
+
 # The forge module starts empty, so a fresh demo node hosts no repo at all.
 # Seed it with ducktape's own source (the `make dogfood-forge` script, pointed
 # at THIS workspace's node) — idempotent, so later laps just refresh it.
@@ -64,5 +113,5 @@ fi
 DUCKTAPE_DEV_FORGE_URL="$URL" bash "$SCRIPT_DIR/dogfood-forge.sh" ||
   log "forge init failed — run \`make dogfood-forge\` when origin is reachable"
 
-log "launching the app — Ctrl-C quits the app, the node stays up"
+log "launching the app — Ctrl-C quits the app, the node and services stay up"
 exec cargo run -p ducktape-app

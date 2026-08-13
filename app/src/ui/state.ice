@@ -249,6 +249,29 @@ state
   // every single frame.
   has_older_history = false
   shell_tab = "chat"
+  // SHELL — one provider/credential selection feeds two deliberately different
+  // surfaces: a byte-faithful PTY and a durable headless chat turn.
+  shell_mode = "chat"
+  shell_provider = "codex"
+  shell_credentials:[AgentCredential] = []
+  shell_credential_options:[str] = []
+  shell_credential = ""
+  shell_credentials_generation:i64 = 0
+  shell_credentials_loading = false
+  shell_terminal:AgentTerminalSession = idle_agent_terminal()
+  shell_terminal_running = false
+  shell_terminal_busy = false
+  shell_terminal_title = ""
+  shell_terminal_error = ""
+  shell_chat_entries:[AgentChatEntry] = []
+  shell_chat_activity:[AgentActivity] = []
+  shell_chat_draft:editor = ""
+  shell_chat_busy = false
+  shell_chat_status = ""
+  shell_chat_detail = ""
+  shell_chat_live = ""
+  shell_chat_error = ""
+  shell_chat_saga = ""
   explorer_blocks:[ExplorerBlock] = []
   explorer_ops:[ExplorerOp] = []
   explorer_generation:i64 = 0

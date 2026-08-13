@@ -49,6 +49,40 @@ extern crate::backend
   ForgeRefresh(repo:str, number:i64, refs_moved:bool)
   LiveUpdate(kind:str, status:str, height:i64, module:str, load_chat:bool, load_pages:bool, debounce:bool, chat:ChatDelta, pages:PagesDelta, bell:BellDelta, forge:ForgeRefresh)
   AppError(message:str, committed:bool)
+  AgentTerminalSession()
+  AgentTerminalNotice(running:bool, title:str)
+  AgentTerminalStarted(session:AgentTerminalSession, title:str)
+  AgentCredential(name:str, provider:str)
+  AgentCredentialsData(generation:i64, rows:[AgentCredential])
+  AgentChatEntry(id:i64, role:str, body:str, provider:str)
+  AgentActivity(id:i64, title:str, detail:str, status:str)
+  AgentChatEvent(id:i64, kind:str, title:str, detail:str, status:str, answer:str, saga_id:str)
+  pure idle_agent_terminal() -> AgentTerminalSession
+  start_agent_terminal(rpc:str, provider:str, credential:str) -> AgentTerminalStarted ! AppError
+  task focus_agent_terminal(session:AgentTerminalSession) -> unit
+  component agent_terminal_surface(session:&AgentTerminalSession) -> unit
+  component agent_markdown(source:str, dark:bool) -> str
+  subscription agent_terminal_events(session:AgentTerminalSession) -> AgentTerminalNotice
+  load_agent_credentials(rpc:str, generation:i64) -> AgentCredentialsData ! HydrationError
+  pure agent_credential_names(rows:[AgentCredential], provider:str) -> [str]
+  pure agent_credential_choice(rows:[AgentCredential], provider:str, current:str) -> str
+  pure agent_provider_label(provider:str) -> str
+  pure agent_provider_initial(provider:str) -> str
+  pure agent_credential_caption(provider:str, credential:str) -> str
+  pure agent_register_hint(provider:str) -> str
+  pure agent_composer_hint(provider:str) -> str
+  pure agent_chat_push_user(entries:[AgentChatEntry], body:str, provider:str) -> [AgentChatEntry]
+  pure agent_chat_finish(entries:[AgentChatEntry], body:str, provider:str) -> [AgentChatEntry]
+  pure agent_activity_apply(rows:[AgentActivity], event:AgentChatEvent) -> [AgentActivity]
+  pure agent_event_status(current:str, event:AgentChatEvent) -> str
+  pure agent_event_detail(current:str, event:AgentChatEvent) -> str
+  pure agent_event_saga(current:str, event:AgentChatEvent) -> str
+  pure agent_event_live(current:str, event:AgentChatEvent) -> str
+  pure agent_event_error(current:str, event:AgentChatEvent) -> str
+  pure agent_event_busy(event:AgentChatEvent) -> bool
+  pure agent_event_entries(entries:[AgentChatEntry], event:AgentChatEvent, provider:str) -> [AgentChatEntry]
+  pure agent_chat_prompt(entries:[AgentChatEntry]) -> str
+  stream agent_chat_turn(rpc:str, provider:str, credential:str, entries:[AgentChatEntry]) -> AgentChatEvent
   OptimisticMutationError(message:str, committed:bool, operation_id:str, scope_id:str, body:str)
   HydrationError(generation:i64, message:str)
   box-style card_style()

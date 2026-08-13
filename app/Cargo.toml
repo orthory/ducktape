@@ -12,6 +12,7 @@ chat.workspace = true
 design.workspace = true
 ducktape-rpc.workspace = true
 forge.workspace = true
+gateway.workspace = true
 # the client-computed merge lane: a bare mirror fetched over the node's
 # /forge/{repo} smart-HTTP bridge + the scratch merge commit MergePr CASes.
 # forge's exact pin (vendored, no TLS transports — the bridge speaks plain
@@ -21,6 +22,7 @@ governance.workspace = true
 identity.workspace = true
 inbox.workspace = true
 pages.workspace = true
+saga.workspace = true
 # RUNTIME, not dev-only: `local_member` derives the signing identity through
 # `sdk::Origin::External(..).actor_string()` on the product path, so a
 # dev-dependency here builds every TEST lane and breaks only the BINARY.
@@ -38,7 +40,8 @@ jpeg-encoder = "0.6"
 zune-jpeg = "0.4"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 zeroize.workspace = true
-iced = { version = "=0.14.0", default-features = false, features = ["advanced", "image-without-codecs", "lazy", "svg", "tokio", "wgpu", "x11"] }
+iced = { version = "=0.14.0", default-features = false, features = ["advanced", "canvas", "image-without-codecs", "lazy", "markdown", "svg", "tokio", "wgpu", "x11"] }
+iced_term = "=0.8.0"
 ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "690b84d9", default-features = false, features = ["full"] }
 ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "690b84d9" }
 ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "690b84d9", version = "=0.1.0" }

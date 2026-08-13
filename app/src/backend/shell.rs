@@ -168,13 +168,14 @@ pub fn open_proposals(rows: Vec<ProposalRow>) -> i64 {
     rows.iter().filter(|row| row.open).count() as i64
 }
 
-/// The rail's module navigation: EIGHT seats, in the artifact's order, the
+/// The rail's module navigation: NINE seats, in the artifact's order, the
 /// active pane flagged. Modules join the shell by joining this list. `settings`
 /// is not here (the rail pins it to its own footer beside the account avatar),
 /// and neither is `node` — the node surface lives under Settings.
 pub fn shell_nav(tab: String, approvals: i64, agent_live: bool) -> Vec<NavItem> {
     [
         ("chat", "Chat", "nav-chat"),
+        ("shell", "Shell", "code-slash"),
         ("pages", "Pages", "nav-pages"),
         ("forge", "Forge", "nav-forge"),
         ("agents", "Agents", "nav-agents"),

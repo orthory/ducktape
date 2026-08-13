@@ -8,13 +8,14 @@ use iced::futures::StreamExt as _;
 use super::*;
 
 #[test]
-fn the_rail_seats_exactly_the_eight_module_screens() {
+fn the_rail_seats_exactly_the_nine_module_screens() {
     let nav = shell_nav("chat".into(), 3, true);
     let ids: Vec<&str> = nav.iter().map(|item| item.id.as_str()).collect();
     assert_eq!(
         ids,
         [
             "chat",
+            "shell",
             "pages",
             "forge",
             "agents",
