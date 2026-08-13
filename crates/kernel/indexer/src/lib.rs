@@ -721,7 +721,6 @@ impl IndexStore {
     ) -> Result<fluent31::Subscription> {
         Ok(self.db(module)?.subscribe(lo, hi)?)
     }
-
 }
 
 /// map a view invocation's engine error onto the tier's surface: a guest
@@ -863,7 +862,9 @@ fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
 /// an error would otherwise spin here forever — and this now runs inside a
 /// joining node's seam, not just a sim.
 fn drain_fold(db: &Db, module: &str) -> Result<()> {
-    let mut floor = u64::MAX;
+    // NOT the backfill floor — the fewest events ever seen queued, which is
+    // what "still shrinking" is measured against.
+    let mut fewest_pending = u64::MAX;
     let mut since_progress = std::time::Instant::now();
     loop {
         let trigger = db
@@ -879,8 +880,8 @@ fn drain_fold(db: &Db, module: &str) -> Result<()> {
         if let Some(err) = trigger.last_error {
             return Err(Error::FoldStuck(format!("{module}: {err}")));
         }
-        if trigger.pending < floor {
-            floor = trigger.pending;
+        if trigger.pending < fewest_pending {
+            fewest_pending = trigger.pending;
             since_progress = std::time::Instant::now();
         } else if since_progress.elapsed() >= FOLD_DRAIN_STALL {
             return Err(Error::FoldStuck(format!(

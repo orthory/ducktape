@@ -196,12 +196,19 @@ pub(crate) fn heal_index(index: &indexer::IndexStore, boundary: u64, label: &str
 ///
 /// # why this is safe exactly here and nowhere else
 ///
-/// pre-serving there are no live block folds, no ws subscribers, and no view
-/// readers on this node. so an ascending fetch-and-write makes COMMIT ORDER
-/// EQUAL KEY ORDER, the changes-mode fold trigger the heal just re-registered
-/// folds every row correctly as it lands, and the fold tip advances
-/// monotonically to the last backfilled row. no refold is needed, and none is
-/// available: this is the only window where the invariant holds.
+/// both call seams sit on the ONE task that ever writes this node's index, and
+/// they sit BEFORE it resumes folding live blocks. so nothing else commits to
+/// these databases while the walk runs, an ascending fetch-and-write makes
+/// COMMIT ORDER EQUAL KEY ORDER, the changes-mode fold trigger the heal just
+/// re-registered folds every row correctly as it lands, and the fold tip
+/// advances monotonically to the last backfilled row. no refold is needed, and
+/// none is available: this is the only window where the invariant holds.
+///
+/// READERS are a different question, and the answer is "no worse than before":
+/// on an epoch-cutover re-ascension the http/ws surfaces are still up, so a
+/// view read can land mid-walk and see a partly backfilled feed. it would
+/// otherwise have seen the empty one the heal's wipe just left, and the floor
+/// does not drop until the fold has consumed everything.
 ///
 /// per-module failure — network, a source that cannot cover the range, a page
 /// that fails structural validation — leaves that module's stamped floor
@@ -274,11 +281,13 @@ pub(crate) async fn heal_and_backfill_index<C: statesync::SyncClient>(
     {
         // the fold has to have CONSUMED what we wrote before the floor may
         // claim it. a module with no folding guest never has a tip, and none
-        // is expected of it.
-        let folds = index.fold_status(&module).ok().flatten().is_some();
-        let derived = !folds
-            || last_row
-                .is_none_or(|last| matches!(index.fold_tip(&module), Ok(Some(tip)) if tip >= last));
+        // is expected of it — but only a status read that SUCCEEDS says so; a
+        // failed one is not evidence of anything, so it still has to show a
+        // tip.
+        let folds = !matches!(index.fold_status(&module), Ok(None));
+        let tip_covers_rows = last_row
+            .is_none_or(|last| matches!(index.fold_tip(&module), Ok(Some(tip)) if tip >= last));
+        let derived = !folds || tip_covers_rows;
         if !derived {
             tracing::warn!(
                 target: "ducktape::statesync",
@@ -324,10 +333,13 @@ async fn backfill_module<C: statesync::SyncClient>(
     let mut rows = 0usize;
     let mut bytes = 0usize;
     let mut last: Option<(u64, u32)> = None;
-    let mut write_failed: Option<String> = None;
+    // the fetcher folds a write refusal into the same `SyncError::Module` a
+    // wire refusal produces, and the message is already carried by `error`;
+    // this only remembers WHICH side failed, for the reason token.
+    let mut write_refused = false;
     let walked = statesync::fetch_index_ops(client, module, boundary, |page| {
         index.write_backfill_rows(module, page).map_err(|e| {
-            write_failed = Some(e.to_string());
+            write_refused = true;
             e.to_string()
         })?;
         rows += page.len();
@@ -354,9 +366,10 @@ async fn backfill_module<C: statesync::SyncClient>(
         Err(err) => {
             // a write failure and a wire failure differ in what an operator
             // does next, so they get their own reason tokens.
-            let reason = match write_failed.take() {
-                Some(_) => "backfill_write_failed",
-                None => "backfill_fetch_failed",
+            let reason = if write_refused {
+                "backfill_write_failed"
+            } else {
+                "backfill_fetch_failed"
             };
             tracing::warn!(
                 target: "ducktape::statesync",
