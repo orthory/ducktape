@@ -16,6 +16,7 @@ static SCREENS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         include_str!("ui/screens/overlays.ice"),
         include_str!("ui/screens/pages.ice"),
         include_str!("ui/screens/roster.ice"),
+        include_str!("ui/screens/node.ice"),
         include_str!("ui/screens/settings.ice"),
         include_str!("ui/screens/shell.ice"),
         include_str!("ui/screens/storage.ice"),
@@ -182,6 +183,7 @@ fn a_pushed_status_moves_the_facts_and_leaves_the_table() {
 
     let _ = app.__update(__DucktapeMessage::NodeStatusPushed(backend::NodeFacts {
         generation: -1,
+        public_key: "node-key".into(),
         version: "0.2.0".into(),
         root_hash: "hash-new".into(),
         checkpoint_height: 512,
@@ -199,8 +201,9 @@ fn a_pushed_status_moves_the_facts_and_leaves_the_table() {
         sync_last_error: "peer hung up".into(),
     }));
 
-    // ALL SIXTEEN, because a field the handler forgot stays frozen at its
+    // ALL SEVENTEEN, because a field the handler forgot stays frozen at its
     // connect-time value for as long as the console is open.
+    assert_eq!(app.node_key, "node-key");
     assert_eq!(app.node_version, "0.2.0");
     assert_eq!(app.node_root_hash, "hash-new");
     assert_eq!(app.node_checkpoint, 512);
@@ -340,7 +343,7 @@ fn the_node_streams_carry_the_gates_their_costs_require() {
     assert_eq!(
         peers,
         [
-            "run node_peers_live(connected_rpc) when (connected && shell_tab == \"settings\" && node_tab == \"overview\") -> node_peers_pushed _"
+            "run node_peers_live(connected_rpc) when (connected && shell_tab == \"node\" && node_tab == \"overview\") -> node_peers_pushed _"
         ],
         "every peers sample encodes the whole metrics registry; this gate is the budget"
     );
@@ -354,7 +357,7 @@ fn the_node_streams_carry_the_gates_their_costs_require() {
     assert!(
         !peers_loads.is_empty()
             && peers_loads.iter().all(|line| line.contains(
-                "keep_i64(shell_tab == \"settings\" && node_tab == \"overview\", node_peers_generation, -1)"
+                "keep_i64(shell_tab == \"node\" && node_tab == \"overview\", node_peers_generation, -1)"
             )),
         "every load_peers must be gated to the tab that draws it: {peers_loads:?}"
     );
@@ -530,6 +533,36 @@ fn shell_tab_is_app_state_and_palette_hits_switch_panes() {
     let _ = app.__update(__DucktapeMessage::OpenChatSearchHit("general".into(), 7, 7));
     assert!(!app.palette_open);
     assert_eq!(app.shell_tab, "chat");
+}
+
+/// Node operations are an operator surface, not a tail appended to device
+/// preferences. Pin all three routing seams so a visual reshuffle cannot bury
+/// the screen in Settings again while leaving its handlers intact.
+#[test]
+fn node_operations_are_a_first_class_screen() {
+    let settings = include_str!("ui/screens/settings.ice");
+    let node = include_str!("ui/screens/node.ice");
+    assert!(settings.contains("component SettingsScreen("));
+    assert!(node.contains("component NodeScreen("));
+    assert!(settings.contains("emit(select_shell_tab, \"node\")"));
+    for node_detail in [
+        "node-overview-tab",
+        "node-permissions-tab",
+        "node-activity-tab",
+        "node-modules-tab",
+    ] {
+        assert!(
+            !settings.contains(node_detail),
+            "Settings must link to Node, not embed {node_detail}"
+        );
+        assert!(node.contains(node_detail), "Node owns {node_detail}");
+    }
+
+    let shell = include_str!("ui/components/shell.ice");
+    assert!(shell.contains("\"node\"\n                  slot node"));
+    let view = include_str!("ui/view.ice");
+    assert!(view.contains("node:\n          NodeScreen"));
+    assert!(view.contains("settings:\n          SettingsScreen"));
 }
 
 /// A hydration error belongs to the pane that raised it.
@@ -726,7 +759,7 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
     }
 
     // THE SETTINGS FACTS ARE THE INLINE HALF OF THE SAME GATE. No module
-    // commits `/v1/status`, a key file or the local prefs, so they get no
+    // commits a key file or the local prefs, so they get no
     // `tab_reads_plane` row and no live arm — just the tab that draws them.
     // The EXACT SET is the pin, both lines: the CONNECT load must stay
     // ungated (it is what fills chat's `user_key`, which chat cannot refetch
@@ -767,7 +800,6 @@ fn a_move_to_a_pane_that_does_not_draw_the_settings_facts_keeps_the_connect_load
         crate::backend::SettingsFacts {
             generation: in_flight,
             endpoint: "http://127.0.0.1:7100".into(),
-            node_key: "node".into(),
             key_path: "/w/user.key".into(),
             key_state: "encrypted".into(),
             data_dir: "/w".into(),
@@ -9554,11 +9586,10 @@ const NOT_CONNECTED_PLATE: &str = concat!(
 /// Exemptions are named with their reason, never left implicit.
 #[test]
 fn every_data_screen_answers_a_dead_node_with_not_connected() {
-    /// The one screen that is NOT a reading of the network: Settings is the
-    /// endpoint, the key, the appearance and the node's own diagnostics, and it
-    /// is where a reader goes to fix the connection. Blanking it would hide the
-    /// repair from the person doing the repairing.
-    const EXEMPT: [&str; 1] = ["SettingsScreen"];
+    /// Settings owns connection repair and Node owns the daemon diagnostics;
+    /// both remain useful while the node is down instead of claiming the
+    /// network's module contents are empty.
+    const EXEMPT: [&str; 2] = ["NodeScreen", "SettingsScreen"];
 
     let mut screens: Vec<&str> = SCREENS
         .lines()
@@ -9578,6 +9609,7 @@ fn every_data_screen_answers_a_dead_node_with_not_connected() {
             "ForgeScreen",
             "GovernanceScreen",
             "MembersScreen",
+            "NodeScreen",
             "PagesScreen",
             "SettingsScreen",
             "ShellScreen",
@@ -9624,7 +9656,7 @@ fn every_data_screen_answers_a_dead_node_with_not_connected() {
 /// rows)` is already honest).
 #[test]
 fn a_disconnected_screen_stands_its_registers_down_too() {
-    const EXEMPT: [&str; 1] = ["SettingsScreen"];
+    const EXEMPT: [&str; 2] = ["NodeScreen", "SettingsScreen"];
 
     for source in [
         include_str!("ui/screens/governance.ice"),
@@ -10303,7 +10335,7 @@ fn every_repeated_component_mount_is_culled_or_argued() {
             "screens/governance.ice",
             "for proposal in settled_proposals(rows)",
         ),
-        ("screens/settings.ice", "for peer in node_peers"),
+        ("screens/node.ice", "for peer in node_peers"),
         ("components/huddle.ice", "for tile in rows"),
         ("components/node.ice", "for entry in rows"),
         ("components/onboarding.ice", "for row in networks"),
@@ -10456,6 +10488,8 @@ fn no_view_expression_hands_an_extern_a_list() {
         ("view.ice", "bell_worst_severity"),
         ("view.ice", "open_proposals"),
         ("view.ice", "any_agent_active"),
+        ("screens/node.ice", "member_tier"),
+        ("screens/node.ice", "members_is_admin"),
         ("screens/settings.ice", "member_tier"),
         ("screens/settings.ice", "members_is_admin"),
         ("screens/settings.ice", "members_summary"),

@@ -168,10 +168,9 @@ pub fn open_proposals(rows: Vec<ProposalRow>) -> i64 {
     rows.iter().filter(|row| row.open).count() as i64
 }
 
-/// The rail's module navigation: NINE seats, in the artifact's order, the
-/// active pane flagged. Modules join the shell by joining this list. `settings`
-/// is not here (the rail pins it to its own footer beside the account avatar),
-/// and neither is `node` — the node surface lives under Settings.
+/// The rail's navigation: nine collaboration surfaces plus the node operator
+/// surface, with the active pane flagged. `settings` is not here because the
+/// rail pins it to its own footer beside the account avatar.
 pub fn shell_nav(tab: String, approvals: i64, agent_live: bool) -> Vec<NavItem> {
     [
         ("chat", "Chat", "nav-chat"),
@@ -181,6 +180,7 @@ pub fn shell_nav(tab: String, approvals: i64, agent_live: bool) -> Vec<NavItem> 
         ("agents", "Agents", "nav-agents"),
         ("files", "Files", "nav-files"),
         ("explorer", "Explorer", "nav-explorer"),
+        ("node", "Node", "node"),
         ("members", "Members", "nav-members"),
         ("governance", "Approvals", "shield-check"),
     ]
@@ -211,8 +211,8 @@ pub fn shell_nav(tab: String, approvals: i64, agent_live: bool) -> Vec<NavItem> 
 pub fn tab_reads_plane(tab: String, plane: String) -> bool {
     let tabs: &[&str] = match plane.as_str() {
         // the tier badge, the admin gate and the forge write gate all read the
-        // roster, so four panes draw it.
-        "members" => &["members", "governance", "forge", "settings"],
+        // roster, so five panes draw it.
+        "members" => &["members", "governance", "forge", "node", "settings"],
         "governance" => &["governance"],
         "agents" => &["agents"],
         // Settings draws the account card; Forge draws the org "about".

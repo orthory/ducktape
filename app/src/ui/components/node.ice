@@ -1,5 +1,5 @@
-// `This node` — the screen the artifact gives no rail seat, so these mount
-// under Settings as the Overview / Permissions / Activity / Modules tabs.
+// `This node` — the dedicated operator screen's Overview / Permissions /
+// Activity / Modules tabs.
 //
 // The artifact's copy asserts two authority axes — a node tier this machine
 // picks, and an ADMIN grant quorum hands out on top of it. This product has
@@ -593,9 +593,8 @@ component MatrixTick(on:bool)
 
 // --------------------------------------------------------------------- MODULES
 
-// The fourth tab under `This node`, and only that: the artifact's Modules
-// screen once had a rail seat, and the rail has nine seats none of which is this
-// one, so the module set lives beside the node's other facts.
+// The fourth tab under `This node`: the module set lives beside the node's
+// other facts because it describes code this daemon executes.
 //
 // This is the INSTALLED half of the artifact's screen and nothing else. What is
 // built is what the chain publishes: `/v1/status` carries every registered

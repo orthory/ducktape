@@ -510,16 +510,43 @@ view
             events
               gov_vote -> gov_vote _ _
               gov_execute -> gov_execute _
+        node:
+          NodeScreen wall_now=wall_now node_log_filter<->node_log_filter #node
+            with
+              node_key
+              node_data_dir
+              members_rows
+              status
+              loading
+              node_tab
+              module_rows
+              node_height
+              node_checkpoint
+              node_last_finalized
+              node_reachable_label
+              node_quorum_label
+              node_version
+              node_root_hash
+              sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
+              node_phase_since
+              node_sync_retries
+              node_sync_failures
+              node_sync_last_error
+              node_peers
+            events
+              select_node_tab -> select_node_tab _
+              open_node_modules -> open_node_modules
+              node_log_filter_changed -> node_log_filter_changed _
+              copy_to_clipboard -> copy_to_clipboard _ _
+            activity_log:
+              extern node_log_timeline(node_log_timeline, connected_rpc) #node-log-timeline -> node_log_timeline_changed _
         settings:
-          SettingsScreen wall_now=wall_now account_name_draft<->account_name_draft node_log_filter<->node_log_filter #settings
+          SettingsScreen account_name_draft<->account_name_draft #settings
             with
               account_name
               network_name
               connected_rpc
               settings_endpoint
-              settings_node_key
-              node_height
-              settings_data_dir
               settings_key_state
               settings_key_path
               settings_open_tabs
@@ -536,20 +563,6 @@ view
               loading
               connected
               mutation_phase
-              node_tab
-              module_rows
-              node_checkpoint
-              node_last_finalized
-              node_reachable_label
-              node_quorum_label
-              node_version
-              node_root_hash
-              sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
-              node_phase_since
-              node_sync_retries
-              node_sync_failures
-              node_sync_last_error
-              node_peers
             events
               select_shell_tab -> select_shell_tab _
               reconnect -> reconnect
@@ -561,13 +574,8 @@ view
               settings_unlock_submit -> settings_unlock_submit _
               lock_session -> lock_session
               forget_workspace_submit -> forget_workspace_submit
-              select_node_tab -> select_node_tab _
-              open_node_modules -> open_node_modules
-              node_log_filter_changed -> node_log_filter_changed _
               set_appearance_light -> set_appearance_light
               set_appearance_dark -> set_appearance_dark
-            activity_log:
-              extern node_log_timeline(node_log_timeline, settings_endpoint) #node-log-timeline -> node_log_timeline_changed _
         explorer:
           ExplorerScreen query<->explorer_query
             with
