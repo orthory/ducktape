@@ -231,7 +231,7 @@ async fn run_action(
     let frame = node::encode_frame(&state.signer, *next_seq, &msg);
     *next_seq += 1;
     match state.node.submit_frame(frame).await {
-        Ok(_height) => action_response(StatusCode::OK, "ok"),
+        Ok(()) => action_response(StatusCode::OK, "ok"),
         Err(error) => action_response(StatusCode::BAD_REQUEST, &error),
     }
 }
