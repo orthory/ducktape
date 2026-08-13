@@ -90,6 +90,7 @@ pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, Liv
                             "governance".to_string(),
                             "identity".to_string(),
                             "agent".to_string(),
+                            "runs".to_string(),
                             "files".to_string(),
                         ],
                         state.cursors.clone(),
@@ -330,7 +331,18 @@ pub(crate) async fn folded_update(
         // (`connect`), which is why this is not the answer for chat or pages.
         // At these rates it is the right trade: no fold to keep correct, and
         // nothing at all on a block that does not touch them.
-        "valset" | "governance" | "identity" | "agent" | "files" => {
+        //
+        // `runs` rides here for a different reason than the rest: NOTHING ON
+        // SCREEN DRAWS A RUN. The fact it feeds lives in another module's
+        // projection — an `AgentRow.live` is `agents_with_a_run_in_flight`
+        // reading `runs`' pending register, joined onto a row `agent` owns
+        // (`backend/node.rs`) — so there is no local state for a fold to fold
+        // INTO and the op can only be a signal to refetch the agents
+        // projection. It commits at agent-TURN rate (a run claimed, a run
+        // finished), which is the same human rate as the others, so the trade
+        // above holds. Without it the Forge seat's live dot had no off-tab
+        // refresh path at all and stayed dark until Agents was opened.
+        "valset" | "governance" | "identity" | "agent" | "runs" | "files" => {
             Some(live_plane(module, height))
         }
         _ => None,
@@ -505,6 +517,21 @@ pub async fn live_resync_load(
 /// module as an argument keeps it to a single predicate for every plane.
 pub fn plane_live_hit(kind: String, module: String, want: String) -> bool {
     kind == "plane" && module == want
+}
+
+/// Did this live update touch the AGENTS projection — from either module?
+///
+/// TWO MODULES, ONE ROW. `agent` owns the registration and `runs` owns the
+/// liveness: `AgentRow.live` is `agents_with_a_run_in_flight` reading `runs`'
+/// pending register, joined on in `load_agents`. So a run starting or ending
+/// changes what the Forge seat's dot draws while `agent` commits nothing at
+/// all — the reason the dot went dark for a whole turn once the tab move
+/// stopped refetching off-tab.
+///
+/// Named rather than spelled inline for the same reason [`plane_live_hit`] is:
+/// the Ice checker cannot type a subscription payload's field inside a `let`.
+pub fn agents_plane_hit(kind: String, module: String) -> bool {
+    kind == "plane" && (module == "agent" || module == "runs")
 }
 
 /// The planes discriminant for [`live_resync_load`].

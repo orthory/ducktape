@@ -747,7 +747,6 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
             "identity",
             "dm_peers_generation",
         ),
-        ("load_agents", "agents_load", "agent", "agents_generation"),
     ] {
         let live = format!(
             "run replace lane={lane} {loader}(connected_rpc, keep_i64(plane_live_hit(next.kind, next.module, \"{module}\"), {generation}, -1))"
@@ -755,6 +754,23 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
         assert!(
             lifecycle.contains(&live),
             "a {module} commit must refresh {loader} on any tab: {live}"
+        );
+    }
+
+    // THE AGENTS PROJECTION IS THE ONE PLANE TWO MODULES WRITE, so its live
+    // arm is the one that does not ride `plane_live_hit`: `agent` commits the
+    // registration and `runs` commits the liveness `AgentRow.live` is read
+    // from (`agents_with_a_run_in_flight`). BOTH lines take the predicate —
+    // a bump without the load refetches nothing, and a load without the bump
+    // answers on a generation `agents_loaded` rejects. Narrow either back to
+    // `"agent"` and the Forge seat's dot goes dark for the length of a run.
+    for line in [
+        "agents_generation = keep_i64(agents_plane_hit(next.kind, next.module), agents_generation + 1, agents_generation)",
+        "run replace lane=agents_load load_agents(connected_rpc, keep_i64(agents_plane_hit(next.kind, next.module), agents_generation, -1))",
+    ] {
+        assert!(
+            lifecycle.contains(line),
+            "the agents live arm must ride the two-module predicate: {line}"
         );
     }
 
@@ -5964,6 +5980,14 @@ fn a_plane_op_refetches_only_the_plane_it_names() {
 
     plane(&mut app, "agent");
     assert_eq!(app.agents_generation, agents + 1);
+
+    // AND `runs` FEEDS THE SAME PROJECTION. `AgentRow.live` — the Forge seat's
+    // dot — is read from the runs module's pending register, so a run
+    // starting or ending changes a row while `agent` commits nothing. Its op
+    // is the dot's ONLY off-tab signal.
+    plane(&mut app, "runs");
+    assert_eq!(app.agents_generation, agents + 2, "runs feeds agents too");
+    assert_eq!(app.account_generation, account + 1, "and nothing else");
 
     plane(&mut app, "files");
     assert_eq!(app.fs_generation, fs + 1);
