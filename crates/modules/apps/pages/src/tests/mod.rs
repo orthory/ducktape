@@ -187,5 +187,6 @@ async fn seed_page(p: &mut Pages, page: &str) {
 
 mod block_tree;
 mod comments;
+mod index_parity;
 mod pages;
 mod storage;
