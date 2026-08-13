@@ -364,10 +364,15 @@ pub(crate) async fn index_view(
     // can only be OLDER than the rows served — the caller waits one more round
     // trip. read after and it can be NEWER, claiming a row this reply does not
     // contain, which is the exact bug the tip exists to close.
-    let folded = match store.fold_tip(&module) {
-        Ok(tip) => tip,
-        Err(err) => return index_error(err),
-    };
+    //
+    // and ADVISORY, never a precondition: a read error here degrades to "no
+    // header", the same answer an unstamped module gives. everything about
+    // this key is best-effort (absent = unknown, a malformed value = unknown),
+    // and `IndexStore::view` promises a poisoned store still serves views —
+    // stale but consistent. failing the whole read because one bookkeeping key
+    // would not load empties the caller's sidebar over nothing. an unknown
+    // module still 404s: `store.view` below answers that.
+    let folded = store.fold_tip(&module).ok().flatten();
     let req_bytes = serde_json::to_vec(&req).expect("a decoded json value re-serializes");
     let mut response = match store.view(&module, &req_bytes) {
         Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
@@ -499,11 +504,23 @@ mod tests {
             .split("\n/// ")
             .next()
             .expect("index_view body");
-        let tip = body.find("store.fold_tip(").expect("the view reads the tip");
+        let tip = body
+            .find("store.fold_tip(")
+            .expect("the view reads the tip");
         let view = body.find("store.view(").expect("the view serves the view");
         assert!(
             tip < view,
             "the fold watermark must be read BEFORE the view snapshot"
+        );
+        // AND IT MUST NOT BE ABLE TO REFUSE THE READ. The tip is advisory —
+        // absent is unknown, malformed is unknown — so an engine error on it
+        // has to degrade to "no header" too. Turning it into a precondition
+        // would answer 500 to a request that could have served the rows fine,
+        // against `IndexStore::view`'s own promise that a poisoned store still
+        // serves views. Nothing between the two reads may leave the function.
+        assert!(
+            !body[tip..view].contains("return"),
+            "an unreadable fold watermark must not refuse the view"
         );
     }
 }
