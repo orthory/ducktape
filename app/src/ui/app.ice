@@ -9,10 +9,14 @@ daemon Ducktape
   font "../../../crates/design/assets/fonts/GeistMono[wght].ttf"
   text-size 13.5
   antialiasing true
+  tray
+    icon-rgba "../../assets/tray.rgba" 128 128
+    tooltip "Ducktape"
   // The launch window: Discord/Steam-shaped — a small fixed column that
   // signs the user in and picks a network. It opens on mount and closes when
   // the console takes over.
   window onboarding
+    icon-rgba "../../assets/icon.rgba" 128 128
     size 480 680
     position centered
     resizable false
@@ -29,6 +33,7 @@ daemon Ducktape
   // alternative is suppressing a rail, and a console that silently drops the
   // pane you just opened is worse than one that will not get that small.
   window console
+    icon-rgba "../../assets/icon.rgba" 128 128
     size 1280 800
     min-size 1040 540
     position centered
@@ -44,6 +49,7 @@ daemon Ducktape
   // 340 = 42 header + 52 controls + 2 rules + ~190 of stage, and the width
   // never goes under the size the window ships at.
   window huddle
+    icon-rgba "../../assets/icon.rgba" 128 128
     size 320 460
     min-size 320 340
 

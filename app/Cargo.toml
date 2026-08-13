@@ -3,6 +3,12 @@ name = "ducktape-app"
 edition.workspace = true
 version.workspace = true
 publish = false
+description = "A local-first consensus workspace for people and agents"
+authors = ["Ducktape contributors"]
+
+[package.metadata.ice.bundle]
+icon = "assets/icon.svg"
+category = "public.app-category.productivity"
 
 [build-dependencies]
 ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "c901afcc", version = "=0.1.0" }
