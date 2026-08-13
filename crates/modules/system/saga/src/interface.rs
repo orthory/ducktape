@@ -381,28 +381,57 @@ pub enum SagaQuery {
     /// a host-side crank pump polls: when the committed next expiry is at or
     /// past the current view, submitting a `Crank` will transition something.
     NextExpiry,
-    /// every PENDING saga whose current attempt is leased to `assignee`,
-    /// projected as the [`WorkerRequest`]s the effect lane would have carried
-    /// — the state-driven read a node that does NOT execute blocks (a synced
-    /// RESIDENT) polls to discover its own assigned work. sorted by saga id;
-    /// terminal sagas and other nodes' leases are excluded.
+    /// ONE PAGE of the PENDING sagas whose current attempt is leased to
+    /// `assignee`, projected as the [`WorkerRequest`]s the effect lane would
+    /// have carried — the state-driven read a node that does NOT execute
+    /// blocks (a synced RESIDENT) polls to discover its own assigned work.
+    /// ascending by saga id; terminal sagas and other nodes' leases are
+    /// excluded.
+    ///
+    /// PAGED, because the answer must cost a bounded number of store reads:
+    /// the module examines at most `saga::PENDING_PAGE` live entries per call
+    /// and hands back the cursor to resume from. A caller that wants the whole
+    /// projection walks it — feed [`PendingPage::next`] back as `after` until
+    /// it is `None`.
     AssignedPending {
         assignee: Vec<u8>,
+        /// resume strictly AFTER this saga id; `None` starts at the first.
+        after: Option<SagaId>,
     },
-    /// every PENDING saga whose current attempt is UNASSIGNED, projected as
-    /// the [`WorkerRequest`]s the effect lane would have carried — the
-    /// ANNOUNCEMENT requests, which a capable host claims with
+    /// ONE PAGE of the PENDING sagas whose current attempt is UNASSIGNED,
+    /// projected as the [`WorkerRequest`]s the effect lane would have carried
+    /// — the ANNOUNCEMENT requests, which a capable host claims with
     /// [`SagaMsg::Accept`] and the first accept in consensus order wins.
     ///
     /// The twin of [`Self::AssignedPending`], and needed for the same reason:
     /// a host that does not execute blocks never observes the effect that
     /// carried the announcement. Without this read, an announcement can only
     /// be claimed by a node running the pool in-process — which is no node at
-    /// all now that compute is a standalone daemon.
+    /// all now that compute is a standalone daemon. It pages for the same
+    /// reason too.
     ///
     /// Read-only, like every other variant here: it derives a projection from
     /// committed state and stages nothing.
-    UnassignedPending,
+    UnassignedPending {
+        /// resume strictly AFTER this saga id; `None` starts at the first.
+        after: Option<SagaId>,
+    },
+}
+
+/// one page of a pending projection, plus where to resume.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct PendingPage {
+    /// the page's requests, ascending by saga id.
+    pub requests: Vec<WorkerRequest>,
+    /// the last live entry this page EXAMINED — pass it back as the query's
+    /// `after` for the next page. `None` means the walk reached the end of the
+    /// index, and is the only signal a caller needs to stop.
+    ///
+    /// It is not simply the last request's id: a page examines a bounded
+    /// number of CANDIDATES, and `AssignedPending` may return fewer requests
+    /// than it examined (another node's lease is a candidate its key rejects).
+    /// So a page can be empty and still carry a cursor.
+    pub next: Option<SagaId>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -416,8 +445,8 @@ pub enum SagaQuery {
 pub enum SagaReply {
     Saga(Option<SagaView>),
     NextExpiry(Option<u64>),
-    AssignedPending(Vec<WorkerRequest>),
-    UnassignedPending(Vec<WorkerRequest>),
+    AssignedPending(PendingPage),
+    UnassignedPending(PendingPage),
 }
 
 /// a saga's observable state — the full read projection.

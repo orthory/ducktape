@@ -552,23 +552,39 @@ enum Lane {
     Unassigned,
 }
 
-/// the committed saga projection for one lane.
+/// the committed saga projection for one lane, WALKED to the end.
+///
+/// The module answers a bounded page per call (its read budget is per query,
+/// not per projection), so the whole lane is this loop over the reply's
+/// cursor. It terminates because the cursor is strictly ascending by saga id.
 ///
 /// `None` when the node is unreachable, the module absent, or the reply
 /// unreadable — a failed read must NEVER masquerade as an empty projection:
-/// emptiness retires entries, and retiring a live attempt re-runs it.
+/// emptiness retires entries, and retiring a live attempt re-runs it. That
+/// holds MID-WALK too, which is why a failed page abandons the whole lane: a
+/// truncated projection is an empty one for every entry it did not reach.
 async fn pending(node: &NodeLink, me: &[u8], lane: Lane) -> Option<Vec<WorkerRequest>> {
-    let query = match lane {
-        Lane::Assigned => SagaQuery::AssignedPending {
-            assignee: me.to_vec(),
-        },
-        Lane::Unassigned => SagaQuery::UnassignedPending,
-    };
-    let reply = node.query("saga", &saga::encode_query(&query)).await.ok()?;
-    match (lane, saga::decode_reply(&reply)) {
-        (Lane::Assigned, Ok(SagaReply::AssignedPending(requests))) => Some(requests),
-        (Lane::Unassigned, Ok(SagaReply::UnassignedPending(requests))) => Some(requests),
-        _ => None,
+    let mut requests = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let query = match lane {
+            Lane::Assigned => SagaQuery::AssignedPending {
+                assignee: me.to_vec(),
+                after,
+            },
+            Lane::Unassigned => SagaQuery::UnassignedPending { after },
+        };
+        let reply = node.query("saga", &saga::encode_query(&query)).await.ok()?;
+        let page = match (lane, saga::decode_reply(&reply)) {
+            (Lane::Assigned, Ok(SagaReply::AssignedPending(page))) => page,
+            (Lane::Unassigned, Ok(SagaReply::UnassignedPending(page))) => page,
+            _ => return None,
+        };
+        requests.extend(page.requests);
+        after = page.next;
+        if after.is_none() {
+            return Some(requests);
+        }
     }
 }
 

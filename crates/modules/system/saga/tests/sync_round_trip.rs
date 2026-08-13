@@ -81,14 +81,27 @@ async fn get(m: &SagaModule, id: &str) -> Option<SagaView> {
     }
 }
 
+/// the WHOLE announcement projection, walked page by page — the read is
+/// bounded per call, so "every announcement" is the caller's loop.
 async fn unassigned(m: &SagaModule) -> Vec<String> {
-    let reply = m
-        .query(&encode_query(&SagaQuery::UnassignedPending))
-        .await
-        .unwrap();
-    match decode_reply(&reply).unwrap() {
-        SagaReply::UnassignedPending(v) => v.into_iter().map(|r| r.saga_id).collect(),
-        other => panic!("expected UnassignedPending reply, got {other:?}"),
+    let mut ids = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let reply = m
+            .query(&encode_query(&SagaQuery::UnassignedPending {
+                after: after.clone(),
+            }))
+            .await
+            .unwrap();
+        let page = match decode_reply(&reply).unwrap() {
+            SagaReply::UnassignedPending(page) => page,
+            other => panic!("expected UnassignedPending reply, got {other:?}"),
+        };
+        ids.extend(page.requests.into_iter().map(|r| r.saga_id));
+        match page.next {
+            Some(cursor) => after = Some(cursor),
+            None => return ids,
+        }
     }
 }
 
