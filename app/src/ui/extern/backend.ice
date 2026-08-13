@@ -268,6 +268,7 @@ extern crate::backend
   pure diff_lines(diff:str) -> [DiffLine]
   SourceLine(number:str, text:str)
   pure source_lines(text:str) -> [SourceLine]
+  pure markdown_path(path:str) -> bool
   pure filter_forge_items(items:[ForgeItem], tab:ForgeTab) -> [ForgeItem]
   pure forge_open_count(items:[ForgeItem], kind:str) -> i64
   pure forge_merge_note(merge_oid:str, branches:str) -> str

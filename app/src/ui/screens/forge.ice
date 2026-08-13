@@ -6,7 +6,7 @@
 // one family, and the guards in main.rs name several of its members verbatim.
 // Everything outside that family drops the redundant `forge_` prefix.
 
-component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[ForgeRepo], list_phase:ForgePhase, open_repo:str, repo_menu:bool, repo_phase:ForgePhase, branches:[str], tab:ForgeTab, items:[ForgeItem], tree_repo:str, tree_path:str, tree_born:bool, tree_entries:[TreeEntry], tree_truncated:bool, code_phase:ForgeCodePhase, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, forge_item_number:i64, item_phase:ForgePhase, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:ForgeReviewVerdict, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, connected:bool, loading:bool)
+component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[ForgeRepo], list_phase:ForgePhase, open_repo:str, repo_menu:bool, repo_phase:ForgePhase, branches:[str], tab:ForgeTab, items:[ForgeItem], tree_repo:str, tree_path:str, tree_born:bool, tree_entries:[TreeEntry], tree_truncated:bool, code_phase:ForgeCodePhase, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, forge_item_number:i64, item_phase:ForgePhase, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:ForgeReviewVerdict, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, connected:bool, loading:bool, dark:bool)
   emits
     forge_open_repo(str)
     forge_close_repo()
@@ -439,7 +439,32 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                           with
                             name=file_path
                             note="This is not text — the reader shows no preview for it."
-                      if code_phase == ForgeCodePhase.ready && !empty(file_path) && !file_binary
+                      // A MARKDOWN BLOB READS AS A DOCUMENT, not a line
+                      // listing: a README is the first file every repo page
+                      // opens, and the shell's agent answers already ship
+                      // the full iced-markdown adapter (`agent_markdown`) —
+                      // this reuses it verbatim. Links route through the
+                      // same `open_message_link` seam the discussion's
+                      // messages already use. Code files stay single-ink
+                      // numbered lines by design (see ForgeCodeLine);
+                      // Markdown-vs-code is the path's call
+                      // (`markdown_path`) because the wire only says
+                      // binary-or-text.
+                      if code_phase == ForgeCodePhase.ready && !empty(file_path) && !file_binary && markdown_path(file_path)
+                        col
+                          with
+                            w=fill
+                            pt=13.0
+                            pb=13.0
+                            gap=9.0
+                          extern agent_markdown(file_text, dark) #forge-markdown -> emit(open_message_link, _)
+                          if file_truncated
+                            text "This file is larger than the 64 KiB preview limit."
+                              with
+                                size=11.5
+                                wrap=none
+                                @text-label
+                      if code_phase == ForgeCodePhase.ready && !empty(file_path) && !file_binary && !markdown_path(file_path)
                         col
                           with
                             w=fill

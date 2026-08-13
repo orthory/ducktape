@@ -871,6 +871,15 @@ pub fn source_lines(text: String) -> Vec<SourceLine> {
         .collect()
 }
 
+/// Whether a tree path names a Markdown document the reader renders as a
+/// document rather than line-numbers. Extension-based on purpose: the wire's
+/// `binary` flag only separates text from bytes, and forge carries no
+/// language field — the path is the one discriminator the app holds.
+pub fn markdown_path(path: String) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".md") || lower.ends_with(".markdown")
+}
+
 /// Split a unified patch into painted rows, tracking both line counters
 /// across hunk headers.
 /// The command that makes a repo. Forge IS a git remote — there is no "new

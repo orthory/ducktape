@@ -466,6 +466,7 @@ view
               discussion_pending=forge_discussion_pending
               connected
               loading
+              dark
             events
               forge_open_repo -> forge_open_repo _
               forge_close_repo -> forge_close_repo
