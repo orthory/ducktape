@@ -206,7 +206,7 @@ view
               unread_marker_seq
               selected_message_seq
               selected_message_rev
-              send_flash_id
+              send_flash_ids
               send_flash_value=animation.interpolate(send_flash, 0.0, 1.0)
               message_action
               message_menu_y
@@ -219,7 +219,7 @@ view
               thread_selected_rev
               thread_message_action
               thread_menu_y
-              thread_send_flash_id
+              thread_send_flash_ids
               thread_has_more
               thread_next_reply_offset
               thread_loading

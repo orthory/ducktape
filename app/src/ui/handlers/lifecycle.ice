@@ -322,10 +322,10 @@ on live_updated(next)
   // four scans this replaced took `messages` and `thread_messages` by value
   // twice each, so a busy channel deep-cloned the timeline and the open rail
   // twice per incoming message before a single row was folded.
-  live_settle = chat_settle(messages, thread_messages, next.chat, active_channel, send_flash_id, thread_send_flash_id)
+  live_settle = chat_settle(messages, thread_messages, next.chat, active_channel, send_flash_ids, thread_send_flash_ids)
   send_flash = live_settle.flashed
-  send_flash_id = live_settle.send_id
-  thread_send_flash_id = live_settle.reply_id
+  send_flash_ids = live_settle.send_ids
+  thread_send_flash_ids = live_settle.reply_ids
   // A HISTORY WINDOW IS A SNAPSHOT, NOT A LIVE TAIL. The rows in hand are a
   // window around one old message, so a new post's seq is past every one of
   // them and `insert_committed_root` puts it at the END of the window — a
@@ -966,7 +966,7 @@ subscribe
   // starts its fade, tick two unmounts it. Gated on an anchored ✓ — it costs
   // nothing outside the seconds after a send settles. A live delta may start
   // the fade earlier; this clock is the floor a quiet network needs.
-  every 1200ms when (!empty(send_flash_id)) || (!empty(thread_send_flash_id)) -> send_flash_tick
+  every 1200ms when (!empty(send_flash_ids)) || (!empty(thread_send_flash_ids)) -> send_flash_tick
   // The page document's autosave: the editor's edits never pass through a
   // handler, so the gate IS the dirty test — the tick only exists while the
   // buffer has drifted from the last text known written.

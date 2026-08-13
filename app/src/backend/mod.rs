@@ -100,15 +100,32 @@ pub struct ChannelRead {
 pub struct ChatSettle {
     /// Whether this delta settles one of OUR optimistic rows, in either lane.
     pub flashed: bool,
-    /// The timeline row the ✓ anchors to, kept through unrelated deltas.
-    pub send_id: String,
-    /// Its thread-rail twin.
-    pub reply_id: String,
+    /// Timeline rows whose ✓ is still inside the shared fade window.
+    pub send_ids: String,
+    /// Their thread-rail twins.
+    pub reply_ids: String,
 }
 
 /// The blank verdict — the scratch field's own default.
 pub fn no_chat_settle() -> ChatSettle {
     ChatSettle::default()
+}
+
+fn with_settled_id(mut ids: String, settled: bool, id: String) -> String {
+    // A scalar bag keeps the view's by-value extern ABI from cloning a list
+    // for every visible row. These are our own `fresh_id` values, so newline
+    // is an exact, collision-free separator.
+    // ponytail: linear scan over human-scale IDs during the short fade; use a
+    // borrowed collection only when the Ice extern ABI can pass one.
+    let missing = !ids.lines().any(|current| current == id.as_str());
+    let new_settle = settled && missing;
+    if new_settle {
+        if !ids.is_empty() {
+            ids.push('\n');
+        }
+        ids.push_str(&id);
+    }
+    ids
 }
 
 /// Read BEFORE the delta is folded in — the match is the pending row the
@@ -118,20 +135,22 @@ pub fn chat_settle(
     thread: Vec<ChatMessage>,
     delta: ChatDelta,
     active_channel: String,
-    send_id: String,
-    reply_id: String,
+    mut send_ids: String,
+    mut reply_ids: String,
 ) -> ChatSettle {
     let sent = send_settled_by(&messages, &delta, &active_channel);
     let replied = reply_settled_by(&thread, &delta, &active_channel);
+    send_ids = with_settled_id(send_ids, sent, delta.message.id.clone());
+    reply_ids = with_settled_id(reply_ids, replied, delta.message.id);
     ChatSettle {
         flashed: sent || replied,
-        send_id: if sent {
-            delta.message.id.clone()
-        } else {
-            send_id
-        },
-        reply_id: if replied { delta.message.id } else { reply_id },
+        send_ids,
+        reply_ids,
     }
+}
+
+pub fn has_flash_id(ids: String, id: String) -> bool {
+    ids.lines().any(|current| current == id.as_str())
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]

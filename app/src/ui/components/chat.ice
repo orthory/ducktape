@@ -928,7 +928,7 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
 // already reading the thread. The card padding matches MessageCard's so the
 // pr=7 indicator inset still tucks under the pr=8 toolbar plate (#926).
 //
-// `flash` — the rail's own settle ✓: `thread_send_flash_id` anchors it to the
+// `flash` — the rail's own settle ✓: `thread_send_flash_ids` anchors it to the
 // reply whose optimistic send just landed, on the stream's shared fade.
 // `open_thread_for` is forwarded only because `MessageContents` declares it:
 // it fires from the reply pill, and a reply carries no replies
