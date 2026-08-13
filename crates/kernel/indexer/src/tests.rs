@@ -411,9 +411,11 @@ fn a_new_mapper_folds_the_op_feed_the_database_already_held() {
         );
     }
     let store = mapped_store(dir.path());
-    // the refold's re-writes commit inside `open`, so the backlog is already
-    // queued here and this barrier is the honest wait for it to drain.
-    store.wait_folds_drained().unwrap();
+    // NO BARRIER HERE, ON PURPOSE. `open` waits the refold out itself, and
+    // that is the property under test: `replay_op_feed` only stages the
+    // re-writes, so an `open` that returned before the runner drained them
+    // would hand a node a read model that is the freshly CLEARED keyspace —
+    // every view answering "no such row" while the feed re-derives behind it.
     // the last row of the pre-existing feed is (2, 1) — the refold walks the
     // whole thing in key order, which for op keys IS block-and-drain order.
     assert_eq!(store.fold_tip("chat").unwrap(), Some((2, 1)));
@@ -481,8 +483,9 @@ fn a_mapper_swap_clears_and_refolds_the_read_model() {
         ],
     )
     .expect("open store");
-    store.wait_folds_drained().unwrap();
 
+    // again with no barrier: the swap's replay is finished by the time `open`
+    // answers, or these rows are not there to read.
     assert_eq!(
         store.view("chat", b"count").unwrap(),
         2u64.to_be_bytes().to_vec(),
@@ -506,6 +509,57 @@ fn a_mapper_swap_clears_and_refolds_the_read_model() {
             .len(),
         2,
         "the op feed is what the refold READ — it is never wiped"
+    );
+}
+
+/// THE OPEN WAITS THE REFOLD OUT, AND SAYS SO WHEN IT CANNOT FINISH.
+///
+/// `replay_op_feed` only STAGES its re-writes — the engine folds them on a
+/// background runner — so an `open` that returned at that point would publish
+/// a store whose read model is the keyspace `clear_derived` just emptied:
+/// every view answering "no such row" for the length of the whole feed, which
+/// reads as a workspace that lost its contents rather than one still starting.
+///
+/// This is the deterministic half of that wait. The two refold tests above
+/// assert what a DRAINED store holds, and a fast fixture drains before they
+/// can look, so they cannot fail when the wait is missing. A poisoned op can:
+/// the fold refuses it forever, and the only way `open` ever reports it is by
+/// having stopped for the runner. Both halves come out of the same
+/// `drain_fold` call — it returns on an empty queue or on a queue that will
+/// never empty, and on nothing else.
+///
+/// Refusing the open is deliberate, and matches what a broken artifact already
+/// gets one line earlier at `wasm_entries`: a guest that cannot fold its own
+/// feed has no read model to serve.
+#[test]
+fn a_refold_that_cannot_finish_refuses_the_open() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        // no guest, so the feed takes the poison op with nothing folding: the
+        // failure belongs to the REFOLD, not to the write that fed it.
+        let store = bare_store(dir.path());
+        store
+            .apply_block(&block(1, vec![chat_op(b"one"), chat_op(b"boom")]))
+            .unwrap();
+    }
+
+    let opened = IndexStore::open(
+        dir.path(),
+        &[
+            IndexModule {
+                id: "chat",
+                guest: Some(TESTMAP),
+            },
+            IndexModule::bare("tasks"),
+        ],
+    );
+
+    let Err(Error::FoldStuck(cause)) = opened else {
+        panic!("a store whose refold cannot complete must refuse to open");
+    };
+    assert!(
+        cause.starts_with("chat: "),
+        "the refusal names the module that could not fold: {cause}"
     );
 }
 
@@ -591,7 +645,6 @@ fn reopen_without_a_guest_converges_the_database() {
     // before the next block is ever applied. `count` reads 2 for both ops, not
     // 3 (a replay onto the surviving row) and not 1 (no replay at all).
     let store = mapped_store(dir.path());
-    store.wait_folds_drained().unwrap();
     let mut sub = store.subscribe("chat", b"seen/", Some(b"seen0")).unwrap();
     store.apply_block(&block(2, vec![chat_op(b"two")])).unwrap();
     wait_for_keys(&mut sub, [seen_key(2, 0)]);

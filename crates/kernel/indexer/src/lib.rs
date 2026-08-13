@@ -76,7 +76,8 @@
 //! boundary: the op feed is still there. [`converge_guest`] clears the derived
 //! keyspace and re-drives the fold over the rows the database already holds,
 //! leaving `op/` and `meta/` alone — a new mapper changes what the rows MEAN,
-//! never what the feed saw.
+//! never what the feed saw. that re-drive completes before [`IndexStore::open`]
+//! returns, so no reader ever sees the cleared keyspace.
 //!
 //! the full contract a per-module index guest must satisfy (fold rules, view
 //! rules, when NOT to index) is `docs/records/specs/indexable-spec.md`; the
@@ -535,31 +536,13 @@ impl IndexStore {
     /// `wait_flushed` progress-wait idiom. `Err` = a fold failed with a
     /// backlog still pending — the views cannot catch up.
     pub fn wait_folds_drained(&self) -> Result<()> {
-        loop {
-            let mut pending = 0u64;
-            for (id, m) in &self.modules {
-                if !m.has_fold {
-                    continue;
-                }
-                let trigger = m
-                    .db
-                    .list_triggers()?
-                    .into_iter()
-                    .find(|t| t.name == FOLD_TRIGGER);
-                if let Some(t) = trigger
-                    && t.pending > 0
-                {
-                    if let Some(err) = t.last_error {
-                        return Err(Error::FoldStuck(format!("{id}: {err}")));
-                    }
-                    pending += t.pending;
-                }
+        for (id, m) in &self.modules {
+            if !m.has_fold {
+                continue;
             }
-            if pending == 0 {
-                return Ok(());
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            drain_fold(&m.db, id)?;
         }
+        Ok(())
     }
 
     /// store one explorer row at `height` WITHOUT a dispatch feed — the write
@@ -797,10 +780,16 @@ struct GuestMarker {
 /// it is exactly the silent-stale-rows failure this exists to prevent. an
 /// author cannot forget a hash.
 ///
-/// ponytail: a view-only mapper edit therefore pays a full replay of the feed
-/// at the next open. the tier is rebuildable by construction and the cost is
-/// bounded by the feed the database holds, so this stays until a measured boot
-/// regression asks for a `shape` field in [`GuestMarker`] to narrow it.
+/// the replay is WAITED OUT before this returns, so `open` answers with a
+/// complete read model or not at all — the cost lands on boot latency, never
+/// on a view that would otherwise answer an empty keyspace as if it were an
+/// empty workspace.
+///
+/// ponytail: a view-only mapper edit therefore pays a full replay of the feed,
+/// synchronously, at the next open. the tier is rebuildable by construction
+/// and the cost is bounded by the feed the database holds, so this stays until
+/// a measured boot regression asks for a `shape` field in [`GuestMarker`] to
+/// narrow which changes refold.
 fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
     let marker = db
         .get(META_GUEST.as_bytes())?
@@ -840,6 +829,20 @@ fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
         clear_derived(db)?;
         create_fold_trigger(db)?;
         replay_op_feed(db)?;
+        // AND WAIT FOR IT. `replay_op_feed` only STAGES the re-writes; the
+        // trigger runner folds them behind it. Returning here would hand the
+        // node an open store whose read model is the freshly CLEARED keyspace
+        // — `/v1/index/*/view` up and answering "no such page" for every page,
+        // for as long as the whole feed takes to re-derive, with nothing on
+        // the boot path consulting `fold_status` to know better. An empty
+        // answer is worse than a slow boot: it is indistinguishable from a
+        // workspace that lost its documents.
+        //
+        // `Err` here refuses the OPEN, matching what a broken artifact already
+        // does at `wasm_entries` above: a guest that cannot fold its own feed
+        // has no read model to serve, and saying so beats serving nothing
+        // quietly.
+        drain_fold(db, spec.id)?;
     }
     // written LAST, so an interrupted refold re-runs whole at the next open
     // instead of leaving a marker that vouches for a half-derived read model.
@@ -850,6 +853,30 @@ fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
     };
     db.put(META_GUEST, borsh::to_vec(&marker)?)?;
     Ok((has_fold, has_view))
+}
+
+/// block until one module's fold trigger has nothing queued: fluent31 drains
+/// folds on a background runner, so both the sim's commit barrier and the
+/// refold above have to join it rather than assume it. a module with no
+/// trigger has nothing to wait for. `Err` = the fold FAILED with a backlog
+/// still pending, which no amount of waiting fixes.
+fn drain_fold(db: &Db, module: &str) -> Result<()> {
+    loop {
+        let trigger = db
+            .list_triggers()?
+            .into_iter()
+            .find(|t| t.name == FOLD_TRIGGER);
+        let Some(trigger) = trigger else {
+            return Ok(());
+        };
+        if trigger.pending == 0 {
+            return Ok(());
+        }
+        if let Some(err) = trigger.last_error {
+            return Err(Error::FoldStuck(format!("{module}: {err}")));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }
 
 /// delete every DERIVED key: everything a mapper wrote (its own rows plus the
