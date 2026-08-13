@@ -2325,12 +2325,12 @@ fn reply_settle_flash_mirrors_the_stream_for_the_thread_rail() {
         pending.clone(),
         settle.clone(),
         "general".into(),
-        "kept".into(),
+        with_settled_id(String::new(), true, "kept".into()),
         String::new(),
     );
     assert!(verdict.flashed);
-    assert_eq!(verdict.reply_id, "reply-a");
-    assert_eq!(verdict.send_id, "kept");
+    assert!(has_flash_id(verdict.reply_ids, "reply-a".into()));
+    assert!(has_flash_id(verdict.send_ids, "kept".into()));
     // Each lane fires only on its own delta kind: a `reply` is the rail's
     // edge and never the stream's, and a `posted` is the reverse.
     assert!(!send_settled_by(&pending, &settle, "general"));
@@ -2361,11 +2361,11 @@ fn send_settle_flash_fires_only_for_own_pending_rows() {
         settle.clone(),
         "general".into(),
         String::new(),
-        "kept".into(),
+        with_settled_id(String::new(), true, "kept".into()),
     );
     assert!(verdict.flashed);
-    assert_eq!(verdict.send_id, "message-a");
-    assert_eq!(verdict.reply_id, "kept");
+    assert!(has_flash_id(verdict.send_ids, "message-a".into()));
+    assert!(has_flash_id(verdict.reply_ids, "kept".into()));
     // Wrong channel, someone else's post, and a non-post delta all keep the
     // current anchor instead of flashing.
     assert!(!send_settled_by(&pending, &settle, "other"));
@@ -2379,12 +2379,12 @@ fn send_settle_flash_fires_only_for_own_pending_rows() {
         Vec::new(),
         reaction,
         "general".into(),
-        "kept".into(),
-        "kept-reply".into(),
+        with_settled_id(String::new(), true, "kept".into()),
+        with_settled_id(String::new(), true, "kept-reply".into()),
     );
     assert!(!unrelated.flashed);
-    assert_eq!(unrelated.send_id, "kept");
-    assert_eq!(unrelated.reply_id, "kept-reply");
+    assert!(has_flash_id(unrelated.send_ids, "kept".into()));
+    assert!(has_flash_id(unrelated.reply_ids, "kept-reply".into()));
 }
 
 #[test]

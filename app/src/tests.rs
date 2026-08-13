@@ -632,7 +632,7 @@ fn assert_no_polling(lifecycle: &str) {
             // the settle-✓'s dismissal clock: two beats — hold + fade, then
             // unmount. Gated on the flash anchor, so it exists only for the
             // seconds after one of OUR sends settles.
-            "every 1200ms when (!empty(send_flash_id)) || (!empty(thread_send_flash_id)) -> send_flash_tick",
+            "every 1200ms when (!empty(send_flash_ids)) || (!empty(thread_send_flash_ids)) -> send_flash_tick",
             // the block editor's autosave clock: the stock editor's edits
             // never pass through a handler, so a dirty buffer is the only
             // signal there is — and the gate IS the dirty test, so the tick
@@ -2776,7 +2776,7 @@ fn optimistic_sends_are_independent_and_never_erase_the_next_draft() {
 
     // …the committed row arrives as a delta and settles ONLY its pending
     let mut committed = message(1, "first", false);
-    committed.id = first_id;
+    committed.id = first_id.clone();
     let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
         "general", committed,
     )));
@@ -2786,6 +2786,22 @@ fn optimistic_sends_are_independent_and_never_erase_the_next_draft() {
     assert_eq!(app.messages[0].seq, 1);
     assert_eq!(app.messages[1].id, second_id);
     assert!(app.messages[1].pending);
+    assert!(backend::has_flash_id(
+        app.send_flash_ids.clone(),
+        first_id.clone()
+    ));
+
+    // A second settle inside the fade window ADDS its confirmation. The old
+    // scalar anchor moved the ✓ from the first row to this one, which is the
+    // visible blip rapid sends exposed.
+    let mut second = message(2, "second", false);
+    second.id = second_id.clone();
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
+        "general", second,
+    )));
+    assert!(app.messages.iter().all(|message| !message.pending));
+    assert!(backend::has_flash_id(app.send_flash_ids.clone(), first_id));
+    assert!(backend::has_flash_id(app.send_flash_ids.clone(), second_id));
 
     let chat = inlined(include_str!("ui/screens/chat.ice"));
     assert!(chat.contains("stack #message(message.id) w=fill"));
@@ -3582,7 +3598,7 @@ fn the_thread_rail_virtualizes_and_caches_its_quiet_replies() {
     for live in [
         "thread_message.seq == thread_target_seq",
         "thread_message.seq == thread_selected_seq",
-        "thread_message.id == thread_send_flash_id",
+        "has_flash_id(thread_send_flash_ids, thread_message.id)",
     ] {
         assert!(chat.contains(live), "the live arm on {live} is gone");
     }
@@ -3810,7 +3826,7 @@ fn thread_messages_mirror_the_main_action_system() {
     // message redesign lands in both lanes at once.
     assert!(card.contains("MessageContents message=message flash=flash"));
     // The rail's settle ✓ is real now: the card takes the fade as a prop and
-    // `thread_send_flash_id` anchors it from the screen's flash arm. (`card`
+    // `thread_send_flash_ids` anchors it from the screen's flash arm. (`card`
     // starts right after the component name, so the signature is its head.)
     assert!(card.starts_with(
         "(message:ChatMessage, selected:bool, menu_open:bool, disabled:bool, flash:f64)"

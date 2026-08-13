@@ -107,9 +107,10 @@ extern crate::backend
   // THE SETTLE ✓, IN ONE CALL. The four scans this replaced each took their
   // list by value, so one incoming message deep-cloned the timeline twice and
   // the open rail twice before a single row was folded.
-  ChatSettle(flashed:bool, send_id:str, reply_id:str)
+  ChatSettle(flashed:bool, send_ids:str, reply_ids:str)
   pure no_chat_settle() -> ChatSettle
-  pure chat_settle(messages:[ChatMessage], thread:[ChatMessage], delta:ChatDelta, active_channel:str, send_id:str, reply_id:str) -> ChatSettle
+  pure chat_settle(messages:[ChatMessage], thread:[ChatMessage], delta:ChatDelta, active_channel:str, send_ids:str, reply_ids:str) -> ChatSettle
+  pure has_flash_id(ids:str, id:str) -> bool
   pure append_thread_page(messages:[ChatMessage], next:[ChatMessage]) -> [ChatMessage]
   pure merge_thread_reply(messages:[ChatMessage], reply:ChatMessage) -> [ChatMessage]
   pure history_has_older(messages:[ChatMessage]) -> bool

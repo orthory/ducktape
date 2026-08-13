@@ -1233,8 +1233,8 @@ on remove_reaction_at(seq, emoji)
 // aimed at hidden and drops the anchor, unmounting the ✓ (the 400ms fade
 // always finishes inside one 1200ms beat).
 on send_flash_tick
-  send_flash_id = keep_str(animation.value(send_flash), send_flash_id, "")
-  thread_send_flash_id = keep_str(animation.value(send_flash), thread_send_flash_id, "")
+  send_flash_ids = keep_str(animation.value(send_flash), send_flash_ids, "")
+  thread_send_flash_ids = keep_str(animation.value(send_flash), thread_send_flash_ids, "")
   send_flash = false
 
 // A reaction's ack has nothing to restore: the optimistic fold is already on

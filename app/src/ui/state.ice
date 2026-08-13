@@ -187,17 +187,14 @@ state
   composer_focus = "none"
   pending_message = ""
   pending_message_id = ""
-  // The transient settle ✓: `send_flash_id` anchors it to the row whose
-  // optimistic send just landed, `send_flash` drives its opacity — true pops
-  // it in on the settle delta, the NEXT live event flips it false and fades
-  // it out. No timer: consensus itself is the metronome (blocks keep coming).
-  send_flash_id = ""
-  // Its thread-rail twin: anchors the same fade to a settled REPLY row. One
-  // shared `send_flash` drives both opacities — two lanes settling in the
-  // same beat share one fade, which reads fine and needs no second animation.
-  thread_send_flash_id = ""
+  // The transient settle ✓s: every optimistic send that lands inside one fade
+  // window keeps its own anchor, so rapid sends confirm together instead of
+  // moving one check from row to row. `send_flash` drives their shared opacity.
+  send_flash_ids = ""
+  // Their thread-rail twins share the same fade.
+  thread_send_flash_ids = ""
   // Scratch, not a reading: the settle verdict `live_updated` computes ONCE
-  // per delta and then spends on the three fields above. A `let` cannot hold
+  // per delta and then spends in three state writes. A `let` cannot hold
   // it — a run-route payload's fields do not type inside one (E151), and
   // `next.chat` is exactly such a payload — so it is a field the handler writes
   // and reads in the same pass, the same shape as `page_install` below.

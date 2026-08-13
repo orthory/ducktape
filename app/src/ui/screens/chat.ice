@@ -19,7 +19,7 @@
 // were briefly caller-filled slots: a sensor's show/resize route used to accept
 // only bare `_` payloads and could not carry a component event (ui-lang#239).
 
-component ChatScreen(network_name:str, status:str, block_height:i64, bind search_draft:str, search_phase:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:str, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, send_flash_id:str, send_flash_value:f64, message_action:str, message_menu_y:f64, bind message_action_focus:str, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_menu_y:f64, thread_send_flash_id:str, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor)
+component ChatScreen(network_name:str, status:str, block_height:i64, bind search_draft:str, search_phase:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:str, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, send_flash_ids:str, send_flash_value:f64, message_action:str, message_menu_y:f64, bind message_action_focus:str, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_menu_y:f64, thread_send_flash_ids:str, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor)
   emits
     search_chat_submit()
     clear_chat_search()
@@ -732,7 +732,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                       open_message_reactions
                                       open_message_actions
                                       open_message_link
-                              if message.seq != selected_message_seq && message.id == send_flash_id
+                              if message.seq != selected_message_seq && has_flash_id(send_flash_ids, message.id)
                                 stack #message(message.id) w=fill
                                   MessageCard
                                     with
@@ -755,7 +755,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                               // mutation and seeds it from the content hash at
                               // construction, so every repaint a reader can see
                               // moves a key.
-                              if message.seq != selected_message_seq && message.id != send_flash_id
+                              if message.seq != selected_message_seq && !has_flash_id(send_flash_ids, message.id)
                                 lazy message by message.seq, message.render_rev as cached_message
                                   stack #message(cached_message.id) w=fill
                                     MessageCard
@@ -1664,7 +1664,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                               open_thread_message_actions
                               open_thread_message_reactions
                               open_message_link
-                        if thread_message.seq != active_thread_seq && thread_message.seq != thread_target_seq && thread_message.seq != thread_selected_seq && thread_message.id == thread_send_flash_id
+                        if thread_message.seq != active_thread_seq && thread_message.seq != thread_target_seq && thread_message.seq != thread_selected_seq && has_flash_id(thread_send_flash_ids, thread_message.id)
                           ThreadMessageCard
                             with
                               message=thread_message
@@ -1688,7 +1688,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         // hovering has no button to disable.
                         // Keyed by (seq, render_rev) exactly as the stream's
                         // quiet arm is — see the note there.
-                        if thread_message.seq != active_thread_seq && thread_message.seq != thread_target_seq && thread_message.seq != thread_selected_seq && thread_message.id != thread_send_flash_id
+                        if thread_message.seq != active_thread_seq && thread_message.seq != thread_target_seq && thread_message.seq != thread_selected_seq && !has_flash_id(thread_send_flash_ids, thread_message.id)
                           lazy thread_message by thread_message.seq, thread_message.render_rev as cached_reply
                             ThreadMessageCard
                               with
