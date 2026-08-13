@@ -161,11 +161,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                 text-size=13.0
                 line-h=1.2
                 @control
-              // NO `border=` HERE. `active` is the base for EVERY status, not
-              // just the resting one, so a border color on this line is written
-              // AFTER `@control`'s `focus:border-ring` and the ring never
-              // paints — the field the caret sits in looked exactly like the
-              // four beside it. The recipe already owns the resting border.
+              // NO `border=` HERE — the recipe already owns the resting border.
               active bg=surface value=fg placeholder=hint selection=fg/18 border-w=1.0 r=8.0
               hovered bg=muted_bg border=control_line
               disabled bg=transparent value=muted
@@ -1026,13 +1022,12 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                     @control
                                   active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
                                   hovered bg=fg/4 border=fg/8
-                                  // THE EDITOR IS BORDERLESS AT REST ON PURPOSE, so it
-                                  // cannot inherit `@control`'s ring: `active` runs as the
-                                  // base of every status and its `border=transparent`
-                                  // lands after the recipe's focus color. `begin_message_edit`
-                                  // drops the caret in here by hand, so without this line the
-                                  // user was dropped into an invisible field whose HOVER read
-                                  // stronger than its focus.
+                                  // THE EDITOR IS BORDERLESS AT REST ON PURPOSE, and the
+                                  // recipe's ring alone on a transparent field is a thin
+                                  // outline around nothing. `begin_message_edit` drops the
+                                  // caret in here by hand, so focus also lifts the plate —
+                                  // without the `bg=` the field's HOVER read stronger than
+                                  // its focus.
                                   focused bg=fg/4 border=ring
                                   disabled value=muted
                                 button "Save" -> emit(edit_message_submit)
@@ -2058,7 +2053,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                               active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
                               hovered bg=fg/4 border=fg/8
                               // Same borderless-at-rest editor as the main stream's, so
-                              // the same authored ring — see `#message-edit` above.
+                              // the same focused plate — see `#message-edit` above.
                               focused bg=fg/4 border=ring
                               disabled value=muted
                             button "Save" -> emit(edit_thread_message_submit)
