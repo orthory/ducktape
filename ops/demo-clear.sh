@@ -119,7 +119,15 @@ fi
 
 # ── 3. delete the workspace dir ────────────────────────────────
 if [ -d "$WSDIR" ]; then
-  rm -rf "$WSDIR"
+  rm -rf "$WSDIR" 2>/dev/null
+  if [ -d "$WSDIR" ] && command -v podman >/dev/null 2>&1; then
+    for overlay in "$WSDIR"/storage/services/*/podman/storage/overlay; do
+      [ -d "$overlay" ] || continue
+      podman unshare mountpoint -q "$overlay" && podman unshare umount "$overlay"
+    done
+    podman unshare rm -rf "$WSDIR" 2>/dev/null
+  fi
+  [ ! -d "$WSDIR" ] || die "could not delete $WSDIR — stop its services and remove the remaining files in their user namespace"
   log "deleted $WSDIR"
 fi
 
