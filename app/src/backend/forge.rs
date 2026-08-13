@@ -66,7 +66,6 @@ fn listed_forge_repo(repo: &serde_json::Value) -> (String, String) {
 
 /// The repo namespace with committed heads.
 pub async fn load_forge(rpc: String, generation: i64) -> Result<ForgeData, HydrationError> {
-    offscreen_guard(generation)?;
     async {
         let repos = list_forge_repos(&rpc)
             .await?
@@ -205,7 +204,6 @@ pub async fn load_forge_item(
 /// rendered through the exact same rows the chat pane uses.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ForgeDiscussionData {
-    pub generation: i64,
     pub channel_id: String,
     pub messages: Vec<ChatMessage>,
     /// the channel's members — the composer's mention vocabulary.
@@ -217,8 +215,7 @@ pub struct ForgeDiscussionData {
 pub async fn load_forge_discussion(
     rpc: String,
     channel_id: String,
-    generation: i64,
-) -> Result<ForgeDiscussionData, HydrationError> {
+) -> Result<ForgeDiscussionData, AppError> {
     async {
         let channel = load_channel_row(&rpc, &channel_id).await?;
         let rpc = rpc_client(&rpc)?;
@@ -226,17 +223,13 @@ pub async fn load_forge_discussion(
         let messages = load_messages(&rpc, &channel_id, head).await?;
         let members = load_channel_members(&rpc, &channel_id).await?;
         Ok(ForgeDiscussionData {
-            generation,
             channel_id,
             messages,
             members,
         })
     }
     .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
+    .map_err(app_error)
 }
 
 /// Submit a batched review on a PR, pinned to the source head the reviewer
@@ -604,7 +597,6 @@ pub struct TreeEntry {
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ForgeTreeData {
-    pub generation: i64,
     pub repo: String,
     pub rev: String,
     pub path: String,
@@ -619,7 +611,6 @@ pub struct ForgeTreeData {
 /// One file's contents at one revision, in the shape the preview pane reads.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct BlobView {
-    pub generation: i64,
     pub repo: String,
     pub rev: String,
     pub path: String,
@@ -633,7 +624,6 @@ pub(crate) fn tree_data(
     reply: serde_json::Value,
     repo: String,
     path: String,
-    generation: i64,
 ) -> Result<ForgeTreeData, String> {
     let tree = reply
         .get("tree")
@@ -657,7 +647,6 @@ pub(crate) fn tree_data(
         })
         .collect();
     Ok(ForgeTreeData {
-        generation,
         repo,
         rev: tree.rev,
         path,
@@ -667,11 +656,7 @@ pub(crate) fn tree_data(
     })
 }
 
-pub(crate) fn blob_view(
-    reply: serde_json::Value,
-    repo: String,
-    generation: i64,
-) -> Result<BlobView, String> {
+pub(crate) fn blob_view(reply: serde_json::Value, repo: String) -> Result<BlobView, String> {
     let blob = reply
         .get("blob")
         .filter(|blob| !blob.is_null())
@@ -683,7 +668,6 @@ pub(crate) fn blob_view(
         false => count_i64(blob.text.lines().count()),
     };
     Ok(BlobView {
-        generation,
         repo,
         rev: blob.rev,
         path: blob.path,
@@ -701,8 +685,7 @@ pub async fn forge_tree(
     repo: String,
     rev: String,
     path: String,
-    generation: i64,
-) -> Result<ForgeTreeData, HydrationError> {
+) -> Result<ForgeTreeData, AppError> {
     async {
         let client = rpc_client(&rpc)?;
         let query = serde_json::json!({ "tree": {
@@ -711,13 +694,10 @@ pub async fn forge_tree(
             "path": &path,
         }});
         let reply = client.query("forge", &query).await?;
-        tree_data(reply, repo, path, generation)
+        tree_data(reply, repo, path)
     }
     .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
+    .map_err(app_error)
 }
 
 /// Read one bounded file preview at the tree's exact revision on the node.
@@ -726,8 +706,7 @@ pub async fn forge_blob(
     repo: String,
     rev: String,
     path: String,
-    generation: i64,
-) -> Result<BlobView, HydrationError> {
+) -> Result<BlobView, AppError> {
     async {
         let client = rpc_client(&rpc)?;
         let query = serde_json::json!({ "blob": {
@@ -736,13 +715,10 @@ pub async fn forge_blob(
             "path": &path,
         }});
         let reply = client.query("forge", &query).await?;
-        blob_view(reply, repo, generation)
+        blob_view(reply, repo)
     }
     .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
+    .map_err(app_error)
 }
 
 /// True when one live update invalidates forge state: a folded forge op, a
@@ -839,6 +815,7 @@ pub async fn forge_live_refresh(
             .unwrap_or_default(),
         items: repo_slice.map(|slice| slice.items).unwrap_or_default(),
         item_loaded: item_slice.is_some(),
+        item: item_slice.unwrap_or(noop.item),
         ..noop
     })
 }
@@ -1257,7 +1234,12 @@ fn hunk_span(line: &str) -> Option<HunkSpan> {
 }
 
 /// The tracker's Pull requests / Issues split.
-pub fn filter_forge_items(items: Vec<ForgeItem>, kind: String) -> Vec<ForgeItem> {
+pub fn filter_forge_items(items: Vec<ForgeItem>, tab: crate::ForgeTab) -> Vec<ForgeItem> {
+    let kind = match tab {
+        crate::ForgeTab::Code => return Vec::new(),
+        crate::ForgeTab::Pulls => "pr",
+        crate::ForgeTab::Issues => "issue",
+    };
     items.into_iter().filter(|item| item.kind == kind).collect()
 }
 

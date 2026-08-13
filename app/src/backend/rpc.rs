@@ -509,19 +509,6 @@ pub(crate) fn user_error(message: String) -> String {
     message
 }
 
-/// A loader handed a NEGATIVE generation is being told its screen is
-/// off-screen: refuse before any I/O. The refusal's impossible generation
-/// makes the failed arm's guard drop it unread — nothing surfaces.
-pub(crate) fn offscreen_guard(generation: i64) -> Result<(), HydrationError> {
-    if generation < 0 {
-        return Err(HydrationError {
-            generation,
-            message: "skipped_offscreen".into(),
-        });
-    }
-    Ok(())
-}
-
 pub(crate) fn app_error(message: String) -> AppError {
     message.into()
 }

@@ -21,7 +21,7 @@ view
           height=block_height
           tier=member_tier(members_rows)
           error=onboarding_error
-          busy=(mutation_phase != "idle")
+          busy=mutation_busy
           restore_empty=empty(restore_words)
           join_empty=empty(join_invite)
         events
@@ -47,7 +47,7 @@ view
             with
               label="Recovery phrase"
               hint="24 words, space-separated"
-              disabled=(mutation_phase != "idle")
+              disabled=mutation_busy
               w=fill
               p=0.0
               text-size=12.0
@@ -61,7 +61,7 @@ view
             with
               label="Invite"
               hint="🦆AAAA…"
-              disabled=(mutation_phase != "idle")
+              disabled=mutation_busy
               submit=join_network_submit
               w=fill
               p=0.0
@@ -97,7 +97,7 @@ view
           status
           height=block_height
           sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
-          loading=(loading || mutation_phase != "idle")
+          loading=(loading || mutation_busy)
           degraded=connection_degraded(status)
           tab=shell_tab
           bell_count=bell_unread
@@ -118,7 +118,7 @@ view
           switch_network -> switch_network
         notice:
           col w=fill
-            if error != ""
+            if has_error
               box
                 with
                   w=fill
@@ -192,7 +192,7 @@ view
               huddle_joined_at
               huddle_now
               call_muted
-              huddle_popped=(huddle_win != none)
+              huddle_popped
               messages
               has_older_history
               history_view
@@ -300,7 +300,7 @@ view
               chat_error=shell_chat_error
               saga_id=shell_chat_saga
               connected
-              dark=(appearance == "dark")
+              dark
             events
               shell_mode_changed -> shell_mode_changed _
               shell_provider_changed -> shell_provider_changed _
@@ -323,7 +323,7 @@ view
               connected
               connected_rpc
               password
-              dark=(appearance == "dark")
+              dark
               active_page
               active_page_title
               active_page_parent
@@ -605,7 +605,7 @@ view
               // huddle's own channel. On every OTHER screen it must show even
               // when that channel is the selected one, which the missing
               // `shell_tab` term used to suppress.
-              if huddle_joined && (huddle_win == none) && (shell_tab != "chat" || huddle_channel != active_channel)
+              if huddle_joined && !huddle_popped && (shell_tab != ShellTab.chat || huddle_channel != active_channel)
                 HuddleDockedPill
                   with
                     channel=huddle_channel_name
@@ -617,11 +617,11 @@ view
             with
               create_open=channel_create_open
               members_only=channel_create_members_only
-              busy=(mutation_phase != "idle")
+              busy=mutation_busy
               connected
               loading
               toast
-              tone=toast_tone
+              tone="info"
               open=palette_open
               searching=palette_searching
               chat_hits=palette_chat_hits

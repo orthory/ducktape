@@ -479,16 +479,9 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
                                   @text-fg
       if connected
         if !empty(preview_entry.path)
-          // `changed_by` / `changed_height` are fed the "not answered"
-          // pair on purpose. `last_changed_at_path` exists and the
-          // panel gates its rows on `changed_height > 0`; wiring that
-          // load later lights these two rows without changing the
-          // selected entry mirrored by the file handlers.
           ObjectPanel
             with
               entry=preview_entry
-              changed_by=""
-              changed_height=0
 
 component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading:bool, kinds:[KindCount], kind:str, partial:str, hits:[ExplorerHit], blocks:[ExplorerBlock], selected:i64, ops:[ExplorerOp], head:i64, sync_line:str)
   emits

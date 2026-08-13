@@ -105,7 +105,6 @@ pub async fn files_ls(
     path: String,
     generation: i64,
 ) -> Result<FsListing, HydrationError> {
-    offscreen_guard(generation)?;
     async {
         let rpc = rpc_client(&rpc)?;
         let listed = rpc.files_get("ls", &[("path", path.as_str())]).await;
@@ -247,7 +246,6 @@ pub async fn files_preview(
 
 /// The committed snapshot window, newest first.
 pub async fn files_history(rpc: String, generation: i64) -> Result<FsHistory, HydrationError> {
-    offscreen_guard(generation)?;
     async {
         let rpc = rpc_client(&rpc)?;
         let reply = rpc.files_get("history", &[("limit", "50")]).await?;
@@ -440,86 +438,6 @@ pub async fn files_diff(
             generation,
             from,
             entries,
-        })
-    }
-    .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
-}
-
-/// Who last changed one duckfs PATH, and at which block.
-///
-/// This is the path's last COMMIT — never blob authorship. duckfs stores
-/// content-addressed objects with no per-blob author, so the honest label is
-/// "last changed at this path", which is exactly what walking the snapshot
-/// window answers.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct ChangeStamp {
-    pub generation: i64,
-    pub path: String,
-    /// The committing member, short form; empty when no commit in the window
-    /// touched this path.
-    pub author: String,
-    /// The committing block height; 0 with an empty author.
-    pub height: i64,
-}
-
-/// How far back a last-changed walk looks. A path untouched in this many
-/// commits reads as unknown rather than wrong.
-//
-// ponytail: one diff round-trip per snapshot until the first hit — recent
-// paths answer in one or two. Bound it lower, or ask the module for a
-// per-path log, if a cold path ever makes this walk visible.
-const CHANGE_STAMP_WINDOW: usize = 50;
-
-/// Walk the committed snapshots newest-first and stop at the first one whose
-/// diff against its parent touches `path`.
-pub async fn last_changed_at_path(
-    rpc: String,
-    path: String,
-    generation: i64,
-) -> Result<ChangeStamp, HydrationError> {
-    async {
-        let client = rpc_client(&rpc)?;
-        let limit = CHANGE_STAMP_WINDOW.to_string();
-        let history = client
-            .files_get("history", &[("limit", limit.as_str())])
-            .await?;
-        // `history` is newest-first, which is the order this walk wants.
-        let snapshots = history["snapshots"].as_array().cloned().unwrap_or_default();
-        for snapshot in &snapshots {
-            let id = snapshot["id"].as_str().unwrap_or_default();
-            let stamp = ChangeStamp {
-                generation,
-                path: path.clone(),
-                author: short_digest(snapshot["author"].as_str().unwrap_or_default()),
-                height: snapshot["height"].as_i64().unwrap_or(0),
-            };
-            // The root snapshot has no parent to diff against: everything the
-            // window still holds was introduced there.
-            let Some(parent) = snapshot["parent"].as_str() else {
-                return Ok(stamp);
-            };
-            let diff = client
-                .files_get(
-                    "diff",
-                    &[("from", parent), ("to", id), ("prefix", path.as_str())],
-                )
-                .await?;
-            let touched = diff["entries"]
-                .as_array()
-                .is_some_and(|entries| !entries.is_empty());
-            if touched {
-                return Ok(stamp);
-            }
-        }
-        Ok(ChangeStamp {
-            generation,
-            path,
-            author: String::new(),
-            height: 0,
         })
     }
     .await

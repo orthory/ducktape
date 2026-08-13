@@ -888,17 +888,7 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
                     disabled=disabled
                     p=5.0
                     @icon_action
-                  // `IconAction`, because ♡ and ⋯ beside it are string labels
-                  // that DO brighten: an svg reads no inherited text color, so
-                  // the one icon in this three-button toolbar was the one glyph
-                  // that stayed grey under the cursor. It takes this button's
-                  // own `disabled` so a dead control does not answer the hand.
-                  IconAction
-                    with
-                      name="nav-chat"
-                      tone="muted"
-                      px=15.0
-                      disabled=disabled
+                  svg icon("nav-chat") memory color=inherit w=15.0 h=15.0
                   active bg=transparent text=muted r=6.0
                   hovered bg=elevated text=fg
                   pressed bg=subtle text=fg
@@ -1174,12 +1164,7 @@ component ComposerMarks(disabled:bool)
           h=fill
           align-x=center
           align-y=center
-        IconAction
-          with
-            name="code-brackets"
-            tone="muted"
-            px=13.0
-            disabled=disabled
+        svg icon("code-brackets") memory color=inherit w=13.0 h=13.0
       active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
       hovered bg=fg/8 text=fg
       pressed bg=fg/12 text=fg
@@ -1197,12 +1182,7 @@ component ComposerMarks(disabled:bool)
           h=fill
           align-x=center
           align-y=center
-        IconAction
-          with
-            name="quote"
-            tone="muted"
-            px=13.0
-            disabled=disabled
+        svg icon("quote") memory color=inherit w=13.0 h=13.0
       active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
       hovered bg=fg/8 text=fg
       pressed bg=fg/12 text=fg

@@ -206,7 +206,6 @@ pub fn baseline_at_submitted_title(canonical: String, submitted: String) -> Stri
 /// illegal edit back.
 #[derive(Clone, Debug)]
 pub struct DocumentSaveResult {
-    pub generation: i64,
     pub written: bool,
     pub refusal: String,
     pub data: PagesData,
@@ -242,20 +241,15 @@ pub async fn save_page_document(
     page_id: String,
     text: String,
     saved: String,
-    generation: i64,
-) -> Result<DocumentSaveResult, HydrationError> {
-    let failed = |message: String| HydrationError {
-        generation,
-        message,
-    };
-    let client = rpc_client(&rpc).map_err(failed)?;
+) -> Result<DocumentSaveResult, AppError> {
+    let client = rpc_client(&rpc).map_err(app_error)?;
     if page_id.is_empty() {
-        return Err(failed("choose a page first".into()));
+        return Err(app_error("choose a page first".into()));
     }
 
     let current = load_pages_data(&client, Some(&page_id))
         .await
-        .map_err(failed)?;
+        .map_err(app_error)?;
     // A SAVE MUST PLAN AGAINST THE PAGE ITS CALLER NAMED.
     //
     // `load_pages_data` drops a requested id the index does not hold and falls
@@ -274,7 +268,7 @@ pub async fn save_page_document(
     // resync that follows a delete moves `active_page` off the dead page, which
     // parks the autosave tick on `active_page != buffer_page` (handlers/pages.ice).
     if current.active_page != page_id {
-        return Err(failed("page was not found".into()));
+        return Err(app_error("page was not found".into()));
     }
     let canonical = |data: &PagesData| {
         crate::pages::sync::page_document_text(&data.active_page_title, &data.blocks)
@@ -285,7 +279,6 @@ pub async fn save_page_document(
 
     if !refusal.is_empty() {
         return Ok(DocumentSaveResult {
-            generation,
             written: false,
             refusal,
             document: canonical(&current),
@@ -302,7 +295,7 @@ pub async fn save_page_document(
     let title = document_title(&text);
     let title_moved = title_write_owed(&title, &saved, &current.active_page_title);
     if title_moved {
-        let bounded = bounded_exact_text(title, "page title", 512).map_err(failed)?;
+        let bounded = bounded_exact_text(title, "page title", 512).map_err(app_error)?;
         write(
             &client,
             &password,
@@ -313,11 +306,10 @@ pub async fn save_page_document(
             },
         )
         .await
-        .map_err(|cause| failed(app_error(cause).message))?;
+        .map_err(app_error)?;
     }
     if ops.is_empty() && !title_moved {
         return Ok(DocumentSaveResult {
-            generation,
             written: false,
             refusal: String::new(),
             document: canonical(&current),
@@ -327,9 +319,8 @@ pub async fn save_page_document(
     if ops.is_empty() {
         let data = load_selected_page_data(&client, &page_id)
             .await
-            .map_err(failed)?;
+            .map_err(committed_error)?;
         return Ok(DocumentSaveResult {
-            generation,
             written: true,
             refusal: String::new(),
             document: canonical(&data),
@@ -345,25 +336,24 @@ pub async fn save_page_document(
     let mut anchor = String::new();
 
     for (index, op) in ops.iter().enumerate() {
-        // Only the FIRST op may report an uncommitted failure; once one write
-        // has landed the page has already moved, so the caller must resync
-        // either way.
-        let committed_so_far = index > 0;
+        // Only the first body op before any title write may report an
+        // uncommitted failure. Once one write has landed the page has already
+        // moved, so the caller must resync either way.
+        let committed_so_far = title_moved || index > 0;
         let message = apply_op(&client, &password, &page_id, &page_head, &mut anchor, op).await;
         if let Err(cause) = message {
             let mark = match committed_so_far {
                 true => committed_error(cause),
                 false => app_error(cause),
             };
-            return Err(failed(mark.message));
+            return Err(mark);
         }
     }
 
     let data = load_selected_page_data(&client, &page_id)
         .await
-        .map_err(failed)?;
+        .map_err(committed_error)?;
     Ok(DocumentSaveResult {
-        generation,
         written: true,
         refusal: String::new(),
         document: canonical(&data),

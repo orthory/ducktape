@@ -28,7 +28,6 @@ pub async fn load_settings_facts(
     rpc: String,
     generation: i64,
 ) -> Result<SettingsFacts, HydrationError> {
-    offscreen_guard(generation)?;
     async {
         let client = rpc_client(&rpc)?;
         let status = client.status().await?;
@@ -191,10 +190,10 @@ pub fn node_log_timeline<'a>(
     state: &'a NodeLogTimelineState,
     source: &'a str,
 ) -> iced::Element<'a, NodeLogTimelineEvent> {
-    use ui_lang_components::ui::log_timeline::{LogTimelineEvent, log_timeline};
-    use ui_lang_components::ui::theme::DARK;
     use iced::widget::{Space, button, column, container, row, text};
     use iced::{Border, Color, Font, Length};
+    use ui_lang_components::ui::log_timeline::{LogTimelineEvent, log_timeline};
+    use ui_lang_components::ui::theme::DARK;
 
     let inspection = state.timeline.inspect(node_log_timeline_config());
     let mono = Font {
@@ -471,7 +470,6 @@ mod log_timeline_tests {
 /// the two-field `Status` type drops, plus the mesh sample's live/total.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct NodeFacts {
-    pub generation: i64,
     /// The daemon's build version, verbatim off `/v1/status` (its own
     /// `CARGO_PKG_VERSION`). A build/commit SHA is NOT published anywhere, so
     /// the version line carries the version alone.
@@ -536,7 +534,6 @@ pub struct NodeFacts {
 impl Default for NodeFacts {
     fn default() -> Self {
         Self {
-            generation: 0,
             version: String::new(),
             root_hash: String::new(),
             view: None,
@@ -562,12 +559,11 @@ impl Default for NodeFacts {
 /// The facts a `/v1/status` document carries — the ONE reader, shared by the
 /// HTTP load and the pushed `status` snapshot, for the same reason
 /// [`peer_rows`] is shared.
-pub(crate) fn node_facts(status: &serde_json::Value, generation: i64) -> NodeFacts {
+pub(crate) fn node_facts(status: &serde_json::Value) -> NodeFacts {
     let operations = &status["operations"];
     let consensus = &operations["consensus"];
     let sync = &operations["sync"];
     NodeFacts {
-        generation,
         version: status["version"].as_str().unwrap_or_default().to_string(),
         root_hash: status["root_hash"].as_str().unwrap_or_default().to_string(),
         view: consensus["view"].as_i64(),
@@ -628,17 +624,14 @@ pub(crate) fn sync_in_progress(phase: &str) -> bool {
     phase == "syncing"
 }
 
-pub async fn load_node_facts(rpc: String, generation: i64) -> Result<NodeFacts, HydrationError> {
+pub async fn load_node_facts(rpc: String) -> Result<NodeFacts, AppError> {
     async {
         let client = rpc_client(&rpc)?;
         let status = client.status_json().await?;
-        Ok(node_facts(&status, generation))
+        Ok(node_facts(&status))
     }
     .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
+    .map_err(app_error)
 }
 
 /// The head a status document actually serves, or [`UNMEASURED`] when it
@@ -669,7 +662,7 @@ fn served_height(height: &serde_json::Value) -> i64 {
 /// What an `operations` reading the node did not publish carries.
 ///
 /// The rule is already written twice — `NodeFacts`'s consensus trio is
-/// `Option` "rather than being filled with misleading zeroes", and `state.ice`
+/// `Option` "rather than being filled with misleading zeroes", and `state/node.ice`
 /// says an absent reading "must print `—`, never a measured `0`". The two
 /// `i64` fields beside them had no way to say it, because `0` is a legal
 /// height and a legal timestamp.
@@ -814,10 +807,8 @@ trait SnapshotReader<T> {
 }
 
 impl SnapshotReader<NodeFacts> for Snapshot {
-    /// The generation is the HTTP loads' stale-reply guard; a PUSH answers no
-    /// request, so `-1` is the app's own "not a reply" reading.
     fn read(&self, document: &serde_json::Value) -> NodeFacts {
-        node_facts(document, -1)
+        node_facts(document)
     }
 }
 
@@ -897,7 +888,6 @@ pub struct ModuleRow {
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ModulesData {
-    pub generation: i64,
     pub rows: Vec<ModuleRow>,
 }
 
@@ -908,7 +898,7 @@ pub struct ModulesData {
 /// The lifecycle half is BEST EFFORT on purpose — the daemon's default module
 /// set has no `lifecycle`, and a network without one still has a real,
 /// complete registered set to show.
-pub async fn load_modules(rpc: String, generation: i64) -> Result<ModulesData, HydrationError> {
+pub async fn load_modules(rpc: String) -> Result<ModulesData, AppError> {
     async {
         let client = rpc_client(&rpc)?;
         let status = client.status_json().await?;
@@ -943,13 +933,10 @@ pub async fn load_modules(rpc: String, generation: i64) -> Result<ModulesData, H
                 }
             })
             .collect();
-        Ok(ModulesData { generation, rows })
+        Ok(ModulesData { rows })
     }
     .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
+    .map_err(app_error)
 }
 
 /// `LifecycleQuery::ModuleStatus` keyed by module id, empty when this network
@@ -1073,7 +1060,6 @@ fn agent_caps(caps: &serde_json::Value) -> Vec<AgentCap> {
 /// Load the agent roster from the canonical registry, each row marked with
 /// whether THIS device's user key is its owner.
 pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, HydrationError> {
-    offscreen_guard(generation)?;
     async {
         let client = rpc_client(&rpc)?;
         let local = local_user_key().await.map(|key| hex_encode(&key));
@@ -1180,12 +1166,6 @@ pub struct RunRow {
     pub summary: String,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct AgentRunsData {
-    pub generation: i64,
-    pub runs: Vec<RunRow>,
-}
-
 /// What a settled run produced, in one line: the forge PR it moved, else the
 /// output ref it wrote, else how it ended. Both fields ride `RunRecord`
 /// (crates/modules/apps/runs/src/interface.rs) — nothing here is invented.
@@ -1202,11 +1182,7 @@ fn run_summary(record: &serde_json::Value, outcome: &str) -> String {
 /// This agent's runs: the pending (RUNNING) entries first, then the delivered
 /// ring newest-first. Two queries because the runs module keeps in-flight
 /// correlation and settled history in two separate projections.
-pub async fn load_agent_runs(
-    rpc: String,
-    agent_id: String,
-    generation: i64,
-) -> Result<AgentRunsData, HydrationError> {
+pub async fn load_agent_runs(rpc: String, agent_id: String) -> Result<Vec<RunRow>, AppError> {
     async {
         let client = rpc_client(&rpc)?;
         // Two independent reads of one module, awaited one after the other. On a
@@ -1260,13 +1236,10 @@ pub async fn load_agent_runs(
                     }
                 }),
         );
-        Ok(AgentRunsData { generation, runs })
+        Ok(runs)
     }
     .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
+    .map_err(app_error)
 }
 
 /// Pause or resume one agent — owner-gated at the module, not quorum-gated.
@@ -1309,7 +1282,6 @@ pub struct AccountData {
 
 /// Load the account this node is bound to (via the canonical resolver).
 pub async fn load_account(rpc: String, generation: i64) -> Result<AccountData, HydrationError> {
-    offscreen_guard(generation)?;
     async {
         let client = rpc_client(&rpc)?;
         let node_key_hex = client.status().await?.public_key;

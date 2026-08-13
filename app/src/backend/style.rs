@@ -77,39 +77,6 @@ pub fn icon_tint(
     }
 }
 
-/// THE SAME RAMP ON A CONTROL'S GLYPH — the hover step its button cannot hand
-/// it, and the disabled step the recipe's `disabled:opacity-50` cannot reach.
-///
-/// A button's `hovered … text=` arrives at its content as an INHERITED text
-/// color, which an svg never reads, and its disabled pass halves the alpha of
-/// that same inherited color — so an icon-only control lit its plate and left
-/// the glyph flat in both directions.
-///
-/// `disabled` comes from the MOUNT, not from `status`: iced computes
-/// `svg::Status::Hovered` from the svg's own bounds inside `Button::update`,
-/// which forwards to its content before it checks `on_press`, so keying the
-/// hover step on status alone would brighten the glyph of a dead control.
-pub fn icon_action_tint(
-    theme: &iced::Theme,
-    status: iced::widget::svg::Status,
-    tone: impl AsRef<str>,
-    disabled: bool,
-) -> iced::widget::svg::Style {
-    let resting = icon_tint(theme, status, tone);
-    if disabled {
-        // The same halving the recipe gives the button's own ink.
-        return iced::widget::svg::Style {
-            color: resting.color.map(|color| color.scale_alpha(0.5)),
-        };
-    }
-    match status {
-        iced::widget::svg::Status::Hovered => iced::widget::svg::Style {
-            color: Some(theme.palette().text),
-        },
-        iced::widget::svg::Status::Idle => resting,
-    }
-}
-
 /// Whether the live palette is the dark reading. The generated theme's base
 /// text color IS `app_text`, so light text means a dark surface — no theme
 /// name string to allocate and compare per style call.
@@ -253,13 +220,6 @@ pub(crate) fn bounded_updated_block_text(kind: BlockKind, text: String) -> Resul
         return bounded_exact_text(text, "page title", 512);
     }
     bounded_exact_text(text, "block text", 64 * 1024)
-}
-
-/// Bump the autosave generation so any in-flight save's reply is discarded.
-/// The debounce ticket map this once also swept died with
-/// `debounced_page_text` — the generation check is the whole mechanism now.
-pub fn cancel_autosaves(_rpc: String, generation: i64) -> i64 {
-    generation.saturating_add(1)
 }
 
 pub(crate) fn block_move(

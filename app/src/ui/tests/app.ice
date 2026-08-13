@@ -4,9 +4,9 @@ preset ui_offline
     status = "Offline"
     connected = false
     loading = false
-    mutation_phase = "idle"
+    mutation_phase = MutationPhase.idle
     error = ""
-    shell_tab = "chat"
+    shell_tab = ShellTab.chat
     channel_draft = ""
     channel_create_members_only = false
     palette_open = false
@@ -17,8 +17,8 @@ preset ui_palette_open
     status = "Offline"
     connected = false
     loading = false
-    mutation_phase = "idle"
-    shell_tab = "chat"
+    mutation_phase = MutationPhase.idle
+    shell_tab = ShellTab.chat
     palette_open = true
     palette_draft = ""
 
@@ -28,9 +28,9 @@ preset ui_settings
     status = "Offline"
     connected = false
     loading = false
-    mutation_phase = "idle"
+    mutation_phase = MutationPhase.idle
     error = ""
-    shell_tab = "settings"
+    shell_tab = ShellTab.settings
 
 preset ui_component_error
   state
@@ -41,12 +41,12 @@ preset ui_component_error
 // without spending a provider credential.
 preset ui_shell_showcase
   state
-    shell_tab = "shell"
+    shell_tab = ShellTab.shell
     connected = false
     loading = false
-    mutation_phase = "idle"
+    mutation_phase = MutationPhase.idle
     error = ""
-    shell_mode = "chat"
+    shell_mode = ShellMode.chat
     shell_provider = "codex"
     shell_credential = ""
     shell_chat_entries = agent_chat_finish(agent_chat_push_user([], "Explain the execution path and call out the failure boundaries.", "codex"), "## Execution path\n\nThe request becomes a durable saga, streams provider activity into this view, and commits the final answer before the turn settles.\n\n- **Scheduling** pins work to the selected compute provider.\n- **Live output** stays observational.\n- **Saga state** is the canonical result.", "codex")
@@ -95,8 +95,8 @@ test shell_chat_surface_contract
   expect text "Execution path" within transcript
   expect transcript.width > 1000.0
   capture shell_chat_light
-  dispatch shell_mode_changed("raw")
-  expect shell_mode == "raw"
+  dispatch shell_mode_changed(ShellMode.raw)
+  expect shell_mode == ShellMode.raw
   expect missing transcript
   capture shell_raw_light
   resize 966 500
@@ -309,9 +309,9 @@ test minimum_window_layout_contract
 
 preset ui_launch
   state
-    mutation_phase = "idle"
+    mutation_phase = MutationPhase.idle
     onboarding_error = ""
-    hub_step = "networks"
+    hub_step = HubStep.networks
     hub_networks = []
     hub_selected = ""
 
@@ -324,7 +324,7 @@ test launch_unlock_contract
   mount
     HubColumn #hub
       with
-        step="unlock"
+        step=HubStep.unlock
         key_state="encrypted"
         networks=hub_networks
         selected=""
@@ -361,9 +361,9 @@ test launch_unlock_contract
   target pw = #hub/root/unlock/root/unlock-password
   expect exists pw
   dispatch go_restore
-  expect hub_step == "restore"
+  expect hub_step == HubStep.restore
   dispatch go_login
-  expect hub_step == "unlock"
+  expect hub_step == HubStep.unlock
 
 test launch_networks_empty_contract
   preset ui_launch
@@ -371,7 +371,7 @@ test launch_networks_empty_contract
   mount
     HubColumn #hub
       with
-        step="networks"
+        step=HubStep.networks
         key_state="encrypted"
         networks=hub_networks
         selected=""
@@ -408,7 +408,7 @@ test launch_networks_empty_contract
   target cta = #hub/root/networks/root/join-cta
   expect exists cta
   click cta
-  expect hub_step == "join"
+  expect hub_step == HubStep.join
 
 preset ui_palette_overlay
   state
@@ -459,11 +459,11 @@ test palette_overlay_contract
 
 preset ui_settings_scroll
   state
-    shell_tab = "settings"
+    shell_tab = ShellTab.settings
     status = "Offline"
     connected = false
     loading = false
-    mutation_phase = "idle"
+    mutation_phase = MutationPhase.idle
     error = ""
 
 // KEYBOARD SCROLL. iced's scrollable answers the wheel and the drag rail only
@@ -646,10 +646,10 @@ test settings_keyboard_scroll_contract
 
 preset ui_explorer_partial
   state
-    shell_tab = "explorer"
+    shell_tab = ShellTab.explorer
     connected = true
     loading = false
-    mutation_phase = "idle"
+    mutation_phase = MutationPhase.idle
     error = ""
     explorer_query = "needle"
     explorer_searching = false
@@ -658,10 +658,10 @@ preset ui_explorer_partial
 
 preset ui_explorer_whole
   state
-    shell_tab = "explorer"
+    shell_tab = ShellTab.explorer
     connected = true
     loading = false
-    mutation_phase = "idle"
+    mutation_phase = MutationPhase.idle
     error = ""
     explorer_query = "needle"
     explorer_searching = false
@@ -740,7 +740,7 @@ preset ui_chat_stream
   state
     connected = true
     loading = false
-    mutation_phase = "idle"
+    mutation_phase = MutationPhase.idle
     error = ""
     // THE ENDPOINT IS PINNED BECAUSE AN EMPTY ONE IS NOT INERT. `choose_channel`
     // launches a real `load_channel_window`, and `rpc_client("")` does not
@@ -753,7 +753,7 @@ preset ui_chat_stream
     // needs root — so the connect is refused immediately and the task settles
     // on the dispatch, deterministically and off the network.
     connected_rpc = "http://127.0.0.1:1"
-    shell_tab = "chat"
+    shell_tab = ShellTab.chat
     active_channel = "channel-a"
     active_channel_name = "general"
     messages = optimistic_message(messages, "The room she is looking at.", "pending-1")

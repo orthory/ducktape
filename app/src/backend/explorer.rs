@@ -30,7 +30,6 @@ pub struct ExplorerData {
 
 /// Load the recent block window for the explorer pane, newest first.
 pub async fn load_explorer(rpc: String, generation: i64) -> Result<ExplorerData, HydrationError> {
-    offscreen_guard(generation)?;
     async {
         let rpc = rpc_client(&rpc)?;
         let rows = rpc.blocks(100).await?;
@@ -201,8 +200,8 @@ pub fn topmost_overlay(
     palette_open: bool,
     bell_open: bool,
     channel_create_open: bool,
-    thread_message_action: String,
-    message_action: String,
+    thread_message_action: crate::MessageAction,
+    message_action: crate::MessageAction,
     channel_settings_open: bool,
     forge_repo_menu: bool,
 ) -> String {
@@ -215,10 +214,10 @@ pub fn topmost_overlay(
     if channel_create_open {
         return "channel_create".into();
     }
-    if thread_message_action != "toolbar" {
+    if thread_message_action != crate::MessageAction::Toolbar {
         return "thread_menu".into();
     }
-    if message_action != "toolbar" {
+    if message_action != crate::MessageAction::Toolbar {
         return "message_menu".into();
     }
     // BELOW both message menus, which float over the drawer, and above the
@@ -249,8 +248,8 @@ pub fn escape_target(
     palette_open: bool,
     bell_open: bool,
     channel_create_open: bool,
-    thread_message_action: String,
-    message_action: String,
+    thread_message_action: crate::MessageAction,
+    message_action: crate::MessageAction,
     channel_settings_open: bool,
     forge_repo_menu: bool,
 ) -> String {
@@ -275,6 +274,14 @@ pub fn escape_target(
         return String::new();
     }
     topmost
+}
+
+pub fn close_message_action(close: bool, current: crate::MessageAction) -> crate::MessageAction {
+    if close {
+        crate::MessageAction::Toolbar
+    } else {
+        current
+    }
 }
 
 /// One keyboard "page", in pixels. iced's scrollable reports its viewport only

@@ -122,7 +122,7 @@ on fs_write_failed(cause)
   error = cause.message
 
 on fs_file_dropped(path)
-  return if shell_tab != "files" || fs_loading || !connected
+  return if shell_tab != ShellTab.files || fs_loading || !connected
   fs_loading = true
   error = ""
   run every files_upload(connected_rpc, fs_path, path) -> fs_wrote _ | fs_write_failed _

@@ -7,9 +7,9 @@
 // That is the whole contract; the bodies below are the ones that used to sit
 // inline in the view's `members:` and `agents:` slots, unchanged.
 
-component MembersScreen(rows:[MemberRow], filter:str, selected:str, admin:bool, connected:bool, answered:bool)
+component MembersScreen(rows:[MemberRow], filter:MembersFilter, selected:str, admin:bool, connected:bool, answered:bool)
   emits
-    pick_members_filter(str)
+    pick_members_filter(MembersFilter)
     open_member(str)
     copy_to_clipboard(str, str)
     agent_set_status(str, bool)
@@ -44,59 +44,59 @@ component MembersScreen(rows:[MemberRow], filter:str, selected:str, admin:bool, 
                 w=fill
                 gap=7.0
                 align=center
-              button -> emit(pick_members_filter, "all")
+              button -> emit(pick_members_filter, MembersFilter.all)
                 with
                   label="Show every member"
-                  checked=(filter == "all")
+                  checked=(filter == MembersFilter.all)
                   p=0.0
                   @ghost_action
                 FilterChip
                   with
                     label="All"
                     count=len(rows)
-                    selected=(filter == "all")
+                    selected=(filter == MembersFilter.all)
                 active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
                 hovered bg=row_hover text=fg
                 pressed bg=elevated text=fg
-              button -> emit(pick_members_filter, "humans")
+              button -> emit(pick_members_filter, MembersFilter.humans)
                 with
                   label="Show people only"
-                  checked=(filter == "humans")
+                  checked=(filter == MembersFilter.humans)
                   p=0.0
                   @ghost_action
                 FilterChip
                   with
                     label="Humans"
-                    count=len(filter_members(rows, "humans"))
-                    selected=(filter == "humans")
+                    count=len(filter_members(rows, MembersFilter.humans))
+                    selected=(filter == MembersFilter.humans)
                 active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
                 hovered bg=row_hover text=fg
                 pressed bg=elevated text=fg
-              button -> emit(pick_members_filter, "agents")
+              button -> emit(pick_members_filter, MembersFilter.agents)
                 with
                   label="Show agents only"
-                  checked=(filter == "agents")
+                  checked=(filter == MembersFilter.agents)
                   p=0.0
                   @ghost_action
                 FilterChip
                   with
                     label="Agents"
-                    count=len(filter_members(rows, "agents"))
-                    selected=(filter == "agents")
+                    count=len(filter_members(rows, MembersFilter.agents))
+                    selected=(filter == MembersFilter.agents)
                 active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
                 hovered bg=row_hover text=fg
                 pressed bg=elevated text=fg
-              button -> emit(pick_members_filter, "validators")
+              button -> emit(pick_members_filter, MembersFilter.validators)
                 with
                   label="Show validators only"
-                  checked=(filter == "validators")
+                  checked=(filter == MembersFilter.validators)
                   p=0.0
                   @ghost_action
                 FilterChip
                   with
                     label="Validators"
-                    count=len(filter_members(rows, "validators"))
-                    selected=(filter == "validators")
+                    count=len(filter_members(rows, MembersFilter.validators))
+                    selected=(filter == MembersFilter.validators)
                 active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
                 hovered bg=row_hover text=fg
                 pressed bg=elevated text=fg

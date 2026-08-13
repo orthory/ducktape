@@ -136,7 +136,6 @@ fn anchor_snippet(text: &str) -> String {
 }
 
 use iced::advanced::text::Wrapping;
-use iced::font::{Style as FontStyle, Weight};
 use iced::widget::text_editor::{self, Action, Content, Cursor, Edit, Position};
 use iced::{Border, Color, Element, Padding};
 use std::hash::{Hash as _, Hasher as _};
@@ -838,16 +837,6 @@ fn replace_range(document: &mut Content, start: Position, end: Position, replace
     document.perform(Action::Edit(Edit::Paste(std::sync::Arc::new(
         replacement.to_string(),
     ))));
-}
-
-/// The composer font at a weight — the document shares the app's default face.
-#[allow(dead_code)]
-fn document_font(weight: Weight, style: FontStyle) -> iced::Font {
-    iced::Font {
-        weight,
-        style,
-        ..crate::Ducktape::default_font()
-    }
 }
 
 #[cfg(test)]
