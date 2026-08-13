@@ -731,9 +731,17 @@ async fn proxy_loopback(
         while let Some(chunk) = chunks.next().await {
             let item = match chunk {
                 Ok(chunk) => {
-                    total = total.saturating_add(chunk.len() as u64);
-                    let over_cap = cap != 0 && total > cap;
+                    let chunk_len = chunk.len() as u64;
+                    let over_cap = cap != 0 && chunk_len > cap.saturating_sub(total);
                     if over_cap {
+                        let remaining = cap.saturating_sub(total);
+                        if remaining != 0 {
+                            let prefix_len = usize::try_from(remaining)
+                                .expect("remaining response cap fits the current chunk");
+                            if tx.send(Ok(chunk.slice(..prefix_len))).await.is_err() {
+                                return;
+                            }
+                        }
                         let _ = tx
                             .send(Err(GatewayFailure::Unavailable(
                                 "loopback response exceeds the signed route cap".into(),
@@ -741,6 +749,7 @@ async fn proxy_loopback(
                             .await;
                         return;
                     }
+                    total = total.saturating_add(chunk_len);
                     Ok(chunk)
                 }
                 Err(error) => {
@@ -1399,7 +1408,12 @@ fn spawn_body_pump<S: AsyncRead + Unpin + Send + 'static>(
     mut buf: Vec<u8>,
     max_response_bytes: u64,
 ) -> noded::GatewayBody {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, GatewayFailure>>(16);
+    // One slot is load-bearing: after a normal body chunk, the pump cannot
+    // enqueue a terminal Failure until Hyper has consumed that chunk. Hyper
+    // therefore observes Pending before the error, commits the response head,
+    // and surfaces a deterministic mid-body truncation instead of occasionally
+    // collapsing the whole request into `IncompleteMessage` at `.send()`.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, GatewayFailure>>(1);
     tokio::spawn(async move {
         let mut total: u64 = 0;
         loop {

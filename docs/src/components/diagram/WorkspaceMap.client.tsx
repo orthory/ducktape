@@ -14,7 +14,7 @@ const nodes: SemanticNode[] = [
   // bins
   { id: 'bin-node', label: 'bin/node', sub: 'validator process', category: 'bin' },
   { id: 'bin-coord', label: 'bin/coordinator', sub: 'UDP rendezvous', category: 'bin' },
-  { id: 'bin-fs', label: 'bin/fs', sub: 'duckfs CLI + FUSE', category: 'bin' },
+  { id: 'cli-fs', label: 'ducktape fs', sub: 'duckfs CLI', category: 'bin' },
   // kernel
   { id: 'sdk', label: 'sdk', sub: 'module contract', category: 'kernel' },
   { id: 'host', label: 'host', sub: 'dispatch + root-hash + worker seam', category: 'kernel' },
@@ -36,7 +36,7 @@ const nodes: SemanticNode[] = [
 const edges: SemanticEdge[] = [
   { from: 'bin-node', to: 'host', label: 'runs' },
   { from: 'bin-node', to: 'consensus', label: 'orders' },
-  { from: 'bin-fs', to: 'duckfs', label: 'drives' },
+  { from: 'cli-fs', to: 'duckfs', label: 'drives' },
   { from: 'apps', to: 'sdk', label: 'depends on', kind: 'dep' },
   { from: 'files', to: 'sdk', label: 'depends on', kind: 'dep' },
   { from: 'files', to: 'duckfs', label: 'adapts' },

@@ -195,8 +195,8 @@ more than one.";
 #[command(
     name = "ducktape",
     about = "one workspace-network node and its operator tools",
-    // clap prints "<name> <version>", so the version string must NOT repeat
-    // the binary name the way `version_line()` (the `version` verb) does.
+    // clap prints "<name> <version>", so the version string must not repeat
+    // the binary name.
     version = env!("CARGO_PKG_VERSION"),
     arg_required_else_help = true,
     // `arg_required_else_help` means a bare `ducktape` lands HERE, so this is

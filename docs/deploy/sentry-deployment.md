@@ -51,12 +51,13 @@ The joiner dials the sentry, the sentry splices to the validator, and the
 encrypted mesh handshake terminates at the validator through the pipe — the
 joiner never learns (and never needs) the validator's private `listen`.
 
-Admission is orthogonal to the sentry and still required: until a member runs
-`invite-accept`, the validator's mesh bouncer rejects the not-yet-admitted key
-(the handshake bytes reach the validator *through* the pipe and are refused
-there, not at the sentry), so the joiner parks as `parked: mesh unreachable` —
-expected, not a sentry fault. Once admitted, the handshake succeeds and
-state-sync/votes flow through the pipe.
+Admission is orthogonal to the sentry and still required. `ducktape node invite`
+mints a signed, single-use bearer grant; `ducktape node join <blob>` presents and
+redeems it on first contact. A tokenless manual join can instead be granted with
+`ducktape node resident accept <pubkey>`. Until standing lands, ordinary mesh
+and state-sync traffic stays gated at the validator rather than at the sentry.
+Once admitted, the handshake succeeds and state-sync flows through the pipe;
+`ducktape node member promote <pubkey>` is the separate validator-seat step.
 
 Realizations of the splice, cheapest first:
 

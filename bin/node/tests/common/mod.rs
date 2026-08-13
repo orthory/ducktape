@@ -123,6 +123,10 @@ pub struct Cluster {
     pub validator_ids: Vec<u64>,
     /// p2p listen port per `peer_ids` position.
     pub p2p_ports: Vec<u16>,
+    /// direct invite intro port per `peer_ids` position. Kept explicit because
+    /// the product default (`wireguard_listen + 1`) can be another node's
+    /// WireGuard port when a test cluster asks the OS for a batch of ports.
+    pub(crate) invite_ports: Vec<u16>,
     /// rpc port per `peer_ids` position (every config gets one; `--sync-only`
     /// simply never binds it).
     pub rpc_ports: Vec<u16>,
@@ -769,14 +773,16 @@ impl Cluster {
         let seq = CLUSTER_SEQ.fetch_add(1, Ordering::Relaxed);
         let namespace = format!("ducktape-e2e-{}-{seq}", std::process::id());
         let dir = e2e_tempdir("cluster");
-        let ports = alloc_ports(peer_ids.len() * 3);
+        let ports = alloc_ports(peer_ids.len() * 4);
         let (p2p_ports, rest) = ports.split_at(peer_ids.len());
-        let (rpc_ports, http_ports) = rest.split_at(peer_ids.len());
+        let (rpc_ports, rest) = rest.split_at(peer_ids.len());
+        let (http_ports, invite_ports) = rest.split_at(peer_ids.len());
         Self {
             namespace,
             peer_ids: peer_ids.to_vec(),
             validator_ids: validator_ids.to_vec(),
             p2p_ports: p2p_ports.to_vec(),
+            invite_ports: invite_ports.to_vec(),
             rpc_ports: rpc_ports.to_vec(),
             http_ports: http_ports.to_vec(),
             advertised: peer_ids.iter().map(|_| None).collect(),
@@ -801,7 +807,7 @@ impl Cluster {
             .to_vec()
     }
 
-    fn config_path(&self, idx: usize) -> PathBuf {
+    pub(crate) fn config_path(&self, idx: usize) -> PathBuf {
         let id = self.peer_ids[idx];
         let path = self.dir.path().join(format!("node{id}.toml"));
         let mut cfg = String::new();
@@ -836,6 +842,10 @@ impl Cluster {
             cfg.push_str(&format!(
                 "wireguard_listen = \"127.0.0.1:{}\"\n",
                 self.p2p_ports[idx]
+            ));
+            cfg.push_str(&format!(
+                "invite_listen = \"127.0.0.1:{}\"\n",
+                self.invite_ports[idx]
             ));
         }
         for line in &self.extra_toml {
@@ -1109,13 +1119,13 @@ impl Cluster {
     /// from every existing member's `peer_seeds` — the mesh refuses it until
     /// governance admits it and the epoch cutover re-tracks. its own config
     /// lists the CURRENT members as mesh + validators (the invite descriptor
-    /// a real joiner receives). rpc/http ports are allocated so the node can
-    /// be driven after it promotes itself. call this AFTER every member
-    /// spawn — it appends to the cluster index space.
+    /// a real joiner receives). transport/rpc/http/invite ports are allocated
+    /// so the node can be driven after it promotes itself. call this AFTER
+    /// every member spawn — it appends to the cluster index space.
     ///
     /// returns the joiner's cluster index.
     pub fn spawn_joiner(&mut self, id: u64) -> usize {
-        let ports = alloc_ports(3);
+        let ports = alloc_ports(4);
         let path = self.dir.path().join(format!("node{id}.toml"));
         let mut cfg = String::new();
         cfg.push_str(&format!("id = {id}\n"));
@@ -1134,6 +1144,10 @@ impl Cluster {
         ));
         cfg.push_str(&format!("rpc_listen = \"127.0.0.1:{}\"\n", ports[1]));
         cfg.push_str(&format!("http_listen = \"127.0.0.1:{}\"\n", ports[2]));
+        if self.wireguard {
+            cfg.push_str(&format!("wireguard_listen = \"127.0.0.1:{}\"\n", ports[0]));
+            cfg.push_str(&format!("invite_listen = \"127.0.0.1:{}\"\n", ports[3]));
+        }
         std::fs::write(&path, cfg).expect("write joiner config");
 
         let log = self.dir.path().join(format!("node{id}.log"));
@@ -1150,6 +1164,7 @@ impl Cluster {
 
         self.peer_ids.push(id);
         self.p2p_ports.push(ports[0]);
+        self.invite_ports.push(ports[3]);
         self.rpc_ports.push(ports[1]);
         self.http_ports.push(ports[2]);
         // keep `advertised`/`env` index-aligned with the extended index space

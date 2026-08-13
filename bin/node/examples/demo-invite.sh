@@ -28,20 +28,32 @@ BIN_PATH="$(cargo metadata --no-deps --format-version 1 | bun -e 'console.log((a
 WORK=$(mktemp -d)
 A="$WORK/founder"
 B="$WORK/friend"
+A_MESH=${A_MESH:-127.0.0.1:53200}
+B_MESH=${B_MESH:-127.0.0.1:53201}
+A_RPC_PORT=${A_RPC_PORT:-53300}
+B_RPC_PORT=${B_RPC_PORT:-53301}
+A_HTTP=${A_HTTP:-127.0.0.1:53400}
+B_HTTP=${B_HTTP:-127.0.0.1:53401}
+A_WIREGUARD=${A_WIREGUARD:-127.0.0.1:53500}
+B_WIREGUARD=${B_WIREGUARD:-127.0.0.1:53501}
+A_INVITE=${A_INVITE:-127.0.0.1:53600}
+B_INVITE=${B_INVITE:-127.0.0.1:53601}
 cleanup() { pkill -P $$ 2>/dev/null || true; }
 trap cleanup EXIT
 
 echo "founder: init..."
 chain_id=$("$BIN_PATH" node init --name demo --dir "$A" \
-  --listen 127.0.0.1:53200 --advertised 127.0.0.1:53200 \
-  --rpc 127.0.0.1:53300 2>/dev/null)
+  --listen "$A_MESH" --advertised "$A_MESH" \
+  --rpc "127.0.0.1:$A_RPC_PORT" --http "$A_HTTP" \
+  --wireguard-listen "$A_WIREGUARD" --invite-listen "$A_INVITE" 2>/dev/null)
 echo "  chain-id: $chain_id"
 invite=$("$BIN_PATH" node invite --config "$A/node.toml" 2>/dev/null)
 
 echo "friend: join (first pass — identity only)..."
 friend_key=$("$BIN_PATH" node join "$invite" --dir "$B" \
-  --listen 127.0.0.1:53201 --advertised 127.0.0.1:53201 \
-  --rpc 127.0.0.1:53301 2>/dev/null)
+  --listen "$B_MESH" --advertised "$B_MESH" \
+  --rpc "127.0.0.1:$B_RPC_PORT" --http "$B_HTTP" \
+  --wireguard-listen "$B_WIREGUARD" --invite-listen "$B_INVITE" 2>/dev/null)
 echo "  friend identity: $friend_key"
 
 echo "founder: admit + refreshed invite..."
@@ -50,8 +62,9 @@ invite2=$("$BIN_PATH" node invite --config "$A/node.toml" 2>/dev/null)
 
 echo "friend: join (refreshed — now a member)..."
 "$BIN_PATH" node join "$invite2" --dir "$B" \
-  --listen 127.0.0.1:53201 --advertised 127.0.0.1:53201 \
-  --rpc 127.0.0.1:53301 >/dev/null 2>&1
+  --listen "$B_MESH" --advertised "$B_MESH" \
+  --rpc "127.0.0.1:$B_RPC_PORT" --http "$B_HTTP" \
+  --wireguard-listen "$B_WIREGUARD" --invite-listen "$B_INVITE" >/dev/null 2>&1
 
 loga=$(mktemp)
 logb=$(mktemp)
@@ -89,10 +102,10 @@ echo "genesis agreed: $ga"
 # is readable on the friend.
 set_op=$(hexenc '{"set":{"key":"ceremony","value":"two members, zero seeds"}}')
 get_q=$(hexenc '{"get":{"key":"ceremony"}}')
-rpc 53300 "{\"cmd\":\"submit\",\"target\":\"directory\",\"payload_hex\":\"$set_op\"}" >/dev/null
+rpc "$A_RPC_PORT" "{\"cmd\":\"submit\",\"target\":\"directory\",\"payload_hex\":\"$set_op\"}" >/dev/null
 converge_ok=""
 for _ in $(seq 1 60); do
-  reply=$(rpc 53301 "{\"cmd\":\"query\",\"target\":\"directory\",\"req_hex\":\"$get_q\"}" || true)
+  reply=$(rpc "$B_RPC_PORT" "{\"cmd\":\"query\",\"target\":\"directory\",\"req_hex\":\"$get_q\"}" || true)
   decoded=$(printf '%s' "$reply" | bun -e '
 try {
   const response = await Bun.stdin.json();
@@ -114,8 +127,8 @@ hash_of() { # hash_of <port>
 }
 final_ok=""
 for _ in $(seq 1 20); do
-  ha=$(hash_of 53300)
-  hb=$(hash_of 53301)
+  ha=$(hash_of "$A_RPC_PORT")
+  hb=$(hash_of "$B_RPC_PORT")
   if [ "$ha" = "$hb" ]; then final_ok="yes"; break; fi
   sleep 0.5
 done

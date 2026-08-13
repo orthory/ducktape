@@ -86,11 +86,11 @@ shows what is built and tested.
 - `crates/examples/evm`: experimental QMDB-backed EVM module, registered in
   the `noded`/`simnode` genesis.
 - `bin/demo`: in-process walkthrough of the registered module set.
-- `bin/node`: real-socket validator process and two-process demo.
+- `bin/node`: real-socket node and unified `ducktape` CLI, including the `fs`
+  working-copy and `mcp` server families.
 - `bin/noded`: daemon behind the app HTTP/WebSocket surface.
 - `bin/simnode`: deterministic scenario node — noded's `/v1` wire over a
   test-scripted block producer.
-- `bin/fs`: `ducktape-fs`, the duckfs working-copy CLI and FUSE-gated mount.
 - `bin/coordinator`: public or private rendezvous/STUN helper.
 
 ## Docs

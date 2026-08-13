@@ -365,9 +365,9 @@ fn page_document_text(app: &Ducktape) -> String {
 }
 
 #[test]
-fn full_view_fits_a_four_mib_stack() {
+fn full_view_fits_the_default_test_stack() {
     std::thread::Builder::new()
-        .stack_size(4 * 1024 * 1024)
+        .stack_size(2 * 1024 * 1024)
         .spawn(|| {
             let (mut app, _) = Ducktape::__boot();
             let console = iced::window::Id::unique();

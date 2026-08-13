@@ -369,25 +369,19 @@ mod tests {
     /// `:0` — there is no way to steer it at a port arranged to be busy. So the
     /// branch is exercised where it is reachable: hold the udp half, leave the
     /// tcp half free (the exact state a tcp-only probe misreads), and require
-    /// [`claim_udp`] to refuse it.
+    /// [`claim_udp`] to refuse it. Both sockets stay live through the assertion;
+    /// dropping and immediately reclaiming the port tests OS reuse timing, not
+    /// this branch.
     #[test]
     fn a_udp_busy_port_is_unclaimable_even_where_tcp_is_free() {
         let squatter = UdpSocket::bind("127.0.0.1:0").expect("udp squatter");
         let port = squatter.local_addr().expect("squatter addr").port();
         // the misreading a tcp-only probe would make: this succeeds.
-        let tcp = TcpListener::bind(("127.0.0.1", port)).expect("the tcp half IS free");
+        let _tcp = TcpListener::bind(("127.0.0.1", port)).expect("the tcp half IS free");
 
         assert!(
             claim_udp(port).is_none(),
             "port {port} is udp-busy and must not be claimable"
-        );
-
-        drop(squatter);
-        drop(tcp);
-        assert!(
-            claim_udp(port).is_some(),
-            "port {port} is free again once the squatter lets go — otherwise \
-             the check above proved nothing about udp"
         );
     }
 

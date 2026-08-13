@@ -84,11 +84,11 @@ and [What Is Left](/en/human/roadmap/what-is-left) keeps the open-work boundary.
   dir recovers the byte-identical root-hash without re-running genesis and keeps
   finalizing over its reopened consensus journal.
 - `cargo test -p node-bin --test invite_e2e` proves invite-after-genesis over
-  real sockets: an uninvited key parks on the mesh, a member's `invite-accept`
-  passes governance, the epoch cutover re-tracks the mesh, and the joiner syncs
-  and promotes itself into a voting validator — both onto a stalled solo
-  network (epoch genesis floor) and onto a live 3-validator quorum (mid-epoch
-  boundary with its served finalization floor certificate).
+  real sockets: a joiner redeems the signed single-use bearer grant minted by
+  `ducktape node invite`, syncs as a resident, and is separately promoted with
+  `ducktape node member promote`; the epoch cutover re-tracks the mesh — both
+  onto a stalled solo network (epoch genesis floor) and onto a live 3-validator
+  quorum (mid-epoch boundary with its served finalization floor certificate).
 
 ## Still Open
 

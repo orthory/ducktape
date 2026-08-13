@@ -55,7 +55,7 @@ pub use agent::SKILL_LIBRARY_PREFIX;
 /// the tier-2 pointer. named tools with their real parameter names, because a
 /// model that has to guess the call will guess wrong: `ducktape_files_ls` takes
 /// `path`, `ducktape_files_grep` takes `pattern` + `prefix`, and
-/// `ducktape_files_read` takes `path` (`bin/mcp/src/tools/read.rs`).
+/// `ducktape_files_read` takes `path` (`bin/node/src/mcp/tools/read.rs`).
 ///
 /// `ducktape_files_ls` is named FIRST, and it was the missing one: the library
 /// has no index file, so listing the directory is the only way to see every
