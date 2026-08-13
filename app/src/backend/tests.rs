@@ -788,6 +788,50 @@ fn a_log_line_splits_into_time_level_and_message() {
 }
 
 #[test]
+fn explorer_ops_keep_the_full_hash_and_pretty_print_json_payloads() {
+    let op_hash = "dd".repeat(32);
+    let rows = vec![serde_json::json!({
+        "height": 7,
+        "hash": "aa".repeat(32),
+        "commit_hash": "bb".repeat(32),
+        "ops": [
+            {
+                "proposer": "cc".repeat(32),
+                "target": "files",
+                "disposition": "applied",
+                "op_hash": op_hash,
+                "payload": "{\"put\":{\"path\":\"/shared/a.png\"}}",
+                "operations": []
+            },
+            {
+                "proposer": "cc".repeat(32),
+                "target": "chat",
+                "disposition": "applied",
+                "op_hash": op_hash,
+                "payload": "plain prose, not a document",
+                "operations": []
+            }
+        ]
+    })];
+    // the window lists newest first: ops arrive [files, chat] and reverse.
+    let data = explorer_window(1, &rows);
+    assert_eq!(
+        data.ops[1].op_hash, op_hash,
+        "the op hash is the blob key — the card carries it whole"
+    );
+    assert_eq!(
+        data.ops[1].payload, "{\n  \"put\": {\n    \"path\": \"/shared/a.png\"\n  }\n}",
+        "a JSON payload renders pretty-printed"
+    );
+    assert_eq!(
+        data.ops[0].payload, "plain prose, not a document",
+        "a non-JSON payload stays verbatim"
+    );
+    // the list's landmark stays the short form
+    assert_eq!(data.blocks[0].hash.chars().count(), 13);
+}
+
+#[test]
 fn a_dm_id_is_pair_derived_and_cannot_be_forged() {
     let a = "aa".repeat(32);
     let b = "bb".repeat(32);

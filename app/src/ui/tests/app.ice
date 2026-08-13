@@ -676,6 +676,7 @@ test explorer_partial_banner_contract
         sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
       events
         refresh_explorer -> refresh_explorer
+        copy_to_clipboard -> copy_to_clipboard _ _
   target query = #explorer/explorer-search
   target clear = #explorer/explorer-clear
   target banner = #explorer/explorer-partial

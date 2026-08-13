@@ -572,6 +572,7 @@ view
               sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
             events
               refresh_explorer -> refresh_explorer
+              copy_to_clipboard -> copy_to_clipboard _ _
         huddle:
           box
             with
