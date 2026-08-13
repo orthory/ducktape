@@ -836,6 +836,66 @@ fn a_move_to_a_pane_that_does_not_draw_the_settings_facts_keeps_the_connect_load
     );
 }
 
+/// THE AGENTS BUMP IS THE SAME HALF, AND `run replace` DOES NOT COVER IT.
+/// Replacing a lane aborts work still running there, but it cannot retract a
+/// completion the runtime has already queued — that reply is delivered
+/// anyway, and an unconditional bump on the way out is precisely what makes
+/// `agents_loaded` throw it away. The Forge seat's live dot reads those rows
+/// on EVERY tab, so opening the destination pane does not re-earn them: the
+/// next `agent` or `runs` op does, and for a run that just started that op is
+/// the one that ends it.
+#[test]
+fn a_move_off_the_agents_tab_keeps_a_live_load_that_already_answered() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+
+    // the run's own commit is what asks for the rows; its generation is the
+    // one the reply below carries.
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+        kind: "plane".into(),
+        status: "Live".into(),
+        height: 12,
+        module: "runs".into(),
+        ..backend::LiveUpdate::default()
+    }));
+    let in_flight = app.agents_generation;
+
+    let _ = app.__update(__DucktapeMessage::SelectShellTab("members".into()));
+    let _ = app.__update(__DucktapeMessage::AgentsLoaded(backend::AgentsData {
+        generation: in_flight,
+        agents: vec![backend::AgentRow {
+            id: "agent-1".into(),
+            name: "Quackbot".into(),
+            initials: "QU".into(),
+            capability: "mock-llm-1".into(),
+            status: "active".into(),
+            owner_key: String::new(),
+            owner_handle: String::new(),
+            created_at: 0,
+            is_mine: false,
+            live: true,
+            tools: 0,
+            secrets: 0,
+            subagent_budget: 0,
+            allowed_actions: Vec::new(),
+            skills: Vec::new(),
+            caps: Vec::new(),
+        }],
+    }));
+    assert!(
+        backend::any_agent_active(app.agents_rows.clone()),
+        "the move off-tab must not revoke the run's own refetch — the dot is drawn on every tab"
+    );
+
+    // and the tab that DOES draw the rows still re-reads on entry.
+    let _ = app.__update(__DucktapeMessage::SelectShellTab("agents".into()));
+    assert_ne!(
+        app.agents_generation, in_flight,
+        "entering Agents must issue a fresh read"
+    );
+}
+
 #[test]
 fn forge_depth_rides_the_established_seams() {
     // the forge handlers moved out of lifecycle.ice into their own file;

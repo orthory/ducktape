@@ -802,7 +802,15 @@ on select_shell_tab(next)
   fs_generation = fs_generation + 1
   members_generation = members_generation + 1
   gov_generation = gov_generation + 1
-  agents_generation = agents_generation + 1
+  // THE AGENTS BUMP IS GATED FOR THE SAME REASON THE SETTINGS ONE BELOW IS.
+  // `run replace lane=agents_load` aborts work still running on the lane, but
+  // it cannot retract a completion the runtime has ALREADY queued — and an
+  // unconditional bump here is what makes `agents_loaded` reject exactly that
+  // completion, throwing away a live-plane read that had already answered. The
+  // Forge seat's dot is drawn off those rows on EVERY tab, so opening the
+  // destination pane does not pay the loss back: it waits for the next `agent`
+  // or `runs` op, which for a run that just started is the moment it ends.
+  agents_generation = keep_i64(tab_reads_plane(shell_tab, "agents"), agents_generation + 1, agents_generation)
   account_generation = account_generation + 1
   forge_generation = forge_generation + 1
   forge_list_phase = keep_str(shell_tab == "forge", "loading", forge_list_phase)
