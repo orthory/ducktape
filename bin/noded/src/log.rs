@@ -234,21 +234,34 @@ impl ModuleNotes {
     }
 
     /// record one unclaimed event. a payload that DECODES as a worker request is
-    /// not observability at all — it means a saga is stuck Pending.
+    /// not observability at all — it means a saga MAY be stuck Pending, and
+    /// [`worker_request_unclaimed`] decides which.
     pub fn unclaimed(&mut self, event: &sdk::Event) {
-        if saga::decode_worker_request(&event.payload).is_ok() {
-            stuck_saga(self.height, &event.source, event.payload.len());
-        } else if self.emitted < NOTE_BUDGET {
-            self.emitted += 1;
-            tracing::info!(
-                target: "ducktape::modules",
-                height = self.height,
-                source = %event.source,
-                note = %sanitize(&event.payload),
-            );
-        } else {
-            self.suppressed += 1;
+        match saga::decode_worker_request(&event.payload) {
+            Ok(request) => worker_request_unclaimed(
+                &request.saga_id,
+                request.attempt,
+                self.height,
+                &event.source,
+                event.payload.len(),
+            ),
+            Err(_) => self.note(event),
         }
+    }
+
+    /// one free-form module note, within the per-drain budget.
+    fn note(&mut self, event: &sdk::Event) {
+        if self.emitted >= NOTE_BUDGET {
+            self.suppressed += 1;
+            return;
+        }
+        self.emitted += 1;
+        tracing::info!(
+            target: "ducktape::modules",
+            height = self.height,
+            source = %event.source,
+            note = %sanitize(&event.payload),
+        );
     }
 
     /// call once at the end of the drain.
@@ -297,10 +310,67 @@ impl Latch {
     }
 }
 
+/// how long a WorkerRequest may go unclaimed before it is CALLED stuck.
+///
+/// Zero was the bug. A claim is a separate submit that cannot land in the block
+/// its request was emitted in, so the first sighting of every healthy run is
+/// unclaimed BY CONSTRUCTION — and every successful run printed
+/// `saga is stuck Pending` exactly once, at the height of its own trigger, while
+/// nothing was stuck. An operator reading the node log has no way to tell that
+/// line from the real thing, which is the whole cost of a false `error!`.
+///
+/// Twelve blocks (~12 s at the 1 s cadence) is past every claim latency we have
+/// on the happy path — the daemon reacts within one — while still catching a
+/// genuine stall in seconds rather than minutes.
+const CLAIM_GRACE_BLOCKS: u64 = 12;
+
+/// requests seen unclaimed but still inside [`CLAIM_GRACE_BLOCKS`]:
+/// `(saga_id, attempt) -> (first_height, last_height)`. Bounded by pruning on
+/// every sighting — a request that gets claimed simply stops re-firing, and its
+/// entry ages out one grace window later.
+static PENDING_REQUESTS: std::sync::Mutex<
+    std::collections::BTreeMap<(String, u32), (u64, u64)>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// One unclaimed WorkerRequest at `height`. Reports only the ones that have been
+/// unclaimed for longer than the grace window — the rest are ordinary runs whose
+/// claim has not landed yet.
+fn worker_request_unclaimed(
+    saga_id: &str,
+    attempt: u32,
+    height: u64,
+    source: &str,
+    bytes: usize,
+) {
+    let pending_blocks = record_unclaimed(saga_id, attempt, height);
+    let still_within_grace = pending_blocks < CLAIM_GRACE_BLOCKS;
+    if still_within_grace {
+        return;
+    }
+    stuck_saga(height, source, bytes, pending_blocks);
+}
+
+/// Record one sighting and answer how many blocks this request has been
+/// unclaimed. Pure bookkeeping — it decides nothing and logs nothing, so the
+/// grace behaviour is testable without a subscriber.
+fn record_unclaimed(saga_id: &str, attempt: u32, height: u64) -> u64 {
+    let mut pending = PENDING_REQUESTS
+        .lock()
+        .expect("pending requests lock poisoned");
+    // a claimed request stops re-firing; drop whatever has gone quiet for a full
+    // window so this map tracks only what is genuinely in flight.
+    pending.retain(|_, (_, last)| height.saturating_sub(*last) <= CLAIM_GRACE_BLOCKS);
+    let seen = pending
+        .entry((saga_id.to_string(), attempt))
+        .or_insert((height, height));
+    seen.1 = height;
+    height.saturating_sub(seen.0)
+}
+
 /// a stuck saga does not clear itself: the same WorkerRequest re-fires every
 /// block, forever. latch it — an `error!` in a permanent loop stops meaning
 /// anything, and it would evict every other line in the ring behind it.
-fn stuck_saga(height: u64, source: &str, bytes: usize) {
+fn stuck_saga(height: u64, source: &str, bytes: usize, pending_blocks: u64) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEEN: AtomicU64 = AtomicU64::new(0);
     let occurrences = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
@@ -311,6 +381,7 @@ fn stuck_saga(height: u64, source: &str, bytes: usize) {
             source,
             bytes,
             occurrences,
+            pending_blocks,
             "WorkerRequest with no worker — saga is stuck Pending"
         );
     }
@@ -344,6 +415,39 @@ mod tests {
 
         // distinct reasons latch independently: a noisy one must never mask another.
         assert_eq!(latch.hit("sync_proof_invalid"), Some(1));
+    }
+
+    /// The happy path must stay SILENT. A worker request is emitted in its
+    /// trigger's own block and the claim is a separate submit, so every healthy
+    /// run is unclaimed on first sighting — reporting that as `saga is stuck
+    /// Pending` put a false `error!` in the log of every successful run.
+    #[test]
+    fn an_unclaimed_request_is_only_stuck_after_the_grace_window() {
+        let quiet = |height| record_unclaimed("saga-fresh", 0, height) >= CLAIM_GRACE_BLOCKS;
+        assert!(!quiet(100), "the trigger's own block is not evidence of a stall");
+        for block in 1..CLAIM_GRACE_BLOCKS {
+            assert!(!quiet(100 + block), "still inside the grace window");
+        }
+        assert!(
+            quiet(100 + CLAIM_GRACE_BLOCKS),
+            "a request unclaimed for a full window IS stuck"
+        );
+    }
+
+    /// A request that goes quiet (claimed, or its saga finished) and much later
+    /// reappears is a NEW sighting, not a continuation — otherwise a re-trigger
+    /// would inherit the old first-height and report stuck immediately.
+    #[test]
+    fn a_request_that_went_quiet_starts_its_window_again() {
+        assert_eq!(record_unclaimed("saga-requeued", 0, 500), 0);
+        assert_eq!(record_unclaimed("saga-requeued", 0, 501), 1);
+        assert_eq!(
+            record_unclaimed("saga-requeued", 0, 501 + CLAIM_GRACE_BLOCKS + 1),
+            0,
+            "the stale entry was pruned, so this is a fresh window"
+        );
+        // a different attempt of the same saga is tracked on its own.
+        assert_eq!(record_unclaimed("saga-requeued", 1, 502 + CLAIM_GRACE_BLOCKS), 0);
     }
 
     #[test]
