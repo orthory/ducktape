@@ -443,6 +443,34 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
         }
     };
 
+    // A DIRECTORY WRITE BEFORE ANYONE JOINS: the resident below never sees
+    // this block as a frame — it arrives inside the synced boundary, with the
+    // op feed that carried it long gone. The join-seam op-row backfill (spec
+    // §7) is the only reason it can ever be in the resident's own feed.
+    cluster.submit(
+        0,
+        "directory",
+        &directory::encode_msg(&DirMsg::Set {
+            key: "pre-join".into(),
+            value: "written".into(),
+        }),
+    );
+    poll(
+        "the pre-join write to finalize on the founder",
+        Box::new(|| {
+            cluster
+                .query(
+                    0,
+                    "directory",
+                    &directory::encode_query(&DirQuery::Get {
+                        key: "pre-join".into(),
+                    }),
+                )
+                .and_then(|raw| directory::decode_reply(&raw).ok())
+                .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "written"))
+        }),
+    );
+
     // ---- invite → park → resident grant ------------------------------------
     let invite = cluster.invite();
     let friend_key = cluster.join_friend_manual(&invite);
@@ -630,19 +658,22 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
         }),
     );
     //     and the op feed BELOW that boundary is really there — the whole
-    //     point of clearing the floor. `/v1/index/directory/ops` starts at
-    //     height 1, not at the height this node happened to arrive.
+    //     point of clearing the floor. The pre-join write finalized before
+    //     this node existed, so nothing but the backfill can have put it in
+    //     THIS node's `/v1/index/directory/ops`.
     let (status, ops) = common::http_request(
         cluster.http_ports[1],
         "GET",
-        "/v1/index/directory/ops?limit=1",
+        "/v1/index/directory/ops?limit=100",
         None,
     );
     assert_eq!(status, 200, "resident op feed: {ops}");
-    assert_eq!(
-        ops["ops"][0]["height"].as_u64(),
-        Some(1),
-        "a cleared floor promises the feed reaches genesis: {ops}"
+    assert!(
+        ops["ops"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|r| r["payload"]["set"]["key"]
+                == serde_json::json!("pre-join"))),
+        "a cleared floor promises pre-boundary rows are really there: {ops}"
     );
 
     // (3) quorum untouched: kill the resident; the founder keeps finalizing.
