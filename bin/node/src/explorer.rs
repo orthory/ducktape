@@ -303,9 +303,12 @@ async fn backfill_module<C: statesync::SyncClient>(
         })?;
         rows += page.len();
         bytes += page.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
-        last = page
-            .last()
-            .and_then(|(key, _)| indexer::parse_op_key(key.as_bytes()));
+        // the last row WRITTEN, not the last page's: a final empty page (a
+        // source that re-stamped mid-walk) must not erase the position the
+        // fold-tip check is about to verify.
+        if let Some((key, _)) = page.last() {
+            last = indexer::parse_op_key(key.as_bytes());
+        }
         tracing::debug!(
             target: "ducktape::statesync",
             node = %label,
