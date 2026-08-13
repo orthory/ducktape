@@ -26,8 +26,9 @@ const BLOCKS_DEFAULT_LIMIT: usize = 256;
 // the bundled index-guest artifacts: each module's fluentabi mapper, built by
 // `guest-builder --index` and committed beside its crate (`make wasm-modules`
 // refreshes the set, `wasm-modules-check` guards it). installed into the
-// module's index database at open — code travels WITH the data from there on
-// (the shipping lane carries it to joiners inside the archive).
+// module's index database at open. every node installs its own mapper from its
+// own bundled artifacts: index code never travels over the wire, so a joiner
+// derives backfilled rows with the mapper IT shipped with.
 const CHAT_INDEX_WASM: &[u8] = include_bytes!("../../../crates/modules/apps/chat/index.wasm");
 const TASKS_INDEX_WASM: &[u8] = include_bytes!("../../../crates/modules/apps/tasks/index.wasm");
 const PAGES_INDEX_WASM: &[u8] = include_bytes!("../../../crates/modules/apps/pages/index.wasm");
@@ -126,7 +127,8 @@ pub fn index_block_ops(
 /// without the op stream — after state-sync installs a boundary, after
 /// recovery skipped re-executing durable blocks, or over a wiped index
 /// directory. history below a boundary re-enters only by replaying blocks
-/// through the feed or adopting a shipped index. returns the stamped ids.
+/// through the feed, or by the joiner's op-row backfill pulling the source's
+/// stored rows in below the stamp (indexable spec §7). returns the stamped ids.
 pub fn stamp_stale_modules(
     index: &indexer::IndexStore,
     boundary: u64,

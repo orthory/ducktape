@@ -217,6 +217,25 @@ pub(crate) async fn heal_and_backfill_index<C: statesync::SyncClient>(
     for module in &stamped {
         if let Some(done) = backfill_module(index, client, module, boundary, label).await {
             backfilled.push(done);
+            continue;
+        }
+        // A REFUSED MODULE IS ROUTINE; A POISONED STORE IS NOT. A write
+        // failure poisons the whole IndexStore, so every later `apply_block`
+        // on this node dies too and the derived tier is finished until an
+        // operator rebuilds it — the per-module "keeps its boundary floor"
+        // warn would badly understate that. stop asking: the remaining
+        // modules can only fail the same way, N identical warns deep.
+        if index.is_poisoned() {
+            tracing::error!(
+                target: "ducktape::modules",
+                event = "node_index_poisoned",
+                node = %label,
+                module = %module,
+                height = boundary,
+                "index backfill poisoned the store; every later fold fails — \
+                 wipe <storage>/index to rebuild"
+            );
+            return;
         }
     }
     if backfilled.is_empty() {
