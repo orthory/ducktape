@@ -2,8 +2,8 @@
 //!
 //! The lane let one signed frame carry a second op (`continue`). The host
 //! released that op under `Origin::Module(parent_op_target)` — a string the
-//! frame's own author chose — so any key holding submit standing (a committed
-//! resident or client, the only policy `verify_relay_submit` adds) reached
+//! frame's own author chose — so any key that could submit a signed frame
+//! (`verify_relay_submit` adds no policy beyond the signature) reached
 //! every `Origin::Module(_)`-gated arm in the tree.
 //!
 //! Reproduced against the pre-deletion tree on the real ordered lane

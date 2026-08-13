@@ -156,6 +156,7 @@ use sdk::{Event, Module, Msg, Origin};
 use serde::{Deserialize, Serialize};
 use statesync::qmdb::QmdbStore;
 use tasks::Tasks;
+use acl::Acl;
 use valset::Valset;
 
 // the sim's genesis sets are the `sim_base` (+ `sim_valset`) selections of the
@@ -890,7 +891,8 @@ fn run_sim(
         ];
         // opt-in governance genesis, AFTER the default 14 in registry order:
         // kv, valset (seeded with the given genesis validators exactly like
-        // bin/node), governance (the sole authorized author of valset change,
+        // bin/node), acl (the submit-policy table, EMPTY = allow-all),
+        // governance (the sole authorized author of valset and acl change,
         // bound to the invite namespace), and the lifecycle coordinator — whose
         // registration alone makes the host's once-per-block boundary `Advance`
         // ride every sim block. governance's code-registry path stays unwired
@@ -907,8 +909,10 @@ fn run_sim(
                 valset.seed(key.clone()).await.expect("seed sim valset");
             }
             valset.finish_seed().await.expect("seed sim valset");
-            // a redeemed role=Client invite records a key in identity's client
-            // ACL (governance emits an `IdentityMsg::GrantClient` follow-up);
+            let acl_table = Acl::new(
+                "acl",
+                Box::new(QmdbStore::init(context.child("acl"), "acl").await),
+            );
             // identity is already in the default module set above. store-backed
             // like bin/node; the sim wires the binding through the native
             // builder (no wasm guest here, so no `__config` seeding).
@@ -918,7 +922,8 @@ fn run_sim(
                 "valset",
                 "identity",
             )
-            .with_invite_binding(invite_binding);
+            .with_invite_binding(invite_binding)
+            .with_acl("acl");
             let lifecycle = Lifecycle::new(
                 "lifecycle",
                 Box::new(QmdbStore::init(context.child("lifecycle"), "lifecycle").await),
@@ -926,6 +931,7 @@ fn run_sim(
             );
             modules.push(Box::new(kv));
             modules.push(Box::new(valset));
+            modules.push(Box::new(acl_table));
             modules.push(Box::new(governance));
             modules.push(Box::new(lifecycle));
         }

@@ -16,11 +16,11 @@ _ducktape() {
     local node_member="promote remove leave status"
     local node_work="list admit revoke"
     local node_join="requests state"
-    local node_flags="--config -n --network --sync-only --json --out --dir --name --listen --advertised --http --rpc --gateway --primary-coordinator --wireguard-listen --wireguard-advertised --invite-listen --role --ttl-days"
+    local node_flags="--config -n --network --sync-only --json --out --dir --name --listen --advertised --http --rpc --gateway --primary-coordinator --wireguard-listen --wireguard-advertised --invite-listen --ttl-days"
 
     local user_key="init restore unlock reveal status"
     local user_cred="add list remove grant revoke inspect seal"
-    local user_verbs="key sign-bind sign-unbind sign-possession sign-add-member sign-remove-member sign-gateway-route sign-frame sign-admin redeem-invite webauthn-challenge p256-payload cred account-init help"
+    local user_verbs="key sign-bind sign-unbind sign-possession sign-add-member sign-remove-member sign-gateway-route sign-frame sign-admin webauthn-challenge p256-payload cred account-init help"
     local user_flags="--path --method --statement --possession --out --key --node -n --network --account-id --chain-id --new-key --new-kind --node-key --node-pub --target-key --nonce --name --json --label --host --remote --attest --pccs-url --snp-product --snp-vcek --vendor --measurement --credentials --cred-kind --access-token --refresh-token"
     local gateway_verbs="bind unbind list help"
     local gateway_flags="--workspace -n --network --label --port"

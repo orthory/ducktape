@@ -2,16 +2,15 @@
 //! pulling a source store's operation range through commonware's qmdb sync,
 //! then wraps a fresh `Identity` around the injected store — the same
 //! discriminating property chat, pages, agent, automations, and governance
-//! prove, over the account + ownership-index + roster + client layout.
+//! prove, over the account + ownership-index + roster layout.
 //!
 //! the source SEEDS the `__config` chain-id record exactly the way the
 //! production genesis path does (`bin/node/src/host_state.rs`
 //! `seed_store_config`), then founds an account, admits a WebAuthn passkey
 //! member (the rp-pinned meta must survive the trip), binds and UNBINDS a
-//! second node (the op log carries an index DELETE, not just inserts), sets
-//! the profile (record overwrites), and grants two clients then revokes one
-//! (aggregate overwrite). only a real sync that ships the ACTUAL proven op
-//! range lands on the same root — and the config record arrives with it,
+//! second node (the op log carries an index DELETE, not just inserts), and
+//! sets the profile (record overwrites). only a real sync that ships the
+//! ACTUAL proven op range lands on the same root — and the config record arrives with it,
 //! which is what lets a joiner's wasm guest read its chain id from the
 //! synced store.
 
@@ -109,15 +108,14 @@ async fn apply_commit(m: &mut Identity, height: u64, origin: Origin, op: Msg) {
 
 /// the read matrix compared source-vs-joiner: the roster-served listing, the
 /// account point read, both ownership-index resolvers (a live node, the
-/// unbound node, the passkey member), and the client set.
-const QUERIES: [&str; 7] = [
+/// unbound node, the passkey member).
+const QUERIES: [&str; 6] = [
     "all",
     "get",
     "of-node-live",
     "of-node-unbound",
     "of-member-founder",
     "of-member-passkey",
-    "clients",
 ];
 
 async fn replies(m: &Identity, account_id: &[u8], nodes: [&[u8]; 2], passkey: &[u8]) -> Vec<IdentityReply> {
@@ -138,7 +136,6 @@ async fn replies(m: &Identity, account_id: &[u8], nodes: [&[u8]; 2], passkey: &[
         encode_query(&IdentityQuery::OfMember {
             member_key: passkey.to_vec(),
         }),
-        encode_query(&IdentityQuery::Clients),
     ];
     let mut out = Vec::new();
     for q in &queries {
@@ -154,7 +151,7 @@ fn identity_over(store: Box<dyn sdk::MerkleStore>) -> Identity {
 }
 
 #[test]
-fn synced_store_reconstructs_source_root_accounts_indexes_and_clients() {
+fn synced_store_reconstructs_source_root_accounts_and_indexes() {
     deterministic::Runner::default().start(|context| async move {
         let founder = ed(1);
         let account_id = ed_pub(&founder);
@@ -241,35 +238,6 @@ fn synced_store_reconstructs_source_root_accounts_indexes_and_clients() {
             }),
         )
         .await;
-        // the client ACL: two grants, one revoke — the aggregate record is
-        // overwritten, and the surviving key is what the joiner must serve.
-        let (client_a, client_b) = (ed_pub(&ed(7)), ed_pub(&ed(8)));
-        apply_commit(
-            &mut src,
-            6,
-            Origin::Module("governance".into()),
-            identity_msg(&IdentityMsg::GrantClient {
-                key: client_a.clone(),
-            }),
-        )
-        .await;
-        apply_commit(
-            &mut src,
-            7,
-            Origin::Module("governance".into()),
-            identity_msg(&IdentityMsg::GrantClient {
-                key: client_b.clone(),
-            }),
-        )
-        .await;
-        apply_commit(
-            &mut src,
-            8,
-            Origin::Module("governance".into()),
-            identity_msg(&IdentityMsg::RevokeClient { key: client_b }),
-        )
-        .await;
-
         let src_root: StateRoot = src.root();
         assert_ne!(src_root, config_root, "the ops moved the root");
         let src_replies = replies(&src, &account_id, [node_a, node_b], &wa_pub(&passkey)).await;
@@ -321,9 +289,9 @@ fn synced_store_reconstructs_source_root_accounts_indexes_and_clients() {
             "synced store root must equal the source root"
         );
 
-        // account record, roster, both ownership indexes, and the client set
-        // synced together: the joiner answers every read exactly like the
-        // source (including the ABSENT index entry for the unbound node).
+        // account record, roster, and both ownership indexes synced together:
+        // the joiner answers every read exactly like the source (including
+        // the ABSENT index entry for the unbound node).
         let synced_replies =
             replies(&synced, &account_id, [node_a, node_b], &wa_pub(&passkey)).await;
         for (name, (a, b)) in QUERIES.iter().zip(src_replies.iter().zip(&synced_replies)) {

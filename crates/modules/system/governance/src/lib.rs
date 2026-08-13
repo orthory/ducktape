@@ -87,8 +87,8 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
 use identity::{
-    IdentityMsg, IdentityQuery, IdentityReply, decode_reply as identity_decode_reply,
-    encode_msg as identity_encode_msg, encode_query as identity_encode_query,
+    IdentityQuery, IdentityReply, decode_reply as identity_decode_reply,
+    encode_query as identity_encode_query,
 };
 use lifecycle::{LifecycleMsg, encode_msg as lifecycle_encode_msg};
 use sdk::{
@@ -236,11 +236,13 @@ pub struct Governance {
     /// genesis wiring — identical on every node; `None` (a net without the code
     /// registry wired) rejects those proposals at the door, deterministically.
     code_registry_id: Option<ModuleId>,
-    /// the Identity account registry used in account-share mode AND as the
-    /// submit-door client ACL: a redeemed `role=Client` invite emits an
-    /// `IdentityMsg::GrantClient` follow-up here (identity is always wired, so
-    /// Client redemption needs no separate module gate).
+    /// the Identity account registry used in account-share mode (member-key
+    /// ballots resolve to accounts and their bound nodes through it).
     identity_id: ModuleId,
+    /// the acl submit-policy table `SetAclPolicy` proposals write. genesis
+    /// wiring — identical on every node; `None` (a net without the module)
+    /// rejects those proposals at the door, deterministically.
+    acl_id: Option<ModuleId>,
     /// the network binding invite tokens sign over (the genesis namespace).
     /// genesis wiring — identical on every node of the same network. `None`
     /// (a shape without a descriptor) refuses every `Redeem` with a clear
@@ -265,9 +267,18 @@ impl Governance {
             valset_id: valset_id.into(),
             code_registry_id: None,
             identity_id: identity_id.into(),
+            acl_id: None,
             invite_binding: None,
             staged: StagedStore::new(store),
         }
+    }
+
+    /// enable the acl path (`SetAclPolicy`) against the submit-policy module at
+    /// `id`. genesis wiring — every node of a network must wire the same id (or
+    /// none), or nodes diverge on whether those proposals are accepted.
+    pub fn with_acl(mut self, id: impl Into<ModuleId>) -> Self {
+        self.acl_id = Some(id.into());
+        self
     }
 
     /// enable the code-registry path (`UpdateModule`/`CancelModuleUpdate`) on the
@@ -816,6 +827,28 @@ impl Governance {
                 lifecycle::CODE_HASH_LEN
             )));
         }
+        // acl policy authorizations: shape-checked at the door like the module
+        // updates above (a proposal that can never execute is rejected here,
+        // not at tally time); the acl module's own target validation is the
+        // sole authority at ingest. a net without a wired acl module
+        // deterministically rejects these (genesis wiring is identical on
+        // every node).
+        if let GovAction::SetAclPolicy { target, .. } = &action {
+            if self.acl_id.is_none() {
+                return Err(Error::Module(
+                    "no acl module wired: submit-policy changes are not available on this network"
+                        .into(),
+                ));
+            }
+            let well_formed_target =
+                !target.is_empty() && target.trim() == target && target.len() <= acl::MAX_TARGET_LEN;
+            if !well_formed_target {
+                return Err(Error::Module(format!(
+                    "acl target must be a non-empty, untrimmed module id of at most {} bytes",
+                    acl::MAX_TARGET_LEN
+                )));
+            }
+        }
         let mut roster = self.roster().await?;
         let position = match roster.binary_search(&proposal_id) {
             Ok(_) => {
@@ -1103,6 +1136,18 @@ impl Governance {
                         self.store(SHARE_MODE_KEY.to_vec(), enabled);
                     }
                 }
+                GovAction::SetAclPolicy { target, standing } => match &self.acl_id {
+                    // the propose-time gate refused an unwired net, so this arm
+                    // only rejects on a wiring change between propose and pass.
+                    None => proposal.status = ProposalStatus::Rejected,
+                    Some(acl_id) => ctx.emit_msg(Msg {
+                        target: acl_id.clone(),
+                        payload: acl::encode_msg(&acl::AclMsg::SetPolicy {
+                            target: target.clone(),
+                            standing: *standing,
+                        }),
+                    }),
+                },
                 GovAction::Signal { .. } => {}
             }
         } else {
@@ -1126,7 +1171,6 @@ impl Governance {
         token_sig: Vec<u8>,
         joiner: Vec<u8>,
         proof: Vec<u8>,
-        role: u8,
         expires_unix_secs: u64,
     ) -> Result<(), Error> {
         // the submitter must be an authenticated frame origin, but is NOT
@@ -1154,7 +1198,6 @@ impl Governance {
             .map_err(|e| Error::Module(format!("token signature: {e}")))?;
         let proof_sig = ed25519::Signature::decode(proof.as_slice())
             .map_err(|e| Error::Module(format!("join proof: {e}")))?;
-        let role = invite::InviteRole::from_u8(role).map_err(Error::Module)?;
         // EVERY invite is bearer (the targeted form was dropped — see the join ADR): there is
         // no target lock. The join proof below binds the redemption to
         // whichever key presents it, and the nonce set makes that
@@ -1162,7 +1205,6 @@ impl Governance {
         let token = invite::InviteToken {
             issuer: issuer_key,
             nonce: nonce_arr,
-            role,
             expires_unix_secs,
             sig,
         };
@@ -1190,54 +1232,27 @@ impl Governance {
                 "the inviting member is no longer part of this network".into(),
             ));
         }
-        // the standing grant differs by role: a Resident invite grants valset
-        // resident standing (mesh + statesync, pre-promotion); a Client invite
-        // grants client-ACL standing — SUBMIT AUTHORIZATION ONLY, never
-        // statesync or a quorum seat (client standing is a facet of identity,
-        // structurally distinct from valset so the sync door never reads it).
-        // the dedup gate and the emitted follow-up op are role-specific; every
-        // check above is shared.
-        let grant = match token.role {
-            invite::InviteRole::Resident => {
-                if members.iter().any(|m| m == &joiner) {
-                    return Err(Error::Module("joiner is already a validator".into()));
-                }
-                if self.residents(ctx).await?.iter().any(|o| o == &joiner) {
-                    return Err(Error::Module(
-                        "joiner already holds resident standing".into(),
-                    ));
-                }
-                Msg {
-                    target: self.valset_id.clone(),
-                    payload: valset_encode_msg(&ValsetMsg::Grant {
-                        key: joiner.clone(),
-                    }),
-                }
-            }
-            invite::InviteRole::Client => {
-                // client standing is a facet of the identity account plane
-                // (identity is always wired), so redemption needs no separate
-                // module gate — it emits an `IdentityMsg::GrantClient` follow-up.
-                if identity::clients(ctx, &self.identity_id)
-                    .await?
-                    .iter()
-                    .any(|c| c == &joiner)
-                {
-                    return Err(Error::Module("joiner already holds client standing".into()));
-                }
-                Msg {
-                    target: self.identity_id.to_string(),
-                    payload: identity_encode_msg(&IdentityMsg::GrantClient {
-                        key: joiner.clone(),
-                    }),
-                }
-            }
+        // an invite grants exactly one thing: valset RESIDENT standing
+        // (mesh + statesync, pre-promotion). submit authorization needs no
+        // grant at all — the door admits any validly signed frame, and
+        // per-module policy is the acl module's dispatch gate.
+        if members.iter().any(|m| m == &joiner) {
+            return Err(Error::Module("joiner is already a validator".into()));
+        }
+        if self.residents(ctx).await?.iter().any(|o| o == &joiner) {
+            return Err(Error::Module(
+                "joiner already holds resident standing".into(),
+            ));
+        }
+        let grant = Msg {
+            target: self.valset_id.clone(),
+            payload: valset_encode_msg(&ValsetMsg::Grant {
+                key: joiner.clone(),
+            }),
         };
-        // exactly-once: the nonce is the single-use key, SHARED across roles
-        // (the staged-over-committed read collapses two redemptions in one
-        // block to first-wins too). a Client and a Resident invite carry
-        // different nonces, but the keyspace is shared so neither token can be
-        // replayed as the other's.
+        // exactly-once: the nonce is the single-use key (the
+        // staged-over-committed read collapses two redemptions in one
+        // block to first-wins too).
         if self.load::<Redemption>(&red_key(&nonce)).await?.is_some() {
             return Err(Error::Module("invite already redeemed".into()));
         }
@@ -1302,19 +1317,9 @@ impl Module for Governance {
                 token_sig,
                 joiner,
                 proof,
-                role,
                 expires_unix_secs,
             } => {
-                self.handle_redeem(
-                    ctx,
-                    issuer,
-                    nonce,
-                    token_sig,
-                    joiner,
-                    proof,
-                    role,
-                    expires_unix_secs,
-                )
+                self.handle_redeem(ctx, issuer, nonce, token_sig, joiner, proof, expires_unix_secs)
                     .await
             }
         }

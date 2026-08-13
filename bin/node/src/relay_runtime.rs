@@ -410,7 +410,6 @@ impl ValidatorRelay {
         Ok(None)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_message<S>(
         &mut self,
         now: SystemTime,
@@ -418,7 +417,6 @@ impl ValidatorRelay {
         msg: relay::RelayMsg,
         members: &[Vec<u8>],
         residents: &[Vec<u8>],
-        clients: &[Vec<u8>],
         relay_tx: &mut S,
     ) -> Option<ValidatorAction>
     where
@@ -534,7 +532,7 @@ impl ValidatorRelay {
                 })
             }
             relay::RelayMsg::Submit { frame } => {
-                let frame_id = match relay::verify_relay_submit(&frame, residents, clients) {
+                let frame_id = match relay::verify_relay_submit(&frame) {
                     Ok(id) => id,
                     Err(detail) => {
                         send_reply(

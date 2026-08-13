@@ -15,7 +15,7 @@ mod harness;
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PrivateKey;
 use governance::invite::{
-    INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteRole, InviteToken, sign_join_proof,
+    INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteToken, sign_join_proof,
 };
 use harness::Sim;
 use serde_json::{Value, json};
@@ -61,7 +61,7 @@ fn governed(storage: &Path) -> (Sim, Vec<Ed>) {
 const FAR_FUTURE: u64 = 4_102_444_800; // 2100-01-01
 
 /// mint a BEARER invite token: the issuer's signature over the grant
-/// preimage `binding ‖ nonce ‖ role ‖ expiry` in the grant namespace —
+/// preimage `binding ‖ nonce ‖ expiry` in the grant namespace —
 /// minting IS the admission decision. the preimage is deliberately RE-STATED
 /// here rather than calling into governance: if the signed shape ever
 /// drifts, this suite fails instead of following along.
@@ -69,28 +69,20 @@ fn mint_as(
     issuer: &Ed,
     binding: &[u8],
     nonce: [u8; INVITE_NONCE_LEN],
-    role: InviteRole,
     expires_unix_secs: u64,
 ) -> InviteToken {
-    let msg = [
-        binding,
-        nonce.as_slice(),
-        &[role.as_u8()],
-        &expires_unix_secs.to_le_bytes(),
-    ]
-    .concat();
+    let msg = [binding, nonce.as_slice(), &expires_unix_secs.to_le_bytes()].concat();
     InviteToken {
         issuer: issuer.public_key(),
         nonce,
-        role,
         expires_unix_secs,
         sig: issuer.sign(INVITE_GRANT_NAMESPACE, &msg),
     }
 }
 
-/// the common shape: a Resident invite, far-future expiry.
+/// the common shape: a bearer invite, far-future expiry.
 fn mint(issuer: &Ed, binding: &[u8], nonce: [u8; INVITE_NONCE_LEN]) -> InviteToken {
-    mint_as(issuer, binding, nonce, InviteRole::Resident, FAR_FUTURE)
+    mint_as(issuer, binding, nonce, FAR_FUTURE)
 }
 
 /// the `GovMsg::Redeem` wire op — all raw bytes, mirroring the lobby announce.
@@ -101,7 +93,6 @@ fn redeem(token: &InviteToken, joiner: Vec<u8>, proof: Vec<u8>) -> Value {
         "token_sig": token.sig.as_ref().to_vec(),
         "joiner": joiner,
         "proof": proof,
-        "role": token.role.as_u8(),
         "expires_unix_secs": token.expires_unix_secs,
     }})
 }
@@ -343,69 +334,6 @@ fn a_blob_holder_cannot_redeem_under_a_key_that_never_asked_to_join() {
     );
 }
 
-// ── B5c: a role=Client invite grants CLIENT standing (thin-client plane) ──
-
-#[test]
-fn a_client_role_invite_grants_client_standing_not_residency_and_is_single_use() {
-    let storage = tempfile::tempdir().expect("storage dir");
-    let (sim, validators) = governed(storage.path());
-    let issuer = &validators[0];
-
-    // the role byte is signature-covered; this is a WELL-FORMED Client invite.
-    let client = Ed::from_seed(54);
-    let token = mint_as(
-        issuer,
-        BINDING,
-        [7u8; INVITE_NONCE_LEN],
-        InviteRole::Client,
-        FAR_FUTURE,
-    );
-    let proof = sign_join_proof(&client, BINDING, &token);
-    sim.submit_ok(
-        "governance",
-        redeem(
-            &token,
-            client.public_key().as_ref().to_vec(),
-            proof.as_ref().to_vec(),
-        ),
-        Some("relay"),
-    );
-
-    // client standing is granted — queryable via identity's client facet.
-    let clients = sim.query("identity", json!("clients"));
-    assert!(
-        has_key(&clients["clients"], client.public_key().as_ref()),
-        "joiner holds client standing: {clients}"
-    );
-    // …and it is CLIENT standing, NOT residency or a quorum seat: the joiner is
-    // absent from BOTH valset sets (the separate-module boundary in the wire).
-    let residents = sim.query("valset", json!("residents"));
-    assert!(
-        !has_key(&residents["residents"], client.public_key().as_ref()),
-        "a Client redeem grants NO resident standing: {residents}"
-    );
-    let validators_now = sim.query("valset", json!("validators"));
-    assert!(
-        !has_key(&validators_now["validators"], client.public_key().as_ref()),
-        "a Client redeem grants NO quorum seat: {validators_now}"
-    );
-
-    // single-use: the same Client nonce cannot redeem again.
-    let error = sim.submit_rejected(
-        "governance",
-        redeem(
-            &token,
-            client.public_key().as_ref().to_vec(),
-            proof.as_ref().to_vec(),
-        ),
-        Some("relay"),
-    );
-    assert!(
-        error.contains("already redeemed") || error.contains("already holds client standing"),
-        "single-use: {error}"
-    );
-}
-
 // ── B5d: expiry is NOT a consensus check — pin the absence ──
 
 #[test]
@@ -425,7 +353,6 @@ fn consensus_admits_a_wall_clock_expired_token_expiry_lives_at_the_doorbells() {
         issuer,
         BINDING,
         [8u8; INVITE_NONCE_LEN],
-        InviteRole::Resident,
         1, // 1970 — expired on any wall clock
     );
     let proof = sign_join_proof(&joiner, BINDING, &token);
@@ -445,22 +372,16 @@ fn consensus_admits_a_wall_clock_expired_token_expiry_lives_at_the_doorbells() {
     );
 }
 
-// ── B5e: a BEARER Client invite — first valid proof wins, exactly once ──
+// ── B5e: a BEARER invite — first valid proof wins, exactly once ──
 
 #[test]
-fn a_bearer_client_invite_grants_client_standing_to_the_first_redeemer_only() {
+fn a_bearer_invite_grants_resident_standing_to_the_first_redeemer_only() {
     let storage = tempfile::tempdir().expect("storage dir");
     let (sim, validators) = governed(storage.path());
     let issuer = &validators[0];
 
     // bearer: NO target lock — the token names no key at mint time.
-    let token = mint_as(
-        issuer,
-        BINDING,
-        [10u8; INVITE_NONCE_LEN],
-        InviteRole::Client,
-        FAR_FUTURE,
-    );
+    let token = mint_as(issuer, BINDING, [10u8; INVITE_NONCE_LEN], FAR_FUTURE);
 
     // key A — any key at all — takes the grant with its own proof.
     let a = Ed::from_seed(70);
@@ -474,16 +395,10 @@ fn a_bearer_client_invite_grants_client_standing_to_the_first_redeemer_only() {
         ),
         Some("relay"),
     );
-    let clients = sim.query("identity", json!("clients"));
-    assert!(
-        has_key(&clients["clients"], a.public_key().as_ref()),
-        "first redeemer holds client standing: {clients}"
-    );
-    // …and ONLY client standing — bearer never reaches the resident plane.
     let residents = sim.query("valset", json!("residents"));
     assert!(
-        !has_key(&residents["residents"], a.public_key().as_ref()),
-        "a bearer redeem grants NO resident standing: {residents}"
+        has_key(&residents["residents"], a.public_key().as_ref()),
+        "first redeemer holds resident standing: {residents}"
     );
 
     // key B presents the SAME blob with its OWN valid proof: the nonce is
@@ -503,10 +418,10 @@ fn a_bearer_client_invite_grants_client_standing_to_the_first_redeemer_only() {
         error.contains("already redeemed"),
         "single-use first-wins: {error}"
     );
-    let clients = sim.query("identity", json!("clients"));
+    let residents = sim.query("valset", json!("residents"));
     assert!(
-        !has_key(&clients["clients"], b.public_key().as_ref()),
-        "the loser gained nothing: {clients}"
+        !has_key(&residents["residents"], b.public_key().as_ref()),
+        "the loser gained nothing: {residents}"
     );
 }
 

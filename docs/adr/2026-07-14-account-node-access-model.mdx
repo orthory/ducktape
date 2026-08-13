@@ -1,10 +1,12 @@
 # ADR: Account ↔ Node Access Model
 
-Date: 2026-07-14. Status: **Accepted** (model approved by the operator; the
-implementation lands incrementally — the client-signing and client-ACL halves
-already merged). This document is the normative account/node/permission model
-the desktop app, the node's RPC surfaces, and the thin-client work all build
-on.
+Date: 2026-07-14. Status: **Accepted**, amended 2026-08-13: the submit door
+no longer checks standing — any validly signed frame is admitted, and
+per-module authorization moved on-chain into the `acl` module's dispatch gate
+(allow-all by default). The client-standing plane (client invites,
+`GrantClient`, the `clients` set) is deleted; "client standing" below is
+historical. This document is the normative account/node/permission model the
+desktop app, the node's RPC surfaces, and the thin-client work all build on.
 
 ## Context
 
@@ -22,7 +24,7 @@ and "user".
 | # | Rule | Where |
 |---|------|-------|
 | A1 | Every account↔node interaction is signed by an account key. No unsigned/impersonated writes. | §1 |
-| A2 | A node exposes **two** RPC surfaces: **public** (data — query/submit, any account with standing) and **private** (control — manage the node, owner only). | §2 |
+| A2 | A node exposes **two** RPC surfaces: **public** (data — query/submit, any account with a valid signature) and **private** (control — manage the node, owner only). | §2 |
 | A3 | A client uses the public RPC; it needs no consensus/join status of the node — only "reachable or not". | §2, §3 |
 | A4 | The node decides **how** it exposes its RPC: WireGuard-tunnel-via-coordinator, or self-expose (LAN/port-forward/public). The app just dials the resulting endpoint. | §4 |
 | A5 | Node **control** requires: authenticated as the owner account (a bound key) **and** reachability of the node's **private** RPC. Only then does the node-control surface appear. | §2, §5 |
@@ -37,10 +39,12 @@ consensus attributes it to the account, not to the node relaying it.
 - **Public data ops** (chat, pages, files, forge, tasks, …): the app signs
   the frame with the account's key and submits over `/v1/submit/frame`; the
   serving node is a courier that never re-signs (shipped: PR #579, the
-  `user_sign_frame` command + `signPayload` transport lane). The node's
-  submit door authorizes the signer against committed **standing** — validator,
-  resident, or **client** (shipped: PR #576, the client-ACL plane +
-  `verify_relay_submit` client admission).
+  `user_sign_frame` command + `signPayload` transport lane). The submit door
+  admits **any validly signed frame** — the signature is the whole door
+  (2026-08-13 amendment; `verify_relay_submit` checks no standing set).
+  Per-module authorization is decided at dispatch: the `acl` module's
+  on-chain policy table (allow-all by default, governance-tightened) plus
+  each module's own semantic origin gates.
 - **Control ops** (admit, promote, shutdown, config): signed by the **owner**
   account's bound key, accepted only on the private RPC (§2).
 
@@ -54,9 +58,9 @@ A node serves two distinct RPC surfaces:
 
 - **Public RPC** — reads and account-signed writes (`/v1/query`,
   `/v1/submit/frame`, `/v1/index/*`, `/v1/files|fs/*`, browse). Any account
-  with committed standing on that network may use it; authorization is the
-  per-op signature + the module's own origin ACL. A client (client-standing
-  account) uses exactly this.
+  may use it; authorization is the per-op signature + the acl module's
+  dispatch policy + the module's own origin gates. A consuming account needs
+  no prior grant of any kind.
 - **Private RPC** — node management (admit joiners, promote/demote, schedule
   upgrades, shutdown, edit config). Owner-only: accepted only from the owner
   account's bound key, and only reachable when the node chooses to expose the
@@ -69,11 +73,12 @@ owner identity, not just a permission check on one endpoint.
 ## 3. A client needs no node status (A3)
 
 A consuming account does not run the join gate, statesync, or the
-consensus-phase machinery — those are for members obtaining chain state (and a
-client is structurally barred from statesync, PR #567). A client only needs to
-know the public RPC is **reachable**; it reads/writes through it. The app's
-remote-connection path should therefore skip the member-status/standing dance
-for a pure client connection and treat it as "connected or not".
+consensus-phase machinery — those are for members obtaining chain state
+(statesync stays fail-closed on valset, PR #567; nothing about submitting
+grants sync). A client only needs to know the public RPC is **reachable**; it
+reads/writes through it. The app's remote-connection path should therefore
+skip the member-status/standing dance for a pure client connection and treat
+it as "connected or not".
 
 ## 4. The node owns its exposure (A4)
 
@@ -112,9 +117,10 @@ The app is organized around the **account**, not the node/workspace:
 
 | Piece | Model rule | Status |
 |-------|-----------|--------|
-| client-ACL plane (`clients` module, `role=Client` grant, submit door) | A1, A2-public | PR #576 merged |
+| client-ACL plane (`clients` set, `role=Client` grant, submit-door standing) | A1, A2-public | PR #576 merged; **deleted 2026-08-13** — the door is signature-only, policy moved to the `acl` module |
+| open submit door + on-chain `acl` policy (allow-all default) | A1, A2-public | 2026-08-13 |
 | account-key-signed remote submits (`user_sign_frame`, `signPayload`) | A1 | PR #579 merged |
-| statesync fail-closed (client never gets chain state) | A2 (client ≠ member) | PR #567 merged |
+| statesync fail-closed (submitting never grants chain state) | A2 (client ≠ member) | PR #567 merged |
 | random owner-owned short-invite id | (invite distribution) | PR #582 merged |
 | **client needs no node status** (skip the member dance on a client connection) | A3 | pending |
 | **public/private RPC surface split** (a distinct owner-only control RPC) | A2, A5 | pending |

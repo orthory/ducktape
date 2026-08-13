@@ -1252,12 +1252,7 @@ mod tests {
         Vec<u8>,
     ) {
         let issuer = ed25519::PrivateKey::from_seed(80);
-        let token = crate::config::mint_invite_token(
-            &issuer,
-            MULE_BINDING,
-            crate::config::InviteRole::Resident,
-            u64::MAX,
-        );
+        let token = crate::config::mint_invite_token(&issuer, MULE_BINDING, u64::MAX);
         let joiner = ed25519::PrivateKey::from_seed(81);
         let keypair = Arc::new(
             reachability::WireGuardKeypair::load_or_generate(&dir.join("joiner.key"))

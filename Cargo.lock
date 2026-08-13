@@ -94,6 +94,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "acl"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "borsh",
+ "commonware-cryptography",
+ "futures",
+ "host",
+ "identity",
+ "sdk",
+ "sdk-testkit",
+ "serde",
+ "serde_json",
+ "valset",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4178,6 +4195,7 @@ dependencies = [
 name = "governance"
 version = "0.1.0"
 dependencies = [
+ "acl",
  "async-trait",
  "borsh",
  "commonware-codec",
@@ -4541,6 +4559,7 @@ dependencies = [
 name = "host"
 version = "0.1.0"
 dependencies = [
+ "acl",
  "agent",
  "async-trait",
  "automations",
@@ -6196,6 +6215,7 @@ dependencies = [
 name = "node-bin"
 version = "0.1.0"
 dependencies = [
+ "acl",
  "agent",
  "agent-service",
  "airlock",
@@ -9051,6 +9071,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 name = "simnode"
 version = "0.1.0"
 dependencies = [
+ "acl",
  "agent",
  "async-trait",
  "automations",

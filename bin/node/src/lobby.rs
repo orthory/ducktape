@@ -19,7 +19,7 @@ use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{INVITE_NONCE_LEN, InviteRole, InviteToken};
+use crate::config::{INVITE_NONCE_LEN, InviteToken};
 
 /// why a gate refused, per ADR §4. wire-stable identifiers (the `detail` prose
 /// is free to change; these are not). the terminal bit — whether the joiner
@@ -43,10 +43,6 @@ pub enum RejectCode {
     /// a lagging view cannot tell removed from not-yet-seen; the joiner fails
     /// over to another member.
     IssuerUnknown,
-    /// the token's role does not redeem over the LOBBY GATE. a `Client`
-    /// token grants submit-only standing and redeems via `user-redeem-invite`
-    /// (`/v1/submit`) — a node join has nothing to gain from it.
-    RoleUnsupported,
     /// §3.2: the member could not settle the gate in time (timeout / submit
     /// failure). NON-TERMINAL — the joiner tries another member.
     Busy,
@@ -60,7 +56,7 @@ pub enum RejectCode {
 pub enum GateMsg {
     /// joiner → member. "this key asks to join, invited by `issuer`" — the
     /// token's fields plus the joiner key and its proof-of-possession, all raw
-    /// bytes. `role` and `expires_unix_secs` are the token's covered fields.
+    /// bytes. `expires_unix_secs` is the token's covered field.
     /// Every invite is bearer: there is no target, the
     /// proof binds the announcing key and single-use bounds it.
     Request {
@@ -69,7 +65,6 @@ pub enum GateMsg {
         token_sig: Vec<u8>,
         joiner: Vec<u8>,
         proof: Vec<u8>,
-        role: u8,
         expires_unix_secs: u64,
     },
 }
@@ -90,7 +85,6 @@ pub fn gate_request(joiner: &ed25519::PrivateKey, binding: &[u8], token: &Invite
         token_sig: token.sig.encode().as_ref().to_vec(),
         joiner: joiner.public_key().as_ref().to_vec(),
         proof: proof.encode().as_ref().to_vec(),
-        role: token.role.as_u8(),
         expires_unix_secs: token.expires_unix_secs,
     }
 }
@@ -125,9 +119,6 @@ pub struct VerifiedJoinRequest {
     pub joiner: ed25519::PublicKey,
     pub issuer: ed25519::PublicKey,
     pub nonce: [u8; INVITE_NONCE_LEN],
-    /// the token's role — `joiner` IS the target (verify enforced it), so no
-    /// separate target field is carried.
-    pub role: InviteRole,
     /// the token's unix-seconds expiry, carried through to the redeem op.
     pub expires_unix_secs: u64,
 }
@@ -143,14 +134,12 @@ pub fn verify_join_request(msg: &GateMsg, binding: &[u8]) -> Result<VerifiedJoin
         token_sig,
         joiner,
         proof,
-        role,
         expires_unix_secs,
     } = msg;
     let issuer =
         ed25519::PublicKey::decode(issuer.as_slice()).map_err(|e| format!("issuer key: {e}"))?;
     let joiner =
         ed25519::PublicKey::decode(joiner.as_slice()).map_err(|e| format!("joiner key: {e}"))?;
-    let role = InviteRole::from_u8(*role)?;
     if nonce.len() != INVITE_NONCE_LEN {
         return Err(format!("nonce must be {INVITE_NONCE_LEN} bytes"));
     }
@@ -164,14 +153,12 @@ pub fn verify_join_request(msg: &GateMsg, binding: &[u8]) -> Result<VerifiedJoin
     let token = InviteToken {
         issuer: issuer.clone(),
         nonce: nonce_arr,
-        role,
         expires_unix_secs: *expires_unix_secs,
         sig,
     };
-    // signature first (kills a tampered role/expiry), then proof-of-possession.
-    // Every invite is bearer — no target lock — so the ROLE gates downstream
-    // (ingress V8, the intro doorbell) are what keep a Client token off the
-    // resident plane, and the sealed intro keeps the token off the wire.
+    // signature first (kills a tampered expiry), then proof-of-possession.
+    // Every invite is bearer — no target lock — the join proof binds the
+    // announcing key, and the sealed intro keeps the token off the wire.
     if !crate::config::verify_invite_token(&token, binding) {
         return Err("invite token signature does not verify for this network".into());
     }
@@ -185,7 +172,6 @@ pub fn verify_join_request(msg: &GateMsg, binding: &[u8]) -> Result<VerifiedJoin
         joiner,
         issuer,
         nonce: nonce_arr,
-        role,
         expires_unix_secs: *expires_unix_secs,
     })
 }
@@ -216,7 +202,6 @@ pub struct IntroRequest {
     pub token_sig: Vec<u8>,
     pub joiner: Vec<u8>,
     pub proof: Vec<u8>,
-    pub role: u8,
     pub expires_unix_secs: u64,
     /// the joiner's X25519 WireGuard public key, raw.
     pub wg_public_key: Vec<u8>,
@@ -234,8 +219,8 @@ pub struct IntroRequest {
 pub enum IntroReply {
     /// tunnel installed; the gate is settling in consensus — keep waiting.
     Installed,
-    /// the doorbell refused before installing a tunnel (bad token / expired /
-    /// wrong role). terminal for this candidate; carries no secret.
+    /// the doorbell refused before installing a tunnel (bad token / expired).
+    /// terminal for this candidate; carries no secret.
     Refused { detail: String },
     /// the AUTHORITATIVE admission: `Redeem` committed at `height` — the
     /// joiner now holds standing (ADR R3).
@@ -277,7 +262,6 @@ pub struct GateForward {
     pub token_sig: Vec<u8>,
     pub joiner: Vec<u8>,
     pub proof: Vec<u8>,
-    pub role: u8,
     pub expires_unix_secs: u64,
 }
 
@@ -312,7 +296,6 @@ pub fn intro_request(
         token_sig: token.sig.encode().as_ref().to_vec(),
         joiner: joiner.public_key().as_ref().to_vec(),
         proof: proof.encode().as_ref().to_vec(),
-        role: token.role.as_u8(),
         expires_unix_secs: token.expires_unix_secs,
         wg_public_key: wg_public_key.to_vec(),
         wg_sig: wg_sig.encode().as_ref().to_vec(),
@@ -342,7 +325,6 @@ pub fn verify_intro(msg: &IntroRequest, binding: &[u8]) -> Result<VerifiedIntro,
             token_sig: msg.token_sig.clone(),
             joiner: msg.joiner.clone(),
             proof: msg.proof.clone(),
-            role: msg.role,
             expires_unix_secs: msg.expires_unix_secs,
         },
         binding,
@@ -374,9 +356,9 @@ mod tests {
 
     const BINDING: &[u8] = b"net#00000000@feedface";
 
-    /// mint a far-future bearer Resident token — the lobby tests' default.
+    /// mint a far-future bearer token — the lobby tests' default.
     fn mint_for(issuer: &ed25519::PrivateKey) -> InviteToken {
-        mint_invite_token(issuer, BINDING, InviteRole::Resident, u64::MAX)
+        mint_invite_token(issuer, BINDING, u64::MAX)
     }
 
     #[test]
@@ -390,7 +372,6 @@ mod tests {
         assert_eq!(verified.joiner, joiner.public_key());
         assert_eq!(verified.issuer, issuer.public_key());
         assert_eq!(verified.nonce, token.nonce);
-        assert_eq!(verified.role, InviteRole::Resident);
         assert_eq!(verified.expires_unix_secs, u64::MAX);
     }
 
@@ -427,7 +408,6 @@ mod tests {
             nonce,
             token_sig,
             joiner: j,
-            role,
             expires_unix_secs,
             ..
         } = msg;
@@ -440,33 +420,10 @@ mod tests {
             token_sig,
             joiner: j,
             proof: bad_proof.encode().as_ref().to_vec(),
-            role,
             expires_unix_secs,
         };
         let err = verify_join_request(&forged, BINDING).expect_err("refused");
         assert!(err.contains("proof-of-possession"), "{err}");
-    }
-
-    #[test]
-    fn a_client_token_verifies_and_pins_role_client() {
-        // a Client token verifies at the gate but comes out role=Client, which
-        // ingress V8 and the intro doorbell terminally refuse — no client path
-        // onto the resident plane.
-        let issuer = ed25519::PrivateKey::from_seed(1);
-        let joiner = ed25519::PrivateKey::from_seed(2);
-        let token = mint_invite_token(&issuer, BINDING, InviteRole::Client, u64::MAX);
-
-        let msg = gate_request(&joiner, BINDING, &token);
-        let verified = verify_join_request(&msg, BINDING).expect("client verifies");
-        assert_eq!(verified.role, InviteRole::Client);
-
-        let intro = intro_request(&joiner, BINDING, &token, [9u8; 32]);
-        let verified = verify_intro(&intro, BINDING).expect("client intro verifies");
-        assert_eq!(verified.joiner, joiner.public_key());
-        assert!(
-            intro.role != InviteRole::Resident.as_u8(),
-            "the doorbell's role gate sees Client and refuses a tunnel"
-        );
     }
 
     #[test]
@@ -494,7 +451,6 @@ mod tests {
             (RejectCode::BadProof, true),
             (RejectCode::Spent, true),
             (RejectCode::IssuerUnknown, false),
-            (RejectCode::RoleUnsupported, true),
             (RejectCode::Busy, false),
         ] {
             let ack = IntroAck {
@@ -523,7 +479,6 @@ mod tests {
             (RejectCode::BadProof, "bad_proof"),
             (RejectCode::Spent, "spent"),
             (RejectCode::IssuerUnknown, "issuer_unknown"),
-            (RejectCode::RoleUnsupported, "role_unsupported"),
             (RejectCode::Busy, "busy"),
         ];
         for (code, wire) in cases {

@@ -31,20 +31,15 @@
 //! it to [`Identity::new`], so this crate never names a storage crate. one
 //! logical record per account (`acct\0{account_id}`), plus the two OWNERSHIP
 //! INDEXES as write-path-maintained point records -- `node\0{node_key}` and
-//! `member\0{member_key}`, each valued by the owning account id -- and two
-//! aggregate records:
+//! `member\0{member_key}`, each valued by the owning account id -- and one
+//! aggregate record:
 //!
 //! - the account ROSTER (the sorted account-id list, bounded by
 //!   [`MAX_ACCOUNTS`]) -- the ONE enumeration read. it stays canonical
 //!   because identity's reads are consumed in-consensus (governance resolves
 //!   actors/shares through them at execute time) and by the operator CLIs;
 //!   the id-length bound is structural ([`KeyKind::pubkey_wellformed`] admits
-//!   nothing past a 65-byte SEC1 point);
-//! - the CLIENT set (the submit-door ACL, bounded by [`MAX_CLIENTS`]) -- the
-//!   node's submit door consumes it whole between drains, and governance's
-//!   redeem dedup reads it, so it lives as one sorted aggregate of fixed
-//!   32-byte ed25519 keys. an empty set deletes the record, so a fully
-//!   revoked plane is byte-identical to one that never granted.
+//!   nothing past a 65-byte SEC1 point).
 //!
 //! `OfNode`/`OfMember` are canonical POINT READS over the index records
 //! (dispatch-consumed: the join/settle paths resolve node standing through
@@ -62,8 +57,7 @@
 //! (bind, add-member, the profile setters) restages the whole record through
 //! the [`MAX_ACCOUNT_RECORD_BYTES`] gate, so no growth can bypass it and no
 //! half-cap headroom is needed; the roster is byte-gated at
-//! [`MAX_ROSTER_RECORD_BYTES`] on top of its count cap; the client set is
-//! bounded by construction (fixed 32-byte keys under [`MAX_CLIENTS`]).
+//! [`MAX_ROSTER_RECORD_BYTES`] on top of its count cap.
 //!
 //! ## Genesis config (the chain id)
 //!
@@ -75,17 +69,6 @@
 //! here uses -- and the guest decodes it per dispatch. the config is
 //! consensus state in the store's merkle root from genesis and rides
 //! state-sync like any other record. this module never writes that key.
-//!
-//! ## client standing (the submit-door ACL, a facet of the account plane)
-//!
-//! identity also carries the CLIENT set: ed25519 keys that hold SUBMIT
-//! authorization at a validator's door and nothing else — no consensus seat,
-//! no mesh, no statesync (the sync/mesh planes read valset, never this set, so
-//! a client can never leak into standing). governance's `role=Client` invite
-//! redemption emits [`IdentityMsg::GrantClient`] as a MODULE-origin follow-up;
-//! [`IdentityMsg::RevokeClient`] drops a key. the set is one store record in
-//! identity's ONE root, so a joiner restores it with the rest of the account
-//! plane.
 //!
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
@@ -105,8 +88,6 @@ pub mod testkit;
 use std::collections::BTreeMap;
 
 use borsh::{BorshDeserialize, BorshSerialize};
-use commonware_codec::DecodeExt as _;
-use commonware_cryptography::ed25519::PublicKey;
 use sdk::{
     Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
     StateRoot, StateSyncHandle,
@@ -127,10 +108,6 @@ pub const MAX_ROSTER_RECORD_BYTES: usize = 512 * 1024;
 /// it -- so an op that would push a record past the cap is refused loudly and
 /// deterministically instead of poisoning the sync wire.
 pub const MAX_ACCOUNT_RECORD_BYTES: usize = 512 * 1024;
-/// client-ACL count cap. clients enter one governance-redeemed invite at a
-/// time and every key is a fixed 32 bytes, so the record stays bounded by
-/// construction under this count.
-pub const MAX_CLIENTS: usize = 1024;
 
 /// per-account record key: prefix + 0 + account id (the single-component
 /// shape chat uses). safe because every key literal below is fixed and none
@@ -166,9 +143,6 @@ fn member_owner_key(member: &[u8]) -> Vec<u8> {
 /// `node\0...` / `member\0...` key (nor the host-seeded `__config`
 /// genesis-config record).
 const ACCOUNT_ROSTER_KEY: &[u8] = b"accounts";
-
-/// the client set's whole key. absent = no client holds standing.
-const CLIENTS_KEY: &[u8] = b"clients";
 
 /// per-member metadata; the public key is the map key, so it is not
 /// repeated. serialized verbatim inside [`AccountRecord`].
@@ -321,11 +295,6 @@ impl Identity {
         Ok(self.load(ACCOUNT_ROSTER_KEY).await?.unwrap_or_default())
     }
 
-    /// the client set, sorted. absent record = empty set.
-    async fn client_set(&self) -> Result<Vec<Vec<u8>>, Error> {
-        Ok(self.load(CLIENTS_KEY).await?.unwrap_or_default())
-    }
-
     /// stage an updated account record under the byte cap -- the ONE write
     /// every account mutation funnels through (see [`MAX_ACCOUNT_RECORD_BYTES`]).
     fn store_account(&mut self, account_id: &[u8], record: &AccountRecord) -> Result<(), Error> {
@@ -338,21 +307,6 @@ impl Identity {
     }
 
     // ---- gates ---------------------------------------------------------------
-
-    /// validate that `key` is a well-formed 32-byte ed25519 public key — the
-    /// explicit length guard keeps the 32-byte invariant independent of decode's
-    /// trailing-byte behavior; `PublicKey::decode` then checks the curve point.
-    fn validate_client_key(key: &[u8]) -> Result<(), Error> {
-        if key.len() != 32 {
-            return Err(Error::Module(format!(
-                "invalid ed25519 client key: expected 32 bytes, got {}",
-                key.len()
-            )));
-        }
-        PublicKey::decode(key)
-            .map_err(|e| Error::Module(format!("invalid ed25519 client key: {e}")))?;
-        Ok(())
-    }
 
     /// the AUTHENTICATED submitter key -- a non-empty external origin, or a
     /// deterministic rejection.
@@ -399,18 +353,6 @@ impl Identity {
             ));
         }
         Ok(())
-    }
-
-    /// client standing changes only via governance: a module origin (its redeem
-    /// follow-up) or a system origin (genesis). part of the deterministic Env,
-    /// enforced identically on every node.
-    fn require_module_origin(ctx: &dyn Ctx) -> Result<(), Error> {
-        match &ctx.env().origin {
-            Origin::Module(_) | Origin::System => Ok(()),
-            Origin::External(_) => Err(Error::Module(
-                "client standing changes only via governance".into(),
-            )),
-        }
     }
 
     fn account_view(account_id: &[u8], record: &AccountRecord) -> AccountView {
@@ -498,8 +440,6 @@ impl Module for Identity {
             IdentityMsg::SetNodeLabel { node_key, label } => {
                 self.set_node_label(ctx, node_key, label).await
             }
-            IdentityMsg::GrantClient { key } => self.grant_client(ctx, key).await,
-            IdentityMsg::RevokeClient { key } => self.revoke_client(ctx, key).await,
         }
     }
 
@@ -545,9 +485,6 @@ impl Module for Identity {
                 };
                 Ok(encode_reply(&IdentityReply::Account(account)))
             }
-            IdentityQuery::Clients => Ok(encode_reply(&IdentityReply::Clients(
-                self.client_set().await?,
-            ))),
         }
     }
 
@@ -910,60 +847,6 @@ impl Identity {
         self.store_account(&account_id, &record)
     }
 
-    /// grant CLIENT (submit-door) standing to `key`. GOVERNANCE-GATED exactly
-    /// like valset membership: only a module origin (governance's redeem
-    /// follow-up) or a system origin (genesis) may stage it — an external key
-    /// cannot self-grant. a key that already holds standing is a no-op that
-    /// stages nothing (no root movement).
-    async fn grant_client(&mut self, ctx: &mut dyn Ctx, key: Vec<u8>) -> Result<(), Error> {
-        Self::require_module_origin(ctx)?;
-        Self::validate_client_key(&key)?;
-        let mut clients = self.client_set().await?;
-        let Err(position) = clients.binary_search(&key) else {
-            return Ok(());
-        };
-        if clients.len() >= MAX_CLIENTS {
-            return Err(Error::Module(format!("client cap reached ({MAX_CLIENTS})")));
-        }
-        clients.insert(position, key);
-        // bounded by construction: ≤ MAX_CLIENTS fixed 32-byte keys.
-        self.store(CLIENTS_KEY.to_vec(), &clients);
-        Ok(())
-    }
-
-    /// revoke client standing by `key`; a no-op (nothing staged) if the key
-    /// holds none. same governance origin gate as [`Identity::grant_client`].
-    /// revoking the last client deletes the record, so the store returns to
-    /// its never-granted shape.
-    async fn revoke_client(&mut self, ctx: &mut dyn Ctx, key: Vec<u8>) -> Result<(), Error> {
-        Self::require_module_origin(ctx)?;
-        let mut clients = self.client_set().await?;
-        let Ok(position) = clients.binary_search(&key) else {
-            return Ok(());
-        };
-        clients.remove(position);
-        if clients.is_empty() {
-            self.staged.delete(CLIENTS_KEY.to_vec());
-        } else {
-            self.store(CLIENTS_KEY.to_vec(), &clients);
-        }
-        Ok(())
-    }
-}
-
-/// the CURRENT client set at `identity_id`: its staged-over-committed
-/// projection, via the host-routed read lane. the one shared read the redeem
-/// path and the submit door's caller funnel through.
-pub async fn clients(ctx: &dyn Ctx, identity_id: &str) -> Result<Vec<Vec<u8>>, Error> {
-    let reply = ctx
-        .query(identity_id, &encode_query(&IdentityQuery::Clients))
-        .await?;
-    match decode_reply(&reply).map_err(Error::Module)? {
-        IdentityReply::Clients(list) => Ok(list),
-        other => Err(Error::Module(format!(
-            "identity answered a Clients query with {other:?}"
-        ))),
-    }
 }
 
 /// trim an optional profile field: `None` or empty-after-trim -> cleared

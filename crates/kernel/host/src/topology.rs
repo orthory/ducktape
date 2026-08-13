@@ -88,6 +88,11 @@ const NONE: &[&str] = &[];
 /// The module id universe with per-module wiring + config. Alphabetical by id
 /// (order here is documentation only — selections carry the composer orders).
 const MODULES: &[ModuleSpec] = &[
+    // the submit-policy federation: allow-all at genesis (an empty table),
+    // governance-tightened. the kernel host's dispatch gate reads it and
+    // resolves principals against valset/identity itself, so the native
+    // struct takes no sibling constructor args (wiring stays empty).
+    ModuleSpec { id: "acl", wiring: NONE, config: NONE },
     ModuleSpec { id: "agent", wiring: &["saga", "runs"], config: NONE },
     ModuleSpec { id: "automations", wiring: &["chat", "tasks", "inbox"], config: NONE },
     ModuleSpec { id: "capability", wiring: NONE, config: NONE },
@@ -116,7 +121,7 @@ const MODULES: &[ModuleSpec] = &[
     ModuleSpec { id: "valset", wiring: NONE, config: NONE },
 ];
 
-/// node's production genesis set (20), in status-report order — every node runs
+/// node's production genesis set (21), in status-report order — every node runs
 /// exactly these, so the set is in the root-hash. A module here is consensus
 /// state forever; experiments live unwired in `crates/labs` and appear in no
 /// selection.
@@ -125,6 +130,7 @@ pub const PRODUCTION: &[&str] = &[
     "chat",
     "forge",
     "valset",
+    "acl",
     "governance",
     "lifecycle",
     "hello",
@@ -167,12 +173,13 @@ pub const SIM_BASE: &[&str] = &[
     "gateway",
 ];
 
-/// the four system modules simnode's opt-in `--with-valset` genesis appends
+/// the five system modules simnode's opt-in `--with-valset` genesis appends
 /// AFTER `sim_base`, in registry order: the KV store, the membership registry
-/// seeded with the genesis validators, governance (the sole authorized author
-/// of valset change), and the lifecycle coordinator — whose mere registration
-/// makes the host-injected once-per-block boundary `Advance` ride every block.
-pub const SIM_VALSET: &[&str] = &["kv", "valset", "governance", "lifecycle"];
+/// seeded with the genesis validators, the acl policy table (empty =
+/// allow-all), governance (the sole authorized author of valset and acl
+/// change), and the lifecycle coordinator — whose mere registration makes the
+/// host-injected once-per-block boundary `Advance` ride every block.
+pub const SIM_VALSET: &[&str] = &["kv", "valset", "acl", "governance", "lifecycle"];
 
 /// the demo walkthrough's native genesis set (17): the base collaboration set
 /// plus kv/directory/greeter, minus the production-only wasm tenants
@@ -228,18 +235,18 @@ mod tests {
     /// here. Counts AND membership, so neither a stray add nor a silent drop slips.
     #[test]
     fn selections_pin_to_todays_sets() {
-        assert_eq!(PRODUCTION.len(), 20, "production is the 20-module set");
+        assert_eq!(PRODUCTION.len(), 21, "production is the 21-module set");
         assert_eq!(SIM_BASE.len(), 14, "sim_base is the default 14-module set");
-        assert_eq!(SIM_VALSET.len(), 4, "sim_valset appends 4 system modules");
+        assert_eq!(SIM_VALSET.len(), 5, "sim_valset appends 5 system modules");
         assert_eq!(DEMO.len(), 17, "demo composes 17 modules");
 
         // exact membership (sorted — registration order is not consensus-relevant)
         assert_eq!(
             sorted(PRODUCTION),
             sorted(&[
-                "agent", "automations", "capability", "chat", "directory", "dispatch", "files",
-                "forge", "gateway", "governance", "hello", "identity", "inbox", "lifecycle",
-                "pages", "runs", "saga", "tagging", "tasks", "valset",
+                "acl", "agent", "automations", "capability", "chat", "directory", "dispatch",
+                "files", "forge", "gateway", "governance", "hello", "identity", "inbox",
+                "lifecycle", "pages", "runs", "saga", "tagging", "tasks", "valset",
             ])
         );
         assert_eq!(
@@ -249,7 +256,10 @@ mod tests {
                 "identity", "inbox", "pages", "runs", "saga", "tagging", "tasks",
             ])
         );
-        assert_eq!(sorted(SIM_VALSET), sorted(&["governance", "kv", "lifecycle", "valset"]));
+        assert_eq!(
+            sorted(SIM_VALSET),
+            sorted(&["acl", "governance", "kv", "lifecycle", "valset"])
+        );
         assert_eq!(
             sorted(DEMO),
             sorted(&[

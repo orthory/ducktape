@@ -17,7 +17,7 @@
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
-use governance::invite::{INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteRole, InviteToken};
+use governance::invite::{INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteToken};
 use governance::{
     GovAction, GovMsg, GovQuery, GovReply, Governance, decode_reply, encode_msg, encode_query,
     invite::sign_join_proof,
@@ -72,17 +72,10 @@ fn gov(m: &GovMsg) -> Msg {
 fn redeem(issuer: &PrivateKey, nonce_byte: u8, joiner: &PrivateKey) -> Msg {
     let nonce = [nonce_byte; INVITE_NONCE_LEN];
     let expires: u64 = u64::MAX;
-    let preimage = [
-        BINDING,
-        nonce.as_slice(),
-        &[InviteRole::Resident.as_u8()],
-        &expires.to_le_bytes(),
-    ]
-    .concat();
+    let preimage = [BINDING, nonce.as_slice(), &expires.to_le_bytes()].concat();
     let token = InviteToken {
         issuer: issuer.public_key(),
         nonce,
-        role: InviteRole::Resident,
         expires_unix_secs: expires,
         sig: issuer.sign(INVITE_GRANT_NAMESPACE, &preimage),
     };
@@ -93,7 +86,6 @@ fn redeem(issuer: &PrivateKey, nonce_byte: u8, joiner: &PrivateKey) -> Msg {
         token_sig: token.sig.encode().as_ref().to_vec(),
         joiner: key_bytes(joiner),
         proof: proof.encode().as_ref().to_vec(),
-        role: InviteRole::Resident.as_u8(),
         expires_unix_secs: expires,
     })
 }

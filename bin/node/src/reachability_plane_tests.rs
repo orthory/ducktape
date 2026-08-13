@@ -39,12 +39,7 @@ fn joiner_wg_keypair() -> reachability::WireGuardKeypair {
 fn intro_bytes() -> (Vec<u8>, ed25519::PublicKey, reachability::WireGuardKeypair) {
     let issuer = ed25519::PrivateKey::from_seed(1);
     let joiner = ed25519::PrivateKey::from_seed(2);
-    let token = mint_invite_token(
-        &issuer,
-        BINDING,
-        crate::config::InviteRole::Resident,
-        u64::MAX,
-    );
+    let token = mint_invite_token(&issuer, BINDING, u64::MAX);
     let wg = joiner_wg_keypair();
     let msg = lobby::intro_request(&joiner, BINDING, &token, wg.public_key().0);
     (lobby::encode_intro(&msg), joiner.public_key(), wg)
@@ -188,12 +183,7 @@ async fn an_expired_token_neither_installs_nor_tunnels() {
     // stops honest joiners.
     let issuer = ed25519::PrivateKey::from_seed(1);
     let joiner = ed25519::PrivateKey::from_seed(2);
-    let token = mint_invite_token(
-        &issuer,
-        BINDING,
-        crate::config::InviteRole::Resident,
-        1, // 1970 — long expired
-    );
+    let token = mint_invite_token(&issuer, BINDING, 1); // 1970 — long expired
     let wg = joiner_wg_keypair();
     let bytes = lobby::encode_intro(&lobby::intro_request(
         &joiner,
@@ -233,61 +223,6 @@ async fn an_expired_token_neither_installs_nor_tunnels() {
         panic!("expected Refused, got {:?}", ack.reply);
     };
     assert!(detail.contains("expired"), "{detail}");
-}
-
-#[tokio::test]
-async fn a_client_role_intro_neither_installs_nor_tunnels() {
-    // a cryptographically VALID intro whose token grants the `Client` role:
-    // verify passes (role is signature-covered), but only `Resident` is
-    // redeemable this generation, so the intro gate (ADR §3.1 V8) must refuse
-    // the tunnel — a doomed join never obtains one.
-    let issuer = ed25519::PrivateKey::from_seed(1);
-    let joiner = ed25519::PrivateKey::from_seed(2);
-    let token = mint_invite_token(
-        &issuer,
-        BINDING,
-        crate::config::InviteRole::Client,
-        u64::MAX,
-    );
-    let wg = joiner_wg_keypair();
-    let bytes = lobby::encode_intro(&lobby::intro_request(
-        &joiner,
-        BINDING,
-        &token,
-        wg.public_key().0,
-    ));
-
-    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<reachability::ReachabilityCommand>(8);
-    let weak = cmd_tx.downgrade();
-    let acked: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
-    let store = acked.clone();
-    let alive = handle_intro(
-        &bytes,
-        src(),
-        BINDING,
-        "test",
-        IntroPath::Direct,
-        &weak,
-        open_identity,
-        None,
-        |b| {
-        store.lock().unwrap().push(b);
-        async {}
-        },
-    )
-    .await;
-    assert!(alive);
-    assert!(
-        cmd_rx.try_recv().is_err(),
-        "no tunnel install for a non-Resident role"
-    );
-    let acked = acked.lock().unwrap();
-    // the role gate runs POST-verify, so its refusal is sealed too.
-    let ack = open_sealed_ack(&wg, &acked[0]);
-    let lobby::IntroReply::Refused { detail } = ack.reply else {
-        panic!("expected Refused, got {:?}", ack.reply);
-    };
-    assert!(detail.contains("not redeemable"), "{detail}");
 }
 
 #[test]

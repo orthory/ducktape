@@ -37,26 +37,6 @@ pub(crate) async fn read_valset_residents(host: &Host) -> Vec<Vec<u8>> {
     }
 }
 
-/// read the current CLIENT set — the submit-door ACL, now a facet of the
-/// identity account plane (committed state — called between drains, outside any
-/// block). the submit door admits a client's own-signed frame; this is a
-/// SEPARATE read from the valset residents (client standing is structurally
-/// distinct from valset), so a client's standing can never leak into the
-/// statesync/mesh reads keyed off valset.
-pub(crate) async fn read_clients(host: &Host) -> Vec<Vec<u8>> {
-    use identity::{IdentityQuery, IdentityReply, decode_reply, encode_query};
-    let Ok(reply) = host
-        .query("identity", &encode_query(&IdentityQuery::Clients))
-        .await
-    else {
-        return Vec::new();
-    };
-    match decode_reply(&reply) {
-        Ok(IdentityReply::Clients(v)) => v,
-        _ => Vec::new(),
-    }
-}
-
 /// the transport-mesh set a parked joiner tracks at a manifest's epoch. it MUST
 /// be the same set every member tracks at that epoch — a validator tracks
 /// `descriptor_mesh ∪ members ∪ residents` (see the `mesh_at` closure in the
