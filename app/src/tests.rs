@@ -3038,6 +3038,9 @@ fn optimistic_sends_are_independent_and_never_erase_the_next_draft() {
     assert!(!chat.contains("keyed message in messages by=message.seq"));
     assert!(chat.contains("stack #message(message.id) w=fill"));
     assert!(!chat.contains("#message(message.seq)"));
+    let externs = inlined(include_str!("ui/extern/backend.ice"));
+    assert!(externs.contains("sync optimistic_message("));
+    assert!(!externs.contains("pure optimistic_message("));
 }
 
 #[test]

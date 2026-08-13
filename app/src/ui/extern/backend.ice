@@ -95,7 +95,7 @@ extern crate::backend
   live_resync_load(rpc:str, channel_id:str, page_id:str, planes:str, debounce:bool, generation:i64, fold_serial:i64, attempt:i64) -> LiveRefresh ! HydrationError
   load_older_messages(rpc:str, channel_id:str, before_seq:i64) -> HistoryPageData ! AppError
   sync fresh_operation_id(prefix:str) -> str
-  pure optimistic_message(messages:[ChatMessage], body:str, message_id:str) -> [ChatMessage]
+  sync optimistic_message(messages:[ChatMessage], body:str, message_id:str) -> [ChatMessage]
   pure mark_author_runs(messages:[ChatMessage]) -> [ChatMessage]
   pure merge_pending_messages(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str) -> [ChatMessage]
   pure resynced_messages(loaded:bool, next:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str, history_view:bool) -> [ChatMessage]
