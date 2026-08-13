@@ -84,7 +84,7 @@ recipe danger_action for button
 
 // LOCAL FORK, not upstream: an icon-only button. Zero padding is the whole
 // point — a `box w=fill h=fill` wrapper inside a fixed-size button collapses an
-// svg child to a hairline, so the Icon is a DIRECT child and the button takes
+// svg child to a hairline, so the glyph is a DIRECT child and the button takes
 // its size from the caller's padding instead.
 recipe icon_action for button
   @p-0px bg-transparent text-fg rounded-7px hover:bg-accent pressed:bg-border disabled:opacity-50

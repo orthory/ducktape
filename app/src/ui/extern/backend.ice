@@ -88,7 +88,6 @@ extern crate::backend
   box-style card_style()
   box-style raised_style()
   svg-style icon_tint(tone:str)
-  svg-style icon_action_tint(tone:str, disabled:bool)
   pure icon(name:str) -> bytes
   connect(rpc:str, attempt:i64, generation:i64) -> WorkspaceData ! HydrationError
   stream live_events(rpc:str) -> LiveUpdate

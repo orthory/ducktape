@@ -219,18 +219,17 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                   disabled=(loading || mutation_phase != "idle" || !connected)
                   p=0.0
                   @icon_action
-                // THE SAME TERM TWICE, because an svg hovers on its OWN bounds
-                // and never reads the button's ink: the glyph would brighten
-                // under a cursor that can press nothing. The other three mounts
-                // hand down a `disabled` prop; this button spells its own out,
-                // so this one repeats it rather than inventing a state field.
-                IconAction
+                // `color=inherit` (ducktape-ui#606): the glyph draws the
+                // button's status-resolved text color — hover ink keys on the
+                // BUTTON's bounds, disabled ink on the status ladder, no
+                // second spelling of the disabled term. `active text=label`
+                // keeps the resting `label` tone the old tinted mount named;
+                // token and tone are the same hex in both palettes.
+                svg icon("plus") memory color=inherit
                   with
-                    name="plus"
-                    tone="label"
-                    px=16.0
-                    disabled=(loading || mutation_phase != "idle" || !connected)
-                active bg=transparent text=muted border=transparent border-w=1.0 r=5.0
+                    w=16.0
+                    h=16.0
+                active bg=transparent text=label border=transparent border-w=1.0 r=5.0
                 hovered bg=separator text=fg
                 pressed bg=subtle text=fg
             if channel_create_open

@@ -197,6 +197,31 @@ test channel_draft_contract
   dispatch toggle_channel_create_members_only
   expect channel_create_members_only
 
+// The composer toolbar's code glyph wears `color=inherit` (ducktape-ui#606):
+// its ink IS the button's status-resolved text color. The probe point sits on
+// the button's plate strictly LEFT of the glyph's own bounds — the exact spot
+// the deleted IconAction ramp (hover on the svg's own bounds) left grey — and
+// must brighten the glyph to the button's `hovered text=fg`; off the plate it
+// rests back on `active text=muted`.
+test composer_mark_glyph_wears_button_ink
+  preset ui_offline
+  viewport 360 160
+  mount
+    box #surface w=fill p=24.0
+      ComposerMarks #marks
+        with
+          disabled=false
+        events
+          mark -> composer_mark _
+  target code = #surface/marks/root/code
+  target glyph = #surface/marks/root/code/glyph
+  expect glyph.x > code.x + 4.0
+  expect glyph.image_color == color.rgb8(107, 105, 98)
+  move (code.x + 2.0) code.center_y
+  expect glyph.image_color == color.rgb8(44, 43, 39)
+  move (code.x - 8.0) code.center_y
+  expect glyph.image_color == color.rgb8(107, 105, 98)
+
 test shared_components_contract
   preset ui_component_error
   viewport 560 360
