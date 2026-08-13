@@ -158,8 +158,13 @@ fn resident_sees(cluster: &NetworkShapeCluster, message_id: &str, what: &str, de
 /// `x-ducktape-folded` means the module has no tip at all, which is exactly
 /// what a stamped-but-unbackfilled module looks like.
 fn resident_view_holds(cluster: &NetworkShapeCluster, message_id: &str, deadline: Duration) {
+    // the view wire's CURRENT dialect (#1128 renamed the timeline read to
+    // `roots` and locked the enum with deny_unknown_fields, so a stale shape
+    // here fails LOUD as a 4xx rather than quietly matching nothing — this
+    // probe found that out the hard way). the pre-join post is a timeline
+    // root, so the roots page is exactly where it must appear.
     let query = serde_json::json!({
-        "messages_range": { "channel_id": "general", "from_seq": 1, "limit": 50 }
+        "roots": { "channel_id": "general", "limit": 50 }
     });
     let body = serde_json::to_vec(&query).expect("view query serializes");
     poll_until(
