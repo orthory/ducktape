@@ -18,6 +18,7 @@ const AGENT_CONTEXT_ROWS: usize = 32;
 const AGENT_CONTEXT_BYTES: usize = 48 * 1024;
 const LINK_TOKEN_BYTES: u64 = 4 * 1024;
 const MAX_ACTIVITY_ROWS: usize = 32;
+const RUNNER_RESULT_VERSION: u64 = 1;
 
 static NEXT_AGENT_TERMINAL_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -82,6 +83,22 @@ pub struct AgentChatEvent {
     pub status: String,
     pub answer: String,
     pub saga_id: String,
+}
+
+/// The current compute-service result contract. Shell renders only the message
+/// facet, but still names every top-level field so contract drift is rejected
+/// instead of leaking an unfamiliar machine envelope into the conversation.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentRunnerResult {
+    ducktape_runner_result: u64,
+    response_text: String,
+    #[serde(rename = "workspace_receipt")]
+    _workspace_receipt: serde_json::Value,
+    #[serde(default, rename = "sink")]
+    _sink: Option<serde_json::Value>,
+    #[serde(default, rename = "status")]
+    _status: Option<serde_json::Value>,
 }
 
 pub fn idle_agent_terminal() -> AgentTerminalSession {
@@ -543,7 +560,7 @@ fn terminal_saga_event(view: SagaView, saga_id: &str) -> Option<AgentChatEvent> 
         SagaStatus::Pending => return None,
         SagaStatus::Done => {
             let bytes = view.result.unwrap_or_default();
-            let answer = String::from_utf8(bytes)
+            let answer = agent_response_text(&bytes)
                 .unwrap_or_else(|_| "The agent returned a result this app could not read.".into());
             ("answer", answer)
         }
@@ -568,6 +585,18 @@ fn terminal_saga_event(view: SagaView, saga_id: &str) -> Option<AgentChatEvent> 
         answer,
         saga_id: saga_id.into(),
     })
+}
+
+fn agent_response_text(bytes: &[u8]) -> Result<String, String> {
+    let result: AgentRunnerResult = serde_json::from_slice(bytes)
+        .map_err(|error| format!("the runner result is malformed: {error}"))?;
+    if result.ducktape_runner_result != RUNNER_RESULT_VERSION {
+        return Err(format!(
+            "runner result version {} is not supported",
+            result.ducktape_runner_result
+        ));
+    }
+    Ok(result.response_text)
 }
 
 fn provider_output_event(provider: &str, line: &str, id: i64) -> Option<AgentChatEvent> {
@@ -1292,6 +1321,33 @@ mod tests {
         assert_eq!(event.kind, "preview");
         assert_eq!(event.answer, "answer");
         assert!(provider_output_event("codex", r#"{"type":"unknown","secret":"no"}"#, 8).is_none());
+    }
+
+    #[test]
+    fn durable_result_projects_the_answer_not_the_runner_receipt() {
+        let wrapped = serde_json::json!({
+            "ducktape_runner_result": 1,
+            "response_text": "UI LIVE OK",
+            "workspace_receipt": {
+                "source_prefix": "/shared/agent-workspaces/sched",
+                "source_snapshot": null,
+                "output_snapshot": null,
+                "commit_height": null,
+                "rebased": false,
+                "no_changes": true
+            }
+        });
+        assert_eq!(
+            agent_response_text(wrapped.to_string().as_bytes()).unwrap(),
+            "UI LIVE OK"
+        );
+
+        let mut drifted = wrapped;
+        drifted["ducktape_runner_result"] = serde_json::json!(2);
+        assert!(agent_response_text(drifted.to_string().as_bytes()).is_err());
+        drifted["ducktape_runner_result"] = serde_json::json!(1);
+        drifted["legacy"] = serde_json::json!(true);
+        assert!(agent_response_text(drifted.to_string().as_bytes()).is_err());
     }
 
     #[test]
