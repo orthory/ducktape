@@ -24,7 +24,7 @@ use iced::{Event, Point, Size, Theme};
 use iced_test::runtime::user_interface::{self, UserInterface};
 
 use super::backend;
-use super::{__DucktapeMessage, Ducktape, ShellTab};
+use super::{__DucktapeMessage, Ducktape, LiveKind, ShellTab};
 
 /// One synthetic channel's worth of scrollback — `CHAT_VIEW_PAGE_LIMIT`, the
 /// page the timeline walk asks for, so the probe measures the widest window a
@@ -35,12 +35,29 @@ const CHANNELS: i64 = 24;
 const WINDOW: Size = Size::new(1440.0, 900.0);
 const HUDDLE_WINDOW: Size = Size::new(320.0, 460.0);
 const PAGE_ROWS: usize = 128;
-/// Two thread pages of replies in the open rail (root + 127 replies).
-const THREAD_ROWS: i64 = 128;
+/// One full thread page plus its root. The root rail deliberately is not
+/// subject to the 256-root hot-window cap.
+const THREAD_ROWS: i64 = backend::THREAD_HOT_WINDOW_LIMIT as i64;
 const HUDDLE_ROWS: usize = 32;
 const LONG_LIST_ROWS: usize = 2_048;
 const FILE_ROWS: usize = 256;
 const DISCUSSION_ROWS: usize = 256;
+/// The same interaction at four timeline sizes. A fixed-size ceiling can stay
+/// green while the frame still grows linearly, so responsiveness is the slope,
+/// not the single 256-row point.
+const CHAT_SLOPE_ROWS: [i64; 4] = [64, 256, 1_024, 4_096];
+/// Reducers deliberately pay for the bounded hot window, so their history
+/// independence starts at the production cap. Loads larger than this must
+/// plateau instead of carrying archive size into an interaction.
+const BOUNDED_CHAT_SLOPE_ROWS: [i64; 3] = [256, 1_024, 4_096];
+const SLOPE_FRAMES: usize = 5;
+const KEYSTROKE_SLOPE_HEADROOM: u64 = 2_000;
+const CHANNEL_SWITCH_SLOPE_HEADROOM: u64 = 2_000;
+const REMOTE_BURST_SLOPE_HEADROOM: u64 = 8_000;
+const REMOTE_BURST_ROWS: [usize; 2] = [32, 256];
+/// A loaded or live timeline is a viewport window, not the chat archive. Older
+/// history remains queryable by cursor; retaining it all here recreates the
+/// O(history) rebuild the probes exist to prevent.
 /// Enough passes to fill the lazy parking lot and settle the text caches.
 const WARMUP_FRAMES: usize = 4;
 const FRAMES: usize = 12;
@@ -249,25 +266,29 @@ fn probe_message(seq: i64) -> backend::ChatMessage {
     }
 }
 
-fn probe_channel(index: i64) -> backend::ChatChannel {
+fn probe_channel_with_head(index: i64, head_seq: i64) -> backend::ChatChannel {
     backend::ChatChannel {
         id: format!("channel-{index}"),
         name: format!("channel-{index}"),
         archived: false,
         members_only: false,
         huddle_count: 0,
-        head_seq: ROWS,
+        head_seq,
     }
 }
 
-/// One window loader's answer: a full page of scrollback for one room, against
-/// the whole channel list. Extracted so the switch probe can land the same
-/// window in several rooms; the rail fixture overrides the two thread fields.
-fn probe_chat_data(channel: &str, generation: i64) -> backend::ChatData {
+fn probe_channel(index: i64) -> backend::ChatChannel {
+    probe_channel_with_head(index, ROWS)
+}
+
+fn probe_chat_data_with_rows(channel: &str, generation: i64, rows: i64) -> backend::ChatData {
     backend::ChatData {
         generation,
-        channels: (0..CHANNELS).map(probe_channel).collect(),
-        messages: (1..=ROWS).map(probe_message).collect(),
+        channels: (0..CHANNELS)
+            .map(|index| probe_channel_with_head(index, rows))
+            .collect(),
+        messages: (1..=rows).map(probe_message).collect(),
+        has_older_history: rows > 1,
         active_channel: channel.into(),
         active_channel_name: channel.into(),
         active_channel_archived: false,
@@ -280,7 +301,6 @@ fn probe_chat_data(channel: &str, generation: i64) -> backend::ChatData {
         active_thread_seq: 0,
         thread_target_seq: 0,
         thread_messages: Vec::new(),
-        thread_next_reply_offset: 0,
         thread_has_more: false,
     }
 }
@@ -290,7 +310,11 @@ fn probe_chat_data(channel: &str, generation: i64) -> backend::ChatData {
 /// mirrored field (`rooms`, `dm_rows`, `post_refusal`,
 /// `unread_marker_seq`, …) holds what it would hold in front of a user.
 fn console_in_chat() -> (Ducktape, iced::window::Id) {
-    console_in_chat_with_thread(Vec::new(), 0)
+    console_in_chat_with_rows(ROWS)
+}
+
+fn console_in_chat_with_rows(rows: i64) -> (Ducktape, iced::window::Id) {
+    console_in_chat_with_thread_and_rows(Vec::new(), 0, rows)
 }
 
 /// [`console_in_chat`] with the THREAD RAIL open on message 1 and a full
@@ -322,6 +346,14 @@ fn console_in_chat_with_thread(
     thread_messages: Vec<backend::ChatMessage>,
     active_thread_seq: i64,
 ) -> (Ducktape, iced::window::Id) {
+    console_in_chat_with_thread_and_rows(thread_messages, active_thread_seq, ROWS)
+}
+
+fn console_in_chat_with_thread_and_rows(
+    thread_messages: Vec<backend::ChatMessage>,
+    active_thread_seq: i64,
+    rows: i64,
+) -> (Ducktape, iced::window::Id) {
     let (mut app, _) = Ducktape::__boot();
     let console = iced::window::Id::unique();
     app.console_win = Some(console);
@@ -332,7 +364,7 @@ fn console_in_chat_with_thread(
     let next = backend::ChatData {
         active_thread_seq,
         thread_messages,
-        ..probe_chat_data("channel-0", app.chat_generation)
+        ..probe_chat_data_with_rows("channel-0", app.chat_generation, rows)
     };
     let _ = app.__update(__DucktapeMessage::ChatUpdated(next));
     let dm_peers = (0..4)
@@ -348,10 +380,25 @@ fn console_in_chat_with_thread(
         generation: app.dm_peers_generation,
         peers: dm_peers,
     }));
+    let expected_hot_rows = usize::try_from(rows)
+        .expect("the synthetic history size is non-negative")
+        .min(backend::CHAT_HOT_WINDOW_LIMIT);
+    let expected_hot_rows_i64 =
+        i64::try_from(expected_hot_rows).expect("the hot window limit fits i64");
     assert_eq!(
         app.messages.len(),
-        ROWS as usize,
-        "the probe drives a full page of scrollback, not an empty room"
+        expected_hot_rows,
+        "the probe must retain only the bounded active tail of its synthetic history"
+    );
+    assert_eq!(
+        app.messages.last().map(|message| message.seq),
+        (rows > 0).then_some(rows),
+        "clamping the hot window must preserve its newest row"
+    );
+    assert_eq!(
+        app.messages.first().map(|message| message.seq),
+        (rows > 0).then_some(rows - expected_hot_rows_i64 + 1),
+        "the hot window must retain a contiguous newest tail"
     );
     assert_eq!(app.dm_rows.len(), 4, "the probe mounts DIRECT rows too");
     (app, console)
@@ -452,6 +499,7 @@ fn console_in_huddle() -> (Ducktape, iced::window::Id) {
         generation: app.chat_generation,
         channels: vec![probe_channel(0)],
         messages: Vec::new(),
+        has_older_history: false,
         active_channel: "channel-0".into(),
         active_channel_name: "channel-0".into(),
         active_channel_archived: false,
@@ -464,7 +512,6 @@ fn console_in_huddle() -> (Ducktape, iced::window::Id) {
         active_thread_seq: 0,
         thread_target_seq: 0,
         thread_messages: Vec::new(),
-        thread_next_reply_offset: 0,
         thread_has_more: false,
     }));
     let _ = app.__update(__DucktapeMessage::HuddleOpened(huddle));
@@ -657,6 +704,40 @@ fn keystroke() -> __DucktapeMessage {
     ))
 }
 
+fn probe_posted_update(seq: i64) -> backend::LiveUpdate {
+    backend::LiveUpdate {
+        kind: LiveKind::Chat,
+        status: format!("Live · block {seq}"),
+        height: seq,
+        module: "chat".into(),
+        chat: vec![backend::ChatDelta::Posted {
+            channel_id: "channel-0".into(),
+            seq,
+            message: probe_message(seq),
+        }],
+        ..backend::LiveUpdate::default()
+    }
+}
+
+fn assert_bounded_allocation_span(label: &str, samples: &[(i64, u64)], headroom: u64) {
+    let smallest = samples
+        .iter()
+        .map(|(_, allocation_count)| *allocation_count)
+        .min()
+        .expect("an allocation slope needs at least one sample");
+    let largest = samples
+        .iter()
+        .map(|(_, allocation_count)| *allocation_count)
+        .max()
+        .expect("an allocation slope needs at least one sample");
+    let bounded = largest <= smallest.saturating_add(headroom);
+    assert!(
+        bounded,
+        "{label} allocations must not grow with retained chat history: {samples:?}; \
+         the {largest} maximum is more than {headroom} above the {smallest} minimum"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The probe
 // ---------------------------------------------------------------------------
@@ -672,6 +753,250 @@ fn a_chat_keystroke_stays_under_its_allocation_ceiling() {
         .expect("the probe thread spawns")
         .join()
         .expect("the probe thread finishes");
+}
+
+#[test]
+fn chat_keystroke_cost_does_not_grow_with_retained_history() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(probe_chat_keystroke_slope)
+        .expect("the keystroke slope probe thread spawns")
+        .join()
+        .expect("the keystroke slope probe thread finishes");
+}
+
+fn probe_chat_keystroke_slope() {
+    let samples: Vec<_> = CHAT_SLOPE_ROWS
+        .into_iter()
+        .map(|rows| (rows, chat_keystroke_allocations(rows)))
+        .collect();
+    eprintln!("chat keystroke allocation slope: {samples:?}");
+    assert_bounded_allocation_span("chat keystroke+rebuild", &samples, KEYSTROKE_SLOPE_HEADROOM);
+}
+
+fn chat_keystroke_allocations(rows: i64) -> u64 {
+    let (mut app, console) = console_in_chat_with_rows(rows);
+    let mut renderer = headless_renderer();
+    let mut cache = warm_settled(
+        "the chat keystroke slope probe",
+        &mut app,
+        console,
+        WINDOW,
+        &mut renderer,
+        user_interface::Cache::default(),
+    );
+    let mut keystrokes = Phase::new("composer keystroke+rebuild slope");
+    for _ in 0..SLOPE_FRAMES {
+        cache = keystrokes
+            .sample(|| {
+                let _ = app.__update(keystroke());
+                UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer)
+            })
+            .into_cache();
+    }
+    keystrokes.median_allocations()
+}
+
+#[test]
+fn remote_post_bursts_publish_reduce_and_rebuild_once_per_bounded_batch() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(probe_remote_post_bursts)
+        .expect("the remote burst probe thread spawns")
+        .join()
+        .expect("the remote burst probe thread finishes");
+}
+
+#[test]
+fn live_chat_batches_take_one_shipping_app_message() {
+    const LIFECYCLE: &str = include_str!("ui/handlers/lifecycle.ice");
+    let live_updated = LIFECYCLE
+        .split_once("on live_updated(next)")
+        .expect("the shipping live handler")
+        .1
+        .split("\non ")
+        .next()
+        .expect("the live handler body");
+
+    assert_eq!(
+        LIFECYCLE
+            .matches("run live_events(connected_rpc) when connected -> live_updated _")
+            .count(),
+        1,
+        "the live subscription must route each publication straight to live_updated"
+    );
+    assert!(
+        live_updated.contains("match next.kind"),
+        "live_updated must dispatch once on its closed LiveKind"
+    );
+    for variant in [
+        "retry", "tip", "ready", "chat", "bell", "pages", "forge", "plane", "resync",
+    ] {
+        assert_eq!(
+            live_updated.matches(&format!("LiveKind.{variant}")).count(),
+            1,
+            "every LiveKind variant must have exactly one explicit arm"
+        );
+    }
+    assert_eq!(
+        live_updated.matches("fold_live_chat(next.chat").count(),
+        1,
+        "the shipping handler has one fused chat fold"
+    );
+    let chat_arm = live_updated.find("LiveKind.chat").expect("the chat arm");
+    let chat_fold = live_updated
+        .find("fold_live_chat(next.chat")
+        .expect("the fused chat fold");
+    let bell_arm = live_updated.find("LiveKind.bell").expect("the bell arm");
+    assert!(
+        chat_arm < chat_fold && chat_fold < bell_arm,
+        "fold_live_chat and its by-value arguments must exist only inside the selected chat arm"
+    );
+    assert!(
+        !LIFECYCLE.contains("live_chat_updated") && !LIFECYCLE.contains("chat_live_update("),
+        "a chat task/second handler costs a second global app update and rebuild per publication"
+    );
+    let generated_dir = std::path::Path::new(env!("OUT_DIR")).join("ui-lang-generated");
+    let has_two_hop_variant = std::fs::read_dir(generated_dir)
+        .expect("the generated ui-lang directory")
+        .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path()).ok())
+        .any(|source| source.contains("LiveChatUpdated("));
+    assert!(
+        !has_two_hop_variant,
+        "the generated message enum must not carry a two-hop live chat route"
+    );
+}
+
+fn probe_remote_post_bursts() {
+    for burst_rows in REMOTE_BURST_ROWS {
+        let samples = [256, 4_096].map(|history_rows| {
+            let mut repetitions = [0; 3];
+            for sample in &mut repetitions {
+                *sample = remote_post_burst_allocations(history_rows, burst_rows);
+            }
+            repetitions.sort_unstable();
+            repetitions[1]
+        });
+        let allocation_slope = [(256, samples[0]), (4_096, samples[1])];
+        eprintln!(
+            "remote {burst_rows}-post allocation slope by historical rows: {allocation_slope:?}"
+        );
+        assert_bounded_allocation_span(
+            "remote post batch reducer+rebuild",
+            &allocation_slope,
+            REMOTE_BURST_SLOPE_HEADROOM,
+        );
+    }
+}
+
+fn remote_post_burst_allocations(history_rows: i64, burst_rows: usize) -> u64 {
+    let (mut app, console) = console_in_chat_with_rows(history_rows);
+    let mut renderer = headless_renderer();
+    let mut cache = warm_settled(
+        "the remote post burst probe",
+        &mut app,
+        console,
+        WINDOW,
+        &mut renderer,
+        user_interface::Cache::default(),
+    );
+    // Prime the CHANGED-timeline path too. The initial warm-up above only
+    // exercises an unchanged dependency hit; without this first unmeasured
+    // publication the smaller fixture pays one-time memo/layout allocation in
+    // the measured phase while a prior large fixture may reclaim it. The
+    // slope compares steady-state remote publications, not process-global
+    // cache history.
+    let warm_sequence = history_rows + 1;
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(probe_posted_update(
+        warm_sequence,
+    )));
+    cache = warm_settled(
+        "the remote post burst changed-timeline path",
+        &mut app,
+        console,
+        WINDOW,
+        &mut renderer,
+        cache,
+    );
+    let burst_rows_i64 = i64::try_from(burst_rows).expect("the burst size fits i64");
+    let expected_sequences: Vec<_> =
+        ((warm_sequence + 1)..=(warm_sequence + burst_rows_i64)).collect();
+    let publications = backend::batch_live_updates(
+        expected_sequences
+            .iter()
+            .copied()
+            .map(probe_posted_update)
+            .collect(),
+    );
+    let expected_publications = burst_rows.div_ceil(backend::LIVE_CHAT_BATCH_LIMIT);
+    assert_eq!(
+        publications.len(),
+        expected_publications,
+        "a ready chat burst must publish once per bounded batch"
+    );
+    assert!(
+        publications.iter().all(|update| {
+            !update.chat.is_empty() && update.chat.len() <= backend::LIVE_CHAT_BATCH_LIMIT
+        }),
+        "every chat publication must be non-empty and respect the production cap"
+    );
+    let published_sequences: Vec<_> = publications
+        .iter()
+        .flat_map(|update| {
+            update.chat.iter().map(|delta| {
+                let backend::ChatDelta::Posted { seq, .. } = delta else {
+                    panic!("the posted-update fixture emitted another transition")
+                };
+                *seq
+            })
+        })
+        .collect();
+    assert_eq!(
+        published_sequences, expected_sequences,
+        "batching must preserve every delta in wire order"
+    );
+
+    let revision_before = app.messages_revision;
+    let mut reducer_updates = 0usize;
+    let mut view_builds = 0usize;
+    let mut phase = Phase::new("remote post batch reducer+rebuild");
+    for publication in publications {
+        cache = phase
+            .sample(|| {
+                let _ = app.__update(__DucktapeMessage::LiveUpdated(publication));
+                reducer_updates += 1;
+                let ui = UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer);
+                view_builds += 1;
+                ui
+            })
+            .into_cache();
+    }
+    assert_eq!(reducer_updates, expected_publications);
+    assert_eq!(view_builds, expected_publications);
+    assert_eq!(
+        app.messages_revision - revision_before,
+        i64::try_from(expected_publications).expect("the publication count fits i64"),
+        "one batch advances the timeline revision once, not once per delta"
+    );
+
+    let expected_hot_rows = usize::try_from(history_rows)
+        .expect("the synthetic history size is non-negative")
+        .saturating_add(1)
+        .saturating_add(burst_rows)
+        .min(backend::CHAT_HOT_WINDOW_LIMIT);
+    assert_eq!(app.messages.len(), expected_hot_rows);
+    assert_eq!(
+        app.messages.last().map(|message| message.seq),
+        expected_sequences.last().copied(),
+        "the active tail must reach the newest remote post"
+    );
+    assert!(
+        app.messages
+            .windows(2)
+            .all(|pair| pair[0].seq + 1 == pair[1].seq),
+        "the bounded active tail must stay ordered, contiguous, and duplicate-free"
+    );
+    phase.median_allocations()
 }
 
 #[test]
@@ -817,16 +1142,24 @@ fn an_optimistic_confirmation_keeps_its_virtual_row_alive() {
 }
 
 fn probe_optimistic_confirmation() {
-    const OPERATION_ID: &str = "probe-optimistic-confirmation";
-
     let (mut app, console) = console_in_chat();
-    app.messages = backend::mark_author_runs(backend::optimistic_message(
-        app.messages,
-        "confirmation probe".into(),
-        OPERATION_ID.into(),
+    app.message_editor = iced::widget::text_editor::Content::with_text("confirmation probe");
+    let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
+        super::editor::ComposerEvent::Submit,
     ));
-    assert_eq!(app.messages.len(), ROWS as usize + 1);
-    let pending_view_key = app.messages.last().expect("the optimistic row").view_key;
+    assert_eq!(app.messages.len(), backend::CHAT_HOT_WINDOW_LIMIT);
+    let pending = app.messages.last().expect("the optimistic row");
+    assert!(
+        pending.pending,
+        "the bounded tail must retain the optimistic row"
+    );
+    let operation_id = pending.id.clone();
+    let pending_view_key = pending.view_key;
+    assert_eq!(
+        app.messages.first().map(|message| message.seq),
+        Some(2),
+        "making room for the pending row drops the oldest committed root"
+    );
 
     let mut renderer = headless_renderer();
     let (cache, pending_frame) = drawn_frame(
@@ -837,32 +1170,36 @@ fn probe_optimistic_confirmation() {
     );
 
     let canonical = backend::ChatMessage {
-        id: OPERATION_ID.into(),
-        view_key: pending_view_key,
+        id: operation_id.clone(),
+        view_key: pending_view_key.saturating_add(10_000),
         seq: ROWS + 1,
         body: "confirmation probe".into(),
         blocks: backend::paragraph_blocks("confirmation probe"),
         ..probe_message(ROWS + 1)
     };
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: "chat".into(),
-        chat: backend::ChatDelta {
-            kind: "posted".into(),
+        kind: LiveKind::Chat,
+        chat: vec![backend::ChatDelta::Posted {
             channel_id: "channel-0".into(),
             seq: canonical.seq,
             message: canonical,
-            ..backend::ChatDelta::default()
-        },
+        }],
         ..backend::LiveUpdate::default()
     }));
 
     let confirmed = app
         .messages
         .iter()
-        .find(|message| message.id == OPERATION_ID)
+        .find(|message| message.id == operation_id)
         .expect("the canonical row replaces its optimistic row");
     assert_eq!(confirmed.view_key, pending_view_key);
     assert!(!confirmed.pending);
+    assert_eq!(app.messages.len(), backend::CHAT_HOT_WINDOW_LIMIT);
+    assert_eq!(
+        app.messages.last().map(|message| message.seq),
+        Some(ROWS + 1),
+        "confirmation keeps the canonical row at the active tail"
+    );
 
     let (_, confirmed_frame) = drawn_frame(&mut app, console, &mut renderer, cache);
     assert_ne!(
@@ -905,31 +1242,29 @@ fn probe_row_repaint() {
     // in the quiet arm (nothing selected), so the repaint
     // must come through the keyed lazy's (seq, render_rev) move.
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: "chat".into(),
-        chat: backend::ChatDelta {
-            kind: "reaction".into(),
+        kind: LiveKind::Chat,
+        chat: vec![backend::ChatDelta::Reaction {
             channel_id: "channel-0".into(),
             seq: ROWS,
             emoji: "👍".into(),
             added: true,
             reactor: "user:repaint-probe".into(),
-            ..backend::ChatDelta::default()
-        },
+            by_me: false,
+        }],
         ..backend::LiveUpdate::default()
     }));
     let (cache, reacted) = drawn_frame(&mut app, console, &mut renderer, cache);
     assert!(
         control != reacted,
-        "a reaction delta must repaint the visible row — `apply_reaction` \
+        "a reaction delta must repaint the visible row — `merge_message_reaction` \
          stopped moving `render_rev` if this frame is unchanged"
     );
 
     // An edit of the same row, one wire revision up.
     let body = "edited by the repaint probe";
     let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
-        kind: "chat".into(),
-        chat: backend::ChatDelta {
-            kind: "edited".into(),
+        kind: LiveKind::Chat,
+        chat: vec![backend::ChatDelta::Edited {
             channel_id: "channel-0".into(),
             seq: ROWS,
             message: backend::ChatMessage {
@@ -939,8 +1274,7 @@ fn probe_row_repaint() {
                 meta: format!("#{ROWS} · edited"),
                 ..backend::ChatMessage::default()
             },
-            ..backend::ChatDelta::default()
-        },
+        }],
         ..backend::LiveUpdate::default()
     }));
     let (_, edited) = drawn_frame(&mut app, console, &mut renderer, cache);
@@ -1014,6 +1348,7 @@ fn probe() {
 
         // One row's dependency changes — an edit landing on the stream.
         app.messages[frame % ROWS as usize].rev += 1;
+        app.messages_revision += 1;
         let ui = row_edit
             .sample(|| UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer));
         cache = ui.into_cache();
@@ -1055,35 +1390,14 @@ fn probe() {
     );
 }
 
-/// A console alternating between rooms until the window cache is FULL —
-/// `CHANNEL_WINDOW_CACHE` parked windows of `ROWS` rows each, which is what a
-/// reader who moves between three rooms carries.
-fn console_with_a_full_window_cache() -> Ducktape {
-    let (mut app, _) = console_in_chat();
-    for channel in ["channel-1", "channel-2", "channel-3"] {
-        let _ = app.__update(__DucktapeMessage::ChooseChannel(channel.into()));
-        let landed = probe_chat_data(channel, app.chat_generation);
-        let _ = app.__update(__DucktapeMessage::ChatUpdated(landed));
-    }
-    assert_eq!(
-        app.message_cache.len(),
-        3,
-        "the switch probe measures a FULL cache, not a warm one"
-    );
-    app
-}
-
 /// ALLOCATIONS PER ROOM SWITCH, REDUCER ONLY — the click's own cost, before any
 /// view work.
 ///
-/// The extern ABI passes every list BY VALUE, so each `message_cache` argument
-/// is a deep copy of ALL three parked windows — thousands of `ChatMessage`
-/// clones — and the switch used to spend three of them before a pixel moved:
-/// the park, then one each for the rows and the member roll. Measured with this
-/// fixture: **23 345** allocations with the restore folded into one
-/// `cached_window` call, **30 265** with it split back into two calls asking
-/// the same window for two of its fields. The ceiling sits between them.
-const CHANNEL_SWITCH_ALLOCATION_CEILING: u64 = 27_000;
+/// The transition retains only tiny per-room drafts, clears the rich window,
+/// and starts one root-window read. A regression that passes the old timeline
+/// through a by-value extern will jump far beyond this budget.
+const CHANNEL_SWITCH_REDUCER_ALLOCATION_CEILING: u64 = 1_500;
+const CHANNEL_SWITCH_FRAME_ALLOCATION_CEILING: u64 = 12_000;
 
 #[test]
 fn a_channel_switch_stays_under_its_allocation_ceiling() {
@@ -1095,12 +1409,77 @@ fn a_channel_switch_stays_under_its_allocation_ceiling() {
         .expect("the switch probe thread finishes");
 }
 
+#[test]
+fn channel_switch_loading_frame_is_low_and_does_not_grow_with_loaded_history() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(probe_channel_switch_slope)
+        .expect("the switch slope probe thread spawns")
+        .join()
+        .expect("the switch slope probe thread finishes");
+}
+
+fn probe_channel_switch_slope() {
+    let samples: Vec<_> = BOUNDED_CHAT_SLOPE_ROWS
+        .into_iter()
+        .map(|rows| (rows, channel_switch_frame_allocations(rows)))
+        .collect();
+    eprintln!("empty-loading channel switch allocation slope: {samples:?}");
+    for (rows, allocations) in &samples {
+        assert!(
+            *allocations < CHANNEL_SWITCH_FRAME_ALLOCATION_CEILING,
+            "the {rows}-row switch frame cost {allocations} allocations, over the \
+             {CHANNEL_SWITCH_FRAME_ALLOCATION_CEILING} absolute ceiling"
+        );
+    }
+    assert_bounded_allocation_span(
+        "empty-loading channel switch+rebuild",
+        &samples,
+        CHANNEL_SWITCH_SLOPE_HEADROOM,
+    );
+}
+
+fn channel_switch_frame_allocations(rows: i64) -> u64 {
+    let (mut app, console) = console_in_chat_with_rows(rows);
+    let mut renderer = headless_renderer();
+    let mut cache = warm_settled(
+        "the channel switch slope probe",
+        &mut app,
+        console,
+        WINDOW,
+        &mut renderer,
+        user_interface::Cache::default(),
+    );
+    let mut switches = Phase::new("empty-loading switch+rebuild slope");
+    for frame in 0..SLOPE_FRAMES {
+        let target = match frame % 2 == 0 {
+            true => "channel-1",
+            false => "channel-2",
+        };
+        cache = switches
+            .sample(|| {
+                let _ = app.__update(__DucktapeMessage::ChooseChannel(target.into()));
+                UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer)
+            })
+            .into_cache();
+        assert!(app.messages.is_empty(), "the old rich window is gone");
+        assert!(app.loading, "the selected root window is still in flight");
+
+        // Settle and render the selected room outside the measured phase so
+        // every sample starts from a populated timeline and pays the real
+        // full-window -> loading-state diff.
+        let landed = probe_chat_data_with_rows(target, app.chat_generation, rows);
+        let _ = app.__update(__DucktapeMessage::ChatUpdated(landed));
+        cache =
+            UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer).into_cache();
+    }
+    switches.median_allocations()
+}
+
 fn probe_channel_switch() {
-    let mut app = console_with_a_full_window_cache();
+    let (mut app, _) = console_in_chat_with_rows(ROWS);
     let mut switch = Phase::new("channel switch (reducer)");
 
-    // A→B→A is the motion the cache exists for, and both rooms are parked, so
-    // every sample is the cache-HIT path with a full cache behind it.
     for frame in 0..FRAMES {
         let target = match frame % 2 == 0 {
             true => "channel-1",
@@ -1109,21 +1488,19 @@ fn probe_channel_switch() {
         switch.sample(|| {
             let _ = app.__update(__DucktapeMessage::ChooseChannel(target.into()));
         });
-        assert_eq!(
-            app.messages.len(),
-            ROWS as usize,
-            "each sample must be a cache HIT — an empty room measures nothing"
-        );
+        assert!(app.messages.is_empty(), "the old rich window is gone");
+        assert!(app.loading, "the selected root window is still in flight");
+
+        let landed = probe_chat_data_with_rows(target, app.chat_generation, ROWS);
+        let _ = app.__update(__DucktapeMessage::ChatUpdated(landed));
     }
     switch.report();
 
     let per_switch = switch.median_allocations();
     assert!(
-        per_switch < CHANNEL_SWITCH_ALLOCATION_CEILING,
+        per_switch < CHANNEL_SWITCH_REDUCER_ALLOCATION_CEILING,
         "one room switch cost {per_switch} allocations, over the \
-         {CHANNEL_SWITCH_ALLOCATION_CEILING} ceiling. Something walks the window cache \
-         an extra time: every `message_cache` argument is a deep copy of every parked \
-         window, so two calls asking the same window for two of its fields cost twice \
-         what one does. Find it before raising this number."
+         {CHANNEL_SWITCH_REDUCER_ALLOCATION_CEILING} ceiling. The switch should clear \
+         the active rich window, retain only tiny draft stores, and launch one root read."
     );
 }

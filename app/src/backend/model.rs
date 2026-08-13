@@ -217,6 +217,52 @@ pub fn refreshed_required_message_seq(
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct MessageSelection {
+    pub seq: i64,
+    pub rev: i64,
+    pub action: crate::MessageAction,
+    pub draft: String,
+}
+
+pub(crate) fn message_selection_after_window_ref(
+    messages: &[ChatMessage],
+    seq: i64,
+    rev: i64,
+    action: crate::MessageAction,
+    draft: String,
+) -> MessageSelection {
+    let visible = seq > 0
+        && messages
+            .iter()
+            .any(|message| message.seq == seq && !message.deleted);
+    if visible {
+        MessageSelection {
+            seq,
+            rev,
+            action,
+            draft,
+        }
+    } else {
+        MessageSelection {
+            seq: 0,
+            rev: 0,
+            action: crate::MessageAction::Toolbar,
+            draft: String::new(),
+        }
+    }
+}
+
+pub fn message_selection_after_window(
+    messages: Vec<ChatMessage>,
+    seq: i64,
+    rev: i64,
+    action: crate::MessageAction,
+    draft: String,
+) -> MessageSelection {
+    message_selection_after_window_ref(&messages, seq, rev, action, draft)
+}
+
 pub fn refreshed_known_message_seq(
     messages: Vec<ChatMessage>,
     current_channel: String,
@@ -298,32 +344,39 @@ pub fn upsert_channel_rows(
     channels
 }
 
-// active-channel scalars re-derived from the (delta-folded) channel list,
-// keeping the current value when the channel is absent from the list.
+/// Everything a room click projects from the channel list, computed in one
+/// ownership crossing. The old shape cloned and scanned the whole workspace
+/// four times before the load task could even start.
+#[derive(Clone, Debug, Default, Hash, PartialEq)]
+pub struct ChannelSwitchFacts {
+    pub unread_boundary: i64,
+    pub name: String,
+    pub archived: bool,
+    pub members_only: bool,
+}
 
-pub fn channel_display_name(
+pub fn channel_switch_facts(
+    reads: Vec<ChannelRead>,
     channels: Vec<ChatChannel>,
-    channel: String,
-    current: String,
-) -> String {
-    channels
-        .iter()
-        .find(|row| row.id == channel)
-        .map_or(current, |row| row.name.clone())
-}
-
-/// Is the clicked channel archived / members-only, per the list the sidebar is
-/// already drawn from? Both ride the click, not the round trip: `post_refusal`
-/// is recomputed the moment the room changes, and reading the room she LEFT for
-/// one round trip is how a public channel came up refusing her post.
-pub fn channel_is_archived(channels: Vec<ChatChannel>, channel: String) -> bool {
-    channels.iter().any(|row| row.id == channel && row.archived)
-}
-
-pub fn channel_is_members_only(channels: Vec<ChatChannel>, channel: String) -> bool {
-    channels
-        .iter()
-        .any(|row| row.id == channel && row.members_only)
+    current_channel: String,
+    next_channel: String,
+    current_boundary: i64,
+    current_name: String,
+) -> ChannelSwitchFacts {
+    let row = channels.iter().find(|row| row.id == next_channel);
+    let head_seq = row.map_or(0, |row| row.head_seq);
+    let unread_boundary = if current_channel == next_channel {
+        current_boundary
+    } else {
+        let last_read = last_read_of(&reads, &next_channel);
+        if head_seq > last_read { last_read } else { 0 }
+    };
+    ChannelSwitchFacts {
+        unread_boundary,
+        name: row.map_or(current_name, |row| row.name.clone()),
+        archived: row.is_some_and(|row| row.archived),
+        members_only: row.is_some_and(|row| row.members_only),
+    }
 }
 
 /// Is the reader inside the last tenth of the loaded scrollback?
@@ -339,61 +392,6 @@ pub fn near_scroll_top(relative_offset: f64) -> bool {
     relative_offset >= 0.9
 }
 
-/// The last rows and member roll seen in one channel, kept so a switch back
-/// paints in one frame instead of on the network. The default IS the cache
-/// miss — an empty room with no roll — which is what [`cached_window`] answers.
-#[derive(Clone, Debug, Default, Hash, PartialEq)]
-pub struct ChannelWindow {
-    pub channel_id: String,
-    pub messages: Vec<ChatMessage>,
-    pub members: Vec<ChatMember>,
-}
-
-/// How many rooms the cache remembers. Alternating between two rooms is the
-/// motion this pays for; a third covers "back out through the room you came
-/// from". Past that it is memory held for windows the refetch would replace
-/// anyway.
-const CHANNEL_WINDOW_CACHE: usize = 3;
-
-/// Park the room being left, most-recent first.
-///
-/// PENDING ROWS DO NOT GO IN. An in-flight send settles against `messages` for
-/// the room the reader is IN — `message_sent`/`message_send_failed` both drop
-/// their timeline surgery once she has moved — so a parked pending row has no
-/// writer left to retire it and would come back as a permanent "Sending…".
-///
-/// A HISTORY WINDOW DOES NOT GO IN EITHER. Those rows are a page around one old
-/// message, not the tail; restoring them under a cleared `history_view` would
-/// paint months-old scrollback as the live conversation.
-pub fn cache_channel_window(
-    cache: Vec<ChannelWindow>,
-    channel_id: String,
-    messages: Vec<ChatMessage>,
-    members: Vec<ChatMember>,
-    history_view: bool,
-) -> Vec<ChannelWindow> {
-    let committed: Vec<ChatMessage> = messages
-        .into_iter()
-        .filter(|message| !message.pending)
-        .collect();
-    let worth_keeping = !history_view && !channel_id.is_empty() && !committed.is_empty();
-    if !worth_keeping {
-        return cache;
-    }
-    let mut kept: Vec<ChannelWindow> = vec![ChannelWindow {
-        channel_id: channel_id.clone(),
-        messages: committed,
-        members,
-    }];
-    kept.extend(
-        cache
-            .into_iter()
-            .filter(|window| window.channel_id != channel_id)
-            .take(CHANNEL_WINDOW_CACHE - 1),
-    );
-    kept
-}
-
 /// One room's unsent composer text, parked while the reader is somewhere else.
 #[derive(Clone, Debug, Default, Hash, PartialEq)]
 pub struct ChannelDraft {
@@ -404,13 +402,9 @@ pub struct ChannelDraft {
 /// Park the composer of the room being left, and drop the entry when there is
 /// nothing to park.
 ///
-/// A SEPARATE STORE FROM [`ChannelWindow`], deliberately. That cache refuses an
-/// empty or history window and evicts past `CHANNEL_WINDOW_CACHE`, all of which
-/// are correct for ROWS the refetch would replace anyway — and every one of them
-/// would silently destroy typed text. Drafts are tiny and self-clearing (an
-/// empty text removes the entry, a send empties the composer, the next park
-/// removes it), so this list holds one short string per room she has unsent
-/// words in and needs no cap.
+/// Drafts are tiny and self-clearing: empty text removes the entry, a send
+/// empties the composer, and the next park removes it. This list therefore holds
+/// one short string per room with unsent words and needs no cap.
 pub fn park_message_draft(
     drafts: Vec<ChannelDraft>,
     channel_id: String,
@@ -473,20 +467,6 @@ pub fn parked_reply_draft(
     parked_message_draft(drafts, thread_draft_key(&channel_id, thread_seq))
 }
 
-/// The parked window for one room, or the empty one.
-///
-/// ONE WALK, ONE CLONE. The extern ABI passes the cache BY VALUE, so asking for
-/// the rows and the roll through two calls deep-copied every parked window
-/// twice — up to three windows of `CHAT_VIEW_PAGE_LIMIT` rows each, thousands
-/// of `ChatMessage` clones, synchronously on the click that the cache exists to
-/// make instant. Both answers live in the same struct; one call hands over both.
-pub fn cached_window(cache: Vec<ChannelWindow>, channel_id: String) -> ChannelWindow {
-    cache
-        .into_iter()
-        .find(|window| window.channel_id == channel_id)
-        .unwrap_or_default()
-}
-
 /// The clicked page's title, from the index the sidebar is already drawn from
 /// — the header has to move with the click, not with the round trip. Falls
 /// back to the current title while the id is not in the list yet.
@@ -495,41 +475,6 @@ pub fn page_display_title(pages: Vec<PageItem>, page: String, current: String) -
         .iter()
         .find(|row| row.id == page)
         .map_or(current, |row| row.title.clone())
-}
-
-pub fn channel_flag_archived(channels: Vec<ChatChannel>, channel: String, current: bool) -> bool {
-    channels
-        .iter()
-        .find(|row| row.id == channel)
-        .map_or(current, |row| row.archived)
-}
-
-pub fn channel_flag_members_only(
-    channels: Vec<ChatChannel>,
-    channel: String,
-    current: bool,
-) -> bool {
-    channels
-        .iter()
-        .find(|row| row.id == channel)
-        .map_or(current, |row| row.members_only)
-}
-
-/// Advance the open thread's next-reply offset when a reply delta for THAT
-/// thread lands (the loaded page grew by one settled row).
-pub fn thread_offset_after_live(
-    offset: i64,
-    has_more: bool,
-    delta: ChatDelta,
-    active_channel: String,
-    root: i64,
-) -> i64 {
-    let is_open_thread_reply =
-        delta.kind == "reply" && delta.channel_id == active_channel && delta.root_seq == root;
-    if !is_open_thread_reply {
-        return offset;
-    }
-    thread_offset_after_reply(offset, has_more, true)
 }
 
 /// Upsert `channel`'s read cursor to `max(existing, seq)`. An empty channel id

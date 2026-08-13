@@ -571,10 +571,10 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
             0,
             "POST",
             "/v1/index/chat/view",
-            Some(&serde_json::json!({"messages_latest": {"channel_id": "dispatch", "limit": 16}})),
+            Some(&serde_json::json!({"roots": {"channel_id": "dispatch", "limit": 16}})),
         );
         (status == 200).then_some(())?;
-        let rows = body["messages"].as_array()?;
+        let rows = body["roots"]["roots"].as_array()?;
         rows.iter()
             .find(|r| r["message_id"] == format!("agent/{run_text}"))
             .map(|_| ())

@@ -6,8 +6,9 @@
 
 use std::collections::BTreeMap;
 
-use super::{ChatViewReply, MsgRow, TagRow, fold_op, msg_key, read_row, read_u64, seq_key,
-    serve_view, tags};
+use super::{
+    ChatViewReply, MsgRow, TagRow, fold_op, msg_key, read_row, read_u64, seq_key, serve_view, tags,
+};
 use crate::{Block, ChatAssigned, ChatMsg, Span, encode_assigned, encode_msg};
 use index_guest::{OpRow, OriginTag, apply_to_map};
 

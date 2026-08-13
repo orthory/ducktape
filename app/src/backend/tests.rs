@@ -773,9 +773,8 @@ fn a_log_line_splits_into_time_level_and_message() {
     assert_eq!(parts.level, "INFO");
     assert_eq!(parts.message, "ducktape::join: admitted resident");
 
-    let micro = split_log_line(
-        "2026-08-14T01:02:03.918273Z DEBUG ducktape::files: staged chunk".into(),
-    );
+    let micro =
+        split_log_line("2026-08-14T01:02:03.918273Z DEBUG ducktape::files: staged chunk".into());
     assert_eq!(
         micro.time, "2026-08-14T01:02:03.918Z",
         "the ring's microsecond timer is trimmed to the column's millisecond width"
@@ -2389,17 +2388,7 @@ fn optimistic_reaction_survives_the_canonical_replay() {
 
     // The settled delta replays the SAME reactor handle — set semantics keep
     // the count at 1 instead of doubling the optimistic chip.
-    let replay = ChatDelta {
-        kind: "reaction".into(),
-        channel_id: "general".into(),
-        seq: 7,
-        emoji: "👍".into(),
-        added: true,
-        reactor,
-        by_me: true,
-        ..ChatDelta::default()
-    };
-    let replayed = apply_chat_messages(tapped, replay, "general".into());
+    let replayed = ::chat::client::merge_message_reaction(tapped, 7, "👍", true, &reactor, true);
     assert_eq!(replayed[0].reactions.len(), 1);
     assert_eq!(replayed[0].reactions[0].count, 1);
     assert!(replayed[0].reactions[0].reacted_by_me);
@@ -2408,69 +2397,6 @@ fn optimistic_reaction_survives_the_canonical_replay() {
     let removed =
         ::chat::client::optimistic_reaction(replayed, 7, "👍".into(), false, "user:aa11".into());
     assert!(removed[0].reactions.is_empty());
-}
-
-#[test]
-fn reply_settle_verdict_mirrors_the_stream_for_the_thread_rail() {
-    let pending = optimistic_message(Vec::new(), "a reply".into(), "reply-a".into());
-    let mut settled_row = pending[0].clone();
-    settled_row.pending = false;
-    settled_row.seq = 9;
-    let settle = ChatDelta {
-        kind: "reply".into(),
-        channel_id: "general".into(),
-        root_seq: 3,
-        seq: 9,
-        message: settled_row,
-        ..ChatDelta::default()
-    };
-    assert!(reply_settled_by(&pending, &settle, "general"));
-    // The fused verdict answers both lanes off one call.
-    assert!(chat_settle(
-        Vec::new(),
-        pending.clone(),
-        settle.clone(),
-        "general".into(),
-    ));
-    // Each lane fires only on its own delta kind: a `reply` is the rail's
-    // edge and never the stream's, and a `posted` is the reverse.
-    assert!(!send_settled_by(&pending, &settle, "general"));
-    let mut as_post = settle.clone();
-    as_post.kind = "posted".into();
-    assert!(!reply_settled_by(&pending, &as_post, "general"));
-    assert!(!reply_settled_by(&pending, &settle, "other"));
-}
-
-#[test]
-fn send_settle_verdict_fires_only_for_own_pending_rows() {
-    let pending = optimistic_message(Vec::new(), "hello".into(), "message-a".into());
-    let mut settled_row = pending[0].clone();
-    settled_row.pending = false;
-    settled_row.seq = 3;
-    let settle = ChatDelta {
-        kind: "posted".into(),
-        channel_id: "general".into(),
-        seq: 3,
-        message: settled_row,
-        ..ChatDelta::default()
-    };
-
-    assert!(send_settled_by(&pending, &settle, "general"));
-    assert!(chat_settle(
-        pending.clone(),
-        Vec::new(),
-        settle.clone(),
-        "general".into(),
-    ));
-    // Wrong channel, someone else's post, and a non-post delta are unrelated.
-    assert!(!send_settled_by(&pending, &settle, "other"));
-    let mut foreign = settle.clone();
-    foreign.message.id = "someone-else".into();
-    assert!(!send_settled_by(&pending, &foreign, "general"));
-    let mut reaction = settle;
-    reaction.kind = "reaction".into();
-    let unrelated = chat_settle(pending, Vec::new(), reaction, "general".into());
-    assert!(!unrelated);
 }
 
 #[test]
@@ -2628,14 +2554,6 @@ fn history_pagination_prepends_older_and_flags_more() {
     );
     // now the oldest loaded root is seq 1 -> no more history to page.
     assert!(!history_has_older(merged));
-}
-
-#[test]
-fn thread_offsets_advance_only_for_loaded_commits() {
-    assert_eq!(thread_offset_after_reply(3, false, true), 4);
-    assert_eq!(thread_offset_after_reply(3, false, false), 3);
-    assert_eq!(thread_offset_after_reply(256, true, true), 256);
-    assert_eq!(thread_offset_after_reply(-1, false, true), -1);
 }
 
 #[test]
@@ -2865,7 +2783,8 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
     let workspace = connect(origin.clone(), 0, 0).await.unwrap();
     let mut live = live_events(origin.clone());
     let ready = next_change(&mut live).await;
-    assert_eq!(ready.kind, "ready");
+    assert_eq!(ready.kind, crate::LiveKind::Ready);
+    drop(ready);
     submit_test(
         &rpc,
         &signer,
@@ -2881,20 +2800,36 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
     )
     .await;
     let changed = next_change(&mut live).await;
-    assert_eq!(changed.kind, "chat", "a chat op folds into a chat delta");
-    assert_eq!(changed.chat.kind, "posted");
-    assert_eq!(changed.chat.channel_id, "general");
     assert_eq!(
-        changed.chat.seq, 2,
+        changed.kind,
+        crate::LiveKind::Chat,
+        "a chat op folds into a chat delta"
+    );
+    assert_eq!(changed.chat.len(), 1);
+    let ChatDelta::Posted {
+        channel_id,
+        seq,
+        message,
+    } = &changed.chat[0]
+    else {
+        panic!("a post must publish a Posted payload")
+    };
+    assert_eq!(channel_id, "general");
+    assert_eq!(
+        *seq, 2,
         "the delta carries the module-assigned sequence from the feed stamp"
     );
-    assert_eq!(changed.chat.message.body, "arrived on the next block");
+    assert_eq!(message.body, "arrived on the next block");
     assert!(
         !changed.load_chat && !changed.load_pages,
         "a folded chat delta requires no reload"
     );
     assert!(changed.height > workspace.height);
     let base_height = changed.height;
+    // Production drops this payload when the generated LiveUpdated reducer
+    // returns. This direct stream fixture is that consumer, so release its
+    // one-in-flight permit before asking the stream for later blocks.
+    drop(changed);
     submit_test(
         &rpc,
         &signer,
@@ -2942,23 +2877,15 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
     assert!(chat.messages[0].edited);
     assert_eq!(chat.messages[0].reply_count, 1);
     assert_eq!(chat.messages[0].reactions[0].emoji, "👍");
-    let thread = load_thread_data(&rpc, "general", 1, 0).await.unwrap();
+    let thread = load_thread_data(&rpc, "general", 1).await.unwrap();
     assert_eq!(thread.messages.len(), 2);
     assert_eq!(thread.messages[1].body, "a threaded reply");
-    let hit = load_chat_hit(
-        origin.clone(),
-        chat.channels.clone(),
-        "general".into(),
-        1,
-        3,
-        7,
-    )
-    .await
-    .unwrap();
-    // ONE ROW BACK, NOT THE LIST IT WAS HANDED. The switch loaders take the
-    // reader's list only as a `head_seq` hint; carrying it back would have the
-    // reducer revert every delta the live stream folded during the round trip
-    // (`upsert_channel_rows`).
+    let hit = load_chat_hit(origin.clone(), "general".into(), 1, 3, 7)
+        .await
+        .unwrap();
+    // ONE ROW BACK, NOT A PRE-CLICK LIST SNAPSHOT. Search navigation reads only
+    // the selected channel row; carrying a list back would revert deltas the
+    // live stream folded during the round trip (`upsert_channel_rows`).
     assert_eq!(
         hit.channels
             .iter()
@@ -3240,95 +3167,28 @@ async fn timeline_pages_past_thread_only_traffic() {
     let chat = load_chat_data(&rpc, Some("general")).await.unwrap();
     assert_eq!(chat.messages.len(), 1);
     assert_eq!(chat.messages[0].body, "root stays visible");
-    // The backward walk is page-bounded now, but the bound may never cut it
-    // short of a root: a page that yields none keeps going, so the walk still
-    // reaches seq 1 here and "Load older messages" stays correctly hidden
-    // rather than becoming a button that returns an empty page forever.
-    assert!(!history_has_older(chat.messages.clone()));
-    let first = load_thread_data(&rpc, "general", 1, 0).await.unwrap();
+    assert!(
+        !chat.has_older_history,
+        "257 replies after the only root do not consume a root page or invent history"
+    );
+    let first = load_thread_data(&rpc, "general", 1).await.unwrap();
     assert_eq!(first.messages.len(), 257);
-    assert_eq!(first.next_reply_offset, 256);
+    assert_eq!(first.next_reply_seq, 257);
     assert!(first.has_more);
-    let last = load_thread_page(origin.clone(), "general".into(), 1, 256, 9)
+    let last = load_thread_page(origin.clone(), "general".into(), 1, first.next_reply_seq, 9)
         .await
         .unwrap();
     assert_eq!(last.messages.len(), 1);
     assert_eq!(last.messages[0].body, "reply 256");
-    assert_eq!(last.next_reply_offset, 257);
+    assert_eq!(last.next_reply_seq, 0);
     assert!(!last.has_more);
-    let sparse = load_thread(origin, "general".into(), 1, 258, -1, 10)
+    let sparse = load_thread(origin, "general".into(), 1, 258, 10)
         .await
         .unwrap();
     assert_eq!(sparse.target_seq, 258);
-    assert_eq!(sparse.next_reply_offset, -1);
+    assert_eq!(sparse.next_reply_seq, 0);
     assert_eq!(sparse.messages.len(), 2);
     assert_eq!(sparse.messages[1].body, "reply 256");
-    sim.shutdown();
-}
-
-/// The page that carried the walk past the root quota is kept whole rather
-/// than trimmed back to it. Those rows already came over the wire, so
-/// discarding them would only mean fetching them again on the first "Load
-/// older messages" click — and the timeline that mounts them is virtualized,
-/// so holding them costs no layout. The quota bounds round trips, not rows.
-#[tokio::test(flavor = "current_thread")]
-async fn a_timeline_load_keeps_the_page_that_crossed_the_root_quota() {
-    let storage = tempfile::tempdir().unwrap();
-    let sim = simnode::boot(
-        storage.path(),
-        "127.0.0.1:0".parse().unwrap(),
-        simnode::SimOpts {
-            auto: true,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let origin = format!("http://{}", sim.addr());
-    let rpc = RpcClient::new(&origin).unwrap();
-    let signer = ed25519::PrivateKey::from_seed(9);
-
-    submit_test(
-        &rpc,
-        &signer,
-        1,
-        "chat",
-        chat::encode_msg(&ChatMsg::CreateChannel {
-            channel_id: "general".into(),
-            name: "General".into(),
-            post_policy: PostPolicy::Open,
-        }),
-    )
-    .await;
-
-    // Comfortably past the quota, and still inside one 256-row page, so the
-    // walk crosses the quota and stops within a single fetch.
-    let roots = CHAT_TIMELINE_ROOT_QUOTA + 20;
-    for index in 0..roots {
-        submit_test(
-            &rpc,
-            &signer,
-            index as u64 + 2,
-            "chat",
-            chat::encode_msg(&ChatMsg::PostMessage {
-                channel_id: "general".into(),
-                message_id: format!("root-{index}"),
-                blocks: vec![chat::Block::paragraph(format!("root {index}"))],
-                thread: None,
-                as_agent: None,
-            }),
-        )
-        .await;
-    }
-
-    let chat = load_chat_data(&rpc, Some("general")).await.unwrap();
-    assert_eq!(
-        chat.messages.len(),
-        roots,
-        "the crossing page is returned whole; trimming it back to the quota \
-         would re-fetch these rows on the first Load older click"
-    );
-    assert_eq!(chat.messages[0].body, "root 0");
-    assert_eq!(chat.messages[roots - 1].body, format!("root {}", roots - 1));
     sim.shutdown();
 }
 
@@ -3634,7 +3494,7 @@ async fn next_change(
 ) -> LiveUpdate {
     loop {
         let update = live.next().await.expect("live stream ended");
-        if update.kind != "tip" {
+        if update.kind != crate::LiveKind::Tip {
             return update;
         }
         // AND WHILE WE ARE HOLDING A REAL ONE, PIN IT HERE. The unit test below
@@ -3741,7 +3601,7 @@ async fn a_runs_op_asks_the_agents_projection_to_refetch() {
     )
     .await
     .expect("a runs op is visible to the shell");
-    assert_eq!(update.kind, "plane");
+    assert_eq!(update.kind, crate::LiveKind::Plane);
     assert_eq!(update.module, "runs", "the module IS the whole payload");
     assert_eq!(update.height, 7);
     assert!(
@@ -3802,19 +3662,75 @@ fn the_live_stream_subscribes_to_every_plane_the_console_reads() {
 #[test]
 fn the_agents_plane_hit_answers_for_both_of_its_modules_and_nothing_else() {
     for (kind, module, want) in [
-        ("plane", "agent", true),
-        ("plane", "runs", true),
-        ("plane", "valset", false),
-        ("chat", "agent", false),
-        ("chat", "runs", false),
-        ("resync", "runs", false),
+        (crate::LiveKind::Plane, "agent", true),
+        (crate::LiveKind::Plane, "runs", true),
+        (crate::LiveKind::Plane, "valset", false),
+        (crate::LiveKind::Chat, "agent", false),
+        (crate::LiveKind::Chat, "runs", false),
+        (crate::LiveKind::Resync, "runs", false),
     ] {
         assert_eq!(
-            agents_plane_hit(kind.into(), module.into()),
+            agents_plane_hit(kind, module.into()),
             want,
-            "{kind} / {module}"
+            "{kind:?} / {module}"
         );
     }
+}
+
+/// The fairness cap counts websocket work, including chat ops that deliberately
+/// fold to no UI delta (hook registration). Counting only `batch.chat.len()`
+/// lets an always-ready invisible run monopolise one stream poll forever.
+#[test]
+fn the_live_chat_batch_budget_counts_invisible_frames() {
+    const LIVE: &str = include_str!("live.rs");
+    let collector = LIVE
+        .split_once("async fn collect_ready_chat_updates(")
+        .expect("the ready-chat collector")
+        .1
+        .split_once("/// The complete chat-owned result")
+        .expect("the collector body")
+        .0;
+    assert!(collector.contains("let mut consumed = batch.chat.len();"));
+    assert!(collector.contains("while consumed < LIVE_CHAT_BATCH_LIMIT"));
+    assert!(collector.contains("consumed += 1;"));
+    assert!(
+        !collector.contains("while batch.chat.len() < LIVE_CHAT_BATCH_LIMIT"),
+        "invisible chat frames must consume the publication's fairness budget"
+    );
+    let outer = LIVE
+        .split_once("let mut skipped_ready_frames = 0usize;")
+        .expect("the outer stream fairness budget")
+        .1
+        .split_once("async fn collect_ready_chat_updates(")
+        .expect("the ready-chat collector boundary")
+        .0;
+    assert!(outer.contains("skipped_ready_frames += 1;"));
+    assert!(outer.contains("tokio::task::yield_now().await;"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_live_subscription_waits_for_the_ui_to_drop_its_publication() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = gate
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("the gate is open");
+    let update = LiveUpdate {
+        permit: LivePermit::held(permit),
+        ..LiveUpdate::default()
+    };
+    assert!(update.permit.is_held());
+    assert!(gate.clone().try_acquire_owned().is_err());
+
+    let generated_message_clone = update.clone();
+    drop(update);
+    assert!(
+        gate.clone().try_acquire_owned().is_err(),
+        "every clone must leave the generated update before the stream resumes"
+    );
+    drop(generated_message_clone);
+    assert!(gate.try_acquire_owned().is_ok());
 }
 
 /// A TIP MOVES THE HEAD AND MUST FETCH NOTHING.
@@ -3831,7 +3747,7 @@ fn the_agents_plane_hit_answers_for_both_of_its_modules_and_nothing_else() {
 /// to it. So the guard is here, on the value itself.
 #[test]
 fn a_tip_carries_the_head_and_loads_nothing() {
-    let tip = live_update("tip", "Live · block 41", 41);
+    let tip = live_update(crate::LiveKind::Tip, "Live · block 41", 41);
     assert_eq!(tip.height, 41, "the head is the tip's entire payload");
     assert!(
         !tip.load_chat && !tip.load_pages,
@@ -3855,7 +3771,7 @@ async fn wait_for_block(
 ) {
     loop {
         let update = live.next().await.expect("live stream ended");
-        let folded = update.kind == "chat" || update.kind == "pages";
+        let folded = matches!(update.kind, crate::LiveKind::Chat | crate::LiveKind::Pages);
         if folded && update.height >= min_height {
             return;
         }
@@ -4447,6 +4363,48 @@ fn backend_sources() -> Vec<(String, String)> {
     out
 }
 
+/// Timeline hydration and history paging each issue one root-index request.
+/// This source shape is load-bearing: putting a loop back here turns a long
+/// reply-only suffix into channel-open latency again even though rows render
+/// in a bounded window.
+#[test]
+fn timeline_pages_are_one_root_view_call_without_a_message_walk() {
+    const LOAD: &str = include_str!("load.rs");
+    let query_roots = LOAD
+        .split("async fn query_roots(")
+        .nth(1)
+        .expect("query_roots is declared")
+        .split("\npub(crate) async fn load_messages(")
+        .next()
+        .expect("query_roots body");
+    assert_eq!(query_roots.matches(".view(").count(), 1);
+    assert!(!query_roots.contains("loop {") && !query_roots.contains("while "));
+
+    let load_messages = LOAD
+        .split("pub(crate) async fn load_messages(")
+        .nth(1)
+        .expect("load_messages is declared")
+        .split("\n}")
+        .next()
+        .expect("load_messages body");
+    assert_eq!(load_messages.matches("query_roots(").count(), 1);
+    assert!(!load_messages.contains(".view("));
+
+    let load_older = LOAD
+        .split("pub async fn load_older_messages(")
+        .nth(1)
+        .expect("load_older_messages is declared")
+        .split("\npub(crate) async fn load_messages_around(")
+        .next()
+        .expect("load_older_messages body");
+    assert_eq!(load_older.matches("query_roots(").count(), 1);
+    assert!(!load_older.contains("loop {") && !load_older.contains("while "));
+
+    assert!(!LOAD.contains("walk_roots_back"));
+    assert!(!LOAD.contains("ChatViewQuery::MessagesLatest"));
+    assert!(!LOAD.contains("ChatViewQuery::MessagesRange"));
+}
+
 /// THE TAB-SWITCH GATE. Four planes used to refetch on every tab move —
 /// members, governance, agents, account — regardless of the destination, so a
 /// click into Files paid four `/v1/query` round trips for rows nothing on
@@ -4503,7 +4461,7 @@ async fn a_forge_op_does_not_load_the_repo_list_for_a_closed_pane() {
         "http://127.0.0.1:9".into(),
         String::new(),
         0,
-        "forge".into(),
+        crate::LiveKind::Forge,
         "forge".into(),
         ForgeRefresh::default(),
         false,
@@ -4648,8 +4606,7 @@ async fn an_unstamped_reply_stops_the_wait_instead_of_spending_it() {
 #[tokio::test(flavor = "current_thread")]
 async fn a_read_waits_out_a_block_this_client_already_knows_about() {
     use std::sync::atomic::Ordering::SeqCst;
-    let (origin, served) =
-        node_scripting_its_fold_watermark(vec![Some("6:0"), Some("9:0")]).await;
+    let (origin, served) = node_scripting_its_fold_watermark(vec![Some("6:0"), Some("9:0")]).await;
     let rpc = rpc_client(&origin).expect("stub client");
 
     assert!(

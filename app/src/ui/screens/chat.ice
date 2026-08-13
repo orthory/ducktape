@@ -15,7 +15,145 @@
 // this root deliberately carries NO `#root`: that would push every id down one
 // more segment for nothing.
 //
-component ChatScreen(network_name:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor)
+// A TIMELINE IS ITS OWN EVENT ISLAND. A keyed lazy nested directly in
+// ChatScreen inherits every event the screen declares, even though a message
+// row can only fire these six. With 4,096 rows that used to manufacture
+// 48 callback routes per row on every unrelated rebuild. This component keeps
+// the row loop's routing surface equal to what the row can actually do.
+component MessageTimeline(messages:[ChatMessage], unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, loading:bool)
+  emits
+    add_reaction_at(i64, str)
+    remove_reaction_at(i64, str)
+    open_thread_for(i64)
+    open_message_reactions(i64, str, i64)
+    open_message_actions(i64, str, i64)
+    open_message_link(str)
+  // KEYED BY STABLE VIEW IDENTITY. This is the app's one virtual list that
+  // prepends, so row state and measured height must follow the message rather
+  // than the slot it occupied before the page arrived.
+  keyed message in messages by=message.view_key
+    with
+      w=fill
+      gap=3.0
+      virtual-row=44.0
+    col w=fill gap=0.0
+      if unread_boundary > 0 && message.seq == unread_marker_seq
+        row
+          with
+            w=fill
+            gap=8.0
+            align=center
+            pt=8.0
+            pb=2.0
+          box
+            with
+              w=fill
+              h=1.0
+              bg=brand/40
+            text ""
+          text "NEW"
+            with
+              size=10.0
+              wrap=none
+              font=code_semibold
+              @text-brand
+          box
+            with
+              w=fill
+              h=1.0
+              bg=brand/40
+            text ""
+      // The selected row stays live because selection and loading are screen
+      // state. Quiet rows keep their own element/layout memo within the
+      // whole-timeline boundary. The plain dependency is intentional: the
+      // outer keyed lazy lends `messages` as a closure-local value, while the
+      // compiler permits nested cheap-key capture only from app state. A live
+      // batch rebuilds this bounded window once; an unchanged frame never
+      // enters it at all.
+      if message.seq == selected_message_seq
+        stack #message(message.id) w=fill
+          MessageCard
+            with
+              message
+              selected=true
+              menu_open=true
+              disabled=loading
+            forward
+              add_reaction_at
+              remove_reaction_at
+              open_thread_for
+              open_message_reactions
+              open_message_actions
+              open_message_link
+      if message.seq != selected_message_seq
+        lazy message as cached_message
+          stack #message(cached_message.id) w=fill
+            MessageCard
+              with
+                message=cached_message
+                selected=false
+                menu_open=false
+                disabled=false
+              forward
+                add_reaction_at
+                remove_reaction_at
+                open_thread_for
+                open_message_reactions
+                open_message_actions
+                open_message_link
+
+// Same boundary for the rail: the root, target and menu rows stay live; quiet
+// replies keep their per-row memo. Paging controls stay outside this component
+// because they are constant-size chrome, not part of the chain-fed list.
+component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_target_seq:i64, thread_selected_seq:i64, loading:bool)
+  emits
+    add_reaction_at(i64, str)
+    remove_reaction_at(i64, str)
+    open_thread_for(i64)
+    open_thread_message_actions(i64, str, i64)
+    open_thread_message_reactions(i64, str, i64)
+    open_message_link(str)
+  keyed thread_message in messages by=thread_message.view_key
+    with
+      w=fill
+      gap=3.0
+      virtual-row=44.0
+    col w=fill gap=0.0
+      if thread_message.seq == active_thread_seq
+        ThreadParentBlock message=thread_message
+          forward
+            open_message_link
+      if thread_message.seq != active_thread_seq && (thread_message.seq == thread_target_seq || thread_message.seq == thread_selected_seq)
+        ThreadMessageCard
+          with
+            message=thread_message
+            selected=(thread_message.seq == thread_target_seq)
+            menu_open=(thread_message.seq == thread_selected_seq)
+            disabled=loading
+          forward
+            add_reaction_at
+            remove_reaction_at
+            open_thread_for
+            open_thread_message_actions
+            open_thread_message_reactions
+            open_message_link
+      if thread_message.seq != active_thread_seq && thread_message.seq != thread_target_seq && thread_message.seq != thread_selected_seq
+        lazy thread_message as cached_reply
+          ThreadMessageCard
+            with
+              message=cached_reply
+              selected=false
+              menu_open=false
+              disabled=false
+            forward
+              add_reaction_at
+              remove_reaction_at
+              open_thread_for
+              open_thread_message_actions
+              open_thread_message_reactions
+              open_message_link
+
+component ChatScreen(network_name:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], messages_revision:i64, has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_messages_revision:i64, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor)
   lifetime retained
   emits
     search_chat_submit()
@@ -552,23 +690,9 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                       active bg=surface text=fg border=warning_line border-w=1.0 r=7.0
                       hovered bg=warning_bg text=fg
                       pressed bg=accent text=fg
-              // THIS GATE IS NOT THE SCROLL RESET — the SWITCH IS. It used to
-              // be: `choose_channel` emptied `messages` before the fetch, the
-              // stack unmounted, its `scrollable::State` died with it and the
-              // next room mounted a fresh one at the tail. The window cache
-              // ended that. A cache hit goes non-empty → non-empty in one
-              // reducer pass, this `if` never renders false, and iced's
-              // positional diff hands the SURVIVING offset — a distance from
-              // the bottom under `anchor-y=end` — to the room being entered.
-              //
-              // So `choose_channel` and `choose_dm` both end with
-              // `task widget scroll-to … 0.0 0.0` (absolute 0 IS the tail under
-              // this anchor) and the tail is asserted rather than inherited.
-              // Two fences: `message_stream_reset_contract` in `tests/app.ice`
-              // still pins that the stream is GONE once `messages` is, and
-              // `a_room_restored_from_the_cache_asserts_the_streams_tail` in
-              // `tests.rs` pins that every handler painting parked rows carries
-              // the operation.
+              // THE EMPTY LOADING STATE RESETS THE STREAM. A room switch clears
+              // `messages`, this gate unmounts the old scrollable and its offset,
+              // and the arriving root window mounts at the tail.
               if connected && !empty(messages)
                 stack w=fill h=fill
                   sensor show=chat_resized resize=chat_resized
@@ -679,89 +803,27 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                           // measuring a never-seen row ABOVE the viewport moves
                           // everything below it, and only a bottom-anchored offset
                           // carries the visible rows along with it.
-                          keyed message in messages by=message.view_key
-                            with
-                              w=fill
-                              gap=3.0
-                              virtual-row=44.0
-                            col w=fill gap=0.0
-                              if unread_boundary > 0 && message.seq == unread_marker_seq
-                                row
-                                  with
-                                    w=fill
-                                    gap=8.0
-                                    align=center
-                                    pt=8.0
-                                    pb=2.0
-                                  box
-                                    with
-                                      w=fill
-                                      h=1.0
-                                      bg=brand/40
-                                    text ""
-                                  text "NEW"
-                                    with
-                                      size=10.0
-                                      wrap=none
-                                      font=code_semibold
-                                      @text-brand
-                                  box
-                                    with
-                                      w=fill
-                                      h=1.0
-                                      bg=brand/40
-                                    text ""
-                              // LAZY OFF THE HOT PATH. A quiet row rebuilds
-                              // only when its MESSAGE changes; ONLY the selected
-                              // row is built live, because its card reads the
-                              // selection. Hover costs no arm at all now — the
-                              // toolbar reveal is the `hover` widget's draw-time
-                              // check inside MessageCard, so a cached row keeps
-                              // it at native latency.
-                              //
-                              // A message in flight LOOKS like a message: no
-                              // dashed frame, no restyle — send-state lives on
-                              // the message itself: confirmation removes its
-                              // pending dot. `render_rev` moves with canonical
-                              // content, so an unselected row stays lazy.
-                              if message.seq == selected_message_seq
-                                stack #message(message.id) w=fill
-                                  MessageCard
-                                    with
-                                      message
-                                      selected=true
-                                      menu_open=true
-                                      disabled=loading
-                                    forward
-                                      add_reaction_at
-                                      remove_reaction_at
-                                      open_thread_for
-                                      open_message_reactions
-                                      open_message_actions
-                                      open_message_link
-                              // KEYED BY (seq, render_rev), NOT BY THE ROW: an
-                              // unchanged frame hashes two ints instead of
-                              // cloning the message into the memo tuple. The
-                              // client bumps `render_rev` on every in-place row
-                              // mutation and seeds it from the content hash at
-                              // construction, so every repaint a reader can see
-                              // moves a key.
-                              if message.seq != selected_message_seq
-                                lazy message by message.seq, message.render_rev as cached_message
-                                  stack #message(cached_message.id) w=fill
-                                    MessageCard
-                                      with
-                                        message=cached_message
-                                        selected=false
-                                        menu_open=false
-                                        disabled=false
-                                      forward
-                                        add_reaction_at
-                                        remove_reaction_at
-                                        open_thread_for
-                                        open_message_reactions
-                                        open_message_actions
-                                        open_message_link
+                          // WHOLE-TIMELINE MEMO. The value stays borrowed from
+                          // root state and only enters the cached element when
+                          // this cheap revision (or one of the five visible
+                          // screen inputs) moves. Composer edits, clocks and
+                          // unrelated live planes therefore build one memo
+                          // widget instead of enumerating every message.
+                          lazy messages by messages_revision, active_channel, unread_boundary, unread_marker_seq, selected_message_seq, loading as cached_messages
+                            MessageTimeline
+                              with
+                                messages=cached_messages
+                                unread_boundary
+                                unread_marker_seq
+                                selected_message_seq
+                                loading
+                              forward
+                                add_reaction_at
+                                remove_reaction_at
+                                open_thread_for
+                                open_message_reactions
+                                open_message_actions
+                                open_message_link
                   overlay
                     with
                       when=(selected_message_seq > 0 && message_action != MessageAction.toolbar)
@@ -1616,67 +1678,27 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         pr=16.0
                         pt=12.0
                         pb=8.0
-                        virtual-row=44.0
-                      for thread_message in thread_messages
-                        // THE ROOT GETS ITS OWN DIVIDED BLOCK. One
-                        // loop, one discriminant: `active_thread_seq`
-                        // IS the root's seq and `thread_messages`
-                        // carries it, so the split needs no state and
-                        // no fn. The root's read-only block is the
-                        // artifact's; its hover bar, reactions and
-                        // edit/delete are not lost, they stay on the
-                        // same message in the stream one pane over,
-                        // which is on screen the whole time this rail
-                        // is.
-                        if thread_message.seq == active_thread_seq
-                          ThreadParentBlock message=thread_message
-                            forward
-                              open_message_link
-                        // THE REST SPLIT THE WAY THE STREAM'S DO, and for the
-                        // same reason: a `lazy` subtree may read nothing but
-                        // its dependency, so every row whose card reads SCREEN
-                        // state — the search target and the open action menu —
-                        // has to be its own live arm. Confirmation lives on the
-                        // message and bumps `render_rev`, so it stays cached.
-                        if thread_message.seq != active_thread_seq && (thread_message.seq == thread_target_seq || thread_message.seq == thread_selected_seq)
-                          ThreadMessageCard
-                            with
-                              message=thread_message
-                              selected=(thread_message.seq == thread_target_seq)
-                              menu_open=(thread_message.seq == thread_selected_seq)
-                              disabled=loading
-                            forward
-                              add_reaction_at
-                              remove_reaction_at
-                              open_thread_for
-                              open_thread_message_actions
-                              open_thread_message_reactions
-                              open_message_link
-                        // THE QUIET ARM. Virtualization stops an offscreen
-                        // reply from being laid out; this stops a VISIBLE one
-                        // from being rebuilt — ~60 nodes of a11y keys and
-                        // scope strings per reply, on every frame the rail is
-                        // open. `disabled=false` is the stream's bargain too: a
-                        // cached row cannot see `loading`, and a row nobody is
-                        // hovering has no button to disable.
-                        // Keyed by (seq, render_rev) exactly as the stream's
-                        // quiet arm is — see the note there.
-                        if thread_message.seq != active_thread_seq && thread_message.seq != thread_target_seq && thread_message.seq != thread_selected_seq
-                          lazy thread_message by thread_message.seq, thread_message.render_rev as cached_reply
-                            ThreadMessageCard
-                              with
-                                message=cached_reply
-                                selected=false
-                                menu_open=false
-                                disabled=false
-                              forward
-                                add_reaction_at
-                                remove_reaction_at
-                                open_thread_for
-                                open_thread_message_actions
-                                open_thread_message_reactions
-                                open_message_link
-                      if thread_has_more && thread_next_reply_offset >= 0 && thread_loading
+                      // The same whole-list boundary as the channel stream.
+                      // Reply-composer edits and unrelated app state stop at
+                      // the cheap revision instead of walking every loaded
+                      // reply. Paging chrome stays outside the memo, so its
+                      // busy phase does not invalidate the timeline.
+                      lazy thread_messages by thread_messages_revision, active_channel, active_thread_seq, thread_target_seq, thread_selected_seq, loading as cached_thread_messages
+                        ThreadTimeline
+                          with
+                            messages=cached_thread_messages
+                            active_thread_seq
+                            thread_target_seq
+                            thread_selected_seq
+                            loading
+                          forward
+                            add_reaction_at
+                            remove_reaction_at
+                            open_thread_for
+                            open_thread_message_actions
+                            open_thread_message_reactions
+                            open_message_link
+                      if thread_has_more && thread_next_reply_seq > 0 && thread_loading
                         button "Loading replies…" -> emit(load_more_thread)
                           with
                             disabled=true
@@ -1687,7 +1709,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                           active bg=transparent text=muted r=7.0
                           hovered bg=fg/9 text=fg
                           pressed bg=brand_bg
-                      if thread_has_more && thread_next_reply_offset >= 0 && !thread_loading
+                      if thread_has_more && thread_next_reply_seq > 0 && !thread_loading
                         button "Load more replies" -> emit(load_more_thread)
                           with
                             disabled=(mutation_phase != MutationPhase.idle)

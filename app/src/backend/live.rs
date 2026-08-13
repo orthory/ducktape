@@ -2,6 +2,61 @@ use super::*;
 use ::chat;
 use ::forge;
 
+/// One UI publication may carry at most this many consecutive chat deltas.
+/// The cap bounds one reducer pass; the capacity-one publication gate below
+/// waits for the UI to finish that pass before the stream reads another one.
+/// No clock participates in batching or fairness.
+pub(crate) const LIVE_CHAT_BATCH_LIMIT: usize = 64;
+
+enum PendingLiveEvent {
+    Event(ducktape_rpc::Result<ModuleEvent>),
+    Closed,
+    Update(Box<LiveUpdate>),
+}
+
+struct LiveEventState {
+    rpc: String,
+    cursors: BTreeMap<String, String>,
+    stream: Option<ducktape_rpc::ModuleEventStream>,
+    pending: Option<PendingLiveEvent>,
+    retry_attempt: u32,
+    publication_gate: Arc<tokio::sync::Semaphore>,
+}
+
+/// Merge one later, consecutive chat publication into `batch` when the shared
+/// production cap permits it. A returned update is a non-chat publication (or
+/// the next full chat batch) that the caller must preserve without reordering.
+fn merge_live_chat_batch(batch: &mut LiveUpdate, mut next: LiveUpdate) -> Option<LiveUpdate> {
+    let both_chat = batch.kind == crate::LiveKind::Chat && next.kind == crate::LiveKind::Chat;
+    let fits = batch.chat.len().saturating_add(next.chat.len()) <= LIVE_CHAT_BATCH_LIMIT;
+    if !both_chat || !fits {
+        return Some(next);
+    }
+    batch.chat.append(&mut next.chat);
+    batch.status = next.status;
+    batch.height = next.height;
+    None
+}
+
+/// Deterministic seam for allocation/update-count probes. Its input is the
+/// sequence of already-ready, already-folded publications; production uses
+/// the same [`merge_live_chat_batch`] decision while greedily polling the live
+/// socket. Non-chat publications are ordering barriers.
+#[cfg(test)]
+pub(crate) fn batch_live_updates(updates: Vec<LiveUpdate>) -> Vec<LiveUpdate> {
+    let mut emitted = Vec::new();
+    for update in updates {
+        let Some(batch) = emitted.last_mut() else {
+            emitted.push(update);
+            continue;
+        };
+        if let Some(update) = merge_live_chat_batch(batch, update) {
+            emitted.push(update);
+        }
+    }
+    emitted
+}
+
 /// `attempt` backs the connect off exactly as `live_resync_load` backs off a
 /// live sync — 1s doubling to a 16s cap. The steady-state path has always
 /// retried forever; the connect that GETS you there gave up after one failure,
@@ -51,21 +106,25 @@ pub async fn connect(
 }
 
 pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, LiveUpdate> {
-    struct State {
-        rpc: String,
-        cursors: BTreeMap<String, String>,
-        stream: Option<ducktape_rpc::ModuleEventStream>,
-        retry_attempt: u32,
-    }
-
     iced::futures::stream::unfold(
-        State {
+        LiveEventState {
             rpc,
             cursors: BTreeMap::new(),
             stream: None,
+            pending: None,
             retry_attempt: 0,
+            publication_gate: Arc::new(tokio::sync::Semaphore::new(1)),
         },
         |mut state| async move {
+            // One subscription item may exist outside this stream at a time.
+            // iced drops the generated LiveUpdated message after `update`;
+            // that drop is the acknowledgement that releases this permit.
+            let publication_permit = state
+                .publication_gate
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("the live publication gate stays open");
             if state.stream.is_none() && state.retry_attempt > 0 {
                 tokio::time::sleep(retry_delay(state.retry_attempt)).await;
             }
@@ -103,22 +162,36 @@ pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, Liv
                     Ok(stream) => state.stream = Some(stream),
                     Err(error) => {
                         state.retry_attempt = state.retry_attempt.saturating_add(1);
-                        return Some((live_retry(error), state));
+                        let mut update = live_retry(error);
+                        update.permit = LivePermit::held(publication_permit);
+                        return Some((update, state));
                     }
                 }
             }
+            let mut skipped_ready_frames = 0usize;
             loop {
-                let event = state
-                    .stream
-                    .as_mut()
-                    .expect("stream initialized above")
-                    .next()
-                    .await;
-                let update = match event {
+                let event = match state.pending.take() {
+                    Some(PendingLiveEvent::Event(event)) => Some(event),
+                    Some(PendingLiveEvent::Closed) => None,
+                    Some(PendingLiveEvent::Update(update)) => {
+                        let mut update = *update;
+                        update.permit = LivePermit::held(publication_permit);
+                        return Some((update, state));
+                    }
+                    None => {
+                        state
+                            .stream
+                            .as_mut()
+                            .expect("stream initialized above")
+                            .next()
+                            .await
+                    }
+                };
+                let mut update = match event {
                     Some(Ok(ModuleEvent::Ready { cursors })) => {
                         state.cursors = cursors;
                         state.retry_attempt = 0;
-                        live_update("ready", "Live", -1)
+                        live_update(crate::LiveKind::Ready, "Live", -1)
                     }
                     Some(Ok(ModuleEvent::Changed { module, cursor, op })) => {
                         state.cursors.insert(format!("module:{module}"), cursor);
@@ -126,7 +199,16 @@ pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, Liv
                             Some(update) => update,
                             // invisible to the UI (hook registration) — keep
                             // draining without emitting.
-                            None => continue,
+                            None => {
+                                skipped_ready_frames += 1;
+                                let exhausted_fairness_budget =
+                                    skipped_ready_frames >= LIVE_CHAT_BATCH_LIMIT;
+                                if exhausted_fairness_budget {
+                                    tokio::task::yield_now().await;
+                                    skipped_ready_frames = 0;
+                                }
+                                continue;
+                            }
                         }
                     }
                     // THIS PLANE IS DEAD FOR THIS CONNECTION; THE OTHERS ARE
@@ -139,7 +221,16 @@ pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, Liv
                     // assigns `status` as its first statement, so any message
                     // put here is overwritten microseconds later. Showing it
                     // needs a per-plane field that no surface reads yet.
-                    Some(Ok(ModuleEvent::Refused { .. })) => continue,
+                    Some(Ok(ModuleEvent::Refused { .. })) => {
+                        skipped_ready_frames += 1;
+                        let exhausted_fairness_budget =
+                            skipped_ready_frames >= LIVE_CHAT_BATCH_LIMIT;
+                        if exhausted_fairness_budget {
+                            tokio::task::yield_now().await;
+                            skipped_ready_frames = 0;
+                        }
+                        continue;
+                    }
                     Some(Ok(ModuleEvent::Lagged { module, cursor })) => {
                         state.cursors.insert(format!("module:{module}"), cursor);
                         live_resync(&module, -1)
@@ -165,7 +256,7 @@ pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, Liv
                     // and the fold path — the part that actually cost something
                     // — is already unreachable.
                     Some(Ok(ModuleEvent::Tip { height })) => live_update(
-                        "tip",
+                        crate::LiveKind::Tip,
                         &format!("Live · block {height}"),
                         i64::try_from(height).unwrap_or(i64::MAX),
                     ),
@@ -180,11 +271,524 @@ pub fn live_events(rpc: String) -> iced::futures::stream::BoxStream<'static, Liv
                         live_retry("RPC stream closed".into())
                     }
                 };
+                if update.kind == crate::LiveKind::Chat {
+                    update = collect_ready_chat_updates(&mut state, update).await;
+                }
+                update.permit = LivePermit::held(publication_permit);
                 return Some((update, state));
             }
         },
     )
     .boxed()
+}
+
+/// Greedily take only chat frames that are ready *now*. The first frame of any
+/// other kind is parked for the next unfold, so a pages/forge/tip/error frame
+/// cannot be overtaken by later chat traffic. Dropping a pending `next()`
+/// future is safe: it owns no frame and the boxed stream retains its socket.
+async fn collect_ready_chat_updates(
+    state: &mut LiveEventState,
+    mut batch: LiveUpdate,
+) -> LiveUpdate {
+    // Count consumed CHAT FRAMES, not only visible deltas. Hook registration
+    // folds to `None`; without this separate budget an always-ready run of
+    // invisible chat frames could monopolise this one stream poll forever.
+    let mut consumed = batch.chat.len();
+    while consumed < LIVE_CHAT_BATCH_LIMIT {
+        let ready = state
+            .stream
+            .as_mut()
+            .expect("a chat update came from an initialized stream")
+            .next()
+            .now_or_never();
+        let Some(event) = ready else {
+            break;
+        };
+        let Some(event) = event else {
+            state.pending = Some(PendingLiveEvent::Closed);
+            break;
+        };
+        let (module, cursor, op) = match event {
+            Ok(ModuleEvent::Changed { module, cursor, op }) => (module, cursor, op),
+            other => {
+                state.pending = Some(PendingLiveEvent::Event(other));
+                break;
+            }
+        };
+        let is_chat = module == "chat";
+        if !is_chat {
+            state.pending = Some(PendingLiveEvent::Event(Ok(ModuleEvent::Changed {
+                module,
+                cursor,
+                op,
+            })));
+            break;
+        }
+        consumed += 1;
+        state.cursors.insert("module:chat".into(), cursor);
+        let Some(update) = folded_update(&state.rpc, "chat", *op).await else {
+            continue;
+        };
+        if let Some(update) = merge_live_chat_batch(&mut batch, update) {
+            state.pending = Some(PendingLiveEvent::Update(Box::new(update)));
+            break;
+        }
+    }
+    batch
+}
+
+/// The complete chat-owned result of one live batch. Ice crosses the extern
+/// boundary once with each list, then assigns the result fields; no delta in
+/// the batch can wander through Pages, Bell, or Forge lifecycle reducers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChatLiveFold {
+    pub messages_changed: bool,
+    pub thread_messages_changed: bool,
+    pub has_older_history: bool,
+    pub selected_message_seq: i64,
+    pub selected_message_rev: i64,
+    pub message_action: crate::MessageAction,
+    pub message_edit_draft: String,
+    pub thread_selected_seq: i64,
+    pub thread_selected_rev: i64,
+    pub thread_message_action: crate::MessageAction,
+    pub thread_edit_draft: String,
+    pub channels: Vec<ChatChannel>,
+    pub messages: Vec<ChatMessage>,
+    pub thread_messages: Vec<ChatMessage>,
+    pub channel_members: Vec<ChatMember>,
+    pub channel_reads: Vec<ChannelRead>,
+    pub rooms: Vec<ChatSidebarRow>,
+    pub dm_rows: Vec<DmSidebarRow>,
+    pub unread_marker_seq: i64,
+    pub active_channel_name: String,
+    pub active_channel_archived: bool,
+    pub active_channel_members_only: bool,
+    pub post_refusal: String,
+    pub forge_discussion: Vec<ChatMessage>,
+    /// A huddle roster change in the active channel needs the canonical roster
+    /// read that a delta cannot derive.
+    pub refresh_chat: bool,
+}
+
+struct ChatFoldState {
+    channels: Vec<ChatChannel>,
+    messages: Vec<ChatMessage>,
+    thread_messages: Vec<ChatMessage>,
+    channel_members: Vec<ChatMember>,
+    forge_discussion: Vec<ChatMessage>,
+    active_channel: String,
+    active_thread_seq: i64,
+    forge_item_channel: String,
+    history_view: bool,
+    messages_changed: bool,
+    thread_messages_changed: bool,
+    refresh_chat: bool,
+}
+
+fn pending_row_matches(messages: &[ChatMessage], id: &str) -> bool {
+    messages
+        .iter()
+        .any(|message| message.pending && message.id == id)
+}
+
+fn contains_committed_seq(messages: &[ChatMessage], seq: i64) -> bool {
+    messages
+        .iter()
+        .any(|message| !message.pending && message.seq == seq)
+}
+
+fn accepts_edit(messages: &[ChatMessage], seq: i64, rev: i64) -> bool {
+    messages.iter().any(|message| {
+        !message.pending && message.seq == seq && !message.deleted && message.rev < rev
+    })
+}
+
+fn fold_channel_created(state: &mut ChatFoldState, channel: ChatChannel) {
+    state.channels = chat::client::insert_channel(std::mem::take(&mut state.channels), channel);
+}
+
+fn fold_channel_renamed(state: &mut ChatFoldState, channel_id: String, name: String) {
+    state.channels =
+        chat::client::rename_channel(std::mem::take(&mut state.channels), &channel_id, name);
+}
+
+fn fold_channel_archived(state: &mut ChatFoldState, channel_id: String, archived: bool) {
+    state.channels =
+        chat::client::archive_channel(std::mem::take(&mut state.channels), &channel_id, archived);
+}
+
+fn fold_posted(state: &mut ChatFoldState, channel_id: String, seq: i64, message: ChatMessage) {
+    state.channels =
+        chat::client::advance_channel_head(std::mem::take(&mut state.channels), &channel_id, seq);
+    let is_active_channel = channel_id == state.active_channel;
+    let settles_pending = is_active_channel && pending_row_matches(&state.messages, &message.id);
+    let folds_active_window = is_active_channel && (!state.history_view || settles_pending);
+    if folds_active_window {
+        let inserts_committed = !contains_committed_seq(&state.messages, seq);
+        state.messages_changed |= settles_pending || inserts_committed;
+        state.messages = chat::client::merge_posted_message(
+            std::mem::take(&mut state.messages),
+            message.clone(),
+        );
+    }
+    let updates_forge_discussion = channel_id == state.forge_item_channel;
+    if updates_forge_discussion {
+        state.forge_discussion = chat::client::merge_posted_message(
+            std::mem::take(&mut state.forge_discussion),
+            message,
+        );
+    }
+}
+
+fn fold_reply(
+    state: &mut ChatFoldState,
+    channel_id: String,
+    seq: i64,
+    root_seq: i64,
+    message: ChatMessage,
+) {
+    state.channels =
+        chat::client::advance_channel_head(std::mem::take(&mut state.channels), &channel_id, seq);
+    let is_active_channel = channel_id == state.active_channel;
+    let settles_pending =
+        is_active_channel && pending_row_matches(&state.thread_messages, &message.id);
+    let folds_active_window = is_active_channel && (!state.history_view || settles_pending);
+    if folds_active_window {
+        let updates_root = contains_committed_seq(&state.messages, root_seq);
+        state.messages_changed |= updates_root;
+        state.messages =
+            chat::client::bump_reply_summary(std::mem::take(&mut state.messages), root_seq);
+    }
+    let updates_open_thread = is_active_channel && root_seq == state.active_thread_seq;
+    if updates_open_thread {
+        state.thread_messages_changed = true;
+        let thread =
+            chat::client::bump_reply_summary(std::mem::take(&mut state.thread_messages), root_seq);
+        state.thread_messages = chat::client::merge_thread_reply(thread, message);
+    }
+    let updates_forge_discussion = channel_id == state.forge_item_channel;
+    if updates_forge_discussion {
+        state.forge_discussion =
+            chat::client::bump_reply_summary(std::mem::take(&mut state.forge_discussion), root_seq);
+    }
+}
+
+fn fold_edited(state: &mut ChatFoldState, channel_id: String, seq: i64, message: ChatMessage) {
+    let folds_active_window = channel_id == state.active_channel && !state.history_view;
+    if folds_active_window {
+        state.messages_changed |= accepts_edit(&state.messages, seq, message.rev);
+        state.messages =
+            chat::client::merge_message_edit(std::mem::take(&mut state.messages), seq, &message);
+    }
+    let updates_open_thread = channel_id == state.active_channel && state.active_thread_seq > 0;
+    if updates_open_thread {
+        state.thread_messages_changed |= accepts_edit(&state.thread_messages, seq, message.rev);
+        state.thread_messages = chat::client::merge_message_edit(
+            std::mem::take(&mut state.thread_messages),
+            seq,
+            &message,
+        );
+    }
+    let updates_forge_discussion = channel_id == state.forge_item_channel;
+    if updates_forge_discussion {
+        state.forge_discussion = chat::client::merge_message_edit(
+            std::mem::take(&mut state.forge_discussion),
+            seq,
+            &message,
+        );
+    }
+}
+
+fn fold_deleted(state: &mut ChatFoldState, channel_id: String, seq: i64) {
+    let folds_active_window = channel_id == state.active_channel && !state.history_view;
+    if folds_active_window {
+        state.messages_changed |= contains_committed_seq(&state.messages, seq);
+        state.messages = chat::client::tombstone_message(std::mem::take(&mut state.messages), seq);
+    }
+    let updates_open_thread = channel_id == state.active_channel && state.active_thread_seq > 0;
+    if updates_open_thread {
+        state.thread_messages_changed |= contains_committed_seq(&state.thread_messages, seq);
+        state.thread_messages =
+            chat::client::tombstone_message(std::mem::take(&mut state.thread_messages), seq);
+    }
+    let updates_forge_discussion = channel_id == state.forge_item_channel;
+    if updates_forge_discussion {
+        state.forge_discussion =
+            chat::client::tombstone_message(std::mem::take(&mut state.forge_discussion), seq);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fold_reaction(
+    state: &mut ChatFoldState,
+    channel_id: String,
+    seq: i64,
+    emoji: String,
+    added: bool,
+    reactor: String,
+    by_me: bool,
+) {
+    let folds_active_window = channel_id == state.active_channel && !state.history_view;
+    if folds_active_window {
+        state.messages_changed |= contains_committed_seq(&state.messages, seq);
+        state.messages = chat::client::merge_message_reaction(
+            std::mem::take(&mut state.messages),
+            seq,
+            &emoji,
+            added,
+            &reactor,
+            by_me,
+        );
+    }
+    let updates_open_thread = channel_id == state.active_channel && state.active_thread_seq > 0;
+    if updates_open_thread {
+        state.thread_messages_changed |= contains_committed_seq(&state.thread_messages, seq);
+        state.thread_messages = chat::client::merge_message_reaction(
+            std::mem::take(&mut state.thread_messages),
+            seq,
+            &emoji,
+            added,
+            &reactor,
+            by_me,
+        );
+    }
+    let updates_forge_discussion = channel_id == state.forge_item_channel;
+    if updates_forge_discussion {
+        state.forge_discussion = chat::client::merge_message_reaction(
+            std::mem::take(&mut state.forge_discussion),
+            seq,
+            &emoji,
+            added,
+            &reactor,
+            by_me,
+        );
+    }
+}
+
+fn fold_membership(state: &mut ChatFoldState, channel_id: String, added: bool, member: ChatMember) {
+    let updates_active_members = channel_id == state.active_channel;
+    if updates_active_members {
+        state.channel_members = chat::client::apply_membership(
+            std::mem::take(&mut state.channel_members),
+            added,
+            member,
+        );
+    }
+}
+
+fn fold_channel_refresh(state: &mut ChatFoldState, channel_id: String) {
+    state.refresh_chat |= channel_id == state.active_channel;
+}
+
+fn fold_channel_updated(state: &mut ChatFoldState, channel_id: String, channel: ChatChannel) {
+    state.refresh_chat |= channel_id == state.active_channel;
+    state.channels =
+        chat::client::replace_channel(std::mem::take(&mut state.channels), &channel_id, channel);
+}
+
+/// Fold one ordered live chat batch in one Rust ownership domain. Lists move
+/// into this function once, then each delta mutates those owned lists in
+/// sequence. This replaces the former Ice handler's repeated by-value extern
+/// calls, which deep-cloned the whole timeline for every operation.
+#[allow(clippy::too_many_arguments)]
+pub fn fold_live_chat(
+    deltas: Vec<ChatDelta>,
+    channels: Vec<ChatChannel>,
+    messages: Vec<ChatMessage>,
+    thread_messages: Vec<ChatMessage>,
+    channel_members: Vec<ChatMember>,
+    mut channel_reads: Vec<ChannelRead>,
+    dm_peers: Vec<DmPeer>,
+    me: String,
+    active_channel: String,
+    active_thread_seq: i64,
+    history_view: bool,
+    chat_visible: bool,
+    unread_boundary: i64,
+    mut active_channel_name: String,
+    mut active_channel_archived: bool,
+    mut active_channel_members_only: bool,
+    forge_discussion: Vec<ChatMessage>,
+    forge_item_channel: String,
+    selected_message_seq: i64,
+    selected_message_rev: i64,
+    message_action: crate::MessageAction,
+    message_edit_draft: String,
+    thread_selected_seq: i64,
+    thread_selected_rev: i64,
+    thread_message_action: crate::MessageAction,
+    thread_edit_draft: String,
+) -> ChatLiveFold {
+    let mut state = ChatFoldState {
+        channels,
+        messages,
+        thread_messages,
+        channel_members,
+        forge_discussion,
+        active_channel,
+        active_thread_seq,
+        forge_item_channel,
+        history_view,
+        messages_changed: false,
+        thread_messages_changed: false,
+        refresh_chat: false,
+    };
+    for delta in deltas {
+        match delta {
+            ChatDelta::ChannelCreated { channel } => fold_channel_created(&mut state, channel),
+            ChatDelta::ChannelRenamed { channel_id, name } => {
+                fold_channel_renamed(&mut state, channel_id, name)
+            }
+            ChatDelta::ChannelArchived {
+                channel_id,
+                archived,
+            } => fold_channel_archived(&mut state, channel_id, archived),
+            ChatDelta::Posted {
+                channel_id,
+                seq,
+                message,
+            } => fold_posted(&mut state, channel_id, seq, message),
+            ChatDelta::Reply {
+                channel_id,
+                seq,
+                root_seq,
+                message,
+            } => fold_reply(&mut state, channel_id, seq, root_seq, message),
+            ChatDelta::Edited {
+                channel_id,
+                seq,
+                message,
+            } => fold_edited(&mut state, channel_id, seq, message),
+            ChatDelta::Deleted { channel_id, seq } => fold_deleted(&mut state, channel_id, seq),
+            ChatDelta::Reaction {
+                channel_id,
+                seq,
+                emoji,
+                added,
+                reactor,
+                by_me,
+            } => fold_reaction(&mut state, channel_id, seq, emoji, added, reactor, by_me),
+            ChatDelta::Membership {
+                channel_id,
+                added,
+                member,
+            } => fold_membership(&mut state, channel_id, added, member),
+            ChatDelta::ChannelRefresh { channel_id } => {
+                fold_channel_refresh(&mut state, channel_id)
+            }
+            ChatDelta::ChannelUpdated {
+                channel_id,
+                channel,
+            } => fold_channel_updated(&mut state, channel_id, channel),
+        }
+    }
+    let ChatFoldState {
+        channels,
+        messages,
+        thread_messages,
+        channel_members,
+        forge_discussion,
+        active_channel,
+        history_view,
+        messages_changed,
+        thread_messages_changed,
+        refresh_chat,
+        ..
+    } = state;
+    let reads_live_tail = !history_view && chat_visible;
+
+    if let Some(channel) = channels.iter().find(|channel| channel.id == active_channel) {
+        active_channel_name.clone_from(&channel.name);
+        active_channel_archived = channel.archived;
+        active_channel_members_only = channel.members_only;
+    }
+    let seated = channel_members.iter().any(|member| member.key == me);
+    let post_refusal = if active_channel_archived {
+        "channel_archived".into()
+    } else if active_channel_members_only && !seated {
+        "members_only".into()
+    } else {
+        String::new()
+    };
+
+    if reads_live_tail {
+        let head = channels
+            .iter()
+            .find(|channel| channel.id == active_channel)
+            .map_or(0, |channel| channel.head_seq);
+        match channel_reads
+            .iter_mut()
+            .find(|read| read.channel == active_channel)
+        {
+            Some(read) => read.seq = read.seq.max(head),
+            None => channel_reads.push(ChannelRead {
+                channel: active_channel.clone(),
+                seq: head,
+            }),
+        }
+    }
+    let unread_marker_seq = if unread_boundary <= 0 {
+        0
+    } else {
+        messages
+            .iter()
+            .find(|message| message.seq > unread_boundary)
+            .map_or(0, |message| message.seq)
+    };
+    let rooms = chat_sidebar_rooms(
+        channels.clone(),
+        dm_peers.clone(),
+        me,
+        channel_reads.clone(),
+    );
+    let dm_rows = chat_sidebar_dms(channels.clone(), dm_peers, channel_reads.clone());
+
+    let has_older_history = messages
+        .iter()
+        .find(|message| !message.pending)
+        .is_some_and(|message| message.seq > 1);
+    let selection = message_selection_after_window_ref(
+        &messages,
+        selected_message_seq,
+        selected_message_rev,
+        message_action,
+        message_edit_draft,
+    );
+    let thread_selection = message_selection_after_window_ref(
+        &thread_messages,
+        thread_selected_seq,
+        thread_selected_rev,
+        thread_message_action,
+        thread_edit_draft,
+    );
+    ChatLiveFold {
+        messages_changed,
+        thread_messages_changed,
+        has_older_history,
+        selected_message_seq: selection.seq,
+        selected_message_rev: selection.rev,
+        message_action: selection.action,
+        message_edit_draft: selection.draft,
+        thread_selected_seq: thread_selection.seq,
+        thread_selected_rev: thread_selection.rev,
+        thread_message_action: thread_selection.action,
+        thread_edit_draft: thread_selection.draft,
+        channels,
+        messages,
+        thread_messages,
+        channel_members,
+        channel_reads,
+        rooms,
+        dm_rows,
+        unread_marker_seq,
+        active_channel_name,
+        active_channel_archived,
+        active_channel_members_only,
+        post_refusal,
+        forge_discussion,
+        refresh_chat,
+    }
 }
 
 /// Fold one applied op into a live update. A decode failure (payload or
@@ -232,34 +836,39 @@ pub(crate) async fn folded_update(
                 current_user.as_deref(),
                 op.height,
             );
-            let mut delta = match folded {
+            let delta = match folded {
                 Ok(Some(delta)) => delta,
                 Ok(None) => return None,
                 Err(_) => return Some(live_resync("chat", height)),
             };
             // huddle membership is roster-derived — reload the one channel
             // row from its canonical record instead of guessing the count.
-            if delta.kind == "channel-refresh" {
-                match load_channel_row(rpc, &delta.channel_id).await {
-                    Ok(channel) => {
-                        delta.kind = "channel-updated".into();
-                        delta.channel = channel;
+            let delta = match delta {
+                ChatDelta::ChannelRefresh { channel_id } => {
+                    let channel = match load_channel_row(rpc, &channel_id).await {
+                        Ok(channel) => channel,
+                        Err(_) => return Some(live_resync("chat", height)),
+                    };
+                    ChatDelta::ChannelUpdated {
+                        channel_id,
+                        channel,
                     }
-                    Err(_) => return Some(live_resync("chat", height)),
                 }
-            }
+                ready => ready,
+            };
             Some(LiveUpdate {
-                kind: "chat".into(),
+                kind: crate::LiveKind::Chat,
                 status: format!("Live · block {height}"),
                 height,
                 module: "chat".into(),
                 load_chat: false,
                 load_pages: false,
                 debounce: false,
-                chat: delta,
+                chat: vec![delta],
                 pages: PagesDelta::default(),
                 bell: BellDelta::default(),
                 forge: ForgeRefresh::default(),
+                permit: LivePermit::default(),
             })
         }
         "inbox" => {
@@ -276,17 +885,18 @@ pub(crate) async fn folded_update(
             );
             match folded {
                 Ok(Some(bell)) => Some(LiveUpdate {
-                    kind: "bell".into(),
+                    kind: crate::LiveKind::Bell,
                     status: format!("Live · block {height}"),
                     height,
                     module: "inbox".into(),
                     load_chat: false,
                     load_pages: false,
                     debounce: false,
-                    chat: ChatDelta::default(),
+                    chat: Vec::new(),
                     pages: PagesDelta::default(),
                     bell,
                     forge: ForgeRefresh::default(),
+                    permit: LivePermit::default(),
                 }),
                 Ok(None) => None,
                 Err(_) => None,
@@ -296,7 +906,7 @@ pub(crate) async fn folded_update(
             Ok(delta) => {
                 let folded = delta.kind == "text";
                 Some(LiveUpdate {
-                    kind: "pages".into(),
+                    kind: crate::LiveKind::Pages,
                     status: format!("Live · block {height}"),
                     height,
                     module: "pages".into(),
@@ -312,17 +922,18 @@ pub(crate) async fn folded_update(
                     load_pages: !folded,
                     // nothing to coalesce when nothing is fetched.
                     debounce: !folded,
-                    chat: ChatDelta::default(),
+                    chat: Vec::new(),
                     pages: delta,
                     bell: BellDelta::default(),
                     forge: ForgeRefresh::default(),
+                    permit: LivePermit::default(),
                 })
             }
             Err(_) => Some(live_resync("pages", height)),
         },
         "forge" => match forge::client::refresh_from_op(&payload) {
             Ok(refresh) => Some(LiveUpdate {
-                kind: "forge".into(),
+                kind: crate::LiveKind::Forge,
                 status: format!("Live · block {height}"),
                 height,
                 module: "forge".into(),
@@ -331,10 +942,11 @@ pub(crate) async fn folded_update(
                 // pushes arrive in bursts (one op per ref batch, then the
                 // tracker follow-ups) — coalesce the reloads like pages does.
                 debounce: true,
-                chat: ChatDelta::default(),
+                chat: Vec::new(),
                 pages: PagesDelta::default(),
                 bell: BellDelta::default(),
                 forge: refresh,
+                permit: LivePermit::default(),
             }),
             Err(_) => Some(live_resync("forge", height)),
         },
@@ -405,6 +1017,7 @@ pub struct LiveRefresh {
     pub chat_loaded: bool,
     pub channels: Vec<ChatChannel>,
     pub messages: Vec<ChatMessage>,
+    pub has_older_history: bool,
     pub active_channel: String,
     pub active_channel_name: String,
     pub active_channel_archived: bool,
@@ -450,6 +1063,7 @@ pub async fn live_resync_load(
             chat_loaded: false,
             channels: Vec::new(),
             messages: Vec::new(),
+            has_older_history: false,
             active_channel: String::new(),
             active_channel_name: String::new(),
             active_channel_archived: false,
@@ -503,6 +1117,7 @@ pub async fn live_resync_load(
             refresh.chat_loaded = true;
             refresh.channels = chat.channels;
             refresh.messages = chat.messages;
+            refresh.has_older_history = chat.has_older_history;
             refresh.active_channel = chat.active_channel;
             refresh.active_channel_name = chat.active_channel_name;
             refresh.active_channel_archived = chat.active_channel_archived;
@@ -535,8 +1150,8 @@ pub async fn live_resync_load(
 /// payload's field inside one (`handlers/overlays.ice` records the same
 /// limitation) — which is why `forge_live_hit` is one too. Taking the wanted
 /// module as an argument keeps it to a single predicate for every plane.
-pub fn plane_live_hit(kind: String, module: String, want: String) -> bool {
-    kind == "plane" && module == want
+pub fn plane_live_hit(kind: crate::LiveKind, module: String, want: String) -> bool {
+    kind == crate::LiveKind::Plane && module == want
 }
 
 /// Did this live update touch the AGENTS projection — from either module?
@@ -550,8 +1165,8 @@ pub fn plane_live_hit(kind: String, module: String, want: String) -> bool {
 ///
 /// Named rather than spelled inline for the same reason [`plane_live_hit`] is:
 /// the Ice checker cannot type a subscription payload's field inside a `let`.
-pub fn agents_plane_hit(kind: String, module: String) -> bool {
-    kind == "plane" && (module == "agent" || module == "runs")
+pub fn agents_plane_hit(kind: crate::LiveKind, module: String) -> bool {
+    kind == crate::LiveKind::Plane && (module == "agent" || module == "runs")
 }
 
 /// The planes discriminant for [`live_resync_load`].
@@ -600,9 +1215,9 @@ fn committed_seq_span(rows: &[ChatMessage]) -> Option<(i64, i64)> {
 
 /// FOLD THE RESYNC'S PAGE ONTO THE WINDOW ON SCREEN — do not replace it.
 ///
-/// [`load_chat_data`] answers with the LATEST page (the last
-/// `CHAT_TIMELINE_ROOT_QUOTA` roots) no matter how far back the reader has
-/// paged, so assigning it back threw away every "Load older" page she had
+/// [`load_chat_data`] answers with the latest root-index page no matter how
+/// far back the reader has paged, so assigning it back threw away every
+/// "Load older" page she had
 /// loaded — and, the scrollable staying mounted at `anchor-y=end`, clamped her
 /// offset onto the top of the suddenly-short window. The trigger is ordinary: a
 /// huddle join/leave in the room on screen, a websocket reconnect, a chat op the
@@ -618,20 +1233,19 @@ fn committed_seq_span(rows: &[ChatMessage]) -> Option<(i64, i64)> {
 /// Merging two windows that do not overlap leaves a HOLE in the middle that
 /// nothing can ever page in: "Load older" walks back from `oldest_message_seq`,
 /// which is now the far-back end, so it steps past the gap forever
-/// (`handlers/chat.ice` states the same hazard for the search window). Two
-/// landings are non-contiguous — a `history_view` window, which is a snapshot
-/// around one old hit; and a tail the client fell too far behind to still
-/// reach, which is what `ModuleEvent::Lagged` means: the missed ops are never
-/// replayed, so the canonical page can start past the newest row on screen. One
+/// (`handlers/chat.ice` states the same hazard for the search window). This is
+/// what `ModuleEvent::Lagged` can produce: the missed ops are never replayed,
+/// so the canonical page can start past the newest row on screen. One
 /// overlapping `seq` is the whole test — thread replies leave gaps in the root
-/// sequence, so "the pages abut" is not `+1`.
+/// sequence, so "the pages abut" is not `+1`. A paged window that still
+/// overlaps the canonical tail remains continuous and keeps the rows the
+/// reader loaded.
 pub fn resynced_messages(
     loaded: bool,
     next: Vec<ChatMessage>,
     current: Vec<ChatMessage>,
     current_channel: String,
     next_channel: String,
-    history_view: bool,
 ) -> Vec<ChatMessage> {
     // the plane-only resync, which is most of them: no chat came back, so the
     // window on screen IS the answer and the merge below is never paid for.
@@ -642,13 +1256,13 @@ pub fn resynced_messages(
         (Some((oldest_canonical, _)), Some((_, newest_held))) => oldest_canonical <= newest_held,
         _ => false,
     };
-    let splice_is_continuous = !history_view && pages_overlap;
+    let splice_is_continuous = pages_overlap;
     if !splice_is_continuous {
         return merge_pending_messages(next, current, current_channel, next_channel);
     }
     let mut merged = merge_message_send_result(next, current, current_channel, next_channel);
     mark_message_groups(&mut merged);
-    merged
+    bounded_chat_window(merged)
 }
 
 pub fn keep_members(
@@ -665,16 +1279,6 @@ pub fn keep_members(
 /// the same guard `huddle_channel` itself carries.
 pub fn keep_roster(joined: bool, next: Vec<HuddleParticipant>) -> Vec<HuddleParticipant> {
     if joined { next } else { Vec::new() }
-}
-
-/// A huddle roster changed on the channel ON SCREEN. The delta path answers
-/// the sidebar dot through the refreshed channel row, but `huddle_joined` and
-/// `huddle_roster` are recomputed only by a chat reload — and the join/leave
-/// ack path carries no roster at all — so exactly this delta must trigger
-/// one. Without it the LIVE pill appeared only after a manual channel
-/// re-pick (or a restart), which read as "huddle does nothing".
-pub fn huddle_refresh_hits(delta: ChatDelta, active_channel: String) -> bool {
-    delta.kind == "channel-updated" && delta.channel_id == active_channel
 }
 
 /// [`keep_roster`]'s loaded-gated half: a resync that did NOT load chat must
@@ -891,9 +1495,8 @@ pub fn keep_i64(loaded: bool, next: i64, current: i64) -> i64 {
     if loaded { next } else { current }
 }
 
-/// The channel the reader just clicked, loaded against the channel list she is
-/// already looking at — see [`load_channel_window_data`] for why the list is
-/// passed in rather than re-paged.
+/// The channel the reader just clicked, without cloning or re-paging the
+/// channel list. Its timeline is one root-index page; no head hint is needed.
 ///
 /// A GENERATION, NOT AN `AppError` — the same reason [`connect`] fails with
 /// one. Nothing serializes these any more (`choose_channel` takes every click
@@ -904,14 +1507,12 @@ pub fn keep_i64(loaded: bool, next: i64, current: i64) -> i64 {
 /// and a room switch has nothing to commit.
 pub async fn load_channel_window(
     rpc: String,
-    channels: Vec<ChatChannel>,
     channel_id: String,
     generation: i64,
 ) -> Result<ChatData, HydrationError> {
     async {
         let rpc = rpc_client(&rpc)?;
-        let mut chat =
-            load_channel_window_data(&rpc, channels, &channel_id, MessageWindow::Tail).await?;
+        let mut chat = load_channel_window_data(&rpc, &channel_id, MessageWindow::Tail).await?;
         chat.generation = generation;
         Ok(chat)
     }
@@ -939,7 +1540,6 @@ async fn load_hit_reply(
 /// Same generation-carrying failure as [`load_channel_window`], same reason.
 pub async fn load_chat_hit(
     rpc: String,
-    channels: Vec<ChatChannel>,
     channel_id: String,
     root_seq: i64,
     target_seq: i64,
@@ -956,7 +1556,7 @@ pub async fn load_chat_hit(
         // window and the reply are independent of the channel's row and its
         // member roll, so the whole thing is one round trip now.
         let (mut chat, reply) = tokio::try_join!(
-            load_channel_window_data(&rpc, channels, &channel_id, MessageWindow::Around(root_seq)),
+            load_channel_window_data(&rpc, &channel_id, MessageWindow::Around(root_seq)),
             load_hit_reply(&rpc, &channel_id, root_seq, target_seq)
         )?;
         let root = chat
@@ -979,7 +1579,6 @@ pub async fn load_chat_hit(
         chat.active_thread_seq = root.seq;
         chat.thread_target_seq = number_i64(target_seq);
         chat.thread_messages = vec![root, chat_message(reply, current_user.as_deref())];
-        chat.thread_next_reply_offset = -1;
         Ok(chat)
     }
     .await
@@ -1022,13 +1621,13 @@ fn landed_on_channel(
     data.huddle_roster = Vec::new();
     data.channel_members = members;
     data.messages = Vec::new();
+    data.has_older_history = false;
     data.selected_message_seq = 0;
     data.selected_message_rev = 0;
     data.selected_message_body = String::new();
     data.active_thread_seq = 0;
     data.thread_target_seq = 0;
     data.thread_messages = Vec::new();
-    data.thread_next_reply_offset = 0;
     data.thread_has_more = false;
     data
 }

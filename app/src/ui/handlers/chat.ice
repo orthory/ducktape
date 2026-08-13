@@ -38,17 +38,14 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   invalidate lane=history
   invalidate lane=thread
   invalidate lane=live_thread
-  // PARK THE ROOM SHE IS LEAVING, exactly as the two pickers do — the way back
-  // OUT of a search hit is a click on that room, and without this it is the one
-  // navigation in the pane that still pays a full round trip.
-  message_cache = cache_channel_window(message_cache, active_channel, messages, channel_members, history_view)
-  // AND PARK HER UNSENT WORDS WITH IT — see `message_drafts`. Both composers:
-  // the rail belongs to this room too, and the reset below closes it.
+  // PARK HER UNSENT WORDS before the room identity moves. Both composers belong
+  // to the room/thread being left; message windows are deliberately not kept.
   message_drafts = park_message_draft(message_drafts, active_channel, trim(editor_text(message_editor)))
   reply_drafts = park_reply_draft(reply_drafts, active_channel, active_thread_seq, trim(editor_text(reply_editor)))
   // FREEZE THE DIVIDER WHILE `active_channel` STILL NAMES THE ROOM SHE LEAVES —
   // same reason as `choose_channel`.
-  unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, channel_id, unread_boundary)
+  let next_channel = channel_switch_facts(channel_reads, channels, active_channel, channel_id, unread_boundary, active_channel_name)
+  unread_boundary = next_channel.unread_boundary
   // THE HIT LANDS ON THE CLICK. Every one of these used to move only in
   // `chat_hit_loaded`, so a hit that lives in another room left that room's
   // header, its sidebar highlight and its rows on screen for the whole walk —
@@ -57,13 +54,11 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   active_channel = channel_id
   active_dm_peer = dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
-  active_channel_name = channel_display_name(channels, active_channel, active_channel_name)
-  active_channel_archived = channel_is_archived(channels, active_channel)
-  active_channel_members_only = channel_is_members_only(channels, active_channel)
-  // A HIT IS A HISTORY WINDOW, so the park is NOT restored here: those rows are
-  // a live tail and these are a page around one old message. An empty timeline
-  // under the skeleton is the honest state, and `history_view` says up front
-  // which kind of window is coming.
+  active_channel_name = next_channel.name
+  active_channel_archived = next_channel.archived
+  active_channel_members_only = next_channel.members_only
+  // A HIT IS A HISTORY WINDOW: an empty timeline under the skeleton is the
+  // honest state until the page around that old message arrives.
   //
   // A HIT THAT FAILS LEAVES IT RAISED, and that is the honest reading too: the
   // amber "Viewing history" banner is gated on `!empty(messages)`
@@ -73,8 +68,10 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   // by the next `choose_channel`/`choose_dm` or by any chat-carrying resync.
   history_view = true
   messages = []
+  messages_revision = messages_revision + 1
   channel_members = []
-  post_refusal = ""
+  let post_gate_known = !active_channel_members_only
+  post_refusal = keep_str(post_gate_known, post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key), "")
   has_older_history = false
   unread_marker_seq = 0
   palette_open = false
@@ -85,8 +82,6 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   // lands in a DIFFERENT channel via `chat_hit_loaded`, so the page still in
   // flight belongs to the room she jumped out of.
   history_loading = false
-  // AND THE WINDOW IT LANDS IN IS STILL OUT — see `chat_window_loading`.
-  chat_window_loading = true
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   loading = true
@@ -101,7 +96,8 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
-  thread_next_reply_offset = 0
+  thread_messages_revision = thread_messages_revision + 1
+  thread_next_reply_seq = 0
   thread_has_more = false
   thread_generation = thread_generation + 1
   invalidate lane=live_thread
@@ -117,7 +113,7 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   chat_generation = chat_generation + 1
   // Reads the room back from state, like `choose_dm` does: `active_channel =
   // channel_id` above already moved the payload.
-  run replace lane=chat_load load_chat_hit(connected_rpc, channels, active_channel, root_seq, target_seq, chat_generation) -> chat_hit_loaded _ | chat_load_failed _
+  run replace lane=chat_load load_chat_hit(connected_rpc, active_channel, root_seq, target_seq, chat_generation) -> chat_hit_loaded _ | chat_load_failed _
 
 // THE LAST CLICK WINS. This used to open `return if loading`, and `loading` is
 // true for the entire switch it starts — so the second click of a fast A→B→C
@@ -136,10 +132,8 @@ on choose_channel(id)
   invalidate lane=history
   invalidate lane=thread
   invalidate lane=live_thread
-  // PARK THE ROOM SHE IS LEAVING, while `active_channel` still names it.
-  message_cache = cache_channel_window(message_cache, active_channel, messages, channel_members, history_view)
-  // AND PARK HER UNSENT WORDS WITH IT — see `message_drafts`. Both composers:
-  // the rail belongs to this room too, and the reset below closes it.
+  // PARK HER UNSENT WORDS while `active_channel` still names the room being
+  // left. Message windows are deliberately not retained across navigation.
   message_drafts = park_message_draft(message_drafts, active_channel, trim(editor_text(message_editor)))
   reply_drafts = park_reply_draft(reply_drafts, active_channel, active_thread_seq, trim(editor_text(reply_editor)))
   active_dm_peer = ""
@@ -150,51 +144,31 @@ on choose_channel(id)
   // FREEZE THE DIVIDER HERE, while the previous room is still `active_channel`
   // — the optimistic assignment below makes current == next by the time
   // `chat_updated` runs its own freeze, which then correctly keeps this value.
-  unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, id, unread_boundary)
-  // The switch is visible NOW: the clicked room takes the header and the
-  // sidebar highlight, and — when it is one of the rooms the cache remembers —
-  // its rows too, in this frame, with `loading` false. The refetch replays over
-  // them through `merge_pending_messages` exactly as a live delta would.
+  let next_channel = channel_switch_facts(channel_reads, channels, active_channel, id, unread_boundary, active_channel_name)
+  unread_boundary = next_channel.unread_boundary
+  // The switch is visible NOW: the clicked room takes the header and sidebar
+  // highlight, then paints an empty loading state until its root window lands.
   active_channel = id
-  active_channel_name = channel_display_name(channels, active_channel, active_channel_name)
+  active_channel_name = next_channel.name
   // BOTH GATE FACTS RIDE THE CLICK. `post_refusal` is recomputed here, and
   // computing it from the room she LEFT is how a public channel came up
   // refusing her post for a whole round trip.
-  active_channel_archived = channel_is_archived(channels, active_channel)
-  active_channel_members_only = channel_is_members_only(channels, active_channel)
-  // ONE WALK OF THE CACHE, NOT TWO. Both answers ride the same parked window
-  // and the ABI charges by the argument — see `cached_window`.
-  let parked = cached_window(message_cache, active_channel)
-  messages = parked.messages
-  channel_members = parked.members
-  // A SEAT IS EITHER KNOWN OR NOT CLAIMED. The roll is [] on a cache miss, and
-  // `post_gate` reads an empty roll as "not seated" — which would refuse the
-  // composer of a members-only room she IS in, for a whole round trip. Archived
-  // and open rooms need no roll to answer, so only the members-only miss is
-  // unknown, and the honest answer there is nothing: a miss leaves `messages`
-  // empty, so `loading` below is true and holds the composer anyway.
-  let seat_known = !active_channel_members_only || !empty(channel_members)
-  post_refusal = keep_str(seat_known, post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key), "")
-  has_older_history = history_has_older(messages)
+  active_channel_archived = next_channel.archived
+  active_channel_members_only = next_channel.members_only
+  messages = []
+  messages_revision = messages_revision + 1
+  channel_members = []
+  let post_gate_known = !active_channel_members_only
+  post_refusal = keep_str(post_gate_known, post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key), "")
+  has_older_history = false
   // THE FLAG BELONGS TO THE REQUEST, AND THE REQUEST BELONGS TO THE ROOM YOU
   // LEFT. Invalidating `history` above ends both before the new room paints.
   history_loading = false
-  // AND THE ROWS ON SCREEN ARE PROVISIONAL UNTIL THE WALK ANSWERS. A cache hit
-  // paints the PREVIOUS window with `loading` false below, and the reply
-  // replaces it wholesale — so the two history routes read this rather than
-  // `loading`, or a page requested against a seq the fresh window no longer
-  // starts at prepends a gap into the middle of the timeline. Only those two
-  // routes read it: the switch handlers stay unswallowed.
-  chat_window_loading = true
-  unread_marker_seq = first_unread_seq(messages, unread_boundary)
+  unread_marker_seq = 0
   chat_search_phase = SearchPhase.idle
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  // A CACHE HIT IS NOT LOADING. The plate is `loading && empty(messages)`, so
-  // painting parked rows already retires it — but `loading` also disables both
-  // composers, and a room that repaints instantly with a dead message box is
-  // the same "did my click land?" question one step later.
-  loading = empty(messages)
+  loading = true
   chat_search_hits = []
   selected_message_seq = 0
   selected_message_rev = 0
@@ -206,7 +180,8 @@ on choose_channel(id)
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
-  thread_next_reply_offset = 0
+  thread_messages_revision = thread_messages_revision + 1
+  thread_next_reply_seq = 0
   thread_has_more = false
   thread_generation = thread_generation + 1
   invalidate lane=live_thread
@@ -224,19 +199,9 @@ on choose_channel(id)
   // first row, for a list this handler is reading two statements above and the
   // live fold keeps current.
   //
-  // AND THE TAIL IS ASSERTED, NOT INHERITED. The reset used to be a side effect
-  // of the stream UNMOUNTING while `messages` was empty — and a cache hit never
-  // empties it, so the `if` around the stack stays true across the whole
-  // switch, iced diffs the surviving `scrollable::State` into the room being
-  // entered, and it opens at the offset the last room was left at, often
-  // clamped to the top of the cached window with the newest rows off screen.
-  // Absolute 0.0 is the TAIL under `anchor-y=end` (a relative `snap-end` would
-  // be the TOP of scrollback), and it is a no-op on the miss, where the stream
-  // really does remount at 0. Composed because a `run` and a widget operation
-  // each want to be the handler's last statement.
-  parallel
-    run replace lane=chat_load load_channel_window(connected_rpc, channels, active_channel, chat_generation) -> chat_updated _ | chat_load_failed _
-    task widget scroll-to #workspace-tabs/content/chat/message-stream 0.0 0.0
+  // One root-window read is the whole switch. Emptying `messages` above also
+  // unmounts the old scroll state, so the arriving room starts at its tail.
+  run replace lane=chat_load load_channel_window(connected_rpc, active_channel, chat_generation) -> chat_updated _ | chat_load_failed _
 
 // A DM is not a second message plane: it is the two-party members-only channel
 // at `dm_channel_id(me, peer)`, resolved or created on the way in. Everything
@@ -249,11 +214,8 @@ on choose_dm(peer_key)
   invalidate lane=thread
   invalidate lane=live_thread
   invalidate lane=chat_load
-  // The room she is leaving is parked here too — she may come back to it from
-  // the DM.
-  message_cache = cache_channel_window(message_cache, active_channel, messages, channel_members, history_view)
-  // AND PARK HER UNSENT WORDS WITH IT — see `message_drafts`. Both composers:
-  // the rail belongs to this room too, and the reset below closes it.
+  // PARK HER UNSENT WORDS before moving to the DM. Message windows are not
+  // retained; every room paints the same bounded, authoritative root window.
   message_drafts = park_message_draft(message_drafts, active_channel, trim(editor_text(message_editor)))
   reply_drafts = park_reply_draft(reply_drafts, active_channel, active_thread_seq, trim(editor_text(reply_editor)))
   active_dm_peer = peer_key
@@ -268,8 +230,8 @@ on choose_dm(peer_key)
   // WITH NO USER KEY BOUND, `dm_room` IS A PHANTOM — `dm_channel_id` hashes ""
   // against the peer and answers an id no channel in the list carries, while
   // the node resolves the real one from its OWN key. That degrades to exactly
-  // the behaviour this line replaced and no further: the cache misses, the
-  // header keeps its previous name (`channel_display_name` falls back to
+  // the behaviour this line replaced and no further: the indexed room lookup
+  // is still out, the header keeps its previous name (`channel_switch_facts` falls back to
   // `current`), no sidebar row highlights, and `chat_updated` lands the real
   // room a round trip later. The DM header still draws, because it reads
   // `active_dm_peer`, which is the payload.
@@ -278,32 +240,24 @@ on choose_dm(peer_key)
   // FREEZE THE DIVIDER WHILE `active_channel` STILL NAMES THE ROOM SHE LEAVES,
   // for the reason `choose_channel` gives: after the assignment below current
   // == next, and `chat_updated`'s own freeze then correctly keeps this value.
-  unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, dm_room, unread_boundary)
+  let next_channel = channel_switch_facts(channel_reads, channels, active_channel, dm_room, unread_boundary, active_channel_name)
+  unread_boundary = next_channel.unread_boundary
   active_channel = dm_room
-  active_channel_name = channel_display_name(channels, active_channel, active_channel_name)
-  active_channel_archived = channel_is_archived(channels, active_channel)
-  active_channel_members_only = channel_is_members_only(channels, active_channel)
-  // AND THE DM COMES OFF THE PARK LIKE ANY OTHER ROOM. It is an ordinary
-  // channel in `message_cache` once its id is known here, so a DM re-opened a
-  // minute later paints in one frame instead of paying the full list walk to
-  // become readable.
-  let parked = cached_window(message_cache, active_channel)
-  messages = parked.messages
-  channel_members = parked.members
-  // Same seat reading as `choose_channel`, and the same reason.
-  let seat_known = !active_channel_members_only || !empty(channel_members)
-  post_refusal = keep_str(seat_known, post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key), "")
-  has_older_history = history_has_older(messages)
-  unread_marker_seq = first_unread_seq(messages, unread_boundary)
+  active_channel_name = next_channel.name
+  active_channel_archived = next_channel.archived
+  active_channel_members_only = next_channel.members_only
+  messages = []
+  messages_revision = messages_revision + 1
+  channel_members = []
+  post_refusal = ""
+  has_older_history = false
+  unread_marker_seq = 0
   // Same lane cancellation as `choose_channel`.
   history_loading = false
-  // Same window still out — see `chat_window_loading`.
-  chat_window_loading = true
   chat_search_phase = SearchPhase.idle
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  // A CACHE HIT IS NOT LOADING — see `choose_channel`.
-  loading = empty(messages)
+  loading = true
   chat_search_hits = []
   selected_message_seq = 0
   selected_message_rev = 0
@@ -315,7 +269,8 @@ on choose_dm(peer_key)
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
-  thread_next_reply_offset = 0
+  thread_messages_revision = thread_messages_revision + 1
+  thread_next_reply_seq = 0
   thread_has_more = false
   thread_generation = thread_generation + 1
   invalidate lane=live_thread
@@ -336,11 +291,7 @@ on choose_dm(peer_key)
   // `open_dm`'s own "it already exists" early return would then treat as
   // finished forever. `chat_generation` drops the superseded REPLY instead.
   chat_generation = chat_generation + 1
-  // Same asserted tail as `choose_channel`, and now for the same reason: a DM
-  // that comes off the park keeps the stream mounted across the switch.
-  parallel
-    run every open_dm(connected_rpc, password, active_dm_peer, chat_generation) -> chat_updated _ | chat_load_failed _
-    task widget scroll-to #workspace-tabs/content/chat/message-stream 0.0 0.0
+  run every open_dm(connected_rpc, password, active_dm_peer, chat_generation) -> chat_updated _ | chat_load_failed _
 
 on create_channel_submit
   return if loading || mutation_phase != MutationPhase.idle || empty(trim(channel_draft))
@@ -352,11 +303,6 @@ on create_channel_submit
   // abandoned here. `mutation_phase` masks the dead button only until the
   // create settles.
   history_loading = false
-  // AND THE SWITCH IT ABANDONS TOO. The bump above discards the reply of any
-  // window load still out, so nothing will ever lower this term for it, and
-  // "Load older" would stay refused in the new room for the rest of the
-  // session. `mutation_phase` guards the window this create replaces.
-  chat_window_loading = false
   pending_channel = trim(channel_draft)
   channel_draft = ""
   error = ""
@@ -516,6 +462,13 @@ on chat_composer_event(event)
   // reader's previous message instead of drawing a header that vanishes the
   // moment the settle delta replaces it.
   messages = mark_author_runs(optimistic_message(messages, pending_message, pending_message_id))
+  messages_revision = messages_revision + 1
+  let selection = message_selection_after_window(messages, selected_message_seq, selected_message_rev, message_action, message_edit_draft)
+  selected_message_seq = selection.seq
+  selected_message_rev = selection.rev
+  message_action = selection.action
+  message_edit_draft = selection.draft
+  has_older_history = history_has_older(messages)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   error = ""
   run every send_message(connected_rpc, password, active_channel, pending_message_id, pending_message, channel_members) -> message_sent _ | message_send_failed _
@@ -542,6 +495,7 @@ on message_send_failed(cause)
   failed_message_draft = remember_failed_draft(failed_message_draft, keep_str(active_channel == cause.scope_id, trim(editor_text(message_editor)), "another room"), cause.body, cause.committed)
   return if active_channel != cause.scope_id
   messages = rollback_pending_message(messages, cause.operation_id, cause.committed)
+  messages_revision = messages_revision + 1
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   message_draft = restore_draft(trim(editor_text(message_editor)), cause.body, cause.committed)
   message_editor = editor(message_draft)
@@ -564,8 +518,9 @@ on chat_updated(next)
   // a peer's post in a third room and the badge it lit, a channel created,
   // renamed or archived — and nothing re-pages the list to heal it.
   channels = upsert_channel_rows(channels, next.channels)
-  messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel)
-  has_older_history = history_has_older(messages)
+  messages = merge_landing_messages(next.messages, messages, active_channel, next.active_channel)
+  messages_revision = messages_revision + 1
+  has_older_history = next.has_older_history || history_has_older(messages)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(channels, next.active_channel))
@@ -604,17 +559,13 @@ on chat_updated(next)
   reply_editor = editor(parked_reply_draft(reply_drafts, active_channel, active_thread_seq))
   thread_target_seq = next.thread_target_seq
   thread_messages = next.thread_messages
-  thread_next_reply_offset = next.thread_next_reply_offset
+  thread_messages_revision = thread_messages_revision + 1
+  thread_next_reply_seq = 0
   thread_has_more = next.thread_has_more
   thread_generation = thread_generation + 1
   invalidate lane=live_thread
   thread_loading = false
   loading = false
-  // THE WINDOW ON SCREEN IS THE ANSWER NOW, so history may page against its
-  // seqs again. Below the generation guard on purpose: a superseded reply must
-  // not open the routes against rows the winning load is still about to
-  // replace.
-  chat_window_loading = false
   error = ""
   // The huddle ended under this fold (or the roster she is on is another
   // channel's): the window mirrors the old popped-card gate, which also
@@ -632,8 +583,9 @@ on chat_hit_loaded(next)
   history_view = true
   // Same fold as `chat_updated`, same loader, same reason.
   channels = upsert_channel_rows(channels, next.channels)
-  messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel)
-  has_older_history = history_has_older(messages)
+  messages = merge_landing_messages(next.messages, messages, active_channel, next.active_channel)
+  messages_revision = messages_revision + 1
+  has_older_history = next.has_older_history || history_has_older(messages)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   // AND NO READ MARK, which is the one line this handler must NOT copy from
@@ -681,17 +633,13 @@ on chat_hit_loaded(next)
   reply_editor = editor(parked_reply_draft(reply_drafts, active_channel, active_thread_seq))
   thread_target_seq = next.thread_target_seq
   thread_messages = next.thread_messages
-  thread_next_reply_offset = next.thread_next_reply_offset
+  thread_messages_revision = thread_messages_revision + 1
+  thread_next_reply_seq = 0
   thread_has_more = next.thread_has_more
   thread_generation = thread_generation + 1
   invalidate lane=live_thread
   thread_loading = false
   loading = false
-  // THE WINDOW ON SCREEN IS THE ANSWER NOW, so history may page against its
-  // seqs again. Below the generation guard on purpose: a superseded reply must
-  // not open the routes against rows the winning load is still about to
-  // replace.
-  chat_window_loading = false
   error = ""
   // Same close-if-ended mirror as `chat_updated` above.
   task window close target=window_target_unless(huddle_joined, huddle_win)
@@ -708,10 +656,6 @@ on chat_load_failed(cause)
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   loading = false
-  // Nothing is coming to replace the rows on screen, so they are as canonical
-  // as they will get and history may page against them — same release as
-  // `chat_updated`, under the same generation guard.
-  chat_window_loading = false
   error = cause.message
 
 on channel_created(next)
@@ -722,18 +666,19 @@ on channel_created(next)
   channel_create_open = false
   channel_create_members_only = false
   mutation_phase = MutationPhase.idle
-  // Superseded by a later switch — see `chat_updated`. The channel is still
-  // created; it arrives in the list on the next fold.
+  // Superseded by a later switch — see `chat_updated`. The mutation still
+  // committed; the live stream owns whatever room the reader chose instead.
   return if next.generation != chat_generation
   // A brand-new channel's latest page IS the whole channel — see
   // `chat_hit_loaded`.
   history_view = false
-  channels = next.channels
-  messages = merge_pending_messages(next.messages, messages, active_channel, next.active_channel)
-  has_older_history = history_has_older(messages)
-  unread_boundary = frozen_unread_boundary(channel_reads, next.channels, active_channel, next.active_channel, unread_boundary)
+  channels = upsert_channel_rows(channels, next.channels)
+  messages = merge_landing_messages(next.messages, messages, active_channel, next.active_channel)
+  messages_revision = messages_revision + 1
+  has_older_history = next.has_older_history || history_has_older(messages)
+  unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
-  channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(next.channels, next.active_channel))
+  channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(channels, next.active_channel))
   rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   // A CREATE IS A ROOM SWITCH, so both composers park here like they do in the
@@ -778,7 +723,8 @@ on channel_created(next)
   reply_editor = editor(parked_reply_draft(reply_drafts, active_channel, active_thread_seq))
   thread_target_seq = next.thread_target_seq
   thread_messages = next.thread_messages
-  thread_next_reply_offset = next.thread_next_reply_offset
+  thread_messages_revision = thread_messages_revision + 1
+  thread_next_reply_seq = 0
   thread_has_more = next.thread_has_more
   thread_generation = thread_generation + 1
   invalidate lane=live_thread
@@ -965,7 +911,8 @@ on open_thread_for(seq)
   // vec wholesale, and a load that FAILS now leaves the root standing instead
   // of a pane that stays blank until Close.
   thread_messages = thread_root_seed(messages, thread_messages, seq)
-  thread_next_reply_offset = 0
+  thread_messages_revision = thread_messages_revision + 1
+  thread_next_reply_seq = 0
   thread_has_more = false
   // A HALF-TYPED REPLY IS NOT THE PRICE OF LOOKING AT ANOTHER THREAD. This
   // handler is what every "N replies" row in the timeline beside the rail
@@ -982,7 +929,7 @@ on open_thread_for(seq)
   // steers the first Cmd+B into an empty box.
   composer_focus = ComposerFocus.unfocused
   error = ""
-  run replace lane=thread load_thread(connected_rpc, active_channel, seq, 0, 0, thread_generation) -> thread_loaded _ | thread_failed _
+  run replace lane=thread load_thread(connected_rpc, active_channel, seq, 0, thread_generation) -> thread_loaded _ | thread_failed _
 
 on clear_message_selection
   selected_message_seq = 0
@@ -994,24 +941,36 @@ on thread_loaded(next)
   return if next.generation != thread_generation || !thread_loading
   active_thread_seq = next.root_seq
   thread_target_seq = next.target_seq
-  thread_messages = next.messages
-  thread_next_reply_offset = next.next_reply_offset
+  thread_messages = merge_thread_refresh(next.messages, thread_messages, active_channel, active_channel)
+  thread_messages_revision = thread_messages_revision + 1
+  let selection = message_selection_after_window(thread_messages, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
+  thread_selected_seq = selection.seq
+  thread_selected_rev = selection.rev
+  thread_message_action = selection.action
+  thread_edit_draft = selection.draft
+  thread_next_reply_seq = next.next_reply_seq
   thread_has_more = next.has_more
   thread_loading = false
   error = ""
 
 on load_more_thread
-  return if thread_loading || mutation_phase != MutationPhase.idle || active_thread_seq <= 0 || thread_next_reply_offset < 0 || !thread_has_more
+  return if thread_loading || mutation_phase != MutationPhase.idle || active_thread_seq <= 0 || !thread_has_more || thread_next_reply_seq <= 0
   thread_generation = thread_generation + 1
   invalidate lane=live_thread
   thread_loading = true
   error = ""
-  run replace lane=thread load_thread_page(connected_rpc, active_channel, active_thread_seq, thread_next_reply_offset, thread_generation) -> thread_page_loaded _ | thread_page_failed _
+  run replace lane=thread load_thread_page(connected_rpc, active_channel, active_thread_seq, thread_next_reply_seq, thread_generation) -> thread_page_loaded _ | thread_page_failed _
 
 on thread_page_loaded(next)
   return if next.generation != thread_generation || !thread_loading
   thread_messages = append_thread_page(thread_messages, next.messages)
-  thread_next_reply_offset = next.next_reply_offset
+  thread_messages_revision = thread_messages_revision + 1
+  let selection = message_selection_after_window(thread_messages, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
+  thread_selected_seq = selection.seq
+  thread_selected_rev = selection.rev
+  thread_message_action = selection.action
+  thread_edit_draft = selection.draft
+  thread_next_reply_seq = next.next_reply_seq
   thread_has_more = next.has_more
   thread_loading = false
   error = ""
@@ -1033,21 +992,13 @@ on thread_page_failed(cause)
 // scroll step, and the extern takes the timeline BY VALUE. The mirror in state
 // is written by every handler that moves `messages` for exactly this reason.
 on chat_scrolled(_absolute_x, _absolute_y, _relative_x, relative_y)
-  return if !near_scroll_top(relative_y) || history_loading || loading || chat_window_loading || mutation_phase != MutationPhase.idle || empty(active_channel) || !has_older_history
+  return if !near_scroll_top(relative_y) || history_loading || loading || mutation_phase != MutationPhase.idle || empty(active_channel) || !has_older_history
   history_loading = true
   error = ""
   run replace lane=history load_older_messages(connected_rpc, active_channel, oldest_message_seq(messages)) -> history_loaded _ | history_failed _
 
-// `chat_window_loading` rides with `loading` in BOTH guards, and it is the one
-// term that survived the cache hit: `loading` is false for the whole round trip
-// of a switch back into a parked room, and the parked rows this would page from
-// are about to be replaced by the walk's own window. Paging against them
-// prepends under a window that no longer starts there — seqs vanish from the
-// MIDDLE of the timeline with no gap marker and `has_older_history` keeps
-// walking backwards past the hole. It gates the two history routes and nothing
-// else: the switch handlers themselves take every click.
 on load_more_history
-  return if history_loading || loading || chat_window_loading || mutation_phase != MutationPhase.idle || empty(active_channel) || empty(messages) || !history_has_older(messages)
+  return if history_loading || loading || mutation_phase != MutationPhase.idle || empty(active_channel) || empty(messages) || !history_has_older(messages)
   history_loading = true
   error = ""
   run replace lane=history load_older_messages(connected_rpc, active_channel, oldest_message_seq(messages)) -> history_loaded _ | history_failed _
@@ -1063,7 +1014,16 @@ on history_loaded(next)
   history_loading = false
   return if next.channel_id != active_channel
   messages = prepend_history(messages, next.messages)
-  has_older_history = history_has_older(messages)
+  messages_revision = messages_revision + 1
+  let selection = message_selection_after_window(messages, selected_message_seq, selected_message_rev, message_action, message_edit_draft)
+  selected_message_seq = selection.seq
+  selected_message_rev = selection.rev
+  message_action = selection.action
+  message_edit_draft = selection.draft
+  // Older pages shift the bounded render window. The archive is still behind
+  // the cursor; this flag keeps live-tail deltas out and exposes Jump to latest.
+  history_view = true
+  has_older_history = next.has_more || history_has_older(messages)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   error = ""
 
@@ -1087,7 +1047,8 @@ on close_thread
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
-  thread_next_reply_offset = 0
+  thread_messages_revision = thread_messages_revision + 1
+  thread_next_reply_seq = 0
   thread_has_more = false
   thread_loading = false
   thread_selected_seq = 0
@@ -1147,7 +1108,9 @@ on add_reaction_submit(emoji)
   hydration_retry_attempt = 0
   error = ""
   messages = reaction_applied(messages, selected_message_seq, emoji, true)
+  messages_revision = messages_revision + 1
   thread_messages = reaction_applied(thread_messages, selected_message_seq, emoji, true)
+  thread_messages_revision = thread_messages_revision + 1
   run every add_reaction(connected_rpc, password, active_channel, selected_message_seq, emoji) -> reaction_acked _ | reaction_failed _
 
 // One-tap reactions do NOT select the row: the tap is its own complete act,
@@ -1163,7 +1126,9 @@ on add_reaction_at(seq, emoji)
   hydration_retry_attempt = 0
   error = ""
   messages = reaction_applied(messages, seq, emoji, true)
+  messages_revision = messages_revision + 1
   thread_messages = reaction_applied(thread_messages, seq, emoji, true)
+  thread_messages_revision = thread_messages_revision + 1
   run every add_reaction(connected_rpc, password, active_channel, seq, emoji) -> reaction_acked _ | reaction_failed _
 
 on remove_reaction_at(seq, emoji)
@@ -1175,7 +1140,9 @@ on remove_reaction_at(seq, emoji)
   hydration_retry_attempt = 0
   error = ""
   messages = reaction_applied(messages, seq, emoji, false)
+  messages_revision = messages_revision + 1
   thread_messages = reaction_applied(thread_messages, seq, emoji, false)
+  thread_messages_revision = thread_messages_revision + 1
   run every remove_reaction(connected_rpc, password, active_channel, seq, emoji) -> reaction_acked _ | reaction_failed _
 
 // A reaction's ack has nothing to restore: the optimistic fold is already on
@@ -1231,7 +1198,13 @@ on reply_composer_event(event)
   let pending_reply = trim(editor_text(reply_editor))
   let pending_reply_id = fresh_operation_id("reply")
   reply_editor = editor("")
-  thread_messages = optimistic_message(thread_messages, pending_reply, pending_reply_id)
+  thread_messages = optimistic_thread_message(thread_messages, pending_reply, pending_reply_id)
+  thread_messages_revision = thread_messages_revision + 1
+  let selection = message_selection_after_window(thread_messages, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
+  thread_selected_seq = selection.seq
+  thread_selected_rev = selection.rev
+  thread_message_action = selection.action
+  thread_edit_draft = selection.draft
   error = ""
   run every send_reply(connected_rpc, password, active_channel, active_thread_seq, pending_reply_id, pending_reply, channel_members) -> thread_reply_sent _ | thread_reply_send_failed _
 
@@ -1244,10 +1217,11 @@ on thread_reply_send_failed(cause)
   return if active_channel != cause.scope_id
   return if !contains_pending_message(thread_messages, cause.operation_id)
   thread_messages = rollback_pending_message(thread_messages, cause.operation_id, cause.committed)
+  thread_messages_revision = thread_messages_revision + 1
   let restored_reply = restore_draft(trim(editor_text(reply_editor)), cause.body, cause.committed)
   reply_editor = editor(restored_reply)
   // AND IT DOES NOT MOVE THE REPLY CURSOR. A committed reply grows the loaded
-  // run by exactly one row, and `live_updated`'s `thread_offset_after_live`
+  // run by exactly one row, and the fused live fold
   // already counts it when that reply's delta lands — which it does for every
   // committed reply, this one included. Counting it here too advanced the
   // cursor past a row nobody had loaded, and the next "Load more replies"
