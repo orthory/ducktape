@@ -4279,13 +4279,7 @@ fn chat_reads_never_cross_the_dispatch_query_lane() {
 #[test]
 fn the_page_read_never_crosses_the_dispatch_query_lane() {
     const LOAD: &str = include_str!("load.rs");
-    let load_page_blocks = LOAD
-        .split("pub(crate) async fn load_page_blocks(")
-        .nth(1)
-        .expect("load_page_blocks is declared")
-        .split("\npub ")
-        .next()
-        .expect("load_page_blocks body");
+    let load_page_blocks = backend_fn(LOAD, "pub(crate) async fn load_page_blocks(");
     assert!(
         load_page_blocks.contains("PagesViewQuery::GetPage {"),
         "the page read is the index view arm"
@@ -4334,6 +4328,49 @@ fn the_page_read_never_crosses_the_dispatch_query_lane() {
         "the ONE kept dispatch read, exactly once — a second call site is a \
          lane decision, not a copy-paste"
     );
+}
+
+/// AND THE READ ITSELF WAITS. The lane pin above proves the page read left
+/// `/v1/query`; this proves read-after-write did not stay behind with it. The
+/// view lane folds BEHIND the block loop, so both pages reads open with
+/// `await_pages_fold` — the reload that ends a save, the plan the next autosave
+/// tick diffs against, the pane a live push refreshes.
+///
+/// Pinned as a source shape because deleting either call fails NOTHING else in
+/// this suite: the wait costs zero probes when nothing is outstanding, so a
+/// passing test cannot tell it apart from an absent one. It shows up on a live
+/// node instead, as a document that lost the line it just took.
+#[test]
+fn the_pages_reads_wait_for_the_fold_before_they_read() {
+    const LOAD: &str = include_str!("load.rs");
+    for (declaration, read) in [
+        ("pub(crate) async fn load_pages_data(", "load_page_index("),
+        ("pub(crate) async fn load_page_blocks(", ".view("),
+    ] {
+        let body = backend_fn(LOAD, declaration);
+        let wait = body
+            .find("await_pages_fold(rpc).await")
+            .unwrap_or_else(|| panic!("{declaration} waits for the pages fold"));
+        let read = body
+            .find(read)
+            .unwrap_or_else(|| panic!("{declaration} reads the index"));
+        assert!(wait < read, "{declaration} waits BEFORE it reads");
+    }
+}
+
+/// One function's body out of a backend module: from its declaration to the
+/// first closing brace at column zero, which in fmt'd Rust is its own. Sliced
+/// rather than scanned to the next `pub` — `pub(crate)` does not start with
+/// `pub `, so that boundary silently runs a negative assertion over the rest
+/// of the file and fails on some LATER function's read.
+fn backend_fn<'a>(source: &'a str, declaration: &str) -> &'a str {
+    source
+        .split(declaration)
+        .nth(1)
+        .unwrap_or_else(|| panic!("{declaration} is declared"))
+        .split("\n}\n")
+        .next()
+        .unwrap_or_else(|| panic!("{declaration} body"))
 }
 
 /// Every backend module's source, this test file excepted — the lane pins
