@@ -201,8 +201,8 @@ fn next_message_view_key() -> i64 {
 
 /// One rendered block of a message body. `kind` is `paragraph` | `code` |
 /// `quote` | `divider`. Plain paragraphs/quotes carry their exact text in
-/// `text` (`rich=false`); formatted ones carry word-level `spans` for a
-/// wrapping flex render (`rich=true`).
+/// `text` (`rich=false`); formatted ones carry run-level `spans` the view's
+/// single rich-text paragraph renders (`rich=true`).
 #[derive(Clone, Debug, Hash, PartialEq, Default)]
 pub struct ChatBlock {
     pub kind: String,
@@ -212,14 +212,22 @@ pub struct ChatBlock {
     pub spans: Vec<ChatSpan>,
 }
 
-/// A word-level run of a rich paragraph/quote, carrying its inline marks.
+/// One inline run of a rich paragraph/quote, pre-sorted into the style arm
+/// the paragraph's span template renders it with. EXACTLY ONE of the text
+/// fields is non-empty per span (`link` rides `link_text`): ice's rich-text
+/// `for` expands a fixed span template per item with no conditionals, so the
+/// arm choice has to be data — the view emits every arm for every run and an
+/// empty span draws no glyphs. A run landing in two fields renders twice; a
+/// run landing in none vanishes ([`span_arm`] owns the decision).
 #[derive(Clone, Debug, Hash, PartialEq, Default)]
 pub struct ChatSpan {
-    pub text: String,
-    pub bold: bool,
-    pub italic: bool,
-    pub highlight: bool,
+    pub mention: String,
+    pub link_text: String,
     pub link: String,
+    pub bold_italic: String,
+    pub bold: String,
+    pub italic: String,
+    pub plain: String,
 }
 
 // ============================================================================
@@ -1068,16 +1076,12 @@ pub fn blocks_view(blocks: &[Block]) -> Vec<ChatBlock> {
     blocks.iter().map(block_view).collect()
 }
 
-/// A single plain paragraph render block — for optimistic sends and fixtures
-/// that never carry inline marks.
+/// The optimistic row's render blocks: the SAME grammar the send commits
+/// ([`parse_message`]), so a pending row previews what will land instead of
+/// showing raw `**marks**` until the settle replaces it. Roster mentions are
+/// the one divergence — they need the channel members the send resolves.
 pub fn paragraph_blocks(text: &str) -> Vec<ChatBlock> {
-    vec![ChatBlock {
-        kind: "paragraph".into(),
-        text: text.to_string(),
-        lang: String::new(),
-        rich: false,
-        spans: Vec::new(),
-    }]
+    blocks_view(&parse_message(text))
 }
 
 fn deleted_block() -> ChatBlock {
@@ -1112,8 +1116,8 @@ fn block_view(block: &Block) -> ChatBlock {
 }
 
 /// A paragraph/quote block. Plain runs keep their exact text for a single
-/// wrapping `text`; any inline mark switches to word-level `spans` a wrapping
-/// flex can reflow.
+/// wrapping `text`; any inline mark switches to run-level `spans` the view's
+/// single rich-text paragraph expands with its `for`.
 fn rich_block(kind: &str, spans: &[Span]) -> ChatBlock {
     let marked = spans.iter().any(|span| !span.marks.is_empty());
     ChatBlock {
@@ -1121,45 +1125,78 @@ fn rich_block(kind: &str, spans: &[Span]) -> ChatBlock {
         text: span_text(spans),
         lang: String::new(),
         rich: marked,
-        spans: if marked { word_spans(spans) } else { Vec::new() },
+        spans: if marked { run_spans(spans) } else { Vec::new() },
     }
 }
 
-fn word_spans(spans: &[Span]) -> Vec<ChatSpan> {
+/// The one style arm a run renders through. The view's rich-text `for`
+/// expands a fixed span template per item with no conditionals, so the arm
+/// decision cannot live view-side — it is made here, once, and encoded as
+/// WHICH [`ChatSpan`] text field carries the run.
+enum SpanArm {
+    Link(String),
+    Mention,
+    BoldItalic,
+    Bold,
+    Italic,
+    Plain,
+}
+
+/// A link outranks every other mark (a bold link is still a destination), a
+/// mention outranks emphasis, and emphasis resolves on the (bold, italic)
+/// pair — the same precedence the per-token view arms encoded.
+fn span_arm(span: &Span) -> SpanArm {
+    let link = span.marks.iter().find_map(|mark| match mark {
+        Mark::Link(url) => Some(url.clone()),
+        _ => None,
+    });
+    if let Some(url) = link {
+        return SpanArm::Link(url);
+    }
+    let mention = span.marks.iter().any(|m| matches!(m, Mark::Mention(_)));
+    if mention {
+        return SpanArm::Mention;
+    }
+    let bold = span.marks.iter().any(|m| matches!(m, Mark::Bold));
+    let italic = span.marks.iter().any(|m| matches!(m, Mark::Italic));
+    match (bold, italic) {
+        (true, true) => SpanArm::BoldItalic,
+        (true, false) => SpanArm::Bold,
+        (false, true) => SpanArm::Italic,
+        (false, false) => SpanArm::Plain,
+    }
+}
+
+/// One [`ChatSpan`] per inline run, exact text preserved — the paragraph
+/// widget wraps natively, so no word splitting happens here anymore.
+fn run_spans(spans: &[Span]) -> Vec<ChatSpan> {
     let mut out = Vec::new();
     for span in spans {
-        let bold = span.marks.iter().any(|m| matches!(m, Mark::Bold));
-        let italic = span.marks.iter().any(|m| matches!(m, Mark::Italic));
-        let link = span.marks.iter().find_map(|mark| match mark {
-            Mark::Link(url) => Some(url.clone()),
-            _ => None,
-        });
-        let mention = span.marks.iter().any(|m| matches!(m, Mark::Mention(_)));
-        let highlight = link.is_some() || mention;
-        // Keep the trailing space baked into each token so a wrapping flex with
-        // zero column-gap reproduces exact spacing around mark boundaries (a
-        // comma right after a bold run stays attached, not " ,").
-        for token in span.text.split_inclusive(' ') {
-            if token.is_empty() {
-                continue;
-            }
-            out.push(ChatSpan {
-                text: token.to_string(),
-                bold,
-                italic,
-                highlight,
-                link: link.clone().unwrap_or_default(),
-            });
+        if span.text.is_empty() {
+            continue;
         }
+        let mut rendered = ChatSpan::default();
+        match span_arm(span) {
+            SpanArm::Link(url) => {
+                rendered.link_text = span.text.clone();
+                rendered.link = url;
+            }
+            SpanArm::Mention => rendered.mention = span.text.clone(),
+            SpanArm::BoldItalic => rendered.bold_italic = span.text.clone(),
+            SpanArm::Bold => rendered.bold = span.text.clone(),
+            SpanArm::Italic => rendered.italic = span.text.clone(),
+            SpanArm::Plain => rendered.plain = span.text.clone(),
+        }
+        out.push(rendered);
     }
     out
 }
 
-/// Word-level rich runs of one block of text — the pages renderer's view of
-/// the chat inline grammar (no roster, so mentions stay plain ink). Empty when
-/// the text carries no inline mark, keeping the plain single-`text` render;
-/// multi-line text stays plain because a wrapping flex cannot force its line
-/// breaks.
+/// Rich runs of one block of text — the pages renderer's view of the chat
+/// inline grammar (no roster, so mentions stay plain ink). Empty when the
+/// text carries no inline mark, keeping the plain single-`text` render;
+/// multi-line text stays plain because a rendered break is a block boundary,
+/// never a `\n` inside one paragraph.
 pub fn plain_rich_spans(text: &str) -> Vec<ChatSpan> {
     if text.contains('\n') {
         return Vec::new();
@@ -1169,7 +1206,7 @@ pub fn plain_rich_spans(text: &str) -> Vec<ChatSpan> {
     if !marked {
         return Vec::new();
     }
-    word_spans(&spans)
+    run_spans(&spans)
 }
 
 // ============================================================================
@@ -1289,8 +1326,8 @@ fn count_i64(value: usize) -> i64 {
 /// list as "- apples - bananas - pears" — and the fold happens on the way to
 /// the CHAIN, so no renderer recovers it. Each line is therefore its own block.
 /// A rendered break has to be a block boundary rather than a `\n` inside one:
-/// a marked-up line renders as a wrapping flex of word tokens (`word_spans`),
-/// and a flex cannot force a line break.
+/// a marked-up line renders as a single rich-text paragraph (`run_spans`),
+/// one paragraph widget per typed line.
 pub fn parse_message(input: &str) -> Vec<Block> {
     parse_message_with_members(input, &[])
 }
@@ -1839,7 +1876,7 @@ mod tests {
         let view = blocks_view(&blocks);
         assert_eq!(view[0].kind, "paragraph");
         assert!(view[0].rich, "formatted paragraph renders as spans");
-        assert!(view[0].spans.iter().any(|span| span.bold && span.text == "world"));
+        assert!(view[0].spans.iter().any(|span| span.bold == "world"));
         assert_eq!(view[3].kind, "code");
         assert_eq!(view[3].text, "fn main() {}");
 
@@ -1855,8 +1892,8 @@ mod tests {
     /// Consecutive lines were folded into one paragraph with a space, so a
     /// typed list posted as "- apples - bananas - pears" — and the fold happens
     /// on the way to the CHAIN, so no renderer recovers it. A rendered break
-    /// has to be a block boundary: a marked-up line renders as a wrapping flex
-    /// of word tokens, and a flex cannot force a line break inside one.
+    /// has to be a block boundary: a marked-up line renders as one rich-text
+    /// paragraph, and a break belongs between paragraphs, not inside one.
     #[test]
     fn a_single_newline_survives_the_trip_to_the_wire() {
         let blocks = parse_message("- apples\n- bananas\n- pears");
@@ -1928,14 +1965,14 @@ mod tests {
         };
         assert!(spans.iter().all(|span| span.marks.is_empty()));
 
-        // rendered mentions highlight
+        // rendered mentions land in the mention arm
         let view = blocks_view(&parse_message_with_members("cc @a1b2c3", &members));
         assert!(view[0].rich);
         assert!(
             view[0]
                 .spans
                 .iter()
-                .any(|span| span.highlight && span.text.starts_with("@a1b2c3"))
+                .any(|span| span.mention.starts_with("@a1b2c3"))
         );
     }
 
@@ -1958,28 +1995,50 @@ mod tests {
         }
     }
 
+    /// The arm fields of one span, in template order.
+    fn arm_texts(span: &ChatSpan) -> [&String; 6] {
+        [
+            &span.mention,
+            &span.link_text,
+            &span.bold_italic,
+            &span.bold,
+            &span.italic,
+            &span.plain,
+        ]
+    }
+
     #[test]
     fn plain_rich_spans_mark_inline_runs_and_stay_empty_for_plain_text() {
         let spans = plain_rich_spans("say **hi** to https://duck.example/x");
-        let bold: Vec<_> = spans.iter().filter(|span| span.bold).collect();
+        let bold: Vec<_> = spans.iter().filter(|span| !span.bold.is_empty()).collect();
         assert_eq!(bold.len(), 1);
-        assert_eq!(bold[0].text.trim_end(), "hi");
-        assert!(spans.iter().any(|span| span.highlight));
-        assert!(spans.iter().all(|span| !span.text.contains("**")));
-
-        // A LINK SPAN IS ALWAYS HIGHLIGHTED — `highlight = link.is_some() ||
-        // mention` up in `word_spans`, and the view's arms are carved out of
-        // that. It paints a link with `!empty(span.link)`, a mention with
-        // `span.highlight && empty(span.link)`, and the four plain runs with
-        // `!span.highlight && …`; a link span that came back unhighlighted
-        // would match the link arm AND a plain arm and render the URL twice.
-        let links_are_highlighted = spans
+        assert_eq!(bold[0].bold, "hi");
+        let link = spans
             .iter()
-            .all(|span| span.link.is_empty() || span.highlight);
-        assert!(
-            links_are_highlighted,
-            "a span carrying a link must be highlighted, or the view draws it twice"
-        );
+            .find(|span| !span.link.is_empty())
+            .expect("the bare url becomes a link span");
+        assert_eq!(link.link_text, "https://duck.example/x");
+        assert_eq!(link.link, "https://duck.example/x");
+
+        // EXACTLY ONE ARM PER RUN — the view's rich-text `for` emits every
+        // template span for every run, so a run filed under two arms renders
+        // twice and a run filed under none vanishes from the paragraph.
+        for span in &spans {
+            let filled = arm_texts(span)
+                .iter()
+                .filter(|text| !text.is_empty())
+                .count();
+            assert_eq!(filled, 1, "one style arm per run: {span:?}");
+        }
+
+        // And the arms concatenate back to the typed text minus the marks —
+        // the same wholeness the one-paragraph render shows the reader.
+        let rendered: String = spans
+            .iter()
+            .flat_map(arm_texts)
+            .map(String::as_str)
+            .collect();
+        assert_eq!(rendered, "say hi to https://duck.example/x");
 
         assert!(plain_rich_spans("no marks here").is_empty());
         assert!(plain_rich_spans("**multi**\nline").is_empty());

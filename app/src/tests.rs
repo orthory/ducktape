@@ -3728,47 +3728,59 @@ fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
     assert_eq!(keys.len(), pending.len(), "every pending row keys apart");
 }
 
-/// A LINK IS A DESTINATION, NOT A PERSON — AND IT PRESSES.
+/// A MESSAGE LINE IS ONE PARAGRAPH, NOT A FLEX OF TOKENS (#1096).
 ///
-/// The chat module sets `highlight` for a `Link` mark and a `Mention` mark
-/// alike (`highlight = link.is_some() || mention`), so ONE arm painted both:
-/// every URL anyone posted wore the mention's plate, in the mention's ink, and
-/// was dead text — no cursor change, no press, no menu — while `span.link`
-/// carried the destination all the way to the view and no `.ice` file read it.
-/// Sharing a URL in this app meant the reader selected it by hand.
+/// ducktape-ui#639 lets a `for` expand spans inside `rich-text`, so the whole
+/// span list — literal runs, mentions, links — lowers into ONE native
+/// paragraph widget: real word wrapping, native selection across the line,
+/// and `link=` on the widget's own route instead of a per-token button. The
+/// template cannot branch, so the arm choice is DATA: exactly one `ChatSpan`
+/// text field per run (the chat client's `span_arm`), and this sweep pins the
+/// template that meets it.
 #[test]
-fn a_posted_url_presses_and_does_not_wear_the_mention_plate() {
+fn the_message_line_is_one_rich_text_paragraph() {
     let components = inlined(include_str!("ui/components/chat.ice"));
-    // The plate is the mention's token, and ONLY the mention's.
-    assert!(components.contains("if span.highlight && empty(span.link)"));
-    assert!(
-        !components.contains("if span.highlight\n"),
-        "an unqualified highlight arm is the mention plate back on every link"
-    );
-    // A link is its own arm, and it is a press.
-    assert!(components.contains("if !empty(span.link)"));
-    assert!(
-        components.contains("button label=span.text p=0.0 -> emit(open_message_link, span.link)")
-    );
-    // AND IT DRAWS THE UNDERLINE — the one link convention every reader
-    // already knows (ducktape-ui#604 grew `underline` on plain `text`). The
-    // rule marks a destination: of RichLine's per-token arms, the link's text
-    // ALONE wears it, and the exact-line equality also proves the ruled text
-    // carries no `tracking=`/`shape=` — the E174 pair a one-span paragraph
-    // cannot express.
     let rich_line = components
         .split_once("component RichLine")
-        .expect("the per-token flex")
+        .expect("the message line component")
         .1;
+    let rich_line = rich_line
+        .split_once("\ncomponent ")
+        .map_or(rich_line, |(body, _)| body);
+    // ONE paragraph, expanded by the widget's own `for` — no wrapping flex of
+    // per-token `text` widgets, and no per-token link button.
+    assert!(rich_line.contains(
+        "rich-text w=fill size=13.5 line-h=1.55 wrap=word-or-glyph color=accent_fg \
+         -> emit(open_message_link, _)"
+    ));
+    assert!(rich_line.contains("for span in block.spans"));
+    assert!(
+        !rich_line.contains("flex") && !rich_line.contains("button"),
+        "a token widget beside the paragraph is the #1071 workaround back"
+    );
+    // The plate is the mention's token, and ONLY the mention's — a posted URL
+    // is a destination, not a person.
+    let plated: Vec<&str> = rich_line
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("span ") && line.contains("bg="))
+        .collect();
+    assert_eq!(
+        plated,
+        ["span span.mention bg=brand_bg px=4.0 r=4.0 font=medium color=brand"],
+        "the mention arm alone wears the plate"
+    );
+    // And the underline is the link's rule alone — it marks a destination,
+    // not an emphasis (ducktape-ui#604).
     let underlined: Vec<&str> = rich_line
         .lines()
         .map(str::trim)
-        .filter(|line| line.starts_with("text span.text") && line.contains(" underline"))
+        .filter(|line| line.starts_with("span ") && line.contains(" underline"))
         .collect();
     assert_eq!(
         underlined,
-        ["text span.text wrap=word-or-glyph size=13.5 line-h=1.55 font=medium underline"],
-        "the link token alone draws the rule"
+        ["span span.link_text link=span.link underline font=medium color=brand"],
+        "the link arm alone draws the rule"
     );
     // It hands off through the SAME external-URL route the page renderer's
     // link press takes — one mechanism for one act, not a second one here.

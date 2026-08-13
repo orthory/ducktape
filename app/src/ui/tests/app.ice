@@ -839,3 +839,146 @@ test message_stream_reset_contract
   dispatch choose_channel("channel-b")
   expect empty(messages)
   expect missing stream
+
+preset ui_rich_paragraph
+  state
+    connected = true
+    loading = false
+    mutation_phase = MutationPhase.idle
+    error = ""
+    // Port 1 for the same reason as `ui_chat_stream` above: `choose_channel`
+    // launches a real `load_channel_window`, and loopback port 1 refuses the
+    // connect immediately, so the task settles on the dispatch and the failed
+    // load leaves the reducer-set rows alone (`chat_load_failed` touches no
+    // `messages`).
+    connected_rpc = "http://127.0.0.1:1"
+    shell_tab = ShellTab.chat
+    active_channel = "channel-a"
+    active_channel_name = "general"
+    // The optimistic path parses the SAME grammar the send commits, so these
+    // rows carry real rich spans — bold, italic, and bare-url link runs —
+    // into the paragraph's `for`.
+    messages = mark_author_runs(optimistic_message(optimistic_message(messages, "ship the **fix** at https://duck.example/x", "pending-rich"), "and the _second_ line lands", "pending-second"))
+
+// A MESSAGE BODY IS ONE PARAGRAPH (ducktape-ui#639, collected by #1096). The
+// span list — plain runs, bold runs, italic runs, links — feeds ONE rich-text
+// widget whose `for` expands a span template per run, so the whole line is a
+// single drawn run: the exact-match text oracle below only holds while every
+// span lands in the same paragraph buffer, marks stripped, spacing intact.
+// The second half asserts the expansion FOLLOWS THE DATA, not a first-render
+// snapshot: `choose_channel` swaps the span lists out and the paragraphs go
+// with them. (The grow direction of a `for` re-expansion is pinned upstream —
+// ducktape-ui `rich_text_for.ice` — and is not reachable offline here: every
+// committed-row mutation handler guards `seq <= 0`, so a pending fixture row
+// cannot be edited, and a failed send removes its own row before the next
+// test statement.)
+test message_body_renders_as_one_rich_paragraph
+  preset ui_rich_paragraph
+  viewport 1120 720
+  mount
+    ChatScreen search_draft<->chat_search_draft message_edit_draft<->message_edit_draft message_editor<->message_editor channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft thread_edit_draft<->thread_edit_draft reply_editor<->reply_editor #chat
+      with
+        network_name
+        status
+        block_height
+        search_phase=chat_search_phase
+        search_hits=chat_search_hits
+        rooms
+        dm_rows
+        channel_create_open
+        connected
+        loading
+        mutation_phase
+        active_channel
+        active_dm_peer
+        active_dm
+        active_channel_name
+        active_channel_archived
+        active_channel_members_only
+        channel_members
+        post_refusal
+        huddle_joined
+        huddle_channel
+        huddle_channel_name
+        huddle_joined_at
+        huddle_now
+        call_muted
+        huddle_popped=false
+        messages
+        has_older_history
+        history_view
+        history_loading
+        unread_boundary
+        unread_marker_seq
+        selected_message_seq
+        selected_message_rev
+        message_action
+        failed_message_draft
+        channel_settings_open
+        active_thread_seq
+        thread_target_seq
+        thread_messages
+        thread_selected_seq
+        thread_selected_rev
+        thread_message_action
+        thread_has_more
+        thread_next_reply_offset
+        thread_loading
+        failed_reply_draft
+      events
+        search_chat_submit -> search_chat_submit
+        clear_chat_search -> clear_chat_search
+        open_chat_search_hit -> open_chat_search_hit _ _ _
+        toggle_channel_create -> toggle_channel_create
+        choose_channel -> choose_channel _
+        choose_dm -> choose_dm _
+        toggle_channel_settings -> toggle_channel_settings
+        pop_huddle -> pop_huddle
+        focus_huddle -> focus_huddle
+        leave_huddle_here -> leave_huddle_here
+        huddle_go_channel -> huddle_go_channel
+        join_huddle_submit -> join_huddle_submit
+        load_more_history -> load_more_history
+        chat_scrolled -> chat_scrolled _ _ _ _
+        open_message_link -> open_message_link _
+        add_reaction_at -> add_reaction_at _ _
+        remove_reaction_at -> remove_reaction_at _ _
+        open_thread_for -> open_thread_for _
+        open_message_actions -> open_message_actions _ _ _
+        open_message_reactions -> open_message_reactions _ _ _
+        begin_message_edit -> begin_message_edit _ _ _
+        arm_message_delete -> arm_message_delete _ _ _
+        clear_message_selection -> clear_message_selection
+        add_reaction_submit -> add_reaction_submit _
+        edit_message_submit -> edit_message_submit
+        delete_message_submit -> delete_message_submit
+        restore_failed_message -> restore_failed_message
+        dismiss_failed_message -> dismiss_failed_message
+        composer_event -> chat_composer_event _
+        composer_mark -> composer_mark _
+        rename_channel_submit -> rename_channel_submit
+        archive_channel_submit -> archive_channel_submit
+        unarchive_channel_submit -> unarchive_channel_submit
+        add_channel_member_submit -> add_channel_member_submit
+        remove_channel_member_submit -> remove_channel_member_submit _
+        close_thread -> close_thread
+        open_thread_message_actions -> open_thread_message_actions _ _ _
+        open_thread_message_reactions -> open_thread_message_reactions _ _ _
+        begin_thread_message_edit -> begin_thread_message_edit _ _ _
+        arm_thread_message_delete -> arm_thread_message_delete _ _ _
+        clear_thread_message_selection -> clear_thread_message_selection
+        edit_thread_message_submit -> edit_thread_message_submit
+        delete_thread_message_submit -> delete_thread_message_submit
+        load_more_thread -> load_more_thread
+        restore_failed_reply -> restore_failed_reply
+        dismiss_failed_reply -> dismiss_failed_reply
+        reply_composer_event -> reply_composer_event _
+        reply_composer_mark -> reply_composer_mark _
+  target stream = #chat/message-stream
+  expect exists stream
+  expect text "ship the fix at https://duck.example/x" within stream
+  expect text "and the second line lands" within stream
+  dispatch choose_channel("channel-b")
+  expect no text "ship the fix at https://duck.example/x"
+  expect no text "and the second line lands"
+  expect missing stream
