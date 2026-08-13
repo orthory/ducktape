@@ -136,8 +136,29 @@ the module's state machinery, never `sdk`/`host`/`indexer`.
    continue instead. Choose per mapper; write it down.
 4. **Reserved namespaces.** `op/` and `meta/` are host-written; the trigger
    range spans `op/` alone, so bookkeeping writes never reach the guest.
-   Guests must not write into either (nothing enforces it engine-side — the
-   prefixes are ordinary user keys there; the contract is this spec).
+   `fold/` is the SHELL's, written by `index_guest::guest::fold_batch` inside
+   the fold transaction — today `fold/tip`, the `(height, seq)` of the last op
+   row consumed, 12 bytes big-endian. A mapper's decision core must not write
+   into any of the three (nothing enforces it engine-side — the prefixes are
+   ordinary user keys there; the contract is this spec).
+
+   `fold/tip` answers ONE question honestly: *has the fold consumed my op at
+   `(H, seq)`* — read-after-your-own-write. It is not general freshness: it
+   advances only on op traffic, so a quiet module's tip is arbitrarily old
+   while its view is perfectly current (unlike `meta/height`, which bumps on
+   every block). ABSENT is normal and means *unknown*, never height 0: a
+   boundary stamp (§6) wipes it with the rest of the derived state, a fresh
+   database has none, and a module that just gained its first index guest has
+   folded nothing yet. So a client waiting on the tip must escape by timeout,
+   never block on it.
+
+   A mapper UPGRADE is the other way round, and is the hazard worth naming:
+   `converge_guest` swaps the wasm and returns — no refold, no clear — so the
+   tip stays PRESENT and keeps vouching for rows the previous mapper wrote. A
+   new mapper whose derived shape differs has to be shipped with a boundary
+   stamp (§6) or a chain replay, exactly as it always did; the tip reports
+   fold progress over the op feed and never claims the rows are the shape the
+   installed mapper would produce.
 5. **Pre-index history is out of scope.** An op referencing state the feed
    never carried (enabled mid-life, boundary stamp) folds to a no-op. The
    honest fix is replaying the chain through the feed, not a guessed

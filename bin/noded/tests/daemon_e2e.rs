@@ -159,6 +159,32 @@ impl Daemon {
         )
     }
 
+    /// POST a module view and return `(status, x-ducktape-folded, reply)` —
+    /// the fold watermark rides a response HEADER, so the json helper alone
+    /// cannot see the half of this route's contract that answers "is my op in
+    /// this snapshot".
+    fn view(
+        &self,
+        module: &str,
+        query: serde_json::Value,
+    ) -> (u16, Option<String>, serde_json::Value) {
+        let body = serde_json::to_vec(&query).expect("view query serializes");
+        let (status, head, reply) = nettest::try_http_headed(
+            self.port,
+            "POST",
+            &format!("/v1/index/{module}/view"),
+            "application/json",
+            &[],
+            &body,
+        )
+        .expect("daemon reachable");
+        (
+            status,
+            nettest::header_of(&head, "x-ducktape-folded"),
+            serde_json::from_slice(&reply).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
     fn query(&self, target: &str, query: serde_json::Value) -> serde_json::Value {
         let (status, reply) = self.request(
             "POST",
@@ -830,16 +856,27 @@ fn per_module_index_serves_ops_and_views() {
 
         // chat's OWN endpoint: the materialized search view.
         await_view_folded(&daemon, "chat");
-        let (code, reply) = daemon.request(
-            "POST",
-            "/v1/index/chat/view",
-            Some(&serde_json::json!({ "search": { "text": "fluent" } })),
+        let (code, folded, reply) = daemon.view(
+            "chat",
+            serde_json::json!({ "search": { "text": "fluent" } }),
         );
         assert_eq!(code, 200, "chat view failed: {reply}");
         let hits = hits_of(&reply);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["message_id"], "m1");
         assert_eq!(hits[0]["author"], "user:alice");
+        // THE FOLD WATERMARK RIDES THE REPLY. It names the last op ROW the
+        // fold consumed — the last row of the feed above, position and all —
+        // which is how a caller that just wrote tells "my op is in this
+        // snapshot" from "not yet". `meta/height` cannot: it reads 3 here
+        // because every module's feed watermark tracks every block, folded or
+        // not.
+        let last = rows.last().expect("chat folded at least one op");
+        assert_eq!(
+            folded.as_deref(),
+            Some(format!("{}:{}", last["height"], last["seq"]).as_str()),
+            "the header names the last folded op row: {rows:?}"
+        );
 
         // tasks' endpoint: the by-status partition.
         await_view_folded(&daemon, "tasks");
@@ -854,13 +891,12 @@ fn per_module_index_serves_ops_and_views() {
         assert_eq!(tasks[0]["title"], "wire the indexer");
 
         // a module with no materialized view answers 404 — forge's substrate
-        // is already a queryable git repo; it never registers one.
-        let (code, _) = daemon.request(
-            "POST",
-            "/v1/index/forge/view",
-            Some(&serde_json::json!({ "anything": {} })),
-        );
+        // is already a queryable git repo; it never registers one. It never
+        // folds either, so there is no watermark to stamp: ABSENT means
+        // unknown, and a caller must never read it as height 0.
+        let (code, folded, _) = daemon.view("forge", serde_json::json!({ "anything": {} }));
         assert_eq!(code, 404);
+        assert_eq!(folded, None, "no fold, no watermark — not a zero one");
 
         // the watermark surface: all three blocks indexed, nothing poisoned.
         // EVERY module's watermark tracks the last applied block — chat reads

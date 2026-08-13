@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
@@ -331,11 +331,26 @@ pub(crate) async fn index_ops(
     .into_response()
 }
 
+/// the fold watermark a view reply carries: `"{height}:{seq}"`, the op row the
+/// module's fold had consumed when the reply was served. ABSENT when the
+/// module has no tip (fresh database, boundary stamp, a guest reinstalled
+/// without a refold) — absent means unknown, never zero.
+///
+/// a HEADER, not an envelope: the module reply enums are the modules' own wire
+/// and stay untouched, and a caller that does not care never sees it.
+pub const FOLDED_HEADER: &str = "x-ducktape-folded";
+
 /// POST /v1/index/{module}/view — the module's materialized view, served by
 /// its registered mapper. request body and reply are module-defined json
 /// (chat: `{"search": {…}}` → `{"hits": […]}`), exactly as opaque to the
 /// daemon as `/v1/query` payloads are. modules with no view answer 404 —
 /// some never will (forge's substrate is already a queryable git repo).
+///
+/// the reply carries [`FOLDED_HEADER`]: how far the fold had consumed the op
+/// feed, so a caller that just wrote can tell whether this snapshot contains
+/// its own op. it answers read-after-YOUR-OWN-WRITE and nothing else — the
+/// fold advances only on op traffic, so a quiet module's tip is arbitrarily
+/// old while its view is perfectly current.
 pub(crate) async fn index_view(
     State(handle): State<NodeHandle>,
     Path(module): Path<String>,
@@ -344,14 +359,38 @@ pub(crate) async fn index_view(
     let Some(store) = index_store(&handle) else {
         return no_index_store_response();
     };
+    // BEFORE the view, deliberately: the two reads take two MVCC snapshots, and
+    // the order decides which way the mismatch falls. read first and the tip
+    // can only be OLDER than the rows served — the caller waits one more round
+    // trip. read after and it can be NEWER, claiming a row this reply does not
+    // contain, which is the exact bug the tip exists to close.
+    //
+    // and ADVISORY, never a precondition: a read error here degrades to "no
+    // header", the same answer an unstamped module gives. everything about
+    // this key is best-effort (absent = unknown, a malformed value = unknown),
+    // and `IndexStore::view` promises a poisoned store still serves views —
+    // stale but consistent. failing the whole read because one bookkeeping key
+    // would not load empties the caller's sidebar over nothing. an unknown
+    // module still 404s: `store.view` below answers that.
+    let folded = store.fold_tip(&module).ok().flatten();
     let req_bytes = serde_json::to_vec(&req).expect("a decoded json value re-serializes");
-    match store.view(&module, &req_bytes) {
+    let mut response = match store.view(&module, &req_bytes) {
         Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
             Ok(value) => Json(value).into_response(),
             Err(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "view reply was not json"),
         },
         Err(err) => index_error(err),
+    };
+    if let Some((height, seq)) = folded {
+        // infallible on purpose: ABSENT is the one honest way to say "no tip"
+        // (§3.2.4), so a header dropped for any other reason would read to the
+        // caller as an unstamped module. two integers and a colon are visible
+        // ascii, which is exactly what a header value may hold.
+        let watermark = HeaderValue::from_str(&format!("{height}:{seq}"))
+            .expect("a numeric watermark is a valid header value");
+        response.headers_mut().insert(FOLDED_HEADER, watermark);
     }
+    response
 }
 
 /// GET /v1/index/{module}/scan?prefix=&after=&limit= — one page of raw index
@@ -445,4 +484,47 @@ pub(crate) async fn blocks(
         }
     }
     Json(serde_json::json!({ "blocks": blocks })).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    /// THE WATERMARK MUST BE READ BEFORE THE VIEW. The two reads take two MVCC
+    /// snapshots, and the ORDER is the whole correctness argument: read the tip
+    /// first and it can only be older than the rows served (the caller waits
+    /// one more round trip — safe); read it after and it can be newer, vouching
+    /// for a row this very reply does not contain — which is exactly the
+    /// acceptance-vs-application bug the header exists to close.
+    ///
+    /// Pinned as a source shape because no behavioural test can see it: both
+    /// orders answer identically except in the interleaving that makes the
+    /// wrong one wrong.
+    #[test]
+    fn the_view_reads_its_fold_watermark_before_the_snapshot() {
+        const SRC: &str = include_str!("index.rs");
+        let body = SRC
+            .split("pub(crate) async fn index_view(")
+            .nth(1)
+            .expect("index_view is declared")
+            .split("\n/// ")
+            .next()
+            .expect("index_view body");
+        let tip = body
+            .find("store.fold_tip(")
+            .expect("the view reads the tip");
+        let view = body.find("store.view(").expect("the view serves the view");
+        assert!(
+            tip < view,
+            "the fold watermark must be read BEFORE the view snapshot"
+        );
+        // AND IT MUST NOT BE ABLE TO REFUSE THE READ. The tip is advisory —
+        // absent is unknown, malformed is unknown — so an engine error on it
+        // has to degrade to "no header" too. Turning it into a precondition
+        // would answer 500 to a request that could have served the rows fine,
+        // against `IndexStore::view`'s own promise that a poisoned store still
+        // serves views. Nothing between the two reads may leave the function.
+        assert!(
+            !body[tip..view].contains("return"),
+            "an unreadable fold watermark must not refuse the view"
+        );
+    }
 }

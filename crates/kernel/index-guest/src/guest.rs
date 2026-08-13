@@ -14,7 +14,10 @@ pub use fluent_guest::{Change, Scan, errno, log};
 #[doc(hidden)]
 pub use fluent_guest::__entry;
 
-use crate::{Fail, OpRow, Page, StateRead, Writes, collect_page, prefix_successor, scan_lo};
+use crate::{
+    FOLD_TIP, Fail, OpRow, Page, StateRead, Writes, collect_page, encode_fold_tip, parse_op_key,
+    prefix_successor, scan_lo,
+};
 
 /// [`Fail`] code: a delete arrived on the fold feed. op rows are immutable
 /// and only ever wiped with the trigger torn down first (`mark_backfilled`),
@@ -104,19 +107,50 @@ pub fn apply(writes: Writes) -> Result<(), Fail> {
     Ok(())
 }
 
+/// run one fold batch and record its tip under [`FOLD_TIP`] — the shared
+/// shell step every mapper inherits through [`fold!`], so no module writes
+/// (or can forget) the record and every `fold_op` core stays pure.
+///
+/// the tip is read off the change KEYS, not the decoded rows: an `op/` key
+/// carries `(height, seq)` verbatim, so a batch the engine cut mid-block
+/// (trigger batch cap / max wasm input) records exactly where the cut fell
+/// instead of over-claiming the whole block.
+///
+/// written AFTER the fold and inside the SAME transaction: a `Fail` aborts
+/// both, so the tip can never claim rows whose derived writes did not land.
+pub fn fold_batch(
+    changes: Vec<Change>,
+    fold: impl FnOnce(Vec<Change>) -> Result<(), Fail>,
+) -> Result<(), Fail> {
+    let tip = changes.iter().filter_map(|c| parse_op_key(c.key())).max();
+    fold(changes)?;
+    // a batch carrying no op-row key is not this feed's traffic — leave the
+    // tip where it stands rather than inventing a position.
+    let Some((height, seq)) = tip else {
+        return Ok(());
+    };
+    apply(vec![(
+        FOLD_TIP.to_string(),
+        Some(encode_fold_tip(height, seq).to_vec()),
+    )])
+}
+
 /// export `$f: fn(Vec<Change>) -> Result<(), index_guest::Fail>` as the
 /// mapper's fold entry (fluentabi `on_apply` — the changes-mode trigger
 /// hook).
 ///
 /// expands to `#[unsafe(no_mangle)] pub extern "C" fn on_apply() -> i32`
 /// delegating decode/encode/exit-code glue to the engine SDK's entry shim,
-/// with the [`Fail`] conversion at the boundary.
+/// with the [`Fail`] conversion at the boundary. the batch runs through
+/// [`fold_batch`], which adds the [`FOLD_TIP`] record.
 #[macro_export]
 macro_rules! fold {
     ($f:path) => {
         #[unsafe(no_mangle)]
         pub extern "C" fn on_apply() -> i32 {
-            $crate::guest::__entry(|changes| $f(changes).map_err(::core::convert::Into::into))
+            $crate::guest::__entry(|changes| {
+                $crate::guest::fold_batch(changes, $f).map_err(::core::convert::Into::into)
+            })
         }
     };
 }

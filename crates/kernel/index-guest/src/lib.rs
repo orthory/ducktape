@@ -18,6 +18,14 @@
 //! vouches for the OP LOG alone — "every block at or below H is in the feed" —
 //! not for the derived rows, which are optimistic and converge.
 //!
+//! what DOES vouch for the derived rows is [`FOLD_TIP`], written by the shared
+//! shell inside the fold's own transaction: the `(height, seq)` of the last op
+//! row folded. it answers exactly one question honestly — "has the fold
+//! consumed MY op at `(H, seq)`" — i.e. read-after-YOUR-OWN-write. it is NOT a
+//! general freshness signal: it only advances on op traffic, so a quiet module
+//! keeps a tip that is arbitrarily old while being perfectly up to date, unlike
+//! `meta/height` which bumps on every block.
+//!
 //! ## authoring shape: decide pure, write thin
 //!
 //! a mapper is decision functions plus a shell. the DECISIONS — fold one op
@@ -80,6 +88,19 @@ pub const OP_PREFIX: &str = "op/";
 /// reserved prefix of the host's store bookkeeping (watermark, backfill
 /// floor). never delivered to a fold (the trigger range excludes it).
 pub const META_PREFIX: &str = "meta/";
+/// reserved prefix of the GUEST SHELL's own bookkeeping — written by the
+/// shared fold shell ([`guest::fold_batch`]), never by a module's decision
+/// core and never by the host. a module's derived key space must stay out of
+/// it (spec §3.2.4).
+pub const FOLD_PREFIX: &str = "fold/";
+/// the fold tip: the `(height, seq)` of the LAST op row the fold consumed,
+/// written inside the fold's own transaction so it can never claim rows whose
+/// derived writes did not land.
+///
+/// (height, seq), not height alone: the engine can cut a block's op rows
+/// mid-batch (trigger batch cap / max wasm input), and a height-only tip would
+/// then claim ops it has not seen.
+pub const FOLD_TIP: &str = "fold/tip";
 /// hard cap on one [`StateRead::scan_page`] page; larger asks are clamped,
 /// mirroring the module query convention rather than erroring.
 pub const MAX_SCAN_LIMIT: usize = 1024;
@@ -114,6 +135,38 @@ pub fn user_handle(bytes: &[u8]) -> String {
 
 pub fn op_key(height: u64, seq: u32) -> String {
     format!("{OP_PREFIX}{height:016x}/{seq:04x}")
+}
+
+/// the `(height, seq)` an op-row key encodes — the inverse of [`op_key`],
+/// `None` for anything else. the fold shell reads its tip straight off the
+/// delivered change KEYS with this, so it never has to decode a row.
+pub fn parse_op_key(key: &[u8]) -> Option<(u64, u32)> {
+    let text = std::str::from_utf8(key).ok()?;
+    let (height, seq) = text.strip_prefix(OP_PREFIX)?.split_once('/')?;
+    Some((
+        u64::from_str_radix(height, 16).ok()?,
+        u32::from_str_radix(seq, 16).ok()?,
+    ))
+}
+
+/// the stored [`FOLD_TIP`] value: 12 bytes big-endian (height then seq), so
+/// lexicographic byte order IS `(height, seq)` order.
+pub fn encode_fold_tip(height: u64, seq: u32) -> [u8; 12] {
+    let mut out = [0u8; 12];
+    out[..8].copy_from_slice(&height.to_be_bytes());
+    out[8..].copy_from_slice(&seq.to_be_bytes());
+    out
+}
+
+/// read a stored [`FOLD_TIP`] value back. `None` = absent or the wrong width
+/// (a wiped index, a database that never folded) — unknown, never zero.
+pub fn decode_fold_tip(bytes: &[u8]) -> Option<(u64, u32)> {
+    let bytes: [u8; 12] = bytes.try_into().ok()?;
+    let (height, seq) = bytes.split_at(8);
+    Some((
+        u64::from_be_bytes(height.try_into().ok()?),
+        u32::from_be_bytes(seq.try_into().ok()?),
+    ))
 }
 
 // ============================================================================
@@ -363,6 +416,32 @@ mod tests {
         let later_height = op_key(0x1_0000, 0);
         assert!(earlier < later_seq);
         assert!(later_seq < later_height);
+    }
+
+    #[test]
+    fn op_keys_parse_back_to_their_position() {
+        assert_eq!(parse_op_key(op_key(7, 3).as_bytes()), Some((7, 3)));
+        assert_eq!(
+            parse_op_key(op_key(u64::MAX, u32::MAX).as_bytes()),
+            Some((u64::MAX, u32::MAX))
+        );
+        // anything that is not an op-row key: the shell must skip it rather
+        // than invent a tip position for it.
+        assert_eq!(parse_op_key(b"meta/height"), None);
+        assert_eq!(parse_op_key(b"op/nothex/0000"), None);
+        assert_eq!(parse_op_key(b"op/0000000000000001"), None);
+    }
+
+    #[test]
+    fn fold_tips_round_trip_and_order_lexicographically() {
+        assert_eq!(decode_fold_tip(&encode_fold_tip(9, 4)), Some((9, 4)));
+        // absent or wrong-width = unknown, never a silent zero.
+        assert_eq!(decode_fold_tip(b""), None);
+        assert_eq!(decode_fold_tip(&9u64.to_be_bytes()), None);
+        // the 12-byte layout is what makes "is the tip past mine" a byte
+        // comparison anywhere it travels.
+        assert!(encode_fold_tip(1, 9) < encode_fold_tip(2, 0));
+        assert!(encode_fold_tip(1, 1) < encode_fold_tip(1, 2));
     }
 
     #[test]

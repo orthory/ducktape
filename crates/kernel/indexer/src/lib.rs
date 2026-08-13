@@ -39,9 +39,14 @@
 //!
 //! per-module key space: `op/…` and `meta/…` are host-reserved (the trigger
 //! range spans `op/` only, so the guest never sees bookkeeping writes);
-//! everything else belongs to the guest's fold. guest code itself lives in
-//! the engine's own reserved 0x00 keyspace — invisible to scans, wiped by
-//! nothing this crate does, and shipped WITH the data by the shipping lane.
+//! `fold/…` belongs to the shared guest SHELL ([`IndexStore::fold_tip`] reads
+//! the one key it writes); everything else belongs to the guest's fold. the
+//! two watermarks answer different questions and are not interchangeable:
+//! `meta/height` vouches for the FEED and bumps on every block, the fold tip
+//! vouches for the DERIVED ROWS and only moves when ops arrive. guest code
+//! itself lives in the engine's own reserved 0x00 keyspace — invisible to
+//! scans, wiped by nothing this crate does, and shipped WITH the data by the
+//! shipping lane.
 //!
 //! alongside the per-module databases the store keeps ONE internal blocks
 //! database (`<base>/_blocks/`, never a module): `blk/{height:016x}` holds the
@@ -96,7 +101,10 @@ use sha2::Digest as _;
 // the shared host↔guest vocabulary: key conventions + the borsh op-row
 // envelope. re-exported so every host-side consumer names them through this
 // crate, exactly as before the wasm cutover.
-pub use index_guest::{META_PREFIX, OP_PREFIX, OpRow, OriginKind, OriginTag, op_key, user_handle};
+pub use index_guest::{
+    FOLD_PREFIX, FOLD_TIP, META_PREFIX, OP_PREFIX, OpRow, OriginKind, OriginTag, op_key,
+    user_handle,
+};
 
 /// key prefix of the per-block explorer rows in the internal blocks database.
 pub const BLOCK_PREFIX: &str = "blk/";
@@ -398,6 +406,24 @@ impl IndexStore {
     /// height is durably stored.
     pub fn blocks_height(&self) -> Result<u64> {
         Ok(read_height(&self.blocks)?)
+    }
+
+    /// the FOLD's own watermark: the `(height, seq)` of the last op row the
+    /// module's guest folded, written by the shared shell inside the fold
+    /// transaction ([`index_guest::FOLD_TIP`]).
+    ///
+    /// this is the only honest answer to "is my op in the view yet": the
+    /// caller knows the `(H, seq)` its op landed at, and a tip at or past it
+    /// means the derived rows for that op are committed. it is NOT general
+    /// freshness — the fold advances only on op traffic, so a quiet module
+    /// keeps an old tip while being perfectly current, and `None` (fresh
+    /// database, boundary stamp, a guest reinstalled without a refold) means
+    /// UNKNOWN, never zero.
+    pub fn fold_tip(&self, module: &str) -> Result<Option<(u64, u32)>> {
+        let db = self.db(module)?;
+        Ok(db
+            .get(FOLD_TIP.as_bytes())
+            .map(|v| v.as_deref().and_then(index_guest::decode_fold_tip))?)
     }
 
     /// the backfill floor: when present, the module was stamped at a boundary

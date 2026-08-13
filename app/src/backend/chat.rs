@@ -875,6 +875,16 @@ pub(crate) fn comment_thread_id(thread_id: String) -> Result<String, String> {
     }
 }
 
+/// The cheapest thing the pages view can be asked: zero targets, so the guest
+/// scans nothing and answers an empty group list. [`await_fold`] reads only
+/// the reply's watermark header, so the body should cost as little as the lane
+/// allows.
+pub(crate) fn empty_pages_probe() -> PagesViewQuery {
+    PagesViewQuery::ThreadsForTargets {
+        targets: Vec::new(),
+    }
+}
+
 pub async fn create_page(
     rpc: String,
     password: String,
@@ -884,7 +894,7 @@ pub async fn create_page(
         let title = bounded_text(title, "page title", 512)?;
         let page_id = fresh_id("page");
         let rpc = rpc_client(&rpc)?;
-        signed_write(
+        let height = signed_write(
             &rpc,
             "pages",
             pages::encode_msg(&PageMsg::CreatePage {
@@ -894,12 +904,20 @@ pub async fn create_page(
             password,
         )
         .await?;
+        // WAIT FOR THE FOLD, THEN RELOAD. `submit_frame` returns when the node
+        // ACCEPTS a transaction, not when it applies one, and the pages read
+        // model is folded behind the block loop — so a reload fired straight
+        // after the write reads an index that predates it. The view lane
+        // answers how far the fold has consumed the op feed, so this waits for
+        // it to reach the block that took the write.
+        await_fold(&rpc, "pages", &empty_pages_probe(), height).await;
         let mut data = load_pages_data(&rpc, Some(&page_id))
             .await
             .map_err(committed_error)?;
-        // LAND ON THE PAGE THAT WAS JUST MADE. `submit_frame` returns when the
-        // node ACCEPTS a transaction, not when it applies one, so this reload
-        // reads an index that does not have the new page yet — measured, not
+        // LAND ON THE PAGE THAT WAS JUST MADE. The wait above narrows the
+        // window; it does not close it (a boundary stamp leaves no watermark,
+        // a busy block can park the fold mid-batch, the budget is bounded on
+        // purpose), so the correction stays the guarantee — measured, not
         // assumed: the reload asked for the new id, was handed the first page
         // in the list instead, and reported the new id absent from that list.
         // `load_pages_data` is right to drop an id it cannot see (a live
@@ -907,7 +925,7 @@ pub async fn create_page(
         // deleted, and must follow the fallback). This is the one caller that
         // KNOWS its id is good, so the correction belongs here: press Enter on
         // a title and you are on that page, not on whichever one sorts first.
-        // Its body arrives with the next refresh.
+        // It is a no-op whenever the fold did arrive.
         if data.active_page != page_id {
             data.active_page = page_id;
             data.active_page_title = title;
@@ -931,7 +949,7 @@ pub async fn delete_page(
             return Err("choose a page first".to_string().into());
         }
         let rpc = rpc_client(&rpc)?;
-        signed_write(
+        let height = signed_write(
             &rpc,
             "pages",
             pages::encode_msg(&PageMsg::RemoveBlock {
@@ -940,12 +958,16 @@ pub async fn delete_page(
             password,
         )
         .await?;
+        await_fold(&rpc, "pages", &empty_pages_probe(), height).await;
         let mut data = load_pages_data(&rpc, None).await.map_err(committed_error)?;
         // DROP WHAT WAS JUST DELETED. Same acceptance-vs-application gap as
-        // `create_page`, read the other way round: this reload can still see
-        // the removed page, so it stayed in the sidebar, stayed selectable,
-        // and re-installed its blocks into the editor when picked — a document
-        // the network no longer has. `RemoveBlock` deletes the whole SUBTREE
+        // `create_page`, read the other way round and narrowed by the same
+        // wait: this reload can still see the removed page, so it stayed in
+        // the sidebar, stayed selectable, and re-installed its blocks into the
+        // editor when picked — a document the network no longer has. The
+        // correction below is idempotent, so it costs nothing once the fold
+        // has arrived and remains the guarantee when it has not.
+        // `RemoveBlock` deletes the whole SUBTREE
         // (pages/src/store.rs walks children with no page-kind stop), so every
         // descendant goes with it, not just the row that was asked for.
         let doomed = descendants_of(&data.pages, &page_id);
