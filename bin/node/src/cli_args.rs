@@ -179,7 +179,7 @@ pub struct NodeAddr {
 /// one rung of the node-addressing ladder — ONE tagged value, so the precedence
 /// is a single ordered expression instead of a hand-written `if` chain per
 /// family. Four of those existed and disagreed about `DUCKTAPE_NODE`, so
-/// `ducktape fs`, `ducktape agent` and `ducktape user redeem-invite` could each
+/// `ducktape fs`, `ducktape agent` and `ducktape user account-init` could each
 /// dial a DIFFERENT node in one shell.
 #[derive(Debug)]
 enum Rung {
@@ -489,31 +489,11 @@ pub struct InitArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct InviteArgs {
-    /// the standing this invite grants when redeemed
-    #[arg(long, value_enum, default_value_t = InviteRoleArg::Resident)]
-    pub role: InviteRoleArg,
-    /// days until the token expires (default: 30 resident, 1 client)
+    /// days until the token expires (default: 30)
     #[arg(long, value_name = "N")]
     pub ttl_days: Option<u64>,
     #[command(flatten)]
     pub selector: Selector,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
-pub enum InviteRoleArg {
-    /// a node that joins the mesh and pre-syncs state
-    Resident,
-    /// submit-only access, redeemed with `ducktape user redeem-invite`
-    Client,
-}
-
-impl From<InviteRoleArg> for config::InviteRole {
-    fn from(role: InviteRoleArg) -> Self {
-        match role {
-            InviteRoleArg::Resident => config::InviteRole::Resident,
-            InviteRoleArg::Client => config::InviteRole::Client,
-        }
-    }
 }
 
 #[derive(Debug, clap::Args)]
@@ -608,8 +588,8 @@ mod tests {
         let rung = addr(Some("http://flag:1/"), Some("some-workspace")).ladder_rung(env(), ctx);
         assert_eq!(rung_base(rung).unwrap(), "http://flag:1");
 
-        // 2. -n/--network beats the env — the rung `user redeem-invite` used to
-        //    reach only because it ignored DUCKTAPE_NODE entirely.
+        // 2. -n/--network beats the env — a rung some user verbs used to
+        //    reach only because they ignored DUCKTAPE_NODE entirely.
         assert!(matches!(
             addr(None, Some("some-workspace")).ladder_rung(env(), ctx),
             Rung::Network(id) if id == "some-workspace"
@@ -754,7 +734,7 @@ mod tests {
 
     /// the fifth-caller guard. `DUCKTAPE_NODE` was read by three families with
     /// three different precedences, so `ducktape fs`, `ducktape agent` and
-    /// `ducktape user redeem-invite` could each dial a different node in one
+    /// `ducktape user account-init` could each dial a different node in one
     /// shell. There is now exactly ONE read; a family that hand-writes its own
     /// ladder fails here instead of shipping a fourth answer.
     ///

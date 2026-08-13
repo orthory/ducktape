@@ -445,7 +445,7 @@ on provision_stepped(step)
   provision_steps = [step]
   return if provision_index != 5 || !provision_settled
   hub_step = "live"
-  run every mint_invite(onboarding_chain, "resident", 7) -> onboarding_invite_minted _ | onboarding_failed _
+  run every mint_invite(onboarding_chain, 7) -> onboarding_invite_minted _ | onboarding_failed _
 
 on onboarding_invite_minted(blob)
   invite_link = blob

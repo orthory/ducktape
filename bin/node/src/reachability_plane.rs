@@ -105,20 +105,7 @@ where
         }
         return true;
     }
-    // V8 role: only `Resident` gates here; a `Client` token redeems via
-    // `user-redeem-invite` and must not obtain a tunnel (R2). V6/V7 need
-    // committed state — those run at the loop (`on_gate_forward`).
-    if msg.role != config::InviteRole::Resident.as_u8() {
-        if path == IntroPath::Direct {
-            ack(sealed_reply(lobby::IntroReply::Refused {
-                detail: "a client invite is not redeemable at a node join — it grants submit \
-                         access; redeem it with `ducktape user redeem-invite`"
-                    .into(),
-            }))
-            .await;
-        }
-        return true;
-    }
+    // V6/V7 need committed state — those run at the loop (`on_gate_forward`).
     let Some(cmds) = cmds.upgrade() else {
         return false;
     };
@@ -200,7 +187,6 @@ async fn gate_reply(
             token_sig: msg.token_sig.clone(),
             joiner: joiner_key,
             proof: msg.proof.clone(),
-            role: msg.role,
             expires_unix_secs: msg.expires_unix_secs,
         })
         .await;

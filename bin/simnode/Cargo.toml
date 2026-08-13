@@ -45,6 +45,7 @@ files = { workspace = true }
 # the opt-in `--with-valset` governance genesis: the KV store, the membership
 # registry, the sole authorized author of valset change, and the upgrade
 # coordinator whose registration makes the host-injected boundary tick ride.
+acl = { workspace = true }
 kv = { workspace = true }
 valset = { workspace = true }
 governance = { workspace = true }

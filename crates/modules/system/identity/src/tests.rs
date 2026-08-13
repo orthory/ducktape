@@ -1,8 +1,7 @@
 //! account-model tests: creation, multi-scheme membership, the "any surviving
-//! member authorizes" recovery path, replay/last-member guards, the valset
-//! gate, and the client-ACL facet — all over the store-backed module (a
-//! [`MemStore`] test double; the qmdb continuity proof lives in
-//! `tests/sync_round_trip.rs`).
+//! member authorizes" recovery path, replay/last-member guards, and the valset
+//! gate — all over the store-backed module (a [`MemStore`] test double; the
+//! qmdb continuity proof lives in `tests/sync_round_trip.rs`).
 
 use super::*;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -60,14 +59,6 @@ fn ctx_gated(key: &[u8], validators: Vec<Vec<u8>>, residents: Vec<Vec<u8>>) -> T
         Some(validators),
         Some(residents),
     )
-}
-/// a governance-follow-up origin (module), the only origin allowed to move
-/// client standing besides genesis.
-fn ctx_module(name: &str) -> TestCtx {
-    ctx_with(sdk::Origin::Module(name.into()), None, None)
-}
-fn ctx_system() -> TestCtx {
-    ctx_with(sdk::Origin::System, None, None)
 }
 
 // ---- member builders (one per scheme) -----------------------------------
@@ -162,12 +153,6 @@ fn new_gated_identity() -> Identity {
         Some("valset".into()),
         CHAIN.to_string(),
     )
-}
-
-/// the root of a store that never committed anything — the store-backed twin
-/// of the old ZERO sentinel (a MemStore hash of the empty map, not ZERO).
-fn empty_root() -> StateRoot {
-    new_identity().root()
 }
 
 /// execute a message from `origin`, then commit the block.
@@ -870,114 +855,15 @@ fn account_of_member(id: &Identity, member: &[u8]) -> Option<AccountView> {
     }
 }
 
-// ---- client standing (the submit-door ACL facet) ------------------------
-
-fn client_set(id: &Identity) -> Vec<Vec<u8>> {
-    let reply = block_on(id.query(&encode_query(&IdentityQuery::Clients))).unwrap();
-    match decode_reply(&reply).unwrap() {
-        IdentityReply::Clients(v) => v,
-        other => panic!("expected Clients, got {other:?}"),
-    }
-}
-
-/// run one client op from `ctx`, committing on success (mirrors `apply` but
-/// keeps the caller's chosen origin — module/system/external).
-fn run_client(id: &mut Identity, ctx: &mut TestCtx, msg: IdentityMsg) -> Result<(), Error> {
-    let m = Msg {
-        target: "identity".into(),
-        payload: encode_msg(&msg),
-    };
-    let r = block_on(id.execute(ctx, &m));
-    if r.is_ok() {
-        block_on(id.commit_block()).unwrap();
-    } else {
-        block_on(id.abort_block()).unwrap();
-    }
-    r
-}
-
 #[test]
-fn client_grant_from_module_origin_moves_root_and_reads_back() {
-    let mut id = new_identity();
-    let empty = empty_root();
-    assert_eq!(id.root(), empty, "nothing committed yet");
-    let key = ed_pub(&ed(1));
-
-    // staged: read-your-writes sees it before commit; root reflects committed.
-    let mut ctx = ctx_module("governance");
-    let m = Msg {
-        target: "identity".into(),
-        payload: encode_msg(&IdentityMsg::GrantClient { key: key.clone() }),
-    };
-    block_on(id.execute(&mut ctx, &m)).unwrap();
-    assert_eq!(id.root(), empty, "root reflects committed only");
-    assert_eq!(client_set(&id), vec![key.clone()], "read-your-writes");
-    block_on(id.commit_block()).unwrap();
-    assert_ne!(id.root(), empty, "a committed grant moves the root");
-    assert_eq!(client_set(&id), vec![key.clone()]);
-
-    // re-granting a key that already holds standing stages NOTHING: the root
-    // is byte-identical after the duplicate commits.
-    let granted = id.root();
-    let mut ctx = ctx_module("governance");
-    run_client(&mut id, &mut ctx, IdentityMsg::GrantClient { key }).unwrap();
-    assert_eq!(id.root(), granted, "a duplicate grant is a staged no-op");
-}
-
-#[test]
-fn client_grant_from_external_origin_is_refused() {
-    let mut id = new_identity();
-    let mut ctx = ctx_external(&ed_pub(&ed(9)));
-    let err = run_client(
-        &mut id,
-        &mut ctx,
-        IdentityMsg::GrantClient { key: ed_pub(&ed(1)) },
-    )
-    .unwrap_err();
-    assert!(
-        matches!(err, Error::Module(m) if m.contains("only via governance")),
-        "external self-grant must be refused",
-    );
-    assert!(client_set(&id).is_empty());
-}
-
-#[test]
-fn client_revoke_restores_the_empty_plane_root() {
-    let mut id = new_identity();
-    let empty = id.root();
-    let key = ed_pub(&ed(2));
-    let mut sys = ctx_system();
-    run_client(&mut id, &mut sys, IdentityMsg::GrantClient { key: key.clone() }).unwrap();
-    assert_eq!(client_set(&id), vec![key.clone()]);
-    run_client(&mut id, &mut sys, IdentityMsg::RevokeClient { key: key.clone() }).unwrap();
-    assert!(client_set(&id).is_empty(), "revoke removed it");
-    // revoking the last client DELETES the record: the store returns to its
-    // never-granted shape, so the root is the empty root again.
-    assert_eq!(id.root(), empty, "the last revoke restores the empty root");
-    // revoking a key that holds no standing stages nothing (still Ok).
-    run_client(&mut id, &mut sys, IdentityMsg::RevokeClient { key }).unwrap();
-    assert_eq!(id.root(), empty);
-}
-
-#[test]
-fn client_grant_rejects_a_malformed_key() {
-    let mut id = new_identity();
-    let mut sys = ctx_system();
-    let err = run_client(&mut id, &mut sys, IdentityMsg::GrantClient { key: vec![0u8; 16] }).unwrap_err();
-    assert!(matches!(err, Error::Module(_)));
-    assert!(client_set(&id).is_empty());
-}
-
-#[test]
-fn abort_block_drops_staged_accounts_and_clients_together() {
+fn abort_block_drops_staged_accounts() {
     let mut id = new_identity();
     let empty = id.root();
     let founder = ed(3);
     let node = b"node-x";
 
-    // stage a founding bind AND a client grant in one block, then abort: no
-    // record, no roster entry, no index entry, no client survives, and the
-    // root never moved.
+    // stage a founding bind, then abort: no record, no roster entry, no
+    // index entry survives, and the root never moved.
     let auth = ed_auth(&founder, IDENTITY_BIND_NS, &bind_preimage(CHAIN, node, 0));
     let mut ctx = ctx_external(node);
     let m = Msg {
@@ -985,21 +871,11 @@ fn abort_block_drops_staged_accounts_and_clients_together() {
         payload: encode_msg(&IdentityMsg::BindNode { authorizer: auth }),
     };
     block_on(id.execute(&mut ctx, &m)).unwrap();
-    let mut sys = ctx_system();
-    let grant = Msg {
-        target: "identity".into(),
-        payload: encode_msg(&IdentityMsg::GrantClient {
-            key: ed_pub(&ed(7)),
-        }),
-    };
-    block_on(id.execute(&mut sys, &grant)).unwrap();
     assert!(get_account(&id, &ed_pub(&founder)).is_some(), "staged read");
-    assert_eq!(client_set(&id).len(), 1, "staged read");
 
     block_on(id.abort_block()).unwrap();
     assert!(get_account(&id, &ed_pub(&founder)).is_none());
     assert!(account_of_node(&id, node).is_none());
     assert!(account_of_member(&id, &ed_pub(&founder)).is_none());
-    assert!(client_set(&id).is_empty());
     assert_eq!(id.root(), empty, "an aborted block leaves no trace");
 }

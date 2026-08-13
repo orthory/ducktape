@@ -4,6 +4,19 @@ Status: design of record for the `acl` module (principal model, policy table,
 capability federation). Implementation is phased; v1 changes no wire format.
 Where this document and shipped code disagree, the code is authoritative.
 
+> **2026-08-13 — v1 shipped**, with deviations the code owns: the module is
+> NATIVE store-backed (like valset), composed in `PRODUCTION` and
+> `SIM_VALSET`; the policy table is EMPTY at genesis (pure allow-all — no
+> seeded system-module entries; each module's own origin gates carry that
+> protection); the dispatch gate lives in the kernel host's drain
+> (`Host::require_submit_standing`); mutation rides
+> `GovAction::SetAclPolicy`. The capability-federation half
+> (`capability_policy`) is NOT implemented. Alongside this, the relay submit
+> door dropped its standing check entirely (any validly signed frame enters
+> consensus) and the client-standing plane was deleted — `Standing` here is
+> `validator | node | user | open`, with `user` resolved through the identity
+> account plane rather than a client set.
+
 ## The model in one paragraph
 
 Validators are validators, full nodes are full nodes, and users are users.

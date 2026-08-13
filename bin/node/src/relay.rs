@@ -1,6 +1,5 @@
-//! the submit-relay channel wire format — how a resident-standing node
-//! delivers a frame it signed, and how a validator answers with the frame's
-//! consensus fate.
+//! the submit-relay channel wire format — how a relaying node delivers a
+//! signed frame, and how a validator answers with the frame's consensus fate.
 //!
 //! transport: ordinary submits ship the frame bytes on `CHANNEL_SUBMIT_RELAY`
 //! to one current validator, exactly as `node::encode_frame` produced them.
@@ -11,14 +10,18 @@
 //! residents speak from the network's DERIVED LOBBY identity (the lobby key
 //! folded into every mesh), which ANY invite holder can derive — so origin
 //! could never equal a real resident's transport peer, and a peer-vs-origin
-//! gate adds nothing anyway. the frame's OWN signature is the authorization:
-//! it binds (origin, seq, target, payload) to the origin key, so forgery is
-//! impossible; committed resident standing on the ORIGIN is the policy gate;
-//! and a byte-identical replay collapses in the consensus lane's exactly-once
-//! digest gate. the validator takes consensus custody via `submit_frame` and
-//! replies when the frame drains — Applied with the sealed block's
-//! coordinates, Rejected for a deterministic no-op, Refused for door failures
-//! and expired holds.
+//! gate adds nothing anyway. the frame's OWN signature is the authorization
+//! AND the whole door: it binds (origin, seq, target, payload) to the origin
+//! key, so forgery is impossible, and a byte-identical replay collapses in the
+//! consensus lane's exactly-once digest gate. the door adds NO standing
+//! policy — any key's validly signed frame enters consensus, the same
+//! contract as a validator's local HTTP submit lane. who may do WHAT is
+//! per-module policy, decided deterministically inside the state machine (the
+//! acl module's dispatch gate plus each module's own origin checks), never at
+//! the transport door. the validator takes consensus custody via
+//! `submit_frame` and replies when the frame drains — Applied with the sealed
+//! block's coordinates, Rejected for a deterministic no-op, Refused for door
+//! failures and expired holds.
 //!
 //! json on the wire: matches the lobby idiom. blob chunks use hex rather than a
 //! JSON byte array so the encoded message stays below commonware's 2 MiB cap.
@@ -45,8 +48,8 @@ pub enum RelayOutcome {
     Applied { height: u64, root_hash: String },
     /// finalized but deterministically rejected by its module.
     Rejected { detail: String },
-    /// refused at the door (bad frame / origin lacks resident standing) or
-    /// the validator's hold expired before finalization — the op may still
+    /// refused at the door (bad frame / non-external origin) or the
+    /// validator's hold expired before finalization — the op may still
     /// land later; clients re-query on block events.
     Refused { detail: String },
 }
@@ -187,40 +190,22 @@ impl BlobAssembly {
 
 /// the validator's door check, pure so it is testable without a mesh: the
 /// frame must decode AND verify (the kernel checks the signature binds
-/// origin/seq/target/payload), its origin must be `Origin::External`, and
-/// that ORIGIN must hold committed resident OR client standing (validators
-/// submit locally; parked joiners have no standing). the sending peer is
-/// DELIBERATELY not an argument: residents ride the network's derived lobby
-/// transport identity — derivable by any invite holder — so a peer-vs-origin
-/// check could never pass for a real resident and would gate nothing. the
-/// frame's signature is the authorization (forgery impossible) and the
-/// exactly-once digest gate collapses byte-identical replays; committed
-/// standing is the only policy the door adds. membership-current state is the
-/// CALLER's to fetch — this needs only bytes.
-///
-/// client standing is admitted HERE and ONLY here: this door authorizes a
-/// SUBMIT, nothing more. it grants the client no statesync, no mesh, no quorum
-/// seat — those planes read valset (never the clients set), so admitting a
-/// client key here cannot widen its standing anywhere else.
-pub fn verify_relay_submit(
-    frame: &[u8],
-    residents: &[Vec<u8>],
-    clients: &[Vec<u8>],
-) -> Result<node::FrameId, String> {
+/// origin/seq/target/payload), and its origin must be `Origin::External`.
+/// that is the WHOLE door — no standing set is consulted. any key's validly
+/// signed frame enters consensus here, exactly as it would on a validator's
+/// local HTTP submit lane; the two lanes deliberately carry one contract.
+/// the sending peer is DELIBERATELY not an argument: residents ride the
+/// network's derived lobby transport identity — derivable by any invite
+/// holder — so a peer-vs-origin check could never pass for a real resident
+/// and would gate nothing. authorization is per-module policy resolved
+/// deterministically at dispatch (the acl module's gate plus each module's
+/// own origin checks), never a transport-door decision — a door-side policy
+/// would only fork the two submit lanes apart again.
+pub fn verify_relay_submit(frame: &[u8]) -> Result<node::FrameId, String> {
     let (origin, _msg) = node::decode_frame(frame).map_err(|e| format!("bad frame: {e}"))?;
-    let sdk::Origin::External(origin_bytes) = origin else {
+    let sdk::Origin::External(_) = origin else {
         return Err("relayed frames carry an external origin".into());
     };
-    if !residents
-        .iter()
-        .chain(clients)
-        .any(|o| o.as_slice() == origin_bytes.as_slice())
-    {
-        return Err(
-            "origin holds no committed resident or client standing — submit ops via a validator"
-                .into(),
-        );
-    }
     Ok(node::frame_id(frame))
 }
 
@@ -305,39 +290,20 @@ mod tests {
     }
 
     #[test]
-    fn door_accepts_a_frame_from_a_standing_origin() {
+    fn door_accepts_any_validly_signed_external_frame() {
+        // NO standing set exists at this door: a fresh key nobody has ever
+        // granted anything submits on the same contract as a validator's local
+        // HTTP lane. the signature is the whole gate; policy is per-module,
+        // resolved at dispatch.
         let author = sk(7);
-        let me = author.public_key().as_ref().to_vec();
         let frame = node::encode_frame(&author, 3, &msg());
-        // the sending peer is never consulted — standing rides on the ORIGIN.
-        let id = verify_relay_submit(&frame, std::slice::from_ref(&me), &[]).expect("accepted");
+        let id = verify_relay_submit(&frame).expect("accepted");
         assert_eq!(id, node::frame_id(&frame));
-    }
-
-    #[test]
-    fn door_accepts_a_frame_from_a_client_origin() {
-        // a committed CLIENT (present in the clients set, NOT the residents set)
-        // is admitted at the door — the thin-client submit path. same signature
-        // gate; standing rides on the ORIGIN, sourced from the clients module.
-        let author = sk(7);
-        let me = author.public_key().as_ref().to_vec();
-        let frame = node::encode_frame(&author, 3, &msg());
-        let id = verify_relay_submit(&frame, &[], std::slice::from_ref(&me)).expect("accepted");
-        assert_eq!(id, node::frame_id(&frame));
-    }
-
-    #[test]
-    fn door_refuses_without_resident_or_client_standing() {
-        let author = sk(7);
-        let frame = node::encode_frame(&author, 0, &msg());
-        let err = verify_relay_submit(&frame, &[], &[]).unwrap_err();
-        assert!(err.contains("standing"), "{err}");
     }
 
     #[test]
     fn door_refuses_a_signature_tampered_frame_that_still_parses() {
         let author = sk(7);
-        let me = author.public_key().as_ref().to_vec();
         let mut tampered = node::encode_frame(&author, 0, &msg());
 
         // flip a bit INSIDE the trailing 64-byte ed25519 signature: the binary
@@ -349,8 +315,8 @@ mod tests {
 
         // it fails at signature verification, NOT as a parse error: a genuine
         // junk envelope errors with different wording.
-        let junk = verify_relay_submit(b"not a frame", std::slice::from_ref(&me), &[]).unwrap_err();
-        let err = verify_relay_submit(&tampered, std::slice::from_ref(&me), &[]).unwrap_err();
+        let junk = verify_relay_submit(b"not a frame").unwrap_err();
+        let err = verify_relay_submit(&tampered).unwrap_err();
         assert_ne!(
             err, junk,
             "tamper must fail at the signature, not the parser"

@@ -35,45 +35,42 @@ pub fn invite_requires_reachability_defaults(_invite: &Invite) -> bool {
 // ============================================================================
 
 pub use governance::invite::{
-    INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteRole, InviteToken, grant_preimage,
+    INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteToken, grant_preimage,
     sign_join_proof, verify_invite_token, verify_join_proof,
 };
 
 /// mint a BEARER invite token binding an invite to `binding` (the genesis
-/// namespace), with `role` and `expires_unix_secs`: fresh OS randomness for the
+/// namespace) with `expires_unix_secs`: fresh OS randomness for the
 /// nonce, signed by this member's identity. minting IS the admission decision —
 /// there is no target (the targeted form was dropped — see the join ADR); whoever presents a
 /// valid join proof for the nonce first redeems it, single-use.
 pub fn mint_invite_token(
     signer: &ed25519::PrivateKey,
     binding: &[u8],
-    role: InviteRole,
     expires_unix_secs: u64,
 ) -> InviteToken {
     let mut nonce = [0u8; INVITE_NONCE_LEN];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
     // sign the SAME preimage every verifier checks (`grant_preimage` is `pub`
     // from the governance crate) — no restated shape to drift.
-    let msg = grant_preimage(binding, &nonce, role, expires_unix_secs);
+    let msg = grant_preimage(binding, &nonce, expires_unix_secs);
     InviteToken {
         issuer: signer.public_key(),
         nonce,
-        role,
         expires_unix_secs,
         sig: signer.sign(INVITE_GRANT_NAMESPACE, &msg),
     }
 }
 
 const INVITE_TOKEN_FILE: &str = "invite.token";
-/// packed token: `issuer(32) ‖ nonce(16) ‖ role(1) ‖ expires_le(8) ‖
-/// sig(64)` — a fixed 121 bytes (every invite is bearer; no kind, no target).
-const INVITE_TOKEN_LEN: usize = 32 + INVITE_NONCE_LEN + 1 + 8 + 64;
+/// packed token: `issuer(32) ‖ nonce(16) ‖ expires_le(8) ‖ sig(64)` — a
+/// fixed 120 bytes (every invite is bearer; no role, no kind, no target).
+const INVITE_TOKEN_LEN: usize = 32 + INVITE_NONCE_LEN + 8 + 64;
 
 fn pack_invite_token(t: &InviteToken) -> Vec<u8> {
     let mut out = Vec::with_capacity(INVITE_TOKEN_LEN);
     out.extend_from_slice(t.issuer.as_ref());
     out.extend_from_slice(&t.nonce);
-    out.push(t.role.as_u8());
     out.extend_from_slice(&t.expires_unix_secs.to_le_bytes());
     out.extend_from_slice(t.sig.encode().as_ref());
     out
@@ -91,8 +88,6 @@ fn unpack_invite_token(bytes: &[u8]) -> Result<InviteToken, String> {
     let mut nonce = [0u8; INVITE_NONCE_LEN];
     nonce.copy_from_slice(&bytes[32..32 + INVITE_NONCE_LEN]);
     let mut pos = 32 + INVITE_NONCE_LEN;
-    let role = InviteRole::from_u8(bytes[pos])?;
-    pos += 1;
     let expires_unix_secs = u64::from_le_bytes(bytes[pos..pos + 8].try_into().expect("8 bytes"));
     pos += 8;
     let sig = ed25519::Signature::decode(&bytes[pos..])
@@ -100,7 +95,6 @@ fn unpack_invite_token(bytes: &[u8]) -> Result<InviteToken, String> {
     Ok(InviteToken {
         issuer,
         nonce,
-        role,
         expires_unix_secs,
         sig,
     })
@@ -310,11 +304,6 @@ pub const INVITE_ENVELOPE_NAMESPACE: &[u8] = b"ducktape-invite-envelope";
 /// otherwise. single-use bounds the damage of a leaked blob; expiry bounds a
 /// LOST one.
 pub const DEFAULT_INVITE_TTL_DAYS: u64 = 7;
-
-/// bearer invites default MUCH shorter: anyone holding the blob can redeem
-/// it until its single use is spent, so the unredeemed-leak window stays a
-/// day, not a week. `--ttl-days` still overrides.
-pub const DEFAULT_BEARER_INVITE_TTL_DAYS: u64 = 1;
 
 const INVITE_B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -830,7 +819,7 @@ mod tests {
         }
     }
 
-    /// mint + encode with the test defaults: issuer-signed, bearer Resident,
+    /// mint + encode with the test defaults: issuer-signed, bearer,
     /// far-future expiry. A caller that passes no WireGuard gets the minimal
     /// coordinated default, since invites always carry a bootstrap.
     fn encode_test_invite(
@@ -838,12 +827,7 @@ mod tests {
         issuer: &ed25519::PrivateKey,
         wireguard: Option<&InviteWireGuard>,
     ) -> String {
-        let token = mint_invite_token(
-            issuer,
-            d.genesis_namespace().as_bytes(),
-            InviteRole::Resident,
-            u64::MAX,
-        );
+        let token = mint_invite_token(issuer, d.genesis_namespace().as_bytes(), u64::MAX);
         let default_wg = coordinated_test_wg();
         let wg = wireguard.unwrap_or(&default_wg);
         encode_invite(d, &token, wg, &[], issuer).expect("encode")
@@ -905,7 +889,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bearer_client_token_roundtrips_the_file_and_blob_codecs() {
+    fn a_bearer_token_roundtrips_the_file_and_blob_codecs() {
         let issuer = ed25519::PrivateKey::from_seed(7);
         let me = issuer.public_key();
         let mut d = NetworkDescriptor {
@@ -918,8 +902,7 @@ mod tests {
         };
         d.add_bootstrap(&me, "127.0.0.1:52200");
         let binding = d.genesis_namespace();
-        let token = mint_invite_token(&issuer, binding.as_bytes(), InviteRole::Client, u64::MAX);
-        assert_eq!(token.role, InviteRole::Client);
+        let token = mint_invite_token(&issuer, binding.as_bytes(), u64::MAX);
         assert!(verify_invite_token(&token, binding.as_bytes()));
 
         // packed-token codec: fixed width, exact roundtrip.
@@ -988,12 +971,7 @@ mod tests {
             reach: vec![],
             coordination: Some("private".into()),
         };
-        let token = mint_invite_token(
-            &issuer,
-            d.genesis_namespace().as_bytes(),
-            InviteRole::Resident,
-            u64::MAX,
-        );
+        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes(), u64::MAX);
         let mut bytes = pack_invite(&d, &token, &coordinated_test_wg(), &[]).unwrap();
         bytes.pop();
         assert!(unpack_invite(&bytes, 0).is_err());
@@ -1007,12 +985,7 @@ mod tests {
         wireguard: Option<&InviteWireGuard>,
         fronts: &[Front],
     ) -> String {
-        let token = mint_invite_token(
-            issuer,
-            d.genesis_namespace().as_bytes(),
-            InviteRole::Resident,
-            u64::MAX,
-        );
+        let token = mint_invite_token(issuer, d.genesis_namespace().as_bytes(), u64::MAX);
         let default_wg = coordinated_test_wg();
         let wg = wireguard.unwrap_or(&default_wg);
         encode_invite(d, &token, wg, fronts, issuer).expect("encode")
@@ -1178,12 +1151,7 @@ mod tests {
             coordination: None,
         };
         // the token carries its OWN expiry now (no separate blob param).
-        let token = mint_invite_token(
-            &issuer,
-            d.genesis_namespace().as_bytes(),
-            InviteRole::Resident,
-            1_000,
-        );
+        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes(), 1_000);
 
         // expiry is enforced at decode, deterministically via the injected clock.
         let blob = encode_invite(&d, &token, &coordinated_test_wg(), &[], &issuer).expect("encode");
@@ -1265,12 +1233,7 @@ mod tests {
         // identity (endpoint None) — survive the signed envelope byte-for-byte.
         let issuer = ed25519::PrivateKey::from_seed(7);
         let d = front_test_descriptor(&issuer);
-        let token = mint_invite_token(
-            &issuer,
-            d.genesis_namespace().as_bytes(),
-            InviteRole::Resident,
-            u64::MAX,
-        );
+        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes(), u64::MAX);
         let fronts = vec![
             Front {
                 member_key: [11u8; 32],
@@ -1299,12 +1262,7 @@ mod tests {
         let dir = tmp("invitetoken");
         assert_eq!(load_invite_token(&dir).expect("absent is fine"), None);
         let issuer = ed25519::PrivateKey::from_seed(7);
-        let token = mint_invite_token(
-            &issuer,
-            b"net#00000000@feedface",
-            InviteRole::Resident,
-            u64::MAX,
-        );
+        let token = mint_invite_token(&issuer, b"net#00000000@feedface", u64::MAX);
         save_invite_token(&dir, &token).expect("save");
         assert_eq!(load_invite_token(&dir).expect("load"), Some(token));
     }

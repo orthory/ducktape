@@ -76,7 +76,7 @@ fn account_of_node(cluster: &Cluster, reader: usize, node: &[u8]) -> Option<Acco
     )?;
     match identity::decode_reply(&bytes).ok()? {
         IdentityReply::Account(account) => account,
-        IdentityReply::Accounts(_) | IdentityReply::Clients(_) => None,
+        IdentityReply::Accounts(_) => None,
     }
 }
 

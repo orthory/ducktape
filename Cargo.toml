@@ -89,6 +89,7 @@ members = [
     "crates/networking/data-plane",
     "crates/networking/overlay-net",
     # modules/system — system modules. every entry implements `sdk::Module`.
+    "crates/modules/system/acl",
     "crates/modules/system/kv",
     "crates/modules/system/valset",
     "crates/modules/system/governance",
@@ -275,6 +276,7 @@ wasm-host = { path = "crates/kernel/wasm-host" }
 # types-only interface crate — never the module impl).
 # internal — module impl crates
 kv = { path = "crates/modules/system/kv" }
+acl = { path = "crates/modules/system/acl" }
 valset = { path = "crates/modules/system/valset" }
 governance = { path = "crates/modules/system/governance" }
 identity = { path = "crates/modules/system/identity" }

@@ -10,7 +10,7 @@ use super::{ValidatorRuntime, graceful_checkpoint};
 use crate::config::{hex_bytes, unhex};
 use crate::constants::{GATE_SETTLE_TIMEOUT, MODULE_IDS, OPS_REFRESH_INTERVAL, SUBMIT_HOLD};
 use crate::host_reads::{
-    read_clients, read_redemption_from_host, read_valset_members, read_valset_residents,
+    read_redemption_from_host, read_valset_members, read_valset_residents,
 };
 use crate::rpc::{
     JoinRequestRecord, JoinRequestView, JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus,
@@ -194,7 +194,7 @@ impl ValidatorRuntime<'_> {
 
     /// the join gate (join ADR §4), arriving over the WireGuard-tunnel
     /// doorbell: the reachability plane already OPENED and VERIFIED the sealed
-    /// intro (V1–V5 crypto, V4 expiry, V8 role) and installed the tunnel —
+    /// intro (V1–V5 crypto, V4 expiry) and installed the tunnel —
     /// what reaches this loop is a verified request. this runs the
     /// COMMITTED-STATE checks (V6/V7/V9), then — on pass — submits `Redeem`
     /// and HOLDS the joiner's outcome against that frame until the drain
@@ -327,7 +327,6 @@ impl ValidatorRuntime<'_> {
             token_sig,
             joiner,
             proof,
-            role,
             expires_unix_secs,
         } = fwd;
         let redeem = governance::GovMsg::Redeem {
@@ -336,7 +335,6 @@ impl ValidatorRuntime<'_> {
             token_sig,
             joiner,
             proof,
-            role,
             expires_unix_secs,
         };
         let seq = *next_seq;
@@ -419,18 +417,17 @@ impl ValidatorRuntime<'_> {
         } = self;
         let now = context.current();
 
-        let needs_standing = matches!(
-            msg,
-            relay::RelayMsg::BlobOffer { .. } | relay::RelayMsg::Submit { .. }
-        );
-        let (members_now, residents_now, clients_now) = if needs_standing {
+        // only the blob-offer door reads standing (pack fanout is node-key
+        // business: members ∪ residents). ordinary submits carry no standing
+        // read at all — the frame signature is the whole door.
+        let needs_node_standing = matches!(msg, relay::RelayMsg::BlobOffer { .. });
+        let (members_now, residents_now) = if needs_node_standing {
             (
                 read_valset_members(node.host()).await,
                 read_valset_residents(node.host()).await,
-                read_clients(node.host()).await,
             )
         } else {
-            (Vec::new(), Vec::new(), Vec::new())
+            (Vec::new(), Vec::new())
         };
         let Some(action) = validator_relay.on_message(
             now,
@@ -438,7 +435,6 @@ impl ValidatorRuntime<'_> {
             msg,
             &members_now,
             &residents_now,
-            &clients_now,
             relay_tx,
         ) else {
             return;

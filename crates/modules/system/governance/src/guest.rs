@@ -66,6 +66,7 @@ const MODULE_ID: &str = "governance";
 const VALSET_ID: &str = "valset";
 const LIFECYCLE_ID: &str = "lifecycle";
 const IDENTITY_ID: &str = "identity";
+const ACL_ID: &str = acl::DEFAULT_ACL_ID;
 /// the genesis-config key carrying this network's invite binding.
 const INVITE_PARAM: &str = "invite";
 
@@ -90,13 +91,12 @@ fn invite_binding() -> Result<Vec<u8>, host::Error> {
 // module is rebuilt fresh per dispatch (see `guest_adapter::store_guest!`).
 // the per-network invite binding comes from the store-seeded genesis config
 // via the bespoke `invite_binding` above (a bytes param, not the chain_id
-// twins' string); redeem-time client grants ride an `IdentityMsg::GrantClient`
-// follow-up into identity (already wired for account-share) — no separate
-// module.
+// twins' string).
 guest_adapter::store_guest! {
     id: MODULE_ID,
     module: Governance,
     new: Governance::new(MODULE_ID, Box::new(WitStore), VALSET_ID, IDENTITY_ID)
         .with_invite_binding(invite_binding()?)
-        .with_code_registry(LIFECYCLE_ID),
+        .with_code_registry(LIFECYCLE_ID)
+        .with_acl(ACL_ID),
 }

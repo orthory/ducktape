@@ -408,29 +408,10 @@ pub async fn join_network(blob: ui_lang_runtime::Secret) -> Result<WorkspaceInit
 /// Mint a single-use bearer invite for a workspace: `ducktape node invite`
 /// prints the `🦆…` blob on stdout. This WRITES (it folds this member's dial
 /// hint into the descriptor), so it is not a read-only probe.
-pub async fn mint_invite(
-    workspace: String,
-    role: String,
-    ttl_days: i64,
-) -> Result<String, AppError> {
+pub async fn mint_invite(workspace: String, ttl_days: i64) -> Result<String, AppError> {
     async {
-        let role = match role.as_str() {
-            "client" => "client",
-            "resident" => "resident",
-            other => return Err(format!("unknown invite role `{other}`")),
-        };
         let ttl = ttl_days.clamp(1, 365).to_string();
-        ducktape_cli(&[
-            "node",
-            "invite",
-            "-n",
-            &workspace,
-            "--role",
-            role,
-            "--ttl-days",
-            &ttl,
-        ])
-        .await
+        ducktape_cli(&["node", "invite", "-n", &workspace, "--ttl-days", &ttl]).await
     }
     .await
     .map_err(app_error)

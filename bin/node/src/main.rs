@@ -218,7 +218,7 @@ enum Family {
     /// run a workspace node, plus operator verbs (init, invite, join, ...)
     #[command(subcommand)]
     Node(cli_args::NodeCmd),
-    /// user-identity keys and signing (init/restore, sign-*, redeem-invite, ...)
+    /// user-identity keys and signing (init/restore, sign-*, account-init, ...)
     #[command(subcommand)]
     User(userkey_cli::UserCmd),
     /// local loopback bindings for signed gateway routes

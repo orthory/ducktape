@@ -554,33 +554,24 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `invite --target <pubkey-hex> [--role resident|client] [--config
-/// node.toml] [--ttl-days N]` — emit the one-line paste blob: the whole
-/// join credential. minting IS the admission decision — the blob carries
-/// the descriptor with THIS member's dial hint folded in (and persisted, so
-/// every future invite carries it), the inviter's WireGuard bootstrap when
-/// the reachability plane is configured (`wireguard_listen`), an expiry, and
-/// a single-use INVITE TOKEN, the whole envelope signed by this member's
-/// identity. the joiner's node redeems the token automatically (governance
-/// `Redeem`) — no member approval step follows.
-///
-/// `--role client` grants submit-only CLIENT standing (redeemed via
-/// `user-redeem-invite`, never `join`); WITHOUT `--target` that is a BEARER
-/// invite — single-use, 1-day default TTL, first valid redeemer wins. the
-/// resident role always requires a target.
+/// `invite [--config node.toml] [--ttl-days N]` — emit the one-line paste
+/// blob: the whole join credential. minting IS the admission decision — the
+/// blob carries the descriptor with THIS member's dial hint folded in (and
+/// persisted, so every future invite carries it), the inviter's WireGuard
+/// bootstrap when the reachability plane is configured (`wireguard_listen`),
+/// an expiry, and a single-use INVITE TOKEN, the whole envelope signed by
+/// this member's identity. the joiner's node redeems the token automatically
+/// (governance `Redeem`) — no member approval step follows. an invite grants
+/// RESIDENT standing only; submitting ops needs no invite at all.
 fn cmd_invite(args: InviteArgs) -> Result<(), Box<dyn std::error::Error>> {
-    // every invite is BEARER (the targeted form was dropped — see the join ADR): `--role`
-    // (default resident) selects the standing plane, and there is no `--target`
-    // — whoever redeems the single-use token first wins. A resident invite is
-    // the admission credential itself, kept off the wire by the sealed
-    // first-contact intro; a client invite redeems over `user-redeem-invite`.
-    let role = config::InviteRole::from(args.role);
+    // every invite is BEARER (the targeted form was dropped — see the join
+    // ADR): there is no `--target` — whoever redeems the single-use token
+    // first wins. the invite is the admission credential itself, kept off the
+    // wire by the sealed first-contact intro.
     let ttl_days: u64 = match args.ttl_days {
         Some(v) => v,
-        // a client invite defaults to a tight window; a resident invite keeps
         // the operator-friendly onboarding default (a LOST blob is the residual
         // risk — single-use + sealing cover interception).
-        None if role == config::InviteRole::Client => config::DEFAULT_BEARER_INVITE_TTL_DAYS,
         None => config::DEFAULT_INVITE_TTL_DAYS,
     };
     if ttl_days == 0 {
@@ -720,21 +711,10 @@ fn cmd_invite(args: InviteArgs) -> Result<(), Box<dyn std::error::Error>> {
         .as_secs()
         + ttl_days * 24 * 60 * 60;
     // the expiry lives INSIDE the token (signed), not as a separate blob field.
-    // every invite is bearer; the role selects the standing plane.
-    let token = config::mint_invite_token(
-        &key,
-        descriptor.genesis_namespace().as_bytes(),
-        role,
-        expires,
-    );
+    // every invite is bearer.
+    let token =
+        config::mint_invite_token(&key, descriptor.genesis_namespace().as_bytes(), expires);
     let blob_string = config::encode_invite(&invite_descriptor, &token, &wireguard, &fronts, &key)?;
-    if role == config::InviteRole::Client {
-        eprintln!(
-            "[invite] bearer CLIENT invite (single-use, expires in {ttl_days} day(s)) — \
-             redeem with: ducktape user redeem-invite <blob> --node <member-http-url> \
-             --key <user.key>",
-        );
-    }
     println!("{blob_string}");
     Ok(())
 }
@@ -1492,17 +1472,6 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
         .as_deref()
         .ok_or("join needs an invite blob (or a `requests`/`state` subcommand)")?;
     let invite = config::decode_invite(blob)?;
-    // a CLIENT invite grants submit access, not a node — a node redeeming it
-    // would gate-fail terminally at the lobby; fail at paste time with the
-    // right pointer instead.
-    if invite.token.role == config::InviteRole::Client {
-        return Err(
-            "this is a CLIENT invite — it grants submit access, not a node. \
-                    redeem it with `ducktape user redeem-invite <blob> --node \
-                    <member-http-url> --key <user.key>`"
-                .into(),
-        );
-    }
     let mut descriptor = invite.descriptor.clone();
     let explicit_dir = args.dir.is_some();
     // same default as `init`: without `--dir` the workspace materializes in
