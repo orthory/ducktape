@@ -925,7 +925,9 @@ fn following_page_block(
         None
     };
     if let Some(child_id) = child_id {
-        return query_row(read, child_id, reads)?.ok_or_else(corrupt).map(Some);
+        return query_row(read, child_id, reads)?
+            .ok_or_else(corrupt)
+            .map(Some);
     }
     if current.block_id == root_id {
         return Ok(None);

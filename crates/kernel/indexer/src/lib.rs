@@ -72,6 +72,12 @@
 //! frame catch-up drives [`IndexStore::apply_block`] again) or by adopting a
 //! shipped index (the staging lane below).
 //!
+//! a MAPPER change is the other way derived rows go stale, and it needs no
+//! boundary: the op feed is still there. [`converge_guest`] clears the derived
+//! keyspace and re-drives the fold over the rows the database already holds,
+//! leaving `op/` and `meta/` alone — a new mapper changes what the rows MEAN,
+//! never what the feed saw.
+//!
 //! the full contract a per-module index guest must satisfy (fold rules, view
 //! rules, when NOT to index) is `docs/records/specs/indexable-spec.md`; the
 //! authoring surface is the `index-guest` crate.
@@ -143,6 +149,10 @@ const META_GUEST: &str = "meta/guest";
 /// how many staged deletes a database wipe accumulates before flushing a
 /// batch: bounds memory while sweeping a large read model.
 const CLEAR_FLUSH_EVERY: usize = 1024;
+/// how many bytes of op rows one refold batch re-writes before flushing.
+/// bounds memory the way [`CLEAR_FLUSH_EVERY`] does, by SIZE because a replay
+/// stages whole op payloads rather than bare keys.
+const REPLAY_FLUSH_BYTES: usize = 4 * 1024 * 1024;
 /// hard cap on one scan page; larger asks are clamped, mirroring the module
 /// query convention (chat's MAX_QUERY_LIMIT) rather than erroring.
 pub const MAX_SCAN_LIMIT: usize = 1024;
@@ -417,7 +427,7 @@ impl IndexStore {
     /// means the derived rows for that op are committed. it is NOT general
     /// freshness — the fold advances only on op traffic, so a quiet module
     /// keeps an old tip while being perfectly current, and `None` (fresh
-    /// database, boundary stamp, a guest reinstalled without a refold) means
+    /// database, boundary stamp, a mapper refold still in flight) means
     /// UNKNOWN, never zero.
     pub fn fold_tip(&self, module: &str) -> Result<Option<(u64, u32)>> {
         let db = self.db(module)?;
@@ -762,13 +772,35 @@ struct GuestMarker {
 }
 
 /// converge one module's database onto its declared guest: install (an
-/// overwrite-put — replacing bytes is the upgrade path) and register the fold
-/// trigger when the guest folds; tear both down when the module ships no
-/// guest. roles come from the CANDIDATE bytes (`wasm_entries`), so a broken
-/// artifact refuses at open, not at first invocation. the marker written
-/// LAST makes the whole converge idempotent-and-free on a warm boot: cranelift
-/// compiles are expensive enough that paying them per open once blew e2e
-/// boot deadlines. returns `(has_fold, has_view)`.
+/// overwrite-put — replacing bytes is the upgrade path), REFOLD the read model
+/// the previous mapper left behind, and register the fold trigger when the
+/// guest folds; tear both down when the module ships no guest. roles come from
+/// the CANDIDATE bytes (`wasm_entries`), so a broken artifact refuses at open,
+/// not at first invocation. the marker written LAST makes the whole converge
+/// idempotent-and-free on a warm boot: cranelift compiles are expensive enough
+/// that paying them per open once blew e2e boot deadlines. returns
+/// `(has_fold, has_view)`.
+///
+/// # the refold, and why it is unconditional
+///
+/// derived rows are the OUTPUT of a mapper, so a database whose mapper changed
+/// holds rows no installed code would produce — while its fold tip happily
+/// vouches for them (`indexable-spec.md` §3.2.4: a mapper upgrade leaves a
+/// PRESENT tip standing over the previous mapper's work). the honest fixes are
+/// a boundary stamp — which throws away the op feed and lies about coverage —
+/// or a replay. the feed is right there: `op/` is never wiped by a converge,
+/// so a replay is a clear of the DERIVED keyspace plus a re-drive of the fold
+/// over rows the database already holds.
+///
+/// it fires on any hash change rather than on a declared shape break because a
+/// declaration is a number an author has to remember to bump, and forgetting
+/// it is exactly the silent-stale-rows failure this exists to prevent. an
+/// author cannot forget a hash.
+///
+/// ponytail: a view-only mapper edit therefore pays a full replay of the feed
+/// at the next open. the tier is rebuildable by construction and the cost is
+/// bounded by the feed the database holds, so this stays until a measured boot
+/// regression asks for a `shape` field in [`GuestMarker`] to narrow it.
 fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
     let marker = db
         .get(META_GUEST.as_bytes())?
@@ -797,14 +829,20 @@ fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
     let roles = db.wasm_entries(bytes)?;
     let has_fold = roles.iter().any(|r| r == "on_apply");
     let has_view = roles.iter().any(|r| r == "query");
-    db.install_module(GUEST_NAME, bytes)?;
-    match (has_fold, fold_registered) {
-        (true, false) => {
-            create_fold_trigger(db)?;
-        }
-        (false, true) => db.delete_trigger(FOLD_TRIGGER)?,
-        _ => {}
+    // the feed goes down FIRST: its pending events describe the previous
+    // mapper's work, and `delete_trigger` discards them with the registration
+    // — the same clean slate a boundary stamp takes, minus the amnesia.
+    if fold_registered {
+        db.delete_trigger(FOLD_TRIGGER)?;
     }
+    db.install_module(GUEST_NAME, bytes)?;
+    if has_fold {
+        clear_derived(db)?;
+        create_fold_trigger(db)?;
+        replay_op_feed(db)?;
+    }
+    // written LAST, so an interrupted refold re-runs whole at the next open
+    // instead of leaving a marker that vouches for a half-derived read model.
     let marker = GuestMarker {
         hash,
         has_fold,
@@ -812,6 +850,64 @@ fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
     };
     db.put(META_GUEST, borsh::to_vec(&marker)?)?;
     Ok((has_fold, has_view))
+}
+
+/// delete every DERIVED key: everything a mapper wrote (its own rows plus the
+/// shell's `fold/` tip), leaving the host-reserved `op/` feed and `meta/`
+/// bookkeeping — the watermark and the backfill floor — untouched. those two
+/// answer for the FEED, which a mapper change does not touch.
+fn clear_derived(db: &Db) -> Result<()> {
+    let snap = db.snapshot();
+    let iter = db.iter_at(None, None, false, &snap)?;
+    let mut batch = WriteBatch::new();
+    let mut staged = 0usize;
+    for kv in iter {
+        let (key, _) = kv?;
+        let host_reserved =
+            key.starts_with(OP_PREFIX.as_bytes()) || key.starts_with(META_PREFIX.as_bytes());
+        if host_reserved {
+            continue;
+        }
+        batch.delete(key);
+        staged += 1;
+        if staged >= CLEAR_FLUSH_EVERY {
+            db.write(std::mem::replace(&mut batch, WriteBatch::new()))?;
+            staged = 0;
+        }
+    }
+    if staged > 0 {
+        db.write(batch)?;
+    }
+    Ok(())
+}
+
+/// re-drive the fold over every op row the database already holds.
+///
+/// a changes-mode trigger delivers writes COMMITTED AFTER its registration, so
+/// re-registering one over a populated range replays nothing. re-writing each
+/// row does: an identical put is still a committed change, and capture happens
+/// inside the commit critical section, so the guest receives the feed in key
+/// order — which for `op/{height:016x}/{seq:04x}` IS block-and-drain order.
+fn replay_op_feed(db: &Db) -> Result<()> {
+    let lo = OP_PREFIX.as_bytes();
+    let hi = prefix_successor(lo);
+    let snap = db.snapshot();
+    let iter = db.iter_at(Some(lo), hi.as_deref(), false, &snap)?;
+    let mut batch = WriteBatch::new();
+    let mut staged = 0usize;
+    for kv in iter {
+        let (key, value) = kv?;
+        staged += key.len() + value.len();
+        batch.put(key, value);
+        if staged >= REPLAY_FLUSH_BYTES {
+            db.write(std::mem::replace(&mut batch, WriteBatch::new()))?;
+            staged = 0;
+        }
+    }
+    if staged > 0 {
+        db.write(batch)?;
+    }
+    Ok(())
 }
 
 /// register the fold feed: [`GUEST_NAME`]'s `on_apply` over exactly the
