@@ -5493,6 +5493,28 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
         assert!(!source.contains("bg=success/"));
         assert!(!source.contains("border=success/"));
     }
+
+    // EVERY action recipe styles its keyboard focus ring with the same token
+    // inputs use (`focus:border-ring` on @control). The ring is origin-aware
+    // (ducktape-ui#611): it paints only on keyboard/AT-acquired focus, so a
+    // mouse click on a nav item no longer wears it — orthory#804's cosmetic
+    // item. Swept over every `for button` recipe rather than a name list, so
+    // the next action recipe added without the arm fails here.
+    let recipes = include_str!("ui/ducktape-ui/recipes.ice");
+    let button_recipes: Vec<_> = recipes
+        .lines()
+        .zip(recipes.lines().skip(1))
+        .filter(|(header, _)| header.starts_with("recipe ") && header.ends_with(" for button"))
+        .collect();
+    assert!(!button_recipes.is_empty(), "the action recipes moved");
+    for (header, styles) in button_recipes {
+        assert!(
+            styles.contains("focus-visible:border-ring"),
+            "{header}: an action recipe styles its keyboard focus ring \
+             `focus-visible:border-ring` — the origin-aware overlay in the app's \
+             ring token, at the button's own radius (ducktape-ui#611, orthory#804)"
+        );
+    }
 }
 
 /// THE RING HAS TO REACH THE WIDGET — asserted against the GENERATED code,
