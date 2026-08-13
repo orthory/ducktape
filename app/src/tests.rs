@@ -3260,6 +3260,26 @@ fn a_posted_url_presses_and_does_not_wear_the_mention_plate() {
     assert!(
         components.contains("button label=span.text p=0.0 -> emit(open_message_link, span.link)")
     );
+    // AND IT DRAWS THE UNDERLINE — the one link convention every reader
+    // already knows (ducktape-ui#604 grew `underline` on plain `text`). The
+    // rule marks a destination: of RichLine's per-token arms, the link's text
+    // ALONE wears it, and the exact-line equality also proves the ruled text
+    // carries no `tracking=`/`shape=` — the E174 pair a one-span paragraph
+    // cannot express.
+    let rich_line = components
+        .split_once("component RichLine")
+        .expect("the per-token flex")
+        .1;
+    let underlined: Vec<&str> = rich_line
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("text span.text") && line.contains(" underline"))
+        .collect();
+    assert_eq!(
+        underlined,
+        ["text span.text wrap=word-or-glyph size=13.5 line-h=1.55 font=medium underline"],
+        "the link token alone draws the rule"
+    );
     // It hands off through the SAME external-URL route the page renderer's
     // link press takes — one mechanism for one act, not a second one here.
     let handlers = include_str!("ui/handlers/chat.ice");
