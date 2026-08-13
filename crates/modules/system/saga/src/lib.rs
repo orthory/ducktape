@@ -4885,10 +4885,35 @@ mod tests {
     #[test]
     fn one_crank_reads_the_shards_plus_only_the_sagas_it_transitions() {
         let reads = counted();
-        let mut m = SagaModule::with_valset("saga", reads.store(), "valset", LeasePolicy::Open);
-        // every one of them is past its deadline, so the sweep is budget-bound
-        // and the ONLY thing keeping the read count down is the meta.
-        backlog(&mut m, BACKLOG, Some(4));
+        let mut m = SagaModule::new("saga", reads.store());
+        // the fixture that tells the two sweeps apart: the sagas that are DUE
+        // sort AFTER the ones that are not, so a sweep that walks the live ids
+        // reads 80 records before it finds any work — while the meta names the
+        // 40 due ones without reading one. and 40 is more than one budget, so
+        // the ceiling is not just "everything expired fits".
+        const DUE_FROM: usize = 80;
+        let mut ctx = CaptureCtx::new().at(1);
+        for i in 0..BACKLOG {
+            let due_already = i >= DUE_FROM;
+            exec(
+                &mut m,
+                &mut ctx,
+                &msg(&SagaMsg::Trigger {
+                    pinned_assignee: None,
+                    saga_id: sid(&format!("s{i:04}")),
+                    spec: b"w".to_vec(),
+                    reply_to: None,
+                    reply_payload: Vec::new(),
+                    deadline: Some(if due_already { 4 } else { 500 }),
+                    max_attempts: 1,
+                    lease_views: None,
+                    capability: None,
+                    demands: Default::default(),
+                }),
+            )
+            .unwrap();
+        }
+        commit(&mut m);
 
         reads.reset();
         let mut ctx = CaptureCtx::new().at(9);
@@ -4902,12 +4927,17 @@ mod tests {
             reads.distinct()
         );
         commit(&mut m);
-        let timed_out = (0..BACKLOG)
-            .filter(|i| {
-                get(&m, &sid(&format!("s{i:04}"))).unwrap().status == SagaStatus::TimedOut
-            })
-            .count();
-        assert_eq!(timed_out as u32, CRANK_BUDGET, "and it did its whole budget");
+        let timed_out: Vec<String> = (0..BACKLOG)
+            .map(|i| sid(&format!("s{i:04}")))
+            .filter(|id| get(&m, id).unwrap().status == SagaStatus::TimedOut)
+            .collect();
+        let expected: Vec<String> = (DUE_FROM..DUE_FROM + CRANK_BUDGET as usize)
+            .map(|i| sid(&format!("s{i:04}")))
+            .collect();
+        assert_eq!(
+            timed_out, expected,
+            "one whole budget, spent on the oldest `due` (the id breaks the tie)"
+        );
     }
 
     #[test]
@@ -4918,15 +4948,16 @@ mod tests {
 
         reads.reset();
         let page = unassigned_page(&m, None);
-        assert_eq!(page.requests.len(), PENDING_PAGE, "a full page");
         // the shards, the page's own records, and the one spec chunk each of
-        // them carries.
+        // them carries. checked BEFORE the page's size, so an unbounded scan
+        // is reported as the read blowout it is.
         let ceiling = PENDING_SHARDS as usize + PENDING_PAGE + PENDING_PAGE;
         assert!(
             reads.distinct() <= ceiling,
             "one page over {BACKLOG} pending sagas read {} keys, over the {ceiling} ceiling",
             reads.distinct()
         );
+        assert_eq!(page.requests.len(), PENDING_PAGE, "a full page");
     }
 
     #[test]
@@ -4981,12 +5012,15 @@ mod tests {
             first.requests.len() < PENDING_PAGE,
             "rendezvous split the backlog, so one key holds part of the page"
         );
+        // BOTH keys' first pages examined the same 64 candidates, so both must
+        // resume at the same place: the cursor is about the INDEX, not about
+        // what matched. a cursor taken from the last MATCH would differ here —
+        // and would end the walk early on a page that matched nothing.
+        let boundary = sid(&format!("s{:04}", PENDING_PAGE - 1));
+        assert_eq!(first.next.as_deref(), Some(boundary.as_str()));
         assert_eq!(
-            first.next.as_deref(),
-            Some(sid(&format!("s{:04}", PENDING_PAGE - 1)).as_str()),
-            "a short page still carries the cursor past every candidate it READ — a cursor \
-             taken from the last MATCH would re-read them, and would end the walk early on a \
-             page that matched nothing"
+            assigned_page(&m, &pool[1], None).next.as_deref(),
+            Some(boundary.as_str())
         );
         // and the walk still sees each of that key's sagas exactly once.
         let mine = assigned_pending(&m, &pool[0]);
