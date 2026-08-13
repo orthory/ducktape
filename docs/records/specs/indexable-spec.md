@@ -312,8 +312,10 @@ boundary (`statesync::fetch_index_ops`): every key is byte-exactly the
 canonical `op/{height:016x}/{seq:04x}` rendering of its own position,
 `(height, seq)` ascends strictly across the whole walk, every height is at or
 below the boundary, every row borsh-decodes as an `OpRow` agreeing with its own
-key, and the source's watermark covers the requested boundary (a source that
-folded less would leave a HOLE above the joiner's floor).
+key, the source's watermark covers the requested boundary (a source that folded
+less would leave a HOLE above the joiner's floor), and the source's own floor
+stays at or below that boundary (one that rose above it holds none of the range
+being asked for).
 
 The key check is byte equality, not a successful parse, and the difference is
 load-bearing. `parse_op_key` reads hex with `from_str_radix`, which accepts any
@@ -326,9 +328,9 @@ The FIXED WIDTH IS THE ORDERING, so it is verified as bytes. Any violation abort
 that module's backfill; its stamped floor stands, which is honest. Per-module
 failure — network, validation, a source that re-stamped past the boundary —
 never aborts the join: it warns once with a stable reason token and the rest of
-the modules continue. A source that re-stamps MID-WALK is composed by taking
-the MAX floor seen across pages: the higher floor is the one that does not
-overclaim.
+the modules continue. A source that re-stamps MID-WALK, but still at or below
+the boundary, is composed by taking the MAX floor seen across pages: the higher
+floor is the one that does not overclaim.
 
 The blocks database (`_blocks`) is deliberately NOT backfilled: its rows are
 node-layer observations, not derived state, and a resident writes its own

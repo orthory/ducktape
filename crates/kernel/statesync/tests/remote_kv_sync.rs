@@ -657,6 +657,36 @@ fn a_source_behind_the_boundary_is_refused_before_a_hole_can_form() {
     assert_eq!(joiner.backfill_height("chat").unwrap(), Some(9));
 }
 
+/// A SOURCE WHOSE FLOOR ROSE ABOVE THE BOUNDARY IS REFUSED, NOT COMPOSED. It
+/// state-synced forward past the range it is being asked for, so it holds none
+/// of it — and inheriting a floor of 20 under a watermark of 9 would leave the
+/// joiner claiming more missing than it has. The stamp is the honest answer.
+#[test]
+fn a_source_that_restamped_past_the_boundary_is_refused_not_composed() {
+    let src_dir = tempfile::tempdir().expect("src dir");
+    let dst_dir = tempfile::tempdir().expect("dst dir");
+    let source = std::sync::Arc::new(store(src_dir.path()));
+    feed(&source, 1..=9);
+    // the source jumped to a boundary ABOVE the one the joiner is asking about,
+    // which wiped every row the joiner wants.
+    source.mark_backfilled("chat", 20).expect("source restamp");
+    feed(&source, 21..=22);
+    let joiner = store(dst_dir.path());
+    joiner.mark_backfilled("chat", 9).expect("stamp");
+
+    let client = IndexOpsClient {
+        source,
+        page_len: 8,
+        corrupt: false,
+    };
+    let err = backfill(&client, &joiner, 9).expect_err("a re-stamped source must refuse");
+    assert!(
+        matches!(&err, SyncError::Module { reason, .. } if reason.contains("rose above")),
+        "want the risen-floor refusal, got {err}"
+    );
+    assert_eq!(joiner.backfill_height("chat").unwrap(), Some(9));
+}
+
 /// A CURSOR WITHOUT ROWS BEHIND IT IS THE WALK'S ONLY UNBOUNDED SHAPE, and it
 /// has to be refused rather than re-asked. A source that serves a page, then
 /// answers "no rows, but ask again from the same place", would otherwise spin

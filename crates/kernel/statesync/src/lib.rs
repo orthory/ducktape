@@ -1789,7 +1789,11 @@ pub async fn fetch_snapshot<C: SyncClient>(
 /// * every row borsh-decodes as an [`index_guest::OpRow`] whose own
 ///   `(height, seq)` matches its key;
 /// * the source's watermark covers `boundary` — a source that folded less
-///   than it is being asked for would leave a HOLE above the joiner's floor.
+///   than it is being asked for would leave a HOLE above the joiner's floor;
+/// * the source's own floor stays at or below `boundary` — a source that
+///   re-stamps ABOVE it mid-walk holds nothing the caller asked for, and
+///   inheriting such a floor would leave the caller claiming more missing than
+///   its own watermark says it has.
 ///
 /// any violation aborts the walk with [`SyncError::Module`]; the caller keeps
 /// its stamped floor, which stays honest.
@@ -1833,6 +1837,16 @@ where
             return Err(refuse(format!(
                 "source index watermark {applied_height} is below the requested \
                  boundary {boundary}; backfilling would leave a hole"
+            )));
+        }
+        // a floor ABOVE the ceiling is not a truncation to inherit, it is a
+        // source that no longer holds the range at all (it re-stamped past the
+        // caller's boundary mid-walk). composing it would hand the caller a
+        // floor above its own watermark — more missing than it has.
+        if let Some(risen) = source_floor.filter(|floor| *floor > boundary) {
+            return Err(refuse(format!(
+                "source index floor {risen} rose above the requested boundary \
+                 {boundary}; it no longer holds the range"
             )));
         }
         floor = floor.max(source_floor);
