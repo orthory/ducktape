@@ -6,31 +6,31 @@ use commonware_cryptography::{Signer as _, ed25519};
 use iced::futures::StreamExt as _;
 
 use super::*;
+use crate::{ForgeTab, MembersFilter, MessageAction, ShellTab};
 
 #[test]
 fn the_rail_seats_exactly_the_nine_module_screens() {
-    let nav = shell_nav("chat".into(), 3, true);
-    let ids: Vec<&str> = nav.iter().map(|item| item.id.as_str()).collect();
+    let nav = shell_nav(ShellTab::Chat, 3, true);
+    let ids: Vec<ShellTab> = nav.iter().map(|item| item.id).collect();
     assert_eq!(
         ids,
         [
-            "chat",
-            "shell",
-            "pages",
-            "forge",
-            "agents",
-            "files",
-            "explorer",
-            "members",
-            "governance"
+            ShellTab::Chat,
+            ShellTab::Shell,
+            ShellTab::Pages,
+            ShellTab::Forge,
+            ShellTab::Agents,
+            ShellTab::Files,
+            ShellTab::Explorer,
+            ShellTab::Members,
+            ShellTab::Governance
         ]
     );
-    let forge = nav.iter().find(|item| item.id == "forge").unwrap();
+    let forge = nav.iter().find(|item| item.id == ShellTab::Forge).unwrap();
     assert!(forge.live, "an engaged agent pulses the forge seat");
-    assert!(!nav.iter().any(|item| item.id == "node"));
     assert_eq!(
         nav.iter()
-            .find(|item| item.id == "governance")
+            .find(|item| item.id == ShellTab::Governance)
             .unwrap()
             .badge,
         3
@@ -980,10 +980,13 @@ fn the_roster_answers_admin_tier_and_filters() {
     let mut answered_without_this_node = rows.clone();
     answered_without_this_node[0].is_this_node = false;
     assert_eq!(member_tier(answered_without_this_node), "guest");
-    assert_eq!(filter_members(rows.clone(), "agents".into()).len(), 1);
-    assert_eq!(filter_members(rows.clone(), "humans".into()).len(), 2);
-    assert_eq!(filter_members(rows.clone(), "validators".into()).len(), 1);
-    assert_eq!(filter_members(rows, "all".into()).len(), 3);
+    assert_eq!(filter_members(rows.clone(), MembersFilter::Agents).len(), 1);
+    assert_eq!(filter_members(rows.clone(), MembersFilter::Humans).len(), 2);
+    assert_eq!(
+        filter_members(rows.clone(), MembersFilter::Validators).len(),
+        1
+    );
+    assert_eq!(filter_members(rows, MembersFilter::All).len(), 3);
 }
 
 /// THE HEADER COUNTS THE LIST IT SITS ABOVE. `members_summary` used to fold the
@@ -1046,7 +1049,9 @@ fn the_tracker_splits_into_open_prs_and_open_issues() {
         item(3, "issue", "open"),
         item(4, "issue", "closed"),
     ];
-    assert_eq!(filter_forge_items(items.clone(), "pr".into()).len(), 2);
+    assert_eq!(filter_forge_items(items.clone(), ForgeTab::Pulls).len(), 2);
+    assert_eq!(filter_forge_items(items.clone(), ForgeTab::Issues).len(), 2);
+    assert!(filter_forge_items(items.clone(), ForgeTab::Code).is_empty());
     assert_eq!(forge_open_count(items.clone(), "pr".into()), 1);
     assert_eq!(forge_open_count(items, "issue".into()), 1);
 }
@@ -1061,7 +1066,6 @@ fn machine_values_read_as_a_person_reads_them() {
     assert_eq!(initials_of("Kestrel Song"), "KS");
     assert_eq!(initials_of("triage"), "TR");
     assert_eq!(initials_of(""), "?");
-    assert_eq!(network_slug("Acme Research!".into()), "acme-research");
     assert_eq!(height_label(84_912), "h 84,912");
     assert_eq!(height_label_short(84_912), "h 84,912");
     assert_eq!(height_label(-1), "h —");
@@ -1109,9 +1113,7 @@ fn a_status_without_operations_produces_unmeasured_readings() {
         "root_hash": "abc",
         "height": 0,
     });
-    let facts = node_facts(&resident, 7);
-
-    assert_eq!(facts.generation, 7);
+    let facts = node_facts(&resident);
     assert_eq!(
         facts.last_finalized_at, UNMEASURED,
         "an omitted `operations` must not read as a finalization at epoch zero"
@@ -1145,7 +1147,7 @@ fn a_finished_sync_is_not_a_sync_in_progress() {
             "sync": { "target_height": 900, "applied_height": 900, "retries": 3, "failures": 1 },
         },
     });
-    let facts = node_facts(&caught_up, 0);
+    let facts = node_facts(&caught_up);
     assert_eq!(facts.phase, "serving");
     assert!(
         !sync_in_progress(&facts.phase),
@@ -1162,7 +1164,7 @@ fn a_finished_sync_is_not_a_sync_in_progress() {
             "sync": { "target_height": 900, "applied_height": 412 },
         },
     });
-    let facts = node_facts(&catching_up, 0);
+    let facts = node_facts(&catching_up);
     assert!(sync_in_progress(&facts.phase));
     assert_eq!(facts.sync_applied, 412);
     assert_eq!(facts.sync_target, 900);
@@ -1171,7 +1173,7 @@ fn a_finished_sync_is_not_a_sync_in_progress() {
     // UNMEASURED because the node published none; the counters are genuinely
     // zero, because a count of nothing IS zero.
     let fresh = serde_json::json!({ "operations": { "phase": "validating" } });
-    let facts = node_facts(&fresh, 0);
+    let facts = node_facts(&fresh);
     assert_eq!(facts.sync_target, UNMEASURED);
     assert_eq!(facts.sync_applied, UNMEASURED);
     assert_eq!(facts.sync_retries, 0);
@@ -1652,9 +1654,7 @@ async fn a_workspace_search_reaches_its_six_sources_together() {
     let watch: std::sync::Arc<Mutex<FanOutWatch>> = Default::default();
     let rpc = node_that_answers_only_a_full_fan_out(9, &[], watch.clone()).await;
 
-    let results = search_workspace(rpc, "needle".into(), 4)
-        .await
-        .expect("the stub answers every lane");
+    let results = search_workspace(rpc, "needle".into()).await;
 
     assert_eq!(
         watch.lock().expect("stub watch").overlapped,
@@ -1726,9 +1726,7 @@ async fn a_search_that_lost_a_source_says_which_one() {
         };
         let rpc = node_that_answers_only_a_full_fan_out(9, leg_alone, Default::default()).await;
 
-        let results = search_workspace(rpc, "needle".into(), 5)
-            .await
-            .expect("the other five sources answered");
+        let results = search_workspace(rpc, "needle".into()).await;
 
         assert_eq!(
             results.partial,
@@ -1772,9 +1770,7 @@ async fn a_search_that_lost_a_source_says_which_one() {
     // case the PR body's own headline scenario describes.
     let rpc =
         node_that_answers_only_a_full_fan_out(9, &["chat", "pages"], Default::default()).await;
-    let results = search_workspace(rpc, "needle".into(), 5)
-        .await
-        .expect("the other four sources answered");
+    let results = search_workspace(rpc, "needle".into()).await;
     assert_eq!(
         results.partial, "Messages, Pages did not answer — these results are incomplete.",
         "both silent sources are named, in screen order"
@@ -1856,7 +1852,7 @@ fn an_unread_block_height_is_not_reported_as_zero() {
     // real height here. What changed is upstream — `served_height` decides that
     // a `0` on the wire was never a measurement, so no zero reaches this label
     // as a head. See `a_resyncing_replica_has_no_head_to_print_a_checkpoint_against`.
-    const STATE: &str = include_str!("../ui/state.ice");
+    const STATE: &str = include_str!("../ui/state/node.ice");
     assert!(
         STATE.contains("node_height:i64 = -1"),
         "an unread height must default to the sentinel, not to a measured zero"
@@ -1937,7 +1933,7 @@ async fn the_node_tile_prints_a_head_and_a_checkpoint_from_one_status_read() {
     const SERVING: &str = r#"{"version":"0.1.0","root_hash":"20c53b","height":426099,"modules":[],"public_key":"ab","operations":{"last_finalized_at":426099,"storage":{"checkpoint_height":425981}}}"#;
     let rpc = node_that_serves_its_status_once(SERVING).await;
 
-    let facts = load_node_facts(rpc, 9)
+    let facts = load_node_facts(rpc)
         .await
         .expect("one read fills the whole card; a second one is the defect");
 
@@ -1969,7 +1965,7 @@ async fn a_resyncing_replica_has_no_head_to_print_a_checkpoint_against() {
     const RESYNCING: &str = r#"{"version":"0.1.0","root_hash":"","height":0,"modules":[],"public_key":"ab","operations":{"last_finalized_at":0,"storage":{"checkpoint_height":425981}}}"#;
     let rpc = node_that_serves_its_status_once(RESYNCING).await;
 
-    let facts = load_node_facts(rpc, 9)
+    let facts = load_node_facts(rpc)
         .await
         .expect("one read fills the whole card; a second one is the defect");
 
@@ -2046,8 +2042,8 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
     let target = |palette: bool,
                   bell: bool,
                   create: bool,
-                  thread_action: &str,
-                  action: &str,
+                  thread_action: MessageAction,
+                  action: MessageAction,
                   drawer: bool,
                   repo_menu: bool| {
         escape_target(
@@ -2055,8 +2051,8 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             palette,
             bell,
             create,
-            thread_action.into(),
-            action.into(),
+            thread_action,
+            action,
             drawer,
             repo_menu,
         )
@@ -2069,31 +2065,74 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             false,
             true,
             true,
-            "more".into(),
-            "more".into(),
+            MessageAction::More,
+            MessageAction::More,
             true,
             true,
         ),
         ""
     );
     // An open palette swallows Escape — palette_key_action owns it.
-    assert_eq!(target(true, true, true, "more", "more", true, true), "");
+    assert_eq!(
+        target(
+            true,
+            true,
+            true,
+            MessageAction::More,
+            MessageAction::More,
+            true,
+            true,
+        ),
+        ""
+    );
     // The ladder order is the z-order: bell over the create modal, menus
     // after both, thread menu over the stream's, popovers last.
     assert_eq!(
-        target(false, true, true, "more", "more", true, true),
+        target(
+            false,
+            true,
+            true,
+            MessageAction::More,
+            MessageAction::More,
+            true,
+            true,
+        ),
         "bell"
     );
     assert_eq!(
-        target(false, false, true, "more", "more", true, true),
+        target(
+            false,
+            false,
+            true,
+            MessageAction::More,
+            MessageAction::More,
+            true,
+            true,
+        ),
         "channel_create"
     );
     assert_eq!(
-        target(false, false, false, "more", "more", true, true),
+        target(
+            false,
+            false,
+            false,
+            MessageAction::More,
+            MessageAction::More,
+            true,
+            true,
+        ),
         "thread_menu"
     );
     assert_eq!(
-        target(false, false, false, "toolbar", "editing", true, true),
+        target(
+            false,
+            false,
+            false,
+            MessageAction::Toolbar,
+            MessageAction::Editing,
+            true,
+            true,
+        ),
         "message_menu"
     );
     // THE DRAWER SITS BETWEEN THEM. Both message menus float over Channel
@@ -2102,17 +2141,41 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
     // overlay answered Escape. Measured: Escape over an open drawer changed
     // exactly zero pixels on the running app.
     assert_eq!(
-        target(false, false, false, "toolbar", "toolbar", true, true),
+        target(
+            false,
+            false,
+            false,
+            MessageAction::Toolbar,
+            MessageAction::Toolbar,
+            true,
+            true,
+        ),
         "channel_settings"
     );
     assert_eq!(
-        target(false, false, false, "toolbar", "toolbar", false, true),
+        target(
+            false,
+            false,
+            false,
+            MessageAction::Toolbar,
+            MessageAction::Toolbar,
+            false,
+            true,
+        ),
         "repo_menu"
     );
     // Nothing transient open → Escape is a no-op. The pages rungs are gone
     // with the menus they dismissed: the document has no transient layer.
     assert_eq!(
-        target(false, false, false, "toolbar", "toolbar", false, false),
+        target(
+            false,
+            false,
+            false,
+            MessageAction::Toolbar,
+            MessageAction::Toolbar,
+            false,
+            false,
+        ),
         ""
     );
 }
@@ -2760,7 +2823,6 @@ async fn chat_and_pages_round_trip_over_signed_frames() {
         "no-such-page".into(),
         "Welcome\n".into(),
         "Welcome\n".into(),
-        0,
     )
     .await;
     // ASSERT THE REASON, NOT JUST THE FAILURE. An unsigned save fails anyway —
@@ -3309,11 +3371,6 @@ fn page_updates_preserve_exact_text() {
 }
 
 #[test]
-fn cancelling_autosaves_bumps_the_generation() {
-    assert_eq!(cancel_autosaves("http://old".into(), 4), 5);
-}
-
-#[test]
 fn block_moves_follow_visible_sibling_order() {
     let block = |id: &str, parent: Option<&str>, kind, children: &[&str]| pages::Block {
         id: id.into(),
@@ -3793,10 +3850,8 @@ fn forge_code_replies_keep_the_server_revision_and_preview_flags() {
         }}),
         "core".into(),
         "src".into(),
-        7,
     )
     .unwrap();
-    assert_eq!(tree.generation, 7);
     assert_eq!(tree.rev, "1".repeat(40));
     assert!(tree.born);
     assert!(tree.truncated);
@@ -3812,7 +3867,6 @@ fn forge_code_replies_keep_the_server_revision_and_preview_flags() {
             "binary": false
         }}),
         "core".into(),
-        8,
     )
     .unwrap();
     assert_eq!(text.lines, 2);
@@ -3828,19 +3882,13 @@ fn forge_code_replies_keep_the_server_revision_and_preview_flags() {
             "binary": true
         }}),
         "core".into(),
-        9,
     )
     .unwrap();
     assert!(binary.binary);
     assert_eq!(binary.lines, 0);
 
     assert_eq!(
-        blob_view(
-            serde_json::json!({ "blob": null }),
-            "core".into(),
-            10,
-        )
-        .unwrap_err(),
+        blob_view(serde_json::json!({ "blob": null }), "core".into(),).unwrap_err(),
         "the requested file was not found"
     );
 }
@@ -4058,11 +4106,10 @@ async fn node_with_a_broken_page_list() -> String {
 #[tokio::test(flavor = "current_thread")]
 async fn a_failed_title_lookup_keeps_the_page_hits_it_could_not_name() {
     let rpc = node_with_a_broken_page_list().await;
-    let data = search_pages(rpc, String::new(), "tail".into(), 7)
+    let data = search_pages(rpc, String::new(), "tail".into())
         .await
         .expect("a search the node answered must not fail on its title lookup");
 
-    assert_eq!(data.generation, 7);
     assert_eq!(data.hits.len(), 1, "the hit the search returned survives");
     assert_eq!(data.hits[0].text, "Tail paragraph after the list");
     assert_eq!(data.hits[0].page_id, "page-1");
@@ -4151,11 +4198,11 @@ fn a_tab_move_only_refetches_what_its_destination_draws() {
     // EVERY tab, taken from the rail itself plus the footer's Settings, so a
     // new seat lands in this sweep instead of quietly defaulting to "reads
     // nothing" behind a hand-written negative list.
-    let mut tabs: Vec<String> = shell_nav("chat".into(), 0, false)
+    let mut tabs: Vec<ShellTab> = shell_nav(ShellTab::Chat, 0, false)
         .into_iter()
         .map(|seat| seat.id)
         .collect();
-    tabs.push("settings".into());
+    tabs.push(ShellTab::Settings);
 
     // the roster is drawn by four panes: its own, the admin gate under
     // Approvals, the forge write gate, and the Settings standing card. The
@@ -4164,53 +4211,26 @@ fn a_tab_move_only_refetches_what_its_destination_draws() {
     for (plane, drawn) in [
         (
             "members",
-            &["forge", "members", "governance", "settings"][..],
+            &[
+                ShellTab::Forge,
+                ShellTab::Members,
+                ShellTab::Governance,
+                ShellTab::Settings,
+            ][..],
         ),
-        ("governance", &["governance"][..]),
-        ("agents", &["agents"][..]),
-        ("account", &["forge", "settings"][..]),
+        ("governance", &[ShellTab::Governance][..]),
+        ("agents", &[ShellTab::Agents][..]),
+        ("account", &[ShellTab::Forge, ShellTab::Settings][..]),
         // an unknown plane name is nobody's — a typo must not silently reopen
         // the storm by answering true.
         ("explorer", &[][..]),
     ] {
-        let readers: Vec<&str> = tabs
+        let readers: Vec<ShellTab> = tabs
             .iter()
-            .filter(|tab| tab_reads_plane((*tab).clone(), plane.into()))
-            .map(String::as_str)
+            .copied()
+            .filter(|tab| tab_reads_plane(*tab, plane.into()))
             .collect();
         assert_eq!(readers, drawn, "exactly these tabs draw {plane}");
-    }
-}
-
-/// THE GATE IS ONLY WORTH ANYTHING IF THE LOADER HONOURS IT. `keep_i64` sends
-/// an off-screen plane generation -1; each loader has to refuse it BEFORE any
-/// I/O, which is what turns the gate into a skipped round trip rather than a
-/// wasted one. `unreachable` is never contacted: reaching the client at all is
-/// the failure this pins.
-#[tokio::test(flavor = "current_thread")]
-async fn an_off_screen_plane_is_refused_before_it_touches_the_node() {
-    let unreachable = "http://127.0.0.1:9".to_string();
-    let refusals = [
-        load_members(unreachable.clone(), -1).await.err(),
-        load_governance(unreachable.clone(), -1).await.err(),
-        load_agents(unreachable.clone(), -1).await.err(),
-        load_account(unreachable.clone(), -1).await.err(),
-        // the DM directory is on the same -1 lane (lifecycle.ice's `identity`
-        // live arm) and its `all{from:0,limit:256}` walk is the priciest of
-        // the five — an ungated one fires on every chat post.
-        load_dm_peers(unreachable.clone(), -1).await.err(),
-        // the settings facts ride the -1 lane on the inline gate instead of a
-        // plane row, and their off-screen cost is not one round trip: a
-        // `/v1/status` call, a `user key status` SUBPROCESS and a prefs read.
-        load_settings_facts(unreachable, -1).await.err(),
-    ];
-    for refusal in refusals {
-        let refusal = refusal.expect("an off-screen load refuses");
-        assert_eq!(refusal.generation, -1);
-        assert_eq!(
-            refusal.message, "skipped_offscreen",
-            "the refusal must be the guard's, not a failed round trip's"
-        );
     }
 }
 
@@ -4239,4 +4259,3 @@ async fn a_forge_op_does_not_load_the_repo_list_for_a_closed_pane() {
     );
     assert!(data.repos.is_empty());
 }
-

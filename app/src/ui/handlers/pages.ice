@@ -1,44 +1,38 @@
 on search_pages_submit
   return if page_searching || empty(trim(page_search_draft))
-  page_search_generation = page_search_generation + 1
   page_searching = true
   page_search_hits = []
   error = ""
-  run replace lane=page_search search_pages(connected_rpc, "", trim(page_search_draft), page_search_generation) -> page_search_loaded _ | page_search_failed _
+  run replace lane=page_search search_pages(connected_rpc, "", trim(page_search_draft)) -> page_search_loaded _ | page_search_failed _
 
 on page_search_loaded(next)
-  return if next.generation != page_search_generation
   page_search_hits = next.hits
   page_searching = false
   error = ""
 
 on page_search_failed(cause)
-  return if cause.generation != page_search_generation
   page_searching = false
   error = cause.message
 
 on clear_page_search
   invalidate lane=page_search
-  page_search_generation = page_search_generation + 1
   page_search_draft = ""
   page_search_hits = []
   page_searching = false
 
 on open_page_search_hit(page_id, _block_id)
-  return if loading || mutation_phase != "idle"
+  return if loading || mutation_phase != MutationPhase.idle
   invalidate lane=page_search
+  invalidate lane=page_autosave
   invalidate lane=block_threads
   invalidate lane=block_comments
   palette_open = false
-  shell_tab = "pages"
+  shell_tab = ShellTab.pages
   invalidate lane=forge_code
-  forge_code_generation = forge_code_generation + 1
   // Same tab-move rule as `select_shell_tab`.
-  composer_focus = "none"
-  page_search_generation = page_search_generation + 1
+  composer_focus = ComposerFocus.unfocused
   page_searching = false
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
-  block_autosave_generation = block_autosave_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   loading = true
@@ -61,17 +55,17 @@ on open_page_search_hit(page_id, _block_id)
   block_thread_comments_loading = false
   block_comment_draft = ""
   pending_block_comment = ""
-  block_autosave_status = "idle"
+  block_autosave_status = AutosaveStatus.idle
   page_delete_armed = false
   error = ""
   run replace lane=page_load load_page(connected_rpc, page_id) -> pages_updated _ | failed _
 
 on choose_page(id)
-  return if loading || mutation_phase != "idle"
+  return if loading || mutation_phase != MutationPhase.idle
   invalidate lane=page_search
+  invalidate lane=page_autosave
   invalidate lane=block_threads
   invalidate lane=block_comments
-  page_search_generation = page_search_generation + 1
   page_searching = false
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
   // THE SWITCH IS VISIBLE NOW — the same choreography as `choose_channel`. The
@@ -92,7 +86,6 @@ on choose_page(id)
   page_editor = installed_page_editor(page_editor, page_moved, "")
   page_saved_text = keep_str(page_moved, "", page_saved_text)
   buffer_page = keep_str(page_moved, "", buffer_page)
-  block_autosave_generation = block_autosave_generation + 1
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   loading = true
@@ -115,16 +108,16 @@ on choose_page(id)
   block_thread_comments_loading = false
   block_comment_draft = ""
   pending_block_comment = ""
-  block_autosave_status = "idle"
+  block_autosave_status = AutosaveStatus.idle
   page_delete_armed = false
   error = ""
   run replace lane=page_load load_page(connected_rpc, id) -> pages_updated _ | failed _
 
 on create_page_submit
-  return if loading || mutation_phase != "idle" || empty(trim(page_draft))
+  return if loading || mutation_phase != MutationPhase.idle || empty(trim(page_draft))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  mutation_phase = "page"
+  mutation_phase = MutationPhase.page
   pending_page = trim(page_draft)
   page_draft = ""
   error = ""
@@ -135,26 +128,26 @@ on toggle_page_create
   return if !page_create_open
   // Same rule as chat's menus: a `task widget focus` is the app moving the
   // caret by hand, so the chat composers' claim on it dies here.
-  composer_focus = "none"
+  composer_focus = ComposerFocus.unfocused
   task widget focus #workspace-tabs/content/pages/new-page
 
 on arm_page_delete
-  return if loading || mutation_phase != "idle" || empty(active_page)
+  return if loading || mutation_phase != MutationPhase.idle || empty(active_page)
   page_delete_armed = true
 
 on disarm_page_delete
   page_delete_armed = false
 
 on delete_page_submit
-  return if loading || mutation_phase != "idle" || empty(active_page) || !page_delete_armed
+  return if loading || mutation_phase != MutationPhase.idle || empty(active_page) || !page_delete_armed
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  mutation_phase = "page-delete"
+  mutation_phase = MutationPhase.page_delete
   page_delete_armed = false
   error = ""
   run every delete_page(connected_rpc, password, active_page) -> pages_mutated _ | mutation_failed _
 on use_orphaned_comment_draft(draft)
-  return if loading || mutation_phase != "idle" || !empty(trim(block_comment_draft))
+  return if loading || mutation_phase != MutationPhase.idle || !empty(trim(block_comment_draft))
   block_comment_draft = draft
   block_comments_open = true
   orphaned_comment_drafts = remove_recovered_draft(orphaned_comment_drafts, draft)
@@ -178,7 +171,7 @@ on discard_orphaned_comment_draft(draft)
 // anything to load. Closing keeps the half-typed comment through the orphan
 // guard, exactly as the rail's own × does.
 on toggle_block_comments
-  return if loading || mutation_phase != "idle" || empty(active_page)
+  return if loading || mutation_phase != MutationPhase.idle || empty(active_page)
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
   block_comments_generation = block_comments_generation + 1
   block_comments_open = !block_comments_open
@@ -239,7 +232,7 @@ on block_threads_loaded(next)
 // The pagination machinery stays wired, and the document query answers in one
 // page (`has_more` false), so this only fires if that ever changes.
 on load_more_block_threads
-  return if block_comment_threads_loading || block_thread_comments_loading || mutation_phase != "idle" || !block_comments_open || !block_comment_threads_has_more
+  return if block_comment_threads_loading || block_thread_comments_loading || mutation_phase != MutationPhase.idle || !block_comments_open || !block_comment_threads_has_more
   block_comments_generation = block_comments_generation + 1
   block_comment_threads_loading = true
   error = ""
@@ -261,7 +254,7 @@ on block_threads_failed(cause)
   error = cause.message
 
 on open_block_comment_thread(id, target)
-  return if block_comment_threads_loading || block_thread_comments_loading || mutation_phase != "idle" || !block_comments_open || empty(id)
+  return if block_comment_threads_loading || block_thread_comments_loading || mutation_phase != MutationPhase.idle || !block_comments_open || empty(id)
   block_comments_generation = block_comments_generation + 1
   active_block_comment_thread = id
   // The thread's OWN anchor, not the page: the node validates a comment read
@@ -285,7 +278,7 @@ on block_comment_page_loaded(next)
   error = ""
 
 on load_more_block_comments
-  return if block_thread_comments_loading || block_comment_threads_loading || mutation_phase != "idle" || empty(active_block_comment_thread) || !block_thread_comments_has_more
+  return if block_thread_comments_loading || block_comment_threads_loading || mutation_phase != MutationPhase.idle || empty(active_block_comment_thread) || !block_thread_comments_has_more
   block_comments_generation = block_comments_generation + 1
   block_thread_comments_loading = true
   error = ""
@@ -305,20 +298,20 @@ on block_comment_page_failed(cause)
   error = cause.message
 
 on resolve_thread_submit(resolved)
-  return if loading || mutation_phase != "idle" || !block_comments_open || empty(active_block_comment_thread)
-  mutation_phase = "comment-resolve"
+  return if loading || mutation_phase != MutationPhase.idle || !block_comments_open || empty(active_block_comment_thread)
+  mutation_phase = MutationPhase.comment_resolve
   error = ""
   run every resolve_comment_thread(connected_rpc, password, active_block_comment_thread, resolved) -> thread_resolved _ | thread_resolve_failed _
 
 on thread_resolved(_written)
-  mutation_phase = "idle"
+  mutation_phase = MutationPhase.idle
   block_comments_generation = block_comments_generation + 1
   block_comment_threads_loading = true
   error = ""
   run replace lane=block_threads load_page_threads(connected_rpc, active_page, block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
 
 on thread_resolve_failed(cause)
-  mutation_phase = "idle"
+  mutation_phase = MutationPhase.idle
   error = cause.message
 
 on close_block_comment_thread
@@ -333,10 +326,10 @@ on close_block_comment_thread
   block_thread_comments_loading = false
 
 on post_block_comment_submit
-  return if loading || block_comment_threads_loading || block_thread_comments_loading || mutation_phase != "idle" || !block_comments_open || empty(active_page) || empty(trim(block_comment_draft))
+  return if loading || block_comment_threads_loading || block_thread_comments_loading || mutation_phase != MutationPhase.idle || !block_comments_open || empty(active_page) || empty(trim(block_comment_draft))
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  mutation_phase = "block-comment"
+  mutation_phase = MutationPhase.block_comment
   pending_block_comment = trim(block_comment_draft)
   block_comment_draft = ""
   // A reply stays on its thread's anchor; a NEW comment anchors on the block
@@ -358,7 +351,7 @@ on block_comment_posted(next)
   block_thread_comments_has_more = next.has_more
   block_thread_comments_loading = false
   pending_block_comment = ""
-  mutation_phase = "idle"
+  mutation_phase = MutationPhase.idle
   error = ""
   block_comments_generation = block_comments_generation + 1
   block_comment_threads_loading = true
@@ -389,13 +382,13 @@ on block_threads_recovered(next)
   block_comment_threads_next_from = next.next_from
   block_comment_threads_has_more = next.has_more
   block_comment_threads_loading = false
-  mutation_phase = keep_str(mutation_phase == "recovering", "idle", mutation_phase)
+  mutation_phase = mutation_phase_after_recovery(mutation_phase)
   error = ""
 
 on block_threads_recovery_failed(cause)
   return if cause.generation != block_comments_generation || !block_comments_open
   block_comment_threads_loading = false
-  mutation_phase = keep_str(mutation_phase == "recovering", "idle", mutation_phase)
+  mutation_phase = mutation_phase_after_recovery(mutation_phase)
   error = cause.message
 on pages_updated(next)
   block_comments_generation = block_comments_generation + 1
@@ -438,15 +431,15 @@ on pages_updated(next)
   block_comment_thread_total = next.comment_thread_total
   commented_block_hits = next.commented_block_hits
   caret_comment_target = ""
-  block_autosave_status = "idle"
-  block_autosave_generation = block_autosave_generation + 1
+  block_autosave_status = AutosaveStatus.idle
+  invalidate lane=page_autosave
   loading = false
   error = ""
   doc_tabs = doc_tabs_with(doc_tabs_pruned(doc_tabs, pages), active_page)
   run replace lane=doc_tabs_save save_doc_tabs(connected_rpc, doc_tabs) -> doc_tabs_saved _
 on pages_mutated(next)
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
-  block_autosave_generation = block_autosave_generation + 1
+  invalidate lane=page_autosave
   pages = next.pages
   // The same one-decision install as `pages_updated` — create/delete moves
   // the selection to another page, and the buffer must follow it; a mutation
@@ -485,9 +478,9 @@ on pages_mutated(next)
   page_refusal = ""
   block_comment_thread_total = next.comment_thread_total
   commented_block_hits = next.commented_block_hits
-  block_autosave_status = "idle"
+  block_autosave_status = AutosaveStatus.idle
   page_delete_armed = false
-  mutation_phase = "idle"
+  mutation_phase = MutationPhase.idle
   error = ""
   // THE SAME TWO LINES `pages_updated` ENDS ON. A mutation moves the selection
   // exactly as a pick does — a create lands on the page it just made — so the
@@ -506,7 +499,7 @@ on doc_tabs_loaded(tabs)
   doc_tabs = tabs
 
 on close_doc_tab(id)
-  return if loading || mutation_phase != "idle"
+  return if loading || mutation_phase != MutationPhase.idle
   closing_doc_tab = id
   active_page = next_doc_tab(doc_tabs, closing_doc_tab, active_page)
   block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
@@ -518,7 +511,7 @@ on close_doc_tab(id)
   // page's text into the NEW page. `pages_updated` clears it and decides the
   // install; closing a background tab reloads the same page, which the
   // install decision keeps harmless for a dirty buffer.
-  block_autosave_generation = block_autosave_generation + 1
+  invalidate lane=page_autosave
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   loading = true
@@ -540,7 +533,7 @@ on page_edited(event)
   // at its reset value whenever the rail is closed (every close path resets
   // them), so opening is just the flip plus the thread load. A badge press
   // with the rail already open is a no-op.
-  let page_rail_open = page_opens_comments(event) && !block_comments_open && !loading && mutation_phase == "idle" && !empty(active_page)
+  let page_rail_open = page_opens_comments(event) && !block_comments_open && !loading && mutation_phase == MutationPhase.idle && !empty(active_page)
   block_comments_generation = block_comments_generation + keep_i64(page_rail_open, 1, 0)
   block_comments_open = block_comments_open || page_rail_open
   block_comments_target = keep_str(page_rail_open, active_page, block_comments_target)
@@ -565,7 +558,7 @@ on external_url_failed(cause)
 // so dirtiness is the buffer's drift from `page_saved_text` and the subscribe
 // block's `every` line only exists while that drift does.
 on page_autosave_tick
-  return if loading || empty(active_page) || mutation_phase != "idle"
+  return if loading || empty(active_page) || mutation_phase != MutationPhase.idle
   // NEVER WRITE A BUFFER INTO A PAGE IT DOES NOT BELONG TO. `active_page` moves
   // the instant the reader clicks; the buffer only becomes that page's when a
   // load lands and stamps `buffer_page`. Between those two moments the pane is
@@ -579,30 +572,28 @@ on page_autosave_tick
   // One op chain at a time: a multi-op save routinely outlives the 900ms
   // tick, and a second chain against the same page defeats the ordering
   // rule the awaited loop exists for (backend/document.rs).
-  return if block_autosave_status == "saving"
+  return if block_autosave_status == AutosaveStatus.saving
   let text = page_text(page_editor)
   return if text == page_saved_text
   // An open ``` swallows every line under it when parsed — the save waits
   // for the close instead of writing (or refusing) a half-typed fence, and
   // SAYS SO: a stale "✓ synced" over held-back text would be a lie.
   let fence_open = has_unclosed_fence(text)
-  block_autosave_status = keep_str(!fence_open, block_autosave_status, "idle")
+  block_autosave_status = AutosaveStatus.idle
   page_refusal = keep_str(!fence_open, page_refusal, "the ``` fence is open — close it to save")
   return if fence_open
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  block_autosave_status = "saving"
-  block_autosave_generation = block_autosave_generation + 1
+  block_autosave_status = AutosaveStatus.saving
   page_inflight_text = text
   error = ""
-  run every save_page_document(connected_rpc, password, active_page, text, page_saved_text, block_autosave_generation) -> page_document_saved _ | page_document_save_failed _
+  run latest lane=page_autosave save_page_document(connected_rpc, password, active_page, text, page_saved_text) -> page_document_saved _ | page_document_save_failed _
 
 // The baseline is the node's own text after a write, and the submitted text
 // after a no-op — `saved_baseline` carries the reasoning. Either way anything
 // typed during the round trip stays dirty, and a depth change that takes one
 // `MoveBlock` per tick keeps ticking until the buffer and the node agree.
 on page_document_saved(next)
-  return if next.generation != block_autosave_generation
   pages = next.data.pages
   blocks = next.data.blocks
   block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
@@ -611,7 +602,7 @@ on page_document_saved(next)
   active_page_parent = next.data.active_page_parent
   page_refusal = next.refusal
   page_saved_text = baseline_at_submitted_title(saved_baseline(next.written, next.document, page_inflight_text), page_inflight_text)
-  block_autosave_status = "saved"
+  block_autosave_status = AutosaveStatus.saved
   error = ""
   return if empty(next.refusal)
   // A REFUSED WRITE ROLLS THE BUFFER BACK — but only when nothing was typed
@@ -625,9 +616,8 @@ on page_document_saved(next)
   // unsaved line 0 here would make the document read clean and retire the very
   // tick that owes the node her rename.
   page_saved_text = baseline_at_submitted_title(next.document, page_inflight_text)
-  block_autosave_status = "idle"
+  block_autosave_status = AutosaveStatus.idle
 
 on page_document_save_failed(cause)
-  return if cause.generation != block_autosave_generation
-  block_autosave_status = "error"
+  block_autosave_status = AutosaveStatus.error
   error = cause.message

@@ -1,5 +1,173 @@
-// The repeated pieces of the canonical console: the shapes that appear on more
-// than one screen. Anything used once stays inline in `view.ice`.
+// The shared composition surface: the small generic pieces the app actually
+// uses plus the repeated shapes of the canonical console. Anything used once
+// stays inline at its call site.
+
+component Panel(title:str, description:str)
+  box #root r=11.0 @panel
+    col @section
+      col @field
+        text title @section_title
+        text description @caption
+      slot
+
+component Alert.Destructive(title:str, description:str)
+  box #root
+    with
+      w=fill
+      p=13.0
+      bg=danger_bg
+      border=danger_line
+      border-w=1.0
+      r=11.0
+    row w=fill gap=9.0
+      box
+        with
+          w=24.0
+          h=24.0
+          align-x=center
+          align-y=center
+          bg=danger_dot
+          r=7.0
+        text "!"
+          with
+            size=14.0
+            @font-semibold
+            @text-danger_fg
+      col w=fill gap=3.0
+        text title
+          with
+            size=14.0
+            @font-semibold
+            @text-fg
+        text description size=13.0 @text-muted
+
+component Field(label:str, description:str)
+  col #root @field
+    text label @field_label
+    slot
+    text description @caption
+
+component Badge.Secondary(label:str)
+  box #root
+    with
+      px=7.0
+      py=3.0
+      bg=primary
+      r=5.0
+    text label @badge_label text-primary_fg
+
+component Badge.Outline(label:str)
+  box #root
+    with
+      px=7.0
+      py=3.0
+      bg=surface
+      border=control_line
+      border-w=1.0
+      r=5.0
+    text label @badge_label text-secondary_fg
+
+component Badge.Destructive(label:str)
+  box #root
+    with
+      px=7.0
+      py=3.0
+      bg=danger_bg
+      border=danger_line
+      border-w=1.0
+      r=5.0
+    row gap=5.0 align=center
+      box
+        with
+          w=6.0
+          h=6.0
+          bg=danger_dot
+          r=3.0
+        space w=1.0 h=1.0
+      text label @badge_label
+
+component Badge.Success(label:str)
+  box #root
+    with
+      px=7.0
+      py=3.0
+      bg=success_bg
+      border=success_line
+      border-w=1.0
+      r=5.0
+    row gap=5.0 align=center
+      box
+        with
+          w=6.0
+          h=6.0
+          bg=success_dot
+          r=3.0
+        space w=1.0 h=1.0
+      text label @badge_label
+
+component Badge.Warning(label:str)
+  box #root
+    with
+      px=7.0
+      py=3.0
+      bg=warning_bg
+      border=warning_line
+      border-w=1.0
+      r=5.0
+    row gap=5.0 align=center
+      box
+        with
+          w=6.0
+          h=6.0
+          bg=warning_dot
+          r=3.0
+        space w=1.0 h=1.0
+      text label @badge_label
+
+component Kbd(label:str)
+  box #root
+    with
+      px=7.0
+      py=3.0
+      bg=accent
+      border=border
+      border-w=1.0
+      r=5.0
+      shadow=black/10
+      shadow-y=1.0
+      shadow-blur=2.0
+    text label @meta text-fg
+
+component Separator()
+  rule horizontal #root thickness=1.0 color=border
+
+// Empty readings sit on the page instead of introducing another bordered slab.
+component EmptyState(title:str, description:str)
+  box #root
+    with
+      w=fill
+      h=fill
+      p=22.0
+      align-x=center
+      align-y=center
+    col
+      with
+        w=fill
+        align=center
+        gap=7.0
+      box
+        with
+          w=42.0
+          h=42.0
+          align-x=center
+          align-y=center
+          bg=surface
+          border=border
+          border-w=1.0
+          r=21.0
+        text "◇" size=20.0 @text-primary
+      text title @section_title text-fg
+      text description @caption
 
 // An all-caps section eyebrow — 9px mono over the widest tracking in the scale.
 component GroupLabel(label:str)

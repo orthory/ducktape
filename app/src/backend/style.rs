@@ -222,13 +222,6 @@ pub(crate) fn bounded_updated_block_text(kind: BlockKind, text: String) -> Resul
     bounded_exact_text(text, "block text", 64 * 1024)
 }
 
-/// Bump the autosave generation so any in-flight save's reply is discarded.
-/// The debounce ticket map this once also swept died with
-/// `debounced_page_text` — the generation check is the whole mechanism now.
-pub fn cancel_autosaves(_rpc: String, generation: i64) -> i64 {
-    generation.saturating_add(1)
-}
-
 pub(crate) fn block_move(
     blocks: &[pages::Block],
     block_id: &str,

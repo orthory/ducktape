@@ -24,7 +24,7 @@ use iced::{Event, Point, Size, Theme};
 use iced_test::runtime::user_interface::{self, UserInterface};
 
 use super::backend;
-use super::{__DucktapeMessage, Ducktape};
+use super::{__DucktapeMessage, Ducktape, ShellTab};
 
 /// One synthetic channel's worth of scrollback — `CHAT_VIEW_PAGE_LIMIT`, the
 /// page the timeline walk asks for, so the probe measures the widest window a
@@ -48,10 +48,10 @@ const FRAMES: usize = 12;
 /// ALLOCATIONS PER KEYSTROKE, AND NOTHING ELSE IS ASSERTED.
 ///
 /// Measured on `dev` after the QA sweep landed: about **16 700** allocations;
-/// the ducktape-ui a099fa6b pin's borrow-aware `for` rows brought the same
-/// fixture to **15 982**, and the 690b84d9 keyed lazy (`by message.seq,
-/// message.render_rev` over by-reference keyed rows) to **11 377** — each
-/// ceiling move locks the win. The count is stable inside one process but can
+/// borrow-aware `for` rows brought the same fixture to **15 982**, and keyed
+/// lazy (`by message.seq, message.render_rev` over by-reference keyed rows) to
+/// **11 377**. Each ceiling move locks the win. The count is stable inside one
+/// process but can
 /// move slightly with global font/cache initialization, so the ceiling leaves
 /// broad headroom. Deleting the stream's `virtual-row=` alone takes it above
 /// 27 000, still well beyond the budget.
@@ -349,13 +349,13 @@ fn console_in_chat_with_thread(
     (app, console)
 }
 
-fn console_on(tab: &str) -> (Ducktape, iced::window::Id) {
+fn console_on(tab: ShellTab) -> (Ducktape, iced::window::Id) {
     let (mut app, _) = Ducktape::__boot();
     let console = iced::window::Id::unique();
     app.console_win = Some(console);
     app.connected = true;
     app.connected_rpc = "http://node".into();
-    let _ = app.__update(__DucktapeMessage::SelectShellTab(tab.into()));
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(tab));
     assert_eq!(app.shell_tab, tab, "the probe mounts the requested screen");
     (app, console)
 }
@@ -377,7 +377,7 @@ fn probe_page_block(index: usize) -> backend::PageBlock {
 }
 
 fn console_in_page_comments() -> (Ducktape, iced::window::Id) {
-    let (mut app, console) = console_on("pages");
+    let (mut app, console) = console_on(ShellTab::Pages);
     let blocks: Vec<_> = (0..PAGE_ROWS).map(probe_page_block).collect();
     let _ = app.__update(__DucktapeMessage::PagesUpdated(backend::PagesData {
         pages: vec![backend::PageItem {
@@ -482,7 +482,7 @@ fn forge_source() -> String {
 }
 
 fn console_in_forge_code() -> (Ducktape, iced::window::Id) {
-    let (mut app, console) = console_on("forge");
+    let (mut app, console) = console_on(ShellTab::Forge);
     let _ = app.__update(__DucktapeMessage::ForgeOpenRepo("probe".into()));
     let _ = app.__update(__DucktapeMessage::ForgeRepoLoaded(backend::ForgeRepoData {
         generation: app.forge_generation,
@@ -491,7 +491,6 @@ fn console_in_forge_code() -> (Ducktape, iced::window::Id) {
         items: Vec::new(),
     }));
     let _ = app.__update(__DucktapeMessage::ForgeTreeLoaded(backend::ForgeTreeData {
-        generation: app.forge_code_generation,
         repo: "probe".into(),
         rev: "1111111111111111111111111111111111111111".into(),
         path: String::new(),
@@ -507,7 +506,6 @@ fn console_in_forge_code() -> (Ducktape, iced::window::Id) {
     let source = forge_source();
     assert!(source.len() < 64 * 1024);
     let _ = app.__update(__DucktapeMessage::ForgeBlobLoaded(backend::BlobView {
-        generation: app.forge_code_generation,
         repo: "probe".into(),
         rev: "1111111111111111111111111111111111111111".into(),
         path: "probe.rs".into(),
@@ -533,7 +531,7 @@ fn forge_diff() -> String {
 }
 
 fn console_in_forge_pr() -> (Ducktape, iced::window::Id) {
-    let (mut app, console) = console_on("forge");
+    let (mut app, console) = console_on(ShellTab::Forge);
     let _ = app.__update(__DucktapeMessage::ForgeOpenRepo("probe".into()));
     let _ = app.__update(__DucktapeMessage::ForgeRepoLoaded(backend::ForgeRepoData {
         generation: app.forge_generation,
@@ -564,7 +562,6 @@ fn console_in_forge_pr() -> (Ducktape, iced::window::Id) {
     }));
     let _ = app.__update(__DucktapeMessage::ForgeDiscussionLoaded(
         backend::ForgeDiscussionData {
-            generation: app.forge_discussion_generation,
             channel_id: "forge:probe:7".into(),
             messages: (1..=DISCUSSION_ROWS as i64).map(probe_message).collect(),
             members: Vec::new(),
@@ -595,7 +592,7 @@ fn probe_fs_entry(index: usize) -> backend::FsEntry {
 }
 
 fn console_in_files() -> (Ducktape, iced::window::Id) {
-    let (mut app, console) = console_on("files");
+    let (mut app, console) = console_on(ShellTab::Files);
     let entries: Vec<_> = (0..FILE_ROWS).map(probe_fs_entry).collect();
     let selected = entries
         .last()
@@ -948,10 +945,10 @@ fn probe() {
 
         // Leaving chat unmounts the stream (parking every lazy row) and
         // trims the scrollback; coming back is the cold return.
-        let _ = app.__update(__DucktapeMessage::SelectShellTab("pages".into()));
+        let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Pages));
         let ui = UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer);
         cache = ui.into_cache();
-        let _ = app.__update(__DucktapeMessage::SelectShellTab("chat".into()));
+        let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Chat));
         cache = screen_switch
             .sample(|| UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer))
             .into_cache();

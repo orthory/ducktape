@@ -157,8 +157,8 @@ pub fn has_flash_id(ids: String, id: String) -> bool {
 pub struct ChatData {
     /// The switch this window answers for. Every route that moves the reader
     /// bumps `chat_generation` and stamps it here, so a room she has already
-    /// clicked past cannot land on top of the one she is looking at — the same
-    /// supersede-by-generation the thread, history and search loaders use.
+    /// clicked past cannot land on top of the one she is looking at. Thread,
+    /// history, and search reads own separate compiler delivery lanes.
     pub generation: i64,
     pub channels: Vec<ChatChannel>,
     pub messages: Vec<ChatMessage>,
@@ -218,7 +218,6 @@ pub struct ThreadPageData {
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct LiveThreadData {
-    pub generation: i64,
     pub channel_id: String,
     pub root_seq: i64,
     pub target_seq: i64,
@@ -239,7 +238,6 @@ pub struct ChatSearchHit {
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ChatSearchData {
-    pub generation: i64,
     pub hits: Vec<ChatSearchHit>,
 }
 
@@ -337,7 +335,6 @@ pub struct PageSearchHit {
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct PageSearchData {
-    pub generation: i64,
     pub hits: Vec<PageSearchHit>,
 }
 

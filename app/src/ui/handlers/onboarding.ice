@@ -14,16 +14,6 @@
 // verifies it against user.key once (`ducktape user key unlock`), then stores
 // it in `password` for the session. Nothing new touches the wire.
 
-state
-  // The steps the provisioning stream has actually reported. Ice has no list
-  // append and no `sync` helper exists to merge one, so this holds the CURRENT
-  // step rather than the artifact's five-row history — see the report.
-  provision_steps:[ProvisionStep] = []
-  provision_index:i64 = 0
-  // The chain id `node join` minted, which is also the `-n`
-  // workspace selector every later CLI call needs.
-  onboarding_chain = ""
-
 // The launch window is up: register it, then load everything it renders —
 // the key state, the network list, and the persisted appearance.
 on onboarding_opened(id)
@@ -40,8 +30,7 @@ on hub_booted(state)
   hub_networks = state.networks
   hub_selected = state.preselect
   hub_step = hub_entry_step(state.key_state)
-  hub_probe_generation = hub_probe_generation + 1
-  stream replace lane=network_probes probe_known_networks(hub_probe_generation) -> network_probed _
+  stream replace lane=network_probes probe_known_networks() -> network_probed _
 
 // A refresh (after forget / after a join) updates the rows where the user
 // already is — the step stays put.
@@ -50,81 +39,79 @@ on hub_refreshed(state)
   hub_hidden = state.hidden
   hub_networks = state.networks
   hub_selected = refreshed_hub_selection(state.networks, hub_selected, state.preselect)
-  hub_probe_generation = hub_probe_generation + 1
-  stream replace lane=network_probes probe_known_networks(hub_probe_generation) -> network_probed _
+  stream replace lane=network_probes probe_known_networks() -> network_probed _
 
 on network_probed(probe)
-  return if probe.generation != hub_probe_generation
   hub_networks = apply_network_probe(hub_networks, probe)
 
 // UNLOCK — verify the password opens user.key, then keep it as the session's
 // signing password. Optimistically stored: the failure arm clears it.
 on unlock_submit(pw)
-  return if mutation_phase != "idle" || empty(pw)
+  return if mutation_phase != MutationPhase.idle || empty(pw)
   onboarding_error = ""
   password = pw
-  mutation_phase = "onboarding"
+  mutation_phase = MutationPhase.onboarding
   run every unlock_user_key(password) -> key_unlocked _ | login_failed _
 
 on key_unlocked(_pubkey)
-  mutation_phase = "idle"
+  mutation_phase = MutationPhase.idle
   onboarding_error = ""
-  hub_step = "networks"
+  hub_step = HubStep.networks
 
 // Reads never need the password — the quiet way past a forgotten one.
 on login_skip
-  return if mutation_phase != "idle"
+  return if mutation_phase != MutationPhase.idle
   password = ""
   onboarding_error = ""
-  hub_step = "networks"
+  hub_step = HubStep.networks
 
 // CREATE — mint user.key under the new password. The confirm field is
 // checked in the component (`password_problem`); this only fires clean.
 on create_submit(pw)
-  return if mutation_phase != "idle" || empty(pw)
+  return if mutation_phase != MutationPhase.idle || empty(pw)
   onboarding_error = ""
   password = pw
-  mutation_phase = "onboarding"
+  mutation_phase = MutationPhase.onboarding
   run every create_user_key(password) -> key_created _ | login_failed _
 
 on key_created(created)
-  mutation_phase = "idle"
+  mutation_phase = MutationPhase.idle
   hub_key_state = "encrypted"
   reveal_words = created.words
-  hub_step = "reveal"
+  hub_step = HubStep.reveal
 
 // The one moment the 24 words exist on screen ends here.
 on reveal_confirm
   reveal_words = ""
-  hub_step = "networks"
+  hub_step = HubStep.networks
 
 on go_restore
-  return if mutation_phase != "idle"
+  return if mutation_phase != MutationPhase.idle
   restore_words = ""
   onboarding_error = ""
-  hub_step = "restore"
+  hub_step = HubStep.restore
 
 on go_login
-  return if mutation_phase != "idle"
+  return if mutation_phase != MutationPhase.idle
   restore_words = ""
   onboarding_error = ""
   hub_step = hub_entry_step(hub_key_state)
 
 on restore_submit(pw)
-  return if mutation_phase != "idle" || empty(restore_words) || empty(pw)
+  return if mutation_phase != MutationPhase.idle || empty(restore_words) || empty(pw)
   onboarding_error = ""
   password = pw
-  mutation_phase = "onboarding"
+  mutation_phase = MutationPhase.onboarding
   run every restore_user_key(restore_words, password) -> key_restored _ | login_failed _
 
 on key_restored(_pubkey)
   restore_words = ""
-  mutation_phase = "idle"
+  mutation_phase = MutationPhase.idle
   hub_key_state = "encrypted"
-  hub_step = "networks"
+  hub_step = HubStep.networks
 
 on login_failed(cause)
-  mutation_phase = "idle"
+  mutation_phase = MutationPhase.idle
   password = ""
   onboarding_error = cause.message
 
@@ -133,7 +120,7 @@ on pick_network(id)
   hub_selected = id
 
 on open_network_submit
-  return if mutation_phase != "idle" || empty(selected_network_endpoint(hub_networks, hub_selected))
+  return if mutation_phase != MutationPhase.idle || empty(selected_network_endpoint(hub_networks, hub_selected))
   rpc = selected_network_endpoint(hub_networks, hub_selected)
   onboarding_error = ""
   task window open console -> console_opened _
@@ -142,7 +129,7 @@ on open_network_submit
 // connect `remember_network` saves it, which is how a `saved_remotes` row is
 // born — the old Settings endpoint field was the only source before.
 on connect_remote_submit(endpoint)
-  return if mutation_phase != "idle" || empty(trim(endpoint))
+  return if mutation_phase != MutationPhase.idle || empty(trim(endpoint))
   rpc = canonical_endpoint(endpoint)
   onboarding_error = ""
   task window open console -> console_opened _
@@ -157,8 +144,9 @@ on connect_remote_submit(endpoint)
 // EVERY per-network reading and draft resets to its default here — the pick
 // may name a DIFFERENT network than the last console, and a channel list,
 // half-typed draft, or open thread from the previous one leaking into this
-// console is a lie about where the user is. The generation bumps are the
-// other half: an in-flight load from the previous network must land dead.
+// console is a lie about where the user is. The lane invalidations and the
+// remaining scoped generation bumps are the other half: an in-flight load
+// from the previous network must land dead.
 // (`reconnect` is the same-endpoint sibling that deliberately KEEPS drafts.)
 on console_opened(id)
   invalidate lane=chat_search
@@ -183,19 +171,19 @@ on console_opened(id)
   invalidate lane=shell_credentials
   invalidate lane=shell_terminal
   invalidate lane=shell_chat
+  invalidate lane=page_autosave
   console_win = some(id)
   wall_now = current_wall_seconds()
   connected = false
   loading = true
   status = "Connecting…"
   error = ""
-  block_autosave_generation = cancel_autosaves(connected_rpc, block_autosave_generation)
   connected_rpc = rpc
   network_name = network_label(account_name, connected_rpc)
   hydration_generation = hydration_generation + 1
   connect_generation = connect_generation + 1
   hydration_retry_attempt = 0
-  mutation_phase = "idle"
+  mutation_phase = MutationPhase.idle
   channels = []
   rooms = []
   dm_rows = []
@@ -247,7 +235,7 @@ on console_opened(id)
   channel_draft = ""
   selected_message_seq = 0
   selected_message_rev = 0
-  message_action = "toolbar"
+  message_action = MessageAction.toolbar
   message_edit_draft = ""
   message_draft = ""
   message_editor = editor("")
@@ -265,7 +253,7 @@ on console_opened(id)
   thread_next_reply_offset = 0
   thread_has_more = false
   thread_generation = thread_generation + 1
-  live_thread_generation = live_thread_generation + 1
+  invalidate lane=live_thread
   thread_loading = false
   reply_draft = ""
   reply_editor = editor("")
@@ -277,13 +265,12 @@ on console_opened(id)
   // that no longer exists. Neither mechanical rule in
   // `every_handler_that_moves_the_caret_retires_the_composer_focus` reaches
   // here (no focus task, no `shell_tab` write); the pinned list does.
-  composer_focus = "none"
+  composer_focus = ComposerFocus.unfocused
   pending_channel = ""
   pending_message = ""
   chat_search_draft = ""
   chat_search_hits = []
-  chat_search_generation = chat_search_generation + 1
-  chat_search_phase = "idle"
+  chat_search_phase = SearchPhase.idle
   pages = []
   doc_tabs = []
   blocks = []
@@ -317,28 +304,25 @@ on console_opened(id)
   buffer_page = ""
   page_inflight_text = ""
   page_refusal = ""
-  block_autosave_status = "idle"
+  block_autosave_status = AutosaveStatus.idle
   orphaned_comment_drafts = []
   page_delete_armed = false
   page_search_draft = ""
   page_search_hits = []
-  page_search_generation = page_search_generation + 1
   page_searching = false
   // Forge's open repo, tracker item, code reading and drafts all name
   // the network being left. The new endpoint may even have the same repo/item
   // names, so identity strings cannot make any of these safe to retain.
   forge_generation = forge_generation + 1
-  forge_code_generation = forge_code_generation + 1
-  forge_discussion_generation = forge_discussion_generation + 1
-  forge_list_phase = "idle"
+  forge_list_phase = ForgePhase.idle
   forge_repos = []
   forge_repo = ""
-  forge_repo_phase = "idle"
+  forge_repo_phase = ForgePhase.idle
   forge_repo_menu = false
   forge_branches = []
   forge_items = []
   forge_item_number = 0
-  forge_item_phase = "idle"
+  forge_item_phase = ForgePhase.idle
   forge_item_diff = ""
   forge_item_channel = ""
   forge_review_draft = ""
@@ -362,7 +346,7 @@ on console_opened(id)
   forge_file_text = ""
   forge_file_binary = false
   forge_file_truncated = false
-  forge_code_phase = "idle"
+  forge_code_phase = ForgeCodePhase.idle
   // The huddle and its media session belong to the PREVIOUS network.
   // `call_session` is subscribed `when huddle_joined`, so this clear IS the
   // teardown — the stream drops and the old node's presence gate reaps the
@@ -385,52 +369,51 @@ on network_remembered(_written)
   error = error
 
 on forget_network_submit(id, kind)
-  return if mutation_phase != "idle"
+  return if mutation_phase != MutationPhase.idle
   run every forget_network(id, kind) -> network_forgotten _
 
 on network_forgotten(_written)
   run replace lane=hub_state hub_state() -> hub_refreshed _
 
 on restore_hidden_submit
-  return if mutation_phase != "idle"
+  return if mutation_phase != MutationPhase.idle
   run every restore_hidden_networks() -> network_forgotten _
 
 // JOIN — unchanged plumbing, new seams: it starts from the network list and
 // settles back into it through the provisioning/live screens.
 on go_join
-  return if mutation_phase != "idle"
+  return if mutation_phase != MutationPhase.idle
   join_invite = ""
-  hub_step = "join"
+  hub_step = HubStep.join
   onboarding_error = ""
 
 on go_networks
-  return if mutation_phase != "idle"
+  return if mutation_phase != MutationPhase.idle
   restore_words = ""
   join_invite = ""
   onboarding_error = ""
-  hub_step = "networks"
+  hub_step = HubStep.networks
   run replace lane=hub_state hub_state() -> hub_refreshed _
 
 on join_network_submit
-  return if mutation_phase != "idle" || empty(join_invite)
+  return if mutation_phase != MutationPhase.idle || empty(join_invite)
   onboarding_error = ""
-  mutation_phase = "onboarding"
+  mutation_phase = MutationPhase.onboarding
   run every join_network(join_invite) -> workspace_materialized _ | onboarding_failed _
 
 // The workspace now exists on disk. Point the app at its endpoint and start
 // watching for the node that will serve it.
 on workspace_materialized(init)
   join_invite = ""
-  mutation_phase = "idle"
+  mutation_phase = MutationPhase.idle
   onboarding_chain = init.chain_id
   onboarding_name = init.chain_id
-  workspace_slug = network_slug(init.chain_id)
   rpc = init.rpc
   invite_link = ""
   provision_steps = []
   provision_index = 0
   onboarding_error = ""
-  hub_step = "provisioning"
+  hub_step = HubStep.provisioning
   stream replace lane=provision provision_progress(init.chain_id, init.rpc) -> provision_stepped _
 
 // Every yielded step replaces the reading. The screen only leaves this step
@@ -440,12 +423,12 @@ on provision_stepped(step)
   // Copy fields first, then the move: `provision_steps = [step]` takes the
   // step whole, so any read of `index`/`state` after it is a use-after-move.
   // `settled` exists precisely so this decision needs no String.
+  let settled = step.settled
   provision_index = step.index
-  provision_settled = step.settled
   provision_steps = [step]
-  return if provision_index != 5 || !provision_settled
-  hub_step = "live"
-  run every mint_invite(onboarding_chain, 7) -> onboarding_invite_minted _ | onboarding_failed _
+  return if provision_index != 5 || !settled
+  hub_step = HubStep.live
+  run every mint_invite(onboarding_chain, "resident", 7) -> onboarding_invite_minted _ | onboarding_failed _
 
 on onboarding_invite_minted(blob)
   invite_link = blob
@@ -454,7 +437,6 @@ on onboarding_invite_minted(blob)
 on copy_onboarding_invite
   return if empty(invite_link)
   toast = "Invite copied"
-  toast_tone = "info"
   toast_age = 0
   task clipboard write invite_link
 
@@ -462,14 +444,14 @@ on copy_onboarding_invite
 // `rpc` already points at the workspace it materialized, so this is the
 // network-pick handoff with the pick pre-made.
 on enter_console
-  return if mutation_phase != "idle"
+  return if mutation_phase != MutationPhase.idle
   onboarding_error = ""
   task window open console -> console_opened _
 
 // A refusal here is recoverable — the workspace is already on disk — so the
 // screen keeps its controls and says what happened.
 on onboarding_failed(cause)
-  mutation_phase = "idle"
+  mutation_phase = MutationPhase.idle
   onboarding_error = cause.message
 
 // THE WAY BACK — the titlebar chip, Settings' Switch network, and Danger
@@ -480,7 +462,8 @@ on onboarding_failed(cause)
 // never the unlock ceremony again; the session's password (or the user's
 // deliberate read-only skip) survives a network switch.
 on switch_network
-  return if mutation_phase != "idle"
+  return if mutation_phase != MutationPhase.idle
+  invalidate lane=page_autosave
   invalidate lane=shell_credentials
   invalidate lane=shell_terminal
   invalidate lane=shell_chat
@@ -498,7 +481,7 @@ on switch_network
 
 on onboarding_reopened(id)
   onboarding_win = some(id)
-  hub_step = "networks"
+  hub_step = HubStep.networks
   parallel
     task window close target=window_target(console_win)
     task window close target=window_target(huddle_win)

@@ -19,7 +19,7 @@
 // were briefly caller-filled slots: a sensor's show/resize route used to accept
 // only bare `_` payloads and could not carry a component event (ui-lang#239).
 
-component ChatScreen(network_name:str, status:str, block_height:i64, bind search_draft:str, search_phase:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:str, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, send_flash_ids:str, send_flash_value:f64, message_action:str, message_menu_y:f64, bind message_action_focus:str, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_menu_y:f64, thread_send_flash_ids:str, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor)
+component ChatScreen(network_name:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, send_flash_ids:str, send_flash_value:f64, message_action:MessageAction, message_menu_y:f64, bind message_action_focus:str, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, thread_menu_y:f64, thread_send_flash_ids:str, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor)
   emits
     search_chat_submit()
     clear_chat_search()
@@ -148,12 +148,11 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
               with
                 label="Search messages"
                 hint="Search…"
-                // NOT `|| search_phase == "searching"`. The field went dead the instant Enter
+                // NOT `|| search_phase == SearchPhase.searching`. The field went dead the instant Enter
                 // was pressed and stayed dead for the whole round trip, so the
                 // query could not be refined while waiting — and a disabled
-                // input drops the caret besides. `chat_search_loaded` already
-                // guards on `chat_search_generation`, so the LATE reply is what
-                // gets dropped; killing the field bought nothing.
+                // input drops the caret besides. The `chat_search` replace lane
+                // drops the superseded reply; killing the field bought nothing.
                 disabled=!connected
                 submit=emit(search_chat_submit)
                 w=fill
@@ -165,7 +164,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
               active bg=surface value=fg placeholder=hint selection=fg/18 border-w=1.0 r=8.0
               hovered bg=muted_bg border=control_line
               disabled bg=transparent value=muted
-            if search_phase != "idle"
+            if search_phase != SearchPhase.idle
               button -> emit(clear_chat_search)
                 with
                   label="Clear message search"
@@ -216,7 +215,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                 with
                   label="New channel"
                   expanded=channel_create_open
-                  disabled=(loading || mutation_phase != "idle" || !connected)
+                  disabled=(loading || mutation_phase != MutationPhase.idle || !connected)
                   p=0.0
                   @icon_action
                 // `color=inherit` (ducktape-ui#606): the glyph draws the
@@ -237,7 +236,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                 with
                   label="Close new channel"
                   expanded=channel_create_open
-                  disabled=(loading || mutation_phase != "idle")
+                  disabled=(loading || mutation_phase != MutationPhase.idle)
                   w=24.0
                   h=24.0
                   p=0.0
@@ -275,7 +274,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                   // no longer refuses a click — the last one wins — so a row
                   // greyed while one is in flight would put the swallowing back.
                   // A mutation does still refuse, and the row now says so.
-                  disabled=(mutation_phase != "idle")
+                  disabled=(mutation_phase != MutationPhase.idle)
                 forward
                   choose_channel
             // DIRECT — the artifact's own word for it, and the honest
@@ -309,7 +308,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                       font=code_medium
                       @text-label
             for dm in dm_rows
-              DmButton peer=dm.peer selected=(dm.peer.key == active_dm_peer) unread=dm.unread disabled=(mutation_phase != "idle")
+              DmButton peer=dm.peer selected=(dm.peer.key == active_dm_peer) unread=dm.unread disabled=(mutation_phase != MutationPhase.idle)
                 forward
                   choose_dm
         // No account footer: the rail's avatar and Settings already carry the
@@ -630,7 +629,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                 pb=8.0
                               button "Load older messages" -> emit(load_more_history)
                                 with
-                                  disabled=(mutation_phase != "idle")
+                                  disabled=(mutation_phase != MutationPhase.idle)
                                   h=30.0
                                   p=6.0
                                   @secondary_action
@@ -773,7 +772,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                         open_message_link
                   overlay
                     with
-                      when=(selected_message_seq > 0 && message_action != "toolbar")
+                      when=(selected_message_seq > 0 && message_action != MessageAction.toolbar)
                       dismiss=emit(clear_message_selection)
                       backdrop=transparent
                       p=8.0
@@ -784,7 +783,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                     layer
                       float x=0.0 y=message_menu_y
                         col
-                          if message_action == "more"
+                          if message_action == MessageAction.more
                             stack
                               input "" #message-action-focus <-> message_action_focus
                                 with
@@ -946,7 +945,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                     active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
                                     hovered bg=danger_bg text=fg
                                     pressed bg=danger_line text=fg
-                          if message_action == "reactions"
+                          if message_action == MessageAction.reactions
                             stack
                               input "" #message-reaction-focus <-> message_action_focus
                                 with
@@ -993,7 +992,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                       active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
                                       hovered bg=fg/10
                                       pressed bg=fg/15
-                          if message_action == "editing"
+                          if message_action == MessageAction.editing
                             // NO max-w: this float is painted OVER the row it
                             // edits, so anything narrower than the column
                             // leaves the tail of the old message showing
@@ -1012,7 +1011,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                   with
                                     label="Edit message"
                                     hint="Edit message"
-                                    disabled=(mutation_phase != "idle")
+                                    disabled=(mutation_phase != MutationPhase.idle)
                                     submit=emit(edit_message_submit)
                                     w=fill
                                     p=6.2
@@ -1032,14 +1031,14 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                 button "Save" -> emit(edit_message_submit)
                                   with
                                     label="Save message changes"
-                                    disabled=(mutation_phase != "idle" || empty(trim(message_edit_draft)))
+                                    disabled=(mutation_phase != MutationPhase.idle || empty(trim(message_edit_draft)))
                                     h=28.0
                                     p=6.0
                                     @primary_action
                                 button -> emit(clear_message_selection)
                                   with
                                     label="Cancel message edit"
-                                    disabled=(mutation_phase != "idle")
+                                    disabled=(mutation_phase != MutationPhase.idle)
                                     w=28.0
                                     h=28.0
                                     p=0.0
@@ -1054,7 +1053,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                   active bg=transparent text=muted r=7.0
                                   hovered bg=fg/10 text=fg
                                   pressed bg=fg/15
-                          if message_action == "delete"
+                          if message_action == MessageAction.delete
                             stack
                               input "" #message-delete-focus <-> message_action_focus
                                 with
@@ -1070,13 +1069,13 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                   text "Delete this message?" size=12.5 @text-muted
                                   button "Delete" -> emit(delete_message_submit)
                                     with
-                                      disabled=(mutation_phase != "idle")
+                                      disabled=(mutation_phase != MutationPhase.idle)
                                       h=26.0
                                       p=5.0
                                       @danger_action
                                   button "Cancel" -> emit(clear_message_selection)
                                     with
-                                      disabled=(mutation_phase != "idle")
+                                      disabled=(mutation_phase != MutationPhase.idle)
                                       h=26.0
                                       p=5.0
                                       @secondary_action
@@ -1119,7 +1118,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         @text-danger
                     button "Restore" -> emit(restore_failed_message)
                       with
-                        disabled=(!empty(trim(editor_text(message_editor))) || mutation_phase != "idle")
+                        disabled=(!empty(trim(editor_text(message_editor))) || mutation_phase != MutationPhase.idle)
                         h=28.0
                         p=5.0
                         @secondary_action
@@ -1147,7 +1146,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
             // child, so a search reflowed the whole conversation down by
             // 148px; as a stack layer it drops over the stream instead and
             // everything beneath keeps its place.
-            if search_phase != "idle"
+            if search_phase != SearchPhase.idle
               box
                 with
                   w=fill
@@ -1169,16 +1168,16 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                     shadow-y=8.0
                     shadow-blur=24.0
                   col w=fill
-                    if search_phase == "searching"
+                    if search_phase == SearchPhase.searching
                       col w=fill gap=14.0 p=8.0
                         SkeletonRow
-                    if search_phase == "done" && empty(search_hits)
+                    if search_phase == SearchPhase.done && empty(search_hits)
                       box w=fill p=14.0 align-x=center
                         text "No messages match"
                           with
                             size=12.5
                             @text-muted
-                    if search_phase == "done" && !empty(search_hits)
+                    if search_phase == SearchPhase.done && !empty(search_hits)
                       scroll
                         with
                           dir=vertical
@@ -1390,7 +1389,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         with
                           label="Channel name"
                           hint="Channel name"
-                          disabled=(mutation_phase != "idle")
+                          disabled=(mutation_phase != MutationPhase.idle)
                           submit=emit(rename_channel_submit)
                           w=fill
                           p=6.6
@@ -1402,7 +1401,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         disabled value=muted
                       button "Rename" -> emit(rename_channel_submit)
                         with
-                          disabled=(mutation_phase != "idle" || empty(trim(channel_name_draft)))
+                          disabled=(mutation_phase != MutationPhase.idle || empty(trim(channel_name_draft)))
                           h=29.0
                           p=6.0
                           @secondary_action
@@ -1432,7 +1431,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         with
                           label="Member public key"
                           hint="Member key (64 hex)"
-                          disabled=(mutation_phase != "idle")
+                          disabled=(mutation_phase != MutationPhase.idle)
                           submit=emit(add_channel_member_submit)
                           w=fill
                           p=7.4
@@ -1445,7 +1444,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         disabled value=muted
                       button "Add" -> emit(add_channel_member_submit)
                         with
-                          disabled=(mutation_phase != "idle" || empty(trim(member_key_draft)))
+                          disabled=(mutation_phase != MutationPhase.idle || empty(trim(member_key_draft)))
                           h=29.0
                           p=6.0
                           @secondary_action
@@ -1459,7 +1458,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                     if !empty(channel_members)
                       col w=fill gap=1.0
                         for member in channel_members
-                          ChatMemberRow member=member disabled=(mutation_phase != "idle")
+                          ChatMemberRow member=member disabled=(mutation_phase != MutationPhase.idle)
                             forward
                               remove_channel_member_submit
               box
@@ -1485,7 +1484,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                   if !active_channel_archived
                     button "Archive channel" -> emit(archive_channel_submit)
                       with
-                        disabled=(mutation_phase != "idle")
+                        disabled=(mutation_phase != MutationPhase.idle)
                         w=fill
                         h=30.0
                         p=6.0
@@ -1496,7 +1495,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                   if active_channel_archived
                     button "Unarchive channel" -> emit(unarchive_channel_submit)
                       with
-                        disabled=(mutation_phase != "idle")
+                        disabled=(mutation_phase != MutationPhase.idle)
                         w=fill
                         h=30.0
                         p=6.0
@@ -1572,7 +1571,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                       button -> emit(close_thread)
                         with
                           label="Close thread"
-                          disabled=(mutation_phase != "idle")
+                          disabled=(mutation_phase != MutationPhase.idle)
                           w=24.0
                           h=24.0
                           p=0.0
@@ -1717,7 +1716,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                       if thread_has_more && thread_next_reply_offset >= 0 && !thread_loading
                         button "Load more replies" -> emit(load_more_thread)
                           with
-                            disabled=(mutation_phase != "idle")
+                            disabled=(mutation_phase != MutationPhase.idle)
                             w=fill
                             h=28.0
                             p=5.0
@@ -1850,7 +1849,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                 @py-6px
               overlay
                 with
-                  when=(thread_selected_seq > 0 && thread_message_action != "toolbar")
+                  when=(thread_selected_seq > 0 && thread_message_action != MessageAction.toolbar)
                   dismiss=emit(clear_thread_message_selection)
                   backdrop=transparent
                   p=8.0
@@ -1861,7 +1860,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                 layer
                   float x=0.0 y=thread_menu_y
                     col
-                      if thread_message_action == "more"
+                      if thread_message_action == MessageAction.more
                         stack
                           input "" #thread-action-focus <-> message_action_focus
                             with
@@ -1982,7 +1981,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                 active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
                                 hovered bg=danger_bg text=fg
                                 pressed bg=danger_line text=fg
-                      if thread_message_action == "reactions"
+                      if thread_message_action == MessageAction.reactions
                         stack
                           input "" #thread-reaction-focus <-> message_action_focus
                             with
@@ -2027,7 +2026,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                   active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
                                   hovered bg=fg/10
                                   pressed bg=fg/15
-                      if thread_message_action == "editing"
+                      if thread_message_action == MessageAction.editing
                         box
                           with
                             w=fill
@@ -2042,7 +2041,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                               with
                                 label="Edit message"
                                 hint="Edit message"
-                                disabled=(mutation_phase != "idle")
+                                disabled=(mutation_phase != MutationPhase.idle)
                                 submit=emit(edit_thread_message_submit)
                                 w=fill
                                 p=6.2
@@ -2058,14 +2057,14 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                             button "Save" -> emit(edit_thread_message_submit)
                               with
                                 label="Save message changes"
-                                disabled=(mutation_phase != "idle" || empty(trim(thread_edit_draft)))
+                                disabled=(mutation_phase != MutationPhase.idle || empty(trim(thread_edit_draft)))
                                 h=28.0
                                 p=6.0
                                 @primary_action
                             button -> emit(clear_thread_message_selection)
                               with
                                 label="Cancel message edit"
-                                disabled=(mutation_phase != "idle")
+                                disabled=(mutation_phase != MutationPhase.idle)
                                 w=28.0
                                 h=28.0
                                 p=0.0
@@ -2080,7 +2079,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                               active bg=transparent text=muted r=7.0
                               hovered bg=fg/10 text=fg
                               pressed bg=fg/15
-                      if thread_message_action == "delete"
+                      if thread_message_action == MessageAction.delete
                         stack
                           input "" #thread-delete-focus <-> message_action_focus
                             with
@@ -2096,13 +2095,13 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                               text "Delete this message?" size=12.5 @text-muted
                               button "Delete" -> emit(delete_thread_message_submit)
                                 with
-                                  disabled=(mutation_phase != "idle")
+                                  disabled=(mutation_phase != MutationPhase.idle)
                                   h=26.0
                                   p=5.0
                                   @danger_action
                               button "Cancel" -> emit(clear_thread_message_selection)
                                 with
-                                  disabled=(mutation_phase != "idle")
+                                  disabled=(mutation_phase != MutationPhase.idle)
                                   h=26.0
                                   p=5.0
                                   @secondary_action

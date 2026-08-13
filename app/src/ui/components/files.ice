@@ -375,14 +375,7 @@ component ObjectRowFace(entry:FsEntry)
 // artifact's kind chip is an uppercased file extension; Ice cannot split a
 // string, so the chip carries the kind duckfs itself reports.
 //
-// `changed_by` / `changed_height` are the newest SNAPSHOT whose diff touches
-// this path — `SnapshotInfo` carries both an author and a height, the history
-// is bounded, and a diff takes a path prefix. That is a real fact and it is
-// labelled for exactly what it is: LAST CHANGED AT THIS PATH. It is NOT blob
-// authorship — a snapshot's author is whoever committed the tree, and the blob
-// under this name may have been written by someone else in an earlier one — so
-// the panel never says "author" or "by" alone.
-component ObjectPanel(entry:FsEntry, changed_by:str, changed_height:i64)
+component ObjectPanel(entry:FsEntry)
   row #root w=306.0 h=fill
     box
       with
@@ -480,15 +473,6 @@ component ObjectPanel(entry:FsEntry, changed_by:str, changed_height:i64)
                 ObjectFact label="size" value="—"
               if entry.kind != "dir"
                 ObjectFact label="size" value=size_label(entry.size)
-              // Height 0 is the genesis block and no snapshot lands on it, so
-              // it is the honest "no stamp yet" — the walk has not answered, or
-              // no snapshot in the bounded history touches this path. Nothing
-              // is drawn then; a dash here would read as "nobody ever wrote
-              // this", which is a different claim than "we do not know".
-              if changed_height > 0
-                col w=fill gap=7.0
-                  ObjectFact label="last changed at this path" value=height_label(changed_height)
-                  ObjectFact label="in the snapshot by" value=changed_by
 
 // One machine value, in the artifact's own r8 pill rather than the app's
 // `KeyValueRow` — the pills are separate outlines, not a divided card. Clipped

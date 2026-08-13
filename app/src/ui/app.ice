@@ -1,6 +1,6 @@
 daemon Ducktape
   title "Ducktape"
-  theme app_theme
+  theme "app"
   palette app_palette
   bg app_background
   fg app_text
@@ -50,9 +50,23 @@ daemon Ducktape
 use "extern/backend.ice"
 use "extern/editor.ice"
 use "extern/call.ice"
-use "ducktape-ui/default.ice"
+use "ducktape-ui/recipes.ice"
+use "ducktape-ui/log-timeline.ice"
 use "theme.ice"
-use "state.ice"
+use "state/types.ice"
+use "state/core.ice"
+use "state/chat.ice"
+use "state/shell.ice"
+use "state/explorer.ice"
+use "state/roster.ice"
+use "state/forge.ice"
+use "state/node.ice"
+use "state/files.ice"
+use "state/overlays.ice"
+use "state/pages.ice"
+use "state/onboarding.ice"
+use "state/huddle.ice"
+use "state/derived.ice"
 use "components/icon.ice"
 use "components/kit.ice"
 use "components/patterns.ice"

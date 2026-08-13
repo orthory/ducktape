@@ -2,18 +2,16 @@ use super::*;
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct BellData {
-    pub generation: i64,
     pub unread: i64,
     pub items: Vec<BellItem>,
 }
 
 /// Load the bell: this member's notification page (newest first) + unread
 /// count from the inbox views. A device without a user key has no inbox.
-pub async fn load_bell(rpc: String, generation: i64) -> Result<BellData, HydrationError> {
+pub async fn load_bell(rpc: String) -> Result<BellData, AppError> {
     async {
         let Some(member) = local_member().await else {
             return Ok(BellData {
-                generation,
                 unread: 0,
                 items: Vec::new(),
             });
@@ -47,16 +45,12 @@ pub async fn load_bell(rpc: String, generation: i64) -> Result<BellData, Hydrati
             .collect();
         items.reverse();
         Ok(BellData {
-            generation,
             unread: unread["unread_count"].as_i64().unwrap_or(0),
             items,
         })
     }
     .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
+    .map_err(app_error)
 }
 
 /// Mark everything at or below `up_to_seq` read (signed by the local user).

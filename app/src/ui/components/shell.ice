@@ -569,7 +569,7 @@ component ConnectionBanner(status:str)
 // Forge alone wears a live dot while an agent is running.
 component RailButton(item:NavItem)
   emits
-    select_shell_tab(str)
+    select_shell_tab(ShellTab)
   stack #root w=58.0
     if item.active
       button -> emit(select_shell_tab, item.id)
@@ -674,9 +674,9 @@ component RailButton(item:NavItem)
               font=code_semibold
               @text-brand_fg
 
-component NavRail(tab:str, approvals:i64, account:str, agent_live:bool)
+component NavRail(tab:ShellTab, approvals:i64, account:str, agent_live:bool)
   emits
-    select_shell_tab(str)
+    select_shell_tab(ShellTab)
   box #root
     with
       w=74.0
@@ -708,8 +708,8 @@ component NavRail(tab:str, approvals:i64, account:str, agent_live:bool)
             RailButton item=item
               forward
                 select_shell_tab
-      if tab == "settings"
-        button -> emit(select_shell_tab, "settings")
+      if tab == ShellTab.settings
+        button -> emit(select_shell_tab, ShellTab.settings)
           with
             label="Settings"
             checked=true
@@ -723,8 +723,8 @@ component NavRail(tab:str, approvals:i64, account:str, agent_live:bool)
           active bg=selected_row text=fg border=transparent border-w=1.0 r=9.0
           hovered bg=rail_hover text=fg
           pressed bg=selected_row text=fg
-      if tab != "settings"
-        button -> emit(select_shell_tab, "settings")
+      if tab != ShellTab.settings
+        button -> emit(select_shell_tab, ShellTab.settings)
           with
             label="Settings"
             checked=false
@@ -742,7 +742,7 @@ component NavRail(tab:str, approvals:i64, account:str, agent_live:bool)
       // The avatar is the one thing hung below the footer button: a 1.5px
       // paper ring inside a 1px hairline halo, which no other person plate in
       // the app wears.
-      button -> emit(select_shell_tab, "settings")
+      button -> emit(select_shell_tab, ShellTab.settings)
         with
           label="Account"
           p=0.0
@@ -848,9 +848,9 @@ component ScreenHeader(title:str, meta:str)
         bg=separator
       space w=1.0 h=1.0
 
-component WorkspaceTabs(network:str, status:str, height:i64, sync_line:str, loading:bool, degraded:bool, tab:str, bell_count:i64, bell_sev:str, approvals:i64, account:str, agent_live:bool, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, wall_now:i64)
+component WorkspaceTabs(network:str, status:str, height:i64, sync_line:str, loading:bool, degraded:bool, tab:ShellTab, bell_count:i64, bell_sev:str, approvals:i64, account:str, agent_live:bool, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, wall_now:i64)
   emits
-    select_shell_tab(str)
+    select_shell_tab(ShellTab)
     toggle_bell
     switch_network
   box
@@ -907,26 +907,26 @@ component WorkspaceTabs(network:str, status:str, height:i64, sync_line:str, load
                 ConnectionBanner status=status
               slot notice
               match tab
-                "chat"
+                ShellTab.chat
                   slot chat
-                "shell"
+                ShellTab.shell
                   slot shell
-                "pages"
+                ShellTab.pages
                   slot pages
-                "files"
-                  slot files
-                "members"
-                  slot members
-                "agents"
-                  slot agents
-                "forge"
+                ShellTab.forge
                   slot forge
-                "governance"
-                  slot governance
-                "settings"
-                  slot settings
-                _
+                ShellTab.agents
+                  slot agents
+                ShellTab.files
+                  slot files
+                ShellTab.explorer
                   slot explorer
+                ShellTab.members
+                  slot members
+                ShellTab.governance
+                  slot governance
+                ShellTab.settings
+                  slot settings
 
       slot palette
       slot bell

@@ -12,7 +12,7 @@
 // only resolve local handlers and declared emissions, so an app handler is
 // never named inside this file.
 
-component HubColumn(step:str, key_state:str, networks:[HubNetwork], selected:str, hidden:i64, name:str, invite:str, reveal:str, steps:[ProvisionStep], step_index:i64, height:i64, tier:str, error:str, busy:bool, restore_empty:bool, join_empty:bool)
+component HubColumn(step:HubStep, key_state:str, networks:[HubNetwork], selected:str, hidden:i64, name:str, invite:str, reveal:str, steps:[ProvisionStep], step_index:i64, height:i64, tier:str, error:str, busy:bool, restore_empty:bool, join_empty:bool)
   emits
     unlock_submit(str)
     login_skip
@@ -41,7 +41,7 @@ component HubColumn(step:str, key_state:str, networks:[HubNetwork], selected:str
       bg=bg_wash
     col gap=0.0
       match step
-        "unlock"
+        HubStep.unlock
           UnlockScreen #unlock
             with
               key_state
@@ -51,23 +51,23 @@ component HubColumn(step:str, key_state:str, networks:[HubNetwork], selected:str
               unlock_submit
               login_skip
               go_restore
-        "create"
+        HubStep.create
           CreateScreen busy=busy error=error
             forward
               create_submit
               go_restore
-        "reveal"
+        HubStep.reveal
           RevealScreen words=reveal
             forward
               reveal_confirm
-        "restore"
+        HubStep.restore
           RestoreScreen busy=busy error=error phrase_empty=restore_empty
             forward
               restore_submit
               go_login
             phrase:
               slot restore_phrase?
-        "networks"
+        HubStep.networks
           NetworksScreen #networks
             with
               networks
@@ -82,14 +82,14 @@ component HubColumn(step:str, key_state:str, networks:[HubNetwork], selected:str
               connect_remote_submit
               restore_hidden_submit
               go_join
-        "provisioning"
+        HubStep.provisioning
           ProvisioningScreen
             with
               name
               steps
               step_index
               error
-        "live"
+        HubStep.live
           LiveScreen
             with
               name
@@ -104,14 +104,14 @@ component HubColumn(step:str, key_state:str, networks:[HubNetwork], selected:str
               go_networks
               copy_onboarding_invite
               enter_console
-        "join"
+        HubStep.join
           JoinScreen busy=busy error=error invite_empty=join_empty
             forward
               go_networks
               join_network_submit
             invite:
               slot join_invite?
-        _
+        HubStep.loading
           col gap=0.0 align=center
             text "…"
               with
@@ -950,7 +950,7 @@ component ProvisioningScreen(name:str, steps:[ProvisionStep], step_index:i64, er
     box w=fill pt=22.0
       col w=fill gap=14.0
         for step in steps
-          ProvisionRow step=step spin=0.0
+          ProvisionRow step=step
     box w=fill pt=26.0
       col
         with
@@ -987,14 +987,10 @@ component ProgressCell(filled:bool)
 // One checklist row. `blocked` is the state the artifact never drew: the node
 // did not come up, and the label the stream carries IS the command that starts
 // it — so the row becomes a refusal plate rather than a spinner that lies.
-//
-// `spin` is carried per the frozen signature and deliberately unconsumed: the
-// artifact's running marker is a CSS-keyframe arc with a transparent top edge,
-// which iced cannot stroke inside a border. The marker is a solid amber ring.
 // Reads each of the step's String fields exactly once, in exclusive `match`
 // arms: two `if` blocks both reading `step.label` move the same String twice
 // and the generated Rust will not compile. Copy fields have no such limit.
-component ProvisionRow(step:ProvisionStep, spin:f64)
+component ProvisionRow(step:ProvisionStep)
   col #root w=fill gap=0.0
     match step.state
       "blocked"

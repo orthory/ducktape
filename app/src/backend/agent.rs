@@ -171,7 +171,6 @@ pub async fn load_agent_credentials(
     rpc: String,
     generation: i64,
 ) -> Result<AgentCredentialsData, HydrationError> {
-    offscreen_guard(generation)?;
     let result = async {
         let client = rpc_client(&rpc)?;
         let reply: GatewayReply = client

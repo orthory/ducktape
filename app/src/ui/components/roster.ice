@@ -15,14 +15,6 @@
 // strip reads active/paused and a person's reads live/offline. The artifact's
 // idle and invited states have no source anywhere and are not drawn.
 //
-// NO AGENT REGISTRY PANEL HERE. The 322px `AgentDetail` record (skills, granted
-// capabilities, allowed actions, recent runs) was built against `AgentRow` +
-// `RunRow` but nothing could ever open it: the Agents screen mounts `AgentCard`
-// only, `agents_selected` has no reader and there is no `open_agent` route. A
-// component no code path reaches is dead code, so it is deleted rather than
-// left reading as delivered — restore it from 9de754551 the moment the agents
-// screen grows a per-agent route.
-
 // The 312px member record. `admin` is members_is_admin — this node holds a
 // quorum seat — and it gates the membership proposals, not the whole panel:
 // a non-admin still sees WHY the writes are refused.

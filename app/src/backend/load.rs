@@ -336,8 +336,7 @@ pub async fn load_older_messages(
     rpc: String,
     channel_id: String,
     before_seq: i64,
-    generation: i64,
-) -> Result<HistoryPageData, HydrationError> {
+) -> Result<HistoryPageData, AppError> {
     let result = async {
         let rpc = rpc_client(&rpc)?;
         let before = u64::try_from(before_seq).unwrap_or(0);
@@ -352,14 +351,10 @@ pub async fn load_older_messages(
     .await;
     result
         .map(|messages| HistoryPageData {
-            generation,
             channel_id,
             messages,
         })
-        .map_err(|message| HydrationError {
-            generation,
-            message: user_error(message),
-        })
+        .map_err(app_error)
 }
 
 pub(crate) async fn load_messages_around(
@@ -486,14 +481,11 @@ async fn walk_roots_back(
     Ok(roots)
 }
 
-/// One page of older history, returned to the reducer with the generation AND
-/// the channel that requested it, so a stale load can be discarded. The channel
-/// carries because a channel switch does not bump the history generation — the
-/// generation alone cannot tell the reducer this page belongs to the room the
-/// reader already left.
+/// One page of older history, returned with the channel that requested it.
+/// The compiler-owned `history` lane drops superseded replies; the channel
+/// identity still guards a page whose room changed without another history run.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct HistoryPageData {
-    pub generation: i64,
     pub channel_id: String,
     pub messages: Vec<ChatMessage>,
 }

@@ -20,12 +20,12 @@
 // The live `block_height` register is deliberately NOT read here. It is the
 // titlebar's, whose job is liveness and which now prints no checkpoint at all
 // (see `StatusCard` in components/shell.ice). The cost of that split is stated
-// rather than hidden: this pair refreshes with `node_facts_generation` — on
-// connect and on a shell-tab change — so it is a coherent sample, not a live
-// one, and reads `h —` until the first one lands.
-component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, settings_endpoint:str, settings_node_key:str, settings_data_dir:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_answered:bool, account_id:str, bind account_name_draft:str, account_renaming:bool, account_bound:bool, account_members:i64, account_nodes:i64, appearance:str, password:str, status:str, loading:bool, connected:bool, mutation_phase:str, node_tab:str, module_rows:[ModuleRow], node_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:str, node_quorum_label:str, node_version:str, node_root_hash:str, sync_line:str, node_phase_since:i64, node_sync_retries:i64, node_sync_failures:i64, node_sync_last_error:str, node_peers:[PeerRow], bind node_log_filter:str, wall_now:i64)
+// rather than hidden: this pair refreshes together on connect and shell-tab
+// change, so it is a coherent sample, not a live one, and reads `h —` until
+// the first one lands.
+component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, settings_endpoint:str, settings_node_key:str, settings_data_dir:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_answered:bool, account_id:str, bind account_name_draft:str, account_renaming:bool, account_bound:bool, account_members:i64, account_nodes:i64, appearance:str, password:str, status:str, loading:bool, connected:bool, mutation_phase:MutationPhase, node_tab:NodeTab, module_rows:[ModuleRow], node_height:i64, node_checkpoint:i64, node_last_finalized:i64, node_reachable_label:str, node_quorum_label:str, node_version:str, node_root_hash:str, sync_line:str, node_phase_since:i64, node_sync_retries:i64, node_sync_failures:i64, node_sync_last_error:str, node_peers:[PeerRow], bind node_log_filter:str, wall_now:i64)
   emits
-    select_shell_tab(str)
+    select_shell_tab(ShellTab)
     reconnect()
     switch_network
     settings_unlock_submit(str)
@@ -35,7 +35,7 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
     copy_to_clipboard(str, str)
     settings_clear_tabs()
     forget_workspace_submit()
-    select_node_tab(str)
+    select_node_tab(NodeTab)
     open_node_modules()
     node_log_filter_changed(str)
     set_appearance_light()
@@ -118,7 +118,7 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                       wrap=none
                       font=code_medium
                       @text-secondary_fg
-                  button "manage" -> emit(select_shell_tab, "members")
+                  button "manage" -> emit(select_shell_tab, ShellTab.members)
                     with
                       h=22.0
                       p=0.0
@@ -146,13 +146,13 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                   space w=fill
                   button "Reconnect" -> emit(reconnect)
                     with
-                      disabled=(loading || (mutation_phase != "idle" && mutation_phase != "recovering"))
+                      disabled=(loading || (mutation_phase != MutationPhase.idle && mutation_phase != MutationPhase.recovering))
                       h=28.0
                       p=6.0
                       @secondary_action
                   button "Switch network" -> emit(switch_network)
                     with
-                      disabled=(mutation_phase != "idle")
+                      disabled=(mutation_phase != MutationPhase.idle)
                       h=28.0
                       p=6.0
                       @secondary_action
@@ -413,7 +413,7 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                           label="Key password"
                           secure=true
                           hint="unlock signing…"
-                          disabled=(mutation_phase != "idle")
+                          disabled=(mutation_phase != MutationPhase.idle)
                           submit=emit(settings_unlock_submit, key_pw)
                           w=fill
                           p=6.2
@@ -425,7 +425,7 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                         disabled bg=muted_bg/54 value=muted
                       button "Unlock" -> emit(settings_unlock_submit, key_pw)
                         with
-                          disabled=(mutation_phase != "idle" || empty(key_pw))
+                          disabled=(mutation_phase != MutationPhase.idle || empty(key_pw))
                           h=28.0
                           p=6.0
                           @secondary_action
@@ -525,7 +525,7 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                     @text-meta
               button "Forget network" -> emit(forget_workspace_submit)
                 with
-                  disabled=(!connected || mutation_phase != "idle")
+                  disabled=(!connected || mutation_phase != MutationPhase.idle)
                   h=32.0
                   p=8.0
                   @icon_action
@@ -564,10 +564,10 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
           StatusPill degraded=connection_degraded(status) loading=loading
           space w=fill
         row gap=3.0 align=center
-          button #node-overview-tab -> emit(select_node_tab, "overview")
+          button #node-overview-tab -> emit(select_node_tab, NodeTab.overview)
             with
               label="Node overview"
-              checked=(node_tab == "overview")
+              checked=(node_tab == NodeTab.overview)
               p=0.0
               @ghost_action
             box px=15.0 py=0.0
@@ -575,14 +575,14 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                 with
                   label="Overview"
                   count=0
-                  active=(node_tab == "overview")
+                  active=(node_tab == NodeTab.overview)
             active bg=transparent text=muted border=transparent border-w=1.0 r=8.0
             hovered bg=row_hover text=fg
             pressed bg=elevated text=fg
-          button #node-permissions-tab -> emit(select_node_tab, "permissions")
+          button #node-permissions-tab -> emit(select_node_tab, NodeTab.permissions)
             with
               label="Node permissions"
-              checked=(node_tab == "permissions")
+              checked=(node_tab == NodeTab.permissions)
               p=0.0
               @ghost_action
             box px=15.0 py=0.0
@@ -590,14 +590,14 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                 with
                   label="Permissions"
                   count=0
-                  active=(node_tab == "permissions")
+                  active=(node_tab == NodeTab.permissions)
             active bg=transparent text=muted border=transparent border-w=1.0 r=8.0
             hovered bg=row_hover text=fg
             pressed bg=elevated text=fg
-          button #node-activity-tab -> emit(select_node_tab, "activity")
+          button #node-activity-tab -> emit(select_node_tab, NodeTab.activity)
             with
               label="Node activity"
-              checked=(node_tab == "activity")
+              checked=(node_tab == NodeTab.activity)
               p=0.0
               @ghost_action
             box px=15.0 py=0.0
@@ -605,14 +605,14 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                 with
                   label="Activity"
                   count=0
-                  active=(node_tab == "activity")
+                  active=(node_tab == NodeTab.activity)
             active bg=transparent text=muted border=transparent border-w=1.0 r=8.0
             hovered bg=row_hover text=fg
             pressed bg=elevated text=fg
           button #node-modules-tab -> emit(open_node_modules)
             with
               label="Node modules"
-              checked=(node_tab == "modules")
+              checked=(node_tab == NodeTab.modules)
               p=0.0
               @ghost_action
             box px=15.0 py=0.0
@@ -620,18 +620,18 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                 with
                   label="Modules"
                   count=len(module_rows)
-                  active=(node_tab == "modules")
+                  active=(node_tab == NodeTab.modules)
             active bg=transparent text=muted border=transparent border-w=1.0 r=8.0
             hovered bg=row_hover text=fg
             pressed bg=elevated text=fg
         match node_tab
-          "modules"
+          NodeTab.modules
             ModulesPanel rows=module_rows
-          "permissions"
+          NodeTab.permissions
             col w=fill gap=18.0
               NodeAccessCard tier=member_tier(members_rows) admin=members_is_admin(members_rows)
               PermissionMatrix tier=member_tier(members_rows)
-          "activity"
+          NodeTab.activity
             LogTimeline.Frame
               with
                 title="Log ring"
@@ -655,7 +655,7 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                     hovered bg=muted_bg border=control_line
                 box w=fill h=420.0
                   slot activity_log
-          _
+          NodeTab.overview
             col w=fill gap=13.0
               GroupLabel label="NETWORK"
               // Three readings this node can actually prove. The artifact's
