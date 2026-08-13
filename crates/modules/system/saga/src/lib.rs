@@ -862,8 +862,8 @@ impl SagaModule {
         self.stage_if_changed(&quota_key(origin), record).await
     }
 
-    /// take one of `origin`'s [`PER_ORIGIN_LIVE_SAGAS`] slots — the accepted
-    /// trigger's claim, made only after the record that occupies it is staged.
+    /// take one of `origin`'s [`live_saga_cap`] slots — the accepted trigger's
+    /// claim, made only after the record that occupies it is staged.
     async fn claim_live_slot(&mut self, origin: &SagaOrigin) -> Result<(), Error> {
         let live = self.live_sagas(origin).await?;
         self.stage_live_count(origin, live.saturating_add(1)).await
@@ -923,9 +923,10 @@ impl SagaModule {
         // the last thing that can refuse, so it is DECIDED before anything is
         // staged: an ending saga hands its slot back, and a count that cannot
         // absorb the decrement is a module bug rather than a clamp.
-        let released = match saga.status.is_terminal() {
-            true => Some(self.live_count_after_release(&saga.origin).await?),
-            false => None,
+        let released = if saga.status.is_terminal() {
+            Some(self.live_count_after_release(&saga.origin).await?)
+        } else {
+            None
         };
 
         self.staged.stage(record_key(saga_id), record);
@@ -1016,7 +1017,11 @@ impl SagaModule {
     /// of maximal specs cannot become a reply no wasm guest can hold. `next` is
     /// the last candidate this page examined — pass it back as `after` — and
     /// `None` means the walk reached the end of the index.
-    async fn pending_page(&self, lane: Lane<'_>, after: Option<&str>) -> Result<PendingPage, Error> {
+    async fn pending_page(
+        &self,
+        lane: Lane<'_>,
+        after: Option<&str>,
+    ) -> Result<PendingPage, Error> {
         let pending = self.load_pending().await?;
         let start = match after {
             Some(cursor) => Bound::Excluded(cursor),
@@ -1045,7 +1050,11 @@ impl SagaModule {
             // than it examined candidates.
             let admitted = lane.admits(&saga);
             let weight = spec_bytes.saturating_add(saga.spec_len as usize);
-            let over_budget = admitted && examined > 0 && weight > PENDING_PAGE_BYTES;
+            // the first candidate is exempt: a spec larger than the whole
+            // budget must still move the walk forward, or the cursor stalls on
+            // it forever.
+            let would_ship_alone = examined == 0;
+            let over_budget = admitted && !would_ship_alone && weight > PENDING_PAGE_BYTES;
             if over_budget {
                 break;
             }
@@ -1664,11 +1673,11 @@ impl SagaModule {
                 expired.sort_unstable();
                 for (_, saga_id) in expired.into_iter().take(CRANK_BUDGET as usize) {
                     let current = self.require(&saga_id).await?;
-                    // the meta named this saga due, so its deadline or its
-                    // lease HAS passed — the pair below says which, and the
-                    // ladder that used to skip a non-expired saga is gone with
-                    // the scan that produced them. (in-seam: if/else-if ladder
-                    // -> one match.)
+                    // the record is NOT re-checked against `now`: the meta
+                    // already named this saga due, and `due` is the minimum of
+                    // the two instants, so at least one of them has passed. the
+                    // pair below only says WHICH — a `deadline_hit` of false
+                    // therefore means the lease is what expired.
                     let deadline_hit = current.deadline.is_some_and(|d| now >= d);
                     let attempts_remain = current.attempt + 1 < current.max_attempts;
                     let mut saga = current;
@@ -4897,20 +4906,21 @@ mod tests {
 
         // a capability with no registry configured assigns NOBODY, so that is
         // how this script gets an announcement into the unassigned lane.
-        let leased = |id: &str, deadline: Option<u64>, max_attempts: u32, capability: Option<&str>| {
-            SagaMsg::Trigger {
-                pinned_assignee: None,
-                saga_id: id.into(),
-                spec: b"w".to_vec(),
-                reply_to: None,
-                reply_payload: Vec::new(),
-                deadline,
-                max_attempts,
-                lease_views: Some(6),
-                capability: capability.map(String::from),
-                demands: Default::default(),
-            }
-        };
+        let leased =
+            |id: &str, deadline: Option<u64>, max_attempts: u32, capability: Option<&str>| {
+                SagaMsg::Trigger {
+                    pinned_assignee: None,
+                    saga_id: id.into(),
+                    spec: b"w".to_vec(),
+                    reply_to: None,
+                    reply_payload: Vec::new(),
+                    deadline,
+                    max_attempts,
+                    lease_views: Some(6),
+                    capability: capability.map(String::from),
+                    demands: Default::default(),
+                }
+            };
 
         let mut ctx = ctx_at(1, alice.clone());
         step(
@@ -4995,7 +5005,12 @@ mod tests {
             &oracle(&ids[1], 0, Err("first attempt died".into())),
             "retry",
         );
-        step(&mut m, &mut ctx, &oracle(&ids[0], 0, Ok(b"r".to_vec())), "done");
+        step(
+            &mut m,
+            &mut ctx,
+            &oracle(&ids[0], 0, Ok(b"r".to_vec())),
+            "done",
+        );
         step(
             &mut m,
             &mut ctx,
@@ -5016,10 +5031,8 @@ mod tests {
         commit(&mut m);
 
         // the script really covered the space it claims to.
-        let statuses: Vec<SagaStatus> = ids
-            .iter()
-            .map(|id| get(&m, id).expect(id).status)
-            .collect();
+        let statuses: Vec<SagaStatus> =
+            ids.iter().map(|id| get(&m, id).expect(id).status).collect();
         assert_eq!(
             statuses,
             vec![
@@ -5258,7 +5271,12 @@ mod tests {
 
         let mut ctx = CaptureCtx::new().at(1).with_origin(alice.clone());
         for i in 0..PER_ORIGIN_LIVE_SAGAS {
-            exec(&mut m, &mut ctx, &trigger(&alice_id(&format!("s{i:04}")), b"w")).unwrap();
+            exec(
+                &mut m,
+                &mut ctx,
+                &trigger(&alice_id(&format!("s{i:04}")), b"w"),
+            )
+            .unwrap();
         }
         commit(&mut m);
         assert_eq!(live(&m, &alice), PER_ORIGIN_LIVE_SAGAS);
@@ -5341,7 +5359,12 @@ mod tests {
             .at(2)
             .with_origin(Origin::External(b"node-a".to_vec()))
             .with_validators(validators.clone());
-        exec(&mut m, &mut ctx, &oracle(&sid("done"), 0, Ok(b"r".to_vec()))).unwrap();
+        exec(
+            &mut m,
+            &mut ctx,
+            &oracle(&sid("done"), 0, Ok(b"r".to_vec())),
+        )
+        .unwrap();
         assert_eq!(live(&m, &Origin::System), 5, "Done returns one slot");
         exec(
             &mut m,
@@ -5414,9 +5437,7 @@ mod tests {
         exec(
             &mut m,
             &mut ctx,
-            &msg(&SagaMsg::Cancel {
-                saga_id: sid("a"),
-            }),
+            &msg(&SagaMsg::Cancel { saga_id: sid("a") }),
         )
         .unwrap();
         commit(&mut m);

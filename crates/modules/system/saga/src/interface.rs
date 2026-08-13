@@ -419,7 +419,7 @@ pub enum SagaQuery {
 }
 
 /// one page of a pending projection, plus where to resume.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct PendingPage {
     /// the page's requests, ascending by saga id.
     pub requests: Vec<WorkerRequest>,
