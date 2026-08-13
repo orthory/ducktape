@@ -20,7 +20,7 @@ use recovery::{Manifest, Recovery};
 use crate::config::{hex_bytes, unhex};
 use crate::constants::*;
 use crate::drain_actions::{CutoverTrigger, EpochActions};
-use crate::explorer::{boundary_block_row, heal_index};
+use crate::explorer::{boundary_block_row, heal_and_backfill_index, heal_index};
 use crate::host_reads::{joiner_epoch_mesh, read_valset_members, read_valset_residents};
 use crate::host_state::{SyncSubstrates, restore_host, sync_all_modules};
 use crate::relay;
@@ -2095,7 +2095,15 @@ pub(super) async fn park(
                             // ascension tip; per-block folds keep it
                             // current from here (no more healing).
                             if last_indexed_root.as_ref() != Some(&root) {
-                                heal_index(&index, tip, &label);
+                                // the stamp, then the SOURCE'S OWN op rows
+                                // below it — inline, while this node is not
+                                // yet serving and not yet folding live
+                                // blocks. that window is the whole
+                                // correctness argument for writing straight
+                                // into the feed (see
+                                // `heal_and_backfill_index`), and it closes
+                                // at `serving = Some(..)` below.
+                                heal_and_backfill_index(&index, &client, tip, &label).await;
                                 if let Err(err) = index.apply_block_record(
                                     tip,
                                     boundary_block_row(tip, &root),
@@ -2307,6 +2315,13 @@ pub(super) async fn park(
                             height: boundary.height,
                             cert,
                         });
+                        // THE LAST MOMENT A SYNC CLIENT EXISTS: `run_promoted`
+                        // seats from the baton and never sees one, so the
+                        // op-row backfill has to run here. it stamps first
+                        // (the wipe would eat anything written before it) at
+                        // exactly the boundary `run_promoted` heals against,
+                        // which makes that later heal the no-op it should be.
+                        heal_and_backfill_index(&index, &client, boundary.height, &label).await;
                         break (boundary, host, floor);
                     }
                     PromotionBoundary::Retry => {}

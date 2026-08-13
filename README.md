@@ -76,7 +76,6 @@ are open and unmerged.
 | `ObjectStore` · `crates/duckfs/core` | `DiskStore` | `MemStore` | `files` module, duckfs client |
 | `Blobs` · `blobstore` — (this campaign, PR #716 — unmerged) | `BlobHandle` (disk) | `MemBlobs` | bin/node blob_fetch/relay_runtime/explorer, statesync serve |
 | `RefsStore` · `crates/duckfs/core` — (this campaign, PR #715 — unmerged) | `DiskRefs` | `MemRefs` | `files` module (`Files<S, R>`) |
-| `IndexDisk` · `crates/kernel/indexer` — (this campaign, PR #717 — unmerged) | `DiskFs` (moved `std::fs`) | `MemDisk` (feature `sim`) | indexer derived-tier writes |
 | `MeshCarrier` · `crates/kernel/consensus` — (this campaign, PR #719 — unmerged) | `DiscoveryMesh` (wraps the `authenticated::discovery` Network) | `SimMesh` (feature `sim`, wraps `simulated::Network`) | bin/node validator engine, in-process cluster test |
 | commonware `Clock` seam (`context.current()`) + source-parsing lint · bin/node, statesync — (this campaign, PR #720 — unmerged) | `tokio::Context` | `deterministic::Runner` | validator run/drain/ingress, statesync monitor |
 | `TestCtx` (`sdk::Ctx`) + `MemStore` (`sdk::MerkleStore`) · `crates/kernel/sdk-testkit` — (this campaign, PR #718/#721 — unmerged) | host runtime `Ctx`, `QmdbStore` | `TestCtx`, `MemStore` | module unit tests (runs, automations, files, governance, …) |

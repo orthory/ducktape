@@ -319,94 +319,58 @@ fn server_rejects_chunk_for_unleased_boundary() {
     );
 }
 
+/// THE BACKFILL LANE TAKES NO LEASE, AND MUST NOT. It is cursor-paged over an
+/// arbitrarily long op history, so binding it to a capture would let a busy
+/// source evict the lease out from under a walk in progress (MAX_CAPTURES is
+/// 4). It carries a plain height CEILING instead, exactly like the Frames
+/// lane's journal range — a boundary this server never captured is a
+/// perfectly good ceiling.
 #[test]
-fn shipped_index_serves_only_attached_leased_boundaries() {
+fn index_ops_need_no_lease_and_answer_empty_without_a_store() {
     let mut srv = SyncServer::new();
-    let boundary = BoundaryId {
-        height: 12,
-        root_hash: StateRoot([6u8; 32]),
-    };
     let host = Host::genesis(vec![]).unwrap();
     let coords = BoundaryCoords::default();
     let ask = |srv: &mut SyncServer, req| block_on(srv.handle(&host, None, &coords, req));
 
-    // unleased boundary: refused like every other per-boundary request.
-    let resp = ask(&mut srv, SyncRequest::IndexModules { boundary });
-    assert!(matches!(resp, SyncResponse::Error(_)));
-
-    srv.insert_capture_for_test(boundary);
-    srv.lease(boundary);
-
-    // leased but unattached: an EMPTY list — the joiner falls back to the
-    // from-state rebuild, no error.
-    let resp = ask(&mut srv, SyncRequest::IndexModules { boundary });
-    assert!(matches!(
-        resp,
-        SyncResponse::IndexModules { ref entries } if entries.is_empty()
-    ));
-    assert!(!srv.index_attached(boundary));
-
-    // attach two blobs; one larger than a chunk to exercise offset paging.
-    let big = vec![0xEE; statesync::CHUNK_LEN + 7];
-    let mut blobs = std::collections::BTreeMap::new();
-    blobs.insert("chat".to_string(), big.clone());
-    blobs.insert("_blocks".to_string(), vec![1, 2, 3]);
-    srv.attach_index(boundary, blobs).expect("attach");
-    assert!(srv.index_attached(boundary));
-
-    let resp = ask(&mut srv, SyncRequest::IndexModules { boundary });
-    match resp {
-        SyncResponse::IndexModules { entries } => assert_eq!(
-            entries,
-            vec![
-                ("_blocks".to_string(), 3),
-                ("chat".to_string(), big.len() as u64)
-            ]
-        ),
-        other => panic!("want IndexModules, got {}", other.kind_name()),
-    }
-
-    // chunked fetch reassembles the exact blob.
-    let mut out = Vec::new();
-    loop {
-        let resp = ask(
-            &mut srv,
-            SyncRequest::IndexChunk {
-                boundary,
-                db: "chat".into(),
-                offset: out.len() as u64,
-            },
-        );
-        match resp {
-            SyncResponse::Chunk { total, bytes } => {
-                assert_eq!(total, big.len() as u64);
-                out.extend_from_slice(&bytes);
-                if out.len() as u64 >= total {
-                    break;
-                }
-            }
-            other => panic!("want Chunk, got {}", other.kind_name()),
-        }
-    }
-    assert_eq!(out, big);
-
-    // a database the source never attached is a loud error.
+    // no capture, no lease, no index store on this owner: an EMPTY page at
+    // watermark 0 — never an error, and never a lease refusal.
     let resp = ask(
         &mut srv,
-        SyncRequest::IndexChunk {
-            boundary,
-            db: "ghost".into(),
-            offset: 0,
+        SyncRequest::IndexOps {
+            boundary: 12,
+            module: "chat".into(),
+            after: None,
         },
     );
-    assert!(matches!(resp, SyncResponse::Error(_)));
+    match resp {
+        SyncResponse::IndexOps {
+            rows,
+            next_after,
+            source_floor,
+            applied_height,
+        } => {
+            assert!(rows.is_empty());
+            assert_eq!(next_after, None);
+            assert_eq!(source_floor, None);
+            assert_eq!(
+                applied_height, 0,
+                "a watermark below the asked boundary is what makes a joiner \
+                 refuse to lower its floor on this answer"
+            );
+        }
+        other => panic!("want IndexOps, got {}", other.kind_name()),
+    }
 
-    // attaching to an unleased boundary is refused.
-    let stale = BoundaryId {
-        height: 99,
-        root_hash: StateRoot([7u8; 32]),
-    };
-    assert!(srv.attach_index(stale, Default::default()).is_err());
+    // and a mid-walk cursor gets the same shape, not a stale-capture error.
+    let resp = ask(
+        &mut srv,
+        SyncRequest::IndexOps {
+            boundary: 12,
+            module: "chat".into(),
+            after: Some((7, 3)),
+        },
+    );
+    assert!(matches!(resp, SyncResponse::IndexOps { .. }));
 }
 
 #[test]

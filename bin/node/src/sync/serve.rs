@@ -375,9 +375,13 @@ pub(crate) enum SyncStateRequest {
         up_to_height: u64,
         reply: tokio::sync::oneshot::Sender<Result<Vec<recovery::JournalFrame>, recovery::Error>>,
     },
-    /// checkpoint the derived index databases for the shipped-index lane.
-    IndexCut {
-        reply: tokio::sync::oneshot::Sender<std::collections::BTreeMap<String, Vec<u8>>>,
+    /// read one page of a module's derived index op rows at or below
+    /// `up_to_height` — the joiner's backfill lane.
+    IndexOps {
+        module: String,
+        after: Option<(u64, u32)>,
+        up_to_height: u64,
+        reply: tokio::sync::oneshot::Sender<Result<SyncIndexOps, String>>,
     },
     /// read the tip's consensus coordinates — the DETECTION lane: answered
     /// straight from loop-owned state (no capture, no lease, no floor-cert
@@ -404,6 +408,17 @@ pub(crate) struct SyncBoundary {
     pub(crate) id: statesync::BoundaryId,
     pub(crate) coords: statesync::BoundaryCoords,
     pub(crate) data: Option<statesync::CaptureData>,
+}
+
+/// the [`SyncStateRequest::IndexOps`] answer: one page of stored op rows in
+/// key order, plus the two facts that let a joiner compose an honest floor —
+/// this node's own backfill floor for the module and its feed watermark.
+pub(crate) struct SyncIndexOps {
+    pub(crate) rows: Vec<(String, Vec<u8>)>,
+    /// more rows exist past the last one served.
+    pub(crate) has_more: bool,
+    pub(crate) source_floor: Option<u64>,
+    pub(crate) applied_height: u64,
 }
 
 const MAX_SYNC_RESPONSE_BODY_LEN: usize =
@@ -440,6 +455,54 @@ fn bounded_frames_response(mut frames: Vec<statesync::FinalizedFrame>) -> states
     }
     frames.truncate(fitting);
     statesync::SyncResponse::Frames { frames }
+}
+
+/// Same binary search as [`bounded_frames_response`], over index op rows: keep
+/// the largest non-empty prefix that fits the mesh's message cap, and set the
+/// cursor whenever anything was left behind. A single row that cannot fit alone
+/// is an explicit error — an empty successful page with `next_after` set would
+/// make the joiner's walk spin without advancing.
+fn bounded_index_ops_response(page: SyncIndexOps) -> statesync::SyncResponse {
+    let SyncIndexOps {
+        mut rows,
+        mut has_more,
+        source_floor,
+        applied_height,
+    } = page;
+    rows.truncate(statesync::INDEX_OPS_BATCH_LEN);
+
+    let mut fitting = 0usize;
+    let mut excluded = rows.len() + 1;
+    while excluded - fitting > 1 {
+        let candidate = fitting + (excluded - fitting) / 2;
+        let encoded_len = statesync::encoded_index_ops_response_len(&rows[..candidate]);
+        let fits_transport = encoded_len <= MAX_SYNC_RESPONSE_BODY_LEN;
+        if fits_transport {
+            fitting = candidate;
+        } else {
+            excluded = candidate;
+        }
+    }
+
+    if fitting == 0 && !rows.is_empty() {
+        return statesync::SyncResponse::Error(format!(
+            "index op row {} exceeds the {MAX_MESSAGE_SIZE}-byte statesync mesh message limit",
+            rows[0].0
+        ));
+    }
+    if fitting < rows.len() {
+        has_more = true;
+        rows.truncate(fitting);
+    }
+    let next_after = has_more
+        .then(|| rows.last().and_then(|(key, _)| indexer::parse_op_key(key.as_bytes())))
+        .flatten();
+    statesync::SyncResponse::IndexOps {
+        rows,
+        next_after,
+        source_floor,
+        applied_height,
+    }
 }
 
 /// drive one decoded statesync request against the serve-task-owned
@@ -549,26 +612,23 @@ pub(crate) async fn drive_sync_request(
                 Err(_) => statesync::SyncResponse::Error(CLOSED.into()),
             }
         }
-        statesync::ServeStep::NeedIndexCut { boundary } => {
-            // the shipped-index lane cuts lazily: the FIRST index request for
-            // a boundary checkpoints the derived databases and attaches the
-            // archives to that capture, so joiners that never opt in cost
-            // nothing. the attach is unconditional, so the re-drive below
-            // resolves — it cannot need a second cut.
+        statesync::ServeStep::NeedIndexOps {
+            boundary,
+            module,
+            after,
+        } => {
             let (tx, rx) = tokio::sync::oneshot::channel();
-            ask(SyncStateRequest::IndexCut { reply: tx }).await;
-            let blobs = match rx.await {
-                Ok(blobs) => blobs,
-                Err(_) => return statesync::SyncResponse::Error(CLOSED.into()),
-            };
-            if let Err(e) = server.attach_index(boundary, blobs) {
-                return statesync::SyncResponse::Error(e);
-            }
-            match server.serve(statesync::SyncRequest::IndexModules { boundary }) {
-                statesync::ServeStep::Reply(resp) => resp,
-                _ => {
-                    statesync::SyncResponse::Error("index attach did not settle the request".into())
-                }
+            ask(SyncStateRequest::IndexOps {
+                module,
+                after,
+                up_to_height: boundary,
+                reply: tx,
+            })
+            .await;
+            match rx.await {
+                Ok(Ok(page)) => bounded_index_ops_response(page),
+                Ok(Err(e)) => statesync::SyncResponse::Error(e),
+                Err(_) => statesync::SyncResponse::Error(CLOSED.into()),
             }
         }
         statesync::ServeStep::NeedCoords => {

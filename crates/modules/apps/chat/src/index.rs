@@ -40,10 +40,11 @@
 //!
 //! caveat (shared by every mapper): the view reflects ops folded SINCE the
 //! index existed. a boundary-stamped or freshly-enabled index has no rows
-//! below its floor until a shipped index (`sync_index`, the default join
-//! path) or a chain replay establishes them; pages honestly skip absent rows
-//! rather than erroring. sequences are exact even across a boundary: every
-//! feed row carries the module-assigned stamp, so numbering never restarts.
+//! below its floor until the join-seam op-row backfill (the joiner pulls the
+//! source's own rows below its boundary, spec §7) or a chain replay
+//! establishes them; pages honestly skip absent rows rather than erroring.
+//! sequences are exact even across a boundary: every feed row carries the
+//! module-assigned stamp, so numbering never restarts.
 //!
 //! this file is the DECISION core — pure functions over [`StateRead`],
 //! compiled natively and unit-tested against a plain map. the wasm shell

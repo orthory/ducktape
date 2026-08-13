@@ -353,10 +353,6 @@ fn run_node(
         mesh_state_file,
         checkpoint_blocks,
         dev_demo,
-        // the shipped-index warm start's staging client rode the retired
-        // promotion exec-reboot; the serve side and the config key await
-        // the follow-up sweep.
-        sync_index: _,
         sandbox,
         compute_backend,
         sandbox_capacity,

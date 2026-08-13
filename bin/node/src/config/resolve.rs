@@ -95,9 +95,6 @@ pub struct Resolved {
     /// ADDITIONAL first-contact paths the joiner races alongside the inviter.
     /// Empty for the dev shape and for members.
     pub invite_fronts: Vec<Front>,
-    /// shipped-index warm start when joining (default on); see
-    /// `NodeToml::sync_index`.
-    pub sync_index: bool,
     /// the reachability plane's coordination privacy (per-network operational
     /// policy). `Private` (the default) requires a genesis-issued `CoordCap`
     /// for a node outside the genesis validator set; `Public` accepts any
@@ -515,7 +512,6 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         invite_token: load_invite_token(base)?,
         invite_wireguard: load_invite_wireguard(base)?,
         invite_fronts: load_invite_fronts(base)?,
-        sync_index: raw.sync_index,
         coordination: descriptor.coordination(),
         // the reachability plane presents this on every coordinator request; a
         // genesis validator needs none (admitted by membership), a joiner is
@@ -787,7 +783,6 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
         invite_token: None,
         invite_wireguard: None,
         invite_fronts: Vec::new(),
-        sync_index: raw.sync_index.unwrap_or(true),
         // the dev shape wires direct sockets only — no real coordinator, so
         // the coordination mode defaults to Private and no cap is presented.
         coordination: Coordination::Private,
@@ -1500,7 +1495,6 @@ mod tests {
             ("primary_coordinator", "\"none\""),
             ("coordinator_relay", "\"none\""),
             ("checkpoint_blocks", "32"),
-            ("sync_index", "false"),
         ];
         defaults
             .iter()
