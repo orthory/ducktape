@@ -12,9 +12,11 @@
 //! inline marks and the todo flag — because [`PagesViewQuery::GetPage`] serves
 //! a page's preorder traversal off these rows and its reply must be
 //! indistinguishable from the canonical [`crate::PageQuery::GetPage`]'s. the
-//! anchor arithmetic (`after`), the reorder-in-place move, and the mark
-//! rebase are therefore mirrored arm for arm from `src/block_ops.rs` and
-//! `src/text_ranges.rs` — the same functions, not a second implementation.
+//! mark handling calls `src/text_ranges.rs` outright; the anchor arithmetic
+//! (`after`), the reorder-in-place move and the preorder walk are mirrors of
+//! `src/block_ops.rs` and `src/store.rs`, written against a row instead of a
+//! block — so `tests/index_parity.rs` is what holds the two in step, and a
+//! change to either side that skips it is a change to only one lane.
 //!
 //! key spaces (inside pages' per-module index database):
 //! - `blk/{block_id}`         — the block's current [`PageBlockRow`].
