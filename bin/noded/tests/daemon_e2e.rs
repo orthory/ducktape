@@ -856,8 +856,10 @@ fn per_module_index_serves_ops_and_views() {
 
         // chat's OWN endpoint: the materialized search view.
         await_view_folded(&daemon, "chat");
-        let (code, folded, reply) =
-            daemon.view("chat", serde_json::json!({ "search": { "text": "fluent" } }));
+        let (code, folded, reply) = daemon.view(
+            "chat",
+            serde_json::json!({ "search": { "text": "fluent" } }),
+        );
         assert_eq!(code, 200, "chat view failed: {reply}");
         let hits = hits_of(&reply);
         assert_eq!(hits.len(), 1);
@@ -875,7 +877,6 @@ fn per_module_index_serves_ops_and_views() {
             Some(format!("{}:{}", last["height"], last["seq"]).as_str()),
             "the header names the last folded op row: {rows:?}"
         );
-
 
         // tasks' endpoint: the by-status partition.
         await_view_folded(&daemon, "tasks");

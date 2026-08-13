@@ -898,13 +898,7 @@ mod tests {
     /// end to end by the app's stub-node tests and noded's daemon e2e.)
     #[test]
     fn a_fold_tip_parses_only_a_complete_position() {
-        assert_eq!(
-            FoldTip::parse("12:3"),
-            Some(FoldTip {
-                height: 12,
-                seq: 3
-            })
-        );
+        assert_eq!(FoldTip::parse("12:3"), Some(FoldTip { height: 12, seq: 3 }));
         for malformed in ["", "12", "12:", ":3", "12:3:4", "twelve:3", "12:-1"] {
             assert_eq!(FoldTip::parse(malformed), None, "{malformed:?} is unknown");
         }

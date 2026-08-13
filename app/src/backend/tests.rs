@@ -3962,7 +3962,7 @@ fn forge_code_replies_keep_the_server_revision_and_preview_flags() {
     assert_eq!(binary.lines, 0);
 
     assert_eq!(
-        blob_view(serde_json::json!({ "blob": null }), "core".into(),).unwrap_err(),
+        blob_view(serde_json::json!({ "blob": null }), "core".into()).unwrap_err(),
         "the requested file was not found"
     );
 }
@@ -4335,7 +4335,6 @@ async fn a_forge_op_does_not_load_the_repo_list_for_a_closed_pane() {
     );
     assert!(data.repos.is_empty());
 }
-
 
 /// A stub node whose `/v1/index/pages/view` replies carry a SCRIPTED fold
 /// watermark: one entry per request, the last one repeating forever. Returns
