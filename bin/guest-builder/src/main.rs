@@ -43,6 +43,7 @@
 
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 
@@ -344,20 +345,26 @@ blst = {{ path = "{blst}" }}
     write(&src.join("lib.rs"), &lib)
 }
 
-/// refresh `<scratch>/tree` with a copy of the platform checkout — the source
-/// the guest build actually compiles, and the reason its bytes do not depend on
-/// where the checkout lives.
+/// refresh `<scratch>/tree` with a copy of the platform checkout's TRACKED
+/// files — the source the guest build actually compiles, and the reason its
+/// bytes do not depend on where the checkout lives.
 ///
-/// tar rather than a hand-rolled walk: it carries symlinks and mtimes over
-/// verbatim, and the mtimes are what keep the next build incremental. `target`,
-/// `.git` and `.worktree` are build output, history and other checkouts —
-/// copying them would drag tens of GB along and recurse into the snapshot
-/// itself. What is left costs ~40 MB of disk per module.
+/// The list comes from `git ls-files`, never from walking the directory: the
+/// tracked set IS the build input set — the committed artifacts rebuild
+/// byte-identically from it, which is the proof that nothing gitignored is an
+/// input — while the directory around it is mostly not. A checkout that
+/// followed the documented docs setup (`cd docs && bun install`) carries ~950 MB
+/// of gitignored bulk (docs/node_modules alone is 834 MB), and a
+/// `make wasm-modules` sweep would tar all of it into each of its 22 scratch
+/// dirs. Walking is also unstable: a live writer (`bun run dev` rewriting
+/// docs/.astro) makes GNU tar exit 1 with "file changed as we read it" and
+/// aborts the sweep half-refreshed.
 ///
-/// The exclude patterns are UNANCHORED on purpose — no leading `./`. Anchored,
-/// they skip only the top-level `target`, and the nested
-/// `crates/guests/*-wasm/target` dirs (~145 MB each) ride along into every
-/// snapshot: 646 MB per module instead of 42 MB.
+/// tar rather than a hand-rolled walk: it carries symlinks (`CLAUDE.md`,
+/// `.claude/skills`) and mtimes over verbatim, and the mtimes are what keep the
+/// next build incremental. A tracked file deleted from the working tree fails
+/// the snapshot with tar naming it — a checkout missing a build input cannot
+/// honestly build.
 fn snapshot(platform_root: &Path, tree: &Path) -> Result<(), String> {
     // wiped first: tar overwrites, it never removes, so a file deleted from the
     // checkout would otherwise live on in here forever.
@@ -365,39 +372,69 @@ fn snapshot(platform_root: &Path, tree: &Path) -> Result<(), String> {
         fs::remove_dir_all(tree).map_err(|e| format!("clearing {}: {e}", tree.display()))?;
     }
     fs::create_dir_all(tree).map_err(|e| format!("creating {}: {e}", tree.display()))?;
+    let tracked = tracked_files(platform_root)?;
 
+    // NUL-separated names on stdin: no quoting, no splitting on whitespace, and
+    // no name mistaken for an option.
     let mut pack = Command::new("tar")
-        .args([
-            "-cf",
-            "-",
-            "--exclude=target",
-            "--exclude=.git",
-            "--exclude=.worktree",
-            "-C",
-        ])
+        .args(["-cf", "-", "-C"])
         .arg(platform_root)
-        .arg(".")
+        .args(["--null", "-T", "-"])
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| format!("running tar: {e}"))?;
-    let Some(packed) = pack.stdout.take() else {
-        return Err("tar produced no output stream".to_string());
+    let (Some(mut names), Some(packed)) = (pack.stdin.take(), pack.stdout.take()) else {
+        return Err("tar produced no name/archive stream".to_string());
     };
-    let unpack = Command::new("tar")
+    // the extractor has to be draining the archive while we are still feeding
+    // names — both pipes are bounded, so writing the whole list first deadlocks.
+    let mut unpack = Command::new("tar")
         .args(["-xf", "-", "-C"])
         .arg(tree)
         .stdin(packed)
-        .status()
+        .spawn()
         .map_err(|e| format!("running tar: {e}"))?;
+    let fed = names.write_all(&tracked);
+    drop(names);
     let packing = pack.wait().map_err(|e| format!("waiting on tar: {e}"))?;
-    if !packing.success() || !unpack.success() {
+    let unpacking = unpack.wait().map_err(|e| format!("waiting on tar: {e}"))?;
+    if !packing.success() || !unpacking.success() {
         return Err(format!(
-            "snapshotting {} into {} failed",
+            "snapshotting {} into {} failed — tar named the offending path above; \
+             a tracked file missing from the working tree is the usual cause",
             platform_root.display(),
             tree.display()
         ));
     }
-    Ok(())
+    // checked after the exit statuses: a tar that died on a missing file closes
+    // the pipe, and its own message is the better diagnosis than our EPIPE.
+    fed.map_err(|e| format!("feeding the file list to tar: {e}"))
+}
+
+/// the checkout's tracked paths, NUL-separated, ready for `tar --null -T -`.
+fn tracked_files(platform_root: &Path) -> Result<Vec<u8>, String> {
+    let listed = Command::new("git")
+        .arg("-C")
+        .arg(platform_root)
+        .args(["ls-files", "-z"])
+        .output()
+        .map_err(|e| format!("running git ls-files: {e}"))?;
+    if !listed.status.success() {
+        return Err(format!(
+            "git ls-files in {}: {}",
+            platform_root.display(),
+            String::from_utf8_lossy(&listed.stderr).trim()
+        ));
+    }
+    if listed.stdout.is_empty() {
+        return Err(format!(
+            "{} tracks no files — --platform-root must be a git checkout, since \
+             the snapshot is its tracked file set",
+            platform_root.display()
+        ));
+    }
+    Ok(listed.stdout)
 }
 
 // ============================================================================
