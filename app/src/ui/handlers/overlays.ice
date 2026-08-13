@@ -18,9 +18,6 @@ on explorer_failed(cause)
   explorer_loading = false
   error = cause.message
 
-on select_explorer_block(height)
-  explorer_selected = height
-
 on close_palette
   invalidate lane=palette_search
   palette_open = false
@@ -43,10 +40,8 @@ on bell_loaded(next)
   bell_items = next.items
 
 on bell_failed(_cause)
-  error = error
 
 on bell_marked(_result)
-  error = error
 
 on global_key_pressed(event)
   // EVERY VERDICT THIS HANDLER CAN ACT ON, RESOLVED FIRST — then the press
@@ -168,33 +163,3 @@ on palette_results(next)
 
 on palette_search_failed(cause)
   palette_searching = false
-
-on explorer_search_submit
-  return if !connected || explorer_searching || empty(trim(explorer_query))
-  explorer_searching = true
-  explorer_hits = []
-  explorer_kinds = []
-  explorer_partial = ""
-  explorer_kind = "all"
-  error = ""
-  run replace lane=workspace_search search_workspace(connected_rpc, trim(explorer_query)) -> explorer_results_loaded _
-
-on explorer_results_loaded(next)
-  explorer_hits = next.hits
-  explorer_kinds = next.kinds
-  explorer_partial = next.partial
-  explorer_searching = false
-  error = ""
-
-on clear_explorer_search
-  invalidate lane=workspace_search
-  explorer_query = ""
-  explorer_hits = []
-  explorer_kinds = []
-  explorer_partial = ""
-  explorer_kind = "all"
-  explorer_searching = false
-
-// The kind strip's only act.
-on pick_explorer_kind(kind)
-  explorer_kind = kind

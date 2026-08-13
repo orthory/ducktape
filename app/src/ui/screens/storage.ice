@@ -3,12 +3,12 @@
 // plus the write bar; Explorer is workspace search over the block ledger it
 // falls back to.
 //
-// See `screens/roster.ice` for the screen contract: a screen is a component, so
-// it cannot reach app state — every reading arrives as a prop and every act
-// leaves as a named event that `view.ice` routes back to the handler of the
-// same name.
+// See `screens/roster.ice` for the screen contract: shared readings arrive as
+// props, interaction-local state stays here, and only application effects leave
+// as named events.
 
-component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, preview_entry:FsEntry, delete_target:str, history_open:bool, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, bind draft:editor, preview_text:str)
+component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, bind draft:editor, preview_text:str)
+  lifetime retained
   emits
     fs_open_dir(str)
     fs_open_file(str)
@@ -19,12 +19,15 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
     fs_arm_delete(str)
     fs_disarm_delete()
     fs_delete_submit()
-    fs_toggle_history()
     fs_close_diff()
     fs_show_diff(str)
     fs_begin_edit()
     fs_cancel_edit()
     fs_save_edit()
+  state
+    history_open = false
+  on fs_toggle_history
+    history_open = !history_open
   col w=fill h=fill
     // THE CRUMB BAR, not a screen header: where you are, what is here,
     // and who may write under it. The counts are pure folds over the
@@ -136,7 +139,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
               events
                 cancel -> emit(fs_disarm_delete)
                 confirm -> emit(fs_delete_submit)
-        button "History" -> emit(fs_toggle_history)
+        button "History" -> fs_toggle_history
           with
             expanded=history_open
             h=26.0
@@ -483,13 +486,44 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
             with
               entry=preview_entry
 
-component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading:bool, kinds:[KindCount], kind:str, partial:str, hits:[ExplorerHit], blocks:[ExplorerBlock], selected:i64, ops:[ExplorerOp], head:i64, sync_line:str)
+component ExplorerScreen(connected_rpc:str, connected:bool, loading:bool, blocks:[ExplorerBlock], ops:[ExplorerOp], head:i64, sync_line:str)
+  lifetime retained
   emits
-    explorer_search_submit()
-    clear_explorer_search()
     refresh_explorer()
-    pick_explorer_kind(str)
-    select_explorer_block(i64)
+  state
+    query = ""
+    kind = "all"
+    hits:[ExplorerHit] = []
+    kinds:[KindCount] = []
+    partial = ""
+    searching = false
+    selected:i64 = 0
+  on explorer_search_submit(rpc, online)
+    let blocked = !online || searching || empty(trim(query))
+    return if blocked
+    searching = true
+    hits = []
+    kinds = []
+    partial = ""
+    kind = "all"
+    run replace lane=workspace_search search_workspace(rpc, trim(query)) -> explorer_results_loaded _
+  on explorer_results_loaded(next)
+    hits = next.hits
+    kinds = next.kinds
+    partial = next.partial
+    searching = false
+  on clear_explorer_search
+    invalidate lane=workspace_search
+    query = ""
+    hits = []
+    kinds = []
+    partial = ""
+    kind = "all"
+    searching = false
+  on pick_explorer_kind(next)
+    kind = next
+  on select_explorer_block(height)
+    selected = height
   col w=fill h=fill
     col
       with
@@ -562,7 +596,7 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
                   label="Search this workspace"
                   hint="Search messages, pages, issues, files, runs…"
                   disabled=(!connected || searching)
-                  submit=emit(explorer_search_submit)
+                  submit=explorer_search_submit(connected_rpc, connected)
                   w=fill
                   p=6.2
                   text-size=13.0
@@ -572,7 +606,7 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
                 hovered bg=transparent border=transparent
                 disabled value=muted
               if !empty(trim(query))
-                button -> emit(clear_explorer_search)
+                button #explorer-clear -> clear_explorer_search
                   with
                     label="Clear workspace search"
                     w=22.0
@@ -657,7 +691,7 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
               gap-x=7.0
               gap-y=7.0
               items=start
-            button -> emit(pick_explorer_kind, "all")
+            button -> pick_explorer_kind("all")
               with
                 label="Show every result"
                 checked=(kind == "all")
@@ -672,7 +706,7 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
               hovered bg=row_hover text=fg
               pressed bg=elevated text=fg
             for kind_count in kinds
-              button -> emit(pick_explorer_kind, kind_count.kind)
+              button -> pick_explorer_kind(kind_count.kind)
                 with
                   label="Filter results by kind"
                   description=kind_count.label
@@ -778,8 +812,8 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
                     with
                       block
                       selected=(block.height == selected)
-                    forward
-                      select_explorer_block
+                    events
+                      select_explorer_block -> select_explorer_block _
           box
             with
               w=fill

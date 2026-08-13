@@ -9,6 +9,3 @@ state
   gov_voting = ""
   agents_rows:[AgentRow] = []
   agents_generation:i64 = 0
-  // Members and agents share one screen and therefore one filter/selection.
-  members_filter:MembersFilter = MembersFilter.all
-  members_selected = ""

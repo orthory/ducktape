@@ -4,7 +4,6 @@ state
   fs_path = "/shared"
   fs_listed_path = ""
   fs_entries:[FsEntry] = []
-  fs_dirs:[FsEntry] = []
   fs_generation:i64 = 0
   fs_loading = false
   fs_preview_path = ""
@@ -13,12 +12,9 @@ state
   fs_preview_truncated = false
   fs_preview_binary = false
   fs_history:[FsSnapshot] = []
-  fs_history_open = false
   fs_new_name = ""
   fs_delete_target = ""
   fs_editor:editor = ""
   fs_editing = false
   fs_diff_from = ""
   fs_diff:[FsDiffEntry] = []
-  // First path page behind the independent tree surface.
-  files_tree:[FsEntry] = []

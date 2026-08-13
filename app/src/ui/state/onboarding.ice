@@ -16,7 +16,6 @@ state
   invite_link = ""
   provision_steps:[ProvisionStep] = []
   provision_index:i64 = 0
-  onboarding_chain = ""
 
 // Capability-bearing text is consumed once by Rust and cannot enter presets,
 // snapshots, captures, routes, or accessibility output.

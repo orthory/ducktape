@@ -67,14 +67,6 @@ pub fn merge_pending_blocks(
     merged
 }
 
-pub fn rollback_blocks(mut blocks: Vec<PageBlock>, keep_pending: bool) -> Vec<PageBlock> {
-    if keep_pending {
-        return blocks;
-    }
-    blocks.retain(|block| !block.pending);
-    blocks
-}
-
 pub fn append_page_comment_threads(
     threads: Vec<PageCommentThread>,
     next: Vec<PageCommentThread>,
@@ -521,13 +513,6 @@ pub fn channel_flag_members_only(
         .iter()
         .find(|row| row.id == channel)
         .map_or(current, |row| row.members_only)
-}
-
-pub fn channel_live_huddle_count(channels: Vec<ChatChannel>, channel: String, current: i64) -> i64 {
-    channels
-        .iter()
-        .find(|row| row.id == channel)
-        .map_or(current, |row| row.huddle_count)
 }
 
 /// Advance the open thread's next-reply offset when a reply delta for THAT

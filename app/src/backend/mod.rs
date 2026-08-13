@@ -26,7 +26,7 @@ pub use ::chat::client::{
     ChatBlock, ChatChannel, ChatDelta, ChatMember, ChatMessage, ChatReaction, ChatSpan,
     append_thread_page, apply_chat_channels, apply_chat_members, apply_chat_messages,
     apply_chat_thread, author_display, author_name, chat_message, contains_pending_message,
-    mark_message_groups, merge_message_send_result, merge_pending_messages, merge_thread_reply,
+    mark_message_groups, merge_message_send_result, merge_pending_messages,
     parse_message_with_members, reply_settled_by, rollback_pending_message, send_settled_by,
     short_label, thread_offset_after_reply,
 };
@@ -166,7 +166,6 @@ pub struct ChatData {
     pub active_channel_name: String,
     pub active_channel_archived: bool,
     pub active_channel_members_only: bool,
-    pub active_channel_huddle_count: i64,
     /// the huddle's roster, not just its length — the faces and the tiles.
     pub huddle_roster: Vec<HuddleParticipant>,
     pub channel_members: Vec<ChatMember>,
@@ -350,7 +349,6 @@ pub struct WorkspaceData {
     pub active_channel_name: String,
     pub active_channel_archived: bool,
     pub active_channel_members_only: bool,
-    pub active_channel_huddle_count: i64,
     pub huddle_roster: Vec<HuddleParticipant>,
     pub channel_members: Vec<ChatMember>,
     pub pages: Vec<PageItem>,

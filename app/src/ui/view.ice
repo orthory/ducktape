@@ -165,7 +165,7 @@ view
                       hovered bg=fg/9 text=fg
                       pressed bg=fg/14
         chat:
-          ChatScreen search_draft<->chat_search_draft message_action_focus<->message_action_focus message_edit_draft<->message_edit_draft message_editor<->message_editor channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft thread_edit_draft<->thread_edit_draft reply_editor<->reply_editor #chat
+          ChatScreen search_draft<->chat_search_draft message_edit_draft<->message_edit_draft message_editor<->message_editor channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft thread_edit_draft<->thread_edit_draft reply_editor<->reply_editor #chat
             with
               network_name
               status
@@ -380,13 +380,12 @@ view
               // reading of `entries` on that screen is gated on this.
               listed=(fs_listed_path == fs_path)
               entries=fs_entries
-              directories=fs_dirs
+              directories=fs_directories(fs_entries)
               connected
               loading=fs_loading
               preview_path=fs_preview_path
               preview_entry=fs_preview_entry
               delete_target=fs_delete_target
-              history_open=fs_history_open
               diff_from=fs_diff_from
               diff=fs_diff
               history=fs_history
@@ -404,7 +403,6 @@ view
               fs_arm_delete -> fs_arm_delete _
               fs_disarm_delete -> fs_disarm_delete
               fs_delete_submit -> fs_delete_submit
-              fs_toggle_history -> fs_toggle_history
               fs_close_diff -> fs_close_diff
               fs_show_diff -> fs_show_diff _
               fs_begin_edit -> fs_begin_edit
@@ -414,14 +412,10 @@ view
           MembersScreen #members
             with
               rows=members_rows
-              filter=members_filter
-              selected=members_selected
               admin=members_is_admin(members_rows)
               connected
               answered=members_answered
             events
-              pick_members_filter -> pick_members_filter _
-              open_member -> open_member _
               copy_to_clipboard -> copy_to_clipboard _ _
               agent_set_status -> agent_set_status _ _
               gov_propose -> gov_propose _ _
@@ -569,26 +563,17 @@ view
             activity_log:
               extern node_log_timeline(node_log_timeline, settings_endpoint) #node-log-timeline -> node_log_timeline_changed _
         explorer:
-          ExplorerScreen query<->explorer_query
+          ExplorerScreen #explorer(connected_rpc)
             with
+              connected_rpc
               connected
-              searching=explorer_searching
               loading=explorer_loading
-              kinds=explorer_kinds
-              kind=explorer_kind
-              partial=explorer_partial
-              hits=explorer_hits
               blocks=explorer_blocks
-              selected=explorer_selected
               ops=explorer_ops
               head=block_height
               sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
             events
-              explorer_search_submit -> explorer_search_submit
-              clear_explorer_search -> clear_explorer_search
               refresh_explorer -> refresh_explorer
-              pick_explorer_kind -> pick_explorer_kind _
-              select_explorer_block -> select_explorer_block _
         huddle:
           box
             with

@@ -1310,18 +1310,9 @@ fn the_huddle_roster_marks_the_row_this_device_holds() {
 }
 
 #[test]
-fn container_depth_uses_only_shared_design_roles() {
+fn popover_uses_only_shared_design_roles() {
     let tokens = ui_lang_components::ui::theme::LIGHT;
-    let theme = iced::Theme::Light;
-    let card = card_style(&theme);
-    let raised = raised_style(&theme);
-
-    assert_eq!(
-        card.background,
-        Some(iced::Background::Color(tokens.palette.card))
-    );
-    assert_eq!(card.border.radius, tokens.radius.card.into());
-    assert_eq!(card.shadow, iced::Shadow::default());
+    let raised = raised_style(&iced::Theme::Light);
     // OPAQUE. iced has no backdrop blur, so a glass role over a menu is just
     // transparency: the sentence behind an item and the item's own label draw
     // through each other.

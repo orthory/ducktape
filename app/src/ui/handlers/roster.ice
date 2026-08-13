@@ -101,13 +101,6 @@ on dm_peers_loaded(next)
 on dm_peers_failed(cause)
   return if cause.generation != dm_peers_generation
 
-// ROSTER — one screen, one filter, one detail panel. An empty key closes it.
-on open_member(key)
-  members_selected = key
-
-on pick_members_filter(filter)
-  members_filter = filter
-
 // The invite modal is pure view state — minting is a separate, explicit act.
 // Pause or resume an agent. The payload is the DESIRED state and it is named
 // for the backend parameter it becomes: `true` PAUSES, `false` resumes. The

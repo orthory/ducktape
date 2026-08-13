@@ -152,7 +152,6 @@ on console_opened(id)
   invalidate lane=chat_search
   invalidate lane=page_search
   invalidate lane=palette_search
-  invalidate lane=workspace_search
   invalidate lane=chat_load
   invalidate lane=page_load
   invalidate lane=history
@@ -226,7 +225,6 @@ on console_opened(id)
   active_channel_name = ""
   active_channel_archived = false
   active_channel_members_only = false
-  active_channel_huddle_count = 0
   channel_members = []
   post_refusal = ""
   channel_settings_open = false
@@ -362,11 +360,10 @@ on console_opened(id)
   call_peers = []
   parallel
     task window close target=window_target(onboarding_win)
-    run every remember_network(connected_rpc) -> network_remembered _
+    flow
+      from run remember_network(connected_rpc)
+      discard
     run replace lane=connect connect(connected_rpc, 0, connect_generation) -> workspace_connected _ | connect_failed _
-
-on network_remembered(_written)
-  error = error
 
 on forget_network_submit(id, kind)
   return if mutation_phase != MutationPhase.idle
@@ -406,7 +403,6 @@ on join_network_submit
 on workspace_materialized(init)
   join_invite = ""
   mutation_phase = MutationPhase.idle
-  onboarding_chain = init.chain_id
   onboarding_name = init.chain_id
   rpc = init.rpc
   invite_link = ""
@@ -428,7 +424,7 @@ on provision_stepped(step)
   provision_steps = [step]
   return if provision_index != 5 || !settled
   hub_step = HubStep.live
-  run every mint_invite(onboarding_chain, "resident", 7) -> onboarding_invite_minted _ | onboarding_failed _
+  run every mint_invite(onboarding_name, "resident", 7) -> onboarding_invite_minted _ | onboarding_failed _
 
 on onboarding_invite_minted(blob)
   invite_link = blob

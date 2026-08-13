@@ -513,7 +513,7 @@ on chat_composer_event(event)
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   pending_message = trim(editor_text(message_editor))
-  pending_message_id = fresh_operation_id("message")
+  let pending_message_id = fresh_operation_id("message")
   message_draft = ""
   message_editor = editor("")
   // The mint does not re-mark the runs — the rail mints through the same call
@@ -586,7 +586,6 @@ on chat_updated(next)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
-  active_channel_huddle_count = next.active_channel_huddle_count
   // Am I in it — see `join_huddle_submit` above. Stamp first: it reads the
   // PREVIOUS `huddle_joined`, so a refresh that finds her still in keeps the
   // clock and one that finds her out re-takes it for the next join.
@@ -664,7 +663,6 @@ on chat_hit_loaded(next)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
-  active_channel_huddle_count = next.active_channel_huddle_count
   // Am I in it — see `join_huddle_submit` above. Stamp first: it reads the
   // PREVIOUS `huddle_joined`, so a refresh that finds her still in keeps the
   // clock and one that finds her out re-takes it for the next join.
@@ -762,7 +760,6 @@ on channel_created(next)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
-  active_channel_huddle_count = next.active_channel_huddle_count
   // Am I in it — see `join_huddle_submit` above. Stamp first: it reads the
   // PREVIOUS `huddle_joined`, so a refresh that finds her still in keeps the
   // clock and one that finds her out re-takes it for the next join.
@@ -1274,7 +1271,7 @@ on reply_composer_event(event)
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
   pending_reply = trim(editor_text(reply_editor))
-  pending_reply_id = fresh_operation_id("reply")
+  let pending_reply_id = fresh_operation_id("reply")
   reply_draft = ""
   reply_editor = editor("")
   thread_messages = optimistic_message(thread_messages, pending_reply, pending_reply_id)

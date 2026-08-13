@@ -38,7 +38,6 @@ on set_appearance_dark
   run replace lane=appearance_save save_appearance(appearance) -> appearance_saved _
 
 on appearance_saved(_written)
-  error = error
 
 // A SAME-ENDPOINT retry: the launch window's picker owns which network, so
 // reconnect no longer changes endpoints — the per-endpoint draft retention
@@ -50,7 +49,6 @@ on reconnect
   invalidate lane=chat_search
   invalidate lane=page_search
   invalidate lane=palette_search
-  invalidate lane=workspace_search
   invalidate lane=chat_load
   invalidate lane=page_load
   invalidate lane=history
@@ -103,7 +101,6 @@ on reconnect
   active_channel_name = ""
   active_channel_archived = false
   active_channel_members_only = false
-  active_channel_huddle_count = 0
   channel_members = []
   post_refusal = ""
   channel_settings_open = false
@@ -210,7 +207,6 @@ on workspace_connected(next)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
-  active_channel_huddle_count = next.active_channel_huddle_count
   // Am I in the active channel's huddle — same stanza as `chat_updated`. A
   // process that reconnects while already on the roster renders LIVE here;
   // without this the pill only appeared after a manual channel re-pick.
@@ -350,7 +346,6 @@ on live_updated(next)
   active_channel_name = channel_display_name(channels, active_channel, active_channel_name)
   active_channel_archived = channel_flag_archived(channels, active_channel, active_channel_archived)
   active_channel_members_only = channel_flag_members_only(channels, active_channel, active_channel_members_only)
-  active_channel_huddle_count = channel_live_huddle_count(channels, active_channel, active_channel_huddle_count)
   post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   channel_reads = mark_channel_read(channel_reads, live_tail_channel, channel_head_seq(channels, live_tail_channel))
   rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
@@ -545,7 +540,6 @@ on live_resynced(next)
   active_channel_name = keep_str(next.chat_loaded, next.active_channel_name, active_channel_name)
   active_channel_archived = keep_bool(next.chat_loaded, next.active_channel_archived, active_channel_archived)
   active_channel_members_only = keep_bool(next.chat_loaded, next.active_channel_members_only, active_channel_members_only)
-  active_channel_huddle_count = keep_i64(next.chat_loaded, next.active_channel_huddle_count, active_channel_huddle_count)
   // The join/leave acks land here: a huddle op forces a chat resync
   // (`live.rs` sets load_chat on roster changes), and this is where the
   // roster it fetched finally answers "am I in it". Without these lines the
@@ -737,7 +731,6 @@ on live_thread_refreshed(next)
   thread_has_more = next.has_more
 
 on live_thread_refresh_failed(_cause)
-  error = error
 
 on select_shell_tab(next)
   shell_tab = next
@@ -800,12 +793,6 @@ on select_shell_tab(next)
   node_peers_generation = node_peers_generation + 1
   explorer_loading = shell_tab == ShellTab.explorer
   fs_loading = shell_tab == ShellTab.files
-  // No `files_find` here. This block runs for EVERY tab but chat and pages, so
-  // a whole-workspace prefix walk was issued on the way into Settings, Forge,
-  // Members and Agents — for a `files_tree` no view reads, on a route whose
-  // failure paints the GLOBAL error banner over a screen with no file operation
-  // in sight. `fs_wrote` still refreshes the tree from inside the files tab.
-  //
   // Optional request payloads select only the destination's effects. `try`
   // lowers an unselected request to Task::none, so changing tabs cannot abort
   // an unrelated replace lane with a synthetic refusal.

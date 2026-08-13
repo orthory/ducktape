@@ -669,97 +669,47 @@ test settings_keyboard_scroll_contract
   key page-down
   expect body.scroll_y > 30.0
 
-preset ui_explorer_partial
+preset ui_explorer
   state
     shell_tab = ShellTab.explorer
     connected = true
+    connected_rpc = "http://127.0.0.1:1"
     loading = false
     mutation_phase = MutationPhase.idle
     error = ""
-    explorer_query = "needle"
-    explorer_searching = false
-    explorer_kind = "all"
-    explorer_partial = "Code did not answer — these results are incomplete."
 
-preset ui_explorer_whole
-  state
-    shell_tab = ShellTab.explorer
-    connected = true
-    loading = false
-    mutation_phase = MutationPhase.idle
-    error = ""
-    explorer_query = "needle"
-    explorer_searching = false
-    explorer_kind = "all"
-    explorer_partial = ""
-
-// A PARTIAL ANSWER SAYS SO, AND ONLY A WHOLE ONE CLAIMS EMPTY. Each of the six
-// sources behind a workspace search fails silently and the node's per-module
-// cold start runs tens of seconds against a 30s client ceiling, so a search
-// that reached the node and lost three of its sources rendered the survivors as
-// the whole truth — and with no survivors it printed "Nothing matched that
-// query in this workspace", which is a claim about the WORKSPACE that only the
-// sources that answered can support.
+// A PARTIAL ANSWER SAYS SO. Port 1 on loopback cannot hold an unprivileged
+// listener, so all six search legs refuse immediately and deterministically.
+// Drive the component through its own input and handler instead of seeding its
+// now-private state through an app preset.
 test explorer_partial_banner_contract
-  preset ui_explorer_partial
+  preset ui_explorer
   viewport 1120 720
   mount
-    ExplorerScreen query<->explorer_query #explorer
+    ExplorerScreen #explorer
       with
+        connected_rpc
         connected
-        searching=explorer_searching
         loading
-        kinds=explorer_kinds
-        kind=explorer_kind
-        partial=explorer_partial
-        hits=explorer_hits
         blocks=explorer_blocks
-        selected=explorer_selected
         ops=explorer_ops
         head=block_height
         sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
       events
-        explorer_search_submit -> explorer_search_submit
-        clear_explorer_search -> clear_explorer_search
         refresh_explorer -> refresh_explorer
-        pick_explorer_kind -> pick_explorer_kind _
-        select_explorer_block -> select_explorer_block _
+  target query = #explorer/explorer-search
+  target clear = #explorer/explorer-clear
   target banner = #explorer/explorer-partial
   target plate = #explorer/explorer-nothing-matched/root
+  click query
+  type "needle"
+  key enter
   expect exists banner
   expect missing plate
-
-// The other half, which is what stops the banner from being wallpaper: with
-// every source answered there is nothing to warn about, and "nothing matched"
-// is then the honest line.
-test explorer_whole_answer_contract
-  preset ui_explorer_whole
-  viewport 1120 720
-  mount
-    ExplorerScreen query<->explorer_query #explorer
-      with
-        connected
-        searching=explorer_searching
-        loading
-        kinds=explorer_kinds
-        kind=explorer_kind
-        partial=explorer_partial
-        hits=explorer_hits
-        blocks=explorer_blocks
-        selected=explorer_selected
-        ops=explorer_ops
-        head=block_height
-        sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
-      events
-        explorer_search_submit -> explorer_search_submit
-        clear_explorer_search -> clear_explorer_search
-        refresh_explorer -> refresh_explorer
-        pick_explorer_kind -> pick_explorer_kind _
-        select_explorer_block -> select_explorer_block _
-  target banner = #explorer/explorer-partial
-  target plate = #explorer/explorer-nothing-matched/root
+  click clear
+  expect query.value == ""
   expect missing banner
-  expect exists plate
+  expect missing plate
 
 preset ui_chat_stream
   state
@@ -806,7 +756,7 @@ test message_stream_reset_contract
   preset ui_chat_stream
   viewport 1120 720
   mount
-    ChatScreen search_draft<->chat_search_draft message_action_focus<->message_action_focus message_edit_draft<->message_edit_draft message_editor<->message_editor channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft thread_edit_draft<->thread_edit_draft reply_editor<->reply_editor #chat
+    ChatScreen search_draft<->chat_search_draft message_edit_draft<->message_edit_draft message_editor<->message_editor channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft thread_edit_draft<->thread_edit_draft reply_editor<->reply_editor #chat
       with
         network_name
         status

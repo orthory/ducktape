@@ -429,7 +429,6 @@ fn live_refresh(
         active_channel_name: active_channel.into(),
         active_channel_archived: false,
         active_channel_members_only: false,
-        active_channel_huddle_count: 0,
         huddle_roster: Vec::new(),
         channel_members: Vec::new(),
         pages_loaded: true,
@@ -468,7 +467,6 @@ fn chat_data(active_channel: &str, messages: Vec<backend::ChatMessage>) -> backe
         active_channel_name: active_channel.into(),
         active_channel_archived: false,
         active_channel_members_only: false,
-        active_channel_huddle_count: 0,
         huddle_roster: Vec::new(),
         channel_members: Vec::new(),
         selected_message_seq: 0,
@@ -494,7 +492,6 @@ fn workspace(active_channel: &str) -> backend::WorkspaceData {
         active_channel_name: active_channel.into(),
         active_channel_archived: false,
         active_channel_members_only: false,
-        active_channel_huddle_count: 0,
         huddle_roster: Vec::new(),
         channel_members: Vec::new(),
         pages: Vec::new(),
@@ -2377,7 +2374,7 @@ fn every_writer_of_a_mirrored_view_reading_refreshes_its_mirror() {
     // (mirror, the sources whose movement invalidates it). `settings_user_key`
     // is in two of them because THIS DEVICE'S KEY decides both which channels
     // are its own DMs and whether it is seated in a members-only room.
-    const MIRRORS: [(&str, &[&str]); 9] = [
+    const MIRRORS: [(&str, &[&str]); 8] = [
         (
             "rooms",
             &["channels", "dm_peers", "settings_user_key", "channel_reads"],
@@ -2396,7 +2393,6 @@ fn every_writer_of_a_mirrored_view_reading_refreshes_its_mirror() {
             &["huddle_roster", "call_peers", "call_muted"],
         ),
         ("fs_preview_entry", &["fs_entries", "fs_preview_path"]),
-        ("fs_dirs", &["fs_entries"]),
         (
             "post_refusal",
             &[
@@ -7112,6 +7108,166 @@ fn forge_empty_states_name_only_routes_that_exist() {
     );
 }
 
+#[test]
+fn interaction_state_stays_with_the_screen_that_owns_it() {
+    fn component<'a>(source: &'a str, name: &str) -> &'a str {
+        let opener = format!("component {name}(");
+        let tail = source
+            .split_once(&opener)
+            .unwrap_or_else(|| panic!("{name} exists"))
+            .1;
+        tail.split_once("\ncomponent ")
+            .map_or(tail, |(body, _)| body)
+    }
+
+    fn local_state(component: &str) -> Vec<&str> {
+        component
+            .lines()
+            .skip_while(|line| line.trim() != "state")
+            .skip(1)
+            .take_while(|line| line.trim().is_empty() || line.starts_with("    "))
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    let members = component(SCREENS.as_str(), "MembersScreen");
+    let members_state = local_state(members);
+    for field in [
+        "filter:MembersFilter = MembersFilter.all",
+        "selected = \"\"",
+    ] {
+        assert!(
+            members_state.contains(&field),
+            "MembersScreen owns `{field}`"
+        );
+    }
+    for handler in ["on pick_members_filter(next)", "on open_member(key)"] {
+        assert!(members.contains(handler), "MembersScreen owns `{handler}`");
+    }
+
+    let explorer = component(SCREENS.as_str(), "ExplorerScreen");
+    let explorer_state = local_state(explorer);
+    for field in [
+        "query = \"\"",
+        "kind = \"all\"",
+        "hits:[ExplorerHit] = []",
+        "kinds:[KindCount] = []",
+        "partial = \"\"",
+        "searching = false",
+        "selected:i64 = 0",
+    ] {
+        assert!(
+            explorer_state.contains(&field),
+            "ExplorerScreen owns `{field}`"
+        );
+    }
+    for handler in [
+        "on explorer_search_submit(rpc, online)",
+        "on explorer_results_loaded(next)",
+        "on clear_explorer_search",
+        "on pick_explorer_kind(next)",
+        "on select_explorer_block(height)",
+    ] {
+        assert!(
+            explorer.contains(handler),
+            "ExplorerScreen owns `{handler}`"
+        );
+    }
+
+    let chat_state = local_state(component(SCREENS.as_str(), "ChatScreen"));
+    assert!(chat_state.contains(&"message_action_focus = \"\""));
+
+    let files = component(SCREENS.as_str(), "FilesScreen");
+    assert!(local_state(files).contains(&"history_open = false"));
+    assert!(files.contains("on fs_toggle_history"));
+
+    let root_state = inlined(concat!(
+        include_str!("ui/state/types.ice"),
+        include_str!("ui/state/core.ice"),
+        include_str!("ui/state/chat.ice"),
+        include_str!("ui/state/shell.ice"),
+        include_str!("ui/state/explorer.ice"),
+        include_str!("ui/state/roster.ice"),
+        include_str!("ui/state/forge.ice"),
+        include_str!("ui/state/node.ice"),
+        include_str!("ui/state/files.ice"),
+        include_str!("ui/state/overlays.ice"),
+        include_str!("ui/state/pages.ice"),
+        include_str!("ui/state/onboarding.ice"),
+        include_str!("ui/state/huddle.ice"),
+        include_str!("ui/state/derived.ice"),
+    ));
+    let root_view = inlined(include_str!("ui/view.ice"));
+    for field in [
+        "members_filter",
+        "members_selected",
+        "explorer_query",
+        "explorer_kind",
+        "explorer_hits",
+        "explorer_kinds",
+        "explorer_partial",
+        "explorer_searching",
+        "explorer_selected",
+        "message_action_focus",
+        "fs_history_open",
+    ] {
+        assert!(
+            !root_state.contains(field),
+            "root state reclaimed `{field}`"
+        );
+        assert!(!root_view.contains(field), "root view plumbs `{field}`");
+    }
+    for route in [
+        "pick_members_filter ->",
+        "open_member ->",
+        "explorer_search_submit ->",
+        "clear_explorer_search ->",
+        "pick_explorer_kind ->",
+        "select_explorer_block ->",
+        "fs_toggle_history ->",
+    ] {
+        assert!(
+            !root_view.contains(route),
+            "root view still routes `{route}`"
+        );
+    }
+
+    // These fields only name values used during one handler invocation.
+    let chat_handlers = inlined(include_str!("ui/handlers/chat.ice"));
+    for local in ["pending_message_id", "pending_reply_id"] {
+        assert!(!root_state.contains(local), "root state holds `{local}`");
+        assert!(
+            chat_handlers.contains(&format!("let {local} =")),
+            "`{local}` is minted as a handler local"
+        );
+    }
+    let page_handlers = inlined(include_str!("ui/handlers/pages.ice"));
+    assert!(!root_state.contains("closing_doc_tab"));
+    assert!(page_handlers.contains("on close_doc_tab(id)"));
+    assert!(page_handlers.contains("doc_tabs = doc_tabs_without(doc_tabs, id)"));
+    assert!(!root_state.contains("page_link"));
+    assert!(page_handlers.contains("let page_link = page_link_of(event)"));
+
+    let native_surfaces = concat!(
+        include_str!("backend/live.rs"),
+        include_str!("backend/load.rs"),
+        include_str!("backend/mod.rs"),
+        include_str!("backend/model.rs"),
+        include_str!("backend/storage.rs"),
+        include_str!("frame_probe.rs"),
+    );
+    for removed in ["files_tree", "active_channel_huddle_count"] {
+        for (path, source) in ice_sources() {
+            assert!(!source.contains(removed), "{path} restored `{removed}`");
+        }
+        assert!(
+            !native_surfaces.contains(removed),
+            "native app code restored `{removed}`"
+        );
+    }
+}
+
 /// THE EXPLORER NAMES WHAT IT SHOWS. Several defects on one screen, all the
 /// same shape — the pixels were right and the words were absent or false.
 ///
@@ -7139,14 +7295,9 @@ fn forge_empty_states_name_only_routes_that_exist() {
 /// value must carry its name, one set must not have two names on one screen,
 /// and no row may contradict the name the screen prints over it.
 ///
-/// AND WHAT THE SCREEN SHOWS MUST REACH IT. The same class one layer out: a
-/// `search_workspace` reply reaches this screen through two ice seams — the
-/// handler that lands it in state and the mount that hands it down — and
-/// neither is visible to an ice screen contract, because a contract MOUNTS
-/// `ExplorerScreen` itself against a preset. So it pins the component while the
-/// app's wiring to it stays severable: deleting `explorer_partial = next.partial`
-/// and passing `partial=""` at the mount left the whole suite green with the
-/// banner gone and the false empty plate back.
+/// AND WHAT THE SCREEN LOADS MUST LAND IN ITS OWN STATE. Search is interaction
+/// state owned by `ExplorerScreen`; its reply and both reset paths must still
+/// carry every field the view reads.
 #[test]
 fn the_explorer_names_what_it_shows() {
     // The dispatch trace, fed the `operations` shape `bin/noded`'s projection
@@ -7265,61 +7416,38 @@ fn the_explorer_names_what_it_shows() {
     }
 
     // EVERY FIELD OF THE REPLY IS CARRIED, OR THE SCREEN SHOWS A DEFAULT AND
-    // CALLS IT AN ANSWER. `generation` is the only one that is not carried —
-    // the handler's first line compares it and returns — so the three that ARE
-    // walk both seams here. `partial` is the field this rule was written for:
+    // CALLS IT AN ANSWER. `partial` is the field this rule was written for:
     // without it the strip's kinds and the hit count are still rendered, so the
     // screen goes back to presenting whatever survived as the whole truth.
-    let loaded = inlined(include_str!("ui/handlers/overlays.ice"));
-    let loaded = loaded
+    let loaded = explorer
         .split_once("on explorer_results_loaded(next)")
         .expect("the Explorer's results handler")
         .1
-        .split_once("\non ")
+        .split_once("\n  on ")
         .expect("the next handler closes it")
-        .0;
-    // `inlined` folds the mount's `with` block back onto its node line, so the
-    // props ARE the rest of that line — anything below it is the event wiring.
-    let mount = inlined(include_str!("ui/view.ice"));
-    let mount = mount
-        .split_once("ExplorerScreen query<->explorer_query")
-        .expect("the app mounts the Explorer")
-        .1
-        .split_once('\n')
-        .expect("the props line ends")
         .0;
     // AND A FACT ABOUT THE LAST SEARCH DIES WITH IT. Both resets already clear
     // the hits and the strip; a `partial` left standing keeps naming a source
     // that failed to answer a query the reader has since cleared or replaced.
-    let handlers = inlined(include_str!("ui/handlers/overlays.ice"));
     let resets = ["on explorer_search_submit", "on clear_explorer_search"].map(|opener| {
-        handlers
+        explorer
             .split_once(opener)
             .unwrap_or_else(|| panic!("`{opener}` is where it was"))
             .1
-            .split_once("\non ")
+            .split_once("\n  on ")
             .expect("the next handler closes it")
             .0
     });
-    for (field, held, cleared) in [
-        ("hits", "explorer_hits", "[]"),
-        ("kinds", "explorer_kinds", "[]"),
-        ("partial", "explorer_partial", r#""""#),
-    ] {
+    for (field, cleared) in [("hits", "[]"), ("kinds", "[]"), ("partial", r#""""#)] {
         assert!(
-            loaded.contains(&format!("{held} = next.{field}")),
+            loaded.contains(&format!("{field} = next.{field}")),
             "`{field}` comes back from the search and nothing lands it in \
-             `{held}`, so the screen renders the state default"
-        );
-        assert!(
-            mount.contains(&format!("{field}={held}")),
-            "the Explorer mount passes something other than `{held}` for \
-             `{field}`, so what the loader read never reaches the screen"
+             the screen's local state"
         );
         for reset in &resets {
             assert!(
-                reset.contains(&format!("{held} = {cleared}")),
-                "a reset that leaves `{held}` standing shows the last search's \
+                reset.contains(&format!("{field} = {cleared}")),
+                "a reset that leaves `{field}` standing shows the last search's \
                  answer over the next one"
             );
         }

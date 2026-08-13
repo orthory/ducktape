@@ -1,7 +1,6 @@
 state
   pages:[PageItem] = []
   doc_tabs:[str] = []
-  closing_doc_tab = ""
   blocks:[PageBlock] = []
   active_page = ""
   active_page_title = ""
@@ -36,7 +35,6 @@ state
   page_landing = ""
   page_install = false
   commented_block_hits:[str] = []
-  page_link = ""
   caret_comment_target = ""
   active_thread_target = ""
   active_thread_anchor = ""

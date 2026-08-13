@@ -16,7 +16,6 @@ state
   active_channel_name = ""
   active_channel_archived = false
   active_channel_members_only = false
-  active_channel_huddle_count:i64 = 0
   channel_members:[ChatMember] = []
   // Cached at the same writes as its inputs; evaluating the list-taking gate
   // in the view would clone the member list once per composer per frame.
@@ -28,7 +27,6 @@ state
   chat_pointer_y = 0.0
   chat_height = 720.0
   message_menu_y = 0.0
-  message_action_focus = ""
   selected_message_rev:i64 = 0
   message_action:MessageAction = MessageAction.toolbar
   message_edit_draft = ""
@@ -49,7 +47,6 @@ state
   history_loading = false
   reply_draft = ""
   pending_reply = ""
-  pending_reply_id = ""
   channel_draft = ""
   channel_create_open = false
   channel_create_members_only = false
@@ -59,7 +56,6 @@ state
   reply_editor:editor = ""
   composer_focus:ComposerFocus = ComposerFocus.unfocused
   pending_message = ""
-  pending_message_id = ""
   // Every optimistic send settling inside one fade keeps its own row anchor.
   send_flash_ids = ""
   thread_send_flash_ids = ""

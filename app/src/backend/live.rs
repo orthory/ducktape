@@ -380,7 +380,6 @@ pub struct LiveRefresh {
     pub active_channel_name: String,
     pub active_channel_archived: bool,
     pub active_channel_members_only: bool,
-    pub active_channel_huddle_count: i64,
     pub huddle_roster: Vec<HuddleParticipant>,
     pub channel_members: Vec<ChatMember>,
     pub pages_loaded: bool,
@@ -426,7 +425,6 @@ pub async fn live_resync_load(
             active_channel_name: String::new(),
             active_channel_archived: false,
             active_channel_members_only: false,
-            active_channel_huddle_count: 0,
             huddle_roster: Vec::new(),
             channel_members: Vec::new(),
             pages_loaded: false,
@@ -474,7 +472,6 @@ pub async fn live_resync_load(
             refresh.active_channel_name = chat.active_channel_name;
             refresh.active_channel_archived = chat.active_channel_archived;
             refresh.active_channel_members_only = chat.active_channel_members_only;
-            refresh.active_channel_huddle_count = chat.active_channel_huddle_count;
             refresh.huddle_roster = chat.huddle_roster;
             refresh.channel_members = chat.channel_members;
         }
@@ -638,12 +635,6 @@ pub fn keep_participants(
     next: Vec<HuddleParticipant>,
     current: Vec<HuddleParticipant>,
 ) -> Vec<HuddleParticipant> {
-    if loaded { next } else { current }
-}
-
-/// The peers table's own keep: a pushed overview frame answers ONE of the two
-/// snapshot topics, so the half it did not carry must survive it.
-pub fn keep_peers(loaded: bool, next: Vec<PeerRow>, current: Vec<PeerRow>) -> Vec<PeerRow> {
     if loaded { next } else { current }
 }
 
@@ -979,7 +970,6 @@ fn landed_on_channel(
     data.active_channel_name = name;
     data.active_channel_archived = false;
     data.active_channel_members_only = members_only;
-    data.active_channel_huddle_count = 0;
     data.huddle_roster = Vec::new();
     data.channel_members = members;
     data.messages = Vec::new();

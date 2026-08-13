@@ -44,7 +44,6 @@ on node_facts_loaded(next)
   node_sync_last_error = next.sync_last_error
 
 on node_facts_failed(_cause)
-  error = error
 
 // A PUSHED status document (lifecycle.ice's ungated subscription). It answers
 // no request, so the freshest sample simply wins in the node's stream order.
@@ -119,10 +118,9 @@ on settings_unlock_failed(cause)
 // holds the opened user key must not outlive the seat it was opened for.
 on lock_session
   password = ""
-  run every lock_signer() -> signer_locked _
-
-on signer_locked(_retired)
-  error = error
+  flow
+    from run lock_signer()
+    discard
 
 // PREFERENCES — device-local, one endpoint at a time.
 // DANGER ZONE — forget this workspace on THIS DEVICE and go back to onboarding.

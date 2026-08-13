@@ -9,7 +9,7 @@ pub struct FsEntry {
     pub name: String,
     pub kind: String,
     pub size: i64,
-    /// the entry's content address — already on the ls/find wire.
+    /// the entry's content address — already on the ls wire.
     pub object: String,
 }
 
@@ -141,32 +141,7 @@ pub async fn files_ls(
     })
 }
 
-/// Every path under one prefix, in full-path order — the duckfs tree sidebar
-/// and Explorer's FILE results read the same wire.
-pub async fn files_find(
-    rpc: String,
-    prefix: String,
-    generation: i64,
-) -> Result<FsListing, HydrationError> {
-    async {
-        let rpc = rpc_client(&rpc)?;
-        let reply = rpc
-            .files_get("find", &[("prefix", prefix.as_str())])
-            .await?;
-        Ok(FsListing {
-            generation,
-            entries: fs_entries(&reply),
-            path: prefix,
-        })
-    }
-    .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
-}
-
-/// The `entries` array of an ls/find reply as rows (both serve `EntryInfo`).
+/// The `entries` array of an ls reply as rows.
 fn fs_entries(reply: &serde_json::Value) -> Vec<FsEntry> {
     reply["entries"]
         .as_array()

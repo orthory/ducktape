@@ -493,19 +493,16 @@ on pages_mutated(next)
   run replace lane=doc_tabs_save save_doc_tabs(connected_rpc, doc_tabs) -> doc_tabs_saved _
 
 on doc_tabs_saved(_result)
-  error = error
 
 on doc_tabs_loaded(tabs)
   doc_tabs = tabs
 
 on close_doc_tab(id)
   return if loading || mutation_phase != MutationPhase.idle
-  closing_doc_tab = id
-  active_page = next_doc_tab(doc_tabs, closing_doc_tab, active_page)
+  active_page = next_doc_tab(doc_tabs, id, active_page)
   block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
   active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
-  doc_tabs = doc_tabs_without(doc_tabs, closing_doc_tab)
-  closing_doc_tab = ""
+  doc_tabs = doc_tabs_without(doc_tabs, id)
   // The same prologue as `choose_page`: `active_page` just moved under the
   // buffer, and without `loading` the next 900ms tick would write the OLD
   // page's text into the NEW page. `pages_updated` clears it and decides the
@@ -541,14 +538,13 @@ on page_edited(event)
   // A link press never touched the buffer — it is a hand-off to the OS. The
   // two runs are exclusive by event kind; each backend treats an empty
   // argument as "not my turn" and answers without side effects.
-  page_link = page_link_of(event)
+  let page_link = page_link_of(event)
   return if empty(page_link) && !page_rail_open
   parallel
     run every open_external_url(page_link) -> external_url_opened _ | external_url_failed _
     run replace lane=block_threads load_page_threads(connected_rpc, keep_str(page_rail_open, active_page, ""), block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
 
 on external_url_opened(_opened)
-  error = error
 
 on external_url_failed(cause)
   error = cause.message

@@ -1,19 +1,23 @@
 // The two ROSTER screens: who may act on this network, and what the registry
 // says they may do.
 //
-// A screen is a component like any other, which means it cannot reach app state
-// — every reading it draws arrives as a prop, and every act it offers leaves as
-// a named event that `view.ice` routes back to the handler of the same name.
-// That is the whole contract; the bodies below are the ones that used to sit
-// inline in the view's `members:` and `agents:` slots, unchanged.
+// A screen is a component like any other: shared readings arrive as props,
+// interaction-local state stays here, and only application effects leave as
+// named events.
 
-component MembersScreen(rows:[MemberRow], filter:MembersFilter, selected:str, admin:bool, connected:bool, answered:bool)
+component MembersScreen(rows:[MemberRow], admin:bool, connected:bool, answered:bool)
+  lifetime retained
   emits
-    pick_members_filter(MembersFilter)
-    open_member(str)
     copy_to_clipboard(str, str)
     agent_set_status(str, bool)
     gov_propose(str, str)
+  state
+    filter:MembersFilter = MembersFilter.all
+    selected = ""
+  on pick_members_filter(next)
+    filter = next
+  on open_member(key)
+    selected = key
   row w=fill h=fill
     col w=fill h=fill
       // THE SUBTITLE FOLDS `rows`, not the valset queries — same list, same
@@ -44,7 +48,7 @@ component MembersScreen(rows:[MemberRow], filter:MembersFilter, selected:str, ad
                 w=fill
                 gap=7.0
                 align=center
-              button -> emit(pick_members_filter, MembersFilter.all)
+              button -> pick_members_filter(MembersFilter.all)
                 with
                   label="Show every member"
                   checked=(filter == MembersFilter.all)
@@ -58,7 +62,7 @@ component MembersScreen(rows:[MemberRow], filter:MembersFilter, selected:str, ad
                 active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
                 hovered bg=row_hover text=fg
                 pressed bg=elevated text=fg
-              button -> emit(pick_members_filter, MembersFilter.humans)
+              button -> pick_members_filter(MembersFilter.humans)
                 with
                   label="Show people only"
                   checked=(filter == MembersFilter.humans)
@@ -72,7 +76,7 @@ component MembersScreen(rows:[MemberRow], filter:MembersFilter, selected:str, ad
                 active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
                 hovered bg=row_hover text=fg
                 pressed bg=elevated text=fg
-              button -> emit(pick_members_filter, MembersFilter.agents)
+              button -> pick_members_filter(MembersFilter.agents)
                 with
                   label="Show agents only"
                   checked=(filter == MembersFilter.agents)
@@ -86,7 +90,7 @@ component MembersScreen(rows:[MemberRow], filter:MembersFilter, selected:str, ad
                 active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
                 hovered bg=row_hover text=fg
                 pressed bg=elevated text=fg
-              button -> emit(pick_members_filter, MembersFilter.validators)
+              button -> pick_members_filter(MembersFilter.validators)
                 with
                   label="Show validators only"
                   checked=(filter == MembersFilter.validators)
@@ -148,7 +152,7 @@ component MembersScreen(rows:[MemberRow], filter:MembersFilter, selected:str, ad
             for member in filter_members(rows, filter)
               col w=fill
                 if member.key == selected
-                  button -> emit(open_member, member.key)
+                  button -> open_member(member.key)
                     with
                       label="Open member"
                       description=member.label
@@ -160,7 +164,7 @@ component MembersScreen(rows:[MemberRow], filter:MembersFilter, selected:str, ad
                     hovered bg=selected_row text=fg
                     pressed bg=subtle text=fg
                 if member.key != selected
-                  button -> emit(open_member, member.key)
+                  button -> open_member(member.key)
                     with
                       label="Open member"
                       description=member.label
@@ -175,8 +179,9 @@ component MembersScreen(rows:[MemberRow], filter:MembersFilter, selected:str, ad
       for member in rows
         if member.key == selected
           MemberDetail member=member admin=admin
+            events
+              open_member -> open_member _
             forward
-              open_member
               copy_to_clipboard
               agent_set_status
               gov_propose

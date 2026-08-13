@@ -11,11 +11,11 @@ extern crate::backend
   HuddleParticipant(key:str, label:str, initials:str, is_agent:bool, is_you:bool, joined_at:i64, node:str)
   ChannelWindow(channel_id:str, messages:[ChatMessage], members:[ChatMember])
   ChannelDraft(channel_id:str, text:str)
-  ChatData(generation:i64, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], selected_message_seq:i64, selected_message_rev:i64, selected_message_body:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_next_reply_offset:i64, thread_has_more:bool)
+  ChatData(generation:i64, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], selected_message_seq:i64, selected_message_rev:i64, selected_message_body:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_next_reply_offset:i64, thread_has_more:bool)
   SendReceipt(operation_id:str, channel_id:str)
   ChatDelta(kind:str, channel_id:str, seq:i64, root_seq:i64, message:ChatMessage, channel:ChatChannel, name:str, archived:bool, emoji:str, added:bool, reactor:str, by_me:bool, member:ChatMember)
   PagesDelta(kind:str, block_id:str, text:str)
-  LiveRefresh(generation:i64, fold_serial:i64, chat_loaded:bool, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], pages_loaded:bool, pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str, comment_thread_total:i64, commented_block_hits:[str])
+  LiveRefresh(generation:i64, fold_serial:i64, chat_loaded:bool, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], pages_loaded:bool, pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str, comment_thread_total:i64, commented_block_hits:[str])
   ThreadLoadData(generation:i64, root_seq:i64, target_seq:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
   ThreadPageData(generation:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
   LiveThreadData(channel_id:str, root_seq:i64, target_seq:i64, messages:[ChatMessage], next_reply_offset:i64, has_more:bool)
@@ -36,7 +36,7 @@ extern crate::backend
   // out would have destroyed records. `document` is the canonical text either
   // way — the buffer takes it, which is what rolls an illegal edit back.
   DocumentSaveResult(written:bool, refusal:str, data:PagesData, document:str)
-  WorkspaceData(generation:i64, rpc:str, status:str, height:i64, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, active_channel_huddle_count:i64, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str, comment_thread_total:i64, commented_block_hits:[str])
+  WorkspaceData(generation:i64, rpc:str, status:str, height:i64, channels:[ChatChannel], messages:[ChatMessage], active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], pages:[PageItem], blocks:[PageBlock], active_page:str, active_page_title:str, active_page_parent:str, comment_thread_total:i64, commented_block_hits:[str])
   BellItem(seq:i64, kind:str, body:str, source:str, height:i64, read:bool)
   BellDelta(kind:str, item:BellItem, up_to_seq:i64)
   BellData(unread:i64, items:[BellItem])
@@ -83,11 +83,9 @@ extern crate::backend
   pure agent_event_error(current:str, event:AgentChatEvent) -> str
   pure agent_event_busy(event:AgentChatEvent) -> bool
   pure agent_event_entries(entries:[AgentChatEntry], event:AgentChatEvent, provider:str) -> [AgentChatEntry]
-  pure agent_chat_prompt(entries:[AgentChatEntry]) -> str
   stream agent_chat_turn(rpc:str, provider:str, credential:str, entries:[AgentChatEntry]) -> AgentChatEvent
   OptimisticMutationError(message:str, committed:bool, operation_id:str, scope_id:str, body:str)
   HydrationError(generation:i64, message:str)
-  box-style card_style()
   box-style raised_style()
   svg-style icon_tint(tone:str)
   pure icon(name:str) -> bytes
@@ -100,7 +98,6 @@ extern crate::backend
   pure optimistic_message(messages:[ChatMessage], body:str, message_id:str) -> [ChatMessage]
   pure mark_author_runs(messages:[ChatMessage]) -> [ChatMessage]
   pure merge_pending_messages(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str, settled_id:str) -> [ChatMessage]
-  pure merge_message_send_result(canonical:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str, settled_id:str) -> [ChatMessage]
   pure resynced_messages(loaded:bool, next:[ChatMessage], current:[ChatMessage], current_channel:str, next_channel:str, history_view:bool) -> [ChatMessage]
   pure rollback_pending_message(messages:[ChatMessage], pending_id:str, committed:bool) -> [ChatMessage]
   pure contains_pending_message(messages:[ChatMessage], pending_id:str) -> bool
@@ -113,7 +110,6 @@ extern crate::backend
   pure chat_settle(messages:[ChatMessage], thread:[ChatMessage], delta:ChatDelta, active_channel:str, send_ids:str, reply_ids:str) -> ChatSettle
   pure has_flash_id(ids:str, id:str) -> bool
   pure append_thread_page(messages:[ChatMessage], next:[ChatMessage]) -> [ChatMessage]
-  pure merge_thread_reply(messages:[ChatMessage], reply:ChatMessage) -> [ChatMessage]
   pure history_has_older(messages:[ChatMessage]) -> bool
   pure oldest_message_seq(messages:[ChatMessage]) -> i64
   pure prepend_history(messages:[ChatMessage], older:[ChatMessage]) -> [ChatMessage]
@@ -122,7 +118,6 @@ extern crate::backend
   // Chat's message/thread menus still place themselves this way; the name is
   // the pages block menu it was written for, which no longer exists.
   pure block_action_menu_y(pointer_y:f64, viewport_height:f64) -> f64
-  pure rollback_blocks(blocks:[PageBlock], keep_pending:bool) -> [PageBlock]
   pure append_page_comment_threads(threads:[PageCommentThread], next:[PageCommentThread]) -> [PageCommentThread]
   pure append_page_comments(comments:[PageComment], next:[PageComment]) -> [PageComment]
   pure remember_failed_draft(existing:str, current:str, pending:str, committed:bool) -> str
@@ -170,8 +165,6 @@ extern crate::backend
   pure no_fs_entry() -> FsEntry
   pure fs_entry_named(entries:[FsEntry], path:str) -> FsEntry
   pure fs_directories(entries:[FsEntry]) -> [FsEntry]
-  pure fs_dir_count(entries:[FsEntry]) -> i64
-  pure fs_file_count(entries:[FsEntry]) -> i64
   pure fs_counts_summary(connected:bool, listed:bool, entries:[FsEntry]) -> str
   pure fs_parent(path:str) -> str
   pure fs_child(path:str, name:str) -> str
@@ -185,7 +178,6 @@ extern crate::backend
   files_ls(rpc:str, path:str, generation:i64) -> FsListing ! HydrationError
   files_preview(rpc:str, path:str, generation:i64) -> FsPreview ! HydrationError
   files_history(rpc:str, generation:i64) -> FsHistory ! HydrationError
-  files_find(rpc:str, prefix:str, generation:i64) -> FsListing ! HydrationError
   pure size_label(bytes:i64) -> str
   pure shell_nav(tab:ShellTab, approvals:i64, agent_live:bool) -> [NavItem]
   pure open_proposals(rows:[ProposalRow]) -> i64
@@ -288,7 +280,6 @@ extern crate::backend
   AgentSkill(name:str, always:bool)
   AgentCap(label:str, arg:str)
   AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_key:str, owner_handle:str, created_at:i64, is_mine:bool, live:bool, tools:i64, secrets:i64, subagent_budget:i64, allowed_actions:[str], skills:[AgentSkill], caps:[AgentCap])
-  RunRow(run_id:str, agent_id:str, outcome:str, running:bool, created_at:i64, summary:str)
   AgentsData(generation:i64, agents:[AgentRow])
   load_agents(rpc:str, generation:i64) -> AgentsData ! HydrationError
   pure any_agent_active(rows:[AgentRow]) -> bool
@@ -317,7 +308,6 @@ extern crate::backend
   pure doc_tabs_with(tabs:[str], page_id:str) -> [str]
   pure doc_tabs_without(tabs:[str], page_id:str) -> [str]
   DocTab(id:str, title:str, active:bool)
-  pure retain_doc_tabs(tabs:[str], pages:[PageItem]) -> [str]
   pure doc_tab_rows(tabs:[str], pages:[PageItem], active:str) -> [DocTab]
   pure next_doc_tab(tabs:[str], closed:str, active:str) -> str
   load_doc_tabs(rpc:str) -> [str]
@@ -375,11 +365,9 @@ extern crate::backend
   pure page_display_title(pages:[PageItem], page:str, current:str) -> str
   pure channel_flag_archived(channels:[ChatChannel], channel:str, current:bool) -> bool
   pure channel_flag_members_only(channels:[ChatChannel], channel:str, current:bool) -> bool
-  pure channel_live_huddle_count(channels:[ChatChannel], channel:str, current:i64) -> i64
   pure keep_channels(loaded:bool, next:[ChatChannel], current:[ChatChannel]) -> [ChatChannel]
   pure keep_members(loaded:bool, next:[ChatMember], current:[ChatMember]) -> [ChatMember]
   pure keep_roster(joined:bool, next:[HuddleParticipant]) -> [HuddleParticipant]
-  pure keep_peers(loaded:bool, next:[PeerRow], current:[PeerRow]) -> [PeerRow]
   pure keep_pages(loaded:bool, next:[PageItem], current:[PageItem]) -> [PageItem]
   pure pages_reply_answers_current(pages:[PageItem], replied:str, current:str) -> bool
   pure keep_blocks(loaded:bool, next:[PageBlock], current:[PageBlock]) -> [PageBlock]

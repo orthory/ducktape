@@ -333,14 +333,6 @@ pub fn doc_tabs_without(mut tabs: Vec<String>, page_id: String) -> Vec<String> {
     tabs
 }
 
-/// The tabs that still exist in the page list — deleted pages drop at render
-/// time and self-heal in the persisted list on the next save.
-pub fn retain_doc_tabs(tabs: Vec<String>, pages: Vec<PageItem>) -> Vec<String> {
-    tabs.into_iter()
-        .filter(|tab| pages.iter().any(|page| page.id == *tab))
-        .collect()
-}
-
 /// One rendered doc tab.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct DocTab {

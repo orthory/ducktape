@@ -28,7 +28,6 @@ pub(crate) async fn load_workspace(
         active_channel_name: chat.active_channel_name,
         active_channel_archived: chat.active_channel_archived,
         active_channel_members_only: chat.active_channel_members_only,
-        active_channel_huddle_count: chat.active_channel_huddle_count,
         huddle_roster: chat.huddle_roster,
         channel_members: chat.channel_members,
         pages: pages.pages,
@@ -128,8 +127,6 @@ pub(crate) async fn load_chat_data(
     let active_channel_archived = active_wire_channel.is_some_and(|info| info.channel.archived);
     let active_channel_members_only =
         active_wire_channel.is_some_and(|info| info.channel.post_policy == PostPolicy::MembersOnly);
-    let active_channel_huddle_count =
-        active_wire_channel.map_or(0, |info| count_i64(info.channel.huddle.len()));
     let me = local_user_key().await;
     let huddle_roster = active_wire_channel.map_or_else(Vec::new, |info| {
         huddle_roster(&info.channel.huddle, me.as_deref())
@@ -154,7 +151,6 @@ pub(crate) async fn load_chat_data(
         active_channel_name,
         active_channel_archived,
         active_channel_members_only,
-        active_channel_huddle_count,
         huddle_roster,
         channel_members,
         selected_message_seq: 0,
@@ -266,7 +262,6 @@ pub(crate) async fn load_channel_window_data(
         active_channel_name: channel.name,
         active_channel_archived: channel.archived,
         active_channel_members_only: channel.members_only,
-        active_channel_huddle_count: channel.huddle_count,
         huddle_roster,
         channel_members,
         selected_message_seq: 0,
