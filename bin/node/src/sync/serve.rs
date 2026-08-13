@@ -469,7 +469,11 @@ fn bounded_index_ops_response(page: SyncIndexOps) -> statesync::SyncResponse {
         source_floor,
         applied_height,
     } = page;
-    rows.truncate(statesync::INDEX_OPS_BATCH_LEN);
+    // the wire caps a page; dropping past it still OWES those rows.
+    if rows.len() > statesync::INDEX_OPS_BATCH_LEN {
+        rows.truncate(statesync::INDEX_OPS_BATCH_LEN);
+        has_more = true;
+    }
 
     let mut fitting = 0usize;
     let mut excluded = rows.len() + 1;

@@ -22,7 +22,9 @@ fn read_index_ops(
             module,
             indexer::OP_PREFIX.as_bytes(),
             cursor.as_deref().map(str::as_bytes),
-            indexer::MAX_SCAN_LIMIT,
+            // the wire's page cap, so the store's own `has_more` already
+            // answers for the whole page and nothing is dropped downstream.
+            statesync::INDEX_OPS_BATCH_LEN,
         )
         .map_err(|e| format!("index op page for {module}: {e}"))?;
     let above_ceiling =

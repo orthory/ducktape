@@ -604,26 +604,45 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
             })
         }),
     );
-    //     …and /v1/index/* answers from healthy read models. under the
-    //     replica pipeline the resident FOLDS blocks, so watermarks advance
-    //     per block PAST the ascension heal's backfill floor (the old
-    //     boundary-healed model pinned them equal — that trailing-watermark
-    //     era is exactly what the fold retired). polled: a heal drops the
-    //     watermark FIRST (crash-safety by re-trigger), so a read racing an
-    //     in-flight heal legitimately sees 0 for a moment.
+    //     …and /v1/index/* answers from healthy read models WITH pre-join
+    //     history. the ascension heal still stamps a floor at the boundary,
+    //     but the op-row backfill then walks the source's rows below it and
+    //     CLEARS that floor (indexable spec §7) — so the honest end state is
+    //     no floor at all, or the SOURCE's own floor inherited when the
+    //     source itself joined late. what must never happen again is a floor
+    //     sitting at the joiner's own boundary with an empty feed beneath it.
+    //     polled: a heal drops the watermark FIRST (crash-safety by
+    //     re-trigger), so a read racing an in-flight heal legitimately sees 0
+    //     for a moment, and the floor clears only after the fold drains.
     poll(
-        "the resident index to report folding watermarks",
+        "the resident index to report folding watermarks over a backfilled feed",
         Box::new(|| {
         let (status, index_status) =
             common::http_request(cluster.http_ports[1], "GET", "/v1/index/status", None);
         let watermark = index_status["modules"]["directory"].as_u64().unwrap_or(0);
+        let floor = index_status["backfilled"]["directory"].as_u64();
+        // the founder is the sync source and has folded from genesis, so it
+        // has no floor of its own to compose in: the joiner's clears outright.
         status == 200
             && index_status["poisoned"] == serde_json::json!(false)
             && watermark > 0
-            && index_status["backfilled"]["directory"]
-                .as_u64()
-                .is_some_and(|floor| floor <= watermark)
+            && floor.is_none()
         }),
+    );
+    //     and the op feed BELOW that boundary is really there — the whole
+    //     point of clearing the floor. `/v1/index/directory/ops` starts at
+    //     height 1, not at the height this node happened to arrive.
+    let (status, ops) = common::http_request(
+        cluster.http_ports[1],
+        "GET",
+        "/v1/index/directory/ops?limit=1",
+        None,
+    );
+    assert_eq!(status, 200, "resident op feed: {ops}");
+    assert_eq!(
+        ops["ops"][0]["height"].as_u64(),
+        Some(1),
+        "a cleared floor promises the feed reaches genesis: {ops}"
     );
 
     // (3) quorum untouched: kill the resident; the founder keeps finalizing.

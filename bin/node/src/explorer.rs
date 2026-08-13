@@ -213,11 +213,10 @@ pub(crate) async fn heal_and_backfill_index<C: statesync::SyncClient>(
     label: &str,
 ) {
     let stamped = heal_index(index, boundary, label);
-    let mut backfilled: Vec<(String, Option<u64>, Option<(u64, u32)>)> = Vec::new();
+    let mut backfilled: Vec<Backfilled> = Vec::new();
     for module in &stamped {
-        match backfill_module(index, client, module, boundary, label).await {
-            Some(done) => backfilled.push((module.clone(), done.0, done.1)),
-            None => continue,
+        if let Some(done) = backfill_module(index, client, module, boundary, label).await {
+            backfilled.push(done);
         }
     }
     if backfilled.is_empty() {
@@ -238,7 +237,12 @@ pub(crate) async fn heal_and_backfill_index<C: statesync::SyncClient>(
         );
         return;
     }
-    for (module, source_floor, last_row) in backfilled {
+    for Backfilled {
+        module,
+        source_floor,
+        last_row,
+    } in backfilled
+    {
         // the fold has to have CONSUMED what we wrote before the floor may
         // claim it. a module with no folding guest never has a tip, and none
         // is expected of it.
@@ -270,16 +274,25 @@ pub(crate) async fn heal_and_backfill_index<C: statesync::SyncClient>(
     }
 }
 
+/// one module whose op rows all landed: what the source said its floor was,
+/// and the last row position written (`None` for a module with no history
+/// below the boundary — nothing for the fold to consume).
+struct Backfilled {
+    module: String,
+    source_floor: Option<u64>,
+    last_row: Option<(u64, u32)>,
+}
+
 /// walk one module's op rows below `boundary` off the source and write them.
-/// `Some((source_floor, last_row))` on a complete walk; `None` when the module
-/// keeps its stamped floor, warned once with a stable reason token.
+/// `None` when the module keeps its stamped floor, warned once with a stable
+/// reason token.
 async fn backfill_module<C: statesync::SyncClient>(
     index: &indexer::IndexStore,
     client: &C,
     module: &str,
     boundary: u64,
     label: &str,
-) -> Option<(Option<u64>, Option<(u64, u32)>)> {
+) -> Option<Backfilled> {
     let mut rows = 0usize;
     let mut bytes = 0usize;
     let mut last: Option<(u64, u32)> = None;
@@ -335,5 +348,9 @@ async fn backfill_module<C: statesync::SyncClient>(
         floor = source_floor.unwrap_or(0),
         "index backfill wrote {rows} op rows for {module} below boundary {boundary}"
     );
-    Some((source_floor, last))
+    Some(Backfilled {
+        module: module.to_string(),
+        source_floor,
+        last_row: last,
+    })
 }
