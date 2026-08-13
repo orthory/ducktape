@@ -561,7 +561,7 @@ on message_send_failed(cause)
   return if !cause.committed
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, "chat", false, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
+  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, "chat", false, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
 
 on chat_updated(next)
   // THE ROOM SHE IS IN NOW, OR NOTHING. Two clicks in flight land in the order
@@ -1259,7 +1259,7 @@ on reaction_failed(cause)
   error = cause.message
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, "chat", false, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
+  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, "chat", false, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
 
 // A composer's `disabled=` is decided at RENDER time; this runs at APPLY time,
 // and the refusal can change in between — a subscription drop flips `connected`,
@@ -1313,7 +1313,7 @@ on thread_reply_send_failed(cause)
   return if !cause.committed
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, "chat", false, hydration_generation, 0) -> live_resynced _ | live_resync_failed _
+  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, "chat", false, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
 
 on thread_reply_sent(next)
   return if active_channel != next.channel_id

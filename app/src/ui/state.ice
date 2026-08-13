@@ -473,6 +473,18 @@ state
   // not type inside one (E151) — and it has to be computed before `active_page`
   // moves, so it is a field the handler writes and reads in the same pass.
   pages_answer_is_current = false
+  // THE PAGES FOLD'S OWN CLOCK (#1041). A text fold (a rename, a body edit)
+  // rewrites titles and block texts WITHOUT bumping `hydration_generation` —
+  // folding instead of reloading is its whole point — so it cannot orphan a
+  // `live_resync_load` reply already in flight the way every structural delta
+  // does. Bumped at the fold site (`live_updated`), snapshotted into each
+  // resync request, echoed back on `LiveRefresh`, and compared at
+  // `live_resynced`, where a mismatch marks the reply pre-fold for exactly
+  // the fold-owned fields.
+  pages_fold_serial:i64 = 0
+  // Scratch for that comparison — same E151 shape as `pages_answer_is_current`
+  // above: a run payload's fields do not type inside a `let`.
+  pages_fold_outran_reply = false
   page_search_draft = ""
   page_search_hits:[PageSearchHit] = []
   page_searching = false
