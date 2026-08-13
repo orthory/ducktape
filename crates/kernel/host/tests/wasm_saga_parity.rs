@@ -271,6 +271,9 @@ async fn replies(h: &Host, ids: &[String], members: &[&[u8]]) -> Vec<Vec<u8>> {
     for m in members {
         queries.push(encode_query(&SagaQuery::AssignedPending {
             assignee: m.to_vec(),
+            // the first page: these fixtures hold far fewer than one page of
+            // live sagas, so it is the whole projection.
+            after: None,
         }));
     }
     let mut out = Vec::new();
