@@ -642,6 +642,43 @@ pub(super) async fn park(
             height = tip,
             source = "recovery"
         );
+        // #1104: the reachability plane's boot Retarget comes from the
+        // RECOVERED state, not the manifest poll — the poll needs the p2p
+        // mesh, the mesh dials through the tunnels restore() would bring
+        // up, and restore() runs only on the first Retarget; without this
+        // the restarted resident deadlocks in that cycle. Same standing
+        // gate, freshness clock, and non-blocking discipline as the poll
+        // below: a shed Retarget is retried there (the epoch latch only
+        // advances when the send is taken).
+        if let Some(cmd) = &reach_cmd
+            && resident_standing
+        {
+            let clock = rec.view_base.max(tip);
+            let members: Vec<ed25519::PublicKey> = rec
+                .participants
+                .iter()
+                .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
+                .collect();
+            let standbys: Vec<ed25519::PublicKey> = rec
+                .residents
+                .iter()
+                .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
+                .collect();
+            let _ = cmd.try_send(reachability::ReachabilityCommand::ViewTick(clock));
+            if cmd
+                .try_send(reachability::ReachabilityCommand::Retarget(
+                    reachability::MeshEpochEvent {
+                        epoch: rec.epoch,
+                        members,
+                        standbys,
+                        current_view: clock,
+                    },
+                ))
+                .is_ok()
+            {
+                last_plane_epoch = Some(rec.epoch);
+            }
+        }
     }
     let not_serving = |standing: bool| -> String {
         if standing {
