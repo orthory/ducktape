@@ -826,8 +826,8 @@ fn forge_depth_rides_the_established_seams() {
     // committed forge ops refresh scoped slices through the handler's one
     // terminal parallel — no polling, no per-op full reloads. The repo LIST
     // is the one slice with no open-scope of its own, so it carries the forge
-    // surface's own gate: a chain op must not walk every repo's git mirror for
-    // a list that is not on screen.
+    // surface's own gate: a chain op must not query a list that is not on
+    // screen.
     assert!(lifecycle.contains(
         "run replace lane=forge_live forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == \"forge\"), forge_generation)"
     ));
@@ -852,32 +852,38 @@ fn forge_depth_rides_the_established_seams() {
     assert!(forge_screen.contains("forge_merge_note(forge_item_merge_oid, forge_item_branches)"));
 }
 
-/// THE REPO EXISTS BEFORE ITS CARD FACTS DO. `list_repos` is a small committed
-/// state query; README/language/time require a smart-HTTP mirror fetch that can
-/// take a minute for this repo. The list must land first, then the optional
-/// card enrichment may run in its own lane.
+/// THE COMMITTED LIST IS THE WHOLE CARD ANSWER. A former follow-up lane launched
+/// from `forge_loaded`, fetched every repo mirror and walked README/tree facts.
+/// That made the tab wait on work no card needs. Keep the landing handler pure
+/// state installation and keep mirror work behind the explicit merge act.
 #[test]
-fn forge_repo_list_lands_before_optional_mirror_facts() {
+fn forge_repo_list_never_launches_mirror_details_work() {
     let backend = inlined(include_str!("backend/forge.rs"));
-    let fast = backend
+    let list_loader = backend
         .split_once("pub async fn load_forge(")
         .expect("forge list loader")
         .1
-        .split_once("pub async fn load_forge_details(")
-        .expect("separate details loader")
-        .0;
-    assert!(fast.contains("list_forge_repos"));
-    assert!(!fast.contains("repo_card_facts"));
-    assert!(!fast.contains("spawn_blocking"));
-
-    let details = backend
-        .split_once("pub async fn load_forge_details(")
-        .expect("forge details loader")
-        .1
         .split_once("pub async fn load_forge_repo(")
-        .expect("details loader boundary")
+        .expect("repo loader boundary")
         .0;
-    assert!(details.contains("repo_card_facts"));
+    assert!(list_loader.contains("list_forge_repos"));
+    for mirror_work in [
+        "load_forge_details",
+        "repo_card_facts",
+        "sync_forge_mirror",
+        "spawn_blocking",
+    ] {
+        assert!(
+            !list_loader.contains(mirror_work),
+            "the repo list must not start {mirror_work}"
+        );
+    }
+    assert!(!backend.contains("pub async fn load_forge_details("));
+    assert!(!backend.contains("fn repo_card_facts("));
+    assert!(
+        backend.contains("fn sync_forge_mirror("),
+        "merge preflight still owns its client-computed commit mirror"
+    );
 
     let handlers = inlined(include_str!("ui/handlers/forge.ice"));
     let loaded = handlers
@@ -887,13 +893,13 @@ fn forge_repo_list_lands_before_optional_mirror_facts() {
         .split_once("\non ")
         .expect("forge loaded arm")
         .0;
-    let list_landed = loaded
-        .find("forge_repos = next.repos")
-        .expect("the committed repo rows land");
-    let details_started = loaded
-        .find("run replace lane=forge_details")
-        .expect("card facts load in the background");
-    assert!(list_landed < details_started);
+    assert!(loaded.contains("forge_repos = next.repos"));
+    assert!(!loaded.contains("run "));
+    assert!(!handlers.contains("forge_details"));
+
+    let externs = inlined(include_str!("ui/extern/backend.ice"));
+    assert!(externs.contains("ForgeRepo(name:str, head:str)"));
+    assert!(!externs.contains("load_forge_details"));
 
     let components = inlined(include_str!("ui/components/forge.ice"));
     let header = components
@@ -906,6 +912,143 @@ fn forge_repo_list_lands_before_optional_mirror_facts() {
     assert!(header.contains("answered:bool"));
     assert!(header.contains("if answered"));
     assert!(!header.contains("if connected"));
+
+    let card = components
+        .split_once("component RepoCard(")
+        .expect("repo card")
+        .1
+        .split_once("\ncomponent ")
+        .expect("repo card boundary")
+        .0;
+    assert!(card.contains("repo.name"));
+    assert!(card.contains("repo.head"));
+    for removed in [
+        "repo.about",
+        "repo.language",
+        "repo.updated_at",
+        "relative_time",
+    ] {
+        assert!(!card.contains(removed), "repo card must not read {removed}");
+    }
+}
+
+/// CODE BROWSING IS AN API READ, NOT A COLD CLONE. The root tree query resolves
+/// an empty revision to one exact commit; every directory and blob click then
+/// sends that commit back. Neither loader may touch the merge-only mirror or a
+/// blocking git task.
+#[test]
+fn forge_code_loaders_query_only_the_requested_tree_or_blob() {
+    let backend = include_str!("backend/forge.rs");
+    let tree = backend
+        .split_once("pub async fn forge_tree(")
+        .expect("tree loader")
+        .1
+        .split_once("pub async fn forge_blob(")
+        .expect("blob loader boundary")
+        .0;
+    let blob = backend
+        .split_once("pub async fn forge_blob(")
+        .expect("blob loader")
+        .1
+        .split_once("pub fn forge_live_hit(")
+        .expect("blob loader boundary")
+        .0;
+    for (loader, query) in [(tree, "\"tree\""), (blob, "\"blob\"")] {
+        assert!(loader.contains(query));
+        for field in ["\"repo\": &repo", "\"rev\": &rev", "\"path\": &path"] {
+            assert!(loader.contains(field));
+        }
+        assert!(loader.contains("client.query(\"forge\", &query).await?"));
+        for full_repo_work in ["sync_forge_mirror", "mirror_holding_revision", "spawn_blocking"] {
+            assert!(
+                !loader.contains(full_repo_work),
+                "Code loader must not start {full_repo_work}"
+            );
+        }
+    }
+
+    let handlers = include_str!("ui/handlers/forge.ice");
+    assert!(handlers.contains(
+        "forge_tree(connected_rpc, forge_repo, \"\", \"\", forge_code_generation)"
+    ));
+    assert!(handlers.contains(
+        "forge_tree(connected_rpc, forge_repo, forge_tree_rev, path, forge_code_generation)"
+    ));
+    assert!(handlers.contains(
+        "forge_blob(connected_rpc, forge_repo, forge_tree_rev, path, forge_code_generation)"
+    ));
+}
+
+/// Forge's repo chrome used to stack three independent rows — crumb, every
+/// branch, then tabs — before a reader reached any code or tracker content.
+/// Keep branch context in the tab row and keep detail navigation in the
+/// persistent repo bar, so neither can quietly grow another empty band.
+#[test]
+fn forge_layout_keeps_repo_navigation_compact() {
+    let screen = inlined(include_str!("ui/screens/forge.ice"));
+
+    let repo_body = screen
+        .split_once("if forge_item_number <= 0")
+        .expect("repo body")
+        .1
+        .split_once("match tab")
+        .expect("repo navigation boundary")
+        .0;
+    let tabs_end = repo_body
+        .find("emit(select_forge_tab, \"issues\")")
+        .expect("issues tab");
+    let branches = repo_body.find("for branch in branches").expect("branch strip");
+    assert!(
+        tabs_end < branches,
+        "branch context follows the tabs in their shared navigation row"
+    );
+    assert_eq!(repo_body.matches("for branch in branches").count(), 1);
+
+    let item_body = screen
+        .split_once("if forge_item_number > 0 && item_phase == \"ready\"")
+        .expect("detail back control")
+        .1;
+    assert!(item_body.starts_with("\n                BackToList"));
+    assert_eq!(screen.matches("BackToList kind=forge_item_kind").count(), 1);
+}
+
+/// Source and patch rows are one code-reading surface. The semantic diff
+/// plates may vary, but their metrics, neutral code ink and numbered gutter do
+/// not: that keeps a changed line from switching type weight or losing its
+/// numbers when the palette flips.
+#[test]
+fn forge_source_and_diff_rows_share_a_compact_code_style() {
+    let components = inlined(include_str!("ui/components/forge.ice"));
+    let source = components
+        .split_once("component ForgeCodeLine(")
+        .expect("source row")
+        .1
+        .split_once("\ncomponent ")
+        .expect("source row boundary")
+        .0;
+    assert_eq!(source.matches("h=20.0").count(), 2);
+    assert_eq!(source.matches("size=11.5").count(), 2);
+    assert!(source.contains("font=code @text-forge_gutter_ink"));
+    assert!(source.contains("font=code @text-strong_ink"));
+    assert!(!source.contains("@text-icon_idle"));
+
+    let diff = components
+        .split_once("component DiffRow(")
+        .expect("diff row")
+        .1
+        .split_once("\ncomponent ")
+        .expect("diff row boundary")
+        .0;
+    assert!(diff.contains("font=code_semibold @text-diff_add_fg"));
+    assert!(diff.contains("font=code_semibold @text-diff_del_fg"));
+    assert!(!diff.contains("text=gutter_ink"));
+    assert_eq!(diff.matches("text=forge_gutter_ink").count(), 3);
+    assert_eq!(
+        diff.matches("font=code @text-strong_ink").count(),
+        3,
+        "added, deleted and context code use the same neutral ink"
+    );
+    assert!(diff.contains("font=code_semibold @text-merged"));
 }
 
 #[test]
@@ -2317,6 +2460,76 @@ fn closing_a_repo_or_an_item_retires_the_load_that_would_reopen_it() {
 }
 
 #[test]
+fn leaving_forge_code_retires_late_successes_and_failures() {
+    let handlers = [
+        ("chat", inlined(include_str!("ui/handlers/chat.ice"))),
+        ("forge", inlined(include_str!("ui/handlers/forge.ice"))),
+        ("huddle", inlined(include_str!("ui/handlers/huddle.ice"))),
+        (
+            "lifecycle",
+            inlined(include_str!("ui/handlers/lifecycle.ice")),
+        ),
+        ("pages", inlined(include_str!("ui/handlers/pages.ice"))),
+    ];
+    let mut shell_routes = 0usize;
+    for (path, source) in handlers {
+        for block in source.split("\non ").skip(1) {
+            let moves_shell = block
+                .lines()
+                .any(|line| line.trim_start().starts_with("shell_tab = "));
+            if !moves_shell {
+                continue;
+            }
+            shell_routes += 1;
+            assert!(
+                block.contains("forge_code_generation = "),
+                "{path}: every direct shell navigation must retire Forge Code work"
+            );
+        }
+    }
+    assert_eq!(shell_routes, 4, "the four direct shell routes stay covered");
+
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.shell_tab = "forge".into();
+    let _ = app.__update(__DucktapeMessage::ForgeOpenRepo("core".into()));
+
+    let tree_generation = app.forge_code_generation;
+    let _ = app.__update(__DucktapeMessage::SelectForgeTab("pulls".into()));
+    assert!(app.forge_code_generation > tree_generation);
+    let _ = app.__update(__DucktapeMessage::ForgeTreeLoaded(backend::ForgeTreeData {
+        generation: tree_generation,
+        repo: "core".into(),
+        rev: "1111111111111111111111111111111111111111".into(),
+        path: String::new(),
+        born: true,
+        entries: Vec::new(),
+        truncated: false,
+    }));
+    assert!(
+        app.forge_tree_rev.is_empty(),
+        "a late tree success cannot repaint the Pulls tab"
+    );
+
+    let _ = app.__update(__DucktapeMessage::SelectForgeTab("code".into()));
+    let _ = app.__update(__DucktapeMessage::ForgeOpenFile("README.md".into()));
+    let file_generation = app.forge_code_generation;
+    let _ = app.__update(__DucktapeMessage::SelectShellTab("settings".into()));
+    assert!(app.forge_code_generation > file_generation);
+    let _ = app.__update(__DucktapeMessage::ForgeFileFailed(
+        backend::HydrationError {
+            generation: file_generation,
+            message: "late code failure".into(),
+        },
+    ));
+    assert!(
+        app.error.is_empty(),
+        "a late blob failure cannot paint another shell tab's error banner"
+    );
+}
+
+#[test]
 fn forge_scoped_reads_do_not_call_loading_or_failure_empty() {
     let (mut failed_list, _) = Ducktape::__boot();
     failed_list.forge_generation = 3;
@@ -2354,9 +2567,11 @@ fn forge_scoped_reads_do_not_call_loading_or_failure_empty() {
         path: String::new(),
         born: true,
         entries: Vec::new(),
+        truncated: true,
     }));
     assert_eq!(app.forge_code_phase, "ready");
     assert!(app.forge_tree_born);
+    assert!(app.forge_tree_truncated);
     assert_eq!(
         app.forge_tree_rev, "1111111111111111111111111111111111111111",
         "nested tree and file reads stay pinned to the tree's commit"
@@ -2373,6 +2588,28 @@ fn forge_scoped_reads_do_not_call_loading_or_failure_empty() {
     ));
     assert_eq!(app.forge_item_phase, "failed");
     assert_eq!(app.error, "tracker unavailable");
+}
+
+#[test]
+fn forge_directory_navigation_clears_the_previous_file_preview() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.forge_repo = "core".into();
+    app.forge_tree_rev = "1111111111111111111111111111111111111111".into();
+    app.forge_file_path = "old.rs".into();
+    app.forge_file_text = "stale".into();
+    app.forge_file_binary = true;
+    app.forge_file_truncated = true;
+
+    let _ = app.__update(__DucktapeMessage::ForgeOpenDir("src".into()));
+
+    assert_eq!(app.forge_tree_path, "src");
+    assert_eq!(app.forge_code_phase, "tree_loading");
+    assert!(app.forge_file_path.is_empty());
+    assert!(app.forge_file_text.is_empty());
+    assert!(!app.forge_file_binary);
+    assert!(!app.forge_file_truncated);
 }
 
 #[test]
@@ -4071,6 +4308,7 @@ fn opening_a_network_clears_the_previous_networks_state() {
     app.forge_review_draft = "node a review".into();
     app.forge_tree_repo = "same-repo".into();
     app.forge_tree_born = true;
+    app.forge_tree_truncated = true;
     app.forge_code_phase = "ready".into();
     app.huddle_joined = true;
     app.huddle_channel = "chan-a".into();
@@ -4111,6 +4349,7 @@ fn opening_a_network_clears_the_previous_networks_state() {
     assert!(app.forge_review_draft.is_empty());
     assert!(app.forge_tree_repo.is_empty());
     assert!(!app.forge_tree_born);
+    assert!(!app.forge_tree_truncated);
     assert_eq!(app.forge_code_phase, "idle");
     assert!(!app.huddle_joined);
     assert!(app.huddle_channel.is_empty());

@@ -428,7 +428,7 @@ view
         agents:
           AgentsScreen rows=agents_rows connected answered=agents_answered #agents
         forge:
-          ForgeScreen wall_now=wall_now review_draft<->forge_review_draft comment_draft<->forge_comment_draft discussion_editor<->forge_discussion_editor
+          ForgeScreen review_draft<->forge_review_draft comment_draft<->forge_comment_draft discussion_editor<->forge_discussion_editor
             with
               org=network_name
               about=account_bio
@@ -446,6 +446,7 @@ view
               tree_path=forge_tree_path
               tree_born=forge_tree_born
               tree_entries=forge_tree_entries
+              tree_truncated=forge_tree_truncated
               code_phase=forge_code_phase
               file_path=forge_file_path
               file_text=forge_file_text

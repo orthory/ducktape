@@ -1,29 +1,14 @@
 // FORGE — repos, the tracker, one item with its reviews, its merge and its
 // discussion. Every loader keys on `forge_generation`.
 
-// Every row lands as soon as the committed namespace answers. Its about line,
-// language and `updated_at` arrive later from the optional mirror-details lane.
-// `updated_at` is UNIX SECONDS off the head commit's git committer time, so it
-// renders with `relative_time(...)` — NOT with `height_label_short()` like the
-// rest of this app. Every other record time here is a consensus stamp (the
-// validator sets consensus_time = height), which is why heights print
-// everywhere else; a git client wrote this one against a real wall clock.
+// The committed namespace is the whole repo-card answer: name and head. Code
+// Browsing queries only the requested listing/blob; merge fetches the selected
+// repo only when that explicit act needs a client-computed commit.
 on forge_loaded(next)
   return if next.generation != forge_generation
   forge_list_phase = "ready"
   forge_repos = next.repos
   error = ""
-  return if shell_tab != "forge" || !empty(forge_repo)
-  run replace lane=forge_details load_forge_details(connected_rpc, forge_generation) -> forge_details_loaded _ | forge_details_failed _
-
-on forge_details_loaded(next)
-  return if next.generation != forge_generation
-  forge_repos = next.repos
-
-// Card facts are optional. The committed repo rows remain the authoritative
-// answer when a mirror cannot be fetched or inspected.
-on forge_details_failed(cause)
-  return if cause.generation != forge_generation
 
 on forge_list_failed(cause)
   return if cause.generation != forge_generation
@@ -61,6 +46,7 @@ on forge_open_repo(name)
   forge_tree_path = ""
   forge_tree_rev = ""
   forge_tree_entries = []
+  forge_tree_truncated = false
   forge_file_path = ""
   forge_file_text = ""
   forge_file_binary = false
@@ -85,7 +71,9 @@ on forge_repo_failed(cause)
 
 on forge_open_item(number)
   return if !connected || empty(forge_repo)
+  invalidate lane=forge_code
   invalidate lane=forge_discussion
+  forge_code_generation = forge_code_generation + 1
   forge_item_number = number
   error = ""
   forge_item_phase = "loading"
@@ -279,8 +267,6 @@ on forge_refreshed(next)
   forge_item_approvals = keep_i64(next.item_loaded, next.item.approvals, forge_item_approvals)
   forge_item_change_requests = keep_i64(next.item_loaded, next.item.change_requests, forge_item_change_requests)
   forge_item_phase = keep_str(next.item_loaded, "ready", forge_item_phase)
-  return if !next.repos_loaded || !empty(forge_repo)
-  run replace lane=forge_details load_forge_details(connected_rpc, forge_generation) -> forge_details_loaded _ | forge_details_failed _
 
 // The breadcrumb home. Nothing else clears `forge_repo`, so without this the
 // repo grid is unreachable for the rest of the session once a repo is opened.
@@ -292,6 +278,7 @@ on forge_close_repo
   invalidate lane=forge_discussion
   invalidate lane=forge_code
   forge_generation = forge_generation + 1
+  forge_code_generation = forge_code_generation + 1
   forge_repo = ""
   forge_repo_phase = "idle"
   forge_branches = []
@@ -344,6 +331,7 @@ state
   forge_tree_repo = ""
   forge_tree_entries:[TreeEntry] = []
   forge_tree_born = false
+  forge_tree_truncated = false
   forge_file_path = ""
   forge_file_text = ""
   forge_file_binary = false
@@ -360,12 +348,14 @@ state
 // repo currently open, and a tree left over from the previous repo can never
 // paint.
 on select_forge_tab(tab)
+  invalidate lane=forge_code
+  forge_code_generation = forge_code_generation + 1
   forge_tab = tab
   return if tab != "code" || !connected || empty(forge_repo)
-  forge_code_generation = forge_code_generation + 1
   forge_tree_path = ""
   forge_tree_rev = ""
   forge_tree_entries = []
+  forge_tree_truncated = false
   forge_file_path = ""
   forge_file_text = ""
   forge_file_binary = false
@@ -382,6 +372,11 @@ on forge_open_dir(path)
   forge_code_generation = forge_code_generation + 1
   forge_tree_path = path
   forge_tree_entries = []
+  forge_tree_truncated = false
+  forge_file_path = ""
+  forge_file_text = ""
+  forge_file_binary = false
+  forge_file_truncated = false
   forge_code_phase = "tree_loading"
   run replace lane=forge_code forge_tree(connected_rpc, forge_repo, forge_tree_rev, path, forge_code_generation) -> forge_tree_loaded _ | forge_tree_failed _
 
@@ -392,6 +387,7 @@ on forge_tree_loaded(next)
   forge_tree_path = next.path
   forge_tree_born = next.born
   forge_tree_entries = next.entries
+  forge_tree_truncated = next.truncated
   forge_code_phase = "ready"
   error = ""
 

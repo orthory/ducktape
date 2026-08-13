@@ -1,22 +1,11 @@
 use super::*;
 use ::forge;
 
-/// One forge repo row: the module's committed head, plus the card facts
-/// derived from the local mirror at that head.
+/// One forge repo row: the module's committed name and head.
 #[derive(Clone, Debug, Default, Hash, PartialEq)]
 pub struct ForgeRepo {
     pub name: String,
     pub head: String,
-    /// The README's opening prose. Empty when the repo has none — the card
-    /// keeps its min-height rather than inventing a description.
-    pub about: String,
-    /// The extension that owns the most files at the head revision.
-    pub language: String,
-    /// The head commit's committer time in UNIX SECONDS — a real wall clock,
-    /// because a forge commit is stamped by a git client, not by consensus.
-    /// Render it with `relative_time`, NOT with `height_label_short`. 0 when
-    /// the repo has no born head.
-    pub updated_at: i64,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -75,8 +64,7 @@ fn listed_forge_repo(repo: &serde_json::Value) -> (String, String) {
     )
 }
 
-/// The repo namespace with committed heads. This is the screen's fast answer:
-/// card facts come from [`load_forge_details`] after these rows are visible.
+/// The repo namespace with committed heads.
 pub async fn load_forge(rpc: String, generation: i64) -> Result<ForgeData, HydrationError> {
     offscreen_guard(generation)?;
     async {
@@ -88,48 +76,9 @@ pub async fn load_forge(rpc: String, generation: i64) -> Result<ForgeData, Hydra
                 ForgeRepo {
                     name,
                     head: short_digest(&head),
-                    ..ForgeRepo::default()
                 }
             })
             .collect();
-        Ok(ForgeData { generation, repos })
-    }
-    .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
-}
-
-/// Fill the optional repo-card facts from local mirrors after the committed
-/// repo rows have landed. Re-listing is a small consensus query and keeps this
-/// work self-contained without carrying full object IDs through the UI.
-pub async fn load_forge_details(rpc: String, generation: i64) -> Result<ForgeData, HydrationError> {
-    offscreen_guard(generation)?;
-    async {
-        let listed = list_forge_repos(&rpc).await?;
-        let mut deriving = Vec::with_capacity(listed.len());
-        for repo in listed {
-            let (name, head) = listed_forge_repo(&repo);
-            let endpoint = rpc.clone();
-            deriving.push(tokio::task::spawn_blocking(move || {
-                let (about, language, updated_at) = repo_card_facts(&endpoint, &name, &head);
-                ForgeRepo {
-                    head: short_digest(&head),
-                    name,
-                    about,
-                    language,
-                    updated_at,
-                }
-            }));
-        }
-        let mut repos = Vec::with_capacity(deriving.len());
-        for task in deriving {
-            let row = task
-                .await
-                .map_err(|error| format!("forge card-details task failed: {error}"))?;
-            repos.push(row);
-        }
         Ok(ForgeData { generation, repos })
     }
     .await
@@ -147,18 +96,15 @@ pub async fn load_forge_repo(
 ) -> Result<ForgeRepoData, HydrationError> {
     async {
         let rpc = rpc_client(&rpc)?;
-        let refs: serde_json::Value = rpc
-            .query(
-                "forge",
-                &serde_json::json!({ "list_refs": { "repo": repo } }),
-            )
-            .await?;
-        let items: serde_json::Value = rpc
-            .query(
-                "forge",
-                &serde_json::json!({ "list_items": { "repo": repo } }),
-            )
-            .await?;
+        // Branches and tracker summaries are independent committed reads. The
+        // repo seat needs both, but neither is a reason to queue behind the
+        // other on the node's query lane.
+        let refs_query = serde_json::json!({ "list_refs": { "repo": &repo } });
+        let items_query = serde_json::json!({ "list_items": { "repo": &repo } });
+        let (refs, items): (serde_json::Value, serde_json::Value) = tokio::try_join!(
+            rpc.query("forge", &refs_query),
+            rpc.query("forge", &items_query)
+        )?;
         let branches = refs["refs"]
             .as_array()
             .cloned()
@@ -589,24 +535,6 @@ fn sync_forge_mirror(endpoint: &str, repo: &str) -> Result<git2::Repository, Str
     Ok(mirror)
 }
 
-/// Use the resident mirror when it already carries the exact revision a tree
-/// read pinned. File and nested-directory clicks then stay on that commit and
-/// do not turn every click into another network fetch.
-fn mirror_holding_revision(
-    endpoint: &str,
-    repo: &str,
-    rev: &str,
-) -> Result<git2::Repository, String> {
-    let dir = forge_mirror_dir(endpoint, repo)?;
-    let resident = git2::Repository::open_bare(&dir).ok();
-    let already_holds_revision =
-        resident.filter(|mirror| !rev.is_empty() && mirror.revparse_single(rev).is_ok());
-    match already_holds_revision {
-        Some(mirror) => Ok(mirror),
-        None => sync_forge_mirror(endpoint, repo),
-    }
-}
-
 /// `<key-root>/forge-remote/<endpoint-slug>/<repo>` — the key root is the same
 /// resolution order the user key uses (`DUCKTAPE_HOME`, then `~/.ducktape`).
 fn forge_mirror_dir(endpoint: &str, repo: &str) -> Result<PathBuf, String> {
@@ -664,8 +592,7 @@ impl Drop for ScratchDir {
     }
 }
 
-/// One entry of a repo's tree at one revision. `kind` is `dir` | `file`; a
-/// directory has no size on the wire and reads 0.
+/// One entry of a repo's tree at one revision. `kind` is `dir` | `file`.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct TreeEntry {
     pub name: String,
@@ -673,7 +600,6 @@ pub struct TreeEntry {
     /// having to re-join it against the current directory.
     pub path: String,
     pub kind: String,
-    pub size: i64,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -682,11 +608,12 @@ pub struct ForgeTreeData {
     pub repo: String,
     pub rev: String,
     pub path: String,
-    /// Whether the mirror has at least one branch. An empty `entries` list can
+    /// Whether the repo has at least one branch. An empty `entries` list can
     /// also be a real empty commit, so the view must not infer "unborn" from
     /// the list alone.
     pub born: bool,
     pub entries: Vec<TreeEntry>,
+    pub truncated: bool,
 }
 
 /// One file's contents at one revision, in the shape the preview pane reads.
@@ -702,115 +629,73 @@ pub struct BlobView {
     pub lines: i64,
 }
 
-/// The default revision a repo browse opens at: the integration branch the
-/// module itself prefers (`dev`, else `main`), else whatever is born.
-fn default_rev(mirror: &git2::Repository) -> Result<String, String> {
-    for preferred in ["dev", "main"] {
-        if mirror
-            .find_branch(preferred, git2::BranchType::Local)
-            .is_ok()
-        {
-            return Ok(preferred.to_string());
-        }
-    }
-    let branches = mirror
-        .branches(Some(git2::BranchType::Local))
-        .map_err(git_err)?;
-    for branch in branches {
-        let (branch, _) = branch.map_err(git_err)?;
-        if let Some(name) = branch.name().map_err(git_err)? {
-            return Ok(name.to_string());
-        }
-    }
-    Err("this repo has no born branch yet".into())
+pub(crate) fn tree_data(
+    reply: serde_json::Value,
+    repo: String,
+    path: String,
+    generation: i64,
+) -> Result<ForgeTreeData, String> {
+    let tree = reply
+        .get("tree")
+        .filter(|tree| !tree.is_null())
+        .ok_or_else(|| "the repository tree was not found".to_string())?;
+    let tree: forge::TreeReply =
+        serde_json::from_value(tree.clone()).map_err(|error| error.to_string())?;
+    let entries = tree
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let kind = match entry.kind {
+                forge::TreeEntryKind::Dir => "dir",
+                forge::TreeEntryKind::File => "file",
+            };
+            TreeEntry {
+                name: entry.name,
+                path: entry.path,
+                kind: kind.into(),
+            }
+        })
+        .collect();
+    Ok(ForgeTreeData {
+        generation,
+        repo,
+        rev: tree.rev,
+        path,
+        born: tree.born,
+        entries,
+        truncated: tree.truncated,
+    })
 }
 
-pub(crate) fn mirror_has_born_branch(mirror: &git2::Repository) -> Result<bool, String> {
-    let mut branches = mirror
-        .branches(Some(git2::BranchType::Local))
-        .map_err(git_err)?;
-    branches
-        .next()
-        .transpose()
-        .map(|branch| branch.is_some())
-        .map_err(git_err)
-}
-
-/// Resolve `rev` (a branch name, or empty for the default) to its commit.
-pub(crate) fn mirror_commit_at<'repo>(
-    mirror: &'repo git2::Repository,
-    rev: &str,
-) -> Result<git2::Commit<'repo>, String> {
-    let rev = match rev.is_empty() {
-        true => default_rev(mirror)?,
-        false => rev.to_string(),
+pub(crate) fn blob_view(
+    reply: serde_json::Value,
+    repo: String,
+    generation: i64,
+) -> Result<BlobView, String> {
+    let blob = reply
+        .get("blob")
+        .filter(|blob| !blob.is_null())
+        .ok_or_else(|| "the requested file was not found".to_string())?;
+    let blob: forge::BlobReply =
+        serde_json::from_value(blob.clone()).map_err(|error| error.to_string())?;
+    let lines = match blob.binary {
+        true => 0,
+        false => count_i64(blob.text.lines().count()),
     };
-    let object = mirror
-        .revparse_single(&rev)
-        .map_err(|_| format!("no such revision {rev:?} in this repo"))?;
-    object.peel_to_commit().map_err(git_err)
+    Ok(BlobView {
+        generation,
+        repo,
+        rev: blob.rev,
+        path: blob.path,
+        text: blob.text,
+        truncated: blob.truncated,
+        binary: blob.binary,
+        lines,
+    })
 }
 
-/// The tree at `path` under `rev`, directories first then files, name order.
-pub(crate) fn read_tree(
-    mirror: &git2::Repository,
-    rev: &str,
-    path: &str,
-) -> Result<Vec<TreeEntry>, String> {
-    let commit = mirror_commit_at(mirror, rev)?;
-    let root = commit.tree().map_err(git_err)?;
-    let path = path.trim_matches('/');
-    let tree = match path.is_empty() {
-        true => root,
-        false => {
-            let entry = root
-                .get_path(Path::new(path))
-                .map_err(|_| format!("no such path {path:?} at this revision"))?;
-            entry
-                .to_object(mirror)
-                .map_err(git_err)?
-                .peel_to_tree()
-                .map_err(|_| format!("{path:?} is a file, not a directory"))?
-        }
-    };
-    let mut entries = Vec::with_capacity(tree.len());
-    for entry in tree.iter() {
-        let name = entry.name().unwrap_or_default().to_string();
-        if name.is_empty() {
-            continue;
-        }
-        let is_dir = entry.kind() == Some(git2::ObjectType::Tree);
-        let size = match is_dir {
-            true => 0,
-            false => entry
-                .to_object(mirror)
-                .ok()
-                .and_then(|object| object.into_blob().ok())
-                .map_or(0, |blob| count_i64(blob.size())),
-        };
-        entries.push(TreeEntry {
-            path: match path.is_empty() {
-                true => name.clone(),
-                false => format!("{path}/{name}"),
-            },
-            kind: match is_dir {
-                true => "dir".into(),
-                false => "file".into(),
-            },
-            name,
-            size,
-        });
-    }
-    entries.sort_by(|left, right| {
-        let dirs_lead = (right.kind == "dir").cmp(&(left.kind == "dir"));
-        dirs_lead.then_with(|| left.name.cmp(&right.name))
-    });
-    Ok(entries)
-}
-
-/// List one repo directory at one revision. No new module wire: the app
-/// already keeps a bare mirror of every branch for the client-computed merge,
-/// so the whole tree is readable locally.
+/// List one repo directory at one pinned revision on the node. Opening Code
+/// transfers only this bounded listing; the merge-only mirror stays cold.
 pub async fn forge_tree(
     rpc: String,
     repo: String,
@@ -819,33 +704,14 @@ pub async fn forge_tree(
     generation: i64,
 ) -> Result<ForgeTreeData, HydrationError> {
     async {
-        tokio::task::spawn_blocking(move || {
-            let mirror = mirror_holding_revision(&rpc, &repo, &rev)?;
-            let born = mirror_has_born_branch(&mirror)?;
-            let is_default_root = rev.is_empty() && path.is_empty();
-            if !born && is_default_root {
-                return Ok(ForgeTreeData {
-                    generation,
-                    repo,
-                    rev,
-                    path,
-                    born,
-                    entries: Vec::new(),
-                });
-            }
-            let resolved_rev = mirror_commit_at(&mirror, &rev)?.id().to_string();
-            let entries = read_tree(&mirror, &resolved_rev, &path)?;
-            Ok::<_, String>(ForgeTreeData {
-                generation,
-                repo,
-                rev: resolved_rev,
-                path,
-                born,
-                entries,
-            })
-        })
-        .await
-        .map_err(|error| format!("forge tree task failed: {error}"))?
+        let client = rpc_client(&rpc)?;
+        let query = serde_json::json!({ "tree": {
+            "repo": &repo,
+            "rev": &rev,
+            "path": &path,
+        }});
+        let reply = client.query("forge", &query).await?;
+        tree_data(reply, repo, path, generation)
     }
     .await
     .map_err(|message: String| HydrationError {
@@ -854,58 +720,7 @@ pub async fn forge_tree(
     })
 }
 
-/// The preview window one blob read returns, matching duckfs's 64 KiB cap.
-const MAX_BLOB_PREVIEW: usize = 64 * 1024;
-
-/// One blob's decoded head, its truncation flag and its line count.
-pub(crate) fn read_blob(
-    mirror: &git2::Repository,
-    repo: String,
-    rev: String,
-    path: String,
-    generation: i64,
-) -> Result<BlobView, String> {
-    let commit = mirror_commit_at(mirror, &rev)?;
-    let tree = commit.tree().map_err(git_err)?;
-    let entry = tree
-        .get_path(Path::new(path.trim_matches('/')))
-        .map_err(|_| format!("no such path {path:?} at this revision"))?;
-    let blob = entry
-        .to_object(mirror)
-        .map_err(git_err)?
-        .into_blob()
-        .map_err(|_| format!("{path:?} is a directory, not a file"))?;
-    let content = blob.content();
-    let truncated = content.len() > MAX_BLOB_PREVIEW;
-    let window = &content[..content.len().min(MAX_BLOB_PREVIEW)];
-    let readable = std::str::from_utf8(window)
-        .ok()
-        .filter(|text| !text.contains('\0'));
-    let Some(text) = readable else {
-        return Ok(BlobView {
-            generation,
-            repo,
-            rev,
-            path,
-            text: format!("{} binary bytes", content.len()),
-            truncated: false,
-            binary: true,
-            lines: 0,
-        });
-    };
-    Ok(BlobView {
-        generation,
-        repo,
-        rev,
-        path,
-        lines: count_i64(text.lines().count()),
-        text: text.to_string(),
-        truncated,
-        binary: false,
-    })
-}
-
-/// Read one file at one revision out of the local mirror.
+/// Read one bounded file preview at the tree's exact revision on the node.
 pub async fn forge_blob(
     rpc: String,
     repo: String,
@@ -914,162 +729,20 @@ pub async fn forge_blob(
     generation: i64,
 ) -> Result<BlobView, HydrationError> {
     async {
-        tokio::task::spawn_blocking(move || {
-            let mirror = mirror_holding_revision(&rpc, &repo, &rev)?;
-            read_blob(&mirror, repo, rev, path, generation)
-        })
-        .await
-        .map_err(|error| format!("forge blob task failed: {error}"))?
+        let client = rpc_client(&rpc)?;
+        let query = serde_json::json!({ "blob": {
+            "repo": &repo,
+            "rev": &rev,
+            "path": &path,
+        }});
+        let reply = client.query("forge", &query).await?;
+        blob_view(reply, repo, generation)
     }
     .await
     .map_err(|message: String| HydrationError {
         generation,
         message: user_error(message),
     })
-}
-
-/// The README names a repo browse recognizes, in preference order.
-const README_NAMES: &[&str] = &["README.md", "README", "readme.md", "README.txt"];
-
-/// The repo "about" line: the README's first prose paragraph, headings and
-/// badges skipped. Empty when there is no README — the card keeps its
-/// min-height rather than inventing a description.
-pub(crate) fn readme_about(mirror: &git2::Repository, commit: &git2::Commit) -> String {
-    let Ok(tree) = commit.tree() else {
-        return String::new();
-    };
-    let found = README_NAMES.iter().find_map(|name| {
-        let entry = tree.get_name(name)?;
-        let blob = entry.to_object(mirror).ok()?.into_blob().ok()?;
-        String::from_utf8(blob.content().to_vec()).ok()
-    });
-    let Some(text) = found else {
-        return String::new();
-    };
-    let lines = text.lines().map(str::trim).collect::<Vec<_>>();
-    let opens_prose = |line: &&&str| {
-        let empty = line.is_empty();
-        let heading = line.starts_with('#');
-        let badge = line.starts_with('[') || line.starts_with('!');
-        !empty && !heading && !badge
-    };
-    let Some(start) = lines.iter().position(|line| opens_prose(&line)) else {
-        return String::new();
-    };
-    // The whole paragraph, not its first physical line. A README is hard
-    // wrapped, so taking one line ended this repo's own card mid-clause —
-    // "…one BFT-replicated state machine that" — which reads as a UI
-    // truncation and carries no ellipsis to say so. A blank line ends the
-    // paragraph, which is what a paragraph IS; a wrapped continuation may
-    // legitimately begin with a bracket, so only the OPENING line is screened
-    // for headings and badges.
-    let prose = lines[start..]
-        .iter()
-        .take_while(|line| !line.is_empty())
-        .copied()
-        .collect::<Vec<_>>()
-        .join(" ");
-    match prose.char_indices().nth(200) {
-        Some((cut, _)) => format!("{}…", &prose[..cut]),
-        None => prose,
-    }
-}
-
-/// The repo's language, by which source extension owns the most files at the
-/// head revision.
-//
-// ponytail: a file-count heuristic over a bounded walk, not linguist's
-// byte-weighted classifier — upgrade to bytes-per-extension if a repo of
-// generated files starts reading wrong.
-pub(crate) fn dominant_language(commit: &git2::Commit) -> String {
-    const MAX_WALKED_ENTRIES: usize = 4096;
-    const LANGUAGES: &[(&str, &str)] = &[
-        ("rs", "Rust"),
-        ("ts", "TypeScript"),
-        ("tsx", "TypeScript"),
-        ("js", "JavaScript"),
-        ("py", "Python"),
-        ("go", "Go"),
-        ("swift", "Swift"),
-        ("kt", "Kotlin"),
-        ("java", "Java"),
-        ("c", "C"),
-        ("h", "C"),
-        ("cpp", "C++"),
-        ("rb", "Ruby"),
-        ("sh", "Shell"),
-        ("ice", "Ice"),
-        ("md", "Markdown"),
-    ];
-    let Ok(tree) = commit.tree() else {
-        return String::new();
-    };
-    let mut walked = 0usize;
-    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-    let _ = tree.walk(git2::TreeWalkMode::PreOrder, |_, entry| {
-        walked += 1;
-        if walked > MAX_WALKED_ENTRIES {
-            return git2::TreeWalkResult::Abort;
-        }
-        let name = entry.name().unwrap_or_default();
-        let extension = name.rsplit_once('.').map(|(_, tail)| tail).unwrap_or("");
-        if let Some((_, language)) = LANGUAGES.iter().find(|(suffix, _)| *suffix == extension) {
-            *counts.entry(*language).or_default() += 1;
-        }
-        git2::TreeWalkResult::Ok
-    });
-    counts
-        .into_iter()
-        .max_by_key(|(_, count)| *count)
-        .map(|(language, _)| language.to_string())
-        .unwrap_or_default()
-}
-
-/// One repo's card facts — about line, language, head committer time — read
-/// off the local mirror at the module's committed head. A repo whose head the
-/// mirror cannot produce renders blank rather than a guess.
-///
-/// BLOCKING: git2 walks a tree and may fetch. Callers run it on the blocking
-/// pool.
-pub(crate) fn repo_card_facts(endpoint: &str, repo: &str, head_oid: &str) -> (String, String, i64) {
-    const BLANK: (String, String, i64) = (String::new(), String::new(), 0);
-    let Ok(head) = git2::Oid::from_str(head_oid) else {
-        return BLANK;
-    };
-    let Ok(mirror) = mirror_holding(endpoint, repo, head) else {
-        return BLANK;
-    };
-    let Ok(commit) = mirror.find_commit(head) else {
-        return BLANK;
-    };
-    (
-        readme_about(&mirror, &commit),
-        dominant_language(&commit),
-        commit.time().seconds(),
-    )
-}
-
-/// The mirror holding `head`. The mirror IS the cache: a head the resident
-/// clone already carries costs no network, so re-listing the repos after every
-/// forge event never refetches a repo whose head has not moved.
-fn mirror_holding(endpoint: &str, repo: &str, head: git2::Oid) -> Result<git2::Repository, String> {
-    let dir = forge_mirror_dir(endpoint, repo)?;
-    let resident = git2::Repository::open_bare(&dir).ok();
-    let already_holds_head = resident.filter(|mirror| mirror.find_commit(head).is_ok());
-    match already_holds_head {
-        Some(mirror) => Ok(mirror),
-        None => sync_forge_mirror(endpoint, repo),
-    }
-}
-
-/// The listed row for `name`, so the open repo's body reads its about line,
-/// language and updated stamp out of the resident list instead of re-deriving
-/// them. An unknown name yields a blank row.
-pub fn forge_repo_row(repos: Vec<ForgeRepo>, name: String) -> ForgeRepo {
-    repos
-        .into_iter()
-        .find(|repo| repo.name == name)
-        .unwrap_or_default()
 }
 
 /// True when one live update invalidates forge state: a folded forge op, a
@@ -1102,10 +775,10 @@ pub struct ForgeLiveData {
 /// keeps leave state untouched); an empty op scope means the scope is
 /// unknown — reload every open slice.
 ///
-/// `forge_open` is the repo LIST's surface gate. That one load was the only
-/// unscoped slice here — a git-mirror walk per repo, on every forge op, for a
-/// list no other tab draws. The repo and item slices keep running off-tab on
-/// purpose: they are already scoped to what the forge pane has open, and
+/// `forge_open` is the repo LIST's surface gate. That one load is the only
+/// unscoped slice here, and no other tab draws it. The repo and item slices
+/// keep running off-tab on purpose: they are already scoped to what the forge
+/// pane has open, and
 /// dropping them would hand a stale PR back on the return trip (the tab-switch
 /// handler's `load_forge` refills the list, and nothing else).
 // Eight arguments, and none of them can be folded away: this is one Ice extern

@@ -133,6 +133,22 @@ pub enum ForgeQuery {
     /// committed branch heads. The node-local object store must contain both
     /// commits and their trees; this query never fetches missing objects.
     PrDiff { repo: String, number: u64 },
+    /// one directory at an exact committed revision. An empty `rev` selects
+    /// the repo's `dev` head, falling back to `main`; a non-empty revision is
+    /// exactly 40 hex characters and must be that head or one of its ancestors.
+    /// The query reads only the node-local object database and never fetches.
+    Tree {
+        repo: String,
+        rev: String,
+        path: String,
+    },
+    /// one UTF-8 file preview at the same revision boundary as [`Self::Tree`].
+    /// The reply never materializes or returns more than [`MAX_BLOB_BYTES`].
+    Blob {
+        repo: String,
+        rev: String,
+        path: String,
+    },
 }
 
 /// the git oid hex of a repo's HEAD (a 40-char sha1 oid), or `None` on an unborn
@@ -158,6 +174,56 @@ pub enum ForgeReply {
     /// a bounded, reviewable pull-request patch (the reply to
     /// [`ForgeQuery::PrDiff`]).
     PrDiff(PrDiff),
+    /// a bounded directory listing (the reply to [`ForgeQuery::Tree`]).
+    Tree(TreeReply),
+    /// a bounded text preview (the reply to [`ForgeQuery::Blob`]).
+    Blob(BlobReply),
+}
+
+/// Maximum entries returned by one [`ForgeQuery::Tree`] call.
+pub const MAX_TREE_ENTRIES: usize = 1_000;
+/// Maximum aggregate tree-object bytes materialized by one browse query.
+pub const MAX_TREE_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum bytes materialized and returned by one [`ForgeQuery::Blob`] call.
+pub const MAX_BLOB_BYTES: usize = 64 * 1024;
+
+/// One directory at one exact commit. An unborn repo has `born == false`, an
+/// empty `rev`, and no entries; otherwise `rev` is the resolved commit oid.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TreeReply {
+    pub rev: String,
+    pub born: bool,
+    pub entries: Vec<TreeEntry>,
+    /// True when more entries exist after this bounded prefix.
+    pub truncated: bool,
+}
+
+/// One visible entry in a [`TreeReply`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct TreeEntry {
+    pub kind: TreeEntryKind,
+    pub name: String,
+    /// Canonical path from the repo root.
+    pub path: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TreeEntryKind {
+    Dir,
+    File,
+}
+
+/// One file at one exact commit. Binary and over-limit blobs carry an empty
+/// `text`; `size` always describes the full blob.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct BlobReply {
+    pub rev: String,
+    pub path: String,
+    pub text: String,
+    pub size: i64,
+    pub truncated: bool,
+    pub binary: bool,
 }
 
 /// Maximum UTF-8 bytes returned in [`PrDiff::patch`]. The limit is fixed by the
@@ -258,15 +324,35 @@ mod tests {
 
     #[test]
     fn new_query_and_reply_variants_round_trip() {
+        let tree_query = ForgeQuery::Tree {
+            repo: "docs".into(),
+            rev: String::new(),
+            path: "src".into(),
+        };
+        let blob_query = ForgeQuery::Blob {
+            repo: "docs".into(),
+            rev: "1".repeat(40),
+            path: "src/lib.rs".into(),
+        };
         for q in [
             ForgeQuery::Head,
             ForgeQuery::HeadOf {
                 repo: "docs".into(),
             },
             ForgeQuery::ListRepos,
+            tree_query.clone(),
+            blob_query,
         ] {
             assert_eq!(decode_query(&encode_query(&q)).unwrap(), q);
         }
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&encode_query(&tree_query)).unwrap(),
+            serde_json::json!({ "tree": {
+                "repo": "docs",
+                "rev": "",
+                "path": "src",
+            }})
+        );
         let reply = ForgeReply::Repos(vec![
             RepoHead {
                 name: "a".into(),
@@ -278,5 +364,39 @@ mod tests {
             },
         ]);
         assert_eq!(decode_reply(&encode_reply(&reply)).unwrap(), reply);
+
+        let tree = ForgeReply::Tree(TreeReply {
+            rev: "1".repeat(40),
+            born: true,
+            entries: vec![TreeEntry {
+                kind: TreeEntryKind::File,
+                name: "lib.rs".into(),
+                path: "src/lib.rs".into(),
+            }],
+            truncated: false,
+        });
+        assert_eq!(decode_reply(&encode_reply(&tree)).unwrap(), tree);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&encode_reply(&tree)).unwrap(),
+            serde_json::json!({ "tree": {
+                "rev": "1111111111111111111111111111111111111111",
+                "born": true,
+                "entries": [{
+                    "kind": "file",
+                    "name": "lib.rs",
+                    "path": "src/lib.rs",
+                }],
+                "truncated": false,
+            }})
+        );
+        let blob = ForgeReply::Blob(BlobReply {
+            rev: "1".repeat(40),
+            path: "src/lib.rs".into(),
+            text: "pub fn one() {}\n".into(),
+            size: 16,
+            truncated: false,
+            binary: false,
+        });
+        assert_eq!(decode_reply(&encode_reply(&blob)).unwrap(), blob);
     }
 }

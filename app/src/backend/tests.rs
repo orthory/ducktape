@@ -3777,179 +3777,72 @@ fn merge_builder_reports_conflicts_and_builds_nothing() {
     assert_eq!(paths, vec!["a.txt".to_string()]);
 }
 
-/// A bare mirror carrying one `main` commit, in the shape the browse
-/// readers take it: a born branch they can resolve by default. A path with
-/// one slash lands in a real subtree, which `mirror_commit`'s flat
-/// treebuilder cannot express.
-fn browsable_mirror(dir: &tempfile::TempDir, files: &[(&str, &str)]) -> git2::Repository {
-    let mirror = git2::Repository::init_bare(dir.path()).unwrap();
-    let mut root_files: Vec<(String, git2::Oid)> = Vec::new();
-    let mut subtrees: BTreeMap<String, Vec<(String, git2::Oid)>> = BTreeMap::new();
-    for (path, contents) in files {
-        let blob = mirror.blob(contents.as_bytes()).unwrap();
-        match path.split_once('/') {
-            Some((directory, name)) => subtrees
-                .entry(directory.to_string())
-                .or_default()
-                .push((name.to_string(), blob)),
-            None => root_files.push(((*path).to_string(), blob)),
-        }
-    }
-    // Every git2 handle below borrows `mirror`, so they live in a block:
-    // the TreeBuilder is still alive at the end of the expression otherwise,
-    // and the repository cannot be moved out to the caller.
-    {
-        let mut root = mirror.treebuilder(None).unwrap();
-        for (name, blob) in root_files {
-            root.insert(&name, blob, 0o100644).unwrap();
-        }
-        for (directory, entries) in subtrees {
-            let mut sub = mirror.treebuilder(None).unwrap();
-            for (name, blob) in entries {
-                sub.insert(&name, blob, 0o100644).unwrap();
-            }
-            let oid = sub.write().unwrap();
-            root.insert(&directory, oid, 0o040000).unwrap();
-        }
-        let tree = mirror.find_tree(root.write().unwrap()).unwrap();
-        let signature = git2::Signature::now("mule", "mule@localhost").unwrap();
-        let head = mirror
-            .commit(None, &signature, &signature, "seed", &tree, &[])
-            .unwrap();
-        let commit = mirror.find_commit(head).unwrap();
-        mirror.branch("main", &commit, true).unwrap();
-    }
-    mirror
-}
-
 #[test]
-fn tree_listing_puts_directories_first_and_sizes_the_files() {
-    let dir = tempfile::tempdir().unwrap();
-    let mirror = browsable_mirror(
-        &dir,
-        &[
-            ("zebra.rs", "fn main() {}\n"),
-            ("src/lib.rs", "pub fn one() {}\n"),
-            ("alpha.md", "# title\n"),
-        ],
-    );
+fn forge_code_replies_keep_the_server_revision_and_preview_flags() {
+    let rev = "1".repeat(40);
+    let tree = tree_data(
+        serde_json::json!({ "tree": {
+            "rev": rev,
+            "born": true,
+            "entries": [{
+                "path": "src/lib.rs",
+                "name": "lib.rs",
+                "kind": "file"
+            }],
+            "truncated": true
+        }}),
+        "core".into(),
+        "src".into(),
+        7,
+    )
+    .unwrap();
+    assert_eq!(tree.generation, 7);
+    assert_eq!(tree.rev, "1".repeat(40));
+    assert!(tree.born);
+    assert!(tree.truncated);
+    assert_eq!(tree.entries[0].path, "src/lib.rs");
 
-    let root = read_tree(&mirror, "main", "").unwrap();
-    let names: Vec<&str> = root.iter().map(|entry| entry.name.as_str()).collect();
-    assert_eq!(names, vec!["src", "alpha.md", "zebra.rs"]);
-    assert_eq!(root[0].kind, "dir");
-    assert_eq!(root[0].size, 0);
-    assert_eq!(root[1].size, "# title\n".len() as i64);
-
-    // an empty rev resolves to the default branch, and a nested path lists
-    // that subtree with full paths.
-    let nested = read_tree(&mirror, "", "src").unwrap();
-    assert_eq!(nested.len(), 1);
-    assert_eq!(nested[0].path, "src/lib.rs");
-    assert_eq!(nested[0].kind, "file");
-}
-
-#[test]
-fn branch_presence_distinguishes_an_unborn_repo_from_an_empty_commit() {
-    let unborn_dir = tempfile::tempdir().unwrap();
-    let unborn = git2::Repository::init_bare(unborn_dir.path()).unwrap();
-    assert!(!mirror_has_born_branch(&unborn).unwrap());
-
-    let born_dir = tempfile::tempdir().unwrap();
-    let born = browsable_mirror(&born_dir, &[]);
-    assert!(mirror_has_born_branch(&born).unwrap());
-    assert!(
-        read_tree(&born, "", "").unwrap().is_empty(),
-        "a born branch can point at a real empty tree"
-    );
-}
-
-#[test]
-fn blob_read_counts_lines_and_names_binary_content() {
-    let dir = tempfile::tempdir().unwrap();
-    let mirror = browsable_mirror(&dir, &[("a.txt", "one\ntwo\n"), ("bin.dat", "head\0tail")]);
-
-    let text = read_blob(&mirror, "repo".into(), "main".into(), "a.txt".into(), 7).unwrap();
-    assert_eq!(text.generation, 7);
+    let text = blob_view(
+        serde_json::json!({ "blob": {
+            "rev": "1".repeat(40),
+            "path": "src/lib.rs",
+            "text": "one\ntwo\n",
+            "size": 8,
+            "truncated": true,
+            "binary": false
+        }}),
+        "core".into(),
+        8,
+    )
+    .unwrap();
     assert_eq!(text.lines, 2);
-    assert!(!text.binary && !text.truncated);
+    assert!(text.truncated && !text.binary);
 
-    let binary = read_blob(&mirror, "repo".into(), "main".into(), "bin.dat".into(), 7).unwrap();
-    assert!(binary.binary, "a NUL byte marks the blob binary");
+    let binary = blob_view(
+        serde_json::json!({ "blob": {
+            "rev": "1".repeat(40),
+            "path": "asset.bin",
+            "text": "",
+            "size": 400,
+            "truncated": false,
+            "binary": true
+        }}),
+        "core".into(),
+        9,
+    )
+    .unwrap();
+    assert!(binary.binary);
     assert_eq!(binary.lines, 0);
 
-    let missing = read_blob(&mirror, "repo".into(), "main".into(), "nope".into(), 7);
-    assert!(
-        missing.is_err(),
-        "a path that is not there must not read empty"
-    );
-}
-
-#[test]
-fn about_skips_headings_and_badges_and_names_the_language() {
-    let dir = tempfile::tempdir().unwrap();
-    let mirror = browsable_mirror(
-        &dir,
-        &[
-            (
-                "README.md",
-                "# ducktape\n\n[![badge](x)](y)\n\nThe consensus core.\nMore prose.\n\nA second paragraph.\n",
-            ),
-            ("a.rs", "fn a() {}\n"),
-            ("b.rs", "fn b() {}\n"),
-            ("c.rs", "fn c() {}\n"),
-        ],
-    );
-    let commit = mirror_commit_at(&mirror, "").unwrap();
-
-    // The whole first paragraph, rejoined — a README is hard wrapped, and
-    // taking one physical line ended this repo's own card mid-clause with no
-    // ellipsis to say it had been cut. The blank line still ends it.
     assert_eq!(
-        readme_about(&mirror, &commit),
-        "The consensus core. More prose."
+        blob_view(
+            serde_json::json!({ "blob": null }),
+            "core".into(),
+            10,
+        )
+        .unwrap_err(),
+        "the requested file was not found"
     );
-    assert_eq!(dominant_language(&commit), "Rust");
-}
-
-/// The card's about line is capped at 200 characters and says so with an
-/// ellipsis. Rejoining a wrapped paragraph is what makes the cap reachable —
-/// this repo's own opening paragraph is 202 characters across three lines, and
-/// before the rejoin no card could ever have shown the mark.
-#[test]
-fn a_long_about_line_is_cut_at_two_hundred_and_says_so() {
-    let dir = tempfile::tempdir().unwrap();
-    let wrapped = "A consensus-based workplace super-app: one BFT-replicated state machine that\nhosts isolated product modules - pages, forge, chat, agent workflows - the\nway CosmWasm isolates contracts, but in native Rust.\n";
-    let mirror = browsable_mirror(&dir, &[("README.md", wrapped), ("a.rs", "fn a() {}\n")]);
-    let commit = mirror_commit_at(&mirror, "").unwrap();
-
-    let about = readme_about(&mirror, &commit);
-    assert_eq!(about.chars().count(), 201, "200 characters plus the mark");
-    assert!(about.ends_with('…'), "a cut line says it was cut");
-    assert!(
-        about.starts_with("A consensus-based workplace super-app: one BFT-replicated state machine that hosts isolated"),
-        "the wrap is rejoined with a single space, not a newline: {about}"
-    );
-}
-
-// An unborn repo has no head oid to resolve, so the card gets nothing —
-// never a fabricated about line, language or stamp. The guard fires before
-// any mirror is opened, so the unreachable endpoint below is never dialled.
-#[test]
-fn an_unborn_head_derives_no_card_facts() {
-    assert_eq!(
-        repo_card_facts("http://127.0.0.1:1", "core", "(unborn)"),
-        (String::new(), String::new(), 0)
-    );
-}
-
-#[test]
-fn about_is_empty_without_a_readme_rather_than_invented() {
-    let dir = tempfile::tempdir().unwrap();
-    let mirror = browsable_mirror(&dir, &[("a.rs", "fn a() {}\n")]);
-    let commit = mirror_commit_at(&mirror, "").unwrap();
-
-    assert!(readme_about(&mirror, &commit).is_empty());
 }
 
 #[test]
@@ -4322,12 +4215,10 @@ async fn an_off_screen_plane_is_refused_before_it_touches_the_node() {
 }
 
 /// THE FORGE REPO LIST IS THE ONE UNSCOPED SLICE. Every other slice here is
-/// keyed on what the forge pane has open, but the list reloaded on EVERY forge
-/// chain op — a git-mirror walk per repo — while any other tab was on screen.
-/// Off the forge tab this reloads nothing, and reaching the (unreachable) node
-/// is what a lost gate would look like.
+/// keyed on what the forge pane has open. Off the forge tab this reloads
+/// nothing, and reaching the (unreachable) node is what a lost gate looks like.
 #[tokio::test(flavor = "current_thread")]
-async fn a_forge_op_does_not_walk_the_repo_mirrors_for_a_closed_pane() {
+async fn a_forge_op_does_not_load_the_repo_list_for_a_closed_pane() {
     let data = forge_live_refresh(
         "http://127.0.0.1:9".into(),
         String::new(),
