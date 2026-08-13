@@ -1,12 +1,10 @@
 // FORGE — the repo grid, the breadcrumb, the CODE BROWSER, the tracker rows,
 // the painted diff, and the review stamps.
 //
-// THE CODE TAB NEEDS NO WIRE CHANGE, and the campaign was wrong to refuse it as
-// "blocked on new module queries". `sync_forge_mirror` (app/src/backend.rs:2957)
-// keeps a bare git2 mirror of every branch of every repo under the key root and
-// already fetches `+refs/heads/*` for the merge preflight. A tree listing, a
-// blob read and a per-path last-commit are `git2` calls against a repository the
-// app has already cloned — `ForgeQuery` is not on that path at all.
+// THE CODE TAB READS BOUNDED SERVER QUERIES. Opening a repo transfers one tree
+// listing; opening a file transfers one capped preview, both pinned to the
+// exact commit returned by the root listing. The full git mirror belongs only
+// to merge preflight and never runs merely because somebody opened Code.
 //
 // WHAT IS STILL DELIBERATELY NOT HERE. Label pills, check runs, reviewer
 // digests, assignees, comment counts, a per-repo language dot / PR-issue tally,
@@ -115,7 +113,7 @@ component ForgeOrgHeader(org:str, about:str, repos:i64, tier:str, answered:bool)
 
 // One compact committed row: repo name and head. README/language/time are not
 // card facts — deriving them cold-fetched every full mirror before Forge became
-// usable. Code and merge fetch only the selected repo on demand.
+// usable. Code queries bounded server reads; only merge fetches a selected repo.
 component RepoCard(repo:ForgeRepo)
   emits
     forge_open_repo(str)
@@ -635,8 +633,7 @@ component ForgeCodeLine(number:str, code:str)
 // says WHICH, and the plate never claims the file is empty.
 //
 // The standing line above it is a fact about this surface and not a seed
-// string: the mirror is a fetch of the node's own forge remote, and the app
-// ships no editor for it.
+// string: the server answers committed code reads, and the app ships no editor.
 component ForgeCodeEmpty(name:str, note:str)
   box #root
     with

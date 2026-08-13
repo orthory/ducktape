@@ -6,7 +6,7 @@
 // one family, and the guards in main.rs name several of its members verbatim.
 // Everything outside that family drops the redundant `forge_` prefix.
 
-component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[ForgeRepo], list_phase:str, open_repo:str, repo_menu:bool, repo_phase:str, branches:[str], tab:str, items:[ForgeItem], tree_repo:str, tree_path:str, tree_born:bool, tree_entries:[TreeEntry], code_phase:str, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, forge_item_number:i64, item_phase:str, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:str, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, connected:bool, loading:bool)
+component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[ForgeRepo], list_phase:str, open_repo:str, repo_menu:bool, repo_phase:str, branches:[str], tab:str, items:[ForgeItem], tree_repo:str, tree_path:str, tree_born:bool, tree_entries:[TreeEntry], tree_truncated:bool, code_phase:str, file_path:str, file_text:str, file_binary:bool, file_truncated:bool, forge_item_number:i64, item_phase:str, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:str, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, connected:bool, loading:bool)
   emits
     forge_open_repo(str)
     forge_close_repo()
@@ -295,8 +295,8 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                 // the breadcrumb directly above already says it, and
                 // Ice has no string concatenation to join the two.
                 // `message` / `author` / `stamp` are the last commit
-                // under this path — the mirror could answer that with a
-                // revwalk, and until a loader does the three slots stay
+                // under this path — a future server log query could answer
+                // that, and until it does the three slots stay
                 // empty rather than printing a middot run around values
                 // nobody read. ForgeCodeHeader drops each empty slot by
                 // construction.
@@ -308,9 +308,8 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                     stamp=""
                   files:
                     // Loading, failure and a truly empty tree are different
-                    // facts. In particular, a slow first mirror fetch must
-                    // never paint "nothing committed" while bytes are still
-                    // arriving.
+                    // facts. In particular, an in-flight tree query must never
+                    // paint "nothing committed" before its answer arrives.
                     col w=fill
                       if code_phase == "tree_loading"
                         box
@@ -343,9 +342,17 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                                   size=11.5
                                   line-h=1.5
                                   @text-label
-                          if empty(tree_entries) && tree_born
+                          if empty(tree_entries) && tree_born && !tree_truncated
                             box w=fill pl=16.0 pr=16.0 pt=8.0
                               text "No files in this commit."
+                                with
+                                  w=fill
+                                  size=11.5
+                                  line-h=1.5
+                                  @text-label
+                          if empty(tree_entries) && tree_born && tree_truncated
+                            box w=fill pl=16.0 pr=16.0 pt=8.0
+                              text "This directory has entries that cannot be shown."
                                 with
                                   w=fill
                                   size=11.5
@@ -400,6 +407,14 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                                   active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
                                   hovered bg=rail_hover text=fg
                                   pressed bg=elevated text=fg
+                          if tree_truncated
+                            box w=fill p=12.0
+                              text "Some entries are not shown."
+                                with
+                                  w=fill
+                                  size=11.5
+                                  line-h=1.5
+                                  @text-label
                   source:
                     // The reader's states, each with its own true reason.
                     col w=fill
@@ -413,8 +428,10 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                         ForgeCodeEmpty name=file_path note="Could not load this file. Pick it again to retry."
                       if code_phase == "ready" && empty(file_path) && empty(tree_entries) && !tree_born
                         ForgeCodeEmpty name="" note="Nothing is committed on this repository yet, so there is no file to read."
-                      if code_phase == "ready" && empty(file_path) && empty(tree_entries) && tree_born
+                      if code_phase == "ready" && empty(file_path) && empty(tree_entries) && tree_born && !tree_truncated
                         ForgeCodeEmpty name="" note="This commit has no files to read."
+                      if code_phase == "ready" && empty(file_path) && empty(tree_entries) && tree_born && tree_truncated
+                        ForgeCodeEmpty name="" note="This directory has entries outside the browser's display limits."
                       if code_phase == "ready" && empty(file_path) && !empty(tree_entries)
                         ForgeCodeEmpty name="" note="Pick a file from the tree to read it."
                       if code_phase == "ready" && !empty(file_path) && file_binary
@@ -440,7 +457,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                             for line in source_lines(file_text)
                               ForgeCodeLine number=line.number code=line.text
                           if file_truncated
-                            text "Truncated at the reader's 64 KiB window — the file on the node is whole."
+                            text "This file is larger than the 64 KiB preview limit."
                               with
                                 size=11.5
                                 wrap=none

@@ -446,6 +446,7 @@ view
               tree_path=forge_tree_path
               tree_born=forge_tree_born
               tree_entries=forge_tree_entries
+              tree_truncated=forge_tree_truncated
               code_phase=forge_code_phase
               file_path=forge_file_path
               file_text=forge_file_text

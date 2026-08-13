@@ -324,7 +324,7 @@ on console_opened(id)
   page_search_hits = []
   page_search_generation = page_search_generation + 1
   page_searching = false
-  // Forge's open repo, tracker item, code mirror reading and drafts all name
+  // Forge's open repo, tracker item, code reading and drafts all name
   // the network being left. The new endpoint may even have the same repo/item
   // names, so identity strings cannot make any of these safe to retain.
   forge_generation = forge_generation + 1
@@ -357,6 +357,7 @@ on console_opened(id)
   forge_tree_path = ""
   forge_tree_born = false
   forge_tree_entries = []
+  forge_tree_truncated = false
   forge_file_path = ""
   forge_file_text = ""
   forge_file_binary = false

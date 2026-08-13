@@ -3777,111 +3777,71 @@ fn merge_builder_reports_conflicts_and_builds_nothing() {
     assert_eq!(paths, vec!["a.txt".to_string()]);
 }
 
-/// A bare mirror carrying one `main` commit, in the shape the browse
-/// readers take it: a born branch they can resolve by default. A path with
-/// one slash lands in a real subtree, which `mirror_commit`'s flat
-/// treebuilder cannot express.
-fn browsable_mirror(dir: &tempfile::TempDir, files: &[(&str, &str)]) -> git2::Repository {
-    let mirror = git2::Repository::init_bare(dir.path()).unwrap();
-    let mut root_files: Vec<(String, git2::Oid)> = Vec::new();
-    let mut subtrees: BTreeMap<String, Vec<(String, git2::Oid)>> = BTreeMap::new();
-    for (path, contents) in files {
-        let blob = mirror.blob(contents.as_bytes()).unwrap();
-        match path.split_once('/') {
-            Some((directory, name)) => subtrees
-                .entry(directory.to_string())
-                .or_default()
-                .push((name.to_string(), blob)),
-            None => root_files.push(((*path).to_string(), blob)),
-        }
-    }
-    // Every git2 handle below borrows `mirror`, so they live in a block:
-    // the TreeBuilder is still alive at the end of the expression otherwise,
-    // and the repository cannot be moved out to the caller.
-    {
-        let mut root = mirror.treebuilder(None).unwrap();
-        for (name, blob) in root_files {
-            root.insert(&name, blob, 0o100644).unwrap();
-        }
-        for (directory, entries) in subtrees {
-            let mut sub = mirror.treebuilder(None).unwrap();
-            for (name, blob) in entries {
-                sub.insert(&name, blob, 0o100644).unwrap();
-            }
-            let oid = sub.write().unwrap();
-            root.insert(&directory, oid, 0o040000).unwrap();
-        }
-        let tree = mirror.find_tree(root.write().unwrap()).unwrap();
-        let signature = git2::Signature::now("mule", "mule@localhost").unwrap();
-        let head = mirror
-            .commit(None, &signature, &signature, "seed", &tree, &[])
-            .unwrap();
-        let commit = mirror.find_commit(head).unwrap();
-        mirror.branch("main", &commit, true).unwrap();
-    }
-    mirror
-}
-
 #[test]
-fn tree_listing_puts_directories_first_and_sizes_the_files() {
-    let dir = tempfile::tempdir().unwrap();
-    let mirror = browsable_mirror(
-        &dir,
-        &[
-            ("zebra.rs", "fn main() {}\n"),
-            ("src/lib.rs", "pub fn one() {}\n"),
-            ("alpha.md", "# title\n"),
-        ],
-    );
+fn forge_code_replies_keep_the_server_revision_and_preview_flags() {
+    let rev = "1".repeat(40);
+    let tree = tree_data(
+        serde_json::json!({ "tree": {
+            "rev": rev,
+            "born": true,
+            "entries": [{
+                "path": "src/lib.rs",
+                "name": "lib.rs",
+                "kind": "file"
+            }],
+            "truncated": true
+        }}),
+        "core".into(),
+        "src".into(),
+        7,
+    )
+    .unwrap();
+    assert_eq!(tree.generation, 7);
+    assert_eq!(tree.rev, "1".repeat(40));
+    assert!(tree.born);
+    assert!(tree.truncated);
+    assert_eq!(tree.entries[0].path, "src/lib.rs");
 
-    let root = read_tree(&mirror, "main", "").unwrap();
-    let names: Vec<&str> = root.iter().map(|entry| entry.name.as_str()).collect();
-    assert_eq!(names, vec!["src", "alpha.md", "zebra.rs"]);
-    assert_eq!(root[0].kind, "dir");
-    assert_eq!(root[0].size, 0);
-    assert_eq!(root[1].size, "# title\n".len() as i64);
-
-    // an empty rev resolves to the default branch, and a nested path lists
-    // that subtree with full paths.
-    let nested = read_tree(&mirror, "", "src").unwrap();
-    assert_eq!(nested.len(), 1);
-    assert_eq!(nested[0].path, "src/lib.rs");
-    assert_eq!(nested[0].kind, "file");
-}
-
-#[test]
-fn branch_presence_distinguishes_an_unborn_repo_from_an_empty_commit() {
-    let unborn_dir = tempfile::tempdir().unwrap();
-    let unborn = git2::Repository::init_bare(unborn_dir.path()).unwrap();
-    assert!(!mirror_has_born_branch(&unborn).unwrap());
-
-    let born_dir = tempfile::tempdir().unwrap();
-    let born = browsable_mirror(&born_dir, &[]);
-    assert!(mirror_has_born_branch(&born).unwrap());
-    assert!(
-        read_tree(&born, "", "").unwrap().is_empty(),
-        "a born branch can point at a real empty tree"
-    );
-}
-
-#[test]
-fn blob_read_counts_lines_and_names_binary_content() {
-    let dir = tempfile::tempdir().unwrap();
-    let mirror = browsable_mirror(&dir, &[("a.txt", "one\ntwo\n"), ("bin.dat", "head\0tail")]);
-
-    let text = read_blob(&mirror, "repo".into(), "main".into(), "a.txt".into(), 7).unwrap();
-    assert_eq!(text.generation, 7);
+    let text = blob_view(
+        serde_json::json!({ "blob": {
+            "rev": "1".repeat(40),
+            "path": "src/lib.rs",
+            "text": "one\ntwo\n",
+            "size": 8,
+            "truncated": true,
+            "binary": false
+        }}),
+        "core".into(),
+        8,
+    )
+    .unwrap();
     assert_eq!(text.lines, 2);
-    assert!(!text.binary && !text.truncated);
+    assert!(text.truncated && !text.binary);
 
-    let binary = read_blob(&mirror, "repo".into(), "main".into(), "bin.dat".into(), 7).unwrap();
-    assert!(binary.binary, "a NUL byte marks the blob binary");
+    let binary = blob_view(
+        serde_json::json!({ "blob": {
+            "rev": "1".repeat(40),
+            "path": "asset.bin",
+            "text": "",
+            "size": 400,
+            "truncated": false,
+            "binary": true
+        }}),
+        "core".into(),
+        9,
+    )
+    .unwrap();
+    assert!(binary.binary);
     assert_eq!(binary.lines, 0);
 
-    let missing = read_blob(&mirror, "repo".into(), "main".into(), "nope".into(), 7);
-    assert!(
-        missing.is_err(),
-        "a path that is not there must not read empty"
+    assert_eq!(
+        blob_view(
+            serde_json::json!({ "blob": null }),
+            "core".into(),
+            10,
+        )
+        .unwrap_err(),
+        "the requested file was not found"
     );
 }
 

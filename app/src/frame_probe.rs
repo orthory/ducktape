@@ -493,15 +493,15 @@ fn console_in_forge_code() -> (Ducktape, iced::window::Id) {
     let _ = app.__update(__DucktapeMessage::ForgeTreeLoaded(backend::ForgeTreeData {
         generation: app.forge_code_generation,
         repo: "probe".into(),
-        rev: "dev".into(),
+        rev: "1111111111111111111111111111111111111111".into(),
         path: String::new(),
         born: true,
         entries: vec![backend::TreeEntry {
             name: "probe.rs".into(),
             path: "probe.rs".into(),
             kind: "file".into(),
-            size: 0,
         }],
+        truncated: false,
     }));
     let _ = app.__update(__DucktapeMessage::ForgeOpenFile("probe.rs".into()));
     let source = forge_source();
@@ -509,7 +509,7 @@ fn console_in_forge_code() -> (Ducktape, iced::window::Id) {
     let _ = app.__update(__DucktapeMessage::ForgeBlobLoaded(backend::BlobView {
         generation: app.forge_code_generation,
         repo: "probe".into(),
-        rev: "dev".into(),
+        rev: "1111111111111111111111111111111111111111".into(),
         path: "probe.rs".into(),
         text: source,
         truncated: false,

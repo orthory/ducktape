@@ -2,7 +2,8 @@
 // discussion. Every loader keys on `forge_generation`.
 
 // The committed namespace is the whole repo-card answer: name and head. Code
-// browsing and merge fetch their own selected repo only when those acts need it.
+// Browsing queries only the requested listing/blob; merge fetches the selected
+// repo only when that explicit act needs a client-computed commit.
 on forge_loaded(next)
   return if next.generation != forge_generation
   forge_list_phase = "ready"
@@ -45,6 +46,7 @@ on forge_open_repo(name)
   forge_tree_path = ""
   forge_tree_rev = ""
   forge_tree_entries = []
+  forge_tree_truncated = false
   forge_file_path = ""
   forge_file_text = ""
   forge_file_binary = false
@@ -326,6 +328,7 @@ state
   forge_tree_repo = ""
   forge_tree_entries:[TreeEntry] = []
   forge_tree_born = false
+  forge_tree_truncated = false
   forge_file_path = ""
   forge_file_text = ""
   forge_file_binary = false
@@ -348,6 +351,7 @@ on select_forge_tab(tab)
   forge_tree_path = ""
   forge_tree_rev = ""
   forge_tree_entries = []
+  forge_tree_truncated = false
   forge_file_path = ""
   forge_file_text = ""
   forge_file_binary = false
@@ -364,6 +368,11 @@ on forge_open_dir(path)
   forge_code_generation = forge_code_generation + 1
   forge_tree_path = path
   forge_tree_entries = []
+  forge_tree_truncated = false
+  forge_file_path = ""
+  forge_file_text = ""
+  forge_file_binary = false
+  forge_file_truncated = false
   forge_code_phase = "tree_loading"
   run replace lane=forge_code forge_tree(connected_rpc, forge_repo, forge_tree_rev, path, forge_code_generation) -> forge_tree_loaded _ | forge_tree_failed _
 
@@ -374,6 +383,7 @@ on forge_tree_loaded(next)
   forge_tree_path = next.path
   forge_tree_born = next.born
   forge_tree_entries = next.entries
+  forge_tree_truncated = next.truncated
   forge_code_phase = "ready"
   error = ""
 

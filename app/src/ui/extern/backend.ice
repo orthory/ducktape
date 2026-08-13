@@ -257,8 +257,8 @@ extern crate::backend
   load_forge_repo(rpc:str, repo:str, generation:i64) -> ForgeRepoData ! HydrationError
   load_forge_item(rpc:str, repo:str, number:i64, generation:i64) -> ForgeItemData ! HydrationError
   load_forge_discussion(rpc:str, channel_id:str, generation:i64) -> ForgeDiscussionData ! HydrationError
-  TreeEntry(name:str, path:str, kind:str, size:i64)
-  ForgeTreeData(generation:i64, repo:str, rev:str, path:str, born:bool, entries:[TreeEntry])
+  TreeEntry(name:str, path:str, kind:str)
+  ForgeTreeData(generation:i64, repo:str, rev:str, path:str, born:bool, entries:[TreeEntry], truncated:bool)
   BlobView(generation:i64, repo:str, rev:str, path:str, text:str, truncated:bool, binary:bool, lines:i64)
   forge_tree(rpc:str, repo:str, rev:str, path:str, generation:i64) -> ForgeTreeData ! HydrationError
   forge_blob(rpc:str, repo:str, rev:str, path:str, generation:i64) -> BlobView ! HydrationError
