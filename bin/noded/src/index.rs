@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 
@@ -381,10 +381,14 @@ pub(crate) async fn index_view(
         },
         Err(err) => index_error(err),
     };
-    if let Some((height, seq)) = folded
-        && let Ok(value) = format!("{height}:{seq}").parse()
-    {
-        response.headers_mut().insert(FOLDED_HEADER, value);
+    if let Some((height, seq)) = folded {
+        // infallible on purpose: ABSENT is the one honest way to say "no tip"
+        // (§3.2.4), so a header dropped for any other reason would read to the
+        // caller as an unstamped module. two integers and a colon are visible
+        // ascii, which is exactly what a header value may hold.
+        let watermark = HeaderValue::from_str(&format!("{height}:{seq}"))
+            .expect("a numeric watermark is a valid header value");
+        response.headers_mut().insert(FOLDED_HEADER, watermark);
     }
     response
 }
