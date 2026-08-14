@@ -1446,7 +1446,12 @@ where
 }
 
 /// Install the stop handlers NOW and return a future that waits on them: SIGTERM
-/// is what systemd and a killed shell send, SIGINT is Ctrl-C.
+/// is what systemd and a killed shell send, SIGINT is Ctrl-C, and SIGHUP is a
+/// dropped ssh session or a closed terminal. SIGHUP must run the same teardown:
+/// the podman service child sits in its OWN process group (so Ctrl-C cannot kill
+/// it before the container sweep), which also means the terminal's HUP no longer
+/// reaches it — without this arm, a hangup would kill the daemon at default
+/// disposition and leave the detached podman running indefinitely.
 ///
 /// The split matters. `signal()` installs the handler when it is CALLED; the
 /// future it returns only waits. Building that future lazily inside a `select!`
@@ -1469,9 +1474,12 @@ where
 /// the new socket on the same graph root. That path must keep working; it is the
 /// only one a SIGKILL has.
 ///
-/// A handler that will not install is NOT fatal — the daemon then dies the way
-/// it did before this arm existed, which is old behavior rather than a new
-/// failure. The future parks so the daemon keeps owning the process.
+/// A handler that will not install is NOT fatal, but it is not harmless either:
+/// the daemon then dies at signal default with no teardown, and because podman
+/// is in its own process group the service survives that death — the SIGKILL
+/// shape, cleaned up only by the next start of this kind ([`PodmanService::
+/// claim`]'s reap plus the boot sweep). The future parks so the daemon keeps
+/// owning the process.
 ///
 /// The other half is deliberately NOT closed, and should stay open: tokio's
 /// handlers remain installed after these `Signal`s drop, so a SECOND SIGTERM
@@ -1482,9 +1490,13 @@ where
 /// this.
 fn arm_stop_requested() -> impl std::future::Future<Output = ()> {
     use tokio::signal::unix::{SignalKind, signal};
-    let armed = (signal(SignalKind::terminate()), signal(SignalKind::interrupt()));
+    let armed = (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+        signal(SignalKind::hangup()),
+    );
     async move {
-        let (Ok(mut terminate), Ok(mut interrupt)) = armed else {
+        let (Ok(mut terminate), Ok(mut interrupt), Ok(mut hangup)) = armed else {
             tracing::warn!(
                 target: "ducktape::service",
                 reason = "signal_handler_install_failed",
@@ -1495,6 +1507,7 @@ fn arm_stop_requested() -> impl std::future::Future<Output = ()> {
         tokio::select! {
             _ = terminate.recv() => {}
             _ = interrupt.recv() => {}
+            _ = hangup.recv() => {}
         }
     }
 }
@@ -1571,7 +1584,24 @@ pub(crate) async fn sweep_own_containers(
         return;
     };
     let label = provider_host::managed_label(&grant.display_id());
-    let outcome = provider_host::reap_by_label(socket, &label).await;
+    // Bounded: `reap_by_label` has no timeout of its own, and a wedged podman
+    // socket must not hang the stop path forever — the second Ctrl-C is
+    // deliberately swallowed (see `arm_stop_requested`), so a hang here would
+    // leave SIGKILL, which orphans the detached podman group, as the only exit.
+    // 30s is load-stated: podman's default stop grace is 10s per container and
+    // one daemon's label rarely covers more than a couple of live runs, while a
+    // WEDGED socket answers nothing at any deadline — past 30s the bound costs
+    // only stop latency. Expiry maps to `SweepReport::Failed`, which both ends
+    // of the daemon's life already declare non-fatal.
+    const SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+    let sweep_future = provider_host::reap_by_label(socket, &label);
+    let outcome = match tokio::time::timeout(SWEEP_BUDGET, sweep_future).await {
+        Ok(outcome) => outcome,
+        Err(_elapsed) => Err(format!(
+            "sweep did not finish within {}s — podman socket not answering",
+            SWEEP_BUDGET.as_secs()
+        )),
+    };
     match sweep_report(sweep, outcome) {
         SweepReport::Quiet => {}
         // a crash destroyed work: once per boot, and the operator's runs are
