@@ -6,14 +6,11 @@ use iced::advanced::widget::{Operation, Tree, tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, renderer};
 use iced::futures::SinkExt as _;
 use iced::{Element, Length, Rectangle, Size, Subscription, Theme, mouse};
-use iced_term::actions::Action;
-use iced_term::settings::{BackendSettings, FontSettings, Settings, ThemeSettings};
-use iced_term::{ColorPalette, Command, Event, Terminal, TerminalView};
+use ui_lang_components::ui::terminal;
 use saga::{SagaQuery, SagaReply, SagaStatus, SagaView};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
-use std::sync::MutexGuard;
 use tokio_tungstenite::tungstenite::Message;
 
 const AGENT_CONTEXT_ROWS: usize = 32;
@@ -26,17 +23,16 @@ const RUNNER_RESULT_VERSION: u64 = 1;
 /// a test below pins.
 const LOCAL_HOST_NODE: &str = "This node";
 
-static NEXT_AGENT_TERMINAL_ID: AtomicU64 = AtomicU64::new(1);
-
+/// The app's handle on a `ducktape agent pty` session. The pty engine, its grid
+/// and the widget that draws it are `ui_lang_components::ui::terminal`; this is
+/// the Ice-facing wrapper, which exists so the extern type keeps its name and
+/// the app decides what a notice means.
 #[derive(Clone)]
-pub struct AgentTerminalSession {
-    id: u64,
-    terminal: Option<Arc<Mutex<Terminal>>>,
-}
+pub struct AgentTerminalSession(terminal::Session);
 
 impl Hash for AgentTerminalSession {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
+        self.0.hash(state);
     }
 }
 
@@ -125,10 +121,7 @@ struct AgentRunnerResult {
 }
 
 pub fn idle_agent_terminal() -> AgentTerminalSession {
-    AgentTerminalSession {
-        id: 0,
-        terminal: None,
-    }
+    AgentTerminalSession(terminal::idle_session())
 }
 
 pub async fn start_agent_terminal(
@@ -142,37 +135,22 @@ pub async fn start_agent_terminal(
     let program = ducktape_binary();
     let working_directory =
         std::env::current_dir().map_err(|error| AppError::from(error.to_string()))?;
-    let id = NEXT_AGENT_TERMINAL_ID.fetch_add(1, Ordering::Relaxed);
     let title = format!("{} · raw session", provider_title(provider));
-    let settings = agent_terminal_settings(program, args, working_directory);
-    let terminal = Terminal::new(id, settings)
-        .map_err(|error| AppError::from(format!("Could not start {title}: {error}")))?;
+    let session = terminal::spawn_session(program, args, working_directory, title.clone())
+        .map_err(|error| AppError::from(error.message))?;
 
     Ok(AgentTerminalStarted {
-        session: AgentTerminalSession {
-            id,
-            terminal: Some(Arc::new(Mutex::new(terminal))),
-        },
+        session: AgentTerminalSession(session),
         title,
     })
 }
 
 pub fn agent_terminal_events(session: AgentTerminalSession) -> Subscription<AgentTerminalNotice> {
-    let Some(terminal) = session.terminal.clone() else {
-        return Subscription::none();
-    };
-    let subscription = agent_terminal_lock(&terminal).subscription();
-    subscription.with(session).map(agent_terminal_notice)
+    terminal::terminal_events(session.0).map(agent_terminal_notice)
 }
 
 pub fn agent_terminal_surface(session: &AgentTerminalSession) -> Element<'static, ()> {
-    let Some(terminal) = session.terminal.clone() else {
-        return iced::widget::text("Start a session to open the agent terminal.").into();
-    };
-    Element::new(SharedAgentTerminal {
-        terminal,
-        id: session.id,
-    })
+    terminal::terminal_surface(&session.0)
 }
 
 /// Parsed Markdown whose items live with the widget instead of borrowing an
@@ -184,11 +162,7 @@ pub fn agent_markdown(source: String, dark: bool) -> Element<'static, String> {
 }
 
 pub fn focus_agent_terminal(session: AgentTerminalSession) -> iced::Task<()> {
-    let Some(terminal) = session.terminal else {
-        return iced::Task::none();
-    };
-    let widget_id = agent_terminal_lock(&terminal).widget_id().clone();
-    TerminalView::focus(widget_id)
+    terminal::focus_terminal(session.0)
 }
 
 pub async fn load_agent_credentials(
@@ -1002,93 +976,16 @@ fn clip_text(text: &str, limit: usize) -> String {
     format!("{}…", &text[..end])
 }
 
-fn agent_terminal_settings(
-    program: PathBuf,
-    args: Vec<String>,
-    working_directory: PathBuf,
-) -> Settings {
-    let mut environment = HashMap::new();
-    environment.insert("TERM".into(), "xterm-256color".into());
-    environment.insert("COLORTERM".into(), "truecolor".into());
-    environment.insert("TERM_PROGRAM".into(), "ducktape-app".into());
-    let palette = ColorPalette {
-        foreground: "#e7eaf0".into(),
-        background: "#090b0e".into(),
-        black: "#1b2028".into(),
-        red: "#ff7b86".into(),
-        green: "#6fdc8c".into(),
-        yellow: "#f4c95d".into(),
-        blue: "#7c9cff".into(),
-        magenta: "#c792ea".into(),
-        cyan: "#66d9d0".into(),
-        white: "#d9dee8".into(),
-        bright_black: "#697386".into(),
-        bright_red: "#ff9aa3".into(),
-        bright_green: "#8be9a8".into(),
-        bright_yellow: "#ffe08a".into(),
-        bright_blue: "#a6baff".into(),
-        bright_magenta: "#ddb3f5".into(),
-        bright_cyan: "#8ce8e1".into(),
-        bright_white: "#ffffff".into(),
-        ..ColorPalette::default()
-    };
-    Settings {
-        font: FontSettings {
-            size: 14.0,
-            scale_factor: 1.25,
-            font_type: iced::Font::MONOSPACE,
-        },
-        theme: ThemeSettings::new(Box::new(palette)),
-        backend: BackendSettings {
-            program: program.to_string_lossy().into_owned(),
-            args,
-            env: environment,
-            working_directory: Some(working_directory),
-        },
+/// The component reports `attention` as well; the app's Ice surface carries a
+/// running flag and a title, so this is where the pty's bell is dropped. A
+/// session that stopped running keeps the component's closing title.
+fn agent_terminal_notice(notice: terminal::Notice) -> AgentTerminalNotice {
+    AgentTerminalNotice {
+        running: notice.running,
+        title: notice.title,
     }
 }
 
-fn process_agent_terminal_event(terminal: &Arc<Mutex<Terminal>>, id: u64, event: Event) -> Action {
-    let Event::BackendCall(event_id, command) = event;
-    if event_id != id {
-        return Action::Ignore;
-    }
-    agent_terminal_lock(terminal).handle(Command::ProxyToBackend(command))
-}
-
-fn agent_terminal_notice((session, event): (AgentTerminalSession, Event)) -> AgentTerminalNotice {
-    let Some(terminal) = &session.terminal else {
-        return AgentTerminalNotice {
-            running: false,
-            title: String::new(),
-        };
-    };
-    match process_agent_terminal_event(terminal, session.id, event) {
-        Action::Shutdown => AgentTerminalNotice {
-            running: false,
-            title: "Session ended".into(),
-        },
-        Action::ChangeTitle(title) => AgentTerminalNotice {
-            running: true,
-            title,
-        },
-        Action::Ignore => AgentTerminalNotice {
-            running: true,
-            title: String::new(),
-        },
-    }
-}
-
-fn agent_terminal_lock(terminal: &Arc<Mutex<Terminal>>) -> MutexGuard<'_, Terminal> {
-    terminal
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-struct SharedAgentTerminal {
-    terminal: Arc<Mutex<Terminal>>,
-    id: u64,
-}
 
 struct AgentMarkdown {
     items: Rc<[iced::widget::markdown::Item]>,
@@ -1237,157 +1134,7 @@ impl Widget<String, Theme, iced::Renderer> for AgentMarkdown {
     }
 }
 
-struct SharedAgentTerminalState {
-    session_id: u64,
-}
 
-impl SharedAgentTerminalState {
-    fn switch_to(&mut self, session_id: u64) -> bool {
-        if self.session_id == session_id {
-            false
-        } else {
-            self.session_id = session_id;
-            true
-        }
-    }
-}
-
-impl Widget<(), Theme, iced::Renderer> for SharedAgentTerminal {
-    fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<SharedAgentTerminalState>()
-    }
-
-    fn state(&self) -> tree::State {
-        tree::State::new(SharedAgentTerminalState {
-            session_id: self.id,
-        })
-    }
-
-    fn children(&self) -> Vec<Tree> {
-        let terminal = agent_terminal_lock(&self.terminal);
-        let content = TerminalView::show(&terminal);
-        vec![Tree::new(content.as_widget())]
-    }
-
-    fn diff(&self, tree: &mut Tree) {
-        let terminal = agent_terminal_lock(&self.terminal);
-        let content = TerminalView::show(&terminal);
-        let session_changed = tree
-            .state
-            .downcast_mut::<SharedAgentTerminalState>()
-            .switch_to(self.id);
-        if session_changed {
-            tree.children = vec![Tree::new(content.as_widget())];
-        } else {
-            tree.diff_children(&[content.as_widget()]);
-        }
-    }
-
-    fn size(&self) -> Size<Length> {
-        Size::new(Length::Fill, Length::Fill)
-    }
-
-    fn layout(
-        &mut self,
-        tree: &mut Tree,
-        renderer: &iced::Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
-        let terminal = agent_terminal_lock(&self.terminal);
-        let mut content = TerminalView::show(&terminal);
-        content
-            .as_widget_mut()
-            .layout(&mut tree.children[0], renderer, limits)
-    }
-
-    fn operate(
-        &mut self,
-        tree: &mut Tree,
-        layout: Layout<'_>,
-        renderer: &iced::Renderer,
-        operation: &mut dyn Operation,
-    ) {
-        let terminal = agent_terminal_lock(&self.terminal);
-        let mut content = TerminalView::show(&terminal);
-        operation.traverse(&mut |operation| {
-            content
-                .as_widget_mut()
-                .operate(&mut tree.children[0], layout, renderer, operation);
-        });
-    }
-
-    fn draw(
-        &self,
-        tree: &Tree,
-        renderer: &mut iced::Renderer,
-        theme: &Theme,
-        style: &renderer::Style,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        viewport: &Rectangle,
-    ) {
-        let terminal = agent_terminal_lock(&self.terminal);
-        let content = TerminalView::show(&terminal);
-        content.as_widget().draw(
-            &tree.children[0],
-            renderer,
-            theme,
-            style,
-            layout,
-            cursor,
-            viewport,
-        );
-    }
-
-    fn update(
-        &mut self,
-        tree: &mut Tree,
-        event: &iced::Event,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        renderer: &iced::Renderer,
-        clipboard: &mut dyn Clipboard,
-        shell: &mut Shell<'_, ()>,
-        viewport: &Rectangle,
-    ) {
-        let mut messages = Vec::new();
-        let mut terminal_shell = Shell::new(&mut messages);
-        {
-            let terminal = agent_terminal_lock(&self.terminal);
-            let mut content = TerminalView::show(&terminal);
-            content.as_widget_mut().update(
-                &mut tree.children[0],
-                event,
-                layout,
-                cursor,
-                renderer,
-                clipboard,
-                &mut terminal_shell,
-                viewport,
-            );
-        }
-        let terminal = self.terminal.clone();
-        let id = self.id;
-        shell.merge(terminal_shell, move |event| {
-            process_agent_terminal_event(&terminal, id, event);
-        });
-    }
-
-    fn mouse_interaction(
-        &self,
-        tree: &Tree,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        viewport: &Rectangle,
-        renderer: &iced::Renderer,
-    ) -> mouse::Interaction {
-        let terminal = agent_terminal_lock(&self.terminal);
-        let content = TerminalView::show(&terminal);
-        content
-            .as_widget()
-            .mouse_interaction(&tree.children[0], layout, cursor, viewport, renderer)
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1624,13 +1371,5 @@ mod tests {
         drifted["ducktape_runner_result"] = serde_json::json!(1);
         drifted["legacy"] = serde_json::json!(true);
         assert!(agent_response_text(drifted.to_string().as_bytes()).is_err());
-    }
-
-    #[test]
-    fn terminal_widget_state_resets_for_a_new_session() {
-        let mut state = SharedAgentTerminalState { session_id: 1 };
-        assert!(!state.switch_to(1));
-        assert!(state.switch_to(2));
-        assert!(!state.switch_to(2));
     }
 }
