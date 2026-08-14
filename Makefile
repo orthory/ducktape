@@ -74,17 +74,20 @@ coordinator-smoke:
 	$(CARGO) test -p coordinator-bin
 
 ifeq ($(UNAME_S),Darwin)
-# the ducktape-ui rev the app pins; cargo-ice comes from the same repo
+# Build cargo-ice from the same ducktape-ui rev as the app. A global cargo-ice
+# can parse a different language than the compiler in app/Cargo.toml.
 ICE_REV = $(shell sed -n 's/.*ducktape-ui.git", rev = "\([^"]*\)".*/\1/p' app/Cargo.toml | head -n1)
+ICE_ROOT = $(CURDIR)/target/cargo-ice/$(ICE_REV)
+ICE_BIN = $(ICE_ROOT)/bin/cargo-ice
+
+$(ICE_BIN):
+	CARGO_TARGET_DIR="$(CURDIR)/target/cargo-ice-build" $(CARGO) install cargo-ice \
+		--git https://github.com/byeongsu-hong/ducktape-ui.git \
+		--rev "$(ICE_REV)" --locked --root "$(ICE_ROOT)"
 
 ## build the signed-ad-hoc Ducktape.app and DMG under target/ice-bundle
-app:
-	@command -v cargo-ice >/dev/null 2>&1 || { \
-		echo "cargo-ice is not installed; install it with:" >&2; \
-		echo "  cargo install cargo-ice --git https://github.com/byeongsu-hong/ducktape-ui.git --rev $(ICE_REV) --locked" >&2; \
-		exit 2; \
-	}
-	$(CARGO) ice bundle -p ducktape-app
+app: $(ICE_BIN)
+	"$(ICE_BIN)" bundle -p ducktape-app
 
 ## install the operator CLI and desktop app without requiring root
 install: install-node install-app
