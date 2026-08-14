@@ -474,9 +474,14 @@ on chat_composer_event(event)
   // Sending is a jump to now: the minted row lands at the tail, and a reader
   // who had scrolled up would otherwise get her own send below the fold —
   // an optimistic insert she cannot see is no confirmation at all.
+  //
+  // `snap … 0.0`, NOT `snap-end`: the stream is `anchor-y=end`, where the
+  // offset counts FROM the tail — relative 0.0 IS the tail. `snap-end` is
+  // relative 1.0, which an end anchor translates to the TOP of history; it
+  // shipped once and every send hurled the reader to the oldest loaded row.
   parallel
     run every send_message(connected_rpc, password, active_channel, pending_message_id, pending_message, channel_members) -> message_sent _ | message_send_failed _
-    task widget snap-end #workspace-tabs/content/chat/message-stream
+    task widget snap #workspace-tabs/content/chat/message-stream 0.0 0.0
 
 on message_sent(next)
   return if active_channel != next.channel_id
