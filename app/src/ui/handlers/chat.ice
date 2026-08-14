@@ -471,7 +471,12 @@ on chat_composer_event(event)
   has_older_history = history_has_older(messages)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   error = ""
-  run every send_message(connected_rpc, password, active_channel, pending_message_id, pending_message, channel_members) -> message_sent _ | message_send_failed _
+  // Sending is a jump to now: the minted row lands at the tail, and a reader
+  // who had scrolled up would otherwise get her own send below the fold —
+  // an optimistic insert she cannot see is no confirmation at all.
+  parallel
+    run every send_message(connected_rpc, password, active_channel, pending_message_id, pending_message, channel_members) -> message_sent _ | message_send_failed _
+    task widget snap-end #workspace-tabs/content/chat/message-stream
 
 on message_sent(next)
   return if active_channel != next.channel_id

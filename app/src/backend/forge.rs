@@ -888,17 +888,18 @@ pub fn code_theme(dark: bool) -> iced::highlighter::Theme {
 /// app palette's stable code roles (`rail`, `forge_gutter_ink`,
 /// `strong_ink` in `theme.ice`), matched per appearance like `AgentMarkdown`.
 ///
-/// KEYED LAZY, the app's adopted projection idiom: the tokenize + row build
-/// runs only when the blob, path, or appearance changes; every other rebuild
-/// is one hash of the key. Without it the full-file build re-ran per frame
-/// and blew the forge-code frame probe's allocation ceiling. `BlobView.text`
-/// is read-capped at 64 KiB upstream, which bounds the one-time build; the
-/// screen's scroll pane owns scrolling.
+/// EAGER ON PURPOSE. This extern once wrapped its surface in a raw
+/// `iced::widget::lazy` — the app's ONLY use of iced's own Lazy, a boundary
+/// nothing else in the codebase exercises — and the shipped pane drew nothing
+/// for every code blob while the same tree passed the headless probes. The
+/// memo boundary lives at the Ice mount now (`lazy … by` in
+/// screens/forge.ice), the projection idiom every other cached surface here
+/// already uses, so the tokenize + row build still runs only when the blob,
+/// path, or appearance moves. `BlobView.text` is read-capped at 64 KiB
+/// upstream, which bounds the one-time build; the screen's scroll pane owns
+/// scrolling.
 pub fn forge_code(source: String, path: String, dark: bool) -> iced::Element<'static, ()> {
-    iced::widget::lazy((source, path, dark), |(source, path, dark)| {
-        code_surface(source, path, *dark)
-    })
-    .into()
+    code_surface(&source, &path, dark)
 }
 
 fn code_surface(source: &str, path: &str, dark: bool) -> iced::Element<'static, ()> {
@@ -920,6 +921,18 @@ fn code_surface(source: &str, path: &str, dark: bool) -> iced::Element<'static, 
         ),
     };
     let mono = iced::Font::with_name("Geist Mono");
+    // An empty blob must say so: zero rows is a zero-height, invisible
+    // surface, and a pane that renders nothing is unreportable.
+    if source.is_empty() {
+        return container(
+            text("This file is empty.")
+                .size(CODE_SIZE)
+                .font(mono)
+                .color(gutter_ink),
+        )
+        .padding(iced::Padding::ZERO.left(13.0))
+        .into();
+    }
     let mut stream = Stream::new(&Settings {
         theme: code_theme(dark),
         token: code_token(path),

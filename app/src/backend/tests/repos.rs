@@ -22,6 +22,27 @@ fn the_forge_hint_is_a_command_that_actually_pushes() {
 }
 
 #[test]
+fn highlight_ranges_hold_char_boundaries_on_real_sources() {
+    // this repo's own sources carry the multibyte punctuation ('—', '·', '→')
+    // an ASCII probe never exercises; a syntect range that split a UTF-8 char
+    // would make `code_surface`'s `line[range]` panic inside the live view.
+    let rust = include_str!("../forge.rs");
+    let toml = include_str!("../../../Cargo.toml");
+    for (path, source) in [("forge.rs", rust), ("Cargo.toml", toml)] {
+        let mut stream = iced::highlighter::Stream::new(&iced::highlighter::Settings {
+            theme: code_theme(true),
+            token: code_token(path),
+        });
+        for line in source.lines() {
+            for (range, _highlight) in stream.highlight_line(line) {
+                let _ = line[range].to_string();
+            }
+            stream.commit();
+        }
+    }
+}
+
+#[test]
 fn forge_code_tokens_follow_the_path_and_rust_really_colors() {
     assert_eq!(code_token("src/main.rs"), "rs");
     assert_eq!(code_token("a/b/query.SQL"), "sql");

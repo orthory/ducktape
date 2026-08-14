@@ -829,13 +829,12 @@ pub fn bounded_chat_window(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
     committed
 }
 
-/// Keep the thread root and one sliding reply page. Pending replies live at
-/// the newest edge and displace the oldest committed replies before they are
-/// ever discarded themselves.
+/// Keep the thread root and one sliding reply page, with the replies' author
+/// runs marked. Pending replies live at the newest edge and displace the
+/// oldest committed replies before they are ever discarded themselves. The
+/// root is held out of the marking pass: it renders as its own divided block,
+/// so the first reply always opens a run.
 pub fn bounded_thread_window(mut messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    if messages.len() <= THREAD_HOT_WINDOW_LIMIT {
-        return messages;
-    }
     let root_index = messages
         .iter()
         .position(|message| !message.pending && message.seq > 0 && message.thread_seq == 0);
@@ -1020,7 +1019,9 @@ pub fn merge_thread_reply(
             reply.view_key = messages[index].view_key;
             messages[index] = reply;
         }
-        return messages;
+        // still through the window fold: a replace that flips `deleted`
+        // re-breaks the author runs around it.
+        return bounded_thread_window(messages);
     }
     if let Some(view_key) = pending_key {
         reply.view_key = view_key;

@@ -1285,6 +1285,88 @@ fn probe_row_repaint() {
     );
 }
 
+/// THE READER MUST DRAW THE BLOB. Everything around the code pane — the path
+/// header, the tabs, the tree — is identical across two blobs at the same
+/// path, so a rewritten blob that paints identical pixels means the
+/// `forge_code` surface renders nothing at all for the file it says it has
+/// open. The allocation probes cannot catch that: a subtree that draws
+/// nothing passes any ceiling trivially.
+#[test]
+fn the_forge_code_pane_draws_the_loaded_blob() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(probe_forge_code_content)
+        .expect("the forge content probe thread spawns")
+        .join()
+        .expect("the forge content probe thread finishes");
+}
+
+fn probe_forge_code_content() {
+    let (mut app, console) = console_in_forge_code();
+    let mut renderer = headless_renderer();
+    let (cache, first) = drawn_frame(
+        &mut app,
+        console,
+        &mut renderer,
+        user_interface::Cache::default(),
+    );
+    let (cache, control) = drawn_frame(&mut app, console, &mut renderer, cache);
+    assert!(
+        first == control,
+        "an unchanged frame must draw identical pixels — without this control \
+         the content assertion below proves nothing"
+    );
+
+    let _ = app.__update(__DucktapeMessage::ForgeBlobLoaded(backend::BlobView {
+        repo: "probe".into(),
+        rev: "1111111111111111111111111111111111111111".into(),
+        path: "probe.rs".into(),
+        text: "const REWRITTEN: bool = true;\n".into(),
+        truncated: false,
+        binary: false,
+        lines: 1,
+    }));
+    assert_eq!(app.forge_file_text.lines().count(), 1);
+    let (cache, rewritten) = drawn_frame(&mut app, console, &mut renderer, cache);
+    assert!(
+        control != rewritten,
+        "a rewritten blob must repaint the code pane — identical pixels mean \
+         the reader is drawing nothing for the file it says it has open"
+    );
+
+    // The live app pumps real events between frames; a cached boundary that
+    // loses its element to the event walk's tree diff evades a build+draw
+    // probe. A scroll down and back over the pane must land on the pixels it
+    // started from.
+    let mut clipboard = clipboard::Null;
+    let mut queued: Vec<__DucktapeMessage> = Vec::new();
+    let position = Point::new(700.0, 300.0);
+    let cursor = mouse::Cursor::Available(position);
+    let mut ui = UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer);
+    let _ = ui.update(
+        &[
+            Event::Mouse(mouse::Event::CursorMoved { position }),
+            Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines { x: 0.0, y: -3.0 },
+            }),
+            Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines { x: 0.0, y: 30.0 },
+            }),
+        ],
+        cursor,
+        &mut renderer,
+        &mut clipboard,
+        &mut queued,
+    );
+    let cache = ui.into_cache();
+    let (_, after_events) = drawn_frame(&mut app, console, &mut renderer, cache);
+    assert!(
+        rewritten == after_events,
+        "a scroll down and back over the code pane must restore the frame — \
+         different pixels mean the surface lost its content to the event diff"
+    );
+}
+
 fn probe() {
     let (mut app, console) = console_in_chat();
     let mut renderer = headless_renderer();

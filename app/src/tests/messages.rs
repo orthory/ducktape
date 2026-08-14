@@ -623,13 +623,13 @@ fn consecutive_sends_stay_in_one_author_run() {
     );
 }
 
-/// THE RAIL IS NOT A PLAIN RUN, SO THE MINT MUST NOT RE-MARK IT.
+/// THE RAIL IS NOT A PLAIN RUN, SO THE MINT RE-MARKS THE REPLIES ONLY.
 ///
 /// A thread's vec is `[root] ++ replies` and the root renders as its own divided
-/// block, so `load_thread_data` marks the REPLIES only. Re-marking the whole vec
-/// when a reply is minted folds the first reply under a root that shares its
-/// author and swallows that reply's header — which then comes back on the next
-/// thread load: the same render jump, one pane over.
+/// block, so the window fold marks the REPLIES only: the first reply keeps its
+/// header even under a root that shares its author, and a minted reply that
+/// continues the previous reply's run folds under it — one header per run, the
+/// same grouping the timeline draws.
 #[test]
 fn a_minted_reply_keeps_the_first_reply_header() {
     let (mut app, _) = Ducktape::__boot();
@@ -660,7 +660,8 @@ fn a_minted_reply_keeps_the_first_reply_header() {
         .collect();
     assert_eq!(
         headers,
-        vec![true, true, true],
-        "the root's header and the first reply's both stand"
+        vec![true, true, false],
+        "the root's header and the first reply's both stand; the minted reply \
+         continues the run"
     );
 }

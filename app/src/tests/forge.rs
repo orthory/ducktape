@@ -287,8 +287,13 @@ fn forge_source_and_diff_rows_share_a_compact_code_style() {
     assert!(source.contains("pub const CODE_GUTTER_WIDTH: f32 = 44.0;"));
     let screen = inlined(include_str!("../ui/screens/forge.ice"));
     assert!(
-        screen.contains("extern forge_code(file_text, file_path, dark) #forge-code"),
+        screen.contains("extern forge_code(cached_source, file_path, dark) #forge-code"),
         "the code pane mounts the highlighted reader"
+    );
+    assert!(
+        screen.contains("lazy file_text by file_text, file_path, dark as cached_source"),
+        "the reader's memo boundary is the Ice mount's lazy — the app keeps \
+         zero raw iced Lazy uses"
     );
 
     let components = inlined(include_str!("../ui/components/forge.ice"));
