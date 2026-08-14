@@ -205,10 +205,11 @@ pub fn palette_key_action(
 /// names a layer that is no longer on screen: Escape then "closes" an
 /// invisible menu while the visible screen swallows the press, and the scroll
 /// reader refuses to move a pane nothing is actually covering. Which scope a
-/// rung gets is read off `view.ice`'s slot layout, not guessed: `slot chat` /
-/// `slot forge` sit inside `match tab`, so their menus are per-tab mounts,
-/// while `slot palette` and `slot bell` sit OUTSIDE it — the palette, the bell
-/// and the create modal ride every tab and stay global on purpose.
+/// rung gets is read off the slot layout in `components/shell.ice`, not
+/// guessed: `slot chat` / `slot forge` sit inside `match tab`, so their menus
+/// are per-tab mounts, while `slot palette` and `slot bell` sit OUTSIDE it —
+/// the palette, the bell and the create modal ride every tab and stay global
+/// on purpose.
 //
 // One argument per layer, plus the tab that scopes them: the Ice extern
 // surface is flat, and the reading must see every layer at once to name the
@@ -260,10 +261,12 @@ pub fn topmost_overlay(
 }
 
 /// The surface Escape dismisses — the topmost transient layer, minus the one
-/// rung Escape does not own. Menus, popovers, the create modal and the bell
-/// close; persistent rails (thread, comments, the channel drawer) keep their
-/// explicit × — closing one from a global key would also have to adjudicate
-/// its half-typed drafts.
+/// rung Escape does not own. Menus, popovers, the create modal, the bell and
+/// the channel drawer close; the thread and comments rails keep their explicit
+/// × — closing one from a global key would also have to adjudicate its
+/// half-typed drafts. The drawer carries no such debt: its only opener
+/// re-seeds the name draft from the live channel name on every open, so its
+/// rung leaks nothing the × doesn't.
 #[allow(clippy::too_many_arguments)]
 pub fn escape_target(
     logical: iced::keyboard::Key,

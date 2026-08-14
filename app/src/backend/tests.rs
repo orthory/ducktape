@@ -2240,7 +2240,7 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
 // unscoped, that stale flag ate the first Escape on every other tab, and the
 // same reading made `content_scroll_step` refuse to move a pane nothing was
 // covering. The palette, bell and create modal are mounted OUTSIDE the tab
-// match in `view.ice` and keep answering from every tab.
+// match in `components/shell.ice` and keep answering from every tab.
 #[test]
 fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
     use iced::keyboard::{Key, key::Named};
@@ -2248,13 +2248,46 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
     let escape = Key::Named(Named::Escape);
     let none = String::new();
 
-    // A stale chat menu names no layer from another tab — for BOTH readers.
-    let stale_thread_menu = |tab: ShellTab| {
+    // One closure per reader, the sibling test's `target` shape: tab first,
+    // then one argument per layer.
+    let overlay = |tab: ShellTab,
+                   thread_action: MessageAction,
+                   action: MessageAction,
+                   drawer: bool,
+                   repo_menu: bool| {
         topmost_overlay(
             tab,
             false,
             false,
             false,
+            thread_action,
+            action,
+            drawer,
+            repo_menu,
+        )
+    };
+    let target = |tab: ShellTab,
+                  bell: bool,
+                  create: bool,
+                  thread_action: MessageAction,
+                  repo_menu: bool| {
+        escape_target(
+            escape.clone(),
+            tab,
+            false,
+            bell,
+            create,
+            thread_action,
+            MessageAction::Toolbar,
+            false,
+            repo_menu,
+        )
+    };
+
+    // A stale chat menu names no layer from another tab — for BOTH readers.
+    let stale_thread_menu = |tab: ShellTab| {
+        overlay(
+            tab,
             MessageAction::More,
             MessageAction::Toolbar,
             false,
@@ -2267,11 +2300,8 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
 
     // Same for the stream's menu and the details drawer.
     assert_eq!(
-        topmost_overlay(
+        overlay(
             ShellTab::Files,
-            false,
-            false,
-            false,
             MessageAction::Toolbar,
             MessageAction::Editing,
             false,
@@ -2280,11 +2310,8 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
         none
     );
     assert_eq!(
-        topmost_overlay(
+        overlay(
             ShellTab::Pages,
-            false,
-            false,
-            false,
             MessageAction::Toolbar,
             MessageAction::Toolbar,
             true,
@@ -2295,11 +2322,8 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
 
     // And the forge menu answers only from Forge.
     let repo_menu = |tab: ShellTab| {
-        topmost_overlay(
+        overlay(
             tab,
-            false,
-            false,
-            false,
             MessageAction::Toolbar,
             MessageAction::Toolbar,
             false,
@@ -2313,48 +2337,18 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
     // is actually on screen. Before scoping, this named "thread_menu" and the
     // visible forge menu survived the press.
     assert_eq!(
-        escape_target(
-            escape.clone(),
-            ShellTab::Forge,
-            false,
-            false,
-            false,
-            MessageAction::More,
-            MessageAction::Toolbar,
-            false,
-            true,
-        ),
+        target(ShellTab::Forge, false, false, MessageAction::More, true),
         "repo_menu"
     );
 
     // Window-level layers ride every tab: mounted outside the tab match, they
     // stay on screen across a switch and must keep answering.
     assert_eq!(
-        escape_target(
-            escape.clone(),
-            ShellTab::Governance,
-            false,
-            true,
-            false,
-            MessageAction::Toolbar,
-            MessageAction::Toolbar,
-            false,
-            false,
-        ),
+        target(ShellTab::Governance, true, false, MessageAction::Toolbar, false),
         "bell"
     );
     assert_eq!(
-        escape_target(
-            escape,
-            ShellTab::Node,
-            false,
-            false,
-            true,
-            MessageAction::Toolbar,
-            MessageAction::Toolbar,
-            false,
-            false,
-        ),
+        target(ShellTab::Node, false, true, MessageAction::Toolbar, false),
         "channel_create"
     );
 }
