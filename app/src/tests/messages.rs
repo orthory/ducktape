@@ -517,6 +517,30 @@ fn the_message_line_is_one_rich_text_paragraph() {
     ));
 }
 
+/// A TAIL SNAP ON AN END-ANCHORED SCROLL IS `snap … 0.0`, NEVER `snap-end`.
+///
+/// Both of the app's snapped scrolls (`#message-stream`, `#transcript`) are
+/// `anchor-y=end`: the offset counts FROM the tail, so relative 0.0 is the
+/// tail and `snap-end` (relative 1.0) is the TOP of loaded history. The
+/// inverted op shipped once — every send hurled the reader to the oldest
+/// loaded row — and is a silent no-op in any fixture whose content fits the
+/// viewport, so only this lint stands between it and a paste-back.
+#[test]
+fn tail_snaps_speak_the_end_anchored_offset() {
+    let chat = include_str!("../ui/handlers/chat.ice");
+    let shell = include_str!("../ui/handlers/shell.ice");
+    assert!(
+        chat.contains("task widget snap #workspace-tabs/content/chat/message-stream 0.0 0.0"),
+        "the send handler snaps the stream to its anchored tail"
+    );
+    for (name, source) in [("chat", chat), ("shell", shell)] {
+        assert!(
+            !source.contains("task widget snap-end"),
+            "{name} handlers invoke snap-end, which is the TOP of an anchor-y=end scroll"
+        );
+    }
+}
+
 /// `· edited` ANNOTATES A MESSAGE, SO IT RIDES THE MESSAGE.
 ///
 /// It lived inside the `show_author` run header, so in a run of five messages

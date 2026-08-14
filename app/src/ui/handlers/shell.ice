@@ -88,7 +88,9 @@ on shell_composer_event(event)
   shell_chat_busy = true
   parallel
     stream replace lane=shell_chat agent_chat_turn(connected_rpc, shell_provider, shell_credential, shell_chat_entries) -> shell_chat_event _
-    task widget snap-end #workspace-tabs/content/shell/root/transcript
+    // `snap … 0.0`, not `snap-end`: the transcript is `anchor-y=end`, where
+    // relative 0.0 IS the tail — `snap-end` (relative 1.0) lands at the TOP.
+    task widget snap #workspace-tabs/content/shell/root/transcript 0.0 0.0
 
 // One pure reducer per field keeps this event handler flat. A progress event
 // cannot accidentally settle the answer, and a terminal event clears every
@@ -102,7 +104,7 @@ on shell_chat_event(next)
   shell_chat_error = agent_event_error(shell_chat_error, next)
   shell_chat_entries = agent_event_entries(shell_chat_entries, next, shell_provider)
   shell_chat_busy = agent_event_busy(next)
-  task widget snap-end #workspace-tabs/content/shell/root/transcript
+  task widget snap #workspace-tabs/content/shell/root/transcript 0.0 0.0
 
 on shell_chat_reset
   return if shell_chat_busy
