@@ -1264,26 +1264,24 @@ fn forge_layout_keeps_repo_navigation_compact() {
     assert_eq!(screen.matches("BackToList kind=forge_item_kind").count(), 1);
 }
 
-/// Source and patch rows are one code-reading surface. The semantic diff
-/// plates may vary, but their metrics, neutral code ink and numbered gutter do
-/// not: that keeps a changed line from switching type weight or losing its
-/// numbers when the palette flips.
+/// Source and patch rows are one code-reading surface. The source rows render
+/// in the backend extern `forge_code` now (syntax colour needs per-span inks
+/// Ice cannot carry), but their metrics and the diff's must not drift apart:
+/// this pins the Rust constants to the Ice diff row's values, and the embed
+/// to the screen.
 #[test]
 fn forge_source_and_diff_rows_share_a_compact_code_style() {
-    let components = inlined(include_str!("ui/components/forge.ice"));
-    let source = components
-        .split_once("component ForgeCodeLine(")
-        .expect("source row")
-        .1
-        .split_once("\ncomponent ")
-        .expect("source row boundary")
-        .0;
-    assert_eq!(source.matches("h=20.0").count(), 2);
-    assert_eq!(source.matches("size=11.5").count(), 2);
-    assert!(source.contains("font=code @text-forge_gutter_ink"));
-    assert!(source.contains("font=code @text-strong_ink"));
-    assert!(!source.contains("@text-icon_idle"));
+    let source = include_str!("backend/forge.rs");
+    assert!(source.contains("pub const CODE_SIZE: f32 = 11.5;"));
+    assert!(source.contains("pub const CODE_ROW_HEIGHT: f32 = 20.0;"));
+    assert!(source.contains("pub const CODE_GUTTER_WIDTH: f32 = 44.0;"));
+    let screen = inlined(include_str!("ui/screens/forge.ice"));
+    assert!(
+        screen.contains("extern forge_code(file_text, file_path, dark) #forge-code"),
+        "the code pane mounts the highlighted reader"
+    );
 
+    let components = inlined(include_str!("ui/components/forge.ice"));
     let diff = components
         .split_once("component DiffRow(")
         .expect("diff row")

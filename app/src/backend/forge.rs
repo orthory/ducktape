@@ -852,29 +852,113 @@ pub struct DiffLine {
     pub side: String,
 }
 
-/// One numbered source line of a blob. `number` is a string for the same reason
-/// `DiffLine.old_no` is: the gutter is a rendered column, not an integer, and
-/// the splitter owns the numbering.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct SourceLine {
-    pub number: String,
-    pub text: String,
+/// The forge code reader's row metrics. One place on purpose: the shape lint
+/// in `app/src/tests.rs` pins these against `DiffRow`'s Ice metrics so the
+/// source and patch surfaces cannot drift apart.
+pub const CODE_SIZE: f32 = 11.5;
+pub const CODE_ROW_HEIGHT: f32 = 20.0;
+pub const CODE_GUTTER_WIDTH: f32 = 44.0;
+
+/// The highlighter's language token: the path's final extension, else the
+/// file name itself lowercased (Makefile, Dockerfile). syntect matches both
+/// and falls back to plain text on an unknown token — an unknown file renders
+/// exactly as the single-ink viewer used to.
+pub fn code_token(path: &str) -> String {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    match name.rsplit_once('.') {
+        Some((_, ext)) if !ext.is_empty() => ext.to_ascii_lowercase(),
+        _ => name.to_ascii_lowercase(),
+    }
 }
 
-/// Split a blob into numbered rows. `BlobView.text` arrives as ONE string and
-/// Ice has no string ops, so the viewer cannot walk it — this is the exact
-/// counterpart `diff_lines` already is for a patch.
+/// The syntect theme per appearance. Only token FOREGROUNDS are taken from
+/// it — the plate and gutter stay the app's own rail tokens, so the reader
+/// keeps one surface even where the theme's background would disagree.
+pub fn code_theme(dark: bool) -> iced::highlighter::Theme {
+    match dark {
+        true => iced::highlighter::Theme::Base16Eighties,
+        false => iced::highlighter::Theme::InspiredGitHub,
+    }
+}
+
+/// The forge blob reader: numbered gutter + syntect-highlighted code, one row
+/// per line. Replaces the Ice `ForgeCodeLine` loop — token colour needs
+/// per-span inks, which Ice's named-token text nodes cannot carry, so the
+/// whole surface renders here (the `agent_markdown` idiom). Colours are the
+/// app palette's stable code roles (`rail`, `forge_gutter_ink`,
+/// `strong_ink` in `theme.ice`), matched per appearance like `AgentMarkdown`.
 ///
-/// An empty blob has no lines, not one blank line: `"".lines()` is empty and
-/// that is the reading the empty plate is drawn for.
-pub fn source_lines(text: String) -> Vec<SourceLine> {
-    text.lines()
-        .enumerate()
-        .map(|(index, line)| SourceLine {
-            number: (index + 1).to_string(),
-            text: line.to_string(),
-        })
-        .collect()
+/// KEYED LAZY, the app's adopted projection idiom: the tokenize + row build
+/// runs only when the blob, path, or appearance changes; every other rebuild
+/// is one hash of the key. Without it the full-file build re-ran per frame
+/// and blew the forge-code frame probe's allocation ceiling. `BlobView.text`
+/// is read-capped at 64 KiB upstream, which bounds the one-time build; the
+/// screen's scroll pane owns scrolling.
+pub fn forge_code(source: String, path: String, dark: bool) -> iced::Element<'static, ()> {
+    iced::widget::lazy((source, path, dark), |(source, path, dark)| {
+        code_surface(source, path, *dark)
+    })
+    .into()
+}
+
+fn code_surface(source: &str, path: &str, dark: bool) -> iced::Element<'static, ()> {
+    use iced::Length;
+    use iced::alignment::{Horizontal, Vertical};
+    use iced::highlighter::{Settings, Stream};
+    use iced::widget::{column, container, rich_text, row, span, text};
+
+    let (rail, gutter_ink, plain_ink) = match dark {
+        true => (
+            iced::Color::from_rgb8(0x20, 0x1f, 0x1b),
+            iced::Color::from_rgb8(0x9d, 0x9b, 0x92),
+            iced::Color::from_rgb8(0xdc, 0xda, 0xd2),
+        ),
+        false => (
+            iced::Color::from_rgb8(0xfa, 0xfa, 0xf8),
+            iced::Color::from_rgb8(0x66, 0x64, 0x5e),
+            iced::Color::from_rgb8(0x3a, 0x39, 0x34),
+        ),
+    };
+    let mono = iced::Font::with_name("Geist Mono");
+    let mut stream = Stream::new(&Settings {
+        theme: code_theme(dark),
+        token: code_token(path),
+    });
+    let rows = source.lines().enumerate().map(|(index, line)| {
+        let spans: Vec<iced::widget::text::Span<'static, ()>> = stream
+            .highlight_line(line)
+            .map(|(range, highlight)| {
+                span(line[range].to_string())
+                    .color(highlight.color().unwrap_or(plain_ink))
+                    .font(mono)
+            })
+            .collect();
+        stream.commit();
+        let number = container(
+            text((index + 1).to_string())
+                .size(CODE_SIZE)
+                .font(mono)
+                .color(gutter_ink)
+                .width(Length::Fill)
+                .align_x(Horizontal::Right),
+        )
+        .width(CODE_GUTTER_WIDTH)
+        .height(CODE_ROW_HEIGHT)
+        .padding(iced::Padding::ZERO.right(12.0))
+        .align_y(Vertical::Center)
+        .style(move |_| iced::widget::container::Style {
+            background: Some(rail.into()),
+            ..Default::default()
+        });
+        let code = container(rich_text(spans).size(CODE_SIZE))
+            .width(Length::Fill)
+            .height(CODE_ROW_HEIGHT)
+            .padding(iced::Padding::ZERO.left(13.0))
+            .align_y(Vertical::Center)
+            .clip(true);
+        row![number, code].width(Length::Fill).into()
+    });
+    column(rows).width(Length::Fill).into()
 }
 
 /// Whether a tree path names a Markdown document the reader renders as a

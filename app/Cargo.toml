@@ -46,7 +46,7 @@ jpeg-encoder = "0.6"
 zune-jpeg = "0.4"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 zeroize.workspace = true
-iced = { version = "=0.14.0", default-features = false, features = ["advanced", "image-without-codecs", "lazy", "markdown", "svg", "tokio", "wgpu", "x11"] }
+iced = { version = "=0.14.0", default-features = false, features = ["advanced", "highlighter", "image-without-codecs", "lazy", "markdown", "svg", "tokio", "wgpu", "x11"] }
 iced_term = "=0.8.0"
 ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "af77d53e1461b09659043a60845c579cc4a1ea68", default-features = false, features = ["log-timeline"] }
 ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "af77d53e1461b09659043a60845c579cc4a1ea68" }

@@ -574,59 +574,13 @@ component ForgeCodeHeader(path:str, message:str, author:str, stamp:str)
         bg=separator
       space w=1.0 h=1.0
 
-// One source line: a 44px right-aligned gutter on `rail`, then the code. The
-// gutter shares `forge_gutter_ink` with the diff, so line numbers stay quiet without
-// disappearing in either palette. `number` is a string for the same reason
-// `DiffLine.old_no` is — the renderer that splits the blob owns the numbering,
-// and a blank gutter has to be expressible.
-//
-// MOUNTED in the Code pane's `source:` slot (view.ice), over
-// `source_lines(forge_file_text)` — the exact counterpart `diff_lines` already
-// is for a patch. `forge_blob` returns `BlobView.text` as ONE string and Ice
-// has no string ops, so the splitter lives in backend.rs; the gutter numbers
-// the rows it produced rather than guessing where the file breaks. A truncated
-// blob numbers what arrived, and the window note under the listing says so.
-//
-// The code is ONE ink. The design system is explicit that this viewer uses no
-// syntax colour ("code uses a single colour, not syntax highlighting") — emphasis is carried by the
-// signed annotation card, so nothing here tints a token. (A BLOB has no
-// annotation affordance — `ReviewComment` anchors into a PR's diff, not into a
-// file read at a rev; `DiffRow` below is where a line comment is authored.)
-component ForgeCodeLine(number:str, code:str)
-  row #root
-    with
-      w=fill
-      gap=0.0
-      align=center
-    box
-      with
-        w=44.0
-        h=20.0
-        pr=12.0
-        align-y=center
-        bg=rail
-      text number
-        with
-          w=fill
-          size=11.5
-          wrap=none
-          align-x=right
-          font=code
-          @text-forge_gutter_ink
-    box
-      with
-        w=fill
-        h=20.0
-        pl=13.0
-        align-y=center
-        clip=true
-      text code
-        with
-          w=fill
-          size=11.5
-          wrap=none
-          font=code
-          @text-strong_ink
+// The source rows themselves live in the backend extern `forge_code`
+// (backend/forge.rs): syntax colour needs per-span inks, which Ice's
+// named-token text nodes cannot carry. The extern mirrors this file's
+// DiffRow metrics (44px `rail` gutter in `forge_gutter_ink`, 20px rows,
+// 11.5 code) — the shape lint in app/src/tests.rs pins both sides so the
+// source and patch surfaces cannot drift apart. Token foregrounds come from
+// syntect per appearance; an unknown extension degrades to one ink.
 
 // The reader with nothing to read. This is one plate for three true reasons —
 // no file picked yet, a binary blob, a blob past the read cap — so the caller
