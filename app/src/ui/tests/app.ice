@@ -466,7 +466,7 @@ test palette_overlay_contract
         toast=""
         tone="info"
         open=palette_open
-        searching=palette_searching
+        search_phase=palette_search_phase
         chat_hits=palette_chat_hits
         page_hits=palette_page_hits
       events

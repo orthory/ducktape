@@ -317,6 +317,7 @@ view
               active_page_parent
               page_searching
               page_search_hits
+              page_search_query
               page_delete_armed
               block_autosave_status
               page_refusal
@@ -605,7 +606,7 @@ view
               toast
               tone="info"
               open=palette_open
-              searching=palette_searching
+              search_phase=palette_search_phase
               chat_hits=palette_chat_hits
               page_hits=palette_page_hits
             events

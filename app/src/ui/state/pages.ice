@@ -45,3 +45,12 @@ state
   page_search_draft = ""
   page_search_hits:[PageSearchHit] = []
   page_searching = false
+  // THE STRING THE ZERO-HIT PLATE IS SPEAKING FOR — the query a search was
+  // actually SENT for, `""` when no answer is standing (an empty value also
+  // gates both reply handlers: no search standing, the reply is dropped).
+  // Not a boolean — the enter-to-submit rationale lives on the plate arm in
+  // `screens/pages.ice`. Written by `search_pages_submit`; cleared by
+  // `page_search_failed` and every handler that drops the hits. (The palette
+  // needs no captured string: `palette_changed` runs on every keystroke —
+  // see `palette_search_phase`.)
+  page_search_query = ""

@@ -531,6 +531,29 @@ fn chat_data(active_channel: &str, messages: Vec<backend::ChatMessage>) -> backe
     }
 }
 
+/// A hit left over from an already-answered search — what a navigation reset
+/// must sweep away. Content is irrelevant; identity says "stale".
+fn stale_chat_hit() -> backend::ChatSearchHit {
+    backend::ChatSearchHit {
+        channel_id: "old".into(),
+        seq: 1,
+        root_seq: 1,
+        author: "user".into(),
+        text: "stale".into(),
+        meta: "#1".into(),
+    }
+}
+
+fn stale_page_hit() -> backend::PageSearchHit {
+    backend::PageSearchHit {
+        page_id: "old".into(),
+        page_title: "Old".into(),
+        block_id: "old-block".into(),
+        kind: "Text".into(),
+        text: "stale".into(),
+    }
+}
+
 fn workspace(active_channel: &str) -> backend::WorkspaceData {
     backend::WorkspaceData {
         generation: 0,
@@ -2616,6 +2639,352 @@ fn closing_a_repo_or_an_item_retires_the_load_that_would_reopen_it() {
     // The identity check still guards the BODY: that outcome describes an item
     // nobody has open, so nothing of it is rendered.
     assert!(merging.forge_merge_conflicts.is_empty());
+}
+
+/// THE ZERO-HIT PLATE SPEAKS FOR A QUERY, AND A BOOL COULD NOT CARRY ONE —
+/// page search is enter-to-submit with no `change=` route, so a keystroke runs
+/// no handler and only `trim(draft) == query` can retire the plate (the full
+/// rationale lives on the plate arm in `screens/pages.ice`). This test walks
+/// the query's whole lifetime: captured at submit, standing through a zero-hit
+/// answer, abandoned by the draft, dropped by navigation and by failure.
+#[test]
+fn the_zero_hit_plate_speaks_for_the_query_it_was_sent() {
+    // Draft -> submit -> empty answer: the state a standing plate reads.
+    let answered_pages = |draft: &str| {
+        let (mut app, _) = Ducktape::__boot();
+        app.connected = true;
+        app.loading = false;
+        app.page_search_draft = draft.into();
+        // A DRAFT IS NOT A QUERY: typing alone runs nothing and captures
+        // nothing, which is why the plate cannot fire on the first keystroke.
+        assert!(app.page_search_query.is_empty());
+        assert!(!app.page_searching);
+        let _ = app.__update(__DucktapeMessage::SearchPagesSubmit);
+        assert!(app.page_searching, "the round trip is not an answer either");
+        let _ = app.__update(__DucktapeMessage::PageSearchLoaded(
+            backend::PageSearchData { hits: vec![] },
+        ));
+        app
+    };
+
+    // The submit captures the TRIMMED query — the same string the node is
+    // asked about — and the empty answer leaves it standing. All five of the
+    // plate arm's terms hold jointly in this state.
+    let mut pages = answered_pages("  zzz  ");
+    assert!(pages.connected);
+    assert!(pages.page_search_hits.is_empty());
+    assert!(!pages.page_searching);
+    assert!(!pages.page_search_query.is_empty());
+    assert_eq!(pages.page_search_draft.trim(), pages.page_search_query);
+    assert_eq!(pages.page_search_query, "zzz");
+
+    // THE CLASS THE BOOL COULD NOT COVER: one more character runs no handler,
+    // so the query stays put while the draft walks away from it, and the arm
+    // stops matching without anything having been told.
+    pages.page_search_draft = "zzzq".into();
+    assert_eq!(pages.page_search_query, "zzz");
+    assert_ne!(pages.page_search_draft.trim(), pages.page_search_query);
+
+    // Every handler that drops the hits drops the query with them.
+    for leaving in [
+        __DucktapeMessage::OpenPageSearchHit("page".into(), "block".into()),
+        __DucktapeMessage::ChoosePage("next".into()),
+        __DucktapeMessage::ClearPageSearch,
+    ] {
+        let mut app = answered_pages("zzz");
+        assert_eq!(app.page_search_query, "zzz");
+        let _ = app.__update(leaving);
+        assert!(
+            app.page_search_query.is_empty(),
+            "opening a hit or navigating must not leave the plate standing"
+        );
+    }
+
+    // A FAILED search never ran, so it found nothing in no sense the plate may
+    // report: the query goes, and `error` carries the cause instead.
+    let (mut failed, _) = Ducktape::__boot();
+    failed.loading = false;
+    failed.page_search_draft = "zzz".into();
+    let _ = failed.__update(__DucktapeMessage::SearchPagesSubmit);
+    let _ = failed.__update(__DucktapeMessage::PageSearchFailed(backend::AppError {
+        message: "node refused".into(),
+        committed: false,
+    }));
+    assert!(!failed.page_searching);
+    assert!(failed.page_search_query.is_empty());
+    assert_eq!(failed.error, "node refused");
+
+    // AN EMPTY QUERY GATES THE REPLY HANDLERS: no search is standing, so a
+    // reply the dismissal could not invalidate (`close_doc_tab` rides a
+    // decision no lane invalidate can) is dropped on arrival instead of
+    // resurrecting the float and clobbering `error`.
+    let (mut dismissed, _) = Ducktape::__boot();
+    dismissed.error = "standing error".into();
+    let _ = dismissed.__update(__DucktapeMessage::PageSearchLoaded(
+        backend::PageSearchData {
+            hits: vec![stale_page_hit()],
+        },
+    ));
+    assert!(
+        dismissed.page_search_hits.is_empty(),
+        "a reply with no standing query must not restore the hits float"
+    );
+    assert_eq!(dismissed.error, "standing error", "nor clobber the banner");
+    let _ = dismissed.__update(__DucktapeMessage::PageSearchFailed(backend::AppError {
+        message: "late failure".into(),
+        committed: false,
+    }));
+    assert_eq!(
+        dismissed.error, "standing error",
+        "a failure nobody is waiting on must not raise a banner"
+    );
+
+    // THE ARM. The plate may not be keyed on a flag, and may not fire during
+    // the round trip its own submit opened.
+    let pages_screen = inlined(include_str!("ui/screens/pages.ice"));
+    assert!(pages_screen.contains(
+        "if connected && empty(page_search_hits) && !page_searching && !empty(page_search_query) && trim(page_search_draft) == page_search_query"
+    ));
+    let overlays = inlined(include_str!("ui/screens/overlays.ice"));
+    assert!(overlays
+        .contains("if search_phase == SearchPhase.done && empty(chat_hits) && empty(page_hits)"));
+
+    // THE PLATE IS OPAQUE. It is a sibling stack LAYER — over the live document
+    // or over "No page selected" — and `EmptyPlate` is `bg=transparent`, so
+    // what it denies would render straight through the sentence denying it.
+    let card = pages_screen
+        .split("if connected && empty(page_search_hits) && !page_searching")
+        .nth(1)
+        .expect("the zero-hit arm");
+    let card = &card[..card.find("No pages matched").expect("the plate's message")];
+    assert!(
+        card.contains("bg=elevated"),
+        "a zero-hit plate must not be a transparent layer"
+    );
+}
+
+/// THE PLATE MUST HAVE A SEAT IN THE STATE THAT MOST NEEDS IT, AND IT MUST SIT
+/// ON TOP. Nested inside `connected && !empty(active_page)` — where the whole
+/// document header including the search input lives — the panel had no answer
+/// for its one real arrival with no page open: `live_resynced` moving
+/// `active_page` to "" under a STANDING query. Nested, that state showed "No
+/// page selected" and said nothing about the query; the × is gone with the
+/// header there, so picking a page would be the only exit. Hoisted to a
+/// sibling layer it must be declared AFTER the document arm: a stack paints in
+/// declaration order, first at the bottom, so an earlier position puts the
+/// opaque card UNDER the document it is supposed to cover.
+#[test]
+fn the_zero_hit_plates_sit_where_the_answer_is_needed() {
+    let pages_screen = inlined(include_str!("ui/screens/pages.ice"));
+    // Both needles carry the SAME ten-space indent, and the indent is the
+    // sibling pin: re-nesting the plate inside the document arm deepens its
+    // indent and its needle stops matching, exactly as hoisting the document
+    // arm would break its own.
+    let document = pages_screen
+        .find("\n          if connected && !empty(active_page)\n")
+        .expect("the document arm, as a stack layer");
+    let plate = pages_screen
+        .find("\n          if connected && empty(page_search_hits)")
+        .expect("the pages zero-hit arm, as a SIBLING stack layer");
+    assert!(
+        document < plate,
+        "the pages plate must be declared AFTER the document arm: a stack draws \
+         its layers in declaration order, first at the BOTTOM, so an earlier plate \
+         is painted UNDER the document it is supposed to cover"
+    );
+}
+
+/// A NAVIGATION DISMISSES THE WHOLE ANSWER, NOT HALF OF IT. `channel_created`
+/// and `pages_mutated` land you somewhere new exactly the way the pickers do,
+/// and `close_doc_tab` does when — and only when — it closes the ACTIVE tab;
+/// each must take the hits and the standing answer with it (pages: the query;
+/// chat: the phase back to idle), or the results float — the one that actually
+/// occludes the room or page you just landed in — travels along.
+///
+/// This is a DISMISSAL POLICY, not a truth requirement: both searches pass an
+/// empty scope and are workspace-wide, so the answer would still be true where
+/// you landed. The reason to drop it is that it is in the way.
+#[test]
+fn the_three_navigation_resets_take_the_hits_and_the_answer() {
+    let pages_mutated = || {
+        __DucktapeMessage::PagesMutated(backend::PagesData {
+            pages: Vec::new(),
+            blocks: Vec::new(),
+            active_page: "fresh".into(),
+            active_page_title: "Fresh".into(),
+            active_page_parent: String::new(),
+            comment_thread_total: 0,
+            commented_block_hits: Vec::new(),
+        })
+    };
+
+    // A CREATE LANDS YOU IN THE NEW CHANNEL — the same dismissal
+    // `choose_channel` and `choose_dm` already perform: the lane invalidate
+    // dropped any reply in flight, so nothing else would ever move the phase
+    // again, and the phase goes idle with the hits.
+    let (mut created, _) = Ducktape::__boot();
+    created.loading = false;
+    created.chat_search_hits = vec![stale_chat_hit()];
+    created.chat_search_phase = SearchPhase::Searching;
+    let _ = created.__update(__DucktapeMessage::ChannelCreated(chat_data(
+        "fresh",
+        Vec::new(),
+    )));
+    assert!(created.chat_search_hits.is_empty());
+    assert_eq!(
+        created.chat_search_phase,
+        SearchPhase::Idle,
+        "the invalidated lane drops the reply; the reset must move the phase"
+    );
+
+    let (mut mutated, _) = Ducktape::__boot();
+    mutated.loading = false;
+    mutated.page_search_query = "zzz".into();
+    mutated.page_search_hits = vec![stale_page_hit()];
+    mutated.page_searching = true;
+    let _ = mutated.__update(pages_mutated());
+    assert!(mutated.page_search_query.is_empty());
+    assert!(mutated.page_search_hits.is_empty());
+    assert!(
+        !mutated.page_searching,
+        "the invalidated lane drops the reply; the reset must lower the flag"
+    );
+
+    // CLOSING THE ACTIVE TAB LANDS YOU ELSEWHERE — a navigation, so it resets.
+    let (mut active, _) = Ducktape::__boot();
+    active.loading = false;
+    active.doc_tabs = vec!["open".into(), "other".into()];
+    active.active_page = "open".into();
+    active.page_search_query = "zzz".into();
+    active.page_search_hits = vec![stale_page_hit()];
+    active.page_searching = true;
+    let _ = active.__update(__DucktapeMessage::CloseDocTab("open".into()));
+    assert_eq!(active.active_page, "other");
+    assert!(active.page_search_query.is_empty());
+    assert!(active.page_search_hits.is_empty());
+    assert!(!active.page_searching);
+
+    // CLOSING A BACKGROUND TAB DOES NOT. `next_doc_tab` returns `active`
+    // unchanged when the closed tab is not the active one, and an
+    // unconditional reset here would dismiss a truthful plate the user is
+    // still reading. The reset rides that same decision.
+    let (mut background, _) = Ducktape::__boot();
+    background.loading = false;
+    background.doc_tabs = vec!["open".into(), "other".into()];
+    background.active_page = "other".into();
+    background.page_search_query = "zzz".into();
+    background.page_search_hits = vec![stale_page_hit()];
+    background.page_searching = true;
+    let _ = background.__update(__DucktapeMessage::CloseDocTab("open".into()));
+    assert_eq!(background.active_page, "other");
+    assert!(
+        background.page_searching,
+        "the reply still lands and lowers it — the query it answers is standing"
+    );
+    assert_eq!(
+        background.page_search_query, "zzz",
+        "closing a background tab navigates nowhere and must not dismiss the answer"
+    );
+    assert_eq!(background.page_search_hits.len(), 1);
+}
+
+/// A FAILED PALETTE SEARCH MUST SAY SO. `palette_search_failed` returns the
+/// phase to idle and clears the hits, and idle under a live draft is reachable
+/// no other way — so the panel needs an arm for exactly that pair, and the arm
+/// is the palette's ONLY possible word about the failure (the rationale for
+/// why no `error` assignment could speak from behind the scrim lives on the
+/// arm itself).
+#[test]
+fn the_palette_says_so_when_a_search_fails() {
+    let overlays = inlined(include_str!("ui/screens/overlays.ice"));
+    let failure = overlays
+        .find("if search_phase == SearchPhase.idle && !empty(trim(query))")
+        .expect("the palette's failure arm");
+    // Bounded at the next sibling arm, so a "Search failed." that migrated
+    // anywhere else in the file cannot satisfy this.
+    let arm = &overlays[failure..];
+    let arm = &arm[..arm
+        .find("if !empty(chat_hits) || !empty(page_hits)")
+        .unwrap_or(arm.len())];
+    assert!(
+        arm.contains("Search failed."),
+        "a palette search that never ran must not render as a bare input"
+    );
+    // And the arm is not rescued by an error the scrim hides: the handler
+    // deliberately sets none. The slice runs to the next handler header, so an
+    // inserted blank line cannot shrink what this lint reads.
+    let handler = include_str!("ui/handlers/overlays.ice")
+        .split("on palette_search_failed(cause)")
+        .nth(1)
+        .expect("the failure handler");
+    let handler = &handler[..handler.find("\non ").unwrap_or(handler.len())];
+    assert!(
+        !handler.contains("error ="),
+        "the console error banner is behind the palette's scrim; the arm is the report"
+    );
+}
+
+/// The palette rides the SAME `SearchPhase` discriminant as chat, and honestly:
+/// `palette_changed` runs on every keystroke and moves it, so no phase can
+/// outlive the draft that earned it and no captured query string is needed.
+/// `done` is written only where a result lands — a failure returns to idle
+/// instead of claiming a completed empty answer.
+#[test]
+fn the_palette_does_not_call_a_failed_search_an_empty_one() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected_rpc = "http://node".into();
+    app.palette_open = true;
+
+    // Typing is not an answer.
+    let _ = app.__update(__DucktapeMessage::PaletteChanged("zzz".into()));
+    assert_eq!(app.palette_search_phase, SearchPhase::Searching);
+
+    // A search that never ran is not an answer either — and it is the one a
+    // bare `!searching` arm would mistake for one.
+    app.palette_chat_hits = vec![stale_chat_hit()];
+    app.palette_page_hits = vec![stale_page_hit()];
+    let _ = app.__update(__DucktapeMessage::PaletteSearchFailed(backend::AppError {
+        message: "node refused".into(),
+        committed: false,
+    }));
+    assert_eq!(
+        app.palette_search_phase,
+        SearchPhase::Idle,
+        "a failed palette search must not claim the workspace holds no match"
+    );
+    // THE RESULTS ARM IS KEYED ON THE HITS ALONE, so hits left standing put
+    // "Search failed." directly above live rows read as its results.
+    assert!(app.palette_chat_hits.is_empty());
+    assert!(app.palette_page_hits.is_empty());
+
+    // An empty result IS one.
+    let _ = app.__update(__DucktapeMessage::PaletteChanged("zzz".into()));
+    let _ = app.__update(__DucktapeMessage::PaletteResults(
+        backend::PaletteSearchData {
+            chat_hits: Vec::new(),
+            page_hits: Vec::new(),
+        },
+    ));
+    assert_eq!(app.palette_search_phase, SearchPhase::Done);
+
+    // ...and the next keystroke retires it, so the claim never outlives its
+    // query.
+    let _ = app.__update(__DucktapeMessage::PaletteChanged("zzzz".into()));
+    assert_eq!(app.palette_search_phase, SearchPhase::Searching);
+
+    // BACKSPACING TO EMPTY RUNS NO SEARCH, so nothing is coming to replace the
+    // rows: `palette_changed` clears them above its early return, or the last
+    // query's results sit listed under a blank field forever.
+    let _ = app.__update(__DucktapeMessage::PaletteResults(
+        backend::PaletteSearchData {
+            chat_hits: Vec::new(),
+            page_hits: vec![stale_page_hit()],
+        },
+    ));
+    assert_eq!(app.palette_page_hits.len(), 1);
+    let _ = app.__update(__DucktapeMessage::PaletteChanged(String::new()));
+    assert!(app.palette_page_hits.is_empty());
+    assert_eq!(app.palette_search_phase, SearchPhase::Idle);
 }
 
 #[test]

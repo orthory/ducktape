@@ -20,6 +20,9 @@ on explorer_failed(cause)
 
 on close_palette
   invalidate lane=palette_search
+  // The invalidate dropped the reply that would have moved the phase — park
+  // it idle, or the next open path inherits a permanent "Searching…".
+  palette_search_phase = SearchPhase.idle
   palette_open = false
 
 // Opening the bell only opens it. Marking read is the Mark-all-read button's
@@ -112,7 +115,7 @@ on global_key_pressed(event)
   palette_draft = ""
   palette_chat_hits = []
   palette_page_hits = []
-  palette_searching = false
+  palette_search_phase = SearchPhase.idle
   return if !palette_open
   // THE PALETTE TAKES THE CARET, and closing it does not hand it back — so the
   // retire is here, at the open, not on a `!palette_open` term in the chord's
@@ -152,14 +155,34 @@ on content_scroll_key(event)
 on palette_changed(next)
   invalidate lane=palette_search
   palette_draft = next
-  palette_searching = !empty(trim(palette_draft))
+  palette_search_phase = SearchPhase.idle
+  // THE ROWS BELONG TO THE OLD QUERY, AND THE RESULTS ARM IS KEYED ON THE HITS
+  // ALONE (`!empty(chat_hits) || !empty(page_hits)`), so anything left here
+  // renders as the answer for what is in the box now. Cleared ABOVE the early
+  // return, which is the path that matters most: backspacing to empty runs
+  // no search at all, and the previous query's hits were left listed under a
+  // blank field with nothing coming to replace them.
+  palette_chat_hits = []
+  palette_page_hits = []
   return if empty(trim(palette_draft))
+  palette_search_phase = SearchPhase.searching
   run replace lane=palette_search palette_search(connected_rpc, trim(palette_draft)) -> palette_results _ | palette_search_failed _
 
 on palette_results(next)
   palette_chat_hits = next.chat_hits
   palette_page_hits = next.page_hits
-  palette_searching = false
+  // The only place `done` is written — an answer, empty or not, has landed.
+  palette_search_phase = SearchPhase.done
 
 on palette_search_failed(cause)
-  palette_searching = false
+  // BACK TO "idle", NOT "done" — a search that never ran did not find nothing.
+  // Idle under a live draft is reachable no other way, and the panel's FAILURE
+  // arm reads exactly that pair; the rationale for why no `error` assignment
+  // could speak here lives on that arm in `screens/overlays.ice`.
+  palette_search_phase = SearchPhase.idle
+  // AND THE HITS GO WITH IT. The results arm is keyed on the hits alone, so a
+  // failure that kept them rendered "Search failed." directly above the
+  // previous query's live, clickable rows — read as results for the query
+  // that just failed.
+  palette_chat_hits = []
+  palette_page_hits = []

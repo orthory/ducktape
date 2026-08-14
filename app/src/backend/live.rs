@@ -1295,6 +1295,14 @@ pub fn keep_pages(loaded: bool, next: Vec<PageItem>, current: Vec<PageItem>) -> 
     if loaded { next } else { current }
 }
 
+pub fn keep_page_hits(
+    loaded: bool,
+    next: Vec<PageSearchHit>,
+    current: Vec<PageSearchHit>,
+) -> Vec<PageSearchHit> {
+    if loaded { next } else { current }
+}
+
 /// Does this pages reply still answer for the page the app is on?
 ///
 /// A live resync is issued with whatever page was active AT THE TIME and then

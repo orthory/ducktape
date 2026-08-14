@@ -152,8 +152,18 @@ on reconnect
   page_refusal = ""
   block_autosave_status = AutosaveStatus.idle
   page_delete_armed = false
+  // The DRAFT survives, like `chat_search_draft` above — a typed-but-never-
+  // submitted query produced nothing this reset needs to discard, and this
+  // handler's doctrine is that typed drafts live through a reconnect. The
+  // ANSWER does not: hits, flag and query go together, and the emptied query
+  // is what keeps the zero-hit plate from reading the emptied list as a
+  // search that matched nothing.
   page_search_hits = []
   page_searching = false
+  page_search_query = ""
+  // The lane invalidate above dropped any palette reply in flight — park the
+  // phase idle, or the palette reopens onto a permanent "Searching…".
+  palette_search_phase = SearchPhase.idle
   error = ""
   status = "Connecting…"
   connect_generation = connect_generation + 1
