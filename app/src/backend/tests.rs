@@ -2082,7 +2082,8 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
     use iced::keyboard::{Key, key::Named};
 
     let escape = Key::Named(Named::Escape);
-    let target = |palette: bool,
+    let target = |tab: ShellTab,
+                  palette: bool,
                   bell: bool,
                   create: bool,
                   thread_action: MessageAction,
@@ -2091,6 +2092,7 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
                   repo_menu: bool| {
         escape_target(
             escape.clone(),
+            tab,
             palette,
             bell,
             create,
@@ -2105,6 +2107,7 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
     assert_eq!(
         escape_target(
             Key::Character("x".into()),
+            ShellTab::Chat,
             false,
             true,
             true,
@@ -2118,6 +2121,7 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
     // An open palette swallows Escape — palette_key_action owns it.
     assert_eq!(
         target(
+            ShellTab::Chat,
             true,
             true,
             true,
@@ -2132,6 +2136,7 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
     // after both, thread menu over the stream's, popovers last.
     assert_eq!(
         target(
+            ShellTab::Chat,
             false,
             true,
             true,
@@ -2144,6 +2149,7 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
     );
     assert_eq!(
         target(
+            ShellTab::Chat,
             false,
             false,
             true,
@@ -2156,6 +2162,7 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
     );
     assert_eq!(
         target(
+            ShellTab::Chat,
             false,
             false,
             false,
@@ -2168,6 +2175,7 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
     );
     assert_eq!(
         target(
+            ShellTab::Chat,
             false,
             false,
             false,
@@ -2185,6 +2193,7 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
     // exactly zero pixels on the running app.
     assert_eq!(
         target(
+            ShellTab::Chat,
             false,
             false,
             false,
@@ -2197,6 +2206,7 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
     );
     assert_eq!(
         target(
+            ShellTab::Forge,
             false,
             false,
             false,
@@ -2211,6 +2221,7 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
     // with the menus they dismissed: the document has no transient layer.
     assert_eq!(
         target(
+            ShellTab::Chat,
             false,
             false,
             false,
@@ -2220,6 +2231,131 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             false,
         ),
         ""
+    );
+}
+
+// A RUNG ANSWERS ONLY FROM THE TAB THAT MOUNTS ITS SURFACE. No tab switch
+// clears menu state (`select_shell_tab` leaves every menu flag set), so a
+// ⋯ menu opened on Chat is still SET while Pages is on screen —
+// unscoped, that stale flag ate the first Escape on every other tab, and the
+// same reading made `content_scroll_step` refuse to move a pane nothing was
+// covering. The palette, bell and create modal are mounted OUTSIDE the tab
+// match in `view.ice` and keep answering from every tab.
+#[test]
+fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
+    use iced::keyboard::{Key, key::Named};
+
+    let escape = Key::Named(Named::Escape);
+    let none = String::new();
+
+    // A stale chat menu names no layer from another tab — for BOTH readers.
+    let stale_thread_menu = |tab: ShellTab| {
+        topmost_overlay(
+            tab,
+            false,
+            false,
+            false,
+            MessageAction::More,
+            MessageAction::Toolbar,
+            false,
+            false,
+        )
+    };
+    assert_eq!(stale_thread_menu(ShellTab::Chat), "thread_menu");
+    assert_eq!(stale_thread_menu(ShellTab::Pages), none);
+    assert_eq!(stale_thread_menu(ShellTab::Explorer), none);
+
+    // Same for the stream's menu and the details drawer.
+    assert_eq!(
+        topmost_overlay(
+            ShellTab::Files,
+            false,
+            false,
+            false,
+            MessageAction::Toolbar,
+            MessageAction::Editing,
+            false,
+            false,
+        ),
+        none
+    );
+    assert_eq!(
+        topmost_overlay(
+            ShellTab::Pages,
+            false,
+            false,
+            false,
+            MessageAction::Toolbar,
+            MessageAction::Toolbar,
+            true,
+            false,
+        ),
+        none
+    );
+
+    // And the forge menu answers only from Forge.
+    let repo_menu = |tab: ShellTab| {
+        topmost_overlay(
+            tab,
+            false,
+            false,
+            false,
+            MessageAction::Toolbar,
+            MessageAction::Toolbar,
+            false,
+            true,
+        )
+    };
+    assert_eq!(repo_menu(ShellTab::Forge), "repo_menu");
+    assert_eq!(repo_menu(ShellTab::Chat), none);
+
+    // THE LOAD-BEARING STACK: a stale chat flag must not SHADOW the menu that
+    // is actually on screen. Before scoping, this named "thread_menu" and the
+    // visible forge menu survived the press.
+    assert_eq!(
+        escape_target(
+            escape.clone(),
+            ShellTab::Forge,
+            false,
+            false,
+            false,
+            MessageAction::More,
+            MessageAction::Toolbar,
+            false,
+            true,
+        ),
+        "repo_menu"
+    );
+
+    // Window-level layers ride every tab: mounted outside the tab match, they
+    // stay on screen across a switch and must keep answering.
+    assert_eq!(
+        escape_target(
+            escape.clone(),
+            ShellTab::Governance,
+            false,
+            true,
+            false,
+            MessageAction::Toolbar,
+            MessageAction::Toolbar,
+            false,
+            false,
+        ),
+        "bell"
+    );
+    assert_eq!(
+        escape_target(
+            escape,
+            ShellTab::Node,
+            false,
+            false,
+            true,
+            MessageAction::Toolbar,
+            MessageAction::Toolbar,
+            false,
+            false,
+        ),
+        "channel_create"
     );
 }
 
