@@ -1204,18 +1204,6 @@ fn nix_uid() -> String {
         .unwrap_or_else(|_| "anon".into())
 }
 
-/// Put the podman child outside the daemon's foreground process group. A
-/// terminal Ctrl-C must stop the daemon first, leaving the socket alive for its
-/// label-scoped container sweep; the daemon then shuts podman down explicitly.
-#[cfg(unix)]
-fn isolate_service_process(command: &mut tokio::process::Command) {
-    use std::os::unix::process::CommandExt as _;
-    command.as_std_mut().process_group(0);
-}
-
-#[cfg(not(unix))]
-fn isolate_service_process(_command: &mut tokio::process::Command) {}
-
 pub struct PodmanService {
     socket: PathBuf,
     child: tokio::process::Child,
@@ -1309,8 +1297,7 @@ impl PodmanService {
         // bind, so clear it now that we know it is nobody's.
         let _ = std::fs::remove_file(&socket);
 
-        let mut command = tokio::process::Command::new(podman_bin);
-        command
+        let child = tokio::process::Command::new(podman_bin)
             .arg("--root")
             .arg(&storage)
             .arg("--runroot")
@@ -1321,14 +1308,13 @@ impl PodmanService {
             .arg("service")
             .arg("--time=0") // never idle-exit; the node owns its lifetime
             .arg(format!("unix://{}", socket.display()))
-            .kill_on_drop(true);
-        isolate_service_process(&mut command);
-        let child = command.spawn().map_err(|e| {
-            format!(
-                "podman service: spawn `{} system service`: {e}",
-                podman_bin.display()
-            )
-        })?;
+            .kill_on_drop(true)
+            // its OWN process group: a terminal Ctrl-C must stop the daemon
+            // first, leaving the socket alive for the daemon's label-scoped
+            // container sweep; [`Self::shutdown`] then kills this group.
+            .process_group(0)
+            .spawn()
+            .map_err(|e| format!("podman service: spawn `{} system service`: {e}", podman_bin.display()))?;
 
         // recorded so a successor can tell "my predecessor's orphan, kill it"
         // from "a live sibling, refuse" — see [`Self::claim`].
@@ -1340,7 +1326,14 @@ impl PodmanService {
             child,
             _root_lock: root_lock,
         };
-        service.await_socket().await?;
+        if let Err(error) = service.await_socket().await {
+            // this child dies with the drop of `service` (kill_on_drop), so the
+            // pid just recorded is garbage either way: left behind, it would
+            // point a later [`Self::claim`] reap at whatever unrelated process
+            // reuses the pid (SIGTERMed if its exe happens to be podman).
+            let _ = std::fs::remove_file(root.join(PODMAN_PID_FILE));
+            return Err(error);
+        }
         Ok(service)
     }
 
@@ -1479,6 +1472,16 @@ impl PodmanService {
 
     /// stop the service child (best-effort; `kill_on_drop` is the backstop).
     pub async fn shutdown(mut self) {
+        // The child leads its own process group (`process_group(0)` at spawn),
+        // so kill the GROUP: helpers podman spawned (gvproxy, rootlessport)
+        // live in it and must not outlive the service. Group before reaping the
+        // leader — reaping first would free the pid for reuse while the group
+        // id still names it. ESRCH (everything already gone) is fine.
+        if let Some(pid) = self.child.id() {
+            // SAFETY: `killpg(2)` only sends a signal and has no memory
+            // effects; the group id is our unreaped child's pid.
+            unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
+        }
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
     }
@@ -1552,16 +1555,23 @@ mod tests {
         PodmanService::claim(&root, &socket).expect("a released root is free again");
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn service_child_is_outside_the_daemons_process_group() {
         let sleep = find_system_tool("sleep").expect("sleep is available on a Unix host");
-        let mut command = tokio::process::Command::new(sleep);
-        command.arg("30").kill_on_drop(true);
-        isolate_service_process(&mut command);
-        let mut child = command.spawn().unwrap();
+        let mut child = tokio::process::Command::new(sleep)
+            .arg("30")
+            .kill_on_drop(true)
+            .process_group(0)
+            .spawn()
+            .unwrap();
         let pid = child.id().unwrap();
 
+        // Observing the group from the PARENT right after spawn relies on
+        // glibc's posix_spawn/vfork ordering: the parent resumes only after the
+        // child has applied setpgid and exec'd. A libc that falls back to plain
+        // fork+exec could let this getpgid race the child's setpgid — if this
+        // ever flakes on an exotic platform, that is the reason, not a lost
+        // process-group flag.
         // SAFETY: `pid` names the live child this test owns; `getpgid` only
         // reads kernel process metadata.
         let process_group = unsafe { libc::getpgid(pid as libc::pid_t) };

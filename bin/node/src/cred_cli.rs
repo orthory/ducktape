@@ -350,6 +350,19 @@ fn cmd_remove(ctx: &VerbCtx, name: String, stdin: &mut impl BufRead) -> CredResu
     gateway::validate_credential_name(&name)?;
     let base = ctx.http_base()?;
     let resolved = ctx.workspace()?;
+
+    // Converge a rerun whose earlier attempt committed the tombstone but failed
+    // the local cleanup: resubmitting an already-removed name is Rejected by
+    // the gateway ("credential is not registered"), which would strand the
+    // local secret dir forever. Names are chain-global, so an absent name means
+    // the tombstone is done and only the local half can remain. (A name that
+    // exists but is owned by someone else still takes the submit path below and
+    // gets the gateway's own refusal.)
+    let registered = query_credentials(&base)?.iter().any(|record| record.name == name);
+    if !registered {
+        return finish_local_removal_only(&resolved.service.storage_dir, &name);
+    }
+
     let user = load_user_signer(&ctx.key_path()?, stdin)?;
     let owner_account = query_owner_account(&base, user.public_key().as_ref())?;
     let statement = gateway::RemoveCredentialStatement {
@@ -363,21 +376,45 @@ fn cmd_remove(ctx: &VerbCtx, name: String, stdin: &mut impl BufRead) -> CredResu
         authorization: authorize(&user, &preimage),
     };
     let height = submit_gateway(&base, &message)?;
-    if let Err(error) = remove_local_credential(&resolved.service.storage_dir, &name) {
-        return Err(format!("removed on-chain at height {height}, but {error}").into());
+    let removed_local = remove_local_credential(&resolved.service.storage_dir, &name)
+        .map_err(|error| format!("removed on-chain at height {height}, but {error}"))?;
+    if removed_local {
+        println!("removed at height {height}");
+    } else {
+        println!(
+            "removed at height {height}; no local credential files on this workspace — \
+             if `cred add` ran on another workspace, remove its files there"
+        );
     }
-    println!("removed at height {height}");
+    Ok(())
+}
+
+/// The rerun tail of `cred remove`: the tombstone already committed, so only the
+/// local half is left. Erroring when nothing is local either keeps a mistyped
+/// name loud instead of "removing" nothing.
+fn finish_local_removal_only(storage: &Path, name: &str) -> CredResult {
+    let removed_local = remove_local_credential(storage, name)?;
+    if !removed_local {
+        return Err(format!(
+            "credential {name} is not registered, and no local credential files exist on this workspace"
+        )
+        .into());
+    }
+    println!("not registered on-chain (already removed); local credential files cleaned up");
     Ok(())
 }
 
 /// Delete exactly one validated credential directory after its consensus
-/// tombstone commits. `seal.key` and sibling credentials live beside it and
-/// must survive. Already absent is the desired postcondition, so it succeeds.
-fn remove_local_credential(storage: &Path, name: &str) -> CredResult {
+/// tombstone commits, reporting whether one existed. `seal.key` and sibling
+/// credentials live beside it and must survive. Already absent is still success
+/// (the postcondition holds) — but the caller words its report differently,
+/// because on a machine with several registered workspaces an absent dir HERE
+/// usually means `cred add` ran on another one and its files survive there.
+fn remove_local_credential(storage: &Path, name: &str) -> Result<bool, Box<dyn std::error::Error>> {
     let dir = airlock_service::cred_store_root(storage).join(name);
     match std::fs::remove_dir_all(&dir) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(format!("remove local credential {}: {error}", dir.display()).into()),
     }
 }
@@ -910,11 +947,17 @@ mod tests {
         std::fs::write(sibling.join(".credentials.json"), "other").unwrap();
         std::fs::write(root.join("seal.key"), "stable").unwrap();
 
-        remove_local_credential(tmp.path(), "alice-codex-1").unwrap();
+        let removed = remove_local_credential(tmp.path(), "alice-codex-1").unwrap();
 
+        assert!(removed);
         assert!(!target.exists());
         assert!(sibling.exists());
         assert!(root.join("seal.key").exists());
+
+        // a rerun (or a workspace `cred add` never touched) has nothing to
+        // delete: still success, but reported as absent so the CLI can say so.
+        let removed_again = remove_local_credential(tmp.path(), "alice-codex-1").unwrap();
+        assert!(!removed_again);
     }
 
     /// Claude must log in with `auth login` (writes `.credentials.json`, which
