@@ -626,8 +626,11 @@ component MessageContents(message:ChatMessage)
               hovered bg=surface text=brand border=brand_line
               pressed bg=surface text=brand border=brand
       // The quiet send-state lane at the row's right edge: an in-flight row
-      // carries a small dot. Canonical confirmation removes it immediately;
-      // no timer, animation, or second collection shadows the row state.
+      // carries the mint's own "Sending…" stamp and a small dot. Canonical
+      // confirmation removes both immediately; no timer, animation, or second
+      // collection shadows the row state. The WORD is load-bearing, not the
+      // dot: a send folds into the author run above it (no header, no spacer),
+      // so a dot alone left an in-flight row pixel-identical to a settled one.
       //
       // The pr=7 inset is load-bearing: it tucks the indicator fully inside
       // the hover toolbar's opaque plate (which ends 8px in from the card
@@ -640,12 +643,19 @@ component MessageContents(message:ChatMessage)
       // recede step should never also carry an alpha fade.
       if message.pending
         box pr=7.0
-          svg icon("dot") memory
-            with
-              w=6.0
-              h=6.0
-              style=icon_tint("muted")
-              opacity=1.0
+          row gap=5.0 align=center
+            text message.meta
+              with
+                size=11.0
+                wrap=none
+                font=code_medium
+                @text-muted
+            svg icon("dot") memory
+              with
+                w=6.0
+                h=6.0
+                style=icon_tint("muted")
+                opacity=1.0
 component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabled:bool)
   emits
     add_reaction_at(i64, str)

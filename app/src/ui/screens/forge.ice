@@ -452,6 +452,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                         col
                           with
                             w=fill
+                            px=16.0
                             pt=13.0
                             pb=13.0
                             gap=9.0
@@ -479,7 +480,16 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                           // to plain text in one ink, the reading this
                           // viewer shipped with. Metrics stay pinned to
                           // DiffRow's by the shape lint in app/src/tests.rs.
-                          extern forge_code(file_text, file_path, dark) #forge-code
+                          //
+                          // THE MEMO BOUNDARY IS THIS `lazy`, not a widget
+                          // inside the extern: the blob IS the key, so the
+                          // tokenize + row build reruns only when the text,
+                          // path, or appearance moves — the same projection
+                          // idiom as every cached surface, instead of the
+                          // app's one raw iced Lazy, which shipped a pane
+                          // that drew nothing.
+                          lazy file_text by file_text, file_path, dark as cached_source
+                            extern forge_code(cached_source, file_path, dark) #forge-code
                           if file_truncated
                             text "This file is larger than the 64 KiB preview limit."
                               with

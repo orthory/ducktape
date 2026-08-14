@@ -57,7 +57,8 @@ pub fn optimistic_thread_message(
 /// The timeline calls it on the vec it just pushed an optimistic row onto. The
 /// thread rail does NOT: its vec is `[root] ++ replies` and the root renders as
 /// its own divided block, so a whole-vec pass folds the first reply under the
-/// root and swallows its header (`load_thread_data` marks the replies only).
+/// root and swallows its header. The rail's replies-only marking lives inside
+/// `bounded_thread_window`, which every rail writer already folds through.
 pub fn mark_author_runs(mut messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
     chat::client::mark_message_groups(&mut messages);
     messages

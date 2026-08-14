@@ -360,6 +360,10 @@ on forge_open_file(path)
   return if !connected || empty(forge_repo)
   forge_file_path = path
   forge_file_text = ""
+  // the previous file's flags must not describe the one in flight: a stale
+  // `binary` would brand the next blob "not text" until its load settles.
+  forge_file_binary = false
+  forge_file_truncated = false
   forge_code_phase = ForgeCodePhase.file_loading
   run replace lane=forge_code forge_blob(connected_rpc, forge_repo, forge_tree_rev, path) -> forge_blob_loaded _ | forge_file_failed _
 
