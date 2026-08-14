@@ -198,11 +198,26 @@ pub fn palette_key_action(
 /// the keyboard scroll asks it only whether anything at all sits over the pane
 /// it would otherwise move. Every keyboard route that ignores this list routes
 /// a key at the screen BEHIND the layer the reader is looking at.
+///
+/// EVERY PER-TAB RUNG IS SCOPED TO THE TAB THAT MOUNTS ITS SURFACE, because no
+/// tab switch clears any of this state — `select_shell_tab` leaves every one
+/// of these flags set. A flag left set on the tab you came from
+/// names a layer that is no longer on screen: Escape then "closes" an
+/// invisible menu while the visible screen swallows the press, and the scroll
+/// reader refuses to move a pane nothing is actually covering. Which scope a
+/// rung gets is read off the slot layout in `components/shell.ice`, not
+/// guessed: `slot chat` / `slot forge` sit inside `match tab`, so their menus
+/// are per-tab mounts, while `slot palette` and `slot bell` sit OUTSIDE it —
+/// the palette, the bell and the create modal ride every tab and stay global
+/// on purpose.
 //
-// One argument per layer: the Ice extern surface is flat, and the reading must
-// see every layer at once to name the topmost.
+// One argument per layer, plus the tab that scopes them: the Ice extern
+// surface is flat, and the reading must see every layer at once to name the
+// topmost. Scoping lives HERE rather than in the call sites' argument lists —
+// a conjunction per caller is one guard per rung to forget.
 #[allow(clippy::too_many_arguments)]
 pub fn topmost_overlay(
+    shell_tab: crate::ShellTab,
     palette_open: bool,
     bell_open: bool,
     channel_create_open: bool,
@@ -211,6 +226,8 @@ pub fn topmost_overlay(
     channel_settings_open: bool,
     forge_repo_menu: bool,
 ) -> String {
+    let on_chat = shell_tab == crate::ShellTab::Chat;
+    let on_forge = shell_tab == crate::ShellTab::Forge;
     if palette_open {
         return "palette".into();
     }
@@ -220,10 +237,10 @@ pub fn topmost_overlay(
     if channel_create_open {
         return "channel_create".into();
     }
-    if thread_message_action != crate::MessageAction::Toolbar {
+    if on_chat && thread_message_action != crate::MessageAction::Toolbar {
         return "thread_menu".into();
     }
-    if message_action != crate::MessageAction::Toolbar {
+    if on_chat && message_action != crate::MessageAction::Toolbar {
         return "message_menu".into();
     }
     // BELOW both message menus, which float over the drawer, and above the
@@ -231,26 +248,29 @@ pub fn topmost_overlay(
     // shipped with an `×` and no keyboard exit while every other overlay in the
     // app answered Escape. Measured on the running app — Escape over an open
     // Channel details changed exactly zero pixels.
-    if channel_settings_open {
+    if on_chat && channel_settings_open {
         return "channel_settings".into();
     }
     // The pages block-actions menu and insert row used to sit here. The page
     // document has neither: there is no transient layer over the canvas to
     // dismiss, and the comments rail is a persistent panel with its own close.
-    if forge_repo_menu {
+    if on_forge && forge_repo_menu {
         return "repo_menu".into();
     }
     String::new()
 }
 
 /// The surface Escape dismisses — the topmost transient layer, minus the one
-/// rung Escape does not own. Menus, popovers, the create modal and the bell
-/// close; persistent rails (thread, comments, the channel drawer) keep their
-/// explicit × — closing one from a global key would also have to adjudicate
-/// its half-typed drafts.
+/// rung Escape does not own. Menus, popovers, the create modal, the bell and
+/// the channel drawer close; the thread and comments rails keep their explicit
+/// × — closing one from a global key would also have to adjudicate its
+/// half-typed drafts. The drawer carries no such debt: its only opener
+/// re-seeds the name draft from the live channel name on every open, so its
+/// rung leaks nothing the × doesn't.
 #[allow(clippy::too_many_arguments)]
 pub fn escape_target(
     logical: iced::keyboard::Key,
+    shell_tab: crate::ShellTab,
     palette_open: bool,
     bell_open: bool,
     channel_create_open: bool,
@@ -265,6 +285,7 @@ pub fn escape_target(
         return String::new();
     }
     let topmost = topmost_overlay(
+        shell_tab,
         palette_open,
         bell_open,
         channel_create_open,
