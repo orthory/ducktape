@@ -270,8 +270,7 @@ extern crate::backend
   DiffLine(key:i64, kind:str, old_no:str, new_no:str, sign:str, text:str, path:str, side:str)
   pure forge_push_command(rpc:str) -> str
   pure diff_lines(diff:str) -> [DiffLine]
-  SourceLine(number:str, text:str)
-  pure source_lines(text:str) -> [SourceLine]
+  component forge_code(source:str, path:str, dark:bool) -> unit
   pure markdown_path(path:str) -> bool
   pure filter_forge_items(items:[ForgeItem], tab:ForgeTab) -> [ForgeItem]
   pure forge_open_count(items:[ForgeItem], kind:str) -> i64

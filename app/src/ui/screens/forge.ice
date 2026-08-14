@@ -445,11 +445,9 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                       // the full iced-markdown adapter (`agent_markdown`) —
                       // this reuses it verbatim. Links route through the
                       // same `open_message_link` seam the discussion's
-                      // messages already use. Code files stay single-ink
-                      // numbered lines by design (see ForgeCodeLine);
-                      // Markdown-vs-code is the path's call
-                      // (`markdown_path`) because the wire only says
-                      // binary-or-text.
+                      // messages already use. Markdown-vs-code is the
+                      // path's call (`markdown_path`) because the wire only
+                      // says binary-or-text.
                       if code_phase == ForgeCodePhase.ready && !empty(file_path) && !file_binary && markdown_path(file_path)
                         col
                           with
@@ -471,16 +469,17 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                             pt=13.0
                             pb=13.0
                             gap=9.0
-                          // NUMBERED LINES. `source_lines` is the exact
-                          // counterpart `diff_lines` already is for a
-                          // patch: `forge_blob` hands back ONE string
-                          // and Ice has no string ops, so the split
-                          // happens in backend.rs and the gutter counts
-                          // the rows it actually produced rather than
-                          // guessing where the file breaks.
-                          col w=fill virtual-row=20.0
-                            for line in source_lines(file_text)
-                              ForgeCodeLine number=line.number code=line.text
+                          // HIGHLIGHTED, NUMBERED LINES. Token colour needs
+                          // per-span inks, which Ice's named-token text
+                          // nodes cannot carry, so the whole surface — the
+                          // gutter and the syntect-coloured code — renders
+                          // in the backend extern (the `agent_markdown`
+                          // idiom). The language is the path's call
+                          // (`code_token`); an unknown extension degrades
+                          // to plain text in one ink, the reading this
+                          // viewer shipped with. Metrics stay pinned to
+                          // DiffRow's by the shape lint in app/src/tests.rs.
+                          extern forge_code(file_text, file_path, dark) #forge-code
                           if file_truncated
                             text "This file is larger than the 64 KiB preview limit."
                               with

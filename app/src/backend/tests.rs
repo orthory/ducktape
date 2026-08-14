@@ -966,14 +966,33 @@ fn directory_rows_are_prepared_from_the_listing() {
 }
 
 #[test]
-fn source_lines_number_from_one_and_an_empty_blob_has_none() {
-    let rows = source_lines("alpha\nbeta\n".into());
-    assert_eq!(rows.len(), 2, "a trailing newline is not a third line");
-    assert_eq!(rows[0].number, "1");
-    assert_eq!(rows[0].text, "alpha");
-    assert_eq!(rows[1].number, "2");
-    assert_eq!(rows[1].text, "beta");
-    assert!(source_lines(String::new()).is_empty());
+fn forge_code_tokens_follow_the_path_and_rust_really_colors() {
+    assert_eq!(code_token("src/main.rs"), "rs");
+    assert_eq!(code_token("a/b/query.SQL"), "sql");
+    assert_eq!(code_token("Makefile"), "makefile");
+    assert_eq!(code_token(".gitignore"), "gitignore");
+    // the stream really tokenizes: one rust line yields more than one ink,
+    // and an unknown token degrades to plain text (uniform ink), never an
+    // error — exactly the old single-ink reading.
+    let colors = |token: &str| -> std::collections::BTreeSet<String> {
+        let mut stream = iced::highlighter::Stream::new(&iced::highlighter::Settings {
+            theme: code_theme(true),
+            token: token.into(),
+        });
+        stream
+            .highlight_line("fn main() { let answer = 42; }")
+            .map(|(_, highlight)| format!("{:?}", highlight.color()))
+            .collect()
+    };
+    assert!(
+        colors("rs").len() > 1,
+        "rust source highlights with more than one color"
+    );
+    assert_eq!(
+        colors("no-such-language").len(),
+        1,
+        "an unknown token is plain text in one ink"
+    );
 }
 
 #[test]
