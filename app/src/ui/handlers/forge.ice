@@ -47,10 +47,6 @@ on forge_open_repo(name)
   forge_tree_rev = ""
   forge_tree_entries = []
   forge_tree_truncated = false
-  forge_file_path = ""
-  forge_file_text = ""
-  forge_file_binary = false
-  forge_file_truncated = false
   forge_tree_born = false
   forge_code_phase = ForgeCodePhase.tree_loading
   parallel
@@ -319,10 +315,6 @@ on select_forge_tab(tab)
   forge_tree_rev = ""
   forge_tree_entries = []
   forge_tree_truncated = false
-  forge_file_path = ""
-  forge_file_text = ""
-  forge_file_binary = false
-  forge_file_truncated = false
   forge_tree_born = false
   forge_code_phase = ForgeCodePhase.tree_loading
   run replace lane=forge_code forge_tree(connected_rpc, forge_repo, "", "") -> forge_tree_loaded _ | forge_tree_failed _
@@ -335,10 +327,6 @@ on forge_open_dir(path)
   forge_tree_path = path
   forge_tree_entries = []
   forge_tree_truncated = false
-  forge_file_path = ""
-  forge_file_text = ""
-  forge_file_binary = false
-  forge_file_truncated = false
   forge_code_phase = ForgeCodePhase.tree_loading
   run replace lane=forge_code forge_tree(connected_rpc, forge_repo, forge_tree_rev, path) -> forge_tree_loaded _ | forge_tree_failed _
 
@@ -356,33 +344,6 @@ on forge_tree_loaded(next)
   forge_code_phase = ForgeCodePhase.ready
   error = ""
 
-on forge_open_file(path)
-  return if !connected || empty(forge_repo)
-  forge_file_path = path
-  forge_file_text = ""
-  // the previous file's flags must not describe the one in flight: a stale
-  // `binary` would brand the next blob "not text" until its load settles.
-  forge_file_binary = false
-  forge_file_truncated = false
-  forge_code_phase = ForgeCodePhase.file_loading
-  run replace lane=forge_code forge_blob(connected_rpc, forge_repo, forge_tree_rev, path) -> forge_blob_loaded _ | forge_file_failed _
-
-on forge_blob_loaded(next)
-  let same_repo = next.repo == forge_repo
-  let same_rev = next.rev == forge_tree_rev
-  let same_path = next.path == forge_file_path
-  return if !same_repo || !same_rev || !same_path
-  forge_file_path = next.path
-  forge_file_text = next.text
-  forge_file_binary = next.binary
-  forge_file_truncated = next.truncated
-  forge_code_phase = ForgeCodePhase.ready
-  error = ""
-
 on forge_tree_failed(cause)
   forge_code_phase = ForgeCodePhase.tree_failed
-  error = cause.message
-
-on forge_file_failed(cause)
-  forge_code_phase = ForgeCodePhase.file_failed
   error = cause.message

@@ -347,10 +347,6 @@ on console_opened(id)
   forge_tree_born = false
   forge_tree_entries = []
   forge_tree_truncated = false
-  forge_file_path = ""
-  forge_file_text = ""
-  forge_file_binary = false
-  forge_file_truncated = false
   forge_code_phase = ForgeCodePhase.idle
   // The huddle and its media session belong to the PREVIOUS network.
   // `call_session` is subscribed `when huddle_joined`, so this clear IS the

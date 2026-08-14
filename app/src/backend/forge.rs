@@ -1237,6 +1237,24 @@ pub fn forge_comment_cap_reached(staged: Vec<ForgeDraftComment>) -> bool {
     staged.len() >= forge::MAX_REVIEW_COMMENTS
 }
 
+/// The reader header's path, gated on the browse position AND revision the
+/// file was opened under: a preview opened in another repository, another
+/// directory, or an older commit was retired by that move, so the header
+/// must not keep naming it.
+pub fn forge_file_header(
+    opened_repo: String,
+    opened_dir: String,
+    opened_rev: String,
+    repo: String,
+    dir: String,
+    rev: String,
+    path: String,
+) -> String {
+    let same_place = opened_repo == repo && opened_dir == dir;
+    let same_commit = opened_rev == rev;
+    if same_place && same_commit { path } else { String::new() }
+}
+
 /// The label a picked-but-unstaged line wears above the composer, empty when no
 /// line is picked — the composer keys its whole visibility on this.
 pub fn forge_comment_target(path: String, line: String, side: String) -> String {

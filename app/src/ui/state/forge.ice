@@ -52,8 +52,4 @@ state
   forge_tree_entries:[TreeEntry] = []
   forge_tree_truncated = false
   forge_tree_born = false
-  forge_file_path = ""
-  forge_file_text = ""
-  forge_file_binary = false
-  forge_file_truncated = false
   forge_code_phase:ForgeCodePhase = ForgeCodePhase.idle

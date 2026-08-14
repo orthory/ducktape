@@ -42,10 +42,8 @@ enum ForgePhase
 enum ForgeCodePhase
   idle
   tree_loading
-  file_loading
   ready
   tree_failed
-  file_failed
 
 enum HubStep
   loading
