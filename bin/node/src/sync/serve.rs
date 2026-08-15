@@ -184,7 +184,10 @@ where
 /// [`verify_manifest_floor`]'s construction. FATAL on undecodable
 /// participants — the boundary already passed the floor verify, so garbage
 /// here is our own bug, not the wire's.
-pub(crate) fn replica_verifier(namespace: &[u8], participant_keys: &[Vec<u8>]) -> simplex_ed25519::Scheme {
+pub(crate) fn replica_verifier(
+    namespace: &[u8],
+    participant_keys: &[Vec<u8>],
+) -> simplex_ed25519::Scheme {
     let mut keys = Vec::with_capacity(participant_keys.len());
     for k in participant_keys {
         let pk = ed25519::PublicKey::decode(k.as_slice())
