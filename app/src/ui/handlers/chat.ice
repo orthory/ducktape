@@ -481,7 +481,7 @@ on chat_composer_event(event)
   // shipped once and every send hurled the reader to the oldest loaded row.
   parallel
     run every send_message(connected_rpc, password, active_channel, pending_message_id, pending_message, channel_members) -> message_sent _ | message_send_failed _
-    task widget snap #workspace-tabs/content/chat/message-stream 0.0 0.0
+    task widget snap #workspace-tabs/content/chat/message-stream 0.0 0.0 window=window_target(console_win)
 
 on message_sent(next)
   return if active_channel != next.channel_id
@@ -780,7 +780,7 @@ on open_thread_message_actions(seq, body, rev)
   // `tests.rs` lints the rule so a ninth one cannot forget it.
   composer_focus = ComposerFocus.unfocused
   sequential
-    task widget focus #workspace-tabs/content/chat/thread-action-focus
+    task widget focus #workspace-tabs/content/chat/thread-action-focus window=window_target(console_win)
     task widget focus-next
 
 on open_thread_message_reactions(seq, body, rev)
@@ -796,7 +796,7 @@ on open_thread_message_reactions(seq, body, rev)
   thread_edit_draft = body
   composer_focus = ComposerFocus.unfocused
   sequential
-    task widget focus #workspace-tabs/content/chat/thread-reaction-focus
+    task widget focus #workspace-tabs/content/chat/thread-reaction-focus window=window_target(console_win)
     task widget focus-next
 
 on arm_thread_message_delete(seq, body, rev)
@@ -807,7 +807,7 @@ on arm_thread_message_delete(seq, body, rev)
   thread_edit_draft = body
   composer_focus = ComposerFocus.unfocused
   sequential
-    task widget focus #workspace-tabs/content/chat/thread-delete-focus
+    task widget focus #workspace-tabs/content/chat/thread-delete-focus window=window_target(console_win)
     task widget focus-next
 
 on begin_thread_message_edit(seq, body, rev)
@@ -817,7 +817,7 @@ on begin_thread_message_edit(seq, body, rev)
   thread_message_action = MessageAction.editing
   thread_edit_draft = body
   composer_focus = ComposerFocus.unfocused
-  task widget focus #workspace-tabs/content/chat/thread-edit
+  task widget focus #workspace-tabs/content/chat/thread-edit window=window_target(console_win)
 
 on clear_thread_message_selection
   thread_selected_seq = 0
@@ -851,7 +851,7 @@ on open_message_actions(seq, body, rev)
   message_edit_draft = body
   composer_focus = ComposerFocus.unfocused
   sequential
-    task widget focus #workspace-tabs/content/chat/message-action-focus
+    task widget focus #workspace-tabs/content/chat/message-action-focus window=window_target(console_win)
     task widget focus-next
 
 on open_message_reactions(seq, body, rev)
@@ -868,7 +868,7 @@ on open_message_reactions(seq, body, rev)
   message_edit_draft = body
   composer_focus = ComposerFocus.unfocused
   sequential
-    task widget focus #workspace-tabs/content/chat/message-reaction-focus
+    task widget focus #workspace-tabs/content/chat/message-reaction-focus window=window_target(console_win)
     task widget focus-next
 
 on arm_message_delete(seq, body, rev)
@@ -879,7 +879,7 @@ on arm_message_delete(seq, body, rev)
   message_edit_draft = body
   composer_focus = ComposerFocus.unfocused
   sequential
-    task widget focus #workspace-tabs/content/chat/message-delete-focus
+    task widget focus #workspace-tabs/content/chat/message-delete-focus window=window_target(console_win)
     task widget focus-next
 
 on begin_message_edit(seq, body, rev)
@@ -889,7 +889,7 @@ on begin_message_edit(seq, body, rev)
   message_action = MessageAction.editing
   message_edit_draft = body
   composer_focus = ComposerFocus.unfocused
-  task widget focus #workspace-tabs/content/chat/message-edit
+  task widget focus #workspace-tabs/content/chat/message-edit window=window_target(console_win)
 
 // A LINK PRESS IS A HAND-OFF TO THE OS, and nothing else: no selection, no
 // draft, no rail. Same route the page renderer's link press takes

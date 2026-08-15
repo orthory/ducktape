@@ -597,6 +597,11 @@ test settings_keyboard_scroll_contract
       bell:
         space w=1.0 h=1.0
   target body = #workspace-tabs/content/settings/settings-body
+  // The scroll handlers qualify their targets with the console window
+  // (`window=window_target(console_win)`), so the test first tells the app
+  // the harness window IS the console — the same fact `task window open`
+  // delivers in the real flow.
+  dispatch console_opened(window)
   expect body.content_height > body.visible_height
   expect body.scroll_y ~= 0.0
   key escape

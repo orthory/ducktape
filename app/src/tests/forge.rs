@@ -33,7 +33,6 @@ fn forge_depth_rides_the_established_seams() {
     assert!(
         lifecycle.contains("let same_rev = empty(forge_tree_rev) || next.rev == forge_tree_rev")
     );
-    assert!(lifecycle.contains("let same_path = next.path == forge_file_path"));
     assert!(backend.contains(
         "load_forge_discussion(rpc:str, channel_id:str) -> ForgeDiscussionData ! AppError"
     ));
@@ -233,10 +232,13 @@ fn forge_code_loaders_query_only_the_requested_tree_or_blob() {
     assert!(handlers.contains(
         "run replace lane=forge_code forge_tree(connected_rpc, forge_repo, forge_tree_rev, path)"
     ));
-    assert!(handlers.contains(
-        "run replace lane=forge_code forge_blob(connected_rpc, forge_repo, forge_tree_rev, path)"
-    ));
     assert!(!handlers.contains("forge_code_generation"));
+
+    let screen = include_str!("../ui/screens/forge.ice");
+    assert!(
+        screen.contains("run replace lane=blob forge_blob(rpc, repo_now, rev, path)"),
+        "the blob read launches from ForgeCodeBrowser's local handler"
+    );
 }
 
 /// Forge's repo chrome used to stack three independent rows — crumb, every
@@ -423,7 +425,6 @@ fn forge_code_reads_are_compiler_replaced_without_ui_generations() {
     for launch in [
         "forge_tree(connected_rpc, forge_repo, \"\", \"\")",
         "forge_tree(connected_rpc, forge_repo, forge_tree_rev, path)",
-        "forge_blob(connected_rpc, forge_repo, forge_tree_rev, path)",
     ] {
         assert!(
             handlers.contains(&format!("run replace lane=forge_code {launch}")),
@@ -431,6 +432,11 @@ fn forge_code_reads_are_compiler_replaced_without_ui_generations() {
         );
     }
     assert!(!handlers.contains("forge_code_generation"));
+    let screen = inlined(include_str!("../ui/screens/forge.ice"));
+    assert!(
+        screen.contains("run replace lane=blob forge_blob(rpc, repo_now, rev, path)"),
+        "the blob read supersedes on the component's own lane"
+    );
 
     let backend = include_str!("../backend/forge.rs");
     assert!(backend.contains("item: item_slice.unwrap_or(noop.item)"));
@@ -518,31 +524,6 @@ fn forge_scoped_reads_do_not_call_loading_or_failure_empty() {
     }));
     assert_eq!(app.forge_code_phase, ForgeCodePhase::Ready);
 
-    let _ = app.__update(__DucktapeMessage::ForgeOpenFile("src/lib.rs".into()));
-    let _ = app.__update(__DucktapeMessage::ForgeBlobLoaded(backend::BlobView {
-        repo: "core".into(),
-        rev: "1111111111111111111111111111111111111111".into(),
-        path: "src/other.rs".into(),
-        text: "wrong file".into(),
-        truncated: false,
-        binary: false,
-        lines: 1,
-    }));
-    assert_eq!(app.forge_code_phase, ForgeCodePhase::FileLoading);
-    assert!(app.forge_file_text.is_empty());
-
-    let _ = app.__update(__DucktapeMessage::ForgeBlobLoaded(backend::BlobView {
-        repo: "core".into(),
-        rev: "1111111111111111111111111111111111111111".into(),
-        path: "src/lib.rs".into(),
-        text: "pub fn main() {}".into(),
-        truncated: false,
-        binary: false,
-        lines: 1,
-    }));
-    assert_eq!(app.forge_code_phase, ForgeCodePhase::Ready);
-    assert_eq!(app.forge_file_text, "pub fn main() {}");
-
     app.forge_item_channel = "forge:core:7".into();
     let _ = app.__update(__DucktapeMessage::ForgeDiscussionLoaded(
         backend::ForgeDiscussionData {
@@ -578,25 +559,61 @@ fn forge_scoped_reads_do_not_call_loading_or_failure_empty() {
 }
 
 #[test]
-fn forge_directory_navigation_clears_the_previous_file_preview() {
+fn forge_directory_navigation_retires_the_previous_file_preview() {
+    // The preview is `ForgeCodeBrowser` component state now, retired by its
+    // gate rather than by a handler clear: `forge_file_header` names the file
+    // only while the browse stands where it was opened — same repository,
+    // same directory, same commit. The app half of a navigation still only
+    // reloads the tree.
+    let moved = |dir: &str, rev: &str| {
+        backend::forge_file_header(
+            "src".into(),
+            "1111".into(),
+            dir.into(),
+            rev.into(),
+            "src/lib.rs".into(),
+        )
+    };
+    assert_eq!(moved("src", "1111"), "src/lib.rs");
+    assert_eq!(moved("", "1111"), "", "leaving the directory retires it");
+    assert_eq!(moved("src", "2222"), "", "a newer commit retires it");
+    // Another repository is another instance: the call site keys the
+    // component on the repo, so cross-repo staleness cannot arise at all.
+
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.connected_rpc = "http://node".into();
     app.forge_repo = "core".into();
     app.forge_tree_rev = "1111111111111111111111111111111111111111".into();
-    app.forge_file_path = "old.rs".into();
-    app.forge_file_text = "stale".into();
-    app.forge_file_binary = true;
-    app.forge_file_truncated = true;
-
     let _ = app.__update(__DucktapeMessage::ForgeOpenDir("src".into()));
-
     assert_eq!(app.forge_tree_path, "src");
     assert_eq!(app.forge_code_phase, ForgeCodePhase::TreeLoading);
-    assert!(app.forge_file_path.is_empty());
-    assert!(app.forge_file_text.is_empty());
-    assert!(!app.forge_file_binary);
-    assert!(!app.forge_file_truncated);
+}
+
+#[test]
+fn the_file_reader_owns_its_cycle_inside_the_component() {
+    // The blob cycle lives in `ForgeCodeBrowser` local state — the pilot
+    // descent. The update-loop harness cannot reach component state
+    // (ducktape-ui#696 tracks the read side), so the contract is pinned by
+    // shape: the local handler runs the read on its own lane, the completion
+    // guards the file it answers for, and every preview surface gates on the
+    // place-and-revision header.
+    let screen = include_str!("../ui/screens/forge.ice");
+    let handlers = include_str!("../ui/handlers/forge.ice");
+
+    let (_, browser) = screen
+        .split_once("component ForgeCodeBrowser(")
+        .expect("the code browser component exists");
+    let (head, _) = browser.split_once("\ncomponent ").unwrap_or((browser, ""));
+    assert!(head.contains("lifetime mounted"));
+    assert!(head.contains("run replace lane=blob forge_blob("));
+    assert!(head.contains("return if next.path != file_path"));
+    let gates = head.matches("forge_file_header(").count();
+    assert!(gates >= 8, "every preview arm gates on the header, found {gates}");
+    assert!(
+        !handlers.contains("forge_blob("),
+        "the app half of the blob cycle is gone"
+    );
 }
 
 #[test]

@@ -431,10 +431,7 @@ view
               tree_entries=forge_tree_entries
               tree_truncated=forge_tree_truncated
               code_phase=forge_code_phase
-              file_path=forge_file_path
-              file_text=forge_file_text
-              file_binary=forge_file_binary
-              file_truncated=forge_file_truncated
+              tree_rev=forge_tree_rev
               forge_item_number
               item_phase=forge_item_phase
               forge_item_kind
@@ -471,7 +468,6 @@ view
               forge_toggle_repo_menu -> forge_toggle_repo_menu
               select_forge_tab -> select_forge_tab _
               forge_open_dir -> forge_open_dir _
-              forge_open_file -> forge_open_file _
               forge_open_item -> forge_open_item _
               forge_close_item -> forge_close_item
               forge_merge_submit -> forge_merge_submit

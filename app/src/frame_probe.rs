@@ -109,7 +109,10 @@ const SCREEN_PROBES: &[ScreenProbe] = &[
         fixture: console_in_huddle,
         allocation_ceiling: 6_000,
     },
-    // 142,166 vs 150,202 for removing source-row virtualization.
+    // 129,731 measured 2026-08-15 for a wire-cap (1,000 entry) directory
+    // listing — the fixture is the tree column now; the syntect source
+    // surface is ForgeCodeBrowser component state and lost its seedable
+    // probe with the descent (ducktape-ui#696 tracks restoring it).
     ScreenProbe {
         label: "forge code build+layout",
         size: WINDOW,
@@ -529,13 +532,20 @@ fn console_in_huddle() -> (Ducktape, iced::window::Id) {
     (app, huddle)
 }
 
-fn forge_source() -> String {
-    (0..LONG_LIST_ROWS)
-        .map(|index| format!("let line_{index:04} = {index};\n"))
+fn forge_tree_rows() -> Vec<backend::TreeEntry> {
+    // The wire caps one listing at forge's MAX_TREE_ENTRIES = 1,000, so this
+    // is the largest directory the un-virtualized tree column can ever be
+    // handed — the honest worst case for its build cost.
+    (0..1_000)
+        .map(|index| backend::TreeEntry {
+            name: format!("file_{index:04}.rs"),
+            path: format!("file_{index:04}.rs"),
+            kind: "file".into(),
+        })
         .collect()
 }
 
-fn console_in_forge_code() -> (Ducktape, iced::window::Id) {
+fn console_in_forge_tree(entries: Vec<backend::TreeEntry>) -> (Ducktape, iced::window::Id) {
     let (mut app, console) = console_on(ShellTab::Forge);
     let _ = app.__update(__DucktapeMessage::ForgeOpenRepo("probe".into()));
     let _ = app.__update(__DucktapeMessage::ForgeRepoLoaded(backend::ForgeRepoData {
@@ -544,33 +554,26 @@ fn console_in_forge_code() -> (Ducktape, iced::window::Id) {
         branches: vec!["dev".into()],
         items: Vec::new(),
     }));
+    let expected = entries.len();
     let _ = app.__update(__DucktapeMessage::ForgeTreeLoaded(backend::ForgeTreeData {
         repo: "probe".into(),
         rev: "1111111111111111111111111111111111111111".into(),
         path: String::new(),
         born: true,
-        entries: vec![backend::TreeEntry {
-            name: "probe.rs".into(),
-            path: "probe.rs".into(),
-            kind: "file".into(),
-        }],
+        entries,
         truncated: false,
     }));
-    let _ = app.__update(__DucktapeMessage::ForgeOpenFile("probe.rs".into()));
-    let source = forge_source();
-    assert!(source.len() < 64 * 1024);
-    let _ = app.__update(__DucktapeMessage::ForgeBlobLoaded(backend::BlobView {
-        repo: "probe".into(),
-        rev: "1111111111111111111111111111111111111111".into(),
-        path: "probe.rs".into(),
-        text: source,
-        truncated: false,
-        binary: false,
-        lines: LONG_LIST_ROWS as i64,
-    }));
-    assert_eq!(app.forge_file_text.lines().count(), LONG_LIST_ROWS);
-    assert_eq!(app.forge_file_path, "probe.rs");
+    assert_eq!(app.forge_tree_entries.len(), expected);
     (app, console)
+}
+
+// The blob half of the reader is `ForgeCodeBrowser` component state now: the
+// update loop cannot seed an open file, so this fixture stops at a long
+// LISTING and the ceiling below guards the tree half only. The syntect
+// source surface lost its allocation guard with the descent — restoring it
+// is exactly ducktape-ui#696 (harness access to component state).
+fn console_in_forge_code() -> (Ducktape, iced::window::Id) {
+    console_in_forge_tree(forge_tree_rows())
 }
 
 fn forge_diff() -> String {
@@ -1301,8 +1304,17 @@ fn the_forge_code_pane_draws_the_loaded_blob() {
         .expect("the forge content probe thread finishes");
 }
 
+// The blob content itself is `ForgeCodeBrowser` component state now, out of
+// the update loop's reach, so the rewritten-blob pixel assertion moved out
+// with it — restoring THAT probe is ducktape-ui#696. What must still hold:
+// clicking the file row — the reader's real control — moves the component's
+// local state and repaints the pane, and the pane survives an event walk.
 fn probe_forge_code_content() {
-    let (mut app, console) = console_in_forge_code();
+    let (mut app, console) = console_in_forge_tree(vec![backend::TreeEntry {
+        name: "probe.rs".into(),
+        path: "probe.rs".into(),
+        kind: "file".into(),
+    }]);
     let mut renderer = headless_renderer();
     let (cache, first) = drawn_frame(
         &mut app,
@@ -1310,35 +1322,60 @@ fn probe_forge_code_content() {
         &mut renderer,
         user_interface::Cache::default(),
     );
-    let (cache, control) = drawn_frame(&mut app, console, &mut renderer, cache);
+    let (mut cache, control) = drawn_frame(&mut app, console, &mut renderer, cache);
     assert!(
         first == control,
         "an unchanged frame must draw identical pixels — without this control \
          the content assertion below proves nothing"
     );
 
-    let _ = app.__update(__DucktapeMessage::ForgeBlobLoaded(backend::BlobView {
-        repo: "probe".into(),
-        rev: "1111111111111111111111111111111111111111".into(),
-        path: "probe.rs".into(),
-        text: "const REWRITTEN: bool = true;\n".into(),
-        truncated: false,
-        binary: false,
-        lines: 1,
-    }));
-    assert_eq!(app.forge_file_text.lines().count(), 1);
-    let (cache, rewritten) = drawn_frame(&mut app, console, &mut renderer, cache);
+    // The row's y depends on the chrome above it, so walk click points down
+    // the tree column until one produces a message. The app-state pins after
+    // the loop prove the hit was the component's file row and not an
+    // app-routed control beside it.
+    let mut clipboard = clipboard::Null;
+    let mut delivered = 0usize;
+    for step in 0..40 {
+        let position = Point::new(150.0, 90.0 + step as f32 * 10.0);
+        let cursor = mouse::Cursor::Available(position);
+        let mut queued: Vec<__DucktapeMessage> = Vec::new();
+        let mut ui = UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer);
+        let _ = ui.update(
+            &[
+                Event::Mouse(mouse::Event::CursorMoved { position }),
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ],
+            cursor,
+            &mut renderer,
+            &mut clipboard,
+            &mut queued,
+        );
+        cache = ui.into_cache();
+        delivered = queued.len();
+        for message in queued {
+            let _ = app.__update(message);
+        }
+        if delivered > 0 {
+            break;
+        }
+    }
+    assert!(delivered > 0, "no click point over the tree column produced a message");
+    assert_eq!(app.forge_repo, "probe", "the click must not leave the repo");
+    assert_eq!(app.forge_tab, crate::ForgeTab::Code, "the click must not switch seats");
+    assert_eq!(app.forge_tree_path, "", "the click must not navigate the tree");
+
+    let (cache, picked) = drawn_frame(&mut app, console, &mut renderer, cache);
     assert!(
-        control != rewritten,
-        "a rewritten blob must repaint the code pane — identical pixels mean \
-         the reader is drawing nothing for the file it says it has open"
+        control != picked,
+        "clicking a file row must repaint the reader — identical pixels mean \
+         the component's local state moved nothing on screen"
     );
 
     // The live app pumps real events between frames; a cached boundary that
     // loses its element to the event walk's tree diff evades a build+draw
     // probe. A scroll down and back over the pane must land on the pixels it
     // started from.
-    let mut clipboard = clipboard::Null;
     let mut queued: Vec<__DucktapeMessage> = Vec::new();
     let position = Point::new(700.0, 300.0);
     let cursor = mouse::Cursor::Available(position);
@@ -1361,8 +1398,8 @@ fn probe_forge_code_content() {
     let cache = ui.into_cache();
     let (_, after_events) = drawn_frame(&mut app, console, &mut renderer, cache);
     assert!(
-        rewritten == after_events,
-        "a scroll down and back over the code pane must restore the frame — \
+        picked == after_events,
+        "a scroll down and back over the pane must restore the frame — \
          different pixels mean the surface lost its content to the event diff"
     );
 }
