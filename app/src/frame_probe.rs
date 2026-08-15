@@ -110,9 +110,20 @@ const SCREEN_PROBES: &[ScreenProbe] = &[
         allocation_ceiling: 6_000,
     },
     // 129,731 measured 2026-08-15 for a wire-cap (1,000 entry) directory
-    // listing — the fixture is the tree column now; the syntect source
-    // surface is ForgeCodeBrowser component state and lost its seedable
-    // probe with the descent (ducktape-ui#696 tracks restoring it).
+    // listing — the un-virtualized tree column at its honest worst case.
+    // 152,723 measured 2026-08-16 post-descent: each row's LOCAL routes now
+    // carry their captured values (rpc, repo, rev, path), ~23 allocations a
+    // row over the app-routed 129,731 — the measured price of the rows
+    // owning their own cycle.
+    ScreenProbe {
+        label: "forge tree build+layout",
+        size: WINDOW,
+        fixture: console_in_forge_tree_only,
+        allocation_ceiling: 165_000,
+    },
+    // The syntect reader on a LONG file, RESTORED: the descent took this
+    // fixture away until the component test seam could seed the blob
+    // through the update loop again. Ceiling re-measured post-descent.
     ScreenProbe {
         label: "forge code build+layout",
         size: WINDOW,
@@ -545,7 +556,12 @@ fn forge_tree_rows() -> Vec<backend::TreeEntry> {
         .collect()
 }
 
-fn console_in_forge_tree(entries: Vec<backend::TreeEntry>) -> (Ducktape, iced::window::Id) {
+/// The whole browse is `ForgeCodeBrowser` component state now, seeded
+/// through the test seam: one headless view pass materializes the keyed
+/// instance (its boot queues a real read this harness never runs), the
+/// seam names the instance scope, and the listing arrives as the same
+/// message the runtime would deliver.
+fn console_in_forge_tree(entries: Vec<backend::TreeEntry>) -> (Ducktape, iced::window::Id, String) {
     let (mut app, console) = console_on(ShellTab::Forge);
     let _ = app.__update(__DucktapeMessage::ForgeOpenRepo("probe".into()));
     let _ = app.__update(__DucktapeMessage::ForgeRepoLoaded(backend::ForgeRepoData {
@@ -554,26 +570,87 @@ fn console_in_forge_tree(entries: Vec<backend::TreeEntry>) -> (Ducktape, iced::w
         branches: vec!["dev".into()],
         items: Vec::new(),
     }));
+    let _ = app.__view(console);
+    let scope = app
+        .__ice_test_scopes_forge_code_browser()
+        .pop()
+        .expect("the code browser materialized");
+    // Deliver the sighting's queued boot NOW — its real read is a dropped
+    // task against a dead endpoint — so the first pumped event pass below
+    // publishes nothing but what the probe itself causes.
+    let boots: Vec<__DucktapeMessage> = app.__ice_boot_queue.borrow_mut().drain(..).collect();
+    for message in boots {
+        let _ = app.__update(message);
+    }
     let expected = entries.len();
-    let _ = app.__update(__DucktapeMessage::ForgeTreeLoaded(backend::ForgeTreeData {
-        repo: "probe".into(),
-        rev: "1111111111111111111111111111111111111111".into(),
-        path: String::new(),
-        born: true,
-        entries,
-        truncated: false,
-    }));
-    assert_eq!(app.forge_tree_entries.len(), expected);
+    let _ = app.__update(Ducktape::__ice_test_message_forge_code_browser_tree_loaded(
+        scope.clone(),
+        backend::ForgeTreeData {
+            repo: "probe".into(),
+            rev: "1111111111111111111111111111111111111111".into(),
+            path: String::new(),
+            born: true,
+            entries,
+            truncated: false,
+        },
+    ));
+    let state = app
+        .__ice_test_state_forge_code_browser(&scope)
+        .expect("the seeded instance answers");
+    assert_eq!(state.tree_entries.len(), expected);
+    (app, console, scope)
+}
+
+/// The reader open on a LONG file — the syntect surface at its measured
+/// worst case, restored to the ceiling probe by the seam seed.
+fn console_in_forge_code() -> (Ducktape, iced::window::Id) {
+    let (mut app, console, scope) = console_in_forge_tree(vec![backend::TreeEntry {
+        name: "probe.rs".into(),
+        path: "probe.rs".into(),
+        kind: "file".into(),
+    }]);
+    seed_forge_blob(&mut app, &scope, forge_source());
     (app, console)
 }
 
-// The blob half of the reader is `ForgeCodeBrowser` component state now: the
-// update loop cannot seed an open file, so this fixture stops at a long
-// LISTING and the ceiling below guards the tree half only. The syntect
-// source surface lost its allocation guard with the descent — restoring it
-// is exactly ducktape-ui#696 (harness access to component state).
-fn console_in_forge_code() -> (Ducktape, iced::window::Id) {
-    console_in_forge_tree(forge_tree_rows())
+fn forge_source() -> String {
+    (0..LONG_LIST_ROWS)
+        .map(|index| format!("let line_{index:04} = {index};\n"))
+        .collect()
+}
+
+fn seed_forge_blob(app: &mut Ducktape, scope: &str, text: String) {
+    let _ = app.__update(Ducktape::__ice_test_message_forge_code_browser_open_file(
+        scope.to_owned(),
+        "http://node".into(),
+        true,
+        "probe".into(),
+        "1111111111111111111111111111111111111111".into(),
+        String::new(),
+        "probe.rs".into(),
+    ));
+    let lines = text.lines().count() as i64;
+    let _ = app.__update(Ducktape::__ice_test_message_forge_code_browser_file_loaded(
+        scope.to_owned(),
+        backend::BlobView {
+            repo: "probe".into(),
+            rev: "1111111111111111111111111111111111111111".into(),
+            path: "probe.rs".into(),
+            text,
+            truncated: false,
+            binary: false,
+            lines,
+        },
+    ));
+    let state = app
+        .__ice_test_state_forge_code_browser(scope)
+        .expect("the seeded instance answers");
+    assert_eq!(state.file_path, "probe.rs");
+}
+
+fn console_in_forge_tree_only() -> (Ducktape, iced::window::Id) {
+    let (app, console, _) = console_in_forge_tree(forge_tree_rows());
+    (app, console)
 }
 
 fn forge_diff() -> String {
@@ -1310,7 +1387,7 @@ fn the_forge_code_pane_draws_the_loaded_blob() {
 // clicking the file row — the reader's real control — moves the component's
 // local state and repaints the pane, and the pane survives an event walk.
 fn probe_forge_code_content() {
-    let (mut app, console) = console_in_forge_tree(vec![backend::TreeEntry {
+    let (mut app, console, scope) = console_in_forge_tree(vec![backend::TreeEntry {
         name: "probe.rs".into(),
         path: "probe.rs".into(),
         kind: "file".into(),
@@ -1326,15 +1403,19 @@ fn probe_forge_code_content() {
     assert!(
         first == control,
         "an unchanged frame must draw identical pixels — without this control \
-         the content assertion below proves nothing"
+         the content assertions below prove nothing"
     );
 
-    // The row's y depends on the chrome above it, so walk click points down
-    // the tree column until one produces a message. The app-state pins after
-    // the loop prove the hit was the component's file row and not an
-    // app-routed control beside it.
+    // The reader's real control still moves it: walk click points down the
+    // tree column until one produces a message, replay it, and the pane
+    // must repaint out of its empty plate. App-state pins prove the hit was
+    // the component's file row and not an app control beside it.
+    // Walk click points down the tree column until one visibly moves the
+    // reader: an inert hit on the way down (the already-selected Code tab
+    // sets a tab that is already set) delivers a message that repaints
+    // nothing, and only the file row's local open_file does.
     let mut clipboard = clipboard::Null;
-    let mut delivered = 0usize;
+    let mut picked = Vec::new();
     for step in 0..40 {
         let position = Point::new(150.0, 90.0 + step as f32 * 10.0);
         let cursor = mouse::Cursor::Available(position);
@@ -1352,24 +1433,46 @@ fn probe_forge_code_content() {
             &mut queued,
         );
         cache = ui.into_cache();
-        delivered = queued.len();
+        let delivered = !queued.is_empty();
         for message in queued {
             let _ = app.__update(message);
         }
-        if delivered > 0 {
+        if !delivered {
+            continue;
+        }
+        assert_eq!(app.forge_repo, "probe", "a click must not leave the repo");
+        assert_eq!(app.forge_tab, crate::ForgeTab::Code, "a click must not switch seats");
+        let (next_cache, frame) = drawn_frame(&mut app, console, &mut renderer, cache);
+        cache = next_cache;
+        if frame != control {
+            picked = frame;
             break;
         }
     }
-    assert!(delivered > 0, "no click point over the tree column produced a message");
-    assert_eq!(app.forge_repo, "probe", "the click must not leave the repo");
-    assert_eq!(app.forge_tab, crate::ForgeTab::Code, "the click must not switch seats");
-    assert_eq!(app.forge_tree_path, "", "the click must not navigate the tree");
-
-    let (cache, picked) = drawn_frame(&mut app, console, &mut renderer, cache);
     assert!(
-        control != picked,
+        !picked.is_empty(),
         "clicking a file row must repaint the reader — identical pixels mean \
          the component's local state moved nothing on screen"
+    );
+
+    // The blob lands through the seam — the same message the runtime would
+    // deliver — and the syntect surface must draw it.
+    seed_forge_blob(&mut app, &scope, forge_source());
+    let (cache, loaded) = drawn_frame(&mut app, console, &mut renderer, cache);
+    assert!(
+        picked != loaded,
+        "a loaded blob must repaint the reader out of its loading plate"
+    );
+
+    // A REWRITTEN blob must repaint the code pane — identical pixels mean
+    // the reader is drawing nothing for the file it says it has open (the
+    // memo-boundary regression class that shipped once already).
+    seed_forge_blob(&mut app, &scope, "const REWRITTEN: bool = true;\n".into());
+    let (cache, rewritten) = drawn_frame(&mut app, console, &mut renderer, cache);
+    assert!(
+        loaded != rewritten,
+        "a rewritten blob must repaint the code pane — identical pixels mean \
+         the reader is drawing nothing for the file it says it has open"
     );
 
     // The live app pumps real events between frames; a cached boundary that
@@ -1398,7 +1501,7 @@ fn probe_forge_code_content() {
     let cache = ui.into_cache();
     let (_, after_events) = drawn_frame(&mut app, console, &mut renderer, cache);
     assert!(
-        picked == after_events,
+        rewritten == after_events,
         "a scroll down and back over the pane must restore the frame — \
          different pixels mean the surface lost its content to the event diff"
     );

@@ -29,10 +29,9 @@ fn forge_depth_rides_the_established_seams() {
         "run replace lane=forge_discussion load_forge_discussion(connected_rpc, forge_item_channel)"
     ));
     assert!(lifecycle.contains("return if next.channel_id != forge_item_channel"));
-    assert!(lifecycle.contains("let same_repo = next.repo == forge_repo"));
-    assert!(
-        lifecycle.contains("let same_rev = empty(forge_tree_rev) || next.rev == forge_tree_rev")
-    );
+    let screen = include_str!("../ui/screens/forge.ice");
+    assert!(screen.contains("return if next.path != tree_path"));
+    assert!(screen.contains("return if !empty(tree_rev) && next.rev != tree_rev"));
     assert!(backend.contains(
         "load_forge_discussion(rpc:str, channel_id:str) -> ForgeDiscussionData ! AppError"
     ));
@@ -225,14 +224,14 @@ fn forge_code_loaders_query_only_the_requested_tree_or_blob() {
 
     let handlers = include_str!("../ui/handlers/forge.ice");
     assert!(
-        handlers.contains(
-            "run replace lane=forge_code forge_tree(connected_rpc, forge_repo, \"\", \"\")"
-        )
+        !handlers.contains("forge_tree(") && !handlers.contains("forge_blob("),
+        "the browse launches from ForgeCodeBrowser, not the app plane"
     );
-    assert!(handlers.contains(
-        "run replace lane=forge_code forge_tree(connected_rpc, forge_repo, forge_tree_rev, path)"
+    let screen = include_str!("../ui/screens/forge.ice");
+    assert!(screen.contains(
+        "run replace lane=tree forge_tree(connected_rpc, repo, \"\", \"\")"
     ));
-    assert!(!handlers.contains("forge_code_generation"));
+    assert!(screen.contains("run replace lane=tree forge_tree(rpc, repo_now, tree_rev, path)"));
 
     let screen = include_str!("../ui/screens/forge.ice");
     assert!(
@@ -338,7 +337,10 @@ fn closing_a_repo_or_an_item_retires_the_load_that_would_reopen_it() {
         .split_once("\non ")
         .expect("repo close arm")
         .0;
-    for lane in ["forge_repo", "forge_item", "forge_discussion", "forge_code"] {
+    // `forge_code` is gone from this list on purpose: the browse's lanes are
+    // instance-owned now, and closing the repo unmounts the keyed instance,
+    // which prunes its state and aborts its lanes.
+    for lane in ["forge_repo", "forge_item", "forge_discussion"] {
         assert!(close_repo.contains(&format!("invalidate lane={lane}")));
     }
     let close_item = handlers
@@ -422,16 +424,17 @@ fn closing_a_repo_or_an_item_retires_the_load_that_would_reopen_it() {
 #[test]
 fn forge_code_reads_are_compiler_replaced_without_ui_generations() {
     let handlers = inlined(include_str!("../ui/handlers/forge.ice"));
+    assert!(!handlers.contains("forge_code_generation"));
+    let component = inlined(include_str!("../ui/screens/forge.ice"));
     for launch in [
-        "forge_tree(connected_rpc, forge_repo, \"\", \"\")",
-        "forge_tree(connected_rpc, forge_repo, forge_tree_rev, path)",
+        "forge_tree(connected_rpc, repo, \"\", \"\")",
+        "forge_tree(rpc, repo_now, tree_rev, path)",
     ] {
         assert!(
-            handlers.contains(&format!("run replace lane=forge_code {launch}")),
+            component.contains(&format!("run replace lane=tree {launch}")),
             "{launch} must supersede the previous code read"
         );
     }
-    assert!(!handlers.contains("forge_code_generation"));
     let screen = inlined(include_str!("../ui/screens/forge.ice"));
     assert!(
         screen.contains("run replace lane=blob forge_blob(rpc, repo_now, rev, path)"),
@@ -440,6 +443,20 @@ fn forge_code_reads_are_compiler_replaced_without_ui_generations() {
 
     let backend = include_str!("../backend/forge.rs");
     assert!(backend.contains("item: item_slice.unwrap_or(noop.item)"));
+}
+
+fn materialized_code_browser(app: &mut Ducktape) -> String {
+    let window = iced::window::Id::unique();
+    app.console_win = Some(window);
+    app.shell_tab = ShellTab::Forge;
+    let _ = app.__view(window);
+    let boots: Vec<__DucktapeMessage> = app.__ice_boot_queue.borrow_mut().drain(..).collect();
+    for message in boots {
+        let _ = app.__update(message);
+    }
+    app.__ice_test_scopes_forge_code_browser()
+        .pop()
+        .expect("the code browser materialized")
 }
 
 #[test]
@@ -461,7 +478,6 @@ fn forge_scoped_reads_do_not_call_loading_or_failure_empty() {
 
     let _ = app.__update(__DucktapeMessage::ForgeOpenRepo("core".into()));
     assert_eq!(app.forge_repo_phase, ForgePhase::Loading);
-    assert_eq!(app.forge_code_phase, ForgeCodePhase::TreeLoading);
     let generation = app.forge_generation;
 
     let _ = app.__update(__DucktapeMessage::ForgeRepoLoaded(backend::ForgeRepoData {
@@ -472,57 +488,52 @@ fn forge_scoped_reads_do_not_call_loading_or_failure_empty() {
     }));
     assert_eq!(app.forge_repo_phase, ForgePhase::Ready);
 
-    let _ = app.__update(__DucktapeMessage::ForgeTreeLoaded(backend::ForgeTreeData {
-        repo: "other".into(),
-        rev: "2222222222222222222222222222222222222222".into(),
-        path: String::new(),
-        born: true,
-        entries: Vec::new(),
-        truncated: false,
-    }));
-    assert_eq!(app.forge_code_phase, ForgeCodePhase::TreeLoading);
-    assert!(!app.forge_tree_born, "another repo's tree must not paint");
+    // The browse guards live in ForgeCodeBrowser now: another repository is
+    // another keyed instance, so the seam exercises the path and revision
+    // guards the completion still carries.
+    let scope = materialized_code_browser(&mut app);
+    let tree = |rev: &str, path: &str, truncated: bool| {
+        Ducktape::__ice_test_message_forge_code_browser_tree_loaded(
+            scope.clone(),
+            backend::ForgeTreeData {
+                repo: "core".into(),
+                rev: rev.into(),
+                path: path.into(),
+                born: true,
+                entries: Vec::new(),
+                truncated,
+            },
+        )
+    };
+    let _ = app.__update(tree("2222222222222222222222222222222222222222", "src", false));
+    let state = app.__ice_test_state_forge_code_browser(&scope).expect("instance");
+    assert!(
+        !state.tree_born,
+        "a listing for a path the browse never asked for must not paint"
+    );
 
-    let _ = app.__update(__DucktapeMessage::ForgeTreeLoaded(backend::ForgeTreeData {
-        repo: "core".into(),
-        rev: "1111111111111111111111111111111111111111".into(),
-        path: String::new(),
-        born: true,
-        entries: Vec::new(),
-        truncated: true,
-    }));
-    assert_eq!(app.forge_code_phase, ForgeCodePhase::Ready);
-    assert!(app.forge_tree_born);
-    assert!(app.forge_tree_truncated);
+    let _ = app.__update(tree("1111111111111111111111111111111111111111", "", true));
+    let state = app.__ice_test_state_forge_code_browser(&scope).expect("instance");
+    assert!(state.tree_born);
+    assert!(state.tree_truncated);
     assert_eq!(
-        app.forge_tree_rev, "1111111111111111111111111111111111111111",
+        state.tree_rev, "1111111111111111111111111111111111111111",
         "nested tree and file reads stay pinned to the tree's commit"
     );
 
-    let _ = app.__update(__DucktapeMessage::ForgeOpenDir("src".into()));
-    let _ = app.__update(__DucktapeMessage::ForgeTreeLoaded(backend::ForgeTreeData {
-        repo: "core".into(),
-        rev: "2222222222222222222222222222222222222222".into(),
-        path: "src".into(),
-        born: true,
-        entries: Vec::new(),
-        truncated: false,
-    }));
-    assert_eq!(app.forge_code_phase, ForgeCodePhase::TreeLoading);
+    let _ = app.__update(Ducktape::__ice_test_message_forge_code_browser_open_dir(
+        scope.clone(),
+        "http://node".into(),
+        true,
+        "core".into(),
+        "src".into(),
+    ));
+    let _ = app.__update(tree("2222222222222222222222222222222222222222", "src", false));
+    let state = app.__ice_test_state_forge_code_browser(&scope).expect("instance");
     assert!(
-        app.forge_tree_entries.is_empty(),
+        state.tree_entries.is_empty() && !state.tree_truncated,
         "a tree from another revision must not paint"
     );
-
-    let _ = app.__update(__DucktapeMessage::ForgeTreeLoaded(backend::ForgeTreeData {
-        repo: "core".into(),
-        rev: "1111111111111111111111111111111111111111".into(),
-        path: "src".into(),
-        born: true,
-        entries: Vec::new(),
-        truncated: false,
-    }));
-    assert_eq!(app.forge_code_phase, ForgeCodePhase::Ready);
 
     app.forge_item_channel = "forge:core:7".into();
     let _ = app.__update(__DucktapeMessage::ForgeDiscussionLoaded(
@@ -584,19 +595,26 @@ fn forge_directory_navigation_retires_the_previous_file_preview() {
     app.connected = true;
     app.connected_rpc = "http://node".into();
     app.forge_repo = "core".into();
-    app.forge_tree_rev = "1111111111111111111111111111111111111111".into();
-    let _ = app.__update(__DucktapeMessage::ForgeOpenDir("src".into()));
-    assert_eq!(app.forge_tree_path, "src");
-    assert_eq!(app.forge_code_phase, ForgeCodePhase::TreeLoading);
+    let scope = materialized_code_browser(&mut app);
+    let _ = app.__update(Ducktape::__ice_test_message_forge_code_browser_open_dir(
+        scope.clone(),
+        "http://node".into(),
+        true,
+        "core".into(),
+        "src".into(),
+    ));
+    let state = app.__ice_test_state_forge_code_browser(&scope).expect("instance");
+    assert_eq!(state.tree_path, "src");
+    assert!(state.tree_entries.is_empty(), "navigation clears the listing it left");
 }
 
 #[test]
 fn the_file_reader_owns_its_cycle_inside_the_component() {
-    // The blob cycle lives in `ForgeCodeBrowser` local state — the pilot
-    // descent. The update-loop harness cannot reach component state
-    // (ducktape-ui#696 tracks the read side), so the contract is pinned by
-    // shape: the local handler runs the read on its own lane, the completion
-    // guards the file it answers for, and every preview surface gates on the
+    // The whole browse lives in `ForgeCodeBrowser` local state. The seam
+    // tests above exercise the behavior; this lint pins the SHAPE — boot
+    // reads the root with the props the instance was mounted with, both
+    // reads run on the component's own lanes, the completions guard what
+    // they answer for, and every preview surface gates on the
     // place-and-revision header.
     let screen = include_str!("../ui/screens/forge.ice");
     let handlers = include_str!("../ui/handlers/forge.ice");
@@ -606,13 +624,17 @@ fn the_file_reader_owns_its_cycle_inside_the_component() {
         .expect("the code browser component exists");
     let (head, _) = browser.split_once("\ncomponent ").unwrap_or((browser, ""));
     assert!(head.contains("lifetime mounted"));
+    assert!(head.contains("  boot\n"));
+    assert!(head.contains("run replace lane=tree forge_tree(connected_rpc, repo, \"\", \"\")"));
+    assert!(head.contains("run replace lane=tree forge_tree(rpc, repo_now, tree_rev, path)"));
     assert!(head.contains("run replace lane=blob forge_blob("));
+    assert!(head.contains("return if next.path != tree_path"));
     assert!(head.contains("return if next.path != file_path"));
     let gates = head.matches("forge_file_header(").count();
     assert!(gates >= 8, "every preview arm gates on the header, found {gates}");
     assert!(
-        !handlers.contains("forge_blob("),
-        "the app half of the blob cycle is gone"
+        !handlers.contains("forge_blob(") && !handlers.contains("forge_tree("),
+        "the app half of the browse is gone"
     );
 }
 
@@ -679,7 +701,7 @@ fn forge_empty_states_name_only_routes_that_exist() {
     // can take seconds for a real repository; only the loader's born bit may
     // decide that no branch exists, and an empty born commit is distinct too.
     assert!(
-        forge.contains("if code_phase == ForgeCodePhase.tree_loading"),
+        forge.contains("if tree_phase == ForgeTreePhase.loading"),
         "the in-flight tree has its own visible state"
     );
     assert!(

@@ -37,21 +37,11 @@ on forge_open_repo(name)
   forge_item_phase = ForgePhase.idle
   forge_item_diff = ""
   forge_generation = forge_generation + 1
-  // THE CODE TAB LOADS ITS OWN CONTENT NOW. Opening a repo landed on Code with
-  // an empty file tree and a line reading "Pick Code again to browse this
-  // repository" — the screen asking to be clicked on the tab it was already
-  // showing, because only `select_forge_tab` ever fired the tree read. Same
-  // reset block as that handler, and the two loads go out together.
+  // The Code tab's content is ForgeCodeBrowser component state now: keying
+  // the instance on the repo makes this open a FRESH instance, whose boot
+  // reads the root listing itself — no tree seeding left to do here.
   forge_tab = ForgeTab.code
-  forge_tree_path = ""
-  forge_tree_rev = ""
-  forge_tree_entries = []
-  forge_tree_truncated = false
-  forge_tree_born = false
-  forge_code_phase = ForgeCodePhase.tree_loading
-  parallel
-    run replace lane=forge_repo load_forge_repo(connected_rpc, forge_repo, forge_generation) -> forge_repo_loaded _ | forge_repo_failed _
-    run replace lane=forge_code forge_tree(connected_rpc, forge_repo, "", "") -> forge_tree_loaded _ | forge_tree_failed _
+  run replace lane=forge_repo load_forge_repo(connected_rpc, forge_repo, forge_generation) -> forge_repo_loaded _ | forge_repo_failed _
 
 on forge_repo_loaded(next)
   return if next.generation != forge_generation
@@ -67,7 +57,6 @@ on forge_repo_failed(cause)
 
 on forge_open_item(number)
   return if !connected || empty(forge_repo)
-  invalidate lane=forge_code
   invalidate lane=forge_discussion
   forge_item_number = number
   error = ""
@@ -269,7 +258,6 @@ on forge_close_repo
   invalidate lane=forge_repo
   invalidate lane=forge_item
   invalidate lane=forge_discussion
-  invalidate lane=forge_code
   forge_generation = forge_generation + 1
   forge_repo = ""
   forge_repo_phase = ForgePhase.idle
@@ -303,47 +291,8 @@ on forge_close_item
   forge_discussion_pending = ""
   forge_merge_conflicts = []
 
-// Picking Code (re)reads the repo root: `forge_tree` lists ONE
-// directory, so the browse always starts from a listing that belongs to the
-// repo currently open, and a tree left over from the previous repo can never
-// paint.
+// The whole code browse — root listing, directory navigation, the file
+// reader — is ForgeCodeBrowser component state: leaving the tab prunes it,
+// re-entering remounts a fresh instance whose boot re-reads the root.
 on select_forge_tab(tab)
-  invalidate lane=forge_code
   forge_tab = tab
-  return if tab != ForgeTab.code || !connected || empty(forge_repo)
-  forge_tree_path = ""
-  forge_tree_rev = ""
-  forge_tree_entries = []
-  forge_tree_truncated = false
-  forge_tree_born = false
-  forge_code_phase = ForgeCodePhase.tree_loading
-  run replace lane=forge_code forge_tree(connected_rpc, forge_repo, "", "") -> forge_tree_loaded _ | forge_tree_failed _
-
-// A directory row NAVIGATES. `forge_tree` answers for one path, so there is no
-// whole-tree read to expand in place against — the same shape the duckfs tree
-// on the Files screen already has, and the reason every row sits at depth 0.
-on forge_open_dir(path)
-  return if !connected || empty(forge_repo)
-  forge_tree_path = path
-  forge_tree_entries = []
-  forge_tree_truncated = false
-  forge_code_phase = ForgeCodePhase.tree_loading
-  run replace lane=forge_code forge_tree(connected_rpc, forge_repo, forge_tree_rev, path) -> forge_tree_loaded _ | forge_tree_failed _
-
-on forge_tree_loaded(next)
-  let same_repo = next.repo == forge_repo
-  let same_path = next.path == forge_tree_path
-  let same_rev = empty(forge_tree_rev) || next.rev == forge_tree_rev
-  return if !same_repo || !same_path || !same_rev
-  forge_tree_repo = next.repo
-  forge_tree_rev = next.rev
-  forge_tree_path = next.path
-  forge_tree_born = next.born
-  forge_tree_entries = next.entries
-  forge_tree_truncated = next.truncated
-  forge_code_phase = ForgeCodePhase.ready
-  error = ""
-
-on forge_tree_failed(cause)
-  forge_code_phase = ForgeCodePhase.tree_failed
-  error = cause.message

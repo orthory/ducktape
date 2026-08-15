@@ -12,13 +12,17 @@ enum ForgeFilePhase
   ready
   failed
 
-component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[ForgeRepo], list_phase:ForgePhase, open_repo:str, repo_menu:bool, repo_phase:ForgePhase, branches:[str], tab:ForgeTab, items:[ForgeItem], tree_repo:str, tree_rev:str, tree_path:str, tree_born:bool, tree_entries:[TreeEntry], tree_truncated:bool, code_phase:ForgeCodePhase, forge_item_number:i64, item_phase:ForgePhase, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:ForgeReviewVerdict, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, connected:bool, loading:bool, dark:bool)
+enum ForgeTreePhase
+  loading
+  ready
+  failed
+
+component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[ForgeRepo], list_phase:ForgePhase, open_repo:str, repo_menu:bool, repo_phase:ForgePhase, branches:[str], tab:ForgeTab, items:[ForgeItem], forge_item_number:i64, item_phase:ForgePhase, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:ForgeReviewVerdict, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, connected:bool, loading:bool, dark:bool)
   emits
     forge_open_repo(str)
     forge_close_repo()
     forge_toggle_repo_menu()
     select_forge_tab(ForgeTab)
-    forge_open_dir(str)
     forge_open_item(i64)
     forge_close_item()
     forge_merge_submit()
@@ -300,16 +304,8 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                     connected_rpc
                     connected
                     repo=open_repo
-                    tree_repo
-                    tree_rev
-                    tree_path
-                    tree_born
-                    tree_entries
-                    tree_truncated
-                    code_phase
                     dark
                   forward
-                    forge_open_dir
                     open_message_link
               ForgeTab.issues
                 ForgeTrackerList
@@ -733,22 +729,27 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                       p=6.0
                       @primary_action
 
-// THE FILE READER OWNS ITS OWN CYCLE. A file click routes to a local
-// handler, the blob lands in component state, and no app handler clears
-// any of it. The call site keys the instance by repository, and mounted
-// lifetime prunes it — state, in-flight lane and all — when the reader
-// leaves the Code tab or the repo: exactly the retirement
-// `select_forge_tab` used to perform by hand. Within a stay, the preview
-// is gated on the directory AND revision it was opened under
-// (`forge_file_header`), so navigating away or a tree that reloaded at a
-// newer commit retires it by moving the ground under it, and returning to
-// the same directory at the same revision honestly resurfaces it.
-component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, tree_repo:str, tree_rev:str, tree_path:str, tree_born:bool, tree_entries:[TreeEntry], tree_truncated:bool, code_phase:ForgeCodePhase, dark:bool)
+// THE CODE BROWSE OWNS ITS OWN CYCLE, whole: boot reads the root listing
+// with the endpoint and repo its instance was mounted with, a directory
+// row navigates through a local handler, and a file click lands the blob
+// in component state — no app handler seeds or clears any of it. The call
+// site keys the instance by repository and mounted lifetime prunes it, so
+// switching repos or leaving the Code tab retires everything and coming
+// back boots a fresh read. Within a stay, the preview is gated on the
+// directory AND revision it was opened under (`forge_file_header`), so
+// navigating away or a tree that reloaded at a newer commit retires it by
+// moving the ground under it.
+component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:bool)
   emits
-    forge_open_dir(str)
     open_message_link(str)
   lifetime mounted
   state
+    tree_path = ""
+    tree_rev = ""
+    tree_entries:[TreeEntry] = []
+    tree_born = false
+    tree_truncated = false
+    tree_phase:ForgeTreePhase = ForgeTreePhase.loading
     file_path = ""
     file_text = ""
     file_binary = false
@@ -757,6 +758,25 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, tree_rep
     opened_dir = ""
     opened_rev = ""
     phase:ForgeFilePhase = ForgeFilePhase.idle
+  boot
+    run replace lane=tree forge_tree(connected_rpc, repo, "", "") -> tree_loaded _ | tree_failed _
+  on open_dir(rpc, online, repo_now, path)
+    return if !online || empty(repo_now)
+    tree_path = path
+    tree_entries = []
+    tree_truncated = false
+    tree_phase = ForgeTreePhase.loading
+    run replace lane=tree forge_tree(rpc, repo_now, tree_rev, path) -> tree_loaded _ | tree_failed _
+  on tree_loaded(next)
+    return if next.path != tree_path
+    return if !empty(tree_rev) && next.rev != tree_rev
+    tree_rev = next.rev
+    tree_born = next.born
+    tree_entries = next.entries
+    tree_truncated = next.truncated
+    tree_phase = ForgeTreePhase.ready
+  on tree_failed(cause)
+    tree_phase = ForgeTreePhase.failed
   on open_file(rpc, online, repo_now, rev, dir, path)
     return if !online || empty(repo_now)
     opened_dir = dir
@@ -800,7 +820,7 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, tree_rep
       // facts. In particular, an in-flight tree query must never
       // paint "nothing committed" before its answer arrives.
       col w=fill
-        if code_phase == ForgeCodePhase.tree_loading
+        if tree_phase == ForgeTreePhase.loading
           box
             with
               w=fill
@@ -813,7 +833,7 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, tree_rep
                 size=11.5
                 line-h=1.5
                 @text-label
-        if code_phase == ForgeCodePhase.tree_failed
+        if tree_phase == ForgeTreePhase.failed
           box w=fill pl=16.0 pr=16.0 pt=8.0
             text "Could not load code. Pick Code to try again."
               with
@@ -821,7 +841,7 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, tree_rep
                 size=11.5
                 line-h=1.5
                 @text-label
-        if tree_repo == repo && code_phase != ForgeCodePhase.tree_loading && code_phase != ForgeCodePhase.tree_failed
+        if tree_phase == ForgeTreePhase.ready
           col w=fill
             if empty(tree_entries) && !tree_born
               box w=fill pl=16.0 pr=16.0 pt=8.0
@@ -848,7 +868,7 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, tree_rep
                     line-h=1.5
                     @text-label
             if !empty(tree_path)
-              button -> emit(forge_open_dir, "")
+              button -> open_dir(connected_rpc, connected, repo, "")
                 with
                   label="Back to the repository root"
                   w=fill
@@ -865,7 +885,7 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, tree_rep
             for entry in tree_entries
               col w=fill
                 if entry.kind == "dir"
-                  button -> emit(forge_open_dir, entry.path)
+                  button -> open_dir(connected_rpc, connected, repo, entry.path)
                     with
                       label="Open directory"
                       description=entry.path
@@ -907,21 +927,21 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, tree_rep
     source:
       // The reader's states, each with its own true reason.
       col w=fill
-        if code_phase == ForgeCodePhase.tree_loading
+        if tree_phase == ForgeTreePhase.loading
           ForgeCodeEmpty name="" note="Loading repository files…"
         if phase == ForgeFilePhase.loading && !empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path))
           ForgeCodeEmpty name=file_path note="Loading file…"
-        if code_phase == ForgeCodePhase.tree_failed
+        if tree_phase == ForgeTreePhase.failed
           ForgeCodeEmpty name="" note="Could not load code. Pick Code to try again."
         if phase == ForgeFilePhase.failed && !empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path))
           ForgeCodeEmpty name=file_path note=failed_note
-        if code_phase == ForgeCodePhase.ready && empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && empty(tree_entries) && !tree_born
+        if tree_phase == ForgeTreePhase.ready && empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && empty(tree_entries) && !tree_born
           ForgeCodeEmpty name="" note="Nothing is committed on this repository yet, so there is no file to read."
-        if code_phase == ForgeCodePhase.ready && empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && empty(tree_entries) && tree_born && !tree_truncated
+        if tree_phase == ForgeTreePhase.ready && empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && empty(tree_entries) && tree_born && !tree_truncated
           ForgeCodeEmpty name="" note="This commit has no files to read."
-        if code_phase == ForgeCodePhase.ready && empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && empty(tree_entries) && tree_born && tree_truncated
+        if tree_phase == ForgeTreePhase.ready && empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && empty(tree_entries) && tree_born && tree_truncated
           ForgeCodeEmpty name="" note="This directory has entries outside the browser's display limits."
-        if code_phase == ForgeCodePhase.ready && empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && !empty(tree_entries)
+        if tree_phase == ForgeTreePhase.ready && empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && !empty(tree_entries)
           ForgeCodeEmpty name="" note="Pick a file from the tree to read it."
         if phase == ForgeFilePhase.ready && !empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && file_binary
           ForgeCodeEmpty

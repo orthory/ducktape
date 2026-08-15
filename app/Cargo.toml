@@ -11,7 +11,7 @@ icon = "assets/icon.svg"
 category = "public.app-category.productivity"
 
 [build-dependencies]
-ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "d24da32d5a9fa89aeb61ae73643457cb3da1e47d", version = "=0.1.0" }
+ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "78b9838a68ff471fc6c1eb072542ca8b255f838e", version = "=0.1.0" }
 
 [dependencies]
 chat.workspace = true
@@ -48,9 +48,9 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt"
 zeroize.workspace = true
 iced = { version = "=0.14.0", default-features = false, features = ["advanced", "highlighter", "image-without-codecs", "lazy", "markdown", "svg", "tokio", "wgpu", "x11"] }
 iced_term = "=0.8.0"
-ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "d24da32d5a9fa89aeb61ae73643457cb3da1e47d", default-features = false, features = ["log-timeline"] }
-ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "d24da32d5a9fa89aeb61ae73643457cb3da1e47d" }
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "d24da32d5a9fa89aeb61ae73643457cb3da1e47d", version = "=0.1.0", default-features = false, features = ["full-runtime"] }
+ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "78b9838a68ff471fc6c1eb072542ca8b255f838e", default-features = false, features = ["log-timeline"] }
+ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "78b9838a68ff471fc6c1eb072542ca8b255f838e" }
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "78b9838a68ff471fc6c1eb072542ca8b255f838e", version = "=0.1.0", default-features = false, features = ["full-runtime"] }
 
 [dev-dependencies]
 commonware-cryptography.workspace = true
@@ -62,4 +62,4 @@ iced_test = "=0.14.0"
 node.workspace = true
 simnode = { path = "../bin/simnode" }
 tempfile.workspace = true
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "d24da32d5a9fa89aeb61ae73643457cb3da1e47d", version = "=0.1.0", default-features = false, features = ["test-runtime"] }
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "78b9838a68ff471fc6c1eb072542ca8b255f838e", version = "=0.1.0", default-features = false, features = ["test-runtime"] }

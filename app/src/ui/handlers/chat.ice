@@ -76,7 +76,6 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   unread_marker_seq = 0
   palette_open = false
   shell_tab = ShellTab.chat
-  invalidate lane=forge_code
   chat_search_phase = SearchPhase.idle
   // Same abandoned request, same dead button — see `choose_channel`. This route
   // lands in a DIFFERENT channel via `chat_hit_loaded`, so the page still in

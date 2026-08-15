@@ -425,13 +425,6 @@ view
               branches=forge_branches
               tab=forge_tab
               items=forge_items
-              tree_repo=forge_tree_repo
-              tree_path=forge_tree_path
-              tree_born=forge_tree_born
-              tree_entries=forge_tree_entries
-              tree_truncated=forge_tree_truncated
-              code_phase=forge_code_phase
-              tree_rev=forge_tree_rev
               forge_item_number
               item_phase=forge_item_phase
               forge_item_kind
@@ -467,7 +460,6 @@ view
               forge_close_repo -> forge_close_repo
               forge_toggle_repo_menu -> forge_toggle_repo_menu
               select_forge_tab -> select_forge_tab _
-              forge_open_dir -> forge_open_dir _
               forge_open_item -> forge_open_item _
               forge_close_item -> forge_close_item
               forge_merge_submit -> forge_merge_submit

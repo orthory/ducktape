@@ -44,12 +44,3 @@ state
 
   forge_tab:ForgeTab = ForgeTab.code
   forge_repo_menu = false
-  forge_tree_path = ""
-  forge_tree_rev = ""
-  // Stamp listings with their repository so a repo switch cannot paint the
-  // previous repository's tree under the new breadcrumb.
-  forge_tree_repo = ""
-  forge_tree_entries:[TreeEntry] = []
-  forge_tree_truncated = false
-  forge_tree_born = false
-  forge_code_phase:ForgeCodePhase = ForgeCodePhase.idle

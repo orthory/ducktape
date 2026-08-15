@@ -48,7 +48,6 @@ on reconnect
   invalidate lane=block_threads
   invalidate lane=block_comments
   invalidate lane=live_resync
-  invalidate lane=forge_code
   invalidate lane=files_preview
   invalidate lane=page_autosave
   orphaned_comment_drafts = remember_orphaned_comment_drafts(orphaned_comment_drafts, [], active_page, block_comment_draft)
