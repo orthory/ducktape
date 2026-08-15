@@ -165,7 +165,6 @@ on console_opened(id)
   invalidate lane=forge_repo
   invalidate lane=forge_item
   invalidate lane=forge_discussion
-  invalidate lane=forge_code
   invalidate lane=files_preview
   invalidate lane=shell_credentials
   invalidate lane=shell_terminal
@@ -341,13 +340,6 @@ on console_opened(id)
   forge_discussion_members = []
   forge_discussion_pending = ""
   forge_discussion_editor = editor("")
-  forge_tree_repo = ""
-  forge_tree_rev = ""
-  forge_tree_path = ""
-  forge_tree_born = false
-  forge_tree_entries = []
-  forge_tree_truncated = false
-  forge_code_phase = ForgeCodePhase.idle
   // The huddle and its media session belong to the PREVIOUS network.
   // `call_session` is subscribed `when huddle_joined`, so this clear IS the
   // teardown — the stream drops and the old node's presence gate reaps the

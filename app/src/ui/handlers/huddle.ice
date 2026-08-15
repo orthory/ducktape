@@ -80,7 +80,6 @@ on dock_huddle
 on huddle_go_channel
   return if loading || mutation_phase != MutationPhase.idle || empty(huddle_channel)
   shell_tab = ShellTab.chat
-  invalidate lane=forge_code
   // Same tab-move rule as `select_shell_tab`. `choose_channel` below retires it
   // again; the rule is uniform on purpose, so no reader has to prove the flow
   // reaches a second retire before trusting this one.

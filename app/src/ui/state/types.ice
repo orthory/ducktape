@@ -39,12 +39,6 @@ enum ForgePhase
   ready
   failed
 
-enum ForgeCodePhase
-  idle
-  tree_loading
-  ready
-  tree_failed
-
 enum HubStep
   loading
   create

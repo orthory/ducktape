@@ -425,10 +425,6 @@ fn opening_a_network_clears_the_previous_networks_state() {
     app.forge_item_number = 1;
     app.forge_item_phase = ForgePhase::Ready;
     app.forge_review_draft = "node a review".into();
-    app.forge_tree_repo = "same-repo".into();
-    app.forge_tree_born = true;
-    app.forge_tree_truncated = true;
-    app.forge_code_phase = ForgeCodePhase::Ready;
     app.huddle_joined = true;
     app.huddle_channel = "chan-a".into();
     // AND THE PARKS, which the by-name clears around them would otherwise miss.
@@ -466,10 +462,9 @@ fn opening_a_network_clears_the_previous_networks_state() {
     assert_eq!(app.forge_item_number, 0);
     assert_eq!(app.forge_item_phase, ForgePhase::Idle);
     assert!(app.forge_review_draft.is_empty());
-    assert!(app.forge_tree_repo.is_empty());
-    assert!(!app.forge_tree_born);
-    assert!(!app.forge_tree_truncated);
-    assert_eq!(app.forge_code_phase, ForgeCodePhase::Idle);
+    // The tree lives in ForgeCodeBrowser component state now: a network
+    // switch closes the console content and mounted-lifetime pruning drops
+    // the instance — there is no app field left to reset.
     assert!(!app.huddle_joined);
     assert!(app.huddle_channel.is_empty());
 

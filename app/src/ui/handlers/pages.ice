@@ -46,7 +46,6 @@ on open_page_search_hit(page_id, _block_id)
   invalidate lane=block_comments
   palette_open = false
   shell_tab = ShellTab.pages
-  invalidate lane=forge_code
   // Same tab-move rule as `select_shell_tab`.
   composer_focus = ComposerFocus.unfocused
   page_searching = false
