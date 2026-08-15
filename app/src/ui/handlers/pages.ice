@@ -149,7 +149,7 @@ on toggle_page_create
   // Same rule as chat's menus: a `task widget focus` is the app moving the
   // caret by hand, so the chat composers' claim on it dies here.
   composer_focus = ComposerFocus.unfocused
-  task widget focus #workspace-tabs/content/pages/new-page
+  task widget focus #workspace-tabs/content/pages/new-page window=window_target(console_win)
 
 on arm_page_delete
   return if loading || mutation_phase != MutationPhase.idle || empty(active_page)

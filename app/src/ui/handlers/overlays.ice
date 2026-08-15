@@ -122,7 +122,7 @@ on global_key_pressed(event)
   // own gate. That term could only mute the chord while the palette was up;
   // Escape then handed a stale "reply" straight back to it.
   composer_focus = ComposerFocus.unfocused
-  task widget focus #workspace-tabs/overlays/palette-input
+  task widget focus #workspace-tabs/overlays/palette-input window=window_target(console_win)
 
 // THE CONTENT PANE'S KEYBOARD SCROLL. iced's scrollable has no focus and no
 // key handling, so Page Down over Settings moved nothing — and neither did
@@ -146,11 +146,11 @@ on content_scroll_key(event)
   let content_scroll = content_scroll_step(event.key, event.modifiers, topmost_overlay(shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, forge_repo_menu))
   return if content_scroll == 0.0
   parallel
-    task widget scroll-by #workspace-tabs/content/settings/settings-body 0.0 content_scroll
-    task widget scroll-by #workspace-tabs/content/node/node-body 0.0 content_scroll
-    task widget scroll-by #workspace-tabs/content/governance/approvals-body 0.0 content_scroll
-    task widget scroll-by #workspace-tabs/content/members/members-body 0.0 content_scroll
-    task widget scroll-by #workspace-tabs/content/agents/agents-body 0.0 content_scroll
+    task widget scroll-by #workspace-tabs/content/settings/settings-body 0.0 content_scroll window=window_target(console_win)
+    task widget scroll-by #workspace-tabs/content/node/node-body 0.0 content_scroll window=window_target(console_win)
+    task widget scroll-by #workspace-tabs/content/governance/approvals-body 0.0 content_scroll window=window_target(console_win)
+    task widget scroll-by #workspace-tabs/content/members/members-body 0.0 content_scroll window=window_target(console_win)
+    task widget scroll-by #workspace-tabs/content/agents/agents-body 0.0 content_scroll window=window_target(console_win)
 
 on palette_changed(next)
   invalidate lane=palette_search

@@ -565,21 +565,20 @@ fn forge_directory_navigation_retires_the_previous_file_preview() {
     // only while the browse stands where it was opened — same repository,
     // same directory, same commit. The app half of a navigation still only
     // reloads the tree.
-    let moved = |dir: &str, rev: &str, repo: &str| {
+    let moved = |dir: &str, rev: &str| {
         backend::forge_file_header(
-            "core".into(),
             "src".into(),
             "1111".into(),
-            repo.into(),
             dir.into(),
             rev.into(),
             "src/lib.rs".into(),
         )
     };
-    assert_eq!(moved("src", "1111", "core"), "src/lib.rs");
-    assert_eq!(moved("", "1111", "core"), "", "leaving the directory retires it");
-    assert_eq!(moved("src", "2222", "core"), "", "a newer commit retires it");
-    assert_eq!(moved("src", "1111", "other"), "", "another repository retires it");
+    assert_eq!(moved("src", "1111"), "src/lib.rs");
+    assert_eq!(moved("", "1111"), "", "leaving the directory retires it");
+    assert_eq!(moved("src", "2222"), "", "a newer commit retires it");
+    // Another repository is another instance: the call site keys the
+    // component on the repo, so cross-repo staleness cannot arise at all.
 
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
@@ -606,9 +605,9 @@ fn the_file_reader_owns_its_cycle_inside_the_component() {
         .split_once("component ForgeCodeBrowser(")
         .expect("the code browser component exists");
     let (head, _) = browser.split_once("\ncomponent ").unwrap_or((browser, ""));
-    assert!(head.contains("lifetime retained"));
+    assert!(head.contains("lifetime mounted"));
     assert!(head.contains("run replace lane=blob forge_blob("));
-    assert!(head.contains("return if next.repo != opened_repo || next.path != file_path"));
+    assert!(head.contains("return if next.path != file_path"));
     let gates = head.matches("forge_file_header(").count();
     assert!(gates >= 8, "every preview arm gates on the header, found {gates}");
     assert!(

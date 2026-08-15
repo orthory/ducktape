@@ -295,7 +295,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
             // filters.
             match tab
               ForgeTab.code
-                ForgeCodeBrowser
+                ForgeCodeBrowser #code(open_repo)
                   with
                     connected_rpc
                     connected
@@ -735,29 +735,30 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
 
 // THE FILE READER OWNS ITS OWN CYCLE. A file click routes to a local
 // handler, the blob lands in component state, and no app handler clears
-// any of it: the preview is gated on the place AND revision it was opened
-// under (`forge_file_header`), so navigating away, switching repos, or a
-// tree that reloaded at a newer commit all retire it by moving the ground
-// under it. Retained lifetime means returning to the same directory at the
-// same revision honestly resurfaces the file that was open there.
+// any of it. The call site keys the instance by repository, and mounted
+// lifetime prunes it — state, in-flight lane and all — when the reader
+// leaves the Code tab or the repo: exactly the retirement
+// `select_forge_tab` used to perform by hand. Within a stay, the preview
+// is gated on the directory AND revision it was opened under
+// (`forge_file_header`), so navigating away or a tree that reloaded at a
+// newer commit retires it by moving the ground under it, and returning to
+// the same directory at the same revision honestly resurfaces it.
 component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, tree_repo:str, tree_rev:str, tree_path:str, tree_born:bool, tree_entries:[TreeEntry], tree_truncated:bool, code_phase:ForgeCodePhase, dark:bool)
   emits
     forge_open_dir(str)
     open_message_link(str)
-  lifetime retained
+  lifetime mounted
   state
     file_path = ""
     file_text = ""
     file_binary = false
     file_truncated = false
     failed_note = ""
-    opened_repo = ""
     opened_dir = ""
     opened_rev = ""
     phase:ForgeFilePhase = ForgeFilePhase.idle
   on open_file(rpc, online, repo_now, rev, dir, path)
     return if !online || empty(repo_now)
-    opened_repo = repo_now
     opened_dir = dir
     opened_rev = rev
     file_path = path
@@ -770,7 +771,7 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, tree_rep
     phase = ForgeFilePhase.loading
     run replace lane=blob forge_blob(rpc, repo_now, rev, path) -> file_loaded _ | file_failed _
   on file_loaded(next)
-    return if next.repo != opened_repo || next.path != file_path
+    return if next.path != file_path
     file_text = next.text
     file_binary = next.binary
     file_truncated = next.truncated
@@ -790,7 +791,7 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, tree_rep
   // construction.
   ForgeCodeTab
     with
-      path=forge_file_header(opened_repo, opened_dir, opened_rev, repo, tree_path, tree_rev, file_path)
+      path=forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)
       message=""
       author=""
       stamp=""
@@ -891,7 +892,7 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, tree_rep
                       with
                         name=entry.name
                         depth=0.0
-                        selected=(entry.path == file_path && opened_repo == repo && opened_dir == tree_path && opened_rev == tree_rev)
+                        selected=(entry.path == file_path && opened_dir == tree_path && opened_rev == tree_rev)
                     active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
                     hovered bg=rail_hover text=fg
                     pressed bg=elevated text=fg
@@ -908,21 +909,21 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, tree_rep
       col w=fill
         if code_phase == ForgeCodePhase.tree_loading
           ForgeCodeEmpty name="" note="Loading repository files…"
-        if phase == ForgeFilePhase.loading && !empty(forge_file_header(opened_repo, opened_dir, opened_rev, repo, tree_path, tree_rev, file_path))
+        if phase == ForgeFilePhase.loading && !empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path))
           ForgeCodeEmpty name=file_path note="Loading file…"
         if code_phase == ForgeCodePhase.tree_failed
           ForgeCodeEmpty name="" note="Could not load code. Pick Code to try again."
-        if phase == ForgeFilePhase.failed && !empty(forge_file_header(opened_repo, opened_dir, opened_rev, repo, tree_path, tree_rev, file_path))
+        if phase == ForgeFilePhase.failed && !empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path))
           ForgeCodeEmpty name=file_path note=failed_note
-        if code_phase == ForgeCodePhase.ready && empty(forge_file_header(opened_repo, opened_dir, opened_rev, repo, tree_path, tree_rev, file_path)) && empty(tree_entries) && !tree_born
+        if code_phase == ForgeCodePhase.ready && empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && empty(tree_entries) && !tree_born
           ForgeCodeEmpty name="" note="Nothing is committed on this repository yet, so there is no file to read."
-        if code_phase == ForgeCodePhase.ready && empty(forge_file_header(opened_repo, opened_dir, opened_rev, repo, tree_path, tree_rev, file_path)) && empty(tree_entries) && tree_born && !tree_truncated
+        if code_phase == ForgeCodePhase.ready && empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && empty(tree_entries) && tree_born && !tree_truncated
           ForgeCodeEmpty name="" note="This commit has no files to read."
-        if code_phase == ForgeCodePhase.ready && empty(forge_file_header(opened_repo, opened_dir, opened_rev, repo, tree_path, tree_rev, file_path)) && empty(tree_entries) && tree_born && tree_truncated
+        if code_phase == ForgeCodePhase.ready && empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && empty(tree_entries) && tree_born && tree_truncated
           ForgeCodeEmpty name="" note="This directory has entries outside the browser's display limits."
-        if code_phase == ForgeCodePhase.ready && empty(forge_file_header(opened_repo, opened_dir, opened_rev, repo, tree_path, tree_rev, file_path)) && !empty(tree_entries)
+        if code_phase == ForgeCodePhase.ready && empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && !empty(tree_entries)
           ForgeCodeEmpty name="" note="Pick a file from the tree to read it."
-        if phase == ForgeFilePhase.ready && !empty(forge_file_header(opened_repo, opened_dir, opened_rev, repo, tree_path, tree_rev, file_path)) && file_binary
+        if phase == ForgeFilePhase.ready && !empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && file_binary
           ForgeCodeEmpty
             with
               name=file_path
@@ -936,7 +937,7 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, tree_rep
         // messages already use. Markdown-vs-code is the
         // path's call (`markdown_path`) because the wire only
         // says binary-or-text.
-        if phase == ForgeFilePhase.ready && !empty(forge_file_header(opened_repo, opened_dir, opened_rev, repo, tree_path, tree_rev, file_path)) && !file_binary && markdown_path(file_path)
+        if phase == ForgeFilePhase.ready && !empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && !file_binary && markdown_path(file_path)
           col
             with
               w=fill
@@ -951,7 +952,7 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, tree_rep
                   size=11.5
                   wrap=none
                   @text-label
-        if phase == ForgeFilePhase.ready && !empty(forge_file_header(opened_repo, opened_dir, opened_rev, repo, tree_path, tree_rev, file_path)) && !file_binary && !markdown_path(file_path)
+        if phase == ForgeFilePhase.ready && !empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && !file_binary && !markdown_path(file_path)
           col
             with
               w=fill

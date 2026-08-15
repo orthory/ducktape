@@ -361,6 +361,9 @@ on console_opened(id)
   call_status = ""
   call_muted = false
   call_peers = []
+  // An empty endpoint names no node: keep the adopted window and the
+  // reset above, but launch nothing a "" could never answer.
+  return if empty(connected_rpc)
   parallel
     task window close target=window_target(onboarding_win)
     flow
