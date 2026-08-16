@@ -58,18 +58,23 @@ extern crate::backend
   AgentTerminalStarted(session:AgentTerminalSession, title:str)
   AgentCredential(name:str, provider:str)
   AgentCredentialsData(generation:i64, rows:[AgentCredential])
+  AgentHostNode(key:str, label:str, providers:[str])
+  AgentHostNodesData(generation:i64, rows:[AgentHostNode])
   AgentChatEntry(id:i64, role:str, body:str, provider:str)
   AgentActivity(id:i64, title:str, detail:str, status:str)
   AgentChatEvent(id:i64, kind:str, title:str, detail:str, status:str, answer:str, saga_id:str)
   pure idle_agent_terminal() -> AgentTerminalSession
-  start_agent_terminal(rpc:str, provider:str, credential:str) -> AgentTerminalStarted ! AppError
+  start_agent_terminal(rpc:str, provider:str, credential:str, host_node:str) -> AgentTerminalStarted ! AppError
   task focus_agent_terminal(session:AgentTerminalSession) -> unit
   component agent_terminal_surface(session:&AgentTerminalSession) -> unit
   component agent_markdown(source:str, dark:bool) -> str
   subscription agent_terminal_events(session:AgentTerminalSession) -> AgentTerminalNotice
   load_agent_credentials(rpc:str, generation:i64) -> AgentCredentialsData ! HydrationError
+  load_agent_host_nodes(rpc:str, generation:i64) -> AgentHostNodesData ! HydrationError
   pure agent_credential_names(rows:[AgentCredential], provider:str) -> [str]
   pure agent_credential_choice(rows:[AgentCredential], provider:str, current:str) -> str
+  pure agent_host_node_options(rows:[AgentHostNode]) -> [str]
+  pure agent_host_node_key(rows:[AgentHostNode], option:str) -> str
   pure agent_provider_label(provider:str) -> str
   pure agent_provider_initial(provider:str) -> str
   pure agent_credential_caption(provider:str, credential:str) -> str
@@ -85,7 +90,7 @@ extern crate::backend
   pure agent_event_error(current:str, event:AgentChatEvent) -> str
   pure agent_event_busy(event:AgentChatEvent) -> bool
   pure agent_event_entries(entries:[AgentChatEntry], event:AgentChatEvent, provider:str) -> [AgentChatEntry]
-  stream agent_chat_turn(rpc:str, provider:str, credential:str, entries:[AgentChatEntry]) -> AgentChatEvent
+  stream agent_chat_turn(rpc:str, provider:str, credential:str, host_node:str, entries:[AgentChatEntry]) -> AgentChatEvent
   OptimisticMutationError(message:str, committed:bool, operation_id:str, scope_id:str, body:str)
   HydrationError(generation:i64, message:str)
   box-style raised_style()

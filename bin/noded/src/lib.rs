@@ -77,7 +77,7 @@ pub use module_code::{CODE_KIND_MODULE, CodePeerReceipt, CodeStageLane, CodeStag
 pub mod term;
 pub use term::{
     CreatedSession, PeerAttach, TermChunkEvent, TermCommandEvent, TermCommandRing, TermError,
-    TermRing, TerminalSessions,
+    TermFeedEvent, TermRing, TerminalSessions,
 };
 
 pub mod term_remote;

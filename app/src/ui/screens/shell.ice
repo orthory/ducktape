@@ -31,13 +31,15 @@ component ShellModeButton(label:str, value:ShellMode, selected:bool, disabled:bo
         pressed bg=elevated text=fg
         disabled bg=muted_bg text=disabled_fg border=transparent border-w=1.0 r=8.0
 
-component AgentCredentialPick(options:[str], selected:str, disabled:bool) -> str
+// The COMPUTE band's one dropdown shape, worn by both of its questions: which
+// credential signs the run, and which peer executes it.
+component ShellPick(options:[str], selected:str, hint:str, width:f64, disabled:bool) -> str
   col #root
     if !disabled
       pick options some(selected) -> emit(_)
         with
-          hint="Choose credential"
-          w=238.0
+          hint=hint
+          w=width
           p=8.0
           text-size=12.5
         active text=fg handle=muted bg=surface border=control_line border-w=1.0 r=8.0
@@ -51,7 +53,7 @@ component AgentCredentialPick(options:[str], selected:str, disabled:bool) -> str
     if disabled
       box
         with
-          w=238.0
+          w=width
           h=34.0
           px=9.0
           align-y=center
@@ -61,7 +63,7 @@ component AgentCredentialPick(options:[str], selected:str, disabled:bool) -> str
           r=8.0
         row w=fill gap=8.0 align=center
           if empty(selected)
-            text "Choose credential" size=12.5 @text-disabled_fg
+            text hint size=12.5 @text-disabled_fg
           if !empty(selected)
             text selected size=12.5 @text-disabled_fg
           space w=fill
@@ -173,11 +175,12 @@ component ShellWelcome(provider:str) -> str
       button "Explain this system" @secondary_action -> emit("Explain this system's architecture and the most important execution path.")
       button "Inspect a failure" @secondary_action -> emit("Help me diagnose the most likely cause of the current failure.")
 
-component ShellScreen(mode:ShellMode, provider:str, credential_options:[str], credential:str, credentials_loading:bool, terminal:AgentTerminalSession, terminal_running:bool, terminal_busy:bool, terminal_title:str, terminal_error:str, entries:[AgentChatEntry], activity:[AgentActivity], bind draft:editor, chat_busy:bool, chat_status:str, chat_detail:str, live:str, chat_error:str, saga_id:str, connected:bool, dark:bool)
+component ShellScreen(mode:ShellMode, provider:str, credential_options:[str], credential:str, host_node_options:[str], host_node:str, credentials_loading:bool, terminal:AgentTerminalSession, terminal_running:bool, terminal_busy:bool, terminal_title:str, terminal_error:str, entries:[AgentChatEntry], activity:[AgentActivity], bind draft:editor, chat_busy:bool, chat_status:str, chat_detail:str, live:str, chat_error:str, saga_id:str, connected:bool, dark:bool)
   emits
     shell_mode_changed(ShellMode)
     shell_provider_changed(str)
     shell_credential_changed(str)
+    shell_host_node_changed(str)
     shell_credentials_refresh()
     shell_terminal_start()
     shell_terminal_stop()
@@ -246,11 +249,23 @@ component ShellScreen(mode:ShellMode, provider:str, credential_options:[str], cr
           box w=1.0 h=24.0 bg=separator
             space w=1.0 h=1.0
           text "CREDENTIAL" size=9.0 font=code_semibold @text-label
-          AgentCredentialPick #credential -> emit(shell_credential_changed, _)
+          ShellPick #credential -> emit(shell_credential_changed, _)
             with
               options=credential_options
               selected=credential
+              hint="Choose credential"
+              width=238.0
               disabled=(!connected || terminal_running || terminal_busy || chat_busy || credentials_loading || empty(credential_options))
+          box w=1.0 h=24.0 bg=separator
+            space w=1.0 h=1.0
+          text "HOST" size=9.0 font=code_semibold @text-label
+          ShellPick #host-node -> emit(shell_host_node_changed, _)
+            with
+              options=host_node_options
+              selected=host_node
+              hint="This node"
+              width=200.0
+              disabled=(!connected || terminal_running || terminal_busy || chat_busy || credentials_loading)
           space w=fill
           button "Refresh" disabled=(!connected || credentials_loading || terminal_busy || chat_busy) @ghost_action -> emit(shell_credentials_refresh)
         if credentials_loading

@@ -61,6 +61,8 @@ test shell_chat_surface_contract
         provider=shell_provider
         credential_options=shell_credential_options
         credential=shell_credential
+        host_node_options=shell_host_node_options
+        host_node=shell_host_node
         credentials_loading=shell_credentials_loading
         terminal=shell_terminal
         terminal_running=shell_terminal_running
@@ -81,6 +83,7 @@ test shell_chat_surface_contract
         shell_mode_changed -> shell_mode_changed _
         shell_provider_changed -> shell_provider_changed _
         shell_credential_changed -> shell_credential_changed _
+        shell_host_node_changed -> shell_host_node_changed _
         shell_credentials_refresh -> shell_credentials_refresh
         shell_terminal_start -> shell_terminal_start
         shell_terminal_stop -> shell_terminal_stop

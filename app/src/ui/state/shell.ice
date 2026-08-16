@@ -7,6 +7,12 @@ state
   shell_credential = ""
   shell_credentials_generation:i64 = 0
   shell_credentials_loading = false
+  // WHICH peer runs the work. The label is what the picker shows; the key is
+  // the `--host-node` value behind it, and "" means the connected node.
+  shell_host_nodes:[AgentHostNode] = []
+  shell_host_node_options:[str] = ["This node"]
+  shell_host_node = "This node"
+  shell_host_node_key = ""
   shell_terminal:AgentTerminalSession = idle_agent_terminal()
   shell_terminal_running = false
   shell_terminal_busy = false

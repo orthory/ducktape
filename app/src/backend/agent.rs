@@ -1,17 +1,16 @@
 use super::*;
+use capability::{CapabilityQuery, CapabilityReply};
 use gateway::{CredentialKind, GatewayQuery, GatewayReply};
+use identity::{AccountView, IdentityQuery, IdentityReply};
 use iced::advanced::widget::{Operation, Tree, tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, renderer};
 use iced::futures::SinkExt as _;
 use iced::{Element, Length, Rectangle, Size, Subscription, Theme, mouse};
-use iced_term::actions::Action;
-use iced_term::settings::{BackendSettings, FontSettings, Settings, ThemeSettings};
-use iced_term::{ColorPalette, Command, Event, Terminal, TerminalView};
+use ui_lang_components::ui::terminal;
 use saga::{SagaQuery, SagaReply, SagaStatus, SagaView};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
-use std::sync::MutexGuard;
 use tokio_tungstenite::tungstenite::Message;
 
 const AGENT_CONTEXT_ROWS: usize = 32;
@@ -19,18 +18,21 @@ const AGENT_CONTEXT_BYTES: usize = 48 * 1024;
 const LINK_TOKEN_BYTES: u64 = 4 * 1024;
 const MAX_ACTIVITY_ROWS: usize = 32;
 const RUNNER_RESULT_VERSION: u64 = 1;
+/// The unpicked host: the run executes on the node the app is connected to.
+/// `app/src/ui/state/shell.ice` seeds the picker with this exact string, which
+/// a test below pins.
+const LOCAL_HOST_NODE: &str = "This node";
 
-static NEXT_AGENT_TERMINAL_ID: AtomicU64 = AtomicU64::new(1);
-
+/// The app's handle on a `ducktape agent pty` session. The pty engine, its grid
+/// and the widget that draws it are `ui_lang_components::ui::terminal`; this is
+/// the Ice-facing wrapper, which exists so the extern type keeps its name and
+/// the app decides what a notice means.
 #[derive(Clone)]
-pub struct AgentTerminalSession {
-    id: u64,
-    terminal: Option<Arc<Mutex<Terminal>>>,
-}
+pub struct AgentTerminalSession(terminal::Session);
 
 impl Hash for AgentTerminalSession {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
+        self.0.hash(state);
     }
 }
 
@@ -56,6 +58,23 @@ pub struct AgentCredential {
 pub struct AgentCredentialsData {
     pub generation: i64,
     pub rows: Vec<AgentCredential>,
+}
+
+/// One peer that announced a provider this app can launch: the 64-hex node key
+/// the CLI's `--host-node` takes, the display name identity knows for the
+/// account operating it (a short key when identity knows none), and the tags
+/// the node announced.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct AgentHostNode {
+    pub key: String,
+    pub label: String,
+    pub providers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct AgentHostNodesData {
+    pub generation: i64,
+    pub rows: Vec<AgentHostNode>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -102,53 +121,36 @@ struct AgentRunnerResult {
 }
 
 pub fn idle_agent_terminal() -> AgentTerminalSession {
-    AgentTerminalSession {
-        id: 0,
-        terminal: None,
-    }
+    AgentTerminalSession(terminal::idle_session())
 }
 
 pub async fn start_agent_terminal(
     rpc: String,
     provider: String,
     credential: String,
+    host_node: String,
 ) -> Result<AgentTerminalStarted, AppError> {
     let provider = agent_provider(&provider).map_err(AppError::from)?;
-    let args = agent_pty_args(&rpc, provider, &credential);
+    let args = agent_pty_args(&rpc, provider, &credential, &host_node);
     let program = ducktape_binary();
     let working_directory =
         std::env::current_dir().map_err(|error| AppError::from(error.to_string()))?;
-    let id = NEXT_AGENT_TERMINAL_ID.fetch_add(1, Ordering::Relaxed);
     let title = format!("{} · raw session", provider_title(provider));
-    let settings = agent_terminal_settings(program, args, working_directory);
-    let terminal = Terminal::new(id, settings)
-        .map_err(|error| AppError::from(format!("Could not start {title}: {error}")))?;
+    let session = terminal::spawn_session(program, args, working_directory, title.clone())
+        .map_err(|error| AppError::from(error.message))?;
 
     Ok(AgentTerminalStarted {
-        session: AgentTerminalSession {
-            id,
-            terminal: Some(Arc::new(Mutex::new(terminal))),
-        },
+        session: AgentTerminalSession(session),
         title,
     })
 }
 
 pub fn agent_terminal_events(session: AgentTerminalSession) -> Subscription<AgentTerminalNotice> {
-    let Some(terminal) = session.terminal.clone() else {
-        return Subscription::none();
-    };
-    let subscription = agent_terminal_lock(&terminal).subscription();
-    subscription.with(session).map(agent_terminal_notice)
+    terminal::terminal_events(session.0).map(agent_terminal_notice)
 }
 
 pub fn agent_terminal_surface(session: &AgentTerminalSession) -> Element<'static, ()> {
-    let Some(terminal) = session.terminal.clone() else {
-        return iced::widget::text("Start a session to open the agent terminal.").into();
-    };
-    Element::new(SharedAgentTerminal {
-        terminal,
-        id: session.id,
-    })
+    terminal::terminal_surface(&session.0)
 }
 
 /// Parsed Markdown whose items live with the widget instead of borrowing an
@@ -160,11 +162,7 @@ pub fn agent_markdown(source: String, dark: bool) -> Element<'static, String> {
 }
 
 pub fn focus_agent_terminal(session: AgentTerminalSession) -> iced::Task<()> {
-    let Some(terminal) = session.terminal else {
-        return iced::Task::none();
-    };
-    let widget_id = agent_terminal_lock(&terminal).widget_id().clone();
-    TerminalView::focus(widget_id)
+    terminal::focus_terminal(session.0)
 }
 
 pub async fn load_agent_credentials(
@@ -219,6 +217,116 @@ pub fn agent_credential_choice(
     } else {
         names.into_iter().next().unwrap_or_default()
     }
+}
+
+/// The COMPUTE band's other half: WHICH peer can run the work. The capability
+/// registry is the network's node -> announced-tags map, and identity names the
+/// account each announcing node is bound to.
+pub async fn load_agent_host_nodes(
+    rpc: String,
+    generation: i64,
+) -> Result<AgentHostNodesData, HydrationError> {
+    let result = async {
+        let client = rpc_client(&rpc)?;
+        let reply: CapabilityReply = client
+            .query("capability", &CapabilityQuery::All)
+            .await
+            .map_err(String::from)?;
+        let CapabilityReply::All(registry) = reply else {
+            return Err("the capability registry returned the wrong reply".into());
+        };
+        let reply: IdentityReply = client
+            .query(
+                "identity",
+                &IdentityQuery::All {
+                    from: 0,
+                    limit: u64::MAX,
+                },
+            )
+            .await
+            .map_err(String::from)?;
+        let IdentityReply::Accounts(accounts) = reply else {
+            return Err("the identity module returned the wrong reply".into());
+        };
+        let names = node_account_names(&accounts);
+        let mut rows = registry
+            .into_iter()
+            .filter_map(|(node, tags)| host_node_row(&names, &node, tags))
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| left.label.cmp(&right.label));
+        Ok(AgentHostNodesData { generation, rows })
+    }
+    .await;
+    result.map_err(|cause: String| HydrationError {
+        generation,
+        message: user_error(cause),
+    })
+}
+
+/// The picker's rows: the local default first, then one row per announcing
+/// peer. The empty list is still one row, so "this node" is always reachable.
+pub fn agent_host_node_options(rows: Vec<AgentHostNode>) -> Vec<String> {
+    std::iter::once(LOCAL_HOST_NODE.to_string())
+        .chain(rows.iter().map(host_node_option))
+        .collect()
+}
+
+/// The `--host-node` value behind a picked row. The local default — and any
+/// label the registry no longer carries — resolves to the empty string, which
+/// the argv builders spell as no flag at all.
+pub fn agent_host_node_key(rows: Vec<AgentHostNode>, option: String) -> String {
+    rows.iter()
+        .find(|row| host_node_option(row) == option)
+        .map(|row| row.key.clone())
+        .unwrap_or_default()
+}
+
+/// The ONE spelling of a picker row — who runs it, and what it announced — so
+/// the option list and the reverse lookup above cannot drift apart.
+fn host_node_option(row: &AgentHostNode) -> String {
+    format!("{} · {}", row.label, row.providers.join(", "))
+}
+
+/// node key -> the display name of the account that bound it. Accounts without
+/// a name contribute nothing, so their nodes fall back to a short key.
+fn node_account_names(accounts: &[AccountView]) -> HashMap<Vec<u8>, String> {
+    accounts
+        .iter()
+        .filter_map(|account| Some((account, account.display_name.clone()?)))
+        .flat_map(|(account, name)| {
+            account
+                .nodes
+                .iter()
+                .map(move |node| (node.node_key.clone(), name.clone()))
+        })
+        .collect()
+}
+
+/// A registry row becomes a pick only when it announces a provider this app can
+/// launch — the same provider set the argv builders accept, so the picker can
+/// never offer a host the run would bounce off.
+fn host_node_row(
+    names: &HashMap<Vec<u8>, String>,
+    node: &[u8],
+    tags: Vec<String>,
+) -> Option<AgentHostNode> {
+    let providers = tags
+        .into_iter()
+        .filter(|tag| agent_provider(tag).is_ok())
+        .collect::<Vec<_>>();
+    if providers.is_empty() {
+        return None;
+    }
+    let key = hex_encode(node);
+    let label = names
+        .get(node)
+        .cloned()
+        .unwrap_or_else(|| short_label(&key));
+    Some(AgentHostNode {
+        key,
+        label,
+        providers,
+    })
 }
 
 pub fn agent_provider_label(provider: String) -> String {
@@ -391,11 +499,12 @@ pub fn agent_chat_turn(
     rpc: String,
     provider: String,
     credential: String,
+    host_node: String,
     entries: Vec<AgentChatEntry>,
 ) -> iced::futures::stream::BoxStream<'static, AgentChatEvent> {
     let (sender, receiver) = tokio::sync::mpsc::channel(64);
     tokio::spawn(async move {
-        run_agent_chat(sender, rpc, provider, credential, entries).await;
+        run_agent_chat(sender, rpc, provider, credential, host_node, entries).await;
     });
     iced::futures::stream::unfold(receiver, |mut receiver| async move {
         receiver.recv().await.map(|event| (event, receiver))
@@ -408,9 +517,10 @@ async fn run_agent_chat(
     rpc: String,
     provider: String,
     credential: String,
+    host_node: String,
     entries: Vec<AgentChatEntry>,
 ) {
-    let result = run_agent_chat_inner(&sender, rpc, provider, credential, entries).await;
+    let result = run_agent_chat_inner(&sender, rpc, provider, credential, host_node, entries).await;
     if let Err(message) = result {
         let _ = sender.send(chat_error(message)).await;
     }
@@ -421,6 +531,7 @@ async fn run_agent_chat_inner(
     rpc: String,
     provider: String,
     credential: String,
+    host_node: String,
     entries: Vec<AgentChatEntry>,
 ) -> Result<(), String> {
     let provider = agent_provider(&provider)?;
@@ -434,7 +545,9 @@ async fn run_agent_chat_inner(
         .await
         .map_err(|_| "the chat view closed".to_string())?;
     let output = tokio::process::Command::new(ducktape_binary())
-        .args(agent_sched_args(&rpc, provider, credential, &prompt))
+        .args(agent_sched_args(
+            &rpc, provider, credential, &host_node, &prompt,
+        ))
         .kill_on_drop(true)
         .output()
         .await
@@ -462,7 +575,7 @@ async fn run_agent_chat_inner(
             id: 1,
             kind: "status".into(),
             title: format!("Running {}", provider_title(provider)),
-            detail: "The run is pinned to this node and will survive reconnects.".into(),
+            detail: host_node_detail(&host_node),
             status: String::new(),
             answer: String::new(),
             saga_id: saga_id.clone(),
@@ -716,7 +829,7 @@ fn provider_title(provider: &str) -> &'static str {
     }
 }
 
-fn agent_pty_args(rpc: &str, provider: &str, credential: &str) -> Vec<String> {
+fn agent_pty_args(rpc: &str, provider: &str, credential: &str, host_node: &str) -> Vec<String> {
     let mut args = vec![
         "agent".into(),
         "pty".into(),
@@ -728,11 +841,18 @@ fn agent_pty_args(rpc: &str, provider: &str, credential: &str) -> Vec<String> {
         args.push("--cred".into());
         args.push(credential.trim().into());
     }
+    push_host_node(&mut args, host_node);
     args
 }
 
-fn agent_sched_args(rpc: &str, provider: &str, credential: &str, prompt: &str) -> Vec<String> {
-    vec![
+fn agent_sched_args(
+    rpc: &str,
+    provider: &str,
+    credential: &str,
+    host_node: &str,
+    prompt: &str,
+) -> Vec<String> {
+    let mut args = vec![
         "agent".into(),
         "sched".into(),
         provider.into(),
@@ -740,9 +860,36 @@ fn agent_sched_args(rpc: &str, provider: &str, credential: &str, prompt: &str) -
         credential.into(),
         "--node".into(),
         rpc.into(),
-        "--".into(),
-        prompt.into(),
-    ]
+    ];
+    push_host_node(&mut args, host_node);
+    args.push("--".into());
+    args.push(prompt.into());
+    args
+}
+
+/// Where the durable run actually lives, said the way the operator picked it —
+/// the dialled node by default, else the peer the `--host-node` key names.
+fn host_node_detail(host_node: &str) -> String {
+    let host_node = host_node.trim();
+    if host_node.is_empty() {
+        return "The run is pinned to this node and will survive reconnects.".into();
+    }
+    format!(
+        "The run is pinned to {} and will survive reconnects.",
+        short_label(host_node)
+    )
+}
+
+/// `--node` is the node the CLI DIALS; `--host-node` is the peer that EXECUTES.
+/// An unpicked host is spelled by the flag's absence — that is what keeps the
+/// work on the dialled node, exactly as it ran before the picker existed.
+fn push_host_node(args: &mut Vec<String>, host_node: &str) {
+    let host_node = host_node.trim();
+    if host_node.is_empty() {
+        return;
+    }
+    args.push("--host-node".into());
+    args.push(host_node.into());
 }
 
 fn dispatch_id_from_saga(saga_id: &str) -> Result<String, String> {
@@ -829,93 +976,16 @@ fn clip_text(text: &str, limit: usize) -> String {
     format!("{}…", &text[..end])
 }
 
-fn agent_terminal_settings(
-    program: PathBuf,
-    args: Vec<String>,
-    working_directory: PathBuf,
-) -> Settings {
-    let mut environment = HashMap::new();
-    environment.insert("TERM".into(), "xterm-256color".into());
-    environment.insert("COLORTERM".into(), "truecolor".into());
-    environment.insert("TERM_PROGRAM".into(), "ducktape-app".into());
-    let palette = ColorPalette {
-        foreground: "#e7eaf0".into(),
-        background: "#090b0e".into(),
-        black: "#1b2028".into(),
-        red: "#ff7b86".into(),
-        green: "#6fdc8c".into(),
-        yellow: "#f4c95d".into(),
-        blue: "#7c9cff".into(),
-        magenta: "#c792ea".into(),
-        cyan: "#66d9d0".into(),
-        white: "#d9dee8".into(),
-        bright_black: "#697386".into(),
-        bright_red: "#ff9aa3".into(),
-        bright_green: "#8be9a8".into(),
-        bright_yellow: "#ffe08a".into(),
-        bright_blue: "#a6baff".into(),
-        bright_magenta: "#ddb3f5".into(),
-        bright_cyan: "#8ce8e1".into(),
-        bright_white: "#ffffff".into(),
-        ..ColorPalette::default()
-    };
-    Settings {
-        font: FontSettings {
-            size: 14.0,
-            scale_factor: 1.25,
-            font_type: iced::Font::MONOSPACE,
-        },
-        theme: ThemeSettings::new(Box::new(palette)),
-        backend: BackendSettings {
-            program: program.to_string_lossy().into_owned(),
-            args,
-            env: environment,
-            working_directory: Some(working_directory),
-        },
+/// The component reports `attention` as well; the app's Ice surface carries a
+/// running flag and a title, so this is where the pty's bell is dropped. A
+/// session that stopped running keeps the component's closing title.
+fn agent_terminal_notice(notice: terminal::Notice) -> AgentTerminalNotice {
+    AgentTerminalNotice {
+        running: notice.running,
+        title: notice.title,
     }
 }
 
-fn process_agent_terminal_event(terminal: &Arc<Mutex<Terminal>>, id: u64, event: Event) -> Action {
-    let Event::BackendCall(event_id, command) = event;
-    if event_id != id {
-        return Action::Ignore;
-    }
-    agent_terminal_lock(terminal).handle(Command::ProxyToBackend(command))
-}
-
-fn agent_terminal_notice((session, event): (AgentTerminalSession, Event)) -> AgentTerminalNotice {
-    let Some(terminal) = &session.terminal else {
-        return AgentTerminalNotice {
-            running: false,
-            title: String::new(),
-        };
-    };
-    match process_agent_terminal_event(terminal, session.id, event) {
-        Action::Shutdown => AgentTerminalNotice {
-            running: false,
-            title: "Session ended".into(),
-        },
-        Action::ChangeTitle(title) => AgentTerminalNotice {
-            running: true,
-            title,
-        },
-        Action::Ignore => AgentTerminalNotice {
-            running: true,
-            title: String::new(),
-        },
-    }
-}
-
-fn agent_terminal_lock(terminal: &Arc<Mutex<Terminal>>) -> MutexGuard<'_, Terminal> {
-    terminal
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-struct SharedAgentTerminal {
-    terminal: Arc<Mutex<Terminal>>,
-    id: u64,
-}
 
 struct AgentMarkdown {
     items: Rc<[iced::widget::markdown::Item]>,
@@ -1064,157 +1134,7 @@ impl Widget<String, Theme, iced::Renderer> for AgentMarkdown {
     }
 }
 
-struct SharedAgentTerminalState {
-    session_id: u64,
-}
 
-impl SharedAgentTerminalState {
-    fn switch_to(&mut self, session_id: u64) -> bool {
-        if self.session_id == session_id {
-            false
-        } else {
-            self.session_id = session_id;
-            true
-        }
-    }
-}
-
-impl Widget<(), Theme, iced::Renderer> for SharedAgentTerminal {
-    fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<SharedAgentTerminalState>()
-    }
-
-    fn state(&self) -> tree::State {
-        tree::State::new(SharedAgentTerminalState {
-            session_id: self.id,
-        })
-    }
-
-    fn children(&self) -> Vec<Tree> {
-        let terminal = agent_terminal_lock(&self.terminal);
-        let content = TerminalView::show(&terminal);
-        vec![Tree::new(content.as_widget())]
-    }
-
-    fn diff(&self, tree: &mut Tree) {
-        let terminal = agent_terminal_lock(&self.terminal);
-        let content = TerminalView::show(&terminal);
-        let session_changed = tree
-            .state
-            .downcast_mut::<SharedAgentTerminalState>()
-            .switch_to(self.id);
-        if session_changed {
-            tree.children = vec![Tree::new(content.as_widget())];
-        } else {
-            tree.diff_children(&[content.as_widget()]);
-        }
-    }
-
-    fn size(&self) -> Size<Length> {
-        Size::new(Length::Fill, Length::Fill)
-    }
-
-    fn layout(
-        &mut self,
-        tree: &mut Tree,
-        renderer: &iced::Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
-        let terminal = agent_terminal_lock(&self.terminal);
-        let mut content = TerminalView::show(&terminal);
-        content
-            .as_widget_mut()
-            .layout(&mut tree.children[0], renderer, limits)
-    }
-
-    fn operate(
-        &mut self,
-        tree: &mut Tree,
-        layout: Layout<'_>,
-        renderer: &iced::Renderer,
-        operation: &mut dyn Operation,
-    ) {
-        let terminal = agent_terminal_lock(&self.terminal);
-        let mut content = TerminalView::show(&terminal);
-        operation.traverse(&mut |operation| {
-            content
-                .as_widget_mut()
-                .operate(&mut tree.children[0], layout, renderer, operation);
-        });
-    }
-
-    fn draw(
-        &self,
-        tree: &Tree,
-        renderer: &mut iced::Renderer,
-        theme: &Theme,
-        style: &renderer::Style,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        viewport: &Rectangle,
-    ) {
-        let terminal = agent_terminal_lock(&self.terminal);
-        let content = TerminalView::show(&terminal);
-        content.as_widget().draw(
-            &tree.children[0],
-            renderer,
-            theme,
-            style,
-            layout,
-            cursor,
-            viewport,
-        );
-    }
-
-    fn update(
-        &mut self,
-        tree: &mut Tree,
-        event: &iced::Event,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        renderer: &iced::Renderer,
-        clipboard: &mut dyn Clipboard,
-        shell: &mut Shell<'_, ()>,
-        viewport: &Rectangle,
-    ) {
-        let mut messages = Vec::new();
-        let mut terminal_shell = Shell::new(&mut messages);
-        {
-            let terminal = agent_terminal_lock(&self.terminal);
-            let mut content = TerminalView::show(&terminal);
-            content.as_widget_mut().update(
-                &mut tree.children[0],
-                event,
-                layout,
-                cursor,
-                renderer,
-                clipboard,
-                &mut terminal_shell,
-                viewport,
-            );
-        }
-        let terminal = self.terminal.clone();
-        let id = self.id;
-        shell.merge(terminal_shell, move |event| {
-            process_agent_terminal_event(&terminal, id, event);
-        });
-    }
-
-    fn mouse_interaction(
-        &self,
-        tree: &Tree,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        viewport: &Rectangle,
-        renderer: &iced::Renderer,
-    ) -> mouse::Interaction {
-        let terminal = agent_terminal_lock(&self.terminal);
-        let content = TerminalView::show(&terminal);
-        content
-            .as_widget()
-            .mouse_interaction(&tree.children[0], layout, cursor, viewport, renderer)
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1223,7 +1143,7 @@ mod tests {
     #[test]
     fn cli_args_use_the_real_agent_contract() {
         assert_eq!(
-            agent_pty_args("http://node", "codex", "team-codex"),
+            agent_pty_args("http://node", "codex", "team-codex", ""),
             [
                 "agent",
                 "pty",
@@ -1234,7 +1154,7 @@ mod tests {
                 "team-codex",
             ]
         );
-        let sched = agent_sched_args("http://node", "claude", "team-claude", "hello");
+        let sched = agent_sched_args("http://node", "claude", "team-claude", "", "hello");
         assert_eq!(sched.last().map(String::as_str), Some("hello"));
         assert_eq!(
             &sched[..8],
@@ -1249,6 +1169,110 @@ mod tests {
                 "--"
             ]
         );
+    }
+
+    /// `--node` and `--host-node` are different questions: the first is who the
+    /// CLI dials, the second is who executes. An unpicked host must emit NO
+    /// flag — the argv above, byte for byte — or every default run silently
+    /// changes shape.
+    #[test]
+    fn a_picked_host_node_is_the_only_thing_that_adds_the_flag() {
+        let peer = "b".repeat(64);
+        assert_eq!(
+            agent_pty_args("http://node", "codex", "team-codex", &peer),
+            [
+                "agent",
+                "pty",
+                "codex",
+                "--node",
+                "http://node",
+                "--cred",
+                "team-codex",
+                "--host-node",
+                peer.as_str(),
+            ]
+        );
+        assert_eq!(
+            agent_sched_args("http://node", "claude", "team-claude", &peer, "hello"),
+            [
+                "agent",
+                "sched",
+                "claude",
+                "--cred",
+                "team-claude",
+                "--node",
+                "http://node",
+                "--host-node",
+                peer.as_str(),
+                "--",
+                "hello",
+            ]
+        );
+        for blank in ["", "   "] {
+            assert!(
+                !agent_pty_args("http://node", "codex", "team-codex", blank)
+                    .contains(&"--host-node".to_string())
+            );
+            assert!(
+                !agent_sched_args("http://node", "claude", "team-claude", blank, "hello")
+                    .contains(&"--host-node".to_string())
+            );
+        }
+    }
+
+    /// The picker's rows and the reverse lookup are one spelling. The local row
+    /// — and any label the registry dropped — must resolve to no host key at
+    /// all, which is what keeps the flag off the default argv.
+    #[test]
+    fn the_host_picker_round_trips_a_row_to_its_node_key() {
+        let rows = vec![AgentHostNode {
+            key: "a".repeat(64),
+            label: "alice".into(),
+            providers: vec!["codex".into(), "claude".into()],
+        }];
+        assert_eq!(
+            agent_host_node_options(rows.clone()),
+            ["This node", "alice · codex, claude"]
+        );
+        assert_eq!(
+            agent_host_node_key(rows.clone(), "alice · codex, claude".into()),
+            "a".repeat(64)
+        );
+        assert_eq!(agent_host_node_key(rows.clone(), LOCAL_HOST_NODE.into()), "");
+        assert_eq!(agent_host_node_key(rows, "a node that left".into()), "");
+    }
+
+    /// A node that announces nothing this app can launch is not a compute
+    /// choice, and an unnamed account still has to read as something.
+    #[test]
+    fn only_launchable_announcements_become_host_rows() {
+        let key = vec![0xab, 0xcd, 0xef, 0x01, 0x23];
+        let names = HashMap::from([(key.clone(), "alice".to_string())]);
+        assert!(host_node_row(&names, &key, vec!["storage".into()]).is_none());
+        assert!(host_node_row(&names, &key, Vec::new()).is_none());
+        let named = host_node_row(&names, &key, vec!["codex".into(), "storage".into()]).unwrap();
+        assert_eq!((named.label.as_str(), named.providers.len()), ("alice", 1));
+        assert_eq!(named.key, "abcdef0123");
+        let unnamed = host_node_row(&HashMap::new(), &key, vec!["claude".into()]).unwrap();
+        assert_eq!(unnamed.label, "abcdef01…");
+    }
+
+    /// The local row is one string in two languages: Rust rebuilds the option
+    /// list on every registry read, Ice seeds both the list and the selection
+    /// for the frames before the first one lands. Drift and the picker opens on
+    /// a label its own list does not carry.
+    #[test]
+    fn the_local_host_row_matches_the_shell_state_default() {
+        let state = include_str!("../ui/state/shell.ice");
+        for seed in [
+            format!("shell_host_node_options:[str] = [\"{LOCAL_HOST_NODE}\"]"),
+            format!("shell_host_node = \"{LOCAL_HOST_NODE}\""),
+        ] {
+            assert!(
+                state.contains(&seed),
+                "the shell state must seed the local host row: {seed}"
+            );
+        }
     }
 
     #[test]
@@ -1347,13 +1371,5 @@ mod tests {
         drifted["ducktape_runner_result"] = serde_json::json!(1);
         drifted["legacy"] = serde_json::json!(true);
         assert!(agent_response_text(drifted.to_string().as_bytes()).is_err());
-    }
-
-    #[test]
-    fn terminal_widget_state_resets_for_a_new_session() {
-        let mut state = SharedAgentTerminalState { session_id: 1 };
-        assert!(!state.switch_to(1));
-        assert!(state.switch_to(2));
-        assert!(!state.switch_to(2));
     }
 }
