@@ -67,11 +67,14 @@ async fn drive_history(v: &mut Valset) {
     apply_commit(v, 4, msg(ValsetMsg::Leave { key: key(2) })).await;
 }
 
-/// the read matrix compared source-vs-joiner: both tier projections.
+/// the read matrix compared source-vs-joiner: both tier projections plus the
+/// mesh-generation window — the window IS replicated state, so a synced
+/// joiner must answer it byte-identically to the source.
 async fn replies(v: &Valset) -> Vec<ValsetReply> {
     let queries = [
         encode_query(&ValsetQuery::Validators),
         encode_query(&ValsetQuery::Residents),
+        encode_query(&ValsetQuery::MeshWindow),
     ];
     let mut out = Vec::new();
     for q in &queries {
@@ -156,5 +159,17 @@ fn synced_store_reconstructs_source_root_and_both_tiers() {
             panic!("expected the residents reply");
         };
         assert!(residents.is_empty(), "the promotion emptied the tier");
+
+        // the mesh window survived the sync: genesis (0) plus the four
+        // changing blocks, the retained depth exactly full.
+        let ValsetReply::MeshWindow(window) = &synced_replies[2] else {
+            panic!("expected the mesh-window reply");
+        };
+        let generations: Vec<u64> = window.iter().map(|s| s.generation).collect();
+        assert_eq!(
+            generations,
+            vec![1, 2, 3, 4],
+            "the synced window is the source's retained window"
+        );
     });
 }

@@ -47,6 +47,9 @@ impl Ctx for TestCtx {
                 ValsetQuery::Residents => Ok(valset::encode_reply(&ValsetReply::Residents(
                     self.residents.clone(),
                 ))),
+                ValsetQuery::MeshWindow => {
+                    Ok(valset::encode_reply(&ValsetReply::MeshWindow(Vec::new())))
+                }
             },
             _ => Err(Error::UnknownModule(target.into())),
         }

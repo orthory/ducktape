@@ -404,6 +404,24 @@ pub struct TipCoords {
     /// whether the server holds the finalization certificate for exactly
     /// `height` — a liveness hint, never the certificate itself.
     pub has_floor: bool,
+    /// the tip's membership GENERATION — the committed valset counter, the
+    /// index namespace the mesh tracks peer sets under (distinct from
+    /// `epoch`, which stays the engine/channel coordinate).
+    pub generation: u64,
+    /// the tip's retained mesh-generation window, ascending — the same
+    /// snapshots the server derives from committed valset state, so a parked
+    /// joiner tracks the identical window every member tracks.
+    pub mesh_window: Vec<MeshWindowEntry>,
+}
+
+/// one mesh-generation snapshot as carried on the sync wire. statesync-local
+/// on purpose: this crate must not depend on the valset module crate — node
+/// code converts at the fill site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshWindowEntry {
+    pub generation: u64,
+    pub validators: Vec<Vec<u8>>,
+    pub residents: Vec<Vec<u8>>,
 }
 
 /// a state-sync response.
@@ -756,6 +774,19 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
                 wire::put_bytes(&mut out, r);
             }
             out.push(u8::from(c.has_floor));
+            out.extend_from_slice(&c.generation.to_le_bytes());
+            out.extend_from_slice(&(c.mesh_window.len() as u64).to_le_bytes());
+            for entry in &c.mesh_window {
+                out.extend_from_slice(&entry.generation.to_le_bytes());
+                out.extend_from_slice(&(entry.validators.len() as u64).to_le_bytes());
+                for v in &entry.validators {
+                    wire::put_bytes(&mut out, v);
+                }
+                out.extend_from_slice(&(entry.residents.len() as u64).to_le_bytes());
+                for r in &entry.residents {
+                    wire::put_bytes(&mut out, r);
+                }
+            }
         }
     }
     out
@@ -1011,6 +1042,45 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 1 => true,
                 t => return Err(WireError::BadTag("has_floor", t)),
             };
+            let generation = wire::take_u64(&mut buf)?;
+            let entries = wire::take_u64(&mut buf)?;
+            if entries > (buf.len() / 8) as u64 {
+                return Err(WireError::Codec(format!(
+                    "mesh window count {entries} exceeds the {} remaining bytes",
+                    buf.len()
+                )));
+            }
+            let mut mesh_window = Vec::with_capacity(entries as usize);
+            for _ in 0..entries {
+                let entry_generation = wire::take_u64(&mut buf)?;
+                let v = wire::take_u64(&mut buf)?;
+                if v > (buf.len() / 8) as u64 {
+                    return Err(WireError::Codec(format!(
+                        "window validator count {v} exceeds the {} remaining bytes",
+                        buf.len()
+                    )));
+                }
+                let mut validators = Vec::with_capacity(v as usize);
+                for _ in 0..v {
+                    validators.push(wire::take_bytes(&mut buf)?.to_vec());
+                }
+                let r = wire::take_u64(&mut buf)?;
+                if r > (buf.len() / 8) as u64 {
+                    return Err(WireError::Codec(format!(
+                        "window resident count {r} exceeds the {} remaining bytes",
+                        buf.len()
+                    )));
+                }
+                let mut residents = Vec::with_capacity(r as usize);
+                for _ in 0..r {
+                    residents.push(wire::take_bytes(&mut buf)?.to_vec());
+                }
+                mesh_window.push(MeshWindowEntry {
+                    generation: entry_generation,
+                    validators,
+                    residents,
+                });
+            }
             SyncResponse::TipCoords(TipCoords {
                 height,
                 root_hash,
@@ -1019,6 +1089,8 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 participants,
                 residents,
                 has_floor,
+                generation,
+                mesh_window,
             })
         }
         8 => SyncResponse::Blob {
@@ -1175,6 +1247,10 @@ pub struct BoundaryCoords {
     pub participants: Vec<Vec<u8>>,
     pub residents: Vec<Vec<u8>>,
     pub floor_cert: Option<Vec<u8>>,
+    /// the committed membership generation and its retained window — the
+    /// mesh's index namespace; see [`TipCoords::generation`].
+    pub generation: u64,
+    pub mesh_window: Vec<MeshWindowEntry>,
 }
 
 /// a consistent boundary capture: every payload from ONE finalized boundary.
@@ -1626,6 +1702,8 @@ impl SyncServer {
                     participants: coords.participants.clone(),
                     residents: coords.residents.clone(),
                     has_floor: coords.floor_cert.is_some(),
+                    generation: coords.generation,
+                    mesh_window: coords.mesh_window.clone(),
                 }))
             }
         }

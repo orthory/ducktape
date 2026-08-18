@@ -130,6 +130,7 @@ pub(crate) async fn run(
         oracle,
         quota,
         mesh_participants,
+        &validators,
         &recovery,
         manifest,
         signer.clone(),

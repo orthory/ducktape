@@ -66,6 +66,20 @@ fn network_shape_joiner_parks_until_promote() {
     cluster.wait_marker(1, "admitted at epoch 1", CONVERGE);
     cluster.wait_marker(1, "synced root_hash=", CONVERGE);
     cluster.wait_marker(1, "promoted: validator at epoch 1", CONVERGE);
+
+    // the grant's mesh admission landed on a FRESH generation index: the
+    // old failure mode — commonware warn-dropping a same-index re-track,
+    // leaving the joiner bounced at the door until the cutover — is
+    // disproven directly by the absence of its warn on the founder.
+    let founder_log = std::fs::read_to_string(cluster.log_path(0)).expect("founder log");
+    assert!(
+        !founder_log.contains("peer set already exists"),
+        "a mesh track was silently rejected on the founder"
+    );
+    assert!(
+        !founder_log.contains("index must monotonically increase"),
+        "a mesh track regressed the index order on the founder"
+    );
 }
 
 /// the SEAT leg the markers above stop short of: after `promoted: validator
