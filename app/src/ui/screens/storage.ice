@@ -62,7 +62,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
           h=28.0
           gap=8.0
           align=center
-        button "↑" -> emit(fs_open_parent)
+        button -> emit(fs_open_parent)
           with
             label="Parent directory"
             disabled=(loading || empty(path))
@@ -70,6 +70,10 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
             h=26.0
             p=0.0
             @icon_action
+          text "↑"
+            with
+              size=12.5
+              font=ui
           active bg=surface text=muted border=card_line border-w=1.0 r=7.0
           hovered bg=elevated text=fg
           pressed bg=subtle

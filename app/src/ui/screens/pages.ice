@@ -419,13 +419,17 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                       active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
                       hovered bg=fg/5 text=fg
                       pressed bg=fg/8
-                    button "×" -> emit(close_doc_tab, tab.id)
+                    button -> emit(close_doc_tab, tab.id)
                       with
                         label="Close page tab"
                         w=24.0
                         h=24.0
                         p=0.0
                         @icon_action
+                      text "×"
+                        with
+                          size=12.5
+                          font=ui
                       active bg=transparent text=muted r=6.0
                       hovered bg=fg/8 text=fg
                       pressed bg=fg/12

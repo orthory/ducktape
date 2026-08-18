@@ -423,12 +423,20 @@ component ShellScreen(mode:ShellMode, provider:str, credential_options:[str], cr
                     r=15.0
                   row w=fill gap=6.0 align=center
                     extern rich_composer(draft, agent_composer_hint(provider), (!connected || chat_busy || empty(credential)), 40.0, 150.0, 8.0) #draft -> emit(shell_composer_event, _)
-                    button "↑" #send -> emit(shell_composer_event, composer_submit_event())
+                    button #send -> emit(shell_composer_event, composer_submit_event())
                       with
                         label="Send"
                         disabled=(!connected || chat_busy || empty(credential) || empty(trim(editor_text(draft))))
                         w=32.0
                         h=32.0
+                      // Regular weight, deliberately — see the note on the
+                      // message toolbar in components/chat.ice: a semibold
+                      // string label sends every non-ASCII glyph down
+                      // cosmic-text's walk-every-face fallback path.
+                      text "↑"
+                        with
+                          size=12.5
+                          font=ui
                       active bg=primary text=primary_fg r=16.0
                       hovered bg=primary_hover text=primary_fg r=16.0
                       disabled bg=disabled text=disabled_fg r=16.0
