@@ -75,6 +75,8 @@ fn a_module_that_cannot_serve_is_refused_per_module_not_by_the_whole_boundary() 
         participants: vec![],
         residents: vec![],
         floor_cert: None,
+        generation: 0,
+        mesh_window: Vec::new(),
     };
     let finalized = host::FinalizedBlock {
         height: 12,
@@ -225,6 +227,19 @@ fn tip_coords_roundtrip_over_the_wire() {
         participants: vec![vec![1u8; 32], vec![2u8; 32]],
         residents: vec![vec![3u8; 32]],
         has_floor: true,
+        generation: 5,
+        mesh_window: vec![
+            statesync::MeshWindowEntry {
+                generation: 4,
+                validators: vec![vec![1u8; 32]],
+                residents: vec![vec![3u8; 32]],
+            },
+            statesync::MeshWindowEntry {
+                generation: 5,
+                validators: vec![vec![1u8; 32], vec![2u8; 32]],
+                residents: vec![vec![3u8; 32]],
+            },
+        ],
     };
     let bytes = encode_response(&SyncResponse::TipCoords(coords.clone()));
     let SyncResponse::TipCoords(back) = decode_response(&bytes).unwrap() else {

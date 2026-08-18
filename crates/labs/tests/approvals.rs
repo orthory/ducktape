@@ -26,6 +26,7 @@ fn valset_reads(validators: Vec<Vec<u8>>) -> impl FnMut(&[u8]) -> Result<Vec<u8>
             validators.clone(),
         ))),
         ValsetQuery::Residents => Ok(valset::encode_reply(&ValsetReply::Residents(vec![]))),
+        ValsetQuery::MeshWindow => Ok(valset::encode_reply(&ValsetReply::MeshWindow(vec![]))),
     }
 }
 

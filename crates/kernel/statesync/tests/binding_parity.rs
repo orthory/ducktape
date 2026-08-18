@@ -180,6 +180,12 @@ fn canned_response(req: &SyncRequest) -> SyncResponse {
             participants: vec![vec![9u8; 32]],
             residents: vec![],
             has_floor: true,
+            generation: 3,
+            mesh_window: vec![statesync::MeshWindowEntry {
+                generation: 3,
+                validators: vec![vec![9u8; 32]],
+                residents: vec![],
+            }],
         }),
         SyncRequest::Blob { digest } => SyncResponse::Blob {
             bytes: Some(digest.to_vec()),

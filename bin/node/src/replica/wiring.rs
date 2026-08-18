@@ -10,7 +10,7 @@
 
 use commonware_cryptography::ed25519;
 use commonware_p2p::authenticated::discovery::{self, Network};
-use commonware_p2p::{Ingress, Manager, Receiver as P2pReceiver};
+use commonware_p2p::{Ingress, Receiver as P2pReceiver};
 use commonware_runtime::{Quota, Spawner, Supervisor};
 use commonware_utils::ordered::Set;
 use consensus::ContentStore;
@@ -56,6 +56,9 @@ pub(super) struct ReplicaChannels {
     /// retired `CHANNEL_LOBBY` gate FSM.
     pub(super) admitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(super) voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
+    /// the mesh window tracker, genesis already tracked — the park loop
+    /// advances it as generations land, and promotion carries it on.
+    pub(super) mesh_window: crate::mesh_window::MeshWindowTracker,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -65,6 +68,7 @@ pub(super) async fn wire(
     oracle: &mut discovery::Oracle<ed25519::PublicKey>,
     quota: Quota,
     mesh_participants: &Set<ed25519::PublicKey>,
+    validators: &[ed25519::PublicKey],
     recovery: &Recovery<commonware_runtime::tokio::Context>,
     manifest: &Option<Manifest>,
     signer: ed25519::PrivateKey,
@@ -99,10 +103,13 @@ pub(super) async fn wire(
              missing — wipe the app state and re-join (KEEP any consensus journal \
              partitions: they are what prevents this key from double-voting)");
     }
-    // the parked mesh identity: genesis set at the base index (no
-    // consensus coordinates yet). engine lanes are NOT black-holed
-    // like the sync-only resident — the replica pipeline (phase 2)
-    // consumes them:
+    // the parked mesh identity: the GENESIS window (index 0, primary =
+    // the descriptor's fingerprinted validators — byte-equal to valset's
+    // generation-0 snapshot; the wider descriptor mesh rides as
+    // secondary). no consensus coordinates yet; the park loop tracks
+    // later generations as it observes them. engine lanes are NOT
+    // black-holed like the sync-only resident — the replica pipeline
+    // (phase 2) consumes them:
     // - CERT lanes bridge their raw bytes to the fold driver, which
     //   decodes finalizations and verifies them against the epoch's
     //   quorum (the phase-1 gate). pre-standing, the same bytes fire
@@ -117,7 +124,11 @@ pub(super) async fn wire(
     //   NOT an option — validators' resolvers send fetch requests to
     //   every tracked peer, and an unread backlog jams the very
     //   connection the sync client rides.
-    oracle.track(PEER_SET, mesh_participants.clone());
+    let mut mesh_window = crate::mesh_window::MeshWindowTracker::new(
+        &mesh_participants.iter().cloned().collect::<Vec<_>>(),
+        label.clone(),
+    );
+    mesh_window.track_genesis(oracle, validators);
     let replica_store = ContentStore::new();
     let (head_wake_tx, head_wake) = futures::channel::mpsc::channel::<()>(1);
     // raw cert-lane bytes for the fold driver: bounded, drop-on-full —
@@ -533,6 +544,7 @@ pub(super) async fn wire(
         relay_rx,
         admitted,
         voice_requests,
+        mesh_window,
     }
 }
 

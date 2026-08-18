@@ -13,15 +13,6 @@ pub(crate) const MAX_MODULE_CODE_BYTES: u64 = 1024 * 1024 * 1024;
 /// the miss (each conversation resumes the staged prefix, so retries only
 /// ever pay for bytes not yet landed).
 pub(crate) const BLOB_FETCH_ATTEMPTS: usize = 3;
-/// the peer-set index a node WITHOUT consensus coordinates tracks (a parked
-/// joiner, a sync-only resident): the genesis mesh at index 0. a VALIDATOR
-/// tracks its epoch's mesh at index = epoch instead — discovery requires
-/// strictly increasing indexes per `track`, ignores indexes a peer does not
-/// know, but KILLS a peer whose set at a SHARED index has a different
-/// length, so the set tracked at a given index must be identical on every
-/// node that tracks it (epoch participant sets are; instantaneous valset
-/// projections are not).
-pub(crate) const PEER_SET: u64 = 0;
 /// a deliberately-unregistered module target. validators submit empty frames
 /// against it to advance the chain when there are no user ops: finalized views
 /// only move with ops, so an idle network would otherwise freeze — parking AT an

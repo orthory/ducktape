@@ -1,7 +1,7 @@
 //! State-sync request handling over loop-owned consensus state.
 
 use super::ValidatorRuntime;
-use crate::host_reads::{read_valset_members, read_valset_residents};
+use crate::host_reads::{read_sync_mesh_window, read_valset_members, read_valset_residents};
 use crate::sync::serve::{SyncBoundary, SyncIndexOps, SyncStateRequest};
 use crate::util::{participant_bytes, resident_bytes};
 
@@ -77,6 +77,12 @@ impl ValidatorRuntime<'_> {
                 // the floor certificate is served only when it certifies
                 // exactly the current boundary — a cert behind the
                 // boundary would make a joiner skip history it needs.
+                // the mesh window rides COMMITTED valset state (the same
+                // read point as Standing), deliberately not the
+                // epoch-frozen orchestrator sets: a frozen set at a live
+                // generation index would recreate the joiner/member
+                // asymmetry the window exists to end.
+                let (generation, mesh_window) = read_sync_mesh_window(node.host()).await;
                 let coords = statesync::BoundaryCoords {
                     epoch: orchestrator.epoch(),
                     view_base: orchestrator.epoch_base(),
@@ -87,6 +93,8 @@ impl ValidatorRuntime<'_> {
                         .filter(|fc| fc.epoch == orchestrator.epoch())
                         .filter(|fc| node.finalized().is_some_and(|f| f.height == fc.height))
                         .map(|fc| fc.cert.clone()),
+                    generation,
+                    mesh_window,
                 };
                 let finalized_for_sync = node
                     .finalized()
@@ -174,18 +182,27 @@ impl ValidatorRuntime<'_> {
                 // Boundary path.
                 let answer = match node.finalized() {
                     None => Err("no finalized boundary to serve yet".to_string()),
-                    Some(f) => Ok(statesync::TipCoords {
-                        height: f.height,
-                        root_hash: f.root_hash,
-                        epoch: orchestrator.epoch(),
-                        view_base: orchestrator.epoch_base(),
-                        participants: participant_bytes(orchestrator),
-                        residents: resident_bytes(orchestrator),
-                        has_floor: latest_floor
-                            .as_ref()
-                            .filter(|fc| fc.epoch == orchestrator.epoch())
-                            .is_some_and(|fc| fc.height == f.height),
-                    }),
+                    Some(f) => {
+                        // committed valset reads, like the Standing arm — the
+                        // window must reflect a just-committed grant NOW, not
+                        // at the epoch cutover.
+                        let (generation, mesh_window) =
+                            read_sync_mesh_window(node.host()).await;
+                        Ok(statesync::TipCoords {
+                            height: f.height,
+                            root_hash: f.root_hash,
+                            epoch: orchestrator.epoch(),
+                            view_base: orchestrator.epoch_base(),
+                            participants: participant_bytes(orchestrator),
+                            residents: resident_bytes(orchestrator),
+                            has_floor: latest_floor
+                                .as_ref()
+                                .filter(|fc| fc.epoch == orchestrator.epoch())
+                                .is_some_and(|fc| fc.height == f.height),
+                            generation,
+                            mesh_window,
+                        })
+                    }
                 };
                 let _ = reply.send(answer);
             }

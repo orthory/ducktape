@@ -25,6 +25,19 @@
 //! one batch at `commit_block`; `abort_block` drops the stage; the module
 //! root IS the store's committed merkle root, and sync belongs to the store.
 //!
+//! ## the mesh-generation window
+//!
+//! every committed block that changed membership advances a GENERATION
+//! counter and snapshots the block's final `(validators, residents)` pair;
+//! the last [`RETAINED_GENERATIONS`] snapshots are retained and served by
+//! [`ValsetQuery::MeshWindow`]. the mesh transport tracks peer sets at
+//! generation indices, so every node — however it arrived at the tip —
+//! derives the IDENTICAL tracked window from this replicated state. one
+//! generation per BLOCK, not per op: intermediate per-op snapshots would be
+//! intra-block-order-dependent and could fork the root. generation 0 is the
+//! genesis membership: the descriptor's fingerprinted validator list,
+//! derivable by a joiner before it has synced anything.
+//!
 //! the observation barrier and the epoch cutover key on this module's root
 //! MOVING, so an idempotent no-op — a re-join, a leave of an absent key, a
 //! re-grant, a revoke of a non-resident — must STAGE NOTHING: a
@@ -67,6 +80,32 @@ const MAX_TIER_RECORD_BYTES: usize = 512 * 1024;
 const VALIDATORS_KEY: &[u8] = b"validators";
 /// the committed resident tier's record key, same shape.
 const RESIDENTS_KEY: &[u8] = b"residents";
+
+/// the membership generation counter's record key: a borsh `u64`, advanced by
+/// exactly one for each committed block that changed a tier. ABSENT reads as
+/// 0 — only reachable on a never-seeded store.
+const GENERATION_KEY: &[u8] = b"generation";
+
+/// generations whose snapshots are retained (and served by
+/// [`ValsetQuery::MeshWindow`]). pinned to the mesh transport's
+/// `tracked_peer_sets` depth by a node-side test — the two moving apart
+/// would let one side track sets the other has already pruned.
+pub const RETAINED_GENERATIONS: u64 = 4;
+
+/// one generation snapshot's record key: `generation/` ++ big-endian `g`.
+/// big-endian so the store's key order matches numeric order.
+fn generation_set_key(generation: u64) -> Vec<u8> {
+    let mut key = b"generation/".to_vec();
+    key.extend_from_slice(&generation.to_be_bytes());
+    key
+}
+
+/// generation 0 is the GENESIS membership: the descriptor's fingerprinted
+/// validator list, and nothing else. this equality is the correctness anchor
+/// for a joiner's pre-sync index-0 track — a node that has synced nothing yet
+/// derives the same snapshot from its descriptor that every member carries in
+/// state.
+const GENESIS_GENERATION: u64 = 0;
 
 pub struct Valset {
     id: ModuleId,
@@ -112,14 +151,22 @@ impl Valset {
     }
 
     /// publish the staged genesis seed in one batch — idempotent: a store
-    /// that already carries a validator tier (a reopened workspace
+    /// that already carries a generation counter (a reopened workspace
     /// re-entering the genesis path) is left byte-untouched, exactly like
-    /// lifecycle's `finish_seed`.
+    /// lifecycle's `finish_seed`. the gate keys on [`GENERATION_KEY`] rather
+    /// than the validator tier because an EMPTY genesis set still commits
+    /// the counter (and no snapshot) — the counter record is the one write
+    /// every genesis performs.
     pub async fn finish_seed(&mut self) -> Result<(), Error> {
-        let already_seeded = self.staged.get_committed(VALIDATORS_KEY).await?.is_some();
+        let already_seeded = self.staged.get_committed(GENERATION_KEY).await?.is_some();
         if already_seeded {
             self.staged.abort();
             return Ok(());
+        }
+        let seeded_validators = self.validators().await?;
+        self.stage_generation_counter(GENESIS_GENERATION);
+        if !seeded_validators.is_empty() {
+            self.stage_generation_snapshot(GENESIS_GENERATION, &seeded_validators, &Vec::new())?;
         }
         self.staged.commit().await
     }
@@ -185,6 +232,110 @@ impl Valset {
         }
         self.staged.stage(key.to_vec(), bytes);
         Ok(())
+    }
+
+    // ---- the membership generation window ------------------------------------
+
+    /// the staged-over-committed generation counter. ABSENT reads as 0 (a
+    /// never-seeded store).
+    async fn generation(&self) -> Result<u64, Error> {
+        let Some(bytes) = self.staged.get(GENERATION_KEY).await? else {
+            return Ok(GENESIS_GENERATION);
+        };
+        borsh::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))
+    }
+
+    fn stage_generation_counter(&mut self, generation: u64) {
+        let bytes = borsh::to_vec(&generation).expect("a u64 is serializable");
+        self.staged.stage(GENERATION_KEY.to_vec(), bytes);
+    }
+
+    /// stage one generation's membership snapshot. the pair rides one record
+    /// so a generation is atomic — there is no state where its validators
+    /// and residents disagree about which transition they describe.
+    fn stage_generation_snapshot(
+        &mut self,
+        generation: u64,
+        validators: &Vec<Vec<u8>>,
+        residents: &Vec<Vec<u8>>,
+    ) -> Result<(), Error> {
+        let bytes =
+            borsh::to_vec(&(validators, residents)).expect("a member snapshot is serializable");
+        if bytes.len() > MAX_TIER_RECORD_BYTES {
+            return Err(Error::Module(format!(
+                "generation snapshot too large: {} > {MAX_TIER_RECORD_BYTES} bytes",
+                bytes.len()
+            )));
+        }
+        self.staged.stage(generation_set_key(generation), bytes);
+        Ok(())
+    }
+
+    /// whether this block's staged tiers differ from the committed tiers — the
+    /// commit-time predicate deciding a generation advance. a pure
+    /// read-compare, deliberately NOT a dirty marker set by the handlers:
+    /// a net-zero block (a leave and a re-join of the same key) stages tier
+    /// writes yet changes no membership, and must not burn a generation.
+    async fn staged_membership_changed(&self) -> Result<bool, Error> {
+        let validators_changed = self.staged.get(VALIDATORS_KEY).await?
+            != self.staged.get_committed(VALIDATORS_KEY).await?;
+        if validators_changed {
+            return Ok(true);
+        }
+        let residents_changed = self.staged.get(RESIDENTS_KEY).await?
+            != self.staged.get_committed(RESIDENTS_KEY).await?;
+        Ok(residents_changed)
+    }
+
+    /// advance the membership generation by one and snapshot the block's
+    /// final tiers. called from `commit_block`, AT MOST ONCE PER BLOCK, and
+    /// only when the block changed membership — never on a no-op block,
+    /// preserving the module's stage-nothing invariant (the doc at the top
+    /// of this file). one generation per block (not per op) keeps intra-block
+    /// op order unable to fork the root: intermediate per-op snapshots would
+    /// be order-dependent, the block's final membership is not. prunes the
+    /// snapshot falling out of the retained window; the prune is
+    /// existence-checked so it never stages a delete of an absent record.
+    async fn advance_generation(&mut self) -> Result<(), Error> {
+        let current = self.generation().await?;
+        let next = current
+            .checked_add(1)
+            .expect("the membership generation counter overflowed u64");
+        self.stage_generation_counter(next);
+        let validators = self.validators().await?;
+        let residents = self.residents().await?;
+        self.stage_generation_snapshot(next, &validators, &residents)?;
+        let Some(stale) = next.checked_sub(RETAINED_GENERATIONS) else {
+            return Ok(());
+        };
+        let stale_key = generation_set_key(stale);
+        if self.staged.get(&stale_key).await?.is_some() {
+            self.staged.delete(stale_key);
+        }
+        Ok(())
+    }
+
+    /// the retained window, ascending: every present snapshot in
+    /// `[latest - (RETAINED_GENERATIONS-1), latest]`. absent entries — pruned,
+    /// or the empty-genesis case where no generation-0 snapshot exists — are
+    /// skipped, never invented.
+    async fn mesh_window(&self) -> Result<Vec<GenerationSet>, Error> {
+        let latest = self.generation().await?;
+        let from = latest.saturating_sub(RETAINED_GENERATIONS - 1);
+        let mut window = Vec::new();
+        for generation in from..=latest {
+            let Some(bytes) = self.staged.get(&generation_set_key(generation)).await? else {
+                continue;
+            };
+            let (validators, residents): (Vec<Vec<u8>>, Vec<Vec<u8>>) =
+                borsh::from_slice(&bytes).map_err(|e| Error::Module(e.to_string()))?;
+            window.push(GenerationSet {
+                generation,
+                validators,
+                residents,
+            });
+        }
+        Ok(window)
     }
 
     // ---- membership op handlers ---------------------------------------------
@@ -374,13 +525,21 @@ impl Module for Valset {
             ValsetQuery::Residents => Ok(encode_reply(&ValsetReply::Residents(
                 self.residents().await?,
             ))),
+            ValsetQuery::MeshWindow => Ok(encode_reply(&ValsetReply::MeshWindow(
+                self.mesh_window().await?,
+            ))),
         }
     }
 
     /// publish the block's staged membership changes in ONE store batch —
     /// `root()` now reflects them. no-op (and no root movement) if nothing
-    /// was staged.
+    /// was staged. a block that changed membership advances the generation
+    /// window in the same batch, so a committed root always carries a
+    /// snapshot of the membership it describes.
     async fn commit_block(&mut self) -> Result<(), Error> {
+        if self.staged_membership_changed().await? {
+            self.advance_generation().await?;
+        }
         self.staged.commit().await
     }
 
@@ -471,6 +630,14 @@ mod tests {
         match crate::decode_reply(&reply).unwrap() {
             ValsetReply::Residents(list) => list,
             other => panic!("expected Residents, got {other:?}"),
+        }
+    }
+    fn mesh_window(v: &Valset) -> Vec<GenerationSet> {
+        let reply =
+            futures::executor::block_on(v.query(&encode_query(&ValsetQuery::MeshWindow))).unwrap();
+        match crate::decode_reply(&reply).unwrap() {
+            ValsetReply::MeshWindow(window) => window,
+            other => panic!("expected MeshWindow, got {other:?}"),
         }
     }
 
@@ -672,6 +839,35 @@ mod tests {
         assert_eq!(v.root(), settled, "no-ops committed nothing");
         assert_eq!(validators(&v), vec![member], "membership unchanged");
         assert_eq!(residents(&v), vec![resident], "residents unchanged");
+        assert_eq!(
+            mesh_window(&v).last().map(|s| s.generation),
+            Some(1),
+            "a no-op block burned no generation"
+        );
+    }
+
+    #[test]
+    fn net_zero_block_burns_no_generation() {
+        // a REAL leave and a REAL re-join of the same key in one block: tier
+        // writes are staged, but the block's final membership is identical to
+        // the committed membership — the commit-time predicate compares
+        // staged vs committed, so no generation advances.
+        let mut v = fresh();
+        let mut ctx = sys_ctx();
+        let (a, b) = (valid_key(1), valid_key(2));
+        run(&mut v, &mut ctx, &join(&a)).unwrap();
+        run(&mut v, &mut ctx, &join(&b)).unwrap();
+        commit(&mut v);
+        assert_eq!(mesh_window(&v).last().unwrap().generation, 1);
+
+        run(&mut v, &mut ctx, &leave(&b)).unwrap();
+        run(&mut v, &mut ctx, &join(&b)).unwrap();
+        commit(&mut v);
+        assert_eq!(
+            mesh_window(&v).last().unwrap().generation,
+            1,
+            "net-zero membership burned no generation"
+        );
     }
 
     #[test]
@@ -704,6 +900,18 @@ mod tests {
         let seeded = v.root();
         assert_ne!(seeded, empty_root(), "the seed set is committed state");
         assert_eq!(validators(&v).len(), 2);
+        let window = mesh_window(&v);
+        assert_eq!(
+            window.iter().map(|s| s.generation).collect::<Vec<_>>(),
+            vec![0],
+            "genesis is generation 0"
+        );
+        assert_eq!(
+            window[0].validators,
+            validators(&v),
+            "the generation-0 snapshot IS the seeded validator list"
+        );
+        assert!(window[0].residents.is_empty());
 
         // a reopened workspace re-entering the genesis path re-seeds — the
         // idempotence gate must leave the store byte-untouched.
@@ -819,5 +1027,118 @@ mod tests {
             "got {err:?}"
         );
         assert!(residents(&v).is_empty());
+    }
+
+    // ---- the mesh-generation window ------------------------------------------
+
+    fn sorted(mut keys: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        keys.sort();
+        keys
+    }
+
+    #[test]
+    fn each_changing_block_advances_one_generation_and_snapshots_it() {
+        let mut v = fresh();
+        let mut ctx = sys_ctx();
+        let (a, r) = (valid_key(1), valid_key(2));
+
+        run(&mut v, &mut ctx, &join(&a)).unwrap();
+        commit(&mut v);
+        run(&mut v, &mut ctx, &grant(&r)).unwrap();
+        commit(&mut v);
+        // PROMOTION is one block and therefore ONE generation, carrying both
+        // tier edits.
+        run(&mut v, &mut ctx, &join(&r)).unwrap();
+        commit(&mut v);
+
+        let window = mesh_window(&v);
+        let generations: Vec<u64> = window.iter().map(|s| s.generation).collect();
+        assert_eq!(generations, vec![1, 2, 3], "one generation per block, ascending");
+        assert_eq!(window[0].validators, vec![a.clone()]);
+        assert!(window[0].residents.is_empty());
+        assert_eq!(window[1].validators, vec![a.clone()]);
+        assert_eq!(window[1].residents, vec![r.clone()]);
+        assert_eq!(
+            window[2].validators,
+            sorted(vec![a, r]),
+            "promotion landed in the validator tier"
+        );
+        assert!(
+            window[2].residents.is_empty(),
+            "promotion left the resident tier in the same generation"
+        );
+    }
+
+    #[test]
+    fn many_ops_in_one_block_burn_one_generation() {
+        let mut v = fresh();
+        let mut ctx = sys_ctx();
+        let (a, b, r) = (valid_key(1), valid_key(2), valid_key(3));
+        run(&mut v, &mut ctx, &join(&a)).unwrap();
+        run(&mut v, &mut ctx, &join(&b)).unwrap();
+        run(&mut v, &mut ctx, &grant(&r)).unwrap();
+        commit(&mut v);
+
+        let window = mesh_window(&v);
+        assert_eq!(window.len(), 1, "one block, one generation");
+        assert_eq!(window[0].generation, 1);
+        assert_eq!(window[0].validators, sorted(vec![a, b]));
+        assert_eq!(window[0].residents, vec![r]);
+    }
+
+    #[test]
+    fn window_prunes_to_retained_depth() {
+        // genesis seeds generation 0; five changing blocks advance to 5. the
+        // window serves exactly the last RETAINED_GENERATIONS snapshots,
+        // ascending — 0 and 1 are pruned records, not just filtered replies.
+        let mut v = fresh();
+        let mut ctx = sys_ctx();
+        futures::executor::block_on(async {
+            v.seed(valid_key(0)).await.unwrap();
+            v.finish_seed().await.unwrap();
+        });
+        assert_eq!(
+            mesh_window(&v).iter().map(|s| s.generation).collect::<Vec<_>>(),
+            vec![0],
+            "genesis committed the generation-0 snapshot"
+        );
+        for seed in 1..=5u16 {
+            run(&mut v, &mut ctx, &join(&valid_key(seed))).unwrap();
+            commit(&mut v);
+        }
+
+        let window = mesh_window(&v);
+        let generations: Vec<u64> = window.iter().map(|s| s.generation).collect();
+        assert_eq!(generations, vec![2, 3, 4, 5], "retained depth is 4, ascending");
+        assert_eq!(
+            window.last().unwrap().validators.len(),
+            6,
+            "the tip snapshot carries the full membership"
+        );
+    }
+
+    #[test]
+    fn empty_genesis_commits_the_counter_only() {
+        // the production pin composes valset with an EMPTY seed set: genesis
+        // still commits the generation counter (the idempotence gate keys on
+        // it), but no generation-0 snapshot is invented for an empty set.
+        let mut v = fresh();
+        futures::executor::block_on(v.finish_seed()).unwrap();
+        assert_ne!(v.root(), empty_root(), "the counter record is committed");
+        assert!(mesh_window(&v).is_empty(), "no snapshot for an empty set");
+
+        // re-entering the genesis path is still byte-untouched.
+        let sealed = v.root();
+        futures::executor::block_on(v.finish_seed()).unwrap();
+        assert_eq!(v.root(), sealed, "re-entry is a no-op");
+
+        // the first real membership block advances to generation 1.
+        let mut ctx = sys_ctx();
+        run(&mut v, &mut ctx, &join(&valid_key(1))).unwrap();
+        commit(&mut v);
+        assert_eq!(
+            mesh_window(&v).iter().map(|s| s.generation).collect::<Vec<_>>(),
+            vec![1]
+        );
     }
 }

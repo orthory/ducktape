@@ -34,6 +34,22 @@ pub enum ValsetQuery {
     Validators,
     /// the full committed resident set.
     Residents,
+    /// the retained mesh-generation window: the last few membership
+    /// snapshots, keyed by generation. every node tracks this identical
+    /// window on the mesh oracle, so peer-set knowledge is a function of
+    /// replicated state, not of when a node joined.
+    MeshWindow,
+}
+
+/// one membership generation: the full transport membership AFTER the op
+/// that created it. `validators` and `residents` are strictly sorted
+/// 32-byte ed25519 keys, disjoint by construction (grant refuses a current
+/// validator; join promotes a resident out of its tier in the same op).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GenerationSet {
+    pub generation: u64,
+    pub validators: Vec<Vec<u8>>,
+    pub residents: Vec<Vec<u8>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -43,6 +59,8 @@ pub enum ValsetReply {
     Validators(Vec<Vec<u8>>),
     /// the committed residents, sorted (order-independent).
     Residents(Vec<Vec<u8>>),
+    /// the retained generation snapshots, ascending by generation.
+    MeshWindow(Vec<GenerationSet>),
 }
 
 pub fn encode_msg(m: &ValsetMsg) -> Vec<u8> {

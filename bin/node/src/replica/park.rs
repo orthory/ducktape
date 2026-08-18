@@ -12,7 +12,7 @@ use commonware_codec::DecodeExt as _;
 use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_p2p::authenticated::discovery;
-use commonware_p2p::{Manager, Receiver as P2pReceiver};
+use commonware_p2p::Receiver as P2pReceiver;
 use commonware_runtime::{Clock, Metrics, Spawner, Supervisor};
 use futures::{FutureExt as _, StreamExt as _};
 use recovery::{Manifest, Recovery};
@@ -21,7 +21,7 @@ use crate::config::{hex_bytes, unhex};
 use crate::constants::*;
 use crate::drain_actions::{CutoverTrigger, EpochActions};
 use crate::explorer::{boundary_block_row, heal_and_backfill_index, heal_index};
-use crate::host_reads::{joiner_epoch_mesh, read_valset_members, read_valset_residents};
+use crate::host_reads::{read_valset_members, read_valset_mesh_window, read_valset_residents};
 use crate::host_state::{SyncSubstrates, restore_host, sync_all_modules};
 use crate::relay;
 use crate::relay_runtime;
@@ -256,6 +256,7 @@ pub(super) async fn park(
         relay_rx,
         admitted,
         voice_requests,
+        mut mesh_window,
     } = channels;
     metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Joining);
     tracing::info!(
@@ -393,7 +394,9 @@ pub(super) async fn park(
     let mut announce_targets: Vec<ed25519::PublicKey> = validators.clone();
 
     let me_bytes = signer.public_key().as_ref().to_vec();
-    let mut last_tracked = PEER_SET;
+    // the tip EPOCH latch for the channel-bank warning and the plane
+    // books — the mesh itself follows GENERATIONS via `mesh_window`.
+    let mut last_tip_epoch = 0u64;
     // the epoch the reachability plane last retargeted to (standby
     // role) — one Retarget per observed epoch.
     let mut last_plane_epoch: Option<u64> = None;
@@ -1348,6 +1351,13 @@ pub(super) async fn park(
                 && let Some(orch) = replica_orchestrator.as_mut()
             {
                 let folded_view = served_height.saturating_sub(replica_view_base);
+                // sync the mesh window at the same frozen read point —
+                // the replica mirror of the validator drain's discipline:
+                // a committed membership change widens the mesh at its
+                // generation index NOW; the cutover below stays a
+                // channel/orderer concern.
+                let committed_window = read_valset_mesh_window(node_r.host()).await;
+                mesh_window.track_new(oracle, &committed_window);
                 let members_raw = read_valset_members(node_r.host()).await;
                 let observed: Vec<ed25519::PublicKey> = members_raw
                     .iter()
@@ -1400,18 +1410,16 @@ pub(super) async fn park(
                             residents: plan_resident_bytes,
                         });
                     } else {
-                        // transport first, exactly like the validator:
-                        // the new epoch's mesh must admit its members.
-                        let mesh =
-                            joiner_epoch_mesh(&peers, &member_bytes, &plan_resident_bytes);
-                        oracle.track(plan.epoch(), mesh);
+                        // no mesh track here: the window sync above already
+                        // tracked the transport union at its GENERATION
+                        // index when the change committed. the epoch-plane
+                        // books follow the cutover, like the validator.
                         if let Some(book) = &gateway_book {
                             book.set_peers(plan.valset().transport_members().iter());
                         }
                         if let Some(peers) = &media_peers {
                             peers.set_peers(plan.valset().transport_members().iter());
                         }
-                        last_tracked = plan.epoch();
                         // the follower swap: same OrderedNode, fresh
                         // orderer, cutover journaled — the epoch-local
                         // view clock restarts with the new base.
@@ -1719,6 +1727,7 @@ pub(super) async fn park(
                 rpc_ingress,
                 http_ingress,
                 prev_ckpt: (Some(folded_tip), pos),
+                mesh_window,
             };
         }
         resident_relay.expire(std::time::Instant::now());
@@ -1756,11 +1765,14 @@ pub(super) async fn park(
                 continue;
             }
         };
-        // follow the mesh rotation while parked. the participant
-        // list is an unverified serving hint — the union with the
-        // descriptor mesh keeps the real members reachable, and
-        // promotion re-derives everything from verified state.
-        if tip.epoch > last_tracked {
+        // follow the mesh rotation while parked: track the tip's
+        // REPLICATED generation window — the identical snapshots every
+        // member tracks, so a parked joiner's tracked sets can never
+        // diverge from the network's (the coordinates are unverified
+        // serving hints; promotion re-derives everything from verified
+        // state). the epoch stays the CHANNEL/book coordinate below.
+        mesh_window.track_new(oracle, &crate::mesh_window::window_from_sync(&tip.mesh_window));
+        if tip.epoch > last_tip_epoch {
             if !lane_bank.covers(tip.epoch) {
                 tracing::warn!(
                     target: "ducktape::reachability",
@@ -1771,8 +1783,6 @@ pub(super) async fn park(
                     "expect reconnect churn while parked"
                 );
             }
-            let mesh = joiner_epoch_mesh(&peers, &tip.participants, &tip.residents);
-            oracle.track(tip.epoch, mesh);
             if gateway_book.is_some() || media_peers.is_some() {
                 let transport: Vec<ed25519::PublicKey> = tip
                     .participants
@@ -1787,7 +1797,7 @@ pub(super) async fn park(
                     peers.set_peers(transport.iter());
                 }
             }
-            last_tracked = tip.epoch;
+            last_tip_epoch = tip.epoch;
         }
         // drive the reachability plane's standby role off the
         // manifest: membership and resident standing come from the
@@ -2427,5 +2437,6 @@ pub(super) async fn park(
         rpc_ingress,
         http_ingress,
         prev_ckpt: (Some(boundary.height), pos),
+        mesh_window,
     }
 }

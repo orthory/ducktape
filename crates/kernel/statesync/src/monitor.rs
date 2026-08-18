@@ -261,6 +261,8 @@ mod tests {
             participants: vec![],
             residents: vec![],
             has_floor: true,
+            generation: 0,
+            mesh_window: Vec::new(),
         });
         monitor.record("aa", SyncRequest::TipCoords.kind_name(), &coords, 256);
 
@@ -284,6 +286,8 @@ mod tests {
             participants: vec![],
             residents: vec![],
             has_floor: true,
+            generation: 0,
+            mesh_window: Vec::new(),
         });
         monitor.record("bb", SyncRequest::TipCoords.kind_name(), &coords, 128);
         let reports = monitor.snapshot();

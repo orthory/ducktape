@@ -10,7 +10,7 @@ mod wiring;
 
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_p2p::authenticated::discovery::{self, Network};
-use commonware_p2p::{Ingress, Manager as _};
+use commonware_p2p::Ingress;
 use commonware_runtime::Quota;
 use recovery::{Manifest, Recovery};
 
@@ -103,6 +103,7 @@ pub(crate) async fn run_validator(
         initial_member_keys,
         initial_resident_keys,
         mesh_oracle,
+        mesh_window,
         bank_base,
         channel_bank,
         sync_tx,
@@ -147,6 +148,7 @@ pub(crate) async fn run_validator(
         resume_epoch,
         pending_boot,
         mesh_oracle,
+        mesh_window,
         channel_bank,
         gateway_book,
         blob_peers,
@@ -163,7 +165,6 @@ pub(crate) async fn run_validator(
         &validators,
         signer.clone(),
         label.clone(),
-        peers.clone(),
         namespace.clone(),
         wireguard_listen.is_some(),
         overlay_slot.clone(),
@@ -177,6 +178,7 @@ pub(crate) async fn run_validator(
         initial_member_keys,
         initial_resident_keys,
         mesh_oracle,
+        mesh_window,
         bank_base,
         channel_bank,
         sync_tx,
@@ -316,6 +318,7 @@ pub(crate) async fn run_validator(
         last_cert_height,
         latest_floor,
         mesh_oracle,
+        mesh_window,
         gateway_book,
         media_peers,
         blob_peers,
@@ -331,7 +334,6 @@ pub(crate) async fn run_validator(
         prev_ckpt,
         signer,
         label,
-        peers,
         validators,
         dev_demo,
         checkpoint_blocks,
@@ -365,7 +367,6 @@ pub(crate) async fn run_promoted(
     signer: ed25519::PrivateKey,
     label: String,
     namespace: Vec<u8>,
-    peers: Vec<ed25519::PublicKey>,
     validators: Vec<ed25519::PublicKey>,
     coordinated: Vec<(ed25519::PublicKey, Ingress, ed25519::PublicKey)>,
     wireguard_listen: Option<std::net::SocketAddr>,
@@ -420,6 +421,7 @@ pub(crate) async fn run_promoted(
         rpc_ingress,
         http_ingress,
         prev_ckpt,
+        mesh_window,
     } = baton;
     metrics.set_role_phase(noded::NodeRole::Validator, noded::NodePhase::Recovering);
     tracing::info!(
@@ -455,10 +457,11 @@ pub(crate) async fn run_promoted(
         .cloned()
         .collect();
 
-    // the seat epoch's transport mesh, tracked at index = epoch — the same
-    // union every member tracks at this index.
-    let mut mesh_oracle = oracle.clone();
-    mesh_oracle.track(epoch, wiring::mesh_at(&peers, &transport));
+    // no mesh track at the seat: the park loop already tracked the seat's
+    // transport union at its GENERATION index (the tracker's bookkeeping
+    // travels in the baton), and the run loop's drain syncs the window
+    // every pass from here on.
+    let mesh_oracle = oracle.clone();
     if !lane_bank.covers(epoch) {
         fatal!(
             label,
@@ -646,6 +649,7 @@ pub(crate) async fn run_promoted(
         last_cert_height,
         latest_floor,
         mesh_oracle,
+        mesh_window,
         gateway_book,
         media_peers,
         blob_peers,
@@ -663,7 +667,6 @@ pub(crate) async fn run_promoted(
         prev_ckpt,
         signer,
         label,
-        peers,
         validators,
         dev_demo,
         checkpoint_blocks,
@@ -823,6 +826,10 @@ pub(crate) struct PromotionBaton {
     /// the promotion checkpoint's (height, oplog position) — the run
     /// loop's prune anchor.
     pub(crate) prev_ckpt: (Option<u64>, u64),
+    /// the mesh window tracker, carried over from the park loop: oracle
+    /// clones share ONE directory, so `last_tracked` must travel with the
+    /// role — the seat continues the same monotonic index sequence.
+    pub(crate) mesh_window: crate::mesh_window::MeshWindowTracker,
 }
 
 /// one epoch's slot in the [`LaneBank`].

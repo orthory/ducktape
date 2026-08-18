@@ -75,12 +75,11 @@ mod gateway_routes;
 mod host_reads;
 mod host_resources;
 mod host_state;
-#[cfg(test)]
-mod joiner_mesh_tests;
 mod lobby;
 #[cfg(test)]
 mod main_tests;
 mod mcp;
+mod mesh_window;
 mod overlay_book;
 mod plane_metrics;
 mod reachability_plane;
@@ -558,6 +557,7 @@ fn run_node(
                 quota,
                 &signer,
                 mesh_participants,
+                &validators,
                 sync_sources,
                 metrics.clone(),
                 storage_for_sync,
@@ -682,7 +682,6 @@ fn run_node(
                 signer,
                 label,
                 namespace,
-                peers,
                 validators,
                 coordinated,
                 wireguard_listen,
