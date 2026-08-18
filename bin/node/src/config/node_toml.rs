@@ -127,10 +127,11 @@ impl NodeToml {
 }
 
 /// the dev-seed harness shape: deterministic seed identities, no
-/// descriptor. node 0 bootstraps nobody; everyone else dials peer_seeds[0]
-/// at `bootstrapper_addr`. Only the test harnesses write this shape, so
-/// its plumbing stays optional — a harness file says exactly what the test
-/// needs and nothing else.
+/// descriptor. every peer's dial address rides `peer_addrs`, index-aligned
+/// with `peer_seeds` — the mesh transport has no address gossip, so the
+/// full list must come from config (the harness knows every port). Only
+/// the test harnesses write this shape, so its plumbing stays optional —
+/// a harness file says exactly what the test needs and nothing else.
 #[derive(Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DevSeedToml {
@@ -138,9 +139,10 @@ pub struct DevSeedToml {
     pub namespace: String,
     pub peer_seeds: Vec<u64>,
     pub validator_seeds: Option<Vec<u64>>,
-    /// `None` for node 0 (bootstraps nobody) — a semantic state, not a
-    /// default.
-    pub bootstrapper_addr: Option<String>,
+    /// one dial address per `peer_seeds` entry, same order. optional only
+    /// for a SOLO node (nobody to dial); a multi-node cluster without it
+    /// is refused at resolve.
+    pub peer_addrs: Option<Vec<String>>,
     pub listen: String,
     pub advertised: Option<String>,
     pub storage_dir: Option<String>,

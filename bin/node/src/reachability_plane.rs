@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use commonware_cryptography::{Signer, ed25519};
-use commonware_p2p::{Ingress, Receiver as P2pReceiver, Recipients, Sender as P2pSender};
+use commonware_p2p::{AddressableManager as _, Ingress, Receiver as P2pReceiver, Recipients, Sender as P2pSender};
 use commonware_runtime::{IoBuf, Spawner, Supervisor};
 
 use crate::config::{self, hex_bytes};
@@ -231,6 +231,13 @@ pub(crate) fn wire_reachability_plane<S, R>(
     // gate requests to the validator run loop through it and answer settled
     // outcomes from its shared map. a joiner's own plane passes `None`.
     gate: Option<GateHook>,
+    // the mesh ADDRESS seam: an accepted signed advert's control endpoint
+    // lands in the book, and — when the effective address changed — is fed
+    // to the lookup oracle's `overwrite`, which severs the stale connection
+    // and redials at the new address. this replaces discovery's on-wire
+    // address gossip outright.
+    mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
+    mesh_oracle: commonware_p2p::authenticated::lookup::Oracle<ed25519::PublicKey>,
     reach_p2p_tx: S,
     mut reach_p2p_rx: R,
     // the promotion seam: when armed, each pump hands its lane half back the
@@ -326,6 +333,8 @@ where
     // so this pump drains the tail and (when armed) hands the sender back.
     {
         let pump_label = label.to_string();
+        let book = mesh_book;
+        let mut oracle = mesh_oracle;
         let mut tx = reach_p2p_tx;
         context
             .child("reachability_out")
@@ -433,15 +442,35 @@ where
                             peer,
                             control_endpoint,
                         } => {
-                            // the mesh address book + oracle overwrite are wired
-                            // by the lookup-swap seam below in this file; this
-                            // arm is completed there.
+                            let Ok(peer_pk) =
+                                <ed25519::PublicKey as commonware_codec::DecodeExt<_>>::decode(
+                                    &peer.0[..],
+                                )
+                            else {
+                                continue;
+                            };
+                            let Some(addr) = book.observe_advert(&peer_pk, control_endpoint)
+                            else {
+                                // unchanged, or pinned by a DNS hint — silent.
+                                continue;
+                            };
+                            let overwrite =
+                                commonware_utils::ordered::Map::from_iter_dedup([(
+                                    peer_pk.clone(),
+                                    addr,
+                                )]);
+                            let _ = oracle.overwrite(overwrite);
+                            tracing::info!(
+                                target: "ducktape::reachability",
+                                node = %pump_label,
+                                peer = %hex_bytes(&peer_pk.as_ref()[..4]),
+                                "mesh address updated from signed advert"
+                            );
                             tracing::debug!(
                                 target: "ducktape::reachability",
                                 node = %pump_label,
-                                peer = %hex_bytes(&peer.0[..4]),
                                 endpoint = %control_endpoint,
-                                "control endpoint observed"
+                                "updated mesh endpoint detail"
                             )
                         }
                     }

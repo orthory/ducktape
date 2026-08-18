@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer, ed25519};
-use commonware_p2p::authenticated::discovery::{self, Network};
+use commonware_p2p::authenticated::lookup::{self, Network};
 use commonware_p2p::{Ingress, Receiver as P2pReceiver, Recipients, Sender as P2pSender};
 use commonware_runtime::{IoBuf, Quota, Spawner, Supervisor};
 use commonware_utils::ordered::Set;
@@ -31,8 +31,9 @@ use statesync::SyncServer;
 pub(super) struct PreWiring {
     pub(super) initial_member_keys: Vec<ed25519::PublicKey>,
     pub(super) initial_resident_keys: Vec<ed25519::PublicKey>,
-    pub(super) mesh_oracle: discovery::Oracle<ed25519::PublicKey>,
+    pub(super) mesh_oracle: lookup::Oracle<ed25519::PublicKey>,
     pub(super) mesh_window: crate::mesh_window::MeshWindowTracker,
+    pub(super) mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
     pub(super) bank_base: u64,
     pub(super) channel_bank: super::LaneBank,
     pub(super) sync_tx: super::MeshSender,
@@ -54,8 +55,9 @@ pub(super) struct RuntimeWiring {
     pub(super) participants: Set<ed25519::PublicKey>,
     pub(super) resume_epoch: u64,
     pub(super) pending_boot: Option<u64>,
-    pub(super) mesh_oracle: discovery::Oracle<ed25519::PublicKey>,
+    pub(super) mesh_oracle: lookup::Oracle<ed25519::PublicKey>,
     pub(super) mesh_window: crate::mesh_window::MeshWindowTracker,
+    pub(super) mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
     pub(super) channel_bank: super::LaneBank,
     pub(super) gateway_book: Option<Arc<crate::gateway_plane::OverlayBook>>,
     pub(super) blob_peers: Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
@@ -91,8 +93,9 @@ pub(super) async fn finish(
     blobs: noded::blobs::BlobHandle,
     initial_member_keys: Vec<ed25519::PublicKey>,
     initial_resident_keys: Vec<ed25519::PublicKey>,
-    mesh_oracle: discovery::Oracle<ed25519::PublicKey>,
+    mesh_oracle: lookup::Oracle<ed25519::PublicKey>,
     mesh_window: crate::mesh_window::MeshWindowTracker,
+    mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
     bank_base: u64,
     mut channel_bank: super::LaneBank,
     sync_tx: super::MeshSender,
@@ -225,6 +228,7 @@ pub(super) async fn finish(
         pending_boot,
         mesh_oracle,
         mesh_window,
+        mesh_book,
         channel_bank,
         gateway_book,
         blob_peers,
@@ -506,7 +510,8 @@ pub(super) fn wire_serve_lanes(
 pub(super) async fn wire(
     context: &commonware_runtime::tokio::Context,
     mut network: Network<super::OverlayCtx, ed25519::PrivateKey>,
-    oracle: &discovery::Oracle<ed25519::PublicKey>,
+    oracle: &lookup::Oracle<ed25519::PublicKey>,
+    mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
     quota: Quota,
     host: &Host,
     resumed: Option<&recovery::Recovered>,
@@ -589,7 +594,7 @@ pub(super) async fn wire(
         );
         std::process::exit(1);
     }
-    mesh_window.track_new(&mut mesh_oracle, &boot_window);
+    mesh_window.track_new(&mut mesh_oracle, &mesh_book, &boot_window);
 
     // lanes for epochs BELOW the resume epoch are registered and
     // black-holed (the sync-only arm's exact trick): a lagging peer still
@@ -750,6 +755,8 @@ pub(super) async fn wire(
                         forward: gate_fwd_tx.clone(),
                         outcomes: gate_outcomes.clone(),
                     }),
+                    mesh_book.clone(),
+                    mesh_oracle.clone(),
                     reach_p2p_tx,
                     reach_p2p_rx,
                     // a validator never hands this plane off in-process:
@@ -791,6 +798,7 @@ pub(super) async fn wire(
         initial_resident_keys,
         mesh_oracle,
         mesh_window,
+        mesh_book,
         bank_base,
         channel_bank,
         sync_tx,

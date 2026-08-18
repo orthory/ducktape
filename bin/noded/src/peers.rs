@@ -257,8 +257,8 @@ mod tests {
 network_tracker_directory_connected{peer="e653"} 1784737525068
 consensus_e1_engine_batcher_latest_vote{peer="7c35"} 0
 network_spawner_messages_sent_total{peer="e653",message="data_15"} 5090
-network_spawner_messages_sent_total{peer="e653",message="greeting"} 1
-network_spawner_messages_received_total{peer="e653",message="bit_vec"} 258
+network_spawner_messages_sent_total{peer="e653",message="ping"} 1
+network_spawner_messages_received_total{peer="e653",message="ping"} 258
 ducktape_statesync_serve_bytes{peer="e653"} 38597
 ducktape_statesync_serve_frames{peer="e653"} 2
 ducktape_statesync_serve_boundary_height{peer="e653"} 230

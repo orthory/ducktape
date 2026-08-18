@@ -50,7 +50,7 @@ pub struct Resolved {
     pub validators: Vec<ed25519::PublicKey>,
     /// (identity, dial ingress) pairs to dial at startup; never contains
     /// self. hostname ingresses stay hostnames — dialers re-resolve them.
-    pub bootstrappers: Vec<(ed25519::PublicKey, Ingress)>,
+    pub dial_hints: Vec<(ed25519::PublicKey, Ingress)>,
     /// reach targets that need the nat client: (target key, coordinator
     /// ingress, coordinator key). empty unless an invite carries Coordinated
     /// hints. the runtime rendezvous/hole-punches through the coordinator to
@@ -476,7 +476,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         &descriptor.genesis_namespace(),
         &me,
     )?;
-    let bootstrappers = bootstrap.into_iter().filter(|(k, _)| *k != me).collect();
+    let dial_hints = bootstrap.into_iter().filter(|(k, _)| *k != me).collect();
     let wireguard_listen: SocketAddr = raw
         .wireguard_listen
         .parse()
@@ -498,7 +498,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         signer,
         mesh,
         validators,
-        bootstrappers,
+        dial_hints,
         coordinated,
         listen,
         advertised,
@@ -685,8 +685,8 @@ fn resolve_advertised(
     }
 }
 
-/// the dev-seed shape, replicating the historical semantics exactly: node 0
-/// bootstraps nobody; everyone else dials peer_seeds[0] at bootstrapper_addr.
+/// the dev-seed shape: every peer dials every other through the
+/// index-aligned `peer_addrs` list (the mesh has no address gossip).
 fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
     // the shared half first: it owns the storage/workspace derivation (which
     // doubles as the podman-socket base) and must run before any field of `raw`
@@ -727,24 +727,41 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
     let mesh: Vec<_> = peer_seeds.iter().map(|s| key_of(*s)).collect();
     let validators: Vec<_> = validator_seeds.iter().map(|s| key_of(*s)).collect();
 
-    let bootstrappers = if id == 0 {
-        Vec::new()
-    } else {
-        let boot_seed = *peer_seeds
-            .first()
-            .ok_or("a bootstrapping node needs peer_seeds[0] = node 0")?;
-        let boot_addr: SocketAddr = raw
-            .bootstrapper_addr
-            .as_deref()
-            .ok_or("a non-zero node needs bootstrapper_addr set")?
-            .parse()
-            .map_err(|e| format!("bootstrapper_addr: {e}"))?;
-        // self-filter matches the Resolved.bootstrappers contract: a config
-        // with peer_seeds[0] == id would otherwise dial (and statesync) itself.
-        vec![(key_of(boot_seed), Ingress::Socket(boot_addr))]
-            .into_iter()
-            .filter(|(k, _)| *k != ed25519::PrivateKey::from_seed(id).public_key())
-            .collect()
+    // every peer's dial address, index-aligned with peer_seeds — the mesh
+    // transport has no address gossip, so the FULL list must come from
+    // config. a solo node needs none; a multi-node cluster without it is a
+    // dead cluster, refused loudly here rather than parked silently.
+    let me = ed25519::PrivateKey::from_seed(id).public_key();
+    let dial_hints: Vec<(ed25519::PublicKey, Ingress)> = match raw.peer_addrs {
+        None if peer_seeds.len() <= 1 => Vec::new(),
+        None => {
+            return Err(
+                "a multi-node dev cluster needs peer_addrs (one address per peer_seeds entry)"
+                    .into(),
+            );
+        }
+        Some(addrs) => {
+            if addrs.len() != peer_seeds.len() {
+                return Err(format!(
+                    "peer_addrs has {} entries but peer_seeds has {} — they are index-aligned",
+                    addrs.len(),
+                    peer_seeds.len()
+                ));
+            }
+            let mut hints = Vec::with_capacity(addrs.len());
+            for (seed, addr) in peer_seeds.iter().zip(addrs.iter()) {
+                let socket: SocketAddr = addr
+                    .parse()
+                    .map_err(|e| format!("peer_addrs entry for seed {seed}: {e}"))?;
+                let peer = key_of(*seed);
+                // self-filter matches the Resolved.dial_hints contract: a
+                // node must never dial (or statesync) itself.
+                if peer != me {
+                    hints.push((peer, Ingress::Socket(socket)));
+                }
+            }
+            hints
+        }
     };
 
     let listen: SocketAddr = raw.listen.parse().map_err(|e| format!("listen: {e}"))?;
@@ -766,7 +783,7 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
         namespace: namespace.into_bytes(),
         mesh,
         validators,
-        bootstrappers,
+        dial_hints,
         // the dev-seed shape never uses coordinated reach — direct sockets only.
         coordinated: Vec::new(),
         listen,
@@ -846,7 +863,7 @@ mod tests {
             r.advertised
         );
         // the unresolvable bootstrap hint is KEPT as a hostname too (self is
-        // filtered from bootstrappers, so check via the descriptor directly).
+        // filtered from dial_hints, so check via the descriptor directly).
         let entries = d.bootstrap_entries().expect("hints parse");
         assert!(
             matches!(&entries[0].1, Ingress::Dns { port: 443, .. }),
@@ -911,7 +928,7 @@ mod tests {
         let r = resolve(&dir.join("node.toml"))
             .expect("a joiner with no advertised and a non-dialable listen must resolve");
         assert_eq!(r.signer.public_key(), me.public_key());
-        assert_eq!(r.bootstrappers.len(), 1, "it dials the founder's hint");
+        assert_eq!(r.dial_hints.len(), 1, "it dials the founder's hint");
     }
 
     #[test]
@@ -950,9 +967,9 @@ mod tests {
         // exactly the validators — no derived lobby identity any more (the
         // join gate rides the tunnel doorbell, join ADR §4).
         assert_eq!(r.mesh.len(), 2);
-        // self never appears in bootstrappers; the other member does.
-        assert_eq!(r.bootstrappers.len(), 1);
-        assert_eq!(r.bootstrappers[0].0, other);
+        // self never appears in dial_hints; the other member does.
+        assert_eq!(r.dial_hints.len(), 1);
+        assert_eq!(r.dial_hints[0].0, other);
         assert!(!r.dev_demo);
         assert_eq!(r.signer.public_key(), me.public_key());
         assert_eq!(r.service.storage_dir, dir.join("storage"));
@@ -1006,7 +1023,7 @@ mod tests {
         let launch_cwd = std::env::current_dir().expect("current directory");
         let raw: DevSeedToml = toml::from_str(
             "id = 7\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\n\
-             peer_seeds = [7]\nbootstrapper_addr = \"127.0.0.1:52220\"\n\
+             peer_seeds = [7]\n\
              storage_dir = \"relative/storage\"\n",
         )
         .expect("parse dev config");
@@ -1016,7 +1033,7 @@ mod tests {
 
         let default_raw: DevSeedToml = toml::from_str(
             "id = 8\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\n\
-             peer_seeds = [8]\nbootstrapper_addr = \"127.0.0.1:52220\"\n",
+             peer_seeds = [8]\n",
         )
         .expect("parse default dev config");
         let default = resolve_dev_shape(default_raw).expect("resolve default storage");
@@ -1758,25 +1775,27 @@ mod tests {
         let dir = tmp("devself");
         std::fs::write(
             dir.join("node.toml"),
-            "id = 1\nlisten = \"127.0.0.1:52230\"\nnamespace = \"demo\"\npeer_seeds = [1, 0]\nbootstrapper_addr = \"127.0.0.1:52231\"\n",
+            "id = 1\nlisten = \"127.0.0.1:52230\"\nnamespace = \"demo\"\npeer_seeds = [1, 0]\npeer_addrs = [\"127.0.0.1:52230\", \"127.0.0.1:52231\"]\n",
         )
         .expect("write");
         let r = resolve(&dir.join("node.toml")).expect("resolve");
-        assert!(
-            r.bootstrappers.is_empty(),
-            "peer_seeds[0] == id must not dial itself"
+        assert_eq!(r.dial_hints.len(), 1, "self is filtered, the other peer stays");
+        assert_eq!(
+            r.dial_hints[0].0,
+            ed25519::PrivateKey::from_seed(0).public_key(),
+            "the surviving hint is the OTHER seed"
         );
     }
 
     #[test]
-    fn dev_shape_matches_historical_semantics() {
+    fn dev_shape_builds_the_full_hint_list() {
         let toml = r#"
 id = 1
 listen = "127.0.0.1:52210"
 namespace = "demo"
 peer_seeds = [0, 1, 2]
 validator_seeds = [0, 1]
-bootstrapper_addr = "127.0.0.1:52200"
+peer_addrs = ["127.0.0.1:52200", "127.0.0.1:52210", "127.0.0.1:52202"]
 "#;
         let dir = tmp("dev");
         std::fs::write(dir.join("node.toml"), toml).expect("write");
@@ -1785,11 +1804,11 @@ bootstrapper_addr = "127.0.0.1:52200"
         assert_eq!(r.label, "#1");
         assert_eq!(r.mesh.len(), 3);
         assert_eq!(r.validators.len(), 2);
-        assert_eq!(r.bootstrappers.len(), 1);
+        assert_eq!(r.dial_hints.len(), 2, "every peer but self carries a hint");
         assert_eq!(
-            r.bootstrappers[0].0,
+            r.dial_hints[0].0,
             ed25519::PrivateKey::from_seed(0).public_key(),
-            "non-zero nodes dial peer_seeds[0]"
+            "hints keep peer_seeds order"
         );
         assert_eq!(
             r.signer.public_key(),
@@ -1818,7 +1837,7 @@ bootstrapper_addr = "127.0.0.1:52200"
     fn overlay_advertised_derives_the_ula_and_requires_v6_listen() {
         let dir = tmp("overlay-advertised");
         let base = "id = 1\nnamespace = \"demo\"\npeer_seeds = [0, 1]\n\
-                    bootstrapper_addr = \"127.0.0.1:52240\"\n";
+                    peer_addrs = [\"127.0.0.1:52240\", \"127.0.0.1:52241\"]\n";
         std::fs::write(
             dir.join("node.toml"),
             format!("{base}listen = \"[::]:52241\"\nadvertised = \"overlay\"\n"),

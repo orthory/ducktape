@@ -31,7 +31,7 @@
 use commonware_codec::{Decode as _, Encode as _};
 use commonware_consensus::simplex::types::Certificate;
 use commonware_cryptography::ed25519;
-use commonware_p2p::authenticated::discovery::{self, Network};
+use commonware_p2p::authenticated::lookup::{self, Network};
 use commonware_p2p::Ingress;
 use commonware_runtime::Quota;
 use commonware_utils::ordered::Set;
@@ -67,9 +67,10 @@ pub(crate) type OverlayCtx = overlay_net::OverlayContext<commonware_runtime::tok
 pub(crate) async fn run(
     context: commonware_runtime::tokio::Context,
     network: Network<OverlayCtx, ed25519::PrivateKey>,
-    oracle: &mut discovery::Oracle<ed25519::PublicKey>,
+    oracle: &mut lookup::Oracle<ed25519::PublicKey>,
     quota: Quota,
     mesh_participants: &Set<ed25519::PublicKey>,
+    mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
     sync_sources: Vec<ed25519::PublicKey>,
     sync_source: Option<ed25519::PublicKey>,
     advertised_reach: Ingress,
@@ -131,6 +132,7 @@ pub(crate) async fn run(
         quota,
         mesh_participants,
         &validators,
+        mesh_book,
         &recovery,
         manifest,
         signer.clone(),

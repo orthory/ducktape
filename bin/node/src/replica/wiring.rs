@@ -9,7 +9,7 @@
 //! [`ReplicaChannels`].
 
 use commonware_cryptography::ed25519;
-use commonware_p2p::authenticated::discovery::{self, Network};
+use commonware_p2p::authenticated::lookup::{self, Network};
 use commonware_p2p::{Ingress, Receiver as P2pReceiver};
 use commonware_runtime::{Quota, Spawner, Supervisor};
 use commonware_utils::ordered::Set;
@@ -42,14 +42,14 @@ pub(super) struct ReplicaChannels {
     pub(super) lane_bank: LaneBank,
     pub(super) head_wake: futures::channel::mpsc::Receiver<()>,
     pub(super) cert_bridge: futures::channel::mpsc::Receiver<Vec<u8>>,
-    pub(super) sync_tx: discovery::Sender<ed25519::PublicKey, OverlayCtx>,
-    pub(super) sync_rx: discovery::Receiver<ed25519::PublicKey>,
+    pub(super) sync_tx: lookup::Sender<ed25519::PublicKey, OverlayCtx>,
+    pub(super) sync_rx: lookup::Receiver<ed25519::PublicKey>,
     pub(super) reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
     /// the reachability lane's promotion handback — resolves once the
     /// standby plane shuts down (`None` = no wireguard, no plane).
     pub(super) reach_reclaim: Option<ReachLaneHandback>,
-    pub(super) relay_tx: discovery::Sender<ed25519::PublicKey, OverlayCtx>,
-    pub(super) relay_rx: discovery::Receiver<ed25519::PublicKey>,
+    pub(super) relay_tx: lookup::Sender<ed25519::PublicKey, OverlayCtx>,
+    pub(super) relay_rx: lookup::Receiver<ed25519::PublicKey>,
     /// the joiner's admission signal (join ADR §4): set by the first-contact
     /// task the moment a member's doorbell answers the gate with the
     /// AUTHORITATIVE `Admitted` — the park loop reads it in place of the
@@ -59,16 +59,19 @@ pub(super) struct ReplicaChannels {
     /// the mesh window tracker, genesis already tracked — the park loop
     /// advances it as generations land, and promotion carries it on.
     pub(super) mesh_window: crate::mesh_window::MeshWindowTracker,
+    /// the mesh address book the tracker composes track payloads through.
+    pub(super) mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn wire(
     context: commonware_runtime::tokio::Context,
     mut network: Network<OverlayCtx, ed25519::PrivateKey>,
-    oracle: &mut discovery::Oracle<ed25519::PublicKey>,
+    oracle: &mut lookup::Oracle<ed25519::PublicKey>,
     quota: Quota,
     mesh_participants: &Set<ed25519::PublicKey>,
     validators: &[ed25519::PublicKey],
+    mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
     recovery: &Recovery<commonware_runtime::tokio::Context>,
     manifest: &Option<Manifest>,
     signer: ed25519::PrivateKey,
@@ -128,7 +131,7 @@ pub(super) async fn wire(
         &mesh_participants.iter().cloned().collect::<Vec<_>>(),
         label.clone(),
     );
-    mesh_window.track_genesis(oracle, validators);
+    mesh_window.track_genesis(oracle, &mesh_book, validators);
     let replica_store = ContentStore::new();
     let (head_wake_tx, head_wake) = futures::channel::mpsc::channel::<()>(1);
     // raw cert-lane bytes for the fold driver: bounded, drop-on-full —
@@ -284,6 +287,8 @@ pub(super) async fn wire(
                     // JOINER side: no gate hook — this node ANSWERS no gates,
                     // it rings them (the first-contact race below).
                     None,
+                    mesh_book.clone(),
+                    oracle.clone(),
                     reach_tx,
                     reach_rx,
                     // promotion reclaims the lane once the standby plane
@@ -545,6 +550,7 @@ pub(super) async fn wire(
         admitted,
         voice_requests,
         mesh_window,
+        mesh_book,
     }
 }
 

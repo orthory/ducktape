@@ -6,7 +6,7 @@
 use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
 use commonware_consensus::types::Epoch;
 use commonware_cryptography::{Signer, ed25519};
-use commonware_p2p::authenticated::discovery;
+use commonware_p2p::authenticated::lookup;
 use commonware_runtime::Supervisor;
 use commonware_utils::ordered::Set;
 
@@ -23,7 +23,7 @@ use crate::util::{epoch_floor, fatal, hex};
 
 pub(super) struct EpochSpawner<'a> {
     context: &'a commonware_runtime::tokio::Context,
-    oracle: discovery::Oracle<ed25519::PublicKey>,
+    oracle: lookup::Oracle<ed25519::PublicKey>,
     signer: ed25519::PrivateKey,
     namespace: Vec<u8>,
     label: String,
@@ -34,7 +34,7 @@ impl<'a> EpochSpawner<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         context: &'a commonware_runtime::tokio::Context,
-        oracle: discovery::Oracle<ed25519::PublicKey>,
+        oracle: lookup::Oracle<ed25519::PublicKey>,
         signer: ed25519::PrivateKey,
         namespace: Vec<u8>,
         label: String,

@@ -11,7 +11,7 @@
 use commonware_codec::DecodeExt as _;
 use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
 use commonware_cryptography::{Signer as _, ed25519};
-use commonware_p2p::authenticated::discovery;
+use commonware_p2p::authenticated::lookup;
 use commonware_p2p::Receiver as P2pReceiver;
 use commonware_runtime::{Clock, Metrics, Spawner, Supervisor};
 use futures::{FutureExt as _, StreamExt as _};
@@ -207,7 +207,7 @@ async fn publish_replica_status(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn park(
     channels: ReplicaChannels,
-    oracle: &mut discovery::Oracle<ed25519::PublicKey>,
+    oracle: &mut lookup::Oracle<ed25519::PublicKey>,
     signer: ed25519::PrivateKey,
     label: String,
     namespace: Vec<u8>,
@@ -257,6 +257,7 @@ pub(super) async fn park(
         admitted,
         voice_requests,
         mut mesh_window,
+        mesh_book,
     } = channels;
     metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Joining);
     tracing::info!(
@@ -1357,7 +1358,7 @@ pub(super) async fn park(
                 // generation index NOW; the cutover below stays a
                 // channel/orderer concern.
                 let committed_window = read_valset_mesh_window(node_r.host()).await;
-                mesh_window.track_new(oracle, &committed_window);
+                mesh_window.track_new(oracle, &mesh_book, &committed_window);
                 let members_raw = read_valset_members(node_r.host()).await;
                 let observed: Vec<ed25519::PublicKey> = members_raw
                     .iter()
@@ -1728,6 +1729,7 @@ pub(super) async fn park(
                 http_ingress,
                 prev_ckpt: (Some(folded_tip), pos),
                 mesh_window,
+                mesh_book: mesh_book.clone(),
             };
         }
         resident_relay.expire(std::time::Instant::now());
@@ -1771,7 +1773,11 @@ pub(super) async fn park(
         // diverge from the network's (the coordinates are unverified
         // serving hints; promotion re-derives everything from verified
         // state). the epoch stays the CHANNEL/book coordinate below.
-        mesh_window.track_new(oracle, &crate::mesh_window::window_from_sync(&tip.mesh_window));
+        mesh_window.track_new(
+            oracle,
+            &mesh_book,
+            &crate::mesh_window::window_from_sync(&tip.mesh_window),
+        );
         if tip.epoch > last_tip_epoch {
             if !lane_bank.covers(tip.epoch) {
                 tracing::warn!(
@@ -2438,5 +2444,6 @@ pub(super) async fn park(
         http_ingress,
         prev_ckpt: (Some(boundary.height), pos),
         mesh_window,
+        mesh_book,
     }
 }
