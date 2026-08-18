@@ -23,7 +23,7 @@
 //! run it deliberately:
 //!
 //! ```text
-//! cargo test -p mcp-bin --test live_runner -- --ignored --nocapture
+//! cargo test -p node-bin --test mcp_live_runner -- --ignored --nocapture
 //! ```
 //!
 //! keep the argv below in lockstep with `capability-host`'s claude spec — the

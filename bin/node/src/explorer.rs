@@ -1,7 +1,7 @@
 use noded::projection::project_root_op;
 use sdk::StateRoot;
 
-use crate::constants::{MODULE_IDS, NOP_TARGET};
+use crate::constants::NOP_TARGET;
 use crate::util::hex;
 
 // ---------------------------------------------------------------------------
@@ -159,12 +159,13 @@ impl recovery::ReplaySink for IndexFold<'_> {
 
 /// stamp every index module whose watermark trails `boundary` as backfilled
 /// (every boot caller sits after a root/root-hash check; history below the
-/// boundary re-enters only by replaying blocks through the feed). failures
-/// poison the store and log; the node boots regardless.
-pub(crate) fn heal_index(index: &indexer::IndexStore, boundary: u64, label: &str) {
+/// boundary re-enters only by replaying blocks through the feed or by the
+/// op-row backfill below). failures poison the store and log; the node boots
+/// regardless. returns the stamped module ids.
+pub(crate) fn heal_index(index: &indexer::IndexStore, boundary: u64, label: &str) -> Vec<String> {
     match noded::stamp_stale_modules(index, boundary) {
         Ok(stamped) => {
-            for module in stamped {
+            for module in &stamped {
                 tracing::info!(
                     target: "ducktape::modules",
                     node = %label,
@@ -173,138 +174,229 @@ pub(crate) fn heal_index(index: &indexer::IndexStore, boundary: u64, label: &str
                     "index for {module} stamped backfilled at height {boundary}"
                 );
             }
+            stamped
         }
-        Err(err) => tracing::error!(
-            target: "ducktape::modules",
-            event = "node_index_poisoned",
-            node = %label,
-            height = boundary,
-            error = %err,
-            "index heal failed; wipe <storage>/index to rebuild"
-        ),
-    }
-}
-
-/// cut and frame every derived-index database (modules + the blocks db) for
-/// the shipped-index lane (indexable spec §7 lane 2). a database that fails
-/// to cut is skipped — whatever a joiner does not receive, its staleness
-/// heal re-derives — and a poisoned store cuts nothing, so the shipment
-/// comes back empty and the joiner falls back entirely.
-pub(crate) fn ship_index_blobs(
-    index: &indexer::IndexStore,
-    label: &str,
-) -> std::collections::BTreeMap<String, Vec<u8>> {
-    let mut blobs = std::collections::BTreeMap::new();
-    let dbs: Vec<String> = index
-        .module_ids()
-        .map(str::to_string)
-        .chain(std::iter::once(indexer::BLOCKS_DB_ID.to_string()))
-        .collect();
-    for db in dbs {
-        match index.checkpoint_files(&db) {
-            Ok(files) => {
-                blobs.insert(db, statesync::encode_index_archive(&files));
-            }
-            Err(err) => tracing::warn!(
-                target: "ducktape::statesync",
+        Err(err) => {
+            tracing::error!(
+                target: "ducktape::modules",
+                event = "node_index_poisoned",
                 node = %label,
-                database = %db,
+                height = boundary,
                 error = %err,
-                reason = "index_checkpoint_failed",
-                "shipped index database skipped"
-            ),
+                "index heal failed; wipe <storage>/index to rebuild"
+            );
+            Vec::new()
         }
     }
-    blobs
 }
 
-/// fetch the sync source's shipped-index checkpoints and stage them for
-/// adoption at the promoted reboot — the OPTIONAL, UNVERIFIED warm start
-/// over the from-state rebuild (indexable spec §7 lane 2). every outcome
-/// short of a staged-and-committed install converges on the same fallback:
-/// the boot heal re-derives whatever the watermarks say is missing, so
-/// failures here log and fall through, never abort the promotion.
-// ORPHANED by the in-process promotion seat (nothing exec-reboots, so
-// nothing adopts a staged index anymore); kept only until the shipped-index
-// lane (serve side, IndexStore adoption, `sync_index` key) is swept as one
-// follow-up removal.
-#[allow(dead_code)]
-pub(crate) async fn stage_shipped_index<C: statesync::SyncClient>(
+/// stamp the derived index at `boundary`, then BACKFILL every stamped module's
+/// op rows from the sync source — inline, at the join seam, before this node
+/// serves anything (indexable spec §7).
+///
+/// # why this is safe exactly here and nowhere else
+///
+/// both call seams sit on the ONE task that ever writes this node's index, and
+/// they sit BEFORE it resumes folding live blocks. so nothing else commits to
+/// these databases while the walk runs, an ascending fetch-and-write makes
+/// COMMIT ORDER EQUAL KEY ORDER, the changes-mode fold trigger the heal just
+/// re-registered folds every row correctly as it lands, and the fold tip
+/// advances monotonically to the last backfilled row. no refold is needed, and
+/// none is available: this is the only window where the invariant holds.
+///
+/// READERS are a different question, and the answer is "no worse than before":
+/// on an epoch-cutover re-ascension the http/ws surfaces are still up, so a
+/// view read can land mid-walk and see a partly backfilled feed. it would
+/// otherwise have seen the empty one the heal's wipe just left, and the floor
+/// does not drop until the fold has consumed everything.
+///
+/// per-module failure — network, a source that cannot cover the range, a page
+/// that fails structural validation — leaves that module's stamped floor
+/// standing, which is today's honest behavior. the join NEVER aborts on it.
+pub(crate) async fn heal_and_backfill_index<C: statesync::SyncClient>(
+    index: &indexer::IndexStore,
     client: &C,
-    boundary: statesync::BoundaryId,
-    storage: &std::path::Path,
+    boundary: u64,
     label: &str,
 ) {
-    let index_base = storage.join("index");
-    let known: std::collections::BTreeSet<&str> = MODULE_IDS
-        .iter()
-        .copied()
-        .chain(std::iter::once(indexer::BLOCKS_DB_ID))
-        .collect();
-    let staged: Result<usize, String> = async {
-        // a retry of the promotion loop may have staged a partial set
-        // already; start clean so attempts never interleave.
-        indexer::discard_staged(&indexer::DiskFs, &index_base).map_err(|e| e.to_string())?;
-        let entries = statesync::fetch_index_modules(client, boundary)
-            .await
-            .map_err(|e| e.to_string())?;
-        let mut staged = 0usize;
-        for (db, _) in &entries {
-            // a db this binary does not know (version skew) would sit
-            // unopened on disk forever — skip it, its module heals instead.
-            if !known.contains(db.as_str()) {
-                tracing::warn!(
-                    target: "ducktape::statesync",
-                    node = %label,
-                    database = %db,
-                    reason = "unknown_index_database",
-                    "shipped index database skipped"
-                );
-                continue;
-            }
-            let blob = statesync::fetch_index_db(client, boundary, db)
-                .await
-                .map_err(|e| format!("{db}: {e}"))?;
-            let files = statesync::decode_index_archive(&blob).map_err(|e| format!("{db}: {e}"))?;
-            indexer::stage_shipped_db(&indexer::DiskFs, &index_base, db, &files)
-                .map_err(|e| e.to_string())?;
-            staged += 1;
+    let stamped = heal_index(index, boundary, label);
+    let mut backfilled: Vec<Backfilled> = Vec::new();
+    for module in &stamped {
+        if let Some(done) = backfill_module(index, client, module, boundary, label).await {
+            backfilled.push(done);
+            continue;
         }
-        if staged > 0 {
-            indexer::commit_staged(&indexer::DiskFs, &index_base).map_err(|e| e.to_string())?;
+        // A REFUSED MODULE IS ROUTINE; A POISONED STORE IS NOT. A write
+        // failure poisons the whole IndexStore, so every later `apply_block`
+        // on this node dies too and the derived tier is finished until an
+        // operator rebuilds it — the per-module "keeps its boundary floor"
+        // warn would badly understate that. stop asking: the remaining
+        // modules can only fail the same way, N identical warns deep.
+        if index.is_poisoned() {
+            tracing::error!(
+                target: "ducktape::modules",
+                event = "node_index_poisoned",
+                node = %label,
+                module = %module,
+                height = boundary,
+                "index backfill poisoned the store; every later fold fails — \
+                 wipe <storage>/index to rebuild"
+            );
+            return;
         }
-        Ok(staged)
     }
-    .await;
-    match staged {
-        Ok(0) => tracing::info!(
+    if backfilled.is_empty() {
+        return;
+    }
+    // ONE drain for the whole set: the trigger runner folds on a background
+    // thread, and the floor must not drop until the rows it vouches for are
+    // derived.
+    //
+    // this BLOCKS a runtime worker, and the honest scope of that is narrower
+    // than "we are pre-serving". PRE-SERVING covers the correctness argument
+    // only — no live folds, no view readers, no ws subscribers on THIS node,
+    // so nothing observes a half-drained index. it does NOT cover the
+    // scheduler: the mesh, sync-serve and reachability tasks share this
+    // runtime's two workers and stay live throughout. the whole seam is
+    // already synchronous disk work (the heal's wipe, every batch write), so
+    // the drain adds no new class of stall — but it is bounded on progress
+    // rather than trusted to end (`indexer::drain_fold`), because an
+    // unbounded spin here would hang the join and hold half the runtime with
+    // it.
+    if let Err(err) = index.wait_folds_drained() {
+        tracing::warn!(
             target: "ducktape::statesync",
             node = %label,
-            "source ships no index; views heal from verified state"
-        ),
-        Ok(n) => tracing::info!(
-            target: "ducktape::statesync",
-            node = %label,
-            databases = n,
-            "shipped index staged; it will be adopted at the promoted reboot"
-        ),
-        Err(e) => {
+            error = %err,
+            reason = "backfill_fold_stuck",
+            "index backfill folded incompletely; boundary floors stand"
+        );
+        return;
+    }
+    for Backfilled {
+        module,
+        source_floor,
+        last_row,
+    } in backfilled
+    {
+        // the fold has to have CONSUMED what we wrote before the floor may
+        // claim it. a module with no folding guest never has a tip, and none
+        // is expected of it — but only a status read that SUCCEEDS says so; a
+        // failed one is not evidence of anything, so it still has to show a
+        // tip.
+        let folds = !matches!(index.fold_status(&module), Ok(None));
+        let tip_covers_rows = last_row
+            .is_none_or(|last| matches!(index.fold_tip(&module), Ok(Some(tip)) if tip >= last));
+        let derived = !folds || tip_covers_rows;
+        if !derived {
             tracing::warn!(
                 target: "ducktape::statesync",
                 node = %label,
-                error = %e,
-                reason = "shipped_index_fetch_failed",
-                "views will heal from verified state instead"
+                module = %module,
+                reason = "backfill_tip_behind",
+                "index backfill rows are not folded; boundary floor stands"
             );
-            if let Err(e) = indexer::discard_staged(&indexer::DiskFs, &index_base) {
-                tracing::warn!(
-                    target: "ducktape::statesync",
-                    node = %label,
-                    error = %e,
-                    reason = "shipped_index_cleanup_failed",
-                    "shipped index staging cleanup failed"
-                );
-            }
+            continue;
+        }
+        if let Err(err) = index.set_backfill_floor(&module, source_floor) {
+            tracing::warn!(
+                target: "ducktape::statesync",
+                node = %label,
+                module = %module,
+                error = %err,
+                reason = "backfill_floor_refused",
+                "index backfill floor not lowered"
+            );
         }
     }
+}
+
+/// one module whose op rows all landed: what the source said its floor was,
+/// and the last row position written (`None` for a module with no history
+/// below the boundary — nothing for the fold to consume).
+struct Backfilled {
+    module: String,
+    source_floor: Option<u64>,
+    last_row: Option<(u64, u32)>,
+}
+
+/// walk one module's op rows below `boundary` off the source and write them.
+/// `None` when the module keeps its stamped floor, warned once with a stable
+/// reason token.
+async fn backfill_module<C: statesync::SyncClient>(
+    index: &indexer::IndexStore,
+    client: &C,
+    module: &str,
+    boundary: u64,
+    label: &str,
+) -> Option<Backfilled> {
+    let mut rows = 0usize;
+    let mut bytes = 0usize;
+    let mut last: Option<(u64, u32)> = None;
+    // the fetcher folds a write refusal into the same `SyncError::Module` a
+    // wire refusal produces, and the message is already carried by `error`;
+    // this only remembers WHICH side failed, for the reason token.
+    let mut write_refused = false;
+    let walked = statesync::fetch_index_ops(client, module, boundary, |page| {
+        index.write_backfill_rows(module, page).map_err(|e| {
+            write_refused = true;
+            e.to_string()
+        })?;
+        rows += page.len();
+        bytes += page.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
+        // the last row WRITTEN, not the last page's: a final empty page (a
+        // source that re-stamped mid-walk) must not erase the position the
+        // fold-tip check is about to verify.
+        if let Some((key, _)) = page.last() {
+            last = indexer::parse_op_key(key.as_bytes());
+        }
+        tracing::debug!(
+            target: "ducktape::statesync",
+            node = %label,
+            module = %module,
+            rows,
+            bytes,
+            "index backfill page written"
+        );
+        Ok(())
+    })
+    .await;
+    let source_floor = match walked {
+        Ok(floor) => floor,
+        Err(err) => {
+            // a write failure and a wire failure differ in what an operator
+            // does next, so they get their own reason tokens.
+            let reason = if write_refused {
+                "backfill_write_failed"
+            } else {
+                "backfill_fetch_failed"
+            };
+            tracing::warn!(
+                target: "ducktape::statesync",
+                node = %label,
+                module = %module,
+                height = boundary,
+                error = %err,
+                reason,
+                "index backfill refused; the module keeps its boundary floor"
+            );
+            return None;
+        }
+    };
+    tracing::info!(
+        target: "ducktape::statesync",
+        event = "index_backfill_complete",
+        node = %label,
+        module = %module,
+        height = boundary,
+        rows,
+        bytes,
+        floor = source_floor.unwrap_or(0),
+        "index backfill wrote {rows} op rows for {module} below boundary {boundary}"
+    );
+    Some(Backfilled {
+        module: module.to_string(),
+        source_floor,
+        last_row: last,
+    })
 }

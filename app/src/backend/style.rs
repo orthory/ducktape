@@ -1,29 +1,34 @@
 use super::*;
 
-pub(crate) fn live_update(kind: &str, status: &str, height: i64) -> LiveUpdate {
+pub(crate) fn live_update(kind: crate::LiveKind, status: &str, height: i64) -> LiveUpdate {
     LiveUpdate {
-        kind: kind.into(),
+        kind,
         status: status.into(),
         height,
         module: String::new(),
-        load_chat: kind == "ready",
-        load_pages: kind == "ready",
+        load_chat: kind == crate::LiveKind::Ready,
+        load_pages: kind == crate::LiveKind::Ready,
         debounce: false,
-        chat: ChatDelta::default(),
+        chat: Vec::new(),
         pages: PagesDelta::default(),
         bell: BellDelta::default(),
         forge: ForgeRefresh::default(),
+        permit: LivePermit::default(),
     }
 }
 
 pub(crate) fn live_retry(_message: String) -> LiveUpdate {
-    live_update("retry", "Reconnecting…", -1)
+    live_update(crate::LiveKind::Retry, "Reconnecting…", -1)
 }
 
 /// One plane's module committed something. The handler refetches that plane and
 /// nothing else — `module` is the whole payload.
 pub(crate) fn live_plane(module: &str, height: i64) -> LiveUpdate {
-    let mut update = live_update("plane", &format!("Live · block {height}"), height);
+    let mut update = live_update(
+        crate::LiveKind::Plane,
+        &format!("Live · block {height}"),
+        height,
+    );
     update.module = module.to_string();
     update
 }
@@ -31,17 +36,24 @@ pub(crate) fn live_plane(module: &str, height: i64) -> LiveUpdate {
 /// A module's replay is unavailable or unfoldable — the handler reloads that
 /// module's slices instead of folding.
 pub(crate) fn live_resync(module: &str, height: i64) -> LiveUpdate {
-    let mut update = live_update("resync", "Live · resyncing", height);
+    let mut update = live_update(crate::LiveKind::Resync, "Live · resyncing", height);
     update.module = module.to_string();
     update.load_chat = module == "chat";
     update.load_pages = module == "pages";
     update
 }
 
-/// The artifact's line icon for `name`, as an SVG document the view hands to
+/// The artifact's line icon for `name`, as the SVG bytes the view hands to
 /// iced as an in-memory handle. An unknown name renders an empty document.
-pub fn icon(name: impl AsRef<str>) -> String {
-    design::icons::svg(name.as_ref()).to_string()
+///
+/// BYTES, NOT `str`: the `svg … memory` node feeds its source straight into
+/// `svg::Handle::from_memory`, and a `str` source makes codegen emit
+/// `(…).as_bytes().to_vec()` — so a `&'static str` became a String and then a
+/// second Vec, per icon, per frame, on a surface that mounts dozens of them
+/// outside the cached message rows. `bytes` lowers to the Vec the handle wants
+/// and the copy happens once.
+pub fn icon(name: impl AsRef<str>) -> Vec<u8> {
+    design::icons::svg(name.as_ref()).as_bytes().to_vec()
 }
 
 /// The titlebar's extra left padding. On macOS the window is drawn with a
@@ -87,25 +99,11 @@ fn rgb(hex: u32) -> iced::Color {
 }
 
 /// The token set matching the live palette reading.
-fn app_tokens(theme: &iced::Theme) -> ducktape_ui::ui::theme::Theme {
+fn app_tokens(theme: &iced::Theme) -> ui_lang_components::ui::theme::Theme {
     if theme_is_dark(theme) {
-        ducktape_ui::ui::theme::DARK
+        ui_lang_components::ui::theme::DARK
     } else {
-        ducktape_ui::ui::theme::LIGHT
-    }
-}
-
-/// Flat paper card derived from the shared design tokens.
-pub fn card_style(theme: &iced::Theme) -> iced::widget::container::Style {
-    let tokens = app_tokens(theme);
-    iced::widget::container::Style {
-        background: Some(iced::Background::Color(tokens.palette.card)),
-        border: iced::Border {
-            color: tokens.palette.border,
-            width: 1.0,
-            radius: tokens.radius.card.into(),
-        },
-        ..Default::default()
+        ui_lang_components::ui::theme::LIGHT
     }
 }
 
@@ -213,13 +211,6 @@ pub(crate) fn bounded_updated_block_text(kind: BlockKind, text: String) -> Resul
         return bounded_exact_text(text, "page title", 512);
     }
     bounded_exact_text(text, "block text", 64 * 1024)
-}
-
-/// Bump the autosave generation so any in-flight save's reply is discarded.
-/// The debounce ticket map this once also swept died with
-/// `debounced_page_text` — the generation check is the whole mechanism now.
-pub fn cancel_autosaves(_rpc: String, generation: i64) -> i64 {
-    generation.saturating_add(1)
 }
 
 pub(crate) fn block_move(

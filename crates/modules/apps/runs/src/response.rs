@@ -601,7 +601,7 @@ impl RunsModule {
     /// follow-ups exist. beyond grants and caps, this probes everything the
     /// emitted follow-ups could make chat or tasks REJECT (which would abort
     /// the delivery block — the no-fail rule): a squatted reply message id, a
-    /// full thread, a duplicate or unknown task id.
+    /// full thread, a duplicate, over-cap, or unknown task id.
     ///
     /// every probe reads COMMITTED state, so a check on a SHARED, countable
     /// resource must also count what this same response already staged — the
@@ -782,6 +782,14 @@ impl RunsModule {
                     if task_id.is_empty() || title.is_empty() {
                         return Err("task actions require a non-empty task_id and title".into());
                     }
+                    // tasks' OWN admission rule for an id, applied with tasks'
+                    // OWN call so the two can never drift: at most
+                    // MAX_TASK_ID bytes, and free of the reserved KEY_SEP. a
+                    // model-authored id is bounded only by MAX_ACTIONS_BYTES,
+                    // so without this an id tasks REJECTS at apply aborts the
+                    // whole settle op instead of failing the run.
+                    sdk::validate_id("task_id", task_id, tasks::MAX_TASK_ID)
+                        .map_err(|e| e.to_string())?;
                     // duplicates — committed or earlier in this very
                     // response — would make tasks reject the follow-up.
                     if existing.contains(task_id) || !created.insert(task_id) {

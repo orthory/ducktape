@@ -66,6 +66,20 @@ fn network_shape_joiner_parks_until_promote() {
     cluster.wait_marker(1, "admitted at epoch 1", CONVERGE);
     cluster.wait_marker(1, "synced root_hash=", CONVERGE);
     cluster.wait_marker(1, "promoted: validator at epoch 1", CONVERGE);
+
+    // the grant's mesh admission landed on a FRESH generation index: the
+    // old failure mode — commonware warn-dropping a same-index re-track,
+    // leaving the joiner bounced at the door until the cutover — is
+    // disproven directly by the absence of its warn on the founder.
+    let founder_log = std::fs::read_to_string(cluster.log_path(0)).expect("founder log");
+    assert!(
+        !founder_log.contains("peer set already exists"),
+        "a mesh track was silently rejected on the founder"
+    );
+    assert!(
+        !founder_log.contains("index must monotonically increase"),
+        "a mesh track regressed the index order on the founder"
+    );
 }
 
 /// the SEAT leg the markers above stop short of: after `promoted: validator
@@ -443,6 +457,34 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
         }
     };
 
+    // A DIRECTORY WRITE BEFORE ANYONE JOINS: the resident below never sees
+    // this block as a frame — it arrives inside the synced boundary, with the
+    // op feed that carried it long gone. The join-seam op-row backfill (spec
+    // §7) is the only reason it can ever be in the resident's own feed.
+    cluster.submit(
+        0,
+        "directory",
+        &directory::encode_msg(&DirMsg::Set {
+            key: "pre-join".into(),
+            value: "written".into(),
+        }),
+    );
+    poll(
+        "the pre-join write to finalize on the founder",
+        Box::new(|| {
+            cluster
+                .query(
+                    0,
+                    "directory",
+                    &directory::encode_query(&DirQuery::Get {
+                        key: "pre-join".into(),
+                    }),
+                )
+                .and_then(|raw| directory::decode_reply(&raw).ok())
+                .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "written"))
+        }),
+    );
+
     // ---- invite → park → resident grant ------------------------------------
     let invite = cluster.invite();
     let friend_key = cluster.join_friend_manual(&invite);
@@ -604,26 +646,48 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
             })
         }),
     );
-    //     …and /v1/index/* answers from healthy read models. under the
-    //     replica pipeline the resident FOLDS blocks, so watermarks advance
-    //     per block PAST the ascension heal's backfill floor (the old
-    //     boundary-healed model pinned them equal — that trailing-watermark
-    //     era is exactly what the fold retired). polled: a heal drops the
-    //     watermark FIRST (crash-safety by re-trigger), so a read racing an
-    //     in-flight heal legitimately sees 0 for a moment.
+    //     …and /v1/index/* answers from healthy read models WITH pre-join
+    //     history. the ascension heal still stamps a floor at the boundary,
+    //     but the op-row backfill then walks the source's rows below it and
+    //     CLEARS that floor (indexable spec §7) — so the honest end state is
+    //     no floor at all, or the SOURCE's own floor inherited when the
+    //     source itself joined late. what must never happen again is a floor
+    //     sitting at the joiner's own boundary with an empty feed beneath it.
+    //     polled: a heal drops the watermark FIRST (crash-safety by
+    //     re-trigger), so a read racing an in-flight heal legitimately sees 0
+    //     for a moment, and the floor clears only after the fold drains.
     poll(
-        "the resident index to report folding watermarks",
+        "the resident index to report folding watermarks over a backfilled feed",
         Box::new(|| {
         let (status, index_status) =
             common::http_request(cluster.http_ports[1], "GET", "/v1/index/status", None);
         let watermark = index_status["modules"]["directory"].as_u64().unwrap_or(0);
+        let floor = index_status["backfilled"]["directory"].as_u64();
+        // the founder is the sync source and has folded from genesis, so it
+        // has no floor of its own to compose in: the joiner's clears outright.
         status == 200
             && index_status["poisoned"] == serde_json::json!(false)
             && watermark > 0
-            && index_status["backfilled"]["directory"]
-                .as_u64()
-                .is_some_and(|floor| floor <= watermark)
+            && floor.is_none()
         }),
+    );
+    //     and the op feed BELOW that boundary is really there — the whole
+    //     point of clearing the floor. The pre-join write finalized before
+    //     this node existed, so nothing but the backfill can have put it in
+    //     THIS node's `/v1/index/directory/ops`.
+    let (status, ops) = common::http_request(
+        cluster.http_ports[1],
+        "GET",
+        "/v1/index/directory/ops?limit=100",
+        None,
+    );
+    assert_eq!(status, 200, "resident op feed: {ops}");
+    assert!(
+        ops["ops"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|r| r["payload"]["set"]["key"]
+                == serde_json::json!("pre-join"))),
+        "a cleared floor promises pre-boundary rows are really there: {ops}"
     );
 
     // (3) quorum untouched: kill the resident; the founder keeps finalizing.
@@ -767,5 +831,109 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     assert!(
         residents.is_empty(),
         "promotion must clear resident standing (got {residents:?})"
+    );
+
+    // (8) restart the still-seated promoted validator. Non-genesis keys now
+    //     resolve every boot from the latest committed manifest, so the same
+    //     resolver must return a promotion baton while the key remains seated.
+    cluster.kill(1);
+    cluster.spawn(1);
+    cluster.wait_marker(1, "promoted: validator at epoch", CONVERGE);
+    cluster.submit(
+        0,
+        "directory",
+        &directory::encode_msg(&DirMsg::Set {
+            key: "validator-role-restart".into(),
+            value: "voting".into(),
+        }),
+    );
+    poll(
+        "the restarted validator to restore quorum and serve the new write",
+        Box::new(|| {
+            cluster
+                .query(
+                    1,
+                    "directory",
+                    &directory::encode_query(&DirQuery::Get {
+                        key: "validator-role-restart".into(),
+                    }),
+                )
+                .and_then(|raw| directory::decode_reply(&raw).ok())
+                .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "voting"))
+        }),
+    );
+
+    // (9) remove the promoted validator. The two-member electorate needs one
+    //     ballot from each node; the cutover drops the friend and its validator
+    //     process halts itself at that committed boundary.
+    let (ok, out) = cluster.run_membership_verb("member remove", &friend_key);
+    assert!(ok, "founder member remove ballot failed:\n{out}");
+    assert!(
+        out.contains("waiting on other voters"),
+        "the first removal ballot should await the friend:\n{out}"
+    );
+    let (ok, out) = cluster.run_membership_verb_as(1, "member remove", &friend_key);
+    assert!(ok, "friend member remove ballot failed:\n{out}");
+    assert!(out.contains("removed"), "unexpected removal output:\n{out}");
+    cluster.wait_marker(1, "demoted from the validator set; halting", CONVERGE);
+    cluster.wait_exit(1, CONVERGE);
+    poll(
+        "the removal to leave only the founder validator",
+        Box::new(|| {
+            cluster
+                .query(0, "valset", &valset::encode_query(&ValsetQuery::Validators))
+                .and_then(|raw| valset::decode_reply(&raw).ok())
+                .is_some_and(|r| matches!(r, ValsetReply::Validators(v) if v.len() == 1))
+        }),
+    );
+
+    // (10) re-grant the stopped key as a resident, then restart its actual
+    //     process with the validator-seating checkpoint left by promotion.
+    //     The latest committed standing, not that stale checkpoint role, must
+    //     select the resident path and resume the follow.
+    let (ok, out) = cluster.run_membership_verb("resident accept", &friend_key);
+    assert!(ok, "post-removal resident accept failed:\n{out}");
+    assert!(
+        out.contains("granted resident standing"),
+        "unexpected post-removal resident grant:\n{out}"
+    );
+    poll(
+        "the removed validator to regain resident standing",
+        Box::new(|| {
+            cluster
+                .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
+                .and_then(|raw| valset::decode_reply(&raw).ok())
+                .is_some_and(|r| {
+                    matches!(
+                        r,
+                        ValsetReply::Residents(v) if v == vec![common::unhex(&friend_key)]
+                    )
+                })
+        }),
+    );
+    cluster.spawn(1);
+    cluster.wait_marker(1, "resident: pre-synced boundary", CONVERGE);
+    cluster.submit(
+        0,
+        "directory",
+        &directory::encode_msg(&DirMsg::Set {
+            key: "validator-to-resident-restart".into(),
+            value: "followed".into(),
+        }),
+    );
+    poll(
+        "the restarted resident to follow a new write",
+        Box::new(|| {
+            cluster
+                .query(
+                    1,
+                    "directory",
+                    &directory::encode_query(&DirQuery::Get {
+                        key: "validator-to-resident-restart".into(),
+                    }),
+                )
+                .and_then(|raw| directory::decode_reply(&raw).ok())
+                .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "followed"))
+        }),
     );
 }

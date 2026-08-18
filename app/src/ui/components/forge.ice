@@ -1,12 +1,10 @@
 // FORGE — the repo grid, the breadcrumb, the CODE BROWSER, the tracker rows,
 // the painted diff, and the review stamps.
 //
-// THE CODE TAB NEEDS NO WIRE CHANGE, and the campaign was wrong to refuse it as
-// "blocked on new module queries". `sync_forge_mirror` (app/src/backend.rs:2957)
-// keeps a bare git2 mirror of every branch of every repo under the key root and
-// already fetches `+refs/heads/*` for the merge preflight. A tree listing, a
-// blob read and a per-path last-commit are `git2` calls against a repository the
-// app has already cloned — `ForgeQuery` is not on that path at all.
+// THE CODE TAB READS BOUNDED SERVER QUERIES. Opening a repo transfers one tree
+// listing; opening a file transfers one capped preview, both pinned to the
+// exact commit returned by the root listing. The full git mirror belongs only
+// to merge preflight and never runs merely because somebody opened Code.
 //
 // WHAT IS STILL DELIBERATELY NOT HERE. Label pills, check runs, reviewer
 // digests, assignees, comment counts, a per-repo language dot / PR-issue tally,
@@ -38,7 +36,7 @@
 // (validator / resident / guest) — the artifact's viewer/maintainer/admin
 // vocabulary does not exist in this product, so the chain's own word is what
 // gets printed. `about` is the workspace bio, not an invented tagline.
-component ForgeOrgHeader(org:str, about:str, repos:i64, tier:str, connected:bool)
+component ForgeOrgHeader(org:str, about:str, repos:i64, tier:str, answered:bool)
   col #root w=fill gap=7.0
     row
       with
@@ -80,7 +78,7 @@ component ForgeOrgHeader(org:str, about:str, repos:i64, tier:str, connected:bool
       // The repo count and the standing are both READINGS, so neither is
       // printed off a node that answered nothing: `0 repositories` beside a
       // dead connection reads as "this org has no repos".
-      if connected
+      if answered
         row gap=5.0 align=center
           text plural(repos, "repository", "repositories")
             with
@@ -113,19 +111,9 @@ component ForgeOrgHeader(org:str, about:str, repos:i64, tier:str, connected:bool
             line-h=1.5
             @text-caption
 
-// One repo card. The artifact org-qualifies the title, but the org it would be
-// qualified WITH is the network name the header and the breadcrumb are both fed
-// (`network_label(...)`), and `RepoCard(repo)` has no seat for it — printing a
-// literal `ducktape/` names a namespace that does not exist on a network called
-// anything else, so the card prints the name the node actually returned. The
-// `about`, `language` and `updated_at` ARE on the wire now — `load_forge`
-// derives all three off the local mirror — so the card draws them. Only the
-// PR/issue tallies still want a `ForgeQuery` field, and they stay out.
-//
-// Each is guarded: a repo with no README draws no about line, a repo whose head
-// resolves no dominant extension draws no language dot, and `updated_at` is
-// rendered with `relative_time` because it is the head commit's UNIX committer
-// time — NOT a block height, and not `height_label_short`.
+// One compact committed row: repo name and head. README/language/time are not
+// card facts — deriving them cold-fetched every full mirror before Forge became
+// usable. Code queries bounded server reads; only merge fetches a selected repo.
 component RepoCard(repo:ForgeRepo)
   emits
     forge_open_repo(str)
@@ -139,68 +127,37 @@ component RepoCard(repo:ForgeRepo)
     box
       with
         w=fill
-        pl=17.0
-        pr=17.0
-        pt=15.0
-        pb=15.0
-      col w=fill gap=10.0
-        row
+        pl=14.0
+        pr=14.0
+        pt=11.0
+        pb=11.0
+      row
+        with
+          w=fill
+          gap=8.0
+          align=center
+        Icon
+          with
+            name="branch"
+            tone="muted"
+            px=14.0
+        box
           with
             w=fill
-            gap=8.0
-            align=center
-          Icon
-            with
-              name="branch"
-              tone="muted"
-              px=14.0
+            clip=true
           text repo.name
             with
-              size=14.0
+              size=13.5
               wrap=none
               font=display
               @text-primary
-        if !empty(repo.about)
-          text repo.about
-            with
-              w=fill
-              size=12.0
-              line-h=1.5
-              @text-caption
-        row
+        text repo.head
           with
-            w=fill
-            gap=14.0
-            align=center
-          if !empty(repo.language)
-            row gap=5.0 align=center
-              box
-                with
-                  w=7.0
-                  h=7.0
-                  bg=kind_code
-                  r=3.5
-                space w=1.0 h=1.0
-              text repo.language
-                with
-                  size=10.5
-                  wrap=none
-                  @text-meta
-          text repo.head
-            with
-              w=fill
-              size=10.5
-              wrap=none
-              font=code_medium
-              @text-input
-          if repo.updated_at > 0
-            text relative_time(repo.updated_at)
-              with
-                size=10.5
-                wrap=none
-                font=code_medium
-                @text-hint
-    active bg=surface text=fg border=card_line border-w=1.0 r=13.0
+            size=10.5
+            wrap=none
+            font=code_medium
+            @text-input
+    active bg=surface text=fg border=card_line border-w=1.0 r=10.0
     hovered bg=card_wash_hover text=fg border=pending_line
     pressed bg=elevated text=fg
 
@@ -308,6 +265,7 @@ component RepoMenuRow(repo:ForgeRepo, active:bool)
         with
           label="Switch repo"
           description=repo.name
+          checked=active
           w=fill
           p=0.0
           @icon_action
@@ -338,6 +296,7 @@ component RepoMenuRow(repo:ForgeRepo, active:bool)
         with
           label="Switch repo"
           description=repo.name
+          checked=active
           w=fill
           p=0.0
           @icon_action
@@ -615,66 +574,20 @@ component ForgeCodeHeader(path:str, message:str, author:str, stamp:str)
         bg=separator
       space w=1.0 h=1.0
 
-// One source line: a 44px right-aligned gutter on `rail` at the artifact's own
-// `#cbc9bf`, then the code. `number` is a string for the same reason
-// `DiffLine.old_no` is — the renderer that splits the blob owns the numbering,
-// and a blank gutter has to be expressible.
-//
-// MOUNTED in the Code pane's `source:` slot (view.ice), over
-// `source_lines(forge_file_text)` — the exact counterpart `diff_lines` already
-// is for a patch. `forge_blob` returns `BlobView.text` as ONE string and Ice
-// has no string ops, so the splitter lives in backend.rs; the gutter numbers
-// the rows it produced rather than guessing where the file breaks. A truncated
-// blob numbers what arrived, and the window note under the listing says so.
-//
-// The code is ONE ink. The design system is explicit that this viewer uses no
-// syntax colour ("code uses a single colour, not syntax highlighting") — emphasis is carried by the
-// signed annotation card, so nothing here tints a token. (A BLOB has no
-// annotation affordance — `ReviewComment` anchors into a PR's diff, not into a
-// file read at a rev; `DiffRow` below is where a line comment is authored.)
-component ForgeCodeLine(number:str, code:str)
-  row #root
-    with
-      w=fill
-      gap=0.0
-      align=center
-    box
-      with
-        w=44.0
-        h=20.0
-        pr=12.0
-        align-y=center
-        bg=rail
-      text number
-        with
-          w=fill
-          size=12.0
-          wrap=none
-          align-x=right
-          font=code
-          @text-icon_idle
-    box
-      with
-        w=fill
-        h=20.0
-        pl=13.0
-        align-y=center
-        clip=true
-      text code
-        with
-          w=fill
-          size=12.0
-          wrap=none
-          font=code
-          @text-accent_fg
+// The source rows themselves live in the backend extern `forge_code`
+// (backend/forge.rs): syntax colour needs per-span inks, which Ice's
+// named-token text nodes cannot carry. The extern mirrors this file's
+// DiffRow metrics (44px `rail` gutter in `forge_gutter_ink`, 20px rows,
+// 11.5 code) — the shape lint in app/src/tests.rs pins both sides so the
+// source and patch surfaces cannot drift apart. Token foregrounds come from
+// syntect per appearance; an unknown extension degrades to one ink.
 
 // The reader with nothing to read. This is one plate for three true reasons —
 // no file picked yet, a binary blob, a blob past the read cap — so the caller
 // says WHICH, and the plate never claims the file is empty.
 //
 // The standing line above it is a fact about this surface and not a seed
-// string: the mirror is a fetch of the node's own forge remote, and the app
-// ships no editor for it.
+// string: the server answers committed code reads, and the app ships no editor.
 component ForgeCodeEmpty(name:str, note:str)
   box #root
     with
@@ -1058,7 +971,6 @@ component IssueBodyCard(author:str, body:str)
   box #root
     with
       w=fill
-      max-w=660.0
       bg=surface
       border=card_line
       border-w=1.0
@@ -1263,7 +1175,6 @@ component DiffPane(file:str, additions:i64, deletions:i64, lines:[DiffLine])
   box #root
     with
       w=fill
-      max-w=720.0
       bg=surface
       border=card_line
       border-w=1.0
@@ -1306,14 +1217,15 @@ component DiffPane(file:str, additions:i64, deletions:i64, lines:[DiffLine])
           h=1.0
           bg=separator
         space w=1.0 h=1.0
-      col w=fill
-        for line in lines
-          DiffRow line=line
-            forward
-              forge_comment_open
+      keyed line in lines by=line.key virtual-row=20.0 w=fill
+        DiffRow line=line
+          forward
+            forge_comment_open
 
 // One patch line. The kind is the whole discriminant: a file header, a hunk
-// header, or a code row whose gutter, sign and ink are its tint.
+// header, or a code row. Addition/deletion keep their semantic plate and sign;
+// code itself stays neutral, so a whole changed line remains as readable as
+// unchanged source instead of becoming a run of low-contrast coloured ink.
 //
 // THE ANCHORING GUTTER IS THE COMMENT AFFORDANCE. Its own line number is the
 // button — the number a comment anchors to is the thing you click, so nothing
@@ -1357,7 +1269,7 @@ component DiffRow(line:DiffLine)
               w=fill
               size=11.0
               wrap=none
-              font=code_medium
+              font=code_semibold
               @text-merged
       "add"
         box w=fill bg=diff_add_bg
@@ -1376,11 +1288,11 @@ component DiffRow(line:DiffLine)
               text line.old_no
                 with
                   w=fill
-                  size=12.0
+                  size=11.5
                   wrap=none
                   align-x=right
                   font=code
-                  @text-gutter_ink
+                  @text-forge_gutter_ink
             if empty(line.path)
               box
                 with
@@ -1392,11 +1304,11 @@ component DiffRow(line:DiffLine)
                 text line.new_no
                   with
                     w=fill
-                    size=12.0
+                    size=11.5
                     wrap=none
                     align-x=right
                     font=code
-                    @text-gutter_ink
+                    @text-forge_gutter_ink
             if !empty(line.path)
               button -> emit(forge_comment_open, line.path, line.new_no, "new")
                 with
@@ -1414,11 +1326,11 @@ component DiffRow(line:DiffLine)
                   text line.new_no
                     with
                       w=fill
-                      size=12.0
+                      size=11.5
                       wrap=none
                       align-x=right
                       font=code
-                active bg=diff_add_gutter text=gutter_ink
+                active bg=diff_add_gutter text=forge_gutter_ink
                 hovered bg=brand_bg text=brand
                 pressed bg=brand_wash text=brand
             box
@@ -1429,9 +1341,9 @@ component DiffRow(line:DiffLine)
                 align-y=center
               text line.sign
                 with
-                  size=12.0
+                  size=11.5
                   wrap=none
-                  font=code
+                  font=code_semibold
                   @text-diff_add_fg
             box
               with
@@ -1442,10 +1354,10 @@ component DiffRow(line:DiffLine)
               text line.text
                 with
                   w=fill
-                  size=12.0
+                  size=11.5
                   wrap=none
                   font=code
-                  @text-diff_add_fg
+                  @text-strong_ink
       "del"
         box w=fill bg=diff_del_bg
           row
@@ -1464,11 +1376,11 @@ component DiffRow(line:DiffLine)
                 text line.old_no
                   with
                     w=fill
-                    size=12.0
+                    size=11.5
                     wrap=none
                     align-x=right
                     font=code
-                    @text-gutter_ink
+                    @text-forge_gutter_ink
             if !empty(line.path)
               button -> emit(forge_comment_open, line.path, line.old_no, "old")
                 with
@@ -1486,11 +1398,11 @@ component DiffRow(line:DiffLine)
                   text line.old_no
                     with
                       w=fill
-                      size=12.0
+                      size=11.5
                       wrap=none
                       align-x=right
                       font=code
-                active bg=diff_del_gutter text=gutter_ink
+                active bg=diff_del_gutter text=forge_gutter_ink
                 hovered bg=brand_bg text=brand
                 pressed bg=brand_wash text=brand
             box
@@ -1503,11 +1415,11 @@ component DiffRow(line:DiffLine)
               text line.new_no
                 with
                   w=fill
-                  size=12.0
+                  size=11.5
                   wrap=none
                   align-x=right
                   font=code
-                  @text-gutter_ink
+                  @text-forge_gutter_ink
             box
               with
                 w=14.0
@@ -1516,9 +1428,9 @@ component DiffRow(line:DiffLine)
                 align-y=center
               text line.sign
                 with
-                  size=12.0
+                  size=11.5
                   wrap=none
-                  font=code
+                  font=code_semibold
                   @text-diff_del_fg
             box
               with
@@ -1529,10 +1441,10 @@ component DiffRow(line:DiffLine)
               text line.text
                 with
                   w=fill
-                  size=12.0
+                  size=11.5
                   wrap=none
                   font=code
-                  @text-diff_del_fg
+                  @text-strong_ink
       "ctx"
         box w=fill bg=surface
           row
@@ -1550,11 +1462,11 @@ component DiffRow(line:DiffLine)
               text line.old_no
                 with
                   w=fill
-                  size=12.0
+                  size=11.5
                   wrap=none
                   align-x=right
                   font=code
-                  @text-gutter_ink
+                  @text-forge_gutter_ink
             if empty(line.path)
               box
                 with
@@ -1566,11 +1478,11 @@ component DiffRow(line:DiffLine)
                 text line.new_no
                   with
                     w=fill
-                    size=12.0
+                    size=11.5
                     wrap=none
                     align-x=right
                     font=code
-                    @text-gutter_ink
+                    @text-forge_gutter_ink
             if !empty(line.path)
               button -> emit(forge_comment_open, line.path, line.new_no, "new")
                 with
@@ -1588,11 +1500,11 @@ component DiffRow(line:DiffLine)
                   text line.new_no
                     with
                       w=fill
-                      size=12.0
+                      size=11.5
                       wrap=none
                       align-x=right
                       font=code
-                active bg=card_wash text=gutter_ink
+                active bg=card_wash text=forge_gutter_ink
                 hovered bg=brand_bg text=brand
                 pressed bg=brand_wash text=brand
             box
@@ -1603,10 +1515,10 @@ component DiffRow(line:DiffLine)
                 align-y=center
               text line.sign
                 with
-                  size=12.0
+                  size=11.5
                   wrap=none
-                  font=code
-                  @text-accent_fg
+                  font=code_semibold
+                  @text-forge_gutter_ink
             box
               with
                 w=fill
@@ -1616,10 +1528,10 @@ component DiffRow(line:DiffLine)
               text line.text
                 with
                   w=fill
-                  size=12.0
+                  size=11.5
                   wrap=none
                   font=code
-                  @text-accent_fg
+                  @text-strong_ink
 
 // ── REVIEWS ───────────────────────────────────────────────────────────────
 
@@ -1748,28 +1660,39 @@ component ReviewVerdict(verdict:str)
 // One seat of the forge tab bar: the tracker under one kind filter. Both the
 // Pull requests and the Issues arms are this component with a different filter
 // and a different empty line, so the two lists can never drift apart.
-component ForgeTrackerList(items:[ForgeItem], empty_message:str)
+component ForgeTrackerList(phase:ForgePhase, items:[ForgeItem], empty_message:str)
   emits
     forge_open_item(i64)
   col #root w=fill h=fill
-    if empty(items)
-      box w=fill p=22.0
-        EmptyPlate message=empty_message
-    if !empty(items)
-      scroll
-        with
-          dir=vertical
-          w=fill
-          h=fill
-        col
-          with
-            w=fill
-            pl=12.0
-            pr=12.0
-            pt=6.0
-            pb=18.0
-            gap=1.0
-          for item in items
-            TrackerRow item=item
-              forward
-                forge_open_item
+    match phase
+      ForgePhase.idle
+        space w=1.0 h=1.0
+      ForgePhase.loading
+        box w=fill p=22.0
+          EmptyPlate message="Loading repository tracker…"
+      ForgePhase.failed
+        box w=fill p=22.0
+          EmptyPlate message="Could not load this repository. Return to all repos and open it again to retry."
+      ForgePhase.ready
+        col w=fill h=fill
+          if empty(items)
+            box w=fill p=22.0
+              EmptyPlate message=empty_message
+          if !empty(items)
+            scroll
+              with
+                dir=vertical
+                w=fill
+                h=fill
+              col
+                with
+                  w=fill
+                  pl=12.0
+                  pr=12.0
+                  pt=6.0
+                  pb=18.0
+                  gap=1.0
+                for item in items
+                  TrackerRow item=item
+                    forward
+                      forge_open_item

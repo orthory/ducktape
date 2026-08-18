@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use commonware_cryptography::{Signer, ed25519};
-use commonware_p2p::{Ingress, Receiver as P2pReceiver, Recipients, Sender as P2pSender};
+use commonware_p2p::{AddressableManager as _, Ingress, Receiver as P2pReceiver, Recipients, Sender as P2pSender};
 use commonware_runtime::{IoBuf, Spawner, Supervisor};
 
 use crate::config::{self, hex_bytes};
@@ -105,20 +105,7 @@ where
         }
         return true;
     }
-    // V8 role: only `Resident` gates here; a `Client` token redeems via
-    // `user-redeem-invite` and must not obtain a tunnel (R2). V6/V7 need
-    // committed state — those run at the loop (`on_gate_forward`).
-    if msg.role != config::InviteRole::Resident.as_u8() {
-        if path == IntroPath::Direct {
-            ack(sealed_reply(lobby::IntroReply::Refused {
-                detail: "a client invite is not redeemable at a node join — it grants submit \
-                         access; redeem it with `ducktape user redeem-invite`"
-                    .into(),
-            }))
-            .await;
-        }
-        return true;
-    }
+    // V6/V7 need committed state — those run at the loop (`on_gate_forward`).
     let Some(cmds) = cmds.upgrade() else {
         return false;
     };
@@ -200,7 +187,6 @@ async fn gate_reply(
             token_sig: msg.token_sig.clone(),
             joiner: joiner_key,
             proof: msg.proof.clone(),
-            role: msg.role,
             expires_unix_secs: msg.expires_unix_secs,
         })
         .await;
@@ -245,6 +231,13 @@ pub(crate) fn wire_reachability_plane<S, R>(
     // gate requests to the validator run loop through it and answer settled
     // outcomes from its shared map. a joiner's own plane passes `None`.
     gate: Option<GateHook>,
+    // the mesh ADDRESS seam: an accepted signed advert's control endpoint
+    // lands in the book, and — when the effective address changed — is fed
+    // to the lookup oracle's `overwrite`, which severs the stale connection
+    // and redials at the new address. this replaces discovery's on-wire
+    // address gossip outright.
+    mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
+    mesh_oracle: commonware_p2p::authenticated::lookup::Oracle<ed25519::PublicKey>,
     reach_p2p_tx: S,
     mut reach_p2p_rx: R,
     // the promotion seam: when armed, each pump hands its lane half back the
@@ -340,6 +333,8 @@ where
     // so this pump drains the tail and (when armed) hands the sender back.
     {
         let pump_label = label.to_string();
+        let book = mesh_book;
+        let mut oracle = mesh_oracle;
         let mut tx = reach_p2p_tx;
         context
             .child("reachability_out")
@@ -441,6 +436,41 @@ where
                                 node = %pump_label, %reason,
                                 consequence = "a cold restart will not restore this epoch",
                                 "mesh state NOT persisted"
+                            )
+                        }
+                        reachability::ReachabilityEvent::ControlEndpointObserved {
+                            peer,
+                            control_endpoint,
+                        } => {
+                            let Ok(peer_pk) =
+                                <ed25519::PublicKey as commonware_codec::DecodeExt<_>>::decode(
+                                    &peer.0[..],
+                                )
+                            else {
+                                continue;
+                            };
+                            let Some(addr) = book.observe_advert(&peer_pk, control_endpoint)
+                            else {
+                                // unchanged, or pinned by a DNS hint — silent.
+                                continue;
+                            };
+                            let overwrite =
+                                commonware_utils::ordered::Map::from_iter_dedup([(
+                                    peer_pk.clone(),
+                                    addr,
+                                )]);
+                            let _ = oracle.overwrite(overwrite);
+                            tracing::info!(
+                                target: "ducktape::reachability",
+                                node = %pump_label,
+                                peer = %hex_bytes(&peer_pk.as_ref()[..4]),
+                                "mesh address updated from signed advert"
+                            );
+                            tracing::debug!(
+                                target: "ducktape::reachability",
+                                node = %pump_label,
+                                endpoint = %control_endpoint,
+                                "updated mesh endpoint detail"
                             )
                         }
                     }

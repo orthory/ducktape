@@ -42,6 +42,9 @@ fn ctx(height: u64, origin: Origin) -> TestCtx {
                 MEMBER.to_vec(),
             ]))),
             ValsetQuery::Residents => Ok(valset_encode_reply(&ValsetReply::Residents(Vec::new()))),
+            ValsetQuery::MeshWindow => {
+                Ok(valset_encode_reply(&ValsetReply::MeshWindow(Vec::new())))
+            }
         }
     })
 }

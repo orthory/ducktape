@@ -86,6 +86,25 @@ default. Query it directly, or drive its module surface with the
 Do not expose capability-bearing URL paths, keys, passwords, or recovery
 phrases in reports.
 
+## Frame telemetry (felt lag as numbers)
+
+Screenshots and CPU numbers cannot see a frame hitch. iced 0.14 ships
+per-stage span telemetry (Update/View/Layout/Interact/Draw/Present) behind a
+feature flag; `ops/beacon-collect` is the headless consumer:
+
+```bash
+(cd ops/beacon-collect && cargo run) &        # listens on 127.0.0.1:9167
+cargo run -p ducktape-app --features iced/debug
+```
+
+STALL lines name the stage the instant any span crosses `STALL_MS` (default
+100), and each 10 s summary window is independent, so scenario segments
+(idle / scroll / switch / typing) read clean. A Layout stall that is
+per-interaction and size-independent means a busted/missing layout cache;
+an Interact stall means the cost is inside the event walk. This lane found
+the 2026-08-16 emoji-fallback row cost — the worked example lives in
+docs/superpowers/specs/2026-08-16-chat-lag-diagnosis-design.md.
+
 ## Process safety
 
 Never use `pkill -f` — a pattern match will cheerfully kill an editor, a grep,

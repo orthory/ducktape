@@ -94,6 +94,20 @@ pub const LIFECYCLE_MODULE_ID: &str = lifecycle::DEFAULT_LIFECYCLE_ID;
 /// a net without the module, in which case nothing is ever injected.
 const DISPATCH_MODULE_ID: &str = dispatch::DEFAULT_DISPATCH_TARGET;
 
+/// the genesis-constant module id the `acl` module registers under. read by
+/// the drain's dispatch gate ([`Host::require_submit_standing`]); absent on a
+/// net without the module, in which case every external submit is admitted
+/// (the allow-all shape an empty policy table also produces).
+const ACL_MODULE_ID: &str = acl::DEFAULT_ACL_ID;
+
+/// the genesis-constant module id the `valset` module registers under —
+/// the sibling read resolving the acl gate's validator/node standings.
+const VALSET_MODULE_ID: &str = "valset";
+
+/// the genesis-constant module id the `identity` module registers under —
+/// the sibling read resolving the acl gate's user standing.
+const IDENTITY_MODULE_ID: &str = "identity";
+
 /// the out-of-band source of component BYTES for a code swap.
 ///
 /// the code registry commits only the 32-byte content hash of each module's
@@ -1405,6 +1419,98 @@ impl Host {
     /// (never cleared), so a caller can thread one set of sinks across several
     /// calls or hand in fresh ones per call. the dispatch budget is per-call:
     /// each queue-run gets a fresh [`MAX_DISPATCHES`].
+    /// the acl dispatch gate: does `submitter` (a verified external origin)
+    /// hold the standing `target` requires? consults the acl module's
+    /// staged-over-committed policy and resolves the principal against the
+    /// valset/identity siblings — deterministic on every node, because the
+    /// drain order and the sibling state are. FAIL-OPEN on an ABSENT acl
+    /// module (a net without the module is an open network, byte-identical to
+    /// an empty table); FAIL-CLOSED on a set policy whose standing set cannot
+    /// be read (a net that demands validator standing but composes no valset
+    /// grants nobody that standing).
+    async fn require_submit_standing(&self, submitter: &[u8], target: &str) -> Result<(), Error> {
+        let Ok(reply) = self
+            .query(
+                ACL_MODULE_ID,
+                &acl::encode_query(&acl::AclQuery::PolicyFor {
+                    target: target.into(),
+                }),
+            )
+            .await
+        else {
+            return Ok(()); // no acl module composed — open network.
+        };
+        let policy = match acl::decode_reply(&reply) {
+            Ok(acl::AclReply::PolicyFor(policy)) => policy,
+            Ok(_) | Err(_) => return Ok(()),
+        };
+        let Some(required) = policy else {
+            return Ok(()); // no entry, no "*" fallback — open by default.
+        };
+        let holds = match required {
+            acl::Standing::Open => true,
+            acl::Standing::Validator => self.valset_tier_holds(submitter, false).await,
+            acl::Standing::Node => self.valset_tier_holds(submitter, true).await,
+            acl::Standing::User => self.identity_account_holds(submitter).await,
+        };
+        if holds {
+            return Ok(());
+        }
+        Err(Error::Module(format!(
+            "acl: target {target} requires {} standing — the submitting origin holds none",
+            required.as_str()
+        )))
+    }
+
+    /// is `submitter` in valset's validator tier (`with_residents: false`) or
+    /// in validators ∪ residents (`true`)? an unreadable tier is an empty
+    /// tier — fail-closed for a policy that names it.
+    async fn valset_tier_holds(&self, submitter: &[u8], with_residents: bool) -> bool {
+        let tier = |q: valset::ValsetQuery| async move {
+            let bytes = self.query(VALSET_MODULE_ID, &valset::encode_query(&q)).await;
+            match bytes.map(|b| valset::decode_reply(&b)) {
+                Ok(Ok(valset::ValsetReply::Validators(keys)))
+                | Ok(Ok(valset::ValsetReply::Residents(keys))) => keys,
+                _ => Vec::new(),
+            }
+        };
+        let in_validators = tier(valset::ValsetQuery::Validators)
+            .await
+            .iter()
+            .any(|k| k.as_slice() == submitter);
+        if in_validators {
+            return true;
+        }
+        with_residents
+            && tier(valset::ValsetQuery::Residents)
+                .await
+                .iter()
+                .any(|k| k.as_slice() == submitter)
+    }
+
+    /// does `submitter` belong to an identity account — as a member key or a
+    /// bound node key? an unreadable reply is "no" — fail-closed for a policy
+    /// that names user standing.
+    async fn identity_account_holds(&self, submitter: &[u8]) -> bool {
+        let owner = |q: identity::IdentityQuery| async move {
+            let bytes = self
+                .query(IDENTITY_MODULE_ID, &identity::encode_query(&q))
+                .await;
+            matches!(
+                bytes.map(|b| identity::decode_reply(&b)),
+                Ok(Ok(identity::IdentityReply::Account(Some(_))))
+            )
+        };
+        owner(identity::IdentityQuery::OfMember {
+            member_key: submitter.to_vec(),
+        })
+        .await
+            || owner(identity::IdentityQuery::OfNode {
+                node_key: submitter.to_vec(),
+            })
+            .await
+    }
+
     async fn drain_queue(
         &mut self,
         height: u64,
@@ -1420,6 +1526,16 @@ impl Host {
             n += 1;
             if n > MAX_DISPATCHES {
                 return Err(Error::BudgetExceeded);
+            }
+
+            // the acl dispatch gate: an EXTERNAL submitter must hold the
+            // target's required standing (allow-all when no policy is set).
+            // module follow-ups and system injections are the host's own
+            // machinery and bypass policy. a refusal is a deterministic
+            // rejection — the identical no-op every honest validator makes,
+            // exactly like a module rejection.
+            if let Origin::External(submitter) = &origin {
+                self.require_submit_standing(submitter, &msg.target).await?;
             }
 
             // remove → owned module, decoupled from the map's borrow.

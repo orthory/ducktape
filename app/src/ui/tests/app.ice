@@ -4,9 +4,9 @@ preset ui_offline
     status = "Offline"
     connected = false
     loading = false
-    mutation_phase = "idle"
+    mutation_phase = MutationPhase.idle
     error = ""
-    shell_tab = "chat"
+    shell_tab = ShellTab.chat
     channel_draft = ""
     channel_create_members_only = false
     palette_open = false
@@ -17,8 +17,8 @@ preset ui_palette_open
     status = "Offline"
     connected = false
     loading = false
-    mutation_phase = "idle"
-    shell_tab = "chat"
+    mutation_phase = MutationPhase.idle
+    shell_tab = ShellTab.chat
     palette_open = true
     palette_draft = ""
 
@@ -28,19 +28,88 @@ preset ui_settings
     status = "Offline"
     connected = false
     loading = false
-    mutation_phase = "idle"
+    mutation_phase = MutationPhase.idle
     error = ""
-    shell_tab = "settings"
+    shell_tab = ShellTab.settings
 
 preset ui_component_error
   state
     error = "Connection failed"
 
+// A dense, settled turn for the inspector: it exercises the real Shell
+// composition, answer markdown, long transcript spacing, and credential footer
+// without spending a provider credential.
+preset ui_shell_showcase
+  state
+    shell_tab = ShellTab.shell
+    connected = false
+    loading = false
+    mutation_phase = MutationPhase.idle
+    error = ""
+    shell_mode = ShellMode.chat
+    shell_provider = "codex"
+    shell_credential = ""
+    shell_chat_entries = agent_chat_finish(agent_chat_push_user([], "Explain the execution path and call out the failure boundaries.", "codex"), "## Execution path\n\nThe request becomes a durable saga, streams provider activity into this view, and commits the final answer before the turn settles.\n\n- **Scheduling** pins work to the selected compute provider.\n- **Live output** stays observational.\n- **Saga state** is the canonical result.", "codex")
+
+test shell_chat_surface_contract
+  preset ui_shell_showcase
+  viewport 1120 720
+  mount
+    ShellScreen draft<->shell_chat_draft #shell
+      with
+        mode=shell_mode
+        provider=shell_provider
+        credential_options=shell_credential_options
+        credential=shell_credential
+        host_node_options=shell_host_node_options
+        host_node=shell_host_node
+        credentials_loading=shell_credentials_loading
+        terminal=shell_terminal
+        terminal_running=shell_terminal_running
+        terminal_busy=shell_terminal_busy
+        terminal_title=shell_terminal_title
+        terminal_error=shell_terminal_error
+        entries=shell_chat_entries
+        activity=shell_chat_activity
+        chat_busy=shell_chat_busy
+        chat_status=shell_chat_status
+        chat_detail=shell_chat_detail
+        live=shell_chat_live
+        chat_error=shell_chat_error
+        saga_id=shell_chat_saga
+        connected=true
+        dark=false
+      events
+        shell_mode_changed -> shell_mode_changed _
+        shell_provider_changed -> shell_provider_changed _
+        shell_credential_changed -> shell_credential_changed _
+        shell_host_node_changed -> shell_host_node_changed _
+        shell_credentials_refresh -> shell_credentials_refresh
+        shell_terminal_start -> shell_terminal_start
+        shell_terminal_stop -> shell_terminal_stop
+        shell_composer_event -> shell_composer_event _
+        shell_chat_reset -> shell_chat_reset
+        shell_chat_suggest -> shell_chat_suggest _
+        shell_open_link -> open_message_link _
+  target transcript = #shell/root/transcript
+  target composer = #shell/root/draft
+  expect exists transcript
+  expect exists composer
+  expect text "Execution path" within transcript
+  expect transcript.width > 1000.0
+  capture shell_chat_light
+  dispatch shell_mode_changed(ShellMode.raw)
+  expect shell_mode == ShellMode.raw
+  expect missing transcript
+  capture shell_raw_light
+  resize 966 500
+  capture shell_raw_min_light
+
 test palette_escape_contract
   preset ui_palette_open
   viewport 1120 720
   mount
-    WorkspaceTabs #workspace-tabs
+    WorkspaceTabs wall_now=wall_now #workspace-tabs
       with
         network="testnet"
         status
@@ -72,6 +141,8 @@ test palette_escape_contract
         space w=1.0 h=1.0
       chat:
         space w=1.0 h=1.0
+      shell:
+        space w=1.0 h=1.0
       pages:
         space w=1.0 h=1.0
       files:
@@ -83,6 +154,8 @@ test palette_escape_contract
       forge:
         space w=1.0 h=1.0
       governance:
+        space w=1.0 h=1.0
+      node:
         space w=1.0 h=1.0
       settings:
         space w=1.0 h=1.0
@@ -129,6 +202,31 @@ test channel_draft_contract
   dispatch toggle_channel_create_members_only
   expect channel_create_members_only
 
+// The composer toolbar's code glyph wears `color=inherit` (ducktape-ui#606):
+// its ink IS the button's status-resolved text color. The probe point sits on
+// the button's plate strictly LEFT of the glyph's own bounds — the exact spot
+// the deleted IconAction ramp (hover on the svg's own bounds) left grey — and
+// must brighten the glyph to the button's `hovered text=fg`; off the plate it
+// rests back on `active text=muted`.
+test composer_mark_glyph_wears_button_ink
+  preset ui_offline
+  viewport 360 160
+  mount
+    box #surface w=fill p=24.0
+      ComposerMarks #marks
+        with
+          disabled=false
+        events
+          mark -> open_message_link _
+  target code = #surface/marks/root/code
+  target glyph = #surface/marks/root/code/glyph
+  expect glyph.x > code.x + 4.0
+  expect glyph.image_color == color.rgb8(107, 105, 98)
+  move (code.x + 2.0) code.center_y
+  expect glyph.image_color == color.rgb8(44, 43, 39)
+  move (code.x - 8.0) code.center_y
+  expect glyph.image_color == color.rgb8(107, 105, 98)
+
 test shared_components_contract
   preset ui_component_error
   viewport 560 360
@@ -170,7 +268,7 @@ test minimum_window_layout_contract
   preset ui_offline
   viewport 1280 800
   mount
-    WorkspaceTabs #workspace-tabs
+    WorkspaceTabs wall_now=wall_now #workspace-tabs
       with
         network="testnet"
         status
@@ -202,6 +300,8 @@ test minimum_window_layout_contract
         space w=1.0 h=1.0
       chat:
         space w=1.0 h=1.0
+      shell:
+        space w=1.0 h=1.0
       pages:
         space w=1.0 h=1.0
       files:
@@ -213,6 +313,8 @@ test minimum_window_layout_contract
       forge:
         space w=1.0 h=1.0
       governance:
+        space w=1.0 h=1.0
+      node:
         space w=1.0 h=1.0
       settings:
         space w=1.0 h=1.0
@@ -239,9 +341,9 @@ test minimum_window_layout_contract
 
 preset ui_launch
   state
-    mutation_phase = "idle"
+    mutation_phase = MutationPhase.idle
     onboarding_error = ""
-    hub_step = "networks"
+    hub_step = HubStep.networks
     hub_networks = []
     hub_selected = ""
 
@@ -254,7 +356,7 @@ test launch_unlock_contract
   mount
     HubColumn #hub
       with
-        step="unlock"
+        step=HubStep.unlock
         key_state="encrypted"
         networks=hub_networks
         selected=""
@@ -268,6 +370,8 @@ test launch_unlock_contract
         tier=""
         error=""
         busy=false
+        restore_empty=true
+        join_empty=true
       events
         unlock_submit -> unlock_submit _
         login_skip -> login_skip
@@ -275,7 +379,7 @@ test launch_unlock_contract
         reveal_confirm -> reveal_confirm
         go_restore -> go_restore
         go_login -> go_login
-        restore_submit -> restore_submit _ _
+        restore_submit -> restore_submit _
         pick_network -> pick_network _
         open_network_submit -> open_network_submit
         forget_network_submit -> forget_network_submit _ _
@@ -283,15 +387,15 @@ test launch_unlock_contract
         restore_hidden_submit -> restore_hidden_submit
         go_join -> go_join
         go_networks -> go_networks
-        join_network_submit -> join_network_submit _
+        join_network_submit -> join_network_submit
         copy_onboarding_invite -> copy_onboarding_invite
         enter_console -> enter_console
   target pw = #hub/root/unlock/root/unlock-password
   expect exists pw
   dispatch go_restore
-  expect hub_step == "restore"
+  expect hub_step == HubStep.restore
   dispatch go_login
-  expect hub_step == "unlock"
+  expect hub_step == HubStep.unlock
 
 test launch_networks_empty_contract
   preset ui_launch
@@ -299,7 +403,7 @@ test launch_networks_empty_contract
   mount
     HubColumn #hub
       with
-        step="networks"
+        step=HubStep.networks
         key_state="encrypted"
         networks=hub_networks
         selected=""
@@ -313,6 +417,8 @@ test launch_networks_empty_contract
         tier=""
         error=""
         busy=false
+        restore_empty=true
+        join_empty=true
       events
         unlock_submit -> unlock_submit _
         login_skip -> login_skip
@@ -320,7 +426,7 @@ test launch_networks_empty_contract
         reveal_confirm -> reveal_confirm
         go_restore -> go_restore
         go_login -> go_login
-        restore_submit -> restore_submit _ _
+        restore_submit -> restore_submit _
         pick_network -> pick_network _
         open_network_submit -> open_network_submit
         forget_network_submit -> forget_network_submit _ _
@@ -328,18 +434,22 @@ test launch_networks_empty_contract
         restore_hidden_submit -> restore_hidden_submit
         go_join -> go_join
         go_networks -> go_networks
-        join_network_submit -> join_network_submit _
+        join_network_submit -> join_network_submit
         copy_onboarding_invite -> copy_onboarding_invite
         enter_console -> enter_console
   target cta = #hub/root/networks/root/join-cta
   expect exists cta
   click cta
-  expect hub_step == "join"
+  expect hub_step == HubStep.join
 
 preset ui_palette_overlay
   state
     palette_open = true
     palette_draft = ""
+    // Every keystroke here launches a real `palette_search`. Pinned for the
+    // reason `ui_chat_stream` states at length: an empty endpoint is a
+    // fallback, not a refusal.
+    connected_rpc = "http://127.0.0.1:1"
 
 // The palette is an `overlay`, not a tinted box, so the backdrop takes the
 // pointer instead of letting clicks through to the console behind it. This
@@ -359,7 +469,7 @@ test palette_overlay_contract
         toast=""
         tone="info"
         open=palette_open
-        searching=palette_searching
+        search_phase=palette_search_phase
         chat_hits=palette_chat_hits
         page_hits=palette_page_hits
       events
@@ -381,11 +491,11 @@ test palette_overlay_contract
 
 preset ui_settings_scroll
   state
-    shell_tab = "settings"
+    shell_tab = ShellTab.settings
     status = "Offline"
     connected = false
     loading = false
-    mutation_phase = "idle"
+    mutation_phase = MutationPhase.idle
     error = ""
 
 // KEYBOARD SCROLL. iced's scrollable answers the wheel and the drag rail only
@@ -400,7 +510,7 @@ test settings_keyboard_scroll_contract
   preset ui_settings_scroll
   viewport 1120 460
   mount
-    WorkspaceTabs #workspace-tabs
+    WorkspaceTabs wall_now=wall_now #workspace-tabs
       with
         network="testnet"
         status
@@ -432,6 +542,8 @@ test settings_keyboard_scroll_contract
         space w=1.0 h=1.0
       chat:
         space w=1.0 h=1.0
+      shell:
+        space w=1.0 h=1.0
       pages:
         space w=1.0 h=1.0
       files:
@@ -444,16 +556,14 @@ test settings_keyboard_scroll_contract
         space w=1.0 h=1.0
       governance:
         space w=1.0 h=1.0
+      node:
+        space w=1.0 h=1.0
       settings:
-        SettingsScreen account_name_draft<->account_name_draft node_log_filter<->node_log_filter #settings
+        SettingsScreen account_name_draft<->account_name_draft #settings
           with
             account_name
             network_name
             connected_rpc
-            settings_endpoint
-            settings_node_key
-            node_height
-            settings_data_dir
             settings_key_state
             settings_key_path
             settings_open_tabs
@@ -470,21 +580,6 @@ test settings_keyboard_scroll_contract
             loading
             connected
             mutation_phase
-            node_tab
-            module_rows
-            node_checkpoint
-            node_last_finalized
-            node_reachable_label
-            node_quorum_label
-            node_version
-            node_root_hash
-            sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
-            node_phase_since
-            node_sync_retries
-            node_sync_failures
-            node_sync_last_error
-            node_peers
-            node_log_lines
           events
             select_shell_tab -> select_shell_tab _
             reconnect -> reconnect
@@ -496,9 +591,6 @@ test settings_keyboard_scroll_contract
             settings_unlock_submit -> settings_unlock_submit _
             lock_session -> lock_session
             forget_workspace_submit -> forget_workspace_submit
-            select_node_tab -> select_node_tab _
-            open_node_modules -> open_node_modules
-            node_log_filter_changed -> node_log_filter_changed _
             set_appearance_light -> set_appearance_light
             set_appearance_dark -> set_appearance_dark
       explorer:
@@ -508,6 +600,11 @@ test settings_keyboard_scroll_contract
       bell:
         space w=1.0 h=1.0
   target body = #workspace-tabs/content/settings/settings-body
+  // The scroll handlers qualify their targets with the console window
+  // (`window=window_target(console_win)`), so the test first tells the app
+  // the harness window IS the console — the same fact `task window open`
+  // delivers in the real flow.
+  dispatch console_opened(window)
   expect body.content_height > body.visible_height
   expect body.scroll_y ~= 0.0
   key escape
@@ -559,94 +656,315 @@ test settings_keyboard_scroll_contract
   key page-down
   expect body.scroll_y > 30.0
 
-preset ui_explorer_partial
+preset ui_explorer
   state
-    shell_tab = "explorer"
+    shell_tab = ShellTab.explorer
     connected = true
+    connected_rpc = "http://127.0.0.1:1"
     loading = false
-    mutation_phase = "idle"
+    mutation_phase = MutationPhase.idle
     error = ""
-    explorer_query = "needle"
-    explorer_searching = false
-    explorer_kind = "all"
-    explorer_partial = "Code did not answer — these results are incomplete."
 
-preset ui_explorer_whole
-  state
-    shell_tab = "explorer"
-    connected = true
-    loading = false
-    mutation_phase = "idle"
-    error = ""
-    explorer_query = "needle"
-    explorer_searching = false
-    explorer_kind = "all"
-    explorer_partial = ""
-
-// A PARTIAL ANSWER SAYS SO, AND ONLY A WHOLE ONE CLAIMS EMPTY. Each of the six
-// sources behind a workspace search fails silently and the node's per-module
-// cold start runs tens of seconds against a 30s client ceiling, so a search
-// that reached the node and lost three of its sources rendered the survivors as
-// the whole truth — and with no survivors it printed "Nothing matched that
-// query in this workspace", which is a claim about the WORKSPACE that only the
-// sources that answered can support.
+// A PARTIAL ANSWER SAYS SO. Port 1 on loopback cannot hold an unprivileged
+// listener, so all six search legs refuse immediately and deterministically.
+// Drive the component through its own input and handler instead of seeding its
+// now-private state through an app preset.
 test explorer_partial_banner_contract
-  preset ui_explorer_partial
+  preset ui_explorer
   viewport 1120 720
   mount
-    ExplorerScreen query<->explorer_query #explorer
+    ExplorerScreen #explorer
       with
+        connected_rpc
         connected
-        searching=explorer_searching
         loading
-        kinds=explorer_kinds
-        kind=explorer_kind
-        partial=explorer_partial
-        hits=explorer_hits
         blocks=explorer_blocks
-        selected=explorer_selected
         ops=explorer_ops
         head=block_height
         sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
       events
-        explorer_search_submit -> explorer_search_submit
-        clear_explorer_search -> clear_explorer_search
         refresh_explorer -> refresh_explorer
-        pick_explorer_kind -> pick_explorer_kind _
-        select_explorer_block -> select_explorer_block _
+        copy_to_clipboard -> copy_to_clipboard _ _
+  target query = #explorer/explorer-search
+  target clear = #explorer/explorer-clear
   target banner = #explorer/explorer-partial
   target plate = #explorer/explorer-nothing-matched/root
+  click query
+  type "needle"
+  key enter
   expect exists banner
   expect missing plate
+  click clear
+  expect query.value == ""
+  expect missing banner
+  expect missing plate
 
-// The other half, which is what stops the banner from being wallpaper: with
-// every source answered there is nothing to warn about, and "nothing matched"
-// is then the honest line.
-test explorer_whole_answer_contract
-  preset ui_explorer_whole
+preset ui_chat_stream
+  state
+    connected = true
+    loading = false
+    mutation_phase = MutationPhase.idle
+    error = ""
+    // THE ENDPOINT IS PINNED BECAUSE AN EMPTY ONE IS NOT INERT. `choose_channel`
+    // launches a real `load_channel_window`, and `rpc_client("")` does not
+    // refuse — it falls back to `$DUCKTAPE_NODE`, then to the dev box's
+    // `~/.ducktape` workspace registry, then to `DEFAULT_RPC`. So this test
+    // issued an HTTP request to whatever the machine running it happened to
+    // have, and the driver's 10s quiescence budget was the only thing between a
+    // slow answer and a red test (`DUCKTAPE_NODE` pointed at a blackhole fails
+    // it 100%). Port 1 on loopback can hold no listener — binding below 1024
+    // needs root — so the connect is refused immediately and the task settles
+    // on the dispatch, deterministically and off the network.
+    connected_rpc = "http://127.0.0.1:1"
+    shell_tab = ShellTab.chat
+    active_channel = "channel-a"
+    active_channel_name = "general"
+    messages = optimistic_message(messages, "The room she is looking at.", "pending-1")
+    messages_revision = messages_revision + 1
+
+// THE GATE IS THE STREAM RESET. Every room switch paints an empty loading state,
+// so the old scrollable and its offset must disappear before the selected room's
+// root window arrives. This asserts that `#chat/message-stream` exists with rows
+// and is GONE without them. (Virtualization note:
+// offscreen rows leave the a11y tree, so a test that wants a message ROW has to
+// scroll it in first. This one only wants the scrollable, which is always
+// mounted when it exists at all.)
+test message_stream_reset_contract
+  preset ui_chat_stream
   viewport 1120 720
   mount
-    ExplorerScreen query<->explorer_query #explorer
+    ChatScreen search_draft<->chat_search_draft message_edit_draft<->message_edit_draft channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft thread_edit_draft<->thread_edit_draft #chat
       with
+        endpoint=connected_rpc
+        network_name
+        status
+        block_height
+        search_phase=chat_search_phase
+        search_hits=chat_search_hits
+        rooms
+        dm_rows
+        channel_create_open
         connected
-        searching=explorer_searching
         loading
-        kinds=explorer_kinds
-        kind=explorer_kind
-        partial=explorer_partial
-        hits=explorer_hits
-        blocks=explorer_blocks
-        selected=explorer_selected
-        ops=explorer_ops
-        head=block_height
-        sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
+        mutation_phase
+        active_channel
+        active_dm_peer
+        active_dm
+        active_channel_name
+        active_channel_archived
+        active_channel_members_only
+        channel_members
+        post_refusal
+        huddle_joined
+        huddle_channel
+        huddle_channel_name
+        huddle_joined_at
+        huddle_now
+        call_muted
+        huddle_popped=false
+        messages
+        messages_revision
+        has_older_history
+        history_view
+        history_loading
+        unread_boundary
+        unread_marker_seq
+        selected_message_seq
+        selected_message_rev
+        message_action
+        channel_settings_open
+        active_thread_seq
+        thread_target_seq
+        thread_messages
+        thread_messages_revision
+        thread_selected_seq
+        thread_selected_rev
+        thread_message_action
+        thread_has_more
+        thread_next_reply_seq
+        thread_loading
       events
-        explorer_search_submit -> explorer_search_submit
-        clear_explorer_search -> clear_explorer_search
-        refresh_explorer -> refresh_explorer
-        pick_explorer_kind -> pick_explorer_kind _
-        select_explorer_block -> select_explorer_block _
-  target banner = #explorer/explorer-partial
-  target plate = #explorer/explorer-nothing-matched/root
-  expect missing banner
-  expect exists plate
+        search_chat_submit -> search_chat_submit
+        clear_chat_search -> clear_chat_search
+        open_chat_search_hit -> open_chat_search_hit _ _ _
+        toggle_channel_create -> toggle_channel_create
+        choose_channel -> choose_channel _
+        choose_dm -> choose_dm _
+        toggle_channel_settings -> toggle_channel_settings
+        pop_huddle -> pop_huddle
+        focus_huddle -> focus_huddle
+        leave_huddle_here -> leave_huddle_here
+        huddle_go_channel -> huddle_go_channel
+        join_huddle_submit -> join_huddle_submit
+        load_more_history -> load_more_history
+        chat_scrolled -> chat_scrolled _ _ _ _
+        open_message_link -> open_message_link _
+        add_reaction_at -> add_reaction_at _ _
+        remove_reaction_at -> remove_reaction_at _ _
+        open_thread_for -> open_thread_for _
+        open_message_actions -> open_message_actions _ _ _
+        open_message_reactions -> open_message_reactions _ _ _
+        begin_message_edit -> begin_message_edit _ _ _
+        arm_message_delete -> arm_message_delete _ _ _
+        clear_message_selection -> clear_message_selection
+        add_reaction_submit -> add_reaction_submit _
+        edit_message_submit -> edit_message_submit
+        delete_message_submit -> delete_message_submit
+        composer_submitted -> composer_submitted _ _ _
+        rename_channel_submit -> rename_channel_submit
+        archive_channel_submit -> archive_channel_submit
+        unarchive_channel_submit -> unarchive_channel_submit
+        add_channel_member_submit -> add_channel_member_submit
+        remove_channel_member_submit -> remove_channel_member_submit _
+        close_thread -> close_thread
+        open_thread_message_actions -> open_thread_message_actions _ _ _
+        open_thread_message_reactions -> open_thread_message_reactions _ _ _
+        begin_thread_message_edit -> begin_thread_message_edit _ _ _
+        arm_thread_message_delete -> arm_thread_message_delete _ _ _
+        clear_thread_message_selection -> clear_thread_message_selection
+        edit_thread_message_submit -> edit_thread_message_submit
+        delete_thread_message_submit -> delete_thread_message_submit
+        load_more_thread -> load_more_thread
+  target stream = #chat/message-stream
+  expect exists stream
+  dispatch choose_channel("channel-b")
+  expect empty(messages)
+  expect missing stream
+
+preset ui_rich_paragraph
+  state
+    connected = true
+    loading = false
+    mutation_phase = MutationPhase.idle
+    error = ""
+    // Port 1 for the same reason as `ui_chat_stream` above: `choose_channel`
+    // launches a real `load_channel_window`, and loopback port 1 refuses the
+    // connect immediately, so the task settles on the dispatch and the failed
+    // load leaves the reducer-set rows alone (`chat_load_failed` touches no
+    // `messages`).
+    connected_rpc = "http://127.0.0.1:1"
+    shell_tab = ShellTab.chat
+    active_channel = "channel-a"
+    active_channel_name = "general"
+    // The optimistic path parses the SAME grammar the send commits, so these
+    // rows carry real rich spans — bold, italic, and bare-url link runs —
+    // into the paragraph's `for`.
+    messages = mark_author_runs(optimistic_message(optimistic_message(messages, "ship the **fix** at https://duck.example/x", "pending-rich"), "and the _second_ line lands", "pending-second"))
+    messages_revision = messages_revision + 1
+
+// A MESSAGE BODY IS ONE PARAGRAPH (ducktape-ui#639, collected by #1096). The
+// span list — plain runs, bold runs, italic runs, links — feeds ONE rich-text
+// widget whose `for` expands a span template per run, so the whole line is a
+// single drawn run: the exact-match text oracle below only holds while every
+// span lands in the same paragraph buffer, marks stripped, spacing intact.
+// The second half asserts the expansion FOLLOWS THE DATA, not a first-render
+// snapshot: `choose_channel` swaps the span lists out and the paragraphs go
+// with them. (The grow direction of a `for` re-expansion is pinned upstream —
+// ducktape-ui `rich_text_for.ice` — and is not reachable offline here: every
+// committed-row mutation handler guards `seq <= 0`, so a pending fixture row
+// cannot be edited, and a failed send removes its own row before the next
+// test statement.)
+test message_body_renders_as_one_rich_paragraph
+  preset ui_rich_paragraph
+  viewport 1120 720
+  mount
+    ChatScreen search_draft<->chat_search_draft message_edit_draft<->message_edit_draft channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft thread_edit_draft<->thread_edit_draft #chat
+      with
+        endpoint=connected_rpc
+        network_name
+        status
+        block_height
+        search_phase=chat_search_phase
+        search_hits=chat_search_hits
+        rooms
+        dm_rows
+        channel_create_open
+        connected
+        loading
+        mutation_phase
+        active_channel
+        active_dm_peer
+        active_dm
+        active_channel_name
+        active_channel_archived
+        active_channel_members_only
+        channel_members
+        post_refusal
+        huddle_joined
+        huddle_channel
+        huddle_channel_name
+        huddle_joined_at
+        huddle_now
+        call_muted
+        huddle_popped=false
+        messages
+        messages_revision
+        has_older_history
+        history_view
+        history_loading
+        unread_boundary
+        unread_marker_seq
+        selected_message_seq
+        selected_message_rev
+        message_action
+        channel_settings_open
+        active_thread_seq
+        thread_target_seq
+        thread_messages
+        thread_messages_revision
+        thread_selected_seq
+        thread_selected_rev
+        thread_message_action
+        thread_has_more
+        thread_next_reply_seq
+        thread_loading
+      events
+        search_chat_submit -> search_chat_submit
+        clear_chat_search -> clear_chat_search
+        open_chat_search_hit -> open_chat_search_hit _ _ _
+        toggle_channel_create -> toggle_channel_create
+        choose_channel -> choose_channel _
+        choose_dm -> choose_dm _
+        toggle_channel_settings -> toggle_channel_settings
+        pop_huddle -> pop_huddle
+        focus_huddle -> focus_huddle
+        leave_huddle_here -> leave_huddle_here
+        huddle_go_channel -> huddle_go_channel
+        join_huddle_submit -> join_huddle_submit
+        load_more_history -> load_more_history
+        chat_scrolled -> chat_scrolled _ _ _ _
+        open_message_link -> open_message_link _
+        add_reaction_at -> add_reaction_at _ _
+        remove_reaction_at -> remove_reaction_at _ _
+        open_thread_for -> open_thread_for _
+        open_message_actions -> open_message_actions _ _ _
+        open_message_reactions -> open_message_reactions _ _ _
+        begin_message_edit -> begin_message_edit _ _ _
+        arm_message_delete -> arm_message_delete _ _ _
+        clear_message_selection -> clear_message_selection
+        add_reaction_submit -> add_reaction_submit _
+        edit_message_submit -> edit_message_submit
+        delete_message_submit -> delete_message_submit
+        composer_submitted -> composer_submitted _ _ _
+        rename_channel_submit -> rename_channel_submit
+        archive_channel_submit -> archive_channel_submit
+        unarchive_channel_submit -> unarchive_channel_submit
+        add_channel_member_submit -> add_channel_member_submit
+        remove_channel_member_submit -> remove_channel_member_submit _
+        close_thread -> close_thread
+        open_thread_message_actions -> open_thread_message_actions _ _ _
+        open_thread_message_reactions -> open_thread_message_reactions _ _ _
+        begin_thread_message_edit -> begin_thread_message_edit _ _ _
+        arm_thread_message_delete -> arm_thread_message_delete _ _ _
+        clear_thread_message_selection -> clear_thread_message_selection
+        edit_thread_message_submit -> edit_thread_message_submit
+        delete_thread_message_submit -> delete_thread_message_submit
+        load_more_thread -> load_more_thread
+  target stream = #chat/message-stream
+  expect exists stream
+  expect text "ship the fix at https://duck.example/x" within stream
+  expect text "and the second line lands" within stream
+  dispatch choose_channel("channel-b")
+  expect no text "ship the fix at https://duck.example/x"
+  expect no text "and the second line lands"
+  expect missing stream

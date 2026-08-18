@@ -4,14 +4,14 @@
 //! simplex_agreed_order.rs) turned into an actual network: instead of N
 //! `SimplexOrderer`s over ONE `p2p::simulated` network under the DETERMINISTIC
 //! clock, each process here stands up its OWN live simplex `Engine` over a real
-//! `authenticated::discovery` encrypted TCP mesh on the REAL tokio runtime, and
+//! `authenticated::lookup` encrypted TCP mesh on the REAL tokio runtime, and
 //! drives an `OrderedNode<SimplexOrderer>` over a `host::Host`.
 //!
 //! the machinery is REUSED verbatim: `consensus::SimplexOrderer::spawn` is
 //! already generic over the runtime context + the three engine channel pairs, so
 //! the only substrate that changes vs the sim is (a) `tokio::Runner` instead of
-//! `deterministic::Runner` (discovery live-locks under the deterministic clock),
-//! (b) `discovery::Network` channels instead of `simulated::Network`, and (c) a
+//! `deterministic::Runner` (the p2p actors live-lock under the deterministic clock),
+//! (b) `lookup::Network` channels instead of `simulated::Network`, and (c) a
 //! per-process `ContentStore`.
 //!
 //! payload dissemination is REAL: each process submits a DISTINCT op (node N
@@ -75,12 +75,12 @@ mod gateway_routes;
 mod host_reads;
 mod host_resources;
 mod host_state;
-#[cfg(test)]
-mod joiner_mesh_tests;
 mod lobby;
 #[cfg(test)]
 mod main_tests;
 mod mcp;
+mod mesh_book;
+mod mesh_window;
 mod overlay_book;
 mod plane_metrics;
 mod reachability_plane;
@@ -119,7 +119,7 @@ use replica::promotion::{
 #[cfg(test)]
 use sdk::{Msg, StateRoot};
 #[cfg(test)]
-use sync::catchup::{apply_post_reboot_catchup_frames, apply_verified_suffix_frame};
+use sync::catchup::{apply_suffix_frames, apply_verified_suffix_frame};
 #[cfg(test)]
 use sync::serve::assert_floor_binds_view;
 #[cfg(test)]
@@ -195,8 +195,8 @@ more than one.";
 #[command(
     name = "ducktape",
     about = "one workspace-network node and its operator tools",
-    // clap prints "<name> <version>", so the version string must NOT repeat
-    // the binary name the way `version_line()` (the `version` verb) does.
+    // clap prints "<name> <version>", so the version string must not repeat
+    // the binary name.
     version = env!("CARGO_PKG_VERSION"),
     arg_required_else_help = true,
     // `arg_required_else_help` means a bare `ducktape` lands HERE, so this is
@@ -218,7 +218,7 @@ enum Family {
     /// run a workspace node, plus operator verbs (init, invite, join, ...)
     #[command(subcommand)]
     Node(cli_args::NodeCmd),
-    /// user-identity keys and signing (init/restore, sign-*, redeem-invite, ...)
+    /// user-identity keys and signing (init/restore, sign-*, account-init, ...)
     #[command(subcommand)]
     User(userkey_cli::UserCmd),
     /// local loopback bindings for signed gateway routes
@@ -328,7 +328,7 @@ fn run_node(
         identity_chain_id,
         peers,
         validators,
-        bootstrappers,
+        mesh_book,
         coordinated,
         listen,
         advertised,
@@ -353,14 +353,9 @@ fn run_node(
         mesh_state_file,
         checkpoint_blocks,
         dev_demo,
-        // the shipped-index warm start's staging client rode the retired
-        // promotion exec-reboot; the serve side and the config key await
-        // the follow-up sweep.
-        sync_index: _,
         sandbox,
         compute_backend,
         sandbox_capacity,
-        promoted,
     } = boot::env::derive(resolved, sync_only);
 
     // A node whose config says it can isolate runs, booting with no compute
@@ -523,7 +518,6 @@ fn run_node(
             sync_candidates,
             listen,
             advertised,
-            bootstrappers,
             wireguard_listen.is_some(),
             overlay_slot.clone(),
         );
@@ -563,6 +557,8 @@ fn run_node(
                 quota,
                 &signer,
                 mesh_participants,
+                &validators,
+                mesh_book.clone(),
                 sync_sources,
                 metrics.clone(),
                 storage_for_sync,
@@ -616,27 +612,21 @@ fn run_node(
         // ---- the JOINER / REPLICA: park on the mesh, bootstrap a boundary,
         // then FOLD the head (unified-node phase 2) ----
         //
-        // decided from the REAL store (the pre-runtime probe only gated
-        // listeners): a key outside the genesis set that no checkpoint seats
-        // as a participant. a fresh join has no checkpoint at all; a
-        // RESTARTED replica has one that names it a resident — it re-enters
-        // here and re-ascends (a fresh bootstrap into its existing journal;
-        // recovering the folded state by journal replay instead is the
-        // remaining phase-2 follow-up). after PROMOTION the checkpoint
-        // seats this key, so a rebooted process falls through to the
-        // validator path below.
-        let checkpoint_seats_me = manifest.as_ref().is_some_and(|m| {
-            m.participants
-                .iter()
-                .any(|k| k.as_slice() == signer.public_key().as_ref())
-        });
-        if !checkpoint_seats_me && !validators.contains(&signer.public_key()) {
+        // Every key outside the immutable genesis set enters the role resolver.
+        // A local checkpoint is only a recovery base; it cannot authoritatively
+        // name the key's CURRENT role while the process was offline. The replica
+        // path reads the latest committed manifest, remains resident when that
+        // boundary grants resident standing, or returns a promotion baton when
+        // it seats the key as a validator.
+        let genesis_validator = validators.contains(&signer.public_key());
+        if !genesis_validator {
             let baton = replica::run(
                 context,
                 network,
                 &mut oracle,
                 quota,
                 &mesh_participants,
+                mesh_book.clone(),
                 sync_sources,
                 sync_source,
                 advertised_reach.clone(),
@@ -694,7 +684,6 @@ fn run_node(
                 signer,
                 label,
                 namespace,
-                peers,
                 validators,
                 coordinated,
                 wireguard_listen,
@@ -725,10 +714,10 @@ fn run_node(
             context,
             network,
             oracle,
+            mesh_book,
             quota,
             metrics,
             status,
-            sync_source,
             advertised_reach,
             status_public_key,
             signer,
@@ -748,7 +737,6 @@ fn run_node(
             chain_id,
             mesh_state_file,
             checkpoint_blocks,
-            promoted,
             dev_demo,
             rpc_listener,
             http_cmds,

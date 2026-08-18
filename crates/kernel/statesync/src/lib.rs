@@ -31,13 +31,12 @@
 //! 4. **Frames** — fetch a bounded recovery-journal suffix: finalized,
 //!    non-discarded frame bytes plus their seal roots/root-hash, so a promoted
 //!    joiner can persist the same replay suffix a restart would have.
-//! 5. **IndexModules / IndexChunk** — the OPTIONAL shipped-index lane
-//!    (indexable spec §7 lane 2): fluent31 checkpoint archives of the
-//!    serving node's derived per-module read models, for an instant warm
-//!    start. see the trust model — this is the one lane that is not
-//!    verifiable, which is why it stays opt-in and why every consumer must
-//!    treat a failed or refused fetch as "fall back to the from-state
-//!    rebuild", never as an error.
+//! 5. **IndexOps** — the derived tier's OP-ROW BACKFILL (indexable spec §7):
+//!    the serving node's stored index op rows below a joiner's boundary,
+//!    cursor-paged in ascending key order. a joiner writes them into its own
+//!    freshly-stamped index so its views hold pre-join history instead of
+//!    beginning empty at the boundary. see the trust model — this is the one
+//!    lane that is not verifiable.
 //!
 //! ## trust model
 //!
@@ -49,12 +48,16 @@
 //! (the manifest root-hash itself is cross-checked against consensus when the
 //! joiner later participates — a fabricated world still cannot vote.)
 //!
-//! the ONE exception is the shipped-index lane: the derived tier has no root
-//! by design (it is never part of the root-hash), so its archives cannot be
-//! verified — a joiner that opts in trusts the serving node for VIEW bytes
-//! only. consensus state is untouched either way, a lying archive can never
-//! fork the node, and the honest remedy for a bad shipment is the same as
-//! for any damaged index: rebuild from verified state.
+//! the ONE exception is the index op-row lane: the derived tier has no root
+//! by design (it is never part of the root-hash), so its rows cannot be
+//! verified — a joiner trusts its OWN SYNC SOURCE for VIEW bytes only, the
+//! same node it just accepted canonical state from. consensus state is
+//! untouched either way, a lying row can never fork the node, and the honest
+//! remedy for a bad backfill is the same as for any damaged index: wipe the
+//! directory and let the boundary stamp answer honestly. what the lane still
+//! enforces at the boundary is STRUCTURE ([`fetch_index_ops`]): key shape,
+//! strictly ascending order, the boundary ceiling, and a decodable row
+//! envelope — a source cannot make a joiner write garbage it would then fold.
 //!
 //! ## wire format
 //!
@@ -108,10 +111,18 @@ impl ResolverTarget {
 /// max snapshot bytes per [`SyncResponse::Chunk`]. sized so a chunk plus
 /// framing stays far under the mesh's 1 MiB message cap.
 pub const CHUNK_LEN: usize = 256 * 1024;
-/// max recovery frames per [`SyncResponse::Frames`] batch. suffix install loops
-/// over batches; one response stays far below the mesh frame cap unless a
-/// single frame itself is already too large for the transport.
+/// max recovery frames examined per [`SyncResponse::Frames`] batch. This is a
+/// work bound, not a byte guarantee: the node serve path separately budgets the
+/// exact encoded response against its configured mesh message cap.
 pub const FRAME_BATCH_LEN: usize = 64;
+/// max index op rows examined per [`SyncResponse::IndexOps`] page. same
+/// contract as [`FRAME_BATCH_LEN`]: a work bound, with the serve path
+/// budgeting the exact encoded response against the mesh message cap.
+pub const INDEX_OPS_BATCH_LEN: usize = 512;
+
+/// fixed bytes prepended to every authenticated statesync request and reply:
+/// requester(32) + proof(64) + request id(8).
+pub const RPC_AUTHED_HEADER_LEN: usize = 32 + 64 + 8;
 
 /// how many boundary captures a server retains. more than one lets a second
 /// joiner start syncing without invalidating the first joiner's in-flight
@@ -313,19 +324,18 @@ pub enum SyncRequest {
         after_height: u64,
         up_to_height: u64,
     },
-    /// list the shipped-index databases attached at a leased boundary — the
-    /// UNVERIFIED warm-start lane (indexable spec §7 lane 2). the derived
+    /// one page of a module's stored index OP ROWS at or below `boundary`,
+    /// in ascending key order, strictly after the `(height, seq)` cursor —
+    /// the UNVERIFIED derived-tier backfill (indexable spec §7). the derived
     /// tier has no root by design, so nothing here composes into the
-    /// root-hash check: a joiner that opts in trusts the serving node's
-    /// bytes; one that doesn't never sends this request and heals via the
-    /// from-state rebuild instead.
-    IndexModules { boundary: BoundaryId },
-    /// fetch a chunk of one shipped-index database's archive blob. same
-    /// trust caveat as [`SyncRequest::IndexModules`].
-    IndexChunk {
-        boundary: BoundaryId,
-        db: String,
-        offset: u64,
+    /// root-hash check: a joiner trusts its own sync source for view bytes.
+    /// `boundary` is a plain height CEILING, not a captured boundary: no
+    /// lease is involved (the rows are node-local derived state, like the
+    /// Frames lane's journal), so a long walk cannot lose a capture midway.
+    IndexOps {
+        boundary: u64,
+        module: ModuleId,
+        after: Option<(u64, u32)>,
     },
     /// read the tip's consensus coordinates (membership, epoch, height) —
     /// the DETECTION lane; see [`TipCoords`].
@@ -365,8 +375,7 @@ impl SyncRequest {
             Self::Chunk { .. } => "chunk",
             Self::Module { .. } => "module",
             Self::Frames { .. } => "frames",
-            Self::IndexModules { .. } => "index_modules",
-            Self::IndexChunk { .. } => "index_chunk",
+            Self::IndexOps { .. } => "index_ops",
             Self::TipCoords => "tip_coords",
             Self::Blob { .. } => "blob",
             Self::BlobInfo { .. } => "blob_info",
@@ -395,6 +404,24 @@ pub struct TipCoords {
     /// whether the server holds the finalization certificate for exactly
     /// `height` — a liveness hint, never the certificate itself.
     pub has_floor: bool,
+    /// the tip's membership GENERATION — the committed valset counter, the
+    /// index namespace the mesh tracks peer sets under (distinct from
+    /// `epoch`, which stays the engine/channel coordinate).
+    pub generation: u64,
+    /// the tip's retained mesh-generation window, ascending — the same
+    /// snapshots the server derives from committed valset state, so a parked
+    /// joiner tracks the identical window every member tracks.
+    pub mesh_window: Vec<MeshWindowEntry>,
+}
+
+/// one mesh-generation snapshot as carried on the sync wire. statesync-local
+/// on purpose: this crate must not depend on the valset module crate — node
+/// code converts at the fill site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshWindowEntry {
+    pub generation: u64,
+    pub validators: Vec<Vec<u8>>,
+    pub residents: Vec<Vec<u8>>,
 }
 
 /// a state-sync response.
@@ -413,12 +440,18 @@ pub enum SyncResponse {
         requested_after: u64,
         retained_from: u64,
     },
-    /// the shipped-index databases attached at a boundary: `(db, blob_len)`
-    /// pairs, in db order. empty means the source ships nothing (index off,
-    /// poisoned, or nothing attached) — the joiner just falls back to the
-    /// from-state rebuild. chunks come back as [`SyncResponse::Chunk`].
-    IndexModules {
-        entries: Vec<(String, u64)>,
+    /// one page of a module's index op rows: `(op key, row bytes)` verbatim,
+    /// in ascending key order. `next_after` is `Some` exactly when the page
+    /// was cut short — its value is the last row's `(height, seq)`, the next
+    /// request's cursor. `source_floor` is the SERVER's own backfill floor
+    /// for the module (rows below it never existed here) and `applied_height`
+    /// its watermark, so the joiner can compose an honest floor and refuse a
+    /// source that cannot cover the range it asked for.
+    IndexOps {
+        rows: Vec<(String, Vec<u8>)>,
+        next_after: Option<(u64, u32)>,
+        source_floor: Option<u64>,
+        applied_height: u64,
     },
     /// the tip's consensus coordinates — the [`SyncRequest::TipCoords`] answer.
     TipCoords(TipCoords),
@@ -451,7 +484,7 @@ impl SyncResponse {
             Self::Module(_) => "Module",
             Self::Frames { .. } => "Frames",
             Self::RangePruned { .. } => "RangePruned",
-            Self::IndexModules { .. } => "IndexModules",
+            Self::IndexOps { .. } => "IndexOps",
             Self::TipCoords(_) => "TipCoords",
             Self::Blob { .. } => "Blob",
             Self::BlobInfo { .. } => "BlobInfo",
@@ -462,6 +495,26 @@ impl SyncResponse {
 }
 
 // ---- frame codec -----------------------------------------------------------
+
+/// an optional `(height, seq)` op-row cursor: presence byte, then 8+4 LE.
+fn put_op_cursor(out: &mut Vec<u8>, cursor: &Option<(u64, u32)>) {
+    match cursor {
+        Some((height, seq)) => {
+            out.push(1);
+            out.extend_from_slice(&height.to_le_bytes());
+            out.extend_from_slice(&seq.to_le_bytes());
+        }
+        None => out.push(0),
+    }
+}
+
+fn take_op_cursor(buf: &mut &[u8]) -> Result<Option<(u64, u32)>, WireError> {
+    Ok(match wire::take_u8(buf)? {
+        0 => None,
+        1 => Some((wire::take_u64(buf)?, wire::take_u32(buf)?)),
+        t => return Err(WireError::BadTag("op cursor", t)),
+    })
+}
 
 pub fn encode_request(req: &SyncRequest) -> Vec<u8> {
     let mut out = Vec::new();
@@ -497,29 +550,23 @@ pub fn encode_request(req: &SyncRequest) -> Vec<u8> {
             out.extend_from_slice(&after_height.to_le_bytes());
             out.extend_from_slice(&up_to_height.to_le_bytes());
         }
-        SyncRequest::IndexModules { boundary } => {
-            out.push(4u8);
-            out.extend_from_slice(&boundary.height.to_le_bytes());
-            out.extend_from_slice(boundary.root_hash.as_bytes());
-        }
-        SyncRequest::IndexChunk {
+        SyncRequest::IndexOps {
             boundary,
-            db,
-            offset,
+            module,
+            after,
         } => {
-            out.push(5u8);
-            out.extend_from_slice(&boundary.height.to_le_bytes());
-            out.extend_from_slice(boundary.root_hash.as_bytes());
-            wire::put_str(&mut out, db);
-            out.extend_from_slice(&offset.to_le_bytes());
+            out.push(4u8);
+            out.extend_from_slice(&boundary.to_le_bytes());
+            wire::put_str(&mut out, module);
+            put_op_cursor(&mut out, after);
         }
-        SyncRequest::TipCoords => out.push(6u8),
+        SyncRequest::TipCoords => out.push(5u8),
         SyncRequest::Blob { digest } => {
-            out.push(7u8);
+            out.push(6u8);
             out.extend_from_slice(digest);
         }
         SyncRequest::BlobInfo { digest } => {
-            out.push(8u8);
+            out.push(7u8);
             out.extend_from_slice(digest);
         }
         SyncRequest::BlobRange {
@@ -527,7 +574,7 @@ pub fn encode_request(req: &SyncRequest) -> Vec<u8> {
             offset,
             len,
         } => {
-            out.push(9u8);
+            out.push(8u8);
             out.extend_from_slice(digest);
             out.extend_from_slice(&offset.to_le_bytes());
             out.extend_from_slice(&len.to_le_bytes());
@@ -561,28 +608,19 @@ pub fn decode_request(bytes: &[u8]) -> Result<SyncRequest, WireError> {
             after_height: wire::take_u64(&mut buf)?,
             up_to_height: wire::take_u64(&mut buf)?,
         },
-        4 => SyncRequest::IndexModules {
-            boundary: BoundaryId {
-                height: wire::take_u64(&mut buf)?,
-                root_hash: StateRoot(wire::take_array::<ROOT_LEN>(&mut buf)?),
-            },
+        4 => SyncRequest::IndexOps {
+            boundary: wire::take_u64(&mut buf)?,
+            module: wire::take_str(&mut buf)?,
+            after: take_op_cursor(&mut buf)?,
         },
-        5 => SyncRequest::IndexChunk {
-            boundary: BoundaryId {
-                height: wire::take_u64(&mut buf)?,
-                root_hash: StateRoot(wire::take_array::<ROOT_LEN>(&mut buf)?),
-            },
-            db: wire::take_str(&mut buf)?,
-            offset: wire::take_u64(&mut buf)?,
-        },
-        6 => SyncRequest::TipCoords,
-        7 => SyncRequest::Blob {
+        5 => SyncRequest::TipCoords,
+        6 => SyncRequest::Blob {
             digest: wire::take_array::<32>(&mut buf)?,
         },
-        8 => SyncRequest::BlobInfo {
+        7 => SyncRequest::BlobInfo {
             digest: wire::take_array::<32>(&mut buf)?,
         },
-        9 => SyncRequest::BlobRange {
+        8 => SyncRequest::BlobRange {
             digest: wire::take_array::<32>(&mut buf)?,
             offset: wire::take_u64(&mut buf)?,
             len: wire::take_u64(&mut buf)?,
@@ -669,13 +707,27 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
             out.push(5u8);
             wire::put_str(&mut out, msg);
         }
-        SyncResponse::IndexModules { entries } => {
+        SyncResponse::IndexOps {
+            rows,
+            next_after,
+            source_floor,
+            applied_height,
+        } => {
             out.push(6u8);
-            out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
-            for (db, len) in entries {
-                wire::put_str(&mut out, db);
-                out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&(rows.len() as u64).to_le_bytes());
+            for (key, value) in rows {
+                wire::put_str(&mut out, key);
+                wire::put_bytes(&mut out, value);
             }
+            put_op_cursor(&mut out, next_after);
+            match source_floor {
+                Some(floor) => {
+                    out.push(1);
+                    out.extend_from_slice(&floor.to_le_bytes());
+                }
+                None => out.push(0),
+            }
+            out.extend_from_slice(&applied_height.to_le_bytes());
         }
         SyncResponse::Blob { bytes } => {
             out.push(8u8);
@@ -722,9 +774,70 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
                 wire::put_bytes(&mut out, r);
             }
             out.push(u8::from(c.has_floor));
+            out.extend_from_slice(&c.generation.to_le_bytes());
+            out.extend_from_slice(&(c.mesh_window.len() as u64).to_le_bytes());
+            for entry in &c.mesh_window {
+                out.extend_from_slice(&entry.generation.to_le_bytes());
+                out.extend_from_slice(&(entry.validators.len() as u64).to_le_bytes());
+                for v in &entry.validators {
+                    wire::put_bytes(&mut out, v);
+                }
+                out.extend_from_slice(&(entry.residents.len() as u64).to_le_bytes());
+                for r in &entry.residents {
+                    wire::put_bytes(&mut out, r);
+                }
+            }
         }
     }
     out
+}
+
+/// exact encoded body length of a Frames response.
+///
+/// Add RPC_AUTHED_HEADER_LEN for the complete mesh message. Saturating
+/// arithmetic makes an impossible aggregate overflow fail closed at any
+/// caller comparing the result with a transport budget.
+pub fn encoded_frames_response_len(frames: &[FinalizedFrame]) -> usize {
+    const TAG_LEN: usize = 1;
+    const U64_LEN: usize = 8;
+    const DISPOSITION_LEN: usize = 1;
+
+    frames.iter().fold(TAG_LEN + U64_LEN, |len, frame| {
+        let roots_len = frame.roots.iter().fold(0usize, |len, (module_id, _)| {
+            len.saturating_add(U64_LEN)
+                .saturating_add(module_id.len())
+                .saturating_add(ROOT_LEN)
+        });
+        len.saturating_add(U64_LEN)
+            .saturating_add(U64_LEN)
+            .saturating_add(frame.frame.len())
+            .saturating_add(DISPOSITION_LEN)
+            .saturating_add(U64_LEN)
+            .saturating_add(roots_len)
+            .saturating_add(ROOT_LEN)
+    })
+}
+
+/// exact encoded body length of an [`SyncResponse::IndexOps`] page carrying
+/// `rows`, with both optional tails PRESENT — the conservative shape, so a
+/// serve path that binary-searches this against a transport budget can never
+/// pick a prefix the real encode then overflows.
+///
+/// Add RPC_AUTHED_HEADER_LEN for the complete mesh message. Saturating
+/// arithmetic makes an impossible aggregate overflow fail closed.
+pub fn encoded_index_ops_response_len(rows: &[(String, Vec<u8>)]) -> usize {
+    const TAG_LEN: usize = 1;
+    const U64_LEN: usize = 8;
+    // presence byte + (height, seq), presence byte + floor, applied_height.
+    const TAIL_LEN: usize = 1 + 8 + 4 + 1 + 8 + 8;
+
+    rows.iter()
+        .fold(TAG_LEN + U64_LEN + TAIL_LEN, |len, (key, value)| {
+            len.saturating_add(U64_LEN)
+                .saturating_add(key.len())
+                .saturating_add(U64_LEN)
+                .saturating_add(value.len())
+        })
 }
 
 pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
@@ -862,19 +975,38 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
         5 => SyncResponse::Error(wire::take_str(&mut buf)?),
         6 => {
             let n = wire::take_u64(&mut buf)?;
-            // each entry costs at least its name length prefix + blob length,
-            // so a forged count can never drive allocation past the buffer.
+            if n > INDEX_OPS_BATCH_LEN as u64 {
+                return Err(WireError::Codec(format!(
+                    "index op page count {n} exceeds cap {INDEX_OPS_BATCH_LEN}"
+                )));
+            }
+            // each row costs at least its key + value length prefixes, so a
+            // forged count can never drive allocation past the buffer.
             if n > (buf.len() / 16) as u64 {
                 return Err(WireError::Codec(format!(
-                    "index db count {n} exceeds the {} remaining bytes",
+                    "index op row count {n} exceeds the {} remaining bytes",
                     buf.len()
                 )));
             }
-            let mut entries = Vec::with_capacity(n as usize);
+            let mut rows = Vec::with_capacity(n as usize);
             for _ in 0..n {
-                entries.push((wire::take_str(&mut buf)?, wire::take_u64(&mut buf)?));
+                rows.push((
+                    wire::take_str(&mut buf)?,
+                    wire::take_bytes(&mut buf)?.to_vec(),
+                ));
             }
-            SyncResponse::IndexModules { entries }
+            let next_after = take_op_cursor(&mut buf)?;
+            let source_floor = match wire::take_u8(&mut buf)? {
+                0 => None,
+                1 => Some(wire::take_u64(&mut buf)?),
+                t => return Err(WireError::BadTag("source floor presence", t)),
+            };
+            SyncResponse::IndexOps {
+                rows,
+                next_after,
+                source_floor,
+                applied_height: wire::take_u64(&mut buf)?,
+            }
         }
         7 => {
             let height = wire::take_u64(&mut buf)?;
@@ -910,6 +1042,45 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 1 => true,
                 t => return Err(WireError::BadTag("has_floor", t)),
             };
+            let generation = wire::take_u64(&mut buf)?;
+            let entries = wire::take_u64(&mut buf)?;
+            if entries > (buf.len() / 8) as u64 {
+                return Err(WireError::Codec(format!(
+                    "mesh window count {entries} exceeds the {} remaining bytes",
+                    buf.len()
+                )));
+            }
+            let mut mesh_window = Vec::with_capacity(entries as usize);
+            for _ in 0..entries {
+                let entry_generation = wire::take_u64(&mut buf)?;
+                let v = wire::take_u64(&mut buf)?;
+                if v > (buf.len() / 8) as u64 {
+                    return Err(WireError::Codec(format!(
+                        "window validator count {v} exceeds the {} remaining bytes",
+                        buf.len()
+                    )));
+                }
+                let mut validators = Vec::with_capacity(v as usize);
+                for _ in 0..v {
+                    validators.push(wire::take_bytes(&mut buf)?.to_vec());
+                }
+                let r = wire::take_u64(&mut buf)?;
+                if r > (buf.len() / 8) as u64 {
+                    return Err(WireError::Codec(format!(
+                        "window resident count {r} exceeds the {} remaining bytes",
+                        buf.len()
+                    )));
+                }
+                let mut residents = Vec::with_capacity(r as usize);
+                for _ in 0..r {
+                    residents.push(wire::take_bytes(&mut buf)?.to_vec());
+                }
+                mesh_window.push(MeshWindowEntry {
+                    generation: entry_generation,
+                    validators,
+                    residents,
+                });
+            }
             SyncResponse::TipCoords(TipCoords {
                 height,
                 root_hash,
@@ -918,6 +1089,8 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 participants,
                 residents,
                 has_floor,
+                generation,
+                mesh_window,
             })
         }
         8 => SyncResponse::Blob {
@@ -961,7 +1134,7 @@ pub const SYNC_AUTH_NAMESPACE: &[u8] = b"ducktape-statesync-auth-v1";
 /// client gates replies by transport peer and root-verifies payloads, so a
 /// reply's requester/proof are never inspected.
 pub fn encode_rpc_authed(requester: &[u8; 32], proof: &[u8; 64], id: u64, body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(32 + 64 + 8 + body.len());
+    let mut out = Vec::with_capacity(RPC_AUTHED_HEADER_LEN + body.len());
     out.extend_from_slice(requester);
     out.extend_from_slice(proof);
     out.extend_from_slice(&id.to_le_bytes());
@@ -1074,6 +1247,10 @@ pub struct BoundaryCoords {
     pub participants: Vec<Vec<u8>>,
     pub residents: Vec<Vec<u8>>,
     pub floor_cert: Option<Vec<u8>>,
+    /// the committed membership generation and its retained window — the
+    /// mesh's index namespace; see [`TipCoords::generation`].
+    pub generation: u64,
+    pub mesh_window: Vec<MeshWindowEntry>,
 }
 
 /// a consistent boundary capture: every payload from ONE finalized boundary.
@@ -1082,12 +1259,6 @@ struct Capture {
     root_hash: StateRoot,
     coords: BoundaryCoords,
     modules: BTreeMap<ModuleId, CapturedModule>,
-    /// shipped-index archive blobs, keyed by database name — the unverified
-    /// warm-start lane. `None` until the serving node attaches them (cut
-    /// lazily on the first index request, so joiners that never opt in cost
-    /// nothing); riding the capture ties their lifetime to its lease/evict
-    /// lifecycle.
-    index_blobs: Option<BTreeMap<String, Vec<u8>>>,
 }
 
 /// a capture produced by the state owner, ready to install into a
@@ -1201,10 +1372,14 @@ pub enum ServeStep {
         after_height: u64,
         up_to_height: u64,
     },
-    /// IndexModules on a leased-but-unattached boundary: cut the shipped-index
-    /// blobs (or decline with an empty attach), [`SyncServer::attach_index`],
-    /// then re-drive the request.
-    NeedIndexCut { boundary: BoundaryId },
+    /// IndexOps lane: read one page of the module's stored index op rows on
+    /// the state owner (which owns the derived index; this crate deliberately
+    /// does not).
+    NeedIndexOps {
+        boundary: u64,
+        module: ModuleId,
+        after: Option<(u64, u32)>,
+    },
     /// TipCoords: read the tip's consensus coordinates from the state owner —
     /// no capture, no lease, no floor-cert alignment gate.
     NeedCoords,
@@ -1259,7 +1434,6 @@ impl SyncServer {
                         root_hash: data.root_hash,
                         coords: data.coords,
                         modules: data.modules,
-                        index_blobs: None,
                     },
                 );
                 // spare the newborn: it is not leased until the manifest_for
@@ -1393,81 +1567,16 @@ impl SyncServer {
                 }
                 ServeStep::NeedModuleServe { module_id, body }
             }
-            SyncRequest::IndexModules { boundary } => {
-                let capture = self.leased_capture(boundary)?;
-                let Some(blobs) = &capture.index_blobs else {
-                    // unattached: the driver cuts + attaches (or declines with
-                    // an empty attach) and re-drives.
-                    return Ok(ServeStep::NeedIndexCut { boundary });
-                };
-                ServeStep::Reply(SyncResponse::IndexModules {
-                    entries: blobs
-                        .iter()
-                        .map(|(db, blob)| (db.clone(), blob.len() as u64))
-                        .collect(),
-                })
-            }
-            SyncRequest::IndexChunk {
+            SyncRequest::IndexOps {
                 boundary,
-                db,
-                offset,
-            } => {
-                let capture = self.leased_capture(boundary)?;
-                let blob = capture
-                    .index_blobs
-                    .as_ref()
-                    .and_then(|blobs| blobs.get(&db))
-                    .ok_or_else(|| {
-                        format!("no shipped index db {db} in capture {}", boundary.height)
-                    })?;
-                let total = blob.len() as u64;
-                if offset > total {
-                    return Err(format!(
-                        "offset {offset} past the {total}-byte index archive of {db}"
-                    ));
-                }
-                let start = offset as usize;
-                let end = (start + CHUNK_LEN).min(blob.len());
-                ServeStep::Reply(SyncResponse::Chunk {
-                    total,
-                    bytes: blob[start..end].to_vec(),
-                })
-            }
+                module,
+                after,
+            } => ServeStep::NeedIndexOps {
+                boundary,
+                module,
+                after,
+            },
         })
-    }
-
-    /// whether shipped-index blobs are already attached at `id` — the caller
-    /// (who owns the index store; this crate deliberately does not) checks
-    /// this on an [`SyncRequest::IndexModules`] and cuts + attaches first
-    /// when they are not.
-    pub fn index_attached(&self, id: BoundaryId) -> bool {
-        self.captures
-            .get(&id)
-            .is_some_and(|c| c.index_blobs.is_some())
-    }
-
-    /// attach shipped-index archive blobs (database name → encoded archive)
-    /// to a leased capture. they are served by [`SyncRequest::IndexModules`]
-    /// / [`SyncRequest::IndexChunk`] and live exactly as long as the capture.
-    /// an empty map is a valid attachment: "this source ships nothing".
-    pub fn attach_index(
-        &mut self,
-        id: BoundaryId,
-        blobs: BTreeMap<String, Vec<u8>>,
-    ) -> Result<(), String> {
-        if !self.leased.contains_key(&id) {
-            return Err(format!(
-                "boundary {} {} is not leased (refetch manifest)",
-                id.height,
-                hex_root(&id.root_hash)
-            ));
-        }
-        let capture = self
-            .captures
-            .get_mut(&id)
-            .ok_or_else(|| format!("no capture at boundary {}", id.height))?;
-        capture.index_blobs = Some(blobs);
-        Ok(())
     }
 
     #[doc(hidden)]
@@ -1478,7 +1587,6 @@ impl SyncServer {
                 root_hash: id.root_hash,
                 coords: BoundaryCoords::default(),
                 modules: BTreeMap::new(),
-                index_blobs: None,
             },
         );
     }
@@ -1571,12 +1679,17 @@ impl SyncServer {
             ServeStep::NeedFrames { .. } => {
                 Err("frame range requests require the recovery journal".into())
             }
-            ServeStep::NeedIndexCut { .. } => {
-                // this owner attaches nothing (no index store here) — an EMPTY
-                // list, not an error, so the joiner cleanly falls back to the
-                // from-state rebuild.
-                Ok(SyncResponse::IndexModules {
-                    entries: Vec::new(),
+            ServeStep::NeedIndexOps { .. } => {
+                // this owner holds no index store — an EMPTY page at floor 0,
+                // not an error: a state owner without a derived tier has
+                // nothing to say about it, and refusing would read as a fault.
+                // `applied_height: 0` is below any boundary a joiner asks for,
+                // so the fetcher refuses to lower its floor on this answer.
+                Ok(SyncResponse::IndexOps {
+                    rows: Vec::new(),
+                    next_after: None,
+                    source_floor: None,
+                    applied_height: 0,
                 })
             }
             ServeStep::NeedCoords => {
@@ -1589,6 +1702,8 @@ impl SyncServer {
                     participants: coords.participants.clone(),
                     residents: coords.residents.clone(),
                     has_floor: coords.floor_cert.is_some(),
+                    generation: coords.generation,
+                    mesh_window: coords.mesh_window.clone(),
                 }))
             }
         }
@@ -1689,22 +1804,25 @@ pub async fn fetch_tip_coords<C: SyncClient>(client: &C) -> Result<TipCoords, Sy
     }
 }
 
-/// reassemble one chunked payload: `req(offset)` builds the per-chunk request
-/// (Chunk or IndexChunk), `module` and `what` shape the mid-payload error.
-async fn fetch_chunked<C: SyncClient>(
+/// fetch a captured module's full snapshot payload, chunk by chunk.
+pub async fn fetch_snapshot<C: SyncClient>(
     client: &C,
-    module: &str,
-    what: &str,
-    req: impl Fn(u64) -> SyncRequest,
+    boundary: BoundaryId,
+    module_id: &str,
 ) -> Result<Vec<u8>, SyncError> {
     let mut out: Vec<u8> = Vec::new();
     loop {
-        match client.request(req(out.len() as u64)).await? {
+        let req = SyncRequest::Chunk {
+            boundary,
+            module_id: module_id.to_string(),
+            offset: out.len() as u64,
+        };
+        match client.request(req).await? {
             SyncResponse::Chunk { total, bytes } => {
                 if bytes.is_empty() && out.len() < total as usize {
                     return Err(SyncError::Module {
-                        module: module.to_string(),
-                        reason: format!("server returned an empty {what} mid-payload"),
+                        module: module_id.to_string(),
+                        reason: "server returned an empty chunk mid-payload".into(),
                     });
                 }
                 out.extend_from_slice(&bytes);
@@ -1722,81 +1840,146 @@ async fn fetch_chunked<C: SyncClient>(
     }
 }
 
-/// fetch a captured module's full snapshot payload, chunk by chunk.
-pub async fn fetch_snapshot<C: SyncClient>(
+/// walk one module's index op rows at or below `boundary` in ASCENDING key
+/// order, handing each page to `write` as it arrives — never accumulating,
+/// because an op history is not a resident `Vec<u8>`. returns the source's own
+/// backfill floor (the max seen across pages: a source may re-stamp mid-walk,
+/// and the higher floor is the honest one to inherit), `None` when the source
+/// claims complete coverage from genesis.
+///
+/// # trust
+///
+/// these rows are NOT consensus-verified — the derived tier has no root by
+/// design. accepting them is exactly the trust the joiner already extended to
+/// this node when it accepted canonical state from it: your own sync source.
+/// what IS enforced here, once, at the trust boundary:
+///
+/// * every key is BYTE-EXACTLY `op/{height:016x}/{seq:04x}` — not merely
+///   parseable as one. [`index_guest::parse_op_key`] reads hex with
+///   `from_str_radix`, which accepts any width and a leading `+`, so `op/2/0`
+///   parses to `(2, 0)` while sorting AFTER `op/0000000000000009/0000`. a
+///   non-canonical key would pass every ascent check here and then break key
+///   order in the store — which the next refold replays as history running
+///   backwards. the fixed width IS the ordering, so it is checked as bytes;
+/// * `(height, seq)` ascends STRICTLY across the whole walk (the caller's
+///   commit order is key order — the invariant the fold depends on);
+/// * every height is at or below `boundary`;
+/// * every row borsh-decodes as an [`index_guest::OpRow`] whose own
+///   `(height, seq)` matches its key;
+/// * the source's watermark covers `boundary` — a source that folded less
+///   than it is being asked for would leave a HOLE above the joiner's floor;
+/// * the source's own floor stays at or below `boundary` — a source that
+///   re-stamps ABOVE it mid-walk holds nothing the caller asked for, and
+///   inheriting such a floor would leave the caller claiming more missing than
+///   its own watermark says it has.
+///
+/// any violation aborts the walk with [`SyncError::Module`]; the caller keeps
+/// its stamped floor, which stays honest.
+pub async fn fetch_index_ops<C, W>(
     client: &C,
-    boundary: BoundaryId,
-    module_id: &str,
-) -> Result<Vec<u8>, SyncError> {
-    fetch_chunked(client, module_id, "chunk", |offset| SyncRequest::Chunk {
-        boundary,
-        module_id: module_id.to_string(),
-        offset,
-    })
-    .await
-}
-
-// ---- the shipped-index archive framing ------------------------------------
-// one shipped database travels as a single blob: `(file name, file bytes)`
-// pairs in the store's file order, wire-framed like everything else here.
-// the joiner hands the decoded set to the indexer's staging writer, which is
-// where hostile names (traversal, hidden files, the engine lock) are refused
-// — one enforcement point, at the trust boundary that touches disk.
-
-/// flatten one database's checkpoint file set into an archive blob.
-pub fn encode_index_archive(files: &[(String, Vec<u8>)]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for (name, bytes) in files {
-        wire::put_str(&mut out, name);
-        wire::put_bytes(&mut out, bytes);
-    }
-    out
-}
-
-/// decode an archive blob back into its file set. structural only — name
-/// policy is the staging writer's.
-pub fn decode_index_archive(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, WireError> {
-    let mut buf = bytes;
-    let mut files = Vec::new();
-    while !buf.is_empty() {
-        let name = wire::take_str(&mut buf)?;
-        let bytes = wire::take_bytes(&mut buf)?.to_vec();
-        files.push((name, bytes));
-    }
-    Ok(files)
-}
-
-/// list the shipped-index databases a source attached at a boundary. empty
-/// means the source ships nothing — fall back to the from-state rebuild.
-pub async fn fetch_index_modules<C: SyncClient>(
-    client: &C,
-    boundary: BoundaryId,
-) -> Result<Vec<(String, u64)>, SyncError> {
-    match client
-        .request(SyncRequest::IndexModules { boundary })
-        .await?
-    {
-        SyncResponse::IndexModules { entries } => Ok(entries),
-        SyncResponse::Error(e) => Err(SyncError::Server(e)),
-        other => Err(SyncError::UnexpectedResponse(other.kind_name())),
-    }
-}
-
-/// fetch one shipped-index database's full archive blob, chunk by chunk —
-/// the index twin of [`fetch_snapshot`].
-pub async fn fetch_index_db<C: SyncClient>(
-    client: &C,
-    boundary: BoundaryId,
-    db: &str,
-) -> Result<Vec<u8>, SyncError> {
-    fetch_chunked(client, db, "index chunk", |offset| {
-        SyncRequest::IndexChunk {
-        boundary,
-        db: db.to_string(),
-        offset,
+    module: &str,
+    boundary: u64,
+    mut write: W,
+) -> Result<Option<u64>, SyncError>
+where
+    C: SyncClient,
+    W: FnMut(&[(String, Vec<u8>)]) -> Result<(), String>,
+{
+    let refuse = |reason: String| SyncError::Module {
+        module: module.to_string(),
+        reason,
+    };
+    let mut cursor: Option<(u64, u32)> = None;
+    let mut floor: Option<u64> = None;
+    loop {
+        let resp = client
+            .request(SyncRequest::IndexOps {
+                boundary,
+                module: module.to_string(),
+                after: cursor,
+            })
+            .await?;
+        let SyncResponse::IndexOps {
+            rows,
+            next_after,
+            source_floor,
+            applied_height,
+        } = resp
+        else {
+            return match resp {
+                SyncResponse::Error(e) => Err(SyncError::Server(e)),
+                other => Err(SyncError::UnexpectedResponse(other.kind_name())),
+            };
+        };
+        if applied_height < boundary {
+            return Err(refuse(format!(
+                "source index watermark {applied_height} is below the requested \
+                 boundary {boundary}; backfilling would leave a hole"
+            )));
         }
-    })
-    .await
+        // a floor ABOVE the ceiling is not a truncation to inherit, it is a
+        // source that no longer holds the range at all (it re-stamped past the
+        // caller's boundary mid-walk). composing it would hand the caller a
+        // floor above its own watermark — more missing than it has.
+        if let Some(risen) = source_floor
+            && risen > boundary
+        {
+            return Err(refuse(format!(
+                "source index floor {risen} rose above the requested boundary \
+                 {boundary}; it no longer holds the range"
+            )));
+        }
+        floor = floor.max(source_floor);
+        let mut last = cursor;
+        for (key, value) in &rows {
+            let pos = index_guest::parse_op_key(key.as_bytes())
+                .ok_or_else(|| refuse(format!("row key {key:?} is not an op-row key")))?;
+            // PARSING IS NOT ENOUGH: only the canonical fixed-width rendering
+            // sorts where its position says it does, and key order is what the
+            // whole lane rests on. round-tripping the parse is the check.
+            if *key != index_guest::op_key(pos.0, pos.1) {
+                return Err(refuse(format!(
+                    "row key {key:?} is not the canonical rendering of {pos:?}"
+                )));
+            }
+            if Some(pos) <= last {
+                return Err(refuse(format!(
+                    "row key {key:?} does not ascend past {last:?}"
+                )));
+            }
+            if pos.0 > boundary {
+                return Err(refuse(format!(
+                    "row height {} is above the requested boundary {boundary}",
+                    pos.0
+                )));
+            }
+            let row = borsh::from_slice::<index_guest::OpRow>(value)
+                .map_err(|e| refuse(format!("row {key:?} is not a borsh op envelope: {e}")))?;
+            if (row.height, row.seq) != pos {
+                return Err(refuse(format!(
+                    "row {key:?} carries position ({}, {}), disagreeing with its key",
+                    row.height, row.seq
+                )));
+            }
+            last = Some(pos);
+        }
+        write(&rows).map_err(refuse)?;
+        let Some(next) = next_after else {
+            return Ok(floor);
+        };
+        // A CURSOR MUST MEAN PROGRESS. `next_after` has to be the last row
+        // actually served, and an empty page carrying one would re-ask the
+        // same cursor forever — the walk's only unbounded shape. Both are
+        // closed here: rows ascend strictly past `cursor` above, so a
+        // non-empty page's last position is strictly greater than it.
+        if rows.is_empty() || last != Some(next) {
+            return Err(refuse(format!(
+                "page cursor {next:?} is not the last of {} rows served ({last:?})",
+                rows.len()
+            )));
+        }
+        cursor = Some(next);
+    }
 }
 
 /// fetch a finite, ordered recovery-frame suffix in bounded batches.
@@ -2036,19 +2219,15 @@ mod tests {
                 after_height: 42,
                 up_to_height: 48,
             },
-            SyncRequest::IndexModules {
-                boundary: BoundaryId {
-                    height: 42,
-                    root_hash: StateRoot([4u8; ROOT_LEN]),
-                },
+            SyncRequest::IndexOps {
+                boundary: 42,
+                module: "chat".into(),
+                after: Some((7, 3)),
             },
-            SyncRequest::IndexChunk {
-                boundary: BoundaryId {
-                    height: 42,
-                    root_hash: StateRoot([4u8; ROOT_LEN]),
-                },
-                db: "_blocks".into(),
-                offset: 1 << 18,
+            SyncRequest::IndexOps {
+                boundary: 42,
+                module: "chat".into(),
+                after: None,
             },
             SyncRequest::Blob { digest: [7u8; 32] },
         ] {
@@ -2136,10 +2315,21 @@ mod tests {
                 retained_from: 12,
             },
             SyncResponse::Error("nope".into()),
-            SyncResponse::IndexModules {
-                entries: vec![("chat".into(), 4096), ("_blocks".into(), 0)],
+            SyncResponse::IndexOps {
+                rows: vec![
+                    ("op/0000000000000001/0000".into(), vec![1, 2, 3]),
+                    ("op/0000000000000002/000a".into(), Vec::new()),
+                ],
+                next_after: Some((2, 10)),
+                source_floor: Some(1),
+                applied_height: 9,
             },
-            SyncResponse::IndexModules { entries: vec![] },
+            SyncResponse::IndexOps {
+                rows: vec![],
+                next_after: None,
+                source_floor: None,
+                applied_height: 0,
+            },
         ] {
             let bytes = encode_response(&resp);
             assert_eq!(decode_response(&bytes).unwrap(), resp);
@@ -2147,18 +2337,67 @@ mod tests {
     }
 
     #[test]
-    fn index_archive_round_trips_and_rejects_truncation() {
-        let files = vec![
-            ("manifest-000001".to_string(), vec![1u8, 2, 3]),
-            ("sst-000001.tbl".to_string(), vec![0xAB; 300]),
-            ("vlog-000001.vlog".to_string(), Vec::new()),
+    fn frames_response_length_matches_codec() {
+        let frames = vec![
+            FinalizedFrame {
+                height: 8,
+                frame: vec![0xAB; 31],
+                disposition: FrameDisposition::Applied,
+                roots: vec![
+                    ("kv".into(), StateRoot([3u8; ROOT_LEN])),
+                    ("a-longer-module-id".into(), StateRoot([4u8; ROOT_LEN])),
+                ],
+                root_hash: StateRoot([5u8; ROOT_LEN]),
+            },
+            FinalizedFrame {
+                height: 9,
+                frame: Vec::new(),
+                disposition: FrameDisposition::Rejected,
+                roots: Vec::new(),
+                root_hash: StateRoot([6u8; ROOT_LEN]),
+            },
         ];
-        let blob = encode_index_archive(&files);
-        assert_eq!(decode_index_archive(&blob).unwrap(), files);
-        assert_eq!(decode_index_archive(&[]).unwrap(), Vec::new());
-        // any cut inside a frame is a loud decode error, not a short file.
-        assert!(decode_index_archive(&blob[..blob.len() - 1]).is_err());
-        assert!(decode_index_archive(&blob[..9]).is_err());
+        let encoded = encode_response(&SyncResponse::Frames {
+            frames: frames.clone(),
+        });
+        assert_eq!(encoded_frames_response_len(&frames), encoded.len());
+    }
+
+    #[test]
+    fn index_ops_response_length_bounds_the_codec() {
+        // the length helper assumes both optional tails present, so it is an
+        // upper bound for every shape — which is what a serve-side binary
+        // search against a transport cap needs to stay sound.
+        let rows = vec![
+            ("op/0000000000000001/0000".to_string(), vec![0xAB; 31]),
+            ("op/0000000000000009/0007".to_string(), Vec::new()),
+        ];
+        let widest = encode_response(&SyncResponse::IndexOps {
+            rows: rows.clone(),
+            next_after: Some((9, 7)),
+            source_floor: Some(1),
+            applied_height: 12,
+        });
+        assert_eq!(encoded_index_ops_response_len(&rows), widest.len());
+        let narrowest = encode_response(&SyncResponse::IndexOps {
+            rows: rows.clone(),
+            next_after: None,
+            source_floor: None,
+            applied_height: 12,
+        });
+        assert!(encoded_index_ops_response_len(&rows) >= narrowest.len());
+    }
+
+    #[test]
+    fn forged_index_op_page_counts_reject_before_allocation() {
+        // tag 6 then a row count far past the buffer: refused, never sized.
+        let mut bytes = vec![6u8];
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(decode_response(&bytes).is_err());
+        // and a count inside the cap but past the remaining bytes.
+        let mut bytes = vec![6u8];
+        bytes.extend_from_slice(&(INDEX_OPS_BATCH_LEN as u64).to_le_bytes());
+        assert!(decode_response(&bytes).is_err());
     }
 
     #[test]
@@ -2190,6 +2429,7 @@ mod tests {
         assert_eq!(p, &proof);
         assert_eq!(id, 99);
         assert_eq!(body, b"body");
+        assert_eq!(framed.len(), RPC_AUTHED_HEADER_LEN + body.len());
         // anything shorter than the 32+64+8 fixed header is Truncated.
         assert!(
             decode_rpc_authed(&framed[..32 + 64 + 7]).is_err(),

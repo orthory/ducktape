@@ -4,6 +4,7 @@
 //! all node logic lives in the library; this file is arg parsing + program
 //! output (the CLI's stdout lines) + turning a fatal into exit 1.
 
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -118,6 +119,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("simnode boot failed: {error}");
         std::process::exit(1);
     });
+    // Machine-readable readiness for child-process drivers. `:0` is the only
+    // collision-free reservation across the genesis-to-bind gap, so report the
+    // actual port only after `boot` owns its listener.
+    println!("DUCKTAPE_SIMNODE_LISTEN={}", handle.addr());
+    std::io::stdout().flush()?;
     tracing::info!(
         target: "ducktape::node",
         listen = %handle.addr(),

@@ -269,6 +269,15 @@ pub enum ReachabilityEvent {
         peer: ed25519::PublicKey,
         interface: String,
     },
+    /// A peer's signed CONTROL endpoint (its mesh address) was accepted with
+    /// a value that differs from the last one observed for that identity —
+    /// the node feeds it to the mesh transport's address book. Emitted
+    /// only-on-change from every record/advert acceptance path and the boot
+    /// restore; `peer` is the owner's raw ed25519 identity bytes.
+    ControlEndpointObserved {
+        peer: ValidatorIdentity,
+        control_endpoint: SocketAddr,
+    },
 }
 
 /// How a peer's WireGuard endpoint was resolved.
@@ -383,6 +392,23 @@ const RENDEZVOUS_FALLBACK_BACKOFF: Duration = Duration::from_secs(
 /// being swept for the epoch; the next `Retarget`'s fresh `EpochState`
 /// resets `rendezvous_attempted` and grants a new budget.
 const RENDEZVOUS_FALLBACK_MAX_ATTEMPTS: u32 = 3;
+
+/// The epoch's record-nonce seed: unix time in MILLISECONDS. Wall-clock for
+/// the same reason the rendezvous readvertise nonce is (see
+/// `rendezvous_keepalive`): a REBOOTED node re-signs the SAME epoch tuple,
+/// and its previous life's nonces are already burnt into every peer's dedup
+/// gates (`prewarm_nonces`, the phase-A record map) — a fixed seed would
+/// replay-drop the reboot's re-introduction for the rest of the epoch
+/// (#1102). Milliseconds so even a sub-second orchestrator relaunch still
+/// climbs. A broken clock degrades to 0 exactly like
+/// `nat_traversal::now_secs`: the node then re-advertises as a stale life
+/// and heals at the next cutover.
+fn epoch_nonce_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
 
 /// Pure backoff/budget decision: attempt iff never attempted this epoch, or
 /// the backoff window has elapsed AND the per-epoch attempt budget remains.
@@ -1080,7 +1106,10 @@ struct EpochState {
     routes: HashMap<ValidatorIdentity, ed25519::PublicKey>,
     /// One strictly-monotonic counter for EVERYTHING this identity signs in
     /// the epoch — replay keys are `(identity, epoch, nonce)`, and the
-    /// advert duplicate rule wants strictly-increasing nonces too.
+    /// advert duplicate rule wants strictly-increasing nonces too. Seeded
+    /// from wall clock (`epoch_nonce_seed`), never a constant, so a reboot's
+    /// fresh counter still supersedes everything the previous life signed
+    /// for this same epoch tuple.
     nonce: u64,
     /// This node's own signed record for the epoch — what the nudge
     /// re-offers. In the member role it also lives in `records`; in the
@@ -1175,6 +1204,11 @@ struct Driver<'a, E, R> {
     /// entry never overrides a validated plan or a pre-warm record for the
     /// same identity, and dissolves once one exists).
     invite_peers: BTreeMap<ValidatorIdentity, PeerTunnelConfig>,
+    /// the last CONTROL endpoint observed per identity — the only-on-change
+    /// ledger behind [`ReachabilityEvent::ControlEndpointObserved`].
+    /// deliberately epoch-independent: a cutover must not re-announce
+    /// unchanged addresses.
+    control_endpoints: BTreeMap<ValidatorIdentity, SocketAddr>,
 }
 
 /// Drive the reachability plane until `Shutdown` (clean exit) or a channel
@@ -1227,6 +1261,7 @@ where
         base_peers: None,
         restore_tried: false,
         invite_peers: BTreeMap::new(),
+        control_endpoints: BTreeMap::new(),
     };
     while let Some(command) = commands.recv().await {
         match command {
@@ -1280,6 +1315,31 @@ where
             .send(event)
             .await
             .map_err(|_| ReachabilityError::ChannelClosed)
+    }
+
+    /// announce an accepted CONTROL endpoint to the node, only when it
+    /// differs from the last one observed for that identity. one ledger for
+    /// every acceptance path (member/standby role, records, adverts, the
+    /// boot restore), so the mesh address book upstream is never churned by
+    /// re-gossip of an unchanged address. own endpoint is skipped — the node
+    /// does not dial itself.
+    async fn observe_control_endpoint(
+        &mut self,
+        owner: ValidatorIdentity,
+        endpoint: Endpoint,
+    ) -> Result<(), ReachabilityError> {
+        if owner == self.me {
+            return Ok(());
+        }
+        let socket = endpoint.socket_addr();
+        if !control_endpoint_changed(&mut self.control_endpoints, owner, socket) {
+            return Ok(());
+        }
+        self.emit(ReachabilityEvent::ControlEndpointObserved {
+            peer: owner,
+            control_endpoint: socket,
+        })
+        .await
     }
 
     async fn send_msg(
@@ -1375,6 +1435,10 @@ where
             .copied()
             .filter(|id| *id != self.me)
             .collect();
+        // the epoch's first signed nonce — wall-clock-seeded so a reboot's
+        // re-signed record strictly supersedes its previous life's (#1102,
+        // see `epoch_nonce_seed`); the counter below starts past it.
+        let epoch_nonce = epoch_nonce_seed();
         let own = SignedEndpointRecord::sign(
             EndpointRecord {
                 namespace: self.config.chain_id.clone(),
@@ -1385,9 +1449,7 @@ where
                 wireguard_public_key: self.keypair.public_key(),
                 control_endpoint: self.config.control_endpoint,
                 wireguard_endpoint: self.config.wireguard_advertised,
-                // the epoch's first signed nonce; the counter below starts
-                // past it.
-                nonce: 1,
+                nonce: epoch_nonce,
             },
             &self.config.signer,
         );
@@ -1402,7 +1464,7 @@ where
             standby_records: BTreeMap::new(),
             prewarm_peers: BTreeMap::new(),
             routes: HashMap::new(),
-            nonce: 1,
+            nonce: epoch_nonce,
             own_record: own.clone(),
             records: BTreeMap::new(),
             adverts: BTreeMap::new(),
@@ -1529,6 +1591,20 @@ where
             .filter(|signed| standby_ids.contains(&signed.record.validator_identity))
             .cloned()
             .collect();
+        // the restored records' control endpoints feed the mesh address
+        // book exactly like live acceptances — a cold restart's book starts
+        // from the same signed evidence the tunnels do.
+        for record in &records {
+            self.observe_control_endpoint(record.validator_identity, record.control_endpoint)
+                .await?;
+        }
+        for signed in &standby_records {
+            self.observe_control_endpoint(
+                signed.record.validator_identity,
+                signed.record.control_endpoint,
+            )
+            .await?;
+        }
         if records.is_empty() && standby_records.is_empty() {
             return Ok(Vec::new());
         }
@@ -1780,35 +1856,78 @@ where
         for (peer, msg) in sends.into_iter().chain(prewarm_sends) {
             self.send_msg(peer, &msg).await?;
         }
-        // change 2 / issue #331: retry the by-identity rendezvous fallback
-        // for any MEMBER peer that is still endpoint-less and still missing
-        // a punched override. `resolve_peer`'s single attempt at handshake
-        // time can lose the race against the peer's own coordinator
-        // registration (both sides often boot together); `resolve_peer`'s
-        // own backoff + bounded per-epoch budget
-        // (`should_attempt_rendezvous_fallback` /
-        // `RENDEZVOUS_FALLBACK_MAX_ATTEMPTS`) keeps this from hammering the
-        // coordinator on every 2s `Nudge` and from sweeping an unpunchable
-        // peer forever — the sweep goes quiet once the budget is spent and
-        // re-arms only at the next epoch's `Retarget`.
-        let retry_targets: Vec<ValidatorIdentity> = match &self.state {
-            Some(state) if state.role == Role::Member => state
+        // the endpoint-less rendezvous sweep, one per role: change 2 /
+        // issue #331 for a member's phase-A peers, issue #1104 for a
+        // standby's pre-warm members. Both ride the same backoff + bounded
+        // per-epoch budget (`should_attempt_rendezvous_fallback` /
+        // `RENDEZVOUS_FALLBACK_MAX_ATTEMPTS`), which keeps the 2s `Nudge`
+        // cadence from hammering the coordinator and from sweeping an
+        // unpunchable peer forever — a sweep goes quiet once the budget is
+        // spent and re-arms only at the next epoch's `Retarget`.
+        match self.state.as_ref().map(|state| state.role) {
+            Some(Role::Member) => self.sweep_member_rendezvous_fallback().await,
+            Some(Role::Standby) => self.sweep_standby_rendezvous_fallback().await,
+            None => Ok(()),
+        }
+    }
+
+    /// change 2 / issue #331: retry the by-identity rendezvous fallback for
+    /// any MEMBER peer that is still endpoint-less and still missing a
+    /// punched override — `resolve_peer`'s single attempt at handshake time
+    /// can lose the race against the peer's own coordinator registration
+    /// (both sides often boot together).
+    async fn sweep_member_rendezvous_fallback(&mut self) -> Result<(), ReachabilityError> {
+        let state = self.state.as_ref().expect("sweep inside an epoch");
+        let retry_targets: Vec<ValidatorIdentity> = state
+            .peers
+            .iter()
+            .copied()
+            .filter(|peer| {
+                !state.overrides.contains_key(peer)
+                    && state
+                        .view_state
+                        .as_ref()
+                        .and_then(|view| view.record(*peer))
+                        .is_some_and(|record| record.wireguard_endpoint.is_none())
+            })
+            .collect();
+        for peer in retry_targets {
+            self.resolve_peer(peer).await?;
+        }
+        Ok(())
+    }
+
+    /// issue #1104: the standby's half of the sweep — rendezvous any member
+    /// whose EFFECTIVE pre-warm entry (the pre-warm layer merged over the
+    /// restored base, `sync_prewarm`'s own layering) is endpoint-less. After
+    /// a reboot that is every fully-NATed member: `restore()` reinstalls
+    /// them endpoint-less from the persisted mesh, and their live records
+    /// cannot arrive to replace them — plane gossip rides the very tunnels
+    /// the missing endpoints keep down. A member with no entry in either
+    /// layer is NOT swept: with no record there is no WireGuard key to
+    /// install, and live assembly still owes us the record itself.
+    async fn sweep_standby_rendezvous_fallback(&mut self) -> Result<(), ReachabilityError> {
+        let targets: Vec<ValidatorIdentity> = {
+            let state = self.state.as_ref().expect("sweep inside an epoch");
+            state
                 .peers
                 .iter()
                 .copied()
                 .filter(|peer| {
-                    !state.overrides.contains_key(peer)
-                        && state
-                            .view_state
-                            .as_ref()
-                            .and_then(|view| view.record(*peer))
-                            .is_some_and(|record| record.wireguard_endpoint.is_none())
+                    let effective = state
+                        .prewarm_peers
+                        .get(peer)
+                        .or_else(|| self.base_peers.as_ref().and_then(|base| base.get(peer)));
+                    effective.is_some_and(|config| config.endpoint.is_none())
                 })
-                .collect(),
-            _ => Vec::new(),
+                .collect()
         };
-        for peer in retry_targets {
-            self.resolve_peer(peer).await?;
+        let mut healed = false;
+        for peer in targets {
+            healed |= self.resolve_standby_prewarm_via_rendezvous(peer).await?;
+        }
+        if healed {
+            self.sync_prewarm().await?;
         }
         Ok(())
     }
@@ -2052,6 +2171,8 @@ where
             self.send_msg(owner, &ReachabilityMsg::Record(own)).await?;
         }
         if accepted {
+            self.observe_control_endpoint(owner, signed.record.control_endpoint)
+                .await?;
             // relay the news: peers with no link to the owner only ever see
             // its record through us — the standbys included, whose pre-warm
             // tunnels want every member's record. Accept-gated, so the
@@ -2148,6 +2269,8 @@ where
         } else if via == owner {
             state.routes.remove(&owner);
         }
+        self.observe_control_endpoint(owner, signed.record.control_endpoint)
+            .await?;
         // the accepted record reaches disk NOW, not at the epoch apply: a
         // solo member never mints plans, and a reboot between accept and the
         // next apply would otherwise strand this standby for good (it cannot
@@ -2243,6 +2366,8 @@ where
             self.send_msg(owner, &ReachabilityMsg::Advert(own)).await?;
         }
         if accepted {
+            self.observe_control_endpoint(owner, advert.record.control_endpoint)
+                .await?;
             // standbys ride the advert flood too: the signed advert set is
             // what they persist for their promotion reboot's restore.
             let targets: Vec<ValidatorIdentity> = {
@@ -2352,6 +2477,8 @@ where
             _ => {}
         }
         state.prewarm_nonces.insert(owner, record.nonce);
+        self.observe_control_endpoint(owner, record.control_endpoint)
+            .await?;
         // endpoint-less member record: install without an endpoint — it initiates.
         let endpoint = match record.wireguard_endpoint.map(|e| e.socket_addr()) {
             None => None,
@@ -2627,13 +2754,70 @@ where
         if state.overrides.contains_key(&peer) {
             return Ok(()); // already resolved this epoch.
         }
+        let Some(addr) = self.attempt_rendezvous_by_identity(peer).await? else {
+            return Ok(());
+        };
+        let state = self.state.as_mut().expect("still in epoch");
+        state.overrides.insert(peer, addr);
+        Ok(())
+    }
+
+    /// The standby twin of `resolve_peer_via_rendezvous_fallback`
+    /// (issue #1104): same coordinator gate, same shared per-epoch budget —
+    /// but the source of truth and the write target are the pre-warm layer,
+    /// not the phase-A view/overrides a standby never assembles. The
+    /// resolved address lands as a pre-warm entry cloned from the effective
+    /// config (the WireGuard key and allowed-ips carry over); the sweep
+    /// batches one `sync_prewarm` for all of them. Returns whether an
+    /// endpoint was written.
+    async fn resolve_standby_prewarm_via_rendezvous(
+        &mut self,
+        peer: ValidatorIdentity,
+    ) -> Result<bool, ReachabilityError> {
+        if self.config.coordinators.is_empty() {
+            return Ok(false);
+        }
+        let effective = {
+            let state = self.state.as_ref().expect("resolving inside an epoch");
+            state
+                .prewarm_peers
+                .get(&peer)
+                .or_else(|| self.base_peers.as_ref().and_then(|base| base.get(&peer)))
+                .cloned()
+        };
+        let Some(mut config) = effective else {
+            return Ok(false);
+        };
+        if config.endpoint.is_some() {
+            return Ok(false); // already dialable.
+        }
+        let Some(addr) = self.attempt_rendezvous_by_identity(peer).await? else {
+            return Ok(false);
+        };
+        config.endpoint = Some(addr);
+        let state = self.state.as_mut().expect("still in epoch");
+        state.prewarm_peers.insert(peer, config);
+        Ok(true)
+    }
+
+    /// The by-identity rendezvous attempt both role sweeps share: burn one
+    /// unit of the per-epoch budget (`should_attempt_rendezvous_fallback` /
+    /// `rendezvous_attempted`), resolve through the coordinator, surface a
+    /// failed resolve as `PeerFailed`. `None` means no address this round —
+    /// the budget refused the attempt, or the resolve failed (already
+    /// reported); both non-fatal, a later `Nudge` retries.
+    async fn attempt_rendezvous_by_identity(
+        &mut self,
+        peer: ValidatorIdentity,
+    ) -> Result<Option<SocketAddr>, ReachabilityError> {
+        let state = self.state.as_ref().expect("resolving inside an epoch");
         let now = Instant::now();
         let previous = state
             .rendezvous_attempted
             .get(&peer)
             .map(|(last, attempts)| (now.saturating_duration_since(*last), *attempts));
         if !should_attempt_rendezvous_fallback(previous) {
-            return Ok(());
+            return Ok(None);
         }
         let pk = state.pk_of.get(&peer).cloned();
         let state = self.state.as_mut().expect("still in epoch");
@@ -2644,11 +2828,7 @@ where
             .resolve_rendezvous_endpoint(binding::node_key(peer))
             .await
         {
-            Ok(addr) => {
-                let state = self.state.as_mut().expect("still in epoch");
-                state.overrides.insert(peer, addr);
-                Ok(())
-            }
+            Ok(addr) => Ok(Some(addr)),
             Err(reason) => {
                 if let Some(pk) = pk {
                     self.emit(ReachabilityEvent::PeerFailed {
@@ -2657,7 +2837,7 @@ where
                     })
                     .await?;
                 }
-                Ok(())
+                Ok(None)
             }
         }
     }
@@ -3240,9 +3420,45 @@ where
     }
 }
 
+/// record `socket` as `owner`'s control endpoint in the ledger, answering
+/// whether it CHANGED — the pure decision behind
+/// [`ReachabilityEvent::ControlEndpointObserved`]'s only-on-change contract.
+fn control_endpoint_changed(
+    ledger: &mut BTreeMap<ValidatorIdentity, SocketAddr>,
+    owner: ValidatorIdentity,
+    socket: SocketAddr,
+) -> bool {
+    ledger.insert(owner, socket) != Some(socket)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_endpoint_ledger_fires_only_on_change() {
+        let mut ledger = BTreeMap::new();
+        let owner = ValidatorIdentity([7; 32]);
+        let first: SocketAddr = "192.0.2.1:8846".parse().unwrap();
+        let moved: SocketAddr = "192.0.2.2:8846".parse().unwrap();
+
+        assert!(
+            control_endpoint_changed(&mut ledger, owner, first),
+            "first observation is a change"
+        );
+        assert!(
+            !control_endpoint_changed(&mut ledger, owner, first),
+            "re-gossip of the same endpoint is silent"
+        );
+        assert!(
+            control_endpoint_changed(&mut ledger, owner, moved),
+            "a moved endpoint fires"
+        );
+        assert!(
+            control_endpoint_changed(&mut ledger, ValidatorIdentity([8; 32]), first),
+            "identities are independent"
+        );
+    }
 
     #[test]
     fn exactly_one_side_of_every_pair_initiates() {

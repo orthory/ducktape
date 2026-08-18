@@ -2,12 +2,11 @@
 // desk / rail / sidebar / content. iced has no backdrop blur, so every surface
 // here is opaque paper; nothing in this file tints, gradients or floats.
 //
-// THE RAIL DECISION. The console has EXACTLY EIGHT seats — Chat, Pages, Forge,
-// Agents, Files, Explorer, Members, Approvals — and no Node capsule. Node facts
-// live in the titlebar's status card (below) and in Settings, reached from the
-// rail's footer button. `shell_nav` returns those eight and nothing else, so
-// WorkspaceTabs routes eight screens plus settings; there is no `node` slot and
-// no Modules seat (its catalog has no data source at all).
+// THE RAIL DECISION. Collaboration modules and this daemon's operator surface
+// are peers here: Node owns status, standing, peers, logs and the code registry.
+// Settings stays in the footer because it owns device preferences and workspace
+// lifecycle. Modules remains a tab inside Node because its catalog describes
+// code this daemon executes rather than a separate collaboration surface.
 //
 // TYPE SCALE. The artifact's own values where the scale carries them — the
 // network name is 11.5 and the chip mark 7 (nearest step 7.5). The scale was
@@ -164,7 +163,7 @@ component StatusPill(degraded:bool, loading:bool)
 // state field ever held them, and filling them cost `load_node_facts` a second
 // HTTP round trip whose handler re-encodes the WHOLE Prometheus registry
 // uncached. They are gone; a gossip row starts by deciding what it needs.
-component StatusCard(degraded:bool, loading:bool, answered:bool, height:i64, sync_line:str, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64)
+component StatusCard(degraded:bool, loading:bool, answered:bool, height:i64, sync_line:str, tier:str, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, wall_now:i64)
   box #root
     with
       w=284.0
@@ -338,7 +337,7 @@ component StatusCard(degraded:bool, loading:bool, answered:bool, height:i64, syn
               font=code_medium
               @text-hint
           space w=fill
-          text relative_time(last_finalized)
+          text relative_time(last_finalized, wall_now)
             with
               size=10.5
               wrap=none
@@ -420,7 +419,7 @@ component BellBadge(count:i64, sev:str, plate:f64)
 // 40px: a 39px bar over its 1px rule. This bar exists only in the console
 // window — the launch window wears the OS's own chrome — so the chip and the
 // right cluster are unconditional now.
-component TitleBar(network:str, height:i64, sync_line:str, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64)
+component TitleBar(network:str, height:i64, sync_line:str, loading:bool, degraded:bool, bell_badge:i64, bell_sev:str, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, wall_now:i64)
   emits
     toggle_bell
     switch_network
@@ -463,7 +462,7 @@ component TitleBar(network:str, height:i64, sync_line:str, loading:bool, degrade
               style=transparent
             StatusPill degraded=degraded loading=loading
             box pr=13.0
-              StatusCard
+              StatusCard wall_now=wall_now
                 with
                   degraded
                   loading
@@ -569,12 +568,13 @@ component ConnectionBanner(status:str)
 // Forge alone wears a live dot while an agent is running.
 component RailButton(item:NavItem)
   emits
-    select_shell_tab(str)
+    select_shell_tab(ShellTab)
   stack #root w=58.0
     if item.active
       button -> emit(select_shell_tab, item.id)
         with
           label=item.title
+          checked=item.active
           w=58.0
           p=0.0
           @icon_action
@@ -602,6 +602,7 @@ component RailButton(item:NavItem)
       button -> emit(select_shell_tab, item.id)
         with
           label=item.title
+          checked=item.active
           w=58.0
           p=0.0
           @icon_action
@@ -672,9 +673,9 @@ component RailButton(item:NavItem)
               font=code_semibold
               @text-brand_fg
 
-component NavRail(tab:str, approvals:i64, account:str, agent_live:bool)
+component NavRail(tab:ShellTab, approvals:i64, account:str, agent_live:bool)
   emits
-    select_shell_tab(str)
+    select_shell_tab(ShellTab)
   box #root
     with
       w=74.0
@@ -706,10 +707,11 @@ component NavRail(tab:str, approvals:i64, account:str, agent_live:bool)
             RailButton item=item
               forward
                 select_shell_tab
-      if tab == "settings"
-        button -> emit(select_shell_tab, "settings")
+      if tab == ShellTab.settings
+        button -> emit(select_shell_tab, ShellTab.settings)
           with
             label="Settings"
+            checked=true
             p=8.0
             @icon_action
           Icon
@@ -720,10 +722,11 @@ component NavRail(tab:str, approvals:i64, account:str, agent_live:bool)
           active bg=selected_row text=fg border=transparent border-w=1.0 r=9.0
           hovered bg=rail_hover text=fg
           pressed bg=selected_row text=fg
-      if tab != "settings"
-        button -> emit(select_shell_tab, "settings")
+      if tab != ShellTab.settings
+        button -> emit(select_shell_tab, ShellTab.settings)
           with
             label="Settings"
+            checked=false
             p=8.0
             @icon_action
           Icon
@@ -738,7 +741,7 @@ component NavRail(tab:str, approvals:i64, account:str, agent_live:bool)
       // The avatar is the one thing hung below the footer button: a 1.5px
       // paper ring inside a 1px hairline halo, which no other person plate in
       // the app wears.
-      button -> emit(select_shell_tab, "settings")
+      button -> emit(select_shell_tab, ShellTab.settings)
         with
           label="Account"
           p=0.0
@@ -844,9 +847,9 @@ component ScreenHeader(title:str, meta:str)
         bg=separator
       space w=1.0 h=1.0
 
-component WorkspaceTabs(network:str, status:str, height:i64, sync_line:str, loading:bool, degraded:bool, tab:str, bell_count:i64, bell_sev:str, approvals:i64, account:str, agent_live:bool, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64)
+component WorkspaceTabs(network:str, status:str, height:i64, sync_line:str, loading:bool, degraded:bool, tab:ShellTab, bell_count:i64, bell_sev:str, approvals:i64, account:str, agent_live:bool, tier:str, answered:bool, root_hash:str, consensus_view:str, quorum:str, reachable:str, last_finalized:i64, wall_now:i64)
   emits
-    select_shell_tab(str)
+    select_shell_tab(ShellTab)
     toggle_bell
     switch_network
   box
@@ -858,7 +861,7 @@ component WorkspaceTabs(network:str, status:str, height:i64, sync_line:str, load
       px-snap=true
     stack w=fill h=fill
       col w=fill h=fill
-        TitleBar #titlebar
+        TitleBar wall_now=wall_now #titlebar
           with
             network
             height
@@ -903,24 +906,28 @@ component WorkspaceTabs(network:str, status:str, height:i64, sync_line:str, load
                 ConnectionBanner status=status
               slot notice
               match tab
-                "chat"
+                ShellTab.chat
                   slot chat
-                "pages"
+                ShellTab.shell
+                  slot shell
+                ShellTab.pages
                   slot pages
-                "files"
-                  slot files
-                "members"
-                  slot members
-                "agents"
-                  slot agents
-                "forge"
+                ShellTab.forge
                   slot forge
-                "governance"
-                  slot governance
-                "settings"
-                  slot settings
-                _
+                ShellTab.agents
+                  slot agents
+                ShellTab.files
+                  slot files
+                ShellTab.explorer
                   slot explorer
+                ShellTab.node
+                  slot node
+                ShellTab.members
+                  slot members
+                ShellTab.governance
+                  slot governance
+                ShellTab.settings
+                  slot settings
 
       slot palette
       slot bell

@@ -1,11 +1,15 @@
-// THIS NODE — the facts /v1/status publishes, its peers, its log stream, the
-// settings screen behind them, and leaving the workspace.
+// THIS NODE — the facts /v1/status publishes, its peers, its log stream, and
+// the dedicated operator screen that draws them.
 
 on node_log_line(line)
-  node_log_lines = push_log_line(node_log_lines, line)
+  node_log_timeline = node_log_timeline_push(node_log_timeline, line)
 
 on node_log_filter_changed(next)
   node_log_filter = next
+  node_log_timeline = node_log_timeline_filter(node_log_timeline, next)
+
+on node_log_timeline_changed(event)
+  node_log_timeline = node_log_timeline_apply(node_log_timeline, event)
 
 on peers_loaded(next)
   return if next.generation != node_peers_generation
@@ -23,7 +27,7 @@ on peers_failed(cause)
 // node genuinely has no reading, so the console prints an absence as an absence
 // instead of as a measured zero.
 on node_facts_loaded(next)
-  return if next.generation != node_facts_generation
+  node_key = next.public_key
   node_version = next.version
   node_root_hash = next.root_hash
   node_last_finalized = next.last_finalized_at
@@ -40,15 +44,12 @@ on node_facts_loaded(next)
   node_sync_failures = next.sync_failures
   node_sync_last_error = next.sync_last_error
 
-on node_facts_failed(cause)
-  return if cause.generation != node_facts_generation
+on node_facts_failed(_cause)
 
-// A PUSHED status document (lifecycle.ice's ungated subscription).
-//
-// NO GENERATION GUARD, and that is not an omission: a generation retires a
-// stale REPLY to a request this app made, and a push answers no request. The
-// freshest sample simply wins, which is the order the node already gives.
+// A PUSHED status document (lifecycle.ice's ungated subscription). It answers
+// no request, so the freshest sample simply wins in the node's stream order.
 on node_status_pushed(next)
+  node_key = next.public_key
   node_version = next.version
   node_root_hash = next.root_hash
   node_last_finalized = next.last_finalized_at
@@ -69,19 +70,24 @@ on node_status_pushed(next)
 on node_peers_pushed(next)
   node_peers = next.peers
 
-// Overview | Permissions | Activity, inside Settings now that the Node rail
-// seat is gone. The log stream below subscribes on this tab.
+// Overview | Permissions | Activity | Modules on the Node rail surface. The
+// log stream subscribes only while its tab is visible.
 on select_node_tab(tab)
   node_tab = tab
 
 on settings_loaded(next)
   return if next.generation != settings_generation
-  settings_endpoint = next.endpoint
-  settings_node_key = next.node_key
-  settings_data_dir = next.data_dir
+  node_data_dir = next.data_dir
   settings_key_path = next.key_path
   settings_key_state = next.key_state
   settings_user_key = next.user_key
+  // THIS DEVICE'S KEY DECIDES BOTH: which channels are its own DMs, and
+  // whether it is seated in a members-only room. The facts load lands after the
+  // first chat load, so without these the sidebar listed every DM under
+  // CHANNELS and the composer stayed refused until the next delta.
+  rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
+  dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
+  post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   settings_open_tabs = next.open_tabs
 
 on settings_failed(cause)
@@ -89,17 +95,17 @@ on settings_failed(cause)
 
 on settings_clear_tabs
   doc_tabs = []
-  run clear_doc_tabs(connected_rpc) -> doc_tabs_saved _
+  run every clear_doc_tabs(connected_rpc) -> doc_tabs_saved _
 
 // IDENTITY KEY — the session's signing seat. Unlock VERIFIES the password
 // against user.key before keeping it; the old CONNECTION field stored blind.
 // Optimistically stored, cleared by the failure arm — the launch window's
 // unlock uses the same shape.
 on settings_unlock_submit(pw)
-  return if mutation_phase != "idle" || empty(pw)
+  return if mutation_phase != MutationPhase.idle || empty(pw)
   error = ""
   password = pw
-  run unlock_user_key(password) -> settings_unlocked _ | settings_unlock_failed _
+  run every unlock_user_key(password) -> settings_unlocked _ | settings_unlock_failed _
 
 on settings_unlocked(_pubkey)
   error = ""
@@ -108,16 +114,21 @@ on settings_unlock_failed(cause)
   password = ""
   error = cause.message
 
+// Locking clears the password AND retires the session signer: the child that
+// holds the opened user key must not outlive the seat it was opened for.
 on lock_session
   password = ""
+  flow
+    from run lock_signer()
+    discard
 
 // PREFERENCES — device-local, one endpoint at a time.
 // DANGER ZONE — forget this workspace on THIS DEVICE and go back to onboarding.
 on forget_workspace_submit
-  return if !connected || mutation_phase != "idle"
-  mutation_phase = "forget-workspace"
+  return if !connected || mutation_phase != MutationPhase.idle
+  mutation_phase = MutationPhase.forget_workspace
   error = ""
-  run forget_workspace(connected_rpc) -> workspace_forgotten _ | mutation_failed _
+  run every forget_workspace(connected_rpc) -> workspace_forgotten _ | mutation_failed _
 
 // `forget_workspace` answers false when the prefs file could not be written.
 // Throwing her out to onboarding on that answer meant the workspace was back in
@@ -125,7 +136,7 @@ on forget_workspace_submit
 // On success the launch window reopens; `onboarding_reopened`
 // (handlers/onboarding.ice) closes the console once it is registered.
 on workspace_forgotten(forgotten)
-  mutation_phase = "idle"
+  mutation_phase = MutationPhase.idle
   error = "This device could not forget the workspace."
   return if !forgotten
   connected = false
@@ -137,7 +148,6 @@ on workspace_forgotten(forgotten)
 // copy lives at the call site and the write itself stays native.
 on copy_to_clipboard(text, label)
   toast = label
-  toast_tone = "info"
   toast_age = 0
   task clipboard write text
 
@@ -155,24 +165,16 @@ on toast_tick
   toast = ""
   toast_age = 0
 
-// Held here beside the loaders that fill them.
-state
-  module_rows:[ModuleRow] = []
-  module_generation:i64 = 0
-
 // The Modules tab picks its own seat AND fetches its own reading — a tab whose
 // list is only filled by a refresh somewhere else opens empty on first click.
 on open_node_modules
-  node_tab = "modules"
+  node_tab = NodeTab.modules
   return if !connected
-  module_generation = module_generation + 1
-  run load_modules(connected_rpc, module_generation) -> modules_loaded _ | modules_failed _
+  run replace lane=modules_load load_modules(connected_rpc) -> modules_loaded _ | modules_failed _
 
 on modules_loaded(next)
-  return if next.generation != module_generation
   module_rows = next.rows
   error = ""
 
 on modules_failed(cause)
-  return if cause.generation != module_generation
   error = cause.message

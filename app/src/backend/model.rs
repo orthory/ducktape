@@ -1,5 +1,29 @@
 use super::*;
 
+/// A selected loader call. Ice task-flow transforms may read only their input,
+/// so the optional carries every argument the chosen effect needs.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct LoadRequest {
+    pub rpc: String,
+    pub key: String,
+    pub generation: i64,
+}
+
+/// Select a loader without launching an offscreen refusal. `try` turns
+/// `None` into `Task::none`, leaving any unrelated in-flight lane untouched.
+pub fn load_request(
+    condition: bool,
+    rpc: String,
+    key: String,
+    generation: i64,
+) -> Option<LoadRequest> {
+    condition.then_some(LoadRequest {
+        rpc,
+        key,
+        generation,
+    })
+}
+
 pub fn fresh_operation_id(prefix: String) -> String {
     fresh_id(&prefix)
 }
@@ -41,14 +65,6 @@ pub fn merge_pending_blocks(
     }
     merged.extend(pending_by_anchor.into_values().flatten());
     merged
-}
-
-pub fn rollback_blocks(mut blocks: Vec<PageBlock>, keep_pending: bool) -> Vec<PageBlock> {
-    if keep_pending {
-        return blocks;
-    }
-    blocks.retain(|block| !block.pending);
-    blocks
 }
 
 pub fn append_page_comment_threads(
@@ -107,33 +123,76 @@ pub fn retain_for_endpoint(value: String, current: String, next: String) -> Stri
     }
 }
 
-pub fn mutation_failure_phase(committed: bool) -> String {
-    if committed { "recovering" } else { "idle" }.into()
+pub fn mutation_failure_phase(committed: bool) -> crate::MutationPhase {
+    if committed {
+        crate::MutationPhase::Recovering
+    } else {
+        crate::MutationPhase::Idle
+    }
 }
 
-fn committed_message_change(phase: &str, committed: bool) -> bool {
-    committed && matches!(phase, "message-edit" | "message-delete")
+pub fn mutation_phase_after_recovery(current: crate::MutationPhase) -> crate::MutationPhase {
+    if current == crate::MutationPhase::Recovering {
+        crate::MutationPhase::Idle
+    } else {
+        current
+    }
 }
 
-pub fn message_seq_after_failure(current: i64, phase: String, committed: bool) -> i64 {
-    if committed_message_change(&phase, committed) {
+fn committed_message_change(phase: crate::MutationPhase, committed: bool) -> bool {
+    if !committed {
+        return false;
+    }
+    match phase {
+        crate::MutationPhase::MessageDelete | crate::MutationPhase::MessageEdit => true,
+        crate::MutationPhase::Idle
+        | crate::MutationPhase::Recovering
+        | crate::MutationPhase::BlockComment
+        | crate::MutationPhase::Channel
+        | crate::MutationPhase::ChannelArchive
+        | crate::MutationPhase::ChannelMember
+        | crate::MutationPhase::ChannelRename
+        | crate::MutationPhase::ChannelUnarchive
+        | crate::MutationPhase::CommentResolve
+        | crate::MutationPhase::ForgetWorkspace
+        | crate::MutationPhase::Huddle
+        | crate::MutationPhase::Onboarding
+        | crate::MutationPhase::Page
+        | crate::MutationPhase::PageDelete => false,
+    }
+}
+
+pub fn message_seq_after_failure(
+    current: i64,
+    phase: crate::MutationPhase,
+    committed: bool,
+) -> i64 {
+    if committed_message_change(phase, committed) {
         0
     } else {
         current
     }
 }
 
-pub fn message_text_after_failure(current: String, phase: String, committed: bool) -> String {
-    if committed_message_change(&phase, committed) {
+pub fn message_text_after_failure(
+    current: String,
+    phase: crate::MutationPhase,
+    committed: bool,
+) -> String {
+    if committed_message_change(phase, committed) {
         String::new()
     } else {
         current
     }
 }
 
-pub fn message_action_after_failure(current: String, phase: String, committed: bool) -> String {
-    if committed_message_change(&phase, committed) {
-        "toolbar".into()
+pub fn message_action_after_failure(
+    current: crate::MessageAction,
+    phase: crate::MutationPhase,
+    committed: bool,
+) -> crate::MessageAction {
+    if committed_message_change(phase, committed) {
+        crate::MessageAction::Toolbar
     } else {
         current
     }
@@ -156,6 +215,52 @@ pub fn refreshed_required_message_seq(
     } else {
         0
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MessageSelection {
+    pub seq: i64,
+    pub rev: i64,
+    pub action: crate::MessageAction,
+    pub draft: String,
+}
+
+pub(crate) fn message_selection_after_window_ref(
+    messages: &[ChatMessage],
+    seq: i64,
+    rev: i64,
+    action: crate::MessageAction,
+    draft: String,
+) -> MessageSelection {
+    let visible = seq > 0
+        && messages
+            .iter()
+            .any(|message| message.seq == seq && !message.deleted);
+    if visible {
+        MessageSelection {
+            seq,
+            rev,
+            action,
+            draft,
+        }
+    } else {
+        MessageSelection {
+            seq: 0,
+            rev: 0,
+            action: crate::MessageAction::Toolbar,
+            draft: String::new(),
+        }
+    }
+}
+
+pub fn message_selection_after_window(
+    messages: Vec<ChatMessage>,
+    seq: i64,
+    rev: i64,
+    action: crate::MessageAction,
+    draft: String,
+) -> MessageSelection {
+    message_selection_after_window_ref(&messages, seq, rev, action, draft)
 }
 
 pub fn refreshed_known_message_seq(
@@ -211,18 +316,128 @@ pub fn channel_head_seq(channels: Vec<ChatChannel>, channel: String) -> i64 {
     head_seq_of(&channels, &channel)
 }
 
-// active-channel scalars re-derived from the (delta-folded) channel list,
-// keeping the current value when the channel is absent from the list.
-
-pub fn channel_display_name(
-    channels: Vec<ChatChannel>,
-    channel: String,
-    current: String,
-) -> String {
+/// FOLD A LOAD'S ROWS INTO THE LIST ON SCREEN — do not replace it with them.
+///
+/// The switch loader is handed the list the reader is already looking at and
+/// answers with the one row it refreshed (`load_channel_window_data`), so
+/// assigning its list back would revert every delta the live stream folded
+/// during the round trip: a peer's post in a THIRD room and the unread badge it
+/// lit, a channel created, renamed or archived. Nothing re-pages the list
+/// afterwards — `load_chat` is raised only by a reconnect — so that loss is
+/// permanent, not a frame of staleness.
+///
+/// `head_seq` only moves FORWARD. The row was read mid-flight; a delta folded
+/// after that read is the newer fact, and letting the row walk it back relights
+/// a badge the reader has already cleared.
+pub fn upsert_channel_rows(
+    mut channels: Vec<ChatChannel>,
+    refreshed: Vec<ChatChannel>,
+) -> Vec<ChatChannel> {
+    for mut row in refreshed {
+        let Some(current) = channels.iter_mut().find(|current| current.id == row.id) else {
+            channels.push(row);
+            continue;
+        };
+        row.head_seq = row.head_seq.max(current.head_seq);
+        *current = row;
+    }
     channels
-        .iter()
-        .find(|row| row.id == channel)
-        .map_or(current, |row| row.name.clone())
+}
+
+/// Everything a room click projects from the channel list, computed in one
+/// ownership crossing. The old shape cloned and scanned the whole workspace
+/// four times before the load task could even start.
+#[derive(Clone, Debug, Default, Hash, PartialEq)]
+pub struct ChannelSwitchFacts {
+    pub unread_boundary: i64,
+    pub name: String,
+    pub archived: bool,
+    pub members_only: bool,
+}
+
+pub fn channel_switch_facts(
+    reads: Vec<ChannelRead>,
+    channels: Vec<ChatChannel>,
+    current_channel: String,
+    next_channel: String,
+    current_boundary: i64,
+    current_name: String,
+) -> ChannelSwitchFacts {
+    let row = channels.iter().find(|row| row.id == next_channel);
+    let head_seq = row.map_or(0, |row| row.head_seq);
+    let unread_boundary = if current_channel == next_channel {
+        current_boundary
+    } else {
+        let last_read = last_read_of(&reads, &next_channel);
+        if head_seq > last_read { last_read } else { 0 }
+    };
+    ChannelSwitchFacts {
+        unread_boundary,
+        name: row.map_or(current_name, |row| row.name.clone()),
+        archived: row.is_some_and(|row| row.archived),
+        members_only: row.is_some_and(|row| row.members_only),
+    }
+}
+
+/// Is the reader inside the last tenth of the loaded scrollback?
+///
+/// The stream is bottom-anchored, so a scrollable reports its offset relative
+/// to the END — 1.0 is the TOP of the history in hand, which is where the next
+/// older page belongs.
+///
+/// A NaN offset (content that fits reports `0/0`) compares false against
+/// everything, which is the answer this wants anyway — iced does not publish a
+/// viewport at all in that case, so it is a belt, not the braces.
+pub fn near_scroll_top(relative_offset: f64) -> bool {
+    relative_offset >= 0.9
+}
+
+/// THE COMPOSER'S INSTANCE KEY (ducktape-ui#697). One retained
+/// `ChatComposer` per room, so a draft never rides a room switch — and the
+/// ENDPOINT is in the key because a channel id is a user-chosen string:
+/// network A's `#general` and network B's `#general` are two rooms, and the
+/// park store this replaced had to be emptied by hand on every network switch
+/// to keep one from handing its words to the other.
+pub fn composer_scope(endpoint: String, channel_id: String) -> String {
+    format!("{endpoint}\u{1f}{channel_id}")
+}
+
+/// Whether a submitted body may be posted, decided ONCE at delivery from
+/// state that may have moved since the composer's frame drew its gate.
+///
+/// It is a verdict and not a bool because the two answers do different work:
+/// an admitted body starts a send, a refused one goes back to the composer
+/// it came from. One discriminant, one `match`, each arm ending in its own
+/// task — a boolean would have to be read twice, and the second read is
+/// where a `return if` swallows the words.
+pub fn submit_verdict(
+    busy: bool,
+    connected: bool,
+    channel: String,
+    refusal: String,
+    seated: bool,
+) -> crate::SubmitVerdict {
+    let refused = busy || !connected || channel.is_empty() || !refusal.is_empty() || !seated;
+    if refused {
+        crate::SubmitVerdict::Refused
+    } else {
+        crate::SubmitVerdict::Admitted
+    }
+}
+
+/// The operation-id prefix each composer mints under, so a pending message and
+/// a pending reply never share an id space.
+pub fn composer_op_prefix(kind: crate::ComposerKind) -> String {
+    match kind {
+        crate::ComposerKind::Message => "message".to_owned(),
+        crate::ComposerKind::Reply => "reply".to_owned(),
+    }
+}
+
+/// The rail's key: a reply belongs to its THREAD, and the same seq under two
+/// rooms is two different threads.
+pub fn thread_scope(endpoint: String, channel_id: String, thread_seq: i64) -> String {
+    format!("{endpoint}\u{1f}{channel_id}#{thread_seq}")
 }
 
 /// The clicked page's title, from the index the sidebar is already drawn from
@@ -233,48 +448,6 @@ pub fn page_display_title(pages: Vec<PageItem>, page: String, current: String) -
         .iter()
         .find(|row| row.id == page)
         .map_or(current, |row| row.title.clone())
-}
-
-pub fn channel_flag_archived(channels: Vec<ChatChannel>, channel: String, current: bool) -> bool {
-    channels
-        .iter()
-        .find(|row| row.id == channel)
-        .map_or(current, |row| row.archived)
-}
-
-pub fn channel_flag_members_only(
-    channels: Vec<ChatChannel>,
-    channel: String,
-    current: bool,
-) -> bool {
-    channels
-        .iter()
-        .find(|row| row.id == channel)
-        .map_or(current, |row| row.members_only)
-}
-
-pub fn channel_live_huddle_count(channels: Vec<ChatChannel>, channel: String, current: i64) -> i64 {
-    channels
-        .iter()
-        .find(|row| row.id == channel)
-        .map_or(current, |row| row.huddle_count)
-}
-
-/// Advance the open thread's next-reply offset when a reply delta for THAT
-/// thread lands (the loaded page grew by one settled row).
-pub fn thread_offset_after_live(
-    offset: i64,
-    has_more: bool,
-    delta: ChatDelta,
-    active_channel: String,
-    root: i64,
-) -> i64 {
-    let is_open_thread_reply =
-        delta.kind == "reply" && delta.channel_id == active_channel && delta.root_seq == root;
-    if !is_open_thread_reply {
-        return offset;
-    }
-    thread_offset_after_reply(offset, has_more, true)
 }
 
 /// Upsert `channel`'s read cursor to `max(existing, seq)`. An empty channel id
@@ -295,12 +468,85 @@ pub fn mark_channel_read(
     reads
 }
 
-/// A channel is unread when its newest `seq` is past what this device has seen.
-/// `initial_channel_reads` seeds every channel at connect, so a caught-up
-/// channel has `last_read == head_seq` and never lights up spuriously; the
-/// cursor only lags once new messages actually arrive.
-pub fn channel_is_unread(reads: Vec<ChannelRead>, channel: String, head_seq: i64) -> bool {
-    head_seq > last_read_of(&reads, &channel)
+/// One channel row with the unread decision already attached. Ice externs take
+/// lists by value, so a view-time lookup cloned the unread list once per row.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct ChatSidebarRow {
+    pub channel: ChatChannel,
+    pub unread: bool,
+}
+
+/// The CHANNELS section, prepared when its source state moves.
+pub fn chat_sidebar_rooms(
+    channels: Vec<ChatChannel>,
+    peers: Vec<DmPeer>,
+    me: String,
+    reads: Vec<ChannelRead>,
+) -> Vec<ChatSidebarRow> {
+    let read_seqs: BTreeMap<&str, i64> = reads
+        .iter()
+        .map(|read| (read.channel.as_str(), read.seq))
+        .collect();
+    let dm_ids: BTreeSet<String> = peers
+        .iter()
+        .filter_map(|peer| {
+            if me.is_empty() {
+                None
+            } else {
+                Some(dm_channel_id(me.clone(), peer.key.clone()))
+            }
+        })
+        .collect();
+    channels
+        .into_iter()
+        .filter(|channel| !dm_ids.contains(&channel.id))
+        .map(|channel| ChatSidebarRow {
+            unread: channel.head_seq
+                > read_seqs
+                    .get(channel.id.as_str())
+                    .copied()
+                    .unwrap_or_default(),
+            channel,
+        })
+        .collect()
+}
+
+/// One DIRECT row with the unread decision already attached.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct DmSidebarRow {
+    pub peer: DmPeer,
+    pub unread: bool,
+}
+
+/// The DIRECT section, prepared when its directory, channels, or read cursors
+/// move. Channel heads are indexed once so the projection itself stays linear.
+pub fn chat_sidebar_dms(
+    channels: Vec<ChatChannel>,
+    peers: Vec<DmPeer>,
+    reads: Vec<ChannelRead>,
+) -> Vec<DmSidebarRow> {
+    let read_seqs: BTreeMap<&str, i64> = reads
+        .iter()
+        .map(|read| (read.channel.as_str(), read.seq))
+        .collect();
+    let heads: BTreeMap<String, i64> = channels
+        .into_iter()
+        .map(|channel| (channel.id, channel.head_seq))
+        .collect();
+    peers
+        .into_iter()
+        .map(|peer| {
+            let head_seq = heads.get(&peer.channel_id).copied().unwrap_or_default();
+            DmSidebarRow {
+                unread: head_seq
+                    > read_seqs
+                        .get(peer.channel_id.as_str())
+                        .copied()
+                        .unwrap_or_default(),
+                peer,
+            }
+        })
+        .collect()
 }
 
 /// On first connect, seed each not-yet-tracked channel's cursor to its own head
@@ -345,7 +591,7 @@ pub fn frozen_unread_boundary(
 
 /// The `seq` of the first message past `boundary` (messages are seq-ascending),
 /// or 0 when the visit started caught up (`boundary <= 0`) or nothing is unread.
-/// Pending optimistic messages carry `seq == -1`, so they never anchor a divider.
+/// Pending optimistic messages carry a negative seq, so they never anchor a divider.
 pub fn first_unread_seq(messages: Vec<ChatMessage>, boundary: i64) -> i64 {
     if boundary <= 0 {
         return 0;
@@ -385,6 +631,28 @@ pub fn thread_loading_after_refresh(
 
 pub fn retain_thread_messages(messages: Vec<ChatMessage>, root_seq: i64) -> Vec<ChatMessage> {
     if root_seq > 0 { messages } else { Vec::new() }
+}
+
+/// The clicked message as the rail's first row, so a thread opens on the
+/// message it is ABOUT instead of a blank 330px plate for the whole round trip.
+/// `thread_loaded` replaces the vec wholesale on arrival, and a load that FAILS
+/// leaves the root standing rather than a permanently empty pane.
+///
+/// BOTH LISTS, because `open_thread_for` is emitted from inside the rail too: a
+/// re-root onto a reply names a seq that lives in `thread`, never in the
+/// timeline. Answers empty when neither holds it — the honest state, and the
+/// one the rail drew before.
+pub fn thread_root_seed(
+    messages: Vec<ChatMessage>,
+    thread: Vec<ChatMessage>,
+    seq: i64,
+) -> Vec<ChatMessage> {
+    messages
+        .into_iter()
+        .chain(thread)
+        .find(|message| message.seq == seq)
+        .into_iter()
+        .collect()
 }
 
 pub fn remember_orphaned_comment_drafts(

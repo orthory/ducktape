@@ -39,9 +39,14 @@
 //!
 //! per-module key space: `op/…` and `meta/…` are host-reserved (the trigger
 //! range spans `op/` only, so the guest never sees bookkeeping writes);
-//! everything else belongs to the guest's fold. guest code itself lives in
-//! the engine's own reserved 0x00 keyspace — invisible to scans, wiped by
-//! nothing this crate does, and shipped WITH the data by the shipping lane.
+//! `fold/…` belongs to the shared guest SHELL ([`IndexStore::fold_tip`] reads
+//! the one key it writes); everything else belongs to the guest's fold. the
+//! two watermarks answer different questions and are not interchangeable:
+//! `meta/height` vouches for the FEED and bumps on every block, the fold tip
+//! vouches for the DERIVED ROWS and only moves when ops arrive. guest code
+//! itself lives in the engine's own reserved 0x00 keyspace — invisible to
+//! scans and wiped by nothing this crate does; every node installs its own
+//! from the bundled artifacts at open.
 //!
 //! alongside the per-module databases the store keeps ONE internal blocks
 //! database (`<base>/_blocks/`, never a module): `blk/{height:016x}` holds the
@@ -64,23 +69,20 @@
 //! honestly BEGIN there, visibly via `meta/backfill`, instead of a watermark
 //! that silently claims pre-boundary coverage the feed never saw. history
 //! below a boundary re-enters only by replaying blocks (the node's journal /
-//! frame catch-up drives [`IndexStore::apply_block`] again) or by adopting a
-//! shipped index (the staging lane below).
+//! frame catch-up drives [`IndexStore::apply_block`] again) or by BACKFILLING
+//! the source's own op rows below it ([`IndexStore::write_backfill_rows`] +
+//! [`IndexStore::set_backfill_floor`], the joiner's inline join-seam walk).
+//!
+//! a MAPPER change is the other way derived rows go stale, and it needs no
+//! boundary: the op feed is still there. [`converge_guest`] clears the derived
+//! keyspace and re-drives the fold over the rows the database already holds,
+//! leaving `op/` and `meta/` alone — a new mapper changes what the rows MEAN,
+//! never what the feed saw. that re-drive completes before [`IndexStore::open`]
+//! returns, so no reader ever sees the cleared keyspace.
 //!
 //! the full contract a per-module index guest must satisfy (fold rules, view
 //! rules, when NOT to index) is `docs/records/specs/indexable-spec.md`; the
 //! authoring surface is the `index-guest` crate.
-
-mod disk;
-pub use disk::{DiskEntry, DiskFs, IndexDisk};
-
-// the mem arm of the disk seam — behind `sim` (and always in test) so it never
-// ships in a release build. the fluent31-backed read models cannot run on it
-// (they own their IO); it drives the shipping lane's staging with no tempdir.
-#[cfg(any(test, feature = "sim"))]
-mod mem;
-#[cfg(any(test, feature = "sim"))]
-pub use mem::MemDisk;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -96,27 +98,16 @@ use sha2::Digest as _;
 // the shared host↔guest vocabulary: key conventions + the borsh op-row
 // envelope. re-exported so every host-side consumer names them through this
 // crate, exactly as before the wasm cutover.
-pub use index_guest::{META_PREFIX, OP_PREFIX, OpRow, OriginKind, OriginTag, op_key, user_handle};
+pub use index_guest::{
+    FOLD_PREFIX, FOLD_TIP, META_PREFIX, OP_PREFIX, OpRow, OriginKind, OriginTag, op_key,
+    parse_op_key, user_handle,
+};
 
 /// key prefix of the per-block explorer rows in the internal blocks database.
 pub const BLOCK_PREFIX: &str = "blk/";
 /// directory name of the store-internal blocks database — reserved, never a
 /// module id (the leading underscore keeps it out of the module namespace).
-/// public because the shipping lane (spec §7 lane 2) addresses it by name:
-/// a source ships it alongside the module databases so a joiner's explorer
-/// history starts warm too.
 pub const BLOCKS_DB_ID: &str = "_blocks";
-/// directory name of a staged shipped-index install awaiting adoption at the
-/// next [`IndexStore::open`] — same underscore convention as [`BLOCKS_DB_ID`].
-const STAGING_DIR: &str = "_staging";
-/// marker file inside [`STAGING_DIR`], written LAST (after every staged file
-/// is durable): a staging directory without it is a torn fetch and is
-/// discarded at open instead of adopted.
-const STAGING_COMPLETE: &str = ".complete";
-/// fixed fork name for a shipping cut. one cut is in flight per database at a
-/// time (the block loop serializes them), so a constant name suffices — a
-/// stale same-name leftover from a crash is deleted before the fresh cut.
-const SHIP_FORK: &str = "ship";
 /// the fluentabi module name every index guest installs under, inside its
 /// module's own database.
 const GUEST_NAME: &str = "index";
@@ -135,6 +126,17 @@ const META_GUEST: &str = "meta/guest";
 /// how many staged deletes a database wipe accumulates before flushing a
 /// batch: bounds memory while sweeping a large read model.
 const CLEAR_FLUSH_EVERY: usize = 1024;
+/// how many bytes of op rows one refold batch re-writes before flushing.
+/// bounds memory the way [`CLEAR_FLUSH_EVERY`] does, by SIZE because a replay
+/// stages whole op payloads rather than bare keys.
+const REPLAY_FLUSH_BYTES: usize = 4 * 1024 * 1024;
+/// how long a fold drain may sit at the SAME pending count before it is called
+/// stuck. not a total budget — a long backlog drains as long as it needs, as
+/// long as it keeps shrinking (see [`drain_fold`]).
+const FOLD_DRAIN_STALL: Duration = Duration::from_secs(60);
+/// ceiling on [`drain_fold`]'s poll backoff. every poll costs a queue count,
+/// so a long drain must not ask a thousand times a second.
+const FOLD_DRAIN_POLL_MAX: Duration = Duration::from_millis(50);
 /// hard cap on one scan page; larger asks are clamped, mirroring the module
 /// query convention (chat's MAX_QUERY_LIMIT) rather than erroring.
 pub const MAX_SCAN_LIMIT: usize = 1024;
@@ -168,11 +170,6 @@ pub enum Error {
     /// the views cannot catch up to the feed without a rebuild.
     #[error("indexer: fold stuck: {0}")]
     FoldStuck(String),
-    /// filesystem io in the shipping lane (fork archive reads, staged
-    /// installs) — io this crate performs itself, outside the engine's own
-    /// error surface.
-    #[error("indexer: index shipping: {0}")]
-    Shipping(String),
     /// the storage engine failed.
     #[error("indexer: engine: {0}")]
     Engine(#[from] fluent31::Error),
@@ -299,10 +296,6 @@ pub struct IndexStore {
     /// tier. guest-fold failures never set this: the engine retains their
     /// events and the backlog is observable instead.
     poisoned: AtomicBool,
-    /// the filesystem the shipping lane ([`IndexStore::checkpoint_files`] and
-    /// the staged-install adoption at open) reads and writes through. defaults
-    /// to [`DiskFs`]; a mem arm exists for driving the staging lane in tests.
-    disk: Box<dyn IndexDisk>,
 }
 
 impl IndexStore {
@@ -311,15 +304,12 @@ impl IndexStore {
     /// mapper bytes, register the fold trigger when the guest folds, tear
     /// both down when a module no longer ships a guest.
     ///
-    /// a COMPLETE staged shipped-index install under `<base>/_staging` (see
-    /// [`stage_shipped_db`]) is adopted first — database directories swap in
-    /// before any engine open, so adoption always precedes open by
-    /// construction. a torn staging directory (no completion marker) is
-    /// discarded, falling back to whatever the databases already hold.
+    /// only the declared module ids (plus `_blocks`) are opened. a
+    /// `<base>/_staging` directory left by an older build is INERT GARBAGE —
+    /// the shipped-index lane that wrote it is gone, nothing adopts or
+    /// enumerates it, and it is safe to delete by hand.
     pub fn open(base: impl AsRef<Path>, modules: &[IndexModule]) -> Result<Self> {
         let base = base.as_ref().to_path_buf();
-        let disk: Box<dyn IndexDisk> = Box::new(DiskFs);
-        adopt_staged(disk.as_ref(), &base)?;
         let opts = Options {
             sync: SyncMode::Periodic { every: SYNC_EVERY },
             // portable positioned IO: the index shares its box with the node's
@@ -346,7 +336,6 @@ impl IndexStore {
             modules: open,
             blocks,
             poisoned: AtomicBool::new(false),
-            disk,
         })
     }
 
@@ -398,6 +387,24 @@ impl IndexStore {
     /// height is durably stored.
     pub fn blocks_height(&self) -> Result<u64> {
         Ok(read_height(&self.blocks)?)
+    }
+
+    /// the FOLD's own watermark: the `(height, seq)` of the last op row the
+    /// module's guest folded, written by the shared shell inside the fold
+    /// transaction ([`index_guest::FOLD_TIP`]).
+    ///
+    /// this is the only honest answer to "is my op in the view yet": the
+    /// caller knows the `(H, seq)` its op landed at, and a tip at or past it
+    /// means the derived rows for that op are committed. it is NOT general
+    /// freshness — the fold advances only on op traffic, so a quiet module
+    /// keeps an old tip while being perfectly current, and `None` (fresh
+    /// database, boundary stamp, a mapper refold still in flight) means
+    /// UNKNOWN, never zero.
+    pub fn fold_tip(&self, module: &str) -> Result<Option<(u64, u32)>> {
+        let db = self.db(module)?;
+        Ok(db
+            .get(FOLD_TIP.as_bytes())
+            .map(|v| v.as_deref().and_then(index_guest::decode_fold_tip))?)
     }
 
     /// the backfill floor: when present, the module was stamped at a boundary
@@ -499,31 +506,13 @@ impl IndexStore {
     /// `wait_flushed` progress-wait idiom. `Err` = a fold failed with a
     /// backlog still pending — the views cannot catch up.
     pub fn wait_folds_drained(&self) -> Result<()> {
-        loop {
-            let mut pending = 0u64;
-            for (id, m) in &self.modules {
-                if !m.has_fold {
-                    continue;
-                }
-                let trigger = m
-                    .db
-                    .list_triggers()?
-                    .into_iter()
-                    .find(|t| t.name == FOLD_TRIGGER);
-                if let Some(t) = trigger
-                    && t.pending > 0
-                {
-                    if let Some(err) = t.last_error {
-                        return Err(Error::FoldStuck(format!("{id}: {err}")));
-                    }
-                    pending += t.pending;
-                }
+        for (id, m) in &self.modules {
+            if !m.has_fold {
+                continue;
             }
-            if pending == 0 {
-                return Ok(());
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            drain_fold(&m.db, id)?;
         }
+        Ok(())
     }
 
     /// store one explorer row at `height` WITHOUT a dispatch feed — the write
@@ -616,6 +605,78 @@ impl IndexStore {
         out
     }
 
+    /// write verbatim op rows into a module's feed WITHOUT touching the
+    /// watermark — the joiner's backfill of history below a boundary stamp
+    /// (indexable spec §7). rows are `(op key, borsh row bytes)` exactly as
+    /// the source stored them; batches flush by size like the refold's.
+    ///
+    /// # the ascending-order invariant this rests on
+    ///
+    /// the fold trigger is a CHANGES-mode trigger, so it delivers committed
+    /// writes in commit order and the guest folds them in that order. these
+    /// rows are therefore only correct if COMMIT ORDER IS KEY ORDER — which
+    /// the caller guarantees by writing strictly ascending `(height, seq)`,
+    /// pre-serving, on a node with no live folds, no ws subscribers, and no
+    /// view readers. under that discipline the guest sees exactly the
+    /// block-and-drain sequence a live feed would have delivered, and the
+    /// fold tip advances monotonically to the last backfilled row. writing
+    /// these out of order (or concurrently with live block folds) would hand
+    /// the guest history backwards and is a defect, not a slow path.
+    ///
+    /// [`META_HEIGHT`] is deliberately untouched: the heal already stamped it
+    /// at the boundary, and it vouches for the FEED's contiguity from the
+    /// floor up. the FLOOR is what says "incomplete below" — lower it with
+    /// [`IndexStore::set_backfill_floor`] once the walk completes, never here.
+    /// only puts, so the delete-side contract (a failing feed row never
+    /// vanishes) is untouched.
+    pub fn write_backfill_rows(&self, module: &str, rows: &[(String, Vec<u8>)]) -> Result<()> {
+        if self.is_poisoned() {
+            return Err(Error::Poisoned);
+        }
+        let db = self.db(module)?;
+        let out = (|| -> Result<()> {
+            let mut batch = WriteBatch::new();
+            let mut staged = 0usize;
+            for (key, value) in rows {
+                staged += key.len() + value.len();
+                batch.put(key.as_bytes(), value.clone());
+                if staged >= REPLAY_FLUSH_BYTES {
+                    db.write(std::mem::replace(&mut batch, WriteBatch::new()))?;
+                    staged = 0;
+                }
+            }
+            if staged > 0 {
+                db.write(batch)?;
+            }
+            Ok(())
+        })();
+        if out.is_err() {
+            self.poisoned.store(true, Ordering::Relaxed);
+        }
+        out
+    }
+
+    /// set (or clear) a module's backfill floor and NOTHING else — no wipe, no
+    /// trigger teardown, unlike [`IndexStore::mark_backfilled`]. the closing
+    /// move of a completed op-row backfill: `Some(floor)` composes the
+    /// source's own truncation into this node's honesty (a late-joined source
+    /// has no rows below its floor either), `None` clears it outright — the
+    /// feed reaches genesis and nothing is missing.
+    pub fn set_backfill_floor(&self, module: &str, floor: Option<u64>) -> Result<()> {
+        if self.is_poisoned() {
+            return Err(Error::Poisoned);
+        }
+        let db = self.db(module)?;
+        let out = match floor {
+            Some(height) => db.put(META_BACKFILL, height.to_be_bytes()),
+            None => db.delete(META_BACKFILL),
+        };
+        if out.is_err() {
+            self.poisoned.store(true, Ordering::Relaxed);
+        }
+        Ok(out?)
+    }
+
     /// point read of one stored key at the current snapshot.
     pub fn get(&self, module: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
         Ok(self.db(module)?.get(key)?)
@@ -663,51 +724,6 @@ impl IndexStore {
     ) -> Result<fluent31::Subscription> {
         Ok(self.db(module)?.subscribe(lo, hi)?)
     }
-
-    /// cut a point-in-time archive of one database (a module id or
-    /// [`BLOCKS_DB_ID`]) and return its complete file set, for the shipping
-    /// lane (spec §7 lane 2): a fork archive is a self-contained database
-    /// directory, so these files written verbatim to a fresh directory open
-    /// as an identical database — watermark, backfill floor, rows, AND the
-    /// installed index guest + trigger state (engine keyspace) included. the
-    /// on-disk archive is transient: cut, read into memory, deleted — nothing
-    /// to sweep after a normal return. safe against the live writers
-    /// (fluent31 cuts are crash-atomic and pin their view).
-    ///
-    /// a poisoned store refuses: shipping a torn read model would hand the
-    /// joiner exactly the state a rebuild exists to replace.
-    pub fn checkpoint_files(&self, db: &str) -> Result<Vec<(String, Vec<u8>)>> {
-        if self.is_poisoned() {
-            return Err(Error::Poisoned);
-        }
-        let handle = if db == BLOCKS_DB_ID {
-            &self.blocks
-        } else {
-            self.db(db)?
-        };
-        // a same-name leftover means an earlier cut crashed between create
-        // and delete; deleting a fork that does not exist is the normal case
-        // and not an error worth surfacing.
-        if handle.list_forks()?.iter().any(|f| f.name == SHIP_FORK) {
-            handle.delete_fork(SHIP_FORK)?;
-        }
-        let info = handle.fork(SHIP_FORK)?;
-        let read = (|| -> std::io::Result<Vec<(String, Vec<u8>)>> {
-            let mut files = Vec::new();
-            for entry in self.disk.read_dir(&info.path)? {
-                if entry.name == "LOCK" {
-                    continue; // never present in an archive; skip defensively
-                }
-                let bytes = self.disk.read(&info.path.join(&entry.name))?;
-                files.push((entry.name, bytes));
-            }
-            files.sort_by(|(a, _), (b, _)| a.cmp(b));
-            Ok(files)
-        })();
-        let files = read.map_err(|e| Error::Shipping(format!("read {db} archive: {e}")))?;
-        handle.delete_fork(SHIP_FORK)?;
-        Ok(files)
-    }
 }
 
 /// map a view invocation's engine error onto the tier's surface: a guest
@@ -736,13 +752,41 @@ struct GuestMarker {
 }
 
 /// converge one module's database onto its declared guest: install (an
-/// overwrite-put — replacing bytes is the upgrade path) and register the fold
-/// trigger when the guest folds; tear both down when the module ships no
-/// guest. roles come from the CANDIDATE bytes (`wasm_entries`), so a broken
-/// artifact refuses at open, not at first invocation. the marker written
-/// LAST makes the whole converge idempotent-and-free on a warm boot: cranelift
-/// compiles are expensive enough that paying them per open once blew e2e
-/// boot deadlines. returns `(has_fold, has_view)`.
+/// overwrite-put — replacing bytes is the upgrade path), REFOLD the read model
+/// the previous mapper left behind, and register the fold trigger when the
+/// guest folds; tear both down when the module ships no guest. roles come from
+/// the CANDIDATE bytes (`wasm_entries`), so a broken artifact refuses at open,
+/// not at first invocation. the marker written LAST makes the whole converge
+/// idempotent-and-free on a warm boot: cranelift compiles are expensive enough
+/// that paying them per open once blew e2e boot deadlines. returns
+/// `(has_fold, has_view)`.
+///
+/// # the refold, and why it is unconditional
+///
+/// derived rows are the OUTPUT of a mapper, so a database whose mapper changed
+/// holds rows no installed code would produce — while its fold tip happily
+/// vouches for them (`indexable-spec.md` §3.2.4: a mapper upgrade leaves a
+/// PRESENT tip standing over the previous mapper's work). the honest fixes are
+/// a boundary stamp — which throws away the op feed and lies about coverage —
+/// or a replay. the feed is right there: `op/` is never wiped by a converge,
+/// so a replay is a clear of the DERIVED keyspace plus a re-drive of the fold
+/// over rows the database already holds.
+///
+/// it fires on any hash change rather than on a declared shape break because a
+/// declaration is a number an author has to remember to bump, and forgetting
+/// it is exactly the silent-stale-rows failure this exists to prevent. an
+/// author cannot forget a hash.
+///
+/// the replay is WAITED OUT before this returns, so `open` answers with a
+/// complete read model or not at all — the cost lands on boot latency, never
+/// on a view that would otherwise answer an empty keyspace as if it were an
+/// empty workspace.
+///
+/// ponytail: a view-only mapper edit therefore pays a full replay of the feed,
+/// synchronously, at the next open. the tier is rebuildable by construction
+/// and the cost is bounded by the feed the database holds, so this stays until
+/// a measured boot regression asks for a `shape` field in [`GuestMarker`] to
+/// narrow which changes refold.
 fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
     let marker = db
         .get(META_GUEST.as_bytes())?
@@ -771,14 +815,34 @@ fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
     let roles = db.wasm_entries(bytes)?;
     let has_fold = roles.iter().any(|r| r == "on_apply");
     let has_view = roles.iter().any(|r| r == "query");
-    db.install_module(GUEST_NAME, bytes)?;
-    match (has_fold, fold_registered) {
-        (true, false) => {
-            create_fold_trigger(db)?;
-        }
-        (false, true) => db.delete_trigger(FOLD_TRIGGER)?,
-        _ => {}
+    // the feed goes down FIRST: its pending events describe the previous
+    // mapper's work, and `delete_trigger` discards them with the registration
+    // — the same clean slate a boundary stamp takes, minus the amnesia.
+    if fold_registered {
+        db.delete_trigger(FOLD_TRIGGER)?;
     }
+    db.install_module(GUEST_NAME, bytes)?;
+    if has_fold {
+        clear_derived(db)?;
+        create_fold_trigger(db)?;
+        replay_op_feed(db)?;
+        // AND WAIT FOR IT. `replay_op_feed` only STAGES the re-writes; the
+        // trigger runner folds them behind it. Returning here would hand the
+        // node an open store whose read model is the freshly CLEARED keyspace
+        // — `/v1/index/*/view` up and answering "no such page" for every page,
+        // for as long as the whole feed takes to re-derive, with nothing on
+        // the boot path consulting `fold_status` to know better. An empty
+        // answer is worse than a slow boot: it is indistinguishable from a
+        // workspace that lost its documents.
+        //
+        // `Err` here refuses the OPEN, matching what a broken artifact already
+        // does at `wasm_entries` above: a guest that cannot fold its own feed
+        // has no read model to serve, and saying so beats serving nothing
+        // quietly.
+        drain_fold(db, spec.id)?;
+    }
+    // written LAST, so an interrupted refold re-runs whole at the next open
+    // instead of leaving a marker that vouches for a half-derived read model.
     let marker = GuestMarker {
         hash,
         has_fold,
@@ -786,6 +850,116 @@ fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
     };
     db.put(META_GUEST, borsh::to_vec(&marker)?)?;
     Ok((has_fold, has_view))
+}
+
+/// block until one module's fold trigger has nothing queued: fluent31 drains
+/// folds on a background runner, so both the sim's commit barrier and the
+/// refold above have to join it rather than assume it. a module with no
+/// trigger has nothing to wait for. `Err` = the fold cannot finish, either
+/// because it FAILED with a backlog still pending or because it stopped making
+/// progress — neither of which more waiting fixes.
+///
+/// the wait is bounded on PROGRESS, never on total time: a backfill of a whole
+/// chain's history is a legitimately long drain, so the only honest stall
+/// signal is a backlog that stops shrinking. a wedged fold that never records
+/// an error would otherwise spin here forever — and this now runs inside a
+/// joining node's seam, not just a sim.
+fn drain_fold(db: &Db, module: &str) -> Result<()> {
+    // NOT the backfill floor — the fewest events ever seen queued, which is
+    // what "still shrinking" is measured against.
+    let mut fewest_pending = u64::MAX;
+    let mut since_progress = std::time::Instant::now();
+    // ASKING IS NOT FREE: `list_triggers` counts the queue by iterating it, so
+    // a poll costs O(pending). At a flat 1ms that burns a core and contends
+    // with the runner exactly when the backlog is biggest — a whole chain's
+    // op rows landing at a join seam. Start tight so a sim's commit barrier
+    // still returns in a millisecond, then back off.
+    let mut poll = Duration::from_millis(1);
+    loop {
+        let trigger = db
+            .list_triggers()?
+            .into_iter()
+            .find(|t| t.name == FOLD_TRIGGER);
+        let Some(trigger) = trigger else {
+            return Ok(());
+        };
+        if trigger.pending == 0 {
+            return Ok(());
+        }
+        if let Some(err) = trigger.last_error {
+            return Err(Error::FoldStuck(format!("{module}: {err}")));
+        }
+        if trigger.pending < fewest_pending {
+            fewest_pending = trigger.pending;
+            since_progress = std::time::Instant::now();
+        } else if since_progress.elapsed() >= FOLD_DRAIN_STALL {
+            return Err(Error::FoldStuck(format!(
+                "{module}: {} events pending, no progress for {}s",
+                trigger.pending,
+                FOLD_DRAIN_STALL.as_secs()
+            )));
+        }
+        std::thread::sleep(poll);
+        poll = (poll * 2).min(FOLD_DRAIN_POLL_MAX);
+    }
+}
+
+/// delete every DERIVED key: everything a mapper wrote (its own rows plus the
+/// shell's `fold/` tip), leaving the host-reserved `op/` feed and `meta/`
+/// bookkeeping — the watermark and the backfill floor — untouched. those two
+/// answer for the FEED, which a mapper change does not touch.
+fn clear_derived(db: &Db) -> Result<()> {
+    let snap = db.snapshot();
+    let iter = db.iter_at(None, None, false, &snap)?;
+    let mut batch = WriteBatch::new();
+    let mut staged = 0usize;
+    for kv in iter {
+        let (key, _) = kv?;
+        let host_reserved =
+            key.starts_with(OP_PREFIX.as_bytes()) || key.starts_with(META_PREFIX.as_bytes());
+        if host_reserved {
+            continue;
+        }
+        batch.delete(key);
+        staged += 1;
+        if staged >= CLEAR_FLUSH_EVERY {
+            db.write(std::mem::replace(&mut batch, WriteBatch::new()))?;
+            staged = 0;
+        }
+    }
+    if staged > 0 {
+        db.write(batch)?;
+    }
+    Ok(())
+}
+
+/// re-drive the fold over every op row the database already holds.
+///
+/// a changes-mode trigger delivers writes COMMITTED AFTER its registration, so
+/// re-registering one over a populated range replays nothing. re-writing each
+/// row does: an identical put is still a committed change, and capture happens
+/// inside the commit critical section, so the guest receives the feed in key
+/// order — which for `op/{height:016x}/{seq:04x}` IS block-and-drain order.
+fn replay_op_feed(db: &Db) -> Result<()> {
+    let lo = OP_PREFIX.as_bytes();
+    let hi = prefix_successor(lo);
+    let snap = db.snapshot();
+    let iter = db.iter_at(Some(lo), hi.as_deref(), false, &snap)?;
+    let mut batch = WriteBatch::new();
+    let mut staged = 0usize;
+    for kv in iter {
+        let (key, value) = kv?;
+        staged += key.len() + value.len();
+        batch.put(key, value);
+        if staged >= REPLAY_FLUSH_BYTES {
+            db.write(std::mem::replace(&mut batch, WriteBatch::new()))?;
+            staged = 0;
+        }
+    }
+    if staged > 0 {
+        db.write(batch)?;
+    }
+    Ok(())
 }
 
 /// register the fold feed: [`GUEST_NAME`]'s `on_apply` over exactly the
@@ -799,116 +973,6 @@ fn create_fold_trigger(db: &Db) -> Result<()> {
         hi.as_deref(),
     )?;
     Ok(())
-}
-
-// ============================================================================
-// shipped-index staging — the joiner side of the shipping lane. a fetched
-// database lands here file by file, is committed with a marker once every
-// byte is durable, and is adopted by the next [`IndexStore::open`]. the
-// ordering mirrors the boundary stamp's crash story inverted: the stamp drops
-// its watermark FIRST so interruption re-triggers; staging writes its marker
-// LAST so interruption discards. free functions, not methods — the writer (a
-// syncing joiner) stages against a base whose store is still open elsewhere
-// in the process, and never needs a handle of its own. they take the
-// [`IndexDisk`] to write through (production passes [`DiskFs`]); the mem arm
-// drives this whole sequence with no tempdir.
-// ============================================================================
-
-/// one path component: non-empty, no separators or traversal, no hidden
-/// files, and never the engine's lock file. shipped names cross a trust
-/// boundary (an unverified server chose them), so anything else is refused.
-fn valid_component(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 255
-        && !name.starts_with('.')
-        && name != "LOCK"
-        && !name.contains(['/', '\\'])
-        && !name.contains('\0')
-}
-
-/// stage one shipped database's file set under `<base>/_staging/<db>` for
-/// adoption at the next [`IndexStore::open`]. every file is fsynced before
-/// return — the completion marker ([`commit_staged`]) must never become
-/// durable ahead of the bytes it vouches for, or a crash could adopt garbage
-/// and turn the next open into a boot failure.
-pub fn stage_shipped_db(
-    disk: &dyn IndexDisk,
-    base: &Path,
-    db: &str,
-    files: &[(String, Vec<u8>)],
-) -> Result<()> {
-    if !valid_component(db) || db == STAGING_DIR {
-        return Err(Error::Shipping(format!("invalid shipped db name {db:?}")));
-    }
-    if let Some((name, _)) = files.iter().find(|(name, _)| !valid_component(name)) {
-        return Err(Error::Shipping(format!(
-            "invalid shipped file name {name:?} for {db}"
-        )));
-    }
-    let dir = base.join(STAGING_DIR).join(db);
-    (|| -> std::io::Result<()> {
-        disk.create_dir_all(&dir)?;
-        for (name, bytes) in files {
-            disk.write(&dir.join(name), bytes)?;
-        }
-        disk.sync_dir(&dir)?;
-        Ok(())
-    })()
-    .map_err(|e| Error::Shipping(format!("stage {db}: {e}")))
-}
-
-/// mark a staged install complete. written LAST: only a marked staging
-/// directory is adopted; everything else is discarded as a torn fetch.
-pub fn commit_staged(disk: &dyn IndexDisk, base: &Path) -> Result<()> {
-    let staging = base.join(STAGING_DIR);
-    (|| -> std::io::Result<()> {
-        disk.write(&staging.join(STAGING_COMPLETE), b"")?;
-        disk.sync_dir(&staging)?;
-        Ok(())
-    })()
-    .map_err(|e| Error::Shipping(format!("commit staged install: {e}")))
-}
-
-/// drop any staged install — the fetch failed partway and lane 1's heal is
-/// the fallback. missing staging is a no-op, so callers can clean
-/// unconditionally.
-pub fn discard_staged(disk: &dyn IndexDisk, base: &Path) -> Result<()> {
-    let staging = base.join(STAGING_DIR);
-    if !disk.exists(&staging) {
-        return Ok(());
-    }
-    disk.remove_dir_all(&staging)
-        .map_err(|e| Error::Shipping(format!("discard staged install: {e}")))
-}
-
-/// adopt a complete staged install: swap each staged database directory into
-/// place, then remove the staging root (marker included) LAST. re-entrant
-/// across crashes — each directory rename is atomic, an interrupted sweep
-/// leaves the marker and the not-yet-adopted remainder for the next open,
-/// and a marker-less staging directory is discarded wholesale.
-fn adopt_staged(disk: &dyn IndexDisk, base: &Path) -> Result<()> {
-    let staging = base.join(STAGING_DIR);
-    if !disk.exists(&staging) {
-        return Ok(());
-    }
-    if !disk.exists(&staging.join(STAGING_COMPLETE)) {
-        return discard_staged(disk, base);
-    }
-    (|| -> std::io::Result<()> {
-        for entry in disk.read_dir(&staging)? {
-            if !entry.is_dir {
-                continue; // the marker file
-            }
-            let dest = base.join(&entry.name);
-            if disk.exists(&dest) {
-                disk.remove_dir_all(&dest)?;
-            }
-            disk.rename(&staging.join(&entry.name), &dest)?;
-        }
-        disk.remove_dir_all(&staging)?;
-        Ok(())
-    })()
-    .map_err(|e| Error::Shipping(format!("adopt staged install: {e}")))
 }
 
 /// lo/hi iteration bounds for a prefix scan resuming strictly after `after`:

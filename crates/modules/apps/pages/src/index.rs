@@ -7,10 +7,16 @@
 //! page list, a page render's comment panels, search — is served here.
 //!
 //! block ids are globally unique (the module's addressability contract), so
-//! rows key on the id alone. the fold mirrors just enough of the tree to stay
-//! correct under `RemoveBlock` — which removes a whole SUBTREE — by keeping
-//! each row's child-id set (membership only; sibling ORDER is not mirrored,
-//! no view needs it).
+//! rows key on the id alone. the fold mirrors the tree EXACTLY as the
+//! canonical module holds it — each row's children in SIBLING ORDER, plus the
+//! inline marks and the todo flag — because [`PagesViewQuery::GetPage`] serves
+//! a page's preorder traversal off these rows and its reply must be
+//! indistinguishable from the canonical [`crate::PageQuery::GetPage`]'s. the
+//! mark handling calls `src/text_ranges.rs` outright; the anchor arithmetic
+//! (`after`), the reorder-in-place move and the preorder walk are mirrors of
+//! `src/block_ops.rs` and `src/store.rs`, written against a row instead of a
+//! block — so `tests/index_parity.rs` is what holds the two in step, and a
+//! change to either side that skips it is a change to only one lane.
 //!
 //! key spaces (inside pages' per-module index database):
 //! - `blk/{block_id}`         — the block's current [`PageBlockRow`].
@@ -37,7 +43,13 @@ use index_guest::search::{self, DEFAULT_POSTING_CAP};
 use index_guest::{Fail, OpRow, OriginKind, OriginTag, StateRead, Writes};
 use serde::{Deserialize, Serialize};
 
-use crate::{BlockKind, MAX_QUERY_TARGETS, PageMsg, RelativeAnchor, decode_msg};
+use crate::error::PageError;
+use crate::text_ranges::{edit_between, rebase_marks, set_span_mark, utf16_len, validate_marks};
+use crate::{
+    Block, BlockKind, MAX_PAGE_DEPTH, MAX_PAGE_QUERY_BYTES, MAX_PAGE_QUERY_LIMIT,
+    MAX_QUERY_TARGETS, MAX_TRAVERSAL_WORK, PageBlockPage, PageMsg, RelativeAnchor, SpanMark,
+    decode_msg,
+};
 
 const DEFAULT_SEARCH_LIMIT: usize = 20;
 const MAX_SEARCH_LIMIT: usize = 100;
@@ -51,8 +63,15 @@ const FAIL_OP_DECODE: i32 = 2;
 const FAIL_ROW_DECODE: i32 = 3;
 /// [`Fail`] code: a view request this mapper does not speak.
 const FAIL_BAD_REQUEST: i32 = 4;
+/// [`Fail`] code: a page read refused its cursor, or walked a tree whose
+/// mirrored shape is impossible. carries the canonical [`PageError`]'s own
+/// sentence so the two lanes refuse a page read with the same words.
+const FAIL_PAGE_READ: i32 = 5;
 
-/// the stored row of one page block, as search results return it.
+/// the stored row of one page block: the canonical [`Block`] plus the fold's
+/// own ranking stamps. every canonical field is mirrored — `children` in
+/// SIBLING ORDER — because [`PagesViewQuery::GetPage`] rebuilds the wire
+/// `Block` straight out of this row.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PageBlockRow {
     pub block_id: String,
@@ -62,11 +81,55 @@ pub struct PageBlockRow {
     pub parent: Option<String>,
     pub kind: BlockKind,
     pub text: String,
-    /// child block ids, membership only (order lives in canonical state).
+    /// persistent inline formatting, mirrored through the canonical module's
+    /// own validate/rebase/split helpers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub marks: Vec<SpanMark>,
+    /// only meaningful for `Todo`, exactly as the canonical block.
+    #[serde(default)]
+    pub checked: bool,
+    /// child block ids in SIBLING ORDER — the preorder a page read walks.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<String>,
     pub height: u64,
     pub time: u64,
+}
+
+impl PageBlockRow {
+    /// the wire block this row mirrors — the exact value the canonical
+    /// [`crate::PageQuery::GetPage`] returns for the same id.
+    fn to_block(&self) -> Block {
+        Block {
+            id: self.block_id.clone(),
+            parent: self.parent.clone(),
+            page: self.page_id.clone(),
+            kind: self.kind,
+            text: self.text.clone(),
+            marks: self.marks.clone(),
+            checked: self.checked,
+            children: self.children.clone(),
+        }
+    }
+}
+
+/// resolve an `after` sibling anchor to an insert index inside `children`,
+/// mirroring `block_ops::idx_after`: `None` -> first child; `Some(id)` -> one
+/// past that sibling.
+///
+/// the canonical op ERRORS on an anchor that is not a child, so an applied op
+/// never carries one — except against a PARTIAL mirror (below a backfill floor
+/// the fold skips ops whose parent it never saw, so a later anchor can name a
+/// block this index does not hold). that lands at the end: a deterministic
+/// placement inside a page the mirror already cannot serve whole, never a held
+/// queue.
+fn insert_index(children: &[String], after: Option<&str>) -> usize {
+    let Some(anchor) = after else {
+        return 0;
+    };
+    children
+        .iter()
+        .position(|child| child == anchor)
+        .map_or(children.len(), |at| at + 1)
 }
 
 /// a token posting's value: rank (time) plus the row address and its page.
@@ -129,6 +192,18 @@ pub struct TargetThreadsRow {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PagesViewQuery {
+    /// One bounded page of blocks in PREORDER — the SAME read as
+    /// [`crate::PageQuery::GetPage`], down to the cursor and the limit
+    /// clamp (`limit == 0` selects [`MAX_PAGE_QUERY_LIMIT`]), served off the
+    /// derived rows instead of through the node's dispatch actor. Opening a
+    /// document is the app's highest-frequency read; on `/v1/query` it paid
+    /// the select-loop/checkpoint tax issue #1018 named.
+    GetPage {
+        page_id: String,
+        #[serde(default)]
+        after: Option<String>,
+        limit: u16,
+    },
     /// the page list, ascending by id, cursor-paged.
     ListPages {
         #[serde(default)]
@@ -153,6 +228,10 @@ pub enum PagesViewQuery {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PagesViewReply {
+    /// one bounded slice of a page's preorder traversal — byte-identical to
+    /// the canonical [`crate::PageReply::Page`]'s body, `None` for a page
+    /// this index does not hold.
+    Page(Option<PageBlockPage>),
     /// one cursor page of the page list, ascending by id.
     Pages {
         pages: Vec<PageRow>,
@@ -364,6 +443,62 @@ fn delete_thread(out: &mut Writes, thread: &ThreadRow) {
     index_guest::delete(out, cthread_key(&thread.id));
 }
 
+/// re-home one block, mirroring `block_ops`' `MoveBlock` arm case for case.
+///
+/// the canonical module treats a SAME-parent move as a reorder in place —
+/// remove the child, re-insert it at the anchor — and that ordering is now
+/// visible here, so this index cannot keep skipping it. page rows keep their
+/// own page id and non-page blocks never leave their page, so `page_id` is
+/// untouched either way.
+fn move_block(
+    read: &impl StateRead,
+    out: &mut Writes,
+    block_id: String,
+    parent: Option<String>,
+    after: Option<String>,
+) -> Result<(), Fail> {
+    // "after myself" describes the position the block already holds — the
+    // canonical no-op, before any read.
+    if after.as_deref() == Some(block_id.as_str()) {
+        return Ok(());
+    }
+    let Some(mut row) = read_row(read, &block_id)? else {
+        return Ok(());
+    };
+    let stays_under_same_parent = row.parent == parent;
+    if stays_under_same_parent {
+        // one parent row, rewritten once: removing then inserting inside the
+        // SAME read is what keeps this correct while the op's own writes only
+        // apply after the decision.
+        // a top-level page asked to stay top-level has no membership to move.
+        let Some(parent_id) = parent.as_deref() else {
+            return Ok(());
+        };
+        let Some(mut parent_row) = read_row(read, parent_id)? else {
+            return Ok(());
+        };
+        parent_row.children.retain(|child| child != &block_id);
+        let at = insert_index(&parent_row.children, after.as_deref());
+        parent_row.children.insert(at, block_id);
+        return put_row(out, &parent_row);
+    }
+    if let Some(old_parent) = &row.parent
+        && let Some(mut old) = read_row(read, old_parent)?
+    {
+        old.children.retain(|child| child != &block_id);
+        put_row(out, &old)?;
+    }
+    if let Some(parent_id) = &parent
+        && let Some(mut new_parent) = read_row(read, parent_id)?
+    {
+        let at = insert_index(&new_parent.children, after.as_deref());
+        new_parent.children.insert(at, block_id.clone());
+        put_row(out, &new_parent)?;
+    }
+    row.parent = parent;
+    put_row(out, &row)
+}
+
 /// fold one applied op into derived writes.
 pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
     let msg = decode_msg(&op.payload).map_err(|e| Fail::new(FAIL_OP_DECODE, e))?;
@@ -389,13 +524,19 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                 parent: None,
                 kind: BlockKind::Page,
                 text: title,
+                marks: Vec::new(),
+                checked: false,
                 children: Vec::new(),
                 height: op.height,
                 time: op.time,
             };
             put_row_and_toks(&mut out, &row)?;
         }
-        PageMsg::InsertBlock { parent, block, .. } => {
+        PageMsg::InsertBlock {
+            parent,
+            after,
+            block,
+        } => {
             // the page is derived from the parent — a parent this index
             // never saw (pre-index tree) leaves the whole insert out.
             let Some(mut parent_row) = read_row(read, &parent)? else {
@@ -414,21 +555,33 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             } else {
                 parent_row.page_id.clone()
             };
+            // the canonical insert normalizes the client's marks against the
+            // block's own text before storing them; same call, same result.
+            let Ok(marks) = validate_marks(&block.text, block.marks) else {
+                return Ok(out);
+            };
             let row = PageBlockRow {
                 block_id: block.id.clone(),
                 page_id,
                 parent: Some(parent.clone()),
                 kind: block.kind,
                 text: block.text,
+                marks,
+                checked: false,
                 children: Vec::new(),
                 height: op.height,
                 time: op.time,
             };
             put_row_and_toks(&mut out, &row)?;
-            parent_row.children.push(block.id);
+            let at = insert_index(&parent_row.children, after.as_deref());
+            parent_row.children.insert(at, block.id);
             put_row(&mut out, &parent_row)?;
         }
-        PageMsg::UpdateText { block_id, text, .. } => {
+        PageMsg::UpdateText {
+            block_id,
+            text,
+            marks,
+        } => {
             let Some(mut row) = read_row(read, &block_id)? else {
                 return Ok(out);
             };
@@ -439,6 +592,24 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                 page.title = text.clone();
                 put_page(&mut out, &page)?;
             }
+            // an atomic replacement REPLACES the marks; a plain edit rebases
+            // the stored ones over the text change — the canonical arm's own
+            // two cases, through the canonical helpers.
+            let replacement = match marks {
+                Some(marks) => match validate_marks(&text, marks) {
+                    Ok(marks) => Some(marks),
+                    Err(_) => return Ok(out),
+                },
+                None => None,
+            };
+            if let Some(edit) = edit_between(&row.text, &text)
+                && replacement.is_none()
+            {
+                rebase_marks(&mut row.marks, edit, utf16_len(&text));
+            }
+            if let Some(marks) = replacement {
+                row.marks = marks;
+            }
             // delete BEFORE re-putting: tokens shared by the old and new
             // text stage a delete then a put, and the last command wins.
             delete_toks(&mut out, &row);
@@ -447,6 +618,21 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             row.time = op.time;
             put_row_and_toks(&mut out, &row)?;
         }
+        PageMsg::SetSpanMark {
+            block_id,
+            start,
+            end,
+            kind,
+            active,
+        } => {
+            let Some(mut row) = read_row(read, &block_id)? else {
+                return Ok(out);
+            };
+            if set_span_mark(&mut row.marks, &row.text, start, end, kind, active).is_err() {
+                return Ok(out);
+            }
+            put_row(&mut out, &row)?;
+        }
         PageMsg::SetKind { block_id, kind } => {
             let Some(mut row) = read_row(read, &block_id)? else {
                 return Ok(out);
@@ -454,37 +640,18 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             row.kind = kind;
             put_row(&mut out, &row)?;
         }
-        PageMsg::MoveBlock {
-            block_id, parent, ..
-        } => {
-            // Re-home the membership edge. Page rows keep their own page id
-            // while non-page rows stay within their page.
+        PageMsg::SetChecked { block_id, checked } => {
             let Some(mut row) = read_row(read, &block_id)? else {
                 return Ok(out);
             };
-            // a same-parent move is a sibling reorder: membership is
-            // unchanged and this index does not mirror order (the module
-            // special-cases it too). re-reading the parent below would see
-            // the pre-op row (this op's writes apply after the decision)
-            // and re-push a duplicate child — so: no-op.
-            if row.parent == parent {
-                return Ok(out);
-            }
-            if let Some(old_parent) = &row.parent
-                && let Some(mut old) = read_row(read, old_parent)?
-            {
-                old.children.retain(|c| c != &block_id);
-                put_row(&mut out, &old)?;
-            }
-            if let Some(parent) = &parent
-                && let Some(mut new_parent) = read_row(read, parent)?
-            {
-                new_parent.children.push(block_id.clone());
-                put_row(&mut out, &new_parent)?;
-            }
-            row.parent = parent;
+            row.checked = checked;
             put_row(&mut out, &row)?;
         }
+        PageMsg::MoveBlock {
+            block_id,
+            parent,
+            after,
+        } => move_block(read, &mut out, block_id, parent, after)?,
         PageMsg::RemoveBlock { block_id } => {
             let Some(row) = read_row(read, &block_id)? else {
                 return Ok(out);
@@ -499,8 +666,6 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             // …then drop the whole subtree, rows and postings both.
             delete_subtree(read, &mut out, row)?;
         }
-        // checked state carries no searchable text.
-        PageMsg::SetChecked { .. } | PageMsg::SetSpanMark { .. } => {}
         PageMsg::AddComment {
             thread_id,
             comment_id,
@@ -613,11 +778,205 @@ fn reply_json(reply: &PagesViewReply) -> Result<Vec<u8>, Fail> {
     serde_json::to_vec(reply).map_err(|e| Fail::new(FAIL_BAD_REQUEST, e.to_string()))
 }
 
+// ── the page read, mirrored off the derived rows ─────────────────────────
+//
+// `Pages::load_page_page` (src/store.rs) walks the canonical block tree in
+// preorder under three budgets — a limit, an encoded-bytes ceiling, and a
+// traversal-work cap — and every one of them decides where a cursor page
+// ENDS. this walk is that walk with `PageBlockRow` in place of `Block`, so
+// the two lanes cut their pages at the same block and hand back the same
+// cursor. `tests/index_parity.rs` is the proof.
+
+fn page_read_fail(error: PageError) -> Fail {
+    Fail::new(FAIL_PAGE_READ, error.to_string())
+}
+
+fn invalid_page_cursor() -> Fail {
+    page_read_fail(PageError::InvalidPageCursor)
+}
+
+fn corrupt() -> Fail {
+    page_read_fail(PageError::Corrupt)
+}
+
+fn page_query_limit(limit: u16) -> usize {
+    usize::from(if limit == 0 {
+        MAX_PAGE_QUERY_LIMIT
+    } else {
+        limit.min(MAX_PAGE_QUERY_LIMIT)
+    })
+}
+
+fn encoded_len(block: &Block) -> Result<usize, Fail> {
+    serde_json::to_vec(block)
+        .map(|bytes| bytes.len())
+        .map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))
+}
+
+/// one row read against the shared traversal budget — the wasm host's
+/// store-read ceiling has no meaning here, but the budget is what makes an
+/// adversarially shaped tree refuse in BOTH lanes instead of one.
+fn query_row(
+    read: &impl StateRead,
+    block_id: &str,
+    reads: &mut usize,
+) -> Result<Option<PageBlockRow>, Fail> {
+    if *reads >= MAX_TRAVERSAL_WORK {
+        return Err(page_read_fail(PageError::PageTraversalTooDeep));
+    }
+    *reads += 1;
+    read_row(read, block_id)
+}
+
+/// one bounded slice of `page_id`'s preorder traversal, or `None` when this
+/// index holds no page block at that id.
+fn get_page(
+    read: &impl StateRead,
+    page_id: &str,
+    after: Option<String>,
+    limit: u16,
+) -> Result<Option<PageBlockPage>, Fail> {
+    let mut reads = 0_usize;
+    let root = match query_row(read, page_id, &mut reads)? {
+        Some(row) if row.kind == BlockKind::Page => row,
+        _ => return Ok(None),
+    };
+    let root_id = root.block_id.clone();
+    let mut current = match after {
+        Some(cursor) => {
+            if cursor.starts_with('\0') {
+                return Err(invalid_page_cursor());
+            }
+            let row = query_row(read, &cursor, &mut reads)?.ok_or_else(invalid_page_cursor)?;
+            validate_page_cursor(read, &root_id, &row, &mut reads)?;
+            following_page_block(read, &root_id, &row, &mut reads)?
+        }
+        None => Some(root),
+    };
+    let limit = page_query_limit(limit);
+    let mut blocks = Vec::with_capacity(limit);
+    let mut spent = 0_usize;
+    while blocks.len() < limit {
+        let Some(row) = current.take() else {
+            break;
+        };
+        let block = row.to_block();
+        let cost = encoded_len(&block)?;
+        if cost > MAX_PAGE_QUERY_BYTES {
+            return Err(corrupt());
+        }
+        if spent.saturating_add(cost) > MAX_PAGE_QUERY_BYTES {
+            current = Some(row);
+            break;
+        }
+        spent += cost;
+        current = following_page_block(read, &root_id, &row, &mut reads)?;
+        blocks.push(block);
+    }
+    let next_after = current
+        .as_ref()
+        .and_then(|_| blocks.last().map(|block| block.id.clone()));
+    Ok(Some(PageBlockPage { blocks, next_after }))
+}
+
+/// a resumed page must resume inside the page it names: the cursor's parent
+/// still lists it and the pair belongs to this document.
+fn validate_page_cursor(
+    read: &impl StateRead,
+    root_id: &str,
+    cursor: &PageBlockRow,
+    reads: &mut usize,
+) -> Result<(), Fail> {
+    if cursor.block_id == root_id {
+        return Ok(());
+    }
+    let parent_id = match cursor.parent.as_deref() {
+        Some(parent_id) => parent_id,
+        None if cursor.kind == BlockKind::Page => return Err(invalid_page_cursor()),
+        None => return Err(corrupt()),
+    };
+    let parent = query_row(read, parent_id, reads)?.ok_or_else(corrupt)?;
+    if !parent.children.iter().any(|id| id == &cursor.block_id) {
+        return Err(corrupt());
+    }
+    let belongs_to_page = if cursor.kind == BlockKind::Page {
+        parent.page_id == root_id
+    } else {
+        cursor.page_id == root_id && parent.page_id == root_id
+    };
+    if belongs_to_page {
+        Ok(())
+    } else {
+        Err(invalid_page_cursor())
+    }
+}
+
+/// the next block in preorder, or `None` at the end of the document. a nested
+/// `Page` is a LEAF of its container: its own descendants belong to its own
+/// document, never to this traversal.
+fn following_page_block(
+    read: &impl StateRead,
+    root_id: &str,
+    current: &PageBlockRow,
+    reads: &mut usize,
+) -> Result<Option<PageBlockRow>, Fail> {
+    let may_descend = current.kind != BlockKind::Page || current.block_id == root_id;
+    let child_id = if may_descend {
+        current.children.first()
+    } else {
+        None
+    };
+    if let Some(child_id) = child_id {
+        return query_row(read, child_id, reads)?
+            .ok_or_else(corrupt)
+            .map(Some);
+    }
+    if current.block_id == root_id {
+        return Ok(None);
+    }
+
+    let mut child_id = current.block_id.clone();
+    let mut parent_id = current.parent.clone();
+    for _ in 0..MAX_PAGE_DEPTH {
+        let Some(id) = parent_id else {
+            return if child_id == root_id {
+                Ok(None)
+            } else {
+                Err(corrupt())
+            };
+        };
+        let parent = query_row(read, &id, reads)?.ok_or_else(corrupt)?;
+        let child_index = parent
+            .children
+            .iter()
+            .position(|id| id == &child_id)
+            .ok_or_else(corrupt)?;
+        if let Some(sibling_id) = parent.children.get(child_index + 1) {
+            return query_row(read, sibling_id, reads)?
+                .ok_or_else(corrupt)
+                .map(Some);
+        }
+        if parent.block_id == root_id {
+            return Ok(None);
+        }
+        child_id = parent.block_id;
+        parent_id = parent.parent;
+    }
+    Err(corrupt())
+}
+
 /// serve one materialized-view request.
 pub fn serve_view(read: &impl StateRead, req: &[u8]) -> Result<Vec<u8>, Fail> {
     let query: PagesViewQuery =
         serde_json::from_slice(req).map_err(|e| Fail::new(FAIL_BAD_REQUEST, e.to_string()))?;
     match query {
+        PagesViewQuery::GetPage {
+            page_id,
+            after,
+            limit,
+        } => reply_json(&PagesViewReply::Page(get_page(
+            read, &page_id, after, limit,
+        )?)),
         PagesViewQuery::ListPages { after, limit } => {
             let limit = limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT);
             let page = read.scan_page(b"page/", after.as_deref().map(str::as_bytes), limit);
@@ -911,7 +1270,7 @@ mod tests {
     }
 
     #[test]
-    fn same_parent_move_does_not_duplicate_membership() {
+    fn same_parent_move_reorders_without_duplicating_membership() {
         let mut map = Map::new();
         apply(
             &mut map,
@@ -925,8 +1284,14 @@ mod tests {
                 insert("p1", "b2", "second"),
             ],
         );
-        // two sibling reorders under the same parent — each used to re-read
-        // the stale parent row and re-push the child, duplicating membership.
+        // `insert`'s anchor is None — FIRST child — so b2 sits ahead of b1.
+        let children = |map: &Map| read_row(map, "p1").unwrap().unwrap().children;
+        assert_eq!(children(&map), ["b2", "b1"]);
+
+        // two sibling reorders under the same parent. this used to be folded
+        // as a no-op ("membership is unchanged"), which stopped being true the
+        // moment a view served ORDER — and the naive fix, re-reading the
+        // parent and re-pushing, saw the pre-op row and duplicated the child.
         apply(
             &mut map,
             2,
@@ -936,6 +1301,7 @@ mod tests {
                 after: Some("b2".into()),
             }],
         );
+        assert_eq!(children(&map), ["b2", "b1"], "already there: a stable move");
         apply(
             &mut map,
             3,
@@ -945,15 +1311,7 @@ mod tests {
                 after: None,
             }],
         );
-
-        let hits = search(&map, serde_json::json!({"search": {"text": "home"}}));
-        assert_eq!(hits.len(), 1);
-        assert_eq!(
-            hits[0].children.iter().filter(|c| *c == "b1").count(),
-            1,
-            "sibling reorders must not duplicate membership: {:?}",
-            hits[0].children
-        );
+        assert_eq!(children(&map), ["b1", "b2"], "None anchors at the HEAD");
     }
 
     #[test]

@@ -18,6 +18,52 @@ pub fn reaction_applied(
     chat::client::optimistic_reaction(messages, seq, emoji, added, reactor)
 }
 
+/// The row a send paints before the block lands. Same arrangement as the
+/// reaction fold above: the client mints the row, the shell supplies the
+/// identity it must be attributed to, so the pending row groups under the
+/// reader's previous message instead of breaking the run and re-grouping when
+/// the settle delta replaces it.
+pub fn optimistic_message(
+    messages: Vec<ChatMessage>,
+    body: String,
+    message_id: String,
+) -> Vec<ChatMessage> {
+    bounded_chat_window(chat::client::optimistic_message(
+        messages,
+        body,
+        message_id,
+        rpc::cached_user_key().as_deref(),
+    ))
+}
+
+/// The thread rail owns a root plus one sliding reply page. The server cursor
+/// remains authoritative for older/newer pages; mounted rich rows stay bounded
+/// while a hot thread keeps receiving replies.
+pub fn optimistic_thread_message(
+    messages: Vec<ChatMessage>,
+    body: String,
+    message_id: String,
+) -> Vec<ChatMessage> {
+    bounded_thread_window(chat::client::optimistic_message(
+        messages,
+        body,
+        message_id,
+        rpc::cached_user_key().as_deref(),
+    ))
+}
+
+/// [`chat::client::mark_message_groups`] as a value fold, for the reducer.
+///
+/// The timeline calls it on the vec it just pushed an optimistic row onto. The
+/// thread rail does NOT: its vec is `[root] ++ replies` and the root renders as
+/// its own divided block, so a whole-vec pass folds the first reply under the
+/// root and swallows its header. The rail's replies-only marking lives inside
+/// `bounded_thread_window`, which every rail writer already folds through.
+pub fn mark_author_runs(mut messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    chat::client::mark_message_groups(&mut messages);
+    messages
+}
+
 pub async fn rename_channel(
     rpc: String,
     password: String,
@@ -312,6 +358,9 @@ pub async fn send_message(
             committed: cause.committed,
             operation_id,
             scope_id: operation_scope,
+            // A message is not in a thread; the stream's composer is keyed
+            // by its room alone.
+            thread_seq: 0,
             body: operation_body,
         })
 }
@@ -321,40 +370,16 @@ pub async fn load_thread(
     channel_id: String,
     root_seq: i64,
     target_seq: i64,
-    through_reply_offset: i64,
     generation: i64,
 ) -> Result<ThreadLoadData, HydrationError> {
-    let result = async {
-        let root_seq = positive_sequence(root_seq)?;
-        let target_seq = u64::try_from(target_seq).unwrap_or(0);
-        let is_sparse_target = through_reply_offset < 0 && target_seq > 0;
-        let through_reply_offset = u64::try_from(through_reply_offset)
-            .unwrap_or(0)
-            .min(chat::MAX_THREAD_REPLIES as u64);
-        let rpc = rpc_client(&rpc)?;
-        if is_sparse_target {
-            return load_sparse_thread_data(&rpc, &channel_id, root_seq, target_seq).await;
-        }
-        let mut thread =
-            load_thread_data(&rpc, &channel_id, root_seq, through_reply_offset).await?;
-        let target_is_loaded = target_seq > 0
-            && thread
-                .messages
-                .iter()
-                .any(|message| message.seq == number_i64(target_seq));
-        if target_is_loaded {
-            thread.target_seq = number_i64(target_seq);
-        }
-        Ok(thread)
-    }
-    .await;
+    let result = load_thread_window(rpc, channel_id, root_seq, target_seq).await;
     result
         .map(|thread| ThreadLoadData {
             generation,
             root_seq: thread.root_seq,
             target_seq: thread.target_seq,
             messages: thread.messages,
-            next_reply_offset: thread.next_reply_offset,
+            next_reply_seq: thread.next_reply_seq,
             has_more: thread.has_more,
         })
         .map_err(|message| HydrationError {
@@ -363,38 +388,45 @@ pub async fn load_thread(
         })
 }
 
+async fn load_thread_window(
+    rpc: String,
+    channel_id: String,
+    root_seq: i64,
+    target_seq: i64,
+) -> Result<ThreadData, String> {
+    let root_seq = positive_sequence(root_seq)?;
+    let target_seq = u64::try_from(target_seq).unwrap_or(0);
+    let rpc = rpc_client(&rpc)?;
+    if target_seq > 0 {
+        return load_sparse_thread_data(&rpc, &channel_id, root_seq, target_seq).await;
+    }
+    load_thread_data(&rpc, &channel_id, root_seq).await
+}
+
 pub async fn load_thread_page(
     rpc: String,
     channel_id: String,
     root_seq: i64,
-    from: i64,
+    after_reply_seq: i64,
     generation: i64,
 ) -> Result<ThreadPageData, HydrationError> {
     let result = async {
         let root_seq = positive_sequence(root_seq)?;
-        let from = u64::try_from(from).map_err(|_| "invalid thread offset".to_string())?;
+        let after_reply_seq = u64::try_from(after_reply_seq).ok().filter(|seq| *seq > 0);
         let rpc = rpc_client(&rpc)?;
-        let thread = query_thread_page(&rpc, &channel_id, root_seq).await?;
-        let total = thread.replies.len() as u64;
-        let start = from.min(total);
-        let page_len = CHAT_VIEW_PAGE_LIMIT.min(total - start);
-        let next_reply_offset = start + page_len;
-        let page_is_full = page_len == CHAT_VIEW_PAGE_LIMIT;
-        let thread_cap_reached = next_reply_offset >= chat::MAX_THREAD_REPLIES as u64;
-        let has_more = page_is_full && !thread_cap_reached;
+        let thread = query_thread_page(&rpc, &channel_id, root_seq, after_reply_seq).await?;
+        let next_reply_seq = number_i64(thread.next_reply_seq.unwrap_or(0));
         let current_user = local_user_key().await;
         let messages = thread
             .replies
             .into_iter()
-            .skip(start as usize)
-            .take(page_len as usize)
             .map(|row| chat_message(row, current_user.as_deref()))
             .collect();
         Ok(ThreadPageData {
             generation,
             messages,
-            next_reply_offset: number_i64(next_reply_offset),
-            has_more,
+            next_reply_seq,
+            has_more: thread.has_more,
         })
     }
     .await;
@@ -408,39 +440,24 @@ pub async fn refresh_live_thread(
     rpc: String,
     channel_id: String,
     root_seq: i64,
-    target_seq: i64,
-    through_reply_offset: i64,
-    generation: i64,
-) -> Result<LiveThreadData, HydrationError> {
+) -> Result<LiveThreadData, AppError> {
     if channel_id.is_empty() || root_seq <= 0 {
         return Ok(LiveThreadData {
-            generation,
             channel_id,
             root_seq: 0,
-            target_seq: 0,
             messages: Vec::new(),
-            next_reply_offset: 0,
-            has_more: false,
         });
     }
-    load_thread(
-        rpc,
-        channel_id.clone(),
-        root_seq,
-        target_seq,
-        through_reply_offset,
-        generation,
-    )
-    .await
-    .map(|thread| LiveThreadData {
-        generation: thread.generation,
-        channel_id,
-        root_seq: thread.root_seq,
-        target_seq: thread.target_seq,
-        messages: thread.messages,
-        next_reply_offset: thread.next_reply_offset,
-        has_more: thread.has_more,
-    })
+    let root_seq = positive_sequence(root_seq).map_err(app_error)?;
+    let rpc = rpc_client(&rpc).map_err(app_error)?;
+    load_thread_data(&rpc, &channel_id, root_seq)
+        .await
+        .map(|thread| LiveThreadData {
+            channel_id,
+            root_seq: thread.root_seq,
+            messages: thread.messages,
+        })
+        .map_err(app_error)
 }
 
 pub async fn send_reply(
@@ -454,6 +471,7 @@ pub async fn send_reply(
 ) -> Result<SendReceipt, OptimisticMutationError> {
     let operation_id = message_id.clone();
     let operation_scope = channel_id.clone();
+    let operation_thread = root_seq;
     let operation_body = body.clone();
     let result = async {
         let root_seq = positive_sequence(root_seq)?;
@@ -486,6 +504,7 @@ pub async fn send_reply(
             committed: cause.committed,
             operation_id,
             scope_id: operation_scope,
+            thread_seq: operation_thread,
             body: operation_body,
         })
 }
@@ -604,8 +623,7 @@ pub async fn search_chat(
     rpc: String,
     channel_id: String,
     text: String,
-    generation: i64,
-) -> Result<ChatSearchData, HydrationError> {
+) -> Result<ChatSearchData, AppError> {
     // The reader, for the same `you` rendering the timeline does — a search hit
     // was showing the RAW wire author (`user:3f8dc8…773`, the full 64-hex key
     // with its prefix) as the row's headline, above the text it matched.
@@ -636,7 +654,6 @@ pub async fn search_chat(
             return Err("chat search returned an invalid reply".into());
         };
         Ok(ChatSearchData {
-            generation,
             hits: hits
                 .into_iter()
                 .map(|hit| ChatSearchHit {
@@ -659,10 +676,7 @@ pub async fn search_chat(
         })
     }
     .await;
-    result.map_err(|message| HydrationError {
-        generation,
-        message: user_error(message),
-    })
+    result.map_err(app_error)
 }
 
 pub async fn load_page(rpc: String, page_id: String) -> Result<PagesData, AppError> {
@@ -847,6 +861,16 @@ pub(crate) fn comment_thread_id(thread_id: String) -> Result<String, String> {
     }
 }
 
+/// The cheapest thing the pages view can be asked: zero targets, so the guest
+/// scans nothing and answers an empty group list. [`await_fold`] reads only
+/// the reply's watermark header, so the body should cost as little as the lane
+/// allows.
+pub(crate) fn empty_pages_probe() -> PagesViewQuery {
+    PagesViewQuery::ThreadsForTargets {
+        targets: Vec::new(),
+    }
+}
+
 pub async fn create_page(
     rpc: String,
     password: String,
@@ -856,7 +880,7 @@ pub async fn create_page(
         let title = bounded_text(title, "page title", 512)?;
         let page_id = fresh_id("page");
         let rpc = rpc_client(&rpc)?;
-        signed_write(
+        let height = signed_write(
             &rpc,
             "pages",
             pages::encode_msg(&PageMsg::CreatePage {
@@ -866,12 +890,22 @@ pub async fn create_page(
             password,
         )
         .await?;
+        // WAIT FOR THE FOLD, THEN RELOAD. `submit_frame` returns when the node
+        // ACCEPTS a transaction, not when it applies one, and the pages read
+        // model is folded behind the block loop — so a reload fired straight
+        // after the write reads an index that predates it. The view lane
+        // answers how far the fold has consumed the op feed, so this waits for
+        // it to reach the block that took the write.
+        await_fold(&rpc, "pages", &empty_pages_probe(), height).await;
+        // The wait above already covers this reload, so it passes None rather
+        // than paying a second probe for the same watermark.
         let mut data = load_pages_data(&rpc, Some(&page_id))
             .await
             .map_err(committed_error)?;
-        // LAND ON THE PAGE THAT WAS JUST MADE. `submit_frame` returns when the
-        // node ACCEPTS a transaction, not when it applies one, so this reload
-        // reads an index that does not have the new page yet — measured, not
+        // LAND ON THE PAGE THAT WAS JUST MADE. The wait above narrows the
+        // window; it does not close it (a boundary stamp leaves no watermark,
+        // a busy block can park the fold mid-batch, the budget is bounded on
+        // purpose), so the correction stays the guarantee — measured, not
         // assumed: the reload asked for the new id, was handed the first page
         // in the list instead, and reported the new id absent from that list.
         // `load_pages_data` is right to drop an id it cannot see (a live
@@ -879,7 +913,7 @@ pub async fn create_page(
         // deleted, and must follow the fallback). This is the one caller that
         // KNOWS its id is good, so the correction belongs here: press Enter on
         // a title and you are on that page, not on whichever one sorts first.
-        // Its body arrives with the next refresh.
+        // It is a no-op whenever the fold did arrive.
         if data.active_page != page_id {
             data.active_page = page_id;
             data.active_page_title = title;
@@ -903,7 +937,7 @@ pub async fn delete_page(
             return Err("choose a page first".to_string().into());
         }
         let rpc = rpc_client(&rpc)?;
-        signed_write(
+        let height = signed_write(
             &rpc,
             "pages",
             pages::encode_msg(&PageMsg::RemoveBlock {
@@ -912,14 +946,17 @@ pub async fn delete_page(
             password,
         )
         .await?;
-        let mut data = load_pages_data(&rpc, None)
-            .await
-            .map_err(committed_error)?;
+        await_fold(&rpc, "pages", &empty_pages_probe(), height).await;
+        // Same as `create_page`: the wait above covers this reload.
+        let mut data = load_pages_data(&rpc, None).await.map_err(committed_error)?;
         // DROP WHAT WAS JUST DELETED. Same acceptance-vs-application gap as
-        // `create_page`, read the other way round: this reload can still see
-        // the removed page, so it stayed in the sidebar, stayed selectable,
-        // and re-installed its blocks into the editor when picked — a document
-        // the network no longer has. `RemoveBlock` deletes the whole SUBTREE
+        // `create_page`, read the other way round and narrowed by the same
+        // wait: this reload can still see the removed page, so it stayed in
+        // the sidebar, stayed selectable, and re-installed its blocks into the
+        // editor when picked — a document the network no longer has. The
+        // correction below is idempotent, so it costs nothing once the fold
+        // has arrived and remains the guarantee when it has not.
+        // `RemoveBlock` deletes the whole SUBTREE
         // (pages/src/store.rs walks children with no page-kind stop), so every
         // descendant goes with it, not just the row that was asked for.
         let doomed = descendants_of(&data.pages, &page_id);
@@ -927,7 +964,11 @@ pub async fn delete_page(
         if doomed.contains(&data.active_page) {
             // Re-resolve exactly as `load_pages_data` would have, had the index
             // already caught up: the first surviving page, or nothing.
-            data.active_page = data.pages.first().map(|page| page.id.clone()).unwrap_or_default();
+            data.active_page = data
+                .pages
+                .first()
+                .map(|page| page.id.clone())
+                .unwrap_or_default();
             data.active_page_title = String::new();
             data.active_page_parent = String::new();
             data.blocks = Vec::new();
@@ -995,8 +1036,7 @@ pub async fn search_pages(
     rpc: String,
     page_id: String,
     text: String,
-    generation: i64,
-) -> Result<PageSearchData, HydrationError> {
+) -> Result<PageSearchData, AppError> {
     let result = async {
         let text = bounded_text(text, "search", 512)?;
         let rpc = rpc_client(&rpc)?;
@@ -1016,10 +1056,7 @@ pub async fn search_pages(
             return Err("page search returned an invalid reply".into());
         };
         if hits.is_empty() {
-            return Ok(PageSearchData {
-                generation,
-                hits: Vec::new(),
-            });
+            return Ok(PageSearchData { hits: Vec::new() });
         }
         // The titles live one view over, in the same index — this is the very
         // call the pages sidebar makes. Paid once per search that matched
@@ -1036,13 +1073,9 @@ pub async fn search_pages(
         // fallback `titled_page_hits` already takes for an unknown page id.
         let index = load_page_index(&rpc).await.unwrap_or_default();
         Ok(PageSearchData {
-            generation,
             hits: titled_page_hits(hits, index),
         })
     }
     .await;
-    result.map_err(|message| HydrationError {
-        generation,
-        message: user_error(message),
-    })
+    result.map_err(app_error)
 }

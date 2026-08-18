@@ -1,6 +1,5 @@
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
-use commonware_utils::ordered::Set;
 
 use host::Host;
 
@@ -37,54 +36,39 @@ pub(crate) async fn read_valset_residents(host: &Host) -> Vec<Vec<u8>> {
     }
 }
 
-/// read the current CLIENT set — the submit-door ACL, now a facet of the
-/// identity account plane (committed state — called between drains, outside any
-/// block). the submit door admits a client's own-signed frame; this is a
-/// SEPARATE read from the valset residents (client standing is structurally
-/// distinct from valset), so a client's standing can never leak into the
-/// statesync/mesh reads keyed off valset.
-pub(crate) async fn read_clients(host: &Host) -> Vec<Vec<u8>> {
-    use identity::{IdentityQuery, IdentityReply, decode_reply, encode_query};
+/// read the valset module's retained mesh-generation window (committed state —
+/// called between drains, outside any block; same read point as
+/// [`read_valset_members`]). unreadable degrades to EMPTY: callers treat an
+/// empty window per their role (a validator fail-stops, a poller retries).
+pub(crate) async fn read_valset_mesh_window(host: &Host) -> Vec<valset::GenerationSet> {
+    use valset::{ValsetQuery, ValsetReply, decode_reply, encode_query};
     let Ok(reply) = host
-        .query("identity", &encode_query(&IdentityQuery::Clients))
+        .query("valset", &encode_query(&ValsetQuery::MeshWindow))
         .await
     else {
         return Vec::new();
     };
     match decode_reply(&reply) {
-        Ok(IdentityReply::Clients(v)) => v,
-        _ => Vec::new(),
+        Ok(ValsetReply::MeshWindow(window)) => window,
+        Ok(_) | Err(_) => Vec::new(),
     }
 }
 
-/// the transport-mesh set a parked joiner tracks at a manifest's epoch. it MUST
-/// be the same set every member tracks at that epoch — a validator tracks
-/// `descriptor_mesh ∪ members ∪ residents` (see the `mesh_at` closure in the
-/// validator boot below) — because `authenticated::discovery` KILLS a peer
-/// whose bit-vector length disagrees at a shared index. the manifest carries
-/// members (`participants`) and residents (`residents`) as separate lists, so a
-/// joiner that folds only `participants` tracks a SHORTER set than every member
-/// the moment any resident is granted, and discovery tears the link down on
-/// every gossip round (a resident redeeming its own grant is exactly this case:
-/// the founder counts it, the joiner does not). the descriptor mesh already
-/// carries the lobby key. undecodable keys are dropped (dead serving hints).
-pub(crate) fn joiner_epoch_mesh(
-    descriptor_mesh: &[ed25519::PublicKey],
-    participants: &[Vec<u8>],
-    residents: &[Vec<u8>],
-) -> Set<ed25519::PublicKey> {
-    let mut union: std::collections::BTreeSet<ed25519::PublicKey> =
-        descriptor_mesh.iter().cloned().collect();
-    // fold BOTH lists: members AND residents. every validator tracks the epoch
-    // as `descriptor_mesh ∪ members ∪ residents`; omitting residents here would
-    // leave the joiner one short and get it killed on every discovery round.
-    for k in participants.iter().chain(residents.iter()) {
-        if let Ok(pk) = ed25519::PublicKey::decode(k.as_slice()) {
-            union.insert(pk);
-        }
-    }
-    Set::try_from(union.into_iter().collect::<Vec<_>>())
-        .expect("a btree-set union has no duplicates")
+/// the committed mesh window in its sync-wire shape: `(latest generation,
+/// entries)` — the fill for [`statesync::TipCoords`] / `BoundaryCoords`.
+/// statesync stays valset-agnostic, so the conversion lives here.
+pub(crate) async fn read_sync_mesh_window(host: &Host) -> (u64, Vec<statesync::MeshWindowEntry>) {
+    let window = read_valset_mesh_window(host).await;
+    let generation = window.last().map(|s| s.generation).unwrap_or(0);
+    let entries = window
+        .into_iter()
+        .map(|s| statesync::MeshWindowEntry {
+            generation: s.generation,
+            validators: s.validators,
+            residents: s.residents,
+        })
+        .collect();
+    (generation, entries)
 }
 
 /// read ONE committed invite redemption by token nonce — the exactly-once

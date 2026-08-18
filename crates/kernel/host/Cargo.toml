@@ -23,6 +23,13 @@ lifecycle = { workspace = true }
 # WIRE-TYPES-ONLY dep, same shape: the drain's delivery injection reads
 # the dispatch module's committed mailbox count between blocks.
 dispatch = { workspace = true }
+# WIRE-TYPES-ONLY deps, same shape: the drain's acl dispatch gate reads the
+# acl module's policy table and resolves the submitting origin's principal
+# against the valset tiers and the identity ownership indexes. host uses only
+# the crate-root wire types — it never constructs or registers the impls.
+acl = { workspace = true }
+valset = { workspace = true }
+identity = { workspace = true }
 
 [dev-dependencies]
 # the host-side qmdb store handle injected into disk-backed modules.
@@ -49,7 +56,6 @@ tasks = { workspace = true }
 tagging = { workspace = true }
 capability = { workspace = true }
 duckdns = { workspace = true }
-identity = { workspace = true }
 # the gateway/governance parity proofs stand the native modules (and their
 # native identity/valset/lifecycle siblings) beside the wasm ports.
 gateway = { workspace = true }
@@ -60,9 +66,6 @@ greeter = { workspace = true }
 # randomness inside a consensus proof).
 p256 = { workspace = true }
 base64 = { workspace = true }
-# the deterministic-activation drain-injection test stands the real lifecycle +
-# valset modules on the host and drives a block across an activation boundary.
-valset = { workspace = true }
 # the delivery drain-injection test stands the real dispatch + saga modules
 # next to a stub receiver.
 saga = { workspace = true }

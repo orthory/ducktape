@@ -28,7 +28,7 @@ use super::resolve::{DEFAULT_CHECKPOINT_BLOCKS, DEFAULT_PODMAN_IMAGE};
 /// a correctness property rather than tidiness — see
 /// [`no_tcp_default_sits_in_the_ephemeral_range`]. The mesh listener was at
 /// `52200`, inside the range, where any outbound connection on the box can take
-/// the port first; commonware's discovery listener `expect`s its bind, so
+/// the port first; commonware's mesh listener `expect`s its bind, so
 /// losing that race is an unwinding panic ten seconds into boot. It now sits
 /// beside the two operator surfaces, which were never at risk.
 pub const DEFAULT_MESH_LISTEN: &str = "[::]:8846";
@@ -94,11 +94,6 @@ pub struct NodeToml {
     pub coordinator_relay: String,
     /// sealed blocks between recovery checkpoints.
     pub checkpoint_blocks: u64,
-    /// shipped-index warm start on join (default ON — the read model arrives
-    /// warm from the sync source, unverified by design). `false` opts this
-    /// node down to consensus-only: verified state, derived views empty at
-    /// the boundary.
-    pub sync_index: bool,
     /// the compute plane: PRESENT = provider runs execute in this sandbox;
     /// ABSENT = consensus-only node (no provider discovery, no announce, no
     /// terminal plane).
@@ -132,10 +127,11 @@ impl NodeToml {
 }
 
 /// the dev-seed harness shape: deterministic seed identities, no
-/// descriptor. node 0 bootstraps nobody; everyone else dials peer_seeds[0]
-/// at `bootstrapper_addr`. Only the test harnesses write this shape, so
-/// its plumbing stays optional — a harness file says exactly what the test
-/// needs and nothing else.
+/// descriptor. every peer's dial address rides `peer_addrs`, index-aligned
+/// with `peer_seeds` — the mesh transport has no address gossip, so the
+/// full list must come from config (the harness knows every port). Only
+/// the test harnesses write this shape, so its plumbing stays optional —
+/// a harness file says exactly what the test needs and nothing else.
 #[derive(Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DevSeedToml {
@@ -143,9 +139,10 @@ pub struct DevSeedToml {
     pub namespace: String,
     pub peer_seeds: Vec<u64>,
     pub validator_seeds: Option<Vec<u64>>,
-    /// `None` for node 0 (bootstraps nobody) — a semantic state, not a
-    /// default.
-    pub bootstrapper_addr: Option<String>,
+    /// one dial address per `peer_seeds` entry, same order. optional only
+    /// for a SOLO node (nobody to dial); a multi-node cluster without it
+    /// is refused at resolve.
+    pub peer_addrs: Option<Vec<String>>,
     pub listen: String,
     pub advertised: Option<String>,
     pub storage_dir: Option<String>,
@@ -159,7 +156,6 @@ pub struct DevSeedToml {
     pub wireguard_advertised: Option<String>,
     pub primary_coordinator: Option<String>,
     pub coordinator_relay: Option<String>,
-    pub sync_index: Option<bool>,
     pub sandbox: Option<SandboxToml>,
 }
 
@@ -228,7 +224,6 @@ pub struct Plumbing {
     pub primary_coordinator: String,
     pub coordinator_relay: String,
     pub checkpoint_blocks: u64,
-    pub sync_index: bool,
     pub sandbox: Option<SandboxToml>,
 }
 
@@ -311,7 +306,6 @@ pub fn merged_plumbing(
         checkpoint_blocks: e
             .map(|r| r.checkpoint_blocks)
             .unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
-        sync_index: e.map(|r| r.sync_index).unwrap_or(true),
         sandbox: e.and_then(|r| r.sandbox.clone()),
         wireguard_listen,
         primary_coordinator,
@@ -389,8 +383,6 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
         "TCP first-contact fallback; \"none\" disables");
     keyline(&mut s, "checkpoint_blocks", format_args!("{}", p.checkpoint_blocks),
         "sealed blocks between recovery checkpoints");
-    keyline(&mut s, "sync_index", format_args!("{}", p.sync_index),
-        "false: consensus-only (skip the unverified index warm start on join)");
     // the [sandbox] table LAST — everything after a toml table header belongs
     // to the table, so no top-level key may follow it.
     match &p.sandbox {
@@ -453,7 +445,7 @@ mod tests {
     /// and the loser of that race is a node that will not start.
     ///
     /// The mesh listener is the one that bit: it sat at `52200`, and
-    /// commonware's discovery listener `expect`s its bind inside the runtime,
+    /// commonware's mesh listener `expect`s its bind inside the runtime,
     /// so losing the race was `thread 'tokio-rt-worker' panicked … BindFailed`
     /// ten seconds into an otherwise healthy boot.
     ///
@@ -505,7 +497,6 @@ mod tests {
             derive_coordinator_relay(DEFAULT_PRIMARY_COORDINATOR)
         );
         assert_eq!(raw.checkpoint_blocks, DEFAULT_CHECKPOINT_BLOCKS);
-        assert!(raw.sync_index);
         // no [sandbox] table by default: a fresh node is consensus-only, and
         // the commented example in the file must not parse as a live table.
         assert_eq!(raw.sandbox, None);

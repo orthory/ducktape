@@ -1,15 +1,13 @@
 use super::*;
 
-/// The settings pane's facts: where this app points and what identity it
-/// holds locally.
+/// The device-local settings facts: where this app points and what identity it
+/// holds locally. Node status belongs to [`NodeFacts`].
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct SettingsFacts {
     pub generation: i64,
-    pub endpoint: String,
-    pub node_key: String,
     pub key_path: String,
     pub key_state: String,
-    /// this workspace's directory on this device — the NETWORK card's Data dir.
+    /// This workspace's directory on this device — the Node overview's data dir.
     pub data_dir: String,
     pub open_tabs: i64,
     /// THE VIEWER'S OWN KEY, full hex — the `me` every membership test needs.
@@ -22,16 +20,13 @@ pub struct SettingsFacts {
 }
 
 /// The NETWORK card's Data dir row.
-/// Load the settings facts: node identity from /v1/status, the local user
-/// key's location and state, and the persisted tab count.
+/// Load the settings facts: the local user key's location and state, the
+/// workspace directory, and the persisted tab count.
 pub async fn load_settings_facts(
     rpc: String,
     generation: i64,
 ) -> Result<SettingsFacts, HydrationError> {
-    offscreen_guard(generation)?;
     async {
-        let client = rpc_client(&rpc)?;
-        let status = client.status().await?;
         let (key_path, key_state) = match user_key_path() {
             Err(_) => ("(unset)".to_string(), "unlocatable".to_string()),
             Ok(path) => {
@@ -48,10 +43,8 @@ pub async fn load_settings_facts(
             .map(|(_, dir)| dir.display().to_string())
             .or_else(|| ducktape_home().map(|home| home.display().to_string()))
             .unwrap_or_default();
-        Ok(SettingsFacts {
+        Ok::<_, String>(SettingsFacts {
             generation,
-            endpoint: rpc,
-            node_key: short_label(&status.public_key),
             key_path,
             key_state,
             data_dir,
@@ -79,6 +72,232 @@ pub async fn clear_doc_tabs(rpc: String) -> bool {
 pub struct NodeLogLine {
     pub cursor: String,
     pub line: String,
+}
+
+pub type NodeLogTimelineEvent = ui_lang_components::ui::log_timeline::LogTimelineEvent<String>;
+
+/// Retained native timeline state plus the bounded rows it renders.
+///
+/// Clone snapshots the same mounted widget state; the old value is replaced by
+/// the Ice assignment that requested the clone.
+#[derive(Debug)]
+pub struct NodeLogTimelineState {
+    timeline: ui_lang_components::ui::log_timeline::LogTimelineState<String>,
+    lines: Arc<[NodeLogLine]>,
+    visible: Arc<[NodeLogLine]>,
+    filter: String,
+}
+
+impl Clone for NodeLogTimelineState {
+    fn clone(&self) -> Self {
+        Self {
+            timeline: self.timeline.update_snapshot(),
+            lines: Arc::clone(&self.lines),
+            visible: Arc::clone(&self.visible),
+            filter: self.filter.clone(),
+        }
+    }
+}
+
+const NODE_LOG_LIMIT: usize = 4_096;
+const NODE_LOG_TRIM: usize = 1_024;
+
+fn node_log_timeline_config() -> ui_lang_components::ui::log_timeline::VirtualListConfig {
+    ui_lang_components::ui::log_timeline::VirtualListConfig::new(26.0)
+        .expect("node log row geometry is fixed")
+        .overscan(4)
+}
+
+pub fn node_log_timeline_state() -> NodeLogTimelineState {
+    NodeLogTimelineState {
+        timeline: ui_lang_components::ui::log_timeline::LogTimelineState::new(
+            ui_lang_components::ui::log_timeline::VirtualListId::new("node-log-timeline"),
+        ),
+        lines: Arc::from([]),
+        visible: Arc::from([]),
+        filter: String::new(),
+    }
+}
+
+pub fn node_log_timeline_reset() -> NodeLogTimelineState {
+    node_log_timeline_state()
+}
+
+pub fn node_log_timeline_push(
+    mut state: NodeLogTimelineState,
+    line: NodeLogLine,
+) -> NodeLogTimelineState {
+    // ponytail: a bounded linear duplicate guard is smaller than retaining a
+    // second cursor index; revisit only if the 4,096-line ceiling moves.
+    let duplicate = state.lines.iter().any(|held| held.cursor == line.cursor);
+    if duplicate {
+        return state;
+    }
+    let mut lines = Vec::from(state.lines.as_ref());
+    lines.push(line);
+    if lines.len() > NODE_LOG_LIMIT {
+        lines.drain(..NODE_LOG_TRIM);
+    }
+    state.lines = lines.into();
+    node_log_timeline_reconcile(state)
+}
+
+pub fn node_log_timeline_filter(
+    mut state: NodeLogTimelineState,
+    filter: String,
+) -> NodeLogTimelineState {
+    state.filter = filter.trim().to_lowercase();
+    node_log_timeline_reconcile(state)
+}
+
+fn node_log_timeline_reconcile(mut state: NodeLogTimelineState) -> NodeLogTimelineState {
+    let visible: Arc<[NodeLogLine]> = state
+        .lines
+        .iter()
+        .filter(|line| state.filter.is_empty() || line.line.to_lowercase().contains(&state.filter))
+        .cloned()
+        .collect::<Vec<_>>()
+        .into();
+    let config = node_log_timeline_config();
+    let append = state
+        .timeline
+        .reconcile(&visible, |line| line.cursor.clone(), config);
+    if append.is_err() {
+        state
+            .timeline
+            .replace(&visible, |line| line.cursor.clone(), config)
+            .expect("node log cursors are unique");
+    }
+    state.visible = visible;
+    state
+}
+
+pub fn node_log_timeline_apply(
+    mut state: NodeLogTimelineState,
+    event: NodeLogTimelineEvent,
+) -> NodeLogTimelineState {
+    state.timeline.apply(event, node_log_timeline_config());
+    state
+}
+
+pub fn node_log_timeline<'a>(
+    state: &'a NodeLogTimelineState,
+    source: &'a str,
+) -> iced::Element<'a, NodeLogTimelineEvent> {
+    use iced::widget::{Space, button, column, container, row, text};
+    use iced::{Border, Color, Font, Length};
+    use ui_lang_components::ui::log_timeline::{LogTimelineEvent, log_timeline};
+    use ui_lang_components::ui::theme::DARK;
+
+    let inspection = state.timeline.inspect(node_log_timeline_config());
+    let mono = Font {
+        family: iced::font::Family::Name(design::fonts::FAMILY_MONO),
+        ..Font::DEFAULT
+    };
+    let tail: iced::Element<'_, NodeLogTimelineEvent> = if inspection.following_tail {
+        text("LIVE")
+            .size(10)
+            .font(mono)
+            .color(DARK.palette.success)
+            .into()
+    } else {
+        button(
+            text(format!("RESUME · {} NEW", inspection.unread_count))
+                .size(10)
+                .font(mono),
+        )
+        .padding([3, 7])
+        .on_press(LogTimelineEvent::ResumeTail)
+        .into()
+    };
+    let header = row![
+        text("NODE LOG")
+            .size(10)
+            .font(mono)
+            .color(DARK.palette.foreground),
+        text(source)
+            .size(10)
+            .font(mono)
+            .color(DARK.palette.muted_foreground),
+        Space::new().width(Length::Fill),
+        tail,
+    ]
+    .spacing(8)
+    .align_y(iced::Alignment::Center);
+    let body: iced::Element<'_, NodeLogTimelineEvent> = if state.visible.is_empty() {
+        let message = if state.lines.is_empty() {
+            "Waiting for the node's log ring…"
+        } else {
+            "No lines match this filter."
+        };
+        container(
+            text(message)
+                .size(12)
+                .font(mono)
+                .color(DARK.palette.muted_foreground),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_y(Length::Fill)
+        .into()
+    } else {
+        log_timeline(
+            &state.timeline,
+            &state.visible,
+            node_log_timeline_config(),
+            "Node log",
+            |line| line.cursor.clone(),
+            |line| line.line.clone(),
+            |_, line, _selected| {
+                let parts = split_log_line(line.line.clone());
+                let level_color = match parts.level.as_str() {
+                    "ERROR" => DARK.palette.destructive,
+                    "WARN" => DARK.palette.warning,
+                    "INFO" => DARK.palette.success,
+                    "DEBUG" | "TRACE" => DARK.palette.muted_foreground,
+                    _ => Color::TRANSPARENT,
+                };
+                row![
+                    // 24 mono chars at size 11 (Geist Mono, 0.6 em advance)
+                    // need ~158 px; 150 let the tail paint over the level.
+                    text(parts.time)
+                        .size(11)
+                        .font(mono)
+                        .color(DARK.palette.muted_foreground)
+                        .width(170),
+                    text(parts.level)
+                        .size(11)
+                        .font(mono)
+                        .color(level_color)
+                        .width(48),
+                    text(parts.message)
+                        .size(11)
+                        .font(mono)
+                        .color(DARK.palette.foreground),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center)
+                .into()
+            },
+            |event| event,
+            &DARK,
+        )
+    };
+    container(column![header, body].spacing(10))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(15)
+        .style(|_| container::Style {
+            background: Some(DARK.palette.background.into()),
+            text_color: Some(DARK.palette.foreground),
+            border: Border {
+                color: DARK.palette.border,
+                width: 1.0,
+                radius: 12.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
 }
 
 /// The node's live log ring as an app stream — reconnects with backoff and
@@ -146,36 +365,30 @@ pub fn node_logs(rpc: String) -> iced::futures::stream::BoxStream<'static, NodeL
     .boxed()
 }
 
-/// Append a log line to the pane's bounded ring (newest last, 500 kept).
-pub fn push_log_line(mut lines: Vec<NodeLogLine>, line: NodeLogLine) -> Vec<NodeLogLine> {
-    let duplicate = lines.last().is_some_and(|last| last.cursor == line.cursor);
-    if duplicate {
-        return lines;
-    }
-    lines.push(line);
-    let excess = lines.len().saturating_sub(500);
-    lines.drain(..excess);
-    lines
-}
-
-/// The pane's visible window: substring-filtered, newest last.
-pub fn filter_log_lines(lines: Vec<NodeLogLine>, filter: String) -> Vec<NodeLogLine> {
-    let needle = filter.trim().to_lowercase();
-    if needle.is_empty() {
-        return lines;
-    }
-    lines
-        .into_iter()
-        .filter(|line| line.line.to_lowercase().contains(&needle))
-        .collect()
-}
-
 /// One tracing line, split for the dark log console's three columns.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct LogParts {
     pub time: String,
     pub level: String,
     pub message: String,
+}
+
+/// The ring's tracing timer prints microseconds (`…T09:12:44.918273Z`, 27
+/// chars) but the console column is sized for milliseconds — an iced text
+/// widget never clips itself, so the extra digits paint over the level
+/// column. Trim the fraction to three digits; any other shape passes through.
+fn trim_time_to_millis(time: &str) -> String {
+    let Some((secs, frac)) = time.rsplit_once('.') else {
+        return time.to_string();
+    };
+    let Some(digits) = frac.strip_suffix('Z') else {
+        return time.to_string();
+    };
+    let trimmable = digits.len() > 3 && digits.bytes().all(|b| b.is_ascii_digit());
+    if !trimmable {
+        return time.to_string();
+    }
+    format!("{secs}.{}Z", &digits[..3])
 }
 
 /// Split `2026-07-27T09:12:44.918Z  INFO ducktape::join: admitted` into its
@@ -193,7 +406,7 @@ pub fn split_log_line(line: String) -> LogParts {
     let timestamped =
         first.contains(':') && first.chars().next().is_some_and(|c| c.is_ascii_digit());
     let (time, level_field) = match timestamped {
-        true => (first.to_string(), fields.next().unwrap_or_default()),
+        true => (trim_time_to_millis(first), fields.next().unwrap_or_default()),
         false => (String::new(), first),
     };
     if !LEVELS.contains(&level_field) {
@@ -213,11 +426,67 @@ pub fn split_log_line(line: String) -> LogParts {
     }
 }
 
+#[cfg(test)]
+mod log_timeline_tests {
+    use super::*;
+
+    #[test]
+    fn timeline_keeps_unique_history_and_replaces_on_filter_changes() {
+        let mut state = node_log_timeline_state();
+        state = node_log_timeline_push(
+            state,
+            NodeLogLine {
+                cursor: "1".into(),
+                line: "INFO admitted resident".into(),
+            },
+        );
+        state = node_log_timeline_push(
+            state,
+            NodeLogLine {
+                cursor: "1".into(),
+                line: "duplicate cursor".into(),
+            },
+        );
+        state = node_log_timeline_push(
+            state,
+            NodeLogLine {
+                cursor: "2".into(),
+                line: "WARN retrying dial".into(),
+            },
+        );
+
+        assert_eq!(state.lines.len(), 2);
+        assert_eq!(state.visible.len(), 2);
+        assert_eq!(
+            state
+                .timeline
+                .inspect(node_log_timeline_config())
+                .list
+                .logical_items,
+            2
+        );
+
+        state = node_log_timeline_filter(state, " warn ".into());
+        assert_eq!(state.visible.len(), 1);
+        assert_eq!(state.visible[0].cursor, "2");
+        assert_eq!(
+            state
+                .timeline
+                .inspect(node_log_timeline_config())
+                .list
+                .logical_items,
+            1
+        );
+    }
+}
+
 /// The node's consensus/storage facts — everything `/v1/status` publishes that
 /// the two-field `Status` type drops, plus the mesh sample's live/total.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct NodeFacts {
-    pub generation: i64,
+    /// The daemon identity, full hex so the operator surface can copy the key
+    /// that membership and peer records actually carry.
+    pub public_key: String,
     /// The daemon's build version, verbatim off `/v1/status` (its own
     /// `CARGO_PKG_VERSION`). A build/commit SHA is NOT published anywhere, so
     /// the version line carries the version alone.
@@ -282,7 +551,7 @@ pub struct NodeFacts {
 impl Default for NodeFacts {
     fn default() -> Self {
         Self {
-            generation: 0,
+            public_key: String::new(),
             version: String::new(),
             root_hash: String::new(),
             view: None,
@@ -308,12 +577,15 @@ impl Default for NodeFacts {
 /// The facts a `/v1/status` document carries — the ONE reader, shared by the
 /// HTTP load and the pushed `status` snapshot, for the same reason
 /// [`peer_rows`] is shared.
-pub(crate) fn node_facts(status: &serde_json::Value, generation: i64) -> NodeFacts {
+pub(crate) fn node_facts(status: &serde_json::Value) -> NodeFacts {
     let operations = &status["operations"];
     let consensus = &operations["consensus"];
     let sync = &operations["sync"];
     NodeFacts {
-        generation,
+        public_key: status["public_key"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
         version: status["version"].as_str().unwrap_or_default().to_string(),
         root_hash: status["root_hash"].as_str().unwrap_or_default().to_string(),
         view: consensus["view"].as_i64(),
@@ -374,17 +646,14 @@ pub(crate) fn sync_in_progress(phase: &str) -> bool {
     phase == "syncing"
 }
 
-pub async fn load_node_facts(rpc: String, generation: i64) -> Result<NodeFacts, HydrationError> {
+pub async fn load_node_facts(rpc: String) -> Result<NodeFacts, AppError> {
     async {
         let client = rpc_client(&rpc)?;
         let status = client.status_json().await?;
-        Ok(node_facts(&status, generation))
+        Ok(node_facts(&status))
     }
     .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
+    .map_err(app_error)
 }
 
 /// The head a status document actually serves, or [`UNMEASURED`] when it
@@ -415,7 +684,7 @@ fn served_height(height: &serde_json::Value) -> i64 {
 /// What an `operations` reading the node did not publish carries.
 ///
 /// The rule is already written twice — `NodeFacts`'s consensus trio is
-/// `Option` "rather than being filled with misleading zeroes", and `state.ice`
+/// `Option` "rather than being filled with misleading zeroes", and `state/node.ice`
 /// says an absent reading "must print `—`, never a measured `0`". The two
 /// `i64` fields beside them had no way to say it, because `0` is a legal
 /// height and a legal timestamp.
@@ -560,10 +829,8 @@ trait SnapshotReader<T> {
 }
 
 impl SnapshotReader<NodeFacts> for Snapshot {
-    /// The generation is the HTTP loads' stale-reply guard; a PUSH answers no
-    /// request, so `-1` is the app's own "not a reply" reading.
     fn read(&self, document: &serde_json::Value) -> NodeFacts {
-        node_facts(document, -1)
+        node_facts(document)
     }
 }
 
@@ -643,7 +910,6 @@ pub struct ModuleRow {
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ModulesData {
-    pub generation: i64,
     pub rows: Vec<ModuleRow>,
 }
 
@@ -654,7 +920,7 @@ pub struct ModulesData {
 /// The lifecycle half is BEST EFFORT on purpose — the daemon's default module
 /// set has no `lifecycle`, and a network without one still has a real,
 /// complete registered set to show.
-pub async fn load_modules(rpc: String, generation: i64) -> Result<ModulesData, HydrationError> {
+pub async fn load_modules(rpc: String) -> Result<ModulesData, AppError> {
     async {
         let client = rpc_client(&rpc)?;
         let status = client.status_json().await?;
@@ -689,13 +955,10 @@ pub async fn load_modules(rpc: String, generation: i64) -> Result<ModulesData, H
                 }
             })
             .collect();
-        Ok(ModulesData { generation, rows })
+        Ok(ModulesData { rows })
     }
     .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
+    .map_err(app_error)
 }
 
 /// `LifecycleQuery::ModuleStatus` keyed by module id, empty when this network
@@ -719,24 +982,7 @@ async fn module_code_by_id(client: &RpcClient) -> BTreeMap<String, serde_json::V
         .collect()
 }
 
-/// One curated skill of an agent: the ref's name and whether it loads as
-/// persona (`LoadMode::Always`) or on demand.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct AgentSkill {
-    pub name: String,
-    pub always: bool,
-}
-
-/// One granted capability, in the `CapRequest` vocabulary: the request name
-/// and the resource it names (empty for the argument-less grants).
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct AgentCap {
-    pub label: String,
-    pub arg: String,
-}
-
-/// One registered agent, rendered. Everything here already rides
-/// `AgentRecord` — the registry reply carries the whole record.
+/// One registered agent, rendered from its registry record and live-run fact.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct AgentRow {
     pub id: String,
@@ -744,22 +990,14 @@ pub struct AgentRow {
     pub initials: String,
     pub capability: String,
     pub status: String,
-    /// the decoded `SagaOrigin::External` key hex, empty for module/system owners.
-    pub owner_key: String,
-    /// that key resolved against the member roster, else the origin's variant tag.
+    /// the external key shortened for display, else the origin's variant tag.
     pub owner_handle: String,
-    pub created_at: i64,
-    pub is_mine: bool,
     /// this agent holds a RUN in flight right now — the runs module's pending
     /// register, NOT `status`. `AgentStatus` is only Active|Paused and Active
     /// is the registration default, so it says "not paused", never "working".
     pub live: bool,
-    pub tools: i64,
-    pub secrets: i64,
-    pub subagent_budget: i64,
-    pub allowed_actions: Vec<String>,
-    pub skills: Vec<AgentSkill>,
-    pub caps: Vec<AgentCap>,
+    pub skill_count: i64,
+    pub cap_count: i64,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -768,61 +1006,25 @@ pub struct AgentsData {
     pub agents: Vec<AgentRow>,
 }
 
-/// The owner origin, decoded: `("<key hex>", "<handle>")`. An external origin
-/// carries raw key bytes; a module/system origin has no key at all and reads
-/// as its own name.
-fn agent_owner(owner: &serde_json::Value) -> (String, String) {
+/// The owner origin rendered as a handle. An external origin carries raw key
+/// bytes; a module/system origin reads as its own name.
+fn agent_owner_handle(owner: &serde_json::Value) -> String {
     let Some(tagged) = owner.as_object() else {
-        let name = owner.as_str().unwrap_or_default().to_string();
-        return (String::new(), name);
+        return owner.as_str().unwrap_or_default().to_string();
     };
     let Some((variant, payload)) = tagged.iter().next() else {
-        return (String::new(), String::new());
+        return String::new();
     };
     if variant != "external" {
-        let name = payload.as_str().unwrap_or(variant.as_str()).to_string();
-        return (String::new(), name);
+        return payload.as_str().unwrap_or(variant.as_str()).to_string();
     }
-    let key = hex_encode(&json_bytes(payload));
-    let handle = short_label(&key);
-    (key, handle)
+    short_label(&hex_encode(&json_bytes(payload)))
 }
 
-/// `ResourceCaps` flattened into the `CapRequest` names the console chips.
-fn agent_caps(caps: &serde_json::Value) -> Vec<AgentCap> {
-    let mut chips = Vec::new();
-    for (field, label) in [
-        ("forge_read", "ForgeRead"),
-        ("forge_push", "ForgePush"),
-        ("duckfs_read", "DuckfsRead"),
-        ("duckfs_write", "DuckfsWrite"),
-        ("tools", "Tool"),
-        ("secrets", "Secret"),
-        ("pages_write", "PagesWrite"),
-    ] {
-        for value in caps[field].as_array().cloned().unwrap_or_default() {
-            chips.push(AgentCap {
-                label: label.into(),
-                arg: value.as_str().unwrap_or_default().to_string(),
-            });
-        }
-    }
-    if caps["subagent_budget"].as_i64().unwrap_or(0) > 0 {
-        chips.push(AgentCap {
-            label: "SpawnSubagent".into(),
-            arg: String::new(),
-        });
-    }
-    chips
-}
-
-/// Load the agent roster from the canonical registry, each row marked with
-/// whether THIS device's user key is its owner.
+/// Load the agent roster from the canonical registry.
 pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, HydrationError> {
-    offscreen_guard(generation)?;
     async {
         let client = rpc_client(&rpc)?;
-        let local = local_user_key().await.map(|key| hex_encode(&key));
         let reply: serde_json::Value = client.query("agent", &serde_json::json!("agents")).await?;
         let working = agents_with_a_run_in_flight(&client).await;
         let agents = reply["agents"]
@@ -832,12 +1034,26 @@ pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, Hyd
             .into_iter()
             .map(|record| {
                 let status = tagged_name(&record["status"]);
-                let (owner_key, owner_handle) = agent_owner(&record["owner"]);
+                let owner_handle = agent_owner_handle(&record["owner"]);
                 let name = record["display_name"]
                     .as_str()
                     .unwrap_or_default()
                     .to_string();
                 let caps = &record["caps"];
+                let has_subagent_grant = caps["subagent_budget"].as_i64().unwrap_or(0) > 0;
+                let cap_count = [
+                    "forge_read",
+                    "forge_push",
+                    "duckfs_read",
+                    "duckfs_write",
+                    "tools",
+                    "secrets",
+                    "pages_write",
+                ]
+                .into_iter()
+                .map(|field| caps[field].as_array().map_or(0, Vec::len))
+                .sum::<usize>()
+                    + usize::from(has_subagent_grant);
                 let id = record["agent_id"].as_str().unwrap_or_default().to_string();
                 AgentRow {
                     live: working.contains(&id),
@@ -846,33 +1062,11 @@ pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, Hyd
                         .as_str()
                         .unwrap_or_default()
                         .to_string(),
-                    created_at: record["created_at"].as_i64().unwrap_or(0),
-                    is_mine: local.as_deref().is_some_and(|key| key == owner_key),
-                    tools: count_i64(caps["tools"].as_array().map_or(0, Vec::len)),
-                    secrets: count_i64(caps["secrets"].as_array().map_or(0, Vec::len)),
-                    subagent_budget: caps["subagent_budget"].as_i64().unwrap_or(0),
-                    allowed_actions: record["allowed_actions"]
-                        .as_array()
-                        .cloned()
-                        .unwrap_or_default()
-                        .iter()
-                        .filter_map(|action| action.as_str().map(str::to_string))
-                        .collect(),
-                    skills: record["skills"]
-                        .as_array()
-                        .cloned()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|skill| AgentSkill {
-                            name: skill["name"].as_str().unwrap_or_default().to_string(),
-                            always: skill["load"].as_str() == Some("always"),
-                        })
-                        .collect(),
-                    caps: agent_caps(caps),
+                    skill_count: count_i64(record["skills"].as_array().map_or(0, Vec::len)),
+                    cap_count: count_i64(cap_count),
                     id,
                     name,
                     status,
-                    owner_key,
                     owner_handle,
                 }
             })
@@ -910,49 +1104,20 @@ pub fn any_agent_active(rows: Vec<AgentRow>) -> bool {
     rows.iter().any(|row| row.live)
 }
 
-/// One run of one agent: the RECENT RUNS card, the agent live chip and the
-/// Explorer RUN hit all read this row.
+/// One agent run indexed by workspace search.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct RunRow {
     pub run_id: String,
     pub agent_id: String,
     pub outcome: String,
-    pub running: bool,
     /// A consensus counter (the creation block), NOT a unix stamp — render it
     /// with `height_ago`/`height_label_short`, never with `relative_time`.
     pub created_at: i64,
-    /// what the run PRODUCED, in one line: `RunRecord` carries `pr_number` and
-    /// `output_ref` and this is the only surface that reads them.
-    pub summary: String,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct AgentRunsData {
-    pub generation: i64,
-    pub runs: Vec<RunRow>,
-}
-
-/// What a settled run produced, in one line: the forge PR it moved, else the
-/// output ref it wrote, else how it ended. Both fields ride `RunRecord`
-/// (crates/modules/apps/runs/src/interface.rs) — nothing here is invented.
-fn run_summary(record: &serde_json::Value, outcome: &str) -> String {
-    if let Some(number) = record["pr_number"].as_u64() {
-        return format!("pr #{number}");
-    }
-    match record["output_ref"].as_str() {
-        Some(output) if !output.is_empty() => output.to_string(),
-        _ => outcome.to_string(),
-    }
-}
-
-/// This agent's runs: the pending (RUNNING) entries first, then the delivered
-/// ring newest-first. Two queries because the runs module keeps in-flight
-/// correlation and settled history in two separate projections.
-pub async fn load_agent_runs(
-    rpc: String,
-    agent_id: String,
-    generation: i64,
-) -> Result<AgentRunsData, HydrationError> {
+/// Pending runs first, then the delivered ring newest-first. Two queries because
+/// the runs module keeps in-flight correlation and settled history separate.
+pub async fn load_agent_runs(rpc: String) -> Result<Vec<RunRow>, AppError> {
     async {
         let client = rpc_client(&rpc)?;
         // Two independent reads of one module, awaited one after the other. On a
@@ -966,25 +1131,16 @@ pub async fn load_agent_runs(
         );
         let pending = pending?;
         let recent = recent?;
-        let wanted = |record: &serde_json::Value| {
-            agent_id.is_empty() || record["agent_id"].as_str() == Some(agent_id.as_str())
-        };
         let mut runs: Vec<RunRow> = pending["pending_runs"]
             .as_array()
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .filter(wanted)
             .map(|record| RunRow {
                 run_id: record["run_id"].as_str().unwrap_or_default().to_string(),
                 agent_id: record["agent_id"].as_str().unwrap_or_default().to_string(),
                 outcome: "running".into(),
-                running: true,
                 created_at: record["created_at"].as_i64().unwrap_or(0),
-                summary: record["channel_id"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string(),
             })
             .collect();
         runs.extend(
@@ -993,26 +1149,20 @@ pub async fn load_agent_runs(
                 .cloned()
                 .unwrap_or_default()
                 .into_iter()
-                .filter(wanted)
                 .map(|record| {
                     let outcome = tagged_name(&record["outcome"]);
                     RunRow {
                         run_id: record["run_id"].as_str().unwrap_or_default().to_string(),
                         agent_id: record["agent_id"].as_str().unwrap_or_default().to_string(),
-                        running: false,
                         created_at: record["created_at"].as_i64().unwrap_or(0),
-                        summary: run_summary(&record, &outcome),
                         outcome,
                     }
                 }),
         );
-        Ok(AgentRunsData { generation, runs })
+        Ok(runs)
     }
     .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
+    .map_err(app_error)
 }
 
 /// Pause or resume one agent — owner-gated at the module, not quorum-gated.
@@ -1055,7 +1205,6 @@ pub struct AccountData {
 
 /// Load the account this node is bound to (via the canonical resolver).
 pub async fn load_account(rpc: String, generation: i64) -> Result<AccountData, HydrationError> {
-    offscreen_guard(generation)?;
     async {
         let client = rpc_client(&rpc)?;
         let node_key_hex = client.status().await?.public_key;

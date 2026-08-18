@@ -31,6 +31,9 @@ valset = { workspace = true }
 # follow-ups into the one lifecycle module; governance never registers it.
 lifecycle = { workspace = true }
 identity = { workspace = true }
+# the acl sibling's wire types: SetAclPolicy proposals validate and emit its
+# SetPolicy op (the same wire-types-only shape as the valset/lifecycle deps).
+acl = { workspace = true }
 async-trait = { workspace = true }
 # the invite capability (token + join-proof verification) is governance's own
 # admission surface: minted by a member, redeemed in-consensus by `Redeem`.

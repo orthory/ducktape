@@ -33,9 +33,10 @@ statesync = { workspace = true }
 kv = { workspace = true }
 directory = { workspace = true }
 # the production module set: system infrastructure + every product module.
+acl = { workspace = true }
 valset = { workspace = true }
 governance = { workspace = true }
-# the invite-accept verb drives governance ops through the local rpc.
+# the resident-accept verb drives governance ops through the local rpc.
 # the network module-code registry. Height-gated live code swaps are realized
 # through the blobstore-backed CodeSource.
 lifecycle = { workspace = true }

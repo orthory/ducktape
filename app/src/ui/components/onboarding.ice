@@ -12,7 +12,7 @@
 // only resolve local handlers and declared emissions, so an app handler is
 // never named inside this file.
 
-component HubColumn(step:str, key_state:str, networks:[HubNetwork], selected:str, hidden:i64, name:str, invite:str, reveal:str, steps:[ProvisionStep], step_index:i64, height:i64, tier:str, error:str, busy:bool)
+component HubColumn(step:HubStep, key_state:str, networks:[HubNetwork], selected:str, hidden:i64, name:str, invite:str, reveal:str, steps:[ProvisionStep], step_index:i64, height:i64, tier:str, error:str, busy:bool, restore_empty:bool, join_empty:bool)
   emits
     unlock_submit(str)
     login_skip
@@ -20,7 +20,7 @@ component HubColumn(step:str, key_state:str, networks:[HubNetwork], selected:str
     reveal_confirm
     go_restore
     go_login
-    restore_submit(str, str)
+    restore_submit(str)
     pick_network(str)
     open_network_submit
     forget_network_submit(str, str)
@@ -28,7 +28,7 @@ component HubColumn(step:str, key_state:str, networks:[HubNetwork], selected:str
     restore_hidden_submit
     go_join
     go_networks
-    join_network_submit(str)
+    join_network_submit
     copy_onboarding_invite
     enter_console
   box #root
@@ -41,7 +41,7 @@ component HubColumn(step:str, key_state:str, networks:[HubNetwork], selected:str
       bg=bg_wash
     col gap=0.0
       match step
-        "unlock"
+        HubStep.unlock
           UnlockScreen #unlock
             with
               key_state
@@ -51,21 +51,23 @@ component HubColumn(step:str, key_state:str, networks:[HubNetwork], selected:str
               unlock_submit
               login_skip
               go_restore
-        "create"
+        HubStep.create
           CreateScreen busy=busy error=error
             forward
               create_submit
               go_restore
-        "reveal"
+        HubStep.reveal
           RevealScreen words=reveal
             forward
               reveal_confirm
-        "restore"
-          RestoreScreen busy=busy error=error
+        HubStep.restore
+          RestoreScreen busy=busy error=error phrase_empty=restore_empty
             forward
               restore_submit
               go_login
-        "networks"
+            phrase:
+              slot restore_phrase?
+        HubStep.networks
           NetworksScreen #networks
             with
               networks
@@ -80,14 +82,14 @@ component HubColumn(step:str, key_state:str, networks:[HubNetwork], selected:str
               connect_remote_submit
               restore_hidden_submit
               go_join
-        "provisioning"
+        HubStep.provisioning
           ProvisioningScreen
             with
               name
               steps
               step_index
               error
-        "live"
+        HubStep.live
           LiveScreen
             with
               name
@@ -102,12 +104,14 @@ component HubColumn(step:str, key_state:str, networks:[HubNetwork], selected:str
               go_networks
               copy_onboarding_invite
               enter_console
-        "join"
-          JoinScreen busy=busy error=error
+        HubStep.join
+          JoinScreen busy=busy error=error invite_empty=join_empty
             forward
               go_networks
               join_network_submit
-        _
+            invite:
+              slot join_invite?
+        HubStep.loading
           col gap=0.0 align=center
             text "…"
               with
@@ -433,12 +437,11 @@ component RevealScreen(words:str)
             @text-primary_fg
 
 // RESTORE. 24 words in, a new password around them, the same pubkey out.
-component RestoreScreen(busy:bool, error:str)
+component RestoreScreen(busy:bool, error:str, phrase_empty:bool)
   emits
-    restore_submit(str, str)
+    restore_submit(str)
     go_login
   state
-    words = ""
     pw = ""
   col #root w=428.0 gap=0.0
     button -> emit(go_login)
@@ -492,19 +495,7 @@ component RestoreScreen(busy:bool, error:str)
           border=primary
           border-w=1.5
           r=10.0
-        input "" <-> words
-          with
-            label="Recovery phrase"
-            hint="24 words, space-separated"
-            disabled=busy
-            w=fill
-            p=0.0
-            text-size=12.0
-            line-h=1.2
-            font=code
-            @control
-          active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
-          disabled value=hint
+        slot phrase
     box w=fill pt=14.0
       text "NEW PASSWORD"
         with
@@ -528,7 +519,7 @@ component RestoreScreen(busy:bool, error:str)
             hint="at least 8 characters"
             secure=true
             disabled=busy
-            submit=emit(restore_submit, words, pw)
+            submit=emit(restore_submit, pw)
             w=fill
             p=0.0
             text-size=13.0
@@ -538,10 +529,10 @@ component RestoreScreen(busy:bool, error:str)
           active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
           disabled value=hint
     box w=fill pt=18.0
-      button -> emit(restore_submit, words, pw)
+      button -> emit(restore_submit, pw)
         with
           label="Restore"
-          disabled=(busy || empty(trim(words)) || empty(pw))
+          disabled=(busy || phrase_empty || empty(pw))
           w=fill
           @primary_action
           @px-0px
@@ -752,6 +743,7 @@ component NetworkRow(row:HubNetwork, selected:bool, busy:bool)
         button -> emit(pick_network, row.id)
           with
             label=row.name
+            checked=selected
             w=fill
             p=0.0
             @icon_action
@@ -829,6 +821,7 @@ component NetworkRow(row:HubNetwork, selected:bool, busy:bool)
       button -> emit(pick_network, row.id)
         with
           label=row.name
+          checked=selected
           w=fill
           p=0.0
           @icon_action
@@ -957,7 +950,7 @@ component ProvisioningScreen(name:str, steps:[ProvisionStep], step_index:i64, er
     box w=fill pt=22.0
       col w=fill gap=14.0
         for step in steps
-          ProvisionRow step=step spin=0.0
+          ProvisionRow step=step
     box w=fill pt=26.0
       col
         with
@@ -994,14 +987,10 @@ component ProgressCell(filled:bool)
 // One checklist row. `blocked` is the state the artifact never drew: the node
 // did not come up, and the label the stream carries IS the command that starts
 // it — so the row becomes a refusal plate rather than a spinner that lies.
-//
-// `spin` is carried per the frozen signature and deliberately unconsumed: the
-// artifact's running marker is a CSS-keyframe arc with a transparent top edge,
-// which iced cannot stroke inside a border. The marker is a solid amber ring.
 // Reads each of the step's String fields exactly once, in exclusive `match`
 // arms: two `if` blocks both reading `step.label` move the same String twice
 // and the generated Rust will not compile. Copy fields have no such limit.
-component ProvisionRow(step:ProvisionStep, spin:f64)
+component ProvisionRow(step:ProvisionStep)
   col #root w=fill gap=0.0
     match step.state
       "blocked"
@@ -1366,12 +1355,10 @@ component LiveStatusStrip(height:i64, peers_live:i64, peers_total:i64, tier:str)
 // JOIN. One field for the blob, and an honest account of what happens next.
 // Nothing in this app can decode an invite, so no reading is claimed; the
 // card states the node's own join ladder instead, including the wait.
-component JoinScreen(busy:bool, error:str)
+component JoinScreen(busy:bool, error:str, invite_empty:bool)
   emits
     go_networks
-    join_network_submit(str)
-  state
-    blob = ""
+    join_network_submit
   col #root w=428.0 gap=0.0
     button -> emit(go_networks)
       with
@@ -1428,20 +1415,7 @@ component JoinScreen(busy:bool, error:str)
           border=primary
           border-w=1.5
           r=10.0
-        input "" #join-invite <-> blob
-          with
-            label="Invite"
-            hint="🦆AAAA…"
-            disabled=busy
-            submit=emit(join_network_submit, blob)
-            w=fill
-            p=0.0
-            text-size=12.0
-            line-h=1.2
-            font=code
-            @control
-          active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
-          disabled value=hint
+        slot invite
     box w=fill pt=18.0
       box
         with
@@ -1473,10 +1447,10 @@ component JoinScreen(busy:bool, error:str)
               note="the console opens on live state"
               tone="later"
     box w=fill pt=22.0
-      button -> emit(join_network_submit, blob)
+      button -> emit(join_network_submit)
         with
           label="Join network"
-          disabled=(busy || empty(trim(blob)))
+          disabled=(busy || invite_empty)
           w=fill
           @primary_action
           @px-0px

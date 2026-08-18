@@ -22,6 +22,15 @@ use crate::{AuthorRef, Block, ChatAssigned, ChatMsg, Mark, PostPolicy, Span, dec
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
+/// Maximum number of roots materialized in one desktop chat window. The
+/// archive remains cursor-queryable; this bounds only the hot read model that
+/// every update and view build touches.
+pub const CHAT_HOT_WINDOW_LIMIT: usize = 256;
+/// One canonical root plus one reply page. Older replies remain queryable by
+/// sequence cursor; keeping every page mounted made each live reply rebuild up
+/// to 4,097 rich rows on the UI thread.
+pub const THREAD_HOT_WINDOW_LIMIT: usize = CHAT_HOT_WINDOW_LIMIT + 1;
+
 // ============================================================================
 // rendered row types — what a chat view iterates over
 // ============================================================================
@@ -55,6 +64,10 @@ pub struct ChatMember {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChatMessage {
     pub id: String,
+    /// Numeric identity for Ice's keyed virtual timeline. The language cannot
+    /// key this column by the string message ID, so merges carry this value
+    /// forward when a row with the same ID is replaced.
+    pub view_key: i64,
     pub seq: i64,
     pub author: String,
     pub meta: String,
@@ -69,8 +82,6 @@ pub struct ChatMessage {
     pub show_author: bool,
     pub initial: String,
     pub avatar_kind: String,
-    /// authored by the viewing device's own user key — the own-message bubble.
-    pub mine: bool,
     /// the block this message settled in; 0 while pending.
     pub height: i64,
     /// that block's `consensus_time` — a block HEIGHT on a validator network
@@ -79,6 +90,14 @@ pub struct ChatMessage {
     /// seconds: render it as a height, never as a wall clock. 0 while pending.
     pub time: i64,
     pub reactions: Vec<ChatReaction>,
+    /// CLIENT-side render revision — the view's cheap lazy key beside `seq`
+    /// (`lazy message by message.seq, message.render_rev`). Bumped by every
+    /// in-place row mutation and SEEDED from the rendered-content hash at
+    /// construction, so a wholesale replacement — a resync reloading a row
+    /// with reactions the displayed copy never saw — moves the key with no
+    /// in-place mutation having run. Identical content seeds identically,
+    /// which is the case where keeping the cached subtree is correct.
+    pub render_rev: i64,
 }
 
 /// The lazy-row dependency hash. `body` and `blocks` are deliberately NOT
@@ -92,6 +111,7 @@ impl std::hash::Hash for ChatMessage {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         let Self {
             id,
+            view_key: _,
             seq,
             author,
             meta,
@@ -106,10 +126,10 @@ impl std::hash::Hash for ChatMessage {
             show_author,
             initial,
             avatar_kind,
-            mine,
             height,
             time,
             reactions,
+            render_rev,
         } = self;
         id.hash(state);
         seq.hash(state);
@@ -124,10 +144,10 @@ impl std::hash::Hash for ChatMessage {
         show_author.hash(state);
         initial.hash(state);
         avatar_kind.hash(state);
-        mine.hash(state);
         height.hash(state);
         time.hash(state);
         reactions.hash(state);
+        render_rev.hash(state);
     }
 }
 
@@ -135,6 +155,7 @@ impl Default for ChatMessage {
     fn default() -> Self {
         Self {
             id: String::new(),
+            view_key: 0,
             seq: 0,
             author: String::new(),
             meta: String::new(),
@@ -149,18 +170,48 @@ impl Default for ChatMessage {
             show_author: true,
             initial: String::new(),
             avatar_kind: String::new(),
-            mine: false,
             height: 0,
             time: 0,
             reactions: Vec::new(),
+            render_rev: 0,
         }
     }
 }
 
+impl ChatMessage {
+    /// The construction seed: a deterministic hash of the rendered content
+    /// (exactly the fields the manual [`Hash`] covers, `render_rev` still at
+    /// its zero default), so a replacement row carrying content the displayed
+    /// copy never saw arrives with a moved key.
+    fn seed_render_rev(mut self) -> Self {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.hash(&mut hasher);
+        self.render_rev = i64::from_ne_bytes(hasher.finish().to_ne_bytes());
+        self
+    }
+
+    /// One in-place row mutation = one bump; the keyed lazy repaints the row
+    /// exactly when this (or `seq`) moves.
+    fn bump_render_rev(&mut self) {
+        self.render_rev = self.render_rev.wrapping_add(1);
+    }
+}
+
+fn next_message_view_key() -> i64 {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    static NEXT: AtomicI64 = AtomicI64::new(1);
+    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |key| {
+        key.checked_add(1)
+    })
+    .expect("a process cannot render more than i64::MAX rows")
+}
+
 /// One rendered block of a message body. `kind` is `paragraph` | `code` |
 /// `quote` | `divider`. Plain paragraphs/quotes carry their exact text in
-/// `text` (`rich=false`); formatted ones carry word-level `spans` for a
-/// wrapping flex render (`rich=true`).
+/// `text` (`rich=false`); formatted ones carry run-level `spans` the view's
+/// single rich-text paragraph renders (`rich=true`).
 #[derive(Clone, Debug, Hash, PartialEq, Default)]
 pub struct ChatBlock {
     pub kind: String,
@@ -170,52 +221,86 @@ pub struct ChatBlock {
     pub spans: Vec<ChatSpan>,
 }
 
-/// A word-level run of a rich paragraph/quote, carrying its inline marks.
+/// One inline run of a rich paragraph/quote, pre-sorted into the style arm
+/// the paragraph's span template renders it with. EXACTLY ONE of the text
+/// fields is non-empty per span (`link` rides `link_text`): ice's rich-text
+/// `for` expands a fixed span template per item with no conditionals, so the
+/// arm choice has to be data — the view emits every arm for every run and an
+/// empty span draws no glyphs. A run landing in two fields renders twice; a
+/// run landing in none vanishes ([`span_arm`] owns the decision).
 #[derive(Clone, Debug, Hash, PartialEq, Default)]
 pub struct ChatSpan {
-    pub text: String,
-    pub bold: bool,
-    pub italic: bool,
-    pub highlight: bool,
+    pub mention: String,
+    pub link_text: String,
     pub link: String,
+    pub bold_italic: String,
+    pub bold: String,
+    pub italic: String,
+    pub plain: String,
 }
 
 // ============================================================================
 // the op-delta — one folded applied op, pre-rendered for state splicing
 // ============================================================================
 
-/// One folded chat op. `kind` picks the arm; unrelated fields sit at their
-/// empty defaults. Rows are built by the SAME renderers hydration uses
-/// ([`chat_message`] over a [`MsgRow`]), so a folded row and a fetched row
-/// are indistinguishable.
-#[derive(Clone, Debug, Hash, PartialEq, Default)]
-pub struct ChatDelta {
-    /// `posted` | `reply` | `edited` | `deleted` | `reaction` |
-    /// `channel-created` | `channel-renamed` | `channel-archived` |
-    /// `membership` | `channel-refresh` (huddle changed — the shell reloads
-    /// the one channel row and re-emits it as `channel-updated`) |
-    /// `channel-updated`.
-    pub kind: String,
-    pub channel_id: String,
-    /// the target message (edited/deleted/reaction) or the new row's seq.
-    pub seq: i64,
-    /// the thread root (`reply`).
-    pub root_seq: i64,
-    /// the rendered row: full for `posted`/`reply`; content carrier
-    /// (body/blocks/rev/meta) for `edited`.
-    pub message: ChatMessage,
-    /// the full channel row (`channel-created` / `channel-updated`).
-    pub channel: ChatChannel,
-    pub name: String,
-    pub archived: bool,
-    pub emoji: String,
-    /// reaction/membership direction: added vs removed.
-    pub added: bool,
-    /// the reacting author's rendered handle (set-semantics dedupe).
-    pub reactor: String,
-    /// the reactor is this device's user.
-    pub by_me: bool,
-    pub member: ChatMember,
+/// One folded chat op with exactly the payload its transition consumes. Rows
+/// are built by the SAME renderers hydration uses ([`chat_message`] over a
+/// [`MsgRow`]), so a folded row and a fetched row are indistinguishable.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub enum ChatDelta {
+    ChannelCreated {
+        channel: ChatChannel,
+    },
+    ChannelRenamed {
+        channel_id: String,
+        name: String,
+    },
+    ChannelArchived {
+        channel_id: String,
+        archived: bool,
+    },
+    Posted {
+        channel_id: String,
+        seq: i64,
+        message: ChatMessage,
+    },
+    Reply {
+        channel_id: String,
+        seq: i64,
+        root_seq: i64,
+        message: ChatMessage,
+    },
+    Edited {
+        channel_id: String,
+        seq: i64,
+        message: ChatMessage,
+    },
+    Deleted {
+        channel_id: String,
+        seq: i64,
+    },
+    Reaction {
+        channel_id: String,
+        seq: i64,
+        emoji: String,
+        added: bool,
+        reactor: String,
+        by_me: bool,
+    },
+    Membership {
+        channel_id: String,
+        added: bool,
+        member: ChatMember,
+    },
+    /// A huddle change first produces this directive; the shell reloads the
+    /// canonical row and replaces it with `ChannelUpdated` before publishing.
+    ChannelRefresh {
+        channel_id: String,
+    },
+    ChannelUpdated {
+        channel_id: String,
+        channel: ChatChannel,
+    },
 }
 
 /// Translate one applied chat op (its feed-row parts) into a [`ChatDelta`].
@@ -246,9 +331,7 @@ pub fn delta_from_op(
             channel_id,
             name,
             post_policy,
-        } => ChatDelta {
-            kind: "channel-created".into(),
-            channel_id: channel_id.clone(),
+        } => ChatDelta::ChannelCreated {
             channel: ChatChannel {
                 id: channel_id,
                 name,
@@ -257,22 +340,16 @@ pub fn delta_from_op(
                 huddle_count: 0,
                 head_seq: 0,
             },
-            ..ChatDelta::default()
         },
-        ChatMsg::RenameChannel { channel_id, name } => ChatDelta {
-            kind: "channel-renamed".into(),
-            channel_id,
-            name,
-            ..ChatDelta::default()
-        },
+        ChatMsg::RenameChannel { channel_id, name } => {
+            ChatDelta::ChannelRenamed { channel_id, name }
+        }
         ChatMsg::SetChannelArchived {
             channel_id,
             archived,
-        } => ChatDelta {
-            kind: "channel-archived".into(),
+        } => ChatDelta::ChannelArchived {
             channel_id,
             archived,
-            ..ChatDelta::default()
         },
         ChatMsg::PostMessage {
             channel_id,
@@ -304,17 +381,19 @@ pub fn delta_from_op(
                 reactions: Vec::new(),
                 tags: Vec::new(),
             };
-            let kind = match thread {
-                Some(_) => "reply",
-                None => "posted",
-            };
-            ChatDelta {
-                kind: kind.into(),
-                channel_id,
-                seq: number_i64(seq),
-                root_seq: number_i64(thread.unwrap_or(0)),
-                message: chat_message(row, current_user),
-                ..ChatDelta::default()
+            let message = chat_message(row, current_user);
+            match thread {
+                Some(root_seq) => ChatDelta::Reply {
+                    channel_id,
+                    seq: number_i64(seq),
+                    root_seq: number_i64(root_seq),
+                    message,
+                },
+                None => ChatDelta::Posted {
+                    channel_id,
+                    seq: number_i64(seq),
+                    message,
+                },
             }
         }
         ChatMsg::EditMessage {
@@ -332,7 +411,7 @@ pub fn delta_from_op(
                 message_id: String::new(),
                 author: index::author(&origin, None),
                 // An edit's stamp is the ORIGINAL post's block, never the
-                // edit's — and `apply_edit_content` copies only body/blocks/
+                // edit's — and `merge_message_edit` copies only body/blocks/
                 // rev/edited/meta off this carrier, so the row on screen keeps
                 // the height it was posted at. Left 0 deliberately.
                 height: 0,
@@ -350,19 +429,15 @@ pub fn delta_from_op(
                 reactions: Vec::new(),
                 tags: Vec::new(),
             };
-            ChatDelta {
-                kind: "edited".into(),
+            ChatDelta::Edited {
                 channel_id,
                 seq: number_i64(seq),
                 message: chat_message(carrier, current_user),
-                ..ChatDelta::default()
             }
         }
-        ChatMsg::DeleteMessage { channel_id, seq } => ChatDelta {
-            kind: "deleted".into(),
+        ChatMsg::DeleteMessage { channel_id, seq } => ChatDelta::Deleted {
             channel_id,
             seq: number_i64(seq),
-            ..ChatDelta::default()
         },
         ChatMsg::AddReaction {
             channel_id,
@@ -381,24 +456,18 @@ pub fn delta_from_op(
             member,
         } => {
             let id = user_handle(&user);
-            ChatDelta {
-                kind: "membership".into(),
+            ChatDelta::Membership {
                 channel_id,
                 added: member,
                 member: ChatMember {
                     label: short_label(&id),
                     key: id,
                 },
-                ..ChatDelta::default()
             }
         }
         ChatMsg::JoinHuddle { channel_id, .. }
         | ChatMsg::LeaveHuddle { channel_id }
-        | ChatMsg::SweepHuddle { channel_id, .. } => ChatDelta {
-            kind: "channel-refresh".into(),
-            channel_id,
-            ..ChatDelta::default()
-        },
+        | ChatMsg::SweepHuddle { channel_id, .. } => ChatDelta::ChannelRefresh { channel_id },
     };
     Ok(Some(delta))
 }
@@ -413,15 +482,13 @@ fn reaction_delta(
 ) -> ChatDelta {
     let reactor = index::author(origin, None);
     let by_me = current_user.is_some_and(|key| reactor == format!("user:{}", hex_encode(key)));
-    ChatDelta {
-        kind: "reaction".into(),
+    ChatDelta::Reaction {
         channel_id,
         seq: number_i64(seq),
         emoji,
         added,
         reactor,
         by_me,
-        ..ChatDelta::default()
     }
 }
 
@@ -444,122 +511,94 @@ fn decode_stamp(assigned: Option<&serde_json::Value>) -> Result<ChatAssigned, St
 // delta that raced a resync applies as a no-op instead of double-counting.
 // ============================================================================
 
-/// Fold one chat delta into the channel list.
-pub fn apply_chat_channels(mut channels: Vec<ChatChannel>, delta: ChatDelta) -> Vec<ChatChannel> {
-    match delta.kind.as_str() {
-        "channel-created" => {
-            let exists = channels.iter().any(|channel| channel.id == delta.channel.id);
-            if !exists {
-                channels.push(delta.channel);
-            }
-        }
-        "channel-updated" => match channels
-            .iter_mut()
-            .find(|channel| channel.id == delta.channel.id)
-        {
-            Some(channel) => *channel = delta.channel,
-            None => channels.push(delta.channel),
-        },
-        "channel-renamed" => {
-            if let Some(channel) = channels.iter_mut().find(|c| c.id == delta.channel_id) {
-                channel.name = delta.name;
-            }
-        }
-        "channel-archived" => {
-            if let Some(channel) = channels.iter_mut().find(|c| c.id == delta.channel_id) {
-                channel.archived = delta.archived;
-            }
-        }
-        "posted" | "reply" => {
-            if let Some(channel) = channels.iter_mut().find(|c| c.id == delta.channel_id) {
-                channel.head_seq = channel.head_seq.max(delta.seq);
-            }
-        }
-        _ => {}
+pub fn insert_channel(mut channels: Vec<ChatChannel>, channel: ChatChannel) -> Vec<ChatChannel> {
+    let exists = channels.iter().any(|current| current.id == channel.id);
+    if !exists {
+        channels.push(channel);
     }
     channels
 }
 
-/// Fold one chat delta into the ACTIVE channel's root timeline.
-pub fn apply_chat_messages(
-    messages: Vec<ChatMessage>,
-    delta: ChatDelta,
-    active_channel: String,
-) -> Vec<ChatMessage> {
-    if delta.channel_id != active_channel {
-        return messages;
+pub fn replace_channel(
+    mut channels: Vec<ChatChannel>,
+    channel_id: &str,
+    channel: ChatChannel,
+) -> Vec<ChatChannel> {
+    match channels.iter_mut().find(|current| current.id == channel_id) {
+        Some(current) => *current = channel,
+        None => channels.push(channel),
     }
-    match delta.kind.as_str() {
-        "posted" => insert_committed_root(messages, delta.message),
-        "reply" => bump_reply_summary(messages, delta.root_seq),
-        "edited" => apply_edit_content(messages, delta.seq, &delta.message),
-        "deleted" => apply_tombstone(messages, delta.seq),
-        "reaction" => apply_reaction(messages, &delta),
-        _ => messages,
-    }
+    channels
 }
 
-/// Fold one chat delta into the OPEN thread panel (root + loaded replies).
-pub fn apply_chat_thread(
-    thread: Vec<ChatMessage>,
-    delta: ChatDelta,
-    active_channel: String,
-    active_thread_seq: i64,
-) -> Vec<ChatMessage> {
-    if delta.channel_id != active_channel || active_thread_seq <= 0 {
-        return thread;
+pub fn rename_channel(
+    mut channels: Vec<ChatChannel>,
+    channel_id: &str,
+    name: String,
+) -> Vec<ChatChannel> {
+    if let Some(channel) = channels.iter_mut().find(|channel| channel.id == channel_id) {
+        channel.name = name;
     }
-    match delta.kind.as_str() {
-        // the rail's root carries the reply summary its replies rule draws —
-        // bump it here exactly as the stream's timeline arm does, then merge
-        // the reply row itself.
-        "reply" if delta.root_seq == active_thread_seq => {
-            merge_thread_reply(bump_reply_summary(thread, delta.root_seq), delta.message)
-        }
-        "edited" => apply_edit_content(thread, delta.seq, &delta.message),
-        "deleted" => apply_tombstone(thread, delta.seq),
-        "reaction" => apply_reaction(thread, &delta),
-        _ => thread,
-    }
+    channels
 }
 
-/// Fold one chat delta into the ACTIVE channel's member panel.
-pub fn apply_chat_members(
+pub fn archive_channel(
+    mut channels: Vec<ChatChannel>,
+    channel_id: &str,
+    archived: bool,
+) -> Vec<ChatChannel> {
+    if let Some(channel) = channels.iter_mut().find(|channel| channel.id == channel_id) {
+        channel.archived = archived;
+    }
+    channels
+}
+
+pub fn advance_channel_head(
+    mut channels: Vec<ChatChannel>,
+    channel_id: &str,
+    seq: i64,
+) -> Vec<ChatChannel> {
+    if let Some(channel) = channels.iter_mut().find(|channel| channel.id == channel_id) {
+        channel.head_seq = channel.head_seq.max(seq);
+    }
+    channels
+}
+
+pub fn apply_membership(
     mut members: Vec<ChatMember>,
-    delta: ChatDelta,
-    active_channel: String,
+    added: bool,
+    member: ChatMember,
 ) -> Vec<ChatMember> {
-    let is_membership = delta.kind == "membership" && delta.channel_id == active_channel;
-    if !is_membership {
-        return members;
-    }
-    members.retain(|member| member.key != delta.member.key);
-    if delta.added {
-        members.push(delta.member);
+    members.retain(|current| current.key != member.key);
+    if added {
+        members.push(member);
     }
     members
 }
 
-/// A committed root row lands: settle the matching pending row in place, or
-/// append in seq order. Skips replies (the timeline is roots-only) and rows
-/// already present.
-fn insert_committed_root(mut messages: Vec<ChatMessage>, row: ChatMessage) -> Vec<ChatMessage> {
+/// A committed root row lands: remove its matching pending placeholder, then
+/// insert it in canonical seq order while preserving the placeholder's stable
+/// virtual key. Skips replies (the timeline is roots-only) and duplicate rows.
+pub fn merge_posted_message(mut messages: Vec<ChatMessage>, row: ChatMessage) -> Vec<ChatMessage> {
     if row.thread_seq > 0 {
         return messages;
     }
-    if let Some(pending) = messages
-        .iter_mut()
+    let pending_key = messages
+        .iter()
         .find(|message| message.pending && message.id == row.id)
-    {
-        *pending = row;
-        mark_message_groups(&mut messages);
-        return messages;
+        .map(|message| message.view_key);
+    if pending_key.is_some() {
+        messages.retain(|message| !message.pending || message.id != row.id);
     }
     let already_present = messages
         .iter()
         .any(|message| !message.pending && message.seq == row.seq);
     if already_present {
         return messages;
+    }
+    let mut row = row;
+    if let Some(view_key) = pending_key {
+        row.view_key = view_key;
     }
     // committed rows stay seq-sorted; pending rows tail the list.
     let insert_at = messages
@@ -568,10 +607,10 @@ fn insert_committed_root(mut messages: Vec<ChatMessage>, row: ChatMessage) -> Ve
         .unwrap_or(messages.len());
     messages.insert(insert_at, row);
     mark_message_groups(&mut messages);
-    messages
+    bounded_chat_window(messages)
 }
 
-fn bump_reply_summary(mut messages: Vec<ChatMessage>, root_seq: i64) -> Vec<ChatMessage> {
+pub fn bump_reply_summary(mut messages: Vec<ChatMessage>, root_seq: i64) -> Vec<ChatMessage> {
     if let Some(root) = messages
         .iter_mut()
         .find(|message| !message.pending && message.seq == root_seq)
@@ -580,6 +619,7 @@ fn bump_reply_summary(mut messages: Vec<ChatMessage>, root_seq: i64) -> Vec<Chat
         // high-water); the stream delivers each op once per cursor, and a
         // reconnect runs the ready-resync which reloads the canonical count.
         root.reply_count += 1;
+        root.bump_render_rev();
     }
     messages
 }
@@ -587,7 +627,7 @@ fn bump_reply_summary(mut messages: Vec<ChatMessage>, root_seq: i64) -> Vec<Chat
 /// Copy an edit's content fields onto the target row, keeping identity fields
 /// (author, reactions, reply summary) intact. An older or replayed revision
 /// applies as a no-op.
-fn apply_edit_content(
+pub fn merge_message_edit(
     mut messages: Vec<ChatMessage>,
     seq: i64,
     content: &ChatMessage,
@@ -603,13 +643,14 @@ fn apply_edit_content(
             row.rev = content.rev;
             row.edited = true;
             row.meta = content.meta.clone();
+            row.bump_render_rev();
         }
     }
     messages
 }
 
 /// The canonical tombstone shape, exactly as a hydrated deleted row renders.
-fn apply_tombstone(mut messages: Vec<ChatMessage>, seq: i64) -> Vec<ChatMessage> {
+pub fn tombstone_message(mut messages: Vec<ChatMessage>, seq: i64) -> Vec<ChatMessage> {
     if let Some(row) = messages
         .iter_mut()
         .find(|message| !message.pending && message.seq == seq)
@@ -618,6 +659,7 @@ fn apply_tombstone(mut messages: Vec<ChatMessage>, seq: i64) -> Vec<ChatMessage>
         row.body = "Message deleted".into();
         row.blocks = vec![deleted_block()];
         row.reactions = Vec::new();
+        row.bump_render_rev();
     }
     mark_message_groups(&mut messages);
     messages
@@ -626,10 +668,17 @@ fn apply_tombstone(mut messages: Vec<ChatMessage>, seq: i64) -> Vec<ChatMessage>
 /// Reactor-set semantics, mirroring the index fold: a reactor appears at most
 /// once per emoji, so replayed or double-submitted reactions cannot drift the
 /// count.
-fn apply_reaction(mut messages: Vec<ChatMessage>, delta: &ChatDelta) -> Vec<ChatMessage> {
+pub fn merge_message_reaction(
+    mut messages: Vec<ChatMessage>,
+    seq: i64,
+    emoji: &str,
+    added: bool,
+    reactor: &str,
+    by_me: bool,
+) -> Vec<ChatMessage> {
     let Some(row) = messages
         .iter_mut()
-        .find(|message| !message.pending && message.seq == delta.seq)
+        .find(|message| !message.pending && message.seq == seq)
     else {
         return messages;
     };
@@ -639,28 +688,31 @@ fn apply_reaction(mut messages: Vec<ChatMessage>, delta: &ChatDelta) -> Vec<Chat
     match row
         .reactions
         .iter_mut()
-        .find(|reaction| reaction.emoji == delta.emoji)
+        .find(|reaction| reaction.emoji == emoji)
     {
         Some(reaction) => {
-            reaction.reactors.retain(|reactor| *reactor != delta.reactor);
-            if delta.added {
-                reaction.reactors.push(delta.reactor.clone());
+            reaction.reactors.retain(|current| current != reactor);
+            if added {
+                reaction.reactors.push(reactor.into());
             }
             reaction.count = count_i64(reaction.reactors.len());
-            reaction.reacted_by_me = match delta.by_me {
-                true => delta.added,
+            reaction.reacted_by_me = match by_me {
+                true => added,
                 false => reaction.reacted_by_me,
             };
         }
-        None if delta.added => row.reactions.push(ChatReaction {
-            emoji: delta.emoji.clone(),
+        None if added => row.reactions.push(ChatReaction {
+            emoji: emoji.into(),
             count: 1,
-            reacted_by_me: delta.by_me,
-            reactors: vec![delta.reactor.clone()],
+            reacted_by_me: by_me,
+            reactors: vec![reactor.into()],
         }),
-        None => {}
+        // a remove of an emoji the row never had touched nothing: no rescan,
+        // no bump.
+        None => return messages,
     }
     row.reactions.retain(|reaction| reaction.count > 0);
+    row.bump_render_rev();
     messages
 }
 
@@ -675,152 +727,222 @@ pub fn optimistic_reaction(
     added: bool,
     reactor: String,
 ) -> Vec<ChatMessage> {
-    let delta = ChatDelta {
-        kind: "reaction".into(),
-        seq,
-        emoji,
-        added,
-        reactor,
-        by_me: true,
-        ..ChatDelta::default()
-    };
-    apply_reaction(messages, &delta)
-}
-
-/// True when this delta settles one of OUR optimistic rows — the pop edge of
-/// the timeline's transient ✓. Read BEFORE the delta is folded in: the match
-/// is the pending row the canonical row is about to replace.
-pub fn send_settled_by(
-    messages: Vec<ChatMessage>,
-    delta: ChatDelta,
-    active_channel: String,
-) -> bool {
-    delta.kind == "posted"
-        && delta.channel_id == active_channel
-        && messages
-            .iter()
-            .any(|message| message.pending && message.id == delta.message.id)
-}
-
-/// [`send_settled_by`] for the OPEN thread rail: a settling reply arrives as
-/// a `reply` delta, not a `posted` one, and its pending row lives in
-/// `thread_messages`. Read BEFORE `apply_chat_thread` folds the delta in.
-pub fn reply_settled_by(
-    thread: Vec<ChatMessage>,
-    delta: ChatDelta,
-    active_channel: String,
-) -> bool {
-    delta.kind == "reply"
-        && delta.channel_id == active_channel
-        && thread
-            .iter()
-            .any(|message| message.pending && message.id == delta.message.id)
-}
-
-/// The id anchoring the thread rail's transient ✓ — the reply twin of
-/// [`settled_send_id`].
-pub fn settled_reply_id(
-    thread: Vec<ChatMessage>,
-    delta: ChatDelta,
-    active_channel: String,
-    current: String,
-) -> String {
-    if reply_settled_by(thread, delta.clone(), active_channel) {
-        delta.message.id
-    } else {
-        current
-    }
-}
-
-/// The id anchoring the transient ✓ — overwritten on each settle, kept
-/// through unrelated deltas so an in-flight fade is not torn down.
-pub fn settled_send_id(
-    messages: Vec<ChatMessage>,
-    delta: ChatDelta,
-    active_channel: String,
-    current: String,
-) -> String {
-    if send_settled_by(messages, delta.clone(), active_channel) {
-        delta.message.id
-    } else {
-        current
-    }
+    merge_message_reaction(messages, seq, &emoji, added, &reactor, true)
 }
 
 // ============================================================================
 // optimistic sends — client-minted rows and their settle/rollback merges
 // ============================================================================
 
+/// The row a send paints before the block lands.
+///
+/// It is minted through the SAME author/avatar path [`chat_message`] renders a
+/// committed row with, because [`mark_message_groups`] opens a run on an author
+/// change and a hand-written label is always a change: a hard-coded `"You"`
+/// against the canonical `"you"` gave every send of your own a full avatar +
+/// header, which then vanished — shifting the row up by the header's height —
+/// the moment the settle delta replaced it. Without a cached identity there is
+/// no handle to render, so the row stays unattributed and simply opens its own
+/// run, which is what an unknown author means everywhere else.
+///
+/// It does NOT re-mark the runs: the thread rail mints through here too, and
+/// its vec is `[root] ++ replies` — the root renders as its own divided block,
+/// so a whole-vec pass would fold the first reply under it and swallow that
+/// reply's header (see `load_thread_data`, which marks the replies only). The
+/// timeline re-marks at its call site, where the vec is a plain run.
 pub fn optimistic_message(
     mut messages: Vec<ChatMessage>,
     body: String,
     message_id: String,
+    current_user: Option<&[u8]>,
 ) -> Vec<ChatMessage> {
     let blocks = paragraph_blocks(&body);
-    messages.push(ChatMessage {
-        id: message_id,
-        seq: -1,
-        author: "You".into(),
-        meta: "Sending…".into(),
-        body,
-        blocks,
-        pending: true,
-        rev: 0,
-        edited: false,
-        deleted: false,
-        reply_count: 0,
-        thread_seq: 0,
-        show_author: true,
-        initial: "Y".into(),
-        avatar_kind: "human".into(),
-        // an optimistic row is this device's own post by construction; it has
-        // no block yet, so height/time stay unset until the canonical row lands.
-        mine: true,
-        height: 0,
-        time: 0,
-        reactions: Vec::new(),
-    });
+    let handle = current_user.map(|key| format!("user:{}", hex_encode(key)));
+    let (author, initial) = match handle.as_deref() {
+        Some(handle) => (author_display(handle, current_user), avatar_initial(handle)),
+        None => ("you".into(), "•".into()),
+    };
+    // Pending sequences remain descending negatives for the existing numeric
+    // guards and ordering. Each concurrent placeholder must be unique inside
+    // the keyed virtual timeline.
+    let next_pending_seq = messages
+        .iter()
+        .map(|message| message.seq)
+        .min()
+        .unwrap_or_default()
+        .min(0)
+        .saturating_sub(1);
+    let view_key = next_message_view_key();
+    messages.push(
+        ChatMessage {
+            id: message_id,
+            view_key,
+            seq: next_pending_seq,
+            author,
+            meta: "Sending…".into(),
+            body,
+            blocks,
+            pending: true,
+            rev: 0,
+            edited: false,
+            deleted: false,
+            reply_count: 0,
+            thread_seq: 0,
+            show_author: true,
+            initial,
+            avatar_kind: "human".into(),
+            height: 0,
+            time: 0,
+            reactions: Vec::new(),
+            render_rev: 0,
+        }
+        .seed_render_rev(),
+    );
     messages
 }
 
-pub fn merge_pending_messages(
+/// Keep one bounded, ordered render window. Committed roots are evicted from
+/// the oldest edge first; optimistic rows stay at the tail and are evicted
+/// only in the degenerate case where more than the whole window is in flight.
+/// A later canonical settle still enters by seq even when its placeholder was
+/// outside the retained window.
+pub fn bounded_chat_window(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    if messages.len() <= CHAT_HOT_WINDOW_LIMIT {
+        return messages;
+    }
+    let (mut pending, mut committed): (Vec<_>, Vec<_>) =
+        messages.into_iter().partition(|message| message.pending);
+    let pending_limit = if committed.is_empty() {
+        CHAT_HOT_WINDOW_LIMIT
+    } else {
+        CHAT_HOT_WINDOW_LIMIT - 1
+    };
+    if pending.len() > pending_limit {
+        pending.drain(..pending.len() - pending_limit);
+    }
+    let committed_limit = CHAT_HOT_WINDOW_LIMIT - pending.len();
+    if committed.len() > committed_limit {
+        committed.drain(..committed.len() - committed_limit);
+    }
+    committed.extend(pending);
+    mark_message_groups(&mut committed);
+    committed
+}
+
+/// Keep the thread root and one sliding reply page, with the replies' author
+/// runs marked. Pending replies live at the newest edge and displace the
+/// oldest committed replies before they are ever discarded themselves. The
+/// root is held out of the marking pass: it renders as its own divided block,
+/// so the first reply always opens a run.
+pub fn bounded_thread_window(mut messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let root_index = messages
+        .iter()
+        .position(|message| !message.pending && message.seq > 0 && message.thread_seq == 0);
+    let root = root_index.map(|index| messages.remove(index));
+    let reply_limit = THREAD_HOT_WINDOW_LIMIT - usize::from(root.is_some());
+    let (mut pending, mut committed): (Vec<_>, Vec<_>) =
+        messages.into_iter().partition(|message| message.pending);
+    if pending.len() > reply_limit {
+        pending.drain(..pending.len() - reply_limit);
+    }
+    let committed_limit = reply_limit - pending.len();
+    if committed.len() > committed_limit {
+        committed.drain(..committed.len() - committed_limit);
+    }
+    committed.extend(pending);
+    mark_message_groups(&mut committed);
+    root.into_iter().chain(committed).collect()
+}
+
+fn merge_pending_rows(
     mut canonical: Vec<ChatMessage>,
     current: Vec<ChatMessage>,
     current_channel: String,
     next_channel: String,
-    settled_id: String,
 ) -> Vec<ChatMessage> {
     if current_channel != next_channel {
         return canonical;
     }
+    retain_client_row_identity(&mut canonical, &current);
     let canonical_ids = canonical
         .iter()
         .map(|message| message.id.clone())
         .collect::<BTreeSet<_>>();
-    canonical.extend(current.into_iter().filter(|message| {
-        message.pending && message.id != settled_id && !canonical_ids.contains(&message.id)
-    }));
+    canonical.extend(
+        current
+            .into_iter()
+            .filter(|message| message.pending && !canonical_ids.contains(&message.id)),
+    );
     canonical
 }
 
-pub fn merge_message_send_result(
+/// Install one root timeline snapshot and keep its render window bounded.
+pub fn merge_pending_messages(
     canonical: Vec<ChatMessage>,
     current: Vec<ChatMessage>,
     current_channel: String,
     next_channel: String,
-    settled_id: String,
+) -> Vec<ChatMessage> {
+    bounded_chat_window(merge_pending_rows(
+        canonical,
+        current,
+        current_channel,
+        next_channel,
+    ))
+}
+
+/// Install a room window without losing committed rows that arrived after the
+/// read began. Navigation clears the previous room before launching the read,
+/// so any same-room committed row in `current` is newer live traffic, not
+/// stale cache state.
+pub fn merge_landing_messages(
+    canonical: Vec<ChatMessage>,
+    current: Vec<ChatMessage>,
+    current_channel: String,
+    next_channel: String,
+) -> Vec<ChatMessage> {
+    let mut merged = merge_message_send_result(canonical, current, current_channel, next_channel);
+    mark_message_groups(&mut merged);
+    bounded_chat_window(merged)
+}
+
+/// Refresh the canonical prefix of an open thread without discarding pages the
+/// reader already loaded. The refresh query returns one page; the pagination
+/// cursor and the rest of the mounted rail remain owned by the UI state.
+pub fn merge_thread_refresh(
+    canonical: Vec<ChatMessage>,
+    current: Vec<ChatMessage>,
+    current_channel: String,
+    next_channel: String,
+) -> Vec<ChatMessage> {
+    bounded_thread_window(merge_message_send_result(
+        canonical,
+        current,
+        current_channel,
+        next_channel,
+    ))
+}
+
+pub fn merge_message_send_result(
+    mut canonical: Vec<ChatMessage>,
+    current: Vec<ChatMessage>,
+    current_channel: String,
+    next_channel: String,
 ) -> Vec<ChatMessage> {
     if current_channel != next_channel {
         return canonical;
     }
+    retain_client_row_identity(&mut canonical, &current);
     let canonical_ids = canonical
         .iter()
         .map(|message| message.id.clone())
         .collect::<BTreeSet<_>>();
-    let mut committed = current
-        .iter()
-        .filter(|message| !message.pending && message.seq > 0)
-        .map(|message| (message.seq, message.clone()))
+    let (pending, committed): (Vec<_>, Vec<_>) = current
+        .into_iter()
+        .partition(|message| message.pending || message.seq <= 0);
+    let mut committed = committed
+        .into_iter()
+        .map(|message| (message.seq, message))
         .collect::<BTreeMap<_, _>>();
     for message in canonical {
         let replace = committed
@@ -831,10 +953,25 @@ pub fn merge_message_send_result(
         }
     }
     let mut merged = committed.into_values().collect::<Vec<_>>();
-    merged.extend(current.into_iter().filter(|message| {
-        message.pending && message.id != settled_id && !canonical_ids.contains(&message.id)
-    }));
+    merged.extend(
+        pending
+            .into_iter()
+            .filter(|message| !canonical_ids.contains(&message.id)),
+    );
     merged
+}
+
+fn retain_client_row_identity(canonical: &mut [ChatMessage], current: &[ChatMessage]) {
+    let current_by_id = current
+        .iter()
+        .map(|message| (message.id.as_str(), message.view_key))
+        .collect::<BTreeMap<_, _>>();
+    for message in canonical {
+        let Some(view_key) = current_by_id.get(message.id.as_str()) else {
+            continue;
+        };
+        message.view_key = *view_key;
+    }
 }
 
 pub fn rollback_pending_message(
@@ -855,26 +992,46 @@ pub fn contains_pending_message(messages: Vec<ChatMessage>, pending_id: String) 
 }
 
 pub fn append_thread_page(messages: Vec<ChatMessage>, next: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    merge_message_send_result(next, messages, String::new(), String::new(), String::new())
-}
-
-pub fn merge_thread_reply(messages: Vec<ChatMessage>, reply: ChatMessage) -> Vec<ChatMessage> {
-    let settled_id = reply.id.clone();
-    merge_message_send_result(
-        vec![reply],
+    bounded_thread_window(merge_message_send_result(
+        next,
         messages,
         String::new(),
         String::new(),
-        settled_id,
-    )
+    ))
 }
 
-pub fn thread_offset_after_reply(offset: i64, has_more: bool, committed: bool) -> i64 {
-    if !committed || offset < 0 || has_more {
-        offset
-    } else {
-        offset.saturating_add(1)
+pub fn merge_thread_reply(
+    mut messages: Vec<ChatMessage>,
+    mut reply: ChatMessage,
+) -> Vec<ChatMessage> {
+    let pending_key = messages
+        .iter()
+        .find(|message| message.pending && message.id == reply.id)
+        .map(|message| message.view_key);
+    if pending_key.is_some() {
+        messages.retain(|message| !message.pending || message.id != reply.id);
     }
+    let existing = messages
+        .iter()
+        .position(|message| !message.pending && message.seq == reply.seq);
+    if let Some(index) = existing {
+        if messages[index].rev <= reply.rev {
+            reply.view_key = messages[index].view_key;
+            messages[index] = reply;
+        }
+        // still through the window fold: a replace that flips `deleted`
+        // re-breaks the author runs around it.
+        return bounded_thread_window(messages);
+    }
+    if let Some(view_key) = pending_key {
+        reply.view_key = view_key;
+    }
+    let insert_at = messages
+        .iter()
+        .position(|message| message.pending || message.seq > reply.seq)
+        .unwrap_or(messages.len());
+    messages.insert(insert_at, reply);
+    bounded_thread_window(messages)
 }
 
 // ============================================================================
@@ -883,7 +1040,6 @@ pub fn thread_offset_after_reply(offset: i64, has_more: bool, committed: bool) -
 
 pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>) -> ChatMessage {
     let edited = row.rev > 0;
-    let mine = authored_by_user(&row.author, current_user);
     let meta = if edited {
         format!("#{} · edited", row.seq)
     } else {
@@ -894,8 +1050,10 @@ pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>) -> ChatMessage {
     } else {
         blocks_view(&row.blocks)
     };
+    let view_key = next_message_view_key();
     ChatMessage {
         id: row.message_id,
+        view_key,
         seq: number_i64(row.seq),
         author: author_display(&row.author, current_user),
         meta,
@@ -914,7 +1072,6 @@ pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>) -> ChatMessage {
         show_author: true,
         initial: avatar_initial(&row.author),
         avatar_kind: avatar_kind(&row.author).into(),
-        mine,
         height: number_i64(row.height),
         time: number_i64(row.time),
         reactions: row
@@ -930,7 +1087,9 @@ pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>) -> ChatMessage {
                 }
             })
             .collect(),
+        render_rev: 0,
     }
+    .seed_render_rev()
 }
 
 /// True when the local user's rendered author string (`user:{hex}`) is among a
@@ -963,10 +1122,22 @@ pub fn mark_message_groups(messages: &mut [ChatMessage]) {
         })
         .collect();
     for (message, show) in messages.iter_mut().zip(opens_run) {
-        message.show_author = show;
+        // flip-only: this re-runs on every merge, and an unmoved header must
+        // not move the row's render key.
+        let flipped = message.show_author != show;
+        if flipped {
+            message.show_author = show;
+            message.bump_render_rev();
+        }
     }
 }
 
+/// Flatten wire blocks back into composer text — the seed for an edit draft.
+///
+/// One `\n` per block boundary, because that is what a block boundary now MEANS
+/// in the composer (`parse_message_with_members` makes every typed line its own
+/// block). A `\n\n` here re-parsed to the same blocks, but it handed the editor
+/// a blank line the author never typed, and every edit added another.
 pub fn message_body(blocks: &[Block]) -> String {
     blocks
         .iter()
@@ -980,7 +1151,7 @@ pub fn message_body(blocks: &[Block]) -> String {
             Block::Divider => "────────".into(),
         })
         .collect::<Vec<_>>()
-        .join("\n\n")
+        .join("\n")
 }
 
 fn span_text(spans: &[Span]) -> String {
@@ -992,16 +1163,12 @@ pub fn blocks_view(blocks: &[Block]) -> Vec<ChatBlock> {
     blocks.iter().map(block_view).collect()
 }
 
-/// A single plain paragraph render block — for optimistic sends and fixtures
-/// that never carry inline marks.
+/// The optimistic row's render blocks: the SAME grammar the send commits
+/// ([`parse_message`]), so a pending row previews what will land instead of
+/// showing raw `**marks**` until the settle replaces it. Roster mentions are
+/// the one divergence — they need the channel members the send resolves.
 pub fn paragraph_blocks(text: &str) -> Vec<ChatBlock> {
-    vec![ChatBlock {
-        kind: "paragraph".into(),
-        text: text.to_string(),
-        lang: String::new(),
-        rich: false,
-        spans: Vec::new(),
-    }]
+    blocks_view(&parse_message(text))
 }
 
 fn deleted_block() -> ChatBlock {
@@ -1036,8 +1203,8 @@ fn block_view(block: &Block) -> ChatBlock {
 }
 
 /// A paragraph/quote block. Plain runs keep their exact text for a single
-/// wrapping `text`; any inline mark switches to word-level `spans` a wrapping
-/// flex can reflow.
+/// wrapping `text`; any inline mark switches to run-level `spans` the view's
+/// single rich-text paragraph expands with its `for`.
 fn rich_block(kind: &str, spans: &[Span]) -> ChatBlock {
     let marked = spans.iter().any(|span| !span.marks.is_empty());
     ChatBlock {
@@ -1045,45 +1212,78 @@ fn rich_block(kind: &str, spans: &[Span]) -> ChatBlock {
         text: span_text(spans),
         lang: String::new(),
         rich: marked,
-        spans: if marked { word_spans(spans) } else { Vec::new() },
+        spans: if marked { run_spans(spans) } else { Vec::new() },
     }
 }
 
-fn word_spans(spans: &[Span]) -> Vec<ChatSpan> {
+/// The one style arm a run renders through. The view's rich-text `for`
+/// expands a fixed span template per item with no conditionals, so the arm
+/// decision cannot live view-side — it is made here, once, and encoded as
+/// WHICH [`ChatSpan`] text field carries the run.
+enum SpanArm {
+    Link(String),
+    Mention,
+    BoldItalic,
+    Bold,
+    Italic,
+    Plain,
+}
+
+/// A link outranks every other mark (a bold link is still a destination), a
+/// mention outranks emphasis, and emphasis resolves on the (bold, italic)
+/// pair — the same precedence the per-token view arms encoded.
+fn span_arm(span: &Span) -> SpanArm {
+    let link = span.marks.iter().find_map(|mark| match mark {
+        Mark::Link(url) => Some(url.clone()),
+        _ => None,
+    });
+    if let Some(url) = link {
+        return SpanArm::Link(url);
+    }
+    let mention = span.marks.iter().any(|m| matches!(m, Mark::Mention(_)));
+    if mention {
+        return SpanArm::Mention;
+    }
+    let bold = span.marks.iter().any(|m| matches!(m, Mark::Bold));
+    let italic = span.marks.iter().any(|m| matches!(m, Mark::Italic));
+    match (bold, italic) {
+        (true, true) => SpanArm::BoldItalic,
+        (true, false) => SpanArm::Bold,
+        (false, true) => SpanArm::Italic,
+        (false, false) => SpanArm::Plain,
+    }
+}
+
+/// One [`ChatSpan`] per inline run, exact text preserved — the paragraph
+/// widget wraps natively, so no word splitting happens here anymore.
+fn run_spans(spans: &[Span]) -> Vec<ChatSpan> {
     let mut out = Vec::new();
     for span in spans {
-        let bold = span.marks.iter().any(|m| matches!(m, Mark::Bold));
-        let italic = span.marks.iter().any(|m| matches!(m, Mark::Italic));
-        let link = span.marks.iter().find_map(|mark| match mark {
-            Mark::Link(url) => Some(url.clone()),
-            _ => None,
-        });
-        let mention = span.marks.iter().any(|m| matches!(m, Mark::Mention(_)));
-        let highlight = link.is_some() || mention;
-        // Keep the trailing space baked into each token so a wrapping flex with
-        // zero column-gap reproduces exact spacing around mark boundaries (a
-        // comma right after a bold run stays attached, not " ,").
-        for token in span.text.split_inclusive(' ') {
-            if token.is_empty() {
-                continue;
-            }
-            out.push(ChatSpan {
-                text: token.to_string(),
-                bold,
-                italic,
-                highlight,
-                link: link.clone().unwrap_or_default(),
-            });
+        if span.text.is_empty() {
+            continue;
         }
+        let mut rendered = ChatSpan::default();
+        match span_arm(span) {
+            SpanArm::Link(url) => {
+                rendered.link_text = span.text.clone();
+                rendered.link = url;
+            }
+            SpanArm::Mention => rendered.mention = span.text.clone(),
+            SpanArm::BoldItalic => rendered.bold_italic = span.text.clone(),
+            SpanArm::Bold => rendered.bold = span.text.clone(),
+            SpanArm::Italic => rendered.italic = span.text.clone(),
+            SpanArm::Plain => rendered.plain = span.text.clone(),
+        }
+        out.push(rendered);
     }
     out
 }
 
-/// Word-level rich runs of one block of text — the pages renderer's view of
-/// the chat inline grammar (no roster, so mentions stay plain ink). Empty when
-/// the text carries no inline mark, keeping the plain single-`text` render;
-/// multi-line text stays plain because a wrapping flex cannot force its line
-/// breaks.
+/// Rich runs of one block of text — the pages renderer's view of the chat
+/// inline grammar (no roster, so mentions stay plain ink). Empty when the
+/// text carries no inline mark, keeping the plain single-`text` render;
+/// multi-line text stays plain because a rendered break is a block boundary,
+/// never a `\n` inside one paragraph.
 pub fn plain_rich_spans(text: &str) -> Vec<ChatSpan> {
     if text.contains('\n') {
         return Vec::new();
@@ -1093,7 +1293,7 @@ pub fn plain_rich_spans(text: &str) -> Vec<ChatSpan> {
     if !marked {
         return Vec::new();
     }
-    word_spans(&spans)
+    run_spans(&spans)
 }
 
 // ============================================================================
@@ -1206,6 +1406,15 @@ fn count_i64(value: usize) -> i64 {
 /// `>` quotes, `---`/`***` dividers, and paragraphs with inline `**bold**` /
 /// `__bold__`, `*italic*` / `_italic_`, and bare `http(s)` links. Everything the
 /// `chat` wire enums can round-trip — nothing client-only.
+///
+/// A SINGLE NEWLINE IS A HARD BREAK, not CommonMark's soft break. The composer
+/// hint says `⇧↵ newline` and `⇧↵` really does put a `\n` in the buffer, so
+/// folding consecutive lines into one paragraph with a space posted a typed
+/// list as "- apples - bananas - pears" — and the fold happens on the way to
+/// the CHAIN, so no renderer recovers it. Each line is therefore its own block.
+/// A rendered break has to be a block boundary rather than a `\n` inside one:
+/// a marked-up line renders as a single rich-text paragraph (`run_spans`),
+/// one paragraph widget per typed line.
 pub fn parse_message(input: &str) -> Vec<Block> {
     parse_message_with_members(input, &[])
 }
@@ -1268,13 +1477,11 @@ fn push_quote_block(
     blocks: &mut Vec<Block>,
 ) -> usize {
     let mut index = start;
-    let mut quoted = Vec::new();
     while index < lines.len() && lines[index].trim().starts_with('>') {
         let stripped = lines[index].trim().trim_start_matches('>').trim_start();
-        quoted.push(stripped.to_string());
+        blocks.push(Block::Quote(inline_spans(stripped, members)));
         index += 1;
     }
-    blocks.push(Block::Quote(inline_spans(&quoted.join(" "), members)));
     index
 }
 
@@ -1285,7 +1492,6 @@ fn push_paragraph_block(
     blocks: &mut Vec<Block>,
 ) -> usize {
     let mut index = start;
-    let mut paragraph = Vec::new();
     while index < lines.len() {
         let trimmed = lines[index].trim();
         let breaks = trimmed.is_empty()
@@ -1296,10 +1502,9 @@ fn push_paragraph_block(
         if breaks {
             break;
         }
-        paragraph.push(trimmed);
+        blocks.push(Block::Paragraph(inline_spans(trimmed, members)));
         index += 1;
     }
-    blocks.push(Block::Paragraph(inline_spans(&paragraph.join(" "), members)));
     index
 }
 
@@ -1406,8 +1611,9 @@ fn mention_at(chars: &[char], at: usize, members: &[ChatMember]) -> Option<(Chat
 /// anything else is the identity's own bytes.
 fn member_key_bytes(member: &ChatMember) -> Vec<u8> {
     let key = &member.key;
-    let looks_hex =
-        !key.is_empty() && key.len().is_multiple_of(2) && key.bytes().all(|b| b.is_ascii_hexdigit());
+    let looks_hex = !key.is_empty()
+        && key.len().is_multiple_of(2)
+        && key.bytes().all(|b| b.is_ascii_hexdigit());
     if looks_hex {
         let decode = |range: &str| u8::from_str_radix(range, 16).ok();
         let bytes: Option<Vec<u8>> = (0..key.len())
@@ -1476,8 +1682,212 @@ pub fn dm_channel_id(a: &str, b: &str) -> String {
 mod tests {
     use super::*;
 
+    fn committed(seq: i64, author: &str) -> ChatMessage {
+        ChatMessage {
+            seq,
+            id: format!("g{seq}"),
+            author: author.into(),
+            ..ChatMessage::default()
+        }
+    }
+
     #[test]
-    fn a_reply_delta_bumps_the_open_thread_roots_summary() {
+    fn a_thread_window_keeps_its_root_pending_tail_and_one_reply_page() {
+        let root = committed(1, "alice");
+        let replies = (2..=300).map(|seq| ChatMessage {
+            thread_seq: 1,
+            ..committed(seq, "alice")
+        });
+        let pending = ChatMessage {
+            id: "pending".into(),
+            seq: -1,
+            pending: true,
+            thread_seq: 0,
+            author: "alice".into(),
+            ..ChatMessage::default()
+        };
+        let window = bounded_thread_window(
+            std::iter::once(root)
+                .chain(replies)
+                .chain(std::iter::once(pending))
+                .collect(),
+        );
+
+        assert_eq!(window.len(), THREAD_HOT_WINDOW_LIMIT);
+        assert_eq!(window[0].seq, 1, "the thread root never leaves the rail");
+        assert_eq!(window[1].seq, 46, "the oldest reply edge slides forward");
+        assert!(
+            window[1].show_author,
+            "the new visible edge opens an author run"
+        );
+        assert!(window.last().is_some_and(|message| message.pending));
+    }
+
+    #[test]
+    fn a_room_landing_keeps_commits_that_arrived_after_its_snapshot() {
+        let canonical = (1..=20).map(|seq| committed(seq, "alice")).collect();
+        let current = vec![committed(21, "bob")];
+
+        let landed = merge_landing_messages(canonical, current, "general".into(), "general".into());
+
+        assert_eq!(
+            landed.iter().map(|message| message.seq).collect::<Vec<_>>(),
+            (1..=21).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_initial_thread_landing_keeps_replies_that_arrived_during_its_read() {
+        let canonical = vec![
+            committed(1, "alice"),
+            ChatMessage {
+                thread_seq: 1,
+                ..committed(2, "alice")
+            },
+        ];
+        let current = vec![
+            committed(1, "alice"),
+            ChatMessage {
+                thread_seq: 1,
+                ..committed(3, "bob")
+            },
+        ];
+
+        let landed = merge_thread_refresh(canonical, current, "general".into(), "general".into());
+
+        assert_eq!(
+            landed.iter().map(|message| message.seq).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+    }
+
+    /// Every in-place row mutation is a render-key move — the view's keyed
+    /// lazy (`by message.seq, message.render_rev`) repaints a row ONLY when a
+    /// key changes, so a path missing its bump is a stale row on screen.
+    #[test]
+    fn every_in_place_row_mutation_bumps_render_rev() {
+        // an edit with a newer rev bumps; its stale replay does not.
+        let messages = vec![committed(1, "a")];
+        let before = messages[0].render_rev;
+        let content = ChatMessage {
+            rev: 1,
+            body: "new".into(),
+            ..ChatMessage::default()
+        };
+        let edited = merge_message_edit(messages, 1, &content);
+        assert_ne!(edited[0].render_rev, before, "an edit bumps");
+        let replayed = merge_message_edit(edited.clone(), 1, &content);
+        assert_eq!(
+            replayed[0].render_rev, edited[0].render_rev,
+            "a stale edit replay is a no-op"
+        );
+
+        // a tombstone bumps.
+        let messages = vec![committed(2, "a")];
+        let before = messages[0].render_rev;
+        let deleted = tombstone_message(messages, 2);
+        assert_ne!(deleted[0].render_rev, before, "a tombstone bumps");
+
+        // a reaction add bumps, its remove bumps again, and a remove of an
+        // emoji the row never had touches nothing.
+        let messages = vec![committed(3, "a")];
+        let before = messages[0].render_rev;
+        let added = optimistic_reaction(messages, 3, "👍".into(), true, "user:ab".into());
+        assert_ne!(added[0].render_rev, before, "a reaction add bumps");
+        let mid = added[0].render_rev;
+        let removed = optimistic_reaction(added, 3, "👍".into(), false, "user:ab".into());
+        assert_ne!(removed[0].render_rev, mid, "a reaction remove bumps");
+        let untouched =
+            optimistic_reaction(removed.clone(), 3, "🎉".into(), false, "user:ab".into());
+        assert_eq!(
+            untouched[0].render_rev, removed[0].render_rev,
+            "a remove of an absent emoji is a no-op"
+        );
+
+        // a reply-summary bump bumps.
+        let messages = vec![committed(4, "a")];
+        let before = messages[0].render_rev;
+        let bumped = bump_reply_summary(messages, 4);
+        assert_ne!(bumped[0].render_rev, before, "a reply summary bumps");
+
+        // a grouping flip bumps — and ONLY a flip: the re-mark that runs on
+        // every merge must not move unmoved headers.
+        let mut messages = vec![committed(5, "a"), committed(6, "a")];
+        mark_message_groups(&mut messages);
+        assert!(
+            !messages[1].show_author,
+            "the second row folds under the run"
+        );
+        let after_flip = messages[1].render_rev;
+        let first_row = messages[0].render_rev;
+        mark_message_groups(&mut messages);
+        assert_eq!(
+            messages[1].render_rev, after_flip,
+            "a re-mark without a flip does not bump"
+        );
+        assert_eq!(
+            messages[0].render_rev, first_row,
+            "an unflipped row never bumps"
+        );
+    }
+
+    /// Construction seeds `render_rev` from the rendered content, so a
+    /// wholesale replacement (a resync) moves the key exactly when the
+    /// replacement row renders differently — and keeps it when it does not.
+    #[test]
+    fn construction_seeds_render_rev_from_rendered_content() {
+        let row = |reactions: Vec<index::ReactionRow>| MsgRow {
+            channel_id: "general".into(),
+            seq: 7,
+            message_id: "m7".into(),
+            author: "user:ab".into(),
+            height: 12,
+            time: 0,
+            blocks: vec![Block::paragraph("hi")],
+            text: String::new(),
+            deleted: false,
+            edited: false,
+            rev: 0,
+            edited_at: None,
+            base_rev: None,
+            thread: None,
+            reply_count: 0,
+            last_reply_seq: None,
+            reactions,
+            tags: Vec::new(),
+        };
+        let plain = chat_message(row(Vec::new()), None);
+        let identical = chat_message(row(Vec::new()), None);
+        assert_eq!(
+            plain.render_rev, identical.render_rev,
+            "identical content seeds identically — the cached subtree is kept"
+        );
+        let reacted = chat_message(
+            row(vec![index::ReactionRow {
+                emoji: "👍".into(),
+                reactors: vec!["user:cd".into()],
+            }]),
+            None,
+        );
+        assert_ne!(
+            plain.render_rev, reacted.render_rev,
+            "a replacement row with reactions the displayed copy never saw moves the key"
+        );
+
+        // the optimistic mint seeds too. NOTE the seed follows the manual
+        // `Hash` contract, which excludes body/blocks: under ONE id a pending
+        // row's body never changes (the settle REPLACES the row and moves
+        // `seq`), and every fresh send mints a fresh id — the field that does
+        // move the seed.
+        let minted = optimistic_message(Vec::new(), "hello".into(), "op1".into(), None);
+        let re_minted = optimistic_message(Vec::new(), "hello".into(), "op1".into(), None);
+        assert_eq!(minted[0].render_rev, re_minted[0].render_rev);
+        let other = optimistic_message(Vec::new(), "hello".into(), "op2".into(), None);
+        assert_ne!(minted[0].render_rev, other[0].render_rev);
+    }
+
+    #[test]
+    fn reply_writers_bump_the_root_and_insert_the_reply() {
         let root = ChatMessage {
             seq: 1,
             id: "g1".into(),
@@ -1490,16 +1900,11 @@ mod tests {
             thread_seq: 1,
             ..ChatMessage::default()
         };
-        let delta = ChatDelta {
-            kind: "reply".into(),
-            channel_id: "general".into(),
-            seq: 3,
-            root_seq: 1,
-            message: reply,
-            ..ChatDelta::default()
-        };
-        let thread = apply_chat_thread(vec![root], delta, "general".into(), 1);
-        assert_eq!(thread[0].reply_count, 2, "the rail's replies rule reads this");
+        let thread = merge_thread_reply(bump_reply_summary(vec![root], 1), reply);
+        assert_eq!(
+            thread[0].reply_count, 2,
+            "the rail's replies rule reads this"
+        );
         assert!(thread.iter().any(|message| message.seq == 3));
     }
 
@@ -1551,8 +1956,10 @@ mod tests {
         .expect("a well-formed op folds")
         .expect("a post is visible to the UI");
 
-        assert_eq!(delta.kind, "posted");
-        assert_eq!(delta.message.height, 276_199);
+        let ChatDelta::Posted { message, .. } = delta else {
+            panic!("a post must decode to the posted transition")
+        };
+        assert_eq!(message.height, 276_199);
     }
 
     #[test]
@@ -1573,7 +1980,7 @@ mod tests {
     fn parse_message_maps_markdown_onto_wire_blocks() {
         let input = "Hello **world** and *friends*\n\n> quote me\n> across lines\n\n```rust\nfn main() {}\n```\n\nvisit https://ducktape.example for more";
         let blocks = parse_message(input);
-        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks.len(), 5);
 
         // paragraph 1: plain / bold / plain / italic runs
         let Block::Paragraph(spans) = &blocks[0] else {
@@ -1586,22 +1993,28 @@ mod tests {
         assert_eq!(spans[3].text, "friends");
         assert_eq!(spans[3].marks, vec![Mark::Italic]);
 
-        // quote joins its lines
-        let Block::Quote(quote) = &blocks[1] else {
+        // a quote keeps its lines apart, exactly as a paragraph does — the
+        // `⇧↵ newline` the composer advertises means the same thing inside a
+        // `>` run as outside one.
+        let Block::Quote(first) = &blocks[1] else {
             panic!("second block is a quote");
         };
-        assert_eq!(span_text(quote), "quote me across lines");
+        let Block::Quote(second) = &blocks[2] else {
+            panic!("third block is a quote");
+        };
+        assert_eq!(span_text(first), "quote me");
+        assert_eq!(span_text(second), "across lines");
 
         // fenced code keeps its language + raw text
-        let Block::Code { lang, text } = &blocks[2] else {
-            panic!("third block is code");
+        let Block::Code { lang, text } = &blocks[3] else {
+            panic!("fourth block is code");
         };
         assert_eq!(lang.as_deref(), Some("rust"));
         assert_eq!(text, "fn main() {}");
 
         // bare url becomes a link mark
-        let Block::Paragraph(spans) = &blocks[3] else {
-            panic!("fourth block is a paragraph");
+        let Block::Paragraph(spans) = &blocks[4] else {
+            panic!("fifth block is a paragraph");
         };
         let link = spans
             .iter()
@@ -1618,15 +2031,47 @@ mod tests {
         let view = blocks_view(&blocks);
         assert_eq!(view[0].kind, "paragraph");
         assert!(view[0].rich, "formatted paragraph renders as spans");
-        assert!(view[0].spans.iter().any(|span| span.bold && span.text == "world"));
-        assert_eq!(view[2].kind, "code");
-        assert_eq!(view[2].text, "fn main() {}");
+        assert!(view[0].spans.iter().any(|span| span.bold == "world"));
+        assert_eq!(view[3].kind, "code");
+        assert_eq!(view[3].text, "fn main() {}");
 
         // a plain message stays a single non-rich paragraph
         let plain = blocks_view(&parse_message("just text here"));
         assert_eq!(plain.len(), 1);
         assert!(!plain[0].rich);
         assert_eq!(plain[0].text, "just text here");
+    }
+
+    /// `⇧↵` PUTS A NEWLINE IN THE BUFFER AND THE COMPOSER SAYS SO.
+    ///
+    /// Consecutive lines were folded into one paragraph with a space, so a
+    /// typed list posted as "- apples - bananas - pears" — and the fold happens
+    /// on the way to the CHAIN, so no renderer recovers it. A rendered break
+    /// has to be a block boundary: a marked-up line renders as one rich-text
+    /// paragraph, and a break belongs between paragraphs, not inside one.
+    #[test]
+    fn a_single_newline_survives_the_trip_to_the_wire() {
+        let blocks = parse_message("- apples\n- bananas\n- pears");
+        assert_eq!(blocks.len(), 3, "one block per typed line");
+        let lines: Vec<String> = blocks
+            .iter()
+            .map(|block| match block {
+                Block::Paragraph(spans) => span_text(spans),
+                other => panic!("every line is a paragraph, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(lines, ["- apples", "- bananas", "- pears"]);
+
+        // The break survives inline marks, which is the case the old fold could
+        // not have been fixed for on the render side.
+        let marked = parse_message("**ship it**\nhttps://ducktape.example");
+        assert_eq!(marked.len(), 2);
+        let view = blocks_view(&marked);
+        assert!(view[0].rich && view[1].rich);
+
+        // And the edit draft the reader gets back is the text she typed, not
+        // her text with a blank line inserted between every pair of lines.
+        assert_eq!(message_body(&blocks), "- apples\n- bananas\n- pears");
     }
 
     #[test]
@@ -1675,14 +2120,14 @@ mod tests {
         };
         assert!(spans.iter().all(|span| span.marks.is_empty()));
 
-        // rendered mentions highlight
+        // rendered mentions land in the mention arm
         let view = blocks_view(&parse_message_with_members("cc @a1b2c3", &members));
         assert!(view[0].rich);
         assert!(
             view[0]
                 .spans
                 .iter()
-                .any(|span| span.highlight && span.text.starts_with("@a1b2c3"))
+                .any(|span| span.mention.starts_with("@a1b2c3"))
         );
     }
 
@@ -1705,14 +2150,50 @@ mod tests {
         }
     }
 
+    /// The arm fields of one span, in template order.
+    fn arm_texts(span: &ChatSpan) -> [&String; 6] {
+        [
+            &span.mention,
+            &span.link_text,
+            &span.bold_italic,
+            &span.bold,
+            &span.italic,
+            &span.plain,
+        ]
+    }
+
     #[test]
     fn plain_rich_spans_mark_inline_runs_and_stay_empty_for_plain_text() {
         let spans = plain_rich_spans("say **hi** to https://duck.example/x");
-        let bold: Vec<_> = spans.iter().filter(|span| span.bold).collect();
+        let bold: Vec<_> = spans.iter().filter(|span| !span.bold.is_empty()).collect();
         assert_eq!(bold.len(), 1);
-        assert_eq!(bold[0].text.trim_end(), "hi");
-        assert!(spans.iter().any(|span| span.highlight));
-        assert!(spans.iter().all(|span| !span.text.contains("**")));
+        assert_eq!(bold[0].bold, "hi");
+        let link = spans
+            .iter()
+            .find(|span| !span.link.is_empty())
+            .expect("the bare url becomes a link span");
+        assert_eq!(link.link_text, "https://duck.example/x");
+        assert_eq!(link.link, "https://duck.example/x");
+
+        // EXACTLY ONE ARM PER RUN — the view's rich-text `for` emits every
+        // template span for every run, so a run filed under two arms renders
+        // twice and a run filed under none vanishes from the paragraph.
+        for span in &spans {
+            let filled = arm_texts(span)
+                .iter()
+                .filter(|text| !text.is_empty())
+                .count();
+            assert_eq!(filled, 1, "one style arm per run: {span:?}");
+        }
+
+        // And the arms concatenate back to the typed text minus the marks —
+        // the same wholeness the one-paragraph render shows the reader.
+        let rendered: String = spans
+            .iter()
+            .flat_map(arm_texts)
+            .map(String::as_str)
+            .collect();
+        assert_eq!(rendered, "say hi to https://duck.example/x");
 
         assert!(plain_rich_spans("no marks here").is_empty());
         assert!(plain_rich_spans("**multi**\nline").is_empty());

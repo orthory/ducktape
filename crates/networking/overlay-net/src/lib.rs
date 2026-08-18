@@ -280,7 +280,9 @@ impl<E: Resolver> Resolver for OverlayContext<E> {
     }
 }
 
-impl<E: Network> Network for OverlayContext<E> {
+// `Clock` rides along for the dial bound below — every concrete context
+// this seam wraps is a full runtime context carrying both.
+impl<E: Network + Clock> Network for OverlayContext<E> {
     type Listener = OverlayListener<E::Listener>;
 
     async fn bind(&self, socket: SocketAddr) -> Result<Self::Listener, Error> {
@@ -320,6 +322,36 @@ impl<E: Network> Network for OverlayContext<E> {
     }
 
     async fn dial(&self, socket: SocketAddr) -> Result<(SinkOf<Self>, StreamOf<Self>), Error> {
+        // EVERY dial is bounded. the p2p dialer holds a per-peer tracker
+        // RESERVATION for the whole dial, and an inbound connection from a
+        // Reserved peer is refused — so one doomed connect left to the OS
+        // timeout (~75s) starves that peer's perfectly good inbound dials
+        // into a near-permanent refusal loop. a blackholed dial is routine
+        // here, not an anomaly: a derived overlay ULA before the tunnel is
+        // up, a tunnel that is applied but dark, a stale underlay hint. the
+        // bound keeps every reservation window short, so inbound acceptance
+        // gets regular gaps regardless of what outbound is stuck on.
+        // raced against the RUNTIME'S OWN clock (never a tokio reactor
+        // timer: this seam also runs under commonware's test runtimes).
+        tokio::select! {
+            result = self.dial_route(socket) => result,
+            _ = self.inner.sleep(DIAL_TIMEOUT) => Err(Error::Timeout),
+        }
+    }
+}
+
+/// the ceiling on any single mesh dial (see the reservation-starvation note
+/// in `dial`): comfortably above a healthy same-network handshake RTT,
+/// far below the OS connect timeout it exists to preempt.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+impl<E: Network + Clock> OverlayContext<E> {
+    /// the unbounded route half of `dial` — by address to the OS or the
+    /// active overlay backend.
+    async fn dial_route(
+        &self,
+        socket: SocketAddr,
+    ) -> Result<(SinkOf<Self>, StreamOf<Self>), Error> {
         if !self.router.is_overlay(&socket) {
             let (sink, stream) = self.inner.dial(socket).await?;
             return Ok((OverlaySink::Os(sink), OverlayStream::Os(stream)));

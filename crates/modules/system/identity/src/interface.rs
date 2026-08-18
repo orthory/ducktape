@@ -159,17 +159,6 @@ pub enum IdentityMsg {
         node_key: Vec<u8>,
         label: Option<String>,
     },
-    /// grant CLIENT standing — SUBMIT authorization at a validator's door and
-    /// nothing else (no consensus seat, no mesh, no statesync). MODULE/SYSTEM
-    /// origin only: governance's `role=Client` invite redemption emits this as
-    /// a follow-up; an external key cannot self-grant. `key` MUST be a 32-byte
-    /// ed25519 public key. the client set is a facet of the account plane's
-    /// state, folded into identity's one root — but structurally distinct from
-    /// membership (the sync door reads valset, never this set).
-    GrantClient { key: Vec<u8> },
-    /// revoke client standing by key; a no-op if the key holds none. same
-    /// MODULE/SYSTEM origin gate as [`IdentityMsg::GrantClient`].
-    RevokeClient { key: Vec<u8> },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -185,8 +174,6 @@ pub enum IdentityQuery {
     /// the account a `member_key` belongs to, if any -- how a device finds its
     /// own account from whatever member key it holds locally.
     OfMember { member_key: Vec<u8> },
-    /// the full committed client-standing set (the submit-door ACL), sorted.
-    Clients,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -194,8 +181,6 @@ pub enum IdentityQuery {
 pub enum IdentityReply {
     Accounts(Vec<AccountView>),
     Account(Option<AccountView>),
-    /// the committed client-standing keys, sorted (order-independent).
-    Clients(Vec<Vec<u8>>),
 }
 
 // ---- signing preimages --------------------------------------------------

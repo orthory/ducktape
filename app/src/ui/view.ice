@@ -21,7 +21,9 @@ view
           height=block_height
           tier=member_tier(members_rows)
           error=onboarding_error
-          busy=(mutation_phase != "idle")
+          busy=mutation_busy
+          restore_empty=empty(restore_words)
+          join_empty=empty(join_invite)
         events
           unlock_submit -> unlock_submit _
           login_skip -> login_skip
@@ -29,17 +31,46 @@ view
           reveal_confirm -> reveal_confirm
           go_restore -> go_restore
           go_login -> go_login
-          restore_submit -> restore_submit _ _
+          restore_submit -> restore_submit _
           pick_network -> pick_network _
           open_network_submit -> open_network_submit
           forget_network_submit -> forget_network_submit _ _
           go_join -> go_join
           go_networks -> go_networks
-          join_network_submit -> join_network_submit _
+          join_network_submit -> join_network_submit
           copy_onboarding_invite -> copy_onboarding_invite
           connect_remote_submit -> connect_remote_submit _
           restore_hidden_submit -> restore_hidden_submit
           enter_console -> enter_console
+        restore_phrase:
+          input "" #restore-words <-> restore_words
+            with
+              label="Recovery phrase"
+              hint="24 words, space-separated"
+              disabled=mutation_busy
+              w=fill
+              p=0.0
+              text-size=12.0
+              line-h=1.2
+              font=code
+              @control
+            active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
+            disabled value=hint
+        join_invite:
+          input "" #join-invite <-> join_invite
+            with
+              label="Invite"
+              hint="🦆AAAA…"
+              disabled=mutation_busy
+              submit=join_network_submit
+              w=fill
+              p=0.0
+              text-size=12.0
+              line-h=1.2
+              font=code
+              @control
+            active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
+            disabled value=hint
     // THE HUDDLE WINDOW — the same panel, now the whole content of a real OS
     // window instead of a card wearing drawn traffic lights. Its close button
     // docks (see `window_was_closed`); leaving the huddle closes it.
@@ -48,10 +79,9 @@ view
         with
           channel=huddle_channel_name
           elapsed=mmss(huddle_now - huddle_joined_at)
-          roster=huddle_roster
+          rows=huddle_rows
           status=call_status
           muted=call_muted
-          peers=call_peers
           camera=call_camera
           video_live=call_video_live
         events
@@ -61,13 +91,13 @@ view
           toggle_call_mute -> toggle_call_mute
           toggle_call_camera -> toggle_call_camera
     if console_win == some(window)
-      WorkspaceTabs #workspace-tabs
+      WorkspaceTabs wall_now=wall_now #workspace-tabs
         with
           network=network_name
           status
           height=block_height
           sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
-          loading=(loading || mutation_phase != "idle")
+          loading=(loading || mutation_busy)
           degraded=connection_degraded(status)
           tab=shell_tab
           bell_count=bell_unread
@@ -88,7 +118,7 @@ view
           switch_network -> switch_network
         notice:
           col w=fill
-            if error != ""
+            if has_error
               box
                 with
                   w=fill
@@ -135,35 +165,37 @@ view
                       hovered bg=fg/9 text=fg
                       pressed bg=fg/14
         chat:
-          ChatScreen search_draft<->chat_search_draft message_action_focus<->message_action_focus message_edit_draft<->message_edit_draft message_editor<->message_editor channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft thread_edit_draft<->thread_edit_draft reply_editor<->reply_editor #chat
+          ChatScreen search_draft<->chat_search_draft message_edit_draft<->message_edit_draft channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft thread_edit_draft<->thread_edit_draft #chat
             with
+              endpoint=connected_rpc
               network_name
               status
               block_height
-              searching=chat_searching
+              search_phase=chat_search_phase
               search_hits=chat_search_hits
-              channels
-              dm_peers
-              channel_reads
-              user_key=settings_user_key
+              rooms
+              dm_rows
               channel_create_open
               connected
               loading
               mutation_phase
               active_channel
               active_dm_peer
+              active_dm
               active_channel_name
               active_channel_archived
               active_channel_members_only
               channel_members
+              post_refusal
               huddle_joined
               huddle_channel
               huddle_channel_name
               huddle_joined_at
               huddle_now
               call_muted
-              huddle_popped=(huddle_win != none)
+              huddle_popped
               messages
+              messages_revision
               has_older_history
               history_view
               history_loading
@@ -171,25 +203,18 @@ view
               unread_marker_seq
               selected_message_seq
               selected_message_rev
-              send_flash_id
-              send_flash_value=animation.interpolate(send_flash, 0.0, 1.0)
               message_action
-              message_menu_y
-              failed_message_draft
               channel_settings_open
               active_thread_seq
               thread_target_seq
               thread_messages
+              thread_messages_revision
               thread_selected_seq
               thread_selected_rev
               thread_message_action
-              thread_menu_y
-              thread_send_flash_id
               thread_has_more
-              thread_next_reply_offset
+              thread_next_reply_seq
               thread_loading
-              failed_reply_draft
-              shift_held
             events
               search_chat_submit -> search_chat_submit
               clear_chat_search -> clear_chat_search
@@ -203,8 +228,9 @@ view
               leave_huddle_here -> leave_huddle_here
               huddle_go_channel -> huddle_go_channel
               join_huddle_submit -> join_huddle_submit
-              chat_pointer_pressed -> chat_pointer_pressed _ _
               load_more_history -> load_more_history
+              chat_scrolled -> chat_scrolled _ _ _ _
+              open_message_link -> open_message_link _
               add_reaction_at -> add_reaction_at _ _
               remove_reaction_at -> remove_reaction_at _ _
               open_thread_for -> open_thread_for _
@@ -216,16 +242,12 @@ view
               add_reaction_submit -> add_reaction_submit _
               edit_message_submit -> edit_message_submit
               delete_message_submit -> delete_message_submit
-              restore_failed_message -> restore_failed_message
-              dismiss_failed_message -> dismiss_failed_message
-              composer_event -> chat_composer_event _
-              composer_mark -> composer_mark _
+              composer_submitted -> composer_submitted _ _ _
               rename_channel_submit -> rename_channel_submit
               archive_channel_submit -> archive_channel_submit
               unarchive_channel_submit -> unarchive_channel_submit
               add_channel_member_submit -> add_channel_member_submit
               remove_channel_member_submit -> remove_channel_member_submit _
-              thread_pointer_pressed -> thread_pointer_pressed _ _
               close_thread -> close_thread
               open_thread_message_actions -> open_thread_message_actions _ _ _
               open_thread_message_reactions -> open_thread_message_reactions _ _ _
@@ -235,12 +257,44 @@ view
               edit_thread_message_submit -> edit_thread_message_submit
               delete_thread_message_submit -> delete_thread_message_submit
               load_more_thread -> load_more_thread
-              restore_failed_reply -> restore_failed_reply
-              dismiss_failed_reply -> dismiss_failed_reply
-              reply_composer_event -> reply_composer_event _
-              reply_composer_mark -> reply_composer_mark _
-              chat_resized -> chat_resized _ _
-              thread_resized -> thread_resized _ _
+
+        shell:
+          ShellScreen draft<->shell_chat_draft #shell
+            with
+              mode=shell_mode
+              provider=shell_provider
+              credential_options=shell_credential_options
+              credential=shell_credential
+              host_node_options=shell_host_node_options
+              host_node=shell_host_node
+              credentials_loading=shell_credentials_loading
+              terminal=shell_terminal
+              terminal_running=shell_terminal_running
+              terminal_busy=shell_terminal_busy
+              terminal_title=shell_terminal_title
+              terminal_error=shell_terminal_error
+              entries=shell_chat_entries
+              activity=shell_chat_activity
+              chat_busy=shell_chat_busy
+              chat_status=shell_chat_status
+              chat_detail=shell_chat_detail
+              live=shell_chat_live
+              chat_error=shell_chat_error
+              saga_id=shell_chat_saga
+              connected
+              dark
+            events
+              shell_mode_changed -> shell_mode_changed _
+              shell_provider_changed -> shell_provider_changed _
+              shell_credential_changed -> shell_credential_changed _
+              shell_host_node_changed -> shell_host_node_changed _
+              shell_credentials_refresh -> shell_credentials_refresh
+              shell_terminal_start -> shell_terminal_start
+              shell_terminal_stop -> shell_terminal_stop
+              shell_composer_event -> shell_composer_event _
+              shell_chat_reset -> shell_chat_reset
+              shell_chat_suggest -> shell_chat_suggest _
+              shell_open_link -> open_message_link _
 
         pages:
           PagesScreen page_draft<->page_draft page_search_draft<->page_search_draft page_editor<->page_editor block_comment_draft<->block_comment_draft #pages
@@ -252,12 +306,13 @@ view
               connected
               connected_rpc
               password
-              dark=(appearance == "dark")
+              dark
               active_page
               active_page_title
               active_page_parent
               page_searching
               page_search_hits
+              page_search_query
               page_delete_armed
               block_autosave_status
               page_refusal
@@ -266,10 +321,12 @@ view
               commented_block_hits
               caret_comment_target
               active_thread_target
+              active_thread_anchor
               orphaned_comment_drafts
               block_comments_open
               block_comment_thread_total
               block_comment_threads
+              block_comment_rows
               block_comment_threads_loading
               block_comment_threads_has_more
               active_block_comment_thread
@@ -307,11 +364,12 @@ view
               // reading of `entries` on that screen is gated on this.
               listed=(fs_listed_path == fs_path)
               entries=fs_entries
+              directories=fs_directories(fs_entries)
               connected
               loading=fs_loading
               preview_path=fs_preview_path
+              preview_entry=fs_preview_entry
               delete_target=fs_delete_target
-              history_open=fs_history_open
               diff_from=fs_diff_from
               diff=fs_diff
               history=fs_history
@@ -329,7 +387,6 @@ view
               fs_arm_delete -> fs_arm_delete _
               fs_disarm_delete -> fs_disarm_delete
               fs_delete_submit -> fs_delete_submit
-              fs_toggle_history -> fs_toggle_history
               fs_close_diff -> fs_close_diff
               fs_show_diff -> fs_show_diff _
               fs_begin_edit -> fs_begin_edit
@@ -339,14 +396,10 @@ view
           MembersScreen #members
             with
               rows=members_rows
-              filter=members_filter
-              selected=members_selected
               admin=members_is_admin(members_rows)
               connected
               answered=members_answered
             events
-              pick_members_filter -> pick_members_filter _
-              open_member -> open_member _
               copy_to_clipboard -> copy_to_clipboard _ _
               agent_set_status -> agent_set_status _ _
               gov_propose -> gov_propose _ _
@@ -360,19 +413,15 @@ view
               connected_rpc
               tier=member_tier(members_rows)
               repos=forge_repos
+              list_phase=forge_list_phase
               open_repo=forge_repo
               repo_menu=forge_repo_menu
+              repo_phase=forge_repo_phase
               branches=forge_branches
               tab=forge_tab
               items=forge_items
-              tree_repo=forge_tree_repo
-              tree_path=forge_tree_path
-              tree_entries=forge_tree_entries
-              file_path=forge_file_path
-              file_text=forge_file_text
-              file_binary=forge_file_binary
-              file_truncated=forge_file_truncated
               forge_item_number
+              item_phase=forge_item_phase
               forge_item_kind
               forge_item_title
               forge_item_state
@@ -396,19 +445,16 @@ view
               review_busy=forge_review_busy
               comment_target=forge_comment_target(forge_comment_path, forge_comment_line, forge_comment_side)
               staged_comments=forge_comment_staged
-              answered=forge_answered
               discussion=forge_discussion
               discussion_pending=forge_discussion_pending
               connected
               loading
-              shift_held
+              dark
             events
               forge_open_repo -> forge_open_repo _
               forge_close_repo -> forge_close_repo
               forge_toggle_repo_menu -> forge_toggle_repo_menu
               select_forge_tab -> select_forge_tab _
-              forge_open_dir -> forge_open_dir _
-              forge_open_file -> forge_open_file _
               forge_open_item -> forge_open_item _
               forge_close_item -> forge_close_item
               forge_merge_submit -> forge_merge_submit
@@ -419,6 +465,7 @@ view
               forge_comment_cancel -> forge_comment_cancel
               forge_comment_drop -> forge_comment_drop _
               note_composer_event -> forge_composer_event _
+              open_message_link -> open_message_link _
         governance:
           GovernanceScreen #governance
             with
@@ -430,16 +477,42 @@ view
             events
               gov_vote -> gov_vote _ _
               gov_execute -> gov_execute _
+        node:
+          NodeScreen wall_now=wall_now node_log_filter<->node_log_filter #node
+            with
+              node_key
+              node_data_dir
+              members_rows
+              status
+              loading
+              node_tab
+              module_rows
+              node_height
+              node_checkpoint
+              node_last_finalized
+              node_reachable_label
+              node_quorum_label
+              node_version
+              node_root_hash
+              sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
+              node_phase_since
+              node_sync_retries
+              node_sync_failures
+              node_sync_last_error
+              node_peers
+            events
+              select_node_tab -> select_node_tab _
+              open_node_modules -> open_node_modules
+              node_log_filter_changed -> node_log_filter_changed _
+              copy_to_clipboard -> copy_to_clipboard _ _
+            activity_log:
+              extern node_log_timeline(node_log_timeline, connected_rpc) #node-log-timeline -> node_log_timeline_changed _
         settings:
-          SettingsScreen account_name_draft<->account_name_draft node_log_filter<->node_log_filter #settings
+          SettingsScreen account_name_draft<->account_name_draft #settings
             with
               account_name
               network_name
               connected_rpc
-              settings_endpoint
-              settings_node_key
-              node_height
-              settings_data_dir
               settings_key_state
               settings_key_path
               settings_open_tabs
@@ -456,21 +529,6 @@ view
               loading
               connected
               mutation_phase
-              node_tab
-              module_rows
-              node_checkpoint
-              node_last_finalized
-              node_reachable_label
-              node_quorum_label
-              node_version
-              node_root_hash
-              sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
-              node_phase_since
-              node_sync_retries
-              node_sync_failures
-              node_sync_last_error
-              node_peers
-              node_log_lines
             events
               select_shell_tab -> select_shell_tab _
               reconnect -> reconnect
@@ -482,32 +540,21 @@ view
               settings_unlock_submit -> settings_unlock_submit _
               lock_session -> lock_session
               forget_workspace_submit -> forget_workspace_submit
-              select_node_tab -> select_node_tab _
-              open_node_modules -> open_node_modules
-              node_log_filter_changed -> node_log_filter_changed _
               set_appearance_light -> set_appearance_light
               set_appearance_dark -> set_appearance_dark
         explorer:
-          ExplorerScreen query<->explorer_query
+          ExplorerScreen #explorer(connected_rpc)
             with
+              connected_rpc
               connected
-              searching=explorer_searching
               loading=explorer_loading
-              kinds=explorer_kinds
-              kind=explorer_kind
-              partial=explorer_partial
-              hits=explorer_hits
               blocks=explorer_blocks
-              selected=explorer_selected
               ops=explorer_ops
               head=block_height
               sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
             events
-              explorer_search_submit -> explorer_search_submit
-              clear_explorer_search -> clear_explorer_search
               refresh_explorer -> refresh_explorer
-              pick_explorer_kind -> pick_explorer_kind _
-              select_explorer_block -> select_explorer_block _
+              copy_to_clipboard -> copy_to_clipboard _ _
         huddle:
           box
             with
@@ -524,7 +571,7 @@ view
               // huddle's own channel. On every OTHER screen it must show even
               // when that channel is the selected one, which the missing
               // `shell_tab` term used to suppress.
-              if huddle_joined && (huddle_win == none) && (shell_tab != "chat" || huddle_channel != active_channel)
+              if huddle_joined && !huddle_popped && (shell_tab != ShellTab.chat || huddle_channel != active_channel)
                 HuddleDockedPill
                   with
                     channel=huddle_channel_name
@@ -536,13 +583,13 @@ view
             with
               create_open=channel_create_open
               members_only=channel_create_members_only
-              busy=(mutation_phase != "idle")
+              busy=mutation_busy
               connected
               loading
               toast
-              tone=toast_tone
+              tone="info"
               open=palette_open
-              searching=palette_searching
+              search_phase=palette_search_phase
               chat_hits=palette_chat_hits
               page_hits=palette_page_hits
             events
@@ -650,10 +697,6 @@ view
                           dir=vertical
                           w=fill
                           h=290.0
-                        col
-                          with
-                            w=fill
-                            p=5.0
-                            gap=1.0
-                          for item in bell_items
-                            BellRow item=item
+                          anchor-y=keep
+                        keyed item in bell_items by=item.seq virtual-row=58.0 w=fill p=5.0 gap=1.0
+                          BellRow item=item

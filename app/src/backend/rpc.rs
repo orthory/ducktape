@@ -1,76 +1,307 @@
 use super::*;
 use ::chat;
 
+/// Sign and submit one module op, answering the height of the block that
+/// INCLUDED it.
+///
+/// The height is the coordinate a follow-up read waits on: the node answers
+/// acceptance, the derived read models fold behind the block loop, and a
+/// reload in between reads an index that does not have the write yet
+/// (`await_fold`). Callers that need it by hand still take it; every caller
+/// gets it for free through [`note_module_block`] below.
 pub(crate) async fn signed_write(
     rpc: &RpcClient,
     target: &str,
     payload: Vec<u8>,
     password: String,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     if payload.is_empty() || payload.len() > MAX_SIGNED_PAYLOAD_BYTES {
         return Err(format!(
             "{target} transaction exceeds the signed payload limit"
         ));
     }
     let frame = sign_frame(target, &payload, password).await?;
-    rpc.submit_frame(frame).await.map_err(Into::into)
+    let height = rpc.submit_frame(frame).await?;
+    note_module_block(rpc, target, height);
+    Ok(height)
 }
 
-async fn sign_frame(target: &str, payload: &[u8], mut password: String) -> Result<Vec<u8>, String> {
-    let key = user_key_path()?;
-    require_encrypted_key(&key)?;
-    let payload_hex = hex_encode(payload);
-    let input = signing_input(&password, &payload_hex);
-    password.zeroize();
-    let input = Zeroizing::new(input?);
-    let mut command = tokio::process::Command::new(ducktape_binary());
-    command
-        .arg("user")
-        .arg("sign-frame")
-        .arg("--key")
-        .arg(&key)
-        .arg("--target")
-        .arg(target)
-        .arg("--seq")
-        .arg(next_sequence().to_string())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = command.spawn().map_err(|error| {
-        format!("could not start the ducktape signer ({error}); build node-bin or set DUCKTAPE_BIN")
-    })?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "ducktape signer stdin is unavailable".to_string())?;
-    stdin
-        .write_all(&input)
-        .await
-        .map_err(|error| format!("could not send payload to signer: {error}"))?;
-    drop(stdin);
-    let output = tokio::time::timeout(RPC_TIMEOUT, child.wait_with_output())
-        .await
-        .map_err(|_| "ducktape signer timed out".to_string())?
-        .map_err(|error| format!("ducktape signer failed: {error}"))?;
-    if !output.status.success() {
+/// Every block this client KNOWS a module took and has not yet seen folded.
+///
+/// A view read must never answer behind something this client already knows
+/// happened, and the caller that reads is generally not the one that learned
+/// it: the autosave plans tick N+1 against a tree tick N wrote, a live resync
+/// reloads on behalf of a push three layers up, and a save that fails halfway
+/// leaves committed ops behind with nobody left holding the receipt. So the
+/// height is kept where it is LEARNED — the two funnels every such fact passes
+/// through, [`signed_write`] for this client's writes and `folded_update` for
+/// the stream's — instead of being threaded through each seam in between,
+/// which is one parameter per seam and a stale read wherever one is missed.
+///
+/// Keyed by ORIGIN as well as module because a height is a coordinate on ONE
+/// chain, and this app points at as many chains as the user has networks —
+/// the same reason `rpc_client`'s own cache is keyed that way.
+///
+/// An entry leaves only when a fold is OBSERVED at or past it: the tip is
+/// monotonic, so a read after that can never fall behind it again, which makes
+/// the steady state zero probes rather than one per read.
+// ponytail: entries leave ONLY on an observed fold, so a node whose chain
+// restarts under a running app (dev-box reset — heights come back below the
+// recorded floor) charges each read of that module one bounded, failing wait
+// until the app restarts. Comparing `/v1/status` tips is the upgrade if a
+// reset chain ever stops being a dev-box-only event.
+static SEEN_BLOCKS: Mutex<BTreeMap<(String, String), u64>> = Mutex::new(BTreeMap::new());
+
+fn seen_blocks() -> std::sync::MutexGuard<'static, BTreeMap<(String, String), u64>> {
+    SEEN_BLOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Record that `module` took a block at `height` — a write this client signed,
+/// or an op its live stream delivered.
+pub(crate) fn note_module_block(rpc: &RpcClient, module: &str, height: u64) {
+    let key = (rpc.origin().to_string(), module.to_string());
+    let mut seen = seen_blocks();
+    let known = seen.entry(key).or_default();
+    *known = (*known).max(height);
+}
+
+/// The block a read of `module`'s view owes itself — the newest one this client
+/// knows about and has not seen folded. `None` = nothing outstanding.
+fn unfolded_block(rpc: &RpcClient, module: &str) -> Option<u64> {
+    seen_blocks()
+        .get(&(rpc.origin().to_string(), module.to_string()))
+        .copied()
+}
+
+/// Retire what the fold has now been seen to carry.
+fn note_folded_through(rpc: &RpcClient, module: &str, height: u64) {
+    let mut seen = seen_blocks();
+    let key = (rpc.origin().to_string(), module.to_string());
+    // ONLY if it is still the height that was waited on: a write landing
+    // during the wait raises the floor, and dropping the entry outright would
+    // discard a requirement nobody has met yet.
+    if seen.get(&key).is_some_and(|known| *known <= height) {
+        seen.remove(&key);
+    }
+}
+
+/// Wait, briefly, for `module`'s fold to carry everything this client knows it
+/// took ([`SEEN_BLOCKS`]) — the read-your-own-writes wait, at the READ rather
+/// than at each of the writes.
+///
+/// Answers on the same terms as [`await_fold`]: `true` = the view is not
+/// behind anything this client knows, which includes the ordinary case of
+/// knowing nothing outstanding and waiting for nothing.
+pub(crate) async fn await_seen_fold<Q: serde::Serialize>(
+    rpc: &RpcClient,
+    module: &str,
+    probe: &Q,
+) -> bool {
+    let Some(height) = unfolded_block(rpc, module) else {
+        return true;
+    };
+    await_fold(rpc, module, probe, height).await
+}
+
+/// How many times a post-write reload probes the module's fold before giving
+/// up, and how long it waits between probes.
+///
+/// Bounded on purpose and short: the watermark can legitimately never arrive
+/// (a boundary stamp wipes the tip, a module with no index guest never has
+/// one), so this narrows the stale-read window — it never guarantees closing
+/// it, and the caller's own correction stays the guarantee.
+pub(crate) const FOLD_WAIT_PROBES: u32 = 5;
+const FOLD_WAIT_STEP: Duration = Duration::from_millis(60);
+
+/// Wait, briefly, for `module`'s fold to reach block `height` — the block that
+/// accepted the caller's own write — so the reload that follows reads a view
+/// containing it instead of one that predates it.
+///
+/// `submit_frame` answers ACCEPTANCE; the derived read models fold behind the
+/// block loop. Everything upstream of this reload used to paper over that gap
+/// by hand, and the hand-patch could only fix the one field it knew about.
+///
+/// `probe` is the module's cheapest view request: this reads the reply's fold
+/// watermark and throws the body away, so the smallest arm is the right one.
+///
+/// Answers whether the fold got there. `false` covers three different facts —
+/// the budget ran out, the node refused, or the module reports no tip at all
+/// (no index guest, a fresh database, a boundary stamp wiped it) — and they
+/// all mean the same thing to a caller: do not trust the reload, apply your own
+/// correction. Unknown is never "not yet": waiting on it would spend the whole
+/// budget for nothing.
+pub(crate) async fn await_fold<Q: serde::Serialize>(
+    rpc: &RpcClient,
+    module: &str,
+    probe: &Q,
+    height: u64,
+) -> bool {
+    for probe_number in 0..FOLD_WAIT_PROBES {
+        if probe_number > 0 {
+            tokio::time::sleep(FOLD_WAIT_STEP).await;
+        }
+        let Ok((_reply, folded)) = rpc
+            .view_folded::<Q, serde::de::IgnoredAny>(module, probe)
+            .await
+        else {
+            return false;
+        };
+        let Some(folded) = folded else {
+            return false;
+        };
+        if folded.reached_block(height) {
+            note_folded_through(rpc, module, height);
+            return true;
+        }
+    }
+    false
+}
+
+/// THE session signer: one `ducktape user sign-frame` child, unlocked once,
+/// then fed one request line per signed write.
+///
+/// Opening the key runs argon2id over 64 MiB (`bin/node/src/userkey.rs`), so
+/// the per-op process this replaced charged every reaction tap ~200-400 ms of
+/// memory-hard KDF plus a spawn — and five taps in a row (reactions skip
+/// `mutation_phase` on purpose) fanned out five concurrent 64 MiB jobs against
+/// the render thread. The posture is unchanged by construction: the app
+/// already holds the password in state, and the private key still lives only
+/// in the child's address space.
+static SIGNER: tokio::sync::Mutex<Option<Signer>> = tokio::sync::Mutex::const_new(None);
+
+/// How long a signer that just failed a request gets to exit before its
+/// stderr is written off. Short on purpose — the request already spent
+/// `RPC_TIMEOUT`, and this is only here to name the cause.
+const SIGNER_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub(super) struct Signer {
+    /// The password this child was unlocked with. A different one is a
+    /// different seat (a re-login, or a restored key), so it gets its own
+    /// child instead of signing under the key this one holds.
+    password: Zeroizing<String>,
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    frames: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+}
+
+impl Signer {
+    /// Spawn the child and hand it the password — the session's one argon2id
+    /// pass. A bad password does not fail here: the child dies on it and the
+    /// first request reports its stderr through [`Signer::reap`].
+    ///
+    /// The binary and key path are arguments rather than reads of
+    /// `ducktape_binary()` / `user_key_path()` so the session can be driven
+    /// against a stub signer without touching this process's environment.
+    pub(super) async fn unlock(
+        binary: PathBuf,
+        key: PathBuf,
+        password: Zeroizing<String>,
+    ) -> Result<Self, String> {
+        require_encrypted_key(&key)?;
+        let input = Zeroizing::new(password_line(&password)?);
+        let mut command = tokio::process::Command::new(binary);
+        command
+            .arg("user")
+            .arg("sign-frame")
+            .arg("--key")
+            .arg(&key)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = command.spawn().map_err(|error| {
+            format!(
+                "could not start the ducktape signer ({error}); build node-bin or set DUCKTAPE_BIN"
+            )
+        })?;
+        let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            return Err("ducktape signer pipes are unavailable".into());
+        };
+        stdin
+            .write_all(&input)
+            .await
+            .map_err(|error| format!("could not unlock the signer: {error}"))?;
+        Ok(Self {
+            password,
+            child,
+            stdin,
+            frames: tokio::io::BufReader::new(stdout).lines(),
+        })
+    }
+
+    /// One request line out, one frame-hex line back.
+    pub(super) async fn sign(&mut self, request: &str) -> Result<Vec<u8>, String> {
+        self.stdin
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|error| format!("could not send payload to signer: {error}"))?;
+        let answer = tokio::time::timeout(RPC_TIMEOUT, self.frames.next_line())
+            .await
+            .map_err(|_| "ducktape signer timed out".to_string())?
+            .map_err(|error| format!("ducktape signer failed: {error}"))?;
+        let frame_hex = answer.ok_or_else(|| "ducktape signer returned no frame".to_string())?;
+        hex_decode(frame_hex.trim())
+    }
+
+    /// Close the pipe and collect the child's exit — its stderr is the only
+    /// place a session-level refusal (wrong password, unreadable key) is
+    /// spelled out.
+    async fn reap(self) -> Option<String> {
+        drop(self.stdin);
+        drop(self.frames);
+        let output = tokio::time::timeout(SIGNER_EXIT_TIMEOUT, self.child.wait_with_output())
+            .await
+            .ok()?
+            .ok()?;
         let detail = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
+        if detail.trim().is_empty() {
+            return None;
+        }
+        Some(format!(
             "ducktape signer refused the transaction: {}",
             bounded_detail(&detail)
-        ));
+        ))
     }
-    let stdout = std::str::from_utf8(&output.stdout)
-        .map_err(|_| "ducktape signer returned non-UTF-8 output".to_string())?;
-    let frame_hex = stdout
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .ok_or_else(|| "ducktape signer returned no frame".to_string())?;
-    hex_decode(frame_hex.trim())
 }
 
-pub(crate) fn signing_input(password: &str, payload_hex: &str) -> Result<Vec<u8>, String> {
+async fn sign_frame(target: &str, payload: &[u8], password: String) -> Result<Vec<u8>, String> {
+    let password = Zeroizing::new(password);
+    let request = format!("{target} {} {}\n", next_sequence(), hex_encode(payload));
+    // The lock IS the semaphore of 1: a burst of reactions queues on one
+    // child instead of fanning out, and it is what keeps the request lines
+    // and the frame lines on the child's pipes paired.
+    let mut session = SIGNER.lock().await;
+    let seated = session
+        .as_ref()
+        .is_some_and(|signer| signer.password == password);
+    if !seated {
+        *session = Some(Signer::unlock(ducktape_binary(), user_key_path()?, password).await?);
+    }
+    let signer = session.as_mut().expect("the session was seated above");
+    let fault = match signer.sign(&request).await {
+        Ok(frame) => return Ok(frame),
+        Err(fault) => fault,
+    };
+    // A signer that failed one request never serves a second: retire it here
+    // so the next write unlocks a fresh one.
+    let Some(refusal) = session.take() else {
+        return Err(fault);
+    };
+    Err(refusal.reap().await.unwrap_or(fault))
+}
+
+/// Retire the session signer — the `Lock` button's other half. Clearing
+/// `password` in state stops the app from signing; this stops the CHILD from
+/// being able to.
+pub async fn lock_signer() -> bool {
+    SIGNER.lock().await.take().is_some()
+}
+
+/// The password as the signer's first stdin line, rejecting what the
+/// line-delimited stdin contract cannot carry.
+pub(crate) fn password_line(password: &str) -> Result<Vec<u8>, String> {
     let invalid_password = password.len() > 16 * 1024
         || password
             .as_bytes()
@@ -82,10 +313,8 @@ pub(crate) fn signing_input(password: &str, payload_hex: &str) -> Result<Vec<u8>
     if password.is_empty() {
         return Err("the local user key is locked; enter its password".into());
     }
-    let mut input = Vec::with_capacity(password.len() + payload_hex.len() + 2);
+    let mut input = Vec::with_capacity(password.len() + 1);
     input.extend_from_slice(password.as_bytes());
-    input.push(b'\n');
-    input.extend_from_slice(payload_hex.as_bytes());
     input.push(b'\n');
     Ok(input)
 }
@@ -190,22 +419,22 @@ pub(crate) fn write_prefs(prefs: &serde_json::Value) -> bool {
     std::fs::write(&path, bytes).is_ok()
 }
 
-/// The persisted appearance override — `"light"` / `"dark"`, or empty when
-/// this device follows the OS. DEVICE-global, not per-endpoint: appearance is
-/// a property of the person's eyes and room, not of a workspace.
-pub async fn load_appearance() -> String {
+/// The persisted appearance override. DEVICE-global, not per-endpoint:
+/// appearance is a property of the person's eyes and room, not of a workspace.
+pub async fn load_appearance() -> crate::Appearance {
     match read_prefs()["appearance"].as_str() {
-        Some("light") => "light".into(),
-        Some("dark") => "dark".into(),
-        _ => String::new(),
+        Some("light") => crate::Appearance::Light,
+        Some("dark") => crate::Appearance::Dark,
+        _ => crate::Appearance::System,
     }
 }
 
-pub async fn save_appearance(mode: String) -> bool {
-    let known = mode == "light" || mode == "dark";
-    if !known {
-        return false;
-    }
+pub async fn save_appearance(mode: crate::Appearance) -> bool {
+    let mode = match mode {
+        crate::Appearance::System => return false,
+        crate::Appearance::Light => "light",
+        crate::Appearance::Dark => "dark",
+    };
     let mut prefs = read_prefs();
     prefs["appearance"] = serde_json::json!(mode);
     write_prefs(&prefs)
@@ -245,14 +474,6 @@ pub fn doc_tabs_with(mut tabs: Vec<String>, page_id: String) -> Vec<String> {
 pub fn doc_tabs_without(mut tabs: Vec<String>, page_id: String) -> Vec<String> {
     tabs.retain(|tab| *tab != page_id);
     tabs
-}
-
-/// The tabs that still exist in the page list — deleted pages drop at render
-/// time and self-heal in the persisted list on the next save.
-pub fn retain_doc_tabs(tabs: Vec<String>, pages: Vec<PageItem>) -> Vec<String> {
-    tabs.into_iter()
-        .filter(|tab| pages.iter().any(|page| page.id == *tab))
-        .collect()
 }
 
 /// One rendered doc tab.
@@ -421,19 +642,6 @@ pub(crate) fn user_error(message: String) -> String {
         return "The node sent a reply this app could not read. Reload and retry.".into();
     }
     message
-}
-
-/// A loader handed a NEGATIVE generation is being told its screen is
-/// off-screen: refuse before any I/O. The refusal's impossible generation
-/// makes the failed arm's guard drop it unread — nothing surfaces.
-pub(crate) fn offscreen_guard(generation: i64) -> Result<(), HydrationError> {
-    if generation < 0 {
-        return Err(HydrationError {
-            generation,
-            message: "skipped_offscreen".into(),
-        });
-    }
-    Ok(())
 }
 
 pub(crate) fn app_error(message: String) -> AppError {

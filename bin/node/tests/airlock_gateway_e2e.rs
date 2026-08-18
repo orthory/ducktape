@@ -76,7 +76,7 @@ fn account_of_node(cluster: &Cluster, reader: usize, node: &[u8]) -> Option<Acco
     )?;
     match identity::decode_reply(&bytes).ok()? {
         IdentityReply::Account(account) => account,
-        IdentityReply::Accounts(_) | IdentityReply::Clients(_) => None,
+        IdentityReply::Accounts(_) => None,
     }
 }
 
@@ -774,7 +774,7 @@ fn gateway_streams_and_caps_over_the_frame_wire() {
     );
 
     // Unsized overflow: the head commits, then the RUNNING cap truncates.
-    let (status, received) = rt.block_on(async move {
+    let (status, received, truncated) = rt.block_on(async move {
         use futures::StreamExt as _;
         let resp = reqwest::Client::new()
             .get(format!("{via}/flood-chunked"))
@@ -784,18 +784,23 @@ fn gateway_streams_and_caps_over_the_frame_wire() {
             .expect("capped GET through the gateway");
         let status = resp.status();
         let mut received = 0usize;
+        let mut truncated = false;
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(chunk) => received += chunk.len(),
-                Err(_) => break, // aborted mid-body = the truncation contract
+                Err(_) => {
+                    truncated = true;
+                    break;
+                }
             }
         }
-        (status, received)
+        (status, received, truncated)
     });
     assert_eq!(status, reqwest::StatusCode::OK, "the head commits before the cap trips");
+    assert!(truncated, "an over-cap chunked body must fail closed");
     assert!(
-        received < 16 * CHUNK,
-        "the running cap must truncate the body ({received} bytes made it through)"
+        (1..=CHUNK).contains(&received),
+        "the running cap must expose a prefix no larger than its signed byte boundary ({received})"
     );
 }

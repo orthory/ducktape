@@ -20,9 +20,7 @@
 //! the member gate on `BindNode` resolves through the runtime's memoized
 //! replay under real dispatch. the WebAuthn (passkey) and multi-scheme member
 //! verifies run IN the guest — deterministic pure-Rust p256 on wasm32 — and
-//! must answer byte-identically to the native module. the client-ACL facet
-//! (governance-origin grants/revokes, the sorted `Clients` read) rides the
-//! same store and is pinned by the same matrix.
+//! must answer byte-identically to the native module.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use commonware_cryptography::Signer as _;
@@ -224,8 +222,7 @@ fn root_of(h: &Host) -> StateRoot {
 
 /// the read matrix: every query family — the roster-served paginated listing
 /// (full, a window, an empty window), per-account gets (present + absent),
-/// both ownership-index resolvers over every key the test knows about, and
-/// the client-ACL set.
+/// and both ownership-index resolvers over every key the test knows about.
 async fn replies(
     h: &Host,
     accounts: &[Vec<u8>],
@@ -248,7 +245,6 @@ async fn replies(
         encode_query(&IdentityQuery::OfMember {
             member_key: b"absent".to_vec(),
         }),
-        encode_query(&IdentityQuery::Clients),
     ];
     for a in accounts {
         queries.push(encode_query(&IdentityQuery::Get {
@@ -570,48 +566,6 @@ async fn same_ops_inner(context: &deterministic::Context) {
     )
     .await;
 
-    // h12/h13: the client-ACL facet — a governance-shaped SYSTEM origin
-    // grants submit-door standing, and a duplicate grant stages nothing (the
-    // root holds). the sorted Clients read rides the reply matrix.
-    roundtrip(
-        &mut native,
-        &mut wasm,
-        &w,
-        12,
-        Origin::System,
-        msg(&IdentityMsg::GrantClient {
-            key: ed_pub(&w.joiner),
-        }),
-        true,
-    )
-    .await;
-    roundtrip(
-        &mut native,
-        &mut wasm,
-        &w,
-        13,
-        Origin::System,
-        msg(&IdentityMsg::GrantClient {
-            key: ed_pub(&w.joiner),
-        }),
-        false,
-    )
-    .await;
-    // h14: revoking the LAST client deletes the record — back to the
-    // never-granted store shape on both runtimes.
-    roundtrip(
-        &mut native,
-        &mut wasm,
-        &w,
-        14,
-        Origin::System,
-        msg(&IdentityMsg::RevokeClient {
-            key: ed_pub(&w.joiner),
-        }),
-        true,
-    )
-    .await;
-
     // decoded spot check on the wasm side: the surviving membership is the
     // founder + the passkey, the name trimmed, node C evicted.
     let reply = wasm
@@ -698,9 +652,8 @@ async fn rejections_inner(context: &deterministic::Context) {
     // the rejection matrix: every distinct refusal family — the valset gate
     // (decided by sibling reads inside the wasm runtime), certificate
     // verification (stale nonce), the registered-kind pin, single-ownership,
-    // membership invariants, the client-ACL origin/shape gates, origin
-    // shapes, and the decode seam. each rejected block must leave BOTH roots
-    // byte-identical (abort: no trace).
+    // membership invariants, origin shapes, and the decode seam. each
+    // rejected block must leave BOTH roots byte-identical (abort: no trace).
     let stale_bind = bind(&w.founder_a, &w.node_b.clone(), 0); // A's nonce is 1 now
     let mut forged_kind = ed_auth(
         &w.founder_a,
@@ -803,20 +756,6 @@ async fn rejections_inner(context: &deterministic::Context) {
                 display_name: "x".repeat(65),
             }),
             "exceeds the 64-byte limit",
-        ),
-        // the client ACL: an external key cannot self-grant, and a malformed
-        // key is refused even from the authorized origin.
-        (
-            Origin::External(w.node_a.clone()),
-            msg(&IdentityMsg::GrantClient {
-                key: ed_pub(&w.joiner),
-            }),
-            "only via governance",
-        ),
-        (
-            Origin::System,
-            msg(&IdentityMsg::GrantClient { key: vec![0; 16] }),
-            "expected 32 bytes",
         ),
         // origin shapes: system and empty-external submitters.
         (

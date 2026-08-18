@@ -4,7 +4,7 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ::chat::index::{ChatViewQuery, ChatViewReply, MsgRow};
@@ -13,27 +13,27 @@ use ::chat::index::{ChatViewQuery, ChatViewReply, MsgRow};
 // import reappearing is the signal that one crawled back onto it.
 use ::chat::{ChatMsg, PostPolicy};
 use ducktape_rpc::{Client as RpcClient, ModuleEvent, Status as NodeStatus};
-use iced::futures::StreamExt as _;
+use iced::futures::{FutureExt as _, StreamExt as _};
 use pages::index::{PageRow, PagesViewQuery, PagesViewReply, ThreadRow};
 use pages::{BlockKind, NewBlock, PageMsg, PageQuery, PageReply};
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+use tokio::sync::OwnedSemaphorePermit;
 use zeroize::{Zeroize as _, Zeroizing};
 
 // chat's client view model is module-owned (`chat::client`) — the rendered
 // row types, the composer parsing, the optimistic merges, and the op-delta
 // splices. re-exported here because the Ice externs resolve `crate::backend`.
 pub use ::chat::client::{
-    ChatBlock, ChatChannel, ChatDelta, ChatMember, ChatMessage, ChatReaction, ChatSpan,
-    append_thread_page, apply_chat_channels, apply_chat_members, apply_chat_messages,
-    apply_chat_thread, author_display, author_name, chat_message, contains_pending_message,
-    mark_message_groups, merge_message_send_result, merge_pending_messages, merge_thread_reply,
-    optimistic_message, parse_message_with_members, reply_settled_by, rollback_pending_message,
-    send_settled_by, settled_reply_id, settled_send_id, short_label, thread_offset_after_reply,
+    CHAT_HOT_WINDOW_LIMIT, ChatBlock, ChatChannel, ChatDelta, ChatMember, ChatMessage,
+    ChatReaction, ChatSpan, append_thread_page, author_display, author_name, bounded_chat_window,
+    bounded_thread_window, chat_message, contains_pending_message, mark_message_groups,
+    merge_landing_messages, merge_message_send_result, merge_pending_messages,
+    merge_thread_refresh, parse_message_with_members, rollback_pending_message, short_label,
 };
 // the composer's block splitter is not called by the shipping binary — only by
 // the app's own test helpers, which build message rows the way a send does.
 #[cfg(test)]
-pub use ::chat::client::paragraph_blocks;
+pub use ::chat::client::{THREAD_HOT_WINDOW_LIMIT, paragraph_blocks};
 // forge's client view model, same arrangement: the tracker rows, the item
 // pane (reviews + merge-box tallies), and the op-refresh classification.
 pub use ::forge::client::{
@@ -58,25 +58,10 @@ const PROVISION_PATIENCE: u32 = 8;
 /// The voting window a membership proposal opens with, in consensus seconds —
 /// the same value the CLI's membership ceremony uses.
 const GOVERNANCE_VOTING_PERIOD: u64 = 1_000_000;
-/// How many thread roots one timeline load mounts. This number IS the cost of
-/// switching into chat: the shell routes modules with a `match tab`, so the
-/// inactive screen is not built at all and every row's lazy cache dies with it
-/// — coming back pays one cold widget build plus one cold text layout per row,
-/// on the UI thread, in one frame. The viewport shows ~15 rows, so 40 is ~2.5
-/// screens of scrollback and "Load older messages" pages in the rest.
-///
-/// ponytail: a knob, not a measured optimum — raise it when the timeline
-/// virtualizes and the mount stops being linear in it.
-const CHAT_TIMELINE_ROOT_LIMIT: usize = 40;
-/// The chat view clamps one message page to 256 rows (default 50, max 256), so
-/// the timeline walk steps in 256-row pages.
-const CHAT_VIEW_PAGE_LIMIT: u64 = 256;
-/// How many such pages one backward walk may spend hunting roots. The walk
-/// filters thread replies client-side, so a thread-heavy channel yields few
-/// roots per page and would otherwise crawl head→seq 1 in 256-row hops before
-/// chat paints anything. Bounded, a load costs at most this many round trips
-/// and leaves the rest to "Load older messages".
-const CHAT_TIMELINE_MAX_PAGES: u32 = 4;
+/// One index view page fills the entire bounded render window. Timeline roots
+/// have their own index keyspace, so this is always one RPC regardless of how
+/// many thread replies sit between roots.
+const CHAT_VIEW_PAGE_LIMIT: usize = CHAT_HOT_WINDOW_LIMIT;
 
 /// Client-local read cursor for one channel: the newest `seq` this device has
 /// "seen". There is no wire read-cursor — this list lives only in app state and
@@ -89,13 +74,18 @@ pub struct ChannelRead {
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ChatData {
+    /// The switch this window answers for. Every route that moves the reader
+    /// bumps `chat_generation` and stamps it here, so a room she has already
+    /// clicked past cannot land on top of the one she is looking at. Thread,
+    /// history, and search reads own separate compiler delivery lanes.
+    pub generation: i64,
     pub channels: Vec<ChatChannel>,
     pub messages: Vec<ChatMessage>,
+    pub has_older_history: bool,
     pub active_channel: String,
     pub active_channel_name: String,
     pub active_channel_archived: bool,
     pub active_channel_members_only: bool,
-    pub active_channel_huddle_count: i64,
     /// the huddle's roster, not just its length — the faces and the tiles.
     pub huddle_roster: Vec<HuddleParticipant>,
     pub channel_members: Vec<ChatMember>,
@@ -105,7 +95,6 @@ pub struct ChatData {
     pub active_thread_seq: i64,
     pub thread_target_seq: i64,
     pub thread_messages: Vec<ChatMessage>,
-    pub thread_next_reply_offset: i64,
     pub thread_has_more: bool,
 }
 
@@ -123,7 +112,7 @@ pub(crate) struct ThreadData {
     pub root_seq: i64,
     pub target_seq: i64,
     pub messages: Vec<ChatMessage>,
-    pub next_reply_offset: i64,
+    pub next_reply_seq: i64,
     pub has_more: bool,
 }
 
@@ -133,7 +122,7 @@ pub struct ThreadLoadData {
     pub root_seq: i64,
     pub target_seq: i64,
     pub messages: Vec<ChatMessage>,
-    pub next_reply_offset: i64,
+    pub next_reply_seq: i64,
     pub has_more: bool,
 }
 
@@ -141,19 +130,15 @@ pub struct ThreadLoadData {
 pub struct ThreadPageData {
     pub generation: i64,
     pub messages: Vec<ChatMessage>,
-    pub next_reply_offset: i64,
+    pub next_reply_seq: i64,
     pub has_more: bool,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct LiveThreadData {
-    pub generation: i64,
     pub channel_id: String,
     pub root_seq: i64,
-    pub target_seq: i64,
     pub messages: Vec<ChatMessage>,
-    pub next_reply_offset: i64,
-    pub has_more: bool,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -168,7 +153,6 @@ pub struct ChatSearchHit {
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct ChatSearchData {
-    pub generation: i64,
     pub hits: Vec<ChatSearchHit>,
 }
 
@@ -266,7 +250,6 @@ pub struct PageSearchHit {
 
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct PageSearchData {
-    pub generation: i64,
     pub hits: Vec<PageSearchHit>,
 }
 
@@ -278,11 +261,11 @@ pub struct WorkspaceData {
     pub height: i64,
     pub channels: Vec<ChatChannel>,
     pub messages: Vec<ChatMessage>,
+    pub has_older_history: bool,
     pub active_channel: String,
     pub active_channel_name: String,
     pub active_channel_archived: bool,
     pub active_channel_members_only: bool,
-    pub active_channel_huddle_count: i64,
     pub huddle_roster: Vec<HuddleParticipant>,
     pub channel_members: Vec<ChatMember>,
     pub pages: Vec<PageItem>,
@@ -306,6 +289,10 @@ pub struct OptimisticMutationError {
     pub committed: bool,
     pub operation_id: String,
     pub scope_id: String,
+    /// The thread a REPLY was for, `0` for a message. The composer that let
+    /// the body go is keyed by its room and its thread, so a failure can only
+    /// be handed back to the box it came from if it says which one that was.
+    pub thread_seq: i64,
     pub body: String,
 }
 
@@ -324,15 +311,16 @@ pub struct HydrationError {
     pub message: String,
 }
 
-#[derive(Clone, Debug, Default, Hash, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LiveUpdate {
     /// `ready` (topics subscribed — run the catch-up resync), `retry`
-    /// (stream down, reconnecting), `chat` / `pages` (one folded delta),
-    /// `resync` (this module's replay lagged — reload its slices).
-    pub kind: String,
+    /// (stream down, reconnecting), `chat` (one ordered bounded delta batch),
+    /// `pages` (one folded delta), `resync` (this module's replay lagged —
+    /// reload its slices).
+    pub kind: crate::LiveKind,
     pub status: String,
     pub height: i64,
-    /// the module needing a scoped resync (`kind == "resync"`).
+    /// the module needing a scoped resync (`kind == LiveKind::Resync`).
     pub module: String,
     /// which plane(s) the handler must reload (`ready` = both after the
     /// subscribe→hydrate ordering race; `resync` = the lagged plane; a pages
@@ -341,13 +329,71 @@ pub struct LiveUpdate {
     pub load_pages: bool,
     /// trail 100ms so a burst of pages ops coalesces into one reload.
     pub debounce: bool,
-    pub chat: ChatDelta,
+    /// Ordered chat deltas. Consecutive, already-ready chat frames are
+    /// published together so one network burst costs one reducer pass and one
+    /// view rebuild per bounded batch, not one of each per operation.
+    pub chat: Vec<ChatDelta>,
     pub pages: PagesDelta,
     pub bell: BellDelta,
-    /// one committed forge op's invalidation scope (`kind == "forge"`).
+    /// one committed forge op's invalidation scope (`kind == LiveKind::Forge`).
     pub forge: ForgeRefresh,
+    /// Subscription backpressure, not UI state. The next socket publication
+    /// cannot be read until the generated app message carrying this token has
+    /// finished its update and all of its clones have been dropped.
+    pub(crate) permit: LivePermit,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct LivePermit(Option<Arc<OwnedSemaphorePermit>>);
+
+impl LivePermit {
+    pub(crate) fn held(permit: OwnedSemaphorePermit) -> Self {
+        Self(Some(Arc::new(permit)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_held(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+impl std::fmt::Debug for LivePermit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("LivePermit")
+            .field(&self.0.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for LivePermit {
+    fn eq(&self, _other: &Self) -> bool {
+        // The permit changes scheduling only; it is not part of a publication's
+        // domain value and must not perturb reducer/test equality.
+        true
+    }
+}
+
+impl Default for LiveUpdate {
+    fn default() -> Self {
+        Self {
+            kind: crate::LiveKind::Retry,
+            status: String::new(),
+            height: 0,
+            module: String::new(),
+            load_chat: false,
+            load_pages: false,
+            debounce: false,
+            chat: Vec::new(),
+            pages: PagesDelta::default(),
+            bell: BellDelta::default(),
+            forge: ForgeRefresh::default(),
+            permit: LivePermit::default(),
+        }
+    }
+}
+
+mod agent;
 mod bell;
 mod chat;
 mod document;
@@ -365,6 +411,7 @@ mod shell;
 mod storage;
 mod style;
 
+pub use agent::*;
 pub use bell::*;
 pub use chat::*;
 pub use document::*;

@@ -179,6 +179,16 @@ pub const MAX_ID_BYTES: usize = 256;
 pub const MAX_FILTER_BYTES: usize = 256;
 /// action template byte bound.
 pub const MAX_TEMPLATE_BYTES: usize = 4096;
+/// byte bound on a SUBSTITUTED template — the same budget as the template it
+/// was rendered from. capping the template alone does not bound the render:
+/// substitution AMPLIFIES, and 17 `{text}` tokens on a 64 KiB chat message
+/// produce a ~1.09 MiB string, past both tasks' record cap and chat's
+/// message-head cap. a follow-up must never be able to fail the op that
+/// triggered it, so an over-cap render is TRUNCATED rather than refused:
+/// refusing is safe for the block (a `build_and_emit` error is RECORDED, not
+/// emitted) but silently stops the rule from firing on every large message
+/// forever, and a clipped title or post body is the honest lesser harm.
+pub const MAX_SUBSTITUTED_BYTES: usize = MAX_TEMPLATE_BYTES;
 /// run-history ring capacity; the oldest record is dropped past this.
 pub const MAX_RUN_HISTORY: usize = 1024;
 /// actions emitted per incoming event; matching rules past this are recorded as
@@ -692,7 +702,7 @@ impl Automations {
                 channel_id,
                 template,
             } => {
-                let body = substitute_vars(template, vars);
+                let body = substitute_bounded(template, vars);
                 if body.is_empty() {
                     return Err("post template produced an empty message".into());
                 }
@@ -750,16 +760,20 @@ impl Automations {
                 task_id_prefix,
                 title_template,
             } => {
-                let title = substitute_vars(title_template, vars);
+                let title = substitute_bounded(title_template, vars);
                 if title.is_empty() {
                     return Err("task template produced an empty title".into());
                 }
                 // deterministic, collision-free per (prefix, message).
                 let task_id = format!("{task_id_prefix}-{event_channel}-{seq}");
-                // composed-id guard BEFORE the probe (see PostMessage).
-                if task_id.len() > MAX_ID_BYTES {
-                    return Err("composed id exceeds cap".into());
-                }
+                // composed-id guard BEFORE the probe (see PostMessage), held
+                // against TASKS' rule rather than this module's: an id tasks
+                // rejects at apply (over MAX_TASK_ID, or carrying the reserved
+                // KEY_SEP a rule author is free to put in the prefix) unwinds
+                // the triggering post. MAX_ID_BYTES happens to equal
+                // MAX_TASK_ID today; that coincidence is not the constraint.
+                sdk::validate_id("task_id", &task_id, tasks::MAX_TASK_ID)
+                    .map_err(|e| e.to_string())?;
                 // probe: the composed task id must be unused — tasks rejects
                 // duplicates, which would abort the block. the tasks wire surface only
                 // exposes List today, so this is an O(n) scan; switch to a Get
@@ -937,6 +951,23 @@ fn substitute(template: &str, channel: &str, seq: u64, author: &str, text: &str)
         mention: "",
     };
     substitute_vars(template, &vars)
+}
+
+/// substitute, then clip the render to [`MAX_SUBSTITUTED_BYTES`] on a UTF-8
+/// char boundary — the guard for every substituted string that rides a
+/// FOLLOW-UP into another module (a post body, a task title). the inbox arm
+/// does not use it: its fields are bounded by the inbox module's own caps.
+fn substitute_bounded(template: &str, vars: &TemplateVars<'_>) -> String {
+    let mut rendered = substitute_vars(template, vars);
+    if rendered.len() <= MAX_SUBSTITUTED_BYTES {
+        return rendered;
+    }
+    let mut keep = MAX_SUBSTITUTED_BYTES;
+    while !rendered.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    rendered.truncate(keep);
+    rendered
 }
 
 fn substitute_vars(template: &str, vars: &TemplateVars<'_>) -> String {

@@ -12,7 +12,7 @@ the two real NATs being punchable.
 >
 > **Status update (2026-07-08).** The node-side reachability plane is wired
 > behind `wireguard_listen`: `bin/node` constructs a `NatResolver` (reflexive
-> discovery, `register`, hole-punch), consumes v3 `Coordinated` hints as
+> discovery, `register`, hole-punch), consumes unversioned `Coordinated` hints as
 > reachability routes, and desktop-created workspaces default to the public
 > coordinator at `p2p.ducktape.byeongsu.dev:3478`. The DERP-style relay remains
 > removed; the coordinator is rendezvous-only (step 8 below).
@@ -39,22 +39,22 @@ Three hosts:
      direct A<->B WireGuard tunnel and drop the coordinator out of the path.
 ```
 
-This extends the Ducktape-2 live-join rig (v2/v3 invite format, the NAT-hairpin
-gotcha, the 2-validator-quorum teardown caveat).
+This extends the current v1 live-join rig (the NAT-hairpin gotcha and the
+2-validator-quorum teardown caveat).
 
 ## Prerequisites
 
 - The coordinator deployed and answering (per [`coordinator.md`](coordinator.md);
   verify with the Task-2 subprocess proof or `ss -lunp 'sport = :3478'`).
 - Validator A and Validator B each have a built `ducktape`.
-- A founder able to mint v3 invites.
+- A founder able to mint a signed, single-use bearer invite.
 - For the tunnel steps: real WireGuard userspace/kernel on A and B.
 
 ## The tagged procedure
 
 1. **Deploy the coordinator on the VPS.** `[WORKS TODAY]` — follow [`coordinator.md`](coordinator.md); confirm it binds UDP `:3478` (`ss -lunp 'sport = :3478'`) and answers a live `BindRequest` (the `deploy_smoke.rs` subprocess proof exercises exactly this).
-2. **Mint a v3 invite carrying a `Coordinated` reach hint.** `[WORKS TODAY]` — default `init` records `coordinated:<ek>@p2p.ducktape.byeongsu.dev:3478#<coord_key>` and public coordination in `network.toml`; the invite round-trips through `bin/node/src/config.rs` `pack`/`unpack`/`parse`.
-3. **A and B each generate an identity and get admitted.** `[WORKS TODAY]` — the founder runs `invite-accept`; this is the unchanged admission path, independent of reachability.
+2. **Mint an invite carrying a `Coordinated` reach hint.** `[WORKS TODAY]` — default `init` records `coordinated:<ek>@p2p.ducktape.byeongsu.dev:3478#<coord_key>` and public coordination in `network.toml`; the one unversioned v1 blob round-trips through `bin/node/src/config/invite.rs`.
+3. **A initializes; B joins and redeems its standing.** `[WORKS TODAY]` — A runs `ducktape node invite`, whose signed bearer token is the admission decision. B runs `ducktape node join <blob>` and redeems it once on first contact. If B must vote as a validator rather than remain a resident, a member then runs `ducktape node member promote <B-pubkey>`. Admission remains independent of reachability.
 4. **A and B boot dial-out-only against the coordinator's reflexive/rendezvous service.** `[WORKS TODAY]` — with `wireguard_listen` configured, the node constructs a `NatResolver`, sends `BindRequest`, registers, and keeps the mapping warm.
 5. **A `Coordinated` hint is consumed as a reachability path.** `[WORKS TODAY]` — `NetworkDescriptor::reach_entries()` returns `ReachDial::Coordinated`, and `bin/node` routes those entries into the reachability resolver instead of dialing the coordinator as a TCP mesh peer.
 6. **A and B publish their reflexive endpoints and rendezvous.** `[NAT-DEPENDENT]` — the node drives lookup and punch through `NatResolver`; success depends on the observed NAT mappings being punchable.
@@ -68,9 +68,9 @@ gotcha, the 2-validator-quorum teardown caveat).
 
 - Deploy the coordinator and prove it answers (the `deploy_smoke.rs` subprocess
   proof; step 1).
-- Mint and parse a v3 `Coordinated` invite, and have the node consume that hint
+- Mint and parse the v1 `Coordinated` invite, and have the node consume that hint
   as coordinated reach (steps 2 and 5).
-- Admit A and B (step 3).
+- Redeem B's resident standing and, when required, promote it (step 3).
 - Register with the public coordinator and discover a coordinator-observed
   reflexive mapping (step 4).
 

@@ -24,6 +24,8 @@ pub mod markdown;
 pub mod menu;
 pub mod sync;
 
+use std::collections::BTreeMap;
+
 /// The `sync` predicate at the extern boundary, which hands values, not
 /// borrows.
 pub fn has_unclosed_fence(text: String) -> bool {
@@ -73,28 +75,67 @@ pub fn comment_anchor_label(
     target: String,
     page_id: String,
 ) -> String {
+    anchor_label(&comment_anchor_labels(&blocks), &target, &page_id)
+}
+
+/// One thread-list row with its document anchor already resolved. The Ice
+/// view reads the scalar; it never clones and searches the whole block list
+/// once per thread.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct PageCommentThreadRow {
+    pub thread: crate::backend::PageCommentThread,
+    pub anchor: String,
+}
+
+pub fn page_comment_thread_rows(
+    blocks: Vec<crate::backend::PageBlock>,
+    threads: Vec<crate::backend::PageCommentThread>,
+    page_id: String,
+) -> Vec<PageCommentThreadRow> {
+    let labels = comment_anchor_labels(&blocks);
+    threads
+        .into_iter()
+        .map(|thread| PageCommentThreadRow {
+            anchor: anchor_label(&labels, &thread.target, &page_id),
+            thread,
+        })
+        .collect()
+}
+
+fn comment_anchor_labels(blocks: &[crate::backend::PageBlock]) -> BTreeMap<String, String> {
+    let text_by_id: BTreeMap<&str, &str> = blocks
+        .iter()
+        .map(|block| (block.id.as_str(), block.text.as_str()))
+        .collect();
+    sync::line_spans(blocks)
+        .into_iter()
+        .map(|(id, start, _)| {
+            let text = text_by_id.get(id.as_str()).copied().unwrap_or_default();
+            (id, format!("line {start} · {}", anchor_snippet(text)))
+        })
+        .collect()
+}
+
+fn anchor_label(labels: &BTreeMap<String, String>, target: &str, page_id: &str) -> String {
     if target.is_empty() || target == page_id {
         return "this page".into();
     }
-    let spans = sync::line_spans(&blocks);
-    let Some((_, start, _)) = spans.into_iter().find(|(id, _, _)| *id == target) else {
-        return "a removed block".into();
-    };
-    let snippet = blocks
-        .iter()
-        .find(|block| block.id == target)
-        .map(|block| block.text.trim().to_string())
-        .unwrap_or_default();
-    let snippet = match snippet.char_indices().nth(36) {
-        Some((cut, _)) => format!("{}…", &snippet[..cut]),
-        None if snippet.is_empty() => "an empty line".into(),
-        None => snippet,
-    };
-    format!("line {start} · {snippet}")
+    labels
+        .get(target)
+        .cloned()
+        .unwrap_or_else(|| "a removed block".into())
+}
+
+fn anchor_snippet(text: &str) -> String {
+    let text = text.trim();
+    match text.char_indices().nth(36) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None if text.is_empty() => "an empty line".into(),
+        None => text.to_owned(),
+    }
 }
 
 use iced::advanced::text::Wrapping;
-use iced::font::{Style as FontStyle, Weight};
 use iced::widget::text_editor::{self, Action, Content, Cursor, Edit, Position};
 use iced::{Border, Color, Element, Padding};
 use std::hash::{Hash as _, Hasher as _};
@@ -360,24 +401,38 @@ fn toggle_todo(mut document: Content, line: usize) -> Content {
     document
 }
 
-/// The Cmd/Ctrl+Z / +Shift+Z route off the app's ONE keyboard subscription —
-/// the editor deliberately bubbles command-letter chords. An empty verdict is
-/// the identity, so the caller stays branch-free.
-pub fn page_history_key(
-    document: Content,
+/// WHICH history move the Cmd/Ctrl+Z / +Shift+Z chord asks for — "undo",
+/// "redo", or "" for every other press. Split out of [`page_history_key`] so
+/// the keyboard handler can resolve the chord BEFORE it decides to rebuild the
+/// buffer: the assignment that applies the move lowers to
+/// `mem::take(&mut page_editor)`, and a taken `editor` leaves a fresh
+/// `Content::default()` behind — a cosmic-text buffer built under a write lock
+/// on the process-global font system, per key press, for a chord that fires
+/// once in a thousand.
+pub fn page_history_shortcut(
     _logical: iced::keyboard::Key,
     physical: iced::keyboard::key::Physical,
     modifiers: iced::keyboard::Modifiers,
     ready: bool,
-) -> Content {
+) -> String {
     use iced::keyboard::key::{Code, Physical};
     let is_z = matches!(physical, Physical::Code(Code::KeyZ));
     if !ready || !is_z || !modifiers.command() {
-        return document;
+        return String::new();
     }
-    let restored = match modifiers.shift() {
-        false => history::undo(|| (document.text(), document.cursor())),
-        true => history::redo(|| (document.text(), document.cursor())),
+    match modifiers.shift() {
+        false => "undo".to_owned(),
+        true => "redo".to_owned(),
+    }
+}
+
+/// Apply the move [`page_history_shortcut`] named. An empty verdict is the
+/// identity, so the caller stays branch-free.
+pub fn page_history_key(document: Content, action: String) -> Content {
+    let restored = match action.as_str() {
+        "undo" => history::undo(|| (document.text(), document.cursor())),
+        "redo" => history::redo(|| (document.text(), document.cursor())),
+        _ => return document,
     };
     restored.unwrap_or(document)
 }
@@ -432,7 +487,7 @@ pub fn apply_page_action(mut document: Content, action: PageAction) -> Content {
 
 /// The document's text, for the save tick's dirty check and its plan.
 ///
-/// Owned, not borrowed: the `sync` extern boundary hands state fields by value.
+/// Owned, not borrowed: the extern boundary hands state fields by value.
 /// VERBATIM: iced 0.14's `Content::text()` joins lines without inventing a
 /// trailing newline, so a trailing newline here IS a final empty line — the
 /// empty paragraph a page can end on. Trimming it made every such page dirty
@@ -784,16 +839,6 @@ fn replace_range(document: &mut Content, start: Position, end: Position, replace
     ))));
 }
 
-/// The composer font at a weight — the document shares the app's default face.
-#[allow(dead_code)]
-fn document_font(weight: Weight, style: FontStyle) -> iced::Font {
-    iced::Font {
-        weight,
-        style,
-        ..crate::Ducktape::default_font()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1119,40 +1164,44 @@ mod tests {
             PageEvent::Action(PageAction::Edit(Action::Edit(Edit::Insert('y')))),
         );
         assert_eq!(typed_doc.text(), "Title\nbody");
-        let undone = page_history_key(
-            typed_doc,
+        let undo = page_history_shortcut(
             Key::Unidentified,
             Physical::Code(Code::KeyZ),
             Modifiers::COMMAND,
             true,
         );
+        assert_eq!(undo, "undo");
+        let undone = page_history_key(typed_doc, undo);
         assert_eq!(undone.text(), "Title\nbod");
         // The caret returns to where the group STARTED, not to the origin.
         assert_eq!(
             undone.cursor().position,
             iced::widget::text_editor::Position { line: 1, column: 3 }
         );
-        let redone = page_history_key(
-            undone,
+        let redo = page_history_shortcut(
             Key::Unidentified,
             Physical::Code(Code::KeyZ),
             Modifiers::COMMAND | Modifiers::SHIFT,
             true,
         );
+        assert_eq!(redo, "redo");
+        let redone = page_history_key(undone, redo);
         assert_eq!(redone.text(), "Title\nbody");
         // …and redo puts it back where the caret sat when Cmd+Z was pressed.
         assert_eq!(
             redone.cursor().position,
             iced::widget::text_editor::Position { line: 1, column: 4 }
         );
-        // Off the pages tab the chord is the identity.
-        let parked = page_history_key(
-            redone,
+        // Off the pages tab the chord names no move — which is what keeps
+        // `global_key_pressed` from taking the buffer on an ordinary keystroke.
+        let parked_move = page_history_shortcut(
             Key::Unidentified,
             Physical::Code(Code::KeyZ),
             Modifiers::COMMAND,
             false,
         );
+        assert_eq!(parked_move, "");
+        let parked = page_history_key(redone, parked_move);
         assert_eq!(parked.text(), "Title\nbody");
         history::reset();
     }

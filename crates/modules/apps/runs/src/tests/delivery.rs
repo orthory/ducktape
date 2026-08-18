@@ -243,6 +243,107 @@ fn invalid_responses_fail_the_run_and_surface_a_threaded_failure_reply() {
 }
 
 #[test]
+fn a_task_id_tasks_would_reject_fails_the_run_not_the_op() {
+    // tasks admits an id through `sdk::validate_id` (MAX_TASK_ID bytes, no
+    // KEY_SEP), and a model-authored id is bounded only by MAX_ACTIONS_BYTES.
+    // an id tasks would REJECT must fail the run here: rejected at apply, the
+    // follow-up would roll back the whole settle op — reply, finalize, run
+    // transition — on every replay, with no breadcrumb to show for it.
+    let cases = [
+        (
+            "t".repeat(tasks::MAX_TASK_ID + 1),
+            format!("the cap is {}", tasks::MAX_TASK_ID),
+        ),
+        (
+            format!("t{}1", sdk::KEY_SEP),
+            "reserved separator".to_owned(),
+        ),
+    ];
+    for (task_id, fragment) in cases {
+        let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_TASKS_CREATE]);
+        let mut ctx = CaptureCtx::new()
+            .at(8)
+            .with_dispatch_origin()
+            .with_registry(&registry)
+            .with_transcript("general", transcript(2));
+        exec(
+            &mut m,
+            &mut ctx,
+            &result_event(
+                &run_id,
+                Ok(response(
+                    &["ok"],
+                    vec![AgentAction::CreateTask {
+                        task_id,
+                        title: "rejected at tasks".into(),
+                    }],
+                )),
+            ),
+        )
+        .expect("the settle op is ACCEPTED — the RUN fails, not the op");
+        assert!(
+            ctx.task_msgs().is_empty(),
+            "no task follow-up is emitted ({fragment})"
+        );
+        assert_eq!(
+            ctx.chat_msgs().len(),
+            1,
+            "only the ⚠ failure reply posts ({fragment})"
+        );
+        let breadcrumbs: Vec<String> = ctx
+            .events
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.payload).into_owned())
+            .collect();
+        assert!(
+            breadcrumbs.iter().any(|b| b.contains(&fragment)),
+            "the fail_run breadcrumb names the constraint: {breadcrumbs:?}"
+        );
+        commit(&mut m);
+        assert_eq!(
+            get_pending(&m, &run_id),
+            None,
+            "the failed run's entry pruned ({fragment})"
+        );
+    }
+}
+
+#[test]
+fn a_task_id_at_the_cap_still_emits() {
+    // the boundary belongs to the ACCEPTING side: tasks admits exactly
+    // MAX_TASK_ID bytes, so this validator must not be one byte stricter.
+    let task_id = "t".repeat(tasks::MAX_TASK_ID);
+    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_TASKS_CREATE]);
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2));
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(response(
+                &["on it"],
+                vec![AgentAction::CreateTask {
+                    task_id: task_id.clone(),
+                    title: "at the cap".into(),
+                }],
+            )),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        ctx.task_msgs(),
+        vec![TaskMsg::CreateTask {
+            task_id,
+            title: "at the cap".into(),
+        }]
+    );
+}
+
+#[test]
 fn raw_model_text_normalizes_into_a_postable_reply() {
     // the oracle wraps the model's RAW text in the runner result; the
     // intake's deterministic normalization turns prose, empty JSON, and

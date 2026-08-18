@@ -279,7 +279,7 @@ fn a_passing_proposal_removes_the_validator_and_emits_leave() {
         // the `member-remove` verb's on-chain shape: a member opens a
         // RemoveValidator proposal, members vote, and execution PERFORMS the
         // membership change by emitting `ValsetMsg::Leave` as a
-        // governance-origin follow-up — the same path `invite-accept` drives
+        // governance-origin follow-up — the same path `node member promote` drives
         // for AddValidator/Join, inverted.
         submit_as(
             &mut host,
@@ -453,7 +453,7 @@ fn a_member_leaves_by_removing_itself_pending_the_remaining_majority() {
 }
 
 /// the solo-network tally: with one member, majority = 1/2 + 1 = 1, so the
-/// founder's own ballot decides immediately — `invite-accept` on a network
+/// founder's own ballot decides immediately — `node member promote` on a network
 /// of one admits the friend in a single propose/vote/execute round, no
 /// second party required.
 #[test]
@@ -844,4 +844,3 @@ fn votes_close_at_the_deadline_and_ballots_are_per_member() {
         );
     });
 }
-

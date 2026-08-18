@@ -7,12 +7,15 @@
 //! expected — hence the file-wide dead_code allow.
 #![allow(dead_code)]
 
+use std::io::{BufRead as _, BufReader};
+use std::net::SocketAddr;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub struct Sim {
     child: Child,
+    stdout: BufReader<ChildStdout>,
     port: u16,
 }
 
@@ -33,49 +36,49 @@ impl Sim {
     /// than restarting at 0 (exercised by reactor_seams.rs's restart scenario;
     /// `Drop` kills+waits the prior child, so a plain drop-then-respawn is safe).
     pub fn spawn(storage: &Path, extra_args: &[&str]) -> Self {
-        let port = free_port();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape-simnode"));
         cmd.arg("--listen")
-            .arg(format!("127.0.0.1:{port}"))
+            .arg("127.0.0.1:0")
             .arg("--storage")
             .arg(storage)
             .args(extra_args)
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             // startup failures land on stderr — keep it visible or they read
-            // as an opaque readiness timeout.
+            // as an opaque closed readiness pipe.
             .stderr(Stdio::inherit());
-        let child = cmd.spawn().expect("spawn ducktape-simnode");
-        let mut sim = Self { child, port };
-        sim.await_status();
+        let mut child = cmd.spawn().expect("spawn ducktape-simnode");
+        let stdout = BufReader::new(child.stdout.take().expect("pipe sim stdout"));
+        let mut sim = Self {
+            child,
+            stdout,
+            port: 0,
+        };
+        sim.port = sim.read_listen_port();
         sim
     }
 
-    /// Block until this sim answers `/v1/status`.
-    ///
-    /// Liveness FIRST, and the order is the whole point: a child that lost its
-    /// listen port exits, and something else is then answering on that number.
-    /// Probing first would read the WINNER's 200 as this child's readiness, and
-    /// the test would drive a stranger's sim for its entire run — visible only
-    /// as an unrelated flake. Asking "is my child alive?" before "did someone
-    /// answer?" turns that into a named startup failure. (The same reorder
-    /// landed in `bin/noded/tests/daemon_e2e.rs`; this harness was the copy left
-    /// behind.)
-    fn await_status(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            if let Some(status) = self.child.try_wait().expect("poll sim") {
-                panic!("sim exited during startup ({status}) — see stderr above");
-            }
-            if let Ok((200, _)) = try_request(self.port, "GET", "/v1/status", None) {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "sim on port {} never answered /v1/status",
-                self.port
-            );
-            std::thread::sleep(Duration::from_millis(150));
+    /// Wait on the child's listener-bound event and return its OS-selected port.
+    /// This is an event handoff, not a probe-and-drop reservation or readiness
+    /// poll: once the line arrives, this exact child owns the reported listener.
+    fn read_listen_port(&mut self) -> u16 {
+        let mut line = String::new();
+        let read = self
+            .stdout
+            .read_line(&mut line)
+            .expect("read sim readiness");
+        if read == 0 {
+            let status = self.child.wait().expect("wait for failed sim startup");
+            panic!("sim exited during startup ({status}) — see stderr above");
         }
+        let addr: SocketAddr = line
+            .strip_prefix("DUCKTAPE_SIMNODE_LISTEN=")
+            .unwrap_or_else(|| panic!("unexpected sim readiness event: {line:?}"))
+            .trim_end()
+            .parse()
+            .unwrap_or_else(|error| panic!("invalid sim readiness address {line:?}: {error}"));
+        assert!(addr.ip().is_loopback(), "sim reported non-loopback {addr}");
+        assert_ne!(addr.port(), 0, "sim reported unresolved listen port");
+        addr.port()
     }
 
     /// this sim's http port — for the routes the helpers below do not wrap,
@@ -286,8 +289,6 @@ impl Sim {
 /// http/1.1 client, `io::Result` so `await_status` can poll a not-yet-up sim.
 /// `embed.rs` drives the embedded server through this directly.
 pub use nettest::try_http_json as try_request;
-
-use nettest::free_port;
 
 /// POST arbitrary body bytes with an explicit content-type — the raw-bytes
 /// twin of [`try_request`] (which is json-only), for the octet-stream frame

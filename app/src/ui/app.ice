@@ -1,18 +1,28 @@
 daemon Ducktape
   title "Ducktape"
-  theme app_theme
+  theme "app"
   palette app_palette
   bg app_background
   fg app_text
   id "dev.ducktape.app"
   font "../../../crates/design/assets/fonts/Geist[wght].ttf"
   font "../../../crates/design/assets/fonts/GeistMono[wght].ttf"
+  // Not a type role: with no emoji face in the font system, cosmic-text
+  // re-scans the whole database for EVERY emoji on EVERY fresh paragraph
+  // (~3.7ms each, uncached on miss) — the chat row toolbar carries three,
+  // which made every freshly mounted row ~11ms and a channel switch a
+  // half-second layout freeze. A resolved fallback costs ~60us.
+  font "../../../crates/design/assets/fonts/NotoColorEmoji.ttf"
   text-size 13.5
   antialiasing true
+  tray
+    icon-rgba "../../assets/tray.rgba" 128 128
+    tooltip "Ducktape"
   // The launch window: Discord/Steam-shaped — a small fixed column that
   // signs the user in and picks a network. It opens on mount and closes when
   // the console takes over.
   window onboarding
+    icon-rgba "../../assets/icon.rgba" 128 128
     size 480 680
     position centered
     resizable false
@@ -29,6 +39,7 @@ daemon Ducktape
   // alternative is suppressing a rail, and a console that silently drops the
   // pane you just opened is worse than one that will not get that small.
   window console
+    icon-rgba "../../assets/icon.rgba" 128 128
     size 1280 800
     min-size 1040 540
     position centered
@@ -44,15 +55,30 @@ daemon Ducktape
   // 340 = 42 header + 52 controls + 2 rules + ~190 of stage, and the width
   // never goes under the size the window ships at.
   window huddle
+    icon-rgba "../../assets/icon.rgba" 128 128
     size 320 460
     min-size 320 340
 
 use "extern/backend.ice"
 use "extern/editor.ice"
 use "extern/call.ice"
-use "ducktape-ui/default.ice"
+use "ducktape-ui/recipes.ice"
+use "ducktape-ui/log-timeline.ice"
 use "theme.ice"
-use "state.ice"
+use "state/types.ice"
+use "state/core.ice"
+use "state/chat.ice"
+use "state/shell.ice"
+use "state/explorer.ice"
+use "state/roster.ice"
+use "state/forge.ice"
+use "state/node.ice"
+use "state/files.ice"
+use "state/overlays.ice"
+use "state/pages.ice"
+use "state/onboarding.ice"
+use "state/huddle.ice"
+use "state/derived.ice"
 use "components/icon.ice"
 use "components/kit.ice"
 use "components/patterns.ice"
@@ -72,9 +98,11 @@ use "screens/governance.ice"
 use "screens/overlays.ice"
 use "screens/storage.ice"
 use "screens/settings.ice"
+use "screens/node.ice"
 use "screens/forge.ice"
 use "screens/pages.ice"
 use "screens/chat.ice"
+use "screens/shell.ice"
 use "handlers/lifecycle.ice"
 use "handlers/forge.ice"
 use "handlers/files.ice"
@@ -85,5 +113,6 @@ use "handlers/chat.ice"
 use "handlers/pages.ice"
 use "handlers/onboarding.ice"
 use "handlers/huddle.ice"
+use "handlers/shell.ice"
 use "view.ice"
 use "tests/app.ice"

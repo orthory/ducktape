@@ -29,7 +29,7 @@ use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PrivateKey;
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use governance::invite::{
-    INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteRole, InviteToken, sign_join_proof,
+    INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteToken, sign_join_proof,
 };
 use governance::{
     GovAction, GovMsg, GovQuery, Governance, ShareAllocation, encode_msg, encode_query,
@@ -205,22 +205,14 @@ fn execute(id: &str) -> Msg {
 /// proof-of-possession) into the Redeem op — deterministic: the nonce is
 /// caller-chosen and ed25519 signing is deterministic.
 fn redeem(issuer: &Ed, nonce: [u8; INVITE_NONCE_LEN], binding: &[u8], joiner: &Ed) -> Msg {
-    // bearer, Resident-role, far-future expiry — the current
-    // grant preimage (binding || nonce || role || expires_le; no kind, no
-    // target).
+    // bearer, far-future expiry — the current grant preimage
+    // (binding || nonce || expires_le; no role, no kind, no target).
     let expires: u64 = 4_102_444_800; // 2100-01-01 — far future, wall-clock-shaped
-    let token_msg = [
-        binding,
-        nonce.as_slice(),
-        &[InviteRole::Resident.as_u8()],
-        &expires.to_le_bytes(),
-    ]
-    .concat();
+    let token_msg = [binding, nonce.as_slice(), &expires.to_le_bytes()].concat();
     let token_sig = issuer.sign(INVITE_GRANT_NAMESPACE, &token_msg);
     let token = InviteToken {
         issuer: issuer.public_key(),
         nonce,
-        role: InviteRole::Resident,
         expires_unix_secs: expires,
         sig: token_sig.clone(),
     };
@@ -231,7 +223,6 @@ fn redeem(issuer: &Ed, nonce: [u8; INVITE_NONCE_LEN], binding: &[u8], joiner: &E
         token_sig: token_sig.as_ref().to_vec(),
         joiner: ed_pub(joiner),
         proof: proof.as_ref().to_vec(),
-        role: InviteRole::Resident.as_u8(),
         expires_unix_secs: expires,
     })
 }
@@ -846,7 +837,6 @@ async fn rejections_inner(context: &deterministic::Context) {
                     token_sig,
                     joiner: joiner.clone(),
                     proof,
-                    role: InviteRole::Resident.as_u8(),
                     expires_unix_secs: 4_102_444_800,
                 });
                 m

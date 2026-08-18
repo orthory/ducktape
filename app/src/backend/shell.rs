@@ -1,9 +1,9 @@
 use super::*;
 
 /// One shell navigation entry. `live` is the capsule's pulse dot.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct NavItem {
-    pub id: String,
+    pub id: crate::ShellTab,
     pub title: String,
     pub icon: String,
     pub badge: i64,
@@ -168,29 +168,34 @@ pub fn open_proposals(rows: Vec<ProposalRow>) -> i64 {
     rows.iter().filter(|row| row.open).count() as i64
 }
 
-/// The rail's module navigation: EIGHT seats, in the artifact's order, the
-/// active pane flagged. Modules join the shell by joining this list. `settings`
-/// is not here (the rail pins it to its own footer beside the account avatar),
-/// and neither is `node` — the node surface lives under Settings.
-pub fn shell_nav(tab: String, approvals: i64, agent_live: bool) -> Vec<NavItem> {
+/// The rail's navigation: nine collaboration surfaces plus the node operator
+/// surface, with the active pane flagged. `settings` is not here because the
+/// rail pins it to its own footer beside the account avatar.
+pub fn shell_nav(tab: crate::ShellTab, approvals: i64, agent_live: bool) -> Vec<NavItem> {
     [
-        ("chat", "Chat", "nav-chat"),
-        ("pages", "Pages", "nav-pages"),
-        ("forge", "Forge", "nav-forge"),
-        ("agents", "Agents", "nav-agents"),
-        ("files", "Files", "nav-files"),
-        ("explorer", "Explorer", "nav-explorer"),
-        ("members", "Members", "nav-members"),
-        ("governance", "Approvals", "shield-check"),
+        (crate::ShellTab::Chat, "Chat", "nav-chat"),
+        (crate::ShellTab::Shell, "Shell", "code-slash"),
+        (crate::ShellTab::Pages, "Pages", "nav-pages"),
+        (crate::ShellTab::Forge, "Forge", "nav-forge"),
+        (crate::ShellTab::Agents, "Agents", "nav-agents"),
+        (crate::ShellTab::Files, "Files", "nav-files"),
+        (crate::ShellTab::Explorer, "Explorer", "nav-explorer"),
+        (crate::ShellTab::Node, "Node", "node"),
+        (crate::ShellTab::Members, "Members", "nav-members"),
+        (crate::ShellTab::Governance, "Approvals", "shield-check"),
     ]
     .into_iter()
     .map(|(id, title, icon)| NavItem {
-        id: id.into(),
+        id,
         title: title.into(),
         icon: icon.into(),
-        badge: if id == "governance" { approvals } else { 0 },
+        badge: if id == crate::ShellTab::Governance {
+            approvals
+        } else {
+            0
+        },
         active: id == tab,
-        live: id == "forge" && agent_live,
+        live: id == crate::ShellTab::Forge && agent_live,
     })
     .collect()
 }
@@ -207,18 +212,24 @@ pub fn shell_nav(tab: String, approvals: i64, agent_live: bool) -> Vec<NavItem> 
 /// The titlebar chips (tier, approvals, agent dot, account name) read all four
 /// from state, and state is what the connect load and the live-plane lane fill
 /// — no chip depends on a tab click.
-pub fn tab_reads_plane(tab: String, plane: String) -> bool {
-    let tabs: &[&str] = match plane.as_str() {
+pub fn tab_reads_plane(tab: crate::ShellTab, plane: String) -> bool {
+    match plane.as_str() {
         // the tier badge, the admin gate and the forge write gate all read the
-        // roster, so four panes draw it.
-        "members" => &["members", "governance", "forge", "settings"],
-        "governance" => &["governance"],
-        "agents" => &["agents"],
+        // roster, so five panes draw it.
+        "members" => matches!(
+            tab,
+            crate::ShellTab::Members
+                | crate::ShellTab::Governance
+                | crate::ShellTab::Forge
+                | crate::ShellTab::Node
+                | crate::ShellTab::Settings
+        ),
+        "governance" => tab == crate::ShellTab::Governance,
+        "agents" => tab == crate::ShellTab::Agents,
         // Settings draws the account card; Forge draws the org "about".
-        "account" => &["settings", "forge"],
-        _ => &[],
-    };
-    tabs.contains(&tab.as_str())
+        "account" => matches!(tab, crate::ShellTab::Settings | crate::ShellTab::Forge),
+        _ => false,
+    }
 }
 
 /// The demo registry, when this machine has one (`ops/demo-seed.sh` is its
@@ -361,32 +372,24 @@ pub struct WorkspaceInit {
     pub rpc: String,
 }
 
-/// A workspace name as its directory slug: lowercase, anything outside
-/// `[a-z0-9-]` folded to `-`, trimmed.
-pub fn network_slug(name: String) -> String {
-    let folded: String = name
-        .to_lowercase()
-        .chars()
-        .map(|character| match character.is_ascii_alphanumeric() {
-            true => character,
-            false => '-',
-        })
-        .collect();
-    folded.trim_matches('-').to_string()
-}
-
 /// Materialize this device's workspace from an invite blob:
 /// `ducktape node join <blob>`.
-pub async fn join_network(blob: String) -> Result<WorkspaceInit, AppError> {
+pub async fn join_network(blob: ui_lang_runtime::Secret) -> Result<WorkspaceInit, AppError> {
     async {
-        let blob = bounded_text(blob, "invite", 64 * 1024)?;
+        let blob = blob.expose().trim();
+        let valid = !blob.is_empty()
+            && blob.len() <= 64 * 1024
+            && !blob.chars().any(|character| character == '\0');
+        if !valid {
+            return Err("invite must be between 1 and 65536 bytes".into());
+        }
         // `join` reports progress on stderr, so the workspace it materialized
         // is identified by diffing the registry around the call.
         let before: BTreeSet<String> = registered_workspaces()
             .into_iter()
             .map(|(chain_id, _)| chain_id)
             .collect();
-        ducktape_cli(&["node", "join", &blob]).await?;
+        ducktape_cli(&["node", "join", blob]).await?;
         let chain_id = registered_workspaces()
             .into_iter()
             .map(|(chain_id, _)| chain_id)
@@ -401,29 +404,10 @@ pub async fn join_network(blob: String) -> Result<WorkspaceInit, AppError> {
 /// Mint a single-use bearer invite for a workspace: `ducktape node invite`
 /// prints the `🦆…` blob on stdout. This WRITES (it folds this member's dial
 /// hint into the descriptor), so it is not a read-only probe.
-pub async fn mint_invite(
-    workspace: String,
-    role: String,
-    ttl_days: i64,
-) -> Result<String, AppError> {
+pub async fn mint_invite(workspace: String, ttl_days: i64) -> Result<String, AppError> {
     async {
-        let role = match role.as_str() {
-            "client" => "client",
-            "resident" => "resident",
-            other => return Err(format!("unknown invite role `{other}`")),
-        };
         let ttl = ttl_days.clamp(1, 365).to_string();
-        ducktape_cli(&[
-            "node",
-            "invite",
-            "-n",
-            &workspace,
-            "--role",
-            role,
-            "--ttl-days",
-            &ttl,
-        ])
-        .await
+        ducktape_cli(&["node", "invite", "-n", &workspace, "--ttl-days", &ttl]).await
     }
     .await
     .map_err(app_error)
@@ -717,14 +701,10 @@ fn wall_clock_seconds(stamp: i64) -> Option<i64> {
 }
 
 /// The titlebar's machine value: `h 84,912`, grouped the way the artifact
-/// writes heights. A height the node has not reported yet reads `h —`; a
-/// unix-millis stamp reads as the wall clock it actually is.
+/// writes heights. A height the node has not reported yet reads `h —`.
 pub fn height_label(height: i64) -> String {
     if height < 0 {
         return "h —".into();
-    }
-    if let Some(seconds) = wall_clock_seconds(height) {
-        return relative_time(seconds);
     }
     format!("h {}", grouped_digits(height))
 }
@@ -739,12 +719,12 @@ pub fn height_label_short(height: i64) -> String {
 /// The honest renderer for a consensus-stamped record time: `412 blocks ago`,
 /// `1 block ago`, `this block` — or, on the unix-millis lane, the real elapsed
 /// wall clock. A record with no stamp prints nothing.
-pub fn height_ago(then_height: i64, now_height: i64) -> String {
+pub fn height_ago(then_height: i64, now_height: i64, wall_now: i64) -> String {
     if then_height <= 0 {
         return String::new();
     }
     if let Some(seconds) = wall_clock_seconds(then_height) {
-        return relative_time(seconds);
+        return relative_time(seconds, wall_now);
     }
     let elapsed = now_height.saturating_sub(then_height);
     match elapsed {
@@ -801,7 +781,7 @@ pub fn initials_of(name: impl AsRef<str>) -> String {
 /// height` (bin/noded/src/index.rs) and a single-writer noded stamps unix
 /// MILLIS, so a record time is a block height, not seconds. Render those with
 /// [`height_ago`] / [`height_label_short`].
-pub fn relative_time(unix_seconds: i64) -> String {
+pub fn relative_time(unix_seconds: i64, wall_now: i64) -> String {
     // [`UNMEASURED`] and "this record carries no stamp" are different facts and
     // print differently: the first is a reading the node never published and
     // owes the reader a `—`, the second is a record that legitimately has no
@@ -812,7 +792,7 @@ pub fn relative_time(unix_seconds: i64) -> String {
     if unix_seconds == 0 {
         return String::new();
     }
-    let elapsed = now_seconds().saturating_sub(unix_seconds);
+    let elapsed = wall_now.saturating_sub(unix_seconds);
     if elapsed < 60 {
         return "just now".into();
     }
@@ -825,9 +805,9 @@ pub fn relative_time(unix_seconds: i64) -> String {
 /// a HEIGHT and the remaining span is counted in blocks — never in hours. On
 /// the unix-millis lane the same field genuinely is a clock, and `height` is
 /// not comparable to it at all, so that lane is counted against the wall.
-pub fn expires_in_blocks(deadline_height: i64, height: i64) -> String {
+pub fn expires_in_blocks(deadline_height: i64, height: i64, wall_now: i64) -> String {
     if let Some(seconds) = wall_clock_seconds(deadline_height) {
-        let remaining = seconds.saturating_sub(now_seconds());
+        let remaining = seconds.saturating_sub(wall_now);
         if remaining <= 0 {
             return "expired".into();
         }
@@ -871,6 +851,10 @@ pub(crate) fn now_seconds() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|since| i64::try_from(since.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+pub fn current_wall_seconds() -> i64 {
+    now_seconds()
 }
 
 /// A serde-tagged enum's variant name, whether it rode as a bare string

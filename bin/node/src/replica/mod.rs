@@ -31,7 +31,7 @@
 use commonware_codec::{Decode as _, Encode as _};
 use commonware_consensus::simplex::types::Certificate;
 use commonware_cryptography::ed25519;
-use commonware_p2p::authenticated::discovery::{self, Network};
+use commonware_p2p::authenticated::lookup::{self, Network};
 use commonware_p2p::Ingress;
 use commonware_runtime::Quota;
 use commonware_utils::ordered::Set;
@@ -51,9 +51,10 @@ pub(crate) type OverlayCtx = overlay_net::OverlayContext<commonware_runtime::tok
 /// the joiner/replica role (unified-node phase 2): park on the mesh,
 /// bootstrap a boundary, fold the head, and — at the activation cutover
 /// that seats this key — promote to a validator IN-PROCESS. entered by
-/// `run_node` exactly when this key holds neither a recovery checkpoint's
-/// participant seat nor genesis validator standing (`!checkpoint_seats_me
-/// && !validators.contains(…)`); the promotion seat is the ONLY return —
+/// `run_node` exactly when this key holds no genesis validator standing.
+/// Recovery checkpoints are local state bases, not role authority: this path
+/// resolves current resident/validator standing from the latest committed
+/// manifest. The promotion seat is the ONLY return —
 /// the [`crate::validator::PromotionBaton`] carries everything the
 /// validator role continues with — and every other exit is
 /// `std::process::exit`.
@@ -66,9 +67,10 @@ pub(crate) type OverlayCtx = overlay_net::OverlayContext<commonware_runtime::tok
 pub(crate) async fn run(
     context: commonware_runtime::tokio::Context,
     network: Network<OverlayCtx, ed25519::PrivateKey>,
-    oracle: &mut discovery::Oracle<ed25519::PublicKey>,
+    oracle: &mut lookup::Oracle<ed25519::PublicKey>,
     quota: Quota,
     mesh_participants: &Set<ed25519::PublicKey>,
+    mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
     sync_sources: Vec<ed25519::PublicKey>,
     sync_source: Option<ed25519::PublicKey>,
     advertised_reach: Ingress,
@@ -129,6 +131,8 @@ pub(crate) async fn run(
         oracle,
         quota,
         mesh_participants,
+        &validators,
+        mesh_book,
         &recovery,
         manifest,
         signer.clone(),

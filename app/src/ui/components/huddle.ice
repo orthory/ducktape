@@ -187,7 +187,7 @@ component HuddleStart()
 // above the whole console, so it needs no signature change. The slot anchors
 // bottom-right; this component draws no offset of its own.
 // The visibility rule is `huddle_joined && huddle_win == none &&
-// !(shell_tab == "chat" && huddle_channel == active_channel)` — the pill is
+// !(shell_tab == ShellTab.chat && huddle_channel == active_channel)` — the pill is
 // what the huddle docks BACK into when its window closes.
 component HuddleDockedPill(channel:str, elapsed:str)
   emits
@@ -330,7 +330,7 @@ component HuddleTile(person:HuddleParticipant, muted:bool)
 // It reads `huddle_roster` from app state, which is kept ONLY while
 // `active_channel == huddle_channel` — the same guard `huddle_channel` itself
 // carries, since a load of any other channel carries THAT channel's roster.
-component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant], status:str, muted:bool, peers:[CallEvent], camera:bool, video_live:bool)
+component HuddlePanel(channel:str, elapsed:str, rows:[HuddleTileRow], status:str, muted:bool, camera:bool, video_live:bool)
   emits
     dock_huddle
     huddle_go_channel
@@ -469,11 +469,11 @@ component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant], stat
         // whole stage — one person in a widened huddle got a 534px-wide,
         // 100px-tall bar with a 34px avatar adrift in it.
         grid max-cell=168.0 gap=8.0
-          for person in roster
+          for tile in rows
             HuddleTile
               with
-                person
-                muted=keep_bool(person.is_you, muted, call_peer_muted(peers, person.node))
+                person=tile.person
+                muted=tile.muted
     box
       with
         w=fill
@@ -503,6 +503,7 @@ component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant], stat
           button -> emit(toggle_call_mute)
             with
               label="Mute the microphone"
+              checked=muted
               w=32.0
               h=32.0
               @icon_action
@@ -526,6 +527,7 @@ component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant], stat
           button -> emit(toggle_call_mute)
             with
               label="Unmute the microphone"
+              checked=muted
               w=32.0
               h=32.0
               @icon_action
@@ -549,6 +551,7 @@ component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant], stat
           button -> emit(toggle_call_camera)
             with
               label="Turn the camera on"
+              checked=camera
               w=32.0
               h=32.0
               @icon_action
@@ -572,6 +575,7 @@ component HuddlePanel(channel:str, elapsed:str, roster:[HuddleParticipant], stat
           button -> emit(toggle_call_camera)
             with
               label="Turn the camera off"
+              checked=camera
               w=32.0
               h=32.0
               @icon_action

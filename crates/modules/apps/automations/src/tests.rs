@@ -1487,7 +1487,134 @@ fn oversized_composed_id_is_recorded_not_emitted() {
     let recs = history(&m, "r", 4);
     assert_eq!(recs.len(), 1);
     assert!(!recs[0].action_ok);
-    assert_eq!(recs[0].detail, "composed id exceeds cap");
+    assert!(
+        recs[0]
+            .detail
+            .contains(&format!("the cap is {}", tasks::MAX_TASK_ID)),
+        "the record names tasks' own id cap: {}",
+        recs[0].detail
+    );
+}
+
+#[test]
+fn an_amplifying_template_truncates_instead_of_failing_the_triggering_post() {
+    // MAX_TEMPLATE_BYTES bounds the TEMPLATE, not the render: substitution
+    // amplifies, and an over-cap title or body makes tasks/chat REJECT the
+    // follow-up, which unwinds the post that triggered it — and every later
+    // large message to that channel, until the rule is deleted.
+    let mut m = module();
+    let mut ctx = CaptureCtx::new();
+    exec(
+        &mut m,
+        &mut ctx,
+        &create(
+            "task",
+            post_trigger(Some("general"), None),
+            task_action("todo", "x{text}"),
+        ),
+    )
+    .expect("create");
+    exec(
+        &mut m,
+        &mut ctx,
+        &create(
+            "post",
+            post_trigger(Some("general"), None),
+            post_action("announce", "x{text}"),
+        ),
+    )
+    .expect("create");
+    block_on(m.commit_block()).expect("commit");
+
+    // a MULTI-BYTE body offset by one literal byte, so the cap falls INSIDE a
+    // char: the clip walks back to the boundary instead of splitting it.
+    let text = "é".repeat(MAX_SUBSTITUTED_BYTES);
+    let mut chat_ctx = CaptureCtx::new()
+        .with_chat_origin()
+        .with_channel("announce")
+        .with_transcript(
+            "general",
+            vec![message(
+                "general",
+                1,
+                user(1),
+                vec![Block::paragraph(&text)],
+            )],
+        );
+    exec(
+        &mut m,
+        &mut chat_ctx,
+        &posted("general", 1, user(1), Vec::new()),
+    )
+    .expect("the triggering post's op is ACCEPTED");
+
+    let tasks = chat_ctx.task_msgs();
+    let [TaskMsg::CreateTask { task_id, title }] = &tasks[..] else {
+        panic!("expected one CreateTask, got {tasks:?}");
+    };
+    assert_eq!(task_id, "todo-general-1");
+    assert_eq!(
+        title.len(),
+        MAX_SUBSTITUTED_BYTES - 1,
+        "clipped back off the char straddling the cap"
+    );
+    assert!(title.starts_with('x') && title.ends_with('é'));
+    let posts = chat_ctx.chat_msgs();
+    let [ChatMsg::PostMessage { blocks, .. }] = &posts[..] else {
+        panic!("expected one post, got {posts:?}");
+    };
+    assert_eq!(
+        *blocks,
+        vec![Block::paragraph(title)],
+        "the post body is clipped the same way"
+    );
+
+    block_on(m.commit_block()).expect("commit");
+    assert!(
+        history(&m, "task", 4)[0].action_ok,
+        "the rule FIRED — a truncated title is not a failure"
+    );
+}
+
+#[test]
+fn a_substituted_title_at_the_cap_is_untruncated() {
+    // the boundary belongs to the accepting side: exactly MAX_SUBSTITUTED_BYTES
+    // renders whole.
+    let mut m = module();
+    let mut ctx = CaptureCtx::new();
+    exec(
+        &mut m,
+        &mut ctx,
+        &create(
+            "r",
+            post_trigger(Some("general"), None),
+            task_action("todo", "{text}"),
+        ),
+    )
+    .expect("create");
+    block_on(m.commit_block()).expect("commit");
+
+    let text = "e".repeat(MAX_SUBSTITUTED_BYTES);
+    let mut chat_ctx = CaptureCtx::new().with_chat_origin().with_transcript(
+        "general",
+        vec![message(
+            "general",
+            1,
+            user(1),
+            vec![Block::paragraph(&text)],
+        )],
+    );
+    exec(
+        &mut m,
+        &mut chat_ctx,
+        &posted("general", 1, user(1), Vec::new()),
+    )
+    .expect("fire");
+    let tasks = chat_ctx.task_msgs();
+    let [TaskMsg::CreateTask { title, .. }] = &tasks[..] else {
+        panic!("expected one CreateTask");
+    };
+    assert_eq!(title, &text, "a render at the cap passes through whole");
 }
 
 #[test]

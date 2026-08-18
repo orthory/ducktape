@@ -70,7 +70,7 @@ pub struct MountPlan {
 /// build the neutral `/ducktape/*` mount plan from a run's HOST paths. every
 /// mapping hides the host side:
 /// - `workdir` → `/ducktape/workspace` (rw, the cwd)
-/// - `bin`     → `/ducktape/bin/<filename>` (ro)
+/// - `bin` + declared companion binaries → `/ducktape/bin/<filename>` (ro)
 /// - each `rw_dir` (CLI auth/state under `home`) → `/ducktape/home/<rel>` (rw)
 /// - a FILE in `ro_paths` (the workspace-parent context doc) → `/ducktape/<name>`,
 ///   one level above the workspace so `../<name>` still resolves
@@ -78,6 +78,7 @@ pub struct MountPlan {
 pub fn plan_mounts(
     workdir: &Path,
     bin: &Path,
+    companion_bins: &[PathBuf],
     ro_paths: &[PathBuf],
     rw_dirs: &[PathBuf],
     home: &Path,
@@ -100,6 +101,15 @@ pub fn plan_mounts(
             read_only: true,
         },
     ];
+    mounts.extend(companion_bins.iter().map(|companion| Mount {
+        host: companion.clone(),
+        guest: root.join("bin").join(
+            companion
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("companion")),
+        ),
+        read_only: true,
+    }));
     for dir in rw_dirs {
         // spec.rs guaranteed these live under HOME; a defensive fallback keeps
         // the basename if a stray one does not, rather than leaking the path.
@@ -1299,6 +1309,10 @@ impl PodmanService {
             .arg("--time=0") // never idle-exit; the node owns its lifetime
             .arg(format!("unix://{}", socket.display()))
             .kill_on_drop(true)
+            // its OWN process group: a terminal Ctrl-C must stop the daemon
+            // first, leaving the socket alive for the daemon's label-scoped
+            // container sweep; [`Self::shutdown`] then kills this group.
+            .process_group(0)
             .spawn()
             .map_err(|e| format!("podman service: spawn `{} system service`: {e}", podman_bin.display()))?;
 
@@ -1307,12 +1321,19 @@ impl PodmanService {
         if let Some(pid) = child.id() {
             let _ = std::fs::write(root.join(PODMAN_PID_FILE), pid.to_string());
         }
-        let service = Self {
+        let mut service = Self {
             socket,
             child,
             _root_lock: root_lock,
         };
-        service.await_socket().await?;
+        if let Err(error) = service.await_socket().await {
+            // this child dies with the drop of `service` (kill_on_drop), so the
+            // pid just recorded is garbage either way: left behind, it would
+            // point a later [`Self::claim`] reap at whatever unrelated process
+            // reuses the pid (SIGTERMed if its exe happens to be podman).
+            let _ = std::fs::remove_file(root.join(PODMAN_PID_FILE));
+            return Err(error);
+        }
         Ok(service)
     }
 
@@ -1401,24 +1422,66 @@ impl PodmanService {
     /// wait until the service is answering on its socket (bounded). The service
     /// child creates the socket asynchronously after spawn; poll a cheap `_ping`
     /// until it responds rather than sleeping a fixed time.
-    async fn await_socket(&self) -> Result<(), String> {
+    ///
+    /// The 60s budget is load-stated, not tuned: several rootless podman
+    /// services sharing one runtime routinely push socket bring-up past the old
+    /// 5s budget on a busy box, so 5s FATALed healthy boots. 60s only fires
+    /// when podman is stuck outright.
+    async fn await_socket(&mut self) -> Result<(), String> {
+        const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+        const BUDGET_POLLS: u32 = 1200; // 60s of 50ms polls
+        const OLD_BUDGET_POLLS: u32 = 100; // the old 5s budget — warn once when crossed
         let client = self.client();
-        for _ in 0..100 {
+        let started = std::time::Instant::now();
+        for attempt in 0..BUDGET_POLLS {
             if UnixStream::connect(&self.socket).await.is_ok()
                 && client.request("GET", "/_ping", None).await.is_ok()
             {
                 return Ok(());
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // a child that already died will never answer — report its exit
+            // status now instead of burning the whole budget against a corpse.
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .map_err(|error| format!("podman service: inspect child: {error}"))?
+            {
+                return Err(format!(
+                    "podman service exited with {status} before answering on {}",
+                    self.socket.display()
+                ));
+            }
+            let crossed_old_budget = attempt == OLD_BUDGET_POLLS;
+            if crossed_old_budget {
+                tracing::warn!(
+                    target: "ducktape::sandbox",
+                    reason = "podman_socket_slow",
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    "podman service socket not answering yet; still waiting (machine load \
+                     routinely pushes this past 5s)"
+                );
+            }
+            tokio::time::sleep(POLL).await;
         }
         Err(format!(
-            "podman service did not answer on {} within 5s",
+            "podman service did not answer on {} within 60s — machine load (several podman \
+             services sharing the runtime) is the known cause of long waits",
             self.socket.display()
         ))
     }
 
     /// stop the service child (best-effort; `kill_on_drop` is the backstop).
     pub async fn shutdown(mut self) {
+        // The child leads its own process group (`process_group(0)` at spawn),
+        // so kill the GROUP: helpers podman spawned (gvproxy, rootlessport)
+        // live in it and must not outlive the service. Group before reaping the
+        // leader — reaping first would free the pid for reuse while the group
+        // id still names it. ESRCH (everything already gone) is fine.
+        if let Some(pid) = self.child.id() {
+            // SAFETY: `killpg(2)` only sends a signal and has no memory
+            // effects; the group id is our unreaped child's pid.
+            unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
+        }
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
     }
@@ -1492,12 +1555,39 @@ mod tests {
         PodmanService::claim(&root, &socket).expect("a released root is free again");
     }
 
+    #[tokio::test]
+    async fn service_child_is_outside_the_daemons_process_group() {
+        let sleep = find_system_tool("sleep").expect("sleep is available on a Unix host");
+        let mut child = tokio::process::Command::new(sleep)
+            .arg("30")
+            .kill_on_drop(true)
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+
+        // Observing the group from the PARENT right after spawn relies on
+        // glibc's posix_spawn/vfork ordering: the parent resumes only after the
+        // child has applied setpgid and exec'd. A libc that falls back to plain
+        // fork+exec could let this getpgid race the child's setpgid — if this
+        // ever flakes on an exotic platform, that is the reason, not a lost
+        // process-group flag.
+        // SAFETY: `pid` names the live child this test owns; `getpgid` only
+        // reads kernel process metadata.
+        let process_group = unsafe { libc::getpgid(pid as libc::pid_t) };
+        assert_eq!(process_group, pid as libc::pid_t);
+
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+    }
+
     #[test]
     fn plan_hides_every_host_path_behind_ducktape() {
         let home = Path::new(HOST_HOME);
         let plan = plan_mounts(
             Path::new(HOST_WORKSPACE),
             Path::new("/usr/bin/claude"),
+            &[],
             &[PathBuf::from("/opt/skills")],
             &[PathBuf::from(HOST_AUTH_DIR)],
             home,
@@ -1588,6 +1678,7 @@ mod tests {
             Path::new(HOST_WORKSPACE),
             Path::new("/usr/bin/claude"),
             &[],
+            &[],
             &[PathBuf::from(HOST_AUTH_DIR)],
             home,
         );
@@ -1630,6 +1721,30 @@ mod tests {
             !guest_view.contains(HOST_USER) && !guest_view.contains("provider-runs"),
             "guest-visible leak: {guest_view}"
         );
+    }
+
+    #[test]
+    fn executor_companions_land_beside_the_primary_binary() {
+        let companion = PathBuf::from("/opt/codex/bin/codex-code-mode-host");
+        let plan = plan_mounts(
+            Path::new(HOST_WORKSPACE),
+            Path::new("/opt/codex/bin/codex"),
+            std::slice::from_ref(&companion),
+            &[],
+            &[],
+            Path::new(HOST_HOME),
+        );
+
+        let mounted = plan
+            .mounts
+            .iter()
+            .find(|mount| mount.host == companion)
+            .expect("the declared companion is mounted");
+        assert_eq!(
+            mounted.guest,
+            Path::new("/ducktape/bin/codex-code-mode-host")
+        );
+        assert!(mounted.read_only);
     }
 
     #[test]

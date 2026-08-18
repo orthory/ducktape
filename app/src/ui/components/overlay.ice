@@ -122,11 +122,7 @@ component ModalShell(title:str, width:f64)
 // The only confirmation surface the artifact has: an ink pill on the bottom
 // edge. The stack that positions it and the timer that retires it belong to
 // the view; this is one toast.
-// NAME: the contract froze this as `Toast`, which is already taken by the
-// vendored `Toast(title, description)` in ducktape-ui/components.ice — a file
-// no item in this campaign owns. `Toast.Confirm` is the same component under
-// the family's own dotted convention (Badge.Success, Alert.Warning).
-component Toast.Confirm(message:str, tone:str)
+component Toast(message:str, tone:str)
   box #root
     with
       px=16.0
@@ -175,7 +171,7 @@ component Toast.Confirm(message:str, tone:str)
 // unconditionally, so the toggle wrote a value nothing read, and it painted ON
 // from the state default before the loader answered `false` a beat later. Every
 // other boolean on screen is a disclosure (`channel_settings_open`,
-// `fs_history_open`, `bell_open`) whose control is the thing it opens, not a
+// `history_open`, `bell_open`) whose control is the thing it opens, not a
 // track and a knob.
 // The label/note half of it is not lost: the Settings THIS DEVICE card draws
 // exactly that pair — 12.5 `@text-accent_fg` over 12.5 `@text-meta` — beside a
@@ -327,7 +323,7 @@ component Eyebrow(label:str, note:str)
 
 // NO SPINNER COMPONENT. The artifact's 2px ring with a transparent quarter is
 // a CSS keyframe; the ice equivalent is a `canvas` arc turned by
-// `animation.value(spin)`. Nothing in this app drives `spin` — state.ice
+// `animation.value(spin)`. Nothing in this app drives `spin` — feature state
 // declares it (.8s linear forever) but no handler ever assigns it, so an
 // `animation` that is never transitioned never ticks. A ring mounted on it
 // would paint a FROZEN arc: a spinner that claims work is in flight and then

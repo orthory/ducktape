@@ -10,9 +10,14 @@ font code_semibold family="Geist Mono" weight=semibold stretch=normal style=norm
 
 // ONE contract, TWO palettes: the kit's 49 semantic roles and the 74 steps the
 // canonical artifact names live together here, in the app's own theme file,
-// with a light and a dark reading of every token. `ducktape-ui/default.ice`
-// stays a verbatim vendor copy with its own theme deleted — a UI kit has no
-// business naming `desk`, `rail`, or `diff_hunk_bg`.
+// with a light and a dark reading of every token. The generic upstream recipes
+// and log timeline are the only vendored Ice sources; app styling stays here.
+
+// Icon actions take their size from the caller. Internal padding would collapse
+// a fixed-size button's direct SVG child to a hairline.
+recipe icon_action for button
+  @p-0px bg-transparent text-fg rounded-7px hover:bg-accent pressed:bg-border disabled:opacity-50 focus-visible:border-ring
+
 theme contract AppTheme
   bg
   surface
@@ -73,6 +78,8 @@ theme contract AppTheme
   rail_hover
   window_line
   separator
+  terminal_bg
+  terminal_line
   card_line
   danger_zone_line
   danger_zone_bg
@@ -113,6 +120,7 @@ theme contract AppTheme
   avatar_bg_sm
   avatar_fg_sm
   agent_live
+  forge_gutter_ink
   merged
   merged_bg
   merged_line
@@ -203,6 +211,8 @@ palette app for AppTheme
   // LINES — window, control, default (`border`), divider, track (`subtle`).
   window_line #d6d4cc
   separator #efeee9
+  terminal_bg #090b0e
+  terminal_line #242a33
   card_line #ece9e1
   danger_zone_line #ecd6d0
   danger_zone_bg #fdf6f4
@@ -273,7 +283,7 @@ palette app for AppTheme
   // step a control's border takes under the cursor.
   pending_line #d9d8d0
   control_line_hover #d5d3ca
-  // Ink for the marks that are not text: chevrons and the diff gutter.
+  // Ink for quiet marks: chevrons and compact table headings.
   ink_soft #b6b4a8
   chevron_idle #c8c6bc
   gutter_ink #c2c0b6
@@ -282,7 +292,9 @@ palette app for AppTheme
   avatar_bg_sm #dcdbd4
   avatar_fg_sm #7a7872
   agent_live #7e9e88
-  // FORGE — merged wears its own violet; finalized wears the success plate.
+  // FORGE — the small mono gutter clears AA against every code/diff plate;
+  // merged wears its own violet, and finalized wears the success plate.
+  forge_gutter_ink #66645e
   merged #7a6f9e
   merged_bg #f1edf5
   merged_line #ddd2e6
@@ -379,6 +391,8 @@ palette app_dark for AppTheme
   // LINES
   window_line #0e0d0b
   separator #2c2b26
+  terminal_bg #090b0e
+  terminal_line #242a33
   card_line #302f29
   danger_zone_line #4d2f2c
   danger_zone_bg #2a1d1b
@@ -423,6 +437,7 @@ palette app_dark for AppTheme
   avatar_fg_sm #a3a198
   agent_live #7e9e88
   // FORGE
+  forge_gutter_ink #9d9b92
   merged #a89ac9
   merged_bg #2a2633
   merged_line #443c57

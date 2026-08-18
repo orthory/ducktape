@@ -75,16 +75,14 @@ lists what is checked in and tested.
 - `crates/examples/greeter`: demo module emitting follow-up writes.
 - `crates/examples/evm`: experimental QMDB-backed EVM module, in the
   `noded`/`simnode` genesis.
-- `bin/node`: the p2p validator/mesh node (also serves the noded app surface).
+- `bin/node`: the p2p validator/mesh node and unified `ducktape` CLI. Its `fs`
+  family owns the read and checkout/status/commit/pin loop over
+  `crates/duckfs/client`; its `mcp` family runs the stdio tool server. There is
+  no kernel-mount verb.
 - `bin/noded`: the single embedded-host daemon behind the http/ws app surface.
 - `bin/simnode`: deterministic scenario node — noded's `/v1` wire over a
   test-scripted block producer.
 - `bin/coordinator`: public or private rendezvous/STUN helper.
-- `bin/fs`: `ducktape-fs`, the duckfs working-copy CLI (read verbs plus the
-  checkout/status/commit/pin loop over `crates/duckfs/client`). The
-  `mount` verb (FUSE, `src/fuse/`) is gated behind the `fuse` cargo feature —
-  read-only over `NodeApi` at a pinned snapshot, `--rw` over a backing checkout —
-  so a default build pulls in no libfuse/`fuser`.
 
 ## Docs
 

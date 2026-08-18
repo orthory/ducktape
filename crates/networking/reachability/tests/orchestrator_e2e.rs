@@ -1838,11 +1838,20 @@ async fn standby_readvertisement_updates_the_endpoint_live() {
                     &nodes[2].signer,
                 )
             };
+            // the live record's nonce is wall-clock-seeded (issue #1102), so
+            // "higher" means "later than the standby signed at retarget" — a
+            // rebind minutes in the future — and "stale" is anything at or
+            // below the seed's floor.
+            let later = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0)
+                + 60_000;
             nodes[0]
                 .cmd
                 .send(ReachabilityCommand::Deliver {
                     from: nodes[2].signer.public_key(),
-                    bytes: ReachabilityMsg::Record(rebind(5, 42)).encode(),
+                    bytes: ReachabilityMsg::Record(rebind(later, 42)).encode(),
                 })
                 .await
                 .unwrap();
@@ -1872,7 +1881,7 @@ async fn standby_readvertisement_updates_the_endpoint_live() {
                 .cmd
                 .send(ReachabilityCommand::Deliver {
                     from: nodes[2].signer.public_key(),
-                    bytes: ReachabilityMsg::Record(rebind(3, 77)).encode(),
+                    bytes: ReachabilityMsg::Record(rebind(1, 77)).encode(),
                 })
                 .await
                 .unwrap();
@@ -1886,6 +1895,147 @@ async fn standby_readvertisement_updates_the_endpoint_live() {
                 .find(|p| p.allowed_ips == vec![ula(nodes[2].identity)])
                 .expect("standby entry present");
             assert_eq!(entry.endpoint, Some(moved), "the stale replay was ignored");
+        })
+        .await;
+}
+
+/// Issue #1102 — the REBOOT form of the re-advertisement above: a standby
+/// that restarts mid-epoch re-signs its record for the SAME epoch tuple in a
+/// fresh orchestrator life, so whatever nonce `retarget` REALLY signs is
+/// what the members judge (no hand-minted nonce here). The previous life's
+/// nonce is already burnt into every member's pre-warm gate; a fixed nonce
+/// seed replay-drops the reboot's re-introduction for the rest of the epoch
+/// and the members keep dialing the dead pre-reboot address. The record
+/// nonce is wall-clock-seeded precisely so the reboot supersedes in place.
+#[tokio::test]
+async fn standby_reboot_supersedes_its_previous_life_in_place() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            let (nodes, mut collected) = spawn_mesh(&local, dir.path(), &[1, 2, 3], vec![]);
+            retarget_all(&nodes, &[0, 1], &[2], 1, 10).await;
+            spawn_nudgers(&local, &nodes);
+            await_prewarmed(&mut collected, &[0, 1], &[(0, 1), (1, 1), (2, 2)], 1).await;
+
+            // both members hold the standby at its life-1 address.
+            let life1: SocketAddr = "8.8.8.30:51820".parse().unwrap();
+            for i in [0usize, 1] {
+                assert!(
+                    latest_config(&nodes[i])
+                        .peers
+                        .iter()
+                        .any(|p| p.endpoint == Some(life1)),
+                    "member {i}: the life-1 standby endpoint installed"
+                );
+            }
+
+            // the standby's process dies. an orderly Shutdown stands in for
+            // the crash — its run() exits, its interface with it — while the
+            // members keep their in-memory epoch state untouched, which is
+            // the point: nothing re-targeted THERE, so their dedup gates
+            // still carry the previous life's nonce.
+            nodes[2]
+                .cmd
+                .send(ReachabilityCommand::Shutdown)
+                .await
+                .unwrap();
+
+            // life 2: the same identity, keystore, and persist file, back
+            // behind a DIFFERENT address (the NAT-remap restart shape).
+            let policy = PortPolicy::production();
+            let reborn_effect = SharedFake::default();
+            let (reborn_cmd, reborn_cmd_rx) = mpsc::channel(256);
+            let (reborn_ev_tx, mut reborn_ev_rx) = mpsc::channel(256);
+            let config = ReachabilityConfig {
+                chain_id: CHAIN.into(),
+                signer: nodes[2].signer.clone(),
+                wireguard_key_file: dir.path().join("wg-2.key"),
+                wireguard_port: 51820,
+                wireguard_advertised: Some(endpoint(&policy, 40, 51820, Transport::Udp)),
+                control_endpoint: endpoint(&policy, 40, 443, Transport::Tcp),
+                coordinators: vec![],
+                port_policy: policy.clone(),
+                persist_file: Some(dir.path().join("mesh-2.json")),
+                gossip_ingress: None,
+            };
+            local.spawn_local(reachability::run(
+                config,
+                reborn_effect.clone(),
+                StaticResolver::default(),
+                reborn_cmd_rx,
+                reborn_ev_tx,
+            ));
+            // the reborn side's router: its record offers reach the members
+            // exactly like the harness's own wiring; everything else drains.
+            {
+                let member_cmds = [nodes[0].cmd.clone(), nodes[1].cmd.clone()];
+                let member_pks = [nodes[0].signer.public_key(), nodes[1].signer.public_key()];
+                let from = nodes[2].signer.public_key();
+                local.spawn_local(async move {
+                    while let Some(event) = reborn_ev_rx.recv().await {
+                        let ReachabilityEvent::Send { to, bytes } = event else {
+                            continue;
+                        };
+                        let Some(j) = member_pks.iter().position(|pk| *pk == to) else {
+                            continue;
+                        };
+                        let _ = member_cmds[j]
+                            .send(ReachabilityCommand::Deliver {
+                                from: from.clone(),
+                                bytes,
+                            })
+                            .await;
+                    }
+                });
+            }
+            let members: Vec<_> = [0usize, 1]
+                .iter()
+                .map(|i| nodes[*i].signer.public_key())
+                .collect();
+            reborn_cmd
+                .send(ReachabilityCommand::Retarget(MeshEpochEvent {
+                    epoch: 1,
+                    members,
+                    standbys: vec![nodes[2].signer.public_key()],
+                    current_view: 12,
+                }))
+                .await
+                .unwrap();
+            // the reborn nudger: re-offering its record is the standby's
+            // whole job.
+            {
+                let cmd = reborn_cmd.clone();
+                local.spawn_local(async move {
+                    let mut tick = tokio::time::interval(Duration::from_millis(50));
+                    loop {
+                        tick.tick().await;
+                        if cmd.send(ReachabilityCommand::Nudge).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+
+            // both members adopt the reboot's address IN PLACE — the
+            // re-signed record supersedes the previous life's.
+            let life2: SocketAddr = "8.8.8.40:51820".parse().unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let both = [0usize, 1].iter().all(|i| {
+                        latest_config(&nodes[*i])
+                            .peers
+                            .iter()
+                            .any(|p| p.endpoint == Some(life2))
+                    });
+                    if both {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("members adopted the reboot's re-advertised address");
         })
         .await;
 }
@@ -2360,6 +2510,159 @@ async fn endpoint_less_members_without_a_coordinator_stay_endpoint_less() {
                      before change 2"
                 );
             }
+        })
+        .await;
+}
+
+/// Issue #1104 — the reboot deadlock's second half: a fully-NATed standby
+/// restarts, `restore()` reinstalls its members from the persisted mesh —
+/// but an endpoint-less member reinstalls endpoint-less, and with both
+/// sides NATed neither can initiate. With a coordinator configured, the
+/// reborn standby's nudge sweep must rendezvous such members BY IDENTITY
+/// and graft the punched address onto the pre-warm layer, instead of
+/// sitting dark for the life of the process.
+#[tokio::test]
+async fn standby_reboot_rendezvouses_its_endpointless_members() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            // members 0 (endpoint-less, the NATed shape) and 1 (advertised),
+            // standby 2. Life 1 configures no coordinators anywhere: the
+            // standby installs member 0 endpoint-less — today's behavior —
+            // and persists the advert set the reboot restores from.
+            let (nodes, mut collected) = spawn_mesh_transported(
+                &local,
+                dir.path(),
+                &[1, 2, 3],
+                vec![],
+                Rc::new(|_, _, _| 1),
+                vec![],
+                None,
+                &[0],
+                &[],
+            );
+            retarget_all(&nodes, &[0, 1], &[2], 1, 10).await;
+            spawn_nudgers(&local, &nodes);
+            await_prewarmed(&mut collected, &[0, 1], &[(2, 2)], 1).await;
+            // both member ADVERTS must reach the standby's persist file
+            // before the crash — that file is everything life 2 has.
+            let persist = dir.path().join("mesh-2.json");
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let persisted = reachability::store::load(&persist, CHAIN).ok().flatten();
+                    if persisted.is_some_and(|mesh| mesh.adverts.len() == 2) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the standby persisted both member adverts");
+
+            // the standby's process dies; the members stay up untouched.
+            nodes[2]
+                .cmd
+                .send(ReachabilityCommand::Shutdown)
+                .await
+                .unwrap();
+
+            // life 2: the same identity, keystore, and persist file — now
+            // WITH a coordinator, and a resolver rigged to punch member 0.
+            // No router wiring back to the members: plane gossip rides the
+            // very tunnels being healed, so nothing can arrive.
+            let punched: SocketAddr = "203.0.113.77:41414".parse().unwrap();
+            let mut rendezvous = StaticResolver::default();
+            rendezvous.0.insert(
+                binding::node_key(nodes[0].identity),
+                Resolution::Punched(punched),
+            );
+            let policy = PortPolicy::production();
+            let reborn_effect = SharedFake::default();
+            let (reborn_cmd, reborn_cmd_rx) = mpsc::channel(256);
+            let (reborn_ev_tx, mut reborn_ev_rx) = mpsc::channel(256);
+            let config = ReachabilityConfig {
+                chain_id: CHAIN.into(),
+                signer: nodes[2].signer.clone(),
+                wireguard_key_file: dir.path().join("wg-2.key"),
+                wireguard_port: 51820,
+                // fully NATed: the reborn resident advertises nothing.
+                wireguard_advertised: None,
+                control_endpoint: endpoint(&policy, 30, 443, Transport::Tcp),
+                coordinators: vec!["203.0.113.53:3478".parse().unwrap()],
+                port_policy: policy.clone(),
+                persist_file: Some(persist),
+                gossip_ingress: None,
+            };
+            local.spawn_local(reachability::run(
+                config,
+                reborn_effect.clone(),
+                rendezvous,
+                reborn_cmd_rx,
+                reborn_ev_tx,
+            ));
+            // drain the reborn side's events — its record re-offers have
+            // nowhere to land, and the assertions read the effect directly.
+            local.spawn_local(async move { while reborn_ev_rx.recv().await.is_some() {} });
+            let members: Vec<_> = [0usize, 1]
+                .iter()
+                .map(|i| nodes[*i].signer.public_key())
+                .collect();
+            reborn_cmd
+                .send(ReachabilityCommand::Retarget(MeshEpochEvent {
+                    epoch: 1,
+                    members,
+                    standbys: vec![nodes[2].signer.public_key()],
+                    current_view: 12,
+                }))
+                .await
+                .unwrap();
+            {
+                let cmd = reborn_cmd.clone();
+                local.spawn_local(async move {
+                    let mut tick = tokio::time::interval(Duration::from_millis(50));
+                    loop {
+                        tick.tick().await;
+                        if cmd.send(ReachabilityCommand::Nudge).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+
+            // the sweep rendezvouses member 0 and re-applies: its entry now
+            // carries the punched address instead of sitting endpoint-less.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let healed = {
+                        let fake = reborn_effect.0.lock().unwrap();
+                        fake.applied.last().is_some_and(|config| {
+                            config.peers.iter().any(|p| {
+                                p.allowed_ips == vec![ula(nodes[0].identity)]
+                                    && p.endpoint == Some(punched)
+                            })
+                        })
+                    };
+                    if healed {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the reborn standby rendezvoused its endpoint-less member");
+            // the advertised member restored untouched, on its own address.
+            let advertised: SocketAddr = "8.8.8.20:51820".parse().unwrap();
+            let config = {
+                let fake = reborn_effect.0.lock().unwrap();
+                fake.applied.last().unwrap().clone()
+            };
+            let member1 = config
+                .peers
+                .iter()
+                .find(|p| p.allowed_ips == vec![ula(nodes[1].identity)])
+                .expect("member 1 restored");
+            assert_eq!(member1.endpoint, Some(advertised));
         })
         .await;
 }

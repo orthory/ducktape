@@ -552,24 +552,55 @@ enum Lane {
     Unassigned,
 }
 
-/// the committed saga projection for one lane.
+/// the committed saga projection for one lane, WALKED to the end.
+///
+/// The module answers a bounded page per call (its read budget is per query,
+/// not per projection), so the whole lane is this loop over the reply's
+/// cursor — advanced by [`advanced_cursor`], which is what makes it terminate.
 ///
 /// `None` when the node is unreachable, the module absent, or the reply
 /// unreadable — a failed read must NEVER masquerade as an empty projection:
-/// emptiness retires entries, and retiring a live attempt re-runs it.
+/// emptiness retires entries, and retiring a live attempt re-runs it. That
+/// holds MID-WALK too, which is why a failed page abandons the whole lane: a
+/// truncated projection is an empty one for every entry it did not reach.
 async fn pending(node: &NodeLink, me: &[u8], lane: Lane) -> Option<Vec<WorkerRequest>> {
-    let query = match lane {
-        Lane::Assigned => SagaQuery::AssignedPending {
-            assignee: me.to_vec(),
-        },
-        Lane::Unassigned => SagaQuery::UnassignedPending,
-    };
-    let reply = node.query("saga", &saga::encode_query(&query)).await.ok()?;
-    match (lane, saga::decode_reply(&reply)) {
-        (Lane::Assigned, Ok(SagaReply::AssignedPending(requests))) => Some(requests),
-        (Lane::Unassigned, Ok(SagaReply::UnassignedPending(requests))) => Some(requests),
-        _ => None,
+    let mut requests = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let query = match lane {
+            Lane::Assigned => SagaQuery::AssignedPending {
+                assignee: me.to_vec(),
+                after: after.clone(),
+            },
+            Lane::Unassigned => SagaQuery::UnassignedPending {
+                after: after.clone(),
+            },
+        };
+        let reply = node.query("saga", &saga::encode_query(&query)).await.ok()?;
+        let page = match (lane, saga::decode_reply(&reply)) {
+            (Lane::Assigned, Ok(SagaReply::AssignedPending(page))) => page,
+            (Lane::Unassigned, Ok(SagaReply::UnassignedPending(page))) => page,
+            _ => return None,
+        };
+        requests.extend(page.requests);
+        let Some(next) = advanced_cursor(after.as_deref(), page.next) else {
+            return Some(requests);
+        };
+        after = Some(next);
     }
+}
+
+/// Where the next page resumes, or `None` to STOP the walk.
+///
+/// The walk terminates because the cursor strictly ascends by saga id, and that
+/// argument is THIS loop's to make, not the reply's: a page whose `next`
+/// repeats or rewinds — a module/version mismatch, a paging change that hands
+/// back its last MATCH instead of its last CANDIDATE — would otherwise spin
+/// inside one `tick` forever, growing `requests` without bound, and the compute
+/// daemon would never reach its claim lane. `None` sorts below every `Some`, so
+/// the first page (no cursor yet) accepts any id.
+fn advanced_cursor(after: Option<&str>, next: Option<String>) -> Option<String> {
+    next.filter(|cursor| Some(cursor.as_str()) > after)
 }
 
 /// The op that fails a refused attempt. Without it a pinned saga aimed at a
@@ -1014,5 +1045,36 @@ mod tests {
             Delivered::classify(renew),
             Delivered::Heartbeat(_)
         ));
+    }
+
+    #[test]
+    fn the_page_walk_only_advances_forward() {
+        // the lane walk's termination lives here: a page that repeats or rewinds
+        // its cursor STOPS the walk instead of spinning the pump tick forever.
+        assert_eq!(
+            advanced_cursor(None, Some("a".into())).as_deref(),
+            Some("a"),
+            "the first page accepts any cursor"
+        );
+        assert_eq!(
+            advanced_cursor(Some("a"), Some("b".into())).as_deref(),
+            Some("b"),
+            "a strictly ascending cursor keeps walking"
+        );
+        assert_eq!(
+            advanced_cursor(Some("b"), Some("b".into())),
+            None,
+            "a repeated cursor stops the walk"
+        );
+        assert_eq!(
+            advanced_cursor(Some("b"), Some("a".into())),
+            None,
+            "so does one that rewinds"
+        );
+        assert_eq!(
+            advanced_cursor(Some("b"), None),
+            None,
+            "and the module's own end-of-index still ends it"
+        );
     }
 }

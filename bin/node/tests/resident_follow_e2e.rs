@@ -32,6 +32,10 @@ const CONVERGE: Duration = Duration::from_secs(180);
 /// just re-armed. 8s leaves ~2x headroom on both sides.
 const WAKE_WINDOW: Duration = Duration::from_secs(8);
 
+/// the message posted before the resident exists — only the op-row backfill
+/// can put it in the resident's view lane.
+const PRE_JOIN: &str = "m-pre-join";
+
 #[test]
 fn resident_adopts_boundaries_on_the_cert_wake_not_the_fallback_poll() {
     let _serial = serial();
@@ -63,6 +67,30 @@ fn resident_adopts_boundaries_on_the_cert_wake_not_the_fallback_poll() {
         matches!(decode_reply(&raw).ok()?, ChatReply::Channel(Some(_))).then_some(())
     });
 
+    // POSTED BEFORE ANYONE JOINS: the resident below never sees this block as
+    // a frame — it arrives inside the synced boundary, with the op feed that
+    // would have carried it long gone. The op-row backfill is the only reason
+    // it can ever answer from the view lane (indexable spec §7).
+    cluster.submit(0, "chat", &encode_msg(&post(PRE_JOIN, "before the join")));
+    poll_until("the pre-join post to finalize on the founder", CONVERGE, || {
+        let raw = cluster.query(
+            0,
+            "chat",
+            &encode_query(&ChatQuery::MessagesRange {
+                channel_id: "general".into(),
+                from_seq: 1,
+                limit: 10,
+            }),
+        )?;
+        let ChatReply::Messages(views) = decode_reply(&raw).ok()? else {
+            return None;
+        };
+        views
+            .into_iter()
+            .any(|v| v.head.message_id == PRE_JOIN)
+            .then_some(())
+    });
+
     // invite + join a fresh identity; grant it RESIDENT standing and wait for
     // the first pre-synced boundary — the follow loop is live from here on.
     let invite = cluster.invite();
@@ -74,6 +102,14 @@ fn resident_adopts_boundaries_on_the_cert_wake_not_the_fallback_poll() {
     assert!(ok, "resident accept failed:\n{out}");
     cluster.wait_admitted(1, CONVERGE);
     cluster.wait_marker(1, "resident: pre-synced boundary", CONVERGE);
+
+    // THE VIEW LANE ANSWERS PRE-JOIN HISTORY. Before the backfill this was a
+    // guaranteed empty timeline: the heal wipes every module's derived index
+    // and stamps a floor at the boundary, so a joiner's chat, pages and inbox
+    // began at the moment it arrived. Gated on the fold watermark the view
+    // itself reports, never on a sleep — the row is only really there once the
+    // fold has consumed it.
+    resident_view_holds(&cluster, PRE_JOIN, CONVERGE);
 
     // ---- arm the phase: one post under the GENEROUS deadline. observing it
     // in the resident's local reads means an adoption just completed, so the
@@ -114,6 +150,45 @@ fn resident_sees(cluster: &NetworkShapeCluster, message_id: &str, what: &str, de
             .any(|v| v.head.message_id == message_id)
             .then_some(())
     });
+}
+
+/// poll the RESIDENT's derived VIEW lane (`POST /v1/index/chat/view`, the
+/// read model the app renders from) until `message_id` is in the timeline AND
+/// the reply vouches for a fold that has consumed something — an absent
+/// `x-ducktape-folded` means the module has no tip at all, which is exactly
+/// what a stamped-but-unbackfilled module looks like.
+fn resident_view_holds(cluster: &NetworkShapeCluster, message_id: &str, deadline: Duration) {
+    // the view wire's CURRENT dialect (#1128 renamed the timeline read to
+    // `roots` and locked the enum with deny_unknown_fields, so a stale shape
+    // here fails LOUD as a 4xx rather than quietly matching nothing — this
+    // probe found that out the hard way). the pre-join post is a timeline
+    // root, so the roots page is exactly where it must appear.
+    let query = serde_json::json!({
+        "roots": { "channel_id": "general", "limit": 50 }
+    });
+    let body = serde_json::to_vec(&query).expect("view query serializes");
+    poll_until(
+        "the resident view lane to answer a pre-join message",
+        deadline,
+        || {
+            let (status, head, reply) = nettest::try_http_headed(
+                cluster.http_ports[1],
+                "POST",
+                "/v1/index/chat/view",
+                "application/json",
+                &[],
+                &body,
+            )
+            .ok()?;
+            if status != 200 {
+                return None;
+            }
+            nettest::header_of(&head, noded::FOLDED_HEADER)?;
+            String::from_utf8_lossy(&reply)
+                .contains(message_id)
+                .then_some(())
+        },
+    );
 }
 
 /// an Open-channel post to `general` with a caller-chosen message id.

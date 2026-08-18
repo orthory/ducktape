@@ -106,7 +106,7 @@ const TART_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const RUN_RUNTIME_DIR: &str = ".ducktape-run";
 
 /// the env var the provisioner exports to point a run at its read-only W6 skills
-/// tree (`bin/noded/src/agent_provision.rs`, consumed by `bin/mcp`). the sandbox
+/// tree (`bin/noded/src/agent_provision.rs`, consumed by `bin/node`'s MCP server). the sandbox
 /// backends read it to know what to MOUNT — see [`CliProvider::sandbox_ro_paths`].
 const SKILLS_ROOT_ENV: &str = "DUCKTAPE_RUN_SKILLS";
 const RUN_ACTION_URL_ENV: &str = "DUCKTAPE_RUN_ACTION_URL";
@@ -694,12 +694,20 @@ impl CliProvider {
         let ro_paths = self.sandbox_ro_paths(ctx, workdir, auth)?;
         let workdir = canonical_mount_path(workdir, "Podman workdir")?;
         let bin_path = canonical_mount_path(&self.bin, "Podman executor")?;
+        let companion_bins = resolve_companion_bins(&bin_path, &self.spec.companions)?;
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or_else(|| "Podman run needs $HOME set to place the neutral home mount".to_string())?;
         let home = canonical_mount_path(&home, "Podman HOME")?;
 
-        let plan = podman_api::plan_mounts(&workdir, &bin_path, &ro_paths, &rw_dirs, &home);
+        let plan = podman_api::plan_mounts(
+            &workdir,
+            &bin_path,
+            &companion_bins,
+            &ro_paths,
+            &rw_dirs,
+            &home,
+        );
         // the guest cwd is known HERE and nowhere earlier — see the fn doc.
         self.trust_guest_workdir(auth, &plan.guest_workdir)?;
         // translate env values + argv to the neutral guest paths (HOME is set
@@ -3456,11 +3464,12 @@ fn operator_spec_dir() -> Option<PathBuf> {
 /// the parameterized core of [`discover`]: specs in, providers out, all env
 /// access injected so tests never mutate process state.
 ///
-/// probing is per unique `(bin, env-override)` identity, not per tag: a spec
+/// probing is per unique `(bin, env-override, companions)` identity, not per
+/// tag: a spec
 /// family (`[[variants]]`) puts dozens of tags over a handful of binaries,
 /// and each PATH walk is a stat per directory — so tags sharing a probe
-/// identity are grouped, the binary is resolved ONCE, and the result fans
-/// out to every tag in the group.
+/// identity and declared companion set are grouped, the executor bundle is
+/// resolved ONCE, and the result fans out to every tag in the group.
 #[cfg(test)]
 fn discover_with(
     specs: SpecSet,
@@ -3489,10 +3498,14 @@ fn discover_with_sink(
     backend: SandboxBackend,
     managed_owner: &str,
 ) -> ProviderSet {
-    let mut groups: BTreeMap<(&str, Option<&str>), Vec<&CapabilitySpec>> = BTreeMap::new();
+    let mut groups: BTreeMap<_, Vec<&CapabilitySpec>> = BTreeMap::new();
     for spec in specs.iter() {
         groups
-            .entry((spec.bin.as_str(), spec.env.as_deref()))
+            .entry((
+                spec.bin.as_str(),
+                spec.env.as_deref(),
+                spec.companions.as_slice(),
+            ))
             .or_default()
             .push(spec);
     }
@@ -3517,7 +3530,8 @@ fn discover_with_sink(
     ProviderSet::assemble(specs, providers)
 }
 
-/// resolve the binary for one probe group — specs sharing one `(bin, env)`
+/// resolve the executor bundle for one probe group — specs sharing one
+/// `(bin, env, companions)`
 /// identity: the env override wins (and a BROKEN override is a loud warning
 /// naming every affected tag + absent capabilities, never a silent fallback
 /// to PATH — the operator said "use this", and this does not exist), else
@@ -3528,23 +3542,78 @@ fn resolve_bin(
     env: &dyn Fn(&str) -> Option<OsString>,
 ) -> Option<PathBuf> {
     let spec = group.first().expect("probe groups are never empty");
-    if let Some(explicit) = spec.env.as_deref().and_then(env) {
+    let bin = if let Some(explicit) = spec.env.as_deref().and_then(env) {
         let p = PathBuf::from(&explicit);
         if is_executable(&p) {
-            return Some(p);
+            p
+        } else {
+            let tags: Vec<&str> = group.iter().map(|s| s.tag.as_str()).collect();
+            tracing::warn!(
+                target: "ducktape::compute",
+                reason = "executor_not_executable",
+                capabilities = ?tags,
+                "capabilities unavailable because their configured executor is not executable"
+            );
+            return None;
         }
+    } else {
+        let path = path?;
+        std::env::split_paths(path)
+            .map(|dir| dir.join(&spec.bin))
+            .find(|candidate| is_executable(candidate))?
+    };
+    if let Err(error) = resolve_companion_bins(&bin, &spec.companions) {
         let tags: Vec<&str> = group.iter().map(|s| s.tag.as_str()).collect();
-        eprintln!(
-            "[capability-host] override for {tags:?} ({}) is not an executable file; \
-             the capabilities will NOT be announced",
-            p.display()
+        tracing::warn!(
+            target: "ducktape::compute",
+            reason = "executor_companion_missing",
+            capabilities = ?tags,
+            error = %error,
+            "capabilities unavailable because their executor bundle is incomplete"
         );
         return None;
     }
-    let path = path?;
-    std::env::split_paths(path)
-        .map(|dir| dir.join(&spec.bin))
-        .find(|candidate| is_executable(candidate))
+    Some(bin)
+}
+
+/// Resolve the files a spec declares beside its primary executable. The main
+/// path is canonicalized first because PATH/env overrides commonly name a
+/// symlink while self-locating executors search beside their real installed
+/// binary. Every companion is required and executable: a partial bundle is an
+/// absent capability at discovery and a loud run failure if files change later.
+fn resolve_companion_bins(bin: &Path, names: &[String]) -> Result<Vec<PathBuf>, String> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let resolved_bin = canonical_mount_path(bin, "executor companion lookup")?;
+    let parent = resolved_bin.parent().ok_or_else(|| {
+        format!(
+            "executor {} has no parent directory for its companions",
+            resolved_bin.display()
+        )
+    })?;
+    names
+        .iter()
+        .map(|name| {
+            let candidate = parent.join(name);
+            if !is_executable(&candidate) {
+                return Err(format!(
+                    "required companion {name:?} is not executable beside {}",
+                    resolved_bin.display()
+                ));
+            }
+            let resolved = canonical_mount_path(&candidate, "executor companion")?;
+            let keeps_declared_name = resolved.file_name() == Some(OsStr::new(name));
+            if !keeps_declared_name {
+                return Err(format!(
+                    "required companion {name:?} resolves to {}; companion symlinks must keep \
+                     their declared sibling file name",
+                    resolved.display()
+                ));
+            }
+            Ok(resolved)
+        })
+        .collect()
 }
 
 // shared with the sandbox runtime probe, so it lives with the sandbox muscle.
@@ -4680,6 +4749,49 @@ broker = "anthropic-messages"
             None,
         );
         assert_eq!(set.capabilities(), vec!["alpha", "beta"], "sorted tag list");
+    }
+
+    #[test]
+    fn discovery_requires_every_declared_executor_companion() {
+        let dir = scratch("discovery-companions");
+        fake_cli(&dir, "bundle-cli", "exit 0");
+        let spec = CapabilitySpec::parse(
+            r#"
+spec = 1
+[capability]
+tag = "bundle"
+[detect]
+bin = "bundle-cli"
+companions = ["bundle-helper"]
+[invoke]
+args = []
+prompt = "stdin"
+[output]
+format = "text"
+"#,
+            "test",
+        )
+        .unwrap();
+
+        let absent = discover_with(
+            SpecSet::from_specs(vec![spec.clone()]),
+            Some(dir.clone().into_os_string()),
+            &no_env,
+            None,
+        );
+        assert!(
+            absent.find("bundle").is_none(),
+            "a partial executor bundle must not be announced"
+        );
+
+        fake_cli(&dir, "bundle-helper", "exit 0");
+        let present = discover_with(
+            SpecSet::from_specs(vec![spec]),
+            Some(dir.into_os_string()),
+            &no_env,
+            None,
+        );
+        assert_eq!(present.capabilities(), ["bundle"]);
     }
 
     #[test]

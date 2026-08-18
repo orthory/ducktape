@@ -77,7 +77,7 @@ pub use module_code::{CODE_KIND_MODULE, CodePeerReceipt, CodeStageLane, CodeStag
 pub mod term;
 pub use term::{
     CreatedSession, PeerAttach, TermChunkEvent, TermCommandEvent, TermCommandRing, TermError,
-    TermRing, TerminalSessions,
+    TermFeedEvent, TermRing, TerminalSessions,
 };
 
 pub mod term_remote;
@@ -101,7 +101,7 @@ pub use term_consensus::{command_blocks, command_text, session_channel};
 // /v1/blocks.
 mod index;
 pub use index::{
-    BlocksParams, IndexScanParams, index_block_ops, index_origin, open_index_store,
+    BlocksParams, FOLDED_HEADER, IndexScanParams, index_block_ops, index_origin, open_index_store,
     stamp_stale_modules,
 };
 // the ducktape_* Prometheus series + GET /metrics.
@@ -256,10 +256,19 @@ impl From<&host::DispatchRecord> for DispatchInfo {
 /// best-effort utf-8 preview of an op payload, capped at
 /// [`PAYLOAD_PREVIEW_MAX`] chars. binary bytes render lossily — payloads on
 /// this lane are module `*Msg` json, so the common case is readable.
+///
+/// the decode is bounded BEFORE the lossy conversion: this runs on the
+/// consensus drain for every op, and a 1 MiB binary chunk (a dropped photo)
+/// lossy-decoded whole allocates ~3 MiB and scans it all to keep 1024 chars.
+/// 4 bytes/char ceilings the prefix that can ever render.
 pub fn payload_preview(payload: &[u8]) -> String {
-    let text = String::from_utf8_lossy(payload);
+    const DECODE_BYTES: usize = 4 * PAYLOAD_PREVIEW_MAX;
+    let clipped = payload.len() > DECODE_BYTES;
+    let head = &payload[..payload.len().min(DECODE_BYTES)];
+    let text = String::from_utf8_lossy(head);
     match text.char_indices().nth(PAYLOAD_PREVIEW_MAX) {
         Some((cut, _)) => format!("{}…", &text[..cut]),
+        None if clipped => format!("{text}…"),
         None => text.into_owned(),
     }
 }
@@ -1002,6 +1011,19 @@ mod tests {
         assert!(preview.ends_with('…'), "truncation is visible");
         // invalid utf-8 renders lossily rather than erroring.
         assert_eq!(payload_preview(&[0xff, 0xfe]), "\u{fffd}\u{fffd}");
+        // a binary payload (every byte invalid utf-8, so every byte becomes a
+        // 3-byte replacement char) is decoded only through the bounded prefix
+        // — the cap holds and the clip is visible. this is the drain-path
+        // guard: a 1 MiB photo chunk must never be lossy-decoded whole.
+        let binary = vec![0xffu8; 8 * 1024];
+        let preview = payload_preview(&binary);
+        assert_eq!(preview.chars().count(), PAYLOAD_PREVIEW_MAX + 1);
+        assert!(preview.ends_with('…'), "byte-clipped previews carry the mark");
+        // multi-byte text still fills its full char budget: 4 bytes/char is
+        // the decode ceiling, so 1024 chars always fit the prefix.
+        let wide = "😀".repeat(PAYLOAD_PREVIEW_MAX + 10);
+        let preview = payload_preview(wide.as_bytes());
+        assert_eq!(preview.chars().count(), PAYLOAD_PREVIEW_MAX + 1);
     }
 
     #[test]

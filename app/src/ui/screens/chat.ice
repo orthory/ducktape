@@ -15,11 +15,146 @@
 // this root deliberately carries NO `#root`: that would push every id down one
 // more segment for nothing.
 //
-// Both `sensor`s live here and report through the screen's own events. They
-// were briefly caller-filled slots: a sensor's show/resize route used to accept
-// only bare `_` payloads and could not carry a component event (ui-lang#239).
+// A TIMELINE IS ITS OWN EVENT ISLAND. A keyed lazy nested directly in
+// ChatScreen inherits every event the screen declares, even though a message
+// row can only fire these six. With 4,096 rows that used to manufacture
+// 48 callback routes per row on every unrelated rebuild. This component keeps
+// the row loop's routing surface equal to what the row can actually do.
+component MessageTimeline(messages:[ChatMessage], unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, loading:bool)
+  emits
+    add_reaction_at(i64, str)
+    remove_reaction_at(i64, str)
+    open_thread_for(i64)
+    open_message_reactions(i64, str, i64)
+    open_message_actions(i64, str, i64)
+    open_message_link(str)
+  // KEYED BY STABLE VIEW IDENTITY. This is the app's one virtual list that
+  // prepends, so row state and measured height must follow the message rather
+  // than the slot it occupied before the page arrived.
+  keyed message in messages by=message.view_key
+    with
+      w=fill
+      gap=3.0
+      virtual-row=44.0
+    col w=fill gap=0.0
+      if unread_boundary > 0 && message.seq == unread_marker_seq
+        row
+          with
+            w=fill
+            gap=8.0
+            align=center
+            pt=8.0
+            pb=2.0
+          box
+            with
+              w=fill
+              h=1.0
+              bg=brand/40
+            text ""
+          text "NEW"
+            with
+              size=10.0
+              wrap=none
+              font=code_semibold
+              @text-brand
+          box
+            with
+              w=fill
+              h=1.0
+              bg=brand/40
+            text ""
+      // The selected row stays live because selection and loading are screen
+      // state. Quiet rows keep their own element/layout memo within the
+      // whole-timeline boundary. The plain dependency is intentional: the
+      // outer keyed lazy lends `messages` as a closure-local value, while the
+      // compiler permits nested cheap-key capture only from app state. A live
+      // batch rebuilds this bounded window once; an unchanged frame never
+      // enters it at all.
+      if message.seq == selected_message_seq
+        stack #message(message.id) w=fill
+          MessageCard
+            with
+              message
+              selected=true
+              menu_open=true
+              disabled=loading
+            forward
+              add_reaction_at
+              remove_reaction_at
+              open_thread_for
+              open_message_reactions
+              open_message_actions
+              open_message_link
+      if message.seq != selected_message_seq
+        lazy message as cached_message
+          stack #message(cached_message.id) w=fill
+            MessageCard
+              with
+                message=cached_message
+                selected=false
+                menu_open=false
+                disabled=false
+              forward
+                add_reaction_at
+                remove_reaction_at
+                open_thread_for
+                open_message_reactions
+                open_message_actions
+                open_message_link
 
-component ChatScreen(network_name:str, status:str, block_height:i64, bind search_draft:str, searching:bool, search_hits:[ChatSearchHit], channels:[ChatChannel], dm_peers:[DmPeer], channel_reads:[ChannelRead], user_key:str, channel_create_open:bool, connected:bool, loading:bool, mutation_phase:str, active_channel:str, active_dm_peer:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, send_flash_id:str, send_flash_value:f64, message_action:str, message_menu_y:f64, bind message_action_focus:str, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:str, thread_menu_y:f64, thread_send_flash_id:str, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_offset:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor, shift_held:bool)
+// Same boundary for the rail: the root, target and menu rows stay live; quiet
+// replies keep their per-row memo. Paging controls stay outside this component
+// because they are constant-size chrome, not part of the chain-fed list.
+component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_target_seq:i64, thread_selected_seq:i64, loading:bool)
+  emits
+    add_reaction_at(i64, str)
+    remove_reaction_at(i64, str)
+    open_thread_for(i64)
+    open_thread_message_actions(i64, str, i64)
+    open_thread_message_reactions(i64, str, i64)
+    open_message_link(str)
+  keyed thread_message in messages by=thread_message.view_key
+    with
+      w=fill
+      gap=3.0
+      virtual-row=44.0
+    col w=fill gap=0.0
+      if thread_message.seq == active_thread_seq
+        ThreadParentBlock message=thread_message
+          forward
+            open_message_link
+      if thread_message.seq != active_thread_seq && (thread_message.seq == thread_target_seq || thread_message.seq == thread_selected_seq)
+        ThreadMessageCard
+          with
+            message=thread_message
+            selected=(thread_message.seq == thread_target_seq)
+            menu_open=(thread_message.seq == thread_selected_seq)
+            disabled=loading
+          forward
+            add_reaction_at
+            remove_reaction_at
+            open_thread_for
+            open_thread_message_actions
+            open_thread_message_reactions
+            open_message_link
+      if thread_message.seq != active_thread_seq && thread_message.seq != thread_target_seq && thread_message.seq != thread_selected_seq
+        lazy thread_message as cached_reply
+          ThreadMessageCard
+            with
+              message=cached_reply
+              selected=false
+              menu_open=false
+              disabled=false
+            forward
+              add_reaction_at
+              remove_reaction_at
+              open_thread_for
+              open_thread_message_actions
+              open_thread_message_reactions
+              open_message_link
+
+component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], messages_revision:i64, has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_messages_revision:i64, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool)
+  lifetime retained
   emits
     search_chat_submit()
     clear_chat_search()
@@ -33,8 +168,9 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
     leave_huddle_here()
     huddle_go_channel()
     join_huddle_submit()
-    chat_pointer_pressed(f64, f64)
     load_more_history()
+    chat_scrolled(f64, f64, f64, f64)
+    open_message_link(str)
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
     open_thread_for(i64)
@@ -46,16 +182,12 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
     add_reaction_submit(str)
     edit_message_submit()
     delete_message_submit()
-    restore_failed_message()
-    dismiss_failed_message()
-    composer_event(ComposerEvent)
-    composer_mark(str)
+    composer_submitted(ComposerKind, str, str)
     rename_channel_submit()
     archive_channel_submit()
     unarchive_channel_submit()
     add_channel_member_submit()
     remove_channel_member_submit(str)
-    thread_pointer_pressed(f64, f64)
     close_thread()
     open_thread_message_actions(i64, str, i64)
     open_thread_message_reactions(i64, str, i64)
@@ -65,12 +197,23 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
     edit_thread_message_submit()
     delete_thread_message_submit()
     load_more_thread()
-    restore_failed_reply()
-    dismiss_failed_reply()
-    reply_composer_event(ComposerEvent)
-    reply_composer_mark(str)
-    chat_resized(f64, f64)
-    thread_resized(f64, f64)
+  state
+    message_action_focus = ""
+    chat_pointer_y = 0.0
+    chat_height = 720.0
+    thread_pointer_y = 0.0
+    thread_height = 720.0
+  // PRESSES, NOT MOVES. Geometry belongs to this screen instance: the pointer
+  // y is read exactly once when an action menu opens, and its computed anchor
+  // stays in the view; only the selected message crosses into app state.
+  on chat_pointer_pressed(_x, y)
+    chat_pointer_y = y
+  on chat_resized(_width, height)
+    chat_height = height
+  on thread_pointer_pressed(_x, y)
+    thread_pointer_y = y
+  on thread_resized(_width, height)
+    thread_height = height
   row w=fill h=fill
     box
       with
@@ -82,13 +225,13 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
         box
           with
             w=fill
-            pl=14.0
-            pr=14.0
-            pt=14.0
-            pb=11.0
+            h=50.0
+            pl=16.0
+            pr=16.0
           row
             with
               w=fill
+              h=fill
               gap=8.0
               align=center
             text network_name
@@ -129,8 +272,8 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
         box
           with
             w=fill
-            pl=12.0
-            pr=12.0
+            pl=16.0
+            pr=16.0
             pt=11.0
             pb=6.0
           // MESSAGE SEARCH LIVES HERE, not in the channel header — the
@@ -146,17 +289,28 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
               with
                 label="Search messages"
                 hint="Search…"
-                disabled=(!connected || searching)
+                // NOT `|| search_phase == SearchPhase.searching`. The field went dead the instant Enter
+                // was pressed and stayed dead for the whole round trip, so the
+                // query could not be refined while waiting — and a disabled
+                // input drops the caret besides. The `chat_search` replace lane
+                // drops the superseded reply; killing the field bought nothing.
+                disabled=!connected
                 submit=emit(search_chat_submit)
                 w=fill
                 p=6.2
                 text-size=13.0
                 line-h=1.2
                 @control
-              active bg=surface border=border value=fg placeholder=hint selection=fg/18 border-w=1.0 r=8.0
+              // NO `border=` HERE — the recipe already owns the resting border.
+              active bg=surface value=fg placeholder=hint selection=fg/18 border-w=1.0 r=8.0
               hovered bg=muted_bg border=control_line
               disabled bg=transparent value=muted
-            if !empty(search_hits)
+            // THE FLOAT'S GATE, OR THE FIELD'S: phase alone left un-clearable
+            // text on every path that parks idle with a draft standing —
+            // `chat_search_failed`, the picker dismissals, `channel_created`.
+            // The button clears both the float and the field, so either
+            // earns it.
+            if search_phase != SearchPhase.idle || !empty(trim(search_draft))
               button -> emit(clear_chat_search)
                 with
                   label="Clear message search"
@@ -174,7 +328,6 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                     with
                       size=13.0
                       wrap=none
-                      @text-muted
                 active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
                 hovered bg=elevated text=fg
                 pressed bg=subtle text=fg
@@ -183,8 +336,8 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
             w=fill
             pl=16.0
             pr=16.0
-            pt=10.0
-            pb=5.0
+            pt=14.0
+            pb=6.0
           row
             with
               w=fill
@@ -197,7 +350,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                 font=code_semibold
                 @text-label
             space w=fill
-            text len(rooms_only(channels, dm_peers, user_key))
+            text len(rooms)
               with
                 size=10.5
                 wrap=none
@@ -207,22 +360,29 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
               button -> emit(toggle_channel_create)
                 with
                   label="New channel"
-                  disabled=(loading || mutation_phase != "idle" || !connected)
+                  expanded=channel_create_open
+                  disabled=(loading || mutation_phase != MutationPhase.idle || !connected)
                   p=0.0
                   @icon_action
-                Icon
+                // `color=inherit` (ducktape-ui#606): the glyph draws the
+                // button's status-resolved text color — hover ink keys on the
+                // BUTTON's bounds, disabled ink on the status ladder, no
+                // second spelling of the disabled term. `active text=label`
+                // keeps the resting `label` tone the old tinted mount named;
+                // token and tone are the same hex in both palettes.
+                svg icon("plus") memory color=inherit
                   with
-                    name="plus"
-                    tone="label"
-                    px=16.0
-                active bg=transparent text=muted border=transparent border-w=1.0 r=5.0
+                    w=16.0
+                    h=16.0
+                active bg=transparent text=label border=transparent border-w=1.0 r=5.0
                 hovered bg=separator text=fg
                 pressed bg=subtle text=fg
             if channel_create_open
               button -> emit(toggle_channel_create)
                 with
                   label="Close new channel"
-                  disabled=(loading || mutation_phase != "idle")
+                  expanded=channel_create_open
+                  disabled=(loading || mutation_phase != MutationPhase.idle)
                   w=24.0
                   h=24.0
                   p=0.0
@@ -237,7 +397,6 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                     with
                       size=13.0
                       wrap=none
-                      @text-muted
                 active bg=separator text=muted border=transparent border-w=1.0 r=5.0
                 hovered bg=subtle text=fg
                 pressed bg=subtle text=fg
@@ -250,25 +409,30 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
           col w=fill gap=2.0
             // DMs are filtered out here, not hidden by CSS: they are real
             // channels and would otherwise list twice, once under each
-            // eyebrow. See `rooms_only`.
-            for channel in rooms_only(channels, dm_peers, user_key)
+            // eyebrow. See `chat_sidebar_rooms`.
+            for room in rooms
               ChannelButton
                 with
-                  channel
-                  selected=(channel.id == active_channel)
-                  unread=channel_is_unread(channel_reads, channel.id, channel.head_seq)
+                  channel=room.channel
+                  selected=(room.channel.id == active_channel)
+                  unread=room.unread
+                  // EXACTLY THE TERM `choose_channel` STILL REFUSES ON. A load
+                  // no longer refuses a click — the last one wins — so a row
+                  // greyed while one is in flight would put the swallowing back.
+                  // A mutation does still refuse, and the row now says so.
+                  disabled=(mutation_phase != MutationPhase.idle)
                 forward
                   choose_channel
             // DIRECT — the artifact's own word for it, and the honest
             // one: a two-party channel, not an encrypted one. Reads
             // carry no authorization and every node replicates the
             // state, so nothing here says "private".
-            if !empty(dm_peers)
+            if !empty(dm_rows)
               box
                 with
                   w=fill
-                  pl=8.0
-                  pr=8.0
+                  pl=16.0
+                  pr=16.0
                   pt=14.0
                   pb=6.0
                 row
@@ -283,14 +447,14 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                       font=code_semibold
                       @text-label
                   space w=fill
-                  text len(dm_peers)
+                  text len(dm_rows)
                     with
                       size=10.5
                       wrap=none
                       font=code_medium
                       @text-label
-            for peer in dm_peers
-              DmButton peer=peer selected=(peer.key == active_dm_peer)
+            for dm in dm_rows
+              DmButton peer=dm.peer selected=(dm.peer.key == active_dm_peer) unread=dm.unread disabled=(mutation_phase != MutationPhase.idle)
                 forward
                   choose_dm
         // No account footer: the rail's avatar and Settings already carry the
@@ -325,18 +489,34 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                     h=fill
                     gap=9.0
                     align=center
-                  // A DM IS A PERSON, NOT A `#`. The peer is a filter
-                  // over `dm_peers` — Ice cannot index a list by field,
-                  // so the row that matches `active_dm_peer` draws and
-                  // the rest do not. A DM whose peer has left the
-                  // identity roster matches nothing and falls back to
-                  // the channel title below, which is the derived
-                  // two-party name — never a blank plate.
-                  if !empty(active_dm_peer)
-                    for peer in dm_peers
-                      if peer.key == active_dm_peer
-                        DmHeader peer=peer
-                  if empty(active_dm_peer)
+                  // A DM IS A PERSON, NOT A `#`. The row is resolved
+                  // where `active_dm_peer` is written (`dm_peer_named`),
+                  // not filtered here: Ice cannot index a list by field,
+                  // so this was `for peer in dm_peers` / `if peer.key ==
+                  // active_dm_peer` — every peer deep-cloned and given a
+                  // scope String, per frame, so that one of them drew.
+                  // A DM whose peer has left the identity roster resolves
+                  // to the blank row and falls back to the channel title
+                  // below, which is the derived two-party name — never a
+                  // blank plate. That fall-through reads the resolved
+                  // NAME, not the key: `dm_peer_named` answers a miss with
+                  // the blank peer while the key stays set, so branching on
+                  // the key drew an empty 24px plate with no name at all.
+                  //
+                  // AND IT IS BOUNDED, for the same reason the channel title
+                  // below is: this row has no main-axis justification, so the
+                  // ⋯ that is the only mouse route to Channel details sits at
+                  // the right edge only while SOME child takes the row's
+                  // slack. With the DM header shrink-sized, ⋯ packed against
+                  // the peer's name and moved with its length, and a long
+                  // name pushed the huddle control and ⋯ past the pane's clip.
+                  if !empty(active_dm.name)
+                    box
+                      with
+                        w=fill
+                        clip=true
+                      DmHeader peer=active_dm
+                  if empty(active_dm.name)
                     text "#"
                       with
                         size=14.0
@@ -352,7 +532,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                   // length rendered the live-huddle pill as a BLANK plate you
                   // could still click, and dropped ⋯ entirely. The window's
                   // `min-size` bounds the other axis; this bounds this one.
-                  if empty(active_dm_peer)
+                  if empty(active_dm.name)
                     box
                       with
                         w=fill
@@ -426,6 +606,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                   button -> emit(toggle_channel_settings)
                     with
                       label="Channel details"
+                      expanded=channel_settings_open
                       w=27.0
                       h=25.0
                       p=0.0
@@ -440,7 +621,6 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         with
                           size=14.0
                           wrap=none
-                          @text-muted
                     active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
                     hovered bg=elevated text=fg
                     pressed bg=subtle text=fg
@@ -457,7 +637,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                 h=fill
                 gap=9.0
                 pl=18.0
-                pr=18.0
+                pr=12.0
                 pt=16.0
                 pb=8.0
               if !connected
@@ -470,14 +650,13 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                   with
                     title="No messages yet"
                     description="Nobody has posted here. Send the first message below."
+              // THREE SKELETON ROWS, not a centred sentence — see
+              // `SkeletonRow` for the geometry they hold to.
               if connected && loading && empty(messages)
-                box
-                  with
-                    w=fill
-                    h=fill
-                    align-x=center
-                    align-y=center
-                  text "Loading messages…" size=12.5 @text-meta
+                col w=fill gap=14.0 pt=4.0
+                  SkeletonRow
+                  SkeletonRow
+                  SkeletonRow
               if connected && !empty(messages) && history_view
                 box
                   with
@@ -509,11 +688,14 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                       active bg=surface text=fg border=warning_line border-w=1.0 r=7.0
                       hovered bg=warning_bg text=fg
                       pressed bg=accent text=fg
+              // THE EMPTY LOADING STATE RESETS THE STREAM. A room switch clears
+              // `messages`, this gate unmounts the old scrollable and its offset,
+              // and the arriving root window mounts at the tail.
               if connected && !empty(messages)
                 stack w=fill h=fill
-                  sensor show=emit(chat_resized, _, _) resize=emit(chat_resized, _, _)
+                  sensor show=chat_resized resize=chat_resized
                     space w=fill h=fill
-                  mouse press-at=emit(chat_pointer_pressed, _, _)
+                  mouse press-at=chat_pointer_pressed
                     // A CONVERSATION GROWS UP FROM THE COMPOSER. `anchor-y=end`
                     // pins the scroll OFFSET, which does nothing until there is
                     // something to scroll — a channel with four messages in it
@@ -524,19 +706,53 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                     // limits, so a long timeline scrolls exactly as before) and
                     // `align-y=end` drops that block onto the composer.
                     box w=fill h=fill align-y=end
-                      scroll
+                      scroll #message-stream
                         with
                           dir=vertical
                           w=fill
                           h=shrink
                           anchor-y=end
                           auto=true
+                          // PREFETCH BEFORE THE HARD STOP. The offset is
+                          // relative to the ANCHOR, which is the end here, so
+                          // 1.0 is the top of the scrollback — `chat_scrolled`
+                          // starts the older page inside the last tenth of it.
+                          // iced drops a viewport identical to the last one it
+                          // published, so this is one message per real scroll
+                          // step, not one per wheel event.
+                          scroll=emit(chat_scrolled, _, _, _, _)
+                        // The page controls are the ONE part of the scrollback
+                        // that is not a message, so they sit in a plain wrapper
+                        // above the keyed column rather than inside it — a
+                        // keyed column repeats one template over one list, and
+                        // a button folded into that list is another row whose
+                        // arrival shifts every index below it.
                         col
                           with
                             w=fill
                             gap=3.0
                             pr=6.0
-                          if has_older_history
+                          // TWO ARMS, ONE BUTTON. The page is a walk of up to
+                          // four sequential round trips and the control carried
+                          // no busy reading at all — `disabled` alone is what a
+                          // dead button looks like. The label says which it is.
+                          if has_older_history && history_loading
+                            box
+                              with
+                                w=fill
+                                align-x=center
+                                pt=4.0
+                                pb=8.0
+                              button "Loading older messages…" -> emit(load_more_history)
+                                with
+                                  disabled=true
+                                  h=30.0
+                                  p=6.0
+                                  @secondary_action
+                                active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=8.0
+                                hovered bg=fg/10 text=fg border=fg/14
+                                pressed bg=fg/14 text=fg
+                          if has_older_history && !history_loading
                             box
                               with
                                 w=fill
@@ -545,103 +761,70 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                 pb=8.0
                               button "Load older messages" -> emit(load_more_history)
                                 with
-                                  disabled=(history_loading || mutation_phase != "idle")
+                                  disabled=(mutation_phase != MutationPhase.idle)
                                   h=30.0
                                   p=6.0
                                   @secondary_action
                                 active bg=fg/6 text=muted border=fg/10 border-w=1.0 r=8.0
                                 hovered bg=fg/10 text=fg border=fg/14
                                 pressed bg=fg/14 text=fg
-                          for message in messages
-                            col w=fill gap=0.0
-                              if unread_boundary > 0 && message.seq == unread_marker_seq
-                                row
-                                  with
-                                    w=fill
-                                    gap=8.0
-                                    align=center
-                                    pt=8.0
-                                    pb=2.0
-                                  box
-                                    with
-                                      w=fill
-                                      h=1.0
-                                      bg=brand/40
-                                    text ""
-                                  text "New messages"
-                                    with
-                                      size=12.5
-                                      wrap=none
-                                      @text-brand
-                                  box
-                                    with
-                                      w=fill
-                                      h=1.0
-                                      bg=brand/40
-                                    text ""
-                              // LAZY OFF THE HOT PATH. A quiet row rebuilds
-                              // only when its MESSAGE changes; ONLY the selected
-                              // row is built live, because its card reads the
-                              // selection. Hover costs no arm at all now — the
-                              // toolbar reveal is the `hover` widget's draw-time
-                              // check inside MessageCard, so a cached row keeps
-                              // it at native latency.
-                              //
-                              // A message in flight LOOKS like a message: no
-                              // dashed frame, no restyle — send-state lives in
-                              // MessageContents' right-edge lane (pending dot,
-                              // then the settle ✓ fading out). The flash arm is
-                              // the one live mount that carries the animated
-                              // opacity; every other unselected row stays lazy.
-                              if message.seq == selected_message_seq
-                                stack #message(message.id) w=fill
-                                  MessageCard
-                                    with
-                                      message
-                                      selected=true
-                                      menu_open=true
-                                      disabled=loading
-                                      flash=0.0
-                                    forward
-                                      add_reaction_at
-                                      remove_reaction_at
-                                      open_thread_for
-                                      open_message_reactions
-                                      open_message_actions
-                              if message.seq != selected_message_seq && message.id == send_flash_id
-                                stack #message(message.id) w=fill
-                                  MessageCard
-                                    with
-                                      message
-                                      selected=false
-                                      menu_open=false
-                                      disabled=false
-                                      flash=send_flash_value
-                                    forward
-                                      add_reaction_at
-                                      remove_reaction_at
-                                      open_thread_for
-                                      open_message_reactions
-                                      open_message_actions
-                              if message.seq != selected_message_seq && message.id != send_flash_id
-                                lazy message as cached_message
-                                  stack #message(cached_message.id) w=fill
-                                    MessageCard
-                                      with
-                                        message=cached_message
-                                        selected=false
-                                        menu_open=false
-                                        disabled=false
-                                        flash=0.0
-                                      forward
-                                        add_reaction_at
-                                        remove_reaction_at
-                                        open_thread_for
-                                        open_message_reactions
-                                        open_message_actions
+                          // VIRTUALIZED, AND KEYED BY STABLE VIEW IDENTITY. Only the rows the
+                          // viewport can see are laid out, so the timeline no
+                          // longer shapes text for scrollback nobody is looking
+                          // at — the mount stopped being linear in how far back
+                          // she paged.
+                          //
+                          // THE KEY IS NOT DECORATION HERE. This is the app's
+                          // one virtual list that PREPENDS: `chat_scrolled`
+                          // fires the older page automatically inside the last
+                          // tenth of the scrollback, and `prepend_history`
+                          // merges up to 256 rows ahead of the timeline. Under
+                          // index diffing every one of those rows hands its
+                          // measured height to its neighbour, so the rows below
+                          // the viewport are re-estimated at 44px, and an
+                          // `anchor-y=end` offset — a fixed distance from the
+                          // bottom — lands on entirely different messages. The
+                          // reader gets thrown backwards mid-sentence, once per
+                          // page. Every row gets a numeric client identity which
+                          // same-ID merges carry forward, so per-row state and
+                          // measurement follow the message through both prepend
+                          // and confirmation instead of following a slot.
+                          //
+                          // 44px is the middle of a real row: a run header (avatar
+                          // + name line + body over 12px of card padding, plus
+                          // the 14px run-boundary spacer) runs ~68, a grouped
+                          // continuation ~31. Biased low on purpose — too small
+                          // over-mounts for one pass and corrects itself, too
+                          // large leaves a gap at the bottom until the next.
+                          //
+                          // The scroll above is anchor-y=end, and this needs it:
+                          // measuring a never-seen row ABOVE the viewport moves
+                          // everything below it, and only a bottom-anchored offset
+                          // carries the visible rows along with it.
+                          // WHOLE-TIMELINE MEMO. The value stays borrowed from
+                          // root state and only enters the cached element when
+                          // this cheap revision (or one of the five visible
+                          // screen inputs) moves. Composer edits, clocks and
+                          // unrelated live planes therefore build one memo
+                          // widget instead of enumerating every message.
+                          lazy messages by messages_revision, active_channel, unread_boundary, unread_marker_seq, selected_message_seq, loading as cached_messages
+                            MessageTimeline
+                              with
+                                messages=cached_messages
+                                unread_boundary
+                                unread_marker_seq
+                                selected_message_seq
+                                loading
+                              forward
+                                add_reaction_at
+                                remove_reaction_at
+                                open_thread_for
+                                open_message_reactions
+                                open_message_actions
+                                open_message_link
                   overlay
                     with
-                      when=(selected_message_seq > 0 && message_action != "toolbar")
+                      when=(selected_message_seq > 0 && message_action != MessageAction.toolbar)
                       dismiss=emit(clear_message_selection)
                       backdrop=transparent
                       p=8.0
@@ -650,9 +833,9 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                     content
                       space w=fill h=fill
                     layer
-                      float x=0.0 y=message_menu_y
+                      box w=fill h=fill pt=block_action_menu_y(chat_pointer_y, chat_height) align-x=end align-y=start
                         col
-                          if message_action == "more"
+                          if message_action == MessageAction.more
                             stack
                               input "" #message-action-focus <-> message_action_focus
                                 with
@@ -673,10 +856,16 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                   p=5.0
                                   style=raised_style()
                                 col w=fill gap=1.0
+                                  // LIVE, SO THE PRESS REACHES THE REFUSAL. A
+                                  // disabled row is pixel-identical to a live
+                                  // one here (`@ghost_action` idles at the same
+                                  // ink), so it read as a working row that ate
+                                  // the click; now the press lands in
+                                  // `open_message_reactions`, which answers with
+                                  // the archived banner.
                                   button -> emit(open_message_reactions, selected_message_seq, message_edit_draft, selected_message_rev)
                                     with
                                       label="Manage reactions"
-                                      disabled=active_channel_archived
                                       w=fill
                                       h=30.0
                                       p=0.0
@@ -808,7 +997,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                     active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
                                     hovered bg=danger_bg text=fg
                                     pressed bg=danger_line text=fg
-                          if message_action == "reactions"
+                          if message_action == MessageAction.reactions
                             stack
                               input "" #message-reaction-focus <-> message_action_focus
                                 with
@@ -855,7 +1044,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                       active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
                                       hovered bg=fg/10
                                       pressed bg=fg/15
-                          if message_action == "editing"
+                          if message_action == MessageAction.editing
                             // NO max-w: this float is painted OVER the row it
                             // edits, so anything narrower than the column
                             // leaves the tail of the old message showing
@@ -874,7 +1063,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                   with
                                     label="Edit message"
                                     hint="Edit message"
-                                    disabled=(mutation_phase != "idle")
+                                    disabled=(mutation_phase != MutationPhase.idle)
                                     submit=emit(edit_message_submit)
                                     w=fill
                                     p=6.2
@@ -883,18 +1072,25 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                     @control
                                   active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
                                   hovered bg=fg/4 border=fg/8
+                                  // THE EDITOR IS BORDERLESS AT REST ON PURPOSE, and the
+                                  // recipe's ring alone on a transparent field is a thin
+                                  // outline around nothing. `begin_message_edit` drops the
+                                  // caret in here by hand, so focus also lifts the plate —
+                                  // without the `bg=` the field's HOVER read stronger than
+                                  // its focus.
+                                  focused bg=fg/4 border=ring
                                   disabled value=muted
                                 button "Save" -> emit(edit_message_submit)
                                   with
                                     label="Save message changes"
-                                    disabled=(mutation_phase != "idle" || empty(trim(message_edit_draft)))
+                                    disabled=(mutation_phase != MutationPhase.idle || empty(trim(message_edit_draft)))
                                     h=28.0
                                     p=6.0
                                     @primary_action
                                 button -> emit(clear_message_selection)
                                   with
                                     label="Cancel message edit"
-                                    disabled=(mutation_phase != "idle")
+                                    disabled=(mutation_phase != MutationPhase.idle)
                                     w=28.0
                                     h=28.0
                                     p=0.0
@@ -909,7 +1105,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                   active bg=transparent text=muted r=7.0
                                   hovered bg=fg/10 text=fg
                                   pressed bg=fg/15
-                          if message_action == "delete"
+                          if message_action == MessageAction.delete
                             stack
                               input "" #message-delete-focus <-> message_action_focus
                                 with
@@ -925,65 +1121,24 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                   text "Delete this message?" size=12.5 @text-muted
                                   button "Delete" -> emit(delete_message_submit)
                                     with
-                                      disabled=(mutation_phase != "idle")
+                                      disabled=(mutation_phase != MutationPhase.idle)
                                       h=26.0
                                       p=5.0
                                       @danger_action
                                   button "Cancel" -> emit(clear_message_selection)
                                     with
-                                      disabled=(mutation_phase != "idle")
+                                      disabled=(mutation_phase != MutationPhase.idle)
                                       h=26.0
                                       p=5.0
                                       @secondary_action
                                     active bg=transparent text=muted r=6.0
                                     hovered bg=fg/10 text=fg
                                     pressed bg=fg/15
-              if !empty(failed_message_draft)
-                row
-                  with
-                    w=fill
-                    gap=6.0
-                    align=center
-                  text "An earlier message wasn’t sent"
-                    with
-                      w=fill
-                      size=12.5
-                      @text-muted
-                  button "Restore" -> emit(restore_failed_message)
-                    with
-                      disabled=(!empty(trim(editor_text(message_editor))) || mutation_phase != "idle")
-                      h=28.0
-                      p=5.0
-                      @secondary_action
-                    active bg=fg/9 text=fg border=fg/11 border-w=1.0 r=7.0
-                    hovered bg=fg/14
-                    pressed bg=fg/18
-                  button -> emit(dismiss_failed_message)
-                    with
-                      label="Dismiss unsent message"
-                      w=28.0
-                      h=28.0
-                      p=0.0
-                      @icon_action
-                    box
-                      with
-                        w=fill
-                        h=fill
-                        align-x=center
-                        align-y=center
-                      text "×" size=14.0
-                    active bg=transparent text=muted r=7.0
-                    hovered bg=fg/10 text=fg
-                    pressed bg=fg/15
-            // THE RESULTS FLOAT. This card used to be the column's first
-            // child, so typing a search reflowed the whole conversation down
-            // by 148px; as a stack layer it drops over the stream instead,
-            // and everything below it keeps its place.
             // THE RESULTS FLOAT. This card used to be the column's first
             // child, so a search reflowed the whole conversation down by
             // 148px; as a stack layer it drops over the stream instead and
             // everything beneath keeps its place.
-            if !empty(search_hits)
+            if search_phase != SearchPhase.idle
               box
                 with
                   w=fill
@@ -995,7 +1150,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                 box
                   with
                     w=fill
-                    h=148.0
+                    max-h=260.0
                     p=6.0
                     bg=elevated
                     border=fg/10
@@ -1004,16 +1159,27 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                     shadow=shadow_popover
                     shadow-y=8.0
                     shadow-blur=24.0
-                  scroll
-                    with
-                      dir=vertical
-                      w=fill
-                      h=fill
-                    col w=fill gap=1.0
-                      for hit in search_hits
-                        ChatSearchResult hit=hit
-                          forward
-                            open_chat_search_hit
+                  col w=fill
+                    if search_phase == SearchPhase.searching
+                      col w=fill gap=14.0 p=8.0
+                        SkeletonRow
+                    if search_phase == SearchPhase.done && empty(search_hits)
+                      box w=fill p=14.0 align-x=center
+                        text "No messages match"
+                          with
+                            size=12.5
+                            @text-muted
+                    if search_phase == SearchPhase.done && !empty(search_hits)
+                      scroll
+                        with
+                          dir=vertical
+                          w=fill
+                          h=shrink
+                        col w=fill gap=1.0
+                          for hit in search_hits
+                            ChatSearchResult hit=hit
+                              forward
+                                open_chat_search_hit
           // The composer is separated from the stream by a hairline and
           // carries the artifact's own 12/16/14 region padding.
           box
@@ -1022,76 +1188,44 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
               h=1.0
               bg=separator
             space w=1.0 h=1.0
-          // THE GATE ABOVE THE PLATE. `post_gate` is called here rather
-          // than mirrored into a state field: it is pure over three
-          // facts the view already holds, `channel_members` lands in
-          // SEVEN handlers, and a seventh copy is six chances to drift.
-          // An empty reason renders nothing and gates nothing.
-          if !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key))
+          // THE GATE ABOVE THE PLATE. `post_refusal` IS `post_gate`'s
+          // verdict, mirrored into state — the call used to sit at each
+          // of its EIGHT mounts, and the extern ABI is by-value, so the
+          // member roll was deep-cloned eight times a frame for a
+          // two-branch `any()`. The seven writers it was worth avoiding
+          // are now seven one-line assignments, and a lint fails the
+          // build on a writer that forgets one. An empty reason renders
+          // nothing and gates nothing.
+          if !empty(post_refusal)
             box
               with
                 w=fill
-                pl=16.0
-                pr=16.0
+                pl=18.0
+                pr=18.0
                 pt=12.0
               ComposerGate
                 with
-                  reason=post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key)
+                  reason=post_refusal
           box
             with
               w=fill
-              pl=16.0
-              pr=16.0
+              pl=18.0
+              pr=18.0
               pt=12.0
               pb=14.0
-            box
+            // ducktape-ui#697: the room's own composer instance. The key is
+            // the room, so the draft IS the room's draft; the plate, marks
+            // row, Send and the failed-send banner all moved inside.
+            ChatComposer #composer(composer_scope(endpoint, active_channel))
               with
-                w=fill
-                bg=surface
-                border=control_line
-                border-w=1.0
-                r=12.0
-                clip=true
-                shadow=shadow_popover
-                shadow-y=1.0
-                shadow-blur=2.0
-              col w=fill
-                extern rich_composer(message_editor, "Message the channel…", (loading || !connected || empty(active_channel) || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key))), shift_held, 44.0, 150.0, 10.0) #message -> emit(composer_event, _)
-                // The Slack seat: format controls on the left, send on the
-                // right, one row under the input. `ComposerMarks` is the SAME
-                // row the rail's composer mounts — it moved into a component
-                // the day the rail stopped going without one.
-                box
-                  with
-                    w=fill
-                    pl=8.0
-                    pr=8.0
-                    pb=8.0
-                  row
-                    with
-                      w=fill
-                      gap=2.0
-                      align=center
-                    ComposerMarks
-                      with
-                        disabled=(loading || !connected || empty(active_channel) || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key)))
-                      events
-                        mark -> emit(composer_mark, _)
-                    space w=fill
-                    text "↵ send · ⇧↵ newline"
-                      with
-                        size=10.5
-                        wrap=none
-                        font=code_medium
-                        @text-label
-                    space w=8.0
-                    button "Send" -> emit(composer_event, composer_submit_event())
-                      with
-                        disabled=(loading || !connected || empty(active_channel) || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key)) || empty(trim(editor_text(message_editor))))
-                        h=29.0
-                        @primary_action
-                        @px-12px
-                        @py-7px
+                kind=ComposerKind.message
+                compact=false
+                hint="Message the channel…"
+                blocked=(loading || !connected || empty(active_channel) || !empty(post_refusal))
+                restore_blocked=(mutation_phase != MutationPhase.idle)
+                failed_note="An earlier message wasn’t sent"
+              events
+                submitted -> emit(composer_submitted, _, _, _)
         // THE DETAILS DRAWER — a sidebar-toned rail with one header bar, the
         // channel's identity up top, eyebrowed NAME and MEMBERS sections, and
         // the archive act alone at the bottom where a destructive control
@@ -1112,13 +1246,13 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
               box
                 with
                   w=fill
+                  h=50.0
                   pl=16.0
                   pr=10.0
-                  pt=9.0
-                  pb=9.0
                 row
                   with
                     w=fill
+                    h=fill
                     gap=6.0
                     align=center
                   text "Channel details"
@@ -1131,6 +1265,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                   button -> emit(toggle_channel_settings)
                     with
                       label="Close channel details"
+                      expanded=channel_settings_open
                       w=28.0
                       h=28.0
                       p=0.0
@@ -1211,19 +1346,19 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         with
                           label="Channel name"
                           hint="Channel name"
-                          disabled=(mutation_phase != "idle")
+                          disabled=(mutation_phase != MutationPhase.idle)
                           submit=emit(rename_channel_submit)
                           w=fill
                           p=6.6
                           text-size=13.0
                           line-h=1.2
                           @control
-                        active bg=surface border=border value=fg placeholder=muted selection=fg/18 border-w=1.0 r=8.0
+                        active bg=surface value=fg placeholder=muted selection=fg/18 border-w=1.0 r=8.0
                         hovered bg=surface border=control_line
                         disabled value=muted
                       button "Rename" -> emit(rename_channel_submit)
                         with
-                          disabled=(mutation_phase != "idle" || empty(trim(channel_name_draft)))
+                          disabled=(mutation_phase != MutationPhase.idle || empty(trim(channel_name_draft)))
                           h=29.0
                           p=6.0
                           @secondary_action
@@ -1253,7 +1388,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         with
                           label="Member public key"
                           hint="Member key (64 hex)"
-                          disabled=(mutation_phase != "idle")
+                          disabled=(mutation_phase != MutationPhase.idle)
                           submit=emit(add_channel_member_submit)
                           w=fill
                           p=7.4
@@ -1261,12 +1396,12 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                           line-h=1.2
                           font=code
                           @control
-                        active bg=surface border=border value=fg placeholder=muted selection=fg/18 border-w=1.0 r=8.0
+                        active bg=surface value=fg placeholder=muted selection=fg/18 border-w=1.0 r=8.0
                         hovered bg=surface border=control_line
                         disabled value=muted
                       button "Add" -> emit(add_channel_member_submit)
                         with
-                          disabled=(mutation_phase != "idle" || empty(trim(member_key_draft)))
+                          disabled=(mutation_phase != MutationPhase.idle || empty(trim(member_key_draft)))
                           h=29.0
                           p=6.0
                           @secondary_action
@@ -1280,7 +1415,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                     if !empty(channel_members)
                       col w=fill gap=1.0
                         for member in channel_members
-                          ChatMemberRow member=member disabled=(mutation_phase != "idle")
+                          ChatMemberRow member=member disabled=(mutation_phase != MutationPhase.idle)
                             forward
                               remove_channel_member_submit
               box
@@ -1306,7 +1441,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                   if !active_channel_archived
                     button "Archive channel" -> emit(archive_channel_submit)
                       with
-                        disabled=(mutation_phase != "idle")
+                        disabled=(mutation_phase != MutationPhase.idle)
                         w=fill
                         h=30.0
                         p=6.0
@@ -1317,7 +1452,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                   if active_channel_archived
                     button "Unarchive channel" -> emit(unarchive_channel_submit)
                       with
-                        disabled=(mutation_phase != "idle")
+                        disabled=(mutation_phase != MutationPhase.idle)
                         w=fill
                         h=30.0
                         p=6.0
@@ -1339,9 +1474,9 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
               h=fill
               bg=sidebar
             stack w=fill h=fill
-              sensor show=emit(thread_resized, _, _) resize=emit(thread_resized, _, _)
+              sensor show=thread_resized resize=thread_resized
                 space w=fill h=fill
-              mouse press-at=emit(thread_pointer_pressed, _, _)
+              mouse press-at=thread_pointer_pressed
                 col w=fill h=fill
                   // The header carries the CHANNEL as its caption, not a reply
                   // count — `len(thread_messages)` counts the root too, and the
@@ -1375,7 +1510,10 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                             font=display
                             @text-fg
                       row gap=2.0 align=center
-                        if empty(active_dm_peer)
+                        // The same discriminant the main header reads: the
+                        // RESOLVED name, so a roster miss shows `# <channel>`
+                        // in both places instead of two readings of one room.
+                        if empty(active_dm.name)
                           text "#"
                             with
                               size=11.0
@@ -1390,7 +1528,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                       button -> emit(close_thread)
                         with
                           label="Close thread"
-                          disabled=(mutation_phase != "idle")
+                          disabled=(mutation_phase != MutationPhase.idle)
                           w=24.0
                           h=24.0
                           p=0.0
@@ -1426,6 +1564,15 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                       auto=true
                     // The 16px right inset doubles as the scrollbar
                     // clearance the code/quote slabs needed (#927).
+                    //
+                    // VIRTUALIZED, on the stream's terms and for the stream's
+                    // reason: a thread pages in at the same 256 replies a
+                    // channel does, and a plain column culls only `draw` —
+                    // `update`, `mouse_interaction`, `overlay` and `layout`
+                    // walk every reply ever loaded, on every event and every
+                    // frame. 44px is the stream's estimate and a reply is the
+                    // stream's card. The scroll above is anchor-y=end, which
+                    // virtualization needs.
                     col
                       with
                         w=fill
@@ -1434,54 +1581,30 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                         pr=16.0
                         pt=12.0
                         pb=8.0
-                      for thread_message in thread_messages
-                        // THE ROOT GETS ITS OWN DIVIDED BLOCK. One
-                        // loop, one discriminant: `active_thread_seq`
-                        // IS the root's seq and `thread_messages`
-                        // carries it, so the split needs no state and
-                        // no fn. The root's read-only block is the
-                        // artifact's; its hover bar, reactions and
-                        // edit/delete are not lost, they stay on the
-                        // same message in the stream one pane over,
-                        // which is on screen the whole time this rail
-                        // is.
-                        if thread_message.seq == active_thread_seq
-                          ThreadParentBlock message=thread_message
-                        // The settle ✓ mirrors the stream's arms: the one
-                        // reply `thread_send_flash_id` anchors rides the
-                        // shared fade, every other row passes 0.0.
-                        if thread_message.seq != active_thread_seq && thread_message.id == thread_send_flash_id
-                          ThreadMessageCard
-                            with
-                              message=thread_message
-                              selected=(thread_message.seq == thread_target_seq)
-                              menu_open=(thread_message.seq == thread_selected_seq)
-                              disabled=loading
-                              flash=send_flash_value
-                            forward
-                              add_reaction_at
-                              remove_reaction_at
-                              open_thread_for
-                              open_thread_message_actions
-                              open_thread_message_reactions
-                        if thread_message.seq != active_thread_seq && thread_message.id != thread_send_flash_id
-                          ThreadMessageCard
-                            with
-                              message=thread_message
-                              selected=(thread_message.seq == thread_target_seq)
-                              menu_open=(thread_message.seq == thread_selected_seq)
-                              disabled=loading
-                              flash=0.0
-                            forward
-                              add_reaction_at
-                              remove_reaction_at
-                              open_thread_for
-                              open_thread_message_actions
-                              open_thread_message_reactions
-                      if thread_has_more && thread_next_reply_offset >= 0
-                        button "Load more replies" -> emit(load_more_thread)
+                      // The same whole-list boundary as the channel stream.
+                      // Reply-composer edits and unrelated app state stop at
+                      // the cheap revision instead of walking every loaded
+                      // reply. Paging chrome stays outside the memo, so its
+                      // busy phase does not invalidate the timeline.
+                      lazy thread_messages by thread_messages_revision, active_channel, active_thread_seq, thread_target_seq, thread_selected_seq, loading as cached_thread_messages
+                        ThreadTimeline
                           with
-                            disabled=(thread_loading || mutation_phase != "idle")
+                            messages=cached_thread_messages
+                            active_thread_seq
+                            thread_target_seq
+                            thread_selected_seq
+                            loading
+                          forward
+                            add_reaction_at
+                            remove_reaction_at
+                            open_thread_for
+                            open_thread_message_actions
+                            open_thread_message_reactions
+                            open_message_link
+                      if thread_has_more && thread_next_reply_seq > 0 && thread_loading
+                        button "Loading replies…" -> emit(load_more_thread)
+                          with
+                            disabled=true
                             w=fill
                             h=28.0
                             p=5.0
@@ -1489,42 +1612,17 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                           active bg=transparent text=muted r=7.0
                           hovered bg=fg/9 text=fg
                           pressed bg=brand_bg
-                  if !empty(failed_reply_draft)
-                    box
-                      with
-                        w=fill
-                        pl=16.0
-                        pr=16.0
-                        pt=8.0
-                      row
-                        with
-                          w=fill
-                          gap=6.0
-                          align=center
-                        text "Unsent reply"
+                      if thread_has_more && thread_next_reply_seq > 0 && !thread_loading
+                        button "Load more replies" -> emit(load_more_thread)
                           with
+                            disabled=(mutation_phase != MutationPhase.idle)
                             w=fill
-                            size=12.5
-                            @text-muted
-                        button "Restore" -> emit(restore_failed_reply)
-                          with
-                            disabled=(!empty(trim(editor_text(reply_editor))))
-                            h=26.0
+                            h=28.0
                             p=5.0
                             @secondary_action
-                          active bg=fg/9 text=fg border=fg/11 border-w=1.0 r=7.0
-                          hovered bg=fg/14
-                          pressed bg=fg/18
-                        button "×" -> emit(dismiss_failed_reply)
-                          with
-                            label="Dismiss unsent reply"
-                            w=26.0
-                            h=26.0
-                            p=4.0
-                            @ghost_action
                           active bg=transparent text=muted r=7.0
-                          hovered bg=fg/10 text=fg
-                          pressed bg=fg/15
+                          hovered bg=fg/9 text=fg
+                          pressed bg=brand_bg
                   // The stream's composer plate, in the rail's width: same
                   // surface/control_line/r12 chrome, the same `ComposerMarks`
                   // row, the same Send.
@@ -1542,7 +1640,11 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                   // optimistic append and a rollback under a raw 400.
                   // `active_channel_archived` drops out because post_gate's
                   // `channel_archived` arm IS that case (see ComposerGate) — one
-                  // discriminant, not two. The reason SENTENCE stays mounted once,
+                  // discriminant, not two. The stream's `loading` drops out for a
+                  // different reason: it is the STREAM's readiness, the rail's is
+                  // `thread_loading`, and `reply_composer_event` no longer refuses
+                  // on it either — a term in the guard that the button does not
+                  // wear is a dead control. The reason SENTENCE stays mounted once,
                   // over the stream's plate: 330px has no room to say it twice.
                   box
                     with
@@ -1551,47 +1653,24 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                       pr=16.0
                       pt=10.0
                       pb=14.0
-                    box
+                    // The rail's composer instance, keyed by the THREAD: a
+                    // reply draft belongs to the thread it replies to, and
+                    // closing the rail no longer discards it — the instance
+                    // (and its words) are simply waiting for the rail to
+                    // reopen on the same thread.
+                    ChatComposer #reply_composer(thread_scope(endpoint, active_channel, active_thread_seq))
                       with
-                        w=fill
-                        bg=surface
-                        border=control_line
-                        border-w=1.0
-                        r=12.0
-                        clip=true
-                        shadow=shadow_popover
-                        shadow-y=1.0
-                        shadow-blur=2.0
-                      col w=fill
-                        extern rich_composer(reply_editor, "Reply…", (thread_loading || !connected || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key))), shift_held, 44.0, 150.0, 10.0) #reply -> emit(reply_composer_event, _)
-                        box
-                          with
-                            w=fill
-                            pl=8.0
-                            pr=8.0
-                            pb=8.0
-                          row
-                            with
-                              w=fill
-                              gap=2.0
-                              align=center
-                            ComposerMarks
-                              with
-                                disabled=(thread_loading || !connected || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key)))
-                              events
-                                mark -> emit(reply_composer_mark, _)
-                            space w=fill
-                            button "Send" -> emit(reply_composer_event, composer_submit_event())
-                              with
-                                label="Send reply"
-                                disabled=(thread_loading || !connected || !empty(post_gate(active_channel_archived, active_channel_members_only, channel_members, user_key)) || empty(trim(editor_text(reply_editor))))
-                                h=28.0
-                                @primary_action
-                                @px-11px
-                                @py-6px
+                        kind=ComposerKind.reply
+                        compact=true
+                        hint="Reply…"
+                        blocked=(thread_loading || !connected || !empty(post_refusal))
+                        restore_blocked=false
+                        failed_note="Unsent reply"
+                      events
+                        submitted -> emit(composer_submitted, _, _, _)
               overlay
                 with
-                  when=(thread_selected_seq > 0 && thread_message_action != "toolbar")
+                  when=(thread_selected_seq > 0 && thread_message_action != MessageAction.toolbar)
                   dismiss=emit(clear_thread_message_selection)
                   backdrop=transparent
                   p=8.0
@@ -1600,9 +1679,9 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                 content
                   space w=fill h=fill
                 layer
-                  float x=0.0 y=thread_menu_y
+                  box w=fill h=fill pt=block_action_menu_y(thread_pointer_y, thread_height) align-x=end align-y=start
                     col
-                      if thread_message_action == "more"
+                      if thread_message_action == MessageAction.more
                         stack
                           input "" #thread-action-focus <-> message_action_focus
                             with
@@ -1620,10 +1699,10 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                               p=5.0
                               style=raised_style()
                             col w=fill gap=1.0
+                              // Live for the same reason as the stream's twin.
                               button -> emit(open_thread_message_reactions, thread_selected_seq, thread_edit_draft, thread_selected_rev)
                                 with
                                   label="Manage reactions"
-                                  disabled=active_channel_archived
                                   w=fill
                                   h=30.0
                                   p=0.0
@@ -1723,7 +1802,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                 active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
                                 hovered bg=danger_bg text=fg
                                 pressed bg=danger_line text=fg
-                      if thread_message_action == "reactions"
+                      if thread_message_action == MessageAction.reactions
                         stack
                           input "" #thread-reaction-focus <-> message_action_focus
                             with
@@ -1768,7 +1847,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                   active bg=transparent text=fg border=transparent border-w=1.0 r=6.0
                                   hovered bg=fg/10
                                   pressed bg=fg/15
-                      if thread_message_action == "editing"
+                      if thread_message_action == MessageAction.editing
                         box
                           with
                             w=fill
@@ -1783,7 +1862,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                               with
                                 label="Edit message"
                                 hint="Edit message"
-                                disabled=(mutation_phase != "idle")
+                                disabled=(mutation_phase != MutationPhase.idle)
                                 submit=emit(edit_thread_message_submit)
                                 w=fill
                                 p=6.2
@@ -1792,18 +1871,21 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                 @control
                               active bg=transparent border=transparent value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
                               hovered bg=fg/4 border=fg/8
+                              // Same borderless-at-rest editor as the main stream's, so
+                              // the same focused plate — see `#message-edit` above.
+                              focused bg=fg/4 border=ring
                               disabled value=muted
                             button "Save" -> emit(edit_thread_message_submit)
                               with
                                 label="Save message changes"
-                                disabled=(mutation_phase != "idle" || empty(trim(thread_edit_draft)))
+                                disabled=(mutation_phase != MutationPhase.idle || empty(trim(thread_edit_draft)))
                                 h=28.0
                                 p=6.0
                                 @primary_action
                             button -> emit(clear_thread_message_selection)
                               with
                                 label="Cancel message edit"
-                                disabled=(mutation_phase != "idle")
+                                disabled=(mutation_phase != MutationPhase.idle)
                                 w=28.0
                                 h=28.0
                                 p=0.0
@@ -1818,7 +1900,7 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                               active bg=transparent text=muted r=7.0
                               hovered bg=fg/10 text=fg
                               pressed bg=fg/15
-                      if thread_message_action == "delete"
+                      if thread_message_action == MessageAction.delete
                         stack
                           input "" #thread-delete-focus <-> message_action_focus
                             with
@@ -1834,13 +1916,13 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                               text "Delete this message?" size=12.5 @text-muted
                               button "Delete" -> emit(delete_thread_message_submit)
                                 with
-                                  disabled=(mutation_phase != "idle")
+                                  disabled=(mutation_phase != MutationPhase.idle)
                                   h=26.0
                                   p=5.0
                                   @danger_action
                               button "Cancel" -> emit(clear_thread_message_selection)
                                 with
-                                  disabled=(mutation_phase != "idle")
+                                  disabled=(mutation_phase != MutationPhase.idle)
                                   h=26.0
                                   p=5.0
                                   @secondary_action

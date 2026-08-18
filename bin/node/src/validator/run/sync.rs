@@ -1,10 +1,61 @@
 //! State-sync request handling over loop-owned consensus state.
 
 use super::ValidatorRuntime;
-use crate::explorer::ship_index_blobs;
-use crate::host_reads::{read_valset_members, read_valset_residents};
-use crate::sync::serve::{SyncBoundary, SyncStateRequest};
+use crate::host_reads::{read_sync_mesh_window, read_valset_members, read_valset_residents};
+use crate::sync::serve::{SyncBoundary, SyncIndexOps, SyncStateRequest};
 use crate::util::{participant_bytes, resident_bytes};
+
+/// one page of a module's stored op rows at or below `up_to_height`, in key
+/// order, for the joiner backfill lane. the store's own `scan` already pages
+/// in key order off one MVCC snapshot; all this adds is the height ceiling —
+/// op keys are fixed-width hex, so lexicographic order IS `(height, seq)`
+/// order and the ceiling is a prefix of the page.
+fn read_index_ops(
+    index: &indexer::IndexStore,
+    module: &str,
+    after: Option<(u64, u32)>,
+    up_to_height: u64,
+) -> Result<SyncIndexOps, String> {
+    let cursor = after.map(|(height, seq)| indexer::op_key(height, seq));
+    let page = index
+        .scan(
+            module,
+            indexer::OP_PREFIX.as_bytes(),
+            cursor.as_deref().map(str::as_bytes),
+            // the wire's page cap, so the store's own `has_more` already
+            // answers for the whole page and nothing is dropped downstream.
+            statesync::INDEX_OPS_BATCH_LEN,
+        )
+        .map_err(|e| format!("index op page for {module}: {e}"))?;
+    let above_ceiling =
+        |key: &[u8]| indexer::parse_op_key(key).is_none_or(|(height, _)| height > up_to_height);
+    let scanned = page.entries.len();
+    let served = page
+        .entries
+        .iter()
+        .position(|(key, _)| above_ceiling(key))
+        .unwrap_or(scanned);
+    let mut rows = Vec::with_capacity(served);
+    for (key, value) in page.entries.into_iter().take(served) {
+        // op keys are ascii by construction; anything else means a damaged
+        // store, and shipping it would only damage the joiner's too.
+        let key = String::from_utf8(key)
+            .map_err(|_| format!("index op key for {module} is not utf-8 — rebuild the index"))?;
+        rows.push((key, value));
+    }
+    Ok(SyncIndexOps {
+        rows,
+        // reaching the ceiling ENDS the walk; only a page cut short by the
+        // store's own limit still owes rows.
+        has_more: served == scanned && page.has_more,
+        source_floor: index
+            .backfill_height(module)
+            .map_err(|e| format!("index floor for {module}: {e}"))?,
+        applied_height: index
+            .applied_height(module)
+            .map_err(|e| format!("index watermark for {module}: {e}"))?,
+    })
+}
 
 impl ValidatorRuntime<'_> {
     pub(super) async fn on_sync(&mut self, req: SyncStateRequest) {
@@ -12,7 +63,6 @@ impl ValidatorRuntime<'_> {
             node,
             orchestrator,
             latest_floor,
-            label,
             index,
             ..
         } = self;
@@ -27,6 +77,12 @@ impl ValidatorRuntime<'_> {
                 // the floor certificate is served only when it certifies
                 // exactly the current boundary — a cert behind the
                 // boundary would make a joiner skip history it needs.
+                // the mesh window rides COMMITTED valset state (the same
+                // read point as Standing), deliberately not the
+                // epoch-frozen orchestrator sets: a frozen set at a live
+                // generation index would recreate the joiner/member
+                // asymmetry the window exists to end.
+                let (generation, mesh_window) = read_sync_mesh_window(node.host()).await;
                 let coords = statesync::BoundaryCoords {
                     epoch: orchestrator.epoch(),
                     view_base: orchestrator.epoch_base(),
@@ -37,6 +93,8 @@ impl ValidatorRuntime<'_> {
                         .filter(|fc| fc.epoch == orchestrator.epoch())
                         .filter(|fc| node.finalized().is_some_and(|f| f.height == fc.height))
                         .map(|fc| fc.cert.clone()),
+                    generation,
+                    mesh_window,
                 };
                 let finalized_for_sync = node
                     .finalized()
@@ -104,8 +162,13 @@ impl ValidatorRuntime<'_> {
                     .await;
                 let _ = reply.send(read);
             }
-            SyncStateRequest::IndexCut { reply } => {
-                let _ = reply.send(ship_index_blobs(index, label));
+            SyncStateRequest::IndexOps {
+                module,
+                after,
+                up_to_height,
+                reply,
+            } => {
+                let _ = reply.send(read_index_ops(index, &module, after, up_to_height));
             }
             SyncStateRequest::TipCoords { reply } => {
                 // the detection lane: everything here is already
@@ -119,18 +182,27 @@ impl ValidatorRuntime<'_> {
                 // Boundary path.
                 let answer = match node.finalized() {
                     None => Err("no finalized boundary to serve yet".to_string()),
-                    Some(f) => Ok(statesync::TipCoords {
-                        height: f.height,
-                        root_hash: f.root_hash,
-                        epoch: orchestrator.epoch(),
-                        view_base: orchestrator.epoch_base(),
-                        participants: participant_bytes(orchestrator),
-                        residents: resident_bytes(orchestrator),
-                        has_floor: latest_floor
-                            .as_ref()
-                            .filter(|fc| fc.epoch == orchestrator.epoch())
-                            .is_some_and(|fc| fc.height == f.height),
-                    }),
+                    Some(f) => {
+                        // committed valset reads, like the Standing arm — the
+                        // window must reflect a just-committed grant NOW, not
+                        // at the epoch cutover.
+                        let (generation, mesh_window) =
+                            read_sync_mesh_window(node.host()).await;
+                        Ok(statesync::TipCoords {
+                            height: f.height,
+                            root_hash: f.root_hash,
+                            epoch: orchestrator.epoch(),
+                            view_base: orchestrator.epoch_base(),
+                            participants: participant_bytes(orchestrator),
+                            residents: resident_bytes(orchestrator),
+                            has_floor: latest_floor
+                                .as_ref()
+                                .filter(|fc| fc.epoch == orchestrator.epoch())
+                                .is_some_and(|fc| fc.height == f.height),
+                            generation,
+                            mesh_window,
+                        })
+                    }
                 };
                 let _ = reply.send(answer);
             }

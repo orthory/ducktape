@@ -11,8 +11,8 @@ use crate::config::{self, Resolved, hex_bytes};
 
 /// `run_node`'s boot-time config derivation (phase P0): the `Resolved`
 /// destructure plus everything derived from it before the first listener
-/// bind — promoted state, the chain-id string, the mesh-state path,
-/// and the cold-restart mesh dial seeds folded into `bootstrappers`.
+/// bind — the chain-id string, the mesh-state path, and the mesh ADDRESS
+/// BOOK seeded from the config dial hints and the persisted mesh state.
 pub(crate) struct BootEnv {
     pub(crate) signer: ed25519::PrivateKey,
     pub(crate) label: String,
@@ -20,7 +20,10 @@ pub(crate) struct BootEnv {
     pub(crate) identity_chain_id: String,
     pub(crate) peers: Vec<ed25519::PublicKey>,
     pub(crate) validators: Vec<ed25519::PublicKey>,
-    pub(crate) bootstrappers: Vec<(ed25519::PublicKey, Ingress)>,
+    /// the mesh transport's address authority: hints + persisted adverts
+    /// seeded here, live adverts observed by the reachability pump.
+    /// (`sync_candidates` below carries the raw hint pairs onward.)
+    pub(crate) mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
     pub(crate) coordinated: Vec<(ed25519::PublicKey, Ingress, ed25519::PublicKey)>,
     pub(crate) listen: SocketAddr,
     pub(crate) advertised: Ingress,
@@ -53,11 +56,6 @@ pub(crate) struct BootEnv {
     pub(crate) mesh_state_file: PathBuf,
     pub(crate) checkpoint_blocks: u64,
     pub(crate) dev_demo: bool,
-    /// ORPHANED by the in-process promotion seat (its only consumer was the
-    /// promotion exec-reboot's index staging); the config key survives until
-    /// the shipped-index lane is swept as one follow-up removal.
-    #[allow(dead_code)]
-    pub(crate) sync_index: bool,
     /// the operator's `[sandbox]` table — HOW a run is isolated on this host.
     /// `None` = consensus-only: no podman service, no terminal plane. The node
     /// itself no longer executes provider work, so this drives the pty plane
@@ -72,7 +70,6 @@ pub(crate) struct BootEnv {
     /// for its pool's ledger, so the scheduler can never be promised what this
     /// host cannot seat. EMPTY for a consensus-only node.
     pub(crate) sandbox_capacity: BTreeMap<String, u64>,
-    pub(crate) promoted: bool,
 }
 
 pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
@@ -100,7 +97,7 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         namespace,
         mesh: peers,
         validators,
-        bootstrappers,
+        dial_hints,
         coordinated,
         listen,
         advertised,
@@ -114,7 +111,6 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         invite_token,
         invite_wireguard,
         invite_fronts,
-        sync_index,
         coordination,
         coord_cap,
         primary_coordinator,
@@ -122,23 +118,19 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         wireguard_advertised,
         compute_backend,
     } = resolved;
-    // a key outside the GENESIS validator set is not an error: post-genesis
-    // members are admitted via governance. with a recovery checkpoint on disk
-    // (a previous run promoted this identity) boot proceeds as a validator
-    // off the recovery record; with a fresh storage dir the node enters
-    // JOINER mode — park on the mesh, sync a boundary whose participant set
-    // includes this key, fabricate the equivalent recovery checkpoint, and
-    // reboot through the normal restore path. this filesystem probe mirrors
-    // the recovery store's layout (storage_dir/<partition>/) and only gates
-    // which listeners bind — the runtime re-decides joiner-vs-validator from
-    // the real store.
-    let promoted = storage
+    // A key outside the GENESIS validator set is not an error: post-genesis
+    // standing is admitted via governance and resolved from the latest
+    // committed manifest at runtime. This cheap filesystem probe only decides
+    // whether the fresh-joiner banner is truthful; the real recovery store is
+    // opened later.
+    let has_recovery_manifest = storage
         .join("recovery-manifest")
         .read_dir()
         .map(|mut entries| entries.next().is_some())
         .unwrap_or(false);
-    let joiner = !sync_only && !validators.contains(&signer.public_key()) && !promoted;
-    if joiner {
+    let fresh_joiner =
+        !sync_only && !validators.contains(&signer.public_key()) && !has_recovery_manifest;
+    if fresh_joiner {
         if invite_token.is_some() {
             tracing::info!(
                 target: "ducktape::join",
@@ -156,18 +148,9 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         }
     }
 
-    // keep the raw (key, addr) pairs for statesync source selection before
-    // discovery's bootstrapper list converts to its own ingress address type.
-    let sync_candidates = bootstrappers.clone();
-    // cold-restart dial seeding: the persisted mesh's control endpoints (the
-    // chain-derived ULAs for overlay-advertised members) join the dial
-    // hints, so a member restarting with every configured ingress gone
-    // still dials its peers over the tunnels the reachability plane
-    // re-applies at boot. Config hints win: a peer that already has a
-    // configured entry gets no seed, in case discovery keeps one ingress
-    // per key — a possibly-dead persisted address must never displace a
-    // live operator-provided one. Load refusals (tamper, format, chain) are
-    // the plane's to surface at its restore; here they just mean no seeds.
+    // keep the raw (key, addr) pairs for statesync source selection; the
+    // mesh reads the same hints through the address book below.
+    let sync_candidates = dial_hints.clone();
     let chain_id = String::from_utf8_lossy(&namespace).to_string();
     let mesh_state_file = storage.join("mesh-state.json");
     // fail-closed check for private coordination: a node that is neither a
@@ -190,39 +173,52 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
              fronted/direct reach hint"
         );
     }
-    let mesh_dial_seeds: Vec<(ed25519::PublicKey, Ingress)> =
-        match reachability::store::load(&mesh_state_file, &chain_id) {
-            Ok(Some(mesh)) => {
-                let me = reachability::identity_of(&signer.public_key());
-                let seeds: Vec<(ed25519::PublicKey, Ingress)> = mesh
-                    .adverts
-                    .iter()
-                    .map(|advert| &advert.record)
-                    .filter(|record| record.validator_identity != me)
-                    .filter_map(|record| {
-                        let pk =
-                            ed25519::PublicKey::decode(&record.validator_identity.0[..]).ok()?;
-                        if bootstrappers.iter().any(|(hinted, _)| *hinted == pk) {
-                            return None;
-                        }
-                        Some((pk, Ingress::Socket(record.control_endpoint.socket_addr())))
-                    })
-                    .collect();
-                if !seeds.is_empty() {
-                    tracing::info!(
-                        target: "ducktape::reachability",
-                        node = %label,
-                        seeds = seeds.len(),
-                        epoch = mesh.epoch,
-                        "persisted mesh dial seeds restored"
-                    );
-                }
-                seeds
-            }
-            _ => Vec::new(),
-        };
-    let bootstrappers: Vec<(ed25519::PublicKey, _)> =
-        bootstrappers.into_iter().chain(mesh_dial_seeds).collect();
+    // the mesh ADDRESS BOOK: config dial hints as the operator tier, then
+    // the persisted mesh's control endpoints (member adverts AND standby
+    // records — a parked resident's endpoint is exactly what a member needs
+    // at its grant re-track) as the weakest tier, so a member restarting
+    // with every configured ingress gone still dials its peers. tier
+    // precedence inside the book keeps a possibly-dead persisted address
+    // from ever displacing a live operator-provided one. Load refusals
+    // (tamper, format, chain) are the plane's to surface at its restore;
+    // here they just mean no seeds.
+    let default_mesh_port = config::DEFAULT_MESH_LISTEN
+        .parse::<SocketAddr>()
+        .expect("the default mesh listen parses")
+        .port();
+    let mesh_book = std::sync::Arc::new(crate::mesh_book::MeshAddressBook::new(
+        chain_id.clone(),
+        default_mesh_port,
+    ));
+    for (peer, ingress) in &dial_hints {
+        mesh_book.seed_hint(peer.clone(), ingress.clone());
+    }
+    if let Ok(Some(mesh)) = reachability::store::load(&mesh_state_file, &chain_id) {
+        let me = reachability::identity_of(&signer.public_key());
+        let persisted_records = mesh
+            .adverts
+            .iter()
+            .map(|advert| &advert.record)
+            .chain(mesh.standby_records.iter().map(|signed| &signed.record))
+            .filter(|record| record.validator_identity != me);
+        let mut seeded = 0usize;
+        for record in persisted_records {
+            let Ok(pk) = ed25519::PublicKey::decode(&record.validator_identity.0[..]) else {
+                continue;
+            };
+            mesh_book.seed_persisted(pk, record.control_endpoint.socket_addr());
+            seeded += 1;
+        }
+        if seeded > 0 {
+            tracing::info!(
+                target: "ducktape::reachability",
+                node = %label,
+                seeds = seeded,
+                epoch = mesh.epoch,
+                "persisted mesh dial seeds restored"
+            );
+        }
+    }
 
     for (i, pk) in peers.iter().enumerate() {
         tracing::debug!(
@@ -276,11 +272,11 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
     // what still needs a TCP foothold is the gossip itself: with ZERO
     // bootstrap links nothing carries this node's records anywhere. a
     // RESTART has one without config: the persisted mesh re-applies at boot
-    // and its ULA seeds joined `bootstrappers` above. what remains uncovered
+    // and its control endpoints seeded the address book above. what remains
     // is the FIRST join (nothing persisted yet) on a coordinated-only
     // config — surface that loudly rather than park silently.
     if !coordinated.is_empty() {
-        if bootstrappers.is_empty() {
+        if dial_hints.is_empty() {
             tracing::warn!(
                 target: "ducktape::reachability",
                 node = %label,
@@ -325,7 +321,7 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         identity_chain_id,
         peers,
         validators,
-        bootstrappers,
+        mesh_book,
         coordinated,
         listen,
         advertised,
@@ -350,10 +346,8 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         mesh_state_file,
         checkpoint_blocks,
         dev_demo,
-        sync_index,
         sandbox,
         compute_backend,
         sandbox_capacity,
-        promoted,
     }
 }

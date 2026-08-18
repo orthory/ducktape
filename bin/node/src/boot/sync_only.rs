@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use commonware_cryptography::ed25519;
-use commonware_p2p::authenticated::discovery::{self, Network};
-use commonware_p2p::{Manager, Receiver as P2pReceiver};
+use commonware_p2p::authenticated::lookup::{self, Network};
+use commonware_p2p::Receiver as P2pReceiver;
 use commonware_runtime::{Clock, Quota, Spawner, Supervisor};
 use commonware_utils::ordered::Set;
 use statesync::fetch_manifest;
@@ -26,10 +26,12 @@ pub(crate) async fn run(
         overlay_net::OverlayContext<commonware_runtime::tokio::Context>,
         ed25519::PrivateKey,
     >,
-    mut oracle: discovery::Oracle<ed25519::PublicKey>,
+    mut oracle: lookup::Oracle<ed25519::PublicKey>,
     quota: Quota,
     signer: &ed25519::PrivateKey,
     mesh_participants: Set<ed25519::PublicKey>,
+    validators: &[ed25519::PublicKey],
+    mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
     sync_sources: Vec<ed25519::PublicKey>,
     metrics: noded::NodeMetrics,
     storage_for_sync: std::path::PathBuf,
@@ -44,12 +46,18 @@ pub(crate) async fn run(
         phase = "syncing",
         node = label
     );
-    // no consensus coordinates yet: track the genesis mesh at the
-    // base index. validators ignore this index if they have rotated
-    // past keeping it; connection authorization is the UNION of every
-    // tracked set on each side, so the descriptor's members stay
-    // reachable.
-    oracle.track(PEER_SET, mesh_participants.clone());
+    // no consensus coordinates yet: track the GENESIS window (index 0,
+    // primary = the descriptor's fingerprinted validators — byte-equal
+    // to valset's generation-0 snapshot on every member; the wider
+    // descriptor mesh rides as secondary). members that rotated past
+    // keeping index 0 ignore it; connection authorization is the UNION
+    // of every tracked set on each side, so the descriptor's members
+    // stay reachable. one-shot: this ephemeral observer never re-tracks.
+    let mut mesh_window = crate::mesh_window::MeshWindowTracker::new(
+        &mesh_participants.iter().cloned().collect::<Vec<_>>(),
+        label,
+    );
+    mesh_window.track_genesis(&mut oracle, &mesh_book, validators);
     // ---- the SYNC-ONLY joiner: no engine, no votes — just the wire ----
     //
     // validators broadcast consensus traffic (votes, certificates,

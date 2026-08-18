@@ -2,7 +2,7 @@
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519};
-use commonware_p2p::{Manager as _, Recipients, Sender as _};
+use commonware_p2p::{Recipients, Sender as _};
 use commonware_runtime::{Clock as _, IoBuf};
 use commonware_utils::ordered::Set;
 
@@ -18,7 +18,7 @@ use crate::drain_actions::{
 };
 use noded::projection::{BlockProjection, project_block};
 use crate::host_reads::{
-    read_valset_members, read_valset_residents,
+    read_valset_members, read_valset_mesh_window, read_valset_residents,
 };
 use crate::{lobby, relay};
 use crate::util::{fatal, hex, participant_bytes, resident_bytes};
@@ -43,6 +43,8 @@ impl ValidatorRuntime<'_> {
             last_cert_height,
             latest_floor,
             mesh_oracle,
+            mesh_window,
+            mesh_book,
             gateway_book,
             media_peers,
             blob_peers,
@@ -53,7 +55,6 @@ impl ValidatorRuntime<'_> {
             prev_ckpt,
             signer,
             label,
-            peers,
             checkpoint_blocks,
             sync_lease,
             stream_hub,
@@ -229,30 +230,19 @@ impl ValidatorRuntime<'_> {
                     }
                     node::Disposition::Discarded => unreachable!("filtered at the loop top"),
                 };
-                // on a GRANT, re-track the just-admitted resident onto the
-                // mesh oracle IMMEDIATELY (blessed decision #1): its real key
-                // must complete the discovery handshake to dial statesync,
-                // and the epoch cutover that formally re-tracks it lands a
-                // few views later — a gap the joiner would spend bounced at
-                // the door. every validator resolves this same Applied block
-                // in its own drain, so the widened set converges within a
-                // beat (the same transient the reboot-inside-cutover window
-                // already tolerates).
-                if let lobby::IntroReply::Admitted { .. } = &reply
-                    && let Ok(joiner_pk) = ed25519::PublicKey::decode(gate.joiner.as_slice())
-                {
-                    let mut transport: std::collections::BTreeSet<ed25519::PublicKey> =
-                        orchestrator
-                            .current_members()
-                            .iter()
-                            .chain(orchestrator.current_residents())
-                            .cloned()
-                            .collect();
-                    transport.insert(joiner_pk);
-                    mesh_oracle.track(
-                        orchestrator.epoch(),
-                        super::super::wiring::mesh_at(peers, &transport),
-                    );
+                // on a GRANT, track the widened mesh window BEFORE the
+                // Admitted settles (blessed decision #1): the joiner's next
+                // act is dialing statesync, so its real key must be tracked
+                // first. the grant advanced the membership GENERATION at its
+                // commit block, so this lands on a fresh monotonic index —
+                // the old same-epoch re-track was silently warn-dropped by
+                // commonware ("peer set already exists") and the joiner
+                // actually waited out the cutover. every validator resolves
+                // this same Applied block in its own drain, so the widened
+                // window converges within a beat.
+                if let lobby::IntroReply::Admitted { .. } = &reply {
+                    let window = read_valset_mesh_window(node.host()).await;
+                    mesh_window.track_new(mesh_oracle, mesh_book, &window);
                 }
                 super::settle_gate(gate_outcomes, gate.joiner, reply);
                 continue;
@@ -633,6 +623,14 @@ impl ValidatorRuntime<'_> {
                     *pending_retarget = Some(event);
                 }
             }
+            // sync the mesh window at the same frozen read point: any
+            // committed membership change — a sibling member's grant, a
+            // governance leave/revoke — widens or narrows the mesh NOW, at
+            // its generation index; the epoch cutover below stays an
+            // engine/channel concern. monotonic bookkeeping makes the
+            // no-change case a silent no-op.
+            let committed_window = read_valset_mesh_window(node.host()).await;
+            mesh_window.track_new(mesh_oracle, mesh_book, &committed_window);
             let members_raw = read_valset_members(node.host()).await;
             let mut observed: Vec<ed25519::PublicKey> = Vec::new();
             for key in &members_raw {
@@ -675,19 +673,13 @@ impl ValidatorRuntime<'_> {
                     .collect();
                 let plan_resident_bytes: Vec<Vec<u8>> =
                     plan_residents.iter().map(|k| k.as_ref().to_vec()).collect();
-                // transport FIRST: the new epoch's mesh must admit
-                // its members (a fresh joiner — or a granted
-                // resident — above all) before anything is
-                // expected of them. the mesh tracks the TRANSPORT
-                // union; the engine below gets validators only.
-                // index = epoch, strictly increasing across
-                // cutovers.
-                mesh_oracle.track(
-                    plan.epoch(),
-                    super::super::wiring::mesh_at(peers, plan.valset().transport_members()),
-                );
+                // no mesh track here: the TRANSPORT union was already
+                // tracked at its GENERATION index by the window sync
+                // above, the moment the membership change committed —
+                // CUTOVER_DELAY views before this cutover. the epoch
+                // plane below (books, channels, engine) follows now.
                 // the gateway plane serves (and admits) exactly
-                // who the mesh tracks — follow the re-track.
+                // who the mesh tracks — follow the cutover.
                 if let Some(book) = &gateway_book {
                     book.set_peers(plan.valset().transport_members().iter());
                 }

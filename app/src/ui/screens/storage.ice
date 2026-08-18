@@ -3,12 +3,12 @@
 // plus the write bar; Explorer is workspace search over the block ledger it
 // falls back to.
 //
-// See `screens/roster.ice` for the screen contract: a screen is a component, so
-// it cannot reach app state — every reading arrives as a prop and every act
-// leaves as a named event that `view.ice` routes back to the handler of the
-// same name.
+// See `screens/roster.ice` for the screen contract: shared readings arrive as
+// props, interaction-local state stays here, and only application effects leave
+// as named events.
 
-component FilesScreen(path:str, listed:bool, entries:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, delete_target:str, history_open:bool, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, bind draft:editor, preview_text:str)
+component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, bind draft:editor, preview_text:str)
+  lifetime retained
   emits
     fs_open_dir(str)
     fs_open_file(str)
@@ -19,12 +19,15 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], connected:bool, 
     fs_arm_delete(str)
     fs_disarm_delete()
     fs_delete_submit()
-    fs_toggle_history()
     fs_close_diff()
     fs_show_diff(str)
     fs_begin_edit()
     fs_cancel_edit()
     fs_save_edit()
+  state
+    history_open = false
+  on fs_toggle_history
+    history_open = !history_open
   col w=fill h=fill
     // THE CRUMB BAR, not a screen header: where you are, what is here,
     // and who may write under it. The counts are pure folds over the
@@ -59,7 +62,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], connected:bool, 
           h=28.0
           gap=8.0
           align=center
-        button "↑" -> emit(fs_open_parent)
+        button -> emit(fs_open_parent)
           with
             label="Parent directory"
             disabled=(loading || empty(path))
@@ -67,6 +70,10 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], connected:bool, 
             h=26.0
             p=0.0
             @icon_action
+          text "↑"
+            with
+              size=12.5
+              font=ui
           active bg=surface text=muted border=card_line border-w=1.0 r=7.0
           hovered bg=elevated text=fg
           pressed bg=subtle
@@ -81,7 +88,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], connected:bool, 
             text-size=13.0
             line-h=1.2
             @control
-          active bg=surface border=border value=fg placeholder=hint selection=fg/18 border-w=1.0 r=7.0
+          active bg=surface value=fg placeholder=hint selection=fg/18 border-w=1.0 r=7.0
           hovered bg=muted_bg border=control_line
           disabled bg=muted_bg/54 value=muted
         button "+ Folder" -> emit(fs_mkdir_submit)
@@ -136,8 +143,9 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], connected:bool, 
               events
                 cancel -> emit(fs_disarm_delete)
                 confirm -> emit(fs_delete_submit)
-        button "History" -> emit(fs_toggle_history)
+        button "History" -> fs_toggle_history
           with
+            expanded=history_open
             h=26.0
             p=5.0
             @secondary_action
@@ -214,7 +222,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], connected:bool, 
               // THIS path there is nothing to read — the node is down, or the
               // rows still describe the directory you just left — and the main
               // pane already says so.
-              if connected && listed && fs_dir_count(entries) <= 0
+              if connected && listed && empty(directories)
                 box
                   with
                     w=fill
@@ -228,15 +236,14 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], connected:bool, 
               // drawing folders from a duckfs nobody could reach — and, after
               // a navigation, folders that live somewhere else.
               if connected && listed
-                for entry in entries
-                  if entry.kind == "dir"
-                    FsTreeRow
-                      with
-                        entry
-                        selected=false
-                        depth=0.0
-                      forward
-                        fs_open_dir
+                keyed entry in directories by=entry.key virtual-row=27.0 w=fill
+                  FsTreeRow
+                    with
+                      entry
+                      selected=false
+                      depth=0.0
+                    forward
+                      fs_open_dir
       box
         with
           w=1.0
@@ -378,12 +385,11 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], connected:bool, 
                   dir=vertical
                   w=fill
                   h=fill
-                col w=fill
-                  for entry in entries
-                    ObjectRow entry=entry selected=(entry.path == preview_path)
-                      forward
-                        fs_open_dir
-                        fs_open_file
+                keyed entry in entries by=entry.key virtual-row=39.0 w=fill
+                  ObjectRow entry=entry selected=(entry.path == preview_path)
+                    forward
+                      fs_open_dir
+                      fs_open_file
             if !empty(preview_path)
               col w=fill h=300.0
                 box
@@ -478,30 +484,51 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], connected:bool, 
                                   size=12.0
                                   font=code
                                   @text-fg
-      if connected && !empty(preview_path)
-        for entry in entries
-          if entry.path == preview_path
-            // `changed_by` / `changed_height` are fed the "not answered"
-            // pair on purpose. `last_changed_at_path` exists and the
-            // panel gates its rows on `changed_height > 0`, but the
-            // walk has to fire when the selected path CHANGES, and the
-            // only place that can watch a state field is the one
-            // `subscribe` block in handlers/lifecycle.ice — which this
-            // file does not own. Wiring the load there lights these two
-            // rows with no change here.
-            ObjectPanel
-              with
-                entry
-                changed_by=""
-                changed_height=0
+      if connected
+        if !empty(preview_entry.path)
+          ObjectPanel
+            with
+              entry=preview_entry
 
-component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading:bool, kinds:[KindCount], kind:str, partial:str, hits:[ExplorerHit], blocks:[ExplorerBlock], selected:i64, ops:[ExplorerOp], head:i64, sync_line:str)
+component ExplorerScreen(connected_rpc:str, connected:bool, loading:bool, blocks:[ExplorerBlock], ops:[ExplorerOp], head:i64, sync_line:str)
+  lifetime retained
   emits
-    explorer_search_submit()
-    clear_explorer_search()
     refresh_explorer()
-    pick_explorer_kind(str)
-    select_explorer_block(i64)
+    copy_to_clipboard(str, str)
+  state
+    query = ""
+    kind = "all"
+    hits:[ExplorerHit] = []
+    kinds:[KindCount] = []
+    partial = ""
+    searching = false
+    selected:i64 = 0
+  on explorer_search_submit(rpc, online)
+    let blocked = !online || searching || empty(trim(query))
+    return if blocked
+    searching = true
+    hits = []
+    kinds = []
+    partial = ""
+    kind = "all"
+    run replace lane=workspace_search search_workspace(rpc, trim(query)) -> explorer_results_loaded _
+  on explorer_results_loaded(next)
+    hits = next.hits
+    kinds = next.kinds
+    partial = next.partial
+    searching = false
+  on clear_explorer_search
+    invalidate lane=workspace_search
+    query = ""
+    hits = []
+    kinds = []
+    partial = ""
+    kind = "all"
+    searching = false
+  on pick_explorer_kind(next)
+    kind = next
+  on select_explorer_block(height)
+    selected = height
   col w=fill h=fill
     col
       with
@@ -574,7 +601,7 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
                   label="Search this workspace"
                   hint="Search messages, pages, issues, files, runs…"
                   disabled=(!connected || searching)
-                  submit=emit(explorer_search_submit)
+                  submit=explorer_search_submit(connected_rpc, connected)
                   w=fill
                   p=6.2
                   text-size=13.0
@@ -584,7 +611,7 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
                 hovered bg=transparent border=transparent
                 disabled value=muted
               if !empty(trim(query))
-                button -> emit(clear_explorer_search)
+                button #explorer-clear -> clear_explorer_search
                   with
                     label="Clear workspace search"
                     w=22.0
@@ -669,9 +696,10 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
               gap-x=7.0
               gap-y=7.0
               items=start
-            button -> emit(pick_explorer_kind, "all")
+            button -> pick_explorer_kind("all")
               with
                 label="Show every result"
+                checked=(kind == "all")
                 p=0.0
                 @ghost_action
               FilterChip
@@ -683,10 +711,11 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
               hovered bg=row_hover text=fg
               pressed bg=elevated text=fg
             for kind_count in kinds
-              button -> emit(pick_explorer_kind, kind_count.kind)
+              button -> pick_explorer_kind(kind_count.kind)
                 with
                   label="Filter results by kind"
                   description=kind_count.label
+                  checked=(kind == kind_count.kind)
                   p=0.0
                   @ghost_action
                 FilterChip
@@ -788,8 +817,8 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
                     with
                       block
                       selected=(block.height == selected)
-                    forward
-                      select_explorer_block
+                    events
+                      select_explorer_block -> select_explorer_block _
           box
             with
               w=fill
@@ -835,41 +864,58 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
                                 @text-fg
                             StatusBadge label=op.disposition
                             space w=fill
-                            // TWO HASHES, ONE SCREEN, NEITHER NAMED. The list
-                            // on the left prints `block.hash` (the frame id);
-                            // this prints `op.op_hash` (the sha256 of the op
-                            // payload — `project_root_op` keys it by
-                            // `put_chunk`, which is also the `GET
-                            // /v1/files/blob/{op_hash}` key). They never match,
-                            // and an unlabelled hex that changes when you open
-                            // a row reads as a contradiction. The label form is
-                            // the `by` beside the proposer, one row down.
-                            //
-                            // `hash`, not `op`: this pane sits beside a list
-                            // whose third column counts `1 op` / `3 ops`, and
-                            // one screen must not spend the same word on a
-                            // count noun and a field name. Inside an op card
-                            // `hash` can only mean this op's, and the block
-                            // hash it could be confused with carries no label
-                            // to collide with. The row costs 14px more than
-                            // `op` did and has room: at the 1040 minimum the
-                            // pane is 1040 − 74 rail − 48 screen padding − 340
-                            // list − 10 gap − 18 box − 18 card = 532px, against
-                            // ~293px of `wrap=none` intrinsics (target, badge,
-                            // label, 13-char digest, four 8px gaps). Arithmetic,
-                            // not a screenshot — this branch was not run.
+                          // TWO HASHES, ONE SCREEN, NEITHER NAMED. The list
+                          // on the left prints `block.hash` (the frame id);
+                          // this prints `op.op_hash` (the sha256 of the op
+                          // payload — `project_root_op` keys it by
+                          // `put_chunk`, which is also the `GET
+                          // /v1/files/blob/{op_hash}` key). They never match,
+                          // and an unlabelled hex that changes when you open
+                          // a row reads as a contradiction. The label form is
+                          // the `by` beside the proposer, one row down.
+                          //
+                          // `hash`, not `op`: this pane sits beside a list
+                          // whose third column counts `1 op` / `3 ops`, and
+                          // one screen must not spend the same word on a
+                          // count noun and a field name. Inside an op card
+                          // `hash` can only mean this op's, and the block
+                          // hash it could be confused with carries no label
+                          // to collide with.
+                          //
+                          // The hash is FULL and lives on its OWN row: it is
+                          // the blob key (QA: the explorer never exposed the
+                          // whole thing), and 64 code chars at 12.0 are
+                          // ~461px against the pane's 532px minimum (1040 −
+                          // 74 rail − 48 screen padding − 340 list − 10 gap
+                          // − 18 box − 18 card) — too wide to share a row
+                          // with the target, wide enough to own one.
+                          // `word-or-glyph` wraps rather than clips anything
+                          // narrower. Clicking it copies the key whole.
+                          row
+                            with
+                              w=fill
+                              gap=8.0
+                              align=center
                             text "hash"
                               with
                                 size=11.0
                                 wrap=none
                                 font=code_medium
                                 @text-muted
-                            text op.op_hash
+                            button -> emit(copy_to_clipboard, op.op_hash, "Op hash copied")
                               with
-                                size=12.0
-                                wrap=none
-                                font=code
-                                @text-muted
+                                label="Copy op hash"
+                                p=2.0
+                                @ghost_action
+                              text op.op_hash
+                                with
+                                  size=12.0
+                                  wrap=word-or-glyph
+                                  font=code
+                                  @text-muted
+                              active bg=transparent text=fg border=transparent border-w=1.0 r=5.0
+                              hovered bg=row_hover text=fg
+                              pressed bg=accent
                           row
                             with
                               w=fill
@@ -911,7 +957,17 @@ component ExplorerScreen(bind query:str, connected:bool, searching:bool, loading
                                   size=12.0
                                   font=code
                                   @text-muted
-                          text op.payload size=13.5 @text-fg
+                          // Pretty-printed JSON (or verbatim text) from
+                          // `explorer_payload` — a code plane, so it reads in
+                          // the code face, whole, wrapping instead of
+                          // clipping.
+                          text op.payload
+                            with
+                              w=fill
+                              size=12.0
+                              wrap=word-or-glyph
+                              font=code
+                              @text-fg
 
 // ONE BLOCK IN THE CHAIN LIST, AND WHETHER IT IS THE ONE YOU OPENED. The row
 // carried no selected state at all: clicking filled the detail pane on the
@@ -940,6 +996,7 @@ component ExplorerBlockRow(block:ExplorerBlock, selected:bool)
       button -> emit(select_explorer_block, block.height)
         with
           label="Inspect block"
+          checked=selected
           w=fill
           p=6.0
           @ghost_action
@@ -951,6 +1008,7 @@ component ExplorerBlockRow(block:ExplorerBlock, selected:bool)
       button -> emit(select_explorer_block, block.height)
         with
           label="Inspect block"
+          checked=selected
           w=fill
           p=6.0
           @ghost_action

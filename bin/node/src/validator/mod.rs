@@ -9,8 +9,8 @@ mod run;
 mod wiring;
 
 use commonware_cryptography::{Signer as _, ed25519};
-use commonware_p2p::authenticated::discovery::{self, Network};
-use commonware_p2p::{Ingress, Manager as _};
+use commonware_p2p::authenticated::lookup::{self, Network};
+use commonware_p2p::Ingress;
 use commonware_runtime::Quota;
 use recovery::{Manifest, Recovery};
 
@@ -22,11 +22,11 @@ use crate::rpc::spawn_rpc_listener;
 pub(crate) async fn run_validator(
     context: commonware_runtime::tokio::Context,
     network: Network<OverlayCtx, ed25519::PrivateKey>,
-    oracle: discovery::Oracle<ed25519::PublicKey>,
+    oracle: lookup::Oracle<ed25519::PublicKey>,
+    mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
     quota: Quota,
     metrics: noded::NodeMetrics,
     status: noded::StatusCell,
-    sync_source: Option<ed25519::PublicKey>,
     advertised_reach: Ingress,
     status_public_key: String,
     signer: ed25519::PrivateKey,
@@ -46,7 +46,6 @@ pub(crate) async fn run_validator(
     chain_id: String,
     mesh_state_file: std::path::PathBuf,
     checkpoint_blocks: u64,
-    promoted: bool,
     dev_demo: bool,
     rpc_listener: Option<std::net::TcpListener>,
     http_cmds: futures::channel::mpsc::Receiver<noded::NodeCommand>,
@@ -105,6 +104,8 @@ pub(crate) async fn run_validator(
         initial_member_keys,
         initial_resident_keys,
         mesh_oracle,
+        mesh_window,
+        mesh_book,
         bank_base,
         channel_bank,
         sync_tx,
@@ -120,6 +121,7 @@ pub(crate) async fn run_validator(
         &context,
         network,
         &oracle,
+        mesh_book.clone(),
         quota,
         &host,
         resumed.as_ref(),
@@ -143,45 +145,14 @@ pub(crate) async fn run_validator(
         planes.clone(),
     )
     .await;
-    let (
-        sync_tx,
-        sync_rx,
-        mut recovery,
-        host,
-        resumed,
-        next_seq,
-        prev_ckpt,
-        recovery_manifest_for_resume,
-        boot_fold,
-    ) = boot::post_reboot_catchup(
-        &context,
-        promoted,
-        sync_source,
-        sync_tx,
-        sync_rx,
-        recovery,
-        host,
-        resumed,
-        next_seq,
-        prev_ckpt,
-        recovery_manifest_for_resume,
-        boot_fold,
-        signer.clone(),
-        label.clone(),
-        namespace.clone(),
-        validators.clone(),
-        forge_repo.clone(),
-        duckfs_dir.clone(),
-        blobs.clone(),
-    )
-    .await;
-
     let wiring::RuntimeWiring {
         member_keys,
         participants,
         resume_epoch,
         pending_boot,
         mesh_oracle,
+        mesh_window,
+        mesh_book,
         channel_bank,
         gateway_book,
         blob_peers,
@@ -198,7 +169,6 @@ pub(crate) async fn run_validator(
         &validators,
         signer.clone(),
         label.clone(),
-        peers.clone(),
         namespace.clone(),
         wireguard_listen.is_some(),
         overlay_slot.clone(),
@@ -212,6 +182,8 @@ pub(crate) async fn run_validator(
         initial_member_keys,
         initial_resident_keys,
         mesh_oracle,
+        mesh_window,
+        mesh_book,
         bank_base,
         channel_bank,
         sync_tx,
@@ -351,6 +323,8 @@ pub(crate) async fn run_validator(
         last_cert_height,
         latest_floor,
         mesh_oracle,
+        mesh_window,
+        mesh_book,
         gateway_book,
         media_peers,
         blob_peers,
@@ -366,7 +340,6 @@ pub(crate) async fn run_validator(
         prev_ckpt,
         signer,
         label,
-        peers,
         validators,
         dev_demo,
         checkpoint_blocks,
@@ -393,14 +366,13 @@ pub(crate) async fn run_validator(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_promoted(
     baton: PromotionBaton,
-    oracle: discovery::Oracle<ed25519::PublicKey>,
+    oracle: lookup::Oracle<ed25519::PublicKey>,
     metrics: noded::NodeMetrics,
     status: noded::StatusCell,
     status_public_key: String,
     signer: ed25519::PrivateKey,
     label: String,
     namespace: Vec<u8>,
-    peers: Vec<ed25519::PublicKey>,
     validators: Vec<ed25519::PublicKey>,
     coordinated: Vec<(ed25519::PublicKey, Ingress, ed25519::PublicKey)>,
     wireguard_listen: Option<std::net::SocketAddr>,
@@ -455,6 +427,8 @@ pub(crate) async fn run_promoted(
         rpc_ingress,
         http_ingress,
         prev_ckpt,
+        mesh_window,
+        mesh_book,
     } = baton;
     metrics.set_role_phase(noded::NodeRole::Validator, noded::NodePhase::Recovering);
     tracing::info!(
@@ -490,10 +464,11 @@ pub(crate) async fn run_promoted(
         .cloned()
         .collect();
 
-    // the seat epoch's transport mesh, tracked at index = epoch — the same
-    // union every member tracks at this index.
-    let mut mesh_oracle = oracle.clone();
-    mesh_oracle.track(epoch, wiring::mesh_at(&peers, &transport));
+    // no mesh track at the seat: the park loop already tracked the seat's
+    // transport union at its GENERATION index (the tracker's bookkeeping
+    // travels in the baton), and the run loop's drain syncs the window
+    // every pass from here on.
+    let mesh_oracle = oracle.clone();
     if !lane_bank.covers(epoch) {
         fatal!(
             label,
@@ -595,6 +570,8 @@ pub(crate) async fn run_promoted(
                     forward: gate_fwd_tx.clone(),
                     outcomes: gate_outcomes.clone(),
                 }),
+                mesh_book.clone(),
+                mesh_oracle.clone(),
                 reach_tx,
                 reach_rx,
                 None,
@@ -681,6 +658,8 @@ pub(crate) async fn run_promoted(
         last_cert_height,
         latest_floor,
         mesh_oracle,
+        mesh_window,
+        mesh_book,
         gateway_book,
         media_peers,
         blob_peers,
@@ -698,7 +677,6 @@ pub(crate) async fn run_promoted(
         prev_ckpt,
         signer,
         label,
-        peers,
         validators,
         dev_demo,
         checkpoint_blocks,
@@ -717,12 +695,12 @@ pub(crate) async fn run_promoted(
 }
 
 type OverlayCtx = overlay_net::OverlayContext<commonware_runtime::tokio::Context>;
-pub(crate) type MeshSender = commonware_p2p::authenticated::discovery::Sender<
+pub(crate) type MeshSender = commonware_p2p::authenticated::lookup::Sender<
     commonware_cryptography::ed25519::PublicKey,
     OverlayCtx,
 >;
 pub(crate) type MeshReceiver =
-    commonware_p2p::authenticated::discovery::Receiver<commonware_cryptography::ed25519::PublicKey>;
+    commonware_p2p::authenticated::lookup::Receiver<commonware_cryptography::ed25519::PublicKey>;
 pub(crate) type MeshChannel = (MeshSender, MeshReceiver);
 pub(crate) type EpochChannels = (
     MeshChannel,
@@ -858,6 +836,12 @@ pub(crate) struct PromotionBaton {
     /// the promotion checkpoint's (height, oplog position) — the run
     /// loop's prune anchor.
     pub(crate) prev_ckpt: (Option<u64>, u64),
+    /// the mesh window tracker, carried over from the park loop: oracle
+    /// clones share ONE directory, so `last_tracked` must travel with the
+    /// role — the seat continues the same monotonic index sequence.
+    pub(crate) mesh_window: crate::mesh_window::MeshWindowTracker,
+    /// the mesh address book, carried with the tracker for the same reason.
+    pub(crate) mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
 }
 
 /// one epoch's slot in the [`LaneBank`].
@@ -943,10 +927,10 @@ impl LaneBank {
     }
 }
 
-/// the mesh-carrier REAL arm: one epoch's pre-registered discovery channels
-/// (a [`LaneBank`] slot) + the [`discovery::Oracle`] the resolver keys on.
-/// This is the `authenticated::discovery` network's per-spawn transport bundle —
-/// the discovery `Network` (`MeshHead`) registers the channels into the bank
+/// the mesh-carrier REAL arm: one epoch's pre-registered mesh channels
+/// (a [`LaneBank`] slot) + the [`lookup::Oracle`] the resolver keys on.
+/// This is the `authenticated::lookup` network's per-spawn transport bundle —
+/// the lookup `Network` (`MeshHead`) registers the channels into the bank
 /// before start, and this bundles one slot with the oracle at the point
 /// [`engine`](self::engine) consumes it, feeding
 /// [`consensus::SimplexOrderer::spawn_with_carrier`] the identical values the
@@ -957,13 +941,13 @@ pub(super) struct DiscoveryMesh {
     resolver: Option<MeshChannel>,
     payload: Option<MeshChannel>,
     fetch: Option<MeshChannel>,
-    oracle: discovery::Oracle<ed25519::PublicKey>,
+    oracle: lookup::Oracle<ed25519::PublicKey>,
 }
 
 impl DiscoveryMesh {
     pub(super) fn new(
         slot: EpochChannels,
-        oracle: discovery::Oracle<ed25519::PublicKey>,
+        oracle: lookup::Oracle<ed25519::PublicKey>,
     ) -> Self {
         let (vote, certificate, resolver, payload, fetch) = slot;
         Self {
@@ -980,8 +964,8 @@ impl DiscoveryMesh {
 impl consensus::MeshCarrier for DiscoveryMesh {
     type Sender = MeshSender;
     type Receiver = MeshReceiver;
-    type Provider = discovery::Oracle<ed25519::PublicKey>;
-    type Blocker = discovery::Oracle<ed25519::PublicKey>;
+    type Provider = lookup::Oracle<ed25519::PublicKey>;
+    type Blocker = lookup::Oracle<ed25519::PublicKey>;
 
     fn vote(&mut self) -> MeshChannel {
         self.vote.take().expect("vote channel taken once")
@@ -998,10 +982,10 @@ impl consensus::MeshCarrier for DiscoveryMesh {
     fn fetch(&mut self) -> MeshChannel {
         self.fetch.take().expect("fetch channel taken once")
     }
-    fn provider(&self) -> discovery::Oracle<ed25519::PublicKey> {
+    fn provider(&self) -> lookup::Oracle<ed25519::PublicKey> {
         self.oracle.clone()
     }
-    fn blocker(&self) -> discovery::Oracle<ed25519::PublicKey> {
+    fn blocker(&self) -> lookup::Oracle<ed25519::PublicKey> {
         self.oracle.clone()
     }
 }

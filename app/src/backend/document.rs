@@ -74,7 +74,12 @@ fn refreshed_page_text(
     blocks: &[PageBlock],
     saved: &str,
 ) -> Option<String> {
-    let dirty = crate::pages::page_text(document.clone()) != saved;
+    // `.text()`, NOT `page_text(document.clone())`: iced's `Content: Clone` is
+    // `with_text(&self.text())` — a whole second cosmic-text buffer built under
+    // a WRITE lock on the process-global font system. This runs on every live
+    // chat delta (`on live_updated`), so the clone was a full re-shape of the
+    // open page per incoming message.
+    let dirty = document.text() != saved;
     if dirty {
         return None;
     }
@@ -96,7 +101,7 @@ pub fn install_decision(
     if current_page != next_page {
         return true;
     }
-    let clean = crate::pages::page_text(document) == saved;
+    let clean = document.text() == saved;
     // A clean, IDENTICAL buffer is left alone: a rebuilt `Content` throws the
     // caret to the origin, and there is nothing to install.
     clean && canonical != saved
@@ -201,7 +206,6 @@ pub fn baseline_at_submitted_title(canonical: String, submitted: String) -> Stri
 /// illegal edit back.
 #[derive(Clone, Debug)]
 pub struct DocumentSaveResult {
-    pub generation: i64,
     pub written: bool,
     pub refusal: String,
     pub data: PagesData,
@@ -237,20 +241,21 @@ pub async fn save_page_document(
     page_id: String,
     text: String,
     saved: String,
-    generation: i64,
-) -> Result<DocumentSaveResult, HydrationError> {
-    let failed = |message: String| HydrationError {
-        generation,
-        message,
-    };
-    let client = rpc_client(&rpc).map_err(failed)?;
+) -> Result<DocumentSaveResult, AppError> {
+    let client = rpc_client(&rpc).map_err(app_error)?;
     if page_id.is_empty() {
-        return Err(failed("choose a page first".into()));
+        return Err(app_error("choose a page first".into()));
     }
 
+    // THE PLAN IS DIFFED AGAINST THIS, so it must not predate this reader's
+    // own last tick: `load_pages_data` waits for the fold to carry every write
+    // this client has made (`backend/rpc.rs`). A tree missing the line the
+    // previous tick inserted is not merely stale — `document_plan` pairs the
+    // disturbed middle POSITIONALLY, so the line comes back as a second
+    // `InsertBlock` and the document ends up holding it twice.
     let current = load_pages_data(&client, Some(&page_id))
         .await
-        .map_err(failed)?;
+        .map_err(app_error)?;
     // A SAVE MUST PLAN AGAINST THE PAGE ITS CALLER NAMED.
     //
     // `load_pages_data` drops a requested id the index does not hold and falls
@@ -269,7 +274,7 @@ pub async fn save_page_document(
     // resync that follows a delete moves `active_page` off the dead page, which
     // parks the autosave tick on `active_page != buffer_page` (handlers/pages.ice).
     if current.active_page != page_id {
-        return Err(failed("page was not found".into()));
+        return Err(app_error("page was not found".into()));
     }
     let canonical = |data: &PagesData| {
         crate::pages::sync::page_document_text(&data.active_page_title, &data.blocks)
@@ -280,7 +285,6 @@ pub async fn save_page_document(
 
     if !refusal.is_empty() {
         return Ok(DocumentSaveResult {
-            generation,
             written: false,
             refusal,
             document: canonical(&current),
@@ -297,7 +301,7 @@ pub async fn save_page_document(
     let title = document_title(&text);
     let title_moved = title_write_owed(&title, &saved, &current.active_page_title);
     if title_moved {
-        let bounded = bounded_exact_text(title, "page title", 512).map_err(failed)?;
+        let bounded = bounded_exact_text(title, "page title", 512).map_err(app_error)?;
         write(
             &client,
             &password,
@@ -308,11 +312,10 @@ pub async fn save_page_document(
             },
         )
         .await
-        .map_err(|cause| failed(app_error(cause).message))?;
+        .map_err(app_error)?;
     }
     if ops.is_empty() && !title_moved {
         return Ok(DocumentSaveResult {
-            generation,
             written: false,
             refusal: String::new(),
             document: canonical(&current),
@@ -322,9 +325,8 @@ pub async fn save_page_document(
     if ops.is_empty() {
         let data = load_selected_page_data(&client, &page_id)
             .await
-            .map_err(failed)?;
+            .map_err(committed_error)?;
         return Ok(DocumentSaveResult {
-            generation,
             written: true,
             refusal: String::new(),
             document: canonical(&data),
@@ -332,33 +334,27 @@ pub async fn save_page_document(
         });
     }
 
-    // The head of the page, for an insert that anchors on nothing. ALWAYS the
-    // page's own record: `blocks` never contains it (`page_blocks` skips the
-    // wire head), so a lookup there could only ever find a SUBPAGE — and a
-    // first-line insert would land inside the child page.
-    let page_head = page_id.clone();
     let mut anchor = String::new();
 
     for (index, op) in ops.iter().enumerate() {
-        // Only the FIRST op may report an uncommitted failure; once one write
-        // has landed the page has already moved, so the caller must resync
-        // either way.
-        let committed_so_far = index > 0;
-        let message = apply_op(&client, &password, &page_id, &page_head, &mut anchor, op).await;
+        // Only the first body op before any title write may report an
+        // uncommitted failure. Once one write has landed the page has already
+        // moved, so the caller must resync either way.
+        let committed_so_far = title_moved || index > 0;
+        let message = apply_op(&client, &password, &page_id, &mut anchor, op).await;
         if let Err(cause) = message {
             let mark = match committed_so_far {
                 true => committed_error(cause),
                 false => app_error(cause),
             };
-            return Err(failed(mark.message));
+            return Err(mark);
         }
     }
 
     let data = load_selected_page_data(&client, &page_id)
         .await
-        .map_err(failed)?;
+        .map_err(committed_error)?;
     Ok(DocumentSaveResult {
-        generation,
         written: true,
         refusal: String::new(),
         document: canonical(&data),
@@ -368,11 +364,17 @@ pub async fn save_page_document(
 
 /// One op, awaited. `anchor` carries the id an insert chain hangs off: the
 /// block just inserted becomes the anchor for the next one.
+///
+/// Three of these arms read the live tree before deciding what to write, and
+/// the op before them has already moved it. They read it through
+/// `load_page_blocks`, which waits for the fold to carry every block this
+/// client knows about — including the write this loop made one iteration ago
+/// (`backend/rpc.rs`, `SEEN_BLOCKS`) — so the ordering this loop is awaited
+/// for survives the trip through the index.
 async fn apply_op(
     client: &RpcClient,
     password: &str,
     page_id: &str,
-    page_head: &str,
     anchor: &mut String,
     op: &BlockOp,
 ) -> Result<(), String> {
@@ -421,7 +423,6 @@ async fn apply_op(
                 client,
                 password,
                 page_id,
-                page_head,
                 match after.is_empty() {
                     true => anchor.as_str(),
                     false => after.as_str(),
@@ -462,7 +463,12 @@ async fn apply_op(
     }
 }
 
-/// One signed op onto the pages module.
+/// One signed op onto the pages module. The receipt height is not carried by
+/// hand: `signed_write` records it against the module, and every read that
+/// must not answer behind it — this save's own next op, the reload that ends
+/// it, the NEXT tick's plan — waits on that record instead (`backend/rpc.rs`,
+/// `SEEN_BLOCKS`). Threading it by hand reached the first two and never the
+/// third, which is the one that duplicates a line.
 async fn write(client: &RpcClient, password: &str, msg: PageMsg) -> Result<(), String> {
     signed_write(
         client,
@@ -471,6 +477,7 @@ async fn write(client: &RpcClient, password: &str, msg: PageMsg) -> Result<(), S
         password.to_string(),
     )
     .await
+    .map(|_height| ())
 }
 
 /// The kind a block currently wears, for the module's per-kind text bound.
@@ -489,11 +496,19 @@ async fn block_kind(
 
 /// Insert one block after `after`, adopting that block's parent — the depth of
 /// a new line is the depth of the line above it, never inferred from the text.
+///
+/// An insert that anchors on nothing lands under the page's own record — and
+/// `after` is never that record's id, which is what the fallback rests on.
+/// `blocks` DOES carry the page head (element 0 of `load_page_blocks`; it is
+/// `page_blocks` that skips it), but the plan only ever anchors on lines
+/// `page_blocks` produced or on ids this save just inserted. Were the head
+/// matched, the parent adopted would be the page's OWN parent and a first-line
+/// insert would land in the enclosing page; failing to find it is exactly what
+/// makes an unanchored insert land under this page.
 async fn insert_block(
     client: &RpcClient,
     password: &str,
     page_id: &str,
-    page_head: &str,
     after: &str,
     kind: &str,
     text: &str,
@@ -504,7 +519,7 @@ async fn insert_block(
     let anchor = blocks.iter().find(|block| block.id == after);
     let parent = anchor
         .and_then(|block| block.parent.clone())
-        .unwrap_or_else(|| page_head.to_string());
+        .unwrap_or_else(|| page_id.to_string());
     let id = fresh_id("block");
     signed_write(
         client,

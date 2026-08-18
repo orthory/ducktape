@@ -8,7 +8,7 @@ use recovery::{Manifest, Recovery};
 use sdk::StateRoot;
 use statesync::{SyncError, SyncServer, fetch_frames};
 
-use crate::constants::CUTOVER_DELAY;
+use crate::constants::{CUTOVER_DELAY, MAX_MESSAGE_SIZE};
 use crate::util::{fatal, hex};
 
 pub(crate) fn assert_floor_binds_view(
@@ -184,7 +184,10 @@ where
 /// [`verify_manifest_floor`]'s construction. FATAL on undecodable
 /// participants — the boundary already passed the floor verify, so garbage
 /// here is our own bug, not the wire's.
-pub(crate) fn replica_verifier(namespace: &[u8], participant_keys: &[Vec<u8>]) -> simplex_ed25519::Scheme {
+pub(crate) fn replica_verifier(
+    namespace: &[u8],
+    participant_keys: &[Vec<u8>],
+) -> simplex_ed25519::Scheme {
     let mut keys = Vec::with_capacity(participant_keys.len());
     for k in participant_keys {
         let pk = ed25519::PublicKey::decode(k.as_slice())
@@ -375,9 +378,13 @@ pub(crate) enum SyncStateRequest {
         up_to_height: u64,
         reply: tokio::sync::oneshot::Sender<Result<Vec<recovery::JournalFrame>, recovery::Error>>,
     },
-    /// checkpoint the derived index databases for the shipped-index lane.
-    IndexCut {
-        reply: tokio::sync::oneshot::Sender<std::collections::BTreeMap<String, Vec<u8>>>,
+    /// read one page of a module's derived index op rows at or below
+    /// `up_to_height` — the joiner's backfill lane.
+    IndexOps {
+        module: String,
+        after: Option<(u64, u32)>,
+        up_to_height: u64,
+        reply: tokio::sync::oneshot::Sender<Result<SyncIndexOps, String>>,
     },
     /// read the tip's consensus coordinates — the DETECTION lane: answered
     /// straight from loop-owned state (no capture, no lease, no floor-cert
@@ -404,6 +411,108 @@ pub(crate) struct SyncBoundary {
     pub(crate) id: statesync::BoundaryId,
     pub(crate) coords: statesync::BoundaryCoords,
     pub(crate) data: Option<statesync::CaptureData>,
+}
+
+/// the [`SyncStateRequest::IndexOps`] answer: one page of stored op rows in
+/// key order, plus the two facts that let a joiner compose an honest floor —
+/// this node's own backfill floor for the module and its feed watermark.
+pub(crate) struct SyncIndexOps {
+    pub(crate) rows: Vec<(String, Vec<u8>)>,
+    /// more rows exist past the last one served.
+    pub(crate) has_more: bool,
+    pub(crate) source_floor: Option<u64>,
+    pub(crate) applied_height: u64,
+}
+
+const MAX_SYNC_RESPONSE_BODY_LEN: usize =
+    MAX_MESSAGE_SIZE as usize - statesync::RPC_AUTHED_HEADER_LEN;
+const _: () = assert!(MAX_SYNC_RESPONSE_BODY_LEN >= 9);
+
+/// Return the largest non-empty prefix that fits the mesh's configured message
+/// cap. An available frame that cannot fit alone is an explicit error: an empty
+/// successful batch would make suffix catch-up retry without advancing.
+fn bounded_frames_response(mut frames: Vec<statesync::FinalizedFrame>) -> statesync::SyncResponse {
+    frames.truncate(statesync::FRAME_BATCH_LEN);
+    if frames.is_empty() {
+        return statesync::SyncResponse::Frames { frames };
+    }
+
+    let mut fitting = 0usize;
+    let mut excluded = frames.len() + 1;
+    while excluded - fitting > 1 {
+        let candidate = fitting + (excluded - fitting) / 2;
+        let encoded_len = statesync::encoded_frames_response_len(&frames[..candidate]);
+        let fits_transport = encoded_len <= MAX_SYNC_RESPONSE_BODY_LEN;
+        if fits_transport {
+            fitting = candidate;
+        } else {
+            excluded = candidate;
+        }
+    }
+
+    if fitting == 0 {
+        return statesync::SyncResponse::Error(format!(
+            "finalized frame at height {} exceeds the {MAX_MESSAGE_SIZE}-byte statesync mesh message limit",
+            frames[0].height
+        ));
+    }
+    frames.truncate(fitting);
+    statesync::SyncResponse::Frames { frames }
+}
+
+/// Same binary search as [`bounded_frames_response`], over index op rows: keep
+/// the largest non-empty prefix that fits the mesh's message cap, and set the
+/// cursor whenever anything was left behind. A single row that cannot fit alone
+/// is an explicit error — an empty successful page with `next_after` set would
+/// make the joiner's walk spin without advancing.
+fn bounded_index_ops_response(page: SyncIndexOps) -> statesync::SyncResponse {
+    let SyncIndexOps {
+        mut rows,
+        mut has_more,
+        source_floor,
+        applied_height,
+    } = page;
+    // the wire caps a page; dropping past it still OWES those rows.
+    if rows.len() > statesync::INDEX_OPS_BATCH_LEN {
+        rows.truncate(statesync::INDEX_OPS_BATCH_LEN);
+        has_more = true;
+    }
+
+    let mut fitting = 0usize;
+    let mut excluded = rows.len() + 1;
+    while excluded - fitting > 1 {
+        let candidate = fitting + (excluded - fitting) / 2;
+        let encoded_len = statesync::encoded_index_ops_response_len(&rows[..candidate]);
+        let fits_transport = encoded_len <= MAX_SYNC_RESPONSE_BODY_LEN;
+        if fits_transport {
+            fitting = candidate;
+        } else {
+            excluded = candidate;
+        }
+    }
+
+    if fitting == 0 && !rows.is_empty() {
+        return statesync::SyncResponse::Error(format!(
+            "index op row {} exceeds the {MAX_MESSAGE_SIZE}-byte statesync mesh message limit",
+            rows[0].0
+        ));
+    }
+    if fitting < rows.len() {
+        has_more = true;
+        rows.truncate(fitting);
+    }
+    let next_after = has_more
+        .then(|| {
+            rows.last()
+                .and_then(|(key, _)| indexer::parse_op_key(key.as_bytes()))
+        })
+        .flatten();
+    statesync::SyncResponse::IndexOps {
+        rows,
+        next_after,
+        source_floor,
+        applied_height,
+    }
 }
 
 /// drive one decoded statesync request against the serve-task-owned
@@ -474,23 +583,15 @@ pub(crate) async fn drive_sync_request(
             })
             .await;
             match rx.await {
-                Ok(Ok(frames)) => {
-                    let mut out = Vec::new();
-                    let mut err = None;
-                    for frame in frames.into_iter().take(statesync::FRAME_BATCH_LEN) {
-                        match recovery_frame_to_sync(frame) {
-                            Ok(frame) => out.push(frame),
-                            Err(e) => {
-                                err = Some(e);
-                                break;
-                            }
-                        }
-                    }
-                    match err {
-                        Some(e) => statesync::SyncResponse::Error(e),
-                        None => statesync::SyncResponse::Frames { frames: out },
-                    }
-                }
+                Ok(Ok(frames)) => match frames
+                    .into_iter()
+                    .take(statesync::FRAME_BATCH_LEN)
+                    .map(recovery_frame_to_sync)
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    Ok(frames) => bounded_frames_response(frames),
+                    Err(e) => statesync::SyncResponse::Error(e),
+                },
                 Ok(Err(recovery::Error::RangePruned {
                     after_height,
                     retained_start,
@@ -521,26 +622,23 @@ pub(crate) async fn drive_sync_request(
                 Err(_) => statesync::SyncResponse::Error(CLOSED.into()),
             }
         }
-        statesync::ServeStep::NeedIndexCut { boundary } => {
-            // the shipped-index lane cuts lazily: the FIRST index request for
-            // a boundary checkpoints the derived databases and attaches the
-            // archives to that capture, so joiners that never opt in cost
-            // nothing. the attach is unconditional, so the re-drive below
-            // resolves — it cannot need a second cut.
+        statesync::ServeStep::NeedIndexOps {
+            boundary,
+            module,
+            after,
+        } => {
             let (tx, rx) = tokio::sync::oneshot::channel();
-            ask(SyncStateRequest::IndexCut { reply: tx }).await;
-            let blobs = match rx.await {
-                Ok(blobs) => blobs,
-                Err(_) => return statesync::SyncResponse::Error(CLOSED.into()),
-            };
-            if let Err(e) = server.attach_index(boundary, blobs) {
-                return statesync::SyncResponse::Error(e);
-            }
-            match server.serve(statesync::SyncRequest::IndexModules { boundary }) {
-                statesync::ServeStep::Reply(resp) => resp,
-                _ => {
-                    statesync::SyncResponse::Error("index attach did not settle the request".into())
-                }
+            ask(SyncStateRequest::IndexOps {
+                module,
+                after,
+                up_to_height: boundary,
+                reply: tx,
+            })
+            .await;
+            match rx.await {
+                Ok(Ok(page)) => bounded_index_ops_response(page),
+                Ok(Err(e)) => statesync::SyncResponse::Error(e),
+                Err(_) => statesync::SyncResponse::Error(CLOSED.into()),
             }
         }
         statesync::ServeStep::NeedCoords => {
@@ -552,5 +650,88 @@ pub(crate) async fn drive_sync_request(
                 Err(_) => statesync::SyncResponse::Error(CLOSED.into()),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(height: u64, payload_len: usize) -> statesync::FinalizedFrame {
+        statesync::FinalizedFrame {
+            height,
+            frame: vec![0xAB; payload_len],
+            disposition: statesync::FrameDisposition::Applied,
+            roots: Vec::new(),
+            root_hash: StateRoot([height as u8; 32]),
+        }
+    }
+
+    fn encoded_mesh_len(resp: &statesync::SyncResponse) -> usize {
+        let body = statesync::encode_response(resp);
+        statesync::encode_rpc_authed(&[0; 32], &[0; 64], 7, &body).len()
+    }
+
+    #[test]
+    fn frames_response_splits_the_observed_oversized_batch() {
+        let original = (1..=statesync::FRAME_BATCH_LEN)
+            .map(|height| {
+                let payload_len = if height < statesync::FRAME_BATCH_LEN {
+                    40_554
+                } else {
+                    40_553
+                };
+                frame(height as u64, payload_len)
+            })
+            .collect::<Vec<_>>();
+        let original_response = statesync::SyncResponse::Frames {
+            frames: original.clone(),
+        };
+        assert_eq!(encoded_mesh_len(&original_response), 2_599_216);
+        assert!(encoded_mesh_len(&original_response) > MAX_MESSAGE_SIZE as usize);
+
+        let bounded = bounded_frames_response(original.clone());
+        let statesync::SyncResponse::Frames { frames } = bounded else {
+            panic!("a fitting prefix must be served");
+        };
+        assert!(!frames.is_empty(), "the client must make height progress");
+        assert!(frames.len() < statesync::FRAME_BATCH_LEN);
+        assert!(
+            encoded_mesh_len(&statesync::SyncResponse::Frames {
+                frames: frames.clone(),
+            }) <= MAX_MESSAGE_SIZE as usize
+        );
+
+        let mut one_more = frames;
+        one_more.push(original[one_more.len()].clone());
+        assert!(
+            encoded_mesh_len(&statesync::SyncResponse::Frames { frames: one_more })
+                > MAX_MESSAGE_SIZE as usize,
+            "the selected prefix is maximal"
+        );
+    }
+
+    #[test]
+    fn frames_response_accepts_exact_limit_and_rejects_one_byte_over() {
+        let fixed_len = statesync::RPC_AUTHED_HEADER_LEN
+            + statesync::encoded_frames_response_len(&[frame(1, 0)]);
+        let exact_payload_len = MAX_MESSAGE_SIZE as usize - fixed_len;
+
+        let exact = bounded_frames_response(vec![frame(1, exact_payload_len)]);
+        let statesync::SyncResponse::Frames { frames } = &exact else {
+            panic!("a frame at the exact transport limit must fit");
+        };
+        assert_eq!(frames.len(), 1);
+        assert_eq!(encoded_mesh_len(&exact), MAX_MESSAGE_SIZE as usize);
+
+        let oversized = bounded_frames_response(vec![frame(2, exact_payload_len + 1)]);
+        let statesync::SyncResponse::Error(message) = &oversized else {
+            panic!("a single oversized frame must fail closed");
+        };
+        assert!(message.contains("exceeds"));
+        assert!(
+            encoded_mesh_len(&oversized) <= MAX_MESSAGE_SIZE as usize,
+            "the fail-closed error must itself fit the transport"
+        );
     }
 }

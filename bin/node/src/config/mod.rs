@@ -8,7 +8,7 @@
 //! shareable genesis artifact — identical content on every member is what
 //! makes genesis deterministic, exactly like a chain-id + genesis file:
 //! `chain_id` doubles as the commonware namespace (it domain-separates the
-//! discovery handshake, the simplex scheme, and the epoch genesis floor), and
+//! mesh handshake, the simplex scheme, and the epoch genesis floor), and
 //! `validators` seeds the valset module at genesis.
 //!
 //! **dev-seed shape** (tests/demos/the app's generated solo config): the flat
@@ -130,7 +130,7 @@ impl NetworkDescriptor {
     /// plus a GENESIS FINGERPRINT (sha256 over scheme + the sorted validator
     /// set; bootstrap hints excluded — they are advisory and legitimately
     /// differ between members). because the namespace domain-separates the
-    /// discovery handshake, the simplex scheme, and the epoch genesis floor,
+    /// mesh handshake, the simplex scheme, and the epoch genesis floor,
     /// a member holding a STALE descriptor (e.g. it missed a pre-genesis
     /// `admit` and kept the old validator list) cannot even connect — genesis
     /// divergence is a loud connectivity failure, never a silent state fork.
@@ -306,7 +306,7 @@ impl NetworkDescriptor {
     /// dialable ingress (unspecified ip / port 0 / malformed host) is skipped.
     pub fn reach_entries(&self) -> Result<Vec<(ed25519::PublicKey, ReachDial)>, String> {
         let mut out = Vec::new();
-        // one DIRECT ingress per key, underlay preferred: discovery keeps one
+        // one DIRECT ingress per key, underlay preferred: the address book keeps one
         // dial address per peer, and an overlay ULA only answers once the
         // reachability plane's tunnels apply — so when a key carries both an
         // underlay route and its overlay route, the mesh dialer gets the
@@ -1115,8 +1115,7 @@ mod tests {
              gateway_listen = \"127.0.0.1:0\"\nrpc_listen = \"127.0.0.1:0\"\n\
              wireguard_listen = \"0.0.0.0:51820\"\ninvite_listen = \"0.0.0.0:51821\"\n\
              wireguard_advertised = \"auto\"\nprimary_coordinator = \"none\"\n\
-             coordinator_relay = \"none\"\ncheckpoint_blocks = 32\n\
-             sync_index = false\n"
+             coordinator_relay = \"none\"\ncheckpoint_blocks = 32\n"
         );
         std::fs::write(dir.join("node.toml"), node_toml).expect("write node.toml");
         dir

@@ -1,6 +1,6 @@
 // A sidebar channel row: 7px radius, 8px side inset, the hash in `label` ink
 // and the name in `list` weight. Selected is the same tint capsule the rail uses.
-component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)
+component ChannelButton(channel:ChatChannel, selected:bool, unread:bool, disabled:bool)
   emits
     choose_channel(str)
   box
@@ -13,55 +13,71 @@ component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)
         button -> emit(choose_channel, channel.id)
           with
             label=channel.name
+            disabled=disabled
+            checked=selected
             w=fill
             p=0.0
             @icon_action
-          box
-            with
-              w=fill
-              pl=10.0
-              pr=10.0
-              pt=7.0
-              pb=7.0
-            row
+          // THE PRESSED PLATE ON AN UNSELECTED ROW SCORES 0.00 FROM
+          // `selected_row` BY THE REPO'S OWN METRIC — no grey the palette
+          // owns is both darker than the hover step and off `selected_row`
+          // by a visible margin, so a grey mark alone cannot survive a
+          // press. A 2.5px brand bar is the mark instead: `brand` stands
+          // 68.00/82.33 from every row plate, which no press state can
+          // imitate. The content box loses 2.5px of its own `pl` so the
+          // TEXT lands at the same 16px the unselected row's does.
+          row gap=0.0
+            box
+              with
+                w=2.5
+                h=fill
+                bg=brand
+                r=1.25
+              space w=1.0 h=1.0
+            box
               with
                 w=fill
-                gap=7.0
-                align=center
-              if channel.members_only
-                text "◆"
-                  with
-                    size=12.0
-                    wrap=none
-                    @text-label
-              if !channel.members_only
-                text "#"
-                  with
-                    size=13.0
-                    wrap=none
-                    @text-label
-              box w=fill clip=true
-                text channel.name
-                  with
-                    size=13.0
-                    wrap=none
-                    font=medium
-                    @text-fg
-              if channel.archived
-                text "archived"
-                  with
-                    size=9.0
-                    wrap=none
-                    font=code_semibold
-                    @text-label
-              if channel.huddle_count > 0
-                box
-                  with
-                    w=7.0
-                    h=7.0
-                    bg=success_dot
-                    r=3.5
-                  space w=1.0 h=1.0
+                pl=5.5
+                pr=8.0
+                pt=7.0
+                pb=7.0
+              row
+                with
+                  w=fill
+                  gap=7.0
+                  align=center
+                if channel.members_only
+                  text "◆"
+                    with
+                      size=12.0
+                      wrap=none
+                      @text-label
+                if !channel.members_only
+                  text "#"
+                    with
+                      size=13.0
+                      wrap=none
+                      @text-label
+                box w=fill clip=true
+                  text channel.name
+                    with
+                      size=13.0
+                      wrap=none
+                      font=medium
+                      @text-fg
+                if channel.archived
+                  text "archived"
+                    with
+                      size=9.0
+                      wrap=none
+                      font=code_semibold
+                      @text-meta
+                if channel.huddle_count > 0
+                  Icon
+                    with
+                      name="headphones"
+                      tone="success"
+                      px=12.0
           active bg=selected_row text=fg border=transparent border-w=1.0 r=7.0
           hovered bg=selected_row text=fg
           pressed bg=rail_hover text=fg
@@ -69,14 +85,16 @@ component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)
         button -> emit(choose_channel, channel.id)
           with
             label=channel.name
+            disabled=disabled
+            checked=selected
             w=fill
             p=0.0
             @icon_action
           box
             with
               w=fill
-              pl=10.0
-              pr=10.0
+              pl=8.0
+              pr=8.0
               pt=7.0
               pb=7.0
             row
@@ -102,7 +120,7 @@ component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)
                     with
                       size=13.0
                       wrap=none
-                      font=medium
+                      font=display
                       @text-fg
               if !unread
                 box w=fill clip=true
@@ -118,15 +136,13 @@ component ChannelButton(channel:ChatChannel, selected:bool, unread:bool)
                     size=9.0
                     wrap=none
                     font=code_semibold
-                    @text-label
+                    @text-meta
               if channel.huddle_count > 0
-                box
+                Icon
                   with
-                    w=7.0
-                    h=7.0
-                    bg=success_dot
-                    r=3.5
-                  space w=1.0 h=1.0
+                    name="headphones"
+                    tone="success"
+                    px=12.0
               if unread
                 box
                   with
@@ -171,70 +187,62 @@ component ChatMemberRow(member:ChatMember, disabled:bool)
           h=fill
           align-x=center
           align-y=center
+        // NO `@text-*` ON THE GLYPH. A class here emits an explicit color, and
+        // an explicit color ignores the button's own `text=` for every status —
+        // so the plate went red on hover while the × stayed muted, and the
+        // disabled ramp never reached it either. Uncolored, the glyph inherits
+        // the four lines below.
         text "×"
           with
             size=13.0
             wrap=none
-            @text-muted
       active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
       hovered bg=danger_bg text=fg
       pressed bg=danger_line text=fg
 
+// ONE PARAGRAPH, NOT A FLEX OF TOKENS (ducktape-ui#639 collected by #1096).
+// The whole span list lowers into a single native rich-text widget: real word
+// wrapping (`word-or-glyph` still, so an unbroken hash or invite one run wide
+// breaks instead of clipping), native selection across the line, and `link=`
+// handled by the widget's own route instead of a per-token button.
+//
+// THE ARM CHOICE IS DATA. A rich-text `for` expands a fixed span template per
+// item with no conditionals, so the module files every run under exactly one
+// `ChatSpan` text field (`span_arm` in chat's client) and this template emits
+// every arm for every run — an empty span draws no glyphs, so the five silent
+// arms of each run cost nothing.
+//
+// A MENTION IS A TOKEN, NOT JUST A TINT: the `brand_bg` plate (68.00+/255
+// from every row plate it can sit on) makes it an entity you can find at a
+// glance, and ONLY a mention wears it — a posted URL is a destination, not a
+// person. A LINK wears the underline instead, the one convention every reader
+// already knows, and ONLY the link arm draws that rule: it marks a
+// destination, not an emphasis. Both keep brand ink; the plate versus the
+// rule is what tells a human from a destination.
 component RichLine(block:ChatBlock)
-  flex
-    with
-      w=fill
-      wrap=wrap
-      gap-x=0.0
-      gap-y=4.0
-      items=start
+  emits
+    open_message_link(str)
+  rich-text w=fill size=13.5 line-h=1.55 wrap=word-or-glyph color=accent_fg -> emit(open_message_link, _)
     for span in block.spans
-      // `word-or-glyph` on every run: a flex wraps BETWEEN spans, so a single
-      // unbroken token — a hash, a base64 invite, a long URL — is one span
-      // wider than the column, and word wrapping cannot break it. It ran off
-      // the message column and the pane clipped the tail away.
-      if span.highlight
-        text span.text
-          with
-            wrap=word-or-glyph
-            size=13.5
-            line-h=1.55
-            font=medium
-            @text-brand
-      if !span.highlight && span.bold && span.italic
-        text span.text
-          with
-            wrap=word-or-glyph
-            size=13.5
-            line-h=1.55
-            font=strongitalic
-            @text-accent_fg
-      if !span.highlight && span.bold && !span.italic
-        text span.text
-          with
-            wrap=word-or-glyph
-            size=13.5
-            line-h=1.55
-            font=strong
-            @text-accent_fg
-      if !span.highlight && !span.bold && span.italic
-        text span.text
-          with
-            wrap=word-or-glyph
-            size=13.5
-            line-h=1.55
-            font=italic
-            @text-accent_fg
-      if !span.highlight && !span.bold && !span.italic
-        text span.text
-          with
-            wrap=word-or-glyph
-            size=13.5
-            line-h=1.55
-            @text-accent_fg
+      span span.mention bg=brand_bg px=4.0 r=4.0 font=medium color=brand
+      span span.link_text link=span.link underline font=medium color=brand
+      span span.bold_italic font=strongitalic
+      span span.bold font=strong
+      span span.italic font=italic
+      span span.plain
 
+// max-w=760.0 STOPS THE LINE, not the pane. Nothing here bounded a line's
+// measure at all — the default window ran ~130 characters a line and a
+// maximized one ~320, both well past the 45–75 characters a reader's eye can
+// find its way back across reliably. 760px at 13.5px Geist is ~110 chars:
+// generous, and it leaves the narrow rail/min-window case (≤300px) untouched.
+// Everything that hangs off this column — the reaction row, the reply pill —
+// inherits the cap through `w=fill`, which is correct: neither belongs 2000px
+// right of the text it is about.
 component MessageBody(message:ChatMessage)
-  col w=fill gap=5.0
+  emits
+    open_message_link(str)
+  col w=fill max-w=760.0 gap=5.0
     for block in message.blocks
       if block.kind == "divider"
         Separator
@@ -288,14 +296,21 @@ component MessageBody(message:ChatMessage)
               pb=2.0
             if block.rich
               RichLine block=block
+                forward
+                  open_message_link
+            // QUIETER THAN THE PROSE QUOTING IT, at the SAME leading the rich
+            // arm renders it at — a quote is cited material, and it should
+            // recede from the author's own words, not out-darken them. This
+            // was the darkest ink in the message (`fg`, 13.4:1); `muted`
+            // (5.37:1) is still comfortably readable and visibly quieter.
             if !block.rich
               text block.text
                 with
                   w=fill
                   size=13.5
-                  line-h=1.45
+                  line-h=1.55
                   wrap=word-or-glyph
-                  @text-fg
+                  @text-muted
           box
             with
               w=3.0
@@ -306,6 +321,8 @@ component MessageBody(message:ChatMessage)
       if block.kind == "paragraph"
         if block.rich
           RichLine block=block
+            forward
+              open_message_link
         if !block.rich
           text block.text
             with
@@ -361,6 +378,7 @@ component ReactionChip(reaction:ChatReaction, seq:i64)
         with
           label="Remove reaction"
           description=reaction.emoji
+          checked=reaction.reacted_by_me
           p=0.0
           @icon_action
         box
@@ -404,6 +422,7 @@ component ReactionChip(reaction:ChatReaction, seq:i64)
         with
           label="Add reaction"
           description=reaction.emoji
+          checked=reaction.reacted_by_me
           p=0.0
           @icon_action
         box
@@ -456,16 +475,13 @@ component ReactionChip(reaction:ChatReaction, seq:i64)
         hovered bg=muted_bg text=fg border=brand_line
         pressed bg=muted_bg text=fg border=brand
 
-component MessageContents(message:ChatMessage, flash:f64)
+component MessageContents(message:ChatMessage)
   emits
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
     open_thread_for(i64)
+    open_message_link(str)
   col w=fill
-    // Run-boundary rhythm: a new author's header breathes a little above,
-    // so grouping reads at a glance — continuations stay tight.
-    if message.show_author
-      space w=1.0 h=4.0
     row
       with
         w=fill
@@ -484,7 +500,7 @@ component MessageContents(message:ChatMessage, flash:f64)
               align=center
             text message.author
               with
-                size=13.0
+                size=13.5
                 wrap=none
                 font=display
                 @text-fg
@@ -505,22 +521,45 @@ component MessageContents(message:ChatMessage, flash:f64)
             // validator writes `consensus_time = height`, so the honest stamp is
             // the block the message landed in. An unsettled row has no height
             // yet and simply carries none.
+            // MUTED, NOT `hint`. This is the only timestamp the product has
+            // (there is no wall clock — a message stamps the BLOCK it
+            // settled in) and `· edited` changes the meaning of the message
+            // it annotates; both are meant to be read, and `hint` measures
+            // 2.10:1 on `bg` — below the 3:1 floor. `muted` clears AA at
+            // 5.37:1; the size and mono face still carry the recede.
             if message.height > 0
               text height_label_short(message.height)
                 with
                   size=11.0
                   wrap=none
                   font=code_medium
-                  @text-hint
+                  @text-muted
             if message.edited
               text "· edited"
                 with
                   size=11.0
                   wrap=none
                   font=code_medium
-                  @text-hint
+                  @text-muted
             space w=fill
         MessageBody message=message
+          forward
+            open_message_link
+        // `· edited` ANNOTATES THE MESSAGE, NOT THE RUN. It lived inside the
+        // `show_author` header, so in a run of five messages only the first
+        // could ever say it had been edited — and runs are most of a busy
+        // channel. A message's text changing under its readers with no mark
+        // anywhere on the row is the one integrity signal this product has,
+        // silently suppressed on the majority of rows. The header keeps it
+        // where a header exists; a continuation row trails it under the body
+        // it belongs to, in the same 11px mono muted the header stamps it in.
+        if message.edited && !message.show_author
+          text "· edited"
+            with
+              size=11.0
+              wrap=none
+              font=code_medium
+              @text-muted
         // Reactions and the replies button STACK — the artifact gives each its
         // own line under the body, never one shared row.
         if !empty(message.reactions)
@@ -587,207 +626,250 @@ component MessageContents(message:ChatMessage, flash:f64)
               hovered bg=surface text=brand border=brand_line
               pressed bg=surface text=brand border=brand
       // The quiet send-state lane at the row's right edge: an in-flight row
-      // carries a small dot, the settle swaps it for a ✓ that fades out (the
-      // `flash` prop is the animation's opacity — nonzero only on the row the
-      // stream's flash arm anchors). Replaces the old "finalizing…" chip line
-      // that restyled the whole message.
+      // carries the mint's own "Sending…" stamp and a small dot. Canonical
+      // confirmation removes both immediately; no timer, animation, or second
+      // collection shadows the row state. The WORD is load-bearing, not the
+      // dot: a send folds into the author run above it (no header, no spacer),
+      // so a dot alone left an in-flight row pixel-identical to a settled one.
       //
       // The pr=7 inset is load-bearing: it tucks the indicator fully inside
       // the hover toolbar's opaque plate (which ends 8px in from the card
-      // edge, rounded r=9), so hovering OCCLUDES the ✓ instead of leaving a
+      // edge, rounded r=9), so hovering OCCLUDES the dot instead of leaving a
       // sliver poking past the plate. The indicator is transient decoration;
       // the toolbar wins the corner while the cursor is on the row.
+      // FULL OPACITY ON `muted`, not a recede step dimmed further: `hint` at
+      // opacity=0.55 computed to ≈1.47:1 on a 7px mark — invisible, not
+      // quiet. `muted` (5.37:1) at full strength reads as a quiet dot; a
+      // recede step should never also carry an alpha fade.
       if message.pending
         box pr=7.0
-          svg icon("dot") memory
-            with
-              w=7.0
-              h=7.0
-              style=icon_tint("hint")
-              opacity=0.55
-      if !message.pending && flash > 0.0
-        box pr=7.0
-          svg icon("check") memory
-            with
-              w=13.0
-              h=13.0
-              style=icon_tint("success-tick")
-              opacity=flash
-
-component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabled:bool, flash:f64)
+          row gap=5.0 align=center
+            text message.meta
+              with
+                size=11.0
+                wrap=none
+                font=code_medium
+                @text-muted
+            svg icon("dot") memory
+              with
+                w=6.0
+                h=6.0
+                style=icon_tint("muted")
+                opacity=1.0
+component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabled:bool)
   emits
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
     open_thread_for(i64)
     open_message_reactions(i64, str, i64)
     open_message_actions(i64, str, i64)
-  // DRAW-TIME HOVER: the tint and the toolbar reveal ride the `hover`
-  // widget's cursor check — no enter/exit routes, no hovered state, no view
-  // rebuild per row crossing. A cached lazy row keeps its toolbar at native
-  // latency; that is the whole point (the state-driven version left the
-  // highlight trailing the cursor by the queued rebuilds).
-  //
-  // `open=` is the one thing the cursor does NOT decide. The ♡ and ⋯ buttons
-  // open a card anchored on this row; `menu_open` is that card's own
-  // openness, handed back so the toolbar dies WITH it. Without it the next
-  // mouse move erased the toolbar and left the emoji picker pointing at a
-  // button that was no longer there.
-  hover tint=row_hover r=9.0 open=menu_open
-    stack w=fill
-      if message.deleted
-        box
-          with
-            w=fill
-            pl=7.0
-            pr=7.0
-            pt=6.0
-            pb=6.0
-            bg=transparent
-            border=transparent
-            border-w=1.0
-            r=9.0
-          MessageContents message=message flash=flash
-            forward
-              add_reaction_at
-              remove_reaction_at
-              open_thread_for
-      // Selection is a tint, not a ring — see the QA note in the stream. The
-      // tint is `selected_row`, the one plate that means "the row you are on":
-      // a menu-open or deep-linked message is that row, exactly as a chosen
-      // channel or an open file is. It read `brand_bg` until the reaction chip
-      // moved onto the same token and vanished on it.
-      if !message.deleted && selected
-        box
-          with
-            w=fill
-            pl=7.0
-            pr=7.0
-            pt=6.0
-            pb=6.0
-            bg=selected_row
-            border=transparent
-            border-w=1.0
-            r=9.0
-          MessageContents message=message flash=flash
-            forward
-              add_reaction_at
-              remove_reaction_at
-              open_thread_for
-      if !message.deleted && !selected
-        box
-          with
-            w=fill
-            pl=7.0
-            pr=7.0
-            pt=6.0
-            pb=6.0
-            bg=transparent
-            border=transparent
-            border-w=1.0
-            r=9.0
-          MessageContents message=message flash=flash
-            forward
-              add_reaction_at
-              remove_reaction_at
-              open_thread_for
-    col w=fill
-      if !message.deleted && !message.pending
-        box
-          with
-            w=fill
-            align-x=end
-            align-y=start
-            pr=8.0
-          // The designer's own opaque answer for this bar: white card, 1px
-          // border, r9 over the 3/12 popover shadow.
+    open_message_link(str)
+  col w=fill
+    if message.show_author
+      space w=1.0 h=14.0
+    // DRAW-TIME HOVER: the tint and the toolbar reveal ride the `hover`
+    // widget's cursor check — no enter/exit routes, no hovered state, no view
+    // rebuild per row crossing. A cached lazy row keeps its toolbar at native
+    // latency; that is the whole point (the state-driven version left the
+    // highlight trailing the cursor by the queued rebuilds).
+    //
+    // `open=` is the one thing the cursor does NOT decide. The ♡ and ⋯ buttons
+    // open a card anchored on this row; `menu_open` is that card's own
+    // openness, handed back so the toolbar dies WITH it. Without it the next
+    // mouse move erased the toolbar and left the emoji picker pointing at a
+    // button that was no longer there.
+    hover tint=row_hover r=9.0 open=menu_open
+      stack w=fill
+        if message.deleted
           box
             with
-              p=2.0
-              bg=surface
-              border=border
+              w=fill
+              pl=7.0
+              pr=7.0
+              pt=4.0
+              pb=4.0
+              bg=transparent
+              border=transparent
               border-w=1.0
               r=9.0
-              shadow=shadow_popover
-              shadow-y=3.0
-              shadow-blur=12.0
-            row gap=1.0 align=center
-              button "👍" -> emit(add_reaction_at, message.seq, "👍")
-                with
-                  label="React with 👍"
-                  disabled=disabled
-                  w=27.0
-                  h=25.0
-                  p=4.0
-                  @ghost_action
-                active bg=transparent text=muted r=6.0
-                hovered bg=elevated text=fg
-                pressed bg=subtle text=fg
-              button "✅" -> emit(add_reaction_at, message.seq, "✅")
-                with
-                  label="React with ✅"
-                  disabled=disabled
-                  w=27.0
-                  h=25.0
-                  p=4.0
-                  @ghost_action
-                active bg=transparent text=muted r=6.0
-                hovered bg=elevated text=fg
-                pressed bg=subtle text=fg
-              button "👀" -> emit(add_reaction_at, message.seq, "👀")
-                with
-                  label="React with 👀"
-                  disabled=disabled
-                  w=27.0
-                  h=25.0
-                  p=4.0
-                  @ghost_action
-                active bg=transparent text=muted r=6.0
-                hovered bg=elevated text=fg
-                pressed bg=subtle text=fg
-              box
-                with
-                  w=1.0
-                  h=16.0
-                  bg=subtle
-                space w=1.0 h=1.0
-              button "♡" -> emit(open_message_reactions, message.seq, message.body, message.rev)
-                with
-                  label="Manage reactions"
-                  disabled=disabled
-                  w=27.0
-                  h=25.0
-                  p=4.0
-                  @ghost_action
-                active bg=transparent text=muted r=6.0
-                hovered bg=elevated text=fg
-                pressed bg=subtle text=fg
-              button -> emit(open_thread_for, message.seq)
-                with
-                  label="Open thread"
-                  disabled=disabled
-                  p=5.0
-                  @icon_action
-                Icon
+            MessageContents message=message
+              forward
+                add_reaction_at
+                remove_reaction_at
+                open_thread_for
+                open_message_link
+        // Selection is a tint, not a ring — see the QA note in the stream. The
+        // tint is `selected_row`, the one plate that means "the row you are on":
+        // a menu-open or deep-linked message is that row, exactly as a chosen
+        // channel or an open file is. It read `brand_bg` until the reaction chip
+        // moved onto the same token and vanished on it.
+        if !message.deleted && selected
+          box
+            with
+              w=fill
+              pl=7.0
+              pr=7.0
+              pt=4.0
+              pb=4.0
+              bg=selected_row
+              border=transparent
+              border-w=1.0
+              r=9.0
+            MessageContents message=message
+              forward
+                add_reaction_at
+                remove_reaction_at
+                open_thread_for
+                open_message_link
+        if !message.deleted && !selected
+          box
+            with
+              w=fill
+              pl=7.0
+              pr=7.0
+              pt=4.0
+              pb=4.0
+              bg=transparent
+              border=transparent
+              border-w=1.0
+              r=9.0
+            MessageContents message=message
+              forward
+                add_reaction_at
+                remove_reaction_at
+                open_thread_for
+                open_message_link
+      col w=fill
+        if !message.deleted && !message.pending
+          box
+            with
+              w=fill
+              align-x=end
+              align-y=start
+              pr=8.0
+            // The designer's own opaque answer for this bar: white card, 1px
+            // border, r9 over the 3/12 popover shadow.
+            box
+              with
+                p=2.0
+                bg=surface
+                border=border
+                border-w=1.0
+                r=9.0
+                shadow=shadow_popover
+                shadow-y=3.0
+                shadow-blur=12.0
+              // EVERY GLYPH LABEL IN THIS BAR IS ITS OWN REGULAR-WEIGHT
+              // `text`, NOT A BUTTON STRING LABEL. A string label is
+              // generated at semibold, and cosmic-text's fallback fast path
+              // only considers faces whose weight matches the request
+              // exactly. Every face this app bundles registers at 400, so a
+              // non-ASCII glyph asked for at 600 misses all of them and walks
+              // the whole font database instead — ~2.4ms per label, per row,
+              // per fresh layout, while the regular face costs ~25us. Five
+              // such labels on a row that a channel switch mounts 46 times is
+              // the half-second freeze: rig-measured 570ms -> 35ms.
+              row gap=1.0 align=center
+                button -> emit(add_reaction_at, message.seq, "👍")
                   with
-                    name="nav-chat"
-                    tone="muted"
-                    px=15.0
-                active bg=transparent text=muted r=6.0
-                hovered bg=elevated text=fg
-                pressed bg=subtle text=fg
-              button "⋯" -> emit(open_message_actions, message.seq, message.body, message.rev)
-                with
-                  label="More message actions"
-                  disabled=disabled
-                  w=27.0
-                  h=25.0
-                  p=4.0
-                  @ghost_action
-                active bg=transparent text=muted r=6.0
-                hovered bg=elevated text=fg
-                pressed bg=subtle text=fg
-      if message.deleted || message.pending
-        space w=1.0 h=1.0
+                    label="React with 👍"
+                    disabled=disabled
+                    w=27.0
+                    h=25.0
+                    p=4.0
+                    @ghost_action
+                  text "👍"
+                    with
+                      size=12.5
+                      font=ui
+                  active bg=transparent text=muted r=6.0
+                  hovered bg=elevated text=fg
+                  pressed bg=subtle text=fg
+                button -> emit(add_reaction_at, message.seq, "✅")
+                  with
+                    label="React with ✅"
+                    disabled=disabled
+                    w=27.0
+                    h=25.0
+                    p=4.0
+                    @ghost_action
+                  text "✅"
+                    with
+                      size=12.5
+                      font=ui
+                  active bg=transparent text=muted r=6.0
+                  hovered bg=elevated text=fg
+                  pressed bg=subtle text=fg
+                button -> emit(add_reaction_at, message.seq, "👀")
+                  with
+                    label="React with 👀"
+                    disabled=disabled
+                    w=27.0
+                    h=25.0
+                    p=4.0
+                    @ghost_action
+                  text "👀"
+                    with
+                      size=12.5
+                      font=ui
+                  active bg=transparent text=muted r=6.0
+                  hovered bg=elevated text=fg
+                  pressed bg=subtle text=fg
+                box
+                  with
+                    w=1.0
+                    h=16.0
+                    bg=subtle
+                  space w=1.0 h=1.0
+                button -> emit(open_message_reactions, message.seq, message.body, message.rev)
+                  with
+                    label="Manage reactions"
+                    disabled=disabled
+                    w=27.0
+                    h=25.0
+                    p=4.0
+                    @ghost_action
+                  text "♡"
+                    with
+                      size=12.5
+                      font=ui
+                  active bg=transparent text=muted r=6.0
+                  hovered bg=elevated text=fg
+                  pressed bg=subtle text=fg
+                button -> emit(open_thread_for, message.seq)
+                  with
+                    label="Open thread"
+                    disabled=disabled
+                    p=5.0
+                    @icon_action
+                  // `color=inherit` (ducktape-ui#606): the glyph reads the
+                  // same status-resolved ink the ♡ and ⋯ string labels beside
+                  // it inherit, so all three brighten and dim together — on
+                  // the button's bounds and the button's disabled status.
+                  svg icon("nav-chat") memory color=inherit
+                    with
+                      w=15.0
+                      h=15.0
+                  active bg=transparent text=muted r=6.0
+                  hovered bg=elevated text=fg
+                  pressed bg=subtle text=fg
+                button -> emit(open_message_actions, message.seq, message.body, message.rev)
+                  with
+                    label="More message actions"
+                    disabled=disabled
+                    w=27.0
+                    h=25.0
+                    p=4.0
+                    @ghost_action
+                  text "⋯"
+                    with
+                      size=12.5
+                      font=ui
+                  active bg=transparent text=muted r=6.0
+                  hovered bg=elevated text=fg
+                  pressed bg=subtle text=fg
+        if message.deleted || message.pending
+          space w=1.0 h=1.0
 
 // A REPLY IS THE SAME MESSAGE BLOCK AS A TIMELINE ROW. It mounts
 // `MessageContents` — the run rhythm, the quiet code slab and quote bar, the
@@ -801,122 +883,135 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
 // already reading the thread. The card padding matches MessageCard's so the
 // pr=7 indicator inset still tucks under the pr=8 toolbar plate (#926).
 //
-// `flash` — the rail's own settle ✓: `thread_send_flash_id` anchors it to the
-// reply whose optimistic send just landed, on the stream's shared fade.
 // `open_thread_for` is forwarded only because `MessageContents` declares it:
 // it fires from the reply pill, and a reply carries no replies
 // (`reply_count` only ever climbs on a root), so the pill never renders here.
-component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabled:bool, flash:f64)
+component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabled:bool)
   emits
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
     open_thread_for(i64)
     open_thread_message_actions(i64, str, i64)
     open_thread_message_reactions(i64, str, i64)
-  // Same draw-time hover as MessageCard — see the note there. `menu_open` is
-  // a prop of its own and not `selected` because in the rail `selected` means
-  // the deep-link TARGET reply, which is not the row whose menu is up.
-  hover tint=row_hover r=9.0 open=menu_open
-    stack w=fill
-      if message.deleted
-        box
-          with
-            w=fill
-            pl=7.0
-            pr=7.0
-            pt=6.0
-            pb=6.0
-            bg=transparent
-            border=transparent
-            border-w=1.0
-            r=9.0
-          MessageContents message=message flash=flash
-            forward
-              add_reaction_at
-              remove_reaction_at
-              open_thread_for
-      // Same `selected_row` tint as the stream — see the note in MessageCard.
-      if !message.deleted && selected
-        box
-          with
-            w=fill
-            pl=7.0
-            pr=7.0
-            pt=6.0
-            pb=6.0
-            bg=selected_row
-            border=transparent
-            border-w=1.0
-            r=9.0
-          MessageContents message=message flash=flash
-            forward
-              add_reaction_at
-              remove_reaction_at
-              open_thread_for
-      if !message.deleted && !selected
-        box
-          with
-            w=fill
-            pl=7.0
-            pr=7.0
-            pt=6.0
-            pb=6.0
-            bg=transparent
-            border=transparent
-            border-w=1.0
-            r=9.0
-          MessageContents message=message flash=flash
-            forward
-              add_reaction_at
-              remove_reaction_at
-              open_thread_for
-    col w=fill
-      if !message.deleted && !message.pending
-        box
-          with
-            w=fill
-            align-x=end
-            align-y=start
-            pr=8.0
-          // The stream's bar, minus its open-thread seat AND its one-tap
-          // reactions: the rail is a fixed 330px plate, and the full 145px
-          // bar would still cover half the author header. Two seats (61px)
-          // keep it clear; the one-tap set lives one click away behind ♡.
+    open_message_link(str)
+  col w=fill
+    if message.show_author
+      space w=1.0 h=14.0
+    // Same draw-time hover as MessageCard — see the note there. `menu_open` is
+    // a prop of its own and not `selected` because in the rail `selected` means
+    // the deep-link TARGET reply, which is not the row whose menu is up.
+    hover tint=row_hover r=9.0 open=menu_open
+      stack w=fill
+        if message.deleted
           box
             with
-              p=2.0
-              bg=surface
-              border=border
+              w=fill
+              pl=7.0
+              pr=7.0
+              pt=4.0
+              pb=4.0
+              bg=transparent
+              border=transparent
               border-w=1.0
               r=9.0
-              shadow=shadow_popover
-              shadow-y=3.0
-              shadow-blur=12.0
-            row gap=1.0 align=center
-              button "♡" -> emit(open_thread_message_reactions, message.seq, message.body, message.rev)
-                with
-                  label="Manage reactions"
-                  disabled=disabled
-                  w=27.0
-                  h=25.0
-                  p=4.0
-                  @ghost_action
-                active bg=transparent text=muted r=6.0
-                hovered bg=elevated text=fg
-                pressed bg=subtle text=fg
-              button "⋯" -> emit(open_thread_message_actions, message.seq, message.body, message.rev)
-                with
-                  label="More message actions"
-                  disabled=disabled
-                  w=27.0
-                  h=25.0
-                  p=4.0
-                  @ghost_action
-                active bg=transparent text=muted r=6.0
-                hovered bg=elevated text=fg
-                pressed bg=subtle text=fg
-      if message.deleted || message.pending
-        space w=1.0 h=1.0
+            MessageContents message=message
+              forward
+                add_reaction_at
+                remove_reaction_at
+                open_thread_for
+                open_message_link
+        // Same `selected_row` tint as the stream — see the note in MessageCard.
+        if !message.deleted && selected
+          box
+            with
+              w=fill
+              pl=7.0
+              pr=7.0
+              pt=4.0
+              pb=4.0
+              bg=selected_row
+              border=transparent
+              border-w=1.0
+              r=9.0
+            MessageContents message=message
+              forward
+                add_reaction_at
+                remove_reaction_at
+                open_thread_for
+                open_message_link
+        if !message.deleted && !selected
+          box
+            with
+              w=fill
+              pl=7.0
+              pr=7.0
+              pt=4.0
+              pb=4.0
+              bg=transparent
+              border=transparent
+              border-w=1.0
+              r=9.0
+            MessageContents message=message
+              forward
+                add_reaction_at
+                remove_reaction_at
+                open_thread_for
+                open_message_link
+      col w=fill
+        if !message.deleted && !message.pending
+          box
+            with
+              w=fill
+              align-x=end
+              align-y=start
+              pr=8.0
+            // The stream's bar, minus its open-thread seat AND its one-tap
+            // reactions: the rail is a fixed 330px plate, and the full 145px
+            // bar would still cover half the author header. Two seats (61px)
+            // keep it clear; the one-tap set lives one click away behind ♡.
+            box
+              with
+                p=2.0
+                bg=surface
+                border=border
+                border-w=1.0
+                r=9.0
+                shadow=shadow_popover
+                shadow-y=3.0
+                shadow-blur=12.0
+              row gap=1.0 align=center
+                button -> emit(open_thread_message_reactions, message.seq, message.body, message.rev)
+                  with
+                    label="Manage reactions"
+                    disabled=disabled
+                    w=27.0
+                    h=25.0
+                    p=4.0
+                    @ghost_action
+                  text "♡"
+                    with
+                      size=12.5
+                      font=ui
+                  active bg=transparent text=muted r=6.0
+                  hovered bg=elevated text=fg
+                  pressed bg=subtle text=fg
+                button -> emit(open_thread_message_actions, message.seq, message.body, message.rev)
+                  with
+                    label="More message actions"
+                    disabled=disabled
+                    w=27.0
+                    h=25.0
+                    p=4.0
+                    @ghost_action
+                  text "⋯"
+                    with
+                      size=12.5
+                      font=ui
+                  active bg=transparent text=muted r=6.0
+                  hovered bg=elevated text=fg
+                  pressed bg=subtle text=fg
+        if message.deleted || message.pending
+          space w=1.0 h=1.0
 
 component ChatSearchResult(hit:ChatSearchHit)
   emits
@@ -995,7 +1090,6 @@ component ComposerMarks(disabled:bool)
             size=12.5
             wrap=none
             font=strong
-            @text-muted
       active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
       hovered bg=fg/8 text=fg
       pressed bg=fg/12 text=fg
@@ -1018,7 +1112,6 @@ component ComposerMarks(disabled:bool)
             size=12.5
             wrap=none
             font=italic
-            @text-muted
       active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
       hovered bg=fg/8 text=fg
       pressed bg=fg/12 text=fg
@@ -1028,7 +1121,7 @@ component ComposerMarks(disabled:bool)
         h=14.0
         bg=separator
       space w=1.0 h=1.0
-    button -> emit(mark, "code")
+    button #code -> emit(mark, "code")
       with
         label="Code block"
         disabled=disabled
@@ -1042,11 +1135,10 @@ component ComposerMarks(disabled:bool)
           h=fill
           align-x=center
           align-y=center
-        Icon
+        svg icon("code-brackets") #glyph memory color=inherit
           with
-            name="code-brackets"
-            tone="muted"
-            px=13.0
+            w=13.0
+            h=13.0
       active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
       hovered bg=fg/8 text=fg
       pressed bg=fg/12 text=fg
@@ -1064,11 +1156,10 @@ component ComposerMarks(disabled:bool)
           h=fill
           align-x=center
           align-y=center
-        Icon
+        svg icon("quote") memory color=inherit
           with
-            name="quote"
-            tone="muted"
-            px=13.0
+            w=13.0
+            h=13.0
       active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
       hovered bg=fg/8 text=fg
       pressed bg=fg/12 text=fg
@@ -1111,6 +1202,172 @@ component ComposerGate(reason:str)
         space w=1.0 h=1.0
 
 // ============================================================================
+// THE COMPOSER IS THE ROOM'S COMPOSER (ducktape-ui#697). One retained
+// instance per key — the stream mounts `#composer(active_channel)`, the rail
+// `#reply_composer(...)` — so a draft never rides a room switch: there is no
+// app-level editor left to park, and the park/restore handler class (with
+// the ordering lint that policed it) is deleted, not moved.
+//
+// WHAT RIDES UP: `submitted(text, operation_id)`, fired from the local
+// handler AFTER the box is cleared, so the app's optimistic insert and the
+// send lane run against a composer that has finished writing. WHAT RIDES
+// DOWN: props. The widget's gate rides the ROUTE (`blocked`), so the handler
+// refuses with the same verdict the frame drew — and the app re-reads its
+// own gate at delivery, where a frame-stale admit stashes the text for the
+// banner below instead of losing it.
+//
+// THE FAILED-SEND BANNER LIVES HERE because its Restore writes THIS
+// instance's content — the one thing the app can no longer reach. Formatting
+// chords land here too: the widget's `on_chord` claims Cmd/Ctrl+B and
+// friends at the caret (see `composer_chord`), so the app's keyboard
+// subscription stopped needing to know which composer is focused.
+// ============================================================================
+component ChatComposer(kind:ComposerKind, compact:bool, hint:str, blocked:bool, restore_blocked:bool, failed_note:str)
+  emits
+    submitted(ComposerKind, str, str)
+  state
+    body:editor = ""
+    // THE UNSENT WORDS BELONG TO THE ROOM THEY WERE WRITTEN IN. This was one
+    // app field, so a send that failed in #private-ops raised its plate over
+    // whatever room the reader had moved to and offered to restore it THERE.
+    // It is the instance's own state now, delivered by a slice keyed to the
+    // room the failure names (ducktape-ui#698).
+    failed = ""
+  on composer_event(event, gate, which)
+    body = apply_composer_event(body, event)
+    return if !composer_submits(event)
+    return if gate
+    let text = trim(editor_text(body))
+    return if empty(text)
+    body = editor("")
+    emit(submitted, which, text, fresh_operation_id(composer_op_prefix(which)))
+  on mark(glyph, gate)
+    return if gate
+    body = composer_toggle_mark(body, glyph)
+  // The app's share-out: what this room's send let go of, handed back to the
+  // box it came from. A committed body is not unsent, so it never stashes.
+  on unsent(text, committed)
+    failed = remember_failed_draft(failed, "stash", text, committed)
+  on restore(gate)
+    return if gate || empty(failed) || !empty(trim(editor_text(body)))
+    body = editor(failed)
+    failed = ""
+  on dismiss
+    failed = ""
+  col #root w=fill gap=10.0
+    // DATA LOSS READS AT LEAST AS LOUD AS AN EXPECTED REFUSAL — the same
+    // reversible-danger plate the archive button wears: the draft is
+    // recoverable, so this is not `@danger_action` loud.
+    if !empty(failed)
+      box
+        with
+          w=fill
+          px=13.0
+          py=11.0
+          bg=danger_zone_bg
+          border=danger_zone_line
+          border-w=1.0
+          r=9.0
+        row
+          with
+            w=fill
+            gap=8.0
+            align=center
+          box
+            with
+              w=6.0
+              h=6.0
+              bg=danger_dot
+              r=3.0
+            space w=1.0 h=1.0
+          text failed_note
+            with
+              w=fill
+              size=12.5
+              line-h=1.45
+              @text-danger
+          button "Restore" -> restore(restore_blocked)
+            with
+              disabled=(restore_blocked || !empty(trim(editor_text(body))))
+              h=28.0
+              p=5.0
+              @secondary_action
+            active bg=fg/9 text=fg border=fg/11 border-w=1.0 r=7.0
+            hovered bg=fg/14
+            pressed bg=fg/18
+          button -> dismiss
+            with
+              label="Dismiss unsent draft"
+              w=28.0
+              h=28.0
+              p=0.0
+              @icon_action
+            box
+              with
+                w=fill
+                h=fill
+                align-x=center
+                align-y=center
+              text "×" size=14.0
+            active bg=transparent text=muted r=7.0
+            hovered bg=fg/10 text=fg
+            pressed bg=fg/15
+    box
+      with
+        w=fill
+        bg=surface
+        border=control_line
+        border-w=1.0
+        r=12.0
+        clip=true
+        shadow=shadow_popover
+        shadow-y=1.0
+        shadow-blur=2.0
+      col w=fill
+        extern rich_composer(body, hint, blocked, 44.0, 150.0, 10.0) #field -> composer_event(_, blocked, kind)
+        box
+          with
+            w=fill
+            pl=8.0
+            pr=8.0
+            pb=8.0
+          row
+            with
+              w=fill
+              gap=2.0
+              align=center
+            ComposerMarks
+              with
+                disabled=blocked
+              events
+                mark -> mark(_, blocked)
+            space w=fill
+            if !compact
+              text "↵ send · ⇧↵ newline"
+                with
+                  size=10.5
+                  wrap=none
+                  font=code_medium
+                  @text-muted
+              space w=8.0
+              button "Send" -> composer_event(composer_submit_event(), blocked, kind)
+                with
+                  disabled=(blocked || empty(trim(editor_text(body))))
+                  h=29.0
+                  @primary_action
+                  @px-12px
+                  @py-7px
+            if compact
+              button "Send" -> composer_event(composer_submit_event(), blocked, kind)
+                with
+                  label="Send reply"
+                  disabled=(blocked || empty(trim(editor_text(body))))
+                  h=28.0
+                  @primary_action
+                  @px-11px
+                  @py-6px
+
+// ============================================================================
 // THREAD RAIL — the artifact opens the rail body with the root message in its
 // own divided block, at a type scale one notch under a reply.
 //
@@ -1134,19 +1391,26 @@ component ComposerGate(reason:str)
 // stream's reply pill already trusts — not `len(thread_messages)` (root
 // included) and not the loaded page (short whenever `thread_has_more` holds).
 component ThreadParentBlock(message:ChatMessage)
+  emits
+    open_message_link(str)
   col #root w=fill
     row
       with
         w=fill
-        gap=10.0
+        gap=11.0
         align=start
         pb=14.0
+      // GUTTER MATCHED TO THE REPLIES BELOW IT: `plate=30.0 gap=11.0` is the
+      // same 41px text gutter `MessageContents` gives every reply, so the
+      // root's body lines up with the column it heads instead of sitting 3px
+      // left of it — the one thing off-grid at the exact spot the eye enters
+      // the rail.
       PrincipalAvatar
         with
           initials=message.initial
           is_agent=(message.avatar_kind == "agent")
-          plate=28.0
-          ink=10.0
+          plate=30.0
+          ink=11.0
           ring=""
       col w=fill gap=2.0
         row
@@ -1156,19 +1420,31 @@ component ThreadParentBlock(message:ChatMessage)
             align=center
           text message.author
             with
-              size=12.5
+              size=13.5
               wrap=none
               font=display
               @text-fg
+          // Same fact, same stamp as the stream's — see the note there.
           if message.height > 0
             text height_label_short(message.height)
               with
-                size=10.0
+                size=11.0
                 wrap=none
-                font=code_semibold
-                @text-hint
+                font=code_medium
+                @text-muted
+          // The root of a thread is edited like any other message, and this
+          // block never said so at all.
+          if message.edited
+            text "· edited"
+              with
+                size=11.0
+                wrap=none
+                font=code_medium
+                @text-muted
           space w=fill
         MessageBody message=message
+          forward
+            open_message_link
     box
       with
         w=fill
@@ -1211,3 +1487,19 @@ component ThreadParentBlock(message:ChatMessage)
 // one `Icon name=… tone="muted" px=14.0` added to four buttons in view.ice, in
 // the file that owns them. The artifact's row metrics for that edit: `gap=9.0`,
 // label 12.5 `@text-accent_fg`, `p=8.0`/`pl=9.0`, `r=7.0`, on a 184px plate.
+
+// ONE GHOST ROW, on the real message row's own geometry: a 30px avatar plate,
+// an 11px gap, a name bar and a body bar. Mounted three-up while a room loads
+// and once inside the search float while a query is out, so the layout does
+// not jump when the real rows land on top of it. `subtle` is the palette's own
+// track grey, quiet in both themes. No spinner: `spin` is declared and never
+// driven (`overlay.ice`), so a ring here would paint a frozen arc.
+component SkeletonRow()
+  row w=fill gap=11.0 align=start
+    box w=30.0 h=30.0 bg=subtle r=15.0
+      space w=1.0 h=1.0
+    col w=fill gap=6.0 pt=4.0
+      box w=96.0 h=9.0 bg=subtle r=4.0
+        space w=1.0 h=1.0
+      box w=fill max-w=420.0 h=9.0 bg=subtle r=4.0
+        space w=1.0 h=1.0

@@ -5,7 +5,7 @@
 // `draft` and `query` are `bind` props: the inputs write straight back to the
 // app state the view passes in, so the palette needs no local mirror of a
 // field the handlers already own.
-component OverlayLayer(create_open:bool, members_only:bool, bind draft:str, busy:bool, connected:bool, loading:bool, toast:str, tone:str, open:bool, bind query:str, searching:bool, chat_hits:[ChatSearchHit], page_hits:[PageSearchHit])
+component OverlayLayer(create_open:bool, members_only:bool, bind draft:str, busy:bool, connected:bool, loading:bool, toast:str, tone:str, open:bool, bind query:str, search_phase:SearchPhase, chat_hits:[ChatSearchHit], page_hits:[PageSearchHit])
   emits
     toggle_channel_create()
     toggle_channel_create_members_only()
@@ -260,7 +260,7 @@ component OverlayLayer(create_open:bool, members_only:bool, bind draft:str, busy
             label="Dismiss"
             p=0.0
             @icon_action
-          Toast.Confirm message=toast tone=tone
+          Toast message=toast tone=tone
           active bg=transparent text=fg border=transparent border-w=1.0 r=10.0
           hovered bg=transparent text=fg
           pressed bg=transparent text=fg
@@ -307,8 +307,30 @@ component OverlayLayer(create_open:bool, members_only:bool, bind draft:str, busy
                 @control
               active bg=muted_bg border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=9.0
               hovered bg=elevated border=fg/21
-            if searching
+            if search_phase == SearchPhase.searching
               text "Searching…" size=12.5 @text-muted
+            // THE PALETTE ANSWERED, WITH NOTHING. `done` is written only where
+            // a result lands, so — unlike a bare `!searching`, which a failure
+            // also satisfies — this arm cannot claim a search that never ran
+            // matched nothing. No draft term needed: `palette_changed` moves
+            // the phase on every keystroke, so `done` cannot outlive the query
+            // that earned it.
+            if search_phase == SearchPhase.done && empty(chat_hits) && empty(page_hits)
+              EmptyPlate message="Nothing matched that search."
+            // AND THE FAILURE SAYS SO, HERE. `palette_search_failed` returns
+            // the phase to idle and clears the hits — so without this arm the
+            // panel collapsed to a bare field indistinguishable from one
+            // nobody had typed into. An `error` assignment could not rescue
+            // it: the error banner lives in the console column and this
+            // palette is an `overlay` with `backdrop=scrim`, so the banner
+            // sits BEHIND the scrim and its Dismiss cannot be clicked. This
+            // arm is the palette's only word about the failure.
+            //
+            // The pair is reachable only after one: `palette_changed` raises
+            // `searching` for every non-empty draft, so idle under a live
+            // query has exactly one cause.
+            if search_phase == SearchPhase.idle && !empty(trim(query))
+              EmptyPlate message="Search failed."
             if !empty(chat_hits) || !empty(page_hits)
               // HUGS ITS RESULTS, up to a ceiling. A flat `h=380.0` meant one
               // hit sat at the top of a 380px panel with the rest of it empty —

@@ -6,24 +6,34 @@
 // one family, and the guards in main.rs name several of its members verbatim.
 // Everything outside that family drops the redundant `forge_` prefix.
 
-component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[ForgeRepo], open_repo:str, repo_menu:bool, branches:[str], tab:str, items:[ForgeItem], tree_repo:str, tree_path:str, tree_entries:[TreeEntry], file_path:str, file_text:str, file_binary:bool, file_truncated:bool, forge_item_number:i64, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:str, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], answered:bool, discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, connected:bool, loading:bool, shift_held:bool)
+enum ForgeFilePhase
+  idle
+  loading
+  ready
+  failed
+
+enum ForgeTreePhase
+  loading
+  ready
+  failed
+
+component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[ForgeRepo], list_phase:ForgePhase, open_repo:str, repo_menu:bool, repo_phase:ForgePhase, branches:[str], tab:ForgeTab, items:[ForgeItem], forge_item_number:i64, item_phase:ForgePhase, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:ForgeReviewVerdict, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, connected:bool, loading:bool, dark:bool)
   emits
     forge_open_repo(str)
     forge_close_repo()
     forge_toggle_repo_menu()
-    select_forge_tab(str)
-    forge_open_dir(str)
-    forge_open_file(str)
+    select_forge_tab(ForgeTab)
     forge_open_item(i64)
     forge_close_item()
     forge_merge_submit()
-    forge_review_pick(str)
+    forge_review_pick(ForgeReviewVerdict)
     forge_review_submit()
     forge_comment_open(str, str, str)
     forge_comment_stage()
     forge_comment_cancel()
     forge_comment_drop(str)
     note_composer_event(ComposerEvent)
+    open_message_link(str)
   col w=fill h=fill
     // NOT CONNECTED IS NOT EMPTY, and the arm sits ABOVE both seats because
     // both of them read. `connected` already disabled every act here, while the
@@ -52,22 +62,28 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
         col
           with
             w=fill
-            p=22.0
-            gap=18.0
+            p=16.0
+            gap=14.0
           ForgeOrgHeader
             with
               org
               about
               repos=len(repos)
               tier
-              connected
+              answered=(list_phase == ForgePhase.ready)
+          if empty(repos) && list_phase == ForgePhase.loading
+            box w=fill p=30.0 align-x=center
+              text "Loading repositories…" size=13.0 @text-meta
+          if empty(repos) && list_phase == ForgePhase.failed
+            box w=fill p=30.0 align-x=center
+              text "Could not load repositories. Reopen Forge to try again." size=13.0 @text-meta
           // NOT `EmptyPlate`: this screen has no "new repository" button and
           // never will, because forge IS a git remote — a repo comes into
           // existence when a push lands on it. Saying only that a repo
           // "appears here once it is created" and naming no way to create one
           // is a dead end, so the plate carries the command with this
           // workspace's own endpoint already in it.
-          if empty(repos) && answered
+          if empty(repos) && list_phase == ForgePhase.ready
             box
               with
                 w=fill
@@ -100,7 +116,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                       font=code
                       @text-accent_fg
           if !empty(repos)
-            grid min-cell=380.0 gap=13.0
+            grid min-cell=320.0 gap=10.0
               for repo in repos
                 RepoCard repo=repo
                   forward
@@ -110,38 +126,56 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
         box
           with
             w=fill
-            pl=22.0
-            pr=22.0
-            pt=14.0
-            pb=12.0
+            pl=16.0
+            pr=16.0
+            pt=8.0
+            pb=8.0
           stack w=fill
             row
               with
                 w=fill
                 gap=9.0
                 align=center
-              button -> emit(forge_toggle_repo_menu)
+              box
                 with
-                  label="Switch repository"
                   w=fill
-                  p=0.0
-                  @ghost_action
-                RepoCrumb
+                  clip=true
+                button -> emit(forge_toggle_repo_menu)
                   with
-                    org
-                    repo=open_repo
-                    branch=""
-                    open=repo_menu
-                active bg=transparent text=fg border=transparent border-w=1.0 r=9.0
-                hovered bg=row_hover text=fg
-                pressed bg=elevated text=fg
+                    label="Switch repository"
+                    expanded=repo_menu
+                    w=fill
+                    p=0.0
+                    @ghost_action
+                  RepoCrumb
+                    with
+                      org
+                      repo=open_repo
+                      branch=""
+                      open=repo_menu
+                  active bg=transparent text=fg border=transparent border-w=1.0 r=9.0
+                  hovered bg=row_hover text=fg
+                  pressed bg=elevated text=fg
+              // Detail navigation belongs in the persistent repo bar. Keeping
+              // it in the scrolling body spent a whole row on a control that
+              // should remain available while a long diff is being read.
+              if forge_item_number > 0 && item_phase == ForgePhase.ready
+                BackToList kind=forge_item_kind
+                  forward
+                    forge_close_item
+              if forge_item_number > 0 && item_phase != ForgePhase.ready
+                button "Back to tracker" -> emit(forge_close_item)
+                  with
+                    h=28.0
+                    p=6.0
+                    @secondary_action
               button "All repos" -> emit(forge_close_repo)
                 with
                   h=28.0
                   p=6.0
                   @secondary_action
             if repo_menu
-              pin x=0.0 y=38.0
+              pin x=0.0 y=36.0
                 Popover width=290.0
                   col w=fill gap=1.0
                     for repo in repos
@@ -156,44 +190,8 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
           space w=1.0 h=1.0
         if forge_item_number <= 0
           col w=fill h=fill
-            if !empty(branches)
-              box
-                with
-                  w=fill
-                  pl=22.0
-                  pr=22.0
-                  pt=10.0
-                  pb=10.0
-                scroll
-                  with
-                    dir=horizontal
-                    w=fill
-                    h=22.0
-                    bar=hidden
-                  row
-                    with
-                      h=fill
-                      gap=4.0
-                      align=center
-                    for branch in branches
-                      box
-                        with
-                          h=20.0
-                          pl=7.0
-                          pr=7.0
-                          align-y=center
-                          bg=surface
-                          border=border
-                          border-w=1.0
-                          r=10.0
-                        text branch
-                          with
-                            size=9.0
-                            wrap=none
-                            font=code_semibold
-                            @text-meta
             // THE TAB BAR THE TRACKER NEVER GOT. `forge_tab` has sat in
-            // state.ice and `filter_forge_items`/`forge_open_count` in
+            // state/forge.ice and `filter_forge_items`/`forge_open_count` in
             // backend.ice since wave 1 with no call site at all, so the
             // screen piled merged PRs and closed issues into one flat
             // list. The counts are OPEN work — a PR counts until it
@@ -201,53 +199,95 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
             box
               with
                 w=fill
-                pl=22.0
-                pr=22.0
+                pl=16.0
+                pr=16.0
               row
                 with
                   w=fill
-                  gap=22.0
+                  gap=18.0
                   align=center
-                button -> emit(select_forge_tab, "code")
+                button -> emit(select_forge_tab, ForgeTab.code)
                   with
                     label="Browse the code"
+                    checked=(tab == ForgeTab.code)
                     p=0.0
                     @ghost_action
                   TabLabel
                     with
                       label="Code"
                       count=0
-                      active=(tab == "code")
+                      active=(tab == ForgeTab.code)
                   active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
                   hovered bg=transparent text=fg
                   pressed bg=transparent text=fg
-                button -> emit(select_forge_tab, "pulls")
+                button -> emit(select_forge_tab, ForgeTab.pulls)
                   with
                     label="Show pull requests"
+                    checked=(tab == ForgeTab.pulls)
                     p=0.0
                     @ghost_action
                   TabLabel
                     with
                       label="Pull requests"
                       count=forge_open_count(items, "pr")
-                      active=(tab == "pulls")
+                      active=(tab == ForgeTab.pulls)
                   active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
                   hovered bg=transparent text=fg
                   pressed bg=transparent text=fg
-                button -> emit(select_forge_tab, "issues")
+                button -> emit(select_forge_tab, ForgeTab.issues)
                   with
                     label="Show issues"
+                    checked=(tab == ForgeTab.issues)
                     p=0.0
                     @ghost_action
                   TabLabel
                     with
                       label="Issues"
                       count=forge_open_count(items, "issue")
-                      active=(tab == "issues")
+                      active=(tab == ForgeTab.issues)
                   active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
                   hovered bg=transparent text=fg
                   pressed bg=transparent text=fg
-                space w=fill
+                // Branches are context for every repo seat, not a separate
+                // destination. Let them spend the remaining tab-bar width and
+                // scroll horizontally instead of charging the content a row.
+                if !empty(branches)
+                  box
+                    with
+                      w=1.0
+                      h=18.0
+                      bg=separator
+                    space w=1.0 h=1.0
+                  scroll
+                    with
+                      dir=horizontal
+                      w=fill
+                      h=22.0
+                      bar=hidden
+                    row
+                      with
+                        h=fill
+                        gap=4.0
+                        align=center
+                      for branch in branches
+                        box
+                          with
+                            h=20.0
+                            pl=7.0
+                            pr=7.0
+                            align-y=center
+                            bg=surface
+                            border=border
+                            border-w=1.0
+                            r=10.0
+                          text branch
+                            with
+                              size=9.0
+                              wrap=none
+                              font=code_semibold
+                              @text-meta
+                if empty(branches)
+                  space w=fill
             box
               with
                 w=fill
@@ -258,152 +298,28 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
             // other two seats are the same tracker list under different
             // filters.
             match tab
-              "code"
-                // The header carries the path from the repo root and
-                // NOTHING ELSE. The artifact prefixes the repo name;
-                // the breadcrumb directly above already says it, and
-                // Ice has no string concatenation to join the two.
-                // `message` / `author` / `stamp` are the last commit
-                // under this path — the mirror could answer that with a
-                // revwalk, and until a loader does the three slots stay
-                // empty rather than printing a middot run around values
-                // nobody read. ForgeCodeHeader drops each empty slot by
-                // construction.
-                ForgeCodeTab
+              ForgeTab.code
+                ForgeCodeBrowser #code(open_repo)
                   with
-                    path=file_path
-                    message=""
-                    author=""
-                    stamp=""
-                  files:
-                    // ONE GUARD, AT THE TOP OF THE PANE. The listing
-                    // paints only for the repo it was read from —
-                    // `forge_open_repo` lives in a handler file this one
-                    // does not own and clears none of this, and another
-                    // project's files under a new breadcrumb is a wrong
-                    // reading, not a stale one. Picking Code re-reads
-                    // the root, so the tab itself is the recovery.
-                    col w=fill
-                      if tree_repo != open_repo
-                        box
-                          with
-                            w=fill
-                            pl=16.0
-                            pr=16.0
-                            pt=8.0
-                          // Reached only by an UNBORN repo now that opening one
-                          // loads its tree: a repo with no push on it has no
-                          // files to list, and saying so beats asking the
-                          // reader to click the tab they are already on.
-                          text "Nothing committed on this branch yet."
-                            with
-                              w=fill
-                              size=11.5
-                              line-h=1.5
-                              @text-label
-                      if tree_repo == open_repo
-                        col w=fill
-                          if !empty(tree_path)
-                            button -> emit(forge_open_dir, "")
-                              with
-                                label="Back to the repository root"
-                                w=fill
-                                p=0.0
-                                @icon_action
-                              ForgeTreeDirRow
-                                with
-                                  name="/"
-                                  depth=0.0
-                                  open=true
-                              active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
-                              hovered bg=rail_hover text=fg
-                              pressed bg=elevated text=fg
-                          for entry in tree_entries
-                            col w=fill
-                              if entry.kind == "dir"
-                                button -> emit(forge_open_dir, entry.path)
-                                  with
-                                    label="Open directory"
-                                    description=entry.path
-                                    w=fill
-                                    p=0.0
-                                    @icon_action
-                                  ForgeTreeDirRow
-                                    with
-                                      name=entry.name
-                                      depth=0.0
-                                      open=false
-                                  active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
-                                  hovered bg=rail_hover text=fg
-                                  pressed bg=elevated text=fg
-                              if entry.kind != "dir"
-                                button -> emit(forge_open_file, entry.path)
-                                  with
-                                    label="Open file"
-                                    description=entry.path
-                                    w=fill
-                                    p=0.0
-                                    @icon_action
-                                  ForgeTreeFileRow
-                                    with
-                                      name=entry.name
-                                      depth=0.0
-                                      selected=(entry.path == file_path)
-                                  active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
-                                  hovered bg=rail_hover text=fg
-                                  pressed bg=elevated text=fg
-                  source:
-                    // The reader's three states, each with its own true
-                    // reason. Nothing here claims a file is empty.
-                    col w=fill
-                      // A TREE WITH NOTHING IN IT IS NOT A TREE TO PICK FROM.
-                      // The sidebar already says "Nothing committed on this
-                      // branch yet"; telling the reader to pick a file from it
-                      // in the same breath sends them looking for something
-                      // that screen has just said does not exist.
-                      if empty(file_path) && empty(tree_entries)
-                        ForgeCodeEmpty name="" note="Nothing is committed on this branch yet, so there is no file to read."
-                      if empty(file_path) && !empty(tree_entries)
-                        ForgeCodeEmpty name="" note="Pick a file from the tree to read it."
-                      if !empty(file_path) && file_binary
-                        ForgeCodeEmpty
-                          with
-                            name=file_path
-                            note="This is not text — the reader shows no preview for it."
-                      if !empty(file_path) && !file_binary
-                        col
-                          with
-                            w=fill
-                            pt=13.0
-                            pb=13.0
-                            gap=9.0
-                          // NUMBERED LINES. `source_lines` is the exact
-                          // counterpart `diff_lines` already is for a
-                          // patch: `forge_blob` hands back ONE string
-                          // and Ice has no string ops, so the split
-                          // happens in backend.rs and the gutter counts
-                          // the rows it actually produced rather than
-                          // guessing where the file breaks.
-                          col w=fill
-                            for line in source_lines(file_text)
-                              ForgeCodeLine number=line.number code=line.text
-                          if file_truncated
-                            text "Truncated at the reader's 64 KiB window — the file on the node is whole."
-                              with
-                                size=11.5
-                                wrap=none
-                                @text-label
-              "issues"
+                    connected_rpc
+                    connected
+                    repo=open_repo
+                    dark
+                  forward
+                    open_message_link
+              ForgeTab.issues
                 ForgeTrackerList
                   with
-                    items=filter_forge_items(items, "issue")
+                    phase=repo_phase
+                    items=filter_forge_items(items, ForgeTab.issues)
                     empty_message="No issues — this app reads the tracker but cannot open one yet."
                   forward
                     forge_open_item
-              _
+              ForgeTab.pulls
                 ForgeTrackerList
                   with
-                    items=filter_forge_items(items, "pr")
+                    phase=repo_phase
+                    items=filter_forge_items(items, ForgeTab.pulls)
                     empty_message="No pull requests — an agent run opens one when it delivers its work."
                   forward
                     forge_open_item
@@ -413,7 +329,13 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
             // the plate described an enforcement that does not exist.
             // The one true sentence about it lives beside the merge
             // button, where the decision is made.
-        if forge_item_number > 0
+        if forge_item_number > 0 && item_phase == ForgePhase.loading
+          box w=fill h=fill p=16.0
+            EmptyPlate message="Loading tracker item…"
+        if forge_item_number > 0 && item_phase == ForgePhase.failed
+          box w=fill h=fill p=16.0
+            EmptyPlate message="Could not load this item. Go back and open it again to retry."
+        if forge_item_number > 0 && item_phase == ForgePhase.ready
           scroll
             with
               dir=vertical
@@ -422,23 +344,26 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
             col
               with
                 w=fill
-                p=22.0
-                gap=14.0
-              BackToList kind=forge_item_kind
-                forward
-                  forge_close_item
+                pl=18.0
+                pr=18.0
+                pt=14.0
+                pb=18.0
+                gap=12.0
               row
                 with
                   w=fill
                   gap=9.0
                   align=center
-                text forge_item_title
+                box
                   with
                     w=fill
-                    size=16.0
-                    wrap=none
-                    font=display
-                    @text-primary
+                    clip=true
+                  text forge_item_title
+                    with
+                      size=16.0
+                      wrap=none
+                      font=display
+                      @text-primary
                 if forge_item_kind == "pr"
                   PrStatePill state=forge_item_state
                 if forge_item_kind != "pr"
@@ -449,26 +374,35 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                   gap=10.0
                   align=center
                 if !empty(forge_item_author)
-                  text forge_item_author
+                  box
                     with
-                      size=11.0
-                      wrap=none
-                      font=code_medium
-                      @text-meta
+                      max-w=160.0
+                      clip=true
+                    text forge_item_author
+                      with
+                        size=11.0
+                        wrap=none
+                        font=code_medium
+                        @text-meta
                 if !empty(forge_item_branches)
-                  text forge_item_branches
+                  box
                     with
-                      size=12.0
-                      wrap=none
-                      font=code
-                      @text-meta
+                      w=fill
+                      clip=true
+                    text forge_item_branches
+                      with
+                        size=12.0
+                        wrap=none
+                        font=code
+                        @text-meta
+                if empty(forge_item_branches)
+                  space w=fill
                 if forge_item_files_changed > 0
                   DiffCount
                     with
                       additions=forge_item_additions
                       deletions=forge_item_deletions
                       files=forge_item_files_changed
-                space w=fill
               if !empty(forge_item_body)
                 IssueBodyCard author=forge_item_author body=forge_item_body
               if !empty(forge_item_diff)
@@ -561,33 +495,36 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                       w=fill
                       gap=6.0
                       align=center
-                    button -> emit(forge_review_pick, "comment")
+                    button -> emit(forge_review_pick, ForgeReviewVerdict.comment)
                       with
                         label="Pick comment verdict"
+                        checked=(review_verdict == ForgeReviewVerdict.comment)
                         h=24.0
                         p=5.0
                         @ghost_action
-                      text verdict_pick_label(review_verdict, "comment", "Comment") size=13.0
+                      text verdict_pick_label(review_verdict, ForgeReviewVerdict.comment, "Comment") size=13.0
                       active bg=surface text=fg border=card_line border-w=1.0 r=7.0
                       hovered bg=elevated text=fg
                       pressed bg=subtle text=fg
-                    button -> emit(forge_review_pick, "approve")
+                    button -> emit(forge_review_pick, ForgeReviewVerdict.approve)
                       with
                         label="Pick approve verdict"
+                        checked=(review_verdict == ForgeReviewVerdict.approve)
                         h=24.0
                         p=5.0
                         @ghost_action
-                      text verdict_pick_label(review_verdict, "approve", "Approve") size=13.0
+                      text verdict_pick_label(review_verdict, ForgeReviewVerdict.approve, "Approve") size=13.0
                       active bg=final_bg text=fg border=final_line border-w=1.0 r=7.0
                       hovered bg=success_bg text=fg
                       pressed bg=success_bg text=fg
-                    button -> emit(forge_review_pick, "request_changes")
+                    button -> emit(forge_review_pick, ForgeReviewVerdict.request_changes)
                       with
                         label="Pick request-changes verdict"
+                        checked=(review_verdict == ForgeReviewVerdict.request_changes)
                         h=24.0
                         p=5.0
                         @ghost_action
-                      text verdict_pick_label(review_verdict, "request_changes", "Request changes")
+                      text verdict_pick_label(review_verdict, ForgeReviewVerdict.request_changes, "Request changes")
                         with
                           size=13.0
                       active bg=alert_bg text=fg border=alert_line border-w=1.0 r=7.0
@@ -635,7 +572,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                             text-size=13.0
                             line-h=1.2
                             @control
-                          active bg=surface border=border value=fg placeholder=hint selection=fg/18 border-w=1.0 r=8.0
+                          active bg=surface value=fg placeholder=hint selection=fg/18 border-w=1.0 r=8.0
                           hovered bg=muted_bg border=control_line
                           disabled bg=muted_bg/54 value=muted
                         button "Add comment" -> emit(forge_comment_stage)
@@ -718,7 +655,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                         text-size=13.0
                         line-h=1.2
                         @control
-                      active bg=surface border=border value=fg placeholder=hint selection=fg/18 border-w=1.0 r=8.0
+                      active bg=surface value=fg placeholder=hint selection=fg/18 border-w=1.0 r=8.0
                       hovered bg=muted_bg border=control_line
                       disabled bg=muted_bg/54 value=muted
                     // The module refuses a review that is empty on BOTH halves,
@@ -734,33 +671,42 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                 GroupLabel label="DISCUSSION"
                 if empty(discussion)
                   text "No discussion yet." size=12.5 @text-caption
-                for message in discussion
-                  row
-                    with
-                      w=fill
-                      gap=9.0
-                      align=start
-                    MessageAvatar initials=message.initial kind=message.avatar_kind
-                    col w=fill gap=2.0
-                      row
-                        with
-                          w=fill
-                          gap=7.0
-                          align=center
-                        text message.author
+                keyed message in discussion by=message.seq virtual-row=44.0 w=fill gap=9.0
+                  // A note is a pure function of its message, so the whole row
+                  // caches under the same (seq, render_rev) key the chat
+                  // stream's quiet arm uses — the live delta fold
+                  // (`fold_live_chat` in lifecycle.ice) bumps `render_rev`
+                  // on every in-place mutation, and a resync's replacement rows
+                  // arrive content-seeded.
+                  lazy message by message.seq, message.render_rev as cached_note
+                    row
+                      with
+                        w=fill
+                        gap=9.0
+                        align=start
+                      MessageAvatar initials=cached_note.initial kind=cached_note.avatar_kind
+                      col w=fill gap=2.0
+                        row
                           with
-                            size=13.0
-                            wrap=none
-                            font=display
-                            @text-fg
-                        text message.meta
-                          with
-                            size=11.0
-                            wrap=none
-                            font=code_medium
-                            @text-meta
-                        space w=fill
-                      MessageBody message=message
+                            w=fill
+                            gap=7.0
+                            align=center
+                          text cached_note.author
+                            with
+                              size=13.0
+                              wrap=none
+                              font=display
+                              @text-fg
+                          text cached_note.meta
+                            with
+                              size=11.0
+                              wrap=none
+                              font=code_medium
+                              @text-meta
+                          space w=fill
+                        MessageBody message=cached_note
+                          forward
+                            open_message_link
                 flex
                   with
                     w=fill
@@ -774,7 +720,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                       border-w=1.0
                       r=8.0
                       clip=true
-                    extern rich_composer(discussion_editor, "Write a note…", (loading || !connected || empty(forge_item_channel)), shift_held, 38.0, 120.0, 6.0) #forge-note -> emit(note_composer_event, _)
+                    extern rich_composer(discussion_editor, "Write a note…", (loading || !connected || empty(forge_item_channel)), 38.0, 120.0, 6.0) #forge-note -> emit(note_composer_event, _)
                   button "Send" -> emit(note_composer_event, composer_submit_event())
                     with
                       disabled=(loading || !connected || empty(forge_item_channel) || !empty(discussion_pending) || empty(trim(editor_text(discussion_editor))))
@@ -782,3 +728,280 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                       h=28.0
                       p=6.0
                       @primary_action
+
+// THE CODE BROWSE OWNS ITS OWN CYCLE, whole: boot reads the root listing
+// with the endpoint and repo its instance was mounted with, a directory
+// row navigates through a local handler, and a file click lands the blob
+// in component state — no app handler seeds or clears any of it. The call
+// site keys the instance by repository and mounted lifetime prunes it, so
+// switching repos or leaving the Code tab retires everything and coming
+// back boots a fresh read. Within a stay, the preview is gated on the
+// directory AND revision it was opened under (`forge_file_header`), so
+// navigating away or a tree that reloaded at a newer commit retires it by
+// moving the ground under it.
+component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:bool)
+  emits
+    open_message_link(str)
+  lifetime mounted
+  state
+    tree_path = ""
+    tree_rev = ""
+    tree_entries:[TreeEntry] = []
+    tree_born = false
+    tree_truncated = false
+    tree_phase:ForgeTreePhase = ForgeTreePhase.loading
+    file_path = ""
+    file_text = ""
+    file_binary = false
+    file_truncated = false
+    failed_note = ""
+    opened_dir = ""
+    opened_rev = ""
+    phase:ForgeFilePhase = ForgeFilePhase.idle
+  boot
+    run replace lane=tree forge_tree(connected_rpc, repo, "", "") -> tree_loaded _ | tree_failed _
+  on open_dir(rpc, online, repo_now, path)
+    return if !online || empty(repo_now)
+    tree_path = path
+    tree_entries = []
+    tree_truncated = false
+    tree_phase = ForgeTreePhase.loading
+    run replace lane=tree forge_tree(rpc, repo_now, tree_rev, path) -> tree_loaded _ | tree_failed _
+  on tree_loaded(next)
+    return if next.path != tree_path
+    return if !empty(tree_rev) && next.rev != tree_rev
+    tree_rev = next.rev
+    tree_born = next.born
+    tree_entries = next.entries
+    tree_truncated = next.truncated
+    tree_phase = ForgeTreePhase.ready
+  on tree_failed(cause)
+    tree_phase = ForgeTreePhase.failed
+  on open_file(rpc, online, repo_now, rev, dir, path)
+    return if !online || empty(repo_now)
+    opened_dir = dir
+    opened_rev = rev
+    file_path = path
+    file_text = ""
+    // the previous file's flags must not describe the one in flight: a stale
+    // `binary` would brand the next blob "not text" until its load settles.
+    file_binary = false
+    file_truncated = false
+    failed_note = ""
+    phase = ForgeFilePhase.loading
+    run replace lane=blob forge_blob(rpc, repo_now, rev, path) -> file_loaded _ | file_failed _
+  on file_loaded(next)
+    return if next.path != file_path
+    file_text = next.text
+    file_binary = next.binary
+    file_truncated = next.truncated
+    phase = ForgeFilePhase.ready
+  on file_failed(cause)
+    phase = ForgeFilePhase.failed
+    failed_note = cause.message
+  // The header carries the path from the repo root and
+  // NOTHING ELSE. The artifact prefixes the repo name;
+  // the breadcrumb directly above already says it, and
+  // Ice has no string concatenation to join the two.
+  // `message` / `author` / `stamp` are the last commit
+  // under this path — a future server log query could answer
+  // that, and until it does the three slots stay
+  // empty rather than printing a middot run around values
+  // nobody read. ForgeCodeHeader drops each empty slot by
+  // construction.
+  ForgeCodeTab
+    with
+      path=forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)
+      message=""
+      author=""
+      stamp=""
+    files:
+      // Loading, failure and a truly empty tree are different
+      // facts. In particular, an in-flight tree query must never
+      // paint "nothing committed" before its answer arrives.
+      col w=fill
+        if tree_phase == ForgeTreePhase.loading
+          box
+            with
+              w=fill
+              pl=16.0
+              pr=16.0
+              pt=8.0
+            text "Loading repository files…"
+              with
+                w=fill
+                size=11.5
+                line-h=1.5
+                @text-label
+        if tree_phase == ForgeTreePhase.failed
+          box w=fill pl=16.0 pr=16.0 pt=8.0
+            text "Could not load code. Pick Code to try again."
+              with
+                w=fill
+                size=11.5
+                line-h=1.5
+                @text-label
+        if tree_phase == ForgeTreePhase.ready
+          col w=fill
+            if empty(tree_entries) && !tree_born
+              box w=fill pl=16.0 pr=16.0 pt=8.0
+                text "Nothing committed on this repository yet."
+                  with
+                    w=fill
+                    size=11.5
+                    line-h=1.5
+                    @text-label
+            if empty(tree_entries) && tree_born && !tree_truncated
+              box w=fill pl=16.0 pr=16.0 pt=8.0
+                text "No files in this commit."
+                  with
+                    w=fill
+                    size=11.5
+                    line-h=1.5
+                    @text-label
+            if empty(tree_entries) && tree_born && tree_truncated
+              box w=fill pl=16.0 pr=16.0 pt=8.0
+                text "This directory has entries that cannot be shown."
+                  with
+                    w=fill
+                    size=11.5
+                    line-h=1.5
+                    @text-label
+            if !empty(tree_path)
+              button -> open_dir(connected_rpc, connected, repo, "")
+                with
+                  label="Back to the repository root"
+                  w=fill
+                  p=0.0
+                  @icon_action
+                ForgeTreeDirRow
+                  with
+                    name="/"
+                    depth=0.0
+                    open=true
+                active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
+                hovered bg=rail_hover text=fg
+                pressed bg=elevated text=fg
+            for entry in tree_entries
+              col w=fill
+                if entry.kind == "dir"
+                  button -> open_dir(connected_rpc, connected, repo, entry.path)
+                    with
+                      label="Open directory"
+                      description=entry.path
+                      w=fill
+                      p=0.0
+                      @icon_action
+                    ForgeTreeDirRow
+                      with
+                        name=entry.name
+                        depth=0.0
+                        open=false
+                    active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
+                    hovered bg=rail_hover text=fg
+                    pressed bg=elevated text=fg
+                if entry.kind != "dir"
+                  button -> open_file(connected_rpc, connected, repo, tree_rev, tree_path, entry.path)
+                    with
+                      label="Open file"
+                      description=entry.path
+                      w=fill
+                      p=0.0
+                      @icon_action
+                    ForgeTreeFileRow
+                      with
+                        name=entry.name
+                        depth=0.0
+                        selected=(entry.path == file_path && opened_dir == tree_path && opened_rev == tree_rev)
+                    active bg=transparent text=fg border=transparent border-w=1.0 r=0.0
+                    hovered bg=rail_hover text=fg
+                    pressed bg=elevated text=fg
+            if tree_truncated
+              box w=fill p=12.0
+                text "Some entries are not shown."
+                  with
+                    w=fill
+                    size=11.5
+                    line-h=1.5
+                    @text-label
+    source:
+      // The reader's states, each with its own true reason.
+      col w=fill
+        if tree_phase == ForgeTreePhase.loading
+          ForgeCodeEmpty name="" note="Loading repository files…"
+        if phase == ForgeFilePhase.loading && !empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path))
+          ForgeCodeEmpty name=file_path note="Loading file…"
+        if tree_phase == ForgeTreePhase.failed
+          ForgeCodeEmpty name="" note="Could not load code. Pick Code to try again."
+        if phase == ForgeFilePhase.failed && !empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path))
+          ForgeCodeEmpty name=file_path note=failed_note
+        if tree_phase == ForgeTreePhase.ready && empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && empty(tree_entries) && !tree_born
+          ForgeCodeEmpty name="" note="Nothing is committed on this repository yet, so there is no file to read."
+        if tree_phase == ForgeTreePhase.ready && empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && empty(tree_entries) && tree_born && !tree_truncated
+          ForgeCodeEmpty name="" note="This commit has no files to read."
+        if tree_phase == ForgeTreePhase.ready && empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && empty(tree_entries) && tree_born && tree_truncated
+          ForgeCodeEmpty name="" note="This directory has entries outside the browser's display limits."
+        if tree_phase == ForgeTreePhase.ready && empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && !empty(tree_entries)
+          ForgeCodeEmpty name="" note="Pick a file from the tree to read it."
+        if phase == ForgeFilePhase.ready && !empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && file_binary
+          ForgeCodeEmpty
+            with
+              name=file_path
+              note="This is not text — the reader shows no preview for it."
+        // A MARKDOWN BLOB READS AS A DOCUMENT, not a line
+        // listing: a README is the first file every repo page
+        // opens, and the shell's agent answers already ship
+        // the full iced-markdown adapter (`agent_markdown`) —
+        // this reuses it verbatim. Links route through the
+        // same `open_message_link` seam the discussion's
+        // messages already use. Markdown-vs-code is the
+        // path's call (`markdown_path`) because the wire only
+        // says binary-or-text.
+        if phase == ForgeFilePhase.ready && !empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && !file_binary && markdown_path(file_path)
+          col
+            with
+              w=fill
+              px=16.0
+              pt=13.0
+              pb=13.0
+              gap=9.0
+            extern agent_markdown(file_text, dark) #forge-markdown -> emit(open_message_link, _)
+            if file_truncated
+              text "This file is larger than the 64 KiB preview limit."
+                with
+                  size=11.5
+                  wrap=none
+                  @text-label
+        if phase == ForgeFilePhase.ready && !empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && !file_binary && !markdown_path(file_path)
+          col
+            with
+              w=fill
+              pt=13.0
+              pb=13.0
+              gap=9.0
+            // HIGHLIGHTED, NUMBERED LINES. Token colour needs
+            // per-span inks, which Ice's named-token text
+            // nodes cannot carry, so the whole surface — the
+            // gutter and the syntect-coloured code — renders
+            // in the backend extern (the `agent_markdown`
+            // idiom). The language is the path's call
+            // (`code_token`); an unknown extension degrades
+            // to plain text in one ink, the reading this
+            // viewer shipped with. Metrics stay pinned to
+            // DiffRow's by the shape lint in app/src/tests.rs.
+            //
+            // THE MEMO BOUNDARY IS THIS `lazy`, not a widget
+            // inside the extern: the blob IS the key, so the
+            // tokenize + row build reruns only when the text,
+            // path, or appearance moves — the same projection
+            // idiom as every cached surface, instead of the
+            // app's one raw iced Lazy, which shipped a pane
+            // that drew nothing.
+            lazy file_text by file_text, file_path, dark as cached_source
+              extern forge_code(cached_source, file_path, dark) #forge-code
+            if file_truncated
+              text "This file is larger than the 64 KiB preview limit."
+                with
+                  size=11.5
+                  wrap=none
+                  @text-label

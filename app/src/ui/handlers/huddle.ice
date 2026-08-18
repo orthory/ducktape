@@ -28,11 +28,15 @@ on call_event(event)
   call_muted = keep_bool(event.kind == "connecting", false, call_muted)
   call_camera = keep_bool(event.kind == "connecting", false, call_camera)
   call_peers = apply_call_peer(call_peers, event)
+  huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)
   call_video_live = call_video_live_after(call_peers, call_camera)
-  call_steered = call_recipients(huddle_recipient_nodes(huddle_roster))
+  task call_recipients(huddle_recipient_nodes(huddle_roster)) -> call_recipients_updated
+
+on call_recipients_updated
 
 on toggle_call_mute
   call_muted = call_set_muted(!call_muted)
+  huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)
 
 on toggle_call_camera
   call_camera = call_set_camera(!call_camera)
@@ -74,12 +78,11 @@ on dock_huddle
 // a loading or mid-mutation app that handler early-returns, and docking the
 // panel for a switch that will not happen is the worse half of the failure.
 on huddle_go_channel
-  return if loading || mutation_phase != "idle" || empty(huddle_channel)
-  shell_tab = "chat"
+  return if loading || mutation_phase != MutationPhase.idle || empty(huddle_channel)
+  shell_tab = ShellTab.chat
   // Same tab-move rule as `select_shell_tab`. `choose_channel` below retires it
   // again; the rule is uniform on purpose, so no reader has to prove the flow
   // reaches a second retire before trusting this one.
-  composer_focus = "none"
   flow
     from done huddle_channel
     done -> choose_channel _
@@ -91,18 +94,22 @@ on huddle_go_channel
 // when `huddle_channel == active_channel` — so every leave control in the app
 // routes here and there is no second leave handler to keep in step.
 on leave_huddle_here
-  return if loading || mutation_phase != "idle" || !huddle_joined || empty(huddle_channel)
+  return if loading || mutation_phase != MutationPhase.idle || !huddle_joined || empty(huddle_channel)
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
-  mutation_phase = "huddle"
+  mutation_phase = MutationPhase.huddle
   call_status = ""
   call_muted = false
   call_camera = false
   call_video_live = false
   call_peers = []
+  // Keep the retained roster visible if the leave is refused. The peer and
+  // local mute state above are already reset, so rebuild the same projection
+  // every other writer of those sources rebuilds.
+  huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)
   error = ""
   // Leaving is the one thing that ends the huddle window: it has nothing left
   // to show. A window task is terminal, so the leave call rides beside it.
   parallel
     task window close target=window_target(huddle_win)
-    run leave_huddle(connected_rpc, password, huddle_channel) -> chat_acked _ | mutation_failed _
+    run every leave_huddle(connected_rpc, password, huddle_channel) -> chat_acked _ | mutation_failed _

@@ -1,6 +1,6 @@
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::Ingress;
-use commonware_p2p::authenticated::discovery::{self, Network};
+use commonware_p2p::authenticated::lookup::{self, Network};
 use commonware_runtime::{Quota, Supervisor};
 use commonware_utils::{NZU32, ordered::Set};
 
@@ -50,7 +50,7 @@ pub(crate) fn binds_an_os_mesh_socket(
 /// already spoken for is a clean startup error instead of
 /// `thread 'tokio-rt-worker' panicked … failed to bind listener: BindFailed`.
 ///
-/// commonware's discovery listener binds INSIDE the runtime and `expect`s the
+/// commonware's mesh listener binds INSIDE the runtime and `expect`s the
 /// result, ~10 seconds into boot — after every other surface has logged itself
 /// up — so the operator's reward for a taken port was a wall of healthy INFO
 /// and then a raw Rust panic with a crates.io path in it.
@@ -67,7 +67,7 @@ pub(crate) fn preflight_mesh_listen(listen: std::net::SocketAddr) -> Result<(), 
 /// `run_node`'s shared runtime head (phase P3): the head of the async
 /// closure `executor.start(|context| async move { … })` runs on — metrics
 /// registration, the tracked mesh set, the statesync source pick,
-/// discovery's config, the overlay-net seam, and the real
+/// lookup's config, the overlay-net seam, and the real
 /// `Network`/`Oracle` pair. Ends before the `if sync_only {` branch,
 /// which stays in `run_node` (that's the sync-only-vs-validator fork).
 pub(crate) struct MeshHead {
@@ -97,7 +97,7 @@ pub(crate) struct MeshHead {
     pub(crate) advertised_reach: Ingress,
     pub(crate) network:
         Network<overlay_net::OverlayContext<commonware_runtime::tokio::Context>, ed25519::PrivateKey>,
-    pub(crate) oracle: discovery::Oracle<ed25519::PublicKey>,
+    pub(crate) oracle: lookup::Oracle<ed25519::PublicKey>,
     pub(crate) quota: Quota,
 }
 
@@ -111,7 +111,6 @@ pub(crate) fn build(
     sync_candidates: Vec<(ed25519::PublicKey, Ingress)>,
     listen: std::net::SocketAddr,
     advertised: Ingress,
-    bootstrappers: Vec<(ed25519::PublicKey, Ingress)>,
     overlay_enabled: bool,
     overlay_slot: overlay_net::userspace::StackSlot,
 ) -> MeshHead {
@@ -136,7 +135,7 @@ pub(crate) fn build(
     let sync_monitor = statesync::monitor::ServeMonitor::new(context.child("statesync_monitor"));
     let sync_metrics = crate::sync::metrics::SyncServeMetrics::register(&context, &sync_monitor);
 
-    // the authorized MESH set, SORTED — what discovery tracks. the
+    // the authorized MESH set, SORTED — what the tracker windows ride on. the
     // consensus scheme uses the (possibly smaller) validator set derived
     // from committed valset state after the recovery boot below.
     let mesh_participants: Set<ed25519::PublicKey> =
@@ -149,39 +148,40 @@ pub(crate) fn build(
     // the statesync source a --sync-only joiner pulls from: only
     // validators serve the channel, so the candidate must be a validator
     // that is not us (a non-validator hint or our own key would be
-    // retried forever — discovery never connects a node to itself).
+    // retried forever — the mesh never connects a node to itself).
     let sync_sources =
         config::sync_source_candidates(&sync_candidates, &validators, &signer.public_key());
     let sync_source = sync_sources.first().cloned();
 
-    // the real encrypted TCP mesh. `local` is the dev preset (allows private
-    // ips). MUST be the real tokio runtime — discovery live-locks under the
+    // the real encrypted TCP mesh, on `authenticated::lookup`: the
+    // application supplies every peer's address (the MeshAddressBook), no
+    // wire address gossip. `local` is the dev preset (allows private ips).
+    // MUST be the real tokio runtime — the p2p actors live-lock under the
     // deterministic clock.
-    // reachability plane (docs/deploy/sentry-deployment.md): a forward sentry on a
-    // private network relies on this `local` preset's allow_private_ips:true;
-    // switching to a preset with allow_private_ips:false would reject the
-    // forwarded connection from a private source IP — use a public-IP sentry
-    // or a reverse tunnel then.
     //
     // TRANSPORT IDENTITY: every node — a parked joiner included — connects
     // under its REAL key (join ADR §4; the derived lobby identity is retired).
     // a fresh joiner's key is untracked on every member until its `Redeem`
-    // grant, when the members' drains re-track it onto the mesh immediately
-    // (ahead of the epoch cutover) — pre-admission it needs no mesh at all:
-    // the join gate rides the WireGuard-tunnel doorbell, not a channel.
+    // grant advances the membership generation, which the members' drains
+    // track immediately — pre-admission it needs no mesh at all: the join
+    // gate rides the WireGuard-tunnel doorbell, not a channel.
     let p2p_signer = signer.clone();
-    // the staged reachability plane derives its advertised control
-    // endpoint from the mesh `advertised`; keep a copy — discovery's
-    // config consumes the original.
-    let advertised_reach = advertised.clone();
-    let p2p_cfg = discovery::Config::local(
-        p2p_signer,
-        &namespace,
-        listen,
-        advertised,
-        bootstrappers,
-        MAX_MESSAGE_SIZE,
-    );
+    // the staged reachability plane derives its advertised control endpoint
+    // from the mesh `advertised`; lookup's config carries no self-address,
+    // so the value survives whole as `advertised_reach`.
+    let advertised_reach = advertised;
+    let mut p2p_cfg = lookup::Config::local(p2p_signer, &namespace, listen, MAX_MESSAGE_SIZE);
+    // EXPLICIT decision — authorization parity with the retired discovery
+    // dialect: admission is the cryptographic handshake plus
+    // key-in-a-tracked-set, source IP ignored. lookup's default source-IP
+    // pinning would reject (a) the sentry forward-splice, which arrives
+    // from the validator's real IP, not the advertised sentry address
+    // (docs/deploy/sentry-deployment.md), (b) NAT'd members whose egress
+    // differs from their advertised ingress, and (c) any DNS-hinted peer,
+    // whose egress IP is unknowable pre-resolution. we forfeit the
+    // pre-handshake IP allowlist (a cheap DoS filter); the handshake rate
+    // limits stay on.
+    p2p_cfg.bypass_ip_check = true;
     // the overlay-net seam (ADR 2026-07-07): the mesh dials/binds through
     // a wrapper context whose Network routes BY ADDRESS — sockets on this
     // chain's ULA /48 go to the active overlay backend (today: the TUN

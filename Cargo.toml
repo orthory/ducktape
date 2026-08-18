@@ -89,6 +89,7 @@ members = [
     "crates/networking/data-plane",
     "crates/networking/overlay-net",
     # modules/system — system modules. every entry implements `sdk::Module`.
+    "crates/modules/system/acl",
     "crates/modules/system/kv",
     "crates/modules/system/valset",
     "crates/modules/system/governance",
@@ -275,6 +276,7 @@ wasm-host = { path = "crates/kernel/wasm-host" }
 # types-only interface crate — never the module impl).
 # internal — module impl crates
 kv = { path = "crates/modules/system/kv" }
+acl = { path = "crates/modules/system/acl" }
 valset = { path = "crates/modules/system/valset" }
 governance = { path = "crates/modules/system/governance" }
 identity = { path = "crates/modules/system/identity" }
@@ -355,13 +357,21 @@ debug = 0
 # at opt-0, past the 8 MiB main-thread default, and SROA at opt-1 collapsed
 # them under 4 MiB. Since then dedup (fdadedf), lazy bodies as associated fns
 # (360d3a5), and the per-fragment split (66ccc13) shrank every frame in the
-# chain, and opt-0 passes the `full_view_fits_a_four_mib_stack` contract
-# again — THAT TEST is the gate for this value, not this comment. opt-0 is
-# the dev-loop choice: the per-build fixed cost (whole-crate mono collection
-# + MIR work at opt-1) dominated the post-split edit loop, and app-crate
-# runtime perf never depended on this stanza (hot paths live in the iced /
-# ducktape-ui stanzas below; the 08-01 lag campaign measured zero win here).
+# chain enough for the app's 8 MiB main thread. opt-0 is the dev-loop choice:
+# the per-build fixed cost (whole-crate mono collection + MIR work at opt-1)
+# dominated the post-split edit loop, and app-crate runtime perf never depended
+# on this stanza (hot paths live in the iced / ducktape-ui stanzas below; the
+# 08-01 lag campaign measured zero win here). The smaller libtest stack has its
+# own profile and executable contract below.
 opt-level = 0
+
+# Ice semantic tests render the same generated component tree from libtest's
+# 2 MiB worker threads. At opt-0, the generated ChatScreen frame alone exceeds
+# that budget on arm64 macOS; opt-1's SROA keeps the test harness on its default
+# stack without slowing the normal app edit loop above.
+[profile.test.package.ducktape-app]
+debug = 0
+opt-level = 1
 
 # `make dev` runs the desktop app under the dev profile, and an unoptimized
 # GUI stack is a lag machine on its own: cosmic-text shapes every glyph run
@@ -379,7 +389,7 @@ opt-level = 2
 # this box, Pages->Chat with 40 mounted rows stalled ~700 ms with these at
 # opt-0. They rebuild only on a pin bump (ducktape-ui) or rarely (design), so
 # the compile-time cost of optimizing them is paid almost never.
-[profile.dev.package.ducktape-ui]
+[profile.dev.package.ui-lang-components]
 opt-level = 2
 
 [profile.dev.package.ui-lang-runtime]
@@ -564,4 +574,3 @@ opt-level = 2
 
 [profile.dev.package.nokhwa-bindings-macos]
 opt-level = 2
-

@@ -13,11 +13,14 @@
 
 use iced::advanced::text::{self, Highlighter};
 use iced::font::{Style as FontStyle, Weight};
-use iced::widget::text_editor::{self, Content};
+use iced::keyboard::{Key, key::Named};
+use iced::widget::text_editor::{self, Binding, Content, Edit, KeyPress};
 use iced::{Border, Color, Element, Font};
 use std::hash::{Hash as _, Hasher as _};
 use std::ops::Range;
-use ui_lang_runtime::rich_text_editor::{ContentVersion, Format, RichTextEditor};
+use ui_lang_runtime::rich_text_editor::{
+    ContentVersion, Format, RichTextEditor, default_key_binding,
+};
 
 pub use ui_lang_runtime::rich_text_editor::Action as RichAction;
 
@@ -69,13 +72,18 @@ fn composer_ink(theme: &iced::Theme) -> &'static ComposerInk {
 const MARK_DIM: Color = rgb8(0x8a, 0x88, 0x7e);
 const MARK_LINK: Color = rgb8(0x6f, 0x8a, 0xab);
 
-/// One composer interaction, classified where the modifiers are still known.
+/// One composer interaction, classified at the widget's own key binding.
 /// `Submit` is plain Enter (and the Send button, via
 /// [`composer_submit_event`]); everything else is an edit to apply.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ComposerEvent {
     Submit,
     Apply(RichAction),
+    /// A formatting chord the widget claimed via its `on_chord` route —
+    /// Cmd/Ctrl+B and friends land HERE, in the composer that has the
+    /// caret, instead of bubbling to the app's one keyboard subscription
+    /// (which cannot see widget focus, let alone a component instance).
+    Mark(String),
 }
 
 pub fn composer_submit_event() -> ComposerEvent {
@@ -86,10 +94,12 @@ pub fn composer_submits(event: ComposerEvent) -> bool {
     matches!(event, ComposerEvent::Submit)
 }
 
-pub fn apply_composer_event(mut document: Content, event: ComposerEvent) -> Content {
+pub fn apply_composer_event(document: Content, event: ComposerEvent) -> Content {
+    let mut document = document;
     match event {
         ComposerEvent::Apply(RichAction::Edit(action)) => document.perform(action),
         ComposerEvent::Apply(RichAction::MoveTo(cursor)) => document.move_to(cursor),
+        ComposerEvent::Mark(kind) => return composer_toggle_mark(document, kind),
         ComposerEvent::Submit => {}
     }
     document
@@ -120,39 +130,33 @@ pub fn composer_toggle_mark(mut document: Content, kind: String) -> Content {
     document
 }
 
-/// The composer's formatting shortcuts, classified where the modifiers are
-/// known: Cmd/Ctrl+B bold, Cmd/Ctrl+I italic, Cmd/Ctrl+Shift+C code block,
-/// Cmd/Ctrl+Shift+9 quote — Slack's own table. The editor deliberately lets
-/// command-letter chords bubble (`command_shortcut_bubbles` in the widget), so
-/// this runs from the app's ONE keyboard subscription with the editor's focus
-/// untouched — the toolbar buttons cannot say the same, a click on them
-/// defocuses the editor. An empty verdict is `composer_toggle_mark`'s no-op.
-pub fn composer_mark_shortcut(
-    _logical: iced::keyboard::Key,
-    physical: iced::keyboard::key::Physical,
-    modifiers: iced::keyboard::Modifiers,
-    chat_ready: bool,
-) -> String {
+/// The composer's formatting shortcuts, classified AT THE WIDGET via its
+/// `on_chord` route: Cmd/Ctrl+B bold, Cmd/Ctrl+I italic, Cmd/Ctrl+Shift+C
+/// code block, Cmd/Ctrl+Shift+9 quote — Slack's own table. These presses
+/// resolve to no binding (the bubble contract for application chords), so
+/// the route sees exactly them; a claimed chord becomes a
+/// [`ComposerEvent::Mark`] on the composer that has the caret, and every
+/// other chord bubbles on to the app subscription untouched.
+fn composer_chord(press: &KeyPress) -> Option<ComposerEvent> {
     use iced::keyboard::key::{Code, Physical};
-    if !chat_ready || !modifiers.command() {
-        return String::new();
+    if !press.modifiers.command() {
+        return None;
     }
-    let shifted = modifiers.shift();
-    let mark = match physical {
+    let shifted = press.modifiers.shift();
+    let mark = match press.physical_key {
         Physical::Code(Code::KeyB) if !shifted => "bold",
         Physical::Code(Code::KeyI) if !shifted => "italic",
         Physical::Code(Code::KeyC) if shifted => "code",
         Physical::Code(Code::Digit9) if shifted => "quote",
-        _ => return String::new(),
+        _ => return None,
     };
-    mark.to_owned()
+    Some(ComposerEvent::Mark(mark.to_owned()))
 }
 
 pub fn rich_composer(
     document: &Content,
     hint: String,
     disabled: bool,
-    shift: bool,
     min_h: f64,
     max_h: f64,
     pad: f64,
@@ -169,13 +173,12 @@ pub fn rich_composer(
         .padding(pad as f32)
         // format_key 0: the format table is static — no theme or mode inputs.
         .highlight_with::<InlineMarkdownHighlighter>((), 0, inline_format)
-        .style(composer_style);
+        .style(composer_style)
+        .key_binding(composer_key_binding);
     if disabled {
         return editor.into();
     }
-    editor
-        .on_action(move |action| classify(action, shift))
-        .into()
+    editor.on_action(classify).on_chord(composer_chord).into()
 }
 
 /// The widget's change-detection key: equal versions promise equal text
@@ -189,12 +192,33 @@ fn content_version(document: &Content) -> ContentVersion {
     ContentVersion::new(0, hasher.finish())
 }
 
-fn classify(action: RichAction, shift: bool) -> ComposerEvent {
+/// Enter or newline, decided AT THE PRESS from its live modifiers — the
+/// widget's `key_binding` seam (ducktape-ui#601), which retired the lagged
+/// `shift_held` mirror and the `keyboard modifiers` subscription that fed it.
+/// ⇧↵ becomes a newline paste HERE, so the only press that can reach
+/// [`classify`] as `Edit::Enter` is a plain Enter — the submit.
+fn composer_key_binding(press: &KeyPress) -> Option<Binding<Edit>> {
+    let enter = matches!(press.key, Key::Named(Named::Enter));
+    if !enter {
+        return default_key_binding(press);
+    }
+    if press.modifiers.shift() {
+        return Some(Binding::Custom(Edit::Paste(std::sync::Arc::new(
+            "\n".to_owned(),
+        ))));
+    }
+    Some(Binding::Enter)
+}
+
+/// Plain Enter is the submit; every other action is an edit to apply.
+/// Sound without a modifier argument because [`composer_key_binding`] already
+/// rewrote ⇧↵ into a newline paste at the press.
+fn classify(action: RichAction) -> ComposerEvent {
     let plain_enter = matches!(
         action,
         RichAction::Edit(text_editor::Action::Edit(text_editor::Edit::Enter))
     );
-    if plain_enter && !shift {
+    if plain_enter {
         return ComposerEvent::Submit;
     }
     ComposerEvent::Apply(action)
@@ -209,7 +233,13 @@ fn composer_style(theme: &iced::Theme, status: text_editor::Status) -> text_edit
         // (the r=12 composer card), and an inner rectangle on focus made the
         // input read as a separate component floating in its card.
         border: Border::default(),
-        placeholder: ink.hint,
+        // THE PLACEHOLDER IS THE ONLY INK AN EMPTY COMPOSER HAS, so it is the
+        // only place a disabled one can say so: `disabled` here is the absence
+        // of `on_action`, the plate around it is unconditional, and an empty
+        // document has no `value` to dim — so a dead composer was pixel-for-
+        // pixel a ready one, and the hover cursor was the whole tell. `muted`
+        // is also the ink the composer's own `⇧↵` hint reads at.
+        placeholder: if disabled { ink.hint } else { ink.muted },
         value: if disabled { ink.muted } else { ink.ink },
         selection: Color { a: 0.18, ..ink.ink },
     }
@@ -403,13 +433,73 @@ mod tests {
         );
     }
 
+    /// A DEAD COMPOSER HAS TO LOOK DEAD, AND ON AN EMPTY ONE THE PLACEHOLDER IS
+    /// THE ONLY INK THERE IS. `disabled` here is just the absence of
+    /// `on_action`; the plate, the border and the shadow around it are
+    /// unconditional and there is no `value` to dim — so a composer refusing
+    /// every keystroke (mid channel switch, disconnected, no channel, any post
+    /// refusal) was pixel-identical to a ready one, and the hover cursor was
+    /// the whole tell.
+    #[test]
+    fn a_disabled_composer_reads_dimmer_than_a_ready_one() {
+        for theme in [iced::Theme::Light, iced::Theme::Dark] {
+            let ready = composer_style(&theme, text_editor::Status::Active);
+            let dead = composer_style(&theme, text_editor::Status::Disabled);
+            assert_ne!(
+                ready.placeholder, dead.placeholder,
+                "the invitation must not read the same in both states"
+            );
+            let ink = composer_ink(&theme);
+            assert_eq!(ready.placeholder, ink.muted);
+            assert_eq!(dead.placeholder, ink.hint);
+        }
+    }
+
+    /// THE ENTER DECISION READS THE PRESS, NOT A MIRROR. `shift_held` lagged
+    /// the key by a full event-loop turn, so a ⇧↵ chord whose two downs landed
+    /// in one drain classified as Submit and POSTED the half-written message.
+    /// `composer_key_binding` sees `press.modifiers` on the press itself:
+    /// plain Enter stays the stock newline binding (which [`classify`] reads
+    /// as Submit), ⇧↵ is rewritten into a newline paste at the widget, and
+    /// every other key delegates to the editor's stock table.
     #[test]
     fn plain_enter_submits_and_shift_enter_edits() {
+        let enter_press = |modifiers: iced::keyboard::Modifiers| KeyPress {
+            key: Key::Named(Named::Enter),
+            modified_key: Key::Named(Named::Enter),
+            physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::Enter),
+            modifiers,
+            text: None,
+            status: text_editor::Status::Focused { is_hovered: false },
+        };
+
+        // Plain Enter keeps the stock binding, and classify reads it as the
+        // submit — the widget publishes `Edit::Enter` for no other press.
+        let plain = composer_key_binding(&enter_press(iced::keyboard::Modifiers::empty()));
+        assert!(matches!(plain, Some(Binding::Enter)));
         let enter = RichAction::Edit(text_editor::Action::Edit(text_editor::Edit::Enter));
-        assert_eq!(classify(enter.clone(), false), ComposerEvent::Submit);
-        assert_eq!(classify(enter.clone(), true), ComposerEvent::Apply(enter));
+        assert_eq!(classify(enter), ComposerEvent::Submit);
+
+        // ⇧↵ becomes a newline PASTE at the press, so it reaches classify as
+        // an ordinary edit and breaks the line instead of posting.
+        let shifted = composer_key_binding(&enter_press(iced::keyboard::Modifiers::SHIFT))
+            .expect("shift+enter binds");
+        let Binding::Custom(edit) = shifted else {
+            panic!("shift+enter must rewrite into a custom edit, got {shifted:?}");
+        };
+        let newline = RichAction::Edit(text_editor::Action::Edit(edit));
+        let event = classify(newline);
+        let ComposerEvent::Apply(_) = &event else {
+            panic!("shift+enter must apply, not submit");
+        };
+        let mut document = Content::with_text("draft");
+        document.perform(text_editor::Action::Move(text_editor::Motion::End));
+        let document = apply_composer_event(document, event);
+        assert_eq!(document.line_count(), 2, "⇧↵ breaks the line");
+
+        // Any other key falls through to the editor's stock table.
         let typed = RichAction::Edit(text_editor::Action::Edit(text_editor::Edit::Insert('x')));
-        assert_eq!(classify(typed.clone(), false), ComposerEvent::Apply(typed));
+        assert_eq!(classify(typed.clone()), ComposerEvent::Apply(typed));
     }
 
     #[test]
@@ -438,35 +528,49 @@ mod tests {
     }
 
     #[test]
-    fn mark_shortcuts_follow_slacks_table_and_respect_the_gate() {
+    fn mark_chords_follow_slacks_table_at_the_widget() {
         use iced::keyboard::key::{Code, Physical};
         use iced::keyboard::{Key, Modifiers};
+        // The route the widget offers a press that resolved to no binding
+        // (ducktape-ui#711). No gate argument any more: the chord reaches the
+        // composer that HAS the caret, so there is nothing left to guess.
         let chord = |code, modifiers| {
-            composer_mark_shortcut(Key::Unidentified, Physical::Code(code), modifiers, true)
+            composer_chord(&KeyPress {
+                key: Key::Unidentified,
+                modified_key: Key::Unidentified,
+                physical_key: Physical::Code(code),
+                modifiers,
+                text: None,
+                status: text_editor::Status::Focused { is_hovered: false },
+            })
         };
-        assert_eq!(chord(Code::KeyB, Modifiers::COMMAND), "bold");
-        assert_eq!(chord(Code::KeyI, Modifiers::COMMAND), "italic");
+        let mark = |code, modifiers| match chord(code, modifiers) {
+            Some(ComposerEvent::Mark(kind)) => kind,
+            _ => String::new(),
+        };
+        assert_eq!(mark(Code::KeyB, Modifiers::COMMAND), "bold");
+        assert_eq!(mark(Code::KeyI, Modifiers::COMMAND), "italic");
         assert_eq!(
-            chord(Code::KeyC, Modifiers::COMMAND | Modifiers::SHIFT),
+            mark(Code::KeyC, Modifiers::COMMAND | Modifiers::SHIFT),
             "code"
         );
         assert_eq!(
-            chord(Code::Digit9, Modifiers::COMMAND | Modifiers::SHIFT),
+            mark(Code::Digit9, Modifiers::COMMAND | Modifiers::SHIFT),
             "quote"
         );
-        // Plain Cmd+C is copy, not code; plain typing marks nothing.
-        assert_eq!(chord(Code::KeyC, Modifiers::COMMAND), "");
-        assert_eq!(chord(Code::KeyB, Modifiers::default()), "");
-        // Off-chat (or palette-open) the gate swallows everything.
-        assert_eq!(
-            composer_mark_shortcut(
-                Key::Unidentified,
-                Physical::Code(Code::KeyB),
-                Modifiers::COMMAND,
-                false
-            ),
-            ""
-        );
+        // Plain Cmd+C is copy, not code; plain typing is an ordinary edit and
+        // never reaches this route at all. An unclaimed chord bubbles on.
+        assert!(chord(Code::KeyC, Modifiers::COMMAND).is_none());
+        assert!(chord(Code::KeyB, Modifiers::default()).is_none());
+    }
+
+    #[test]
+    fn a_marked_chord_applies_like_any_other_composer_event() {
+        // The claimed chord rides the ordinary event route into the
+        // instance's local handler, where it wraps the selection.
+        let document = Content::with_text("draft");
+        let document = apply_composer_event(document, ComposerEvent::Mark("bold".into()));
+        assert_eq!(document.text().trim_end(), "****draft");
     }
 
     #[test]

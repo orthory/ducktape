@@ -51,12 +51,13 @@ The joiner dials the sentry, the sentry splices to the validator, and the
 encrypted mesh handshake terminates at the validator through the pipe — the
 joiner never learns (and never needs) the validator's private `listen`.
 
-Admission is orthogonal to the sentry and still required: until a member runs
-`invite-accept`, the validator's mesh bouncer rejects the not-yet-admitted key
-(the handshake bytes reach the validator *through* the pipe and are refused
-there, not at the sentry), so the joiner parks as `parked: mesh unreachable` —
-expected, not a sentry fault. Once admitted, the handshake succeeds and
-state-sync/votes flow through the pipe.
+Admission is orthogonal to the sentry and still required. `ducktape node invite`
+mints a signed, single-use bearer grant; `ducktape node join <blob>` presents and
+redeems it on first contact. A tokenless manual join can instead be granted with
+`ducktape node resident accept <pubkey>`. Until standing lands, ordinary mesh
+and state-sync traffic stays gated at the validator rather than at the sentry.
+Once admitted, the handshake succeeds and state-sync flows through the pipe;
+`ducktape node member promote <pubkey>` is the separate validator-seat step.
 
 Realizations of the splice, cheapest first:
 
@@ -89,21 +90,21 @@ identical ("dial this address, expect this key").
 
 ## Caveats
 
-- **`allow_private_ips` coupling (forward sentry on a private network).** The
-  node builds its mesh with the `local` discovery preset, which sets
-  `allow_private_ips: true` (`bin/node/src/main.rs`, at the
-  `discovery::Config::local` call, ~line 1595; see the inline comment there). A
-  **forward** sentry that splices from a private source IP (recipe A over a VPC)
-  depends on this. Switching to a preset with `allow_private_ips: false` would
-  make the validator's listener **reject any inbound whose observed source IP is
-  not globally routable** (`is_global`; the listener keys on the *accepted
-  socket's* remote IP). That rejects **every** fronting scheme that keeps
-  `listen` private — a private-network forward splice (recipe A over a VPC), a
-  **reverse tunnel** whose egress reaches the validator over loopback (recipe B),
-  and a public-IP sentry that still reaches a private `listen`. The only combos
-  that satisfy `allow_private_ips: false` are a **globally-routable (firewalled)
-  validator `listen`** or exposing a per-IP-gate override (future work). Today the
-  node hardcodes the `local` preset, so this does not bite yet.
+- **`allow_private_ips` + `bypass_ip_check` coupling (fronting depends on
+  both).** The node builds its mesh with the `local` lookup preset
+  (`allow_private_ips: true`) and explicitly sets `bypass_ip_check: true`
+  (`bin/node/src/boot/mesh.rs`, at the `lookup::Config::local` call; see the
+  inline comment there). Both are load-bearing for fronting. Without
+  `allow_private_ips`, the validator's listener would **reject any inbound
+  whose observed source IP is not globally routable** — every fronting scheme
+  that keeps `listen` private (a private-network forward splice, a reverse
+  tunnel arriving over loopback). Without `bypass_ip_check`, lookup's own
+  source-IP pinning would reject any inbound whose source IP differs from the
+  peer's *tracked address* — which is exactly a fronted validator's situation
+  (peers track the sentry's address; the validator dials out from its real
+  IP), and a NAT'd member's too. With the bypass, admission is the
+  cryptographic handshake plus key-in-a-tracked-set — the same authorization
+  the retired discovery dialect enforced.
 
 - **Handshake rate limit funnels through the sentry's IP.** commonware
   rate-limits inbound handshakes **per source IP** and per subnet (/24 for IPv4,
@@ -119,11 +120,16 @@ identical ("dial this address, expect this key").
   and commonware has no PROXY-protocol parsing to recover the real client IP, so
   fronting *blinds* the validator's own per-IP defenses rather than adding them.)
 
-- **DNS pinning at boot.** A DNS-named edge (`advertised = "sentry.example.com:443"`)
-  is resolved **once at startup** (`resolve_one` in `bin/node/src/config.rs`) and
-  pinned to that IP for the process lifetime. This is fine for a static A-record;
-  if the edge's IP can change, restart the node after the record moves, or front
-  it with a stable IP.
+- **DNS re-resolution, and the hint pin.** A DNS-named edge
+  (`advertised = "sentry.example.com:443"`) stays a hostname in the address
+  book and is **re-resolved at every dial** (`Ingress::Dns`; see
+  `config/mod.rs`'s `ingress_of`), so a moved A-record heals on the next
+  dial without a restart. The mesh address book deliberately **pins a DNS
+  hint against live reachability adverts** (`dns_hint_pins_address` in
+  `bin/node/src/mesh_book.rs`): an advert would freeze the name to one stale
+  resolution. The flip side: a fronted validator that moves behind a *new
+  name* needs a descriptor edit — adverts will not retarget a DNS-hinted
+  peer.
 
 - **State-sync still terminates at a validator.** The sentry is pure path — it
   never serves state. A joiner's `--sync-only` source is chosen **by key**, and

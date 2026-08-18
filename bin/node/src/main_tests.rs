@@ -1,5 +1,4 @@
 use super::*;
-use crate::sync::catchup::write_post_reboot_catchup_checkpoint;
 use commonware_cryptography::ed25519;
 use directory::{DirMsg, Directory, encode_msg};
 use host::Host;
@@ -501,7 +500,7 @@ fn suffix_installer_rejects_mismatched_served_seal() {
 }
 
 #[test]
-fn post_reboot_catchup_applies_verifies_and_journals_served_suffix() {
+fn suffix_catchup_applies_verifies_and_journals_served_frames() {
     let executor = commonware_runtime::deterministic::Runner::default();
     executor.start(|context| async move {
         let signer = ed25519::PrivateKey::from_seed(78);
@@ -516,7 +515,7 @@ fn post_reboot_catchup_applies_verifies_and_journals_served_suffix() {
             .await
             .expect("open recovery");
         let applied =
-            apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 2, frames.clone(), None)
+            apply_suffix_frames(&mut recovery, &mut host, 0, 2, frames.clone(), None)
                 .await
                 .expect("catch up");
 
@@ -535,7 +534,7 @@ fn post_reboot_catchup_applies_verifies_and_journals_served_suffix() {
 }
 
 #[test]
-fn post_reboot_catchup_checkpoint_makes_mixed_durability_suffix_recoverable() {
+fn suffix_catchup_reconciles_mixed_durability_state() {
     let executor = commonware_runtime::deterministic::Runner::default();
     executor.start(|context| async move {
         let signer = ed25519::PrivateKey::from_seed(81);
@@ -567,7 +566,7 @@ fn post_reboot_catchup_checkpoint_makes_mixed_durability_suffix_recoverable() {
             .await
             .expect("write base manifest");
         let applied =
-            apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 1, vec![served], None)
+            apply_suffix_frames(&mut recovery, &mut host, 0, 1, vec![served], None)
                 .await
                 .expect("catch up");
 
@@ -596,33 +595,11 @@ fn post_reboot_catchup_checkpoint_makes_mixed_durability_suffix_recoverable() {
             "disk cohort stays at its durable post-state"
         );
 
-        let ckpt = write_post_reboot_catchup_checkpoint(
-            &mut recovery,
-            &host,
-            Some(&base_manifest),
-            &target,
-            &applied.blocks,
-            1,
-        )
-        .await
-        .expect("write catch-up checkpoint");
-        assert_eq!(ckpt.height, Some(1));
-        assert_eq!(ckpt.root_hash, target.root_hash);
-        assert_eq!(ckpt.snapshot("mem"), Some([7u8].as_slice()));
-
-        let mut restored = restore_mixed_durability_host(durable_store, &ckpt);
-        let recovered = recovery
-            .recover(&mut restored, &ckpt)
-            .await
-            .expect("T checkpoint must recover without replaying the torn suffix");
-        assert_eq!(recovered.height, Some(1));
-        assert_eq!(recovered.root_hash, target.root_hash);
-        assert_eq!(recovered.applied, 0);
     });
 }
 
 #[test]
-fn post_reboot_catchup_aborts_on_mismatched_served_seal() {
+fn suffix_catchup_aborts_on_mismatched_served_seal() {
     let executor = commonware_runtime::deterministic::Runner::default();
     executor.start(|context| async move {
         let signer = ed25519::PrivateKey::from_seed(79);
@@ -636,7 +613,7 @@ fn post_reboot_catchup_aborts_on_mismatched_served_seal() {
             .await
             .expect("open recovery");
         let err =
-            apply_post_reboot_catchup_frames(&mut recovery, &mut host, 0, 1, vec![served], None)
+            apply_suffix_frames(&mut recovery, &mut host, 0, 1, vec![served], None)
                 .await
                 .expect_err("seal mismatch must abort");
 
@@ -648,7 +625,7 @@ fn post_reboot_catchup_aborts_on_mismatched_served_seal() {
 }
 
 #[test]
-fn post_reboot_catchup_is_noop_when_there_is_no_gap() {
+fn suffix_catchup_is_noop_when_there_is_no_gap() {
     let executor = commonware_runtime::deterministic::Runner::default();
     executor.start(|context| async move {
         let mut host = fresh_directory_host();
@@ -657,7 +634,7 @@ fn post_reboot_catchup_is_noop_when_there_is_no_gap() {
             .await
             .expect("open recovery");
         let applied =
-            apply_post_reboot_catchup_frames(&mut recovery, &mut host, 5, 5, Vec::new(), None)
+            apply_suffix_frames(&mut recovery, &mut host, 5, 5, Vec::new(), None)
                 .await
                 .expect("noop catch up");
 

@@ -74,6 +74,16 @@ pub enum GovAction {
     /// AUTHORIZE clearing a pending module code swap before its boundary: emits
     /// `LifecycleMsg::CancelSwap { name, module_id }` on execution.
     CancelModuleUpdate { name: String, module_id: String },
+    /// set (or clear, with `standing: None`) one target's required submit
+    /// standing in the acl module: emits `AclMsg::SetPolicy` on execution.
+    /// `target` is a module id or the `"*"` wildcard. the acl table is EMPTY
+    /// at genesis (allow-all); this action is how a network tightens — one
+    /// ballot, not a release. a net without a wired acl module
+    /// deterministically rejects it at propose.
+    SetAclPolicy {
+        target: String,
+        standing: Option<acl::Standing>,
+    },
 }
 
 /// one non-transferable governance-share allocation.
@@ -125,23 +135,18 @@ pub enum GovMsg {
     /// proof-of-possession (all raw bytes, mirroring the lobby announce);
     /// the module re-verifies both signatures against the network binding,
     /// requires the issuer to be a CURRENT member, and enforces single-use
-    /// via the redeemed-nonce set in consensus state. success emits the
-    /// role's grant in the same block: `Resident` → `ValsetMsg::Grant`
-    /// (full node standing — mesh + statesync, no quorum seat), `Client` →
-    /// `IdentityMsg::GrantClient` (submit authorization only).
+    /// via the redeemed-nonce set in consensus state. success emits
+    /// `ValsetMsg::Grant` in the same block (full node RESIDENT standing —
+    /// mesh + statesync, no quorum seat). EVERY invite is bearer (the
+    /// targeted form was dropped — see the join ADR): no `target` — the
+    /// `proof` binds the redemption to whichever key presents it and the
+    /// nonce set makes that exactly-once.
     Redeem {
         issuer: Vec<u8>,
         nonce: Vec<u8>,
         token_sig: Vec<u8>,
         joiner: Vec<u8>,
         proof: Vec<u8>,
-        /// the invite role byte (`Resident = 0`, `Client = 1`). a `Resident`
-        /// redeem grants valset resident standing; a `Client` redeem grants
-        /// submit-only client standing in the identity module. EVERY invite
-        /// is bearer (the targeted form was dropped — see the join ADR): no `target` — the
-        /// `proof` binds the redemption to whichever key presents it and the
-        /// nonce set makes that exactly-once.
-        role: u8,
         /// the token's unix-seconds expiry — enforced against block time.
         expires_unix_secs: u64,
     },

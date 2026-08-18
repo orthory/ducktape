@@ -13,15 +13,6 @@ pub(crate) const MAX_MODULE_CODE_BYTES: u64 = 1024 * 1024 * 1024;
 /// the miss (each conversation resumes the staged prefix, so retries only
 /// ever pay for bytes not yet landed).
 pub(crate) const BLOB_FETCH_ATTEMPTS: usize = 3;
-/// the peer-set index a node WITHOUT consensus coordinates tracks (a parked
-/// joiner, a sync-only resident): the genesis mesh at index 0. a VALIDATOR
-/// tracks its epoch's mesh at index = epoch instead — discovery requires
-/// strictly increasing indexes per `track`, ignores indexes a peer does not
-/// know, but KILLS a peer whose set at a SHARED index has a different
-/// length, so the set tracked at a given index must be identical on every
-/// node that tracks it (epoch participant sets are; instantaneous valset
-/// projections are not).
-pub(crate) const PEER_SET: u64 = 0;
 /// a deliberately-unregistered module target. validators submit empty frames
 /// against it to advance the chain when there are no user ops: finalized views
 /// only move with ops, so an idle network would otherwise freeze — parking AT an
@@ -40,25 +31,15 @@ pub(crate) const NOP_TARGET: &str = noded::projection::NOP_TARGET;
 // finalizes (its height keeps ticking) and any pending cutover still crosses
 // — paced to the same interval the leader's idle-propose holds a view open,
 // so the idle beat never outpaces the view hold.
-/// request timeout for the promoted-validator boot catch-up client. it is long
-/// enough to let discovery links warm, but bounded so boot cannot hang forever
-/// before the statesync server bridge is installed.
-pub(crate) const BOOT_SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 /// how often the reachability plane re-offers whatever it still waits on —
 /// un-acked gossip while assembling, stalled handshake messages after
 /// verification (`ReachabilityCommand::Nudge`). fast enough that a lost
 /// message costs one beat of mesh convergence, slow enough to be noise-free
 /// — the nudge is a no-op once the epoch's handshakes have all completed.
 pub(crate) const NUDGE_INTERVAL: Duration = Duration::from_secs(2);
-/// post-reboot catch-up should close the reboot gap, not chase a live chain
-/// forever. any tiny lag left after this cap is handled by the normal engine.
-pub(crate) const POST_REBOOT_CATCHUP_MAX_ITERS: usize = 8;
-/// how many times the promoted-validator boot retries an unavailable catch-up
-/// source before failing over to the supervisor. sized (with the escalating
-/// beat at the retry site) to ride out an overlay-only source whose tunnels
-/// are still assembling after the reboot — several minutes, not seconds: an
-/// exec-restart would only redo the plane restore from zero.
-pub(crate) const POST_REBOOT_CATCHUP_MAX_ATTEMPTS: usize = 60;
+/// suffix catch-up should close one boundary gap, not chase a live chain
+/// forever. any tiny lag left after this cap is handled by the follower.
+pub(crate) const SUFFIX_CATCHUP_MAX_ITERS: usize = 8;
 /// max wire message size we accept on a channel (2 MiB). the tallest honest
 /// messages are (a) an op frame carrying a full 1 MiB duckfs chunk — capped at
 /// `node::MAX_FRAME_BYTES` by the submit-boundary guard, then gossiped raw on
@@ -125,7 +106,7 @@ pub(crate) const JOINER_POLL: Duration = Duration::from_secs(2);
 /// this tick only covers a missed wake — a mesh hiccup swallowing a
 /// certificate burst, or an idle stretch with nothing to follow.
 pub(crate) const RESIDENT_FALLBACK_POLL: Duration = Duration::from_secs(12);
-/// how many epochs of engine channels are PRE-REGISTERED. discovery channels
+/// how many epochs of engine channels are PRE-REGISTERED. mesh channels
 /// can only be registered before `network.start()`, and every epoch's respawned
 /// engine needs FRESH channels (an aborted old engine must never collide with
 /// its successor) — so a bank is reserved up front. exhausting it is a
@@ -164,7 +145,7 @@ pub(crate) const GATE_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// eager payload-relay lane, and the payload FETCH lane (the lazy catch-up
 /// backstop — a validator that missed the one-shot relay gossip for a
 /// finalized op fetches its bytes by digest instead of wedging its apply
-/// prefix forever). starts at 9, clear of the fixed discovery channels
+/// prefix forever). starts at 9, clear of the fixed mesh channels
 /// (statesync 4, retired lobby 5, reachability 6).
 pub(crate) fn engine_channels(epoch: u64) -> (u64, u64, u64, u64, u64) {
     let base = 9 + epoch * 5;

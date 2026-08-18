@@ -38,7 +38,7 @@ The tree groups by function into three layers — module / kernel / networking:
 | `crates/guests/` | Shared wasm-port infra only: `guest-adapter` (the `ducktape:module` world binding every port shares), the wasm32 dep stubs, and the kernel-fixture test guests. Every module carries its own port (`src/guest.rs` behind the `guest` feature) and `bin/guest-builder` synthesizes the packaging — no per-module crate lives here |
 | `crates/examples/` | Reference modules: `directory` (also bin/node's liveness canary), `greeter` (types-only composition example) |
 | `crates/labs/` | Quarantined experimental modules (`evm`, `multisig`): in-tree and tested but registered by NO genesis set, kept as a standalone crate EXCLUDED from the workspace so its heavy deps (revm, alloy) never tax the shipping build — gated via `make labs-gate` |
-| `bin/` | Runnable binaries: `demo` (in-process walkthrough), `node` (validator), `noded` (app-facing daemon), `simnode` (deterministic /v1 twin), `coordinator` (STUN rendezvous), `fs` (duckfs CLI), `mcp` (MCP tool server), `airlock-gateway` (the TEE enclave lender; the non-TEE lender is `ducktape service run airlock`), `guest-builder` (module → wasm component packaging tool) |
+| `bin/` | Runnable binaries: `node` (the unified `ducktape` CLI: validator plus `fs`/`mcp` families), `noded` (app-facing daemon), `simnode` (deterministic /v1 twin), `demo` (in-process walkthrough), `coordinator` (STUN rendezvous), `airlock-gateway` (the TEE enclave lender; the non-TEE lender is `ducktape service run airlock`), `guest-builder` (module → wasm component packaging tool) |
 | `app/` | `ducktape-app`, the native Iced desktop client (Chat + Pages), UI declared in `src/ui/*.ice`; `crates/design` is its design system |
 | `docs/` | Nimbus documentation site (human and agent tracks) |
 
@@ -76,7 +76,6 @@ are open and unmerged.
 | `ObjectStore` · `crates/duckfs/core` | `DiskStore` | `MemStore` | `files` module, duckfs client |
 | `Blobs` · `blobstore` — (this campaign, PR #716 — unmerged) | `BlobHandle` (disk) | `MemBlobs` | bin/node blob_fetch/relay_runtime/explorer, statesync serve |
 | `RefsStore` · `crates/duckfs/core` — (this campaign, PR #715 — unmerged) | `DiskRefs` | `MemRefs` | `files` module (`Files<S, R>`) |
-| `IndexDisk` · `crates/kernel/indexer` — (this campaign, PR #717 — unmerged) | `DiskFs` (moved `std::fs`) | `MemDisk` (feature `sim`) | indexer derived-tier writes |
 | `MeshCarrier` · `crates/kernel/consensus` — (this campaign, PR #719 — unmerged) | `DiscoveryMesh` (wraps the `authenticated::discovery` Network) | `SimMesh` (feature `sim`, wraps `simulated::Network`) | bin/node validator engine, in-process cluster test |
 | commonware `Clock` seam (`context.current()`) + source-parsing lint · bin/node, statesync — (this campaign, PR #720 — unmerged) | `tokio::Context` | `deterministic::Runner` | validator run/drain/ingress, statesync monitor |
 | `TestCtx` (`sdk::Ctx`) + `MemStore` (`sdk::MerkleStore`) · `crates/kernel/sdk-testkit` — (this campaign, PR #718/#721 — unmerged) | host runtime `Ctx`, `QmdbStore` | `TestCtx`, `MemStore` | module unit tests (runs, automations, files, governance, …) |
@@ -199,10 +198,11 @@ Three binaries plus the desktop app are runnable:
   Pages, its UI declared in `app/src/ui/*.ice`. `cargo run -p ducktape-app`; it
   dials `DUCKTAPE_NODE`, else `http://127.0.0.1:8844`. See `app/README.md`.
 
-Install the `ducktape` operator CLI into `~/.cargo/bin`:
+Install the `ducktape` operator CLI into `~/.cargo/bin`; on macOS this also
+builds the Ice `.app`/`.dmg` and installs `Ducktape.app` into `~/Applications`:
 
 ```sh
-make install          # == make install-node
+make install
 ```
 
 Seed a local "demo" network preloaded with sample data — chat channels and

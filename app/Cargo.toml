@@ -3,15 +3,25 @@ name = "ducktape-app"
 edition.workspace = true
 version.workspace = true
 publish = false
+description = "A local-first consensus workspace for people and agents"
+authors = ["Ducktape contributors"]
+
+[package.metadata.ice.bundle]
+icon = "assets/icon.svg"
+category = "public.app-category.productivity"
 
 [build-dependencies]
-ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "19d79902", version = "=0.1.0" }
+ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "2377ffa61861c36d7405ff6a86e18b1611d780f5", version = "=0.1.0" }
 
 [dependencies]
+# the network's node -> announced-provider registry, behind the Shell's host
+# picker: which peers can actually run an agent.
+capability.workspace = true
 chat.workspace = true
 design.workspace = true
 ducktape-rpc.workspace = true
 forge.workspace = true
+gateway.workspace = true
 # the client-computed merge lane: a bare mirror fetched over the node's
 # /forge/{repo} smart-HTTP bridge + the scratch merge commit MergePr CASes.
 # forge's exact pin (vendored, no TLS transports — the bridge speaks plain
@@ -21,6 +31,7 @@ governance.workspace = true
 identity.workspace = true
 inbox.workspace = true
 pages.workspace = true
+saga.workspace = true
 # RUNTIME, not dev-only: `local_member` derives the signing identity through
 # `sdk::Origin::External(..).actor_string()` on the product path, so a
 # dev-dependency here builds every TEST lane and breaks only the BINARY.
@@ -38,13 +49,19 @@ jpeg-encoder = "0.6"
 zune-jpeg = "0.4"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 zeroize.workspace = true
-iced = { version = "=0.14.0", default-features = false, features = ["advanced", "image-without-codecs", "lazy", "svg", "tokio", "wgpu", "x11"] }
-ducktape-ui = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "19d79902", default-features = false, features = ["full"] }
-ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "19d79902" }
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "19d79902", version = "=0.1.0" }
+iced = { version = "=0.14.0", default-features = false, features = ["advanced", "highlighter", "image-without-codecs", "lazy", "markdown", "svg", "tokio", "wgpu", "x11"] }
+ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "2377ffa61861c36d7405ff6a86e18b1611d780f5", default-features = false, features = ["log-timeline", "terminal"] }
+ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "2377ffa61861c36d7405ff6a86e18b1611d780f5" }
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "2377ffa61861c36d7405ff6a86e18b1611d780f5", version = "=0.1.0", default-features = false, features = ["full-runtime"] }
 
 [dev-dependencies]
 commonware-cryptography.workspace = true
+# `src/frame_probe.rs` needs a headless `UserInterface` to measure a whole
+# frame (build + layout + event walk + draw), and iced does not re-export
+# `iced_runtime`. The explicit test-only ui-lang runtime feature below keeps
+# that renderer out of the product dependency surface.
+iced_test = "=0.14.0"
 node.workspace = true
 simnode = { path = "../bin/simnode" }
 tempfile.workspace = true
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "2377ffa61861c36d7405ff6a86e18b1611d780f5", version = "=0.1.0", default-features = false, features = ["test-runtime"] }

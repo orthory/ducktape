@@ -1,14 +1,39 @@
 use super::*;
 
 /// One files-browser row.
-#[derive(Clone, Debug, Hash, PartialEq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq)]
 pub struct FsEntry {
+    /// Session-stable identity for keyed rendering.
+    pub key: i64,
     pub path: String,
     pub name: String,
     pub kind: String,
     pub size: i64,
-    /// the entry's content address — already on the ls/find wire.
+    /// the entry's content address — already on the ls wire.
     pub object: String,
+}
+
+/// Blank selection mirrored into Ice while no listed object is selected.
+pub fn no_fs_entry() -> FsEntry {
+    FsEntry::default()
+}
+
+/// Resolve a selected object when selection or its listing changes, not while
+/// the view renders every frame.
+pub fn fs_entry_named(entries: Vec<FsEntry>, path: String) -> FsEntry {
+    entries
+        .into_iter()
+        .find(|entry| entry.path == path)
+        .unwrap_or_default()
+}
+
+/// Directory rows prepared with the listing so the keyed sidebar does not
+/// filter and clone the full entry list while building every frame.
+pub fn fs_directories(entries: Vec<FsEntry>) -> Vec<FsEntry> {
+    entries
+        .into_iter()
+        .filter(|entry| entry.kind == "dir")
+        .collect()
 }
 
 /// What is under this crumb, counted. Ice cannot filter a list by field, so the
@@ -80,7 +105,6 @@ pub async fn files_ls(
     path: String,
     generation: i64,
 ) -> Result<FsListing, HydrationError> {
-    offscreen_guard(generation)?;
     async {
         let rpc = rpc_client(&rpc)?;
         let listed = rpc.files_get("ls", &[("path", path.as_str())]).await;
@@ -117,32 +141,7 @@ pub async fn files_ls(
     })
 }
 
-/// Every path under one prefix, in full-path order — the duckfs tree sidebar
-/// and Explorer's FILE results read the same wire.
-pub async fn files_find(
-    rpc: String,
-    prefix: String,
-    generation: i64,
-) -> Result<FsListing, HydrationError> {
-    async {
-        let rpc = rpc_client(&rpc)?;
-        let reply = rpc
-            .files_get("find", &[("prefix", prefix.as_str())])
-            .await?;
-        Ok(FsListing {
-            generation,
-            entries: fs_entries(&reply),
-            path: prefix,
-        })
-    }
-    .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
-}
-
-/// The `entries` array of an ls/find reply as rows (both serve `EntryInfo`).
+/// The `entries` array of an ls reply as rows.
 fn fs_entries(reply: &serde_json::Value) -> Vec<FsEntry> {
     reply["entries"]
         .as_array()
@@ -157,6 +156,7 @@ fn fs_entries(reply: &serde_json::Value) -> Vec<FsEntry> {
                 .unwrap_or(entry_path.as_str())
                 .to_string();
             FsEntry {
+                key: stable_view_key(&format!("duckfs:{entry_path}")),
                 name,
                 kind: entry["kind"].as_str().unwrap_or_default().to_string(),
                 size: entry["size"].as_i64().unwrap_or(0),
@@ -221,7 +221,6 @@ pub async fn files_preview(
 
 /// The committed snapshot window, newest first.
 pub async fn files_history(rpc: String, generation: i64) -> Result<FsHistory, HydrationError> {
-    offscreen_guard(generation)?;
     async {
         let rpc = rpc_client(&rpc)?;
         let reply = rpc.files_get("history", &[("limit", "50")]).await?;
@@ -337,6 +336,11 @@ pub async fn files_write_text(rpc: String, path: String, text: String) -> Result
 /// small files ride inline; larger ones stage 1 MiB chunks then commit a
 /// chunk list. The dropped path never leaves this device — only bytes do.
 pub async fn files_upload(rpc: String, dir: String, dropped: String) -> Result<bool, AppError> {
+    // the node refuses to serve back any object larger than files_http's
+    // MAX_OBJECT_BYTES, and every staged MiB is a consensus block — a cap
+    // HERE turns "drop a video, drive 300 blocks, node RSS grows by 300 MB"
+    // into one refusal toast.
+    const MAX_DROP_BYTES: u64 = 64 * 1024 * 1024;
     async {
         let source = PathBuf::from(&dropped);
         let name = source
@@ -344,8 +348,22 @@ pub async fn files_upload(rpc: String, dir: String, dropped: String) -> Result<b
             .and_then(|name| name.to_str())
             .ok_or_else(|| "dropped path has no file name".to_string())?
             .to_string();
-        let bytes =
-            std::fs::read(&source).map_err(|error| format!("cannot read {dropped}: {error}"))?;
+        let size = std::fs::metadata(&source)
+            .map_err(|error| format!("cannot read {dropped}: {error}"))?
+            .len();
+        if size > MAX_DROP_BYTES {
+            return Err(format!(
+                "{name} is {} MiB — the node stores files up to {} MiB",
+                size / (1024 * 1024),
+                MAX_DROP_BYTES / (1024 * 1024)
+            ));
+        }
+        // off the render runtime: a multi-MB read is a blocking call.
+        let read = tokio::task::spawn_blocking(move || std::fs::read(&source));
+        let bytes = read
+            .await
+            .map_err(|error| format!("file read task failed: {error}"))?
+            .map_err(|error| format!("cannot read {dropped}: {error}"))?;
         let rpc = rpc_client(&rpc)?;
         let target = fs_child(dir, name.clone());
         let content = match bytes.len() as u64 <= 256 * 1024 {
@@ -414,86 +432,6 @@ pub async fn files_diff(
             generation,
             from,
             entries,
-        })
-    }
-    .await
-    .map_err(|message: String| HydrationError {
-        generation,
-        message: user_error(message),
-    })
-}
-
-/// Who last changed one duckfs PATH, and at which block.
-///
-/// This is the path's last COMMIT — never blob authorship. duckfs stores
-/// content-addressed objects with no per-blob author, so the honest label is
-/// "last changed at this path", which is exactly what walking the snapshot
-/// window answers.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct ChangeStamp {
-    pub generation: i64,
-    pub path: String,
-    /// The committing member, short form; empty when no commit in the window
-    /// touched this path.
-    pub author: String,
-    /// The committing block height; 0 with an empty author.
-    pub height: i64,
-}
-
-/// How far back a last-changed walk looks. A path untouched in this many
-/// commits reads as unknown rather than wrong.
-//
-// ponytail: one diff round-trip per snapshot until the first hit — recent
-// paths answer in one or two. Bound it lower, or ask the module for a
-// per-path log, if a cold path ever makes this walk visible.
-const CHANGE_STAMP_WINDOW: usize = 50;
-
-/// Walk the committed snapshots newest-first and stop at the first one whose
-/// diff against its parent touches `path`.
-pub async fn last_changed_at_path(
-    rpc: String,
-    path: String,
-    generation: i64,
-) -> Result<ChangeStamp, HydrationError> {
-    async {
-        let client = rpc_client(&rpc)?;
-        let limit = CHANGE_STAMP_WINDOW.to_string();
-        let history = client
-            .files_get("history", &[("limit", limit.as_str())])
-            .await?;
-        // `history` is newest-first, which is the order this walk wants.
-        let snapshots = history["snapshots"].as_array().cloned().unwrap_or_default();
-        for snapshot in &snapshots {
-            let id = snapshot["id"].as_str().unwrap_or_default();
-            let stamp = ChangeStamp {
-                generation,
-                path: path.clone(),
-                author: short_digest(snapshot["author"].as_str().unwrap_or_default()),
-                height: snapshot["height"].as_i64().unwrap_or(0),
-            };
-            // The root snapshot has no parent to diff against: everything the
-            // window still holds was introduced there.
-            let Some(parent) = snapshot["parent"].as_str() else {
-                return Ok(stamp);
-            };
-            let diff = client
-                .files_get(
-                    "diff",
-                    &[("from", parent), ("to", id), ("prefix", path.as_str())],
-                )
-                .await?;
-            let touched = diff["entries"]
-                .as_array()
-                .is_some_and(|entries| !entries.is_empty());
-            if touched {
-                return Ok(stamp);
-            }
-        }
-        Ok(ChangeStamp {
-            generation,
-            path,
-            author: String::new(),
-            height: 0,
         })
     }
     .await

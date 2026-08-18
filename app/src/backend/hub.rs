@@ -25,7 +25,6 @@ pub struct HubNetwork {
 /// reading (`live == false`), not a failure to hide behind a banner.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct HubProbe {
-    pub generation: i64,
     pub id: String,
     pub live: bool,
     pub height: i64,
@@ -150,10 +149,11 @@ fn preselect_id(rows: &[HubNetwork]) -> String {
 /// Which step the launch window opens on: no key on disk means the create
 /// ceremony, anything else lands on unlock — a plaintext or unlocatable key
 /// renders its refusal plate there rather than on a separate screen.
-pub fn hub_entry_step(key_state: String) -> String {
-    match key_state.as_str() {
-        "absent" => "create".into(),
-        _ => "unlock".into(),
+pub fn hub_entry_step(key_state: String) -> crate::HubStep {
+    if key_state == "absent" {
+        crate::HubStep::Create
+    } else {
+        crate::HubStep::Unlock
     }
 }
 
@@ -264,8 +264,7 @@ pub async fn restore_hidden_networks() -> bool {
     write_prefs(&prefs)
 }
 
-/// Merge one probe answer into the list — by row id, generations already
-/// checked by the handler.
+/// Merge one probe answer into the list by row id.
 pub fn apply_network_probe(networks: Vec<HubNetwork>, probe: HubProbe) -> Vec<HubNetwork> {
     networks
         .into_iter()
@@ -295,14 +294,11 @@ pub fn network_run_hint(row: HubNetwork) -> String {
 
 /// Probe every known network's endpoint, emitting one reading per row as it
 /// answers. Bounded: one `/v1/status` with a short timeout per endpoint.
-pub fn probe_known_networks(
-    generation: i64,
-) -> iced::futures::stream::BoxStream<'static, HubProbe> {
+pub fn probe_known_networks() -> iced::futures::stream::BoxStream<'static, HubProbe> {
     use iced::futures::StreamExt;
     let probes = known_networks().into_iter().map(move |row| async move {
         let reading = probe_endpoint(&row.endpoint).await;
         HubProbe {
-            generation,
             id: row.id,
             live: reading.is_some(),
             height: reading.unwrap_or(-1),
@@ -406,16 +402,27 @@ pub async fn create_user_key(password: String) -> Result<KeyCreated, AppError> {
 
 /// `user key restore` — re-seal an identity from its 24 words under a new
 /// password. Returns the pubkey.
-pub async fn restore_user_key(words: String, password: String) -> Result<String, AppError> {
+pub async fn restore_user_key(
+    words: ui_lang_runtime::Secret,
+    mut password: String,
+) -> Result<String, AppError> {
     async {
-        let normalized = words.split_whitespace().collect::<Vec<_>>().join(" ");
+        let normalized = Zeroizing::new(
+            words
+                .expose()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
         if normalized.split(' ').count() != 24 {
             return Err("a recovery phrase is exactly 24 words".to_string());
         }
         let path = user_key_path()?;
+        let password_line = secret_line(&password);
+        password.zeroize();
         let input = secret_line(&normalized)?
             .into_iter()
-            .chain(secret_line(&password)?)
+            .chain(password_line?)
             .collect::<Vec<u8>>();
         let stdout = user_key_cli_raw(&["restore", "--out"], &path, input).await?;
         let pubkey = last_line(&stdout)?;
@@ -444,7 +451,7 @@ pub async fn unlock_user_key(password: String) -> Result<String, AppError> {
 }
 
 /// One secret as the CLI's stdin field: the bytes plus the newline, refusing
-/// embedded delimiters the same way `signing_input` does.
+/// embedded delimiters the same way `password_line` does.
 fn secret_line(value: &str) -> Result<Vec<u8>, String> {
     let invalid = value.len() > 16 * 1024
         || value

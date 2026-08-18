@@ -22,7 +22,7 @@
 //! from `mixed` frames. Late audio is dead audio: the ring caps at ~200 ms
 //! and drops oldest, capture frames drop when the pump is behind.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -68,7 +68,9 @@ impl CallEvent {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientControl {
-    Recipients { peers: Vec<String> },
+    Recipients {
+        peers: Vec<String>,
+    },
     Beacon {
         muted: bool,
         camera_on: bool,
@@ -132,17 +134,17 @@ pub(crate) fn beacon_state() {
 }
 
 /// Steer the fan-out set to the huddle roster's peer NODE keys (self
-/// excluded). Called wherever the roster refreshes; a no-session call is a
-/// no-op `false`.
-pub fn call_recipients(nodes: Vec<String>) -> bool {
+/// excluded). Called wherever the roster refreshes; a missing session is a
+/// no-op.
+pub fn call_recipients(nodes: Vec<String>) -> iced::Task<()> {
     let guard = handles().lock().expect("call handles");
     let Some(handles) = guard.as_ref() else {
-        return false;
+        return iced::Task::none();
     };
-    handles
+    let _ = handles
         .control
-        .send(ClientControl::Recipients { peers: nodes })
-        .is_ok()
+        .send(ClientControl::Recipients { peers: nodes });
+    iced::Task::none()
 }
 
 /// The session stream: connect, pump, and yield state the handlers fold. The
@@ -183,7 +185,10 @@ async fn run_session(
         }
         Err(_) => {
             let _ = events
-                .send(CallEvent::failed("error", "call socket: connection timed out"))
+                .send(CallEvent::failed(
+                    "error",
+                    "call socket: connection timed out",
+                ))
                 .await;
             return;
         }
@@ -407,8 +412,8 @@ impl Resampler {
         for sample in input {
             // Emit every 48 kHz tick that lands before this input sample.
             while self.phase < 1.0 {
-                let mixed = f64::from(self.last) * (1.0 - self.phase)
-                    + f64::from(*sample) * self.phase;
+                let mixed =
+                    f64::from(self.last) * (1.0 - self.phase) + f64::from(*sample) * self.phase;
                 output.push(mixed as i16);
                 self.phase += self.step;
             }
@@ -637,11 +642,35 @@ pub fn call_video_live_after(peers: Vec<CallEvent>, camera: bool) -> bool {
     camera || peers.iter().any(|peer| peer.camera_on)
 }
 
-/// Whether the roster row at `node` is currently muted, per the beacons.
-pub fn call_peer_muted(peers: Vec<CallEvent>, node: String) -> bool {
-    peers
-        .iter()
-        .any(|peer| peer.peer == node && peer.muted)
+/// One huddle tile with its mute decision already attached.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct HuddleTileRow {
+    pub person: crate::backend::HuddleParticipant,
+    pub muted: bool,
+}
+
+/// Tile rows prepared whenever the roster, call beacons, or local mute moves.
+pub fn huddle_tile_rows(
+    roster: Vec<crate::backend::HuddleParticipant>,
+    peers: Vec<CallEvent>,
+    local_muted: bool,
+) -> Vec<HuddleTileRow> {
+    let muted_peers: BTreeSet<String> = peers
+        .into_iter()
+        .filter(|peer| peer.muted)
+        .map(|peer| peer.peer)
+        .collect();
+    roster
+        .into_iter()
+        .map(|person| HuddleTileRow {
+            muted: if person.is_you {
+                local_muted
+            } else {
+                muted_peers.contains(&person.node)
+            },
+            person,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -701,10 +730,7 @@ mod tests {
         assert_eq!(call_status_after("x".into(), CallEvent::of("live")), "live");
         let mut live = CallEvent::of("live");
         live.message = "no microphone".into();
-        assert_eq!(
-            call_status_after("x".into(), live),
-            "live · no microphone"
-        );
+        assert_eq!(call_status_after("x".into(), live), "live · no microphone");
         assert_eq!(
             call_status_after("live".into(), CallEvent::failed("refused", "nope")),
             "nope"
@@ -717,11 +743,30 @@ mod tests {
             ..CallEvent::default()
         };
         let peers = apply_call_peer(Vec::new(), beacon("aa", true));
-        let peers = apply_call_peer(peers, beacon("bb", false));
+        let peers = apply_call_peer(peers, beacon("bb", true));
         let peers = apply_call_peer(peers, beacon("aa", false));
         assert_eq!(peers.len(), 2);
-        assert!(!call_peer_muted(peers.clone(), "aa".into()));
-        assert!(!call_peer_muted(peers, "cc".into()));
+        let participant = |node: &str, is_you: bool| crate::backend::HuddleParticipant {
+            key: node.into(),
+            label: node.into(),
+            initials: node.into(),
+            is_agent: false,
+            is_you,
+            joined_at: 0,
+            node: node.into(),
+        };
+        let rows = huddle_tile_rows(
+            vec![
+                participant("aa", false),
+                participant("bb", false),
+                participant("cc", true),
+            ],
+            peers,
+            true,
+        );
+        assert!(!rows[0].muted);
+        assert!(rows[1].muted);
+        assert!(rows[2].muted, "the local tile reads the local mute");
     }
 
     #[test]
@@ -751,7 +796,10 @@ mod tests {
         .unwrap();
         assert!(matches!(
             beacon,
-            ServerControl::PeerBeacon { camera_on: true, .. }
+            ServerControl::PeerBeacon {
+                camera_on: true,
+                ..
+            }
         ));
         assert!(matches!(
             serde_json::from_str::<ServerControl>(r#"{"type":"rate_hint","max_kbps":900}"#)

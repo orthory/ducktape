@@ -2,7 +2,7 @@
 
 Status: shipped — the wasm index-guest architecture: host-written op feed,
 engine-folded read models (fluent31 changes-mode triggers), per-module view
-guests, boundary stamps, and index-archive shipping. Since the read-model
+guests, boundary stamps, and the join-seam op-row backfill. Since the read-model
 cutover, this tier IS the human-facing read surface: canonical module
 queries serve dispatch alone (§5).
 Code: `crates/kernel/indexer` (the host store: feed writer + guest converge),
@@ -11,7 +11,8 @@ reference mapper), the chat/tasks/pages/inbox/saga modules' `src/index.rs`
 (pure decision cores) + `src/index_guest.rs` (wasm shells, packaged by
 `guest-builder --index`), `bin/noded` (the feed, the HTTP lanes, the shared
 store construction with bundled guests), `bin/node` (the validator: live
-feed, replay feed, boundary stamps).
+feed, replay feed, boundary stamps, the join-seam backfill), `crates/kernel/statesync`
+(the `IndexOps` wire lane + the joiner-side walk).
 
 ## 1. Position: the derived tier
 
@@ -84,9 +85,10 @@ when the guest folds, teardown of both when a module stops shipping one. A
 converge marker (`meta/guest`: artifact hash + roles) written last makes a
 warm boot free — a matching marker skips every wasm compile.
 
-Because the guest lives in the database's engine keyspace, **code travels
-with the data**: a shipped index archive (§7) carries its mapper, and no
-wipe this tier performs can touch it.
+Because the guest lives in the database's engine keyspace, no wipe this tier
+performs can touch it — `mark_backfilled`'s clear and `converge_guest`'s clear
+both sweep only user keys. Every node installs its own mapper from its bundled
+artifacts at open; nothing ships code over the wire.
 
 ### 3.1 Authoring shape: decide pure, write thin
 
@@ -136,12 +138,33 @@ the module's state machinery, never `sdk`/`host`/`indexer`.
    continue instead. Choose per mapper; write it down.
 4. **Reserved namespaces.** `op/` and `meta/` are host-written; the trigger
    range spans `op/` alone, so bookkeeping writes never reach the guest.
-   Guests must not write into either (nothing enforces it engine-side — the
-   prefixes are ordinary user keys there; the contract is this spec).
+   `fold/` is the SHELL's, written by `index_guest::guest::fold_batch` inside
+   the fold transaction — today `fold/tip`, the `(height, seq)` of the last op
+   row consumed, 12 bytes big-endian. A mapper's decision core must not write
+   into any of the three (nothing enforces it engine-side — the prefixes are
+   ordinary user keys there; the contract is this spec).
+
+   `fold/tip` answers ONE question honestly: *has the fold consumed my op at
+   `(H, seq)`* — read-after-your-own-write. It is not general freshness: it
+   advances only on op traffic, so a quiet module's tip is arbitrarily old
+   while its view is perfectly current (unlike `meta/height`, which bumps on
+   every block). ABSENT is normal and means *unknown*, never height 0: a
+   boundary stamp (§6) wipes it with the rest of the derived state, a fresh
+   database has none, and a module that just gained its first index guest has
+   folded nothing yet. So a client waiting on the tip must escape by timeout,
+   never block on it.
+
+   A mapper UPGRADE was once the hazard here — a swapped wasm left the tip
+   PRESENT over the previous mapper's rows. It no longer is: `converge_guest`
+   REFOLDS unconditionally on any artifact-hash change (clear the derived
+   keyspace, re-drive the fold over the `op/` rows the database already holds,
+   and WAIT it out before `open` returns), so a tip that survives an upgrade
+   vouches for rows the installed mapper produced. `op/` and `meta/` are left
+   alone: a new mapper changes what the rows MEAN, never what the feed saw.
 5. **Pre-index history is out of scope.** An op referencing state the feed
    never carried (enabled mid-life, boundary stamp) folds to a no-op. The
-   honest fix is replaying the chain through the feed, not a guessed
-   backfill.
+   honest fixes are replaying the chain through the feed or pulling the
+   source's real op rows below the boundary (§7) — never a guessed backfill.
 
 ### 3.3 View rules
 
@@ -223,7 +246,7 @@ feed traffic), watermark dropped, user keys cleared (the engine keyspace,
 guest included, is invisible to the sweep and survives), watermark + floor
 stamped, trigger re-registered. Its feed and views honestly BEGIN there,
 visibly via `meta/backfill`; history below a boundary re-enters only by
-replaying blocks through the feed or adopting a shipped archive (§7).
+replaying blocks through the feed or by the join-seam op-row backfill (§7).
 The former from-state rebuild lane (mappers re-deriving rows from canonical
 `Module::query` state) is deleted with the native mappers: one fold path,
 no second derivation with its own degradation matrix.
@@ -251,34 +274,67 @@ no second derivation with its own degradation matrix.
 - Durability is `SyncMode::Periodic` (bounded loss window, torn tails
   truncate on recovery) — correct for a tier whose worst case is a rebuild.
 
-## 7. State-sync: index-archive shipping
+## 7. State-sync: the join-seam op-row backfill
 
 A joiner state-syncs **state**, not op history, so the feed has nothing to
-carry — and a synced node with empty views renders its modules poorly. The
-shipped answer is the archive lane (the former lane 2, now the only lane):
+carry — and a synced node whose views begin empty at the boundary renders its
+modules as a workspace that lost its contents. The shipped answer is the
+BACKFILL lane: the joiner fetches the SOURCE'S OWN op rows below its boundary
+and writes them into its own feed.
 
-fluent31 fork archives are complete database directories; a source node cuts
-one per module database plus `_blocks` (`IndexStore::checkpoint_files` —
-fork, read into memory, fork deleted) and ships the file sets alongside
-state-sync. The joiner stages them under `<storage>/index/_staging` (every
-file fsynced, a `.complete` marker LAST) and the promoted reboot's
-`IndexStore::open` adopts the staging directory before any engine open — a
-torn fetch is discarded, never adopted. The archive carries rows, watermark,
-floor, AND the installed guest + its trigger/queue state, so a shipped index
-resumes folding mid-stream on the joiner.
+The lane is three moves at the join seams (resident ascension, cold direct
+admission), inline, BEFORE the node serves anything:
 
-Contents are NOT root-verifiable (the derived tier has no root by design),
-so the lane trusts the serving node — accepted, because the read model is
-how a node renders at all, and a joiner already trusted its sync source
-enough to join through it. The lane is ON by default (`sync_index` in
-node.toml, node-local operator policy); `sync_index = false` opts a node
-down to consensus-only — it boundary-stamps instead (§6): views begin at
-the boundary, exact and honest. Shipped watermarks land at the source's fold tip, so a module whose
-watermark reaches the joiner's boundary skips its stamp (warm), and
-anything stale, missing, or refused falls to `watermark < boundary` and
-stamps exactly as if nothing was shipped. The blocks database rides along
-verbatim — the only path by which a joiner ever gets pre-boundary
-`/v1/blocks` history.
+1. the heal stamps every stale module at the boundary (§6) and returns the
+   stamped ids — this re-registers a fresh fold trigger over an empty `op/`;
+2. for each stamped module, `SyncRequest::IndexOps { boundary, module, after }`
+   walks the source's rows in ASCENDING key order, cursor-paged and bounded by
+   bytes, writing each page through `IndexStore::write_backfill_rows`;
+3. the fold drains, and `IndexStore::set_backfill_floor` composes the source's
+   own floor into this node's — `None` when the source reaches genesis.
+
+**Why no refold is needed, and why this window is the only one.** Pre-serving
+there are no live folds, no ws subscribers, and no view readers on this node.
+So ascending fetch-and-write makes COMMIT ORDER EQUAL KEY ORDER, which for
+`op/{height:016x}/{seq:04x}` is block-and-drain order: the changes-mode trigger
+folds every row correctly as it lands, and the fold tip advances monotonically
+to the last backfilled row. Doing this later — against a folding, serving node
+— would hand a guest history backwards, and is a defect rather than a slow path.
+`write_backfill_rows` never touches `meta/height`: the heal already stamped it,
+and it vouches for feed contiguity FROM THE FLOOR UP. The floor is the one
+thing a backfill moves.
+
+Contents are NOT root-verifiable (the derived tier has no root by design), so
+the lane trusts the serving node — accepted, because the read model is how a
+node renders at all, and the joiner already trusted this exact node enough to
+accept canonical state from it. What is still enforced, once, at the trust
+boundary (`statesync::fetch_index_ops`): every key is byte-exactly the
+canonical `op/{height:016x}/{seq:04x}` rendering of its own position,
+`(height, seq)` ascends strictly across the whole walk, every height is at or
+below the boundary, every row borsh-decodes as an `OpRow` agreeing with its own
+key, the source's watermark covers the requested boundary (a source that folded
+less would leave a HOLE above the joiner's floor), and the source's own floor
+stays at or below that boundary (one that rose above it holds none of the range
+being asked for).
+
+The key check is byte equality, not a successful parse, and the difference is
+load-bearing. `parse_op_key` reads hex with `from_str_radix`, which accepts any
+width and a leading `+`: `op/2/0` parses to `(2, 0)` while sorting AFTER
+`op/0000000000000009/0000`. Such a key would satisfy every other check above
+and still break the one invariant this lane rests on — and the damage is
+durable and silent, because the next `converge_guest` refold replays `op/` in
+KEY order and would rebuild every derived view from history running backwards.
+The FIXED WIDTH IS THE ORDERING, so it is verified as bytes. Any violation aborts
+that module's backfill; its stamped floor stands, which is honest. Per-module
+failure — network, validation, a source that re-stamped past the boundary —
+never aborts the join: it warns once with a stable reason token and the rest of
+the modules continue. A source that re-stamps MID-WALK, but still at or below
+the boundary, is composed by taking the MAX floor seen across pages: the higher
+floor is the one that does not overclaim.
+
+The blocks database (`_blocks`) is deliberately NOT backfilled: its rows are
+node-layer observations, not derived state, and a resident writes its own
+honest boundary row instead (`IndexStore::apply_block_record`, §6).
 
 ## 8. The index-only node (direction)
 

@@ -63,9 +63,9 @@ duckfs Phases 1–2 are shipped: the rebuilt `files` module (staging, atomic
 per-path-CAS commits, snapshots, pins, watches, snapshot-addressed reads),
 resolver-backed state sync to full possession, restart durability, and the
 noded HTTP surface are present. The client side is also built: `crates/duckfs/client`
-owns the checkout/status/commit engine, `ducktape-fs` ships read verbs plus
-checkout/status/commit/pin, and `mount` exists behind the `fuse` cargo feature.
-Do not list the engine, CLI, or mount as missing. Remaining work is the app
+owns the checkout/status/commit engine, and `ducktape fs` ships read verbs plus
+checkout/status/commit/pin. Kernel mounting is deliberately absent. Do not list
+the engine or CLI as missing. Remaining work is the app
 FilesView/UX rebuilt on duckfs verbs. The old memory/workspace surface was
 absorbed by duckfs snapshots and `duck://files/...` evidence. Filesystem-change
 automations would return as a new duckfs-watch trigger, a fresh feature, not a

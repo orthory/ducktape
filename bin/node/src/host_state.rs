@@ -18,6 +18,7 @@ use statesync::{
     fetch_snapshot,
     qmdb::{QmdbStore, RemoteQmdbResolver},
 };
+use acl::Acl;
 use valset::Valset;
 use wasm_host::WasmModule;
 
@@ -540,6 +541,7 @@ struct ProductionModules {
     chat: WasmModule,
     forge: Forge,
     valset: Valset,
+    acl: Acl,
     governance: WasmModule,
     lifecycle: Lifecycle,
     hello_wasm: WasmModule,
@@ -568,6 +570,7 @@ impl ProductionModules {
             Box::new(self.chat),
             Box::new(self.forge),
             Box::new(self.valset),
+            Box::new(self.acl),
             Box::new(self.governance),
             Box::new(self.lifecycle),
             Box::new(self.hello_wasm),
@@ -695,18 +698,25 @@ pub(super) async fn genesis_host(
         .finish_seed()
         .await
         .expect("genesis valset seed commits");
+    // the submit-policy federation is NATIVE and store-backed like valset,
+    // and deliberately EMPTY at genesis: an empty table is allow-all, so a
+    // fresh network admits any validly signed frame to any module and the
+    // table exists only for governance to tighten later.
+    let acl_table = Acl::new(
+        "acl",
+        Box::new(QmdbStore::init(context.child("acl"), "acl").await),
+    );
     ProductionModules {
         pages,
         chat,
         forge,
         valset,
-        // governance is the SOLE authorized author of valset AND client-ACL
-        // changes: member proposals + ballots, deterministic tally, follow-up
-        // membership ops, and the redeem-time client grant (an
-        // `IdentityMsg::GrantClient` follow-up into identity — the client set is
-        // now a facet of the account plane, empty at genesis). store-backed
-        // over the host-constructed qmdb store; the invite binding is the
-        // store-seeded `__config` record, sibling ids compiled into the guest.
+        acl: acl_table,
+        // governance is the SOLE authorized author of valset changes: member
+        // proposals + ballots, deterministic tally, follow-up membership ops,
+        // and the redeem-time resident grant. store-backed over the
+        // host-constructed qmdb store; the invite binding is the store-seeded
+        // `__config` record, sibling ids compiled into the guest.
         governance,
         // the network module-code registry: the consensus commitment to WHICH
         // component each hot-swappable wasm module runs, seeded with the genesis
@@ -853,6 +863,11 @@ pub(super) async fn restore_host(
         "valset",
         Box::new(QmdbStore::init(context.child("valset"), "valset").await),
     );
+    // the submit-policy table reopens the same way (empty store = allow-all).
+    let acl_table = Acl::new(
+        "acl",
+        Box::new(QmdbStore::init(context.child("acl"), "acl").await),
+    );
 
     // the lifecycle module-code registry reopens like the other store-backed
     // tenants (its store carries the genesis seeds and every committed swap);
@@ -908,6 +923,7 @@ pub(super) async fn restore_host(
         chat,
         forge,
         valset,
+        acl: acl_table,
         governance,
         lifecycle,
         hello_wasm,
@@ -1201,6 +1217,21 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         ),
     );
 
+    // the submit-policy table joins like the other store-backed tenants.
+    let (target, resolver) = fetch_target("acl").await?;
+    let acl_table = Acl::new(
+        "acl",
+        Box::new(
+            QmdbStore::sync_from(
+                scratch_context.child(child_label("acl")),
+                "acl",
+                target,
+                resolver,
+            )
+            .await?,
+        ),
+    );
+
     let (target, resolver) = fetch_target("saga").await?;
     let saga = saga_wasm(Box::new(
         QmdbStore::sync_from(
@@ -1313,6 +1344,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
         chat,
         forge,
         valset,
+        acl: acl_table,
         governance,
         lifecycle,
         hello_wasm,
@@ -1377,7 +1409,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "1a1c19cde395ac4ea8d813d357c9c97be6163352eb23e4d05c0a8f85e243ccfe";
+        "1414242f8f4c99b29d1190e87f2a61f40b174d19351c39e4670f08a9fc72655b";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's store as a genesis
@@ -1392,7 +1424,25 @@ mod tests {
     /// Compose the production genesis host in a throwaway storage root and
     /// return `(module ids sorted, root hash hex)` — everything both pins below
     /// need, so neither has to keep its own copy of the construction.
+    ///
+    /// Production runs this root future on macOS's ~8 MiB process stack. Run
+    /// the test twin on the same budget: libtest's 2 MiB worker stack is just
+    /// below this full 20-module composition's debug-build requirement.
+    const GENESIS_TEST_STACK_BYTES: usize = 8 * 1024 * 1024;
+
     fn genesis_facts() -> (Vec<String>, String) {
+        std::thread::Builder::new()
+            .name("production-genesis-test".into())
+            .stack_size(GENESIS_TEST_STACK_BYTES)
+            .spawn(compose_genesis_facts)
+            .expect("spawn production genesis test")
+            .join()
+            // Keep the original assertion or construction panic and location;
+            // turning it into a generic join failure would hide the regression.
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+    }
+
+    fn compose_genesis_facts() -> (Vec<String>, String) {
         let dir = tempfile::tempdir().expect("tempdir");
         let forge_repo = dir.path().join("forge");
         let duckfs_dir = dir.path().join("duckfs");

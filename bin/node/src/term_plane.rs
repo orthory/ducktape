@@ -38,8 +38,8 @@ use provider_host::ResolvedCredential;
 use futures::SinkExt as _;
 use futures::channel::{mpsc as fmpsc, oneshot};
 use noded::{
-    CreatedSession, NodeCommand, PeerAttach, SessionInputWire, SessionJob, TermChunkEvent,
-    TermCommandEvent, TermCommandRing, TermError, TerminalSessions, TermRing,
+    CreatedSession, NodeCommand, PeerAttach, SessionInputWire, SessionJob, TermCommandEvent,
+    TermCommandRing, TermError, TermFeedEvent, TerminalSessions, TermRing,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -305,7 +305,7 @@ async fn receive_chunks<S: AsyncRead + Unpin>(
     ring: TermRing,
 ) -> io::Result<()> {
     while peers.contains(peer) {
-        let Some(event) = read_frame::<_, TermChunkEvent>(&mut stream).await? else {
+        let Some(event) = read_frame::<_, TermFeedEvent>(&mut stream).await? else {
             return Ok(());
         };
         if !peers.contains(peer) {
@@ -313,8 +313,17 @@ async fn receive_chunks<S: AsyncRead + Unpin>(
         }
         // a peer sending a malformed session id is a bug, not consensus — skip
         // the grain and keep the stream (best-effort, observational).
-        if agent_service::wire::valid_session(&event.session) {
-            ring.append_remote(event);
+        if !agent_service::wire::valid_session(event.session()) {
+            continue;
+        }
+        match event {
+            TermFeedEvent::Chunk(chunk) => ring.append_remote(chunk),
+            // the host says the pty is over. Flag it LOCAL-ONLY: this node is
+            // mirroring someone else's session, so re-publishing would fan the
+            // grain back out. Flagging it is what lets this node's `term:<id>`
+            // catch-up emit `TermEnded` and release the `agent pty` client that
+            // has been blocked on the topic since the child exited.
+            TermFeedEvent::Ended { session } => ring.mark_ended_local_only(&session),
         }
     }
     Ok(())
@@ -410,7 +419,7 @@ async fn send_peer<T: DataPlaneTransport>(
             tokio::select! {
                 event = chunks.recv() => match event {
                     Ok(event) => {
-                        if agent_service::wire::valid_session(&event.session)
+                        if agent_service::wire::valid_session(event.session())
                             && write_frame(&mut chunk_stream, &event).await.is_err()
                         {
                             break;
@@ -1124,6 +1133,7 @@ async fn owner_airlock_authority(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use noded::TermChunkEvent;
 
     #[test]
     fn valid_session_accepts_16_hex_and_rejects_the_rest() {
@@ -1137,13 +1147,23 @@ mod tests {
     #[tokio::test]
     async fn frame_round_trips_both_event_types() {
         let (mut a, mut b) = tokio::io::duplex(64 * 1024);
-        let chunk = TermChunkEvent {
+        let chunk = TermFeedEvent::Chunk(TermChunkEvent {
             session: "00000000deadbeef".into(),
             chunk_b64: "aGVsbG8=".into(),
-        };
+        });
         write_frame(&mut a, &chunk).await.unwrap();
-        let got: TermChunkEvent = read_frame(&mut b).await.unwrap().unwrap();
+        let got: TermFeedEvent = read_frame(&mut b).await.unwrap().unwrap();
         assert_eq!(got, chunk);
+
+        // the terminal grain rides the SAME stream as the bytes — a peer that
+        // could not decode it would leave every cross-node `agent pty` attached
+        // to a dead session.
+        let ended = TermFeedEvent::Ended {
+            session: "00000000deadbeef".into(),
+        };
+        write_frame(&mut a, &ended).await.unwrap();
+        let got: TermFeedEvent = read_frame(&mut b).await.unwrap().unwrap();
+        assert_eq!(got, ended);
 
         let cmd = TermCommandEvent {
             session: "00000000deadbeef".into(),
@@ -1482,7 +1502,7 @@ mod tests {
     async fn read_frame_returns_none_on_clean_eof() {
         let (a, mut b) = tokio::io::duplex(16);
         drop(a);
-        let got: Option<TermChunkEvent> = read_frame(&mut b).await.unwrap();
+        let got: Option<TermFeedEvent> = read_frame(&mut b).await.unwrap();
         assert!(got.is_none(), "a clean EOF is end-of-stream, not an error");
     }
 
@@ -1490,7 +1510,7 @@ mod tests {
     async fn read_frame_rejects_an_oversized_length_prefix() {
         let (mut a, mut b) = tokio::io::duplex(16);
         a.write_all(&(u32::MAX).to_be_bytes()).await.unwrap();
-        let err = read_frame::<_, TermChunkEvent>(&mut b).await.unwrap_err();
+        let err = read_frame::<_, TermFeedEvent>(&mut b).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

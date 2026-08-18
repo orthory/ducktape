@@ -2,13 +2,15 @@
 #
 # `make node` / `make coordinator` build the runnable product surfaces (the
 # networked node daemon and the untrusted UDP coordinator). `make install`
-# installs the `ducktape` operator CLI into ~/.cargo/bin. `make test` is the
-# full local verification gate — run it before every push.
+# installs the `ducktape` operator CLI and, on macOS, Ducktape.app. `make test`
+# is the full local verification gate — run it before every push.
 
 CARGO ?= cargo
+APP_DEST ?= $(HOME)/Applications
 BIN_DEST ?= $(HOME)/.cargo/bin
+UNAME_S := $(shell uname -s)
 
-.PHONY: all dev demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-repro-check labs-gate
+.PHONY: all app dev demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-repro-check labs-gate
 
 ## build every workspace crate (the default target)
 all:
@@ -16,10 +18,11 @@ all:
 
 ## the app dev loop: seed the "demo" localnet if it does not exist yet
 ## (DEV_RESEED=1 forces a fresh seed), start its node when it is not already
-## serving, sync ducktape's own repo into that node's forge (dogfood-forge —
-## non-fatal when origin is unreachable), then run the desktop app against it
-## in the foreground. Ctrl-C quits the app and leaves the node running;
-## `make demo-clear` tears down.
+## serving, start the local compute/agent/airlock services, sync ducktape's own
+## repo into that node's forge (dogfood-forge — non-fatal when origin is
+## unreachable), then run the desktop app against it in the foreground. Ctrl-C
+## quits the app and leaves the node and services running; `make demo-clear`
+## tears down.
 dev:
 	@bash ops/dev.sh
 
@@ -70,8 +73,38 @@ coordinator:
 coordinator-smoke:
 	$(CARGO) test -p coordinator-bin
 
+ifeq ($(UNAME_S),Darwin)
+# Build cargo-ice from the same ducktape-ui rev as the app. A global cargo-ice
+# can parse a different language than the compiler in app/Cargo.toml.
+ICE_REV = $(shell sed -n 's/.*ducktape-ui.git", rev = "\([^"]*\)".*/\1/p' app/Cargo.toml | head -n1)
+ICE_ROOT = $(CURDIR)/target/cargo-ice/$(ICE_REV)
+ICE_BIN = $(ICE_ROOT)/bin/cargo-ice
+
+$(ICE_BIN):
+	CARGO_TARGET_DIR="$(CURDIR)/target/cargo-ice-build" $(CARGO) install cargo-ice \
+		--git https://github.com/byeongsu-hong/ducktape-ui.git \
+		--rev "$(ICE_REV)" --locked --root "$(ICE_ROOT)"
+
+## build the signed-ad-hoc Ducktape.app and DMG under target/ice-bundle
+app: $(ICE_BIN)
+	"$(ICE_BIN)" bundle -p ducktape-app
+
+## install the operator CLI and desktop app without requiring root
+install: install-node install-app
+
+install-app: app
+	mkdir -p "$(APP_DEST)"
+	rm -rf "$(APP_DEST)/Ducktape.app"
+	cp -R target/ice-bundle/Ducktape.app "$(APP_DEST)/"
+	@echo "installed $(APP_DEST)/Ducktape.app"
+else
 ## install the ducktape operator CLI into ~/.cargo/bin
 install: install-node
+
+install-app:
+	@echo "install-app is currently supported on macOS" >&2
+	@exit 2
+endif
 
 install-node:
 	$(CARGO) install --path bin/node --locked

@@ -41,6 +41,57 @@ impl From<Error> for String {
 /// Result returned by the RPC client.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The response header the index view lane stamps its fold watermark into.
+const FOLDED_HEADER: &str = "x-ducktape-folded";
+
+/// How far a module's fold had consumed its op feed when a view snapshot was
+/// taken: the `(height, seq)` of the last op ROW folded.
+///
+/// `seq` is the block-wide dispatch index, so `(height, seq)` — not height
+/// alone — is what makes the comparison exact when a block's ops fold in
+/// several batches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FoldTip {
+    pub height: u64,
+    pub seq: u32,
+}
+
+impl FoldTip {
+    /// The wire form: `"{height}:{seq}"`. `None` for anything else — a
+    /// malformed watermark is unknown, never a guessed position.
+    fn parse(value: &str) -> Option<Self> {
+        let (height, seq) = value.split_once(':')?;
+        Some(Self {
+            height: height.parse().ok()?,
+            seq: seq.parse().ok()?,
+        })
+    }
+
+    /// Whether the fold has reached block `height` — the question a caller
+    /// that just wrote at `height` asks of a view snapshot.
+    ///
+    /// NECESSARY, and sufficient in every case a client can distinguish:
+    ///
+    /// - Necessary because the fold consumes op rows in `(height, seq)` order,
+    ///   so it cannot hold the caller's row without having reached the block.
+    /// - Not a PROOF, because the engine cuts a block's rows at its trigger
+    ///   batch (fluent31: 512), so a tip of exactly `(height, s)` can sit
+    ///   before the caller's own `seq`. Only `tip.height > height` proves
+    ///   coverage outright — and that is unreachable on a quiet module, since
+    ///   the fold advances only on op traffic. Demanding it would mean waiting
+    ///   out the timeout on every block whose single op is the caller's own,
+    ///   which is the ordinary case.
+    /// - The gap needs one module to take 512+ dispatches in ONE block, and it
+    ///   is a transient drain state (the runner re-invokes immediately for the
+    ///   remainder), not a resting one. Nothing reports an op's `seq` to its
+    ///   submitter, so a client cannot close it by comparing — callers keep
+    ///   their own correction for the residue and treat this as what it is: a
+    ///   way to make the correction almost never fire.
+    pub fn reached_block(&self, height: u64) -> bool {
+        self.height >= height
+    }
+}
+
 /// A live module event from the node's resumable `/v1/ws` stream.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ModuleEvent {
@@ -300,11 +351,33 @@ impl Client {
 
     /// Submit one typed index-tier view request and decode its typed reply —
     /// the read model behind every human-facing list, page, and search.
+    ///
+    /// Drops the reply's fold watermark. Use [`Client::view_folded`] when the
+    /// caller just wrote and needs to know whether this snapshot already
+    /// contains its own op; every other read genuinely does not care.
     pub async fn view<Q: Serialize, R: DeserializeOwned>(
         &self,
         module: &str,
         query: &Q,
     ) -> Result<R> {
+        Ok(self.view_folded(module, query).await?.0)
+    }
+
+    /// [`Client::view`] keeping the reply's fold watermark: how far the
+    /// module's fold had consumed the op feed when this snapshot was taken.
+    ///
+    /// It answers exactly one question — "has the fold reached MY op at
+    /// `(H, seq)`", i.e. read-after-your-own-write. It is NOT general
+    /// freshness: the fold only advances on op traffic, so a quiet module's
+    /// tip is arbitrarily old while its view is perfectly current. `None` is
+    /// UNKNOWN (a module that ships no index guest, a fresh database, a
+    /// boundary stamp that wiped the tip) — never height 0, and never a reason
+    /// to keep waiting.
+    pub async fn view_folded<Q: Serialize, R: DeserializeOwned>(
+        &self,
+        module: &str,
+        query: &Q,
+    ) -> Result<(R, Option<FoldTip>)> {
         let response = self
             .http
             .post(self.url(&format!("v1/index/{module}/view"))?)
@@ -312,7 +385,12 @@ impl Client {
             .send()
             .await
             .map_err(|error| Error::new(format!("{module} view failed: {error}")))?;
-        decode_json(response).await
+        let folded = response
+            .headers()
+            .get(FOLDED_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(FoldTip::parse);
+        Ok((decode_json(response).await?, folded))
     }
 
     /// Read the recent block rows (`GET /v1/blocks`), oldest-first — the
@@ -575,8 +653,15 @@ impl Client {
         self.snapshot_events("peers").await
     }
 
-    /// Submit an already-signed operation frame.
-    pub async fn submit_frame(&self, frame: Vec<u8>) -> Result<()> {
+    /// Submit an already-signed operation frame, answering the height of the
+    /// block that INCLUDED it.
+    ///
+    /// The node has always returned that height in its submit receipt and this
+    /// client always threw it away, which is why every caller that needed to
+    /// read its own write had to guess. Acceptance is not application: the
+    /// derived read models fold behind the block loop, so the height is the
+    /// coordinate a follow-up read waits on ([`Client::view_folded`]).
+    pub async fn submit_frame(&self, frame: Vec<u8>) -> Result<u64> {
         let response = self
             .http
             .post(self.url("v1/submit/frame")?)
@@ -585,10 +670,15 @@ impl Client {
             .send()
             .await
             .map_err(|error| Error::new(format!("transaction submission failed: {error}")))?;
-        if response.status().is_success() {
-            return Ok(());
+        if !response.status().is_success() {
+            return Err(response_error(response).await);
         }
-        Err(response_error(response).await)
+        #[derive(Deserialize)]
+        struct Receipt {
+            height: u64,
+        }
+        let receipt: Receipt = decode_json(response).await?;
+        Ok(receipt.height)
     }
 
     /// Connect to the node stream and subscribe to committed module changes.
@@ -800,6 +890,33 @@ fn bounded_detail(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE WATERMARK IS A POSITION OR IT IS NOTHING. A header this client
+    /// cannot read is UNKNOWN — parsing half of it, or defaulting the missing
+    /// half to zero, would hand a caller a tip that claims coverage the fold
+    /// never reported. (The wire itself — header on, receipt off — is driven
+    /// end to end by the app's stub-node tests and noded's daemon e2e.)
+    #[test]
+    fn a_fold_tip_parses_only_a_complete_position() {
+        assert_eq!(FoldTip::parse("12:3"), Some(FoldTip { height: 12, seq: 3 }));
+        for malformed in ["", "12", "12:", ":3", "12:3:4", "twelve:3", "12:-1"] {
+            assert_eq!(FoldTip::parse(malformed), None, "{malformed:?} is unknown");
+        }
+    }
+
+    /// REACHING THE BLOCK IS THE ANSWERABLE QUESTION. A tip BELOW the caller's
+    /// block cannot hold its op — the fold consumes rows in (height, seq)
+    /// order — so that half is a proof. A tip AT the block is where the honest
+    /// limit sits: it is the ordinary case (one op, one block, nothing after
+    /// it to push the tip further), so demanding strictly-past would time out
+    /// every single time and make the whole watermark useless.
+    #[test]
+    fn a_tip_reaches_a_block_at_it_not_only_past_it() {
+        let tip = FoldTip { height: 7, seq: 9 };
+        assert!(tip.reached_block(6));
+        assert!(tip.reached_block(7), "at the block is reaching it");
+        assert!(!tip.reached_block(8), "a block the fold has not seen");
+    }
 
     /// A NODE THAT ADMITS THE TOPIC MUST FAIL THE STREAM, NOT GO QUIET.
     ///
