@@ -165,8 +165,9 @@ view
                       hovered bg=fg/9 text=fg
                       pressed bg=fg/14
         chat:
-          ChatScreen search_draft<->chat_search_draft message_edit_draft<->message_edit_draft message_editor<->message_editor channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft thread_edit_draft<->thread_edit_draft reply_editor<->reply_editor #chat
+          ChatScreen search_draft<->chat_search_draft message_edit_draft<->message_edit_draft channel_name_draft<->channel_name_draft member_key_draft<->member_key_draft thread_edit_draft<->thread_edit_draft #chat
             with
+              endpoint=connected_rpc
               network_name
               status
               block_height
@@ -243,10 +244,9 @@ view
               add_reaction_submit -> add_reaction_submit _
               edit_message_submit -> edit_message_submit
               delete_message_submit -> delete_message_submit
-              restore_failed_message -> restore_failed_message
-              dismiss_failed_message -> dismiss_failed_message
-              composer_event -> chat_composer_event _
-              composer_mark -> composer_mark _
+              composer_submitted -> composer_submitted _ _ _
+              composer_restored -> composer_restored _
+              composer_dismissed -> composer_dismissed _
               rename_channel_submit -> rename_channel_submit
               archive_channel_submit -> archive_channel_submit
               unarchive_channel_submit -> unarchive_channel_submit
@@ -261,10 +261,6 @@ view
               edit_thread_message_submit -> edit_thread_message_submit
               delete_thread_message_submit -> delete_thread_message_submit
               load_more_thread -> load_more_thread
-              restore_failed_reply -> restore_failed_reply
-              dismiss_failed_reply -> dismiss_failed_reply
-              reply_composer_event -> reply_composer_event _
-              reply_composer_mark -> reply_composer_mark _
 
         shell:
           ShellScreen draft<->shell_chat_draft #shell

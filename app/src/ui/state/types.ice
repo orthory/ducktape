@@ -21,8 +21,11 @@ enum Appearance
   light
   dark
 
-enum ComposerFocus
-  unfocused
+// WHICH COMPOSER (ducktape-ui#697+#712). A handler-emitted event resolves to
+// ONE app handler — the emitting handler cannot see which call site it is at —
+// so the instance says which it is, and the app dispatches on the tag rather
+// than on which of two near-identical handlers the route happened to name.
+enum ComposerKind
   message
   reply
 

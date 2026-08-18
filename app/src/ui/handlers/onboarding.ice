@@ -233,14 +233,11 @@ on console_opened(id)
   selected_message_rev = 0
   message_action = MessageAction.toolbar
   message_edit_draft = ""
-  message_draft = ""
-  message_editor = editor("")
-  // AND THE PARKS GO WITH THE NETWORK. A channel id is a user-chosen string, so
-  // network A's `#general` and network B's `#general` share a park key — without
-  // these two lines a sentence typed on one node was handed back on ANOTHER,
-  // armed to send there. Same reasoning as the by-name clears around them.
-  message_drafts = []
-  reply_drafts = []
+  // NO COMPOSER LINES HERE, AND THE NETWORK IS WHY THEY ARE NOT NEEDED: every
+  // composer instance keys on `(endpoint, room)` (ducktape-ui#697), so network
+  // A's `#general` and network B's `#general` are two instances. The park store
+  // this replaced shared one key per channel id and had to be emptied by hand
+  // right here, or a sentence typed on one node was handed back on ANOTHER.
   failed_message_draft = ""
   failed_reply_draft = ""
   active_thread_seq = 0
@@ -252,15 +249,6 @@ on console_opened(id)
   thread_generation = thread_generation + 1
   invalidate lane=live_thread
   thread_loading = false
-  reply_editor = editor("")
-  // Both composers above are new empty boxes now, and the click that got here
-  // was on the titlebar's network chip or Settings' "Switch network" — not on
-  // an editor. `shell_tab` SURVIVES the switch, so without this a stale
-  // "message" rides into the new workspace and the first Cmd+B marks a draft
-  // that no longer exists. Neither mechanical rule in
-  // `every_handler_that_moves_the_caret_retires_the_composer_focus` reaches
-  // here (no focus task, no `shell_tab` write); the pinned list does.
-  composer_focus = ComposerFocus.unfocused
   pending_channel = ""
   chat_search_draft = ""
   chat_search_hits = []

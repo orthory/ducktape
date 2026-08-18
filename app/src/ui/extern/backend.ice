@@ -11,7 +11,6 @@ extern crate::backend
   ChatMessage(id:str, view_key:i64, seq:i64, author:str, meta:str, body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_kind:str, height:i64, time:i64, reactions:[ChatReaction], render_rev:i64)
   MessageSelection(seq:i64, rev:i64, action:MessageAction, draft:str)
   HuddleParticipant(key:str, label:str, initials:str, is_agent:bool, is_you:bool, joined_at:i64, node:str)
-  ChannelDraft(channel_id:str, text:str)
   ChatData(generation:i64, channels:[ChatChannel], messages:[ChatMessage], has_older_history:bool, active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], selected_message_seq:i64, selected_message_rev:i64, selected_message_body:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_has_more:bool)
   SendReceipt(operation_id:str, channel_id:str)
   ChatDelta()
@@ -341,14 +340,13 @@ extern crate::backend
   // live stream is still folding into.
   pure upsert_channel_rows(channels:[ChatChannel], refreshed:[ChatChannel]) -> [ChatChannel]
   pure near_scroll_top(relative_offset:f64) -> bool
-  // Composer drafts are the only per-room state retained across navigation.
-  pure park_message_draft(drafts:[ChannelDraft], channel_id:str, text:str) -> [ChannelDraft]
-  pure parked_message_draft(drafts:[ChannelDraft], channel_id:str) -> str
-  // The rail's twin, keyed by room AND root. NOT a `failed_reply_draft` harvest
-  // — that one is channel-scoped and would re-target the words at another
-  // thread; see `park_reply_draft`.
-  pure park_reply_draft(drafts:[ChannelDraft], channel_id:str, thread_seq:i64, text:str) -> [ChannelDraft]
-  pure parked_reply_draft(drafts:[ChannelDraft], channel_id:str, thread_seq:i64) -> str
+  // The composer instances' keys (ducktape-ui#697). The ENDPOINT is in both:
+  // a channel id is a user-chosen string, so two networks' `#general` are two
+  // rooms — the park store this replaced had to be emptied by hand on every
+  // network switch to keep one from handing its words to the other.
+  pure composer_op_prefix(kind:ComposerKind) -> str
+  pure composer_scope(endpoint:str, channel_id:str) -> str
+  pure thread_scope(endpoint:str, channel_id:str, thread_seq:i64) -> str
   // The page header title of a page that
   // has only just been clicked, read from the list already in hand.
   pure page_display_title(pages:[PageItem], page:str, current:str) -> str

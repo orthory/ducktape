@@ -79,6 +79,11 @@ const MARK_LINK: Color = rgb8(0x6f, 0x8a, 0xab);
 pub enum ComposerEvent {
     Submit,
     Apply(RichAction),
+    /// A formatting chord the widget claimed via its `on_chord` route —
+    /// Cmd/Ctrl+B and friends land HERE, in the composer that has the
+    /// caret, instead of bubbling to the app's one keyboard subscription
+    /// (which cannot see widget focus, let alone a component instance).
+    Mark(String),
 }
 
 pub fn composer_submit_event() -> ComposerEvent {
@@ -89,10 +94,12 @@ pub fn composer_submits(event: ComposerEvent) -> bool {
     matches!(event, ComposerEvent::Submit)
 }
 
-pub fn apply_composer_event(mut document: Content, event: ComposerEvent) -> Content {
+pub fn apply_composer_event(document: Content, event: ComposerEvent) -> Content {
+    let mut document = document;
     match event {
         ComposerEvent::Apply(RichAction::Edit(action)) => document.perform(action),
         ComposerEvent::Apply(RichAction::MoveTo(cursor)) => document.move_to(cursor),
+        ComposerEvent::Mark(kind) => return composer_toggle_mark(document, kind),
         ComposerEvent::Submit => {}
     }
     document
@@ -123,32 +130,27 @@ pub fn composer_toggle_mark(mut document: Content, kind: String) -> Content {
     document
 }
 
-/// The composer's formatting shortcuts, classified where the modifiers are
-/// known: Cmd/Ctrl+B bold, Cmd/Ctrl+I italic, Cmd/Ctrl+Shift+C code block,
-/// Cmd/Ctrl+Shift+9 quote — Slack's own table. The editor deliberately lets
-/// command-letter chords bubble (`command_shortcut_bubbles` in the widget), so
-/// this runs from the app's ONE keyboard subscription with the editor's focus
-/// untouched — the toolbar buttons cannot say the same, a click on them
-/// defocuses the editor. An empty verdict is `composer_toggle_mark`'s no-op.
-pub fn composer_mark_shortcut(
-    _logical: iced::keyboard::Key,
-    physical: iced::keyboard::key::Physical,
-    modifiers: iced::keyboard::Modifiers,
-    chat_ready: bool,
-) -> String {
+/// The composer's formatting shortcuts, classified AT THE WIDGET via its
+/// `on_chord` route: Cmd/Ctrl+B bold, Cmd/Ctrl+I italic, Cmd/Ctrl+Shift+C
+/// code block, Cmd/Ctrl+Shift+9 quote — Slack's own table. These presses
+/// resolve to no binding (the bubble contract for application chords), so
+/// the route sees exactly them; a claimed chord becomes a
+/// [`ComposerEvent::Mark`] on the composer that has the caret, and every
+/// other chord bubbles on to the app subscription untouched.
+fn composer_chord(press: &KeyPress) -> Option<ComposerEvent> {
     use iced::keyboard::key::{Code, Physical};
-    if !chat_ready || !modifiers.command() {
-        return String::new();
+    if !press.modifiers.command() {
+        return None;
     }
-    let shifted = modifiers.shift();
-    let mark = match physical {
+    let shifted = press.modifiers.shift();
+    let mark = match press.physical_key {
         Physical::Code(Code::KeyB) if !shifted => "bold",
         Physical::Code(Code::KeyI) if !shifted => "italic",
         Physical::Code(Code::KeyC) if shifted => "code",
         Physical::Code(Code::Digit9) if shifted => "quote",
-        _ => return String::new(),
+        _ => return None,
     };
-    mark.to_owned()
+    Some(ComposerEvent::Mark(mark.to_owned()))
 }
 
 pub fn rich_composer(
@@ -176,7 +178,7 @@ pub fn rich_composer(
     if disabled {
         return editor.into();
     }
-    editor.on_action(classify).into()
+    editor.on_action(classify).on_chord(composer_chord).into()
 }
 
 /// The widget's change-detection key: equal versions promise equal text
@@ -526,35 +528,49 @@ mod tests {
     }
 
     #[test]
-    fn mark_shortcuts_follow_slacks_table_and_respect_the_gate() {
+    fn mark_chords_follow_slacks_table_at_the_widget() {
         use iced::keyboard::key::{Code, Physical};
         use iced::keyboard::{Key, Modifiers};
+        // The route the widget offers a press that resolved to no binding
+        // (ducktape-ui#711). No gate argument any more: the chord reaches the
+        // composer that HAS the caret, so there is nothing left to guess.
         let chord = |code, modifiers| {
-            composer_mark_shortcut(Key::Unidentified, Physical::Code(code), modifiers, true)
+            composer_chord(&KeyPress {
+                key: Key::Unidentified,
+                modified_key: Key::Unidentified,
+                physical_key: Physical::Code(code),
+                modifiers,
+                text: None,
+                status: text_editor::Status::Focused { is_hovered: false },
+            })
         };
-        assert_eq!(chord(Code::KeyB, Modifiers::COMMAND), "bold");
-        assert_eq!(chord(Code::KeyI, Modifiers::COMMAND), "italic");
+        let mark = |code, modifiers| match chord(code, modifiers) {
+            Some(ComposerEvent::Mark(kind)) => kind,
+            _ => String::new(),
+        };
+        assert_eq!(mark(Code::KeyB, Modifiers::COMMAND), "bold");
+        assert_eq!(mark(Code::KeyI, Modifiers::COMMAND), "italic");
         assert_eq!(
-            chord(Code::KeyC, Modifiers::COMMAND | Modifiers::SHIFT),
+            mark(Code::KeyC, Modifiers::COMMAND | Modifiers::SHIFT),
             "code"
         );
         assert_eq!(
-            chord(Code::Digit9, Modifiers::COMMAND | Modifiers::SHIFT),
+            mark(Code::Digit9, Modifiers::COMMAND | Modifiers::SHIFT),
             "quote"
         );
-        // Plain Cmd+C is copy, not code; plain typing marks nothing.
-        assert_eq!(chord(Code::KeyC, Modifiers::COMMAND), "");
-        assert_eq!(chord(Code::KeyB, Modifiers::default()), "");
-        // Off-chat (or palette-open) the gate swallows everything.
-        assert_eq!(
-            composer_mark_shortcut(
-                Key::Unidentified,
-                Physical::Code(Code::KeyB),
-                Modifiers::COMMAND,
-                false
-            ),
-            ""
-        );
+        // Plain Cmd+C is copy, not code; plain typing is an ordinary edit and
+        // never reaches this route at all. An unclaimed chord bubbles on.
+        assert!(chord(Code::KeyC, Modifiers::COMMAND).is_none());
+        assert!(chord(Code::KeyB, Modifiers::default()).is_none());
+    }
+
+    #[test]
+    fn a_marked_chord_applies_like_any_other_composer_event() {
+        // The claimed chord rides the ordinary event route into the
+        // instance's local handler, where it wraps the selection.
+        let document = Content::with_text("draft");
+        let document = apply_composer_event(document, ComposerEvent::Mark("bold".into()));
+        assert_eq!(document.text().trim_end(), "****draft");
     }
 
     #[test]

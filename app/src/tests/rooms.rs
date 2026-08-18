@@ -75,164 +75,14 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
         );
     }
 
-    // THE COMPOSER IS PER-ROOM, AND ITS TWO LINES ARE ORDER-DEPENDENT. The park
-    // must read `active_channel` while it still names the room being LEFT and
-    // the restore must read it once it names the room being ENTERED, so the
-    // rule is not "both lines are present" but "park, move, restore" — a
-    // restore above the move hands the old room its own draft back and the new
-    // one whatever it was already holding.
-    //
-    // `channel_created` IS ON THIS LIST, and was the route that proved it has
-    // to be: creating a channel lands the reader IN it (`create_channel_submit`
-    // abandons the old room's load for exactly that reason), so a composer left
-    // alone there followed her into the new room armed to send — and the next
-    // switch parked those words under the NEW room's id, silently reattributing
-    // them. The three landings that also write `active_channel`
-    // (`chat_updated`, `chat_hit_loaded`, `live_resynced`) are NOT switches:
-    // they re-affirm or correct the id of the room already on screen, so a park
-    // there would file the live composer under a room she never left.
-    //
-    // AND ONE SWITCH IS SPREAD OVER TWO HANDLERS, which is how it escaped: the
-    // pair is `reconnect` (blanks the room, carrying the live composer across)
-    // and `workspace_connected` (lands on `landing_channel(channels)` — the
-    // first room with traffic, which is rarely the room she left). Both halves
-    // are named here so the ordering rule reaches across the round trip.
-    let body_of = |handler: &str| {
-        HANDLERS
-            .split(&format!("\non {handler}"))
-            .nth(1)
-            .unwrap_or_else(|| panic!("{handler} is a handler"))
-            .split("\non ")
-            .next()
-            .expect("handler body")
-    };
-    let at = |handler: &str, body: &str, token: &str| {
-        body.lines()
-            .position(|line| line.trim_start().starts_with(token))
-            .unwrap_or_else(|| {
-                panic!(
-                    "{handler} moves the reader between contexts and must carry \
-                     `{token}` — a composer that follows her is armed to send \
-                     what she wrote next door into the room she clicked"
-                )
-            })
-    };
-    for (leaves, lands) in [
-        ("choose_channel", "choose_channel"),
-        ("choose_dm", "choose_dm"),
-        ("open_chat_search_hit", "open_chat_search_hit"),
-        ("channel_created", "channel_created"),
-        ("reconnect", "workspace_connected"),
-    ] {
-        let out = body_of(leaves);
-        let landing = body_of(lands);
-        let park = at(leaves, out, "message_drafts = park_message_draft(");
-        let rail_park = at(leaves, out, "reply_drafts = park_reply_draft(");
-        let left = at(leaves, out, "active_channel = ");
-        let arrived = at(lands, landing, "active_channel = ");
-        let restore = at(
-            lands,
-            landing,
-            "message_editor = editor(parked_message_draft(",
-        );
-        assert!(
-            park < left && rail_park < left && arrived < restore,
-            "{leaves} must park BOTH composers BEFORE it moves `active_channel` \
-             and {lands} must restore AFTER (park {park}, rail park {rail_park}, \
-             move {left}, landing move {arrived}, restore {restore})"
-        );
-    }
-
-    // AND THE RAIL'S OWN SWITCH OBEYS THE SAME RULE ONE LEVEL DOWN, on
-    // `active_thread_seq` instead of `active_channel`. `open_thread_for` is
-    // what every "N replies" row in the timeline emits, so this is the ordinary
-    // click that used to destroy a half-typed reply.
-    //
-    // THE PARK MUST SIT ABOVE THE WRITE, not merely inside the handler:
-    // `park_reply_draft` refuses `thread_seq <= 0` outright, so a park read
-    // below a line that can zero the seq — `live_resynced`'s deleted-root and
-    // channel-move arms — is a guaranteed no-op that files nothing.
-    for parker in ["open_thread_for", "live_resynced"] {
-        let body = body_of(parker);
-        let park = at(parker, body, "reply_drafts = park_reply_draft(");
-        let moved = at(parker, body, "active_thread_seq = ");
-        assert!(
-            park < moved,
-            "{parker} must park the reply BEFORE it moves `active_thread_seq` — \
-             a park below the move reads a seq that no longer names the thread \
-             (park {park}, move {moved})"
-        );
-    }
-
-    // AND EVERY LANDING THAT SEATS A THREAD RESTORES BESIDE THE WRITE. Arriving
-    // in a thread by any other route left an empty box over parked words, and
-    // the first character typed into it parked OVER them under the same key —
-    // silent overwrite, not just loss of a live buffer. `chat_hit_loaded` is the
-    // reachable one (`load_chat_hit` answers with `root.seq` for a reply hit);
-    // `chat_updated` and `channel_created` answer 0 today and ride the same
-    // rule so a payload that starts seating a thread cannot forget it.
-    //
-    // THE SEATERS ARE DERIVED, NOT LISTED, exactly as the movers above are. A
-    // literal `active_thread_seq = 0` RETIRES the rail rather than seating one,
-    // so the zero writers stay off this list; every other writer lands on it,
-    // and a new one fails the pin below until its restore decision is made.
-    let mut handler = "";
-    let mut seaters: Vec<&str> = Vec::new();
-    for line in HANDLERS.lines() {
-        if let Some(rest) = line.strip_prefix("on ") {
-            handler = rest.split('(').next().unwrap_or(rest).trim();
-        }
-        let writes = line.trim_start().starts_with("active_thread_seq = ");
-        let retires = line.trim() == "active_thread_seq = 0";
-        if writes && !retires {
-            seaters.push(handler);
-        }
-    }
-    seaters.sort_unstable();
-    seaters.dedup();
-
-    assert_eq!(
-        seaters,
-        [
-            "channel_created",
-            "chat_hit_loaded",
-            "chat_updated",
-            "live_resynced",
-            "open_thread_for",
-            "thread_loaded",
-        ],
-        "a handler started or stopped seating `active_thread_seq`: decide \
-         whether it restores the parked reply beside the write, then update \
-         this list"
-    );
-
-    for landing in &seaters {
-        // Two seaters land under a rail whose LIVE buffer is the truth, so
-        // they must NOT restore — each is pinned to that refusal below.
-        let live_buffer_is_the_truth = matches!(*landing, "live_resynced" | "thread_loaded");
-        if live_buffer_is_the_truth {
-            continue;
-        }
-        let body = body_of(landing);
-        let moved = at(landing, body, "active_thread_seq = ");
-        let restore = at(landing, body, "reply_editor = editor(parked_reply_draft(");
-        assert!(
-            moved < restore,
-            "{landing} seats `active_thread_seq` and must restore the parked \
-             reply AFTER it (move {moved}, restore {restore})"
-        );
-    }
-    assert!(
-        !body_of("thread_loaded").contains("parked_reply_draft("),
-        "thread_loaded lands under a rail that is already open and typeable — a \
-         restore there overwrites the keystrokes the round trip collected"
-    );
-    assert!(
-        !body_of("live_resynced").contains("parked_reply_draft("),
-        "live_resynced either leaves the rail on the thread it was already on — \
-         where the live buffer is the truth — or closes it, and a closed rail \
-         has no composer to fill"
-    );
+    // THE COMPOSER IS PER-ROOM, AND NOTHING HERE CARRIES IT ANY MORE. It used
+    // to be app state parked and restored by every handler on the list above —
+    // a whole handler class, policed from here by an ordering rule (park while
+    // `active_channel` still names the room being LEFT, restore once it names
+    // the room being ENTERED). The class is gone: each composer is a retained
+    // component instance keyed by its own room (ducktape-ui#697), so a room
+    // switch cannot touch a draft, and this lint pins the two facts that
+    // replaced it — see `the_composers_are_out_of_reach_of_every_handler`.
 
     // TWO READINGS OF THE ROOM RIDE WITH IT. `active_dm_peer` decides whether
     // the header names a peer instead of the channel (suppressing the `#` and
@@ -259,6 +109,76 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
                  `{reading}` — a reading of the room cannot outlive it"
             );
         }
+    }
+}
+
+/// THE COMPOSERS ARE OUT OF REACH, AND THAT IS THE WHOLE SAFETY ARGUMENT
+/// (ducktape-ui#697). Two facts replace the retired park/restore class:
+///
+/// 1. NO handler can name a composer, because the app holds none. The park
+///    store, the two `editor` states and the focus discriminant are gone, so
+///    there is nothing for a room switch to carry, drop, or hand to the wrong
+///    room — the bug class the ordering lint policed cannot be written.
+/// 2. EVERY composer key carries the ENDPOINT. A channel id is a user-chosen
+///    string: two networks' `#general` are two rooms, and a key without the
+///    endpoint would hand one network's words to the other — exactly what the
+///    old store had to be emptied by hand on every network switch to avoid.
+#[test]
+fn the_composers_are_out_of_reach_of_every_handler() {
+    const HANDLERS: &str = concat!(
+        include_str!("../ui/handlers/chat.ice"),
+        include_str!("../ui/handlers/lifecycle.ice"),
+        include_str!("../ui/handlers/onboarding.ice"),
+        include_str!("../ui/handlers/overlays.ice"),
+        include_str!("../ui/handlers/huddle.ice"),
+        include_str!("../ui/handlers/pages.ice"),
+    );
+    const STATE: &str = include_str!("../ui/state/chat.ice");
+
+    for retired in [
+        "message_editor",
+        "reply_editor",
+        "message_drafts",
+        "reply_drafts",
+        "composer_focus",
+        "park_message_draft",
+        "park_reply_draft",
+        "parked_message_draft",
+        "parked_reply_draft",
+        "composer_mark_shortcut",
+    ] {
+        // An ASSIGNMENT or a CALL, not a mention: the prose above may name
+        // what was retired, and should.
+        assert!(
+            !HANDLERS.lines().any(|line| {
+                let line = line.trim_start();
+                !line.starts_with("//") && line.contains(retired)
+            }),
+            "`{retired}` is back in a handler — the composers are component              instances, and app state that shadows one can only disagree with it"
+        );
+        assert!(
+            !STATE.lines().any(|line| {
+                let line = line.trim_start();
+                !line.starts_with("//") && line.starts_with(retired)
+            }),
+            "`{retired}` is back in app state — see above"
+        );
+    }
+
+    const SCREEN: &str = include_str!("../ui/screens/chat.ice");
+    for (mount, key) in [
+        ("ChatComposer #composer(", "composer_scope(endpoint,"),
+        ("ChatComposer #reply_composer(", "thread_scope(endpoint,"),
+    ] {
+        let line = SCREEN
+            .lines()
+            .map(str::trim_start)
+            .find(|line| line.starts_with(mount))
+            .unwrap_or_else(|| panic!("`{mount}` is mounted"));
+        assert!(
+            line.contains(key),
+            "`{mount}` must key on `{key}` — a key without the endpoint gives              two networks' rooms of the same name ONE composer, and the words              typed on one node are handed back on another"
+        );
     }
 }
 
@@ -411,13 +331,11 @@ fn opening_a_network_clears_the_previous_networks_state() {
     app.message_action = MessageAction::Editing;
     app.message_edit_draft = "node a edit".into();
     app.active_thread_seq = 1;
-    app.reply_editor = compose("node a reply");
     app.page_editor = compose("node a page body");
     app.page_saved_text = "node a page body".into();
     app.block_comments_open = true;
     app.block_comments_target = "same-id".into();
     app.block_comment_draft = "node a comment".into();
-    app.message_editor = compose("node a message");
     app.page_search_draft = "node a search".into();
     app.forge_list_phase = ForgePhase::Ready;
     app.forge_repo = "same-repo".into();
@@ -427,13 +345,18 @@ fn opening_a_network_clears_the_previous_networks_state() {
     app.forge_review_draft = "node a review".into();
     app.huddle_joined = true;
     app.huddle_channel = "chan-a".into();
-    // AND THE PARKS, which the by-name clears around them would otherwise miss.
-    // A channel id is a user-chosen string, so both networks can hold a
-    // `#general` and a park keyed on it would hand node A's sentence to node B.
-    app.message_drafts =
-        backend::park_message_draft(Vec::new(), "general".into(), "node a draft".into());
-    app.reply_drafts =
-        backend::park_reply_draft(Vec::new(), "general".into(), 1, "node a reply draft".into());
+    // AND A COMPOSER WITH WORDS IN IT, typed against node A. A channel id is a
+    // user-chosen string, so both networks can hold a `#general` — the key
+    // carries the ENDPOINT for exactly that reason (ducktape-ui#697), and the
+    // assertions below drive both halves of the promise.
+    let node_a_composer = composer_scope(&mut app);
+    type_into(
+        &mut app,
+        &node_a_composer,
+        ComposerKind::Message,
+        "node a draft",
+    );
+    assert_eq!(composer_text(&app, &node_a_composer), "node a draft");
 
     let _ = app.__update(__DucktapeMessage::ConsoleOpened(iced::window::Id::unique()));
 
@@ -443,17 +366,29 @@ fn opening_a_network_clears_the_previous_networks_state() {
     assert_eq!(app.message_action, MessageAction::Toolbar);
     assert!(app.message_edit_draft.is_empty());
     assert_eq!(app.active_thread_seq, 0);
-    assert!(reply_composer(&app).is_empty());
     assert!(page_document_text(&app).is_empty());
     assert!(app.page_saved_text.is_empty());
     assert!(!app.block_comments_open);
     assert!(app.block_comments_target.is_empty());
     assert!(app.block_comment_draft.is_empty());
-    assert!(app.message_draft.is_empty());
-    assert!(composer(&app).is_empty());
+    // NODE B'S ROOM IS NODE B'S. Same channel id, other endpoint, other
+    // instance — and node A's words are still under node A's key, which is
+    // the half a `message_drafts = []` clear used to get wrong by throwing
+    // them away instead.
+    let node_b_composer = composer_scope(&mut app);
+    assert_ne!(
+        node_b_composer, node_a_composer,
+        "the endpoint is in the key, so #general on node B is not #general on \
+         node A"
+    );
     assert!(
-        app.message_drafts.is_empty() && app.reply_drafts.is_empty(),
-        "a draft parked on node A is not node B's to hand back"
+        composer_text(&app, &node_b_composer).is_empty(),
+        "a draft typed on node A is not node B's to hand back"
+    );
+    assert_eq!(
+        composer_text(&app, &node_a_composer),
+        "node a draft",
+        "and it is still node A's, waiting where it was typed"
     );
     assert!(app.page_search_draft.is_empty());
     assert_eq!(app.forge_list_phase, ForgePhase::Idle);
@@ -475,35 +410,14 @@ fn opening_a_network_clears_the_previous_networks_state() {
     assert_eq!(app.connected_rpc, "http://node-b");
 }
 
-/// A CLAIM ON THE CARET HAS TO DIE WHEN THE CARET LEAVES. `composer_focus`
-/// stands in for widget focus the app cannot read: the rich editor drops its
-/// own focus on any press landing outside it (`rich_text_editor.rs` sets
-/// `state.focus = None` in the else-arm of its press handler) and publishes
-/// NOTHING when it does. So a discriminant stamped on entry is honest only for
-/// as long as the set of handlers that retire it is complete — and #1005
-/// shipped the claim with no retire at all, leaving Cmd+B marking the reply
-/// draft while the caret sat in an inline edit box, on another tab, or in a
-/// channel two switches away.
-///
-/// The enforcement is three MECHANICAL rules, not a remembered list, because
-/// the hole was never in a route that existed — it was in the one nobody
-/// thought to write. A handler carrying a `task widget focus` moves the caret
-/// by hand; a handler writing `shell_tab` unmounts the composer under it; a
-/// handler writing a literal `active_thread_seq = 0` tears the rail, and the
-/// reply composer, out from under it. Any of the three must RETIRE — `"none"`
-/// and nothing else, since a mover by definition took the caret somewhere that
-/// is not a chat composer. The pinned set then catches the two the rules cannot
-/// name, `open_thread_for`'s reset included: deleting that line used to fail
-/// nothing.
-///
-/// Every rule here records the VALUE and not merely the assignment. A retire
-/// flipped to `"message"` is a claim on a composer the caret is not in — the
-/// exact defect — and a lint that only counted assignments called that green.
-///
-/// The rules cannot reach every rail close, and the last arm here is the one
-/// they miss on purpose — which is what the chord's own `active_thread_seq > 0`
-/// term is for. Both halves are driven, so neither the guard nor the retires
-/// can be deleted quietly.
+/// A CLAIM ON THE CARET USED TO HAVE TO DIE WHEN THE CARET LEFT.
+/// `composer_focus` stood in for widget focus the app cannot read, and every
+/// handler that moved the caret owed it a retire — a rule enforced from here,
+/// three mechanical clauses plus a pinned set for the two they could not
+/// name. The discriminant is gone with the descent: a formatting chord is
+/// claimed by the widget that HAS the caret (`RichTextEditor::on_chord`,
+/// ducktape-ui#711) and marks that instance's own content, so nothing has to
+/// guess which composer is focused and nothing can guess wrong.
 /// OPENING THE CHANNEL DRAWER IS NOT A REQUEST TO CLOSE THE THREAD.
 /// `toggle_channel_settings` cleared `active_thread_seq`, the thread's messages
 /// and `reply_editor` on the way in, so a part-typed reply was gone and closing
@@ -531,12 +445,13 @@ fn the_channel_drawer_does_not_eat_a_reply_you_are_typing() {
     app.active_channel = "general".into();
     app.active_thread_seq = 7;
     app.thread_messages = vec![message(7, "the root", false)];
-    app.reply_editor = compose("half a reply");
+    let rail = reply_composer_scope(&mut app);
+    type_into(&mut app, &rail, ComposerKind::Reply, "half a reply");
 
     let _ = app.__update(__DucktapeMessage::ToggleChannelSettings);
     assert!(app.channel_settings_open, "the drawer opened");
     assert_eq!(
-        reply_composer(&app),
+        composer_text(&app, &rail),
         "half a reply",
         "the drawer does not discard a reply in progress"
     );
@@ -550,7 +465,7 @@ fn the_channel_drawer_does_not_eat_a_reply_you_are_typing() {
     // Closing it gives the rail back exactly as it was.
     let _ = app.__update(__DucktapeMessage::ToggleChannelSettings);
     assert!(!app.channel_settings_open);
-    assert_eq!(reply_composer(&app), "half a reply");
+    assert_eq!(composer_text(&app, &rail), "half a reply");
     assert_eq!(app.active_thread_seq, 7);
 
     // The screen is what hides the rail while the drawer is up — the handler
@@ -559,8 +474,6 @@ fn the_channel_drawer_does_not_eat_a_reply_you_are_typing() {
         SCREENS.contains("if active_thread_seq > 0 && !channel_settings_open"),
         "the rail is drawn under the drawer's own gate"
     );
-    // And the claim on the caret still retires, because the drawer lays its own
-    // inputs over a composer that stays mounted.
     let chat = inlined(include_str!("../ui/handlers/chat.ice"));
     let arm = chat
         .split_once("on toggle_channel_settings")
@@ -577,7 +490,6 @@ fn the_channel_drawer_does_not_eat_a_reply_you_are_typing() {
         .map(str::trim)
         .filter(|line| !line.starts_with("//"))
         .collect();
-    assert!(statements.contains(&"composer_focus = ComposerFocus.unfocused"));
     assert!(
         !statements.contains(&"active_thread_seq = 0"),
         "the drawer must not tear the rail down"

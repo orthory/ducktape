@@ -40,8 +40,6 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   invalidate lane=live_thread
   // PARK HER UNSENT WORDS before the room identity moves. Both composers belong
   // to the room/thread being left; message windows are deliberately not kept.
-  message_drafts = park_message_draft(message_drafts, active_channel, trim(editor_text(message_editor)))
-  reply_drafts = park_reply_draft(reply_drafts, active_channel, active_thread_seq, trim(editor_text(reply_editor)))
   // FREEZE THE DIVIDER WHILE `active_channel` STILL NAMES THE ROOM SHE LEAVES —
   // same reason as `choose_channel`.
   let next_channel = channel_switch_facts(channel_reads, channels, active_channel, channel_id, unread_boundary, active_channel_name)
@@ -101,13 +99,6 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   thread_generation = thread_generation + 1
   invalidate lane=live_thread
   thread_loading = false
-  reply_editor = editor("")
-  // AND THE MESSAGE COMPOSER COMES OFF ITS OWN PARK — the line that made this
-  // comment true. It said "both composers are rebuilt" while only the rail's
-  // was, so the stream's draft walked into the hit's room armed to send there.
-  message_editor = editor(parked_message_draft(message_drafts, active_channel))
-  // Both composers are rebuilt under the caret and the tab moved besides.
-  composer_focus = ComposerFocus.unfocused
   error = ""
   chat_generation = chat_generation + 1
   // Reads the room back from state, like `choose_dm` does: `active_channel =
@@ -133,8 +124,6 @@ on choose_channel(id)
   invalidate lane=live_thread
   // PARK HER UNSENT WORDS while `active_channel` still names the room being
   // left. Message windows are deliberately not retained across navigation.
-  message_drafts = park_message_draft(message_drafts, active_channel, trim(editor_text(message_editor)))
-  reply_drafts = park_reply_draft(reply_drafts, active_channel, active_thread_seq, trim(editor_text(reply_editor)))
   active_dm_peer = ""
   active_dm = no_dm_peer()
   // "Jump to latest" IS this handler, aimed at the room already on screen — so
@@ -185,12 +174,10 @@ on choose_channel(id)
   thread_generation = thread_generation + 1
   invalidate lane=live_thread
   thread_loading = false
-  reply_editor = editor("")
-  // A NEW ROOM'S COMPOSER IS THAT ROOM'S COMPOSER. Its own parked words, or an
-  // empty box — never the ones she was writing next door.
-  message_editor = editor(parked_message_draft(message_drafts, active_channel))
-  // A new room's composer is a new box: the caret does not come with it.
-  composer_focus = ComposerFocus.unfocused
+  // THE COMPOSER DOES NOT APPEAR IN THIS HANDLER, and that is the point
+  // (ducktape-ui#697): `#composer(active_channel)` keys one retained instance
+  // per room, so the words she was writing next door stay next door and the
+  // arriving room shows its own — no park, no restore, no ordering rule.
   error = ""
   chat_generation = chat_generation + 1
   // THE CHANNEL LIST GOES DOWN, IT DOES NOT COME BACK. `load_chat_data`
@@ -215,8 +202,6 @@ on choose_dm(peer_key)
   invalidate lane=chat_load
   // PARK HER UNSENT WORDS before moving to the DM. Message windows are not
   // retained; every room paints the same bounded, authoritative root window.
-  message_drafts = park_message_draft(message_drafts, active_channel, trim(editor_text(message_editor)))
-  reply_drafts = park_reply_draft(reply_drafts, active_channel, active_thread_seq, trim(editor_text(reply_editor)))
   active_dm_peer = peer_key
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   // A DM IS A CHANNEL AND ITS ID IS DERIVABLE. `dm_channel_id` is the same
@@ -274,12 +259,8 @@ on choose_dm(peer_key)
   thread_generation = thread_generation + 1
   invalidate lane=live_thread
   thread_loading = false
-  reply_editor = editor("")
-  // Same per-room composer as `choose_channel`. A DM is an ordinary channel and
-  // its draft parks under `dm_room` like any other.
-  message_editor = editor(parked_message_draft(message_drafts, active_channel))
-  // Same new box as `choose_channel`.
-  composer_focus = ComposerFocus.unfocused
+  // Same per-room composer as `choose_channel`: a DM is an ordinary channel,
+  // so its composer instance keys under `dm_room` like any other.
   error = ""
   // Reads the peer back from state: `active_dm_peer = peer_key` above already
   // moved the payload, so passing `peer_key` here would be a use after move.
@@ -323,7 +304,6 @@ on toggle_channel_create
   // composer, which stays mounted underneath. The press that got here was on
   // the New-channel button, and the next one goes into the modal's field — the
   // caret is in no composer either way, opening or cancelling.
-  composer_focus = ComposerFocus.unfocused
 
 on toggle_channel_settings
   return if empty(active_channel)
@@ -333,21 +313,20 @@ on toggle_channel_settings
   // caret retires whether the panel is opening or closing. This handler is on
   // the NAMED list for that reason — it no longer writes `active_thread_seq = 0`
   // and so the rail rule cannot derive it.
-  composer_focus = ComposerFocus.unfocused
   channel_name_draft = active_channel_name
-  // AND IT DOES NOT TEAR THE RAIL DOWN. It used to clear the thread, its
-  // messages and `reply_editor` — so opening this drawer DISCARDED a reply you
-  // were part-way through typing, and closing it again gave you an empty
-  // composer. Nobody asked to close the thread; they asked to see the channel.
+  // AND IT DOES NOT TEAR THE RAIL DOWN. It used to clear the thread and its
+  // messages — so opening this drawer DISCARDED a reply you were part-way
+  // through typing. Nobody asked to close the thread; they asked to see the
+  // channel.
   //
   // The teardown was never needed to hide the rail either: the screen already
   // draws it under `if active_thread_seq > 0 && !channel_settings_open`, so the
   // drawer covers it either way. `close_thread` stays the one route that
   // discards a reply, because that one is a request to.
   //
-  // The app's own rule, from the other direction: `reconnect` parks the
-  // composer draft and `workspace_connected` hands it back rather than
-  // letting a transition eat it.
+  // The app's own rule, from the other direction: a transition never eats a
+  // draft, because no transition touches one — each composer instance keeps
+  // its own (ducktape-ui#697).
 
 on rename_channel_submit
   return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || empty(trim(channel_name_draft))
@@ -416,71 +395,74 @@ on join_huddle_submit
 // the apply is a no-op on Submit, and the single guard below is the send/edit
 // fork. The Send button emits a synthetic Submit through the same route, so
 // there is exactly ONE send path.
-// A toolbar mark is an edit, not a send: wrap the selection (or park the
-// cursor inside a fresh marker pair) and hand the editor back. The same
-// disabled gate as the editor guards the buttons in the view.
-// The two mark handlers are the ONLY unambiguous route: the button names its
-// editor at the mount, so no focus reading is involved. The chord in
-// `handlers/overlays.ice` has no such luxury and reads `composer_focus`.
-on composer_mark(kind)
-  return if loading || !connected || empty(active_channel)
-  message_editor = composer_toggle_mark(message_editor, kind)
+// A toolbar mark is an edit, not a send — and both live in the composer
+// instance now (`ChatComposer.mark`), beside the content they wrap. The
+// formatting CHORDS live there too: the widget's `on_chord` claims them at
+// the caret (`composer_chord`), which retired `composer_focus` outright —
+// the app's keyboard subscription never needed to know which composer was
+// focused, only the chord did.
 
-// Its rail twin. `thread_loading` replaces `loading` and the open-rail check
-// replaces the channel check, matching the reply composer's own gate; a mark
-// is a local edit, so `post_gate` stays out of it exactly as it does above.
-on reply_composer_mark(kind)
-  return if thread_loading || !connected || active_thread_seq <= 0
-  reply_editor = composer_toggle_mark(reply_editor, kind)
-
-on chat_composer_event(event)
-  // THE CLAIM. Every editor interaction — a click into one included — lands in
-  // one of these two handlers, so they are the only two things that may say
-  // the caret is in a composer; the chord arrives on the app's ONE keyboard
-  // subscription, which cannot see widget focus. A claim lasts until a handler
-  // that moves the caret RETIRES it (grep `composer_focus = ComposerFocus.unfocused`), because
-  // the editor widget drops its own focus on any press landing outside it and
-  // publishes nothing when it does.
-  composer_focus = ComposerFocus.message
-  message_editor = apply_composer_event(message_editor, event)
-  return if !composer_submits(event)
-  // Same apply-time re-read as `reply_composer_event` below: the composer's
-  // `disabled=` was decided a frame ago. `post_refusal` IS that re-read now —
-  // it is state written by the handlers that move the gate's four inputs, so it
-  // is as current here as a call would be, without the member-roll clone.
-  return if loading || !connected || empty(active_channel) || !empty(post_refusal) || empty(trim(editor_text(message_editor)))
-  hydration_generation = hydration_generation + 1
-  hydration_retry_attempt = 0
-  let pending_message = trim(editor_text(message_editor))
-  let pending_message_id = fresh_operation_id("message")
-  message_draft = ""
-  message_editor = editor("")
-  // The mint does not re-mark the runs — the rail mints through the same call
-  // and its `[root] ++ replies` vec must keep the first reply's header. This
-  // vec is a plain run, so it re-marks here: the pending row groups under the
-  // reader's previous message instead of drawing a header that vanishes the
-  // moment the settle delta replaces it.
-  messages = mark_author_runs(optimistic_message(messages, pending_message, pending_message_id))
-  messages_revision = messages_revision + 1
-  let selection = message_selection_after_window(messages, selected_message_seq, selected_message_rev, message_action, message_edit_draft)
-  selected_message_seq = selection.seq
-  selected_message_rev = selection.rev
-  message_action = selection.action
-  message_edit_draft = selection.draft
-  has_older_history = history_has_older(messages)
-  unread_marker_seq = first_unread_seq(messages, unread_boundary)
-  error = ""
-  // Sending is a jump to now: the minted row lands at the tail, and a reader
-  // who had scrolled up would otherwise get her own send below the fold —
-  // an optimistic insert she cannot see is no confirmation at all.
-  //
-  // `snap … 0.0`, NOT `snap-end`: the stream is `anchor-y=end`, where the
-  // offset counts FROM the tail — relative 0.0 IS the tail. `snap-end` is
-  // relative 1.0, which an end anchor translates to the TOP of history; it
-  // shipped once and every send hurled the reader to the oldest loaded row.
-  parallel
-    run every send_message(connected_rpc, password, active_channel, pending_message_id, pending_message, channel_members) -> message_sent _ | message_send_failed _
-    task widget snap #workspace-tabs/content/chat/message-stream 0.0 0.0 window=window_target(console_win)
+// ONE EVENT, ONE HANDLER, ONE DISPATCH. Both composer instances fire the same
+// `submitted` — a handler-emitted event resolves to one app handler
+// (ducktape-ui#712), and the instance says which composer it is rather than
+// the route naming one of two near-identical handlers.
+on composer_submitted(kind, pending_body, pending_id)
+  match kind
+    ComposerKind.message
+      // THE GATE, RE-READ AT DELIVERY. The instance refused with the verdict its
+      // frame drew (`blocked` rode the route); this is the fresh verdict — and on
+      // a frame-stale admit the text goes to the banner stash instead of the
+      // timeline. It cannot go back to the box: the composer cleared itself
+      // before emitting, so silence here would LOSE the words.
+      let refused = loading || !connected || empty(active_channel) || !empty(post_refusal)
+      failed_message_draft = remember_failed_draft(failed_message_draft, keep_str(refused, "stash", ""), pending_body, false)
+      return if refused
+      hydration_generation = hydration_generation + 1
+      hydration_retry_attempt = 0
+      // The mint does not re-mark the runs — the rail mints through the same call
+      // and its `[root] ++ replies` vec must keep the first reply's header. This
+      // vec is a plain run, so it re-marks here: the pending row groups under the
+      // reader's previous message instead of drawing a header that vanishes the
+      // moment the settle delta replaces it.
+      messages = mark_author_runs(optimistic_message(messages, pending_body, pending_id))
+      messages_revision = messages_revision + 1
+      let selection = message_selection_after_window(messages, selected_message_seq, selected_message_rev, message_action, message_edit_draft)
+      selected_message_seq = selection.seq
+      selected_message_rev = selection.rev
+      message_action = selection.action
+      message_edit_draft = selection.draft
+      has_older_history = history_has_older(messages)
+      unread_marker_seq = first_unread_seq(messages, unread_boundary)
+      error = ""
+      // Sending is a jump to now: the minted row lands at the tail, and a reader
+      // who had scrolled up would otherwise get her own send below the fold —
+      // an optimistic insert she cannot see is no confirmation at all.
+      //
+      // `snap … 0.0`, NOT `snap-end`: the stream is `anchor-y=end`, where the
+      // offset counts FROM the tail — relative 0.0 IS the tail. `snap-end` is
+      // relative 1.0, which an end anchor translates to the TOP of history; it
+      // shipped once and every send hurled the reader to the oldest loaded row.
+      parallel
+        run every send_message(connected_rpc, password, active_channel, pending_id, pending_body, channel_members) -> message_sent _ | message_send_failed _
+        task widget snap #workspace-tabs/content/chat/message-stream 0.0 0.0 window=window_target(console_win)
+    ComposerKind.reply
+      // The rail twin of `message_submitted`: fresh gate at delivery, stash on a
+      // frame-stale admit, then the same optimistic append the old handler made.
+      let refused = thread_loading || !connected || empty(active_channel) || active_thread_seq <= 0 || !empty(post_refusal)
+      failed_reply_draft = remember_failed_draft(failed_reply_draft, keep_str(refused, "stash", ""), pending_body, false)
+      return if refused
+      invalidate lane=live_thread
+      hydration_generation = hydration_generation + 1
+      hydration_retry_attempt = 0
+      thread_messages = optimistic_thread_message(thread_messages, pending_body, pending_id)
+      thread_messages_revision = thread_messages_revision + 1
+      let selection = message_selection_after_window(thread_messages, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
+      thread_selected_seq = selection.seq
+      thread_selected_rev = selection.rev
+      thread_message_action = selection.action
+      thread_edit_draft = selection.draft
+      error = ""
+      run every send_reply(connected_rpc, password, active_channel, active_thread_seq, pending_id, pending_body, channel_members) -> thread_reply_sent _ | thread_reply_send_failed _
 
 on message_sent(next)
   return if active_channel != next.channel_id
@@ -494,20 +476,17 @@ on message_sent(next)
 //
 // So the room check scopes the TIMELINE SURGERY only. The unsent stash and the
 // error banner are written first, unconditionally, above the guard.
-//
-// `remember_failed_draft` routes the body to the stash whenever the composer
-// cannot take it back; the composer of the room she moved to cannot, and a
-// non-empty `current` is how that is said here (`live_resynced` says it with
-// the literal "channel").
 on message_send_failed(cause)
   error = cause.message
-  failed_message_draft = remember_failed_draft(failed_message_draft, keep_str(active_channel == cause.scope_id, trim(editor_text(message_editor)), "another room"), cause.body, cause.committed)
+  // EVERY uncommitted body goes to the stash: the composer is its room's own
+  // instance now (ducktape-ui#697), so this handler cannot look inside it to
+  // decide the old silent refill — the instance's banner offers the words
+  // back one click away instead, whatever room she is in when it fails.
+  failed_message_draft = remember_failed_draft(failed_message_draft, "stash", cause.body, cause.committed)
   return if active_channel != cause.scope_id
   messages = rollback_pending_message(messages, cause.operation_id, cause.committed)
   messages_revision = messages_revision + 1
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
-  message_draft = restore_draft(trim(editor_text(message_editor)), cause.body, cause.committed)
-  message_editor = editor(message_draft)
   return if !cause.committed
   hydration_generation = hydration_generation + 1
   hydration_retry_attempt = 0
@@ -560,12 +539,9 @@ on chat_updated(next)
   message_action = MessageAction.toolbar
   message_edit_draft = next.selected_message_body
   active_thread_seq = next.active_thread_seq
-  // AND THE THREAD'S OWN COMPOSER COMES WITH IT — see `reply_drafts`. The
-  // window loaders answer with seq 0, so today this is `editor("")` on top of a
-  // box `choose_channel`/`choose_dm` already emptied; it rides with the write
-  // because the rule is per-writer, not per-handler — a payload that starts
-  // seating a thread must not have to remember to add it.
-  reply_editor = editor(parked_reply_draft(reply_drafts, active_channel, active_thread_seq))
+  // The thread's composer needs nothing here: `#reply_composer(thread)` keys
+  // an instance per thread, so whichever thread this write seats brings its
+  // own box (ducktape-ui#697).
   thread_target_seq = next.thread_target_seq
   thread_messages = next.thread_messages
   thread_messages_revision = thread_messages_revision + 1
@@ -634,12 +610,9 @@ on chat_hit_loaded(next)
   message_action = MessageAction.toolbar
   message_edit_draft = next.selected_message_body
   active_thread_seq = next.active_thread_seq
-  // AND THE THREAD'S OWN COMPOSER COMES WITH IT — see `reply_drafts`. This is
-  // the landing that made the line necessary: `load_chat_hit` answers with
-  // `root.seq` when the hit is a reply, so a chat-search jump SEATS a thread —
-  // and it did it with an empty box over a parked reply, which the next
-  // keystroke then parked over.
-  reply_editor = editor(parked_reply_draft(reply_drafts, active_channel, active_thread_seq))
+  // A chat-search jump can SEAT a thread (`load_chat_hit` answers with
+  // `root.seq` when the hit is a reply) — and the seated thread brings its
+  // own composer instance, words intact (ducktape-ui#697).
   thread_target_seq = next.thread_target_seq
   thread_messages = next.thread_messages
   thread_messages_revision = thread_messages_revision + 1
@@ -702,21 +675,13 @@ on channel_created(next)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(channels, next.active_channel))
   rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
-  // A CREATE IS A ROOM SWITCH, so both composers park here like they do in the
-  // three pickers — the line below lands her IN the new channel. Both keys must
-  // be read while `active_channel` still names the room she is leaving.
-  message_drafts = park_message_draft(message_drafts, active_channel, trim(editor_text(message_editor)))
-  reply_drafts = park_reply_draft(reply_drafts, active_channel, active_thread_seq, trim(editor_text(reply_editor)))
+  // A CREATE IS A ROOM SWITCH — the line below lands her IN the new channel,
+  // and the composer she was typing into stays keyed to the room she left
+  // (ducktape-ui#697).
   active_channel = next.active_channel
   // Creating lands you in the new room, which is nobody's DM.
   active_dm_peer = dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
-  // AND THE NEW ROOM'S COMPOSER IS THE NEW ROOM'S. Without this the sentence
-  // she was writing in the room she left followed her into the channel she just
-  // made, sat above a live Send there, and the NEXT switch parked it under the
-  // new room's id — silently reattributing it, so it was gone when she went
-  // back for it.
-  message_editor = editor(parked_message_draft(message_drafts, active_channel))
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
@@ -736,12 +701,8 @@ on channel_created(next)
   message_action = MessageAction.toolbar
   message_edit_draft = next.selected_message_body
   active_thread_seq = next.active_thread_seq
-  // AND THE THREAD'S OWN COMPOSER COMES WITH IT — see `reply_drafts`. A create
-  // lands on seq 0 and this is `editor("")`, but it is the same one line every
-  // writer of `active_thread_seq` owes: without it a landing that seats a
-  // thread leaves the box empty over a parked reply, and the first character
-  // typed into it parks OVER her stored words under that same key.
-  reply_editor = editor(parked_reply_draft(reply_drafts, active_channel, active_thread_seq))
+  // A create lands on seq 0 — no thread seated, and no composer line owed:
+  // each thread's instance keeps its own words (ducktape-ui#697).
   thread_target_seq = next.thread_target_seq
   thread_messages = next.thread_messages
   thread_messages_revision = thread_messages_revision + 1
@@ -777,7 +738,6 @@ on open_thread_message_actions(seq, body, rev)
   // hand, and dismissing the menu does not move it back. Every handler with a
   // `task widget focus` retires the discriminant for exactly this reason;
   // `tests.rs` lints the rule so a ninth one cannot forget it.
-  composer_focus = ComposerFocus.unfocused
   sequential
     task widget focus #workspace-tabs/content/chat/thread-action-focus window=window_target(console_win)
     task widget focus-next
@@ -793,7 +753,6 @@ on open_thread_message_reactions(seq, body, rev)
   thread_selected_rev = rev
   thread_message_action = MessageAction.reactions
   thread_edit_draft = body
-  composer_focus = ComposerFocus.unfocused
   sequential
     task widget focus #workspace-tabs/content/chat/thread-reaction-focus window=window_target(console_win)
     task widget focus-next
@@ -804,7 +763,6 @@ on arm_thread_message_delete(seq, body, rev)
   thread_selected_rev = rev
   thread_message_action = MessageAction.delete
   thread_edit_draft = body
-  composer_focus = ComposerFocus.unfocused
   sequential
     task widget focus #workspace-tabs/content/chat/thread-delete-focus window=window_target(console_win)
     task widget focus-next
@@ -815,7 +773,6 @@ on begin_thread_message_edit(seq, body, rev)
   thread_selected_rev = rev
   thread_message_action = MessageAction.editing
   thread_edit_draft = body
-  composer_focus = ComposerFocus.unfocused
   task widget focus #workspace-tabs/content/chat/thread-edit window=window_target(console_win)
 
 on clear_thread_message_selection
@@ -848,7 +805,6 @@ on open_message_actions(seq, body, rev)
   selected_message_rev = rev
   message_action = MessageAction.more
   message_edit_draft = body
-  composer_focus = ComposerFocus.unfocused
   sequential
     task widget focus #workspace-tabs/content/chat/message-action-focus window=window_target(console_win)
     task widget focus-next
@@ -865,7 +821,6 @@ on open_message_reactions(seq, body, rev)
   selected_message_rev = rev
   message_action = MessageAction.reactions
   message_edit_draft = body
-  composer_focus = ComposerFocus.unfocused
   sequential
     task widget focus #workspace-tabs/content/chat/message-reaction-focus window=window_target(console_win)
     task widget focus-next
@@ -876,7 +831,6 @@ on arm_message_delete(seq, body, rev)
   selected_message_rev = rev
   message_action = MessageAction.delete
   message_edit_draft = body
-  composer_focus = ComposerFocus.unfocused
   sequential
     task widget focus #workspace-tabs/content/chat/message-delete-focus window=window_target(console_win)
     task widget focus-next
@@ -887,7 +841,6 @@ on begin_message_edit(seq, body, rev)
   selected_message_rev = rev
   message_action = MessageAction.editing
   message_edit_draft = body
-  composer_focus = ComposerFocus.unfocused
   task widget focus #workspace-tabs/content/chat/message-edit window=window_target(console_win)
 
 // A LINK PRESS IS A HAND-OFF TO THE OS, and nothing else: no selection, no
@@ -903,10 +856,6 @@ on open_message_link(url)
 
 on open_thread_for(seq)
   return if seq <= 0 || empty(active_channel)
-  // PARK THE REPLY OF THE THREAD SHE IS LEAVING, while `active_thread_seq`
-  // still names it — see `reply_drafts`. A no-op on an ordinary open, where the
-  // rail was closed or its composer empty.
-  reply_drafts = park_reply_draft(reply_drafts, active_channel, active_thread_seq, trim(editor_text(reply_editor)))
   channel_settings_open = false
   selected_message_seq = 0
   selected_message_rev = 0
@@ -935,20 +884,13 @@ on open_thread_for(seq)
   thread_messages_revision = thread_messages_revision + 1
   thread_next_reply_seq = 0
   thread_has_more = false
-  // A HALF-TYPED REPLY IS NOT THE PRICE OF LOOKING AT ANOTHER THREAD. This
-  // handler is what every "N replies" row in the timeline beside the rail
-  // emits, and it blanks the LIVE buffer — so a click meant to check something
-  // destroyed text nobody asked to discard, with no banner and no way back. The
-  // park above holds it; the line below hands back whatever THIS thread was
-  // left holding, which is the only thread those words can be posted in.
-  // `close_thread` stays the one route that discards a reply, because that one
-  // is a request to.
-  reply_editor = editor(parked_reply_draft(reply_drafts, active_channel, active_thread_seq))
-  // A rail that just opened has an UNTOUCHED reply composer, and the click
-  // that opened it was on a message row, not on either editor — so the caret
-  // is in NEITHER. Without this the previous thread's "reply" outlives it and
-  // steers the first Cmd+B into an empty box.
-  composer_focus = ComposerFocus.unfocused
+  // A HALF-TYPED REPLY IS NOT THE PRICE OF LOOKING AT ANOTHER THREAD: each
+  // thread's composer is its own instance (ducktape-ui#697), so the one she
+  // was writing waits under its thread's key and the one that opens here is
+  // whatever THIS thread was left holding — the only thread those words can
+  // be posted in. Formatting chords land in whichever composer has the
+  // caret, at the widget (`composer_chord`); no app-side discriminant to
+  // steer wrong.
   error = ""
   run replace lane=thread load_thread(connected_rpc, active_channel, seq, 0, thread_generation) -> thread_loaded _ | thread_failed _
 
@@ -1061,10 +1003,11 @@ on close_thread
   invalidate lane=thread
   invalidate lane=live_thread
   thread_generation = thread_generation + 1
-  // CLOSE IS A REQUEST TO DISCARD, and the park has to hear it: an empty park
-  // DROPS the entry, so the reply she closed away does not come back the next
-  // time she opens that thread. Read while `active_thread_seq` still names it.
-  reply_drafts = park_reply_draft(reply_drafts, active_channel, active_thread_seq, "")
+  // CLOSE USED TO DISCARD THE REPLY; it no longer does. The composer is its
+  // thread's own retained instance (ducktape-ui#697), so the draft waits for
+  // the rail to reopen on the same thread — closing hides it, Dismiss on the
+  // banner (or sending) is how words are actually let go. A deliberate
+  // semantics change: an accidental Escape stopped being able to eat text.
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
@@ -1076,9 +1019,6 @@ on close_thread
   thread_selected_rev = 0
   thread_message_action = MessageAction.toolbar
   thread_edit_draft = ""
-  reply_editor = editor("")
-  // The composer the caret may have been in is gone from the tree.
-  composer_focus = ComposerFocus.unfocused
 
 on edit_message_submit
   return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || selected_message_seq <= 0 || empty(trim(message_edit_draft))
@@ -1208,39 +1148,18 @@ on reaction_failed(cause)
 // still out behind a cross-tab bounce (`open_page_search_hit`, `choose_page`),
 // during which a reply is perfectly valid. `thread_loading` is the rail's own
 // readiness, and it is what the button wears.
-on reply_composer_event(event)
-  composer_focus = ComposerFocus.reply
-  reply_editor = apply_composer_event(reply_editor, event)
-  return if !composer_submits(event)
-  return if thread_loading || !connected || empty(active_channel) || active_thread_seq <= 0 || !empty(post_refusal) || empty(trim(editor_text(reply_editor)))
-  invalidate lane=live_thread
-  hydration_generation = hydration_generation + 1
-  hydration_retry_attempt = 0
-  let pending_reply = trim(editor_text(reply_editor))
-  let pending_reply_id = fresh_operation_id("reply")
-  reply_editor = editor("")
-  thread_messages = optimistic_thread_message(thread_messages, pending_reply, pending_reply_id)
-  thread_messages_revision = thread_messages_revision + 1
-  let selection = message_selection_after_window(thread_messages, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
-  thread_selected_seq = selection.seq
-  thread_selected_rev = selection.rev
-  thread_message_action = selection.action
-  thread_edit_draft = selection.draft
-  error = ""
-  run every send_reply(connected_rpc, password, active_channel, active_thread_seq, pending_reply_id, pending_reply, channel_members) -> thread_reply_sent _ | thread_reply_send_failed _
-
 // Same rule as `message_send_failed`, and the hole is wider here: `close_thread`
 // clears `thread_messages`, so merely closing the rail under an in-flight reply
 // made the pending check fail and threw the text away with no error at all.
 on thread_reply_send_failed(cause)
   error = cause.message
-  failed_reply_draft = remember_failed_draft(failed_reply_draft, keep_str(active_channel == cause.scope_id && contains_pending_message(thread_messages, cause.operation_id), trim(editor_text(reply_editor)), "another thread"), cause.body, cause.committed)
+  // Stash-only, like `message_send_failed`: the reply composer is its
+  // thread's own instance, and the banner is the restore path.
+  failed_reply_draft = remember_failed_draft(failed_reply_draft, "stash", cause.body, cause.committed)
   return if active_channel != cause.scope_id
   return if !contains_pending_message(thread_messages, cause.operation_id)
   thread_messages = rollback_pending_message(thread_messages, cause.operation_id, cause.committed)
   thread_messages_revision = thread_messages_revision + 1
-  let restored_reply = restore_draft(trim(editor_text(reply_editor)), cause.body, cause.committed)
-  reply_editor = editor(restored_reply)
   // AND IT DOES NOT MOVE THE REPLY CURSOR. A committed reply grows the loaded
   // run by exactly one row, and the fused live fold
   // already counts it when that reply's delta lands — which it does for every

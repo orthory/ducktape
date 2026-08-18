@@ -396,13 +396,20 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     assert!(SCREENS.contains("emit(switch_network)"));
     assert!(SCREENS.contains("input \"\" #key-password <-> key_pw label=\"Key password\""));
     assert!(SCREENS.contains("if active_thread_seq > 0 && !channel_settings_open"));
-    // Both chat composers wear the SAME plate now — the rail dropped its old
-    // transparent fg/12 frame for the stream's surface/control_line/r12 chrome.
+    // Both chat composers wear the SAME plate — and now they wear the same
+    // SOURCE: one `ChatComposer` mounted twice (ducktape-ui#697), so the
+    // chrome cannot drift between the stream and the rail by editing one.
+    let chat_components = inlined(include_str!("../ui/components/chat.ice"));
     assert_eq!(
-        SCREENS
+        chat_components
             .matches("box w=fill bg=surface border=control_line border-w=1.0 r=12.0 clip=true")
             .count(),
-        2
+        1
+    );
+    assert_eq!(
+        SCREENS.matches("ChatComposer #").count(),
+        2,
+        "the stream and the rail are the two mounts of that one plate"
     );
     // the palette card moved into the overlay layer with the rest of the
     // window-level surfaces; the assertion follows the code it guards.
@@ -423,12 +430,14 @@ fn compact_controls_share_a_single_geometry_and_type_scale() {
     assert!(SCREENS.contains("p=6.2 text-size=13.0 line-h=1.2"));
     // The composer geometry moved into the `rich_composer` extern args
     // (min_h, max_h, pad); type scale (13.5/1.3) is owned by the adapter.
-    // Both chat composers share one plate; the forge note runs compact.
-    assert_eq!(SCREENS.matches(", 44.0, 150.0, 10.0) #").count(), 2);
+    // Both chat composers share ONE call now — they are one component — and
+    // the forge note keeps its own compact geometry on the screen.
+    let chat_components = inlined(include_str!("../ui/components/chat.ice"));
+    assert_eq!(chat_components.matches(", 44.0, 150.0, 10.0) #").count(), 1);
     assert!(SCREENS.contains(", 38.0, 120.0, 6.0) #forge-note"));
-    assert!(SCREENS.contains("button \"Send\" disabled="));
-    assert!(SCREENS.contains(
-        "h=29.0 @primary_action @px-12px @py-7px -> emit(composer_event, composer_submit_event())"
+    assert!(chat_components.contains("button \"Send\" disabled="));
+    assert!(chat_components.contains(
+        "h=29.0 @primary_action @px-12px @py-7px -> composer_event(composer_submit_event(), blocked, kind)"
     ));
     assert!(
         SCREENS
@@ -826,7 +835,10 @@ fn control_focus_ring_survives_the_active_base() {
 fn ice_sources_hold_to_the_design_system() {
     let sources = [
         ("view.ice", inlined(include_str!("../ui/view.ice"))),
-        ("chat.ice", inlined(include_str!("../ui/components/chat.ice"))),
+        (
+            "chat.ice",
+            inlined(include_str!("../ui/components/chat.ice")),
+        ),
         ("dm.ice", inlined(include_str!("../ui/components/dm.ice"))),
         (
             "files.ice",
@@ -840,9 +852,15 @@ fn ice_sources_hold_to_the_design_system() {
             "huddle.ice",
             inlined(include_str!("../ui/components/huddle.ice")),
         ),
-        ("icon.ice", inlined(include_str!("../ui/components/icon.ice"))),
+        (
+            "icon.ice",
+            inlined(include_str!("../ui/components/icon.ice")),
+        ),
         ("kit.ice", inlined(include_str!("../ui/components/kit.ice"))),
-        ("node.ice", inlined(include_str!("../ui/components/node.ice"))),
+        (
+            "node.ice",
+            inlined(include_str!("../ui/components/node.ice")),
+        ),
         (
             "onboarding.ice",
             inlined(include_str!("../ui/components/onboarding.ice")),
@@ -1315,8 +1333,10 @@ fn the_chat_surface_holds_to_its_measured_geometry() {
     );
 
     // A FAILED SEND WEARS GateNote's REVERSIBLE-DANGER PLATE, not a muted
-    // sentence quieter than the archived-channel notice above it.
-    assert!(screen.contains(
+    // sentence quieter than the archived-channel notice above it. It lives
+    // with the composer it offers the words back to (ducktape-ui#697), which
+    // is why there is one of it instead of a stream copy and a rail copy.
+    assert!(components.contains(
         "box w=fill px=13.0 py=11.0 bg=danger_zone_bg border=danger_zone_line border-w=1.0 r=9.0"
     ));
 

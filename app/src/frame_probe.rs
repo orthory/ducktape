@@ -779,12 +779,25 @@ fn headless_renderer() -> iced::Renderer {
         .expect("a headless tiny-skia renderer")
 }
 
-fn keystroke() -> __DucktapeMessage {
-    __DucktapeMessage::ChatComposerEvent(super::editor::ComposerEvent::Apply(
-        super::editor::RichAction::Edit(iced::widget::text_editor::Action::Edit(
-            iced::widget::text_editor::Edit::Insert('x'),
+/// The stream composer's instance scope, read off a rendered frame — the
+/// composers are component instances now (ducktape-ui#697), so a probe that
+/// types has to name the one it is typing into.
+fn composer_scope(app: &Ducktape) -> String {
+    app.__ice_test_scopes_chat_composer()
+        .into_iter()
+        .find(|scope| scope.contains("/composer("))
+        .expect("the stream composer materialized")
+}
+
+fn keystroke(scope: &str) -> __DucktapeMessage {
+    Ducktape::__ice_test_message_chat_composer_composer_event(
+        scope.to_owned(),
+        super::editor::ComposerEvent::Apply(super::editor::RichAction::Edit(
+            iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Insert('x')),
         )),
-    ))
+        false,
+        crate::ComposerKind::Message,
+    )
 }
 
 fn probe_posted_update(seq: i64) -> backend::LiveUpdate {
@@ -869,10 +882,11 @@ fn chat_keystroke_allocations(rows: i64) -> u64 {
         user_interface::Cache::default(),
     );
     let mut keystrokes = Phase::new("composer keystroke+rebuild slope");
+    let composer = composer_scope(&app);
     for _ in 0..SLOPE_FRAMES {
         cache = keystrokes
             .sample(|| {
-                let _ = app.__update(keystroke());
+                let _ = app.__update(keystroke(&composer));
                 UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer)
             })
             .into_cache();
@@ -1226,9 +1240,10 @@ fn an_optimistic_confirmation_keeps_its_virtual_row_alive() {
 
 fn probe_optimistic_confirmation() {
     let (mut app, console) = console_in_chat();
-    app.message_editor = iced::widget::text_editor::Content::with_text("confirmation probe");
-    let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
-        super::editor::ComposerEvent::Submit,
+    let _ = app.__update(__DucktapeMessage::ComposerSubmitted(
+        crate::ComposerKind::Message,
+        "confirmation probe".into(),
+        backend::fresh_operation_id("message".into()),
     ));
     assert_eq!(app.messages.len(), backend::CHAT_HOT_WINDOW_LIMIT);
     let pending = app.messages.last().expect("the optimistic row");
@@ -1444,7 +1459,11 @@ fn probe_forge_code_content() {
             continue;
         }
         assert_eq!(app.forge_repo, "probe", "a click must not leave the repo");
-        assert_eq!(app.forge_tab, crate::ForgeTab::Code, "a click must not switch seats");
+        assert_eq!(
+            app.forge_tab,
+            crate::ForgeTab::Code,
+            "a click must not switch seats"
+        );
         let (next_cache, frame) = drawn_frame(&mut app, console, &mut renderer, cache);
         cache = next_cache;
         if frame != control {
@@ -1528,6 +1547,7 @@ fn probe() {
     let mut keystroke_frame = Phase::new("composer keystroke+rebuild");
     let mut row_edit = Phase::new("one-row edit rebuild");
     let mut screen_switch = Phase::new("screen switch (pages->chat)");
+    let composer = composer_scope(&app);
 
     for frame in 0..FRAMES {
         let mut ui = build
@@ -1566,7 +1586,7 @@ fn probe() {
         // truth. `no_keyboard_subscription_charges_a_captured_key_to_a_bare_composer`
         // in `tests.rs` is what keeps it honest; the ceiling cannot see it.
         let ui = keystroke_frame.sample(|| {
-            let _ = app.__update(keystroke());
+            let _ = app.__update(keystroke(&composer));
             UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer)
         });
         cache = ui.into_cache();

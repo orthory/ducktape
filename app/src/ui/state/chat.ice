@@ -5,10 +5,6 @@ state
   // Renderer invalidation for the whole-timeline lazy island. Domain handlers
   // advance it only when the corresponding owned window changes.
   messages_revision:i64 = 0
-  // Composer drafts are keyed by their owning room/thread so navigation never
-  // posts another room's text.
-  message_drafts:[ChannelDraft] = []
-  reply_drafts:[ChannelDraft] = []
   chat_generation:i64 = 0
   channel_reads:[ChannelRead] = []
   unread_boundary:i64 = 0
@@ -45,10 +41,10 @@ state
   channel_create_open = false
   channel_create_members_only = false
   pending_channel = ""
-  message_draft = ""
-  message_editor:editor = ""
-  reply_editor:editor = ""
-  composer_focus:ComposerFocus = ComposerFocus.unfocused
+  // THE COMPOSERS ARE NOT HERE (ducktape-ui#697): each is a retained
+  // `ChatComposer` instance keyed by `(endpoint, room)` / `(endpoint, thread)`,
+  // so no app state can be handed to the wrong room. What stays is the
+  // failed-send STASH, which outlives the box it came from.
   failed_message_draft = ""
   failed_reply_draft = ""
   chat_search_draft = ""

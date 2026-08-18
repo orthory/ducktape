@@ -392,79 +392,29 @@ pub fn near_scroll_top(relative_offset: f64) -> bool {
     relative_offset >= 0.9
 }
 
-/// One room's unsent composer text, parked while the reader is somewhere else.
-#[derive(Clone, Debug, Default, Hash, PartialEq)]
-pub struct ChannelDraft {
-    pub channel_id: String,
-    pub text: String,
+/// THE COMPOSER'S INSTANCE KEY (ducktape-ui#697). One retained
+/// `ChatComposer` per room, so a draft never rides a room switch — and the
+/// ENDPOINT is in the key because a channel id is a user-chosen string:
+/// network A's `#general` and network B's `#general` are two rooms, and the
+/// park store this replaced had to be emptied by hand on every network switch
+/// to keep one from handing its words to the other.
+pub fn composer_scope(endpoint: String, channel_id: String) -> String {
+    format!("{endpoint}\u{1f}{channel_id}")
 }
 
-/// Park the composer of the room being left, and drop the entry when there is
-/// nothing to park.
-///
-/// Drafts are tiny and self-clearing: empty text removes the entry, a send
-/// empties the composer, and the next park removes it. This list therefore holds
-/// one short string per room with unsent words and needs no cap.
-pub fn park_message_draft(
-    drafts: Vec<ChannelDraft>,
-    channel_id: String,
-    text: String,
-) -> Vec<ChannelDraft> {
-    let mut kept: Vec<ChannelDraft> = drafts
-        .into_iter()
-        .filter(|draft| draft.channel_id != channel_id)
-        .collect();
-    let worth_keeping = !channel_id.is_empty() && !text.is_empty();
-    if worth_keeping {
-        kept.push(ChannelDraft { channel_id, text });
+/// The operation-id prefix each composer mints under, so a pending message and
+/// a pending reply never share an id space.
+pub fn composer_op_prefix(kind: crate::ComposerKind) -> String {
+    match kind {
+        crate::ComposerKind::Message => "message".to_owned(),
+        crate::ComposerKind::Reply => "reply".to_owned(),
     }
-    kept
 }
 
-/// The parked composer text for one room, or nothing.
-pub fn parked_message_draft(drafts: Vec<ChannelDraft>, channel_id: String) -> String {
-    drafts
-        .into_iter()
-        .find(|draft| draft.channel_id == channel_id)
-        .map(|draft| draft.text)
-        .unwrap_or_default()
-}
-
-/// A thread's park key: the rail belongs to a room AND a root, and the same seq
-/// under two rooms is two different threads.
-fn thread_draft_key(channel_id: &str, thread_seq: i64) -> String {
-    format!("{channel_id}#{thread_seq}")
-}
-
-/// Park the reply composer of the thread being left, in its OWN store.
-///
-/// NOT a harvest into `failed_reply_draft`: that field is channel-scoped, so a
-/// reply typed in thread A would raise its "Unsent reply" plate over every later
-/// thread of the room and Restore would arm A's words to post in B. Parked text
-/// is invisible until she opens the thread it belongs to, which is the only
-/// place it can be posted.
-pub fn park_reply_draft(
-    drafts: Vec<ChannelDraft>,
-    channel_id: String,
-    thread_seq: i64,
-    text: String,
-) -> Vec<ChannelDraft> {
-    // NO OPEN RAIL, NOTHING TO PARK. The composite key is never empty on its
-    // own, so `park_message_draft`'s empty-room check cannot stand in for this.
-    let open_rail = !channel_id.is_empty() && thread_seq > 0;
-    if !open_rail {
-        return drafts;
-    }
-    park_message_draft(drafts, thread_draft_key(&channel_id, thread_seq), text)
-}
-
-/// The parked reply text for one thread, or nothing.
-pub fn parked_reply_draft(
-    drafts: Vec<ChannelDraft>,
-    channel_id: String,
-    thread_seq: i64,
-) -> String {
-    parked_message_draft(drafts, thread_draft_key(&channel_id, thread_seq))
+/// The rail's key: a reply belongs to its THREAD, and the same seq under two
+/// rooms is two different threads.
+pub fn thread_scope(endpoint: String, channel_id: String, thread_seq: i64) -> String {
+    format!("{endpoint}\u{1f}{channel_id}#{thread_seq}")
 }
 
 /// The clicked page's title, from the index the sidebar is already drawn from
