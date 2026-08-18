@@ -927,10 +927,10 @@ impl LaneBank {
     }
 }
 
-/// the mesh-carrier REAL arm: one epoch's pre-registered discovery channels
+/// the mesh-carrier REAL arm: one epoch's pre-registered mesh channels
 /// (a [`LaneBank`] slot) + the [`lookup::Oracle`] the resolver keys on.
 /// This is the `authenticated::lookup` network's per-spawn transport bundle —
-/// the discovery `Network` (`MeshHead`) registers the channels into the bank
+/// the lookup `Network` (`MeshHead`) registers the channels into the bank
 /// before start, and this bundles one slot with the oracle at the point
 /// [`engine`](self::engine) consumes it, feeding
 /// [`consensus::SimplexOrderer::spawn_with_carrier`] the identical values the

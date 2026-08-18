@@ -4,14 +4,14 @@
 //! simplex_agreed_order.rs) turned into an actual network: instead of N
 //! `SimplexOrderer`s over ONE `p2p::simulated` network under the DETERMINISTIC
 //! clock, each process here stands up its OWN live simplex `Engine` over a real
-//! `authenticated::discovery` encrypted TCP mesh on the REAL tokio runtime, and
+//! `authenticated::lookup` encrypted TCP mesh on the REAL tokio runtime, and
 //! drives an `OrderedNode<SimplexOrderer>` over a `host::Host`.
 //!
 //! the machinery is REUSED verbatim: `consensus::SimplexOrderer::spawn` is
 //! already generic over the runtime context + the three engine channel pairs, so
 //! the only substrate that changes vs the sim is (a) `tokio::Runner` instead of
-//! `deterministic::Runner` (discovery live-locks under the deterministic clock),
-//! (b) `discovery::Network` channels instead of `simulated::Network`, and (c) a
+//! `deterministic::Runner` (the p2p actors live-lock under the deterministic clock),
+//! (b) `lookup::Network` channels instead of `simulated::Network`, and (c) a
 //! per-process `ContentStore`.
 //!
 //! payload dissemination is REAL: each process submits a DISTINCT op (node N

@@ -64,7 +64,7 @@ impl<'a> EpochSpawner<'a> {
                  ({EPOCH_CHANNEL_BANK}) — rebuild with a wider bank"
             );
         };
-        // bundle this epoch's discovery channel slot + the oracle behind the mesh
+        // bundle this epoch's mesh channel slot + the oracle behind the mesh
         // carrier seam — the swap point where the sim arm substitutes an
         // in-process `simulated::Network` (crates/kernel/consensus/tests/
         // in_process_cluster.rs) for this real encrypted-TCP transport.

@@ -1,6 +1,6 @@
 //! Validator mesh wiring.
 //!
-//! All discovery channels are registered before the one legal
+//! All mesh channels are registered before the one legal
 //! `network.start()` call; post-catch-up ingress bridges then hand bounded
 //! local receivers to the consensus pump.
 

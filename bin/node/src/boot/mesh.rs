@@ -50,7 +50,7 @@ pub(crate) fn binds_an_os_mesh_socket(
 /// already spoken for is a clean startup error instead of
 /// `thread 'tokio-rt-worker' panicked … failed to bind listener: BindFailed`.
 ///
-/// commonware's discovery listener binds INSIDE the runtime and `expect`s the
+/// commonware's mesh listener binds INSIDE the runtime and `expect`s the
 /// result, ~10 seconds into boot — after every other surface has logged itself
 /// up — so the operator's reward for a taken port was a wall of healthy INFO
 /// and then a raw Rust panic with a crates.io path in it.
@@ -67,7 +67,7 @@ pub(crate) fn preflight_mesh_listen(listen: std::net::SocketAddr) -> Result<(), 
 /// `run_node`'s shared runtime head (phase P3): the head of the async
 /// closure `executor.start(|context| async move { … })` runs on — metrics
 /// registration, the tracked mesh set, the statesync source pick,
-/// discovery's config, the overlay-net seam, and the real
+/// lookup's config, the overlay-net seam, and the real
 /// `Network`/`Oracle` pair. Ends before the `if sync_only {` branch,
 /// which stays in `run_node` (that's the sync-only-vs-validator fork).
 pub(crate) struct MeshHead {
@@ -135,7 +135,7 @@ pub(crate) fn build(
     let sync_monitor = statesync::monitor::ServeMonitor::new(context.child("statesync_monitor"));
     let sync_metrics = crate::sync::metrics::SyncServeMetrics::register(&context, &sync_monitor);
 
-    // the authorized MESH set, SORTED — what discovery tracks. the
+    // the authorized MESH set, SORTED — what the tracker windows ride on. the
     // consensus scheme uses the (possibly smaller) validator set derived
     // from committed valset state after the recovery boot below.
     let mesh_participants: Set<ed25519::PublicKey> =
@@ -148,7 +148,7 @@ pub(crate) fn build(
     // the statesync source a --sync-only joiner pulls from: only
     // validators serve the channel, so the candidate must be a validator
     // that is not us (a non-validator hint or our own key would be
-    // retried forever — discovery never connects a node to itself).
+    // retried forever — the mesh never connects a node to itself).
     let sync_sources =
         config::sync_source_candidates(&sync_candidates, &validators, &signer.public_key());
     let sync_source = sync_sources.first().cloned();

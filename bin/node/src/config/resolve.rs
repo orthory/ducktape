@@ -44,7 +44,7 @@ pub struct Resolved {
     /// the network genesis namespace, or the dev shape's raw namespace.
     pub namespace: Vec<u8>,
     /// the authorized mesh set (unsorted here; the caller builds the ordered
-    /// Set discovery tracks).
+    /// Set the mesh tracks).
     pub mesh: Vec<ed25519::PublicKey>,
     /// the genesis consensus participant subset.
     pub validators: Vec<ed25519::PublicKey>,
@@ -126,7 +126,7 @@ pub struct Resolved {
     /// the operator's `[sandbox]` table says HOW runs are isolated on this
     /// host, and the user's `services.toml` grant (`ducktape service enable
     /// compute`) says WHETHER this node runs any. `None` = no provider
-    /// discovery, no oracle pool, no capability announce.
+    /// mesh, no oracle pool, no capability announce.
     ///
     /// Deliberately NOT the same value as `service.sandbox`: the interactive
     /// terminal plane and the airlock gateway key off the table alone, so a node

@@ -819,9 +819,7 @@ impl Cluster {
         cfg.push_str(&format!("namespace = {:?}\n", self.namespace));
         cfg.push_str(&format!("peer_seeds = {:?}\n", self.peer_ids));
         cfg.push_str(&format!("validator_seeds = {:?}\n", self.validator_ids));
-        if idx != 0 {
-            cfg.push_str(&format!("bootstrapper_addr = \"{}\"\n", self.bootstrap_addr()));
-        }
+        cfg.push_str(&self.peer_addrs_toml());
         cfg.push_str(&format!(
             "storage_dir = {:?}\n",
             self.dir
@@ -1115,6 +1113,23 @@ impl Cluster {
             .unwrap_or_else(|| format!("127.0.0.1:{}", self.p2p_ports[0]))
     }
 
+    /// the full `peer_addrs` line, index-aligned with `peer_seeds`: node 0
+    /// rides `bootstrap_addr()` (honoring a sentry/forwarder override), the
+    /// rest their real p2p ports. the mesh has no address gossip, so every
+    /// config carries the whole list; self-entries are filtered at resolve.
+    fn peer_addrs_toml(&self) -> String {
+        let addrs: Vec<String> = self
+            .p2p_ports
+            .iter()
+            .enumerate()
+            .map(|(i, port)| match i {
+                0 => self.bootstrap_addr(),
+                _ => format!("127.0.0.1:{port}"),
+            })
+            .collect();
+        format!("peer_addrs = {addrs:?}\n")
+    }
+
     /// spawn an UNINVITED joiner: identity seed `id`, deliberately absent
     /// from every existing member's `peer_seeds` — the mesh refuses it until
     /// governance admits it and the epoch cutover re-tracks. its own config
@@ -1133,7 +1148,7 @@ impl Cluster {
         cfg.push_str(&format!("namespace = {:?}\n", self.namespace));
         cfg.push_str(&format!("peer_seeds = {:?}\n", self.peer_ids));
         cfg.push_str(&format!("validator_seeds = {:?}\n", self.validator_ids));
-        cfg.push_str(&format!("bootstrapper_addr = \"{}\"\n", self.bootstrap_addr()));
+        cfg.push_str(&self.peer_addrs_toml());
         cfg.push_str(&format!(
             "storage_dir = {:?}\n",
             self.dir

@@ -28,7 +28,7 @@ use super::resolve::{DEFAULT_CHECKPOINT_BLOCKS, DEFAULT_PODMAN_IMAGE};
 /// a correctness property rather than tidiness — see
 /// [`no_tcp_default_sits_in_the_ephemeral_range`]. The mesh listener was at
 /// `52200`, inside the range, where any outbound connection on the box can take
-/// the port first; commonware's discovery listener `expect`s its bind, so
+/// the port first; commonware's mesh listener `expect`s its bind, so
 /// losing that race is an unwinding panic ten seconds into boot. It now sits
 /// beside the two operator surfaces, which were never at risk.
 pub const DEFAULT_MESH_LISTEN: &str = "[::]:8846";
@@ -445,7 +445,7 @@ mod tests {
     /// and the loser of that race is a node that will not start.
     ///
     /// The mesh listener is the one that bit: it sat at `52200`, and
-    /// commonware's discovery listener `expect`s its bind inside the runtime,
+    /// commonware's mesh listener `expect`s its bind inside the runtime,
     /// so losing the race was `thread 'tokio-rt-worker' panicked … BindFailed`
     /// ten seconds into an otherwise healthy boot.
     ///
