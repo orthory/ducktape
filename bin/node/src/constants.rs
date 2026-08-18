@@ -106,7 +106,7 @@ pub(crate) const JOINER_POLL: Duration = Duration::from_secs(2);
 /// this tick only covers a missed wake — a mesh hiccup swallowing a
 /// certificate burst, or an idle stretch with nothing to follow.
 pub(crate) const RESIDENT_FALLBACK_POLL: Duration = Duration::from_secs(12);
-/// how many epochs of engine channels are PRE-REGISTERED. discovery channels
+/// how many epochs of engine channels are PRE-REGISTERED. mesh channels
 /// can only be registered before `network.start()`, and every epoch's respawned
 /// engine needs FRESH channels (an aborted old engine must never collide with
 /// its successor) — so a bank is reserved up front. exhausting it is a
@@ -145,7 +145,7 @@ pub(crate) const GATE_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// eager payload-relay lane, and the payload FETCH lane (the lazy catch-up
 /// backstop — a validator that missed the one-shot relay gossip for a
 /// finalized op fetches its bytes by digest instead of wedging its apply
-/// prefix forever). starts at 9, clear of the fixed discovery channels
+/// prefix forever). starts at 9, clear of the fixed mesh channels
 /// (statesync 4, retired lobby 5, reachability 6).
 pub(crate) fn engine_channels(epoch: u64) -> (u64, u64, u64, u64, u64) {
     let base = 9 + epoch * 5;

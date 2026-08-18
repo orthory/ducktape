@@ -26,7 +26,7 @@ use tracing_subscriber::{EnvFilter, Layer as _, reload};
 /// so anything that needs an env var to be visible is, in practice, invisible.
 ///
 /// commonware keeps several node-health failures at `debug`. admit only the
-/// operational scopes: discovery owns dial/listen/handshake/peer-set health,
+/// operational scopes: the lookup mesh owns dial/listen/handshake/peer-set health,
 /// the p2p resolver owns finalized-payload fetch timeouts, and the simplex
 /// engine names the child actor whose exit stopped consensus. broader crate
 /// filters would also admit per-view and per-request chatter.
@@ -41,7 +41,7 @@ use tracing_subscriber::{EnvFilter, Layer as _, reload};
 const DEFAULT_FILTER: &str = concat!(
     "info,",
     "defguard_boringtun=off,",
-    "commonware_p2p::authenticated::discovery=debug,",
+    "commonware_p2p::authenticated::lookup=debug,",
     "commonware_resolver::p2p=debug,",
     "commonware_consensus::simplex::engine=debug",
 );
@@ -475,15 +475,14 @@ mod tests {
 
         tracing::subscriber::with_default(subscriber, || {
             tracing::debug!(
-                target: "commonware_p2p::authenticated::discovery::actors::dialer",
+                target: "commonware_p2p::authenticated::lookup::actors::dialer",
                 error = "connection refused",
                 "failed to dial peer"
             );
-            tracing::debug!(
-                target: "commonware_p2p::authenticated::discovery::actors::tracker::directory",
-                expected = 3,
-                actual = 2,
-                "bit vector length mismatch"
+            tracing::warn!(
+                target: "commonware_p2p::authenticated::lookup::actors::tracker::directory",
+                index = 3u64,
+                "peer set already exists"
             );
             tracing::debug!(
                 target: "commonware_resolver::p2p::engine",
@@ -499,7 +498,7 @@ mod tests {
                 "routine per-view noise"
             );
             tracing::debug!(
-                target: "commonware_p2p::authenticated::lookup::actors::peer::actor",
+                target: "commonware_p2p::authenticated::discovery::actors::peer::actor",
                 "unused p2p implementation noise"
             );
         });
@@ -512,7 +511,7 @@ mod tests {
             .join("\n");
         for expected in [
             "failed to dial peer",
-            "bit vector length mismatch",
+            "peer set already exists",
             "requester timeout",
             "voter stopped, shutting down engine",
         ] {

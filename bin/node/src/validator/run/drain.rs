@@ -44,6 +44,7 @@ impl ValidatorRuntime<'_> {
             latest_floor,
             mesh_oracle,
             mesh_window,
+            mesh_book,
             gateway_book,
             media_peers,
             blob_peers,
@@ -241,7 +242,7 @@ impl ValidatorRuntime<'_> {
                 // window converges within a beat.
                 if let lobby::IntroReply::Admitted { .. } = &reply {
                     let window = read_valset_mesh_window(node.host()).await;
-                    mesh_window.track_new(mesh_oracle, &window);
+                    mesh_window.track_new(mesh_oracle, mesh_book, &window);
                 }
                 super::settle_gate(gate_outcomes, gate.joiner, reply);
                 continue;
@@ -629,7 +630,7 @@ impl ValidatorRuntime<'_> {
             // engine/channel concern. monotonic bookkeeping makes the
             // no-change case a silent no-op.
             let committed_window = read_valset_mesh_window(node.host()).await;
-            mesh_window.track_new(mesh_oracle, &committed_window);
+            mesh_window.track_new(mesh_oracle, mesh_book, &committed_window);
             let members_raw = read_valset_members(node.host()).await;
             let mut observed: Vec<ed25519::PublicKey> = Vec::new();
             for key in &members_raw {

@@ -4,14 +4,14 @@
 //! simplex_agreed_order.rs) turned into an actual network: instead of N
 //! `SimplexOrderer`s over ONE `p2p::simulated` network under the DETERMINISTIC
 //! clock, each process here stands up its OWN live simplex `Engine` over a real
-//! `authenticated::discovery` encrypted TCP mesh on the REAL tokio runtime, and
+//! `authenticated::lookup` encrypted TCP mesh on the REAL tokio runtime, and
 //! drives an `OrderedNode<SimplexOrderer>` over a `host::Host`.
 //!
 //! the machinery is REUSED verbatim: `consensus::SimplexOrderer::spawn` is
 //! already generic over the runtime context + the three engine channel pairs, so
 //! the only substrate that changes vs the sim is (a) `tokio::Runner` instead of
-//! `deterministic::Runner` (discovery live-locks under the deterministic clock),
-//! (b) `discovery::Network` channels instead of `simulated::Network`, and (c) a
+//! `deterministic::Runner` (the p2p actors live-lock under the deterministic clock),
+//! (b) `lookup::Network` channels instead of `simulated::Network`, and (c) a
 //! per-process `ContentStore`.
 //!
 //! payload dissemination is REAL: each process submits a DISTINCT op (node N
@@ -79,6 +79,7 @@ mod lobby;
 #[cfg(test)]
 mod main_tests;
 mod mcp;
+mod mesh_book;
 mod mesh_window;
 mod overlay_book;
 mod plane_metrics;
@@ -327,7 +328,7 @@ fn run_node(
         identity_chain_id,
         peers,
         validators,
-        bootstrappers,
+        mesh_book,
         coordinated,
         listen,
         advertised,
@@ -517,7 +518,6 @@ fn run_node(
             sync_candidates,
             listen,
             advertised,
-            bootstrappers,
             wireguard_listen.is_some(),
             overlay_slot.clone(),
         );
@@ -558,6 +558,7 @@ fn run_node(
                 &signer,
                 mesh_participants,
                 &validators,
+                mesh_book.clone(),
                 sync_sources,
                 metrics.clone(),
                 storage_for_sync,
@@ -625,6 +626,7 @@ fn run_node(
                 &mut oracle,
                 quota,
                 &mesh_participants,
+                mesh_book.clone(),
                 sync_sources,
                 sync_source,
                 advertised_reach.clone(),
@@ -712,6 +714,7 @@ fn run_node(
             context,
             network,
             oracle,
+            mesh_book,
             quota,
             metrics,
             status,

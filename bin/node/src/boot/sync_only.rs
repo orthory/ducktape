@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use commonware_cryptography::ed25519;
-use commonware_p2p::authenticated::discovery::{self, Network};
+use commonware_p2p::authenticated::lookup::{self, Network};
 use commonware_p2p::Receiver as P2pReceiver;
 use commonware_runtime::{Clock, Quota, Spawner, Supervisor};
 use commonware_utils::ordered::Set;
@@ -26,11 +26,12 @@ pub(crate) async fn run(
         overlay_net::OverlayContext<commonware_runtime::tokio::Context>,
         ed25519::PrivateKey,
     >,
-    mut oracle: discovery::Oracle<ed25519::PublicKey>,
+    mut oracle: lookup::Oracle<ed25519::PublicKey>,
     quota: Quota,
     signer: &ed25519::PrivateKey,
     mesh_participants: Set<ed25519::PublicKey>,
     validators: &[ed25519::PublicKey],
+    mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
     sync_sources: Vec<ed25519::PublicKey>,
     metrics: noded::NodeMetrics,
     storage_for_sync: std::path::PathBuf,
@@ -56,7 +57,7 @@ pub(crate) async fn run(
         &mesh_participants.iter().cloned().collect::<Vec<_>>(),
         label,
     );
-    mesh_window.track_genesis(&mut oracle, validators);
+    mesh_window.track_genesis(&mut oracle, &mesh_book, validators);
     // ---- the SYNC-ONLY joiner: no engine, no votes — just the wire ----
     //
     // validators broadcast consensus traffic (votes, certificates,

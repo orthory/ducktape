@@ -269,6 +269,15 @@ pub enum ReachabilityEvent {
         peer: ed25519::PublicKey,
         interface: String,
     },
+    /// A peer's signed CONTROL endpoint (its mesh address) was accepted with
+    /// a value that differs from the last one observed for that identity —
+    /// the node feeds it to the mesh transport's address book. Emitted
+    /// only-on-change from every record/advert acceptance path and the boot
+    /// restore; `peer` is the owner's raw ed25519 identity bytes.
+    ControlEndpointObserved {
+        peer: ValidatorIdentity,
+        control_endpoint: SocketAddr,
+    },
 }
 
 /// How a peer's WireGuard endpoint was resolved.
@@ -1195,6 +1204,11 @@ struct Driver<'a, E, R> {
     /// entry never overrides a validated plan or a pre-warm record for the
     /// same identity, and dissolves once one exists).
     invite_peers: BTreeMap<ValidatorIdentity, PeerTunnelConfig>,
+    /// the last CONTROL endpoint observed per identity — the only-on-change
+    /// ledger behind [`ReachabilityEvent::ControlEndpointObserved`].
+    /// deliberately epoch-independent: a cutover must not re-announce
+    /// unchanged addresses.
+    control_endpoints: BTreeMap<ValidatorIdentity, SocketAddr>,
 }
 
 /// Drive the reachability plane until `Shutdown` (clean exit) or a channel
@@ -1247,6 +1261,7 @@ where
         base_peers: None,
         restore_tried: false,
         invite_peers: BTreeMap::new(),
+        control_endpoints: BTreeMap::new(),
     };
     while let Some(command) = commands.recv().await {
         match command {
@@ -1300,6 +1315,31 @@ where
             .send(event)
             .await
             .map_err(|_| ReachabilityError::ChannelClosed)
+    }
+
+    /// announce an accepted CONTROL endpoint to the node, only when it
+    /// differs from the last one observed for that identity. one ledger for
+    /// every acceptance path (member/standby role, records, adverts, the
+    /// boot restore), so the mesh address book upstream is never churned by
+    /// re-gossip of an unchanged address. own endpoint is skipped — the node
+    /// does not dial itself.
+    async fn observe_control_endpoint(
+        &mut self,
+        owner: ValidatorIdentity,
+        endpoint: Endpoint,
+    ) -> Result<(), ReachabilityError> {
+        if owner == self.me {
+            return Ok(());
+        }
+        let socket = endpoint.socket_addr();
+        if !control_endpoint_changed(&mut self.control_endpoints, owner, socket) {
+            return Ok(());
+        }
+        self.emit(ReachabilityEvent::ControlEndpointObserved {
+            peer: owner,
+            control_endpoint: socket,
+        })
+        .await
     }
 
     async fn send_msg(
@@ -1551,6 +1591,20 @@ where
             .filter(|signed| standby_ids.contains(&signed.record.validator_identity))
             .cloned()
             .collect();
+        // the restored records' control endpoints feed the mesh address
+        // book exactly like live acceptances — a cold restart's book starts
+        // from the same signed evidence the tunnels do.
+        for record in &records {
+            self.observe_control_endpoint(record.validator_identity, record.control_endpoint)
+                .await?;
+        }
+        for signed in &standby_records {
+            self.observe_control_endpoint(
+                signed.record.validator_identity,
+                signed.record.control_endpoint,
+            )
+            .await?;
+        }
         if records.is_empty() && standby_records.is_empty() {
             return Ok(Vec::new());
         }
@@ -2117,6 +2171,8 @@ where
             self.send_msg(owner, &ReachabilityMsg::Record(own)).await?;
         }
         if accepted {
+            self.observe_control_endpoint(owner, signed.record.control_endpoint)
+                .await?;
             // relay the news: peers with no link to the owner only ever see
             // its record through us — the standbys included, whose pre-warm
             // tunnels want every member's record. Accept-gated, so the
@@ -2213,6 +2269,8 @@ where
         } else if via == owner {
             state.routes.remove(&owner);
         }
+        self.observe_control_endpoint(owner, signed.record.control_endpoint)
+            .await?;
         // the accepted record reaches disk NOW, not at the epoch apply: a
         // solo member never mints plans, and a reboot between accept and the
         // next apply would otherwise strand this standby for good (it cannot
@@ -2308,6 +2366,8 @@ where
             self.send_msg(owner, &ReachabilityMsg::Advert(own)).await?;
         }
         if accepted {
+            self.observe_control_endpoint(owner, advert.record.control_endpoint)
+                .await?;
             // standbys ride the advert flood too: the signed advert set is
             // what they persist for their promotion reboot's restore.
             let targets: Vec<ValidatorIdentity> = {
@@ -2417,6 +2477,8 @@ where
             _ => {}
         }
         state.prewarm_nonces.insert(owner, record.nonce);
+        self.observe_control_endpoint(owner, record.control_endpoint)
+            .await?;
         // endpoint-less member record: install without an endpoint — it initiates.
         let endpoint = match record.wireguard_endpoint.map(|e| e.socket_addr()) {
             None => None,
@@ -3358,9 +3420,45 @@ where
     }
 }
 
+/// record `socket` as `owner`'s control endpoint in the ledger, answering
+/// whether it CHANGED — the pure decision behind
+/// [`ReachabilityEvent::ControlEndpointObserved`]'s only-on-change contract.
+fn control_endpoint_changed(
+    ledger: &mut BTreeMap<ValidatorIdentity, SocketAddr>,
+    owner: ValidatorIdentity,
+    socket: SocketAddr,
+) -> bool {
+    ledger.insert(owner, socket) != Some(socket)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_endpoint_ledger_fires_only_on_change() {
+        let mut ledger = BTreeMap::new();
+        let owner = ValidatorIdentity([7; 32]);
+        let first: SocketAddr = "192.0.2.1:8846".parse().unwrap();
+        let moved: SocketAddr = "192.0.2.2:8846".parse().unwrap();
+
+        assert!(
+            control_endpoint_changed(&mut ledger, owner, first),
+            "first observation is a change"
+        );
+        assert!(
+            !control_endpoint_changed(&mut ledger, owner, first),
+            "re-gossip of the same endpoint is silent"
+        );
+        assert!(
+            control_endpoint_changed(&mut ledger, owner, moved),
+            "a moved endpoint fires"
+        );
+        assert!(
+            control_endpoint_changed(&mut ledger, ValidatorIdentity([8; 32]), first),
+            "identities are independent"
+        );
+    }
 
     #[test]
     fn exactly_one_side_of_every_pair_initiates() {
