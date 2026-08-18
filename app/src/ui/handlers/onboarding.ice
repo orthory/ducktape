@@ -238,8 +238,6 @@ on console_opened(id)
   // A's `#general` and network B's `#general` are two instances. The park store
   // this replaced shared one key per channel id and had to be emptied by hand
   // right here, or a sentence typed on one node was handed back on ANOTHER.
-  failed_message_draft = ""
-  failed_reply_draft = ""
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []

@@ -358,6 +358,9 @@ pub async fn send_message(
             committed: cause.committed,
             operation_id,
             scope_id: operation_scope,
+            // A message is not in a thread; the stream's composer is keyed
+            // by its room alone.
+            thread_seq: 0,
             body: operation_body,
         })
 }
@@ -468,6 +471,7 @@ pub async fn send_reply(
 ) -> Result<SendReceipt, OptimisticMutationError> {
     let operation_id = message_id.clone();
     let operation_scope = channel_id.clone();
+    let operation_thread = root_seq;
     let operation_body = body.clone();
     let result = async {
         let root_seq = positive_sequence(root_seq)?;
@@ -500,6 +504,7 @@ pub async fn send_reply(
             committed: cause.committed,
             operation_id,
             scope_id: operation_scope,
+            thread_seq: operation_thread,
             body: operation_body,
         })
 }
@@ -943,9 +948,7 @@ pub async fn delete_page(
         .await?;
         await_fold(&rpc, "pages", &empty_pages_probe(), height).await;
         // Same as `create_page`: the wait above covers this reload.
-        let mut data = load_pages_data(&rpc, None)
-            .await
-            .map_err(committed_error)?;
+        let mut data = load_pages_data(&rpc, None).await.map_err(committed_error)?;
         // DROP WHAT WAS JUST DELETED. Same acceptance-vs-application gap as
         // `create_page`, read the other way round and narrowed by the same
         // wait: this reload can still see the removed page, so it stayed in

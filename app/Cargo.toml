@@ -11,7 +11,7 @@ icon = "assets/icon.svg"
 category = "public.app-category.productivity"
 
 [build-dependencies]
-ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "c2751298c0da4f0e32c8137dc3d41f4ec9053673", version = "=0.1.0" }
+ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "2377ffa61861c36d7405ff6a86e18b1611d780f5", version = "=0.1.0" }
 
 [dependencies]
 # the network's node -> announced-provider registry, behind the Shell's host
@@ -50,9 +50,9 @@ zune-jpeg = "0.4"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 zeroize.workspace = true
 iced = { version = "=0.14.0", default-features = false, features = ["advanced", "highlighter", "image-without-codecs", "lazy", "markdown", "svg", "tokio", "wgpu", "x11"] }
-ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "c2751298c0da4f0e32c8137dc3d41f4ec9053673", default-features = false, features = ["log-timeline", "terminal"] }
-ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "c2751298c0da4f0e32c8137dc3d41f4ec9053673" }
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "c2751298c0da4f0e32c8137dc3d41f4ec9053673", version = "=0.1.0", default-features = false, features = ["full-runtime"] }
+ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "2377ffa61861c36d7405ff6a86e18b1611d780f5", default-features = false, features = ["log-timeline", "terminal"] }
+ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "2377ffa61861c36d7405ff6a86e18b1611d780f5" }
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "2377ffa61861c36d7405ff6a86e18b1611d780f5", version = "=0.1.0", default-features = false, features = ["full-runtime"] }
 
 [dev-dependencies]
 commonware-cryptography.workspace = true
@@ -64,4 +64,4 @@ iced_test = "=0.14.0"
 node.workspace = true
 simnode = { path = "../bin/simnode" }
 tempfile.workspace = true
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "c2751298c0da4f0e32c8137dc3d41f4ec9053673", version = "=0.1.0", default-features = false, features = ["test-runtime"] }
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "2377ffa61861c36d7405ff6a86e18b1611d780f5", version = "=0.1.0", default-features = false, features = ["test-runtime"] }

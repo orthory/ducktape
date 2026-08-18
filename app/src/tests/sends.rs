@@ -179,6 +179,26 @@ fn the_delivery_re_read_refuses_only_on_what_the_mount_showed() {
     // both without the mount wearing them — the STRUCTURE shows them.
     const ANSWERED_BY_THE_MOUNT: [&str; 2] = ["active_thread_seq <= 0", "empty(active_channel)"];
 
+    // Arguments split at top-level commas, so `post_gate(a, b)` stays whole.
+    fn split_top(source: &str) -> Vec<&str> {
+        let mut parts = Vec::new();
+        let mut depth = 0usize;
+        let mut start = 0usize;
+        for (index, character) in source.char_indices() {
+            match character {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    parts.push(source[start..index].trim());
+                    start = index + 1;
+                }
+                _ => {}
+            }
+        }
+        parts.push(source[start..].trim());
+        parts
+    }
+
     // A term is an `||` operand with its own balanced parens; only wrapping
     // parens come off, so `empty(active_channel)` survives whole.
     let terms = |expression: &str| -> Vec<String> {
@@ -205,11 +225,32 @@ fn the_delivery_re_read_refuses_only_on_what_the_mount_showed() {
         .filter_map(|line| line.strip_suffix(')'))
         .map(terms)
         .collect();
+    // The re-read is a VERDICT now, computed once from the same four inputs
+    // the mount's gate wears — so the lint reads its arguments rather than a
+    // hand-written `||` chain.
     let refused: Vec<Vec<String>> = HANDLERS
         .lines()
         .map(str::trim)
-        .filter_map(|line| line.strip_prefix("let refused = "))
-        .map(terms)
+        .filter_map(|line| line.strip_prefix("match submit_verdict("))
+        .filter_map(|line| line.strip_suffix(')'))
+        .map(|arguments| {
+            split_top(arguments)
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, argument)| match index {
+                    // busy, connected, channel, refusal, seated — spelled as
+                    // the terms a mount's `blocked=` would carry.
+                    0 => Some(argument.to_owned()),
+                    1 => Some(format!("!{argument}")),
+                    2 => Some(format!("empty({argument})")),
+                    3 => Some(format!("!empty({argument})")),
+                    // `seated` is the mount's own structural term, spelled
+                    // positively here and negatively on the gate.
+                    4 if argument != "true" => Some(argument.replace(" > 0", " <= 0")),
+                    _ => None,
+                })
+                .collect()
+        })
         .collect();
     assert_eq!(
         shown.len(),
@@ -276,7 +317,9 @@ fn a_resync_never_eats_the_message_being_typed() {
 }
 
 // Reconnect is the same-endpoint retry now — the picker owns endpoint
-// changes — so typed drafts survive it untouched.
+// changes — so typed drafts survive it untouched, and so does the plate
+// standing over them: both are the one instance's own state (ducktape-ui#698),
+// and the reconnect never reaches inside a composer to blank either.
 #[test]
 fn same_endpoint_reconnect_preserves_unsent_drafts() {
     let (mut app, _) = Ducktape::__boot();
@@ -284,13 +327,19 @@ fn same_endpoint_reconnect_preserves_unsent_drafts() {
     app.connected_rpc = "http://node-a".into();
     let composer = composer_scope(&mut app);
     type_into(&mut app, &composer, ComposerKind::Message, "next message");
-    app.failed_message_draft = "unsent message".into();
+    // The stash is seeded the only way anything writes it now: the `unsent`
+    // message the app's failure slices publish, addressed to this instance.
+    let _ = app.__update(Ducktape::__ice_test_message_chat_composer_unsent(
+        composer.clone(),
+        "unsent message".into(),
+        false,
+    ));
 
     let _ = app.__update(__DucktapeMessage::Reconnect);
 
     assert_eq!(app.connected_rpc, "http://node-a");
     assert_eq!(composer_text(&app, &composer), "next message");
-    assert_eq!(app.failed_message_draft, "unsent message");
+    assert_eq!(composer_stash(&app, &composer), "unsent message");
 }
 
 /// SURVIVING THE RECONNECT IS NOT THE SAME AS SURVIVING IT IN THE RIGHT ROOM.
@@ -359,11 +408,13 @@ fn a_reconnect_lands_each_composer_in_the_room_it_was_typed_in() {
 ///
 /// `reconnect`'s editor harvest predated the park and left `message_draft` —
 /// the settled stash — holding the LEFT room's text after the landing. Its one
-/// consumer, `live_resynced`'s `remember_failed_draft(…, "channel",
-/// message_draft, …)`, fires when a chat-carrying resync lands on a different
-/// room, so opening a DM after reconnecting out of a room raised the
-/// failed-draft plate offering to restore the old room's words into the DM
-/// composer. The instance owns the trip now; the stash stays empty across it.
+/// consumer was `live_resynced`'s failed-draft rescue, which fires when a
+/// chat-carrying resync lands on a different room, so opening a DM after
+/// reconnecting out of a room raised the failed-draft plate offering to
+/// restore the old room's words into the DM composer. NEITHER half of that is
+/// left: the instance owns the trip, so there is no harvest to leak, and the
+/// rescue is a slice keyed to the room being left (ducktape-ui#698), so the
+/// room she lands in is not addressable by it at all.
 #[test]
 fn a_reconnect_does_not_leak_the_left_rooms_draft_into_the_failed_plate() {
     let (mut app, _) = Ducktape::__boot();
@@ -385,7 +436,11 @@ fn a_reconnect_does_not_leak_the_left_rooms_draft_into_the_failed_plate() {
     let _ = app.__update(__DucktapeMessage::WorkspaceConnected(landed));
 
     // A chat-carrying resync lands on another room — the exact trip that used
-    // to stash the harvest into `failed_message_draft`.
+    // to stash the harvest onto the app-wide plate. The rescue it still runs
+    // is a slice addressed to `#general`, the room it is carrying her OUT of,
+    // and it carries the inline edit's text: nothing is being edited here, so
+    // there is no body for it to hand anyone.
+    let general = composer_scope(&mut app);
     let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
         app.hydration_generation,
         "dm-with-alice",
@@ -395,10 +450,20 @@ fn a_reconnect_does_not_leak_the_left_rooms_draft_into_the_failed_plate() {
     )));
 
     assert_eq!(app.active_channel, "dm-with-alice");
+    let dm = composer_scope(&mut app);
     assert!(
-        app.failed_message_draft.is_empty(),
+        composer_text(&app, &dm).is_empty() && composer_stash(&app, &dm).is_empty(),
         "the room she left keeps its own words in its own instance, and is \
-         never offered to the room she is in"
+         never offered to the room she is in — neither in its box nor on its plate"
+    );
+    assert!(
+        composer_stash(&app, &general).is_empty(),
+        "and the room the resync carried her out of was handed nothing either"
+    );
+    assert_eq!(
+        composer_text(&app, &ops),
+        "the incident started at",
+        "they are still waiting in #private-ops, where she typed them"
     );
 }
 
@@ -432,7 +497,9 @@ fn reconnect_recovers_active_drafts_for_the_same_endpoint() {
 /// clears itself the moment it emits (ducktape-ui#697), so by the time the app
 /// re-reads the gate the box is already empty: silence here would lose her
 /// words outright. The failed-send plate is where they land, one click from
-/// being back in the box.
+/// being back in the box — and the arm slices them straight back to the
+/// composer that let them go (ducktape-ui#698), so they land on THAT room's
+/// plate rather than on whichever room the reader happens to be in.
 #[test]
 fn neither_composer_sends_into_a_channel_that_refuses_the_post() {
     // The two reasons `post_gate` names, each driven through both composers.
@@ -460,21 +527,33 @@ fn neither_composer_sends_into_a_channel_that_refuses_the_post() {
         );
         assert_eq!(app.post_refusal, reason);
 
-        submit(&mut app, ComposerKind::Message, "into the void");
+        let stream = composer_scope(&mut app);
+        submit_refused(&mut app, &stream, ComposerKind::Message, "into the void");
         assert!(
             app.messages.is_empty(),
             "the main composer must refuse a {reason} channel at apply time"
         );
-        // The words are still hers — the stash holds what the box let go of.
-        assert_eq!(app.failed_message_draft, "into the void");
+        // The words are still hers — #general's own plate holds what
+        // #general's box let go of.
+        assert_eq!(composer_stash(&app, &stream), "into the void");
 
         app.active_thread_seq = 7;
-        submit(&mut app, ComposerKind::Reply, "into the void");
+        let rail = reply_composer_scope(&mut app);
+        submit_refused(&mut app, &rail, ComposerKind::Reply, "into the void");
         assert!(
             app.thread_messages.is_empty(),
             "the reply composer must refuse a {reason} channel at apply time"
         );
-        assert_eq!(app.failed_reply_draft, "into the void");
+        assert_eq!(composer_stash(&app, &rail), "into the void");
+        // AND ONLY THAT THREAD'S. The rail's refusal is sliced to the root it
+        // was written under, so it cannot reach the room's stream composer —
+        // a plate that took both would read `"into the void\ninto the void"`,
+        // which is what `remember_failed_draft` does with a second stash.
+        assert_eq!(
+            composer_stash(&app, &stream),
+            "into the void",
+            "the stream plate holds only what the stream itself refused"
+        );
     }
 
     // AND THE GATE IS NOT A BLANKET REFUSAL: seated in the same members-only
@@ -718,26 +797,35 @@ fn an_inert_key_press_leaves_the_handler_before_it_rebuilds_an_editor() {
 /// the box. The composer cleared itself when it emitted (ducktape-ui#697), so
 /// the app cannot refill it — and refilling it would be wrong anyway: the
 /// failure can arrive while she is in another room, typing something else.
-/// The stash is the offer, and Restore is her taking it.
+/// The stash is the offer, and Restore is her taking it. The offer is a slice
+/// addressed to the room `cause.scope_id` names (ducktape-ui#698), so the
+/// handler's task has to be pumped for the composer to hear it.
 #[test]
 fn failed_optimistic_send_rolls_back_and_stashes_the_draft() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
     app.active_channel = "general".into();
-    submit(&mut app, ComposerKind::Message, "retry me");
+    // THROUGH THE INSTANCE, which is the real path and the reason the stash
+    // can reach it: a composer that has never been typed into holds no state
+    // yet, and a slice delivers to instances that do.
+    let composer = composer_scope(&mut app);
+    type_into(&mut app, &composer, ComposerKind::Message, "retry me");
+    submit_composer(&mut app, &composer, ComposerKind::Message, false);
     let operation_id = app.messages[0].id.clone();
-    let _ = app.__update(__DucktapeMessage::MessageSendFailed(
+    let task = app.__update(__DucktapeMessage::MessageSendFailed(
         backend::OptimisticMutationError {
             message: "rejected".into(),
             committed: false,
             operation_id,
             scope_id: "general".into(),
+            thread_seq: 0,
             body: "retry me".into(),
         },
     ));
+    pump(&mut app, task);
 
-    assert_eq!(app.failed_message_draft, "retry me");
+    assert_eq!(composer_stash(&app, &composer), "retry me");
     assert!(app.messages.is_empty());
     assert_eq!(app.error, "rejected");
     assert_eq!(app.mutation_phase, MutationPhase::Idle);
@@ -753,52 +841,48 @@ fn failed_send_preserves_the_next_and_unsent_drafts() {
     let operation_id = app.messages[0].id.clone();
     let composer = composer_scope(&mut app);
     type_into(&mut app, &composer, ComposerKind::Message, "second");
-    let _ = app.__update(__DucktapeMessage::MessageSendFailed(
+    let task = app.__update(__DucktapeMessage::MessageSendFailed(
         backend::OptimisticMutationError {
             message: "rejected".into(),
             committed: false,
             operation_id,
             scope_id: "general".into(),
+            thread_seq: 0,
             body: "first".into(),
         },
     ));
+    pump(&mut app, task);
 
     assert_eq!(
         composer_text(&app, &composer),
         "second",
         "the words she is writing now are untouched"
     );
-    assert_eq!(app.failed_message_draft, "first");
+    assert_eq!(composer_stash(&app, &composer), "first");
 
     // AND RESTORE REFUSES OVER A NON-EMPTY BOX — the instance's own guard,
-    // which is why the plate's Restore is disabled while she is typing.
-    let restore = |app: &mut Ducktape, scope: &str| {
-        let message = Ducktape::__ice_test_message_chat_composer_restore(
-            scope.to_owned(),
-            app.failed_message_draft.clone(),
-            false,
-            ComposerKind::Message,
-        );
-        let task = app.__update(message);
-        pump(app, task);
-    };
-    restore(&mut app, &composer);
+    // which is why the plate's Restore is disabled while she is typing. The
+    // stash is not passed in any more: the instance restores from the words it
+    // is already holding, so there is no route by which another room's plate
+    // could be armed to post here.
+    restore_composer(&mut app, &composer, false);
     assert_eq!(
         composer_text(&app, &composer),
         "second",
         "restoring over a draft in progress would overwrite it"
     );
     assert_eq!(
-        app.failed_message_draft, "first",
+        composer_stash(&app, &composer),
+        "first",
         "so the stash still holds"
     );
 
     seed_composer(&mut app, &composer, ComposerKind::Message, "");
-    restore(&mut app, &composer);
+    restore_composer(&mut app, &composer, false);
     assert_eq!(composer_text(&app, &composer), "first");
     assert!(
-        app.failed_message_draft.is_empty(),
-        "and the app clears the stash once the instance says the words are back"
+        composer_stash(&app, &composer).is_empty(),
+        "and the instance clears its own plate the moment the words are back"
     );
 }
 
@@ -807,15 +891,31 @@ fn failed_send_preserves_the_next_and_unsent_drafts() {
 /// The whole handler used to return on the room check, so a send refused while
 /// she was reading another channel left no error, no unsent stash, and no row —
 /// and the last thing she saw was the message sitting in the timeline. The room
-/// check now scopes the timeline surgery only: the stash and the banner are
-/// written above it, and the composer she is typing in NOW is not touched.
+/// check now scopes the timeline surgery only: the banner is written above it,
+/// and the stash rides a slice to the room `cause.scope_id` names.
+///
+/// WHICH IS THE HALF THIS TEST GREW. One app-wide stash meant the plate went up
+/// wherever she was standing, so #general's refused deploy note raised "An
+/// earlier message wasn't sent" over #random — and its Restore was armed to
+/// drop those words into #random's box, one click from posting them in the
+/// wrong room. The words go home to #general's own instance now
+/// (ducktape-ui#698), and #random's composer never hears about it.
 #[test]
 fn a_send_that_fails_after_she_moved_rooms_still_reaches_her() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
     app.active_channel = "general".into();
-    submit(&mut app, ComposerKind::Message, "the deploy is at 4pm");
+    // Through #general's own box, so the room she leaves has an instance to
+    // hand the words back to.
+    let general = composer_scope(&mut app);
+    type_into(
+        &mut app,
+        &general,
+        ComposerKind::Message,
+        "the deploy is at 4pm",
+    );
+    submit_composer(&mut app, &general, ComposerKind::Message, false);
     let operation_id = app.messages[0].id.clone();
 
     // She switches rooms while the write is in flight, and starts a new message
@@ -829,53 +929,71 @@ fn a_send_that_fails_after_she_moved_rooms_still_reaches_her() {
         "different thought",
     );
 
-    let _ = app.__update(__DucktapeMessage::MessageSendFailed(
+    let task = app.__update(__DucktapeMessage::MessageSendFailed(
         backend::OptimisticMutationError {
             message: "rejected".into(),
             committed: false,
             operation_id,
             scope_id: "general".into(),
+            thread_seq: 0,
             body: "the deploy is at 4pm".into(),
         },
     ));
+    pump(&mut app, task);
 
     assert_eq!(app.error, "rejected", "the refusal must be said out loud");
     assert_eq!(
-        app.failed_message_draft, "the deploy is at 4pm",
-        "and the body she typed must be recoverable, not gone"
+        composer_stash(&app, &general),
+        "the deploy is at 4pm",
+        "and the body she typed must be recoverable in the room it was for"
+    );
+    assert!(
+        composer_stash(&app, &random).is_empty(),
+        "#random raises no plate about #general's send — the offer would have \
+         armed those words to post in a room she never wrote them for"
     );
     assert_eq!(
         composer_text(&app, &random),
         "different thought",
-        "the composer belongs to the room she is in now — a restore here would \
-         overwrite the message she is writing"
+        "and the box she is typing in is untouched either way"
     );
 
     // THE SAME HOLE ON THE REPLY PATH, and wider: `close_thread` empties
     // `thread_messages`, so merely closing the rail under an in-flight reply
-    // made the pending check fail and dropped the failure whole.
+    // made the pending check fail and dropped the failure whole. `thread_seq`
+    // is what carries the reply home once the rail has moved on: the room
+    // alone cannot name which of its threads let the words go.
     let (mut rail, _) = Ducktape::__boot();
     rail.connected = true;
     rail.loading = false;
     rail.active_channel = "general".into();
     rail.active_thread_seq = 7;
-    submit(&mut rail, ComposerKind::Reply, "on it");
+    // Through the rail's own box, for the reason #general's half is: a sighted
+    // instance holds no state until a message reaches it, and a slice delivers
+    // only to instances that do.
+    let rail_composer = reply_composer_scope(&mut rail);
+    type_into(&mut rail, &rail_composer, ComposerKind::Reply, "on it");
+    submit_composer(&mut rail, &rail_composer, ComposerKind::Reply, false);
     let reply_id = rail.thread_messages[0].id.clone();
     let _ = rail.__update(__DucktapeMessage::CloseThread);
-    let _ = rail.__update(__DucktapeMessage::ThreadReplySendFailed(
+    let task = rail.__update(__DucktapeMessage::ThreadReplySendFailed(
         backend::OptimisticMutationError {
             message: "reply rejected".into(),
             committed: false,
             operation_id: reply_id,
             scope_id: "general".into(),
+            thread_seq: 7,
             body: "on it".into(),
         },
     ));
+    pump(&mut rail, task);
 
     assert_eq!(rail.error, "reply rejected");
     assert_eq!(
-        rail.failed_reply_draft, "on it",
-        "a closed rail is not a reason to throw the reply away"
+        composer_stash(&rail, &rail_composer),
+        "on it",
+        "a closed rail is not a reason to throw the reply away — it is waiting \
+         in thread 7, which is the only place it can be posted from"
     );
 }
 
@@ -935,18 +1053,29 @@ fn committed_mutation_keeps_optimistic_state_until_refresh() {
     app.active_channel = "general".into();
     submit(&mut app, ComposerKind::Message, "committed once");
     let operation_id = app.messages[0].id.clone();
+    let composer = composer_scope(&mut app);
     let _ = app.__update(__DucktapeMessage::MessageSendFailed(
         backend::OptimisticMutationError {
             message: "read failed after commit".into(),
             committed: true,
             operation_id,
             scope_id: "general".into(),
+            thread_seq: 0,
             body: "committed once".into(),
         },
     ));
 
+    // The offer the handler slices out, delivered by hand — the committed arm
+    // goes on to launch the recovery resync, so pumping the whole task would
+    // put a real request on a node this test does not have. A committed body
+    // is not unsent, and the INSTANCE is what says so: `unsent` refuses it.
+    let _ = app.__update(Ducktape::__ice_test_message_chat_composer_unsent(
+        composer.clone(),
+        "committed once".into(),
+        true,
+    ));
     assert!(
-        app.failed_message_draft.is_empty(),
+        composer_stash(&app, &composer).is_empty(),
         "a COMMITTED body is not unsent — the plate must not offer it back"
     );
     assert_eq!(app.messages.len(), 1);

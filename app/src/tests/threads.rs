@@ -312,11 +312,11 @@ fn opening_another_thread_invalidates_the_pending_thread() {
 ///
 /// Each rail owns a retained `ChatComposer` instance now (ducktape-ui#697),
 /// keyed by room AND root, so there is no shared buffer left for a rail open to
-/// blank: the words stay in the one composer they can be posted from. The key is
-/// NOT `failed_reply_draft`, which is only channel-scoped — that plate would
-/// have offered thread A's words over every later thread of the room, and its
-/// Restore would have armed them to post in B, the same cross-context
-/// re-targeting the stream composer's own key exists to end.
+/// blank: the words stay in the one composer they can be posted from. The PLATE
+/// is keyed the same way (ducktape-ui#698); it used to be one channel-scoped
+/// app field, which offered thread A's words over every later thread of the
+/// room and armed its Restore to post them in B — the same cross-context
+/// re-targeting the composer's own key exists to end.
 ///
 /// `close_thread` USED to be the one route that discarded; it no longer is, and
 /// the last arm pins that. Closing hides the rail, and an accidental Escape
@@ -349,9 +349,9 @@ fn opening_another_thread_leaves_the_reply_in_the_thread_it_belongs_to() {
         "a rail that just opened has an untouched composer"
     );
     assert!(
-        app.failed_reply_draft.is_empty(),
-        "and NOT through the channel-scoped plate, which would offer thread 1's \
-         words to every other thread in #general"
+        composer_stash(&app, &thread_two).is_empty(),
+        "and no plate over it either — a channel-scoped stash would have \
+         offered thread 1's words to every other thread in #general"
     );
 
     // Back to the thread they belong to, and they are waiting there — the same
@@ -825,17 +825,21 @@ fn failed_thread_reply_rolls_back_only_itself_and_preserves_the_newer_draft() {
     let second_id = app.thread_messages[1].id.clone();
     type_into(&mut app, &rail, ComposerKind::Reply, "newer draft");
 
-    let _ = app.__update(__DucktapeMessage::ThreadReplySendFailed(
+    let task = app.__update(__DucktapeMessage::ThreadReplySendFailed(
         backend::OptimisticMutationError {
             message: "rejected".into(),
             committed: false,
             operation_id: first_id,
             scope_id: "general".into(),
+            thread_seq: 1,
             body: "first".into(),
         },
     ));
+    // The stash rides a slice keyed to `(room, thread)`, so the words only
+    // reach this rail's own plate once the publication is delivered.
+    pump(&mut app, task);
     assert_eq!(composer_text(&app, &rail), "newer draft");
-    assert_eq!(app.failed_reply_draft, "first");
+    assert_eq!(composer_stash(&app, &rail), "first");
     assert_eq!(app.thread_messages.len(), 1);
     assert_eq!(app.thread_messages[0].id, second_id);
     assert!(app.thread_messages[0].pending);
@@ -845,32 +849,21 @@ fn failed_thread_reply_rolls_back_only_itself_and_preserves_the_newer_draft() {
     // RESTORE REFUSES OVER A LIVE DRAFT, and the guard is the instance's own
     // (`restore` returns on a non-empty body) — the words she is typing now are
     // never overwritten by a banner about an older send.
-    let stashed = app.failed_reply_draft.clone();
-    let __restore = app.__update(Ducktape::__ice_test_message_chat_composer_restore(
-        rail.clone(),
-        stashed.clone(),
-        false,
-        ComposerKind::Reply,
-    ));
-    pump(&mut app, __restore);
+    restore_composer(&mut app, &rail, false);
     assert_eq!(composer_text(&app, &rail), "newer draft");
     assert_eq!(
-        app.failed_reply_draft, "first",
+        composer_stash(&app, &rail),
+        "first",
         "a refused restore leaves the plate armed"
     );
 
-    // Empty the box and it hands them back. The instance writes the words; the
-    // `composer_restored` message it emits only clears the plate.
+    // Empty the box and it hands them back. One instance does the whole move:
+    // it writes the words it was holding and clears its own plate, so nothing
+    // outside it can hand the stash to a composer it was never written in.
     seed_composer(&mut app, &rail, ComposerKind::Reply, "");
-    let __restore = app.__update(Ducktape::__ice_test_message_chat_composer_restore(
-        rail.clone(),
-        stashed,
-        false,
-        ComposerKind::Reply,
-    ));
-    pump(&mut app, __restore);
+    restore_composer(&mut app, &rail, false);
     assert_eq!(composer_text(&app, &rail), "first");
-    assert!(app.failed_reply_draft.is_empty());
+    assert!(composer_stash(&app, &rail).is_empty());
 }
 
 #[test]
@@ -881,6 +874,7 @@ fn committed_thread_reply_refreshes_without_blocking_the_composer() {
     app.connected_rpc = "http://node".into();
     app.active_channel = "general".into();
     app.active_thread_seq = 1;
+    let rail = reply_composer_scope(&mut app);
     submit(&mut app, ComposerKind::Reply, "committed");
     let operation_id = app.thread_messages[0].id.clone();
     let _ = app.__update(__DucktapeMessage::ThreadReplySendFailed(
@@ -889,13 +883,23 @@ fn committed_thread_reply_refreshes_without_blocking_the_composer() {
             committed: true,
             operation_id,
             scope_id: "general".into(),
+            thread_seq: 1,
             body: "committed".into(),
         },
     ));
     assert_eq!(app.thread_messages.len(), 1);
     assert!(app.thread_messages[0].pending);
+    // The offer the handler slices out, delivered by hand — the committed arm
+    // goes on to launch the recovery resync, so pumping the whole task would
+    // put a real request on a node this test does not have. The rail's own
+    // `unsent` is what refuses a committed body.
+    let _ = app.__update(Ducktape::__ice_test_message_chat_composer_unsent(
+        rail.clone(),
+        "committed".into(),
+        true,
+    ));
     assert!(
-        app.failed_reply_draft.is_empty(),
+        composer_stash(&app, &rail).is_empty(),
         "a committed body is on the node, so no banner offers it back"
     );
     assert_eq!(app.mutation_phase, MutationPhase::Idle);

@@ -204,7 +204,6 @@ view
               selected_message_seq
               selected_message_rev
               message_action
-              failed_message_draft
               channel_settings_open
               active_thread_seq
               thread_target_seq
@@ -216,7 +215,6 @@ view
               thread_has_more
               thread_next_reply_seq
               thread_loading
-              failed_reply_draft
             events
               search_chat_submit -> search_chat_submit
               clear_chat_search -> clear_chat_search
@@ -245,8 +243,6 @@ view
               edit_message_submit -> edit_message_submit
               delete_message_submit -> delete_message_submit
               composer_submitted -> composer_submitted _ _ _
-              composer_restored -> composer_restored _
-              composer_dismissed -> composer_dismissed _
               rename_channel_submit -> rename_channel_submit
               archive_channel_submit -> archive_channel_submit
               unarchive_channel_submit -> unarchive_channel_submit

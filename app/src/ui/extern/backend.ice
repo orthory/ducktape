@@ -90,7 +90,7 @@ extern crate::backend
   pure agent_event_busy(event:AgentChatEvent) -> bool
   pure agent_event_entries(entries:[AgentChatEntry], event:AgentChatEvent, provider:str) -> [AgentChatEntry]
   stream agent_chat_turn(rpc:str, provider:str, credential:str, host_node:str, entries:[AgentChatEntry]) -> AgentChatEvent
-  OptimisticMutationError(message:str, committed:bool, operation_id:str, scope_id:str, body:str)
+  OptimisticMutationError(message:str, committed:bool, operation_id:str, scope_id:str, thread_seq:i64, body:str)
   HydrationError(generation:i64, message:str)
   box-style raised_style()
   svg-style icon_tint(tone:str)
@@ -344,6 +344,7 @@ extern crate::backend
   // a channel id is a user-chosen string, so two networks' `#general` are two
   // rooms — the park store this replaced had to be emptied by hand on every
   // network switch to keep one from handing its words to the other.
+  pure submit_verdict(busy:bool, connected:bool, channel:str, refusal:str, seated:bool) -> SubmitVerdict
   pure composer_op_prefix(kind:ComposerKind) -> str
   pure composer_scope(endpoint:str, channel_id:str) -> str
   pure thread_scope(endpoint:str, channel_id:str, thread_seq:i64) -> str

@@ -139,9 +139,16 @@ fn materialize_composers(app: &mut Ducktape) {
 /// promise — so a scope lookup has to say which room it means, exactly as the
 /// mount does.
 fn composer_scope_named(app: &Ducktape, mount: &str, key: &str) -> Option<String> {
+    // THIS APP'S OWN WINDOW, and no other's. The sighting side-channel a
+    // freshly rendered instance is found through is a THREAD-local, so a
+    // sibling test that rendered the same room on the same test thread has a
+    // scope with the same mount and the same key — differing only in the
+    // window the render was for. Reading that one back finds no state and the
+    // assertion fails in a full run while passing alone.
+    let window = format!("/{:?}/", app.console_win?);
     app.__ice_test_scopes_chat_composer()
         .into_iter()
-        .find(|scope| scope.contains(mount) && scope.contains(key))
+        .find(|scope| scope.contains(&window) && scope.contains(mount) && scope.contains(key))
 }
 
 /// The stream composer of the room the app is in, materializing it if needed.
@@ -268,11 +275,53 @@ fn submit(app: &mut Ducktape, kind: ComposerKind, body: &str) -> String {
     id
 }
 
+/// THE SUBMIT THE GATE TURNS BACK. A refusal is not a discard: the refusing
+/// arm hands the body to that room's own composer with a slice, and a slice is
+/// a published message — so this one pumps, where `submit` above deliberately
+/// does not. Only the refused arm is safe to pump: the admitted arm's task IS
+/// the send request, and running it here would answer with the failure a unit
+/// test's absent node returns.
+fn submit_refused(app: &mut Ducktape, scope: &str, kind: ComposerKind, body: &str) {
+    // The instance has to EXIST for the refusal to reach it — a composer that
+    // has never been typed into holds no state yet, and a slice delivers to
+    // instances that do. Typing and clearing is what a real submit did.
+    seed_composer(app, scope, kind, body);
+    seed_composer(app, scope, kind, "");
+    let id = backend::fresh_operation_id(backend::composer_op_prefix(kind));
+    let task = app.__update(__DucktapeMessage::ComposerSubmitted(
+        kind,
+        body.to_owned(),
+        id,
+    ));
+    pump(app, task);
+}
+
 /// One composer instance's draft, as the reader sees it.
 fn composer_text(app: &Ducktape, scope: &str) -> String {
     app.__ice_test_state_chat_composer(scope)
         .map(|state| state.body.trim().to_owned())
         .unwrap_or_default()
+}
+
+/// THE WORDS ONE COMPOSER INSTANCE'S PLATE IS HOLDING. The failed-send stash
+/// used to be two app fields, so the plate a refused send raised followed the
+/// reader into whatever room she moved to; it is the instance's own state now
+/// (ducktape-ui#698), which is why reading it takes a scope.
+fn composer_stash(app: &Ducktape, scope: &str) -> String {
+    app.__ice_test_state_chat_composer(scope)
+        .map(|state| state.failed)
+        .unwrap_or_default()
+}
+
+/// Clicks one composer instance's Restore, the way the plate's button does.
+/// The instance writes its own body and clears its own stash under its own
+/// guards, so `blocked` is the verdict the frame drew, nothing more.
+fn restore_composer(app: &mut Ducktape, scope: &str, blocked: bool) {
+    let task = app.__update(Ducktape::__ice_test_message_chat_composer_restore(
+        scope.to_owned(),
+        blocked,
+    ));
+    pump(app, task);
 }
 
 fn compose(text: &str) -> iced::widget::text_editor::Content {
