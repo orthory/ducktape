@@ -1770,13 +1770,17 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                             active bg=fg/9 text=fg border=fg/11 border-w=1.0 r=7.0
                             hovered bg=fg/14
                             pressed bg=fg/18
-                          button "×" -> emit(dismiss_failed_reply)
+                          button -> emit(dismiss_failed_reply)
                             with
                               label="Dismiss unsent reply"
                               w=26.0
                               h=26.0
                               p=4.0
                               @ghost_action
+                            text "×"
+                              with
+                                size=12.5
+                                font=ui
                             active bg=transparent text=muted r=7.0
                             hovered bg=fg/10 text=fg
                             pressed bg=fg/15

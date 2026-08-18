@@ -101,6 +101,41 @@ without anyone having to *feel* it.
   Mac. They attribute cost; they do not predict absolute Mac frame times.
   The user-felt verdict on the Mac remains the final gate.
 
+## What the measurement actually found (2026-08-18)
+
+The lane worked, and it overturned the first hypothesis — recorded here
+because the wrong turn is the useful part.
+
+Attribution: a channel switch spends its half-second in Layout, laying out
+~46 fresh chat rows (28, then 18 more after the virtual window re-aims).
+Each fresh row cost ~12.6ms, and elimination on `MessageCard` put ~95% of
+that in the hover toolbar. The toolbar's SVG icon was innocent; swapping the
+three emoji labels for ASCII took a row to 3.3ms, and removing the toolbar
+entirely took the switch's first layout pass from 350ms to 23ms.
+
+Root cause, one level down: cosmic-text's font-fallback fast path only
+considers faces whose weight matches the request EXACTLY
+(`font_weight_diff == 0`). A button's string label is generated at semibold,
+and every face this app bundles registers at weight 400 — so each non-ASCII
+glyph in the bar (three emoji, `♡`, `⋯`) missed every candidate and fell
+into the walk-every-face path. In-app timings, same process, same fonts:
+
+| requested weight | one emoji paragraph | `♡` |
+|---|---|---|
+| 400 regular | 26us | 16us |
+| 500 medium | 1,648us | 1,239us |
+| 600 semibold | 2,963us | 1,288us |
+
+Bundling an emoji font (this branch's first commit) fixed RENDERING — the
+glyphs were tofu boxes on this box — but not the cost, because at semibold
+the fast path could not see the new face either. The shipped fix asks for
+the regular face on those five labels; a rig patch that instead relaxed
+cosmic-text's weight filter reproduced the same win, which is what confirms
+the mechanism rather than a coincidence.
+
+Result on the rig, switch layout: **~570ms → ~35ms**, rows over 1ms per
+switch 224 → 48.
+
 ## Testing / success criteria
 
 1. An attribution table exists for all four scenarios (stage × p50/p95/max,

@@ -13,10 +13,16 @@ pub mod fonts {
     /// the data face — hashes, seqs, diffs, code, the log ring.
     pub const FAMILY_MONO: &str = "Geist Mono";
     /// the embedded files, relative to this crate's root — what `app.ice`
-    /// points its `font` settings at.
-    pub const ASSETS: [&str; 2] = [
+    /// points its `font` settings at. The emoji face is not a type role:
+    /// it exists so cosmic-text's emoji fallback RESOLVES in-process — an
+    /// unresolved emoji re-scans the whole font database on every fresh
+    /// paragraph (~3.7ms per emoji, uncached), and the chat row toolbar
+    /// carries three of them, which turned every freshly mounted row into
+    /// ~11ms of layout and a channel switch into a half-second freeze.
+    pub const ASSETS: [&str; 3] = [
         "assets/fonts/Geist[wght].ttf",
         "assets/fonts/GeistMono[wght].ttf",
+        "assets/fonts/NotoColorEmoji.ttf",
     ];
 }
 

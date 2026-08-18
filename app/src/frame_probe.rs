@@ -764,6 +764,9 @@ fn headless_renderer() -> iced::Renderer {
         fonts.load_font(Cow::Borrowed(include_bytes!(
             "../../crates/design/assets/fonts/GeistMono[wght].ttf"
         )));
+        fonts.load_font(Cow::Borrowed(include_bytes!(
+            "../../crates/design/assets/fonts/NotoColorEmoji.ttf"
+        )));
     });
     tokio::runtime::Builder::new_current_thread()
         .build()

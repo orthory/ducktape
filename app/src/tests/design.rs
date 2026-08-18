@@ -1586,3 +1586,48 @@ fn no_view_expression_hands_an_extern_a_list() {
         );
     }
 }
+
+/// AN ICON GLYPH IS NEVER A BUTTON STRING LABEL.
+///
+/// A string label is generated at semibold, and cosmic-text's fallback fast
+/// path only considers faces whose weight matches the request exactly. Every
+/// face this app bundles registers at 400, so a glyph asked for at 600 misses
+/// all of them and walks the whole font database instead — the rig measured
+/// ~2.4ms per label per fresh layout against ~25us on the fast path, which is
+/// the whole half-second channel-switch freeze once a row carries five of
+/// them. The glyph goes in its own `text … font=ui` child instead.
+///
+/// Scoped to labels that are ONLY symbols: prose labels (`← Threads`,
+/// `Loading older messages…`) are chrome mounted once, where the semibold the
+/// design asks for is worth its one-time price and dropping to regular would
+/// change how the label reads.
+#[test]
+fn no_button_wears_an_icon_glyph_as_its_string_label() {
+    let mut offenders = Vec::new();
+    for (path, source) in super::ice_sources() {
+        for (number, line) in source.lines().enumerate() {
+            let Some(rest) = line.trim_start().strip_prefix("button \"") else {
+                continue;
+            };
+            let Some((label, _)) = rest.split_once('"') else {
+                continue;
+            };
+            let is_icon_glyph = !label.is_ascii()
+                && !label
+                    .chars()
+                    .any(|glyph| glyph.is_ascii_alphanumeric() || glyph.is_alphabetic());
+            if is_icon_glyph {
+                offenders.push(format!("{path}:{}: button \"{label}\"", number + 1));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "a button wears an icon glyph as its string label, which the generator \
+         renders at semibold — every bundled face is weight 400, so the glyph \
+         misses cosmic-text's exact-weight fallback path and walks the font \
+         database on every fresh layout. Give the button a `text \"…\" with \
+         font=ui` child instead:\n{}",
+        offenders.join("\n")
+    );
+}

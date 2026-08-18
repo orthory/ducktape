@@ -759,8 +759,18 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
                 shadow=shadow_popover
                 shadow-y=3.0
                 shadow-blur=12.0
+              // EVERY GLYPH LABEL IN THIS BAR IS ITS OWN REGULAR-WEIGHT
+              // `text`, NOT A BUTTON STRING LABEL. A string label is
+              // generated at semibold, and cosmic-text's fallback fast path
+              // only considers faces whose weight matches the request
+              // exactly. Every face this app bundles registers at 400, so a
+              // non-ASCII glyph asked for at 600 misses all of them and walks
+              // the whole font database instead — ~2.4ms per label, per row,
+              // per fresh layout, while the regular face costs ~25us. Five
+              // such labels on a row that a channel switch mounts 46 times is
+              // the half-second freeze: rig-measured 570ms -> 35ms.
               row gap=1.0 align=center
-                button "👍" -> emit(add_reaction_at, message.seq, "👍")
+                button -> emit(add_reaction_at, message.seq, "👍")
                   with
                     label="React with 👍"
                     disabled=disabled
@@ -768,10 +778,14 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
                     h=25.0
                     p=4.0
                     @ghost_action
+                  text "👍"
+                    with
+                      size=12.5
+                      font=ui
                   active bg=transparent text=muted r=6.0
                   hovered bg=elevated text=fg
                   pressed bg=subtle text=fg
-                button "✅" -> emit(add_reaction_at, message.seq, "✅")
+                button -> emit(add_reaction_at, message.seq, "✅")
                   with
                     label="React with ✅"
                     disabled=disabled
@@ -779,10 +793,14 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
                     h=25.0
                     p=4.0
                     @ghost_action
+                  text "✅"
+                    with
+                      size=12.5
+                      font=ui
                   active bg=transparent text=muted r=6.0
                   hovered bg=elevated text=fg
                   pressed bg=subtle text=fg
-                button "👀" -> emit(add_reaction_at, message.seq, "👀")
+                button -> emit(add_reaction_at, message.seq, "👀")
                   with
                     label="React with 👀"
                     disabled=disabled
@@ -790,6 +808,10 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
                     h=25.0
                     p=4.0
                     @ghost_action
+                  text "👀"
+                    with
+                      size=12.5
+                      font=ui
                   active bg=transparent text=muted r=6.0
                   hovered bg=elevated text=fg
                   pressed bg=subtle text=fg
@@ -799,7 +821,7 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
                     h=16.0
                     bg=subtle
                   space w=1.0 h=1.0
-                button "♡" -> emit(open_message_reactions, message.seq, message.body, message.rev)
+                button -> emit(open_message_reactions, message.seq, message.body, message.rev)
                   with
                     label="Manage reactions"
                     disabled=disabled
@@ -807,6 +829,10 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
                     h=25.0
                     p=4.0
                     @ghost_action
+                  text "♡"
+                    with
+                      size=12.5
+                      font=ui
                   active bg=transparent text=muted r=6.0
                   hovered bg=elevated text=fg
                   pressed bg=subtle text=fg
@@ -827,7 +853,7 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
                   active bg=transparent text=muted r=6.0
                   hovered bg=elevated text=fg
                   pressed bg=subtle text=fg
-                button "⋯" -> emit(open_message_actions, message.seq, message.body, message.rev)
+                button -> emit(open_message_actions, message.seq, message.body, message.rev)
                   with
                     label="More message actions"
                     disabled=disabled
@@ -835,6 +861,10 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
                     h=25.0
                     p=4.0
                     @ghost_action
+                  text "⋯"
+                    with
+                      size=12.5
+                      font=ui
                   active bg=transparent text=muted r=6.0
                   hovered bg=elevated text=fg
                   pressed bg=subtle text=fg
@@ -950,7 +980,7 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, 
                 shadow-y=3.0
                 shadow-blur=12.0
               row gap=1.0 align=center
-                button "♡" -> emit(open_thread_message_reactions, message.seq, message.body, message.rev)
+                button -> emit(open_thread_message_reactions, message.seq, message.body, message.rev)
                   with
                     label="Manage reactions"
                     disabled=disabled
@@ -958,10 +988,14 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, 
                     h=25.0
                     p=4.0
                     @ghost_action
+                  text "♡"
+                    with
+                      size=12.5
+                      font=ui
                   active bg=transparent text=muted r=6.0
                   hovered bg=elevated text=fg
                   pressed bg=subtle text=fg
-                button "⋯" -> emit(open_thread_message_actions, message.seq, message.body, message.rev)
+                button -> emit(open_thread_message_actions, message.seq, message.body, message.rev)
                   with
                     label="More message actions"
                     disabled=disabled
@@ -969,6 +1003,10 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, 
                     h=25.0
                     p=4.0
                     @ghost_action
+                  text "⋯"
+                    with
+                      size=12.5
+                      font=ui
                   active bg=transparent text=muted r=6.0
                   hovered bg=elevated text=fg
                   pressed bg=subtle text=fg
