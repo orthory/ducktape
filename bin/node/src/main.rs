@@ -79,6 +79,7 @@ mod lobby;
 #[cfg(test)]
 mod main_tests;
 mod mcp;
+mod mesh_book;
 mod mesh_window;
 mod overlay_book;
 mod plane_metrics;

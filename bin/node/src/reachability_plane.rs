@@ -429,6 +429,21 @@ where
                                 "mesh state NOT persisted"
                             )
                         }
+                        reachability::ReachabilityEvent::ControlEndpointObserved {
+                            peer,
+                            control_endpoint,
+                        } => {
+                            // the mesh address book + oracle overwrite are wired
+                            // by the lookup-swap seam below in this file; this
+                            // arm is completed there.
+                            tracing::debug!(
+                                target: "ducktape::reachability",
+                                node = %pump_label,
+                                peer = %hex_bytes(&peer.0[..4]),
+                                endpoint = %control_endpoint,
+                                "control endpoint observed"
+                            )
+                        }
                     }
                 }
                 if let Some(handback) = tx_handback {
