@@ -45,7 +45,16 @@ keep_str(next.chat_loaded, next.active_channel, active_channel))"
         )));
     }
     assert!(refresh.contains("selected_message_seq = refreshed_required_message_seq("));
-    assert!(refresh.contains("failed_message_draft = remember_failed_draft("));
+    // The evicted inline edit is rescued to the composer of the room it was
+    // in, not to an app-wide plate (ducktape-ui#698). The DESTINATION is the
+    // half worth pinning: `active_channel` still names the room being LEFT
+    // here — its own assignment is further down the handler — so the rescue
+    // cannot surface over the room the resync is carrying her to.
+    assert!(refresh.contains(
+        "slice ChatComposer.unsent(keep_str(message_action == MessageAction.editing, \
+message_edit_draft, \"\"), selected_message_seq > 0 || message_action != \
+MessageAction.editing) at composer_scope(connected_rpc, active_channel)"
+    ));
     assert!(lifecycle.contains("run live_events(connected_rpc) when connected"));
     assert_no_polling(&lifecycle);
     assert!(lifecycle.contains("run replace lane=live_resync live_resync_load(connected_rpc"));

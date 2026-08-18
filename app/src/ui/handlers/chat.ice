@@ -409,60 +409,63 @@ on join_huddle_submit
 on composer_submitted(kind, pending_body, pending_id)
   match kind
     ComposerKind.message
-      // THE GATE, RE-READ AT DELIVERY. The instance refused with the verdict its
-      // frame drew (`blocked` rode the route); this is the fresh verdict — and on
-      // a frame-stale admit the text goes to the banner stash instead of the
-      // timeline. It cannot go back to the box: the composer cleared itself
-      // before emitting, so silence here would LOSE the words.
-      let refused = loading || !connected || empty(active_channel) || !empty(post_refusal)
-      failed_message_draft = remember_failed_draft(failed_message_draft, keep_str(refused, "stash", ""), pending_body, false)
-      return if refused
-      hydration_generation = hydration_generation + 1
-      hydration_retry_attempt = 0
-      // The mint does not re-mark the runs — the rail mints through the same call
-      // and its `[root] ++ replies` vec must keep the first reply's header. This
-      // vec is a plain run, so it re-marks here: the pending row groups under the
-      // reader's previous message instead of drawing a header that vanishes the
-      // moment the settle delta replaces it.
-      messages = mark_author_runs(optimistic_message(messages, pending_body, pending_id))
-      messages_revision = messages_revision + 1
-      let selection = message_selection_after_window(messages, selected_message_seq, selected_message_rev, message_action, message_edit_draft)
-      selected_message_seq = selection.seq
-      selected_message_rev = selection.rev
-      message_action = selection.action
-      message_edit_draft = selection.draft
-      has_older_history = history_has_older(messages)
-      unread_marker_seq = first_unread_seq(messages, unread_boundary)
-      error = ""
-      // Sending is a jump to now: the minted row lands at the tail, and a reader
-      // who had scrolled up would otherwise get her own send below the fold —
-      // an optimistic insert she cannot see is no confirmation at all.
-      //
-      // `snap … 0.0`, NOT `snap-end`: the stream is `anchor-y=end`, where the
-      // offset counts FROM the tail — relative 0.0 IS the tail. `snap-end` is
-      // relative 1.0, which an end anchor translates to the TOP of history; it
-      // shipped once and every send hurled the reader to the oldest loaded row.
-      parallel
-        run every send_message(connected_rpc, password, active_channel, pending_id, pending_body, channel_members) -> message_sent _ | message_send_failed _
-        task widget snap #workspace-tabs/content/chat/message-stream 0.0 0.0 window=window_target(console_win)
+      // THE GATE, RE-READ AT DELIVERY. The instance refused with the verdict
+      // its frame drew (`blocked` rode the route); this is the fresh one, and
+      // the two answers do DIFFERENT WORK — so it is a discriminant with an
+      // arm each, not a bool read twice. A refused body cannot go back into
+      // the box by itself (the composer cleared itself before emitting), so
+      // the refusing arm hands it to that room's own plate (ducktape-ui#698).
+      match submit_verdict(loading, connected, active_channel, post_refusal, true)
+        SubmitVerdict.refused
+          slice ChatComposer.unsent(pending_body, false) at composer_scope(connected_rpc, active_channel)
+        SubmitVerdict.admitted
+          hydration_generation = hydration_generation + 1
+          hydration_retry_attempt = 0
+          // The mint does not re-mark the runs — the rail mints through the same
+          // call and its `[root] ++ replies` vec must keep the first reply's
+          // header. This vec is a plain run, so it re-marks here: the pending row
+          // groups under the reader's previous message instead of drawing a
+          // header that vanishes the moment the settle delta replaces it.
+          messages = mark_author_runs(optimistic_message(messages, pending_body, pending_id))
+          messages_revision = messages_revision + 1
+          let selection = message_selection_after_window(messages, selected_message_seq, selected_message_rev, message_action, message_edit_draft)
+          selected_message_seq = selection.seq
+          selected_message_rev = selection.rev
+          message_action = selection.action
+          message_edit_draft = selection.draft
+          has_older_history = history_has_older(messages)
+          unread_marker_seq = first_unread_seq(messages, unread_boundary)
+          error = ""
+          // Sending is a jump to now: the minted row lands at the tail, and a
+          // reader who had scrolled up would otherwise get her own send below the
+          // fold — an optimistic insert she cannot see is no confirmation at all.
+          //
+          // `snap … 0.0`, NOT `snap-end`: the stream is `anchor-y=end`, where the
+          // offset counts FROM the tail — relative 0.0 IS the tail. `snap-end` is
+          // relative 1.0, which an end anchor translates to the TOP of history; it
+          // shipped once and every send hurled the reader to the oldest loaded row.
+          parallel
+            run every send_message(connected_rpc, password, active_channel, pending_id, pending_body, channel_members) -> message_sent _ | message_send_failed _
+            task widget snap #workspace-tabs/content/chat/message-stream 0.0 0.0 window=window_target(console_win)
     ComposerKind.reply
-      // The rail twin of `message_submitted`: fresh gate at delivery, stash on a
-      // frame-stale admit, then the same optimistic append the old handler made.
-      let refused = thread_loading || !connected || empty(active_channel) || active_thread_seq <= 0 || !empty(post_refusal)
-      failed_reply_draft = remember_failed_draft(failed_reply_draft, keep_str(refused, "stash", ""), pending_body, false)
-      return if refused
-      invalidate lane=live_thread
-      hydration_generation = hydration_generation + 1
-      hydration_retry_attempt = 0
-      thread_messages = optimistic_thread_message(thread_messages, pending_body, pending_id)
-      thread_messages_revision = thread_messages_revision + 1
-      let selection = message_selection_after_window(thread_messages, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
-      thread_selected_seq = selection.seq
-      thread_selected_rev = selection.rev
-      thread_message_action = selection.action
-      thread_edit_draft = selection.draft
-      error = ""
-      run every send_reply(connected_rpc, password, active_channel, active_thread_seq, pending_id, pending_body, channel_members) -> thread_reply_sent _ | thread_reply_send_failed _
+      // The rail twin, with the rail's own two terms: its readiness is
+      // `thread_loading`, and an open rail is what `seated` says.
+      match submit_verdict(thread_loading, connected, active_channel, post_refusal, active_thread_seq > 0)
+        SubmitVerdict.refused
+          slice ChatComposer.unsent(pending_body, false) at thread_scope(connected_rpc, active_channel, active_thread_seq)
+        SubmitVerdict.admitted
+          invalidate lane=live_thread
+          hydration_generation = hydration_generation + 1
+          hydration_retry_attempt = 0
+          thread_messages = optimistic_thread_message(thread_messages, pending_body, pending_id)
+          thread_messages_revision = thread_messages_revision + 1
+          let selection = message_selection_after_window(thread_messages, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
+          thread_selected_seq = selection.seq
+          thread_selected_rev = selection.rev
+          thread_message_action = selection.action
+          thread_edit_draft = selection.draft
+          error = ""
+          run every send_reply(connected_rpc, password, active_channel, active_thread_seq, pending_id, pending_body, channel_members) -> thread_reply_sent _ | thread_reply_send_failed _
 
 on message_sent(next)
   return if active_channel != next.channel_id
@@ -478,11 +481,12 @@ on message_sent(next)
 // error banner are written first, unconditionally, above the guard.
 on message_send_failed(cause)
   error = cause.message
-  // EVERY uncommitted body goes to the stash: the composer is its room's own
-  // instance now (ducktape-ui#697), so this handler cannot look inside it to
-  // decide the old silent refill — the instance's banner offers the words
-  // back one click away instead, whatever room she is in when it fails.
-  failed_message_draft = remember_failed_draft(failed_message_draft, "stash", cause.body, cause.committed)
+  slice ChatComposer.unsent(cause.body, cause.committed) at composer_scope(connected_rpc, cause.scope_id)
+  // THE ROOM IT WAS WRITTEN IN GETS ITS WORDS BACK — not whatever room she
+  // has moved to since. The plate is the composer instance's own state now
+  // (ducktape-ui#698) and `cause.scope_id` names the room the send was for,
+  // so the failure reaches exactly that box. The timeline surgery below is
+  // still scoped to the room ON SCREEN, which is a different question.
   return if active_channel != cause.scope_id
   messages = rollback_pending_message(messages, cause.operation_id, cause.committed)
   messages_revision = messages_revision + 1
@@ -1153,9 +1157,10 @@ on reaction_failed(cause)
 // made the pending check fail and threw the text away with no error at all.
 on thread_reply_send_failed(cause)
   error = cause.message
-  // Stash-only, like `message_send_failed`: the reply composer is its
-  // thread's own instance, and the banner is the restore path.
-  failed_reply_draft = remember_failed_draft(failed_reply_draft, "stash", cause.body, cause.committed)
+  // THE THREAD IT WAS WRITTEN IN, which is why the failure carries one: a
+  // reply belongs to its thread, and `cause.thread_seq` is the only thing
+  // that can name the box it came from once the rail has moved on.
+  slice ChatComposer.unsent(cause.body, cause.committed) at thread_scope(connected_rpc, cause.scope_id, cause.thread_seq)
   return if active_channel != cause.scope_id
   return if !contains_pending_message(thread_messages, cause.operation_id)
   thread_messages = rollback_pending_message(thread_messages, cause.operation_id, cause.committed)

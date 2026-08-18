@@ -1222,13 +1222,17 @@ component ComposerGate(reason:str)
 // friends at the caret (see `composer_chord`), so the app's keyboard
 // subscription stopped needing to know which composer is focused.
 // ============================================================================
-component ChatComposer(kind:ComposerKind, compact:bool, hint:str, blocked:bool, restore_blocked:bool, failed_draft:str, failed_note:str)
+component ChatComposer(kind:ComposerKind, compact:bool, hint:str, blocked:bool, restore_blocked:bool, failed_note:str)
   emits
     submitted(ComposerKind, str, str)
-    restored(ComposerKind)
-    dismissed(ComposerKind)
   state
     body:editor = ""
+    // THE UNSENT WORDS BELONG TO THE ROOM THEY WERE WRITTEN IN. This was one
+    // app field, so a send that failed in #private-ops raised its plate over
+    // whatever room the reader had moved to and offered to restore it THERE.
+    // It is the instance's own state now, delivered by a slice keyed to the
+    // room the failure names (ducktape-ui#698).
+    failed = ""
   on composer_event(event, gate, which)
     body = apply_composer_event(body, event)
     return if !composer_submits(event)
@@ -1240,15 +1244,21 @@ component ChatComposer(kind:ComposerKind, compact:bool, hint:str, blocked:bool, 
   on mark(glyph, gate)
     return if gate
     body = composer_toggle_mark(body, glyph)
-  on restore(draft, gate, which)
-    return if gate || empty(draft) || !empty(trim(editor_text(body)))
-    body = editor(draft)
-    emit(restored, which)
+  // The app's share-out: what this room's send let go of, handed back to the
+  // box it came from. A committed body is not unsent, so it never stashes.
+  on unsent(text, committed)
+    failed = remember_failed_draft(failed, "stash", text, committed)
+  on restore(gate)
+    return if gate || empty(failed) || !empty(trim(editor_text(body)))
+    body = editor(failed)
+    failed = ""
+  on dismiss
+    failed = ""
   col #root w=fill gap=10.0
     // DATA LOSS READS AT LEAST AS LOUD AS AN EXPECTED REFUSAL — the same
     // reversible-danger plate the archive button wears: the draft is
     // recoverable, so this is not `@danger_action` loud.
-    if !empty(failed_draft)
+    if !empty(failed)
       box
         with
           w=fill
@@ -1276,7 +1286,7 @@ component ChatComposer(kind:ComposerKind, compact:bool, hint:str, blocked:bool, 
               size=12.5
               line-h=1.45
               @text-danger
-          button "Restore" -> restore(failed_draft, restore_blocked, kind)
+          button "Restore" -> restore(restore_blocked)
             with
               disabled=(restore_blocked || !empty(trim(editor_text(body))))
               h=28.0
@@ -1285,7 +1295,7 @@ component ChatComposer(kind:ComposerKind, compact:bool, hint:str, blocked:bool, 
             active bg=fg/9 text=fg border=fg/11 border-w=1.0 r=7.0
             hovered bg=fg/14
             pressed bg=fg/18
-          button -> emit(dismissed, kind)
+          button -> dismiss
             with
               label="Dismiss unsent draft"
               w=28.0

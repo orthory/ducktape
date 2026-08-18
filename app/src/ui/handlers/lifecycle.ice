@@ -406,7 +406,12 @@ on live_resynced(next)
   // the OLD room.
   history_loading = history_loading && active_channel == keep_str(next.chat_loaded, next.active_channel, active_channel)
   selected_message_seq = refreshed_required_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), selected_message_seq)
-  failed_message_draft = remember_failed_draft(failed_message_draft, keep_str(message_action == MessageAction.editing, "editing", ""), message_edit_draft, selected_message_seq > 0 || message_action != MessageAction.editing)
+  // AN EVICTED INLINE EDIT IS UNSENT TEXT TOO, and it belongs to the room its
+  // message was in — handed over HERE, while `active_channel` still names
+  // that room (ducktape-ui#698). The plate is instance state now, so the
+  // rescue has to say WHICH plate; a publication sits mid-handler, so the
+  // guards below it still run.
+  slice ChatComposer.unsent(keep_str(message_action == MessageAction.editing, message_edit_draft, ""), selected_message_seq > 0 || message_action != MessageAction.editing) at composer_scope(connected_rpc, active_channel)
   selected_message_rev = message_seq_after_failure(selected_message_rev, MutationPhase.message_edit, selected_message_seq <= 0)
   message_action = message_action_after_failure(message_action, MutationPhase.message_edit, selected_message_seq <= 0)
   message_edit_draft = message_text_after_failure(message_edit_draft, MutationPhase.message_edit, selected_message_seq <= 0)
@@ -415,7 +420,6 @@ on live_resynced(next)
   member_key_draft = retain_for_endpoint(member_key_draft, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
   thread_generation = thread_generation_after_refresh(thread_generation, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq, refreshed_known_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq))
   thread_loading = thread_loading_after_refresh(thread_loading, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq, refreshed_known_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq))
-  failed_reply_draft = retain_for_endpoint(failed_reply_draft, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
   // The line below zeroes the seq when the root was deleted or the room
   // moved under her — and the reply she was typing needs nothing from it:
   // the composer is that thread's own instance (ducktape-ui#697), waiting
@@ -966,24 +970,9 @@ on mutation_failed(cause)
 on dismiss_error
   error = ""
 
-// THE RESTORE ITSELF HAPPENS IN THE COMPOSER (ducktape-ui#697): only the
-// instance can write its own content, and it does that under its own guards —
-// non-empty stash, empty box, and the `restore_blocked` verdict its frame
-// drew. These two handlers own what is left, the stash, and they run only
-// once the instance says the words are back in the box.
-on composer_restored(kind)
-  match kind
-    ComposerKind.message
-      failed_message_draft = ""
-    ComposerKind.reply
-      failed_reply_draft = ""
-
-on composer_dismissed(kind)
-  match kind
-    ComposerKind.message
-      failed_message_draft = ""
-    ComposerKind.reply
-      failed_reply_draft = ""
+// THE RESTORE AND THE DISMISS ARE THE INSTANCE'S OWN NOW. The plate, the
+// words behind it and both buttons live in the composer they belong to
+// (ducktape-ui#698), so the app has nothing left to clear.
 
 // THE CONNECT RETRIES; IT USED TO GIVE UP AFTER ONE FAILURE. The steady-state
 // path has always retried forever (`live_resync_failed` below), so the console

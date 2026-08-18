@@ -402,6 +402,29 @@ pub fn composer_scope(endpoint: String, channel_id: String) -> String {
     format!("{endpoint}\u{1f}{channel_id}")
 }
 
+/// Whether a submitted body may be posted, decided ONCE at delivery from
+/// state that may have moved since the composer's frame drew its gate.
+///
+/// It is a verdict and not a bool because the two answers do different work:
+/// an admitted body starts a send, a refused one goes back to the composer
+/// it came from. One discriminant, one `match`, each arm ending in its own
+/// task — a boolean would have to be read twice, and the second read is
+/// where a `return if` swallows the words.
+pub fn submit_verdict(
+    busy: bool,
+    connected: bool,
+    channel: String,
+    refusal: String,
+    seated: bool,
+) -> crate::SubmitVerdict {
+    let refused = busy || !connected || channel.is_empty() || !refusal.is_empty() || !seated;
+    if refused {
+        crate::SubmitVerdict::Refused
+    } else {
+        crate::SubmitVerdict::Admitted
+    }
+}
+
 /// The operation-id prefix each composer mints under, so a pending message and
 /// a pending reply never share an id space.
 pub fn composer_op_prefix(kind: crate::ComposerKind) -> String {

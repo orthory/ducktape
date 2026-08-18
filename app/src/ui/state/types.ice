@@ -25,6 +25,11 @@ enum Appearance
 // ONE app handler — the emitting handler cannot see which call site it is at —
 // so the instance says which it is, and the app dispatches on the tag rather
 // than on which of two near-identical handlers the route happened to name.
+// The one decision a submitted body faces at delivery. See `submit_verdict`.
+enum SubmitVerdict
+  admitted
+  refused
+
 enum ComposerKind
   message
   reply

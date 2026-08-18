@@ -153,7 +153,7 @@ component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_t
               open_thread_message_reactions
               open_message_link
 
-component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], messages_revision:i64, has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, failed_message_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_messages_revision:i64, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, failed_reply_draft:str)
+component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], messages_revision:i64, has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_messages_revision:i64, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool)
   lifetime retained
   emits
     search_chat_submit()
@@ -183,8 +183,6 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
     edit_message_submit()
     delete_message_submit()
     composer_submitted(ComposerKind, str, str)
-    composer_restored(ComposerKind)
-    composer_dismissed(ComposerKind)
     rename_channel_submit()
     archive_channel_submit()
     unarchive_channel_submit()
@@ -1225,12 +1223,9 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                 hint="Message the channel…"
                 blocked=(loading || !connected || empty(active_channel) || !empty(post_refusal))
                 restore_blocked=(mutation_phase != MutationPhase.idle)
-                failed_draft=failed_message_draft
                 failed_note="An earlier message wasn’t sent"
               events
                 submitted -> emit(composer_submitted, _, _, _)
-                restored -> emit(composer_restored, _)
-                dismissed -> emit(composer_dismissed, _)
         // THE DETAILS DRAWER — a sidebar-toned rail with one header bar, the
         // channel's identity up top, eyebrowed NAME and MEMBERS sections, and
         // the archive act alone at the bottom where a destructive control
@@ -1670,12 +1665,9 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                         hint="Reply…"
                         blocked=(thread_loading || !connected || !empty(post_refusal))
                         restore_blocked=false
-                        failed_draft=failed_reply_draft
                         failed_note="Unsent reply"
                       events
                         submitted -> emit(composer_submitted, _, _, _)
-                        restored -> emit(composer_restored, _)
-                        dismissed -> emit(composer_dismissed, _)
               overlay
                 with
                   when=(thread_selected_seq > 0 && thread_message_action != MessageAction.toolbar)

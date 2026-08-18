@@ -43,10 +43,9 @@ state
   pending_channel = ""
   // THE COMPOSERS ARE NOT HERE (ducktape-ui#697): each is a retained
   // `ChatComposer` instance keyed by `(endpoint, room)` / `(endpoint, thread)`,
-  // so no app state can be handed to the wrong room. What stays is the
-  // failed-send STASH, which outlives the box it came from.
-  failed_message_draft = ""
-  failed_reply_draft = ""
+  // so no app state can be handed to the wrong room — and neither is the
+  // failed-send stash, which followed the reader out of the room its words
+  // were written in until a slice keyed it to that room (ducktape-ui#698).
   chat_search_draft = ""
   chat_search_hits:[ChatSearchHit] = []
   chat_search_phase:SearchPhase = SearchPhase.idle

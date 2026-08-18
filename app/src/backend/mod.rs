@@ -289,6 +289,10 @@ pub struct OptimisticMutationError {
     pub committed: bool,
     pub operation_id: String,
     pub scope_id: String,
+    /// The thread a REPLY was for, `0` for a message. The composer that let
+    /// the body go is keyed by its room and its thread, so a failure can only
+    /// be handed back to the box it came from if it says which one that was.
+    pub thread_seq: i64,
     pub body: String,
 }
 

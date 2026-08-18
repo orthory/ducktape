@@ -116,9 +116,13 @@ fn every_handler_that_moves_the_reader_between_rooms_is_accounted_for() {
 /// (ducktape-ui#697). Two facts replace the retired park/restore class:
 ///
 /// 1. NO handler can name a composer, because the app holds none. The park
-///    store, the two `editor` states and the focus discriminant are gone, so
-///    there is nothing for a room switch to carry, drop, or hand to the wrong
-///    room — the bug class the ordering lint policed cannot be written.
+///    store, the two `editor` states, the focus discriminant and the two
+///    failed-send stashes are gone, so there is nothing for a room switch to
+///    carry, drop, or hand to the wrong room — the bug class the ordering lint
+///    policed cannot be written. The stash was the last of them to descend
+///    (ducktape-ui#698): it is instance state reached by a slice keyed to the
+///    room the failure names, so a refusal in #private-ops can no longer raise
+///    its plate over whatever room the reader has moved to.
 /// 2. EVERY composer key carries the ENDPOINT. A channel id is a user-chosen
 ///    string: two networks' `#general` are two rooms, and a key without the
 ///    endpoint would hand one network's words to the other — exactly what the
@@ -146,6 +150,8 @@ fn the_composers_are_out_of_reach_of_every_handler() {
         "parked_message_draft",
         "parked_reply_draft",
         "composer_mark_shortcut",
+        "failed_message_draft",
+        "failed_reply_draft",
     ] {
         // An ASSIGNMENT or a CALL, not a mention: the prose above may name
         // what was retired, and should.
