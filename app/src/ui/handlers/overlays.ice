@@ -69,30 +69,16 @@ on global_key_pressed(event)
   // grammar has no branches, so the keepers ARE the routing. Sits before
   // the palette block, whose open path must end in its focus task.
   let escape_key = escape_target(event.key, shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, forge_repo_menu)
-  // The composer's formatting chords (Cmd/Ctrl+B/I, +Shift+C, +Shift+9). The
-  // editor lets command-letter presses bubble on purpose, so its focus is
-  // still on the draft when the mark lands; an empty verdict is a no-op.
-  //
-  // ONE chord, TWO composers, and BOTH arms self-select on a POSITIVE match of
-  // `composer_focus` — the same keeper shape as the escape ladder below. The
-  // negation this replaced (`!reply_chord`) made the stream's composer the
-  // fallback for every state, so the moment the discriminant said "the caret
-  // left" the chord went right back to marking a draft nobody was in.
-  let chord_ready = connected && shell_tab == ShellTab.chat
-  let message_chord = chord_ready && composer_focus == ComposerFocus.message
-  // A closed rail can never be the target, however stale the discriminant is —
-  // and one route leaves it stale ON PURPOSE. Every rail teardown a USER asks
-  // for retires (they all write a literal `active_thread_seq = 0`, which is a
-  // linted rule), but `live_resynced` closes the rail when the thread root is
-  // deleted under you, and that same handler runs on every ordinary resync
-  // while you keep typing in the rail — so it cannot retire unconditionally.
-  // This term is that route's only cover; the lint pins it by driving it.
-  let reply_chord = chord_ready && composer_focus == ComposerFocus.reply && active_thread_seq > 0
+  // THE COMPOSER'S FORMATTING CHORDS ARE NOT HERE ANY MORE. They land at the
+  // widget that has the caret — `RichTextEditor::on_chord` (ducktape-ui#711)
+  // is offered exactly the presses the bubble contract releases — so the
+  // composer instance marks its OWN content and this subscription never
+  // needed a `composer_focus` discriminant to guess which one was focused.
   // The page document's undo/redo (Cmd/Ctrl+Z, +Shift+Z) — the editor
   // bubbles command-letter chords on purpose; an off-pages press names no move.
   let pages_ready = connected && shell_tab == ShellTab.pages && !palette_open
   let palette_key = palette_key_action(event.key, event.physical_key, event.modifiers, palette_open)
-  return if empty(escape_key) && palette_key == "none" && empty(composer_mark_shortcut(event.key, event.physical_key, event.modifiers, message_chord || reply_chord)) && empty(page_history_shortcut(event.key, event.physical_key, event.modifiers, pages_ready))
+  return if empty(escape_key) && palette_key == "none" && empty(page_history_shortcut(event.key, event.physical_key, event.modifiers, pages_ready))
   bell_open = bell_open && escape_key != "bell"
   channel_create_open = channel_create_open && escape_key != "channel_create"
   thread_selected_seq = keep_i64(escape_key == "thread_menu", 0, thread_selected_seq)
@@ -105,8 +91,6 @@ on global_key_pressed(event)
   message_edit_draft = keep_str(escape_key == "message_menu", "", message_edit_draft)
   channel_settings_open = channel_settings_open && escape_key != "channel_settings"
   forge_repo_menu = forge_repo_menu && escape_key != "repo_menu"
-  message_editor = composer_toggle_mark(message_editor, composer_mark_shortcut(event.key, event.physical_key, event.modifiers, message_chord))
-  reply_editor = composer_toggle_mark(reply_editor, composer_mark_shortcut(event.key, event.physical_key, event.modifiers, reply_chord))
   page_editor = page_history_key(page_editor, page_history_shortcut(event.key, event.physical_key, event.modifiers, pages_ready))
   return if palette_key == "none"
   return if palette_key == "open" && !connected
@@ -117,11 +101,6 @@ on global_key_pressed(event)
   palette_page_hits = []
   palette_search_phase = SearchPhase.idle
   return if !palette_open
-  // THE PALETTE TAKES THE CARET, and closing it does not hand it back — so the
-  // retire is here, at the open, not on a `!palette_open` term in the chord's
-  // own gate. That term could only mute the chord while the palette was up;
-  // Escape then handed a stale "reply" straight back to it.
-  composer_focus = ComposerFocus.unfocused
   task widget focus #workspace-tabs/overlays/palette-input window=window_target(console_win)
 
 // THE CONTENT PANE'S KEYBOARD SCROLL. iced's scrollable has no focus and no

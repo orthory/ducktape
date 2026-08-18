@@ -1202,6 +1202,162 @@ component ComposerGate(reason:str)
         space w=1.0 h=1.0
 
 // ============================================================================
+// THE COMPOSER IS THE ROOM'S COMPOSER (ducktape-ui#697). One retained
+// instance per key — the stream mounts `#composer(active_channel)`, the rail
+// `#reply_composer(...)` — so a draft never rides a room switch: there is no
+// app-level editor left to park, and the park/restore handler class (with
+// the ordering lint that policed it) is deleted, not moved.
+//
+// WHAT RIDES UP: `submitted(text, operation_id)`, fired from the local
+// handler AFTER the box is cleared, so the app's optimistic insert and the
+// send lane run against a composer that has finished writing. WHAT RIDES
+// DOWN: props. The widget's gate rides the ROUTE (`blocked`), so the handler
+// refuses with the same verdict the frame drew — and the app re-reads its
+// own gate at delivery, where a frame-stale admit stashes the text for the
+// banner below instead of losing it.
+//
+// THE FAILED-SEND BANNER LIVES HERE because its Restore writes THIS
+// instance's content — the one thing the app can no longer reach. Formatting
+// chords land here too: the widget's `on_chord` claims Cmd/Ctrl+B and
+// friends at the caret (see `composer_chord`), so the app's keyboard
+// subscription stopped needing to know which composer is focused.
+// ============================================================================
+component ChatComposer(kind:ComposerKind, compact:bool, hint:str, blocked:bool, restore_blocked:bool, failed_draft:str, failed_note:str)
+  emits
+    submitted(ComposerKind, str, str)
+    restored(ComposerKind)
+    dismissed(ComposerKind)
+  state
+    body:editor = ""
+  on composer_event(event, gate, which)
+    body = apply_composer_event(body, event)
+    return if !composer_submits(event)
+    return if gate
+    let text = trim(editor_text(body))
+    return if empty(text)
+    body = editor("")
+    emit(submitted, which, text, fresh_operation_id(composer_op_prefix(which)))
+  on mark(glyph, gate)
+    return if gate
+    body = composer_toggle_mark(body, glyph)
+  on restore(draft, gate, which)
+    return if gate || empty(draft) || !empty(trim(editor_text(body)))
+    body = editor(draft)
+    emit(restored, which)
+  col #root w=fill gap=10.0
+    // DATA LOSS READS AT LEAST AS LOUD AS AN EXPECTED REFUSAL — the same
+    // reversible-danger plate the archive button wears: the draft is
+    // recoverable, so this is not `@danger_action` loud.
+    if !empty(failed_draft)
+      box
+        with
+          w=fill
+          px=13.0
+          py=11.0
+          bg=danger_zone_bg
+          border=danger_zone_line
+          border-w=1.0
+          r=9.0
+        row
+          with
+            w=fill
+            gap=8.0
+            align=center
+          box
+            with
+              w=6.0
+              h=6.0
+              bg=danger_dot
+              r=3.0
+            space w=1.0 h=1.0
+          text failed_note
+            with
+              w=fill
+              size=12.5
+              line-h=1.45
+              @text-danger
+          button "Restore" -> restore(failed_draft, restore_blocked, kind)
+            with
+              disabled=(restore_blocked || !empty(trim(editor_text(body))))
+              h=28.0
+              p=5.0
+              @secondary_action
+            active bg=fg/9 text=fg border=fg/11 border-w=1.0 r=7.0
+            hovered bg=fg/14
+            pressed bg=fg/18
+          button -> emit(dismissed, kind)
+            with
+              label="Dismiss unsent draft"
+              w=28.0
+              h=28.0
+              p=0.0
+              @icon_action
+            box
+              with
+                w=fill
+                h=fill
+                align-x=center
+                align-y=center
+              text "×" size=14.0
+            active bg=transparent text=muted r=7.0
+            hovered bg=fg/10 text=fg
+            pressed bg=fg/15
+    box
+      with
+        w=fill
+        bg=surface
+        border=control_line
+        border-w=1.0
+        r=12.0
+        clip=true
+        shadow=shadow_popover
+        shadow-y=1.0
+        shadow-blur=2.0
+      col w=fill
+        extern rich_composer(body, hint, blocked, 44.0, 150.0, 10.0) #field -> composer_event(_, blocked, kind)
+        box
+          with
+            w=fill
+            pl=8.0
+            pr=8.0
+            pb=8.0
+          row
+            with
+              w=fill
+              gap=2.0
+              align=center
+            ComposerMarks
+              with
+                disabled=blocked
+              events
+                mark -> mark(_, blocked)
+            space w=fill
+            if !compact
+              text "↵ send · ⇧↵ newline"
+                with
+                  size=10.5
+                  wrap=none
+                  font=code_medium
+                  @text-muted
+              space w=8.0
+              button "Send" -> composer_event(composer_submit_event(), blocked, kind)
+                with
+                  disabled=(blocked || empty(trim(editor_text(body))))
+                  h=29.0
+                  @primary_action
+                  @px-12px
+                  @py-7px
+            if compact
+              button "Send" -> composer_event(composer_submit_event(), blocked, kind)
+                with
+                  label="Send reply"
+                  disabled=(blocked || empty(trim(editor_text(body))))
+                  h=28.0
+                  @primary_action
+                  @px-11px
+                  @py-6px
+
+// ============================================================================
 // THREAD RAIL — the artifact opens the rail body with the root message in its
 // own divided block, at a type scale one notch under a reply.
 //

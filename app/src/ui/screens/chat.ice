@@ -153,7 +153,7 @@ component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_t
               open_thread_message_reactions
               open_message_link
 
-component ChatScreen(network_name:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], messages_revision:i64, has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, failed_message_draft:str, bind message_editor:editor, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_messages_revision:i64, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, failed_reply_draft:str, bind reply_editor:editor)
+component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], messages_revision:i64, has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, failed_message_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_messages_revision:i64, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, failed_reply_draft:str)
   lifetime retained
   emits
     search_chat_submit()
@@ -182,10 +182,9 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
     add_reaction_submit(str)
     edit_message_submit()
     delete_message_submit()
-    restore_failed_message()
-    dismiss_failed_message()
-    composer_event(ComposerEvent)
-    composer_mark(str)
+    composer_submitted(ComposerKind, str, str)
+    composer_restored(ComposerKind)
+    composer_dismissed(ComposerKind)
     rename_channel_submit()
     archive_channel_submit()
     unarchive_channel_submit()
@@ -200,10 +199,6 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
     edit_thread_message_submit()
     delete_thread_message_submit()
     load_more_thread()
-    restore_failed_reply()
-    dismiss_failed_reply()
-    reply_composer_event(ComposerEvent)
-    reply_composer_mark(str)
   state
     message_action_focus = ""
     chat_pointer_y = 0.0
@@ -1141,66 +1136,6 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                                     active bg=transparent text=muted r=6.0
                                     hovered bg=fg/10 text=fg
                                     pressed bg=fg/15
-              // DATA LOSS READS AT LEAST AS LOUD AS AN EXPECTED REFUSAL. This
-              // used to be a bare muted sentence, quieter than the archived-
-              // channel gate a few lines up — GateNote's own danger-family
-              // plate, mirrored (`danger_zone_bg`/`danger_zone_line` are the
-              // REVERSIBLE-danger pair the archive button already wears: the
-              // draft is recoverable, so this is not `@danger_action` loud).
-              if !empty(failed_message_draft)
-                box
-                  with
-                    w=fill
-                    px=13.0
-                    py=11.0
-                    bg=danger_zone_bg
-                    border=danger_zone_line
-                    border-w=1.0
-                    r=9.0
-                  row
-                    with
-                      w=fill
-                      gap=8.0
-                      align=center
-                    box
-                      with
-                        w=6.0
-                        h=6.0
-                        bg=danger_dot
-                        r=3.0
-                      space w=1.0 h=1.0
-                    text "An earlier message wasn’t sent"
-                      with
-                        w=fill
-                        size=12.5
-                        line-h=1.45
-                        @text-danger
-                    button "Restore" -> emit(restore_failed_message)
-                      with
-                        disabled=(!empty(trim(editor_text(message_editor))) || mutation_phase != MutationPhase.idle)
-                        h=28.0
-                        p=5.0
-                        @secondary_action
-                      active bg=fg/9 text=fg border=fg/11 border-w=1.0 r=7.0
-                      hovered bg=fg/14
-                      pressed bg=fg/18
-                    button -> emit(dismiss_failed_message)
-                      with
-                        label="Dismiss unsent message"
-                        w=28.0
-                        h=28.0
-                        p=0.0
-                        @icon_action
-                      box
-                        with
-                          w=fill
-                          h=fill
-                          align-x=center
-                          align-y=center
-                        text "×" size=14.0
-                      active bg=transparent text=muted r=7.0
-                      hovered bg=fg/10 text=fg
-                      pressed bg=fg/15
             // THE RESULTS FLOAT. This card used to be the column's first
             // child, so a search reflowed the whole conversation down by
             // 148px; as a stack layer it drops over the stream instead and
@@ -1280,54 +1215,22 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
               pr=18.0
               pt=12.0
               pb=14.0
-            box
+            // ducktape-ui#697: the room's own composer instance. The key is
+            // the room, so the draft IS the room's draft; the plate, marks
+            // row, Send and the failed-send banner all moved inside.
+            ChatComposer #composer(composer_scope(endpoint, active_channel))
               with
-                w=fill
-                bg=surface
-                border=control_line
-                border-w=1.0
-                r=12.0
-                clip=true
-                shadow=shadow_popover
-                shadow-y=1.0
-                shadow-blur=2.0
-              col w=fill
-                extern rich_composer(message_editor, "Message the channel…", (loading || !connected || empty(active_channel) || !empty(post_refusal)), 44.0, 150.0, 10.0) #message -> emit(composer_event, _)
-                // The Slack seat: format controls on the left, send on the
-                // right, one row under the input. `ComposerMarks` is the SAME
-                // row the rail's composer mounts — it moved into a component
-                // the day the rail stopped going without one.
-                box
-                  with
-                    w=fill
-                    pl=8.0
-                    pr=8.0
-                    pb=8.0
-                  row
-                    with
-                      w=fill
-                      gap=2.0
-                      align=center
-                    ComposerMarks
-                      with
-                        disabled=(loading || !connected || empty(active_channel) || !empty(post_refusal))
-                      events
-                        mark -> emit(composer_mark, _)
-                    space w=fill
-                    text "↵ send · ⇧↵ newline"
-                      with
-                        size=10.5
-                        wrap=none
-                        font=code_medium
-                        @text-muted
-                    space w=8.0
-                    button "Send" -> emit(composer_event, composer_submit_event())
-                      with
-                        disabled=(loading || !connected || empty(active_channel) || !empty(post_refusal) || empty(trim(editor_text(message_editor))))
-                        h=29.0
-                        @primary_action
-                        @px-12px
-                        @py-7px
+                kind=ComposerKind.message
+                compact=false
+                hint="Message the channel…"
+                blocked=(loading || !connected || empty(active_channel) || !empty(post_refusal))
+                restore_blocked=(mutation_phase != MutationPhase.idle)
+                failed_draft=failed_message_draft
+                failed_note="An earlier message wasn’t sent"
+              events
+                submitted -> emit(composer_submitted, _, _, _)
+                restored -> emit(composer_restored, _)
+                dismissed -> emit(composer_dismissed, _)
         // THE DETAILS DRAWER — a sidebar-toned rail with one header bar, the
         // channel's identity up top, eyebrowed NAME and MEMBERS sections, and
         // the archive act alone at the bottom where a destructive control
@@ -1725,65 +1628,6 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                           active bg=transparent text=muted r=7.0
                           hovered bg=fg/9 text=fg
                           pressed bg=brand_bg
-                  // Same danger-family plate as the stream's — see the note
-                  // there.
-                  if !empty(failed_reply_draft)
-                    box
-                      with
-                        w=fill
-                        pl=16.0
-                        pr=16.0
-                        pt=8.0
-                      box
-                        with
-                          w=fill
-                          px=13.0
-                          py=11.0
-                          bg=danger_zone_bg
-                          border=danger_zone_line
-                          border-w=1.0
-                          r=9.0
-                        row
-                          with
-                            w=fill
-                            gap=6.0
-                            align=center
-                          box
-                            with
-                              w=6.0
-                              h=6.0
-                              bg=danger_dot
-                              r=3.0
-                            space w=1.0 h=1.0
-                          text "Unsent reply"
-                            with
-                              w=fill
-                              size=12.5
-                              line-h=1.45
-                              @text-danger
-                          button "Restore" -> emit(restore_failed_reply)
-                            with
-                              disabled=(!empty(trim(editor_text(reply_editor))))
-                              h=26.0
-                              p=5.0
-                              @secondary_action
-                            active bg=fg/9 text=fg border=fg/11 border-w=1.0 r=7.0
-                            hovered bg=fg/14
-                            pressed bg=fg/18
-                          button -> emit(dismiss_failed_reply)
-                            with
-                              label="Dismiss unsent reply"
-                              w=26.0
-                              h=26.0
-                              p=4.0
-                              @ghost_action
-                            text "×"
-                              with
-                                size=12.5
-                                font=ui
-                            active bg=transparent text=muted r=7.0
-                            hovered bg=fg/10 text=fg
-                            pressed bg=fg/15
                   // The stream's composer plate, in the rail's width: same
                   // surface/control_line/r12 chrome, the same `ComposerMarks`
                   // row, the same Send.
@@ -1814,44 +1658,24 @@ component ChatScreen(network_name:str, status:str, block_height:i64, bind search
                       pr=16.0
                       pt=10.0
                       pb=14.0
-                    box
+                    // The rail's composer instance, keyed by the THREAD: a
+                    // reply draft belongs to the thread it replies to, and
+                    // closing the rail no longer discards it — the instance
+                    // (and its words) are simply waiting for the rail to
+                    // reopen on the same thread.
+                    ChatComposer #reply_composer(thread_scope(endpoint, active_channel, active_thread_seq))
                       with
-                        w=fill
-                        bg=surface
-                        border=control_line
-                        border-w=1.0
-                        r=12.0
-                        clip=true
-                        shadow=shadow_popover
-                        shadow-y=1.0
-                        shadow-blur=2.0
-                      col w=fill
-                        extern rich_composer(reply_editor, "Reply…", (thread_loading || !connected || !empty(post_refusal)), 44.0, 150.0, 10.0) #reply -> emit(reply_composer_event, _)
-                        box
-                          with
-                            w=fill
-                            pl=8.0
-                            pr=8.0
-                            pb=8.0
-                          row
-                            with
-                              w=fill
-                              gap=2.0
-                              align=center
-                            ComposerMarks
-                              with
-                                disabled=(thread_loading || !connected || !empty(post_refusal))
-                              events
-                                mark -> emit(reply_composer_mark, _)
-                            space w=fill
-                            button "Send" -> emit(reply_composer_event, composer_submit_event())
-                              with
-                                label="Send reply"
-                                disabled=(thread_loading || !connected || !empty(post_refusal) || empty(trim(editor_text(reply_editor))))
-                                h=28.0
-                                @primary_action
-                                @px-11px
-                                @py-6px
+                        kind=ComposerKind.reply
+                        compact=true
+                        hint="Reply…"
+                        blocked=(thread_loading || !connected || !empty(post_refusal))
+                        restore_blocked=false
+                        failed_draft=failed_reply_draft
+                        failed_note="Unsent reply"
+                      events
+                        submitted -> emit(composer_submitted, _, _, _)
+                        restored -> emit(composer_restored, _)
+                        dismissed -> emit(composer_dismissed, _)
               overlay
                 with
                   when=(thread_selected_seq > 0 && thread_message_action != MessageAction.toolbar)

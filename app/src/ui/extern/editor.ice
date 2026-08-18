@@ -13,7 +13,6 @@ extern crate::editor
   pure composer_submits(event:ComposerEvent) -> bool
   pure composer_submit_event() -> ComposerEvent
   sync composer_toggle_mark(document:editor, kind:str) -> editor
-  pure composer_mark_shortcut(logical:key, physical:physical-key, modifiers:key-modifiers, chat_ready:bool) -> str
 
 // THE PAGE DOCUMENT — one editor over the whole page, not one per block.
 // Every key is a pure buffer edit (`crate::pages`); nothing here writes to the

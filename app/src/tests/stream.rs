@@ -73,7 +73,12 @@ fn resyncs_cannot_retarget_drafts_to_fallback_contexts() {
     app.loading = false;
     app.hydration_generation = 7;
     app.active_channel = "deleted-channel".into();
-    app.message_draft = "channel draft".into();
+    // The rail's instance has to materialize BEFORE the drawer goes up: the
+    // screen draws the rail under `!channel_settings_open`, so a capture with
+    // the drawer open would find nothing to name.
+    app.active_thread_seq = 7;
+    let rail = reply_composer_scope(&mut app);
+    type_into(&mut app, &rail, ComposerKind::Reply, "thread reply");
     app.selected_message_seq = 7;
     app.selected_message_rev = 2;
     app.message_action = MessageAction::Editing;
@@ -81,14 +86,12 @@ fn resyncs_cannot_retarget_drafts_to_fallback_contexts() {
     app.channel_settings_open = true;
     app.channel_name_draft = "channel rename".into();
     app.member_key_draft = "member".into();
-    app.active_thread_seq = 7;
     app.thread_generation = 4;
     app.thread_target_seq = 9;
     app.thread_messages = vec![message(7, "old thread", false)];
     app.thread_next_reply_seq = 4;
     app.thread_has_more = true;
     app.thread_loading = true;
-    app.reply_editor = compose("thread reply");
     app.active_page = "deleted-page".into();
 
     let _ = app.__update(__DucktapeMessage::LiveResynced(live_refresh(
@@ -114,11 +117,10 @@ fn resyncs_cannot_retarget_drafts_to_fallback_contexts() {
     assert_eq!(app.thread_next_reply_seq, 0);
     assert!(!app.thread_has_more);
     assert!(!app.thread_loading);
-    assert_eq!(
-        backend::parked_reply_draft(app.reply_drafts.clone(), "deleted-channel".into(), 7,),
-        "thread reply"
-    );
-    assert!(app.message_draft.is_empty());
+    // The rail closed under her, and her words did NOT go with it: the reply
+    // composer is that thread's own retained instance (ducktape-ui#697), so
+    // it waits under its key for the rail to reopen there.
+    assert_eq!(composer_text(&app, &rail), "thread reply");
     assert_eq!(app.active_page, "fallback-page");
 }
 
@@ -135,8 +137,10 @@ fn mutation_acks_preserve_open_editors_and_thread_state() {
     app.thread_messages = vec![message(9, "thread root", false)];
     app.thread_next_reply_seq = 3;
     app.thread_has_more = true;
-    app.reply_editor = compose("reply in progress");
-    app.message_editor = compose("next message");
+    let rail = reply_composer_scope(&mut app);
+    let stream = composer_scope(&mut app);
+    type_into(&mut app, &rail, ComposerKind::Reply, "reply in progress");
+    type_into(&mut app, &stream, ComposerKind::Message, "next message");
     app.mutation_phase = MutationPhase::Channel;
 
     // an unrelated mutation's ack carries no snapshot — nothing to stomp
@@ -152,8 +156,8 @@ fn mutation_acks_preserve_open_editors_and_thread_state() {
     assert_eq!(app.thread_messages.len(), 1);
     assert_eq!(app.thread_next_reply_seq, 3);
     assert!(app.thread_has_more);
-    assert_eq!(reply_composer(&app), "reply in progress");
-    assert_eq!(composer(&app), "next message");
+    assert_eq!(composer_text(&app, &rail), "reply in progress");
+    assert_eq!(composer_text(&app, &stream), "next message");
     assert_eq!(app.mutation_phase, MutationPhase::Idle);
 }
 
@@ -760,10 +764,7 @@ fn a_live_post_does_not_splice_itself_into_a_history_window() {
     // HER OWN SEND IS THE EXCEPTION. The composer posts from a window too and
     // splices the optimistic row in unconditionally, so a refused settle would
     // strand it `pending` forever.
-    app.message_editor = compose("mine, from the window");
-    let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
-        editor::composer_submit_event(),
-    ));
+    submit(&mut app, ComposerKind::Message, "mine, from the window");
     assert!(app.messages[1].pending);
     let mut settled = message(501, "mine, from the window", false);
     settled.id = app.messages[1].id.clone();
@@ -992,11 +993,7 @@ fn a_bounded_window_never_leaves_actions_targeting_an_evicted_row() {
     app.selected_message_rev = 7;
     app.message_action = MessageAction::Delete;
     app.message_edit_draft = "stale edit".into();
-    app.message_editor = compose("new tail");
-
-    let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
-        editor::composer_submit_event(),
-    ));
+    submit(&mut app, ComposerKind::Message, "new tail");
     assert_eq!(app.messages.first().map(|row| row.seq), Some(2));
     assert_eq!(app.selected_message_seq, 0);
     assert_eq!(app.selected_message_rev, 0);
@@ -1039,10 +1036,7 @@ fn a_bounded_window_never_leaves_actions_targeting_an_evicted_row() {
     app.thread_selected_rev = 3;
     app.thread_message_action = MessageAction::Delete;
     app.thread_edit_draft = "evicted reply".into();
-    app.reply_editor = compose("new reply at the tail");
-    let _ = app.__update(__DucktapeMessage::ReplyComposerEvent(
-        editor::composer_submit_event(),
-    ));
+    submit(&mut app, ComposerKind::Reply, "new reply at the tail");
     assert!(!app.thread_messages.iter().any(|row| row.seq == 2));
     assert_eq!(app.thread_selected_seq, 0);
     assert_eq!(app.thread_selected_rev, 0);

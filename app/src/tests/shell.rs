@@ -987,13 +987,22 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
             "app handler reclaimed component geometry route `{handler}`"
         );
     }
-    for local in ["pending_message_id", "pending_reply_id"] {
+    // The operation id is a value of ONE send, and it is minted where the
+    // send begins: the composer instance mints it as it emits
+    // (ducktape-ui#697), and the app receives it as a handler parameter.
+    // Neither half may park it in state.
+    for local in ["pending_message_id", "pending_reply_id", "pending_id"] {
         assert!(!root_state.contains(local), "root state holds `{local}`");
-        assert!(
-            chat_handlers.contains(&format!("let {local} =")),
-            "`{local}` is minted as a handler local"
-        );
     }
+    let chat_components = inlined(include_str!("../ui/components/chat.ice"));
+    assert!(
+        chat_components.contains("fresh_operation_id(composer_op_prefix("),
+        "the composer mints its own operation id as it emits"
+    );
+    assert!(
+        chat_handlers.contains("on composer_submitted(kind, pending_body, pending_id)"),
+        "and the app takes it as a parameter, not from state"
+    );
     assert!(
         !inlined(include_str!("../ui/state/chat.ice"))
             .lines()

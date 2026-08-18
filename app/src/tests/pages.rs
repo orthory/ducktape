@@ -38,7 +38,7 @@ fn background_refresh_preserves_editing_state() {
             .any(|name| line.trim_start().starts_with(&format!("{name} =")))
     });
     assert!(!overwrites_editable);
-    for scoped in ["channel_name_draft", "member_key_draft", "message_draft"] {
+    for scoped in ["channel_name_draft", "member_key_draft"] {
         assert!(refresh.contains(&format!(
             "{scoped} = retain_for_endpoint({scoped}, active_channel, \
 keep_str(next.chat_loaded, next.active_channel, active_channel))"
@@ -147,18 +147,13 @@ fn a_pages_load_in_flight_does_not_deaden_the_lit_reply_send() {
     // What `open_page_search_hit` leaves behind: the stream's flag up, the rail
     // untouched, and `select_shell_tab` back to Chat clears neither.
     app.loading = true;
-    app.reply_editor = compose("on it");
-
-    let _ = app.__update(__DucktapeMessage::ReplyComposerEvent(
-        editor::composer_submit_event(),
-    ));
+    submit(&mut app, ComposerKind::Reply, "on it");
     assert_eq!(
         app.thread_messages.len(),
         1,
         "a Send the surface draws as live must actually send"
     );
     assert!(app.thread_messages[0].pending);
-    assert!(reply_composer(&app).is_empty());
 }
 
 // The dirty gate makes the tick FIRE; these two guards make it WAIT. An

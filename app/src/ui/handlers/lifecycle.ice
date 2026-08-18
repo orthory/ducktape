@@ -67,19 +67,11 @@ on reconnect
   history_loading = false
   channel_reads = []
   unread_boundary = 0
-  // A RECONNECT IS A ROOM SWITCH SPREAD OVER TWO HANDLERS, so it parks like the
-  // four pickers do — here, while `active_channel` and `active_thread_seq` still
-  // name the room and thread she is in — and `workspace_connected` restores
-  // below its own landing write. The line below blanks the key, so a park under
-  // it would file both composers under "" and drop them. Without this the live
-  // composer rode the reconnect into `landing_channel(channels)` — the first
-  // room with traffic, not the one she left — armed to send there, and the
-  // next pick parked her words under THAT room's id. The park reads the live
-  // editor directly: the `message_draft` harvest that used to sit above it was
-  // this park's predecessor, and its leftover stash is what `live_resynced`'s
-  // failed-draft plate later offered to a room she never typed it in.
-  message_drafts = park_message_draft(message_drafts, active_channel, trim(editor_text(message_editor)))
-  reply_drafts = park_reply_draft(reply_drafts, active_channel, active_thread_seq, trim(editor_text(reply_editor)))
+  // A RECONNECT IS A ROOM SWITCH SPREAD OVER TWO HANDLERS — and neither half
+  // owes the composer anything now: each instance is keyed by
+  // `(endpoint, room)` (ducktape-ui#697), so blanking `active_channel` below
+  // simply unmounts the box, words intact, until any landing renders that
+  // room again.
   active_channel = ""
   // The room is gone, so its two readings go with it: no peer names an empty
   // channel, and no window survives a reconnect.
@@ -107,16 +99,6 @@ on reconnect
   thread_generation = thread_generation + 1
   invalidate lane=live_thread
   thread_loading = false
-  // THE RAIL CLOSES AND ITS WORDS DO NOT GO WITH IT. This blank used to be the
-  // one composer a reconnect still ate, two dozen lines below a handler that
-  // goes out of its way to carry the stream's — the park above holds it under
-  // `channel#seq`, and the next `open_thread_for` on that thread hands it back.
-  reply_editor = editor("")
-  // Both composers above are new empty boxes and the rail is gone. `connected`
-  // goes false here, which only MUTES the chord — the stale claim would ride
-  // straight through the reconnect and mark a rebuilt draft on the first
-  // Cmd+B after it lands.
-  composer_focus = ComposerFocus.unfocused
   pending_channel = ""
   chat_search_hits = []
   chat_search_phase = SearchPhase.idle
@@ -190,13 +172,10 @@ on workspace_connected(next)
   has_older_history = next.has_older_history || history_has_older(messages)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   active_channel = next.active_channel
-  // AND THE LANDING ROOM'S COMPOSER IS THE LANDING ROOM'S — the restore half of
-  // the park `reconnect` files. The room above is `landing_channel(channels)`,
-  // the first room with traffic and rarely the one she left, so without this
-  // her half-typed line stood over a stranger's Send. `message_drafts` survives
-  // the reconnect (same endpoint, no store reset), so this hands back whatever
-  // THIS room was left holding, and nothing else.
-  message_editor = editor(parked_message_draft(message_drafts, active_channel))
+  // THE LANDING ROOM'S COMPOSER IS THE LANDING ROOM'S by construction now:
+  // the room above is `landing_channel(channels)` — rarely the one she left —
+  // and rendering it mounts that room's own instance, words and all
+  // (ducktape-ui#697).
   // A reconnect lands on `channels.first()`, which is nobody's DM unless the
   // derivation says so — see `dm_peer_of_channel`.
   active_dm_peer = dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel)
@@ -426,7 +405,6 @@ on live_resynced(next)
   // `thread_has_more` below, and it must read `active_channel` while it is still
   // the OLD room.
   history_loading = history_loading && active_channel == keep_str(next.chat_loaded, next.active_channel, active_channel)
-  failed_message_draft = remember_failed_draft(failed_message_draft, "channel", message_draft, active_channel == keep_str(next.chat_loaded, next.active_channel, active_channel))
   selected_message_seq = refreshed_required_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), selected_message_seq)
   failed_message_draft = remember_failed_draft(failed_message_draft, keep_str(message_action == MessageAction.editing, "editing", ""), message_edit_draft, selected_message_seq > 0 || message_action != MessageAction.editing)
   selected_message_rev = message_seq_after_failure(selected_message_rev, MutationPhase.message_edit, selected_message_seq <= 0)
@@ -438,35 +416,16 @@ on live_resynced(next)
   thread_generation = thread_generation_after_refresh(thread_generation, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq, refreshed_known_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq))
   thread_loading = thread_loading_after_refresh(thread_loading, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq, refreshed_known_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq))
   failed_reply_draft = retain_for_endpoint(failed_reply_draft, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
-  // PARK ABOVE THE LINE THAT CAN CLOSE THE RAIL, while `active_channel` and
-  // `active_thread_seq` still name the thread being typed in. The line below
-  // zeroes the seq when the root was deleted or the room moved under her — and
-  // a park read AFTER it is `thread_seq <= 0`, which `park_reply_draft` refuses
-  // outright, so the next `open_thread_for` cannot harvest what is no longer
-  // addressable. The retired settled mirror read "" the whole time someone was
-  // typing; the plate mounted INSIDE the rail captured nothing and had nowhere
-  // to render it. Idempotent on the ordinary resync that leaves the rail alone
-  // — same key, same text, and
-  // the entry drops itself once the box is empty.
-  reply_drafts = park_reply_draft(reply_drafts, active_channel, active_thread_seq, trim(editor_text(reply_editor)))
+  // The line below zeroes the seq when the root was deleted or the room
+  // moved under her — and the reply she was typing needs nothing from it:
+  // the composer is that thread's own instance (ducktape-ui#697), waiting
+  // under its key for the rail to reopen there.
   active_thread_seq = refreshed_known_message_seq(messages, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), active_thread_seq)
-  // NO RESTORE BESIDE IT: a resync either leaves the rail on the thread it was
-  // already on — where `reply_editor` is untouched and the live buffer is the
-  // truth — or closes it, and a closed rail has no composer to fill.
   thread_target_seq = refreshed_channel_value(active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), thread_target_seq)
   thread_next_reply_seq = refreshed_channel_value(active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), thread_next_reply_seq)
   thread_messages = retain_thread_messages(thread_messages, active_thread_seq)
   thread_messages_revision = keep_i64(next.chat_loaded, thread_messages_revision + 1, thread_messages_revision)
   thread_has_more = thread_has_more && active_channel == keep_str(next.chat_loaded, next.active_channel, active_channel) && active_thread_seq > 0
-  // `message_draft` is the SETTLED stash (the body a failed send hands back) —
-  // it never tracks keystrokes, so it reads
-  // "" the whole time someone is typing. Rebuilding the composer from it here
-  // emptied a half-written message on every resync: a `files` write in another
-  // window, a teammate joining the huddle, any plane op at all. The composer
-  // owns its own text and no resync produces a new one, so nothing writes it —
-  // the same answer `choose_channel` already gives, and the same one
-  // `refreshed_page_editor` gives the page buffer below.
-  message_draft = retain_for_endpoint(message_draft, active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel))
   active_channel = keep_str(next.chat_loaded, next.active_channel, active_channel)
   // The one landing with NO launch behind it, so it is the one that could move
   // the room under a DM header nobody cleared — see `dm_peer_of_channel`.
@@ -691,11 +650,6 @@ on select_shell_tab(next)
   // cannot repaint a screen the reader already left.
   shell_credentials_generation = shell_credentials_generation + 1
   shell_credentials_loading = connected && shell_tab == ShellTab.shell
-  // A TAB MOVE UNMOUNTS THE CHAT COMPOSERS, so the caret they claimed is gone
-  // — and a `shell_tab == ShellTab.chat` term on the chord could only mute it while
-  // she is away, then hand the stale claim straight back on the return trip.
-  // Every handler that writes `shell_tab` retires it, linted in tests.rs.
-  composer_focus = ComposerFocus.unfocused
   has_older_history = history_has_older(messages)
   // A RETURN TO THE CHAT TAB IS A CHANNEL ENTRY, and it is the other half of
   // `live_updated`'s tab gate: the cursor stood still while the pane was
@@ -1012,26 +966,24 @@ on mutation_failed(cause)
 on dismiss_error
   error = ""
 
-on restore_failed_message
-  return if empty(failed_message_draft) || !empty(trim(editor_text(message_editor))) || mutation_phase != MutationPhase.idle
-  message_draft = failed_message_draft
-  message_editor = editor(message_draft)
-  failed_message_draft = ""
+// THE RESTORE ITSELF HAPPENS IN THE COMPOSER (ducktape-ui#697): only the
+// instance can write its own content, and it does that under its own guards —
+// non-empty stash, empty box, and the `restore_blocked` verdict its frame
+// drew. These two handlers own what is left, the stash, and they run only
+// once the instance says the words are back in the box.
+on composer_restored(kind)
+  match kind
+    ComposerKind.message
+      failed_message_draft = ""
+    ComposerKind.reply
+      failed_reply_draft = ""
 
-on dismiss_failed_message
-  failed_message_draft = ""
-
-on restore_failed_reply
-  return if empty(failed_reply_draft) || !empty(trim(editor_text(reply_editor)))
-  let restored_reply = failed_reply_draft
-  reply_editor = editor(restored_reply)
-  failed_reply_draft = ""
-  // The reply composer is an extern `rich_composer` mount now, and `task
-  // widget focus` cannot target an extern component — restoring no longer
-  // auto-focuses. Re-add when ui-lang grows extern focus targets.
-
-on dismiss_failed_reply
-  failed_reply_draft = ""
+on composer_dismissed(kind)
+  match kind
+    ComposerKind.message
+      failed_message_draft = ""
+    ComposerKind.reply
+      failed_reply_draft = ""
 
 // THE CONNECT RETRIES; IT USED TO GIVE UP AFTER ONE FAILURE. The steady-state
 // path has always retried forever (`live_resync_failed` below), so the console

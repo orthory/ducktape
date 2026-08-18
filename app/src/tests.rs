@@ -3,16 +3,16 @@
 // exactly as they did when this mod lived inline in main.rs.
 use super::*;
 
-mod shell;
+mod connection;
+mod design;
 mod forge;
+mod messages;
+mod pages;
+mod rooms;
+mod sends;
+mod shell;
 mod stream;
 mod threads;
-mod messages;
-mod sends;
-mod rooms;
-mod pages;
-mod design;
-mod connection;
 
 /// EVERY SCREEN BODY, as one string. These are the slot bodies that used to
 /// sit inline in `view.ice`; the sweeps below read the console's authored
@@ -118,16 +118,165 @@ fn message(seq: i64, body: &str, deleted: bool) -> backend::ChatMessage {
     }
 }
 
+/// THE COMPOSERS ARE COMPONENT INSTANCES NOW (ducktape-ui#697), so a harness
+/// reaches them the way any harness does: render once to materialize the
+/// instances, then read and drive them through the generated test seam
+/// (ducktape-ui#696 layer 1). The scope is the rendered instance path; the
+/// two composers are told apart by the id segment their mount declares.
+fn materialize_composers(app: &mut Ducktape) {
+    let window = app.console_win.unwrap_or_else(iced::window::Id::unique);
+    app.console_win = Some(window);
+    app.shell_tab = ShellTab::Chat;
+    let _ = app.__view(window);
+    let boots: Vec<__DucktapeMessage> = app.__ice_boot_queue.borrow_mut().drain(..).collect();
+    for message in boots {
+        let _ = app.__update(message);
+    }
+}
+
+/// The instance whose scope names BOTH the mount and this key. Retained
+/// storage keeps every instance the app has ever rendered, which is the whole
+/// promise — so a scope lookup has to say which room it means, exactly as the
+/// mount does.
+fn composer_scope_named(app: &Ducktape, mount: &str, key: &str) -> Option<String> {
+    app.__ice_test_scopes_chat_composer()
+        .into_iter()
+        .find(|scope| scope.contains(mount) && scope.contains(key))
+}
+
+/// The stream composer of the room the app is in, materializing it if needed.
+fn composer_scope(app: &mut Ducktape) -> String {
+    materialize_composers(app);
+    let key = backend::composer_scope(app.connected_rpc.clone(), app.active_channel.clone());
+    composer_scope_named(app, "/composer(", &key)
+        .unwrap_or_else(|| panic!("the composer for `{}` materialized", app.active_channel))
+}
+
+/// The rail composer of the thread the app is in, materializing it if needed.
+fn reply_composer_scope(app: &mut Ducktape) -> String {
+    materialize_composers(app);
+    let key = backend::thread_scope(
+        app.connected_rpc.clone(),
+        app.active_channel.clone(),
+        app.active_thread_seq,
+    );
+    composer_scope_named(app, "/reply_composer(", &key).unwrap_or_else(|| {
+        panic!(
+            "the reply composer for thread {} materialized",
+            app.active_thread_seq
+        )
+    })
+}
+
+/// Types `text` into one composer instance, one character at a time — the
+/// same route a real keystroke takes through the rich composer.
+fn type_into(app: &mut Ducktape, scope: &str, kind: ComposerKind, text: &str) {
+    for character in text.chars() {
+        let message = Ducktape::__ice_test_message_chat_composer_composer_event(
+            scope.to_owned(),
+            editor::ComposerEvent::Apply(editor::RichAction::Edit(
+                iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Insert(
+                    character,
+                )),
+            )),
+            false,
+            kind,
+        );
+        let task = app.__update(message);
+        pump(app, task);
+    }
+}
+
+/// Replaces one composer instance's whole content.
+fn seed_composer(app: &mut Ducktape, scope: &str, kind: ComposerKind, text: &str) {
+    let clear = Ducktape::__ice_test_message_chat_composer_composer_event(
+        scope.to_owned(),
+        editor::ComposerEvent::Apply(editor::RichAction::Edit(
+            iced::widget::text_editor::Action::SelectAll,
+        )),
+        false,
+        kind,
+    );
+    let _ = app.__update(clear);
+    let cut = Ducktape::__ice_test_message_chat_composer_composer_event(
+        scope.to_owned(),
+        editor::ComposerEvent::Apply(editor::RichAction::Edit(
+            iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Delete),
+        )),
+        false,
+        kind,
+    );
+    let _ = app.__update(cut);
+    type_into(app, scope, kind, text);
+}
+
+/// Submits one composer instance, the way plain Enter and the Send button do.
+fn submit_composer(app: &mut Ducktape, scope: &str, kind: ComposerKind, blocked: bool) {
+    let message = Ducktape::__ice_test_message_chat_composer_composer_event(
+        scope.to_owned(),
+        editor::composer_submit_event(),
+        blocked,
+        kind,
+    );
+    let task = app.__update(message);
+    pump(app, task);
+}
+
+/// DELIVERS WHAT A HANDLER'S TASK PUBLISHES back into the loop. A component
+/// handler's `emit` rides `Task::done` (ducktape-ui#712) — the event is the
+/// NEXT update-loop message, so the emitting handler's writes land first —
+/// and a test that drops the returned task never sees the app half of the
+/// round trip.
+fn pump(app: &mut Ducktape, task: iced::Task<__DucktapeMessage>) {
+    use iced_test::futures::futures::StreamExt as _;
+    let Some(stream) = iced_test::runtime::task::into_stream(task) else {
+        return;
+    };
+    let published: Vec<__DucktapeMessage> = iced_test::futures::futures::executor::block_on(
+        stream
+            .filter_map(|action| async move {
+                match action {
+                    iced_test::runtime::Action::Output(message) => Some(message),
+                    _ => None,
+                }
+            })
+            .collect(),
+    );
+    // ONE HOP, AND NO FURTHER. An `emit` is `Task::done`, so this task is a
+    // ready message and nothing else — but what the RECEIVING handler
+    // launches is a real request, and running that here would answer with the
+    // failure a unit test's absent node returns and roll the optimistic row
+    // back under the assertions. A test that wants the answer drives it, as
+    // every other test in this file already does.
+    for message in published {
+        let _ = app.__update(message);
+    }
+}
+
+/// THE SUBMIT AS THE APP SEES IT. A composer instance clears itself and then
+/// hands up `(kind, body, operation_id)`; a test that is about what the app
+/// does with a submitted body says exactly that, without driving keystrokes
+/// through an instance it never asserts on. Returns the operation id, which
+/// the send lane's receipts and failures are keyed by.
+fn submit(app: &mut Ducktape, kind: ComposerKind, body: &str) -> String {
+    let id = backend::fresh_operation_id(backend::composer_op_prefix(kind));
+    let _ = app.__update(__DucktapeMessage::ComposerSubmitted(
+        kind,
+        body.to_owned(),
+        id.clone(),
+    ));
+    id
+}
+
+/// One composer instance's draft, as the reader sees it.
+fn composer_text(app: &Ducktape, scope: &str) -> String {
+    app.__ice_test_state_chat_composer(scope)
+        .map(|state| state.body.trim().to_owned())
+        .unwrap_or_default()
+}
+
 fn compose(text: &str) -> iced::widget::text_editor::Content {
     iced::widget::text_editor::Content::with_text(text)
-}
-
-fn composer(app: &Ducktape) -> String {
-    app.message_editor.text().trim().to_string()
-}
-
-fn reply_composer(app: &Ducktape) -> String {
-    app.reply_editor.text().trim().to_string()
 }
 
 /// The page document's text, the way the save tick reads it.

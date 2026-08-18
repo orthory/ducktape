@@ -618,10 +618,7 @@ fn consecutive_sends_stay_in_one_author_run() {
     }];
 
     for body in ["first", "second"] {
-        app.message_editor = compose(body);
-        let _ = app.__update(__DucktapeMessage::ChatComposerEvent(
-            editor::composer_submit_event(),
-        ));
+        submit(&mut app, ComposerKind::Message, body);
     }
 
     let authors: Vec<&str> = app
@@ -671,11 +668,7 @@ fn a_minted_reply_keeps_the_first_reply_header() {
             ..message(8, "the first reply", false)
         },
     ];
-    app.reply_editor = compose("and one more");
-
-    let _ = app.__update(__DucktapeMessage::ReplyComposerEvent(
-        editor::composer_submit_event(),
-    ));
+    submit(&mut app, ComposerKind::Reply, "and one more");
 
     let headers: Vec<bool> = app
         .thread_messages
