@@ -1641,3 +1641,56 @@ fn every_ladder_rung_is_scoped_to_the_tab_that_mounts_its_surface() {
         );
     }
 }
+
+/// A TAB MOVE RETIRES THE MENUS THE TAB IT LEFT OWNED.
+///
+/// Nothing did: `select_shell_tab` left every menu flag set, which is the whole
+/// reason the escape ladder has to be scoped tab by tab (#1132). The scoping
+/// stays — a rung must not answer for a surface that is not on screen, however
+/// the flag got there — and this is the other half of it: an armed delete
+/// confirm that survives a tab round trip is a mouse click away from deleting
+/// the page the reader forgot she armed, and a ⋯ menu is not state anyone
+/// expects to come back to.
+#[test]
+fn a_tab_move_retires_the_menu_only_state_of_the_screen_it_left() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.shell_tab = ShellTab::Chat;
+    app.selected_message_seq = 4;
+    app.selected_message_rev = 2;
+    app.message_action = MessageAction::More;
+    app.message_edit_draft = "half typed".into();
+    app.thread_selected_seq = 7;
+    app.thread_selected_rev = 1;
+    app.thread_message_action = MessageAction::Editing;
+    app.thread_edit_draft = "half typed too".into();
+    app.forge_repo_menu = true;
+    app.page_delete_armed = true;
+    app.fs_delete_target = "/shared/report.md".into();
+
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Node));
+
+    assert_eq!(app.message_action, MessageAction::Toolbar);
+    assert_eq!(app.message_edit_draft, "");
+    assert_eq!(app.selected_message_seq, 0);
+    assert_eq!(app.selected_message_rev, 0);
+    assert_eq!(app.thread_message_action, MessageAction::Toolbar);
+    assert_eq!(app.thread_edit_draft, "");
+    assert_eq!(app.thread_selected_seq, 0);
+    assert_eq!(app.thread_selected_rev, 0);
+    assert!(!app.forge_repo_menu);
+    assert!(
+        !app.page_delete_armed,
+        "an armed delete never rides a tab move"
+    );
+    assert_eq!(app.fs_delete_target, "");
+
+    // The disconnected path returns before the generation bumps, and retires
+    // the same set — the clear sits above both early returns, like `error`.
+    let (mut app, _) = Ducktape::__boot();
+    app.shell_tab = ShellTab::Files;
+    app.fs_delete_target = "/shared/report.md".into();
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Chat));
+    assert_eq!(app.fs_delete_target, "");
+    assert_eq!(app.shell_tab, ShellTab::Chat);
+}

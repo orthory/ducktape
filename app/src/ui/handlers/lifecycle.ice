@@ -673,6 +673,26 @@ on select_shell_tab(next)
   channel_reads = mark_channel_read(channel_reads, chat_tab_channel, channel_head_seq(channels, chat_tab_channel))
   rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
+  // MENU-ONLY STATE BELONGS TO THE SCREEN THAT MOUNTED IT, and every one of
+  // these surfaces is mounted under an arm of `match tab`. Left set, an armed
+  // delete confirm comes back on the tab round trip one click from deleting a
+  // page the reader has forgotten she armed, and a ⋯ menu is not state anyone
+  // expects to return to. The escape ladder's tab scoping still stands beside
+  // this — a rung must not answer for a surface that is off screen however the
+  // flag got there — and the same retire is what `open_chat_search_hit`,
+  // `open_page_search_hit` and `huddle_go_channel` already do on their own tab
+  // moves. ABOVE both early returns, for the reason `error` is.
+  selected_message_seq = 0
+  selected_message_rev = 0
+  message_action = MessageAction.toolbar
+  message_edit_draft = ""
+  thread_selected_seq = 0
+  thread_selected_rev = 0
+  thread_message_action = MessageAction.toolbar
+  thread_edit_draft = ""
+  forge_repo_menu = false
+  page_delete_armed = false
+  fs_delete_target = ""
   // A hydration error belongs to the pane that raised it. Leaving it up after
   // a navigation tells the user the pane they just opened is broken, which is
   // a lie the banner has no way to walk back — it is dismissed by hand or not
