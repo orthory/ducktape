@@ -328,6 +328,7 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             thread_action,
             action,
             drawer,
+            false,
             repo_menu,
         )
     };
@@ -342,6 +343,7 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             true,
             MessageAction::More,
             MessageAction::More,
+            true,
             true,
             true,
         ),
@@ -465,8 +467,27 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
         ),
         "repo_menu"
     );
-    // Nothing transient open → Escape is a no-op. The pages rungs are gone
-    // with the menus they dismissed: the document has no transient layer.
+    // THE PAGES DELETE CONFIRM. A scrim and a confirm over the canvas, inside
+    // the Pages screen — so it is a rung, and it answers only from Pages.
+    let armed = |tab: ShellTab, page_delete: bool| {
+        escape_target(
+            escape.clone(),
+            tab,
+            false,
+            false,
+            false,
+            MessageAction::Toolbar,
+            MessageAction::Toolbar,
+            false,
+            page_delete,
+            false,
+        )
+    };
+    assert_eq!(armed(ShellTab::Pages, true), "page_delete");
+    assert_eq!(armed(ShellTab::Chat, true), "");
+
+    // Nothing transient open → Escape is a no-op. The pages block menus are
+    // gone with the surfaces they dismissed.
     assert_eq!(
         target(
             ShellTab::Chat,
@@ -511,6 +532,7 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
             thread_action,
             action,
             drawer,
+            false,
             repo_menu,
         )
     };
@@ -527,6 +549,7 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
             create,
             thread_action,
             MessageAction::Toolbar,
+            false,
             false,
             repo_menu,
         )
@@ -642,6 +665,7 @@ fn the_content_pane_claims_only_the_keys_nothing_else_owns() {
         "thread_menu",
         "message_menu",
         "channel_settings",
+        "page_delete",
         "repo_menu",
     ] {
         for key in [Named::PageDown, Named::PageUp, Named::End, Named::Home] {

@@ -224,9 +224,11 @@ pub fn topmost_overlay(
     thread_message_action: crate::MessageAction,
     message_action: crate::MessageAction,
     channel_settings_open: bool,
+    page_delete_armed: bool,
     forge_repo_menu: bool,
 ) -> String {
     let on_chat = shell_tab == crate::ShellTab::Chat;
+    let on_pages = shell_tab == crate::ShellTab::Pages;
     let on_forge = shell_tab == crate::ShellTab::Forge;
     if palette_open {
         return "palette".into();
@@ -260,9 +262,16 @@ pub fn topmost_overlay(
     if on_chat && channel_settings_open {
         return "channel_settings".into();
     }
-    // The pages block-actions menu and insert row used to sit here. The page
-    // document has neither: there is no transient layer over the canvas to
-    // dismiss, and the comments rail is a persistent panel with its own close.
+    // The pages block-actions menu and insert row used to sit here, and the
+    // comments rail is a persistent panel with its own close. THE ARMED DELETE
+    // IS NEITHER: it paints a scrim and a confirm over the canvas, and it
+    // shipped with the mouse as its only exit. `pages_ready` in
+    // `handlers/overlays.ice` names it for the same reason — a layer that eats
+    // the mouse must eat the keyboard, or Cmd/Ctrl+Z mutates (and autosaves)
+    // the document the reader is being asked to confirm the deletion of.
+    if on_pages && page_delete_armed {
+        return "page_delete".into();
+    }
     if on_forge && forge_repo_menu {
         return "repo_menu".into();
     }
@@ -286,6 +295,7 @@ pub fn escape_target(
     thread_message_action: crate::MessageAction,
     message_action: crate::MessageAction,
     channel_settings_open: bool,
+    page_delete_armed: bool,
     forge_repo_menu: bool,
 ) -> String {
     use iced::keyboard::{Key, key::Named};
@@ -301,6 +311,7 @@ pub fn escape_target(
         thread_message_action,
         message_action,
         channel_settings_open,
+        page_delete_armed,
         forge_repo_menu,
     );
     // `palette_key_action` owns the palette's keys — an open palette swallows

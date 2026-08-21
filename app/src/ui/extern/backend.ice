@@ -156,8 +156,8 @@ extern crate::backend
   pure connection_degraded(status:str) -> bool
   pure titlebar_inset() -> f64
   pure palette_key_action(logical:key, physical:physical-key, modifiers:key-modifiers, open:bool) -> str
-  pure topmost_overlay(tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, forge_repo_menu:bool) -> str
-  pure escape_target(logical:key, tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, forge_repo_menu:bool) -> str
+  pure topmost_overlay(tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, page_delete_armed:bool, forge_repo_menu:bool) -> str
+  pure escape_target(logical:key, tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, page_delete_armed:bool, forge_repo_menu:bool) -> str
   pure close_message_action(close:bool, current:MessageAction) -> MessageAction
   pure content_scroll_step(logical:key, modifiers:key-modifiers, overlay:str) -> f64
   NavItem(id:ShellTab, title:str, icon:str, badge:i64, active:bool, live:bool)
