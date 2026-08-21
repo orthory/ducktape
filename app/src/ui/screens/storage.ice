@@ -503,6 +503,13 @@ component ExplorerScreen(connected_rpc:str, connected:bool, loading:bool, blocks
     partial = ""
     searching = false
     selected:i64 = 0
+    // THE STRING THE ZERO-HIT PLATE IS SPEAKING FOR — the query a search was
+    // actually SENT for, `""` while no answer stands. Not a flag: this box is
+    // ENTER-TO-SUBMIT and two-way bound with no `change=` route, so a keystroke
+    // writes `query` and runs no handler at all — only `trim(query) ==
+    // sent_query` can retire the plate as the reader types (the same class
+    // `page_search_query` carries on pages).
+    sent_query = ""
   on explorer_search_submit(rpc, online)
     let blocked = !online || searching || empty(trim(query))
     return if blocked
@@ -511,7 +518,10 @@ component ExplorerScreen(connected_rpc:str, connected:bool, loading:bool, blocks
     kinds = []
     partial = ""
     kind = "all"
-    run replace lane=workspace_search search_workspace(rpc, trim(query)) -> explorer_results_loaded _
+    // Captured at the last place the draft and the string being sent are known
+    // to match — and sent from here, so the two cannot drift apart.
+    sent_query = trim(query)
+    run replace lane=workspace_search search_workspace(rpc, sent_query) -> explorer_results_loaded _
   on explorer_results_loaded(next)
     hits = next.hits
     kinds = next.kinds
@@ -525,6 +535,7 @@ component ExplorerScreen(connected_rpc:str, connected:bool, loading:bool, blocks
     partial = ""
     kind = "all"
     searching = false
+    sent_query = ""
   on pick_explorer_kind(next)
     kind = next
   on select_explorer_block(height)
@@ -763,7 +774,11 @@ component ExplorerScreen(connected_rpc:str, connected:bool, loading:bool, blocks
       // "Nothing matched" is a claim about the WORKSPACE, and only the sources
       // that answered can support it. With `partial` standing, the banner above
       // already says why the screen is empty.
-      if connected && empty(hits) && !searching && !empty(trim(query)) && empty(partial)
+      //
+      // ON THE QUERY THAT WAS SENT, NOT ON THE ONE IN THE BOX: keyed on the
+      // live draft, one more keystroke after a zero-hit answer re-aimed this
+      // sentence at a string the node was never asked about.
+      if connected && empty(hits) && !searching && !empty(sent_query) && trim(query) == sent_query && empty(partial)
         EmptyPlate message="Nothing matched that query in this workspace." #explorer-nothing-matched
       // NOT CONNECTED IS NOT EMPTY. `connected` already disables the query box
       // above; the ledger below it still asserted "No blocks yet" off a node

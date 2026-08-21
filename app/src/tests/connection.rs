@@ -153,6 +153,48 @@ fn the_zero_hit_plates_sit_where_the_answer_is_needed() {
     );
 }
 
+/// THE EXPLORER'S PLATE SPEAKS FOR THE QUERY IT WAS SENT — the same class the
+/// pages plate above was fixed for, on the last surface that still keyed its
+/// zero-hit sentence on the LIVE draft. Workspace search is enter-to-submit and
+/// two-way bound with no `change=` route, so a keystroke after a zero-hit answer
+/// runs no handler at all: only `trim(query) == sent_query` can retire the
+/// plate, and the captured string is the only thing that can carry the
+/// comparison. Read off the component's own source because its state is
+/// instance-local and its draft is written by the input widget, not by a
+/// handler the harness could dispatch.
+#[test]
+fn the_explorer_plate_speaks_for_the_query_it_was_sent() {
+    let explorer = inlined(include_str!("../ui/screens/storage.ice"));
+    let submit = ice_handler_body(&explorer, "explorer_search_submit");
+    // CAPTURED AT SUBMIT, AND SENT FROM THE CAPTURE — passing `trim(query)` to
+    // the call a second time would let the string asked about and the string
+    // spoken for drift apart in a later edit.
+    assert!(
+        submit.contains("sent_query = trim(query)"),
+        "the submit must capture the query it sends"
+    );
+    assert!(
+        submit.contains(
+            "run replace lane=workspace_search search_workspace(rpc, sent_query) -> explorer_results_loaded _"
+        ),
+        "the search must be sent for the captured string itself"
+    );
+    // THE ARM. A flag could never carry this: `searching` is down and the hits
+    // are empty for a zero-hit answer no matter what is in the box.
+    assert!(
+        explorer.contains(
+            "if connected && empty(hits) && !searching && !empty(sent_query) && trim(query) == sent_query && empty(partial)"
+        ),
+        "the zero-hit plate must be keyed on the query that was sent"
+    );
+    // AND THE DISMISSAL DROPS IT. Left standing, the plate would speak for a
+    // query whose box has been emptied.
+    assert!(
+        ice_handler_body(&explorer, "clear_explorer_search").contains("sent_query = \"\""),
+        "clearing the box must take the standing answer with it"
+    );
+}
+
 /// A NAVIGATION DISMISSES THE WHOLE ANSWER, NOT HALF OF IT. `channel_created`
 /// and `pages_mutated` land you somewhere new exactly the way the pickers do,
 /// and `close_doc_tab` does when — and only when — it closes the ACTIVE tab;
