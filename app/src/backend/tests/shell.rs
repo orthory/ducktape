@@ -329,6 +329,7 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             action,
             drawer,
             false,
+            String::new(),
             repo_menu,
         )
     };
@@ -345,6 +346,7 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             MessageAction::More,
             true,
             true,
+            "/shared/q3.md".into(),
             true,
         ),
         ""
@@ -469,7 +471,7 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
     );
     // THE PAGES DELETE CONFIRM. A scrim and a confirm over the canvas, inside
     // the Pages screen — so it is a rung, and it answers only from Pages.
-    let armed = |tab: ShellTab, page_delete: bool| {
+    let armed = |tab: ShellTab, page_delete: bool, fs_delete: &str| {
         escape_target(
             escape.clone(),
             tab,
@@ -480,11 +482,14 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             MessageAction::Toolbar,
             false,
             page_delete,
+            fs_delete.into(),
             false,
         )
     };
-    assert_eq!(armed(ShellTab::Pages, true), "page_delete");
-    assert_eq!(armed(ShellTab::Chat, true), "");
+    assert_eq!(armed(ShellTab::Pages, true, ""), "page_delete");
+    assert_eq!(armed(ShellTab::Chat, true, ""), "");
+    assert_eq!(armed(ShellTab::Files, false, "/shared/q3.md"), "fs_delete");
+    assert_eq!(armed(ShellTab::Node, false, "/shared/q3.md"), "");
 
     // Nothing transient open → Escape is a no-op. The pages block menus are
     // gone with the surfaces they dismissed.
@@ -533,6 +538,7 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
             action,
             drawer,
             false,
+            String::new(),
             repo_menu,
         )
     };
@@ -551,6 +557,7 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
             MessageAction::Toolbar,
             false,
             false,
+            String::new(),
             repo_menu,
         )
     };
@@ -666,6 +673,7 @@ fn the_content_pane_claims_only_the_keys_nothing_else_owns() {
         "message_menu",
         "channel_settings",
         "page_delete",
+        "fs_delete",
         "repo_menu",
     ] {
         for key in [Named::PageDown, Named::PageUp, Named::End, Named::Home] {

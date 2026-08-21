@@ -225,10 +225,12 @@ pub fn topmost_overlay(
     message_action: crate::MessageAction,
     channel_settings_open: bool,
     page_delete_armed: bool,
+    fs_delete_target: String,
     forge_repo_menu: bool,
 ) -> String {
     let on_chat = shell_tab == crate::ShellTab::Chat;
     let on_pages = shell_tab == crate::ShellTab::Pages;
+    let on_files = shell_tab == crate::ShellTab::Files;
     let on_forge = shell_tab == crate::ShellTab::Forge;
     if palette_open {
         return "palette".into();
@@ -272,6 +274,14 @@ pub fn topmost_overlay(
     if on_pages && page_delete_armed {
         return "page_delete".into();
     }
+    // The same confirm one screen over: `fs_delete_target` arms a scrim and a
+    // `ConfirmDelete` over duckfs (`screens/storage.ice`), and it had no
+    // keyboard exit either — the state the channel drawer was in before #1132
+    // gave it a rung. A destructive confirm is the LAST layer that should need
+    // the mouse.
+    if on_files && !fs_delete_target.is_empty() {
+        return "fs_delete".into();
+    }
     if on_forge && forge_repo_menu {
         return "repo_menu".into();
     }
@@ -296,6 +306,7 @@ pub fn escape_target(
     message_action: crate::MessageAction,
     channel_settings_open: bool,
     page_delete_armed: bool,
+    fs_delete_target: String,
     forge_repo_menu: bool,
 ) -> String {
     use iced::keyboard::{Key, key::Named};
@@ -312,6 +323,7 @@ pub fn escape_target(
         message_action,
         channel_settings_open,
         page_delete_armed,
+        fs_delete_target,
         forge_repo_menu,
     );
     // `palette_key_action` owns the palette's keys — an open palette swallows

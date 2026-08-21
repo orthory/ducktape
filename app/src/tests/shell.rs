@@ -1425,3 +1425,32 @@ fn escape_closes_the_drawer_over_a_thread_menu_the_drawer_unmounted() {
     assert_eq!(app.thread_message_action, MessageAction::Toolbar);
     assert_eq!(app.thread_edit_draft, "");
 }
+
+/// THE FILES DELETE CONFIRM IS AN OVERLAY, SO IT ANSWERS ESCAPE.
+///
+/// `fs_delete_target` arms a scrim + `ConfirmDelete` over duckfs
+/// (`screens/storage.ice`). Its dismiss route is the backdrop click and the
+/// Cancel button — a destructive confirm with no keyboard exit, which is the
+/// state the drawer was in before #1132 gave it a rung.
+#[test]
+fn escape_disarms_the_files_delete_confirm_from_the_files_tab_only() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.shell_tab = ShellTab::Files;
+    app.fs_delete_target = "/shared/report.md".into();
+
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape_press()));
+    assert_eq!(
+        app.fs_delete_target, "",
+        "Escape is the keyboard way out of a destructive confirm"
+    );
+
+    // And the rung is scoped like every other per-tab rung: from another tab
+    // the confirm is not on screen, so the press names no layer at all.
+    app.shell_tab = ShellTab::Node;
+    app.fs_delete_target = "/shared/report.md".into();
+    app.bell_open = true;
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape_press()));
+    assert!(!app.bell_open, "the bell rides every tab and answers first");
+    assert_eq!(app.fs_delete_target, "/shared/report.md");
+}

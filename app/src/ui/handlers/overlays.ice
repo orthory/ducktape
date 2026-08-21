@@ -68,7 +68,7 @@ on global_key_pressed(event)
   // every closable flag self-selects against the verdict: the handler
   // grammar has no branches, so the keepers ARE the routing. Sits before
   // the palette block, whose open path must end in its focus task.
-  let escape_key = escape_target(event.key, shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, page_delete_armed, forge_repo_menu)
+  let escape_key = escape_target(event.key, shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, page_delete_armed, fs_delete_target, forge_repo_menu)
   // THE COMPOSER'S FORMATTING CHORDS ARE NOT HERE ANY MORE. They land at the
   // widget that has the caret — `RichTextEditor::on_chord` (ducktape-ui#711)
   // is offered exactly the presses the bubble contract releases — so the
@@ -91,6 +91,7 @@ on global_key_pressed(event)
   message_edit_draft = keep_str(escape_key == "message_menu", "", message_edit_draft)
   channel_settings_open = channel_settings_open && escape_key != "channel_settings"
   page_delete_armed = page_delete_armed && escape_key != "page_delete"
+  fs_delete_target = keep_str(escape_key == "fs_delete", "", fs_delete_target)
   forge_repo_menu = forge_repo_menu && escape_key != "repo_menu"
   page_editor = page_history_key(page_editor, page_history_shortcut(event.key, event.physical_key, event.modifiers, pages_ready))
   return if palette_key == "none"
@@ -123,7 +124,7 @@ on global_key_pressed(event)
 // say which one the reader means. Giving them a keyboard scroll is a focus
 // design, not a bug fix, and guessing a pane would move the wrong one.
 on content_scroll_key(event)
-  let content_scroll = content_scroll_step(event.key, event.modifiers, topmost_overlay(shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, page_delete_armed, forge_repo_menu))
+  let content_scroll = content_scroll_step(event.key, event.modifiers, topmost_overlay(shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, page_delete_armed, fs_delete_target, forge_repo_menu))
   return if content_scroll == 0.0
   parallel
     task widget scroll-by #workspace-tabs/content/settings/settings-body 0.0 content_scroll window=window_target(console_win)
