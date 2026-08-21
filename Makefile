@@ -173,7 +173,10 @@ test: wasm-modules-check
 ## committed bytes — commit the refreshed set TOGETHER; `wasm-modules-check`
 ## guards mutual consistency. bytes no longer depend on WHERE the checkout
 ## lives (guest-builder remaps the path prefixes away), so the same toolchain
-## on any box reproduces them — `wasm-repro-check` is that pin.
+## on any box reproduces them — `wasm-repro-check` is that pin. nor on WHEN:
+## guest-builder seeds the scratch workspace from the host `Cargo.lock`, so a
+## crates.io publish no longer moves these bytes — a `Cargo.lock` bump that
+## touches a guest-graph crate does, and that is a reviewable diff.
 #
 # Every product/example module carries its own guest port (src/guest.rs behind
 # the `guest` feature); guest-builder synthesizes the packaging workspace and
