@@ -5,11 +5,16 @@ use crate::host_reads::{read_sync_mesh_window, read_valset_members, read_valset_
 use crate::sync::serve::{SyncBoundary, SyncIndexOps, SyncStateRequest};
 use crate::util::{participant_bytes, resident_bytes};
 
-/// one page of a module's stored op rows at or below `up_to_height`, in key
-/// order, for the joiner backfill lane. the store's own `scan` already pages
-/// in key order off one MVCC snapshot; all this adds is the height ceiling —
-/// op keys are fixed-width hex, so lexicographic order IS `(height, seq)`
-/// order and the ceiling is a prefix of the page.
+/// up to [`crate::sync::serve::INDEX_OPS_LOOP_PAGES`] wire pages of a module's
+/// stored op rows at or below `up_to_height`, in key order, for the joiner
+/// backfill lane. the store's own `scan` already pages in key order off one
+/// MVCC snapshot; all this adds is the height ceiling — op keys are
+/// fixed-width hex, so lexicographic order IS `(height, seq)` order and the
+/// ceiling is a prefix of the page.
+///
+/// READING A BUDGET, not a page: this read crosses to the consensus loop, and
+/// the serve task hands the surplus out itself, so a joiner's walk costs one
+/// touch per budget instead of one per wire page.
 pub(crate) fn read_index_ops(
     index: &indexer::IndexStore,
     module: &str,
@@ -22,9 +27,9 @@ pub(crate) fn read_index_ops(
             module,
             indexer::OP_PREFIX.as_bytes(),
             cursor.as_deref().map(str::as_bytes),
-            // the wire's page cap, so the store's own `has_more` already
-            // answers for the whole page and nothing is dropped downstream.
-            statesync::INDEX_OPS_BATCH_LEN,
+            // a whole budget of wire pages, so the store's own `has_more`
+            // answers for all of them and nothing is dropped downstream.
+            crate::sync::serve::INDEX_OPS_LOOP_ROWS,
         )
         .map_err(|e| format!("index op page for {module}: {e}"))?;
     let above_ceiling =

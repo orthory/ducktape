@@ -598,7 +598,8 @@ mod tests {
                         boundary,
                     ) {
                         Ok(page) => {
-                            let resp = crate::sync::serve::bounded_index_ops_response(page);
+                            let (resp, _read_ahead) =
+                                crate::sync::serve::split_index_ops_response(page);
                             if let SyncResponse::IndexOps { rows, .. } = &resp {
                                 self.served.lock().expect("served").extend(
                                     rows.iter().filter_map(|(key, _)| {
