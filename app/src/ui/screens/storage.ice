@@ -37,7 +37,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
     // belong to the directory you left. The crumb has already moved, so
     // `0 files · 1 dir` beside it would be the OLD directory's tally
     // printed under the NEW directory's name.
-    CrumbBar
+    CrumbBar #crumb
       with
         path
         meta=fs_counts_summary(connected, listed, entries)
