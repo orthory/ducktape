@@ -701,7 +701,16 @@ impl IndexStore {
             return Ok(());
         }
         let out = (|| -> Result<()> {
-            // the feed goes down FIRST: its pending events describe rows the
+            // THE MARKER COMES DOWN FIRST AND GOES BACK UP LAST, exactly as
+            // `converge_guest` writes it last: while the derived keyspace is
+            // cleared and re-driven, NOTHING may vouch for it. A crash in
+            // between must leave no marker at all, so the next `open` finds
+            // one absent, refolds whole, and writes it — instead of matching
+            // the guest hash, returning early, and serving a half-built read
+            // model with a fold tip below its own feed.
+            let marker = m.db.get(META_GUEST.as_bytes())?;
+            m.db.delete(META_GUEST)?;
+            // the feed goes down next: its pending events describe rows the
             // clear below is about to delete, and `delete_trigger` discards
             // them with the registration.
             m.db.delete_trigger(FOLD_TRIGGER)?;
@@ -711,7 +720,11 @@ impl IndexStore {
             // AND WAIT FOR IT, for `converge_guest`'s reason: returning over a
             // cleared keyspace serves "no such page" for every page, which is
             // indistinguishable from a workspace that lost its documents.
-            drain_fold(&m.db, module)
+            drain_fold(&m.db, module)?;
+            if let Some(marker) = marker {
+                m.db.put(META_GUEST, marker)?;
+            }
+            Ok(())
         })();
         if out.is_err() {
             self.poisoned.store(true, Ordering::Relaxed);

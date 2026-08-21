@@ -2120,9 +2120,9 @@ pub(super) async fn park(
                             // ascension tip; per-block folds keep it
                             // current from here (no more healing).
                             if last_indexed_root.as_ref() != Some(&root) {
-                                // the stamp, then the SOURCE'S OWN op rows
-                                // below it — inline, while this node is not
-                                // yet serving and not yet folding live
+                                // the SOURCE'S OWN op rows, under whatever
+                                // this node already holds — inline, while it
+                                // is not yet serving and not yet folding live
                                 // blocks. that window is the whole
                                 // correctness argument for writing straight
                                 // into the feed (see

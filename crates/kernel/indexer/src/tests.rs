@@ -903,6 +903,100 @@ fn a_refold_rebuilds_the_read_model_over_a_feed_extended_downward() {
     );
 }
 
+/// A REFOLD MUST NOT LEAVE A MARKER VOUCHING FOR A KEYSPACE IT IS STILL
+/// REBUILDING. `converge_guest` writes `meta/guest` LAST for this reason: it
+/// says "this database is converged on that artifact", and a warm open that
+/// finds it matching returns early without looking at the read model at all.
+/// A refold that cleared and then crashed with the marker still in place would
+/// therefore be adopted forever — a truncated read model with a fold tip below
+/// its own feed, and nothing on the boot path to notice.
+///
+/// Pinned as a source shape because no behavioural test can see it: the window
+/// exists only between two writes inside one call, and both orders leave the
+/// same store behind when nothing crashes.
+#[test]
+fn the_refold_drops_its_guest_marker_before_clearing_and_writes_it_back_last() {
+    const SRC: &str = include_str!("lib.rs");
+    let body = SRC
+        .split("pub fn refold(")
+        .nth(1)
+        .expect("refold is declared")
+        .split("\n    /// ")
+        .next()
+        .expect("refold body");
+    let dropped = body
+        .find("delete(META_GUEST")
+        .expect("the refold drops the marker");
+    let cleared = body
+        .find("clear_derived(")
+        .expect("the refold clears the derived keyspace");
+    let drained = body.find("drain_fold(").expect("the refold drains");
+    let written = body
+        .find("put(META_GUEST")
+        .expect("the refold writes the marker back");
+    assert!(
+        dropped < cleared,
+        "the marker must come down BEFORE the keyspace it vouches for"
+    );
+    assert!(
+        drained < written,
+        "and go back up only AFTER the fold has caught up with the feed"
+    );
+}
+
+/// ...AND AN INTERRUPTED ONE IS RE-RUN WHOLE. The payoff of the order above:
+/// the state a crashed refold leaves — derived keyspace cleared, no marker —
+/// is exactly the state `IndexStore::open` rebuilds from, so the truncation
+/// heals at the next boot instead of being adopted.
+#[test]
+fn an_interrupted_refold_is_re_run_whole_by_the_next_open() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = mapped_store(dir.path());
+        for h in 1..=5 {
+            store
+                .apply_block(&block(h, vec![chat_op(b"payload")]))
+                .unwrap();
+        }
+        store.wait_folds_drained().unwrap();
+        assert_eq!(store.fold_tip("chat").unwrap(), Some((5, 0)));
+
+        // the wreckage of a refold that died after its clear.
+        let db = &store.modules.get("chat").expect("chat is open").db;
+        db.delete(META_GUEST).unwrap();
+        clear_derived(db).unwrap();
+        assert_eq!(
+            store.fold_tip("chat").unwrap(),
+            None,
+            "the read model is gone, and the feed still holds every row"
+        );
+        assert_eq!(
+            store
+                .scan("chat", OP_PREFIX.as_bytes(), None, 100)
+                .unwrap()
+                .entries
+                .len(),
+            5
+        );
+    }
+
+    let reopened = mapped_store(dir.path());
+    assert_eq!(
+        reopened.fold_tip("chat").unwrap(),
+        Some((5, 0)),
+        "the next open refolded it whole"
+    );
+    assert_eq!(
+        reopened
+            .scan("chat", b"seen/", None, 100)
+            .unwrap()
+            .entries
+            .len(),
+        5,
+        "every derived row is back"
+    );
+}
+
 /// THE FLOOR IS THE ONLY THING A BACKFILL MOVES. `write_backfill_rows` must
 /// never touch the watermark (the heal already stamped it at the boundary, and
 /// it vouches for feed contiguity from the floor up), and the floor setter

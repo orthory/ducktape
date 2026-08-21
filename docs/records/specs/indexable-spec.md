@@ -308,17 +308,26 @@ that gap is what a resident restarting over a wiped index directory holds: the
 checkpoint heal stamps the empty databases and the journal replay folds the
 suffix back on top, so every watermark is at the tip and nothing is stale.
 The seam therefore also runs over the floored modules — the restart seam calls
-the same helper the ascension does. Nothing is WIPED there: that module has a
-feed and views, and a stamp would destroy both for a walk that can still fail
-on its next page, leaving it worse than it was and doing it again at the next
-seam. The rows land UNDER the feed instead, which is out of key order for the
-fold by construction, so the read model is rebuilt from the whole feed
-afterwards (`IndexStore::refold` — clear the derived keyspace, re-drive `op/`
-in key order, drain), whether the walk finished or died holding half a range.
-The feed only ever GAINS rows, and the floor drops only when the walk
-completed. The walk is asked for only when it can succeed: one request from a
-cursor past the boundary returns an empty page carrying the source's own
-floor, and a source floored no lower than this node ends the matter there.
+the same helper the ascension does. The FEED is never wiped there: that module
+has one, and a stamp would destroy it for a walk that can still fail on its
+next page, leaving it worse than it was and doing the same again at the next
+seam. The rows land UNDER the feed instead, which only ever GAINS rows here,
+and the floor drops only when the walk completed.
+
+The READ MODEL is a different matter: rows below what the fold already consumed
+arrive out of key order by construction, so the derived keyspace is CLEARED and
+re-driven from the whole feed afterwards (`IndexStore::refold` — drop the guest
+marker, clear the derived keys, re-drive `op/` in key order, drain, write the
+marker back), whether the walk finished or died holding half a range. Views are
+blank for the length of that replay — the same window a mapper swap opens at
+boot (§6) — with the feed under them intact throughout, and a walk that wrote
+nothing skips it entirely. The marker discipline is what makes a crash mid-refold
+safe: nothing vouches for the keyspace while it is being rebuilt, so an
+interrupted refold is re-run whole by the next `open` instead of being adopted.
+
+The walk is asked for only when it can succeed: one request from a cursor past
+the boundary returns an empty page carrying the source's own floor, and a
+source floored no lower than this node ends the matter there.
 
 **Why no refold is needed, and why this window is the only one.** Pre-serving
 there are no live folds, no ws subscribers, and no view readers on this node.

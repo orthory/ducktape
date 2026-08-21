@@ -406,20 +406,27 @@ async fn heal_module<C: statesync::SyncClient>(
         return Some(resumed);
     }
     stamp_module(index, module, boundary, label)?;
-    backfill_module(index, client, module, boundary, None, label).await
+    backfill_module(index, client, module, boundary, None, label)
+        .await
+        .ok()
 }
 
 /// close a module's FLOOR: pull the history below it, when a source holds any.
 ///
-/// NOTHING IS WIPED AHEAD OF THE PULL. This module HAS a feed and views; a
-/// stamp would destroy both for a walk that can still fail on its next page —
-/// a source that drops, a page failing the canonical seal, a source that
-/// re-stamps mid-walk — and the next seam, seeing the same floor, would do it
-/// again. So the rows land UNDER the feed instead. That is out of key order
-/// for the fold by construction (they sit below rows it already consumed), so
-/// the read model is rebuilt from the whole feed afterwards
+/// THE FEED IS NEVER WIPED AHEAD OF THE PULL. This module HAS a feed; a stamp
+/// would destroy it for a walk that can still fail on its next page — a source
+/// that drops, a page failing the canonical seal, a source that re-stamps
+/// mid-walk — and the next seam, seeing the same floor, would do it again. So
+/// the rows land UNDER the feed instead, which only ever GAINS rows here.
+///
+/// The READ MODEL is a different matter: rows below what the fold already
+/// consumed arrive out of key order by construction, so the derived keyspace
+/// is cleared and re-driven from the whole feed afterwards
 /// ([`indexer::IndexStore::refold`]) — whether the walk finished or died
-/// holding half a range. The feed only ever GAINS rows here.
+/// holding half a range. Views are blank for the length of that replay, which
+/// is the same window a mapper swap opens at boot, and the feed under them is
+/// intact throughout. A walk that wrote NOTHING disturbed nothing, and skips
+/// it.
 ///
 /// Asked only when a source can actually close the gap: one empty page
 /// carries the source's own floor, and a source floored no lower than this
@@ -447,6 +454,12 @@ async fn close_floor<C: statesync::SyncClient>(
     // already in this node's feed, and re-fetching it would only re-fold rows
     // the views already carry.
     let closed = backfill_module(index, client, module, floor, None, label).await;
+    if matches!(closed, Err(Wrote(None))) {
+        // the source promised and then refused before writing a row. the read
+        // model is exactly as it was, and replaying the whole feed to prove it
+        // would cost every boot this seam runs — it gates `serving`.
+        return None;
+    }
     if let Err(err) = index.refold(module) {
         tracing::warn!(
             target: "ducktape::statesync",
@@ -458,7 +471,7 @@ async fn close_floor<C: statesync::SyncClient>(
         );
         return None;
     }
-    closed
+    closed.ok()
 }
 
 /// does the source hold op rows BELOW `floor`? every index-op reply carries
@@ -555,7 +568,8 @@ async fn resume_module<C: statesync::SyncClient>(
         Some((held, AFTER_EVERY_SEQ)),
         label,
     )
-    .await?;
+    .await
+    .ok()?;
     // THE SOURCE MUST REACH THE RESUME POINT. a source floor ABOVE this
     // node's watermark means the source's own history starts inside the range
     // this node is missing, so the delta would leave a HOLE between them —
@@ -607,10 +621,15 @@ async fn resume_module<C: statesync::SyncClient>(
     })
 }
 
+/// what a REFUSED walk still left in the feed: the last row it wrote, `None`
+/// when it wrote nothing at all. the caller's "is there anything to clean up
+/// after" — a walk that never wrote cannot have disturbed anything.
+struct Wrote(Option<(u64, u32)>);
+
 /// walk one module's op rows below `boundary` off the source and write them,
 /// resuming strictly after `after` when the caller already holds a feed.
-/// `None` when the module keeps its stamped floor, warned once with a stable
-/// reason token.
+/// `Err` when the module keeps its floor, warned once with a stable reason
+/// token, carrying how far the walk got.
 async fn backfill_module<C: statesync::SyncClient>(
     index: &indexer::IndexStore,
     client: &C,
@@ -618,7 +637,7 @@ async fn backfill_module<C: statesync::SyncClient>(
     boundary: u64,
     after: Option<(u64, u32)>,
     label: &str,
-) -> Option<Backfilled> {
+) -> Result<Backfilled, Wrote> {
     let mut rows = 0usize;
     let mut bytes = 0usize;
     let mut last: Option<(u64, u32)> = None;
@@ -669,7 +688,7 @@ async fn backfill_module<C: statesync::SyncClient>(
                 reason,
                 "index backfill refused; the module keeps its boundary floor"
             );
-            return None;
+            return Err(Wrote(last));
         }
     };
     tracing::info!(
@@ -683,7 +702,7 @@ async fn backfill_module<C: statesync::SyncClient>(
         floor = source_floor.unwrap_or(0),
         "index backfill wrote {rows} op rows for {module} below boundary {boundary}"
     );
-    Some(Backfilled {
+    Ok(Backfilled {
         module: module.to_string(),
         source_floor,
         last_row: last,
@@ -786,6 +805,22 @@ mod tests {
 
     fn store(dir: &std::path::Path) -> indexer::IndexStore {
         indexer::IndexStore::open(dir, &[indexer::IndexModule::bare("chat")]).expect("open index")
+    }
+
+    /// the reference mapper (`crates/kernel/index-guest/testmap`, refreshed by
+    /// `make wasm-modules`) — the same artifact the indexer's own fold tests
+    /// run, so a module here can have a REAL fold and a read model to check.
+    const TESTMAP: &[u8] = include_bytes!("../../../crates/kernel/index-guest/testmap/index.wasm");
+
+    fn mapped_store(dir: &std::path::Path) -> indexer::IndexStore {
+        indexer::IndexStore::open(
+            dir,
+            &[indexer::IndexModule {
+                id: "chat",
+                guest: Some(TESTMAP),
+            }],
+        )
+        .expect("open index")
     }
 
     fn block(height: u64) -> indexer::BlockOps {
@@ -965,6 +1000,57 @@ mod tests {
             joiner.backfill_height("chat").expect("floor"),
             Some(FLOOR),
             "the floor it found stands: nothing below it can be claimed yet"
+        );
+    }
+
+    /// THE SEAM REBUILDS THE READ MODEL IT DISTURBS. Every other test here
+    /// runs a BARE module — no guest, no fold — which cannot see the half of
+    /// this seam that matters most: rows landing below what the fold already
+    /// consumed leave the derived keyspace describing a feed that no longer
+    /// exists, and the fold tip pointing at the low row it just wrote. A
+    /// caller waiting for its own op at height 10 would wait forever. Delete
+    /// the refold from `close_floor` and this is what fails.
+    #[tokio::test]
+    async fn closing_a_floor_leaves_the_read_model_current_with_the_whole_feed() {
+        const FLOOR: u64 = 5;
+        let source_dir = tempfile::tempdir().expect("source dir");
+        let joiner_dir = tempfile::tempdir().expect("joiner dir");
+        // the source only has to SERVE rows; the joiner is the one deriving.
+        let source = store(source_dir.path());
+        let joiner = mapped_store(joiner_dir.path());
+        for height in 1..=10 {
+            source.apply_block(&block(height)).expect("source folds");
+        }
+        joiner.mark_backfilled("chat", FLOOR).expect("stamp");
+        for height in (FLOOR + 1)..=10 {
+            joiner.apply_block(&block(height)).expect("replay folds");
+        }
+        joiner
+            .wait_folds_drained()
+            .expect("the replayed suffix folds");
+        assert_eq!(joiner.fold_tip("chat").expect("tip"), Some((10, 0)));
+
+        let client = SourceNode::new(source);
+        heal_and_backfill_index(&joiner, &client, 10, "resident").await;
+
+        assert_eq!(
+            joiner.fold_tip("chat").expect("tip"),
+            Some((10, 0)),
+            "the tip vouches for the whole feed, not the last row backfilled"
+        );
+        assert_eq!(
+            joiner
+                .scan("chat", b"seen/", None, 100)
+                .expect("scan")
+                .entries
+                .len(),
+            10,
+            "and every row below the floor derived its view row"
+        );
+        assert_eq!(
+            joiner.backfill_height("chat").expect("floor"),
+            None,
+            "the floor is gone: the feed reaches genesis"
         );
     }
 
