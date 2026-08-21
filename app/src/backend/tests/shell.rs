@@ -397,10 +397,29 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             false,
             MessageAction::More,
             MessageAction::More,
-            true,
+            false,
             true,
         ),
         "thread_menu"
+    );
+    // AND THE DRAWER OUTRANKS THE THREAD MENU WHEN IT IS OPEN. The rail is not
+    // mounted while Channel details is up (`if active_thread_seq > 0 &&
+    // !channel_settings_open`, `screens/chat.ice`), so a ⋯ flag left set behind
+    // it names no layer on screen — this test used to pin the opposite verdict,
+    // where the first Escape wiped `thread_edit_draft` and left the drawer
+    // standing.
+    assert_eq!(
+        target(
+            ShellTab::Chat,
+            false,
+            false,
+            false,
+            MessageAction::More,
+            MessageAction::Toolbar,
+            true,
+            true,
+        ),
+        "channel_settings"
     );
     assert_eq!(
         target(
@@ -415,8 +434,8 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
         ),
         "message_menu"
     );
-    // THE DRAWER SITS BETWEEN THEM. Both message menus float over Channel
-    // details, so they win; the repo menu lives on another tab, so it loses.
+    // THE DRAWER SITS BETWEEN THEM. The stream's menu floats over Channel
+    // details, so it wins; the repo menu lives on another tab, so it loses.
     // It had no rung at all — an `×` and no keyboard exit, while every other
     // overlay answered Escape. Measured: Escape over an open drawer changed
     // exactly zero pixels on the running app.

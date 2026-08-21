@@ -237,14 +237,23 @@ pub fn topmost_overlay(
     if channel_create_open {
         return "channel_create".into();
     }
-    if on_chat && thread_message_action != crate::MessageAction::Toolbar {
+    // THE DRAWER UNMOUNTS THE THREAD RAIL — `if active_thread_seq > 0 &&
+    // !channel_settings_open` in `screens/chat.ice` — and nothing clears the ⋯
+    // flag on the way in, so the same rule the tab scoping states one level up
+    // applies here: a rung answers only while its surface is mounted. Without
+    // the term, opening a thread action and then Channel details was a
+    // mouse-reachable state where the first Escape wiped a half-typed
+    // `thread_edit_draft` and left the drawer standing. It cannot be expressed
+    // by moving one rung in the ladder's total order — the stream's own menu
+    // really does float over the drawer and must stay above it.
+    if on_chat && !channel_settings_open && thread_message_action != crate::MessageAction::Toolbar {
         return "thread_menu".into();
     }
     if on_chat && message_action != crate::MessageAction::Toolbar {
         return "message_menu".into();
     }
-    // BELOW both message menus, which float over the drawer, and above the
-    // repo menu, which lives on another tab. The drawer had no rung at all: it
+    // BELOW the stream's message menu, which floats over the drawer, and above
+    // the repo menu, which lives on another tab. The drawer had no rung at all: it
     // shipped with an `×` and no keyboard exit while every other overlay in the
     // app answered Escape. Measured on the running app — Escape over an open
     // Channel details changed exactly zero pixels.

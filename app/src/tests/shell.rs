@@ -1388,3 +1388,40 @@ fn the_files_pane_reports_only_a_directory_it_has_listed() {
         "the mount has to compute it"
     );
 }
+
+/// ESCAPE CLOSES WHAT IS ON SCREEN, AND THE THREAD RAIL IS NOT.
+///
+/// Channel details unmounts the rail — `if active_thread_seq > 0 &&
+/// !channel_settings_open` in `screens/chat.ice` — and nothing clears the ⋯
+/// flag on the way in, so opening a thread action and then the drawer is a
+/// mouse-reachable state where the ladder's first rung named a menu nobody
+/// could see: the press wiped a half-typed `thread_edit_draft` and left the
+/// drawer standing. Same rule as the tab scoping, one level down — a rung
+/// answers only while its surface is mounted.
+#[test]
+fn escape_closes_the_drawer_over_a_thread_menu_the_drawer_unmounted() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.shell_tab = ShellTab::Chat;
+    app.active_channel = "general".into();
+    app.thread_selected_seq = 7;
+    app.thread_message_action = MessageAction::Editing;
+    app.thread_edit_draft = "half typed".into();
+    app.channel_settings_open = true;
+
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape_press()));
+    assert!(
+        !app.channel_settings_open,
+        "the first Escape closes the drawer the reader is looking at"
+    );
+    assert_eq!(
+        app.thread_edit_draft, "half typed",
+        "and leaves the unmounted rail's draft where she left it"
+    );
+    assert_eq!(app.thread_message_action, MessageAction::Editing);
+
+    // With the drawer down the rail is mounted again, and its rung answers.
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape_press()));
+    assert_eq!(app.thread_message_action, MessageAction::Toolbar);
+    assert_eq!(app.thread_edit_draft, "");
+}
