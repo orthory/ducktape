@@ -1693,4 +1693,24 @@ fn a_tab_move_retires_the_menu_only_state_of_the_screen_it_left() {
     let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Chat));
     assert_eq!(app.fs_delete_target, "");
     assert_eq!(app.shell_tab, ShellTab::Chat);
+
+    // AND A RE-SELECT IS NOT A MOVE. The rail emits `select_shell_tab(item.id)`
+    // from the seat that is already active, and Settings' rows emit their own
+    // tab while the reader is on it — so an unconditional retire is one click
+    // from destroying an inline edit on the screen she never left.
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.shell_tab = ShellTab::Chat;
+    app.selected_message_seq = 4;
+    app.selected_message_rev = 2;
+    app.message_action = MessageAction::Editing;
+    app.message_edit_draft = "still typing".into();
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Chat));
+    assert_eq!(
+        app.message_edit_draft, "still typing",
+        "clicking the tab you are on retires nothing"
+    );
+    assert_eq!(app.message_action, MessageAction::Editing);
+    assert_eq!(app.selected_message_seq, 4);
+    assert_eq!(app.selected_message_rev, 2);
 }
