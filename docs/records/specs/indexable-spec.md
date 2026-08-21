@@ -303,6 +303,19 @@ the boundary:
 4. the fold drains, and `IndexStore::set_backfill_floor` composes the source's
    own floor into a stamped module's — `None` when the source reaches genesis.
 
+A module that is NOT stale can still be missing everything below its FLOOR, and
+that gap is what a resident restarting over a wiped index directory holds: the
+checkpoint heal stamps the empty databases and the journal replay folds the
+suffix back on top, so every watermark is at the tip and nothing is stale.
+The seam therefore also runs over the floored modules — the restart seam calls
+the same helper the ascension does. Closing such a floor means REBUILDING the
+feed (rows below it, appended under rows the fold already consumed, would hand
+the guest history backwards), so it is a stamp-and-pull, and it is asked for
+only when it can succeed: one request from a cursor past the boundary returns
+an empty page carrying the source's own floor, and a source floored no lower
+than this node ends the matter there — a wipe that rebuilt the same feed minus
+its views would be pure loss.
+
 **Why no refold is needed, and why this window is the only one.** Pre-serving
 there are no live folds, no ws subscribers, and no view readers on this node.
 So ascending fetch-and-write makes COMMIT ORDER EQUAL KEY ORDER, which for

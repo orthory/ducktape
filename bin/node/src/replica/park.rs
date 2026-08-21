@@ -625,7 +625,16 @@ pub(super) async fn park(
             root_hash = %hex(&root),
             "resident: pre-synced boundary {tip} root_hash={}", hex(&root)
         );
-        heal_index(&index, tip, &label);
+        // THE LAST SEAM BEFORE THIS RESIDENT SERVES, and the only one a
+        // restart passes through: the same helper the ascension runs, because
+        // a restart over a WIPED index directory lands here holding nothing
+        // but a floor. The replay above stamped it (`heal_index` at the
+        // checkpoint) and then folded the suffix back on top, so no module is
+        // stale and no later seam looks again — the pre-boundary history is
+        // reachable only here, and only from a source. An unreachable one
+        // leaves every floor standing, which is exactly where this line
+        // stood before.
+        heal_and_backfill_index(&index, &client, tip, &label).await;
         last_indexed_root = Some(root);
         serving = Some((tip, node_r));
         metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Serving);

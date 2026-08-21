@@ -190,11 +190,13 @@ pub(crate) fn heal_index(index: &indexer::IndexStore, boundary: u64, label: &str
     }
 }
 
-/// bring every module whose feed trails `boundary` up to it from the sync
-/// source — inline, at the join seam, before this node serves anything
-/// (indexable spec §7). a module that already holds a feed RESUMES above its
-/// own watermark and keeps everything under it; one that holds nothing usable
-/// is stamped at the boundary and pulled from the source's own floor up.
+/// bring every module whose feed trails `boundary` — or begins at a floor —
+/// up to it from the sync source, inline at the seam, before this node serves
+/// anything (indexable spec §7). a module that already holds a feed RESUMES
+/// above its own watermark and keeps everything under it; one that holds
+/// nothing usable is stamped at the boundary and pulled from the source's own
+/// floor up; one whose only gap is BELOW its floor is rebuilt the same way,
+/// but only when a source says it holds that history.
 ///
 /// # why this is safe exactly here and nowhere else
 ///
@@ -235,6 +237,18 @@ pub(crate) async fn heal_and_backfill_index<C: statesync::SyncClient>(
             return;
         }
     };
+    // A MODULE THAT IS NOT STALE CAN STILL BE MISSING EVERYTHING BELOW ITS
+    // FLOOR — the marker a boundary stamp leaves behind. That is exactly what
+    // a resident restarting over a wiped index directory holds: the journal
+    // replay brings every watermark back to the tip, so nothing is stale, and
+    // the history below the stamp is reachable only from a source. Listed
+    // BEFORE the stale pass, whose own stamps write fresh floors nobody owes
+    // a second walk.
+    let floored: Vec<(String, u64)> = index
+        .module_ids()
+        .filter(|id| !stale.iter().any(|stale| stale == id))
+        .filter_map(|id| Some((id.to_string(), index.backfill_height(id).ok()??)))
+        .collect();
     let mut backfilled: Vec<Backfilled> = Vec::new();
     for module in &stale {
         if let Some(done) = heal_module(index, client, module, boundary, label).await {
@@ -247,6 +261,24 @@ pub(crate) async fn heal_and_backfill_index<C: statesync::SyncClient>(
         // operator rebuilds it — the per-module "keeps its boundary floor"
         // warn would badly understate that. stop asking: the remaining
         // modules can only fail the same way, N identical warns deep.
+        if index.is_poisoned() {
+            tracing::error!(
+                target: "ducktape::modules",
+                event = "node_index_poisoned",
+                node = %label,
+                module = %module,
+                height = boundary,
+                "index backfill poisoned the store; every later fold fails — \
+                 wipe <storage>/index to rebuild"
+            );
+            return;
+        }
+    }
+    for (module, floor) in &floored {
+        if let Some(done) = close_floor(index, client, module, *floor, boundary, label).await {
+            backfilled.push(done);
+            continue;
+        }
         if index.is_poisoned() {
             tracing::error!(
                 target: "ducktape::modules",
@@ -362,6 +394,61 @@ async fn heal_module<C: statesync::SyncClient>(
     }
     stamp_module(index, module, boundary, label)?;
     backfill_module(index, client, module, boundary, None, label).await
+}
+
+/// close a module's FLOOR: pull the history below it, when a source holds any.
+///
+/// closing the gap means REBUILDING the feed, not appending under it — rows
+/// below the floor written beneath rows the fold already consumed would hand
+/// the guest history backwards (indexable spec §7) — so the module is stamped
+/// at the boundary and pulled whole. that is a wipe, so it is only worth doing
+/// when the source can actually close the gap: a source floored no lower than
+/// this node would leave it exactly where it started, minus its views.
+async fn close_floor<C: statesync::SyncClient>(
+    index: &indexer::IndexStore,
+    client: &C,
+    module: &str,
+    floor: u64,
+    boundary: u64,
+    label: &str,
+) -> Option<Backfilled> {
+    if !source_reaches_below(client, module, floor, boundary).await {
+        return None;
+    }
+    tracing::info!(
+        target: "ducktape::statesync",
+        node = %label,
+        module,
+        floor,
+        height = boundary,
+        "index backfill closing the floor at {floor}: the source holds history below it"
+    );
+    stamp_module(index, module, boundary, label)?;
+    backfill_module(index, client, module, boundary, None, label).await
+}
+
+/// does the source hold op rows BELOW `floor`? every index-op reply carries
+/// the source's own floor, so asking from a cursor PAST the boundary answers
+/// it with an empty page — the cheapest honest question, and a boot seam
+/// cannot afford a dearer one. a refusal answers `false`: an unreachable or
+/// unwilling source is never a reason to wipe a module's views.
+async fn source_reaches_below<C: statesync::SyncClient>(
+    client: &C,
+    module: &str,
+    floor: u64,
+    boundary: u64,
+) -> bool {
+    let asked = client
+        .request(statesync::SyncRequest::IndexOps {
+            boundary,
+            module: module.to_string(),
+            after: Some((boundary, AFTER_EVERY_SEQ)),
+        })
+        .await;
+    let Ok(statesync::SyncResponse::IndexOps { source_floor, .. }) = asked else {
+        return false;
+    };
+    source_floor.is_none_or(|source| source < floor)
 }
 
 /// stamp ONE module at the boundary: its feed and views begin there, visibly
@@ -690,6 +777,84 @@ mod tests {
             joiner.backfill_height("chat").expect("floor"),
             None,
             "a resumed module was never floored"
+        );
+    }
+
+    /// A RESTART OVER A WIPED INDEX DIRECTORY CLOSES ITS FLOOR. The journal
+    /// replay brings a wiped module's watermark back to the recovered tip, so
+    /// nothing is STALE — and the history below the stamp the wipe left is
+    /// reachable only from a source. Before this, that resident stamped and
+    /// served a feed that simply began at its restart, forever.
+    #[tokio::test]
+    async fn a_restart_over_a_wiped_index_pulls_the_history_below_its_floor() {
+        let source_dir = tempfile::tempdir().expect("source dir");
+        let joiner_dir = tempfile::tempdir().expect("joiner dir");
+        let source = store(source_dir.path());
+        let joiner = store(joiner_dir.path());
+        for height in 1..=10 {
+            source.apply_block(&block(height)).expect("source folds");
+        }
+        // the wiped resident: stamped at its checkpoint, then the journal
+        // replay folded the suffix back on top — watermark at the tip, floor
+        // at 5, and nothing below it.
+        joiner.mark_backfilled("chat", 5).expect("stamp");
+        for height in 6..=10 {
+            joiner.apply_block(&block(height)).expect("replay folds");
+        }
+        assert_eq!(joiner.applied_height("chat").expect("watermark"), 10);
+        let client = SourceNode::new(source);
+
+        heal_and_backfill_index(&joiner, &client, 10, "resident").await;
+
+        assert_eq!(
+            op_rows(&joiner),
+            (1..=10).map(|h| (h, 0)).collect::<Vec<_>>(),
+            "the history below the floor reaches the feed"
+        );
+        assert_eq!(
+            joiner.backfill_height("chat").expect("floor"),
+            None,
+            "and the floor it was left holding is gone"
+        );
+    }
+
+    /// A SOURCE MISSING THE SAME HISTORY IS NOT WORTH A WIPE. Closing a floor
+    /// means rebuilding the feed, so the seam asks first — one empty page
+    /// carries the source's own floor — and a source floored no lower than
+    /// this node ends the matter there.
+    #[tokio::test]
+    async fn a_floor_the_source_cannot_lower_costs_one_question_and_no_wipe() {
+        let source_dir = tempfile::tempdir().expect("source dir");
+        let joiner_dir = tempfile::tempdir().expect("joiner dir");
+        let source = store(source_dir.path());
+        let joiner = store(joiner_dir.path());
+        // BOTH nodes begin at 5: the source cannot answer for what neither
+        // of them kept.
+        source.mark_backfilled("chat", 5).expect("source stamp");
+        joiner.mark_backfilled("chat", 5).expect("stamp");
+        for height in 6..=10 {
+            source.apply_block(&block(height)).expect("source folds");
+            joiner.apply_block(&block(height)).expect("replay folds");
+        }
+        let client = SourceNode::new(source);
+
+        heal_and_backfill_index(&joiner, &client, 10, "resident").await;
+
+        assert_eq!(
+            client.pages_asked(),
+            1,
+            "the question, and nothing after it"
+        );
+        assert!(client.rows_served().is_empty(), "not one row crosses");
+        assert_eq!(
+            op_rows(&joiner),
+            (6..=10).map(|h| (h, 0)).collect::<Vec<_>>(),
+            "the feed it had stands — a wipe would have rebuilt it for nothing"
+        );
+        assert_eq!(
+            joiner.backfill_height("chat").expect("floor"),
+            Some(5),
+            "and the floor stays honest"
         );
     }
 
