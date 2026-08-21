@@ -677,6 +677,48 @@ impl IndexStore {
         Ok(out?)
     }
 
+    /// re-derive a module's read model from the op feed it already holds:
+    /// every derived key cleared, then the whole `op/` range re-driven through
+    /// the guest in KEY order. `op/` and `meta/` are untouched — a refold
+    /// changes what the rows MEAN, never what the feed saw.
+    ///
+    /// the closing move of a backfill that extended the feed DOWNWARD (the
+    /// floored-module seam, indexable spec §7): rows below what the fold has
+    /// already consumed arrive out of order by construction, so the read model
+    /// disagrees with the feed until this runs — and it must run whether the
+    /// walk finished or died holding half a range. that is what buys the seam
+    /// its safety: nothing is wiped ahead of a pull that might fail.
+    ///
+    /// the same sequence [`converge_guest`] runs for a new mapper (feed down,
+    /// clear, feed up, replay, drain), and a no-op for a module with no
+    /// folding guest. failures poison, like every other write here.
+    pub fn refold(&self, module: &str) -> Result<()> {
+        if self.is_poisoned() {
+            return Err(Error::Poisoned);
+        }
+        let m = self.module(module)?;
+        if !m.has_fold {
+            return Ok(());
+        }
+        let out = (|| -> Result<()> {
+            // the feed goes down FIRST: its pending events describe rows the
+            // clear below is about to delete, and `delete_trigger` discards
+            // them with the registration.
+            m.db.delete_trigger(FOLD_TRIGGER)?;
+            clear_derived(&m.db)?;
+            create_fold_trigger(&m.db)?;
+            replay_op_feed(&m.db)?;
+            // AND WAIT FOR IT, for `converge_guest`'s reason: returning over a
+            // cleared keyspace serves "no such page" for every page, which is
+            // indistinguishable from a workspace that lost its documents.
+            drain_fold(&m.db, module)
+        })();
+        if out.is_err() {
+            self.poisoned.store(true, Ordering::Relaxed);
+        }
+        out
+    }
+
     /// advance a module's feed watermark to `height` and NOTHING else — the
     /// closing move of a RESUMED backfill, where the rows between the old
     /// watermark and the boundary just landed verbatim, so the feed honestly

@@ -830,6 +830,79 @@ fn a_backfilled_store_matches_a_store_that_saw_the_blocks() {
     );
 }
 
+/// A FEED EXTENDED DOWNWARD IS ONLY HONEST AFTER A REFOLD. The floored-module
+/// seam appends rows BELOW the ones the fold already consumed — out of order
+/// by construction, because nothing may be wiped ahead of a pull that might
+/// fail — which walks the fold tip BACKWARDS: a caller that wrote at height 8
+/// would read a tip of 5 and wait forever for its own op. Re-driving the whole
+/// feed in key order is what puts the read model back in agreement with it,
+/// byte-identical to a store that watched every block go by.
+#[test]
+fn a_refold_rebuilds_the_read_model_over_a_feed_extended_downward() {
+    let live_dir = tempfile::tempdir().unwrap();
+    let joiner_dir = tempfile::tempdir().unwrap();
+    let live = mapped_store(live_dir.path());
+    let joiner = mapped_store(joiner_dir.path());
+
+    const FLOOR: u64 = 5;
+    const TIP: u64 = 10;
+    for h in 1..=TIP {
+        live.apply_block(&block(h, vec![chat_op(b"payload")]))
+            .unwrap();
+    }
+    live.wait_folds_drained().unwrap();
+
+    // the restarted resident: stamped at a checkpoint, then the journal replay
+    // folded the suffix back on top — watermark at the tip, floor at 5.
+    joiner.mark_backfilled("chat", FLOOR).unwrap();
+    for h in (FLOOR + 1)..=TIP {
+        joiner
+            .apply_block(&block(h, vec![chat_op(b"payload")]))
+            .unwrap();
+    }
+    joiner.wait_folds_drained().unwrap();
+
+    // ...and the seam pulls the history below the floor in UNDER it.
+    let below: Vec<(String, Vec<u8>)> = live
+        .scan("chat", OP_PREFIX.as_bytes(), None, 100)
+        .unwrap()
+        .entries
+        .iter()
+        .map(|(k, v)| (String::from_utf8(k.clone()).unwrap(), v.clone()))
+        .filter(|(k, _)| parse_op_key(k.as_bytes()).is_some_and(|(h, _)| h <= FLOOR))
+        .collect();
+    assert_eq!(below.len(), FLOOR as usize);
+    joiner.write_backfill_rows("chat", &below).unwrap();
+    joiner.wait_folds_drained().unwrap();
+    joiner.set_backfill_floor("chat", None).unwrap();
+    assert_eq!(
+        joiner.fold_tip("chat").unwrap(),
+        Some((FLOOR, 0)),
+        "the out-of-order fold left the tip below the feed it has"
+    );
+
+    joiner.refold("chat").unwrap();
+
+    let derived = |s: &IndexStore| {
+        s.scan("chat", b"", None, 1024)
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter(|(k, _)| !k.starts_with(META_PREFIX.as_bytes()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(derived(&live), derived(&joiner), "every key byte-identical");
+    assert_eq!(
+        joiner.view("chat", b"count").unwrap(),
+        live.view("chat", b"count").unwrap()
+    );
+    assert_eq!(
+        joiner.fold_tip("chat").unwrap(),
+        Some((TIP, 0)),
+        "and the tip vouches for the whole feed again"
+    );
+}
+
 /// THE FLOOR IS THE ONLY THING A BACKFILL MOVES. `write_backfill_rows` must
 /// never touch the watermark (the heal already stamped it at the boundary, and
 /// it vouches for feed contiguity from the floor up), and the floor setter

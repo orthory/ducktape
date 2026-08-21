@@ -2342,10 +2342,9 @@ pub(super) async fn park(
                         });
                         // THE LAST MOMENT A SYNC CLIENT EXISTS: `run_promoted`
                         // seats from the baton and never sees one, so the
-                        // op-row backfill has to run here. it stamps first
-                        // (the wipe would eat anything written before it) at
-                        // exactly the boundary `run_promoted` heals against,
-                        // which makes that later heal the no-op it should be.
+                        // op-row backfill has to run here — at exactly the
+                        // boundary `run_promoted` heals against, which makes
+                        // that later heal the no-op it should be.
                         heal_and_backfill_index(&index, &client, boundary.height, &label).await;
                         break (boundary, host, floor);
                     }

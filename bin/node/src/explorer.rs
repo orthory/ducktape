@@ -244,11 +244,24 @@ pub(crate) async fn heal_and_backfill_index<C: statesync::SyncClient>(
     // the history below the stamp is reachable only from a source. Listed
     // BEFORE the stale pass, whose own stamps write fresh floors nobody owes
     // a second walk.
-    let floored: Vec<(String, u64)> = index
+    let mut floored: Vec<(String, u64)> = Vec::new();
+    for id in index
         .module_ids()
         .filter(|id| !stale.iter().any(|stale| stale == id))
-        .filter_map(|id| Some((id.to_string(), index.backfill_height(id).ok()??)))
-        .collect();
+    {
+        match index.backfill_height(id) {
+            Ok(Some(floor)) => floored.push((id.to_string(), floor)),
+            Ok(None) => {}
+            Err(err) => tracing::warn!(
+                target: "ducktape::statesync",
+                node = %label,
+                module = %id,
+                error = %err,
+                reason = "backfill_floor_unreadable",
+                "index floor unreadable; this module's gap stays where it is"
+            ),
+        }
+    }
     let mut backfilled: Vec<Backfilled> = Vec::new();
     for module in &stale {
         if let Some(done) = heal_module(index, client, module, boundary, label).await {
@@ -398,12 +411,19 @@ async fn heal_module<C: statesync::SyncClient>(
 
 /// close a module's FLOOR: pull the history below it, when a source holds any.
 ///
-/// closing the gap means REBUILDING the feed, not appending under it — rows
-/// below the floor written beneath rows the fold already consumed would hand
-/// the guest history backwards (indexable spec §7) — so the module is stamped
-/// at the boundary and pulled whole. that is a wipe, so it is only worth doing
-/// when the source can actually close the gap: a source floored no lower than
-/// this node would leave it exactly where it started, minus its views.
+/// NOTHING IS WIPED AHEAD OF THE PULL. This module HAS a feed and views; a
+/// stamp would destroy both for a walk that can still fail on its next page —
+/// a source that drops, a page failing the canonical seal, a source that
+/// re-stamps mid-walk — and the next seam, seeing the same floor, would do it
+/// again. So the rows land UNDER the feed instead. That is out of key order
+/// for the fold by construction (they sit below rows it already consumed), so
+/// the read model is rebuilt from the whole feed afterwards
+/// ([`indexer::IndexStore::refold`]) — whether the walk finished or died
+/// holding half a range. The feed only ever GAINS rows here.
+///
+/// Asked only when a source can actually close the gap: one empty page
+/// carries the source's own floor, and a source floored no lower than this
+/// node is not worth a walk.
 async fn close_floor<C: statesync::SyncClient>(
     index: &indexer::IndexStore,
     client: &C,
@@ -423,8 +443,22 @@ async fn close_floor<C: statesync::SyncClient>(
         height = boundary,
         "index backfill closing the floor at {floor}: the source holds history below it"
     );
-    stamp_module(index, module, boundary, label)?;
-    backfill_module(index, client, module, boundary, None, label).await
+    // the ceiling is the FLOOR, not the boundary: everything above it is
+    // already in this node's feed, and re-fetching it would only re-fold rows
+    // the views already carry.
+    let closed = backfill_module(index, client, module, floor, None, label).await;
+    if let Err(err) = index.refold(module) {
+        tracing::warn!(
+            target: "ducktape::statesync",
+            node = %label,
+            module,
+            error = %err,
+            reason = "backfill_refold_failed",
+            "index backfill could not rebuild the read model; the floor stands"
+        );
+        return None;
+    }
+    closed
 }
 
 /// does the source hold op rows BELOW `floor`? every index-op reply carries
@@ -496,7 +530,20 @@ async fn resume_module<C: statesync::SyncClient>(
     boundary: u64,
     label: &str,
 ) -> Option<Backfilled> {
-    let held = index.applied_height(module).ok()?;
+    let held = match index.applied_height(module) {
+        Ok(held) => held,
+        Err(err) => {
+            tracing::warn!(
+                target: "ducktape::statesync",
+                node = %label,
+                module,
+                error = %err,
+                reason = "backfill_watermark_unreadable",
+                "index watermark unreadable; stamping at the boundary instead of resuming"
+            );
+            return None;
+        }
+    };
     if held == 0 {
         return None; // an empty feed has nothing to resume from.
     }
@@ -540,8 +587,22 @@ async fn resume_module<C: statesync::SyncClient>(
         );
         return None;
     }
+    let held_floor = match index.backfill_height(module) {
+        Ok(floor) => floor,
+        Err(err) => {
+            tracing::warn!(
+                target: "ducktape::statesync",
+                node = %label,
+                module,
+                error = %err,
+                reason = "backfill_floor_unreadable",
+                "index floor unreadable after a resumed walk; stamping at the boundary instead"
+            );
+            return None;
+        }
+    };
     Some(Backfilled {
-        source_floor: index.backfill_height(module).ok()?,
+        source_floor: held_floor,
         ..done
     })
 }
@@ -645,6 +706,9 @@ mod tests {
         source: Arc<indexer::IndexStore>,
         asked: Recorded<Option<(u64, u32)>>,
         served: Recorded<(u64, u32)>,
+        /// how many asks this source answers before it starts refusing — the
+        /// source that drops mid-walk.
+        answers: usize,
     }
 
     /// what the source was asked for / handed out, shared with the test.
@@ -656,7 +720,13 @@ mod tests {
                 source: Arc::new(source),
                 asked: Arc::new(Mutex::new(Vec::new())),
                 served: Arc::new(Mutex::new(Vec::new())),
+                answers: usize::MAX,
             }
+        }
+        /// the same source, dropping after `answers` asks.
+        fn answering(mut self, answers: usize) -> Self {
+            self.answers = answers;
+            self
         }
         fn pages_asked(&self) -> usize {
             self.asked.lock().expect("asked").len()
@@ -677,13 +747,22 @@ mod tests {
                     module,
                     after,
                 } => {
-                    self.asked.lock().expect("asked").push(after);
-                    match crate::validator::run::sync::read_index_ops(
-                        &self.source,
-                        &module,
-                        after,
-                        boundary,
-                    ) {
+                    let asks = {
+                        let mut asked = self.asked.lock().expect("asked");
+                        asked.push(after);
+                        asked.len()
+                    };
+                    let read = if asks > self.answers {
+                        Err("source dropped mid-walk".to_string())
+                    } else {
+                        crate::validator::run::sync::read_index_ops(
+                            &self.source,
+                            &module,
+                            after,
+                            boundary,
+                        )
+                    };
+                    match read {
                         Ok(page) => {
                             let (resp, _read_ahead) =
                                 crate::sync::serve::split_index_ops_response(page);
@@ -815,6 +894,77 @@ mod tests {
             joiner.backfill_height("chat").expect("floor"),
             None,
             "and the floor it was left holding is gone"
+        );
+    }
+
+    /// one block carrying many ops — enough op rows at a single height to
+    /// span more than one wire page.
+    fn wide_block(height: u64, ops: usize) -> indexer::BlockOps {
+        indexer::BlockOps {
+            height,
+            time: height,
+            ops: (0..ops)
+                .map(|n| indexer::AppliedOp {
+                    module: "chat".into(),
+                    origin: indexer::OriginTag::external("jess"),
+                    payload: format!(r#"{{"height":{height},"n":{n}}}"#).into_bytes(),
+                    assigned: Vec::new(),
+                })
+                .collect(),
+            record: None,
+        }
+    }
+
+    /// CLOSING A FLOOR NEVER TRADES A HEALTHY FEED FOR A WALK THAT MIGHT FAIL.
+    /// The probe only proves the source answered once; the walk can still die
+    /// on its next page — a dropped source, a page failing the canonical seal,
+    /// a source that re-stamps mid-walk. A seam that wiped first would leave
+    /// that module — perfectly fine before it ran — floored at the boundary
+    /// with its feed and views destroyed, and the next restart would do it
+    /// again. So the rows land UNDER the feed and the read model is rebuilt
+    /// from the whole of it; a failed walk costs bandwidth, never data.
+    #[tokio::test]
+    async fn a_close_that_fails_mid_walk_keeps_the_feed_and_floor_it_found() {
+        const FLOOR: u64 = 5;
+        // wide enough that the history below the floor takes two wire pages,
+        // so the source can drop with rows already written.
+        const BELOW: usize = statesync::INDEX_OPS_BATCH_LEN + 97;
+        let source_dir = tempfile::tempdir().expect("source dir");
+        let joiner_dir = tempfile::tempdir().expect("joiner dir");
+        let source = store(source_dir.path());
+        let joiner = store(joiner_dir.path());
+        source
+            .apply_block(&wide_block(FLOOR, BELOW))
+            .expect("source folds the wide block");
+        for height in (FLOOR + 1)..=10 {
+            source.apply_block(&block(height)).expect("source folds");
+        }
+        joiner.mark_backfilled("chat", FLOOR).expect("stamp");
+        for height in (FLOOR + 1)..=10 {
+            joiner.apply_block(&block(height)).expect("replay folds");
+        }
+        let held = op_rows(&joiner);
+
+        // the probe is answered, the walk's first page is answered, and then
+        // the source is gone.
+        let client = SourceNode::new(source).answering(2);
+        heal_and_backfill_index(&joiner, &client, 10, "resident").await;
+
+        assert_eq!(client.pages_asked(), 3, "probe, one page, then the refusal");
+        let rows = op_rows(&joiner);
+        assert_eq!(
+            rows.iter().filter(|(height, _)| *height == FLOOR).count(),
+            statesync::INDEX_OPS_BATCH_LEN,
+            "the one page that did arrive was kept"
+        );
+        assert!(
+            held.iter().all(|row| rows.contains(row)),
+            "and not one row the module already had was lost"
+        );
+        assert_eq!(
+            joiner.backfill_height("chat").expect("floor"),
+            Some(FLOOR),
+            "the floor it found stands: nothing below it can be claimed yet"
         );
     }
 
