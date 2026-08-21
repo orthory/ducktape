@@ -465,7 +465,7 @@ fn bounded_frames_response(mut frames: Vec<statesync::FinalizedFrame>) -> states
 /// cursor whenever anything was left behind. A single row that cannot fit alone
 /// is an explicit error — an empty successful page with `next_after` set would
 /// make the joiner's walk spin without advancing.
-fn bounded_index_ops_response(page: SyncIndexOps) -> statesync::SyncResponse {
+pub(crate) fn bounded_index_ops_response(page: SyncIndexOps) -> statesync::SyncResponse {
     let SyncIndexOps {
         mut rows,
         mut has_more,

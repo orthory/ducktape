@@ -10,7 +10,7 @@ use crate::util::{participant_bytes, resident_bytes};
 /// in key order off one MVCC snapshot; all this adds is the height ceiling —
 /// op keys are fixed-width hex, so lexicographic order IS `(height, seq)`
 /// order and the ceiling is a prefix of the page.
-fn read_index_ops(
+pub(crate) fn read_index_ops(
     index: &indexer::IndexStore,
     module: &str,
     after: Option<(u64, u32)>,

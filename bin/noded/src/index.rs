@@ -133,16 +133,30 @@ pub fn stamp_stale_modules(
     index: &indexer::IndexStore,
     boundary: u64,
 ) -> Result<Vec<String>, indexer::Error> {
+    let stale = stale_modules(index, boundary)?;
+    for module in &stale {
+        index.mark_backfilled(module, boundary)?;
+    }
+    Ok(stale)
+}
+
+/// every module whose op feed trails `boundary` — the stamp's candidates,
+/// listed WITHOUT stamping them. a caller that can pull the missing rows
+/// decides per module whether the feed is resumable (extend it and keep the
+/// views under it) or has to be stamped and rebuilt from the boundary down.
+pub fn stale_modules(
+    index: &indexer::IndexStore,
+    boundary: u64,
+) -> Result<Vec<String>, indexer::Error> {
     let modules: Vec<String> = index.module_ids().map(str::to_string).collect();
-    let mut stamped = Vec::new();
+    let mut stale = Vec::new();
     for module in modules {
         if index.applied_height(&module)? >= boundary {
             continue;
         }
-        index.mark_backfilled(&module, boundary)?;
-        stamped.push(module);
+        stale.push(module);
     }
-    Ok(stamped)
+    Ok(stale)
 }
 
 // ---------------------------------------------------------------------------

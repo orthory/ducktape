@@ -477,22 +477,34 @@ fn feed(store: &indexer::IndexStore, heights: std::ops::RangeInclusive<u64>) {
     }
 }
 
-/// walk the wire into a joiner store, exactly as the node's join seam does.
-fn backfill(
+/// walk the wire into a joiner store, exactly as the node's join seam does —
+/// `after` resumes above a feed the joiner already holds.
+fn backfill_after(
     client: &IndexOpsClient,
     joiner: &indexer::IndexStore,
     boundary: u64,
+    after: Option<(u64, u32)>,
 ) -> Result<Option<u64>, SyncError> {
     futures::executor::block_on(statesync::fetch_index_ops(
         client,
         "chat",
         boundary,
+        after,
         |page| {
             joiner
                 .write_backfill_rows("chat", page)
                 .map_err(|e| e.to_string())
         },
     ))
+}
+
+/// the walk from the source's own beginning — the fresh joiner's seam.
+fn backfill(
+    client: &IndexOpsClient,
+    joiner: &indexer::IndexStore,
+    boundary: u64,
+) -> Result<Option<u64>, SyncError> {
+    backfill_after(client, joiner, boundary, None)
 }
 
 /// THE CRATE-LEVEL PROOF OF SPEC §7: a joiner stamped at a boundary pulls the
@@ -687,6 +699,100 @@ fn a_source_that_restamped_past_the_boundary_is_refused_not_composed() {
     assert_eq!(joiner.backfill_height("chat").unwrap(), Some(9));
 }
 
+/// A RESUMED WALK IS ANCHORED AT ITS CURSOR. `after` is not a hint the source
+/// may ignore: the caller already holds every row at or below it (that is what
+/// its own watermark vouches for), and re-writing those rows would re-fold ops
+/// its views already carry. So the walk asks strictly above the cursor and
+/// anchors its ascent check there — a source replaying its history from
+/// genesis under a resume is REFUSED, not composed.
+#[test]
+fn a_resumed_walk_starts_at_its_cursor_and_refuses_a_replay_below_it() {
+    let src_dir = tempfile::tempdir().expect("src dir");
+    let source = std::sync::Arc::new(store(src_dir.path()));
+    feed(&source, 1..=9);
+    let client = IndexOpsClient {
+        source,
+        page_len: 2,
+        corrupt: false,
+    };
+
+    // the honest resume: a caller whose feed reaches height 5 pulls 6..=9.
+    let mut carried: Vec<(u64, u32)> = Vec::new();
+    let floor = futures::executor::block_on(statesync::fetch_index_ops(
+        &client,
+        "chat",
+        9,
+        Some((5, u32::MAX)),
+        |page| {
+            carried.extend(
+                page.iter()
+                    .filter_map(|(key, _)| indexer::parse_op_key(key.as_bytes())),
+            );
+            Ok(())
+        },
+    ))
+    .expect("the resumed walk completes");
+    assert_eq!(floor, None, "the source covers the range from genesis");
+    assert_eq!(
+        carried,
+        vec![(6, 0), (7, 0), (8, 0), (9, 0)],
+        "only the rows above the cursor may cross"
+    );
+
+    /// answers every ask with the history from genesis, cursor or no cursor.
+    #[derive(Clone)]
+    struct Replayer;
+    impl SyncClient for Replayer {
+        fn request(
+            &self,
+            req: SyncRequest,
+        ) -> impl std::future::Future<Output = Result<SyncResponse, SyncError>> + Send {
+            let SyncRequest::IndexOps { .. } = req else {
+                unreachable!("only the IndexOps lane is asked")
+            };
+            async move {
+                let row = |height: u64| {
+                    borsh::to_vec(&indexer::OpRow {
+                        height,
+                        seq: 0,
+                        time: 1_000 + height,
+                        origin: indexer::OriginTag::external("jess"),
+                        payload: b"{}".to_vec(),
+                        assigned: Vec::new(),
+                    })
+                    .expect("row encodes")
+                };
+                Ok(SyncResponse::IndexOps {
+                    rows: vec![
+                        (indexer::op_key(1, 0), row(1)),
+                        (indexer::op_key(2, 0), row(2)),
+                    ],
+                    next_after: None,
+                    source_floor: None,
+                    applied_height: 9,
+                })
+            }
+        }
+    }
+    let mut written = 0usize;
+    let err = futures::executor::block_on(statesync::fetch_index_ops(
+        &Replayer,
+        "chat",
+        9,
+        Some((5, u32::MAX)),
+        |page| {
+            written += page.len();
+            Ok(())
+        },
+    ))
+    .expect_err("a replay below the resume cursor must refuse");
+    assert!(
+        matches!(&err, SyncError::Module { reason, .. } if reason.contains("does not ascend")),
+        "want the ascent refusal, got {err}"
+    );
+    assert_eq!(written, 0, "nothing below the cursor reaches the store");
+}
+
 /// A CURSOR WITHOUT ROWS BEHIND IT IS THE WALK'S ONLY UNBOUNDED SHAPE, and it
 /// has to be refused rather than re-asked. A source that serves a page, then
 /// answers "no rows, but ask again from the same place", would otherwise spin
@@ -729,11 +835,14 @@ fn an_empty_page_re_offering_its_cursor_is_refused_not_re_asked() {
             }
         }
     }
-    let err =
-        futures::executor::block_on(statesync::fetch_index_ops(&StuckSource, "chat", 9, |_| {
-            Ok(())
-        }))
-        .expect_err("an empty page re-offering its cursor must refuse");
+    let err = futures::executor::block_on(statesync::fetch_index_ops(
+        &StuckSource,
+        "chat",
+        9,
+        None,
+        |_| Ok(()),
+    ))
+    .expect_err("an empty page re-offering its cursor must refuse");
     assert!(
         matches!(&err, SyncError::Module { reason, .. } if reason.contains("0 rows served")),
         "want the no-progress refusal, got {err}"
@@ -795,12 +904,17 @@ fn a_non_canonical_op_key_is_refused_even_though_it_parses_and_ascends() {
     );
 
     let mut written = 0usize;
-    let err =
-        futures::executor::block_on(statesync::fetch_index_ops(&WidthLiar, "chat", 9, |page| {
+    let err = futures::executor::block_on(statesync::fetch_index_ops(
+        &WidthLiar,
+        "chat",
+        9,
+        None,
+        |page| {
             written += page.len();
             Ok(())
-        }))
-        .expect_err("a non-canonical op key must refuse");
+        },
+    ))
+    .expect_err("a non-canonical op key must refuse");
     assert!(
         matches!(&err, SyncError::Module { reason, .. } if reason.contains("canonical")),
         "want the canonical-shape refusal, got {err}"

@@ -5,7 +5,7 @@
 
 mod drain;
 mod ingress;
-mod sync;
+pub(crate) mod sync;
 
 use commonware_cryptography::{Signer, ed25519};
 use commonware_runtime::Clock;

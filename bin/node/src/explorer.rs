@@ -190,9 +190,11 @@ pub(crate) fn heal_index(index: &indexer::IndexStore, boundary: u64, label: &str
     }
 }
 
-/// stamp the derived index at `boundary`, then BACKFILL every stamped module's
-/// op rows from the sync source — inline, at the join seam, before this node
-/// serves anything (indexable spec §7).
+/// bring every module whose feed trails `boundary` up to it from the sync
+/// source — inline, at the join seam, before this node serves anything
+/// (indexable spec §7). a module that already holds a feed RESUMES above its
+/// own watermark and keeps everything under it; one that holds nothing usable
+/// is stamped at the boundary and pulled from the source's own floor up.
 ///
 /// # why this is safe exactly here and nowhere else
 ///
@@ -219,10 +221,23 @@ pub(crate) async fn heal_and_backfill_index<C: statesync::SyncClient>(
     boundary: u64,
     label: &str,
 ) {
-    let stamped = heal_index(index, boundary, label);
+    let stale = match noded::stale_modules(index, boundary) {
+        Ok(stale) => stale,
+        Err(err) => {
+            tracing::error!(
+                target: "ducktape::modules",
+                event = "node_index_poisoned",
+                node = %label,
+                height = boundary,
+                error = %err,
+                "index heal failed; wipe <storage>/index to rebuild"
+            );
+            return;
+        }
+    };
     let mut backfilled: Vec<Backfilled> = Vec::new();
-    for module in &stamped {
-        if let Some(done) = backfill_module(index, client, module, boundary, label).await {
+    for module in &stale {
+        if let Some(done) = heal_module(index, client, module, boundary, label).await {
             backfilled.push(done);
             continue;
         }
@@ -320,7 +335,132 @@ struct Backfilled {
     last_row: Option<(u64, u32)>,
 }
 
-/// walk one module's op rows below `boundary` off the source and write them.
+/// the op-row seq no real row carries: a watermark vouches for whole HEIGHTS,
+/// so a cursor at `(watermark, AFTER_EVERY_SEQ)` names the end of that height
+/// — everything at or below it is already in this node's feed.
+const AFTER_EVERY_SEQ: u32 = u32::MAX;
+
+/// one stale module: RESUME above the feed it already holds, or stamp it at
+/// the boundary and pull the whole history below.
+///
+/// resuming is the difference between a re-stamping ascension costing one
+/// delta and costing the entire op history. the module's watermark is the
+/// contract for what it holds, its derived views were folded from exactly
+/// those rows, and the delta lands ascending on top — so the stamp's WIPE
+/// (feed and views, floored at the boundary) is the fallback, needed only
+/// when nothing below can be composed: an empty feed, or a source whose own
+/// history starts above the resume point.
+async fn heal_module<C: statesync::SyncClient>(
+    index: &indexer::IndexStore,
+    client: &C,
+    module: &str,
+    boundary: u64,
+    label: &str,
+) -> Option<Backfilled> {
+    if let Some(resumed) = resume_module(index, client, module, boundary, label).await {
+        return Some(resumed);
+    }
+    stamp_module(index, module, boundary, label)?;
+    backfill_module(index, client, module, boundary, None, label).await
+}
+
+/// stamp ONE module at the boundary: its feed and views begin there, visibly
+/// via the floor. `None` when the store refused — the caller stops asking.
+fn stamp_module(
+    index: &indexer::IndexStore,
+    module: &str,
+    boundary: u64,
+    label: &str,
+) -> Option<()> {
+    match index.mark_backfilled(module, boundary) {
+        Ok(()) => {
+            tracing::info!(
+                target: "ducktape::modules",
+                node = %label,
+                module,
+                height = boundary,
+                "index for {module} stamped backfilled at height {boundary}"
+            );
+            Some(())
+        }
+        Err(err) => {
+            tracing::error!(
+                target: "ducktape::modules",
+                event = "node_index_poisoned",
+                node = %label,
+                module,
+                height = boundary,
+                error = %err,
+                "index heal failed; wipe <storage>/index to rebuild"
+            );
+            None
+        }
+    }
+}
+
+/// pull only what this module is MISSING: the rows above its own watermark,
+/// written onto the feed it already holds. `None` refuses the resume — the
+/// caller falls back to the stamp — and never leaves a claim standing: the
+/// partial rows a refused walk wrote are wiped by that stamp.
+async fn resume_module<C: statesync::SyncClient>(
+    index: &indexer::IndexStore,
+    client: &C,
+    module: &str,
+    boundary: u64,
+    label: &str,
+) -> Option<Backfilled> {
+    let held = index.applied_height(module).ok()?;
+    if held == 0 {
+        return None; // an empty feed has nothing to resume from.
+    }
+    let done = backfill_module(
+        index,
+        client,
+        module,
+        boundary,
+        Some((held, AFTER_EVERY_SEQ)),
+        label,
+    )
+    .await?;
+    // THE SOURCE MUST REACH THE RESUME POINT. a source floor ABOVE this
+    // node's watermark means the source's own history starts inside the range
+    // this node is missing, so the delta would leave a HOLE between them —
+    // and a floor cannot express a hole. stamp instead, and inherit the
+    // source's truncation honestly.
+    if done.source_floor.is_some_and(|floor| floor > held) {
+        tracing::warn!(
+            target: "ducktape::statesync",
+            node = %label,
+            module,
+            held,
+            floor = done.source_floor.unwrap_or(0),
+            reason = "backfill_resume_uncovered",
+            "index backfill cannot resume from this source; stamping at the boundary"
+        );
+        return None;
+    }
+    // the feed now reaches the boundary, so the watermark says so. the FLOOR
+    // does not move: this node kept every row it already had, and nothing
+    // below it was ever claimed.
+    if let Err(err) = index.advance_watermark(module, boundary) {
+        tracing::warn!(
+            target: "ducktape::statesync",
+            node = %label,
+            module,
+            error = %err,
+            reason = "backfill_watermark_refused",
+            "index backfill could not advance the feed watermark"
+        );
+        return None;
+    }
+    Some(Backfilled {
+        source_floor: index.backfill_height(module).ok()?,
+        ..done
+    })
+}
+
+/// walk one module's op rows below `boundary` off the source and write them,
+/// resuming strictly after `after` when the caller already holds a feed.
 /// `None` when the module keeps its stamped floor, warned once with a stable
 /// reason token.
 async fn backfill_module<C: statesync::SyncClient>(
@@ -328,6 +468,7 @@ async fn backfill_module<C: statesync::SyncClient>(
     client: &C,
     module: &str,
     boundary: u64,
+    after: Option<(u64, u32)>,
     label: &str,
 ) -> Option<Backfilled> {
     let mut rows = 0usize;
@@ -337,7 +478,7 @@ async fn backfill_module<C: statesync::SyncClient>(
     // wire refusal produces, and the message is already carried by `error`;
     // this only remembers WHICH side failed, for the reason token.
     let mut write_refused = false;
-    let walked = statesync::fetch_index_ops(client, module, boundary, |page| {
+    let walked = statesync::fetch_index_ops(client, module, boundary, after, |page| {
         index.write_backfill_rows(module, page).map_err(|e| {
             write_refused = true;
             e.to_string()
@@ -399,4 +540,189 @@ async fn backfill_module<C: statesync::SyncClient>(
         source_floor,
         last_row: last,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::{Arc, Mutex};
+
+    use statesync::{SyncError, SyncRequest, SyncResponse};
+
+    /// a serving source for the index-op lane: answers off a REAL store
+    /// through the production serve path (the loop-side read plus the wire
+    /// bounding), and records every page it was asked for and served.
+    #[derive(Clone)]
+    struct SourceNode {
+        source: Arc<indexer::IndexStore>,
+        asked: Recorded<Option<(u64, u32)>>,
+        served: Recorded<(u64, u32)>,
+    }
+
+    /// what the source was asked for / handed out, shared with the test.
+    type Recorded<T> = Arc<Mutex<Vec<T>>>;
+
+    impl SourceNode {
+        fn new(source: indexer::IndexStore) -> Self {
+            Self {
+                source: Arc::new(source),
+                asked: Arc::new(Mutex::new(Vec::new())),
+                served: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+        fn pages_asked(&self) -> usize {
+            self.asked.lock().expect("asked").len()
+        }
+        fn rows_served(&self) -> Vec<(u64, u32)> {
+            self.served.lock().expect("served").clone()
+        }
+    }
+
+    impl statesync::SyncClient for SourceNode {
+        fn request(
+            &self,
+            req: SyncRequest,
+        ) -> impl std::future::Future<Output = Result<SyncResponse, SyncError>> + Send {
+            let resp = match req {
+                SyncRequest::IndexOps {
+                    boundary,
+                    module,
+                    after,
+                } => {
+                    self.asked.lock().expect("asked").push(after);
+                    match crate::validator::run::sync::read_index_ops(
+                        &self.source,
+                        &module,
+                        after,
+                        boundary,
+                    ) {
+                        Ok(page) => {
+                            let resp = crate::sync::serve::bounded_index_ops_response(page);
+                            if let SyncResponse::IndexOps { rows, .. } = &resp {
+                                self.served.lock().expect("served").extend(
+                                    rows.iter().filter_map(|(key, _)| {
+                                        indexer::parse_op_key(key.as_bytes())
+                                    }),
+                                );
+                            }
+                            resp
+                        }
+                        Err(e) => SyncResponse::Error(e),
+                    }
+                }
+                other => SyncResponse::Error(format!("unexpected {}", other.kind_name())),
+            };
+            async move { Ok(resp) }
+        }
+    }
+
+    fn store(dir: &std::path::Path) -> indexer::IndexStore {
+        indexer::IndexStore::open(dir, &[indexer::IndexModule::bare("chat")]).expect("open index")
+    }
+
+    fn block(height: u64) -> indexer::BlockOps {
+        indexer::BlockOps {
+            height,
+            time: height,
+            ops: vec![indexer::AppliedOp {
+                module: "chat".into(),
+                origin: indexer::OriginTag::external("jess"),
+                payload: format!(r#"{{"height":{height}}}"#).into_bytes(),
+                assigned: Vec::new(),
+            }],
+            record: None,
+        }
+    }
+
+    fn op_rows(index: &indexer::IndexStore) -> Vec<(u64, u32)> {
+        index
+            .scan("chat", indexer::OP_PREFIX.as_bytes(), None, 1024)
+            .expect("scan")
+            .entries
+            .iter()
+            .filter_map(|(key, _)| indexer::parse_op_key(key))
+            .collect()
+    }
+
+    /// A RE-STAMPING ASCENSION PULLS ONLY WHAT IT IS MISSING. A resident that
+    /// already folded blocks 1..=8 and re-ascends at boundary 10 holds every
+    /// op row below its own watermark; re-pulling them costs the source (and
+    /// the joiner's fold) the whole history for a two-block delta. The wire
+    /// must carry the delta and nothing else — and the feed the node already
+    /// had must survive the ascension.
+    #[tokio::test]
+    async fn a_re_stamping_ascension_pulls_only_what_it_is_missing() {
+        let source_dir = tempfile::tempdir().expect("source dir");
+        let joiner_dir = tempfile::tempdir().expect("joiner dir");
+        let source = store(source_dir.path());
+        let joiner = store(joiner_dir.path());
+        for height in 1..=10 {
+            source.apply_block(&block(height)).expect("source folds");
+        }
+        // the joiner watched the first eight blocks itself: its feed reaches
+        // its watermark, which is exactly what a resume may stand on.
+        for height in 1..=8 {
+            joiner.apply_block(&block(height)).expect("joiner folds");
+        }
+        let client = SourceNode::new(source);
+
+        heal_and_backfill_index(&joiner, &client, 10, "joiner").await;
+
+        assert_eq!(
+            client.rows_served(),
+            vec![(9, 0), (10, 0)],
+            "only the rows above the joiner's watermark may cross the wire"
+        );
+        assert_eq!(client.pages_asked(), 1, "one wire page carries the delta");
+        assert_eq!(
+            op_rows(&joiner),
+            (1..=10).map(|h| (h, 0)).collect::<Vec<_>>(),
+            "the feed the joiner already held survives the ascension"
+        );
+        assert_eq!(
+            joiner.applied_height("chat").expect("watermark"),
+            10,
+            "the resumed feed reaches the boundary"
+        );
+        assert_eq!(
+            joiner.backfill_height("chat").expect("floor"),
+            None,
+            "a resumed module was never floored"
+        );
+    }
+
+    /// A JOINER WITH NO FEED STILL STAMPS AND PULLS THE WHOLE HISTORY. The
+    /// resume above is an optimization on held rows, never a reason to skip
+    /// the boundary stamp a fresh joiner needs (#1130).
+    #[tokio::test]
+    async fn a_fresh_joiner_stamps_and_pulls_the_whole_history() {
+        let source_dir = tempfile::tempdir().expect("source dir");
+        let joiner_dir = tempfile::tempdir().expect("joiner dir");
+        let source = store(source_dir.path());
+        let joiner = store(joiner_dir.path());
+        for height in 1..=10 {
+            source.apply_block(&block(height)).expect("source folds");
+        }
+        let client = SourceNode::new(source);
+
+        heal_and_backfill_index(&joiner, &client, 10, "joiner").await;
+
+        assert_eq!(
+            client.rows_served(),
+            (1..=10).map(|h| (h, 0)).collect::<Vec<_>>(),
+            "a joiner holding nothing pulls the whole history below the boundary"
+        );
+        assert_eq!(
+            op_rows(&joiner),
+            (1..=10).map(|h| (h, 0)).collect::<Vec<_>>(),
+            "and every one of them lands in the joiner's feed"
+        );
+        assert_eq!(joiner.applied_height("chat").expect("watermark"), 10);
+        assert_eq!(
+            joiner.backfill_height("chat").expect("floor"),
+            None,
+            "the source covered the range from genesis, so nothing is missing"
+        );
+    }
 }

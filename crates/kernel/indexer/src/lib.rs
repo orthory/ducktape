@@ -677,6 +677,31 @@ impl IndexStore {
         Ok(out?)
     }
 
+    /// advance a module's feed watermark to `height` and NOTHING else — the
+    /// closing move of a RESUMED backfill, where the rows between the old
+    /// watermark and the boundary just landed verbatim, so the feed honestly
+    /// covers them. no wipe, no floor change, no trigger teardown (unlike
+    /// [`IndexStore::mark_backfilled`]); a watermark already at or past
+    /// `height` stands, so this is idempotent. failures poison, like every
+    /// other feed write.
+    pub fn advance_watermark(&self, module: &str, height: u64) -> Result<()> {
+        if self.is_poisoned() {
+            return Err(Error::Poisoned);
+        }
+        let db = self.db(module)?;
+        let out = (|| -> Result<()> {
+            if read_height(db)? >= height {
+                return Ok(());
+            }
+            db.put(META_HEIGHT, height.to_be_bytes())?;
+            Ok(())
+        })();
+        if out.is_err() {
+            self.poisoned.store(true, Ordering::Relaxed);
+        }
+        out
+    }
+
     /// point read of one stored key at the current snapshot.
     pub fn get(&self, module: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
         Ok(self.db(module)?.get(key)?)

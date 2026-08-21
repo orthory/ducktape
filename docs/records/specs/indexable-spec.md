@@ -282,16 +282,26 @@ modules as a workspace that lost its contents. The shipped answer is the
 BACKFILL lane: the joiner fetches the SOURCE'S OWN op rows below its boundary
 and writes them into its own feed.
 
-The lane is three moves at the join seams (resident ascension, cold direct
-admission), inline, BEFORE the node serves anything:
+The lane runs at the join seams (resident ascension, cold direct admission),
+inline, BEFORE the node serves anything, over every module whose feed trails
+the boundary:
 
-1. the heal stamps every stale module at the boundary (§6) and returns the
-   stamped ids — this re-registers a fresh fold trigger over an empty `op/`;
-2. for each stamped module, `SyncRequest::IndexOps { boundary, module, after }`
-   walks the source's rows in ASCENDING key order, cursor-paged and bounded by
-   bytes, writing each page through `IndexStore::write_backfill_rows`;
-3. the fold drains, and `IndexStore::set_backfill_floor` composes the source's
-   own floor into this node's — `None` when the source reaches genesis.
+1. a module that already holds a feed RESUMES: the walk starts strictly above
+   its own watermark (`(watermark, u32::MAX)` — the watermark vouches for whole
+   heights), so only the delta crosses the wire and the derived views folded
+   from the rows below it stand untouched. `IndexStore::advance_watermark`
+   closes it: the feed now reaches the boundary, and the floor never moved
+   because nothing below it was ever dropped;
+2. a module with nothing to resume from is STAMPED at the boundary (§6) —
+   which re-registers a fresh fold trigger over an empty `op/` — and walks the
+   whole history below it. So is one whose resume the source cannot cover
+   (a source floor ABOVE the resume point would leave a hole between the two
+   that a single floor cannot express);
+3. either way `SyncRequest::IndexOps { boundary, module, after }` walks the
+   source's rows in ASCENDING key order, cursor-paged and bounded by bytes,
+   writing each page through `IndexStore::write_backfill_rows`;
+4. the fold drains, and `IndexStore::set_backfill_floor` composes the source's
+   own floor into a stamped module's — `None` when the source reaches genesis.
 
 **Why no refold is needed, and why this window is the only one.** Pre-serving
 there are no live folds, no ws subscribers, and no view readers on this node.
@@ -300,9 +310,11 @@ So ascending fetch-and-write makes COMMIT ORDER EQUAL KEY ORDER, which for
 folds every row correctly as it lands, and the fold tip advances monotonically
 to the last backfilled row. Doing this later — against a folding, serving node
 — would hand a guest history backwards, and is a defect rather than a slow path.
-`write_backfill_rows` never touches `meta/height`: the heal already stamped it,
-and it vouches for feed contiguity FROM THE FLOOR UP. The floor is the one
-thing a backfill moves.
+`write_backfill_rows` never touches `meta/height`: on a stamped module the heal
+already set it, and it vouches for feed contiguity FROM THE FLOOR UP. A resumed
+module's watermark moves once, after the walk (`advance_watermark`), for the
+same reason — it may only claim the boundary once the rows below it have
+landed.
 
 Contents are NOT root-verifiable (the derived tier has no root by design), so
 the lane trusts the serving node — accepted, because the read model is how a

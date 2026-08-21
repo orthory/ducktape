@@ -5,7 +5,7 @@
 mod boot;
 pub(crate) mod code_announce;
 mod engine;
-mod run;
+pub(crate) mod run;
 mod wiring;
 
 use commonware_cryptography::{Signer as _, ed25519};
