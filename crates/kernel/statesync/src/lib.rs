@@ -1847,6 +1847,10 @@ pub async fn fetch_snapshot<C: SyncClient>(
 /// and the higher floor is the honest one to inherit), `None` when the source
 /// claims complete coverage from genesis.
 ///
+/// `after` RESUMES the walk: rows must ascend strictly past it, so a caller
+/// that already holds a contiguous feed names its own end and pulls only the
+/// delta above it. `None` walks from the source's own beginning.
+///
 /// # trust
 ///
 /// these rows are NOT consensus-verified — the derived tier has no root by
@@ -1879,6 +1883,7 @@ pub async fn fetch_index_ops<C, W>(
     client: &C,
     module: &str,
     boundary: u64,
+    after: Option<(u64, u32)>,
     mut write: W,
 ) -> Result<Option<u64>, SyncError>
 where
@@ -1889,7 +1894,7 @@ where
         module: module.to_string(),
         reason,
     };
-    let mut cursor: Option<(u64, u32)> = None;
+    let mut cursor = after;
     let mut floor: Option<u64> = None;
     loop {
         let resp = client

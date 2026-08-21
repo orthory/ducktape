@@ -625,7 +625,16 @@ pub(super) async fn park(
             root_hash = %hex(&root),
             "resident: pre-synced boundary {tip} root_hash={}", hex(&root)
         );
-        heal_index(&index, tip, &label);
+        // THE LAST SEAM BEFORE THIS RESIDENT SERVES, and the only one a
+        // restart passes through: the same helper the ascension runs, because
+        // a restart over a WIPED index directory lands here holding nothing
+        // but a floor. The replay above stamped it (`heal_index` at the
+        // checkpoint) and then folded the suffix back on top, so no module is
+        // stale and no later seam looks again — the pre-boundary history is
+        // reachable only here, and only from a source. An unreachable one
+        // leaves every floor standing, which is exactly where this line
+        // stood before.
+        heal_and_backfill_index(&index, &client, tip, &label).await;
         last_indexed_root = Some(root);
         serving = Some((tip, node_r));
         metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Serving);
@@ -2111,9 +2120,9 @@ pub(super) async fn park(
                             // ascension tip; per-block folds keep it
                             // current from here (no more healing).
                             if last_indexed_root.as_ref() != Some(&root) {
-                                // the stamp, then the SOURCE'S OWN op rows
-                                // below it — inline, while this node is not
-                                // yet serving and not yet folding live
+                                // the SOURCE'S OWN op rows, under whatever
+                                // this node already holds — inline, while it
+                                // is not yet serving and not yet folding live
                                 // blocks. that window is the whole
                                 // correctness argument for writing straight
                                 // into the feed (see
@@ -2333,10 +2342,9 @@ pub(super) async fn park(
                         });
                         // THE LAST MOMENT A SYNC CLIENT EXISTS: `run_promoted`
                         // seats from the baton and never sees one, so the
-                        // op-row backfill has to run here. it stamps first
-                        // (the wipe would eat anything written before it) at
-                        // exactly the boundary `run_promoted` heals against,
-                        // which makes that later heal the no-op it should be.
+                        // op-row backfill has to run here — at exactly the
+                        // boundary `run_promoted` heals against, which makes
+                        // that later heal the no-op it should be.
                         heal_and_backfill_index(&index, &client, boundary.height, &label).await;
                         break (boundary, host, floor);
                     }

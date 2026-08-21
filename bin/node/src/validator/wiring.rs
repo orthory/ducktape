@@ -324,6 +324,9 @@ pub(super) fn wire_serve_lanes(
         .child("statesync_serve")
         .spawn(move |_ctx| async move {
             let mut server = SyncServer::new();
+            // the joiner backfill lane's read-ahead: one loop touch reads a
+            // budget of wire pages, and this hands the surplus out.
+            let mut pager = crate::sync::serve::IndexOpsPager::default();
             // every refusal below is a SILENT DROP: "why is this joiner never
             // syncing?" is unanswerable from the serving side, because
             // standing-refused, proof-invalid and malformed all look identical
@@ -477,7 +480,7 @@ pub(super) fn wire_serve_lanes(
                             crate::sync::serve::unix_now_secs(),
                             std::sync::atomic::Ordering::Relaxed,
                         );
-                        drive_sync_request(&mut server, &state_tx, req).await
+                        drive_sync_request(&mut server, &mut pager, &state_tx, req).await
                     }
                 };
                 let framed = statesync::encode_rpc_authed(

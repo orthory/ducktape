@@ -677,6 +677,86 @@ impl IndexStore {
         Ok(out?)
     }
 
+    /// re-derive a module's read model from the op feed it already holds:
+    /// every derived key cleared, then the whole `op/` range re-driven through
+    /// the guest in KEY order. `op/` and `meta/` are untouched — a refold
+    /// changes what the rows MEAN, never what the feed saw.
+    ///
+    /// the closing move of a backfill that extended the feed DOWNWARD (the
+    /// floored-module seam, indexable spec §7): rows below what the fold has
+    /// already consumed arrive out of order by construction, so the read model
+    /// disagrees with the feed until this runs — and it must run whether the
+    /// walk finished or died holding half a range. that is what buys the seam
+    /// its safety: nothing is wiped ahead of a pull that might fail.
+    ///
+    /// the same sequence [`converge_guest`] runs for a new mapper (feed down,
+    /// clear, feed up, replay, drain), and a no-op for a module with no
+    /// folding guest. failures poison, like every other write here.
+    pub fn refold(&self, module: &str) -> Result<()> {
+        if self.is_poisoned() {
+            return Err(Error::Poisoned);
+        }
+        let m = self.module(module)?;
+        if !m.has_fold {
+            return Ok(());
+        }
+        let out = (|| -> Result<()> {
+            // THE MARKER COMES DOWN FIRST AND GOES BACK UP LAST, exactly as
+            // `converge_guest` writes it last: while the derived keyspace is
+            // cleared and re-driven, NOTHING may vouch for it. A crash in
+            // between must leave no marker at all, so the next `open` finds
+            // one absent, refolds whole, and writes it — instead of matching
+            // the guest hash, returning early, and serving a half-built read
+            // model with a fold tip below its own feed.
+            let marker = m.db.get(META_GUEST.as_bytes())?;
+            m.db.delete(META_GUEST)?;
+            // the feed goes down next: its pending events describe rows the
+            // clear below is about to delete, and `delete_trigger` discards
+            // them with the registration.
+            m.db.delete_trigger(FOLD_TRIGGER)?;
+            clear_derived(&m.db)?;
+            create_fold_trigger(&m.db)?;
+            replay_op_feed(&m.db)?;
+            // AND WAIT FOR IT, for `converge_guest`'s reason: returning over a
+            // cleared keyspace serves "no such page" for every page, which is
+            // indistinguishable from a workspace that lost its documents.
+            drain_fold(&m.db, module)?;
+            if let Some(marker) = marker {
+                m.db.put(META_GUEST, marker)?;
+            }
+            Ok(())
+        })();
+        if out.is_err() {
+            self.poisoned.store(true, Ordering::Relaxed);
+        }
+        out
+    }
+
+    /// advance a module's feed watermark to `height` and NOTHING else — the
+    /// closing move of a RESUMED backfill, where the rows between the old
+    /// watermark and the boundary just landed verbatim, so the feed honestly
+    /// covers them. no wipe, no floor change, no trigger teardown (unlike
+    /// [`IndexStore::mark_backfilled`]); a watermark already at or past
+    /// `height` stands, so this is idempotent. failures poison, like every
+    /// other feed write.
+    pub fn advance_watermark(&self, module: &str, height: u64) -> Result<()> {
+        if self.is_poisoned() {
+            return Err(Error::Poisoned);
+        }
+        let db = self.db(module)?;
+        let out = (|| -> Result<()> {
+            if read_height(db)? >= height {
+                return Ok(());
+            }
+            db.put(META_HEIGHT, height.to_be_bytes())?;
+            Ok(())
+        })();
+        if out.is_err() {
+            self.poisoned.store(true, Ordering::Relaxed);
+        }
+        out
+    }
+
     /// point read of one stored key at the current snapshot.
     pub fn get(&self, module: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
         Ok(self.db(module)?.get(key)?)
