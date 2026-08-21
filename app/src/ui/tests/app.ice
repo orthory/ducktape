@@ -1033,3 +1033,50 @@ test files_write_bar_clears_the_crumb_bar
   expect crumb.height > 40.0
   expect field.width ~= 160.0
   expect field.y >= crumb.bottom
+
+// AND THE BACKDROP TAKES THE POINTER. #804's other half: the palette used to be
+// a `box bg=scrim`, which tints the console and captures nothing — the rail and
+// the composer behind it stayed live and clicking the dim did nothing at all.
+// `palette_overlay_contract` above proves the field inside the layer is still
+// reachable; this proves the console underneath is NOT. The click is aimed at a
+// live control beneath the layer, and the two expectations are the whole claim:
+// its handler does not fire, and the press lands on the backdrop, which
+// dismisses. Both are established as false-then-true, so neither can pass on a
+// palette that never opened.
+test palette_backdrop_takes_the_pointer
+  preset ui_palette_overlay
+  viewport 1120 720
+  mount
+    stack w=fill h=fill
+      button "Create a channel" #beneath @primary_action -> toggle_channel_create
+      OverlayLayer draft<->channel_draft query<->palette_draft #overlays
+        with
+          create_open=false
+          members_only=false
+          busy=false
+          connected=true
+          loading=false
+          toast=""
+          tone="info"
+          open=palette_open
+          search_phase=palette_search_phase
+          chat_hits=palette_chat_hits
+          page_hits=palette_page_hits
+        events
+          toggle_channel_create -> toggle_channel_create
+          toggle_channel_create_members_only -> toggle_channel_create_members_only
+          create_channel_submit -> create_channel_submit
+          dismiss_toast -> dismiss_toast
+          close_palette -> close_palette
+          palette_changed -> palette_changed _
+          open_chat_search_hit -> open_chat_search_hit _ _ _
+          open_page_search_hit -> open_page_search_hit _ _
+  target beneath = #beneath
+  target field = #overlays/palette-input
+  expect palette_open
+  expect !channel_create_open
+  expect exists field
+  click beneath
+  expect !channel_create_open
+  expect !palette_open
+  expect missing field
