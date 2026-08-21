@@ -79,6 +79,45 @@ fn ice_sources() -> Vec<(String, String)> {
     out
 }
 
+/// Every `on <name>` handler in one `.ice` source, as (name, body). A handler
+/// body runs from its header to the next line at or above its own indent, so a
+/// slice taken this way cannot absorb the handler after it — which is what
+/// keeps a `contains`/`!contains` assertion over one falsifiable. App handlers
+/// sit at column 0 and a component's at column 2; both are found the same way.
+fn ice_handlers(source: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut current: Option<(String, usize, Vec<&str>)> = None;
+    for line in source.lines() {
+        let indent = line.len() - line.trim_start().len();
+        if let Some((_, header_indent, body)) = &mut current
+            && (line.trim().is_empty() || indent > *header_indent)
+        {
+            body.push(line);
+            continue;
+        }
+        if let Some((name, _, body)) = current.take() {
+            out.push((name, body.join("\n")));
+        }
+        let Some(rest) = line.trim_start().strip_prefix("on ") else {
+            continue;
+        };
+        let name = rest.split(['(', ' ']).next().unwrap_or_default().to_owned();
+        current = Some((name, indent, Vec::new()));
+    }
+    if let Some((name, _, body)) = current {
+        out.push((name, body.join("\n")));
+    }
+    out
+}
+
+fn ice_handler_body(source: &str, handler: &str) -> String {
+    ice_handlers(source)
+        .into_iter()
+        .find(|(name, _)| name == handler)
+        .unwrap_or_else(|| panic!("`on {handler}` is a handler in this source"))
+        .1
+}
+
 fn ice_sources_in(directory: &str) -> String {
     let suffix = std::path::Path::new("src/ui").join(directory);
     ice_sources()

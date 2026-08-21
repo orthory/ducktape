@@ -153,7 +153,7 @@ component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_t
               open_thread_message_reactions
               open_message_link
 
-component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], messages_revision:i64, has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_messages_revision:i64, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool)
+component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], messages_revision:i64, has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_messages_revision:i64, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool)
   lifetime retained
   emits
     search_chat_submit()
@@ -1138,7 +1138,22 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
             // child, so a search reflowed the whole conversation down by
             // 148px; as a stack layer it drops over the stream instead and
             // everything beneath keeps its place.
-            if search_phase != SearchPhase.idle
+            //
+            // THE GATE CARRIES THE RETIREMENT, so the three arms below stay
+            // the phase reads they already were and no edit to one of them can
+            // leave an empty card floating. `done` alone stood while the
+            // reader typed on: this field is enter-to-submit and two-way
+            // bound, so a keystroke runs no handler and only
+            // `trim(draft) == query` can retire an answer as the box moves
+            // away from it.
+            //
+            // ONLY THE ZERO-HIT ARM RETIRES THAT WAY. Hit rows are still
+            // useful under a draft nobody has sent — they are the thing being
+            // typed toward — so `!empty(search_hits)` holds the float up on
+            // its own until a new query is sent or the box is cleared, which
+            // is what the pages hits float does. A sentence claiming NOTHING
+            // matched has no such life: it is a claim about one string.
+            if search_phase == SearchPhase.searching || !empty(search_hits) || search_answer_stands(search_query, search_draft, search_phase == SearchPhase.searching)
               box
                 with
                   w=fill

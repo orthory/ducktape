@@ -740,6 +740,7 @@ test message_stream_reset_contract
         status
         block_height
         search_phase=chat_search_phase
+        search_query=chat_search_query
         search_hits=chat_search_hits
         rooms
         dm_rows
@@ -875,6 +876,7 @@ test message_body_renders_as_one_rich_paragraph
         status
         block_height
         search_phase=chat_search_phase
+        search_query=chat_search_query
         search_hits=chat_search_hits
         rooms
         dm_rows
