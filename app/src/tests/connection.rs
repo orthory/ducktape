@@ -195,6 +195,89 @@ fn the_explorer_plate_speaks_for_the_query_it_was_sent() {
     );
 }
 
+/// CHAT'S FLOAT MAY NOT OUTLIVE THE QUERY IN THE BOX — and only its zero-hit
+/// arm retires that way. The message field is enter-to-submit and two-way
+/// bound, so a keystroke runs no handler and `done` went on standing over a
+/// string the node never saw: "No messages match" kept asserting about a query
+/// nobody had sent. Hit ROWS are a different thing — they are what the reader
+/// is typing toward — so they stand until a new query is sent or the box is
+/// cleared, exactly as the pages hits float does.
+#[test]
+fn the_chat_float_stands_only_for_the_query_it_was_sent() {
+    // Draft -> submit -> answer: the state a standing float reads.
+    let answered = |draft: &str, hits: Vec<backend::ChatSearchHit>| {
+        let (mut app, _) = Ducktape::__boot();
+        app.connected = true;
+        app.loading = false;
+        app.chat_search_draft = draft.into();
+        // A DRAFT IS NOT A QUERY: typing alone runs nothing and captures
+        // nothing.
+        assert!(app.chat_search_query.is_empty());
+        let _ = app.__update(__DucktapeMessage::SearchChatSubmit);
+        assert_eq!(app.chat_search_phase, SearchPhase::Searching);
+        assert_eq!(
+            app.chat_search_query, "zzz",
+            "the submit captures the TRIMMED string it sent"
+        );
+        let _ = app.__update(__DucktapeMessage::ChatSearchLoaded(
+            backend::ChatSearchData { hits },
+        ));
+        assert_eq!(app.chat_search_phase, SearchPhase::Done);
+        app
+    };
+
+    // THE ZERO-HIT ANSWER STANDS FOR ITS OWN QUERY, and one more character
+    // walks the draft away from it with no handler run.
+    let mut empty = answered("  zzz  ", Vec::new());
+    assert!(empty.chat_search_hits.is_empty());
+    assert_eq!(empty.chat_search_draft.trim(), empty.chat_search_query);
+    empty.chat_search_draft = "zzzq".into();
+    assert_ne!(empty.chat_search_draft.trim(), empty.chat_search_query);
+
+    // THE WITH-HITS ANSWER DOES NOT RETIRE THAT WAY — the rows survive the
+    // keystroke, and the float's gate says so on its own `!empty(search_hits)`
+    // term.
+    let mut rows = answered("zzz", vec![stale_chat_hit()]);
+    rows.chat_search_draft = "zzzq".into();
+    assert_eq!(rows.chat_search_hits.len(), 1);
+
+    // A FAILED search never ran, so nothing may stand for it.
+    let mut failed = answered("zzz", Vec::new());
+    let _ = failed.__update(__DucktapeMessage::ChatSearchFailed(backend::AppError {
+        message: "node refused".into(),
+        committed: false,
+    }));
+    assert_eq!(failed.chat_search_phase, SearchPhase::Idle);
+    assert!(failed.chat_search_query.is_empty());
+    assert_eq!(failed.error, "node refused");
+
+    // AND EVERY DISMISSAL TAKES THE QUERY WITH THE HITS, or the next answer
+    // inherits a string that was never sent for it.
+    for leaving in [
+        __DucktapeMessage::ClearChatSearch,
+        __DucktapeMessage::ChooseChannel("next".into()),
+        __DucktapeMessage::ChooseDm("peer".into()),
+    ] {
+        let mut app = answered("zzz", vec![stale_chat_hit()]);
+        let _ = app.__update(leaving);
+        assert!(
+            app.chat_search_query.is_empty(),
+            "a dismissal must not leave a query standing"
+        );
+    }
+
+    // THE GATE. The float stands while the search is out, while hits are in
+    // hand, or while the box still holds the string the answer speaks for —
+    // and for no other reason, so a zero-hit answer cannot outlive its query.
+    let chat = inlined(include_str!("../ui/screens/chat.ice"));
+    assert!(
+        chat.contains(
+            "if search_phase == SearchPhase.searching || !empty(search_hits) || (!empty(search_query) && trim(search_draft) == search_query)"
+        ),
+        "the results float must be gated on the query it was sent for"
+    );
+}
+
 /// A NAVIGATION DISMISSES THE WHOLE ANSWER, NOT HALF OF IT. `channel_created`
 /// and `pages_mutated` land you somewhere new exactly the way the pickers do,
 /// and `close_doc_tab` does when — and only when — it closes the ACTIVE tab;
@@ -886,13 +969,16 @@ fn a_failed_message_search_closes_the_float_instead_of_claiming_zero_results() {
 /// Enter (lands `done`+empty again), not clearing the field (the submit
 /// handler returns early on an empty query, leaving the phase untouched).
 /// Only a channel/DM switch or a reconnect ever wrote "idle" again. The ×
-/// must share the float's own gate, not a narrower one.
+/// must therefore never be gated more narrowly than the float. It is gated
+/// WIDER: the float's own discriminant OR a live field. Every state that
+/// raises the float is covered — searching and done are both `!= idle`, and an
+/// answer that still stands for the box means the box is not empty.
 #[test]
 fn the_clear_search_button_survives_a_zero_hit_result() {
     let screen = inlined(include_str!("../ui/screens/chat.ice"));
     assert!(
-        screen.contains("if search_phase != SearchPhase.idle\n"),
-        "the float and the clear button read the same discriminant"
+        screen.contains("if search_phase != SearchPhase.idle || !empty(trim(search_draft))\n"),
+        "the clear × must open on the float's discriminant or on a live field"
     );
     assert!(
         !screen.contains("if !empty(search_hits)\n"),

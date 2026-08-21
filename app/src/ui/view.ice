@@ -172,6 +172,7 @@ view
               status
               block_height
               search_phase=chat_search_phase
+              search_query=chat_search_query
               search_hits=chat_search_hits
               rooms
               dm_rows

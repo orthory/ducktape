@@ -49,6 +49,14 @@ state
   chat_search_draft = ""
   chat_search_hits:[ChatSearchHit] = []
   chat_search_phase:SearchPhase = SearchPhase.idle
+  // THE STRING THE FLOAT'S ZERO-HIT ARM IS SPEAKING FOR — the query a search
+  // was actually SENT for, `""` while no answer stands. The phase alone could
+  // not carry it: this box is enter-to-submit with no `change=` route, so a
+  // keystroke writes the draft and runs no handler, and `done` went on
+  // standing over a string the node never saw. Only the WITH-HITS arm may
+  // outlive the box — rows stay until a new query is sent or the box is
+  // cleared, exactly as the pages hits float does; see `screens/chat.ice`.
+  chat_search_query = ""
   history_view = false
   has_older_history = false
 

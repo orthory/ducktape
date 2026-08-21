@@ -102,6 +102,7 @@ on reconnect
   pending_channel = ""
   chat_search_hits = []
   chat_search_phase = SearchPhase.idle
+  chat_search_query = ""
   pages = []
   doc_tabs = []
   blocks = []

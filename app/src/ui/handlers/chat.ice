@@ -6,8 +6,11 @@ on search_chat_submit
   return if empty(trim(chat_search_draft))
   chat_search_phase = SearchPhase.searching
   chat_search_hits = []
+  // Captured at the last place the draft and the string being sent are known
+  // to match — and sent from here, so the two cannot drift apart.
+  chat_search_query = trim(chat_search_draft)
   error = ""
-  run replace lane=chat_search search_chat(connected_rpc, "", trim(chat_search_draft)) -> chat_search_loaded _ | chat_search_failed _
+  run replace lane=chat_search search_chat(connected_rpc, "", chat_search_query) -> chat_search_loaded _ | chat_search_failed _
 
 on chat_search_loaded(next)
   chat_search_hits = next.hits
@@ -20,6 +23,9 @@ on chat_search_failed(cause)
   // search that never ran — a confident zero-result card beside the error
   // banner that says the opposite.
   chat_search_phase = SearchPhase.idle
+  // A FAILED SEARCH FOUND NOTHING BECAUSE IT NEVER RAN, so nothing may be
+  // standing for it — the float goes with the query.
+  chat_search_query = ""
   error = cause.message
 
 on clear_chat_search
@@ -27,6 +33,7 @@ on clear_chat_search
   chat_search_draft = ""
   chat_search_hits = []
   chat_search_phase = SearchPhase.idle
+  chat_search_query = ""
 
 on open_chat_search_hit(channel_id, root_seq, target_seq)
   // NO `loading` TERM. A hit clicked while another room is still loading used
@@ -83,6 +90,7 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   hydration_retry_attempt = 0
   loading = true
   chat_search_hits = []
+  chat_search_query = ""
   selected_message_seq = 0
   selected_message_rev = 0
   message_action = MessageAction.toolbar
@@ -158,6 +166,7 @@ on choose_channel(id)
   hydration_retry_attempt = 0
   loading = true
   chat_search_hits = []
+  chat_search_query = ""
   selected_message_seq = 0
   selected_message_rev = 0
   message_action = MessageAction.toolbar
@@ -243,6 +252,7 @@ on choose_dm(peer_key)
   hydration_retry_attempt = 0
   loading = true
   chat_search_hits = []
+  chat_search_query = ""
   selected_message_seq = 0
   selected_message_rev = 0
   message_action = MessageAction.toolbar
@@ -667,6 +677,7 @@ on channel_created(next)
   invalidate lane=chat_search
   chat_search_phase = SearchPhase.idle
   chat_search_hits = []
+  chat_search_query = ""
   // A brand-new channel's latest page IS the whole channel — see
   // `chat_hit_loaded`.
   history_view = false
