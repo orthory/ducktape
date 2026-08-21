@@ -151,6 +151,27 @@ fn the_zero_hit_plates_sit_where_the_answer_is_needed() {
          its layers in declaration order, first at the BOTTOM, so an earlier plate \
          is painted UNDER the document it is supposed to cover"
     );
+    // AND THE HITS HALF SITS BESIDE IT. Nested in the document arm it was a row
+    // in the document COLUMN, so `live_resynced` emptying `active_page` under a
+    // standing answer took the input, the × and the hits down together — "No
+    // page selected" over a search nobody could see or dismiss. Same indent,
+    // same pin: re-nesting it deepens the indent and this needle stops
+    // matching.
+    let hits = pages_screen
+        .find("\n          if connected && !empty(page_search_hits)")
+        .expect("the pages hits float, as a SIBLING stack layer");
+    assert!(
+        document < hits,
+        "the pages hits float must be declared AFTER the document arm, for the \
+         same paint order its zero-hit sibling needs"
+    );
+    // OPAQUE, like the plate: it floats over live document text.
+    let card = &pages_screen[hits..];
+    let card = &card[..card.find("PageSearchResult").expect("the hit rows")];
+    assert!(
+        card.contains("bg=elevated"),
+        "a hits float over the document must not be a transparent layer"
+    );
 }
 
 /// THE EXPLORER'S PLATE SPEAKS FOR THE QUERY IT WAS SENT — the same class the

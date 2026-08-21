@@ -481,26 +481,6 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                   w=fill
                   h=fill
                   gap=8.0
-                if !empty(page_search_hits)
-                  box
-                    with
-                      w=fill
-                      h=148.0
-                      p=5.0
-                      bg=elevated
-                      border=fg/8
-                      border-w=1.0
-                      r=9.0
-                    scroll
-                      with
-                        dir=vertical
-                        w=fill
-                        h=fill
-                      col w=fill gap=1.0
-                        for hit in page_search_hits
-                          PageSearchResult hit=hit
-                            forward
-                              open_page_search_hit
                 // A REFUSED (or fence-held) WRITE SAYS SO, IN THE DOCUMENT.
                 // An untouched buffer was rolled back to the canonical text by
                 // the time this paints; a buffer the user kept typing into is
@@ -626,6 +606,49 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                         active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
                         hovered bg=fg/4 text=fg border=fg/7
                         pressed bg=fg/8 text=fg
+          // THE HITS FLOAT, A SIBLING STACK LAYER FOR THE SAME REASONS AS THE
+          // ZERO-HIT PLATE BELOW — and it needed them just as badly. Nested in
+          // the document arm it was a row in the document COLUMN, so
+          // `live_resynced` emptying `active_page` under a standing answer took
+          // the whole thing down: the input, the ×, and the hits themselves,
+          // leaving "No page selected" over a search nobody could see or
+          // dismiss. Hoisted, the answer survives that arrival and a hit is the
+          // way back into a document.
+          //
+          // Declared AFTER the document arm for the stack's paint order (see
+          // the plate below), and it is the same opaque card it always was —
+          // `bg=elevated` over live text. `connected` is carried here now that
+          // no ancestor supplies it; the hits alone still gate the rest, since
+          // every handler that drops them drops the standing query with them.
+          if connected && !empty(page_search_hits)
+            box
+              with
+                w=fill
+                h=fill
+                pl=22.0
+                pr=40.0
+                pt=26.0
+                align-y=start
+              box
+                with
+                  w=fill
+                  max-w=766.0
+                  h=148.0
+                  p=5.0
+                  bg=elevated
+                  border=fg/8
+                  border-w=1.0
+                  r=9.0
+                scroll
+                  with
+                    dir=vertical
+                    w=fill
+                    h=fill
+                  col w=fill gap=1.0
+                    for hit in page_search_hits
+                      PageSearchResult hit=hit
+                        forward
+                          open_page_search_hit
           // NOTHING MATCHED — A STACK LAYER, NOT A ROW IN THE DOCUMENT COLUMN,
           // AND DECLARED AFTER THE DOCUMENT ARM: a stack draws its layers in
           // declaration order, first at the BOTTOM, so above the document this
