@@ -778,7 +778,8 @@ component ExplorerScreen(connected_rpc:str, connected:bool, loading:bool, blocks
       // ON THE QUERY THAT WAS SENT, NOT ON THE ONE IN THE BOX: keyed on the
       // live draft, one more keystroke after a zero-hit answer re-aimed this
       // sentence at a string the node was never asked about.
-      if connected && empty(hits) && !searching && !empty(sent_query) && trim(query) == sent_query && empty(partial)
+      // `search_answer_stands` is that comparison, shared with pages and chat.
+      if connected && empty(hits) && empty(partial) && search_answer_stands(sent_query, query, searching)
         EmptyPlate message="Nothing matched that query in this workspace." #explorer-nothing-matched
       // NOT CONNECTED IS NOT EMPTY. `connected` already disables the query box
       // above; the ledger below it still asserted "No blocks yet" off a node

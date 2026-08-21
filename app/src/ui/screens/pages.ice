@@ -669,9 +669,10 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
           // ON THE QUERY, NOT ON A FLAG: this field is enter-to-submit and
           // two-way bound, so a keystroke runs no handler and only
           // `trim(draft) == query` can retire the plate as the user types.
-          // `!page_searching` covers the round trip; `page_search_failed`
+          // That comparison is `search_answer_stands`, shared with chat and the
+          // explorer — it carries the round trip too, and `page_search_failed`
           // drops the query.
-          if connected && empty(page_search_hits) && !page_searching && !empty(page_search_query) && trim(page_search_draft) == page_search_query
+          if connected && empty(page_search_hits) && search_answer_stands(page_search_query, page_search_draft, page_searching)
             box
               with
                 w=fill

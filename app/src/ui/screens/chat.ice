@@ -1153,7 +1153,7 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
             // its own until a new query is sent or the box is cleared, which
             // is what the pages hits float does. A sentence claiming NOTHING
             // matched has no such life: it is a claim about one string.
-            if search_phase == SearchPhase.searching || !empty(search_hits) || (!empty(search_query) && trim(search_draft) == search_query)
+            if search_phase == SearchPhase.searching || !empty(search_hits) || search_answer_stands(search_query, search_draft, search_phase == SearchPhase.searching)
               box
                 with
                   w=fill

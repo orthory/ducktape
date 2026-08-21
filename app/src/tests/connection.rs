@@ -102,7 +102,7 @@ fn the_zero_hit_plate_speaks_for_the_query_it_was_sent() {
     // the round trip its own submit opened.
     let pages_screen = inlined(include_str!("../ui/screens/pages.ice"));
     assert!(pages_screen.contains(
-        "if connected && empty(page_search_hits) && !page_searching && !empty(page_search_query) && trim(page_search_draft) == page_search_query"
+        "if connected && empty(page_search_hits) && search_answer_stands(page_search_query, page_search_draft, page_searching)"
     ));
     let overlays = inlined(include_str!("../ui/screens/overlays.ice"));
     assert!(overlays
@@ -112,7 +112,7 @@ fn the_zero_hit_plate_speaks_for_the_query_it_was_sent() {
     // or over "No page selected" — and `EmptyPlate` is `bg=transparent`, so
     // what it denies would render straight through the sentence denying it.
     let card = pages_screen
-        .split("if connected && empty(page_search_hits) && !page_searching")
+        .split("if connected && empty(page_search_hits) && search_answer_stands(")
         .nth(1)
         .expect("the zero-hit arm");
     let card = &card[..card.find("No pages matched").expect("the plate's message")];
@@ -204,7 +204,7 @@ fn the_explorer_plate_speaks_for_the_query_it_was_sent() {
     // are empty for a zero-hit answer no matter what is in the box.
     assert!(
         explorer.contains(
-            "if connected && empty(hits) && !searching && !empty(sent_query) && trim(query) == sent_query && empty(partial)"
+            "if connected && empty(hits) && empty(partial) && search_answer_stands(sent_query, query, searching)"
         ),
         "the zero-hit plate must be keyed on the query that was sent"
     );
@@ -293,9 +293,196 @@ fn the_chat_float_stands_only_for_the_query_it_was_sent() {
     let chat = inlined(include_str!("../ui/screens/chat.ice"));
     assert!(
         chat.contains(
-            "if search_phase == SearchPhase.searching || !empty(search_hits) || (!empty(search_query) && trim(search_draft) == search_query)"
+            "if search_phase == SearchPhase.searching || !empty(search_hits) || search_answer_stands(search_query, search_draft, search_phase == SearchPhase.searching)"
         ),
         "the results float must be gated on the query it was sent for"
+    );
+}
+
+/// ONE PREDICATE, THREE SURFACES. Pages, chat and the explorer each grew their
+/// own copy of the same conjunct arm, and a fourth surface would have grown a
+/// fourth; the arithmetic lives in one place now, and the three arms call it.
+#[test]
+fn one_predicate_decides_whether_a_search_answer_still_stands() {
+    // The answer speaks for the string it was sent for — trimmed, because that
+    // is what was sent.
+    assert!(backend::search_answer_stands(
+        "zzz".into(),
+        "  zzz  ".into(),
+        false
+    ));
+    // ONE MORE CHARACTER AND IT DOES NOT. No handler ran; only this comparison
+    // can tell.
+    assert!(!backend::search_answer_stands(
+        "zzz".into(),
+        "zzzq".into(),
+        false
+    ));
+    // A ROUND TRIP IS NOT AN ANSWER — the submit's own search is still out.
+    assert!(!backend::search_answer_stands(
+        "zzz".into(),
+        "zzz".into(),
+        true
+    ));
+    // AND AN EMPTY QUERY IS NO ANSWER AT ALL, which is what every dismissal
+    // leaves behind: an emptied box must not match an emptied query.
+    assert!(!backend::search_answer_stands(
+        String::new(),
+        String::new(),
+        false
+    ));
+
+    // The three arms read it, so none of them can drift from the others.
+    for (source, call) in [
+        (
+            inlined(include_str!("../ui/screens/pages.ice")),
+            "search_answer_stands(page_search_query, page_search_draft, page_searching)",
+        ),
+        (
+            inlined(include_str!("../ui/screens/chat.ice")),
+            "search_answer_stands(search_query, search_draft, search_phase == SearchPhase.searching)",
+        ),
+        (
+            inlined(include_str!("../ui/screens/storage.ice")),
+            "search_answer_stands(sent_query, query, searching)",
+        ),
+    ] {
+        assert!(
+            source.contains(call),
+            "every search surface decides through the shared predicate: `{call}`"
+        );
+    }
+}
+
+/// THE PAIRING IS WALKED, NOT ENUMERATED. An answer and the query it speaks
+/// for are one fact in two fields, so a handler that drops the hits and leaves
+/// the query behind arms the next reply to render an answer nobody asked for —
+/// and the navigation test that checks today's handlers cannot see the
+/// navigation handler added next year. This reads every `on` block in every
+/// authored `.ice` source instead.
+#[test]
+fn a_handler_that_drops_search_hits_drops_the_query_with_it() {
+    // The three surfaces that capture a query. Two app-scope pairs and the
+    // explorer's component-local one; a bare `hits` cannot collide with the
+    // prefixed names, because the match is anchored at the start of the line.
+    const PAIRED: [(&str, &str); 3] = [
+        ("page_search_hits", "page_search_query"),
+        ("chat_search_hits", "chat_search_query"),
+        ("hits", "sent_query"),
+    ];
+    let mut walked = 0;
+    for (path, source) in ice_sources() {
+        for (handler, body) in ice_handlers(&source) {
+            for (hits, query) in PAIRED {
+                // A DROP, not a write: `x = next.hits` is an answer landing.
+                // `keep_` is the conditional drop `close_doc_tab` rides.
+                let drops = body.lines().any(|line| {
+                    let line = line.trim();
+                    line.starts_with(&format!("{hits} = "))
+                        && (line.ends_with("= []") || line.contains("= keep_"))
+                });
+                if !drops {
+                    continue;
+                }
+                walked += 1;
+                assert!(
+                    body.lines()
+                        .any(|line| line.trim().starts_with(&format!("{query} = "))),
+                    "`on {handler}` in {path} drops `{hits}` and leaves `{query}` \
+                     standing — the plate would speak for a query nobody sent"
+                );
+            }
+        }
+    }
+    assert!(
+        walked >= 10,
+        "the walk found only {walked} hit-dropping handlers, so it is not \
+         reading the sources it claims to"
+    );
+}
+
+/// A WORKSPACE ANSWER BELONGS TO THE NETWORK IT WAS SENT FROM, and the
+/// explorer's search state is the one search state exempt from every app-level
+/// reset: `ExplorerScreen` is `lifetime retained`, so no reconnect and no
+/// network switch reaches inside it. What keeps a reply issued on one network
+/// from rendering as another's is the identity in its INSTANCE KEY —
+/// `#explorer(connected_rpc)` — which the run inherits as its scope at send
+/// time and the reply carries back. Switching networks renders a different
+/// instance, and the answer in flight lands on the one that asked for it.
+///
+/// The key is therefore load-bearing, not decoration: dropped, both networks
+/// share one instance and a cross-network answer renders as the new network's.
+#[test]
+fn an_explorer_answer_lands_on_the_network_that_asked_for_it() {
+    let (mut app, _) = Ducktape::__boot();
+    let console = iced::window::Id::unique();
+    app.console_win = Some(console);
+    app.connected = true;
+    app.loading = false;
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Explorer));
+
+    // A render materializes the instance the mount's key names — this app's own
+    // window and no other's, since the sighting channel is thread-local and a
+    // sibling test on the same thread renders the same mount.
+    let mounted = |app: &mut Ducktape| -> Vec<String> {
+        let _ = app.__view(console);
+        let window = format!("/{console:?}/");
+        app.__ice_test_scopes_explorer_screen()
+            .into_iter()
+            .filter(|scope| scope.contains(&window))
+            .collect()
+    };
+
+    app.connected_rpc = "http://one".into();
+    let one = mounted(&mut app);
+    assert_eq!(one.len(), 1, "one network, one explorer instance");
+    app.connected_rpc = "http://two".into();
+    let both = mounted(&mut app);
+    assert_eq!(
+        both.len(),
+        2,
+        "the explorer instance must be keyed by the network it is reading — one \
+         instance shared across networks is exactly what lets an answer sent on \
+         the first render as the second's"
+    );
+    let first = one[0].clone();
+    let second = both
+        .iter()
+        .find(|scope| **scope != first)
+        .expect("the second network's instance")
+        .clone();
+
+    // THE REPLY IN FLIGHT, delivered to the scope its send captured — the app
+    // is on the second network by now.
+    let _ = app.__update(
+        Ducktape::__ice_test_message_explorer_screen_explorer_results_loaded(
+            first.clone(),
+            backend::ExplorerResults {
+                hits: vec![backend::ExplorerHit {
+                    kind: "page".into(),
+                    code: "pg".into(),
+                    title: "Old".into(),
+                    snippet: "stale".into(),
+                    meta: String::new(),
+                    target: "page".into(),
+                }],
+                kinds: Vec::new(),
+                partial: String::new(),
+            },
+        ),
+    );
+    assert_eq!(
+        app.__ice_test_state_explorer_screen(&first)
+            .expect("the first network's instance answers")
+            .hits
+            .len(),
+        1,
+        "the answer belongs to the network that asked for it"
+    );
+    assert!(
+        app.__ice_test_state_explorer_screen(&second)
+            .is_none_or(|state| state.hits.is_empty()),
+        "a cross-network answer must not render as the new network's"
     );
 }
 
