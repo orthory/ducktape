@@ -585,6 +585,19 @@ fn command_chord(code: iced::keyboard::key::Code) -> __IceKeyPress {
     }
 }
 
+/// The press the escape ladder answers, as the subscription delivers it.
+fn escape_press() -> __IceKeyPress {
+    __IceKeyPress {
+        key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+        modified_key: iced::keyboard::Key::Unidentified,
+        physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::Escape),
+        location: iced::keyboard::Location::Standard,
+        modifiers: iced::keyboard::Modifiers::empty(),
+        text: None,
+        repeat: false,
+    }
+}
+
 fn room(id: &str, head: i64) -> backend::ChatChannel {
     backend::ChatChannel {
         id: id.into(),

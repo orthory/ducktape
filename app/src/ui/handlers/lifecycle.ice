@@ -648,6 +648,11 @@ on live_thread_refreshed(next)
 on live_thread_refresh_failed(_cause)
 
 on select_shell_tab(next)
+  // A RE-SELECT IS NOT A MOVE. The rail emits `select_shell_tab(item.id)` from
+  // the seat that is already active, and Settings' rows emit their own tab
+  // while the reader is on it — so the retires below have to ask, or one click
+  // on the tab you are already looking at destroys an inline edit in progress.
+  let moved = shell_tab != next
   shell_tab = next
   // A credential read belongs to the Shell visit that issued it. Bump on
   // EVERY move, including the chat/pages early return below, so a late reply
@@ -673,6 +678,27 @@ on select_shell_tab(next)
   channel_reads = mark_channel_read(channel_reads, chat_tab_channel, channel_head_seq(channels, chat_tab_channel))
   rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
+  // MENU-ONLY STATE BELONGS TO THE SCREEN THAT MOUNTED IT, and every one of
+  // these surfaces is mounted under an arm of `match tab`. Left set, an armed
+  // delete confirm comes back on the tab round trip one click from deleting a
+  // page the reader has forgotten she armed, and a ⋯ menu is not state anyone
+  // expects to return to. The escape ladder's tab scoping still stands beside
+  // this — a rung must not answer for a surface that is off screen however the
+  // flag got there — and the same retire is what `open_chat_search_hit`,
+  // `open_page_search_hit` and `huddle_go_channel` already do on their own tab
+  // moves. ABOVE both early returns, for the reason `error` is, and gated on
+  // `moved` because a re-select of the screen she is on is not a move.
+  selected_message_seq = keep_i64(moved, 0, selected_message_seq)
+  selected_message_rev = keep_i64(moved, 0, selected_message_rev)
+  message_action = close_message_action(moved, message_action)
+  message_edit_draft = keep_str(moved, "", message_edit_draft)
+  thread_selected_seq = keep_i64(moved, 0, thread_selected_seq)
+  thread_selected_rev = keep_i64(moved, 0, thread_selected_rev)
+  thread_message_action = close_message_action(moved, thread_message_action)
+  thread_edit_draft = keep_str(moved, "", thread_edit_draft)
+  forge_repo_menu = forge_repo_menu && !moved
+  page_delete_armed = page_delete_armed && !moved
+  fs_delete_target = keep_str(moved, "", fs_delete_target)
   // A hydration error belongs to the pane that raised it. Leaving it up after
   // a navigation tells the user the pane they just opened is broken, which is
   // a lie the banner has no way to walk back — it is dismissed by hand or not
@@ -888,7 +914,7 @@ subscribe
   //
   // `key=escape` is the key-level gate: typing into an open layer's own field
   // no longer publishes a redundant captured-key update per character.
-  keyboard press key=escape status=captured when !empty(topmost_overlay(shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, forge_repo_menu)) -> global_key_pressed _
+  keyboard press key=escape status=captured when !empty(topmost_overlay(shell_tab, palette_open, bell_open, channel_create_open, thread_message_action, message_action, channel_settings_open, page_delete_armed, fs_delete_target, forge_repo_menu)) -> global_key_pressed _
   // THE PANE SCROLL'S KEYS ARE THE LEFTOVERS. `status=ignored` drops every key
   // a focused widget CONSUMED — Home in a text field, an arrow in an open
   // list — but it is only half the arbitration: iced's single-line input drops

@@ -328,6 +328,8 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             thread_action,
             action,
             drawer,
+            false,
+            String::new(),
             repo_menu,
         )
     };
@@ -343,6 +345,8 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             MessageAction::More,
             MessageAction::More,
             true,
+            true,
+            "/shared/q3.md".into(),
             true,
         ),
         ""
@@ -397,10 +401,29 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             false,
             MessageAction::More,
             MessageAction::More,
-            true,
+            false,
             true,
         ),
         "thread_menu"
+    );
+    // AND THE DRAWER OUTRANKS THE THREAD MENU WHEN IT IS OPEN. The rail is not
+    // mounted while Channel details is up (`if active_thread_seq > 0 &&
+    // !channel_settings_open`, `screens/chat.ice`), so a ⋯ flag left set behind
+    // it names no layer on screen — this test used to pin the opposite verdict,
+    // where the first Escape wiped `thread_edit_draft` and left the drawer
+    // standing.
+    assert_eq!(
+        target(
+            ShellTab::Chat,
+            false,
+            false,
+            false,
+            MessageAction::More,
+            MessageAction::Toolbar,
+            true,
+            true,
+        ),
+        "channel_settings"
     );
     assert_eq!(
         target(
@@ -415,8 +438,8 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
         ),
         "message_menu"
     );
-    // THE DRAWER SITS BETWEEN THEM. Both message menus float over Channel
-    // details, so they win; the repo menu lives on another tab, so it loses.
+    // THE DRAWER SITS BETWEEN THEM. The stream's menu floats over Channel
+    // details, so it wins; the repo menu lives on another tab, so it loses.
     // It had no rung at all — an `×` and no keyboard exit, while every other
     // overlay answered Escape. Measured: Escape over an open drawer changed
     // exactly zero pixels on the running app.
@@ -446,8 +469,30 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
         ),
         "repo_menu"
     );
-    // Nothing transient open → Escape is a no-op. The pages rungs are gone
-    // with the menus they dismissed: the document has no transient layer.
+    // THE PAGES DELETE CONFIRM. A scrim and a confirm over the canvas, inside
+    // the Pages screen — so it is a rung, and it answers only from Pages.
+    let armed = |tab: ShellTab, page_delete: bool, fs_delete: &str| {
+        escape_target(
+            escape.clone(),
+            tab,
+            false,
+            false,
+            false,
+            MessageAction::Toolbar,
+            MessageAction::Toolbar,
+            false,
+            page_delete,
+            fs_delete.into(),
+            false,
+        )
+    };
+    assert_eq!(armed(ShellTab::Pages, true, ""), "page_delete");
+    assert_eq!(armed(ShellTab::Chat, true, ""), "");
+    assert_eq!(armed(ShellTab::Files, false, "/shared/q3.md"), "fs_delete");
+    assert_eq!(armed(ShellTab::Node, false, "/shared/q3.md"), "");
+
+    // Nothing transient open → Escape is a no-op. The pages block menus are
+    // gone with the surfaces they dismissed.
     assert_eq!(
         target(
             ShellTab::Chat,
@@ -492,6 +537,8 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
             thread_action,
             action,
             drawer,
+            false,
+            String::new(),
             repo_menu,
         )
     };
@@ -509,6 +556,8 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
             thread_action,
             MessageAction::Toolbar,
             false,
+            false,
+            String::new(),
             repo_menu,
         )
     };
@@ -623,6 +672,8 @@ fn the_content_pane_claims_only_the_keys_nothing_else_owns() {
         "thread_menu",
         "message_menu",
         "channel_settings",
+        "page_delete",
+        "fs_delete",
         "repo_menu",
     ] {
         for key in [Named::PageDown, Named::PageUp, Named::End, Named::Home] {

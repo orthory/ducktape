@@ -1388,3 +1388,329 @@ fn the_files_pane_reports_only_a_directory_it_has_listed() {
         "the mount has to compute it"
     );
 }
+
+/// ESCAPE CLOSES WHAT IS ON SCREEN, AND THE THREAD RAIL IS NOT.
+///
+/// Channel details unmounts the rail — `if active_thread_seq > 0 &&
+/// !channel_settings_open` in `screens/chat.ice` — and nothing clears the ⋯
+/// flag on the way in, so opening a thread action and then the drawer is a
+/// mouse-reachable state where the ladder's first rung named a menu nobody
+/// could see: the press wiped a half-typed `thread_edit_draft` and left the
+/// drawer standing. Same rule as the tab scoping, one level down — a rung
+/// answers only while its surface is mounted.
+#[test]
+fn escape_closes_the_drawer_over_a_thread_menu_the_drawer_unmounted() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.shell_tab = ShellTab::Chat;
+    app.active_channel = "general".into();
+    app.thread_selected_seq = 7;
+    app.thread_message_action = MessageAction::Editing;
+    app.thread_edit_draft = "half typed".into();
+    app.channel_settings_open = true;
+
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape_press()));
+    assert!(
+        !app.channel_settings_open,
+        "the first Escape closes the drawer the reader is looking at"
+    );
+    assert_eq!(
+        app.thread_edit_draft, "half typed",
+        "and leaves the unmounted rail's draft where she left it"
+    );
+    assert_eq!(app.thread_message_action, MessageAction::Editing);
+
+    // With the drawer down the rail is mounted again, and its rung answers.
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape_press()));
+    assert_eq!(app.thread_message_action, MessageAction::Toolbar);
+    assert_eq!(app.thread_edit_draft, "");
+}
+
+/// THE FILES DELETE CONFIRM IS AN OVERLAY, SO IT ANSWERS ESCAPE.
+///
+/// `fs_delete_target` arms a scrim + `ConfirmDelete` over duckfs
+/// (`screens/storage.ice`). Its dismiss route is the backdrop click and the
+/// Cancel button — a destructive confirm with no keyboard exit, which is the
+/// state the drawer was in before #1132 gave it a rung.
+#[test]
+fn escape_disarms_the_files_delete_confirm_from_the_files_tab_only() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.shell_tab = ShellTab::Files;
+    app.fs_delete_target = "/shared/report.md".into();
+
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape_press()));
+    assert_eq!(
+        app.fs_delete_target, "",
+        "Escape is the keyboard way out of a destructive confirm"
+    );
+
+    // And the rung is scoped like every other per-tab rung: from another tab
+    // the confirm is not on screen, so the press names no layer at all.
+    app.shell_tab = ShellTab::Node;
+    app.fs_delete_target = "/shared/report.md".into();
+    app.bell_open = true;
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape_press()));
+    assert!(!app.bell_open, "the bell rides every tab and answers first");
+    assert_eq!(app.fs_delete_target, "/shared/report.md");
+}
+
+/// THE LADDER'S TAB SCOPING IS READ OFF THE MOUNT LAYOUT — SO THE LAYOUT PINS IT.
+///
+/// #1132 scoped every per-tab rung in `topmost_overlay` by reading
+/// `components/shell.ice`'s `match tab`: a rung whose surface is mounted under
+/// an arm answers only from that arm's tab, and one whose surface sits OUTSIDE
+/// the match (the palette, the bell, the create modal) rides every tab. That
+/// reading was done once, by hand, and nothing held it: move a screen to
+/// another arm — or add a rung and forget its guard — and the pre-#1132 symptom
+/// comes back silently, a stale flag eating the first Escape on every other
+/// tab while the visible screen swallows the press.
+///
+/// So the rule is derived here instead of restated: `match tab` says which slot
+/// each tab mounts, `view.ice` says which state each slot is handed, and the
+/// ladder itself says which flags each rung reads and which tab it is guarded
+/// on. Nothing in this test names a tab, a slot or a rung — the three sources
+/// have to agree on their own.
+#[test]
+fn every_ladder_rung_is_scoped_to_the_tab_that_mounts_its_surface() {
+    /// `contains`, but a whole identifier — `message_action` must not match
+    /// inside `thread_message_action`.
+    fn mentions(haystack: &str, needle: &str) -> bool {
+        let part = |c: char| c.is_alphanumeric() || c == '_';
+        haystack.match_indices(needle).any(|(at, _)| {
+            !haystack[..at].chars().next_back().is_some_and(part)
+                && !haystack[at + needle.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(part)
+        })
+    }
+
+    // 1. THE MOUNT LAYOUT. Every `slot` the shell declares, and the tab arm
+    //    that mounts it — `None` for the window-level layers outside the match.
+    let shell = include_str!("../ui/components/shell.ice");
+    assert_eq!(
+        shell
+            .lines()
+            .filter(|line| line.trim() == "match tab")
+            .count(),
+        1,
+        "one tab match, and this walk found it"
+    );
+    let arms = shell.split_once("match tab\n").expect("the tab match").1;
+    let mut mounted: Vec<(&str, &str)> = Vec::new();
+    let mut arm: Option<&str> = None;
+    for line in arms.lines() {
+        let line = line.trim();
+        if let Some(tab) = line.strip_prefix("ShellTab.") {
+            arm = Some(tab);
+        } else if let Some(slot) = line.strip_prefix("slot ") {
+            // A `slot` with no arm above it is past the match — the palette,
+            // the bell and the huddle, which ride every screen.
+            let Some(tab) = arm.take() else { break };
+            mounted.push((slot, tab));
+        }
+    }
+    let declared: Vec<&str> = shell
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("slot "))
+        .collect();
+    assert!(
+        mounted.len() > 8 && declared.len() > mounted.len(),
+        "the walk found the arms ({}) and the layers outside them ({})",
+        mounted.len(),
+        declared.len()
+    );
+
+    // 2. WHAT EACH SLOT IS HANDED. `view.ice` fills them, and the state a
+    //    surface is plumbed is what says which surface a flag belongs to.
+    let view = include_str!("../ui/view.ice");
+    let filled: Vec<(&str, Option<&str>, String)> = declared
+        .iter()
+        .map(|slot| {
+            let head = format!("\n        {slot}:\n");
+            let body = view
+                .split_once(&head)
+                .unwrap_or_else(|| panic!("`{slot}:` is filled in view.ice"))
+                .1
+                .lines()
+                .take_while(|line| line.trim().is_empty() || line.starts_with("          "))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let tab = mounted
+                .iter()
+                .find(|(mounted, _)| mounted == slot)
+                .map(|(_, tab)| *tab);
+            (*slot, tab, body)
+        })
+        .collect();
+
+    // 3. THE LADDER: its layer flags, its tab predicates, and its rungs.
+    let explorer = include_str!("../backend/explorer.rs");
+    let ladder = explorer
+        .split_once("pub fn topmost_overlay(")
+        .expect("the ladder")
+        .1;
+    let (signature, body) = ladder.split_once(") -> String {").expect("the ladder");
+    let body = body.split_once("\n}\n").expect("the ladder ends").0;
+    let layers: Vec<&str> = signature
+        .lines()
+        .filter_map(|line| line.trim().split_once(':'))
+        .map(|(name, _)| name)
+        .collect();
+    let guards: Vec<(&str, &str)> = body
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("let "))
+        .filter_map(|line| line.split_once(" = shell_tab == crate::ShellTab::"))
+        .map(|(name, tab)| (name, tab.trim_end_matches(';')))
+        .collect();
+    let mut rungs: Vec<(&str, &str)> = Vec::new();
+    let mut condition: Option<&str> = None;
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some(open) = line.strip_prefix("if ").and_then(|c| c.strip_suffix(" {")) {
+            condition = Some(open);
+        } else if let Some(rung) = line
+            .strip_prefix("return \"")
+            .and_then(|rung| rung.strip_suffix("\".into();"))
+            && let Some(open) = condition.take()
+        {
+            rungs.push((rung, open));
+        }
+    }
+    assert_eq!(
+        rungs.len(),
+        body.matches("return \"").count(),
+        "every rung's condition parsed — one `if <condition> {{` per rung"
+    );
+
+    // 4. AND THE THREE HAVE TO AGREE.
+    for (rung, condition) in rungs {
+        let read: Vec<&&str> = layers
+            .iter()
+            .filter(|layer| mentions(condition, layer))
+            .collect();
+        assert!(!read.is_empty(), "rung `{rung}` reads no layer flag");
+        let mut tabs: Vec<&str> = Vec::new();
+        let mut rides_every_tab = false;
+        for layer in read {
+            let plumbed: Vec<&(&str, Option<&str>, String)> = filled
+                .iter()
+                .filter(|(_, _, body)| mentions(body, layer))
+                .collect();
+            assert!(
+                !plumbed.is_empty(),
+                "`{layer}` reaches no slot — rung `{rung}` is scoped against nothing"
+            );
+            for (_, tab, _) in plumbed {
+                match tab {
+                    Some(tab) => tabs.push(tab),
+                    None => rides_every_tab = true,
+                }
+            }
+        }
+        let guard = guards
+            .iter()
+            .find(|(predicate, _)| mentions(condition, predicate));
+        // A layer plumbed into a slot outside `match tab` stays on screen
+        // across a switch, so its rung must keep answering from every tab.
+        if rides_every_tab {
+            assert!(
+                guard.is_none(),
+                "rung `{rung}` is mounted outside the tab match and must not be scoped"
+            );
+            continue;
+        }
+        tabs.dedup();
+        assert_eq!(
+            tabs.len(),
+            1,
+            "rung `{rung}` reads state from more than one tab's slot: {tabs:?}"
+        );
+        let (predicate, scoped_to) = guard.unwrap_or_else(|| {
+            panic!(
+                "rung `{rung}` mounts under `{}` and must be scoped to it",
+                tabs[0]
+            )
+        });
+        assert!(
+            scoped_to.eq_ignore_ascii_case(tabs[0]),
+            "rung `{rung}` is scoped by `{predicate}` to {scoped_to}, but the shell mounts \
+             its surface under ShellTab.{}",
+            tabs[0]
+        );
+    }
+}
+
+/// A TAB MOVE RETIRES THE MENUS THE TAB IT LEFT OWNED.
+///
+/// Nothing did: `select_shell_tab` left every menu flag set, which is the whole
+/// reason the escape ladder has to be scoped tab by tab (#1132). The scoping
+/// stays — a rung must not answer for a surface that is not on screen, however
+/// the flag got there — and this is the other half of it: an armed delete
+/// confirm that survives a tab round trip is a mouse click away from deleting
+/// the page the reader forgot she armed, and a ⋯ menu is not state anyone
+/// expects to come back to.
+#[test]
+fn a_tab_move_retires_the_menu_only_state_of_the_screen_it_left() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.shell_tab = ShellTab::Chat;
+    app.selected_message_seq = 4;
+    app.selected_message_rev = 2;
+    app.message_action = MessageAction::More;
+    app.message_edit_draft = "half typed".into();
+    app.thread_selected_seq = 7;
+    app.thread_selected_rev = 1;
+    app.thread_message_action = MessageAction::Editing;
+    app.thread_edit_draft = "half typed too".into();
+    app.forge_repo_menu = true;
+    app.page_delete_armed = true;
+    app.fs_delete_target = "/shared/report.md".into();
+
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Node));
+
+    assert_eq!(app.message_action, MessageAction::Toolbar);
+    assert_eq!(app.message_edit_draft, "");
+    assert_eq!(app.selected_message_seq, 0);
+    assert_eq!(app.selected_message_rev, 0);
+    assert_eq!(app.thread_message_action, MessageAction::Toolbar);
+    assert_eq!(app.thread_edit_draft, "");
+    assert_eq!(app.thread_selected_seq, 0);
+    assert_eq!(app.thread_selected_rev, 0);
+    assert!(!app.forge_repo_menu);
+    assert!(
+        !app.page_delete_armed,
+        "an armed delete never rides a tab move"
+    );
+    assert_eq!(app.fs_delete_target, "");
+
+    // The disconnected path returns before the generation bumps, and retires
+    // the same set — the clear sits above both early returns, like `error`.
+    let (mut app, _) = Ducktape::__boot();
+    app.shell_tab = ShellTab::Files;
+    app.fs_delete_target = "/shared/report.md".into();
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Chat));
+    assert_eq!(app.fs_delete_target, "");
+    assert_eq!(app.shell_tab, ShellTab::Chat);
+
+    // AND A RE-SELECT IS NOT A MOVE. The rail emits `select_shell_tab(item.id)`
+    // from the seat that is already active, and Settings' rows emit their own
+    // tab while the reader is on it — so an unconditional retire is one click
+    // from destroying an inline edit on the screen she never left.
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.shell_tab = ShellTab::Chat;
+    app.selected_message_seq = 4;
+    app.selected_message_rev = 2;
+    app.message_action = MessageAction::Editing;
+    app.message_edit_draft = "still typing".into();
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Chat));
+    assert_eq!(
+        app.message_edit_draft, "still typing",
+        "clicking the tab you are on retires nothing"
+    );
+    assert_eq!(app.message_action, MessageAction::Editing);
+    assert_eq!(app.selected_message_seq, 4);
+    assert_eq!(app.selected_message_rev, 2);
+}
