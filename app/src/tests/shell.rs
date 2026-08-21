@@ -1454,3 +1454,190 @@ fn escape_disarms_the_files_delete_confirm_from_the_files_tab_only() {
     assert!(!app.bell_open, "the bell rides every tab and answers first");
     assert_eq!(app.fs_delete_target, "/shared/report.md");
 }
+
+/// THE LADDER'S TAB SCOPING IS READ OFF THE MOUNT LAYOUT — SO THE LAYOUT PINS IT.
+///
+/// #1132 scoped every per-tab rung in `topmost_overlay` by reading
+/// `components/shell.ice`'s `match tab`: a rung whose surface is mounted under
+/// an arm answers only from that arm's tab, and one whose surface sits OUTSIDE
+/// the match (the palette, the bell, the create modal) rides every tab. That
+/// reading was done once, by hand, and nothing held it: move a screen to
+/// another arm — or add a rung and forget its guard — and the pre-#1132 symptom
+/// comes back silently, a stale flag eating the first Escape on every other
+/// tab while the visible screen swallows the press.
+///
+/// So the rule is derived here instead of restated: `match tab` says which slot
+/// each tab mounts, `view.ice` says which state each slot is handed, and the
+/// ladder itself says which flags each rung reads and which tab it is guarded
+/// on. Nothing in this test names a tab, a slot or a rung — the three sources
+/// have to agree on their own.
+#[test]
+fn every_ladder_rung_is_scoped_to_the_tab_that_mounts_its_surface() {
+    /// `contains`, but a whole identifier — `message_action` must not match
+    /// inside `thread_message_action`.
+    fn mentions(haystack: &str, needle: &str) -> bool {
+        let part = |c: char| c.is_alphanumeric() || c == '_';
+        haystack.match_indices(needle).any(|(at, _)| {
+            !haystack[..at].chars().next_back().is_some_and(part)
+                && !haystack[at + needle.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(part)
+        })
+    }
+
+    // 1. THE MOUNT LAYOUT. Every `slot` the shell declares, and the tab arm
+    //    that mounts it — `None` for the window-level layers outside the match.
+    let shell = include_str!("../ui/components/shell.ice");
+    assert_eq!(
+        shell
+            .lines()
+            .filter(|line| line.trim() == "match tab")
+            .count(),
+        1,
+        "one tab match, and this walk found it"
+    );
+    let arms = shell.split_once("match tab\n").expect("the tab match").1;
+    let mut mounted: Vec<(&str, &str)> = Vec::new();
+    let mut arm: Option<&str> = None;
+    for line in arms.lines() {
+        let line = line.trim();
+        if let Some(tab) = line.strip_prefix("ShellTab.") {
+            arm = Some(tab);
+        } else if let Some(slot) = line.strip_prefix("slot ") {
+            // A `slot` with no arm above it is past the match — the palette,
+            // the bell and the huddle, which ride every screen.
+            let Some(tab) = arm.take() else { break };
+            mounted.push((slot, tab));
+        }
+    }
+    let declared: Vec<&str> = shell
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("slot "))
+        .collect();
+    assert!(
+        mounted.len() > 8 && declared.len() > mounted.len(),
+        "the walk found the arms ({}) and the layers outside them ({})",
+        mounted.len(),
+        declared.len()
+    );
+
+    // 2. WHAT EACH SLOT IS HANDED. `view.ice` fills them, and the state a
+    //    surface is plumbed is what says which surface a flag belongs to.
+    let view = include_str!("../ui/view.ice");
+    let filled: Vec<(&str, Option<&str>, String)> = declared
+        .iter()
+        .map(|slot| {
+            let head = format!("\n        {slot}:\n");
+            let body = view
+                .split_once(&head)
+                .unwrap_or_else(|| panic!("`{slot}:` is filled in view.ice"))
+                .1
+                .lines()
+                .take_while(|line| line.trim().is_empty() || line.starts_with("          "))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let tab = mounted
+                .iter()
+                .find(|(mounted, _)| mounted == slot)
+                .map(|(_, tab)| *tab);
+            (*slot, tab, body)
+        })
+        .collect();
+
+    // 3. THE LADDER: its layer flags, its tab predicates, and its rungs.
+    let explorer = include_str!("../backend/explorer.rs");
+    let ladder = explorer
+        .split_once("pub fn topmost_overlay(")
+        .expect("the ladder")
+        .1;
+    let (signature, body) = ladder.split_once(") -> String {").expect("the ladder");
+    let body = body.split_once("\n}\n").expect("the ladder ends").0;
+    let layers: Vec<&str> = signature
+        .lines()
+        .filter_map(|line| line.trim().split_once(':'))
+        .map(|(name, _)| name)
+        .collect();
+    let guards: Vec<(&str, &str)> = body
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("let "))
+        .filter_map(|line| line.split_once(" = shell_tab == crate::ShellTab::"))
+        .map(|(name, tab)| (name, tab.trim_end_matches(';')))
+        .collect();
+    let mut rungs: Vec<(&str, &str)> = Vec::new();
+    let mut condition: Option<&str> = None;
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some(open) = line.strip_prefix("if ").and_then(|c| c.strip_suffix(" {")) {
+            condition = Some(open);
+        } else if let Some(rung) = line
+            .strip_prefix("return \"")
+            .and_then(|rung| rung.strip_suffix("\".into();"))
+            && let Some(open) = condition.take()
+        {
+            rungs.push((rung, open));
+        }
+    }
+    assert_eq!(
+        rungs.len(),
+        body.matches("return \"").count(),
+        "every rung's condition parsed — one `if <condition> {{` per rung"
+    );
+
+    // 4. AND THE THREE HAVE TO AGREE.
+    for (rung, condition) in rungs {
+        let read: Vec<&&str> = layers
+            .iter()
+            .filter(|layer| mentions(condition, layer))
+            .collect();
+        assert!(!read.is_empty(), "rung `{rung}` reads no layer flag");
+        let mut tabs: Vec<&str> = Vec::new();
+        let mut rides_every_tab = false;
+        for layer in read {
+            let plumbed: Vec<&(&str, Option<&str>, String)> = filled
+                .iter()
+                .filter(|(_, _, body)| mentions(body, layer))
+                .collect();
+            assert!(
+                !plumbed.is_empty(),
+                "`{layer}` reaches no slot — rung `{rung}` is scoped against nothing"
+            );
+            for (_, tab, _) in plumbed {
+                match tab {
+                    Some(tab) => tabs.push(tab),
+                    None => rides_every_tab = true,
+                }
+            }
+        }
+        let guard = guards
+            .iter()
+            .find(|(predicate, _)| mentions(condition, predicate));
+        // A layer plumbed into a slot outside `match tab` stays on screen
+        // across a switch, so its rung must keep answering from every tab.
+        if rides_every_tab {
+            assert!(
+                guard.is_none(),
+                "rung `{rung}` is mounted outside the tab match and must not be scoped"
+            );
+            continue;
+        }
+        tabs.dedup();
+        assert_eq!(
+            tabs.len(),
+            1,
+            "rung `{rung}` reads state from more than one tab's slot: {tabs:?}"
+        );
+        let (predicate, scoped_to) = guard.unwrap_or_else(|| {
+            panic!(
+                "rung `{rung}` mounts under `{}` and must be scoped to it",
+                tabs[0]
+            )
+        });
+        assert!(
+            scoped_to.eq_ignore_ascii_case(tabs[0]),
+            "rung `{rung}` is scoped by `{predicate}` to {scoped_to}, but the shell mounts \
+             its surface under ShellTab.{}",
+            tabs[0]
+        );
+    }
+}
