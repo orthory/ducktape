@@ -121,9 +121,14 @@ const SCREEN_PROBES: &[ScreenProbe] = &[
         fixture: console_in_forge_tree_only,
         allocation_ceiling: 165_000,
     },
-    // The syntect reader on a LONG file, RESTORED: the descent took this
-    // fixture away until the component test seam could seed the blob
-    // through the update loop again. Ceiling re-measured post-descent.
+    // The syntect reader on a LONG file: the descent took this fixture away
+    // until the component test seam could seed the blob through the update
+    // loop again. 2,848 measured 2026-08-21 with the Ice-side memo boundary
+    // (`lazy file_text by file_text, file_path, dark`) holding the tokenized
+    // rows across unchanged frames; 650,972 without it — the negative control
+    // this ceiling sits between, and the whole reason the fixture must have a
+    // file OPEN. An empty reader makes the number unreachable and the ceiling
+    // vacuous.
     ScreenProbe {
         label: "forge code build+layout",
         size: WINDOW,
@@ -1399,11 +1404,12 @@ fn the_forge_code_pane_draws_the_loaded_blob() {
         .expect("the forge content probe thread finishes");
 }
 
-// The blob content itself is `ForgeCodeBrowser` component state now, out of
-// the update loop's reach, so the rewritten-blob pixel assertion moved out
-// with it — restoring THAT probe is ducktape-ui#696. What must still hold:
-// clicking the file row — the reader's real control — moves the component's
-// local state and repaints the pane, and the pane survives an event walk.
+// The blob content is `ForgeCodeBrowser` component state, reached through the
+// generated seam (ducktape-ui#696) rather than the app's update loop. Four
+// things must hold: clicking the file row — the reader's real control — moves
+// the component's local state and repaints the pane, a landed blob repaints it
+// out of its loading plate, a REWRITTEN blob repaints it again, and the pane
+// survives an event walk.
 fn probe_forge_code_content() {
     let (mut app, console, scope) = console_in_forge_tree(vec![backend::TreeEntry {
         name: "probe.rs".into(),

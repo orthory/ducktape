@@ -29,9 +29,9 @@ fn forge_depth_rides_the_established_seams() {
         "run replace lane=forge_discussion load_forge_discussion(connected_rpc, forge_item_channel)"
     ));
     assert!(lifecycle.contains("return if next.channel_id != forge_item_channel"));
-    let screen = include_str!("../ui/screens/forge.ice");
-    assert!(screen.contains("return if next.path != tree_path"));
-    assert!(screen.contains("return if !empty(tree_rev) && next.rev != tree_rev"));
+    // The browse's own completion guards are behavior now, not shape:
+    // `forge_scoped_reads_do_not_call_loading_or_failure_empty` and
+    // `a_blob_for_another_file_does_not_paint_the_open_one` drive them.
     assert!(backend.contains(
         "load_forge_discussion(rpc:str, channel_id:str) -> ForgeDiscussionData ! AppError"
     ));
@@ -608,14 +608,72 @@ fn forge_directory_navigation_retires_the_previous_file_preview() {
     assert!(state.tree_entries.is_empty(), "navigation clears the listing it left");
 }
 
+/// A BLOB ANSWERS FOR ONE FILE. The reader keeps a single in-flight path, and
+/// a completion that names another one is a superseded read landing late — the
+/// replace lane cancels most of them, but the one already in the runtime's hand
+/// still arrives. Painting it puts one file's source under another file's
+/// header.
+#[test]
+fn a_blob_for_another_file_does_not_paint_the_open_one() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.forge_repo = "core".into();
+    let scope = materialized_code_browser(&mut app);
+    let _ = app.__update(Ducktape::__ice_test_message_forge_code_browser_open_file(
+        scope.clone(),
+        "http://node".into(),
+        true,
+        "core".into(),
+        "1111111111111111111111111111111111111111".into(),
+        String::new(),
+        "src/lib.rs".into(),
+    ));
+    let blob = |path: &str, text: &str| {
+        Ducktape::__ice_test_message_forge_code_browser_file_loaded(
+            scope.clone(),
+            backend::BlobView {
+                repo: "core".into(),
+                rev: "1111111111111111111111111111111111111111".into(),
+                path: path.into(),
+                text: text.into(),
+                truncated: false,
+                binary: false,
+                lines: 1,
+            },
+        )
+    };
+
+    let _ = app.__update(blob("src/main.rs", "fn main() {}"));
+    let state = app
+        .__ice_test_state_forge_code_browser(&scope)
+        .expect("instance");
+    assert!(
+        state.file_text.is_empty(),
+        "another file's blob must not paint under this file's header"
+    );
+    assert_eq!(
+        state.phase,
+        ForgeFilePhase::Loading,
+        "the read the reader is waiting for is still in flight"
+    );
+
+    let _ = app.__update(blob("src/lib.rs", "pub fn open() {}"));
+    let state = app
+        .__ice_test_state_forge_code_browser(&scope)
+        .expect("instance");
+    assert_eq!(state.file_text, "pub fn open() {}");
+    assert_eq!(state.phase, ForgeFilePhase::Ready);
+}
+
 #[test]
 fn the_file_reader_owns_its_cycle_inside_the_component() {
     // The whole browse lives in `ForgeCodeBrowser` local state. The seam
-    // tests above exercise the behavior; this lint pins the SHAPE — boot
-    // reads the root with the props the instance was mounted with, both
-    // reads run on the component's own lanes, the completions guard what
-    // they answer for, and every preview surface gates on the
-    // place-and-revision header.
+    // tests above own the behavior — including both completion guards — and
+    // this lint pins only what no run of the app can observe: that boot reads
+    // the root with the props the instance was mounted with, that both reads
+    // run on the component's own replace lanes, that every preview surface
+    // gates on the place-and-revision header, and that the app half is gone.
     let screen = include_str!("../ui/screens/forge.ice");
     let handlers = include_str!("../ui/handlers/forge.ice");
 
@@ -628,8 +686,6 @@ fn the_file_reader_owns_its_cycle_inside_the_component() {
     assert!(head.contains("run replace lane=tree forge_tree(connected_rpc, repo, \"\", \"\")"));
     assert!(head.contains("run replace lane=tree forge_tree(rpc, repo_now, tree_rev, path)"));
     assert!(head.contains("run replace lane=blob forge_blob("));
-    assert!(head.contains("return if next.path != tree_path"));
-    assert!(head.contains("return if next.path != file_path"));
     let gates = head.matches("forge_file_header(").count();
     assert!(gates >= 8, "every preview arm gates on the header, found {gates}");
     assert!(
