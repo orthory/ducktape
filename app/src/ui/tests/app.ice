@@ -970,3 +970,66 @@ test message_body_renders_as_one_rich_paragraph
   expect no text "ship the fix at https://duck.example/x"
   expect no text "and the second line lands"
   expect missing stream
+
+preset ui_files
+  state
+    shell_tab = ShellTab.files
+    connected = true
+    // Pinned for the reason `ui_chat_stream` states at length: an empty
+    // endpoint is a fallback, not a refusal, and port 1 on loopback can hold
+    // no listener, so anything this screen launches refuses off the network.
+    connected_rpc = "http://127.0.0.1:1"
+    loading = false
+    mutation_phase = MutationPhase.idle
+    error = ""
+
+// THE CRUMB AND THE RENAME FIELD ARE TWO ROWS, MEASURED. #804's first live run
+// found `/shared` drawn straight over the "new name…" input; the write controls
+// are a separate bar under `CrumbBar` now, and this is what keeps them there —
+// the field's top edge sits at or below the crumb bar's bottom, with both boxes
+// proven to have really drawn first so the ordering cannot pass on a collapsed
+// one. 965 wide is the narrowest content pane this console can produce: the
+// window declares `min-size 1040`, less the 74px rail and the 1px rule.
+test files_write_bar_clears_the_crumb_bar
+  preset ui_files
+  viewport 965 720
+  mount
+    FilesScreen new_name<->fs_new_name draft<->fs_editor #files
+      with
+        path=fs_path
+        listed=(fs_listed_path == fs_path)
+        entries=fs_entries
+        directories=fs_directories(fs_entries)
+        connected
+        loading=fs_loading
+        preview_path=fs_preview_path
+        preview_entry=fs_preview_entry
+        delete_target=fs_delete_target
+        diff_from=fs_diff_from
+        diff=fs_diff
+        history=fs_history
+        preview_truncated=fs_preview_truncated
+        preview_binary=fs_preview_binary
+        editing=fs_editing
+        preview_text=fs_preview_text
+      events
+        fs_open_dir -> fs_open_dir _
+        fs_open_file -> fs_open_file _
+        fs_open_parent -> fs_open_parent
+        fs_new_name_changed -> fs_new_name_changed _
+        fs_mkdir_submit -> fs_mkdir_submit
+        fs_new_file_submit -> fs_new_file_submit
+        fs_arm_delete -> fs_arm_delete _
+        fs_disarm_delete -> fs_disarm_delete
+        fs_delete_submit -> fs_delete_submit
+        fs_close_diff -> fs_close_diff
+        fs_show_diff -> fs_show_diff _
+        fs_begin_edit -> fs_begin_edit
+        fs_cancel_edit -> fs_cancel_edit
+        fs_save_edit -> fs_save_edit
+  target crumb = #files/crumb/root
+  target field = #files/fs-new
+  expect text "/shared" within crumb
+  expect crumb.height > 40.0
+  expect field.width ~= 160.0
+  expect field.y >= crumb.bottom
