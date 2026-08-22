@@ -13,17 +13,17 @@ protocol; the TS module table implements it.
 
 | # | Rule |
 |---|------|
-| R1 | One grammar: `duck://<authority><path>[#<fragment>]`; a dotless single-label authority is a **module** (this protocol), a dotted authority is a **gateway host** (`duck-browser.ts`, unchanged) |
-| R2 | The module table lives in ONE place — `app/src/domain/duck-uri.ts` (`classifyDuckRef`) — and every surface (chat tokenizer, comment renderer, browser address bar) classifies through it |
+| R1 | One grammar: `duck://<authority><path>[@<rev>][#<fragment>]`; a dotless single-label authority is a **module** (this protocol), a dotted authority is a **gateway host** (gateway plane, unchanged) |
+| R2 | The module table lives in ONE place — `app/src/backend/duck_uri.rs` (`classify_duck_link`) — and every surface (the open plane, the forge reader's Markdown images) classifies through it |
 | R3 | An invalid or unknown ref never errors in a body: it stays literal text, losslessly |
 | R4 | A chip's face is canonical/store data, never the authored markdown label (labels can lie) |
-| R5 | Opening a ref maps onto the store's EXISTING navigation vocabulary via one adapter (`openDuckRef`); the protocol adds no navigation machinery |
+| R5 | Opening a ref maps onto the app's EXISTING navigation vocabulary via one handler (`open_message_link`, `handlers/chat.ice`); the protocol adds no navigation machinery — a two-step target parks a one-shot focus the second step's load consumes |
 | R6 | Agent injection is per-module opt-in; v1 injects `page` and `files` only — the Rust parser is untouched, preserving the fuzz-verified "Rust refs ⊆ TS refs, the agent never over-reads" invariant |
 
 ## 1. Grammar
 
 ```
-duck-uri     = "duck://" authority path [ "#" fragment ]
+duck-uri     = "duck://" authority path [ "@" rev ] [ "#" fragment ]
 authority    = module | gateway-host
 module       = [a-z][a-z0-9-]*          ; single label, NO dots
 gateway-host = contains "."             ; must end ".duck"
@@ -41,7 +41,7 @@ parse the same bytes.
 |---|---|---|---|
 | `page` | `/<id>` (one segment) | live store title, else raw id | `openPage` + pages screen |
 | `files` | `/shared/attachments/<dir>/<name>` | filename chip; `![…]` embeds images | chip: download/preview; address bar: files browser |
-| `forge` | `/<repo>` or `/<repo>/<n>`; `#<seq>` anchors a Discussion message (`n`, `seq` 1-based decimals) | `repo` / `repo#n` | `openForgeItem` (one-shot `forgeFocus` hand-off; `number` null = repo-only) |
+| `forge` | `/<repo>` or `/<repo>/<n>`; `#<seq>` anchors a Discussion message (`n`, `seq` 1-based decimals); `/<repo>/blob/<path>[@<rev>]` names a committed file (no dot-segments; `rev` = oid or branch, default head) | `repo` / `repo#n`; a blob `![…]` embeds the picture | repo → `forge_open_repo`; item → the one-shot focus `forge_repo_loaded` hands to `forge_open_item`; blob → the Code browser's `focus_file`, opened at the tree's head (`@rev` is honoured by the image loader, not the browser) |
 | `channel` | `/<id>` (ids may contain `:`); `#<seq>` anchors a message | live `#name`, else raw id; `forge:<repo>:<n>` faces as `repo#n` | `selectChannel` / `focusMessage`; hidden `forge:*` discussion ids reroute to their forge item |
 
 Reserved names: `memory` (agent-side evidence URIs, Rust-only), every dotted
@@ -62,9 +62,8 @@ remain an agent-facing convention outside the chat grammar.
 
 ## 4. Adding a module
 
-One ref interface + one `DuckRef` variant + one classify arm in
-`domain/duck-uri.ts`, one chip in `chat/rich-text.tsx`, one arm in
-`store/open-duck-ref.ts`, one row in §2. Injection stays off unless a
+One `DuckKind` variant + one classify arm in `app/src/backend/duck_uri.rs`
+(with its table test), one `match` arm in `open_message_link`, one row in §2. Injection stays off unless a
 product decision defines what content the module's ref should pull into an
 agent run.
 

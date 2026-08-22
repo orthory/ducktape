@@ -70,6 +70,26 @@ enum AutosaveStatus
   saved
   error
 
+// The duck:// module table's verdict on a clicked or embedded link
+// (`classify_duck_link`): which existing navigation it maps onto. `unknown` is
+// a malformed/unknown ref; `web` is an http(s) URL for the OS opener.
+enum DuckKind
+  unknown
+  web
+  page
+  files
+  forge_repo
+  forge_item
+  forge_blob
+  channel
+  channel_message
+
+// The second step a forge deep link still owes once its repo is open.
+enum ForgeFocus
+  idle
+  item
+  blob
+
 enum ShellTab
   chat
   shell

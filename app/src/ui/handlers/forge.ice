@@ -49,6 +49,20 @@ on forge_repo_loaded(next)
   forge_repo_phase = ForgePhase.ready
   forge_branches = next.branches
   forge_items = next.items
+  // A deep link's second step: the repo is open, now its item or its file.
+  // The file goes to the code browser itself — only it knows the tree
+  // revision the reader's header gates on.
+  match forge_focus_kind(forge_focus_number, forge_focus_path)
+    ForgeFocus.idle
+      return if true
+    ForgeFocus.item
+      let number = forge_focus_number
+      forge_focus_number = 0
+      run every duck_echo_i64(number) -> forge_open_item _ | external_url_failed _
+    ForgeFocus.blob
+      let path = forge_focus_path
+      forge_focus_path = ""
+      slice ForgeCodeBrowser.focus_file(connected_rpc, connected, forge_repo, path) at forge_repo
 
 on forge_repo_failed(cause)
   return if cause.generation != forge_generation

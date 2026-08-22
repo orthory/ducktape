@@ -45,6 +45,11 @@ on fs_listed(next)
   fs_listed_path = next.path
   fs_entries = next.entries
   fs_preview_entry = fs_entry_named(fs_entries, fs_preview_path)
+  // A deep link's second step: the directory is listed, now its file.
+  return if empty(fs_focus_path)
+  let focus = fs_focus_path
+  fs_focus_path = ""
+  run every duck_echo_str(focus) -> fs_open_file _ | external_url_failed _
 
 on fs_previewed(next)
   return if next.generation != fs_generation

@@ -275,6 +275,93 @@ fn forge_layout_keeps_repo_navigation_compact() {
     assert_eq!(screen.matches("BackToList kind=forge_item_kind").count(), 1);
 }
 
+/// THE duck:// OPEN PLANE ADDS ADDRESSES, NEVER NAVIGATION. `open_message_link`
+/// classifies once and every kind lands on a handler a click on the screen
+/// would already reach; the two-step targets park a focus that the second
+/// step's loader-result handler consumes and clears.
+#[test]
+fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
+    let chat = include_str!("../ui/handlers/chat.ice");
+    let open = chat
+        .split_once("on open_message_link(url)")
+        .expect("the handler")
+        .1
+        .split_once("\non ")
+        .expect("the handler ends")
+        .0;
+    assert!(open.contains("let link = classify_duck_link(url)") && open.contains("match link.kind"));
+    for route in [
+        "run every open_external_url(url)",
+        "-> open_page_search_hit(_, \"\")",
+        "-> fs_open_dir _",
+        "-> forge_open_repo _",
+        "-> choose_channel _",
+        "-> open_chat_search_hit(_, link.seq, link.seq)",
+    ] {
+        assert!(open.contains(route), "a kind routes onto existing navigation: {route}");
+    }
+    assert!(!open.contains("run replace"), "the open plane owns no lane of its own");
+
+    let forge = include_str!("../ui/handlers/forge.ice");
+    let repo_loaded = forge
+        .split_once("on forge_repo_loaded(next)")
+        .expect("the handler")
+        .1
+        .split_once("\non ")
+        .expect("the handler ends")
+        .0;
+    assert!(
+        repo_loaded.contains("match forge_focus_kind(forge_focus_number, forge_focus_path)")
+            && repo_loaded.contains("-> forge_open_item _")
+            && repo_loaded.contains("slice ForgeCodeBrowser.focus_file(connected_rpc, connected, forge_repo, path) at forge_repo"),
+        "the repo's load consumes the forge focus"
+    );
+    let files = include_str!("../ui/handlers/files.ice");
+    let listed = files
+        .split_once("on fs_listed(next)")
+        .expect("the handler")
+        .1
+        .split_once("\non ")
+        .expect("the handler ends")
+        .0;
+    assert!(
+        listed.contains("return if empty(fs_focus_path)") && listed.contains("-> fs_open_file _"),
+        "the listing consumes the files focus"
+    );
+    let screen = include_str!("../ui/screens/forge.ice");
+    assert!(
+        screen.contains("on focus_file(rpc, online, repo_now, path)")
+            && screen.matches("-> open_file(focus_rpc, focus_online, focus_repo, tree_rev, tree_path, _)").count() == 2,
+        "the browser opens a focused file at its OWN tree revision, now or when the tree lands"
+    );
+}
+
+/// A MARKDOWN BLOB'S IN-REPO PICTURES DRAW INLINE. The reader mounts
+/// `forge_markdown` with the document's path (the plain `agent_markdown`
+/// has no document and keeps alt text), and `forge_blob` preloads a Markdown
+/// blob's pictures only — a code blob never pays for a parse.
+#[test]
+fn the_forge_reader_draws_a_markdown_blobs_pictures_inline() {
+    let screen = inlined(include_str!("../ui/screens/forge.ice"));
+    assert!(
+        screen.contains("extern forge_markdown(file_text, file_path, dark) #forge-markdown"),
+        "the markdown arm mounts the document-aware adapter"
+    );
+    let loader = include_str!("../backend/forge.rs");
+    let text_loader = loader
+        .split_once("async fn forge_text(")
+        .expect("the text loader")
+        .1
+        .split_once("\nasync fn ")
+        .expect("the loader ends")
+        .0;
+    assert!(
+        text_loader.contains("markdown_path(view.path.clone()) && !view.binary")
+            && text_loader.contains("load_inline_pictures(client, &view).await"),
+        "pictures preload for a markdown blob and nothing else"
+    );
+}
+
 /// THE FORGE READER DRAWS A PICTURE THROUGH THE SAME VIEWER THE FILES PREVIEW
 /// MOUNTS. `forge_blob` decides by path and parks the decoded handle under the
 /// forge surface; the screen draws it in its own arm, and neither text arm

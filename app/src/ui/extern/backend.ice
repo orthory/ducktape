@@ -67,6 +67,7 @@ extern crate::backend
   task focus_agent_terminal(session:AgentTerminalSession) -> unit
   component agent_terminal_surface(session:&AgentTerminalSession) -> unit
   component agent_markdown(source:str, dark:bool) -> str
+  component forge_markdown(source:str, doc:str, dark:bool) -> str
   subscription agent_terminal_events(session:AgentTerminalSession) -> AgentTerminalNotice
   load_agent_credentials(rpc:str, generation:i64) -> AgentCredentialsData ! HydrationError
   load_agent_host_nodes(rpc:str, generation:i64) -> AgentHostNodesData ! HydrationError
@@ -166,6 +167,11 @@ extern crate::backend
   FsListing(generation:i64, path:str, entries:[FsEntry])
   FsPreview(generation:i64, path:str, text:str, truncated:bool, binary:bool, picture:bool, width:i64, height:i64)
   FsHistory(generation:i64, snapshots:[FsSnapshot])
+  DuckLink(kind:DuckKind, repo:str, number:i64, seq:i64, page:str, channel:str, path:str, rev:str)
+  pure classify_duck_link(url:str) -> DuckLink
+  pure forge_focus_kind(number:i64, path:str) -> ForgeFocus
+  duck_echo_str(value:str) -> str ! AppError
+  duck_echo_i64(value:i64) -> i64 ! AppError
   pure no_fs_entry() -> FsEntry
   pure fs_entry_named(entries:[FsEntry], path:str) -> FsEntry
   pure fs_directories(entries:[FsEntry]) -> [FsEntry]
