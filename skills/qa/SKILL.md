@@ -46,19 +46,32 @@ ops/huddle-lane.sh                               # stands a two-node network up 
 `ops/huddle-lane.sh` is the live lane: two real nodes, one user key per side,
 and `app/src/tests/huddle_live.rs` run once per side (it is `#[ignore]`d, so it
 only runs when asked). Each side joins the huddle through the app's own
-`join_huddle`, waits for the other, publishes this box's camera and asserts the
-other side's beacon AND picture arrive. A headless box can borrow a camera:
+`join_huddle`, waits for the other, publishes this box's camera and microphone,
+and asserts the other side's beacon, picture AND voice all arrive. A headless
+box can borrow the devices — one camera for the pair, one sound card per side:
 
 ```bash
 sudo modprobe v4l2loopback devices=1 exclusive_caps=1 max_openers=8
 sudo chmod a+rw /dev/video0
 ffmpeg -re -f lavfi -i testsrc=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video0 &
+
+sudo modprobe snd-aloop index=0,1 enable=1,1 pcm_substreams=4 id=lanea,laneb
+sudo chmod -R a+rw /dev/snd
+ffmpeg -y -f lavfi -i "sine=frequency=500:duration=600:sample_rate=48000" -ac 2 \
+       -c:a pcm_s16le /tmp/tone.wav
+for card in lanea laneb; do while true; do aplay -D hw:$card,1,0 /tmp/tone.wav; done & done
 ```
 
-Measured on zk-dev 2026-08-22: both sides saw the other's 640×480 picture
-about one second after joining. With the `ffmpeg` producer stopped, both sides
-fail on the picture with the beacon still true — which is what makes the
-passing run mean something.
+An aloop card loops device 1's playback into device 0's capture — which is what
+`default` records from — so that tone IS the side's microphone, and `ALSA_CARD`
+picks which card a process calls `default`. Both `snd-aloop` and the v4l2 core
+live in `linux-modules-extra-$(uname -r)`.
+
+Measured on zk-dev 2026-08-22: both sides had the other's 640×480 picture and
+40+ audible mixed frames about one second after joining. Stop the `ffmpeg`
+producer and both sides fail on the picture; stop the `aplay` loops and both
+fail on the voice, beacon and picture still true. That falsifiability is what
+makes the passing run mean anything.
 
 ### On macOS: raise the fd limit first
 
