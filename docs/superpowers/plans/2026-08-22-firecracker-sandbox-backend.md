@@ -48,17 +48,100 @@ firecracker exit=0
 ```
 
 - **kernel boot → init: 1.04 s**
-- **whole VMM lifecycle, wall: 2.28 s** (median of 3: 2.28 / 2.27 / 2.29)
+- **whole VMM lifecycle, wall: 2.28 s** (median of 3) — of which **1.0 s is the
+  `panic=1` reboot delay**, an artifact of using `/bin/true` as init. The real
+  guest init powers off directly, so the comparable figure is ~1.28 s.
 
-Take this, not the marketing figure, as the cold-boot baseline. Firecracker's
+Take this, not the marketing figure, as the starting point. Firecracker's
 widely-quoted ~125 ms is a *minimal* kernel with an initramfs; a full distro
-kernel with a squashfs root is an order of magnitude slower to boot, and that
-is the shape our guest rootfs actually has.
+kernel with a real root filesystem is an order of magnitude slower, and that is
+the shape our guest has.
 
-**What it means for the design:** an agent run lasts minutes, so 2.3 s of boot
-is ~1-2% overhead and the backend is perfectly usable without snapshots. The
-snapshot/restore follow-on is a latency optimisation, not a prerequisite —
-treat any plan that makes it a blocker as wrong.
+### Kernel command line — profiled, not copied
+
+Every token in the boot args below was measured on this host with
+`ops/firecracker/boot-bench.sh`, committed alongside this plan so the numbers
+are reproducible rather than folklore:
+
+```
+ops/firecracker/boot-bench.sh --fetch      # get the CI kernel + rootfs
+MODE=compare sg kvm -c ops/firecracker/boot-bench.sh
+```
+
+Two changes dominate:
+
+| Change | 512 MiB, 2 vcpu | Saving |
+|---|---|---|
+| baseline (`i8042.noaux` only) | 1285 ms | — |
+| + i8042 fully off | 811 ms | **−474 ms** |
+| + `quiet loglevel=1` (alone) | 950 ms | −335 ms |
+| **+ both** | **452 ms** | **−833 ms (2.84×)** |
+
+- **The i8042 probe is the single biggest cost.** A profile of the baseline
+  showed one 0.458 s gap between `clk: Disabling unused clocks` and
+  `input: AT Raw Set 2 keyboard … /i8042/serio0/…` — the kernel waiting out a
+  legacy PS/2 controller. `i8042.noaux` alone does NOT fix it (it disables only
+  the aux/mouse port); the full group is
+  `i8042.noaux i8042.nokbd i8042.nomux i8042.nopnp i8042.dumbkbd`.
+- **Serial console output costs ~335 ms.** The baseline emits 268 console lines
+  and every one is a synchronous write through a VMM exit. `quiet loglevel=1`
+  keeps the console usable for diagnosis while dropping the bulk.
+- Dropping the serial device entirely (`8250.nr_uarts=0`) buys only 20 ms more
+  and costs all boot diagnostics. Not worth it.
+- `tsc=reliable`, `no_timer_check`, `random.trust_cpu=on`: no measurable effect.
+- vCPU count barely matters (1 / 2 / 4 → 450 / 457 / 462 ms).
+- The 5.10 CI kernel is **slower** than 6.1 (577 ms vs 452 ms). Use 6.1.
+- squashfs vs ext4 root: 457 ms vs 438 ms, but 78 MB vs 503 MB on disk. The boot
+  difference is noise; keep squashfs for the artifact size.
+
+**`acpi=off` is FORBIDDEN.** It appears to save 69 ms and is a correctness bug:
+Firecracker enumerates vCPUs through ACPI, so the guest boots with exactly one
+processor regardless of `vcpu_count`. Verified directly —
+`vcpu_count=4` gives `smpboot: Total of 4 processors activated` with ACPI on and
+`Total of 1 processors activated` with `acpi=off`. A node would sell four cores
+and deliver one, silently. Task 5's test asserts the flag is absent.
+
+### Guest RAM dominates above 2 GiB — and only snapshots fix it
+
+Same tuned cmdline, 2 vcpu, varying guest memory:
+
+| Guest RAM | wall | guest-side | host-side (VMM) |
+|---|---|---|---|
+| 512 MiB | 827 ms | 586 ms | 241 ms |
+| 1 GiB | 883 ms | 637 ms | 246 ms |
+| 2 GiB | 1015 ms | 778 ms | 237 ms |
+| 4 GiB | 1908 ms | 1659 ms | 249 ms |
+| 8 GiB | 2441 ms | 2153 ms | 288 ms |
+| 16 GiB | 3379 ms | 3058 ms | 321 ms |
+
+**Host-side VMM setup is flat** (241 → 321 ms); the whole curve is inside the
+guest kernel, initialising its own page structures. The kernel says so itself at
+16 GiB: `node 0 deferred pages initialised in 1304ms`, plus ~1 s of early zone
+and memmap setup before that.
+
+`CONFIG_DEFERRED_STRUCT_PAGE_INIT=y` is **already set** in the CI kernel config —
+the kernel still waits for those background threads before running init, so the
+usual mitigation is spent. Firecracker's `huge_pages: "2M"` needs host pages
+reserved (`HugePages_Total: 0` here) and would not change the guest's own memmap
+work anyway.
+
+**This corrects the "snapshots are only an optimisation" line above.** For small
+runs it holds — 1 vcpu / 1 GiB boots in 542 ms. For a node selling large
+`mem_gb` it does not: 8 vcpu / 16 GiB costs ~2.9 s of boot on **every run**, and
+a restored snapshot is the only thing that skips memmap init. Snapshot/restore
+therefore stays a follow-on for the backend's correctness, but it is a
+**prerequisite for selling large-memory runs at a good latency**.
+
+Before/after at realistic run shapes (the cmdline saving is flat, so it matters
+proportionally less as memory grows):
+
+| Run shape | before | after | saved |
+|---|---|---|---|
+| 1 vcpu / 1 GiB | 1399 ms | **542 ms** | 857 ms |
+| 2 vcpu / 2 GiB | 1504 ms | **656 ms** | 848 ms |
+| 4 vcpu / 4 GiB | 2380 ms | **1538 ms** | 842 ms |
+| 8 vcpu / 8 GiB | 2869 ms | **2041 ms** | 828 ms |
+| 8 vcpu / 16 GiB | 3737 ms | **2923 ms** | 814 ms |
 
 Artifacts used (also the fastest way to get Task 8's e2e running before
 `build-guest-rootfs.sh` exists):
@@ -82,6 +165,7 @@ starting point for the "build our own kernel?" open question below.
 | `crates/services/sandbox/src/lib.rs` | modify — declare and re-export the new modules. |
 | `bin/duck-guest-init/` | new crate — the static guest PID 1. Depends only on `sandbox-host`'s `guest_proto` (a `no-std`-friendly, dependency-light module) and libc. |
 | `ops/firecracker-setup.sh` | new — install the VMM, name the group requirement, verify `/dev/kvm` access. |
+| `ops/firecracker/boot-bench.sh` | **already committed with this plan** — the harness every boot-time number below came from. `MODE=shapes\|compare\|memory`. Re-run it after changing the kernel, the rootfs or the boot args. |
 | `ops/build-guest-rootfs.sh` | new — build the shared read-only rootfs and fetch/build the guest kernel. |
 | `crates/services/provider/src/lib.rs` | modify — a `RunControl::MicroVm` arm and the boot/teardown call sites. |
 | `bin/node/src/config/resolve.rs` | modify — accept `runtime = "firecracker"`. |
@@ -1110,6 +1194,44 @@ mod tests {
         assert!(boot.2.contains("panic=1"), "a guest panic must halt, not hang: {}", boot.2);
     }
 
+    /// The i8042 group and `quiet` are worth ~840 ms together, measured, and the
+    /// saving is flat across every run shape. Losing a token here is a silent
+    /// regression nobody notices — the run still works, just slower — so the
+    /// cmdline is pinned by a test rather than by a comment.
+    #[test]
+    fn the_boot_args_keep_the_measured_boot_time_wins() {
+        let reqs = boot_requests(&cfg());
+        let boot = reqs.iter().find(|(_, p, _)| p == "/boot-source").expect("boot-source");
+        for token in [
+            "i8042.noaux",
+            "i8042.nokbd",
+            "i8042.nomux",
+            "i8042.nopnp",
+            "i8042.dumbkbd",
+            "quiet",
+        ] {
+            assert!(boot.2.contains(token), "lost {token}, worth ~840ms total: {}", boot.2);
+        }
+    }
+
+    /// `acpi=off` reads like a 69 ms win and is a correctness bug: Firecracker
+    /// enumerates vCPUs through ACPI, so the guest comes up with ONE processor
+    /// whatever `vcpu_count` says. Verified directly — vcpu_count=4 gives
+    /// "Total of 4 processors activated" with ACPI and "Total of 1" without.
+    /// A node would sell four cores and deliver one, with nothing in any log.
+    #[test]
+    fn acpi_is_never_disabled() {
+        let boot_source = boot_requests(&cfg())
+            .into_iter()
+            .find(|(_, p, _)| p == "/boot-source")
+            .expect("boot-source");
+        assert!(
+            !boot_source.2.contains("acpi=off"),
+            "acpi=off silently drops every vcpu but the boot one: {}",
+            boot_source.2
+        );
+    }
+
     /// A run with no tap is a run with no network device at all — not a run
     /// with an unconfigured one.
     #[test]
@@ -1137,12 +1259,21 @@ Expected: FAIL — module and types undefined.
 /// added after `InstanceStart` — silently, so the guest simply never sees its
 /// workspace and the run fails as an unexplained empty result.
 pub fn boot_requests(cfg: &VmConfig) -> Vec<(&'static str, String, String)> {
-    // `panic=1` so a guest panic HALTS: without it a panicking guest sits at
-    // the kernel prompt and the run burns its whole idle timeout before the
-    // host learns anything. `pci=off`/`i8042.noaux` drop probes for buses this
-    // machine does not have, which is most of a microVM's boot time.
+    // Every token here was MEASURED, not copied from a tutorial — see
+    // "Kernel command line" above. The i8042 group and `quiet` are worth ~840 ms
+    // together, and that saving is flat across every run shape.
+    //
+    // `panic=1` so a guest panic HALTS rather than sitting at the kernel prompt
+    // burning the run's whole idle timeout.
+    //
+    // NEVER add `acpi=off`. It looks like a 69 ms win and is a correctness bug:
+    // Firecracker enumerates vCPUs through ACPI, so the guest comes up with ONE
+    // processor no matter what `vcpu_count` says. A node would sell four cores
+    // and deliver one, silently.
     let boot_args = format!(
-        "console=ttyS0 reboot=k panic=1 pci=off i8042.noaux          init=/duck-guest-init ducktape.run={}",
+        "console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=1 \
+         i8042.noaux i8042.nokbd i8042.nomux i8042.nopnp i8042.dumbkbd \
+         init=/duck-guest-init ducktape.run={}",
         cfg.manifest_token
     );
     let mut reqs = vec![
@@ -1568,7 +1699,7 @@ and never from a probe."
 
 ## Follow-on plans (not this one)
 
-- **Snapshot/restore.** Boot once, snapshot, restore per run at ~150 ms with COW-mapped base pages. Pure latency work; the backend is correct without it.
+- **Snapshot/restore.** Boot once, snapshot after init, restore per run with COW-mapped base pages. The backend is correct without it, so it is not a blocker — but it is the **only** fix for the memory-scaling cost measured above (a restored snapshot does not re-run memmap init), so it becomes a prerequisite the moment a node wants to sell large-`mem_gb` runs at a good latency. Measure the restore path here rather than quoting a figure; every other number in this plan was measured and two of the three quoted ones turned out wrong.
 - **Egress logging and the public-egress toggle.** Spec step 3's remaining half.
 - **Remove the podman path.** Spec step 4: `PodmanService`, the libpod client, the attach framing, and `pasta`/`conmon` from the probe. Deliberately last — until the Firecracker path has run real work, podman is the working backend.
 

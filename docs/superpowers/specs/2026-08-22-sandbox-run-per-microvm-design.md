@@ -132,10 +132,34 @@ Firecracker v1.16.1, a 6.1.128 kernel, a squashfs root, 2 vcpu / 512 MiB —
 (median of 3). The ~125 ms figure is a minimal kernel with an initramfs, not a
 distro kernel with a real root filesystem, which is the shape our guest has.
 
-That is still fine, and it settles a design question: an agent run lasts
-minutes, so ~2.3 s of boot is 1-2% overhead. **Snapshot/restore is a latency
-optimisation, not a prerequisite** — per-run VMs stand on their own without it,
-and any plan that makes snapshots a blocker for the backend is wrong.
+Profiling that boot then cut it by **2.84×**, to 452 ms, with two kernel command
+line changes: disabling the i8042 PS/2 controller properly (−474 ms; the usual
+`i8042.noaux` covers only the mouse port, and the kernel spends 0.458 s waiting
+out the keyboard port) and `quiet loglevel=1` (−335 ms; the baseline emits 268
+console lines and each is a synchronous write through a VMM exit). The saving is
+flat across every run shape. Detail and the full matrix live in the
+implementation plan.
+
+One tempting flag is **forbidden**: `acpi=off` looks like another 69 ms and is a
+correctness bug. Firecracker enumerates vCPUs through ACPI, so the guest boots
+with exactly one processor whatever `vcpu_count` says — `vcpu_count=4` gives
+`Total of 4 processors activated` with ACPI and `Total of 1` without. A node
+would sell four cores and deliver one, silently.
+
+**Guest memory, not boot overhead, is what actually costs.** With the tuned
+command line, wall time runs 827 ms at 512 MiB, 1.0 s at 2 GiB, 2.4 s at 8 GiB
+and 3.4 s at 16 GiB. Host-side VMM setup is flat across all of it (241 → 321 ms);
+the whole curve is the guest kernel initialising its own page structures, which
+it reports itself: `node 0 deferred pages initialised in 1304ms` at 16 GiB.
+`CONFIG_DEFERRED_STRUCT_PAGE_INIT` is already on and the kernel still waits for
+it before running init.
+
+So the design conclusion is split rather than simple. For ordinary runs the
+overhead is negligible against a minutes-long agent invocation, and **per-run
+VMs stand on their own with no snapshot machinery**. For a node that wants to
+sell large-`mem_gb` runs, snapshot/restore stops being an optimisation and
+becomes the prerequisite for acceptable start latency — it is the only thing
+that skips memmap init.
 
 Per-run also means no session-affinity state and no shared kernel between
 buyers — the property namespaces cannot provide, and the reason every vendor
