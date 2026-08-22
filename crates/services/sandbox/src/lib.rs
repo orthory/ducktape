@@ -16,6 +16,8 @@ use std::path::Path;
 #[cfg(unix)]
 pub mod podman_api;
 pub mod sandbox;
+// pure + dependency-free: the guest init includes this same file directly.
+pub mod guest_proto;
 // the microVM backend's storage: shells out to e2fsprogs and walks unix modes.
 #[cfg(unix)]
 pub mod workspace_image;
