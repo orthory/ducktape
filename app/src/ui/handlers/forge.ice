@@ -61,8 +61,10 @@ on forge_repo_loaded(next)
       run every duck_echo_i64(number) -> forge_open_item _ | external_url_failed _
     ForgeFocus.blob
       let path = forge_focus_path
+      let rev = forge_focus_rev
       forge_focus_path = ""
-      slice ForgeCodeBrowser.focus_file(connected_rpc, connected, forge_repo, path) at forge_repo
+      forge_focus_rev = ""
+      slice ForgeCodeBrowser.focus_file(connected_rpc, connected, forge_repo, path, rev) at forge_repo
 
 on forge_repo_failed(cause)
   return if cause.generation != forge_generation
@@ -73,6 +75,9 @@ on forge_open_item(number)
   return if !connected || empty(forge_repo)
   invalidate lane=forge_discussion
   forge_item_number = number
+  // The highlight belongs to the item it was landed on; the one-shot
+  // `forge_focus_seq` survives this open — it is THIS open's landing.
+  forge_linked_note = none
   error = ""
   forge_item_phase = ForgePhase.loading
   forge_review_verdict = ForgeReviewVerdict.comment
@@ -128,6 +133,13 @@ on forge_discussion_loaded(next)
   return if next.channel_id != forge_item_channel
   forge_discussion = next.messages
   forge_discussion_members = next.members
+  // A deep link's `#seq` lands here, once: the note is picked out of the list and
+  // the item's page snaps to its Discussion (the last section). An exact
+  // scroll to the row waits on a scroll-to-key for `keyed` lists.
+  return if forge_focus_seq == 0
+  forge_linked_note = linked_note(forge_discussion, forge_focus_seq)
+  forge_focus_seq = 0
+  task widget snap #workspace-tabs/content/forge/item-detail 0.0 1.0 window=window_target(console_win)
 
 on forge_discussion_failed(cause)
   error = cause.message
@@ -297,6 +309,8 @@ on forge_close_item
   invalidate lane=forge_discussion
   forge_generation = forge_generation + 1
   forge_item_number = 0
+  forge_linked_note = none
+  forge_focus_seq = 0
   forge_item_phase = ForgePhase.idle
   forge_item_diff = ""
   forge_item_channel = ""

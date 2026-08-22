@@ -157,7 +157,15 @@ fn classify_forge(segments: &[&str], rev: &str, fragment: &str) -> DuckLink {
             }
         }
         [repo, "blob", file @ ..] => {
-            let named = !file.is_empty() && fragment.is_empty() && !rev.contains('/');
+            // The node browses a pinned revision by exact oid only (a branch
+            // name is not an address — it moves), so the protocol says the
+            // same: `@rev` is 40 lowercase hex or absent (the head).
+            let oid = rev.is_empty()
+                || (rev.len() == 40
+                    && rev
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+            let named = !file.is_empty() && fragment.is_empty() && oid;
             if !named {
                 return DuckLink::unknown();
             }
@@ -236,6 +244,15 @@ pub fn forge_focus_kind(number: i64, path: String) -> crate::ForgeFocus {
     }
 }
 
+/// The Discussion note a `#seq` deep link landed on, if it is in the loaded
+/// discussion — drawn once above the list by the forge item page.
+pub fn linked_note(discussion: Vec<super::ChatMessage>, focus: i64) -> Option<super::ChatMessage> {
+    if focus <= 0 {
+        return None;
+    }
+    discussion.into_iter().find(|note| note.seq == focus)
+}
+
 use super::AppError;
 
 #[cfg(test)]
@@ -303,8 +320,16 @@ mod tests {
             (head.kind, head.repo.as_str(), head.path.as_str(), head.rev.as_str()),
             (DuckKind::ForgeBlob, "ducktape", "docs/logo.png", "")
         );
-        let pinned = classify_duck_link("duck://forge/ducktape/blob/README.md@main".into());
-        assert_eq!((pinned.kind, pinned.rev.as_str()), (DuckKind::ForgeBlob, "main"));
+        assert_eq!(
+            kind("duck://forge/ducktape/blob/README.md@main"),
+            DuckKind::Unknown,
+            "a branch name moves — a rev is an exact oid"
+        );
+        assert_eq!(
+            kind("duck://forge/ducktape/blob/a.png@ABCDEF0000000000000000000000000000000000"),
+            DuckKind::Unknown,
+            "lowercase hex"
+        );
         let oid = classify_duck_link(
             "duck://forge/ducktape/blob/a/b.png@1111111111111111111111111111111111111111".into(),
         );
@@ -314,7 +339,6 @@ mod tests {
         assert_eq!(kind("duck://forge/ducktape/blob/"), DuckKind::Unknown, "no file");
         assert_eq!(kind("duck://forge/ducktape/blob/../x"), DuckKind::Unknown, "no dot-segments");
         assert_eq!(kind("duck://forge/ducktape/blob/a.png#L3"), DuckKind::Unknown, "no fragment yet");
-        assert_eq!(kind("duck://forge/ducktape/blob/a.png@x/y"), DuckKind::Unknown, "a rev has no slash");
     }
 
     #[test]

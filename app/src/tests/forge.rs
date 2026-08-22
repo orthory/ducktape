@@ -313,7 +313,7 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
     assert!(
         repo_loaded.contains("match forge_focus_kind(forge_focus_number, forge_focus_path)")
             && repo_loaded.contains("-> forge_open_item _")
-            && repo_loaded.contains("slice ForgeCodeBrowser.focus_file(connected_rpc, connected, forge_repo, path) at forge_repo"),
+            && repo_loaded.contains("slice ForgeCodeBrowser.focus_file(connected_rpc, connected, forge_repo, path, rev) at forge_repo"),
         "the repo's load consumes the forge focus"
     );
     let files = include_str!("../ui/handlers/files.ice");
@@ -329,11 +329,47 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
         "the listing consumes the files focus"
     );
     let screen = include_str!("../ui/screens/forge.ice");
+    let focus_file = screen
+        .split_once("on focus_file(rpc, online, repo_now, path, rev)")
+        .expect("the browser's handler")
+        .1
+        .split_once("\n  on ")
+        .expect("the handler ends")
+        .0;
     assert!(
-        screen.contains("on focus_file(rpc, online, repo_now, path)")
-            && screen.matches("-> open_file(focus_rpc, focus_online, focus_repo, tree_rev, tree_path, _)").count() == 2,
-        "the browser opens a focused file at its OWN tree revision, now or when the tree lands"
+        focus_file.contains("tree_path = fs_parent(path)")
+            && focus_file.contains("tree_rev = keep_str(!empty(rev), rev, tree_rev)")
+            && focus_file.contains("run replace lane=tree forge_tree(rpc, repo_now, tree_rev, tree_path)"),
+        "a focused file first moves the tree to its directory, pinned to the link's rev"
     );
+    assert!(
+        screen.matches("-> open_file(focus_rpc, focus_online, focus_repo, tree_rev, tree_path, _)").count() == 1,
+        "and opens from `tree_loaded` alone — under the tree's own revision"
+    );
+
+    // The `#seq` landing: one-shot into the highlight, page snapped to the
+    // Discussion, and the highlight retired by the item's own open/close.
+    let discussion_loaded = forge
+        .split_once("on forge_discussion_loaded(next)")
+        .expect("the handler")
+        .1
+        .split_once("\non ")
+        .expect("the handler ends")
+        .0;
+    assert!(
+        discussion_loaded.contains("return if forge_focus_seq == 0")
+            && discussion_loaded.contains("forge_linked_note = linked_note(forge_discussion, forge_focus_seq)")
+            && discussion_loaded.contains("task widget snap #workspace-tabs/content/forge/item-detail 0.0 1.0"),
+        "the discussion's load lands the seq"
+    );
+    assert!(
+        screen.contains("scroll #item-detail") && screen.contains("match linked_note\n"),
+        "the page is addressable and the landed note is drawn once, above the list"
+    );
+    for retiring in ["on forge_open_item(number)", "on forge_close_item"] {
+        let body = forge.split_once(retiring).expect(retiring).1.split_once("\non ").expect("ends").0;
+        assert!(body.contains("forge_linked_note = none"), "{retiring} retires the landed note");
+    }
 }
 
 /// A MARKDOWN BLOB'S IN-REPO PICTURES DRAW INLINE. The reader mounts

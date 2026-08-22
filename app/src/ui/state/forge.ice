@@ -5,6 +5,12 @@ state
   // A forge deep link's second step, consumed by `forge_repo_loaded`.
   forge_focus_number:i64 = 0
   forge_focus_path = ""
+  forge_focus_rev = ""
+  // A forge item deep link's `#seq`: the Discussion note to land on, consumed
+  // by `forge_discussion_loaded` into the note below — picked ONCE there, so
+  // the view never hands the discussion list to anything.
+  forge_focus_seq:i64 = 0
+  forge_linked_note:ChatMessage? = none
   forge_repo_phase:ForgePhase = ForgePhase.idle
   forge_branches:[str] = []
   forge_items:[ForgeItem] = []
