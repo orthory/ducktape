@@ -1085,8 +1085,45 @@ test palette_backdrop_takes_the_pointer
 
 // The status item's rows are commands, and a chosen row reaches its handler:
 // a row index that drifts in codegen fails here, not silently in the menu bar.
+// The two stat rows are not commands — a reader reads them — and with no node
+// answering the icon is the grey one.
 test tray_menu_contract
   preset ui_offline
+  expect tray icon "../../assets/tray-offline.rgba"
+  expect tray item "No network"
+  expect tray item "Offline"
+  expect no tray command "Offline"
   expect tray command "Open Ducktape"
   expect tray command "Quit Ducktape"
   tray choose "Open Ducktape"
+
+preset ui_tray_live
+  state
+    connected = true
+    // Refused at once, off the network — see `ui_chat_stream`. The live
+    // stream's failure writes `status` (the retry arm), which is why no test
+    // below reads the status row; `tray_menu_contract` does, offline.
+    connected_rpc = "http://127.0.0.1:1"
+    network_name = "demo"
+    bell_unread = 3
+    huddle_joined = true
+    huddle_channel_name = "general"
+    call_muted = false
+    appearance = Appearance.dark
+
+// The rows READ the state — the bell count rides the icon, the label and its
+// row; the huddle's channel names its submenu; the appearance wears its ✓ —
+// and a chosen row moves it: Mute becomes Unmute.
+test tray_menu_reads_the_state
+  preset ui_tray_live
+  expect tray icon "../../assets/tray-unread.rgba"
+  expect tray label "3"
+  expect tray item "demo"
+  expect tray item "Notifications · 3 unread"
+  expect tray item "Huddle · #general"
+  expect tray item "✓ Dark"
+  expect no tray item "✓ Light"
+  expect tray command "Mute"
+  tray choose "Mute"
+  expect tray item "Unmute"
+  expect call_muted
