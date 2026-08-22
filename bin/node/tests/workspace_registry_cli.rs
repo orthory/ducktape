@@ -92,22 +92,25 @@ fn init_with_path(home: &Path, name: &str, path_dir: &Path) -> (String, std::pat
     (toml, workspace)
 }
 
-/// fresh-workspace compute detection: the adapter's runtime on PATH (a fake
-/// `podman`) makes a flagless init write a LIVE `[sandbox]` table while granting
-/// no service at all; an empty PATH keeps today's commented example.
+/// fresh-workspace compute detection on a host that cannot run a microVM: the
+/// `[sandbox]` table stays the commented example, and no service is granted.
+///
+/// A fake `firecracker` on PATH is deliberately NOT enough. Detection asks
+/// `SandboxBackend::probe`, which opens `/dev/kvm` and stats the kernel and
+/// rootfs images — a table naming a runtime this host cannot start would just
+/// move the failure to the next boot, where nobody is standing. So the only
+/// hermetic half of detection is this one: no usable microVM, no live table.
+/// The agreement between the table init writes and the backend it probes is
+/// pinned by `cli::sandbox_detection_tests`.
 #[test]
-fn flagless_init_detects_the_platform_runtime_into_a_live_sandbox_table() {
+fn init_on_a_host_without_a_microvm_keeps_the_commented_sandbox_table() {
     use std::os::unix::fs::PermissionsExt as _;
 
-    // the probe wants the adapter AND its hard deps executable on PATH, so the
-    // fake dir carries the full set — detection only writes a table the boot
-    // probe would accept. Podman's deps are `pasta` (the netns backend) plus
-    // `nft` + `nsenter` (the egress firewall the createRuntime hook installs);
-    // see `SandboxBackend::probe`.
-    let (runtime, fake_bins): (&str, &[&str]) =
-        ("podman", &["podman", "pasta", "nft", "nsenter"]);
+    // an executable named like the adapter, and its hard deps beside it: the
+    // PATH question alone answers yes here, so a live table would prove
+    // detection stopped at PATH instead of asking the host.
     let bins = tempfile::tempdir().expect("fake bin dir");
-    for bin in fake_bins {
+    for bin in ["firecracker", "mke2fs", "debugfs", "nft"] {
         let fake = bins.path().join(bin);
         std::fs::write(&fake, "#!/bin/sh\nexit 0\n").expect("write fake runtime");
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
@@ -116,15 +119,14 @@ fn flagless_init_detects_the_platform_runtime_into_a_live_sandbox_table() {
 
     let home = tempfile::tempdir().expect("tempdir");
     let (toml, workspace) = init_with_path(home.path(), "computed", bins.path());
-    assert!(toml.contains("\n[sandbox]"), "live table written:\n{toml}");
     assert!(
-        toml.contains(&format!("runtime = \"{runtime}\"")),
-        "the platform adapter is chosen:\n{toml}"
+        toml.contains("#[sandbox]") && !toml.contains("\n[sandbox]"),
+        "a fake runtime on PATH must not pass the host probe:\n{toml}"
     );
-    // detection never opts the node into publishing capacity: the table says
-    // only HOW a run would be isolated. Announcing needs a compute grant,
-    // which init cannot mint (there is no daemon signaling yet), so a fresh
-    // workspace carries no services.toml at all.
+    // detection never opts the node into publishing capacity either way: the
+    // table would say only HOW a run is isolated. Announcing needs a compute
+    // grant, which init cannot mint (there is no daemon signaling yet), so a
+    // fresh workspace carries no services.toml at all.
     assert!(
         !workspace.join("services.toml").exists(),
         "a fresh workspace grants no service"

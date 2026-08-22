@@ -2,20 +2,19 @@
 //! is an audited in-tree adapter — a run NEVER executes bare on the host, so
 //! the seam has no unsandboxed variant a config could select.
 //!
-//! This module owns the [`SandboxBackend`] enum + its boot probe. The Podman
-//! backend's execution — building each run's neutral-path `SpecGenerator`,
-//! driving create/start/attach/wait over the node-private libpod socket, and
-//! the egress firewall — lives in [`crate::podman_api`]; there is no `podman`
-//! CLI path any more.
+//! This module owns the [`SandboxBackend`] enum + its boot probe. The backend's
+//! execution — the VM configuration ([`crate::firecracker_api`]), the run
+//! lifecycle ([`crate::microvm`]), the block images
+//! ([`crate::workspace_image`]) and the egress firewall ([`crate::egress`]) —
+//! lives beside it.
 
 use std::path::{Path, PathBuf};
 
 /// how a provider child is spawned — always inside an isolation adapter; a
 /// bare host spawn is unrepresentable here by design ("nothing ever runs
-/// directly on the node"). `Podman` wraps each run in a rootless container. a
-/// node sandboxes EVERY run it makes — demandless ones included — because a
-/// sandboxed node sandboxes everything; the numeric limit flags are added only
-/// for the dimensions actually present on the run.
+/// directly on the node"). `Firecracker` gives each run its own microVM. a node
+/// sandboxes EVERY run it makes — demandless ones included — because a
+/// sandboxed node sandboxes everything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxBackend {
     /// one Firecracker microVM per run: hard vcpu/memory limits enforced by the

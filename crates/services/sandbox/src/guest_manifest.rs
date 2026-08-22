@@ -64,6 +64,17 @@ pub struct RunManifest {
     /// to the wrong service.
     #[serde(default)]
     pub tunnel_ports: Vec<u16>,
+    /// run the child on a PTY instead of pipes — what an interactive TUI needs
+    /// to render at all (a CLI that finds no terminal on its stdout draws
+    /// nothing, or refuses).
+    ///
+    /// The pty is allocated INSIDE the guest, by `duck-guest-init`. It cannot
+    /// be the host's: a pty master and its slave are two ends of one kernel
+    /// object, and the guest runs on a different kernel. So the host's terminal
+    /// bytes ride the ordinary stdin/stdout frames and the guest is what makes
+    /// them a terminal.
+    #[serde(default)]
+    pub pty: bool,
 }
 
 /// the device's contents: a little-endian length, then that many bytes of JSON.
@@ -146,6 +157,7 @@ mod tests {
                 },
             ],
             tunnel_ports: vec![8931, 8932],
+            pty: false,
         }
     }
 
@@ -199,6 +211,7 @@ mod tests {
             cwd: "/workspace".into(),
             mounts: Vec::new(),
             tunnel_ports: Vec::new(),
+            pty: false,
         })
         .expect("encodes");
         let err = decode(&blob).expect_err("refused");

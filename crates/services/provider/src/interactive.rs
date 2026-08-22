@@ -5,19 +5,26 @@
 //!
 //! This shares the headless path's whole isolation seam — the broker holds the
 //! credential and the child gets only an opaque bearer + loopback base URL, the
-//! fresh config home stops any dotfile fallback, and the Podman backend fences
-//! the filesystem — and differs in exactly two places: the argv is the spec's
+//! fresh config home stops any dotfile fallback, and the microVM fences
+//! everything else — and differs in exactly two places: the argv is the spec's
 //! `[interactive]` TUI argv (not `[invoke]`'s headless one), and the child's
-//! stdio is a pty the host holds the master of, not pipes.
+//! stdio is a pty, not pipes.
 //!
-//! **Sandboxed only.** A bare spawn would have no mount namespace and no fresh
-//! HOME, so an interactive session outside the sandbox would expose the
-//! operator's whole home
-//! to whoever is typing — the exact thing the sandbox exists to prevent, and
-//! exactly why [`crate::SandboxBackend`] cannot express one; the
-//! pty primitive underneath ([`InteractiveSession::spawn_on_pty`]) is backend
-//! agnostic only so its behavior can be unit-tested against a plain local
-//! child.
+//! **The pty is allocated where the child runs.** A pty master and its slave
+//! are two ends of ONE kernel object, so a session inside a guest cannot be
+//! given a terminal from here: `duck-guest-init` opens the pair, and the
+//! operator's keystrokes reach it as ordinary stdin frames. That is the whole
+//! of [`Transport`]'s two variants — the operator's own vendor login runs on
+//! this host and gets a host pty; every lent session runs in a guest and gets a
+//! guest one.
+//!
+//! **Sandboxed only.** A bare spawn would have no fresh HOME and no filesystem
+//! fence, so an interactive session outside the sandbox would expose the
+//! operator's whole home to whoever is typing — the exact thing the sandbox
+//! exists to prevent, and exactly why [`crate::SandboxBackend`] cannot express
+//! one; the host-pty primitive underneath
+//! ([`InteractiveSession::spawn_on_pty`]) is reachable on its own only for that
+//! vendor login.
 //!
 //! There is deliberately NO idle-timeout kill here (a terminal is idle by
 //! nature): a session ends on explicit [`InteractiveSession::close`], on the
@@ -29,34 +36,71 @@ use std::path::Path;
 use std::process::Stdio;
 
 use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::Mutex;
 
 use crate::broker::RunBroker;
+use crate::microvm;
 use crate::sandbox::SandboxBackend;
 use crate::{
     BrokerKind, CliProvider, LiveChild, RunAuth, RunContext, RunHome,
     broker_provider_overrides, canonical_mount_path, configure_process_group,
 };
 
-/// how a live interactive session carries the terminal: a real pty this process
-/// holds the master of.
+/// how a live interactive session carries the terminal.
 ///
-/// A second variant used to carry the container backend's hijacked attach
-/// stream. It went with the container backend — a microVM session will need a
-/// GUEST-side pty and a frame on the vsock wire, not a host-side transport, so
-/// the old variant is not a shape to keep warm for it.
+/// Two shapes, because the terminal is allocated in two different kernels. The
+/// operator's own vendor login runs on THIS host, so its pty is a pty and this
+/// process holds the master. A lent session runs in a guest, where the master
+/// is unreachable from here — so the terminal bytes ride the run's ordinary
+/// stdio frames and the GUEST is what makes them a terminal.
 ///
-/// One variant, still a `match`: the next transport must fail the build until
-/// every arm routes it.
+/// A `match` everywhere, no wildcard: the next transport must fail the build
+/// until every arm routes it.
 enum Transport {
-    Pty {
-        /// the master's read half (a dup of the pty master, non-blocking).
-        reader: AsyncFd<OwnedFd>,
-        /// the master's write half (a second dup of the same master).
-        writer: AsyncFd<OwnedFd>,
-        /// the child, behind a lock so `close` can tear it down through `&self`.
-        live: Mutex<LiveChild>,
-    },
+    /// a run inside a microVM, whose `duck-guest-init` allocated the pty.
+    ///
+    /// Both variants are boxed, and symmetrically: each carries a live child's
+    /// worth of state, and inlining either would size every `Transport` — and
+    /// so every `InteractiveSession` — at the larger of the two.
+    MicroVm(Box<GuestTerminal>),
+    Pty(Box<HostPty>),
+}
+
+/// a live session's half of a pty on THIS host.
+struct HostPty {
+    /// the master's read half (a dup of the pty master, non-blocking).
+    reader: AsyncFd<OwnedFd>,
+    /// the master's write half (a second dup of the same master).
+    writer: AsyncFd<OwnedFd>,
+    /// the child, behind a lock so `close` can tear it down through `&self`.
+    live: Mutex<LiveChild>,
+}
+
+/// a live session's half of a booted microVM.
+struct GuestTerminal {
+    /// terminal output, behind its OWN lock: a read blocks for as long as the
+    /// terminal is quiet, and a shared lock would make that block the next
+    /// keystroke too.
+    output: Mutex<tokio::io::DuplexStream>,
+    /// keystrokes.
+    input: Mutex<tokio::io::DuplexStream>,
+    /// window size, under NO lock: [`InteractiveSession::resize`] is
+    /// synchronous (the terminal plane's resize handler is), so it has no lock
+    /// to await.
+    resize: microvm::ResizeLane,
+    /// held for the session, never read — see [`microvm::TerminalIo`].
+    _idle_stderr: tokio::io::DuplexStream,
+    _pump: tokio::task::JoinHandle<()>,
+    /// resolves when the guest reports the child's exit; a watch rather than
+    /// the guest's oneshot so [`InteractiveSession::wait_child_exit`] can be
+    /// awaited more than once.
+    exited: tokio::sync::watch::Receiver<bool>,
+    /// the VM itself, taken on close so the workspace is read back exactly
+    /// once.
+    vm: Mutex<Option<microvm::MicroVm>>,
+    /// where the session's workspace is read back TO.
+    workdir: std::path::PathBuf,
 }
 
 /// a live interactive session. Every method takes `&self`, so the owner can wrap
@@ -73,9 +117,50 @@ pub struct InteractiveSession {
 }
 
 impl InteractiveSession {
+    /// adopt a booted microVM whose guest allocated the pty.
+    ///
+    /// The guest's exit oneshot is converted to a watch here, once: a session's
+    /// exit is asked about by more than one caller (the plane that renders it
+    /// and the reaper that tears it down), and a oneshot answers once.
+    fn from_microvm(
+        vm: microvm::MicroVm,
+        io: microvm::TerminalIo,
+        workdir: std::path::PathBuf,
+        broker: Option<RunBroker>,
+        config_home: Option<RunHome>,
+    ) -> Self {
+        let microvm::TerminalIo {
+            output,
+            input,
+            exit,
+            resize,
+            idle_stderr,
+            pump,
+        } = io;
+        let (exited_tx, exited) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            let _ = exit.await;
+            let _ = exited_tx.send(true);
+        });
+        Self {
+            transport: Transport::MicroVm(Box::new(GuestTerminal {
+                output: Mutex::new(output),
+                input: Mutex::new(input),
+                resize,
+                _idle_stderr: idle_stderr,
+                _pump: pump,
+                exited,
+                vm: Mutex::new(Some(vm)),
+                workdir,
+            })),
+            _broker: broker,
+            _config_home: config_home,
+        }
+    }
+
     /// spawn `command` with its stdio wired to a fresh pty and keep the master.
-    /// The pty transport backs the operator's local vendor-login run; a Podman
-    /// session uses [`Self::from_attach`] instead.
+    /// The pty transport backs the operator's local vendor-login run; a lent
+    /// session uses [`Self::from_microvm`] instead.
     fn spawn_on_pty(
         mut command: tokio::process::Command,
         broker: Option<RunBroker>,
@@ -105,11 +190,11 @@ impl InteractiveSession {
         let reader = AsyncFd::new(master).map_err(|e| format!("register pty master: {e}"))?;
         let writer = AsyncFd::new(writer_fd).map_err(|e| format!("register pty master: {e}"))?;
         Ok(Self {
-            transport: Transport::Pty {
+            transport: Transport::Pty(Box::new(HostPty {
                 reader,
                 writer,
                 live: Mutex::new(live),
-            },
+            })),
             _broker: broker,
             _config_home: config_home,
         })
@@ -128,7 +213,10 @@ impl InteractiveSession {
     /// read the next chunk of terminal output. `Ok(0)` means end of session.
     pub async fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         match &self.transport {
-            Transport::Pty { reader, .. } => Self::pty_read(reader, buf).await,
+            Transport::Pty(pty) => Self::pty_read(&pty.reader, buf).await,
+            // the guest's pump closes this half when the guest's own pty read
+            // ends, so `Ok(0)` arrives without translating anything.
+            Transport::MicroVm(guest) => guest.output.lock().await.read(buf).await,
         }
     }
 
@@ -161,7 +249,8 @@ impl InteractiveSession {
     /// write input (keystrokes) to the terminal, in full.
     pub async fn write_all(&self, data: &[u8]) -> std::io::Result<()> {
         match &self.transport {
-            Transport::Pty { writer, .. } => Self::pty_write(writer, data).await,
+            Transport::Pty(pty) => Self::pty_write(&pty.writer, data).await,
+            Transport::MicroVm(guest) => guest.input.lock().await.write_all(data).await,
         }
     }
 
@@ -187,25 +276,30 @@ impl InteractiveSession {
         Ok(())
     }
 
-    /// resize the terminal. For a pty, setting the master window size SIGWINCHes
-    /// the container process. For a socket session, the resize is a libpod call;
-    /// it is best-effort (a fire-and-forget task) so this stays sync for the
-    /// terminal plane's synchronous resize handler.
+    /// resize the terminal, SIGWINCHing whatever is drawing on it.
+    ///
+    /// Sync, because the terminal plane's resize handler is. A host pty is an
+    /// ioctl on the master; a guest pty is a frame the guest applies to its
+    /// own master, queued without blocking.
     pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
         match &self.transport {
-            Transport::Pty { reader, .. } => {
+            Transport::Pty(pty) => {
                 let ws = libc::winsize {
                     ws_row: rows,
                     ws_col: cols,
                     ws_xpixel: 0,
                     ws_ypixel: 0,
                 };
-                let fd = reader.get_ref().as_raw_fd();
+                let fd = pty.reader.get_ref().as_raw_fd();
                 // SAFETY: fd is our live master pty; &ws is a valid winsize.
                 let rc = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &ws) };
                 if rc != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+                Ok(())
+            }
+            Transport::MicroVm(guest) => {
+                guest.resize.resize(cols, rows);
                 Ok(())
             }
         }
@@ -217,35 +311,67 @@ impl InteractiveSession {
     /// hang the way read-until-EOF would); for a socket, it waits the container.
     pub async fn wait_child_exit(&self) {
         match &self.transport {
-            Transport::Pty { live, .. } => {
-                let Some(pid) = live.lock().await.leader_pid() else {
+            Transport::Pty(pty) => {
+                let Some(pid) = pty.live.lock().await.leader_pid() else {
                     std::future::pending::<()>().await;
                     unreachable!()
                 };
                 crate::wait_leader_exit_unreaped(pid, "interactive session").await;
             }
+            // the guest reports its own child's exit; the VMM's status would
+            // only say whether the hypervisor exited cleanly.
+            Transport::MicroVm(guest) => {
+                let mut exited = guest.exited.clone();
+                while !*exited.borrow_and_update() {
+                    // the sender lives as long as the watching task, so an
+                    // error here means the guest is gone without reporting —
+                    // which is an exit too.
+                    if exited.changed().await.is_err() {
+                        return;
+                    }
+                }
+            }
         }
     }
 
-    /// end the session: terminate the child / kill + remove the container.
-    /// Idempotent-ish — safe to call once on session teardown.
+    /// end the session: terminate the child, or kill the VM and walk its
+    /// workspace back to the host. Idempotent — safe to call on teardown after
+    /// the session already ended on its own.
     pub async fn close(&self) {
         match &self.transport {
-            Transport::Pty { live, .. } => live.lock().await.terminate().await,
+            Transport::Pty(pty) => pty.live.lock().await.terminate().await,
+            Transport::MicroVm(guest) => {
+                // taken, so a second close is a no-op rather than a second
+                // read-back over a workspace the first one already wrote.
+                let Some(mut vm) = guest.vm.lock().await.take() else {
+                    return;
+                };
+                vm.terminate().await;
+                if let Err(e) = vm.collect(&guest.workdir).await {
+                    tracing::warn!(
+                        target: "ducktape::compute",
+                        event = "session_workspace_read_back_failed",
+                        reason = "collect_failed",
+                        error = %e,
+                        "an interactive session's workspace did not come back"
+                    );
+                }
+            }
         }
     }
 
     #[cfg(test)]
     fn window_size(&self) -> (u16, u16) {
-        // one variant today; a `match` so a second one fails the build here
-        // rather than silently reporting the wrong window size.
-        #[allow(irrefutable_let_patterns)]
-        let Transport::Pty { reader, .. } = &self.transport else {
-            panic!("window_size is only meaningful for a pty transport");
+        // Reads the HOST pty's master directly, so it only answers for that
+        // transport. A guest's master is on the other side of a hypervisor —
+        // there is no ioctl to make here, and reporting some other number would
+        // be worse than refusing.
+        let Transport::Pty(pty) = &self.transport else {
+            panic!("window_size is only meaningful for a host pty transport");
         };
         // SAFETY: zeroed winsize is valid; ioctl fills it from the master pty.
         let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-        let fd = reader.get_ref().as_raw_fd();
+        let fd = pty.reader.get_ref().as_raw_fd();
         let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
         assert_eq!(
             rc,
@@ -261,10 +387,11 @@ impl CliProvider {
     /// spawn this capability's interactive TUI on a pty, inside the provider's
     /// sandbox backend, from a spec with an `[interactive]`
     /// argv. The isolation is
-    /// the headless path's (a broker holding the credential, a fresh config home,
-    /// the container fence); only the argv and the stdio (pty, not pipes)
-    /// differ. Podman keeps the container lifecycle on the attach stream
-    /// itself.
+    /// the headless path's (a broker holding the credential, a fresh config
+    /// home, the VM fence); only the argv and the stdio (a guest pty, not
+    /// pipes) differ. The VM's lifetime is the session's: it is torn down by
+    /// [`InteractiveSession::close`], which is also what reads the workspace
+    /// back.
     pub(crate) async fn spawn_interactive_session(
         &self,
         ctx: &RunContext,
@@ -307,13 +434,19 @@ impl CliProvider {
         };
         let args = interactive_argv(base, &auth, &workdir, self.spec.isolation.broker);
 
-        let _ = (&args, &workdir, ctx, &auth, &broker, &home);
         match &self.backend {
-            SandboxBackend::Firecracker { .. } => Err(format!(
-                "{}: an interactive session inside a microVM needs a guest-side pty, which \
-                 duck-guest-init does not allocate yet — run the vendor login on the host",
-                self.spec.tag
-            )),
+            SandboxBackend::Firecracker { .. } => {
+                let (vm, io) = self
+                    .microvm_boot(&args, &workdir, ctx, &auth, crate::GuestStdio::Pty)
+                    .await?;
+                Ok(InteractiveSession::from_microvm(
+                    vm,
+                    io.into_terminal(),
+                    workdir,
+                    broker,
+                    home,
+                ))
+            }
             #[cfg(any(test, feature = "testkit"))]
             SandboxBackend::Bare => {
                 unreachable!("interactive sessions never run under the bare test harness")
@@ -374,7 +507,7 @@ fn open_pty() -> Result<(OwnedFd, OwnedFd), String> {
     // SAFETY: `slave` is a fresh fd we now own.
     let slave = unsafe { OwnedFd::from_raw_fd(slave) };
     // Give the pty a sane INITIAL size (80x24). A pty is created at 0x0; a TUI
-    // handed 0x0 (podman -t relays it into the container tty) renders blank until
+    // handed 0x0 renders blank until
     // the first resize — and the app's first resize can be dropped while its ws
     // is still connecting. The real client geometry replaces this via `resize`.
     let ws = libc::winsize {
@@ -441,7 +574,7 @@ mod tests {
 
     /// the pty primitive pumps bytes both ways: write to the master, the child
     /// (`cat`) echoes it back, we read it. Proves openpty + AsyncFd read/write
-    /// without needing podman or a logged-in CLI. (`cat` on a pty also sees the
+    /// without needing a VM or a logged-in CLI. (`cat` on a pty also sees the
     /// line-discipline echo, so the payload is guaranteed to come back.)
     #[tokio::test]
     async fn pty_round_trips_bytes_through_a_child() {
@@ -518,7 +651,7 @@ mod tests {
     }
 
     /// resize sets the master's window size; the kernel reflects it back through
-    /// TIOCGWINSZ. Pure ioctl round-trip — no podman.
+    /// TIOCGWINSZ. Pure ioctl round-trip — no VM.
     #[tokio::test]
     async fn resize_sets_the_window_size() {
         let session = InteractiveSession::spawn_on_pty(
@@ -576,30 +709,16 @@ mod tests {
         assert_eq!(claude, vec!["--foo".to_string()]);
     }
 
-    // ---- live podman integration -------------------------------------------
-    // These exercise the SAME pty primitive against a REAL `podman run -it`
-    // container — the bridge PR1 could only argv-assert off a podman host.
+    // ---- where the live coverage lives --------------------------------------
     //
-    // `#[ignore]`, like every other live test in this module. This crate's
-    // default lane is 85 tests that need nothing, and making the whole
-    // inner-loop `cargo test -p provider-host` require podman for 2 of them is
-    // where the pressure to put the opt-out in a shell profile comes from — an
-    // opt-out in a profile buys nothing and costs churn. An IGNORED test is
-    // disclosed: libtest prints `N ignored` in the summary, which is the exact
-    // property a captured "skipping" line lacked. Run them with
-    // `cargo test -p provider-host -- --ignored`, where the podman gate below
-    // still FAILS loudly on a host that cannot honour it.
+    // Not here. The sandboxed session is a two-kernel object — a guest
+    // allocates the pty, the host holds neither end of it — so there is nothing
+    // meaningful to assert without booting a real VM, and this crate's default
+    // lane is 85 tests that need nothing at all.
     //
-    // Nothing is lost on a provisioned box: `bin/node/tests/remote_session.rs`
-    // drives this same pty primitive end to end through a real sandbox (guest
-    // directs, host spawns, keystroke forwarded, echo fanned back), in a suite
-    // that does run by default.
-
-    // The live model-turn suites that used to sit here drove a REAL container
-    // through the podman backend. They are not ported: a microVM interactive
-    // session needs a guest-side pty, which duck-guest-init does not allocate
-    // yet, so there is nothing for them to drive. Re-add them against the
-    // microVM when that lands — they were the only coverage of a lent
-    // interactive session reaching a model, and `bin/node/tests/remote_session.rs`
-    // covers the pty primitive itself but not the sandboxed path.
+    // `bin/node/tests/remote_session.rs` drives the whole thing end to end
+    // through a real microVM (a guest node directs, the host boots the VM, a
+    // keystroke crosses the forwarded lane, and the child's echo fans back onto
+    // the directing node's topic), in a suite that runs by default on a
+    // provisioned box.
 }

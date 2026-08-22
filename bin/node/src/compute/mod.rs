@@ -1,8 +1,8 @@
 //! `ducktape service run compute` — the standalone compute daemon.
 //!
 //! This is the compute plane. The node process constructs no provider set, no
-//! dispatch pool, no resource ledger and — since the agent carve — no podman
-//! service either; it keeps the consensus lanes and nothing else. Everything
+//! dispatch pool and no resource ledger; it keeps the consensus lanes and
+//! nothing else. Everything
 //! below runs in a separate process with its own failure domain, and reaches its
 //! node exactly the way the CLI does — over localhost `/v1` + ws.
 //!
@@ -16,16 +16,14 @@
 //! | `WorkspaceProvisioner` | `noded::agent_provision` over the same `/v1` lane |
 //! | work intake (effect lane) | `SagaQuery::AssignedPending` + ws hints ([`intake`]) |
 //! | `OutputSink` → stream hub | a `run_output` ws frame ([`link`]) |
-//! | `__egress-hook` | already a subcommand of THIS binary — the hook podman fires is `ducktape __egress-hook`, and the daemon ships in the same executable, so nothing moved |
 //!
-//! ## podman is this daemon's, not the node's
+//! ## a run's isolation is this daemon's, not the node's
 //!
-//! This daemon starts its own node-private podman service under
-//! `<storage>/services/compute` — socket, storage root and egress hook. The node
-//! starts none, and neither does it share one with the agent daemon: a
-//! `kill_on_drop` service child shared between two processes would make them a
-//! single failure domain. Container ownership is label-scoped ON TOP of that —
-//! see [`reap`] — so the two guarantees are independent.
+//! Every run this daemon starts is its own microVM: the VMM is a child of THIS
+//! process and dies with the run, so there is no daemon to share with the node
+//! or with the agent daemon and no long-lived state between runs. Run ownership
+//! is still tracked explicitly — see [`reap`] — because a crashed daemon's VMs
+//! have to be identifiable by the one that replaces it.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -69,8 +67,8 @@ pub(crate) struct Compute {
 /// operational state, not an error.
 ///
 /// Through [`crate::services::serve_until_stopped`], which owns the runtime and
-/// arms SIGTERM/SIGINT before a line of this daemon runs: the `podman system
-/// service` started below must never outlive the process that started it.
+/// arms SIGTERM/SIGINT before a line of this daemon runs: a run's VMM is a
+/// child of this process and must never outlive it holding guest memory.
 pub(crate) fn serve(compute: Compute) -> Result<(), Box<dyn std::error::Error>> {
     crate::services::serve_until_stopped(std::future::pending(), |stop| run(compute, stop))
 }

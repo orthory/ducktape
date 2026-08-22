@@ -57,10 +57,9 @@ pub(crate) struct BootEnv {
     pub(crate) checkpoint_blocks: u64,
     pub(crate) dev_demo: bool,
     /// the operator's `[sandbox]` table — HOW a run is isolated on this host.
-    /// `None` = consensus-only: no podman service, no terminal plane. The node
-    /// itself no longer executes provider work, so this drives the pty plane
-    /// and the podman service the compute daemon shares; the daemon resolves
-    /// the same table for its own provider set.
+    /// `None` = consensus-only: no terminal plane, no runs. The node itself no
+    /// longer executes provider work, so this drives the pty plane; the compute
+    /// daemon resolves the same table for its own provider set.
     pub(crate) sandbox: Option<SandboxBackend>,
     /// the same table, gated on the user's `services.toml` compute grant —
     /// `None` when a sandbox is configured but compute was never enabled,

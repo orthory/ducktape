@@ -43,6 +43,7 @@ const TAG_STDERR: u8 = 1;
 const TAG_EXIT: u8 = 2;
 const TAG_STDIN: u8 = 3;
 const TAG_STDIN_EOF: u8 = 4;
+const TAG_RESIZE: u8 = 5;
 const HEADER_BYTES: usize = 5;
 
 /// One enum for both directions. The host sends [`Frame::Stdin`] and
@@ -63,6 +64,14 @@ pub enum Frame {
     /// the prompt is complete; the guest closes the child's stdin so a CLI
     /// blocking on EOF proceeds.
     StdinEof,
+    /// the operator's terminal changed size. Only meaningful for a `pty` run:
+    /// the guest applies it to the pty master, which is what delivers SIGWINCH
+    /// to the TUI. A pipe-backed run ignores it — a window size is a property
+    /// of a terminal, and there is none.
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
 }
 
 pub fn encode(frame: &Frame) -> Vec<u8> {
@@ -76,6 +85,14 @@ pub fn encode(frame: &Frame) -> Vec<u8> {
             out.push(TAG_EXIT);
             out.extend((4u32).to_le_bytes());
             out.extend(code.to_le_bytes());
+            return out;
+        }
+        Frame::Resize { cols, rows } => {
+            let mut out = Vec::with_capacity(HEADER_BYTES + 4);
+            out.push(TAG_RESIZE);
+            out.extend((4u32).to_le_bytes());
+            out.extend(cols.to_le_bytes());
+            out.extend(rows.to_le_bytes());
             return out;
         }
     };
@@ -118,6 +135,15 @@ pub fn decode(buf: &mut Vec<u8>) -> Result<Option<Frame>, String> {
                 .map_err(|_| format!("guest exit frame carried {} bytes, want 4", payload.len()))?;
             Frame::Exit(i32::from_le_bytes(bytes))
         }
+        TAG_RESIZE => {
+            let bytes: [u8; 4] = payload.as_slice().try_into().map_err(|_| {
+                format!("guest resize frame carried {} bytes, want 4", payload.len())
+            })?;
+            Frame::Resize {
+                cols: u16::from_le_bytes([bytes[0], bytes[1]]),
+                rows: u16::from_le_bytes([bytes[2], bytes[3]]),
+            }
+        }
         other => return Err(format!("guest frame carried unknown tag {other}")),
     };
     Ok(Some(frame))
@@ -140,6 +166,17 @@ mod tests {
             // mangled by the length field's unsignedness.
             Frame::Exit(-9),
             Frame::Stdout(Vec::new()),
+            // cols and rows are two u16s in one 4-byte payload: swapping them
+            // renders every TUI at the wrong aspect, which looks like the CLI
+            // being broken rather than the wire being wrong.
+            Frame::Resize {
+                cols: 120,
+                rows: 40,
+            },
+            Frame::Resize {
+                cols: u16::MAX,
+                rows: 0,
+            },
         ] {
             let mut buf = encode(&frame);
             let got = decode(&mut buf).expect("decode").expect("a whole frame");

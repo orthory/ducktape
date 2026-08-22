@@ -1,6 +1,6 @@
 //! one run, one microVM: boot it, carry its stdio, read its workspace back.
 //!
-//! This is the seat `podman_api`'s create/start/attach/wait occupied, and it is
+//! This is the seat a container runtime's create/start/attach/wait held, and it is
 //! smaller because a VM needs no daemon: the VMM is a child of this process and
 //! dies with the run. There is nothing to reap, no socket to keep alive between
 //! runs, and no image store to garbage-collect.
@@ -47,6 +47,71 @@ pub struct MicroVmIo {
     /// which only says whether the hypervisor exited cleanly.
     pub exit: tokio::sync::oneshot::Receiver<i32>,
     pub pump: tokio::task::JoinHandle<()>,
+    /// every host→guest frame goes out through here, which is why the resize
+    /// lane exists at all: ONE task owns the socket's write half (it must, see
+    /// [`pump_frames`]), so a second writer would have to be a second owner.
+    input: tokio::sync::mpsc::Sender<Frame>,
+}
+
+impl MicroVmIo {
+    /// take this io apart into the halves a TERMINAL session drives
+    /// independently.
+    ///
+    /// Separate owners on purpose: the terminal plane pumps output in one task
+    /// while feeding keystrokes from another, so a single lock over both would
+    /// let a quiet terminal block the next keystroke indefinitely.
+    pub fn into_terminal(self) -> TerminalIo {
+        TerminalIo {
+            output: self.stdout,
+            input: self.stdin,
+            exit: self.exit,
+            resize: ResizeLane(self.input),
+            idle_stderr: self.stderr,
+            pump: self.pump,
+        }
+    }
+}
+
+/// one interactive session's io: what to read, what to write, how to resize,
+/// and when the guest's child exited.
+///
+/// Every field is public and separately owned, because a terminal session wants
+/// them in different places at once — output under one lock, input under
+/// another, and resize under NO lock (the caller notices a window change on a
+/// synchronous path and cannot await one).
+pub struct TerminalIo {
+    /// terminal output. A pty merges the child's stderr into it, so this is the
+    /// whole of what the session renders.
+    pub output: tokio::io::DuplexStream,
+    /// keystrokes, as ordinary stdin bytes. The guest writes them into the pty
+    /// master, which is what makes them terminal input.
+    pub input: tokio::io::DuplexStream,
+    pub exit: tokio::sync::oneshot::Receiver<i32>,
+    pub resize: ResizeLane,
+    /// KEEP THIS ALIVE, never read it. The pump writes any stderr frame here,
+    /// and a dropped receiver turns that write into an error that ends the
+    /// whole session. A pty run sends no stderr frames, so this is a trap being
+    /// disarmed rather than a lane in use.
+    pub idle_stderr: tokio::io::DuplexStream,
+    /// the pump task, so it is owned for the session's lifetime rather than
+    /// detached.
+    pub pump: tokio::task::JoinHandle<()>,
+}
+
+/// the window-size lane, split out so it can be used without holding the input
+/// lock: a resize arrives on a synchronous path that has no lock to await.
+#[derive(Clone)]
+pub struct ResizeLane(tokio::sync::mpsc::Sender<Frame>);
+
+impl ResizeLane {
+    /// tell the guest the operator's terminal changed size.
+    ///
+    /// Best-effort and non-blocking: a resize is a redraw hint, and a session
+    /// whose input queue is momentarily full must not stall the caller that
+    /// noticed the window move.
+    pub fn resize(&self, cols: u16, rows: u16) {
+        let _ = self.0.try_send(Frame::Resize { cols, rows });
+    }
 }
 
 /// a booted microVM. Dropping it kills the VMM — a run whose caller went away
@@ -56,14 +121,34 @@ pub struct MicroVm {
     run_dir: PathBuf,
     workspace_image: PathBuf,
     console: PathBuf,
+    /// this run's vsock socket. Held for its PARENT directory, which is the
+    /// run's alone and is removed with it.
+    vsock_uds: PathBuf,
     /// the tunnel acceptors, aborted when the VM goes away.
     tunnels: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for MicroVm {
+    /// Aborts the tunnels and DELETES the run's scratch — both the run
+    /// directory and the socket directory.
+    ///
+    /// The run directory holds this run's workspace image, its read-only asset
+    /// image and its manifest: gigabytes for a run whose PATH entries are a
+    /// build tree, and nothing there outlives the VM. Leaving it was measured
+    /// at 21 GB of `/tmp` across one afternoon of tests, with no owner to
+    /// notice — a node serving runs continuously would fill its disk.
+    ///
+    /// In Drop rather than in [`Self::collect`] so that a run that FAILED
+    /// cleans up too. Every diagnostic that outlives the VM has already been
+    /// read into an error string by then (see [`Self::boot_failure`]), so
+    /// there is nothing here left to read.
     fn drop(&mut self) {
         for tunnel in self.tunnels.drain(..) {
             tunnel.abort();
+        }
+        let _ = std::fs::remove_dir_all(&self.run_dir);
+        if let Some(socket_dir) = self.vsock_uds.parent() {
+            let _ = std::fs::remove_dir_all(socket_dir);
         }
     }
 }
@@ -153,6 +238,7 @@ impl MicroVm {
             run_dir: run_dir.to_path_buf(),
             workspace_image: cfg.workspace.clone(),
             console: console.clone(),
+            vsock_uds: cfg.vsock_uds.clone(),
             tunnels,
         };
 
@@ -258,14 +344,24 @@ fn vsock_port_path(uds: &Path, port: u32) -> PathBuf {
 }
 
 /// wire the guest connection to duplex streams the caller can treat as pipes.
+/// how many host→guest frames may queue before the writer backpressures.
+///
+/// Bounded on purpose: an unbounded queue would let a prompt larger than the
+/// socket buffer pile up in host memory instead of slowing the reader that
+/// produced it. Small, because the only producers are one prompt reader and the
+/// occasional resize.
+const INPUT_QUEUE: usize = 16;
+
 fn spawn_pump(stream: UnixStream) -> MicroVmIo {
     // 64 KiB matches the invoke loop's read granularity.
     let (stdin_host, stdin_task) = tokio::io::duplex(64 * 1024);
     let (out_task, stdout_host) = tokio::io::duplex(64 * 1024);
     let (err_task, stderr_host) = tokio::io::duplex(64 * 1024);
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel(INPUT_QUEUE);
 
-    let pump = tokio::spawn(pump_frames(stream, stdin_task, out_task, err_task, exit_tx));
+    tokio::spawn(frame_stdin(stdin_task, input_tx.clone()));
+    let pump = tokio::spawn(pump_frames(stream, input_rx, out_task, err_task, exit_tx));
 
     MicroVmIo {
         stdin: stdin_host,
@@ -273,41 +369,61 @@ fn spawn_pump(stream: UnixStream) -> MicroVmIo {
         stderr: stderr_host,
         exit: exit_rx,
         pump,
+        input: input_tx,
     }
+}
+
+/// turn the caller's stdin writes into frames.
+///
+/// Its own task so a prompt larger than the socket buffer cannot block the
+/// guest's output from being drained: the caller writing the prompt and the
+/// caller reading the answer are frequently the same loop.
+async fn frame_stdin(mut stdin: tokio::io::DuplexStream, input: tokio::sync::mpsc::Sender<Frame>) {
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = match stdin.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        if input.send(Frame::Stdin(buf[..n].to_vec())).await.is_err() {
+            return;
+        }
+    }
+    // The prompt is complete. A headless guest closes the child's stdin on
+    // this so a CLI blocking on EOF proceeds; an interactive one ignores it,
+    // because a terminal has no EOF to close.
+    let _ = input.send(Frame::StdinEof).await;
 }
 
 async fn pump_frames(
     stream: UnixStream,
-    mut stdin: tokio::io::DuplexStream,
+    mut input: tokio::sync::mpsc::Receiver<Frame>,
     mut stdout: tokio::io::DuplexStream,
     mut stderr: tokio::io::DuplexStream,
     exit: tokio::sync::oneshot::Sender<i32>,
 ) {
     let (mut read_half, mut write_half) = stream.into_split();
 
-    // host -> guest: the prompt, then EOF. Its own task so a prompt larger than
-    // the socket buffer cannot block the guest's output from being drained.
+    // host -> guest. ONE owner of the write half, which is why every inbound
+    // lane (the prompt, keystrokes, resizes) is funnelled through one channel
+    // rather than writing here directly.
     let feed = tokio::spawn(async move {
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            let n = match stdin.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            let frame = guest_proto::encode(&Frame::Stdin(buf[..n].to_vec()));
-            if write_half.write_all(&frame).await.is_err() {
+        while let Some(frame) = input.recv().await {
+            if write_half
+                .write_all(&guest_proto::encode(&frame))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
-        let eof = guest_proto::encode(&Frame::StdinEof);
-        let _ = write_half.write_all(&eof).await;
 
-        // The prompt is sent, but this task must NOT end: it owns the write
-        // half, and Firecracker's vsock backend maps a host-side half-close
-        // onto a full connection RESET rather than a half-close. Dropping it
-        // here therefore kills the guest's output stream mid-run — measured,
-        // the guest echoed the prompt and got EPIPE, and the host saw a run
-        // that produced nothing and reported no exit code.
+        // Everything sendable is sent, but this task must NOT end: it owns the
+        // write half, and Firecracker's vsock backend maps a host-side
+        // half-close onto a full connection RESET rather than a half-close.
+        // Dropping it here therefore kills the guest's output stream mid-run —
+        // measured, the guest echoed the prompt and got EPIPE, and the host saw
+        // a run that produced nothing and reported no exit code.
         //
         // The abort at the end of this function is what ends it, and that
         // close is also the guest's signal that its exit frame landed.
@@ -356,7 +472,7 @@ async fn pump_frames(
                 }
                 // the guest never sends these; a stray one is not worth failing
                 // a finished run over.
-                Frame::Stdin(_) | Frame::StdinEof => {}
+                Frame::Stdin(_) | Frame::StdinEof | Frame::Resize { .. } => {}
             }
         }
     }

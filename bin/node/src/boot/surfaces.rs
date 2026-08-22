@@ -221,7 +221,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // This node SPAWNS NO PTY. What is wired here is the rings, the per-session
     // metadata and the admission entry points; the ptys themselves live in the
     // agent daemon (`ducktape service run agent`), which attaches over this
-    // node's own ws and owns its own podman. So the gate is purely "is there an
+    // node's own ws and owns its own sandbox. So the gate is purely "is there an
     // app surface to serve it on" — no sandbox backend, no provider discovery,
     // no execution identity. With no daemon attached a create returns the
     // "requires an agent service" 503, still distinct from the "terminal

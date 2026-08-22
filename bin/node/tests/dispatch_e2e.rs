@@ -26,8 +26,8 @@
 //!   one `OracleResult` op commits PER ATTEMPT, which rules out two nodes both
 //!   believing they won one claim. It does not rule out a node that lost its
 //!   lease mid-run finishing and paying for the work anyway — that gap is a
-//!   product guard (the cancellation check between podman `create` and `start`,
-//!   held by a source lint in `provider-host`), not something committed state
+//!   product guard (the cancellation check before the VM is booted, held by a
+//!   source lint in `provider-host`), not something committed state
 //!   can show, because the late result lands as a no-op.
 //!
 //! ## the compute plane is a real, sandboxed, out-of-process one
@@ -209,12 +209,12 @@ fn boot(cluster: &mut Cluster) {
     assert_eq!(genesis[0], genesis[2], "genesis fork between nodes 0 and 2");
     for i in 0..3 {
         cluster.wait_marker(i, "converged root_hash=", CONVERGE);
-        // What this marker covers, exactly: the daemon reached `PodmanService`
-        // + provider discovery. It does NOT cover the image — nothing is pulled
-        // at boot, so an unpullable tag passes here on every node and fails the
-        // run ~20s later. A dead libpod socket does not print it at all and
-        // burns the full budget. Neither is a skip: past `probe()` this suite
-        // has declared the host capable, so an unusable sandbox is a failure.
+        // What this marker covers, exactly: the daemon reached the sandbox
+        // probe + provider discovery. It does NOT cover a bootable guest — no
+        // VM starts until a run does, so an unreadable rootfs passes here on
+        // every node and fails the run seconds later. Not a skip either: past
+        // `probe()` this suite has declared the host capable, so an unusable
+        // sandbox is a failure.
         cluster.wait_compute_marker(i, "compute daemon serving", CONVERGE);
     }
 }

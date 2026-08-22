@@ -16,9 +16,9 @@
 //!   actor lane. A daemon holds no keypair and no mesh identity, so that path
 //!   stays node-to-node — which is what the design always said it was.
 //!
-//! What crossed is exactly the podman-touching half: provider discovery, the
-//! `PodmanService`, `spawn_interactive`, and each session's pump and reaper.
-//! That is the whole milestone — after this, `bin/node` constructs none of them.
+//! What crossed is exactly the sandbox-touching half: provider discovery,
+//! `spawn_interactive`, and each session's pump and reaper. That is the whole
+//! milestone — after this, `bin/node` constructs none of them.
 //!
 //! ## agent and compute are siblings
 //!
@@ -27,11 +27,11 @@
 //! provider/sandbox/broker libraries and spawn their own sandboxes; their bus,
 //! where they have one at all, is the chain.
 //!
-//! The one real co-tenancy hazard is podman. Two resolutions, both in force:
-//! container ownership is label-scoped to this instance
-//! (`io.ducktape.managed=agent#<hex8>`), and this daemon runs its OWN podman
-//! service under its own root — so neither reaper can see the other's
-//! containers and neither process's exit can kill the other's service child.
+//! Co-tenancy is not a hazard here, and the microVM backend is why: a run's VMM
+//! is a child of the daemon that started it and dies with it, so there is no
+//! shared daemon, no shared storage root and no shared reaper to confuse. Run
+//! ownership is still recorded per instance (`agent#<hex8>`) so a restarted
+//! daemon can tell its own leftovers from a sibling's.
 //!
 //! ## the credential path is unchanged in shape
 //!
@@ -70,8 +70,8 @@ pub(crate) struct Agent {
 /// that is an operational state, not an error.
 ///
 /// Through [`crate::services::serve_until_stopped`], which owns the runtime and
-/// arms SIGTERM/SIGINT before a line of this daemon runs: the `podman system
-/// service` started below must never outlive the process that started it.
+/// arms SIGTERM/SIGINT before a line of this daemon runs: a session's VMM is a
+/// child of this process and must never outlive it holding guest memory.
 pub(crate) fn serve(agent: Agent) -> Result<(), Box<dyn std::error::Error>> {
     crate::services::serve_until_stopped(std::future::pending(), |stop| run(agent, stop))
 }

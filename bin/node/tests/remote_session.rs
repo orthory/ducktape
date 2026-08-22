@@ -4,14 +4,15 @@
 //! running a scripted child (`cat`, standing in for a provider so the test needs
 //! no real API), forwards a keystroke line over the INPUT lane, and observes the
 //! echoed bytes fan back onto the guest node's own `term:<id>` topic. Then the
-//! guest closes the session and the host reaps the container.
+//! guest closes the session and the host tears the VM down.
 //!
 //! Every wait is on the system's own events — a committed-state query, a log
 //! marker, or the next ws frame — never a fixed sleep.
 //!
-//! Requires a working Podman (the interactive plane exists only on a sandboxed node):
-//! the test SKIPS loudly when podman is absent, exactly like the crate's other
-//! live-podman integration tests. The credential/airlock swap is proven by the
+//! Requires a bootable microVM (the interactive plane exists only on a
+//! sandboxed node): `/dev/kvm` open to this process and the guest images built.
+//! The test SKIPS loudly when they are absent, exactly like the crate's other
+//! live sandbox integration tests. The credential/airlock swap is proven by the
 //! airlock e2e; the echo provider declares no broker, so the seeded credential
 //! here only exercises the host's admission gate, not a live upstream.
 //!
@@ -262,8 +263,8 @@ fn guest_drives_a_scripted_child_on_the_host_over_the_forwarded_lane() {
     // node's whole lifetime.
     let spec_dir = echo_spec_dir();
 
-    // two real WireGuard nodes: guest (0) directs, host (1) sandboxes. Both run a
-    // Podman terminal plane; only the host carries the echo provider.
+    // two real WireGuard nodes: guest (0) directs, host (1) sandboxes. Both run
+    // a terminal plane; only the host carries the echo provider.
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
     cluster.wireguard = true;
     cluster.extra_toml = sandbox_toml();
@@ -359,8 +360,8 @@ fn guest_drives_a_scripted_child_on_the_host_over_the_forwarded_lane() {
     // node 1 saying it will run node 0's work at all. Work admission landed in
     // "a host decides whose work it runs" (2026-07-26), which taught
     // `sched_pinned_run` to write this policy but not this suite — and this
-    // suite could not notice, because it was skipped for want of the podman
-    // sandbox tools and libtest counts a skip as `ok`. Without it the host
+    // suite could not notice, because it was skipped for want of the sandbox's
+    // host prerequisites and libtest counts a skip as `ok`. Without it the host
     // answers 502 `work_not_admitted`.
     //
     // Written as the FILE the operator (and `ducktape node work admit`)

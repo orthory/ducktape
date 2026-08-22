@@ -30,24 +30,60 @@ pub const MIN_WORKSPACE_BYTES: u64 = 32 * 1024 * 1024;
 /// cannot be salvaged by retrying, so it must fail at submit-adjacent time.
 pub const MAX_WORKSPACE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
-/// headroom multiplier over the measured tree: the guest WRITES into this
-/// image (that is the point), so it needs room for the run's output, not just
-/// its input.
+/// headroom multiplier over the measured tree, for an image the guest WRITES
+/// into: it needs room for the run's output, not just its input.
 const HEADROOM: u64 = 3;
 
-/// the image size for `workdir`: measured tree × [`HEADROOM`], floored at
+/// spare room over the measured tree for an image nothing writes into. Not
+/// headroom — ext4's own metadata (inodes, bitmaps, the journal) does not fit
+/// in the file bytes alone, and `mke2fs -d` fails with `No space left` if the
+/// image is sized at exactly the payload.
+const READ_ONLY_MARGIN_PERCENT: u64 = 20;
+
+/// the image size for a WRITABLE tree: measured × [`HEADROOM`], floored at
 /// [`MIN_WORKSPACE_BYTES`] and refused above [`MAX_WORKSPACE_BYTES`].
 pub fn sized_for(workdir: &Path) -> Result<u64, String> {
     let measured = tree_bytes(workdir)?;
-    size_or_refuse(measured.saturating_mul(HEADROOM).max(MIN_WORKSPACE_BYTES))
+    size_or_refuse(
+        "workspace",
+        workdir,
+        measured.saturating_mul(HEADROOM).max(MIN_WORKSPACE_BYTES),
+    )
+}
+
+/// the image size for a READ-ONLY tree: measured plus a metadata margin, and
+/// no headroom at all.
+///
+/// Tripling a read-only image was not merely wasteful — it decided runs. A
+/// run's read-only inputs are its PATH commands, and on a machine where those
+/// include a build directory they measure gigabytes; at ×3 the same tree
+/// crossed the cap and the run was REFUSED for a size two thirds of which was
+/// zeroes nothing could ever write to.
+pub fn sized_for_read_only(dir: &Path) -> Result<u64, String> {
+    let measured = tree_bytes(dir)?;
+    let margin = measured / 100 * READ_ONLY_MARGIN_PERCENT;
+    size_or_refuse(
+        "read-only inputs",
+        dir,
+        measured
+            .saturating_add(margin)
+            .max(MIN_WORKSPACE_BYTES),
+    )
 }
 
 /// the size decision alone, split out so the refusal is unit-testable without
 /// materialising gigabytes on disk.
-pub fn size_or_refuse(size: u64) -> Result<u64, String> {
+///
+/// `what` and `dir` are in the message because there are two images and one
+/// used to say "workspace" for both — sending a reader to inspect a 4 KiB
+/// workspace while the 3 GB asset tree that actually blew the cap went
+/// unnamed.
+pub fn size_or_refuse(what: &str, dir: &Path, size: u64) -> Result<u64, String> {
     if size > MAX_WORKSPACE_BYTES {
         return Err(format!(
-            "workspace needs {size} bytes of image, over the {MAX_WORKSPACE_BYTES}-byte cap"
+            "the {what} at {} need {size} bytes of image, over the \
+             {MAX_WORKSPACE_BYTES}-byte cap",
+            dir.display()
         ));
     }
     Ok(size)
@@ -146,10 +182,14 @@ pub fn build_assets(assets: &[GuestAsset], image: &Path, staging: &Path) -> Resu
         }
     }
 
-    let size = sized_for(staging)?;
-    build(staging, image, size)?;
+    // Removed on EVERY exit, not just the happy one. Staged inputs are a copy
+    // of what already exists elsewhere, and the tree runs to gigabytes when a
+    // PATH entry is a build directory — a `?` straight to the caller left one
+    // behind per failed run, and they accumulate under the run root until
+    // something notices the disk. Measured: 21 GB across one afternoon's runs.
+    let built = sized_for_read_only(staging).and_then(|size| build(staging, image, size));
     let _ = std::fs::remove_dir_all(staging);
-    Ok(())
+    built
 }
 
 /// one read-only input, and HOW MUCH of it crosses into the guest.
@@ -384,13 +424,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A workspace over the cap cannot be salvaged by retrying, so it is
-    /// refused before anything is materialised on disk.
+    /// A tree over the cap cannot be salvaged by retrying, so it is refused
+    /// before anything is materialised on disk — and the refusal NAMES which
+    /// of the run's two images it is about. There are two, they blow the cap
+    /// for entirely different reasons, and a message that said "workspace" for
+    /// both sent a reader to inspect a 4 KiB directory while the 3 GB asset
+    /// tree that actually refused went unnamed.
     #[test]
-    fn an_oversized_workspace_is_refused_before_any_image_exists() {
-        let refused = size_or_refuse(MAX_WORKSPACE_BYTES + 1).expect_err("must refuse");
+    fn an_oversized_tree_is_refused_before_any_image_exists_and_names_itself() {
+        let refused = size_or_refuse("read-only inputs", Path::new("/run/assets"), MAX_WORKSPACE_BYTES + 1)
+            .expect_err("must refuse");
         assert!(refused.contains("over the"), "{refused}");
-        size_or_refuse(MAX_WORKSPACE_BYTES).expect("the cap itself is allowed");
+        assert!(refused.contains("read-only inputs"), "names the tree: {refused}");
+        assert!(refused.contains("/run/assets"), "names the directory: {refused}");
+
+        size_or_refuse("workspace", Path::new("/run/ws"), MAX_WORKSPACE_BYTES)
+            .expect("the cap itself is allowed");
+    }
+
+    /// A read-only image gets a metadata margin, NOT the writable image's ×3.
+    ///
+    /// This decided real runs: a run's read-only inputs are its PATH commands,
+    /// and where those include a build directory they measure gigabytes. At ×3
+    /// the same tree crossed the cap and the run was refused over a size two
+    /// thirds of which was zeroes nothing could ever write to.
+    #[test]
+    fn a_read_only_image_is_not_sized_for_writes_that_cannot_happen() {
+        let root = scratch("ro-size");
+        // sparse and well over MIN_WORKSPACE_BYTES, so the FLOOR is not what
+        // either answer is — the measurement is. `tree_bytes` reads the logical
+        // length, so this costs no disk.
+        let payload: u64 = 512 * 1024 * 1024;
+        std::fs::File::create(root.join("blob"))
+            .expect("create")
+            .set_len(payload)
+            .expect("set_len");
+
+        let writable = sized_for(&root).expect("writable size");
+        let read_only = sized_for_read_only(&root).expect("read-only size");
+        assert_eq!(writable, payload * 3, "writable is measured × HEADROOM");
+        assert!(
+            read_only < writable,
+            "read-only {read_only} must be under writable {writable}"
+        );
+        assert!(
+            read_only >= payload,
+            "…but still hold the payload: {read_only} < {payload}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// An empty workspace still needs a journal, so the floor applies rather

@@ -450,13 +450,12 @@ impl NetworkShapeCluster {
     ///
     /// The daemon PROCESS is deliberately not spawned, and that is a SCOPING
     /// choice, not a limitation of the host: a daemon's entire contribution to
-    /// the announce lane is this POST, so booting a container runtime to prove
-    /// capability announcement buys no extra signal and couples this lane to
-    /// podman's availability and startup cost. What a real daemon would
-    /// additionally prove — that a REAL hello carries the shape this lane
-    /// expects — is a daemon-fixture concern, and it belongs in the dispatch
-    /// e2e (#826), which owns the `[sandbox]` fixture, the portable-podman
-    /// PATH, and the libpod pull-on-404 fix that lane actually needs.
+    /// the announce lane is this POST, so booting a sandbox to prove capability
+    /// announcement buys no extra signal and couples this lane to `/dev/kvm`
+    /// and the guest artifacts. What a real daemon would additionally prove —
+    /// that a REAL hello carries the shape this lane expects — is a
+    /// daemon-fixture concern, and it belongs in the dispatch e2e (#826), which
+    /// owns the `[sandbox]` fixture that lane actually needs.
     ///
     /// The FIRST hello is synchronous and asserted — that IS the readiness
     /// event; the refresh then rides a heartbeat thread like the daemon's.
@@ -1273,7 +1272,7 @@ impl Cluster {
     ///
     /// The compute plane is a SEPARATE PROCESS with its own failure domain, and
     /// without this the suite has no eye on it at all: a daemon that exits at
-    /// boot — an unconfigured `[sandbox]`, a podman it cannot probe, a hello that
+    /// boot — an unconfigured `[sandbox]`, a `/dev/kvm` it cannot open, a hello that
     /// raced its node — leaves a cluster that looks perfectly healthy, because
     /// the node is. The suite then waits out a three-minute convergence budget
     /// and fails on whatever unrelated predicate it happened to be holding,
@@ -1543,8 +1542,8 @@ pub fn http_text_request(port: u16, path: &str) -> (u16, String) {
 // compute daemon needs a `[sandbox]` table (without one the daemon exits at
 // boot) AND needs to know whether this host can honour it — and the two answers
 // have to agree. They were separately copied into two test binaries, which is
-// how one of them ended up gating on `podman version` while the other gated on
-// the product's own predicate.
+// how one of them ended up gating on a runtime's version string while the other
+// gated on the product's own predicate.
 
 /// the `[sandbox]` table a cluster node boots with. Appended LAST to
 /// [`Cluster::extra_toml`] — nothing may follow a toml table header.

@@ -382,7 +382,9 @@ struct MockUpstream {
 async fn mock_oauth(State(st): State<Arc<MockUpstream>>) -> Json<serde_json::Value> {
     let mut n = st.n.lock().unwrap();
     *n += 1;
-    Json(json!({ "access_token": format!("acc-{n}"), "refresh_token": format!("ref-{n}"), "expires_in": 3600 }))
+    Json(
+        json!({ "access_token": format!("acc-{n}"), "refresh_token": format!("ref-{n}"), "expires_in": 3600 }),
+    )
 }
 
 async fn mock_messages(
@@ -398,7 +400,11 @@ async fn mock_messages(
     if got != want {
         return (axum::http::StatusCode::UNAUTHORIZED, "bad upstream bearer").into_response();
     }
-    ([("content-type", "text/event-stream")], "data: AIRLOCK-OK\n\n").into_response()
+    (
+        [("content-type", "text/event-stream")],
+        "data: AIRLOCK-OK\n\n",
+    )
+        .into_response()
 }
 
 async fn bind_and_serve(app: Router) -> String {
@@ -500,7 +506,12 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
     cluster.submit(
         0,
         "gateway",
-        &gateway::encode_msg(&signed_airlock_route(&owner, &cluster.namespace, &owner_node, 1)),
+        &gateway::encode_msg(&signed_airlock_route(
+            &owner,
+            &cluster.namespace,
+            &owner_node,
+            1,
+        )),
     );
     poll_until("airlock route revision 1", FINALIZE, || {
         (airlock_route_revision(&cluster, 1, owner.public_key().as_ref()) == Some(1)).then_some(())
@@ -564,7 +575,9 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
         &via_pre,
         &seal,
         "owner-claude-1",
-        WorkRef::Saga { saga_id: delegated.into() },
+        WorkRef::Saga {
+            saga_id: delegated.into(),
+        },
     )
     .expect("an ungranted executor draws on the SUBMITTER's grant for work it holds");
 
@@ -580,7 +593,9 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
         &via_pre,
         &seal,
         "owner-claude-1",
-        WorkRef::Saga { saga_id: owners_own.into() },
+        WorkRef::Saga {
+            saga_id: owners_own.into(),
+        },
     )
     .expect_err("a pointer to work this caller was not pinned to is no grant");
     assert!(
@@ -607,7 +622,9 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
         &via_pre,
         &seal,
         "owner-claude-1",
-        WorkRef::Saga { saga_id: names_another.into() },
+        WorkRef::Saga {
+            saga_id: names_another.into(),
+        },
     )
     .expect_err("work naming another credential entitles this session to nothing");
     assert!(
@@ -621,15 +638,19 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
     // permanent, unmetered draw the owner has nothing to revoke: the executor
     // holds no grant, so `user cred revoke` has no subject.
     cancel_saga(&cluster, 0, delegated);
-    poll_until("the delegated saga to reach a terminal status", FINALIZE, || {
-        saga_view(&cluster, 0, delegated).filter(|view| view.status.is_terminal())
-    });
+    poll_until(
+        "the delegated saga to reach a terminal status",
+        FINALIZE,
+        || saga_view(&cluster, 0, delegated).filter(|view| view.status.is_terminal()),
+    );
     let finished = open_session_as_node_1(
         &rt,
         &via_pre,
         &seal,
         "owner-claude-1",
-        WorkRef::Saga { saga_id: delegated.into() },
+        WorkRef::Saga {
+            saga_id: delegated.into(),
+        },
     )
     .expect_err("a finished run is not a standing licence");
     assert!(
@@ -676,7 +697,10 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
 
     // Compute resolves the name from committed state and pins its on-chain seal_pk.
     let record = query_credential(&cluster, 1, "owner-claude-1").expect("record");
-    assert_eq!(record.seal_pk, seal_pk, "the pinned seal_pk is the store's own key");
+    assert_eq!(
+        record.seal_pk, seal_pk,
+        "the pinned seal_pk is the store's own key"
+    );
 
     // Compute's browser-gateway origin base — the `via` a compute-side host posts
     // to (no Origin header ⇒ it passes the only guard).
@@ -707,7 +731,11 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
             .expect("proxied messages over overlay");
         (resp.status(), resp.text().await.unwrap())
     });
-    assert_eq!(reply.0, reqwest::StatusCode::OK, "granted overlay call: {reply:?}");
+    assert_eq!(
+        reply.0,
+        reqwest::StatusCode::OK,
+        "granted overlay call: {reply:?}"
+    );
     assert!(
         reply.1.contains("AIRLOCK-OK"),
         "the lent credential's reply must return over the overlay: {reply:?}"
@@ -723,7 +751,7 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
     // The runtime half — an ungranted node is refused by the real lender — ran
     // above, before the grant committed, in this same lane and with no sandbox,
     // as did delegation and all four of its negatives. What needs a real RUN, and
-    // therefore podman, is the end-to-end proof that the executing node's own
+    // therefore a real VM, is the end-to-end proof that the executing node's own
     // broker composes that pointer without being told to:
     // `sched_pinned_run::a_delegated_run_draws_on_the_submitters_grant`.
 

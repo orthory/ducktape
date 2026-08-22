@@ -396,9 +396,9 @@ fn run_node(
     // There is NO sandbox probe here any more, and its absence is the point:
     // this process runs nothing in a sandbox. Both planes that did — compute's
     // headless runs and agent's interactive ptys — are separate daemons that
-    // probe the runtime themselves before they signal, and start their own
-    // podman service before they serve. Probing here would have made a missing
-    // podman a fatal BOOT error on a node that never needed one.
+    // probe the runtime themselves before they signal. Probing here would have
+    // made a missing hypervisor, or a missing guest image, a fatal BOOT error
+    // on a node that never needed one.
 
     // THE MESH LISTENER, taken for a moment while a bind failure can still be
     // a sentence. Everything below this line runs inside commonware's runtime,

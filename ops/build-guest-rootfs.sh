@@ -73,10 +73,12 @@ unsquashfs -no-xattrs -quiet -force -dest "$TREE" "$BASE"
 
 # ---- 3. the init -----------------------------------------------------------
 INIT="$HERE/target/x86_64-unknown-linux-musl/release/duck-guest-init"
-if [[ ! -x "$INIT" ]]; then
-  say "building duck-guest-init (static musl)"
-  (cd "$HERE" && cargo build -p duck-guest-init --release --target x86_64-unknown-linux-musl)
-fi
+# ALWAYS, never "only if it is missing". cargo is already incremental, so this
+# costs nothing when the source has not moved — while skipping it on an
+# existing binary bakes a stale PID 1 into the image and the next boot silently
+# runs last week's init.
+say "building duck-guest-init (static musl)"
+(cd "$HERE" && cargo build -p duck-guest-init --release --target x86_64-unknown-linux-musl)
 install -m 0755 "$INIT" "$TREE/duck-guest-init"
 say "init: $(du -h "$TREE/duck-guest-init" | cut -f1) static"
 

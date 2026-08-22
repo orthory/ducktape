@@ -128,6 +128,11 @@ fn read_manifest() -> Result<RunManifest, String> {
 fn mount_base_filesystems() -> Result<(), String> {
     for (source, target, fstype) in [
         ("devtmpfs", "/dev", "devtmpfs"),
+        // AFTER devtmpfs, which lands over /dev and would bury it. An
+        // interactive run's pty slave is a node in here: without devpts,
+        // `ptsname` names a path that does not exist and the TUI never gets a
+        // terminal. Cheap enough to mount unconditionally.
+        ("devpts", "/dev/pts", "devpts"),
         ("proc", "/proc", "proc"),
         ("sysfs", "/sys", "sysfs"),
         ("tmpfs", "/tmp", "tmpfs"),
@@ -359,7 +364,74 @@ fn send(fd: RawFd, frame: &Frame) {
 // the run
 // ---------------------------------------------------------------------------
 
+/// run the child and carry its stdio to the host, either way it is wired.
+///
+/// The two shapes are genuinely different plumbing, not one with a flag: pipes
+/// give three descriptors and a separate stderr, a pty gives ONE bidirectional
+/// descriptor whose read end is stdout+stderr merged by the kernel. Only the
+/// tail — report the exit code, wait for the host to acknowledge — is shared,
+/// and it is shared HERE so neither path can forget it.
 fn exec_and_pump(manifest: &RunManifest, host: RawFd) -> Result<i32, String> {
+    let code = match manifest.pty {
+        true => run_on_pty(manifest, host)?,
+        false => run_on_pipes(manifest, host)?,
+    };
+    send(host, &Frame::Exit(code));
+    wait_for_host_close(host);
+    Ok(code)
+}
+
+/// the interactive shape: the child owns a pty slave as its controlling
+/// terminal, and this process holds the master.
+///
+/// The pty is allocated in the GUEST because a pty master and its slave are two
+/// ends of one kernel object — the host's kernel cannot hand a terminal to a
+/// process on another one. So the operator's keystrokes arrive as ordinary
+/// stdin frames and become terminal input here.
+fn run_on_pty(manifest: &RunManifest, host: RawFd) -> Result<i32, String> {
+    let (master, slave) = open_pty()?;
+    // A SANE INITIAL SIZE, before the child ever runs. A pty is created 0x0,
+    // and a TUI handed 0x0 draws nothing until its first resize — while the
+    // host's first `Resize` can easily arrive after the CLI has already
+    // painted. 80x24 is what every terminal assumes when it knows nothing.
+    resize_pty(master, 80, 24);
+
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        return Err(format!("fork: {}", std::io::Error::last_os_error()));
+    }
+    if child == 0 {
+        // ---- child: never returns ----
+        unsafe {
+            libc::close(master);
+            // A NEW SESSION FIRST. TIOCSCTTY only grants a controlling terminal
+            // to a session leader, and without a controlling terminal the TUI
+            // gets no SIGWINCH, no job control, and no ^C.
+            libc::setsid();
+            libc::ioctl(slave, libc::TIOCSCTTY, 0);
+            libc::dup2(slave, libc::STDIN_FILENO);
+            libc::dup2(slave, libc::STDOUT_FILENO);
+            libc::dup2(slave, libc::STDERR_FILENO);
+            if slave > libc::STDERR_FILENO {
+                libc::close(slave);
+            }
+        }
+        exec_child(manifest);
+    }
+
+    // the slave stays open in the CHILD only: holding a copy here would keep
+    // the master readable forever after the child exits, and the pump would
+    // never see the end of the session.
+    unsafe { libc::close(slave) };
+    pump_pty(host, master);
+    let code = wait_for(child);
+    unsafe { libc::close(master) };
+    Ok(code)
+}
+
+/// the headless shape: three pipes, stderr kept separate so the host can report
+/// a CLI's diagnostics apart from its answer.
+fn run_on_pipes(manifest: &RunManifest, host: RawFd) -> Result<i32, String> {
     let mut in_pipe = [0 as RawFd; 2];
     let mut out_pipe = [0 as RawFd; 2];
     let mut err_pipe = [0 as RawFd; 2];
@@ -395,10 +467,147 @@ fn exec_and_pump(manifest: &RunManifest, host: RawFd) -> Result<i32, String> {
         libc::close(err_pipe[1]);
     }
     pump(host, in_pipe[1], out_pipe[0], err_pipe[0]);
-    let code = wait_for(child);
-    send(host, &Frame::Exit(code));
-    wait_for_host_close(host);
-    Ok(code)
+    Ok(wait_for(child))
+}
+
+/// allocate a pty pair. `posix_openpt` + `grantpt` + `unlockpt` + `ptsname` is
+/// the portable four-step; the slave path it yields is a node under the devpts
+/// [`mount_base_filesystems`] mounted.
+fn open_pty() -> Result<(RawFd, RawFd), String> {
+    let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+    if master < 0 {
+        return Err(format!("posix_openpt: {}", std::io::Error::last_os_error()));
+    }
+    if unsafe { libc::grantpt(master) } != 0 {
+        unsafe { libc::close(master) };
+        return Err(format!("grantpt: {}", std::io::Error::last_os_error()));
+    }
+    if unsafe { libc::unlockpt(master) } != 0 {
+        unsafe { libc::close(master) };
+        return Err(format!("unlockpt: {}", std::io::Error::last_os_error()));
+    }
+    let mut name = [0 as libc::c_char; 128];
+    let rc = unsafe { libc::ptsname_r(master, name.as_mut_ptr(), name.len()) };
+    if rc != 0 {
+        unsafe { libc::close(master) };
+        return Err(format!(
+            "ptsname_r: {}",
+            std::io::Error::from_raw_os_error(rc)
+        ));
+    }
+    let slave = unsafe { libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+    if slave < 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(master) };
+        return Err(format!("open pty slave: {err}"));
+    }
+    Ok((master, slave))
+}
+
+/// carry the session between the pty master and the host until the child's side
+/// of the terminal closes.
+///
+/// ONE descriptor for both directions, which is the whole difference from
+/// [`pump`]: what the child writes comes back off the master, and what the host
+/// sends is written into it. Reading the master after the last slave closes
+/// gives EIO on Linux rather than EOF — that is the end of the session, not an
+/// error to report.
+fn pump_pty(host: RawFd, master: RawFd) {
+    let mut host_buf: Vec<u8> = Vec::new();
+    let mut fds = [
+        libc::pollfd {
+            fd: master,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: host,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        if rc < 0 {
+            let interrupted =
+                std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted;
+            if interrupted {
+                continue;
+            }
+            return;
+        }
+        for (slot, pollfd) in fds.iter_mut().enumerate() {
+            let retired = pollfd.fd < 0;
+            let ready = pollfd.revents & (libc::POLLIN | libc::POLLHUP) != 0;
+            if retired || !ready {
+                continue;
+            }
+            let n = unsafe { libc::read(pollfd.fd, buf.as_mut_ptr().cast(), buf.len()) };
+            let is_master = slot == 0;
+            if n > 0 {
+                match is_master {
+                    // a pty merges the child's stdout and stderr into one
+                    // stream — there is no second descriptor to tell them
+                    // apart, and a terminal never had them apart.
+                    true => send(host, &Frame::Stdout(buf[..n as usize].to_vec())),
+                    false => {
+                        host_buf.extend_from_slice(&buf[..n as usize]);
+                        feed_pty(&mut host_buf, master);
+                    }
+                }
+                continue;
+            }
+            // the master went quiet: the child closed its last slave
+            // descriptor, so the session is over whatever the host is doing.
+            if is_master {
+                return;
+            }
+            // the host stopped sending input. NOT the end of the run: the child
+            // keeps running and its exit code still has to go out on this same
+            // socket, so retire only this direction.
+            pollfd.fd = -1;
+        }
+    }
+}
+
+/// drain whole frames out of `buf` and apply them to the pty master.
+///
+/// A partial frame stays in the buffer for the next read.
+fn feed_pty(buf: &mut Vec<u8>, master: RawFd) {
+    loop {
+        let frame = match guest_proto::decode(buf) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => return,
+            Err(e) => {
+                let _ = writeln!(std::io::stderr(), "duck-guest-init: input frame: {e}");
+                return;
+            }
+        };
+        match frame {
+            Frame::Stdin(bytes) => write_all(master, &bytes),
+            // A TERMINAL HAS NO EOF TO CLOSE. The headless path closes the
+            // child's stdin here so a CLI blocking on EOF proceeds; doing that
+            // to a pty would tear down the session the operator is still
+            // typing into. `^D` is a byte on the Stdin lane like any other.
+            Frame::StdinEof => {}
+            Frame::Resize { cols, rows } => resize_pty(master, cols, rows),
+            // the host never sends these.
+            Frame::Stdout(_) | Frame::Stderr(_) | Frame::Exit(_) => {}
+        }
+    }
+}
+
+/// apply a window size to the pty. The kernel is what turns this into the
+/// SIGWINCH the TUI redraws on, so there is nothing to forward to the child.
+fn resize_pty(master: RawFd, cols: u16, rows: u16) {
+    let size = libc::winsize {
+        ws_col: cols,
+        ws_row: rows,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &size) };
 }
 
 /// block until the host closes the connection.
@@ -572,6 +781,9 @@ fn feed_stdin(buf: &mut Vec<u8>, stdin_fd: &mut RawFd) {
         match frame {
             Frame::Stdin(bytes) => write_all(*stdin_fd, &bytes),
             Frame::StdinEof => close_stdin(stdin_fd),
+            // a window size is a property of a terminal, and a headless run's
+            // stdin is a pipe. Nothing to apply it to.
+            Frame::Resize { .. } => {}
             // The host never sends these; ignoring them keeps a host-side bug
             // from taking the run down.
             Frame::Stdout(_) | Frame::Stderr(_) | Frame::Exit(_) => {}

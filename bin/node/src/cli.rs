@@ -396,9 +396,9 @@ fn cmd_keygen(args: KeyArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// the compute adapter as the `[sandbox]` table generation writes it (`0` =
 /// probe the host at boot) plus the probeable backend, so generation and
 /// detection share one choice. There is one adapter: the sandbox is Linux-only.
-/// `node init` writes the block commented out, so a host that cannot run podman
-/// gets the probe's loud error when an operator uncomments it, not a silent
-/// misconfiguration now.
+/// `node init` writes the block commented out, so a host that cannot run a
+/// microVM gets the probe's loud error when an operator uncomments it, not a
+/// silent misconfiguration now.
 fn platform_sandbox() -> (config::SandboxToml, provider_host::SandboxBackend) {
     // This only writes the default [sandbox] TOML at `node init`. The images
     // need not exist yet — `node init` runs before `ops/build-guest-rootfs.sh`
@@ -1594,6 +1594,47 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("{me_hex}");
     Ok(())
+}
+
+#[cfg(test)]
+mod sandbox_detection_tests {
+    use crate::config;
+
+    /// The table `node init` would write and the backend the probe would test
+    /// must name ONE runtime and ONE pair of images. They are produced together
+    /// by [`super::platform_sandbox`] precisely so a host can never be probed
+    /// for one thing and configured for another — a drift that would surface as
+    /// a boot error on a machine whose images are exactly where init said.
+    ///
+    /// This is the hermetic half of detection. The other half — a live table
+    /// actually landing in node.toml — is not fakeable and must not be: the
+    /// probe opens `/dev/kvm` and stats both images, so it answers about the
+    /// real host. `workspace_registry_cli` pins the outcome an unprovisioned
+    /// host gets.
+    #[test]
+    fn the_written_table_and_the_probed_backend_name_one_runtime() {
+        let (table, backend) = super::platform_sandbox();
+        let (kernel, rootfs) = match &backend {
+            provider_host::SandboxBackend::Firecracker { kernel, rootfs } => (kernel, rootfs),
+            // `Bare` exists only when provider-host is built with its testkit
+            // feature, which cargo's feature unification can switch on from
+            // another crate in the same invocation. So this arm has to exist
+            // without being required — hence the allow, not a `#[cfg]` (the
+            // feature belongs to a DIFFERENT crate and is not nameable here).
+            #[allow(unreachable_patterns)]
+            other => panic!("the Linux adapter is Firecracker, got {other:?}"),
+        };
+        assert_eq!(table.runtime, "firecracker");
+        assert_eq!((&table.kernel, &table.rootfs), (kernel, rootfs));
+
+        let guest = std::path::Path::new(config::DEFAULT_GUEST_DIR);
+        assert_eq!(table.kernel, guest.join("vmlinux"));
+        assert_eq!(table.rootfs, guest.join("rootfs.ext4"));
+
+        // `0` is "probe the host at boot", not "no cores" — a written table
+        // must not pin this box's CPU/RAM into a config that travels.
+        assert_eq!((table.cores, table.mem_gb), (0, 0));
+    }
 }
 
 #[cfg(test)]

@@ -13,18 +13,17 @@
 //! dotfiles. that is still the floor, but a spec can now do better, and the two
 //! options are mutually exclusive by construction (see [`spec`]):
 //!
-//!   * `[isolation]` — the STRONG path. the HOST reads the credential and holds
+//!   * `[isolation]` — the only path. the HOST reads the credential and holds
 //!     it in this process; a per-run loopback [`broker`] serves the model API
 //!     and the child gets only an opaque bearer plus a FRESH, empty config home
 //!     (so the CLI cannot fall back to reading the operator's real one). the
-//!     credential never enters the child's process tree at all. codex is here.
-//!   * `[sandbox] rw_dirs` — the WEAK path, for a CLI with no broker: its auth
-//!     dir crosses into the sandbox and the credential DOES enter the child.
-//!     claude is here, until an Anthropic-side broker exists.
+//!     credential never enters the child's process tree at all. codex and
+//!     claude are both here. There is no second path: a run has no host
+//!     filesystem to mount an auth dir from.
 //!
-//! orthogonally, [`SandboxBackend`] decides HOW the child is spawned (a
-//! resource-capped Podman container — never bare on the host).
-//! the two compose: codex under Podman gets the broker AND the jail.
+//! orthogonally, [`SandboxBackend`] decides HOW the child is spawned (its own
+//! Firecracker microVM — never bare on the host).
+//! the two compose: codex in a microVM gets the broker AND the jail.
 //!
 //! ## executors are data: the capability spec
 //!
@@ -68,8 +67,8 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 const HARD_TIMEOUT_FACTOR: u32 = 36;
 
 /// how long a cancelled child process group gets to handle SIGTERM before the
-/// host escalates to SIGKILL. Podman gets the same budget for each targeted
-/// stop/wait operation; every cleanup command is itself kill-on-drop.
+/// host escalates to SIGKILL. A microVM needs no such budget — the VMM is a
+/// child of this process and `kill_on_drop` takes the whole guest with it.
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 /// how often the teardown paths re-check whether a process or process group is
 /// gone. Nothing to do with any particular runtime — it is the granularity of
@@ -131,8 +130,12 @@ const PROVIDER_CONTROL_TOKEN_ENV: &str = "DUCKTAPE_PROVIDER_CONTROL_TOKEN";
 /// env and must actively remove them (which is exactly what the tests pin).
 /// covers both the OpenAI (codex) and Anthropic (claude) upstreams.
 #[cfg(any(test, feature = "testkit"))]
-const UPSTREAM_CREDENTIAL_ENV: [&str; 4] =
-    ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"];
+const UPSTREAM_CREDENTIAL_ENV: [&str; 4] = [
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+];
 
 /// the `-c` overrides that aim a codex invocation at this run's loopback broker:
 /// the model-provider block (base URL + [`BROKER_TOKEN_ENV`] bearer, retries
@@ -261,11 +264,11 @@ pub struct RunContext {
     pub run_key: Option<String>,
     /// host-local cancellation for this live run. `None` = the run cannot be
     /// cancelled (runs to completion); cancelling the token terminates the
-    /// provider process tree and any managed Podman container.
+    /// provider process tree and any live microVM.
     pub cancellation: Option<RunCancellation>,
-    /// canonical [`execution_node_id`] of the node running this attempt.
-    /// Podman requires it so lifecycle cleanup can never
-    /// cross into another Ducktape node sharing the same rootless user.
+    /// canonical [`execution_node_id`] of the node running this attempt. It
+    /// names the run's directories, so two Ducktape nodes sharing one user
+    /// never collide on a run's images or its vsock socket.
     pub executing_node: Option<String>,
     /// an already-materialized workspace this specific run must execute in.
     /// set only by the provisioning wrapper (`compute-service::bind_workspace`)
@@ -282,9 +285,9 @@ pub struct RunContext {
     pub path_entries: Vec<PathBuf>,
     /// the run's numeric resource demands (`ExecJob.demands`), keyed by
     /// dimension (`cores`, `mem_gb`, ...). the pool fills this before
-    /// `provider.run`; under a `Podman` backend the dimensions this backend
-    /// knows how to enforce become container limit flags, the rest are inert
-    /// (scheduling already matched them). Default empty.
+    /// `provider.run`; `cores` and `mem_gb` become the VM's machine config and
+    /// are REQUIRED (a VM is built at a size), the rest are inert (scheduling
+    /// already matched them). Default empty.
     pub limits: BTreeMap<String, u64>,
     /// the run's assembled context document — the agent's curated skills, built
     /// into ONE markdown doc by the provisioner (the "soul"). ONE assembly, TWO
@@ -381,10 +384,10 @@ pub trait Provider: Send + Sync {
             .map(|text| ProviderOutput { text, usage: None })
     }
     /// spawn an INTERACTIVE, pty-backed session driving this executor's TUI (see
-    /// [`crate::interactive`]). The default refuses — only a spec with an
-    /// `[interactive]` argv on a Podman backend supports it; everything else
-    /// keeps the historical headless-only surface. `restricted` selects the
-    /// read-only, non-prompting argv for a SHARED (command-lane) session.
+    /// [`crate::interactive`]). The default refuses; a spec with an
+    /// `[interactive]` argv supports it, and the pty itself is allocated inside
+    /// the guest by `duck-guest-init`. `restricted` selects the read-only,
+    /// non-prompting argv for a SHARED (command-lane) session.
     #[cfg(unix)]
     async fn spawn_interactive(
         &self,
@@ -464,10 +467,6 @@ impl ProviderSet {
     }
 }
 
-/// a sandbox backend's env overlay (`(key, value)` pairs) plus the spec's
-/// `~/`-relative rw mount dirs expanded to absolute host paths.
-type SandboxEnvRw = (Vec<(String, String)>, Vec<PathBuf>);
-
 /// everything one run hands its child so the CLI can authenticate WITHOUT the
 /// operator's credential — both `None` for a plain BYO spec (no `[isolation]`),
 /// which is the historical posture and still the default.
@@ -523,6 +522,26 @@ pub(crate) struct CliProvider {
     /// discovery, so a compute daemon and (later) an agent daemon sharing one
     /// node each reap only their own.
     managed_owner: String,
+}
+
+/// how the GUEST wires the child's stdio. Chosen by the caller of
+/// [`CliProvider::microvm_boot`], since it is the difference between the two
+/// kinds of run rather than a property of the executor.
+///
+/// A pty cannot come from the host: a master and its slave are two ends of one
+/// kernel object, and the guest runs on a different kernel. So this crosses in
+/// the manifest and `duck-guest-init` is what allocates one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GuestStdio {
+    /// three pipes, stderr kept separate — a headless run's answer and its
+    /// diagnostics are different things, and the caller reports them
+    /// differently.
+    Pipes,
+    /// one pty. A CLI that finds no terminal on its stdout draws nothing, or
+    /// refuses outright, so this is what makes a TUI session possible at all.
+    /// stderr arrives merged into stdout, the way a terminal has always
+    /// delivered it.
+    Pty,
 }
 
 impl CliProvider {
@@ -581,7 +600,6 @@ impl CliProvider {
         auth: &RunAuth<'_>,
     ) -> Result<tokio::process::Command, String> {
         self.prepared_command(args, workdir, ctx, auth)
-            .map(|prepared| prepared.command)
     }
 
     // in a non-test build only the two error arms remain, so the inputs the Bare
@@ -593,7 +611,7 @@ impl CliProvider {
         workdir: &Path,
         ctx: &RunContext,
         auth: &RunAuth<'_>,
-    ) -> Result<PreparedCommand, String> {
+    ) -> Result<tokio::process::Command, String> {
         // Only the Bare test harness reaches here now: a microVM is booted in
         // [`Self::invoke`], before this seam. (`args`/`ctx`/`auth` are consumed
         // only by the Bare arm, so in a non-test build they are legitimately
@@ -612,7 +630,7 @@ impl CliProvider {
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .kill_on_drop(true);
-                Ok(PreparedCommand { command })
+                Ok(command)
             }
         }
     }
@@ -621,10 +639,10 @@ impl CliProvider {
     /// with the spec's argv and an ADDITIVE env overlay (the inherited
     /// environment plus this run's scoped `ctx.env` / PATH bindings, plus
     /// [`Self::apply_auth_env`]). exists so the run loop's env/auth/session
-    /// contracts stay unit-testable without a container runtime; a shipped
-    /// binary has no bare spawn — the sandbox backend (fresh mount namespace,
-    /// only the spec's `[sandbox] rw_dirs` under HOME) is the D7 isolation
-    /// mechanism on every real node.
+    /// contracts stay unit-testable without a hypervisor; a shipped binary has
+    /// no bare spawn — the microVM backend (its own kernel, its own
+    /// filesystem, nothing of the host's) is the D7 isolation mechanism on
+    /// every real node.
     #[cfg(any(test, feature = "testkit"))]
     fn bare_command(
         &self,
@@ -674,6 +692,7 @@ impl CliProvider {
         workdir: &Path,
         ctx: &RunContext,
         auth: &RunAuth<'_>,
+        stdio: GuestStdio,
     ) -> Result<(microvm::MicroVm, microvm::MicroVmIo), String> {
         // one discriminant, one match, no wildcard: `Bare` exists only in
         // test/testkit builds, so a `let ... else` here is irrefutable in a
@@ -686,7 +705,7 @@ impl CliProvider {
             }
         };
 
-        let (envs, _rw_dirs) = self.sandbox_env_and_rw(ctx, auth)?;
+        let envs = self.sandbox_env(ctx, auth)?;
         let workdir = canonical_mount_path(workdir, "microVM workdir")?;
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -728,10 +747,9 @@ impl CliProvider {
             .collect();
         let manifest_argv = guest_argv(&self.bin, args, &layout);
 
-        // THE paid-execution guard. Checked before the VM is booted rather than
-        // after: unlike podman's `create` there is no pull to outlive a lease,
-        // so the check has nothing to race and belongs at the last moment
-        // before anything is spent.
+        // THE paid-execution guard, at the last moment before anything is
+        // spent. There is no pull or create step here to race — booting the VM
+        // IS the spend — so the check belongs immediately in front of it.
         let cancelled = ctx
             .cancellation
             .as_ref()
@@ -743,7 +761,10 @@ impl CliProvider {
             ));
         }
 
-        let run_dir = microvm_run_dir(ctx)?;
+        // ONE slot for both directories, drawn per boot: they are two halves of
+        // the same run's scratch and are removed together when the VM drops.
+        let slot = run_slot();
+        let run_dir = microvm_run_dir(&slot)?;
         let vm_config = firecracker_api::VmConfig {
             kernel: kernel.clone(),
             rootfs: rootfs.clone(),
@@ -753,7 +774,7 @@ impl CliProvider {
             workspace: run_dir.join("workspace.ext4"),
             vcpus: vm_cores(&ctx.limits)?,
             mem_mib: vm_mem_mib(&ctx.limits)?,
-            vsock_uds: microvm_socket(ctx)?,
+            vsock_uds: microvm_socket(&slot)?,
             // no tap: the guest reaches this node's broker over vsock and needs
             // no interface. See the spec's egress section.
             tap: None,
@@ -783,28 +804,30 @@ impl CliProvider {
             cwd: guest_workdir.display().to_string(),
             mounts: firecracker_api::manifest_mounts(&vm_config),
             tunnel_ports,
+            pty: stdio == GuestStdio::Pty,
         };
 
         microvm::MicroVm::boot(&run_dir, &workdir, &assets, &vm_config, &manifest).await
     }
 
-    /// the env carried into a sandbox + the spec's `~/` rw_dirs expanded against
-    /// $HOME at their identical host paths. the CLI's auth dotfiles ride a SET
-    /// HOME (so the CLI finds them at their mounted paths) while deliberately
-    /// NOT carrying the node's ambient secrets; $HOME itself is never mounted
-    /// (D7). $HOME unset is a loud error, not a silent unsandboxed fallback.
+    /// the env carried into a sandbox.
+    ///
+    /// `HOME` is carried as the HOST's home path and then rewritten to the
+    /// guest's fixed home by [`GuestLayout`] — the host directory itself never
+    /// crosses (D7). $HOME unset is a loud error, not a silent unsandboxed
+    /// fallback.
     ///
     /// this env is an ALLOWLIST — a sandboxed child inherits nothing it is not
     /// handed here — so a broker's upstream credential vars are excluded by
     /// simply never being added, with no subtraction step to forget.
-    fn sandbox_env_and_rw(
+    fn sandbox_env(
         &self,
         ctx: &RunContext,
         auth: &RunAuth<'_>,
-    ) -> Result<SandboxEnvRw, String> {
+    ) -> Result<Vec<(String, String)>, String> {
         let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
             format!(
-                "{}: a sandbox backend needs $HOME set to mount the CLI's auth dirs",
+                "{}: a sandbox backend needs $HOME set to anchor the guest's home",
                 self.spec.tag
             )
         })?;
@@ -828,28 +851,7 @@ impl CliProvider {
             envs.push((key.clone(), value));
         }
         self.apply_auth_env(auth, |k, v| envs.push((k.to_string(), v)))?;
-        // spec.rs already rejected absolute / `..` entries, so join is safe.
-        let rw_dirs: Vec<PathBuf> = self
-            .spec
-            .rw_dirs
-            .iter()
-            .map(|d| {
-                let path = home.join(d.strip_prefix("~/").unwrap_or(d));
-                std::fs::create_dir_all(&path).map_err(|error| {
-                    format!("create sandbox writable mount {}: {error}", path.display())
-                })?;
-                let resolved = canonical_mount_path(&path, "sandbox writable mount")?;
-                if resolved != path {
-                    return Err(format!(
-                        "sandbox writable mount {} resolves to {}; symlinked auth mounts are refused",
-                        path.display(),
-                        resolved.display()
-                    ));
-                }
-                Ok(resolved)
-            })
-            .collect::<Result<_, _>>()?;
-        Ok((envs, rw_dirs))
+        Ok(envs)
     }
 
     /// the paths mounted READ-ONLY into a sandbox: the run's PATH entries (its
@@ -1083,9 +1085,9 @@ impl CliProvider {
     /// rather than provenance — this deliberately does NOT claim the workdir's
     /// contents are safe:
     ///
-    /// - The child never runs on the host. `[sandbox] runtime` is `podman` and
-    ///   there is no second arm, so the blast radius of "trusted" is a
-    ///   container this run created and destroys.
+    /// - The child never runs on the host. `[sandbox] runtime` is
+    ///   `firecracker` and there is no second arm, so the blast radius of
+    ///   "trusted" is a guest this run booted and destroys.
     /// - That sandbox has a private netns and an egress allowlist (broker +
     ///   node RPC + public), so a project hook reaches nothing the run was not
     ///   already given.
@@ -1102,8 +1104,8 @@ impl CliProvider {
     ///
     /// Keyed on the GUEST path, which is why this is not folded into
     /// [`Self::prepare_config_home`]: the key is the cwd the executor actually
-    /// starts in, and that path is backend-specific (`/ducktape/workspace` for
-    /// podman) — so a value decided once at config-home time could be stale for
+    /// starts in, and that path is the GUEST's (`/duck/workspace`), not the
+    /// host's — so a value decided once at config-home time could be stale for
     /// a later invocation of the same run. It MERGES, so each spawn adds its
     /// own key and none of them fight.
     fn trust_guest_workdir(&self, auth: &RunAuth<'_>, guest_workdir: &Path) -> Result<(), String> {
@@ -1170,8 +1172,7 @@ impl CliProvider {
     /// broker (codex: an opaque model bearer + its separately-scoped
     /// provider-control capability; claude: ANTHROPIC_BASE_URL + a `claudeAiOauth`
     /// credentials file seeded into the config home). `set` is how the caller
-    /// applies one binding — the Podman process environment behind a value-free
-    /// `-e K`.
+    /// applies one binding — the guest manifest's `env` list.
     ///
     /// NOTE what is NOT here: the REAL credential. that is the whole point — the
     /// host holds it and the broker spends it. what the child gets is only the
@@ -1229,7 +1230,11 @@ impl CliProvider {
                 })
                 .to_string();
                 std::fs::write(&creds, blob).map_err(|e| {
-                    format!("{}: write claude credentials {}: {e}", self.spec.tag, creds.display())
+                    format!(
+                        "{}: write claude credentials {}: {e}",
+                        self.spec.tag,
+                        creds.display()
+                    )
                 })?;
                 // 0600: a credentials file, even one holding only the throwaway
                 // loopback bearer (owner-only, as the old ANTHROPIC_AUTH_TOKEN env
@@ -1302,7 +1307,8 @@ impl CliProvider {
     }
 
     /// the run-scoped PATH: `ctx.path_entries` prepended to the inherited PATH,
-    /// or `None` when the run adds no entries. Podman exports it via `-e PATH`;
+    /// or `None` when the run adds no entries. The microVM carries it in the
+    /// guest manifest's env, translated to the guest's own asset mountpoints;
     /// the test-only bare harness sets it as the child's PATH env.
     fn run_path(&self, ctx: &RunContext) -> Result<Option<OsString>, String> {
         if ctx.path_entries.is_empty() {
@@ -1492,8 +1498,8 @@ fn guest_argv(bin: &Path, args: &[String], layout: &GuestLayout) -> Vec<String> 
 /// whole 9.1 GB of it and died with `No space left on device` — with the node's
 /// memory as the thing consumed. Only the socket belongs there; see
 /// [`microvm_socket`].
-fn microvm_run_dir(ctx: &RunContext) -> Result<PathBuf, String> {
-    let dir = std::env::temp_dir().join(format!("dt-vm-{:016x}", run_tag(ctx)));
+fn microvm_run_dir(slot: &str) -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join(format!("dt-vm-{slot}"));
     std::fs::create_dir_all(&dir).map_err(|e| format!("create run dir {}: {e}", dir.display()))?;
     Ok(dir)
 }
@@ -1506,38 +1512,40 @@ fn microvm_run_dir(ctx: &RunContext) -> Result<PathBuf, String> {
 /// long home blows straight through the cap, and the failure is
 /// `path must be shorter than SUN_LEN` at bind time — after the images have
 /// already been built.
-fn microvm_socket(ctx: &RunContext) -> Result<PathBuf, String> {
+fn microvm_socket(slot: &str) -> Result<PathBuf, String> {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    let dir = base.join(format!("dt-vm-{:016x}", run_tag(ctx)));
+    let dir = base.join(format!("dt-vm-{slot}"));
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("create socket dir {}: {e}", dir.display()))?;
     Ok(dir.join("v.sock"))
 }
 
-/// FNV over the run's identity: short, fixed width, and collision-avoidance
-/// between concurrent runs is all it has to do.
-fn run_tag(ctx: &RunContext) -> u64 {
-    let mut tag: u64 = 0xcbf2_9ce4_8422_2325;
-    let identity = format!(
-        "{}-{}",
-        ctx.executing_node.as_deref().unwrap_or("node"),
-        ctx.run_key.as_deref().unwrap_or("run")
-    );
-    for byte in identity.as_bytes() {
-        tag ^= u64::from(*byte);
-        tag = tag.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    tag
+/// this run's directory name, DRAWN FRESH — never derived from the run's
+/// coordinates.
+///
+/// It used to be an FNV hash of `(executing_node, run_key)`, which reads like
+/// collision avoidance and is the opposite: `run_key` is optional, so every
+/// keyless run on a node hashed to the SAME name. Two concurrent ones then
+/// shared one directory and overwrote each other's workspace image, asset image
+/// and manifest — and once the directory is cleaned up on teardown, the first to
+/// finish deletes the images out from under the other's live VM.
+///
+/// 8 bytes, hex: the same 16 characters the hash occupied, so the socket path
+/// underneath stays the same length and the `SUN_LEN` budget is unchanged.
+fn run_slot() -> String {
+    let mut slot = [0u8; 8];
+    rand::rngs::OsRng.fill_bytes(&mut slot);
+    slot.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// the run's vcpu count.
 ///
 /// A VM has no "unlimited": every VM is given a size at configuration time, so
 /// a missing dimension is a config error rather than a value to guess from
-/// probed host totals. Under podman an absent key meant an unlimited run; that
-/// state is unrepresentable here and must not be silently invented.
+/// probed host totals. Under a container an absent key meant an unlimited run;
+/// that state is unrepresentable here and must not be silently invented.
 fn vm_cores(limits: &BTreeMap<String, u64>) -> Result<u32, String> {
     let cores = limits.get("cores").copied().ok_or_else(|| {
         "a microVM run needs an explicit `cores` limit; a VM has no unlimited size".to_string()
@@ -1583,12 +1591,6 @@ impl Drop for ContextGuard {
             );
         }
     }
-}
-
-/// A prepared provider command plus the host-only Podman identity needed to
-/// stop the exact container if this invocation is cancelled.
-struct PreparedCommand {
-    command: tokio::process::Command,
 }
 
 /// the TCP port in an `http://host:port/...` URL, if any — the egress firewall
@@ -1810,8 +1812,8 @@ async fn wait_owned_child_complete(
 /// ignored TERM. A SIGKILLed leader is always waited before return: a zombie is
 /// therefore reaped, while an uninterruptible D-state leader intentionally
 /// keeps this future (and its resource reservation) pending fail-closed. This is
-/// the local-child (Bare test harness) path; a Podman run is killed + removed over
-/// its socket (see [`RunControl::terminate`]), never here.
+/// the local-child (Bare test harness) path; a microVM run is killed by
+/// dropping its VMM (see [`RunControl::terminate`]), never here.
 async fn terminate_child(
     child: &mut tokio::process::Child,
     process_group: Option<u32>,
@@ -2113,9 +2115,9 @@ impl Drop for LiveChild {
 }
 
 /// how [`CliProvider::invoke`] waits for and tears down a run, unifying the two
-/// backends: a `Local` child (the Bare test harness), reaped through
-/// its process group; or a `Container` driven over the podman socket, waited and
-/// removed through the libpod API. The output loop drives whichever one this is
+/// backends: a `Local` child (the Bare test harness), reaped through its
+/// process group; or a `MicroVm`, waited on the guest's own exit frame and
+/// torn down by dropping its VMM. The output loop drives whichever one this is
 /// identically.
 enum RunControl {
     Local(LiveChild),
@@ -2313,7 +2315,9 @@ impl CliProvider {
             RunControl,
         ) = if matches!(self.backend, SandboxBackend::Firecracker { .. }) {
             let final_args = self.broker_argv(args, workdir, &auth);
-            let (vm, io) = self.microvm_boot(&final_args, workdir, ctx, &auth).await?;
+            let (vm, io) = self
+                .microvm_boot(&final_args, workdir, ctx, &auth, GuestStdio::Pipes)
+                .await?;
             (
                 Box::new(io.stdin),
                 Box::new(io.stdout),
@@ -2326,7 +2330,7 @@ impl CliProvider {
                 }),
             )
         } else {
-            let mut command = self.prepared_command(args, workdir, ctx, &auth)?.command;
+            let mut command = self.prepared_command(args, workdir, ctx, &auth)?;
             command
                 .current_dir(workdir)
                 .stdin(Stdio::piped())
@@ -3166,10 +3170,9 @@ format = "{format}"
         sh_provider(mock_spec(tag, tag, format), script, wd)
     }
 
-    /// LIVE end-to-end through the REAL Podman socket path: build a provider
-    /// whose executor is a tiny shell script that echoes its stdin, run it in an
-    /// alpine container over the node-private socket, and confirm the prompt
-    /// comes back. Exercises the whole headless path — the workspace and asset
+    /// LIVE end-to-end on a real VMM: build a provider whose executor is `cat`,
+    /// boot a microVM for it, and confirm the prompt comes back the way it went
+    /// in. Exercises the whole headless path — the workspace and asset
     /// images, the boot config, the vsock stdio, the exit frame and the
     /// workspace read-back — against a real VMM.
     ///
@@ -3380,8 +3383,7 @@ format = "text"
 
     // ---- the credential broker ----------------------------------------------
 
-    /// a broker-backed spec: the strong auth path (and so, by the parse-time
-    /// invariant, NO `[sandbox] rw_dirs`).
+    /// a broker-backed spec: the only auth path there is.
     fn broker_spec(tag: &str) -> CapabilitySpec {
         CapabilitySpec::parse(
             &format!(
@@ -3602,9 +3604,7 @@ broker = "anthropic-messages"
             .insert(PROVIDER_CONTROL_URL_ENV.into(), "http://foreign".into());
         ctx.env
             .insert(PROVIDER_CONTROL_TOKEN_ENV.into(), "foreign-token".into());
-        let (envs, _) = provider
-            .sandbox_env_and_rw(&ctx, &RunAuth::default())
-            .unwrap();
+        let envs = provider.sandbox_env(&ctx, &RunAuth::default()).unwrap();
         assert!(envs.iter().all(|(key, _)| {
             key != PROVIDER_CONTROL_URL_ENV && key != PROVIDER_CONTROL_TOKEN_ENV
         }));
@@ -3684,29 +3684,29 @@ broker = "anthropic-messages"
         // nothing is trusted until a spawn names a cwd.
         assert!(read()["projects"].as_object().is_none_or(|p| p.is_empty()));
 
-        let podman = std::path::Path::new("/ducktape/workspace");
+        let guest_cwd = std::path::Path::new("/duck/workspace");
         provider
-            .trust_guest_workdir(&auth, podman)
-            .expect("the podman guest cwd is answerable");
+            .trust_guest_workdir(&auth, guest_cwd)
+            .expect("the guest cwd is answerable");
         assert_eq!(
-            read()["projects"]["/ducktape/workspace"]["hasTrustDialogAccepted"].as_bool(),
+            read()["projects"]["/duck/workspace"]["hasTrustDialogAccepted"].as_bool(),
             Some(true),
             "without this the TUI parks on the trust prompt with no error"
         );
 
         // a second spawn of the SAME run under a different guest cwd: the seed
         // must MERGE, not replace.
-        let second = std::path::Path::new("/ducktape/workspace-2");
+        let second = std::path::Path::new("/duck/workspace-2");
         provider
             .trust_guest_workdir(&auth, second)
             .expect("a second guest cwd is answerable too");
         let state = read();
         assert_eq!(
-            state["projects"]["/ducktape/workspace-2"]["hasTrustDialogAccepted"].as_bool(),
+            state["projects"]["/duck/workspace-2"]["hasTrustDialogAccepted"].as_bool(),
             Some(true)
         );
         assert_eq!(
-            state["projects"]["/ducktape/workspace"]["hasTrustDialogAccepted"].as_bool(),
+            state["projects"]["/duck/workspace"]["hasTrustDialogAccepted"].as_bool(),
             Some(true),
             "the earlier spawn's answer must survive the later one"
         );
@@ -3725,10 +3725,7 @@ broker = "anthropic-messages"
             SandboxBackend::Bare,
         );
         provider
-            .trust_guest_workdir(
-                &RunAuth::default(),
-                std::path::Path::new("/ducktape/workspace"),
-            )
+            .trust_guest_workdir(&RunAuth::default(), std::path::Path::new("/duck/workspace"))
             .expect("no config home is not an error");
     }
 
@@ -4873,9 +4870,8 @@ printf '%s\n' "$PATH"
 
     /// a run INHERITS the ambient `$HOME` — with or without a provisioned
     /// workspace mount — so the headless claude/codex CLI finds its BYO
-    /// credentials. This test covers the direct backend; Podman cross
-    /// the D7 filesystem boundary only through their explicit auth and
-    /// workspace mounts.
+    /// credentials. This test covers the bare test harness; a microVM run
+    /// crosses the D7 filesystem boundary only through its own block devices.
     #[tokio::test]
     async fn runs_inherit_the_ambient_home_for_byo_auth() {
         let dir = scratch("portable-home");
@@ -4898,14 +4894,14 @@ printf '%s\n' "$PATH"
         );
     }
 
-    /// The paid-execution guard must stay between `create` and `start`.
+    /// The paid-execution guard must stay in front of the boot.
     ///
     /// A source-parsing lint (the `clock_lint` shape) because the SHAPE is the
-    /// property and no unit test can reach the seam — it needs a live podman
-    /// socket. What matters is only that nothing can start a container after the
-    /// run's attempt was reassigned. Delete the check and this fails, which is
-    /// the whole job: the bug it prevents costs a second paid provider call and
-    /// leaves no trace in committed state.
+    /// property and no unit test can reach the seam — it needs `/dev/kvm` and
+    /// the guest artifacts. What matters is only that nothing can boot a VM
+    /// after the run's attempt was reassigned. Delete the check and this fails,
+    /// which is the whole job: the bug it prevents costs a second paid provider
+    /// call and leaves no trace in committed state.
     #[test]
     fn a_cancelled_attempt_can_never_boot_a_vm() {
         let src = include_str!("lib.rs");
@@ -4942,6 +4938,40 @@ printf '%s\n' "$PATH"
             "a host path in an argument is rewritten"
         );
         assert_eq!(argv.len(), 3);
+    }
+
+    /// Two runs never share a scratch directory, INCLUDING two runs that carry
+    /// no distinguishing coordinates at all.
+    ///
+    /// The name used to be an FNV hash of `(executing_node, run_key)`, which
+    /// looks like collision avoidance and is the opposite: `run_key` is
+    /// optional, so every keyless run on one node produced the SAME name. Two
+    /// concurrent ones overwrote each other's workspace image, asset image and
+    /// manifest; with the directory now removed on teardown, the first to
+    /// finish would delete the images out from under the other's live VM.
+    ///
+    /// The paths are also checked for LENGTH here, because the socket lives
+    /// under one: a unix socket path is capped near `SUN_LEN` (108) and
+    /// Firecracker appends `_<port>` to it.
+    #[test]
+    fn two_runs_never_share_a_scratch_directory() {
+        let slots: std::collections::BTreeSet<String> =
+            (0..64).map(|_| run_slot()).collect();
+        assert_eq!(slots.len(), 64, "every run draws its own slot");
+
+        for slot in &slots {
+            assert_eq!(slot.len(), 16, "the slot is 16 hex chars: {slot}");
+            let socket = microvm_socket(slot).expect("socket path");
+            let dialled = format!("{}_{}", socket.display(), 1024);
+            assert!(
+                dialled.len() < 108,
+                "the guest dials {dialled} ({} bytes), past SUN_LEN",
+                dialled.len()
+            );
+            if let Some(dir) = socket.parent() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
     }
 
     /// The full hardware path on a real VMM: a spec's argv and prompt reach a
@@ -5048,7 +5078,9 @@ format = "text"
     }
 
     async fn live_model_turn(tag: &str) {
-        let Some(set) = live_microvm_set() else { return };
+        let Some(set) = live_microvm_set() else {
+            return;
+        };
         let provider = match set.resolve(tag) {
             Ok(provider) => provider,
             Err(why) => {

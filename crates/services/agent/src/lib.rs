@@ -22,9 +22,9 @@
 //!
 //! What is left below the pty is exactly this crate: a provider set, a bounded
 //! map of live `InteractiveSession`s, one pump task each, and a wall-clock
-//! reaper. That is also precisely the podman-touching part, which is the point:
-//! after the carve the node process constructs no provider set, no
-//! `PodmanService` and no pty.
+//! reaper. That is also precisely the sandbox-touching part, which is the
+//! point: after the carve the node process constructs no provider set and no
+//! pty.
 //!
 //! ## the failure domain
 //!
@@ -78,8 +78,8 @@ struct Inner {
     /// optional: a daemon with no runnable sandbox refuses to start, so "no
     /// sandbox" is a state only the node can be in (no daemon attached).
     providers: ProviderSet,
-    /// this host's canonical execution id — podman lifecycle cleanup scopes
-    /// container reaping to it.
+    /// this host's canonical execution id — a run's directories are named from
+    /// it, so two nodes sharing one user never collide.
     executing_node: String,
     /// per-session workdirs are created under here (the provider mounts one rw
     /// into the container; the fresh mount namespace fences the rest off), and
@@ -192,7 +192,7 @@ enum Drive {
 }
 
 impl Sessions {
-    /// build the plane. `executing_node` is this host's podman lifecycle id and
+    /// build the plane. `executing_node` is this host's run-scoping id and
     /// `events` is the daemon's link to its node.
     pub fn new(
         providers: ProviderSet,
@@ -351,9 +351,9 @@ impl Sessions {
             .map_err(|detail| (wire::Refusal::SpawnFailed, detail))?;
         let ctx = RunContext {
             agent_id: Some(spec.provider.clone()),
-            // podman requires the executing-node id for lifecycle scoping.
+            // the executing-node id scopes this run's directories.
             executing_node: Some(self.0.executing_node.clone()),
-            // a fresh per-session workdir, mounted rw into the container and
+            // a fresh per-session workdir, carried into the sandbox rw and
             // removed when `home` drops.
             workdir_override: Some(home.path()),
             limits: spec.limits,
@@ -628,8 +628,8 @@ pub fn discover(
 mod tests {
     use super::*;
 
-    /// a provider that spawns a pty on a plain host `cat` — no podman, no
-    /// broker, no image — so the session LIFECYCLE (which is what owns the
+    /// a provider that spawns a pty on a plain host `cat` — no VM, no broker,
+    /// no guest image — so the session LIFECYCLE (which is what owns the
     /// workdir) is exercisable without a sandbox. `spawns = false` is the
     /// spawn-failure arm.
     struct StubProvider {

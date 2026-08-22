@@ -1393,9 +1393,8 @@ pub(crate) type Stop = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
 /// ordering that matters exists in ONE place: the handlers are installed before
 /// `body` is even constructed, which is what closes the window in which a
 /// default-disposition SIGTERM kills a daemon that has already published a
-/// gateway route or started a `podman system service`. That orphaned service
-/// child outlives its owner at ppid 1, still answering on its socket, with its
-/// containers still running — the defect this exists to prevent. Copying the
+/// gateway route — a route file outliving its owner, pointing at a port
+/// anything may then bind, is the defect this exists to prevent. Copying the
 /// ordering into three `serve` fns is how two of them drift; a body cannot get
 /// it wrong here, because it never touches it.
 ///
@@ -1428,19 +1427,14 @@ where
 
 /// Install the stop handlers NOW and return a future that waits on them: SIGTERM
 /// is what systemd and a killed shell send, SIGINT is Ctrl-C, and SIGHUP is a
-/// dropped ssh session or a closed terminal. SIGHUP must run the same teardown:
-/// the podman service child sits in its OWN process group (so Ctrl-C cannot kill
-/// it before the container sweep), which also means the terminal's HUP no longer
-/// reaches it — without this arm, a hangup would kill the daemon at default
-/// disposition and leave the detached podman running indefinitely.
+/// dropped ssh session or a closed terminal. All three run the same teardown —
+/// a daemon that dies at signal default leaves its published gateway route
+/// pointing at a port anything may then bind.
 ///
 /// The split matters. `signal()` installs the handler when it is CALLED; the
 /// future it returns only waits. Building that future lazily inside a `select!`
 /// would leave a window between the daemon publishing something and the first
-/// poll in which a SIGTERM takes its DEFAULT disposition — killing the process
-/// with a live gateway route pointing at a port anything may then bind, or with
-/// a `podman system service` child that survives at ppid 1 with its containers
-/// still running.
+/// poll in which a SIGTERM takes its DEFAULT disposition.
 ///
 /// It must also be called INSIDE a runtime: `signal()` PANICS outside a reactor
 /// rather than returning `Err`, so hoisting this out of
@@ -1448,27 +1442,22 @@ where
 /// compile-time complaint.
 ///
 /// SIGKILL is deliberately NOT covered, and cannot be: nothing runs on a
-/// `kill -9`, so the service child and its containers survive it. The answer
-/// there is the next start of the same kind — `PodmanService::claim` reaps the
-/// podman service recorded under a root nobody holds any more, and each daemon's
-/// boot sweep ([`Sweep::CrashOrphans`]) removes its label-scoped containers over
-/// the new socket on the same graph root. That path must keep working; it is the
-/// only one a SIGKILL has.
+/// `kill -9`. What survives it is only the route file, which the next start of
+/// the same kind reclaims. A run's guest does NOT survive it — the VMM is a
+/// child of this process, so the kernel takes it down with the daemon. That is
+/// the whole reason the container era's orphan sweep is gone rather than
+/// ported.
 ///
-/// A handler that will not install is NOT fatal, but it is not harmless either:
-/// the daemon then dies at signal default with no teardown, and because podman
-/// is in its own process group the service survives that death — the SIGKILL
-/// shape, cleaned up only by the next start of this kind ([`PodmanService::
-/// claim`]'s reap plus the boot sweep). The future parks so the daemon keeps
-/// owning the process.
+/// A handler that will not install is NOT fatal: the daemon then dies at signal
+/// default with no teardown, which is the SIGKILL shape above. The future parks
+/// so the daemon keeps owning the process.
 ///
 /// The other half is deliberately NOT closed, and should stay open: tokio's
 /// handlers remain installed after these `Signal`s drop, so a SECOND SIGTERM
 /// arriving during a teardown is swallowed and SIGKILL is the operator's only
-/// escape. A teardown is one file write or one container sweep — a hang there
-/// means an unwritable workspace or a wedged podman, which is the real problem —
-/// and a SIGTERM-count escalation is not worth its complexity. Do not "finish"
-/// this.
+/// escape. A teardown is one file write — a hang there means an unwritable
+/// workspace, which is the real problem — and a SIGTERM-count escalation is not
+/// worth its complexity. Do not "finish" this.
 fn arm_stop_requested() -> impl std::future::Future<Output = ()> {
     use tokio::signal::unix::{SignalKind, signal};
     let armed = (
@@ -2035,8 +2024,8 @@ mod tests {
     /// while the production ordering was broken.
     ///
     /// The body raises a REAL SIGTERM at this process the moment it starts, i.e.
-    /// at the first instant a daemon could have published a route or started a
-    /// `podman system service`. Delete the arming and the default disposition
+    /// at the first instant a daemon could have published a route or booted a
+    /// run's VM. Delete the arming and the default disposition
     /// ends the test binary right there; hoist it out of `block_on` and
     /// `signal()` panics for want of a reactor. It then returns only because the
     /// armed handler is WIRED into the stop the body was handed — `also_stop` is
@@ -2058,8 +2047,8 @@ mod tests {
 
     /// The shape, guarded where a comment cannot reach: every daemon must ENTER
     /// through [`serve_until_stopped`]. One that builds its own runtime again is
-    /// one whose `podman system service` outlives it at ppid 1 — and no test
-    /// above would notice, because the arming it skipped still works.
+    /// one whose gateway route outlives it — and no test above would notice,
+    /// because the arming it skipped still works.
     #[test]
     fn every_daemon_enters_through_the_one_armed_entry() {
         for (daemon, source) in [
