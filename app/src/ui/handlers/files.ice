@@ -14,7 +14,7 @@ on fs_open_dir(path)
   run replace lane=files_list files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
 
 on fs_open_parent
-  return if fs_loading || !connected || empty(fs_path)
+  return if fs_loading || !connected || fs_path == "/"
   invalidate lane=files_preview
   invalidate lane=files_diff
   fs_path = fs_parent(fs_path)

@@ -488,3 +488,14 @@ fn a_defaulted_node_facts_prints_as_unserved_everywhere() {
     // that a real `0` still prints `h 0`. Repeating it here would be
     // duplication wearing the costume of defence in depth.
 }
+
+/// The duckfs root is `/`, never "": the module's path check is `starts_with('/')`,
+/// so the crumb's "" root answered every root open with a 400.
+#[test]
+fn the_files_root_is_a_slash() {
+    assert_eq!(fs_parent("/shared".into()), "/");
+    assert_eq!(fs_parent("/".into()), "/");
+    assert_eq!(fs_parent("/shared/reports".into()), "/shared");
+    assert_eq!(fs_child("/".into(), "notes".into()), "/notes");
+    assert_eq!(fs_child("/shared".into(), "notes".into()), "/shared/notes");
+}

@@ -563,13 +563,11 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// A child path under the current directory.
+/// A child path under the current directory (`/` is the root, never "").
 pub fn fs_child(path: String, name: String) -> String {
     let name = name.trim().trim_matches('/');
-    if path.is_empty() {
-        return format!("/{name}");
-    }
-    format!("{path}/{name}")
+    let dir = path.trim_end_matches('/');
+    format!("{dir}/{name}")
 }
 
 /// Minimal base64 (standard alphabet, padded) — the files read lane's wire.
@@ -596,10 +594,11 @@ pub(crate) fn base64_decode(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// The breadcrumb path one level up ("" at the root).
+/// The breadcrumb path one level up. The root is `/` — duckfs only accepts
+/// absolute paths, and "" earned a 400 from the node on every root open.
 pub fn fs_parent(path: String) -> String {
     match path.rfind('/') {
-        Some(0) | None => String::new(),
+        Some(0) | None => "/".to_string(),
         Some(cut) => path[..cut].to_string(),
     }
 }
