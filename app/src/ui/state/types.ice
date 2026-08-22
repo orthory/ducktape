@@ -103,9 +103,12 @@ enum ShellTab
   governance
   settings
 
-enum ShellMode
-  raw
-  chat
+// The Shell tab's two SURFACES, not two modes: a durable task conversation and
+// an interactive terminal. Both can be live at once — the node holds a saga and
+// a pty session independently — so this only says which one is on screen.
+enum ShellSurface
+  tasks
+  terminal
 
 enum ForgeTab
   code

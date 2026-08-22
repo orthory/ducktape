@@ -875,7 +875,13 @@ on wall_tick
 // Node's expensive streams stay scoped to the operator pane that renders them.
 subscribe
   run live_events(connected_rpc) when connected -> live_updated _
-  agent_terminal_events(shell_terminal) when (connected && shell_tab == ShellTab.shell && shell_mode == ShellMode.raw && shell_terminal_running) -> shell_terminal_notice _
+  // A LIVE SESSION IS WATCHED WHEREVER THE OPERATOR IS. This used to be gated
+  // on the Shell tab being open AND its terminal surface being the one on
+  // screen, so a session that exited while the operator read the transcript
+  // kept its "running" dot lit until they navigated back. The session outlives
+  // the view — the pty is owned by `shell_terminal`, not by the widget — so the
+  // notice that says it ended has to as well.
+  agent_terminal_events(shell_terminal) when (connected && shell_terminal_running) -> shell_terminal_notice _
   // THE CALL SESSION IS THIS SUBSCRIPTION. Joining a huddle flips
   // `huddle_joined` and the media leg connects; leaving (or disconnecting)
   // stops the subscription, the stream drops, and the websocket + audio

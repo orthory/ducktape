@@ -59,8 +59,9 @@ extern crate::backend
   AgentCredentialsData(generation:i64, rows:[AgentCredential])
   AgentHostNode(key:str, label:str, providers:[str])
   AgentHostNodesData(generation:i64, rows:[AgentHostNode])
-  AgentChatEntry(id:i64, role:str, body:str, provider:str)
+  AgentIdentity(label:str, provider:str, credential:str)
   AgentActivity(id:i64, title:str, detail:str, status:str)
+  AgentChatEntry(id:i64, role:str, body:str, provider:str, status:str, saga_id:str, steps:[AgentActivity], steps_label:str)
   AgentChatEvent(id:i64, kind:str, title:str, detail:str, status:str, answer:str, saga_id:str)
   pure idle_agent_terminal() -> AgentTerminalSession
   start_agent_terminal(rpc:str, provider:str, credential:str, host_node:str) -> AgentTerminalStarted ! AppError
@@ -71,26 +72,36 @@ extern crate::backend
   subscription agent_terminal_events(session:AgentTerminalSession) -> AgentTerminalNotice
   load_agent_credentials(rpc:str, generation:i64) -> AgentCredentialsData ! HydrationError
   load_agent_host_nodes(rpc:str, generation:i64) -> AgentHostNodesData ! HydrationError
-  pure agent_credential_names(rows:[AgentCredential], provider:str) -> [str]
-  pure agent_credential_choice(rows:[AgentCredential], provider:str, current:str) -> str
-  pure agent_host_node_options(rows:[AgentHostNode]) -> [str]
+  pure agent_identities(rows:[AgentCredential]) -> [AgentIdentity]
+  pure agent_identity_options(rows:[AgentIdentity]) -> [str]
+  pure agent_identity_choice(rows:[AgentIdentity], current:str) -> str
+  pure agent_identity_provider(rows:[AgentIdentity], label:str) -> str
+  pure agent_identity_credential(rows:[AgentIdentity], label:str) -> str
+  pure agent_host_node_options(rows:[AgentHostNode], provider:str, credential:str) -> [str]
+  pure agent_host_node_choice(options:[str], current:str) -> str
   pure agent_host_node_key(rows:[AgentHostNode], option:str) -> str
+  pure agent_host_grant_note(host_node:str, credential:str) -> str
+  pure agent_run_line(identity:str, host_node:str) -> str
   pure agent_provider_label(provider:str) -> str
   pure agent_provider_initial(provider:str) -> str
-  pure agent_credential_caption(provider:str, credential:str) -> str
   pure agent_register_hint(provider:str) -> str
   pure agent_composer_hint(provider:str) -> str
+  pure agent_task_blurb(host_node:str) -> str
+  pure agent_terminal_note(provider:str, credential:str) -> str
+  pure agent_run_label(saga_id:str) -> str
   pure agent_chat_push_user(entries:[AgentChatEntry], body:str, provider:str) -> [AgentChatEntry]
-  pure agent_chat_finish(entries:[AgentChatEntry], body:str, provider:str) -> [AgentChatEntry]
+  pure agent_chat_answer(entries:[AgentChatEntry], body:str, provider:str, status:str, saga_id:str, steps:[AgentActivity]) -> [AgentChatEntry]
+  pure agent_chat_detach(entries:[AgentChatEntry], provider:str, saga_id:str, steps:[AgentActivity]) -> [AgentChatEntry]
+  pure agent_chat_drop_detached(entries:[AgentChatEntry]) -> [AgentChatEntry]
   pure agent_activity_apply(rows:[AgentActivity], event:AgentChatEvent) -> [AgentActivity]
   pure agent_event_status(current:str, event:AgentChatEvent) -> str
   pure agent_event_detail(current:str, event:AgentChatEvent) -> str
   pure agent_event_saga(current:str, event:AgentChatEvent) -> str
   pure agent_event_live(current:str, event:AgentChatEvent) -> str
-  pure agent_event_error(current:str, event:AgentChatEvent) -> str
   pure agent_event_busy(event:AgentChatEvent) -> bool
-  pure agent_event_entries(entries:[AgentChatEntry], event:AgentChatEvent, provider:str) -> [AgentChatEntry]
+  pure agent_event_entries(entries:[AgentChatEntry], event:AgentChatEvent, provider:str, saga_id:str, steps:[AgentActivity]) -> [AgentChatEntry]
   stream agent_chat_turn(rpc:str, provider:str, credential:str, host_node:str, entries:[AgentChatEntry]) -> AgentChatEvent
+  stream agent_chat_watch(rpc:str, provider:str, saga_id:str) -> AgentChatEvent
   OptimisticMutationError(message:str, committed:bool, operation_id:str, scope_id:str, thread_seq:i64, body:str)
   HydrationError(generation:i64, message:str)
   box-style raised_style()

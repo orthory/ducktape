@@ -262,9 +262,11 @@ view
         shell:
           ShellScreen draft<->shell_chat_draft #shell
             with
-              mode=shell_mode
+              surface=shell_surface
+              setup_open=shell_setup_open
+              identity_options=shell_identity_options
+              identity=shell_identity
               provider=shell_provider
-              credential_options=shell_credential_options
               credential=shell_credential
               host_node_options=shell_host_node_options
               host_node=shell_host_node
@@ -280,21 +282,25 @@ view
               chat_status=shell_chat_status
               chat_detail=shell_chat_detail
               live=shell_chat_live
-              chat_error=shell_chat_error
               saga_id=shell_chat_saga
+              steps_open=shell_steps_open
+              detached_saga=shell_detached_saga
               connected
               dark
             events
-              shell_mode_changed -> shell_mode_changed _
-              shell_provider_changed -> shell_provider_changed _
-              shell_credential_changed -> shell_credential_changed _
+              shell_surface_changed -> shell_surface_changed _
+              shell_setup_toggled -> shell_setup_toggled
+              shell_identity_changed -> shell_identity_changed _
               shell_host_node_changed -> shell_host_node_changed _
               shell_credentials_refresh -> shell_credentials_refresh
               shell_terminal_start -> shell_terminal_start
               shell_terminal_stop -> shell_terminal_stop
               shell_composer_event -> shell_composer_event _
               shell_chat_reset -> shell_chat_reset
-              shell_chat_suggest -> shell_chat_suggest _
+              shell_chat_detach -> shell_chat_detach
+              shell_chat_reopen -> shell_chat_reopen
+              shell_chat_discard -> shell_chat_discard
+              shell_chat_steps_toggled -> shell_chat_steps_toggled _
               shell_open_link -> open_message_link _
 
         pages:

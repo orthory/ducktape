@@ -37,8 +37,8 @@ preset ui_component_error
     error = "Connection failed"
 
 // A dense, settled turn for the inspector: it exercises the real Shell
-// composition, answer markdown, long transcript spacing, and credential footer
-// without spending a provider credential.
+// composition, answer markdown, long transcript spacing, and the composer's
+// disabled-reason line without spending a provider credential.
 preset ui_shell_showcase
   state
     shell_tab = ShellTab.shell
@@ -46,20 +46,23 @@ preset ui_shell_showcase
     loading = false
     mutation_phase = MutationPhase.idle
     error = ""
-    shell_mode = ShellMode.chat
+    shell_surface = ShellSurface.tasks
+    shell_identity = "team-codex · Codex"
     shell_provider = "codex"
-    shell_credential = ""
-    shell_chat_entries = agent_chat_finish(agent_chat_push_user([], "Explain the execution path and call out the failure boundaries.", "codex"), "## Execution path\n\nThe request becomes a durable saga, streams provider activity into this view, and commits the final answer before the turn settles.\n\n- **Scheduling** pins work to the selected compute provider.\n- **Live output** stays observational.\n- **Saga state** is the canonical result.", "codex")
+    shell_credential = "team-codex"
+    shell_chat_entries = agent_chat_answer(agent_chat_push_user([], "Explain the execution path and call out the failure boundaries.", "codex"), "## Execution path\n\nThe request becomes a durable saga, streams provider activity into this view, and commits the final answer before the turn settles.\n\n- **Scheduling** pins work to the selected compute provider.\n- **Live output** stays observational.\n- **Saga state** is the canonical result.", "codex", "done", "", [])
 
-test shell_chat_surface_contract
+test shell_task_surface_contract
   preset ui_shell_showcase
   viewport 1120 720
   mount
     ShellScreen draft<->shell_chat_draft #shell
       with
-        mode=shell_mode
+        surface=shell_surface
+        setup_open=shell_setup_open
+        identity_options=shell_identity_options
+        identity=shell_identity
         provider=shell_provider
-        credential_options=shell_credential_options
         credential=shell_credential
         host_node_options=shell_host_node_options
         host_node=shell_host_node
@@ -75,35 +78,121 @@ test shell_chat_surface_contract
         chat_status=shell_chat_status
         chat_detail=shell_chat_detail
         live=shell_chat_live
-        chat_error=shell_chat_error
         saga_id=shell_chat_saga
+        steps_open=shell_steps_open
+        detached_saga=shell_detached_saga
         connected=true
         dark=false
       events
-        shell_mode_changed -> shell_mode_changed _
-        shell_provider_changed -> shell_provider_changed _
-        shell_credential_changed -> shell_credential_changed _
+        shell_surface_changed -> shell_surface_changed _
+        shell_setup_toggled -> shell_setup_toggled
+        shell_identity_changed -> shell_identity_changed _
         shell_host_node_changed -> shell_host_node_changed _
         shell_credentials_refresh -> shell_credentials_refresh
         shell_terminal_start -> shell_terminal_start
         shell_terminal_stop -> shell_terminal_stop
         shell_composer_event -> shell_composer_event _
         shell_chat_reset -> shell_chat_reset
-        shell_chat_suggest -> shell_chat_suggest _
+        shell_chat_detach -> shell_chat_detach
+        shell_chat_reopen -> shell_chat_reopen
+        shell_chat_discard -> shell_chat_discard
+        shell_chat_steps_toggled -> shell_chat_steps_toggled _
         shell_open_link -> open_message_link _
   target transcript = #shell/root/transcript
   target composer = #shell/root/draft
+  target setup = #shell/root/setup
   expect exists transcript
   expect exists composer
   expect text "Execution path" within transcript
   expect transcript.width > 1000.0
-  capture shell_chat_light
-  dispatch shell_mode_changed(ShellMode.raw)
-  expect shell_mode == ShellMode.raw
+  // The setup is folded away once an identity is picked: the header's one
+  // summary line replaced the permanent four-control band.
+  expect missing setup
+  capture shell_tasks_light
+  dispatch shell_setup_toggled
+  expect exists setup
+  capture shell_setup_light
+  dispatch shell_setup_toggled
+  // A SWITCH IS NEVER REFUSED. This used to be gated on nothing running; the
+  // gate is gone, so the same dispatch lands whatever the tab is doing.
+  dispatch shell_surface_changed(ShellSurface.terminal)
+  expect shell_surface == ShellSurface.terminal
   expect missing transcript
-  capture shell_raw_light
+  capture shell_terminal_light
   resize 966 500
-  capture shell_raw_min_light
+  capture shell_terminal_min_light
+
+// The state the old screen could not represent at all: a run this app stopped
+// watching, which the node is still executing. The plate is the address back to
+// it, and the composer is held until the operator says which way that turn ends.
+preset ui_shell_detached
+  state
+    shell_tab = ShellTab.shell
+    connected = false
+    loading = false
+    mutation_phase = MutationPhase.idle
+    error = ""
+    shell_surface = ShellSurface.tasks
+    shell_identity = "team-codex · Codex"
+    shell_provider = "codex"
+    shell_credential = "team-codex"
+    shell_detached_saga = "sched-4f1c8a2b9d0e"
+    shell_chat_entries = agent_chat_detach(agent_chat_push_user([], "Rebuild the drain loop benchmark and report the regression.", "codex"), "codex", "sched-4f1c8a2b9d0e", [])
+
+test shell_detached_run_contract
+  preset ui_shell_detached
+  viewport 1120 720
+  mount
+    ShellScreen draft<->shell_chat_draft #shell
+      with
+        surface=shell_surface
+        setup_open=shell_setup_open
+        identity_options=shell_identity_options
+        identity=shell_identity
+        provider=shell_provider
+        credential=shell_credential
+        host_node_options=shell_host_node_options
+        host_node=shell_host_node
+        credentials_loading=shell_credentials_loading
+        terminal=shell_terminal
+        terminal_running=shell_terminal_running
+        terminal_busy=shell_terminal_busy
+        terminal_title=shell_terminal_title
+        terminal_error=shell_terminal_error
+        entries=shell_chat_entries
+        activity=shell_chat_activity
+        chat_busy=shell_chat_busy
+        chat_status=shell_chat_status
+        chat_detail=shell_chat_detail
+        live=shell_chat_live
+        saga_id=shell_chat_saga
+        steps_open=shell_steps_open
+        detached_saga=shell_detached_saga
+        connected=true
+        dark=false
+      events
+        shell_surface_changed -> shell_surface_changed _
+        shell_setup_toggled -> shell_setup_toggled
+        shell_identity_changed -> shell_identity_changed _
+        shell_host_node_changed -> shell_host_node_changed _
+        shell_credentials_refresh -> shell_credentials_refresh
+        shell_terminal_start -> shell_terminal_start
+        shell_terminal_stop -> shell_terminal_stop
+        shell_composer_event -> shell_composer_event _
+        shell_chat_reset -> shell_chat_reset
+        shell_chat_detach -> shell_chat_detach
+        shell_chat_reopen -> shell_chat_reopen
+        shell_chat_discard -> shell_chat_discard
+        shell_chat_steps_toggled -> shell_chat_steps_toggled _
+        shell_open_link -> open_message_link _
+  target transcript = #shell/root/transcript
+  expect exists transcript
+  expect text "Still running on the network" within transcript
+  capture shell_detached_light
+  // Discarding is what releases the composer, and it is the operator's call —
+  // never a side effect of typing.
+  dispatch shell_chat_discard
+  expect shell_detached_saga == ""
 
 test palette_escape_contract
   preset ui_palette_open
