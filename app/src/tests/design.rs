@@ -97,9 +97,12 @@ fn message_action_toolbar_stays_compact_and_accessible() {
     assert!(chat.contains("mouse press-at=chat_pointer_pressed"));
     // per-press, never per-move: a move= stream here rebuilds the view per pixel
     assert!(!chat.contains("mouse move="));
-    assert!(chat.contains(
-        "box w=fill h=fill pt=block_action_menu_y(chat_pointer_y, chat_height) align-x=end align-y=start"
-    ));
+    // The layer is the menu, never the pane: codegen wraps an overlay's layer
+    // in a press swallower, so a fill-sized layer hides the backdrop's dismiss
+    // behind it. The pointer-y offset is a pressable gap, not padding.
+    assert!(!chat.contains("box w=fill h=fill pt=block_action_menu_y"));
+    assert!(chat.contains("mouse press=emit(clear_message_selection)"));
+    assert!(chat.contains("space w=fill h=block_action_menu_y(chat_pointer_y, chat_height)"));
     // the pointer sensor is the MESSAGE-LIST stack's first child, so it
     // measures the message list itself and not whatever an overlay happens
     // to cover. The anchor names that stack by its exact indentation: the
