@@ -92,11 +92,17 @@ pub async fn store_picture(
         .await
         .map_err(|error| format!("picture decode task failed: {error}"))??;
     let dimensions = (decoded.width, decoded.height);
+    park_picture(surface, path, decoded);
+    Ok(dimensions)
+}
+
+/// Park one decoded picture under `surface` as `path`'s, replacing whatever
+/// the surface held. The one writer to the store.
+pub(crate) fn park_picture(surface: &'static str, path: String, picture: Picture) {
     store()
         .lock()
         .expect("picture store")
-        .insert(surface, (path, decoded));
-    Ok(dimensions)
+        .insert(surface, (path, picture));
 }
 
 /// The picture parked under `surface`, only if it is still `path`'s — a slot

@@ -628,6 +628,50 @@ fn seed_forge_blob(app: &mut Ducktape, scope: &str, text: String) {
     seed_forge_file(app, scope, "probe.rs", text);
 }
 
+/// A solid 64×64 picture of one colour, parked under the forge surface as
+/// `path`'s — what `forge_blob` leaves behind for a picture, minus the wire.
+fn park_forge_picture(path: &str, rgb: [u8; 3]) {
+    let pixels = [rgb[0], rgb[1], rgb[2], 255].repeat(64 * 64);
+    backend::park_picture(
+        backend::FORGE_SURFACE,
+        path.to_owned(),
+        backend::Picture {
+            width: 64,
+            height: 64,
+            handle: iced::widget::image::Handle::from_rgba(64, 64, pixels),
+        },
+    );
+}
+
+/// Open `path` in the browser and land it as a picture blob through the
+/// same seam `seed_forge_file` uses for text.
+fn seed_forge_picture(app: &mut Ducktape, scope: &str, path: &str) {
+    let _ = app.__update(Ducktape::__ice_test_message_forge_code_browser_open_file(
+        scope.to_owned(),
+        "http://node".into(),
+        true,
+        "probe".into(),
+        "1111111111111111111111111111111111111111".into(),
+        String::new(),
+        path.into(),
+    ));
+    let _ = app.__update(Ducktape::__ice_test_message_forge_code_browser_file_loaded(
+        scope.to_owned(),
+        backend::BlobView {
+            repo: "probe".into(),
+            rev: "1111111111111111111111111111111111111111".into(),
+            path: path.into(),
+            text: String::new(),
+            truncated: false,
+            binary: false,
+            lines: 0,
+            picture: true,
+            width: 64,
+            height: 64,
+        },
+    ));
+}
+
 fn seed_forge_file(app: &mut Ducktape, scope: &str, path: &str, text: String) {
     let _ = app.__update(Ducktape::__ice_test_message_forge_code_browser_open_file(
         scope.to_owned(),
@@ -1395,6 +1439,53 @@ fn probe_row_repaint() {
         reacted != edited,
         "an edit delta must repaint the visible row — `apply_edit_content` \
          stopped moving `render_rev` if this frame is unchanged"
+    );
+}
+
+/// THE READER MUST DRAW THE PICTURE. The `picture` extern reads a handle out
+/// of a process-wide slot, so nothing in the Ice tree changes between two
+/// pictures at the same path: only the pixels can prove the extern drew the
+/// slot's handle at all — and drew the CURRENT one, not a cached first.
+#[test]
+fn the_forge_reader_draws_the_loaded_picture() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(probe_forge_picture_content)
+        .expect("the forge picture probe thread spawns")
+        .join()
+        .expect("the forge picture probe thread finishes");
+}
+
+fn probe_forge_picture_content() {
+    let (mut app, console, scope) = console_in_forge_tree(vec![backend::TreeEntry {
+        name: "logo.png".into(),
+        path: "logo.png".into(),
+        kind: "file".into(),
+    }]);
+    let mut renderer = headless_renderer();
+    let (cache, empty) = drawn_frame(
+        &mut app,
+        console,
+        &mut renderer,
+        user_interface::Cache::default(),
+    );
+
+    park_forge_picture("logo.png", [220, 40, 40]);
+    seed_forge_picture(&mut app, &scope, "logo.png");
+    let (cache, red) = drawn_frame(&mut app, console, &mut renderer, cache);
+    assert!(
+        empty != red,
+        "a loaded picture must repaint the reader out of its empty plate"
+    );
+
+    // Same path, same Ice state, a different picture in the slot: only the
+    // extern's draw can move these pixels.
+    park_forge_picture("logo.png", [40, 40, 220]);
+    let (_cache, blue) = drawn_frame(&mut app, console, &mut renderer, cache);
+    assert!(
+        red != blue,
+        "a replaced picture must repaint — identical pixels mean the reader \
+         draws a stale handle, or no handle at all"
     );
 }
 
