@@ -7,6 +7,7 @@ version.workspace = true
 # sha1 oid. libgit2 is VENDORED (built from source) so the node binary is
 # self-contained — no host `git` install needed.
 [dependencies]
+base64 = { workspace = true }
 sdk = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

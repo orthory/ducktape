@@ -34,6 +34,7 @@ on fs_open_file(path)
   fs_preview_text = ""
   fs_preview_truncated = false
   fs_preview_binary = false
+  fs_preview_picture = false
   fs_generation = fs_generation + 1
   run replace lane=files_preview files_preview(connected_rpc, fs_preview_path, fs_generation) -> fs_previewed _ | fs_failed _
 
@@ -50,6 +51,9 @@ on fs_previewed(next)
   fs_preview_text = next.text
   fs_preview_truncated = next.truncated
   fs_preview_binary = next.binary
+  fs_preview_picture = next.picture
+  fs_preview_width = next.width
+  fs_preview_height = next.height
 
 on fs_history_loaded(next)
   return if next.generation != fs_generation

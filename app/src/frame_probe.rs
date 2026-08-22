@@ -649,6 +649,9 @@ fn seed_forge_file(app: &mut Ducktape, scope: &str, path: &str, text: String) {
             truncated: false,
             binary: false,
             lines,
+            picture: false,
+            width: 0,
+            height: 0,
         },
     ));
     let state = app
@@ -754,6 +757,9 @@ fn console_in_files() -> (Ducktape, iced::window::Id) {
         text: "selected file preview".into(),
         truncated: false,
         binary: false,
+        picture: false,
+        width: 0,
+        height: 0,
     }));
     assert_eq!(app.fs_entries.len(), FILE_ROWS);
     assert_eq!(app.fs_preview_path, selected);
