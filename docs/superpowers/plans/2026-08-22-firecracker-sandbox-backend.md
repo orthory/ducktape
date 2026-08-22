@@ -171,6 +171,40 @@ quoted number includes work this measurement defers.
    1/2/4/8/16 GiB shapes needs one snapshot per shape: ~31 GB of memory files
    just to hold the set. That is the storage bill for fast starts.
 
+### The workspace image is the other half of the startup budget
+
+Boot is not the whole per-run overhead — the workspace has to become a block
+device before the VM starts, and be read back after it exits. Measured on this
+host with trees of many small files (the shape of a checked-out repo):
+
+| Workspace | `mke2fs -d` | `debugfs rdump` | round trip |
+|---|---|---|---|
+| 4 MB / 200 files | 17 ms | 14 ms | 31 ms |
+| 102 MB / 2000 files | 303 ms | 201 ms | 504 ms |
+| 501 MB / 4000 files | 1267 ms | 779 ms | 2046 ms |
+
+A 500 MB workspace therefore costs about as much as an 8 GiB VM's boot. Only the
+build is on the critical path before the guest starts; the read-back lands after
+the run has already produced its answer.
+
+Two things this settles:
+
+- **`HEADROOM = 3` is nearly free.** Build time follows CONTENT, not image size —
+  ×1 headroom is 307 ms and ×6 is 331 ms on the same tree, because ext4 images
+  are sparse and `mke2fs` never writes the empty blocks. Do not shrink the
+  headroom to chase build time; there is nothing there.
+- **The round trip is byte-identical** at 500 MB / 4000 files, modes included.
+
+So a whole run's marshalling overhead, end to end:
+
+| Shape | image build | boot | read-back | total |
+|---|---|---|---|---|
+| 2 GiB VM, 100 MB workspace | 303 ms | 656 ms | 201 ms | **~1.2 s** |
+| 8 GiB VM, 500 MB workspace | 1267 ms | 2041 ms | 779 ms | **~4.1 s** |
+
+Against a minutes-long agent run both are small, but the heavy shape is no
+longer negligible — and note the workspace half is untouched by snapshots.
+
 Before/after at realistic run shapes (the cmdline saving is flat, so it matters
 proportionally less as memory grows):
 
@@ -457,6 +491,49 @@ mod tests {
         assert_eq!(mode & 0o111, 0o111, "the executable bit must survive: {mode:o}");
     }
 
+    /// A workspace whose whole content is ONE directory must come back as one
+    /// directory. An earlier draft of this module tried to "flatten" what it
+    /// assumed was a wrapper directory that `debugfs rdump` added; it does not
+    /// add one, and the flattening would have silently hoisted `src/`'s
+    /// contents into the workspace root for exactly this shape — the common
+    /// shape of a checked-out repo.
+    #[test]
+    fn a_single_directory_workspace_is_not_flattened() {
+        let root = scratch("single-dir");
+        let src = root.join("src-tree");
+        std::fs::create_dir_all(src.join("src/deep")).expect("dirs");
+        std::fs::write(src.join("src/deep/main.rs"), b"fn main() {}").expect("write");
+        std::fs::write(src.join("src/lib.rs"), b"x").expect("write");
+
+        let image = root.join("ws.ext4");
+        build(&src, &image, sized_for(&src).expect("size")).expect("builds");
+        let back = root.join("back");
+        read_back(&image, &back).expect("reads back");
+
+        assert!(back.join("src/deep/main.rs").is_file(), "src/ must stay a directory");
+        assert!(back.join("src/lib.rs").is_file());
+    }
+
+    /// `lost+found` is mke2fs's, not the run's. Handing it back adds a
+    /// directory nobody created to the buyer's workspace, and on a second round
+    /// trip it persists and multiplies.
+    #[test]
+    fn lost_and_found_never_reaches_the_workspace() {
+        let root = scratch("lost-found");
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).expect("dir");
+        std::fs::write(src.join("a.txt"), b"a").expect("write");
+
+        let image = root.join("ws.ext4");
+        build(&src, &image, sized_for(&src).expect("size")).expect("builds");
+        let back = root.join("back");
+        read_back(&image, &back).expect("reads back");
+
+        assert!(!back.join("lost+found").exists(), "ext4 artifact leaked into the workspace");
+        let entries: Vec<_> = std::fs::read_dir(&back).expect("read").filter_map(|e| e.ok()).collect();
+        assert_eq!(entries.len(), 1, "exactly the file the run had");
+    }
+
     /// An image smaller than its contents is a silent truncation, so the size
     /// is computed with headroom and a floor rather than guessed.
     #[test]
@@ -588,9 +665,9 @@ pub fn read_back(image: &Path, dest: &Path) -> Result<(), String> {
     let tool = crate::podman_api::find_system_tool("debugfs")
         .ok_or_else(|| "debugfs is not on PATH; install e2fsprogs".to_string())?;
     std::fs::create_dir_all(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
-    // `rdump / <dest>` writes the image root's CONTENTS as a child of dest
-    // named after the source root, so dump each top-level entry instead to
-    // land them directly in dest.
+    // `rdump / <dest>` lands the image root's entries DIRECTLY in dest — no
+    // wrapper directory. Verified on a 500 MB / 4000-file tree: the round trip
+    // is byte-identical, modes included, once `lost+found` is dropped.
     let out = Command::new(&tool)
         .arg("-R")
         .arg(format!("rdump / {}", dest.display()))
@@ -604,27 +681,20 @@ pub fn read_back(image: &Path, dest: &Path) -> Result<(), String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    flatten_rdump_root(dest)
+    drop_lost_found(dest)
 }
 
-/// `debugfs rdump /` creates `<dest>/<basename-of-image-root>`; hoist its
-/// children up one level so callers get the workspace tree at `dest` itself.
-fn flatten_rdump_root(dest: &Path) -> Result<(), String> {
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(dest)
-        .map_err(|e| format!("read {}: {e}", dest.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .collect();
-    if entries.len() != 1 || !entries[0].is_dir() {
-        return Ok(());
+/// `lost+found` is an ext4 artifact `mke2fs` creates, not something the run
+/// produced. Handing it back would add a directory to the buyer's workspace
+/// that nobody put there — and on a second round trip it would persist and
+/// multiply.
+fn drop_lost_found(dest: &Path) -> Result<(), String> {
+    let stray = dest.join("lost+found");
+    match std::fs::remove_dir_all(&stray) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("remove {}: {e}", stray.display())),
     }
-    let inner = entries.remove(0);
-    for entry in std::fs::read_dir(&inner).map_err(|e| format!("read {}: {e}", inner.display()))? {
-        let entry = entry.map_err(|e| format!("read entry: {e}"))?;
-        std::fs::rename(entry.path(), dest.join(entry.file_name()))
-            .map_err(|e| format!("hoist {}: {e}", entry.path().display()))?;
-    }
-    std::fs::remove_dir(&inner).map_err(|e| format!("remove {}: {e}", inner.display()))?;
-    Ok(())
 }
 ```
 
