@@ -1877,11 +1877,12 @@ fn probe_forge_code_selection() {
     assert!(released == quiet, "Escape must give the quiet pixels back");
 }
 
-/// A MARKDOWN BLOB'S TEXT IS DRAGGABLE TOO. A README renders as a document
-/// through `agent_markdown` (iced's markdown widget, outside Ice), so its
-/// paragraphs must prove the same contract the code plate does: a drag
-/// across a paragraph paints a selection, Ctrl+C copies the README's own
-/// words, Escape gives the quiet pixels back.
+/// A MARKDOWN BLOB'S TEXT IS DRAGGABLE TOO, AND ACROSS ITS BLOCKS. A README
+/// renders as a document through `agent_markdown` (iced's markdown widget,
+/// outside Ice), whose heading, paragraph and code plate are each their own
+/// widget — so the drag has to prove more than the one-run code plate does:
+/// a drag DOWN THE DOCUMENT paints a selection, Ctrl+C copies every block it
+/// ran through and nothing else, Escape gives the quiet pixels back.
 #[test]
 fn the_forge_markdown_selects_by_drag() {
     std::thread::Builder::new()
@@ -1913,12 +1914,14 @@ fn probe_forge_markdown_selection() {
 
     // Walk press points down the document column until a drag copies: the
     // header and spacing above the first paragraph are not the document's
-    // business to pin here, a copy is.
+    // business to pin here, a copy is. The first press that lands is the
+    // topmost block, and every drag runs 250 px down from it — past the
+    // paragraph, past the code plate, off the end of the document.
     let mut copied = None;
     for step in 0..30 {
         let y = 190.0 + step as f32 * 8.0;
         let from = Point::new(520.0, y);
-        let to = Point::new(640.0, y);
+        let to = Point::new(640.0, y + 250.0);
         cache = walk_events(
             &mut app,
             console,
@@ -1950,9 +1953,24 @@ fn probe_forge_markdown_selection() {
         }
     }
     let copied = copied.expect("a drag over the document copies its text");
+    for line in copied.lines() {
+        assert!(
+            readme.contains(line),
+            "the copy is the README's own words: {line:?} is not in it"
+        );
+    }
+    // The press landed in a block above the code plate and the pointer left
+    // the document below it, so everything between is one selection: the copy
+    // runs from wherever in the paragraph it started, through the paragraph's
+    // end, into the plate and off its last line. Where exactly the press
+    // landed is the pane's business; CROSSING is this document's, and one
+    // block's worth is the bug pinned here — a drag used to stop dead at the
+    // block it started in.
     assert!(
-        readme.contains(&copied) && !copied.trim().is_empty(),
-        "the copy is the README's own words: {copied:?}"
+        copied.contains("second line of the pane.")
+            && copied.contains("let other = answer + 1;"),
+        "the drag ran to the end of the document, so the copy crosses its \
+         blocks: {copied:?}"
     );
     let (cache, selected) = drawn_frame(&mut app, console, &mut renderer, cache);
     assert!(

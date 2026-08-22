@@ -1174,45 +1174,245 @@ const CODE_FONT: iced::Font = iced::Font::with_name("Geist Mono");
 /// line of text, wrong for a file of them.
 type CodeParagraph = iced::advanced::graphics::text::Paragraph;
 
+/// Which document's selection a run of text takes part in, and where it sits
+/// in that document's reading order. A Markdown document is many widgets — a
+/// heading, a paragraph, a list item, a code plate are each their own run —
+/// and a drag crosses them, so neither end of the selection is one run's to
+/// hold: they share the one in [`drag`], and each answers only how much of
+/// ITSELF that selection covers. A run built on its own — the forge reader's
+/// whole blob — is a document of one, keyed by its own text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SelectPlace {
+    doc: u64,
+    ordinal: usize,
+}
+
+impl SelectPlace {
+    /// The `ordinal`th run of the document keyed `doc`, in reading order.
+    pub fn block(doc: u64, ordinal: usize) -> Self {
+        Self { doc, ordinal }
+    }
+}
+
+/// The window's open selection, ACROSS the runs it covers.
+/// `ui_lang_runtime::selection` already says which surface the window is
+/// showing a selection on; this says where that selection runs inside it,
+/// which a Markdown document cannot keep in any one widget.
+///
+/// A document is keyed by its own text, so two documents spelling the same
+/// bytes on screen at once show one selection twice. That is the whole cost
+/// of not threading an identity down through iced's Markdown viewer.
+mod drag {
+    use super::SelectPlace;
+    use std::cell::{Cell, RefCell};
+
+    /// One end of a selection: which run, and the byte offset inside it.
+    type Spot = (usize, usize);
+
+    #[derive(Clone, Copy)]
+    struct Drag {
+        doc: u64,
+        token: u64,
+        held: bool,
+        anchor: Spot,
+        cursor: Spot,
+        /// Bumped where a selection ENDS — a press starting another one, or
+        /// Escape letting this one go. A run's quads are drawn only while they
+        /// carry the current revision, so a run the event walk reaches before
+        /// the run that ended it cannot go on painting what it was showing:
+        /// the press that collapses a selection is delivered to the runs in
+        /// reading order, and the one it lands in is rarely the first.
+        revision: u64,
+    }
+
+    thread_local! {
+        static OPEN: Cell<Drag> = const {
+            Cell::new(Drag {
+                doc: 0,
+                token: 0,
+                held: false,
+                anchor: (0, 0),
+                cursor: (0, 0),
+                revision: 0,
+            })
+        };
+        /// The copy being built: every run the selection covers appends its
+        /// own words as the key walk reaches it — reading order — and the run
+        /// holding the far end takes the whole thing to the clipboard.
+        static COPY: RefCell<String> = const { RefCell::new(String::new()) };
+    }
+
+    /// Take the window's selection for `place`, anchored at `offset`.
+    pub fn open(place: SelectPlace, offset: usize) {
+        let spot = (place.ordinal, offset);
+        OPEN.set(Drag {
+            doc: place.doc,
+            token: ui_lang_runtime::selection::claim(),
+            held: true,
+            anchor: spot,
+            cursor: spot,
+            revision: OPEN.get().revision + 1,
+        });
+    }
+
+    /// Whether the selection the window is showing is this run's document's.
+    pub fn shows(place: SelectPlace) -> bool {
+        let open = OPEN.get();
+        open.doc == place.doc && ui_lang_runtime::selection::holds(open.token)
+    }
+
+    /// Whether the pointer is still down on it.
+    pub fn held(place: SelectPlace) -> bool {
+        shows(place) && OPEN.get().held
+    }
+
+    /// Which revision of the selection the runs must be painting.
+    pub fn revision() -> u64 {
+        OPEN.get().revision
+    }
+
+    /// Move the far end into `place` at `offset`. No new revision: the runs
+    /// whose share of the selection this moves refresh their own quads in the
+    /// same event walk.
+    pub fn reach(place: SelectPlace, offset: usize) {
+        let mut open = OPEN.get();
+        open.cursor = (place.ordinal, offset);
+        OPEN.set(open);
+    }
+
+    /// Take the document from its first byte through `place`'s `offset`.
+    /// Ctrl+A reaches the document's END because EVERY run runs this as the
+    /// key walk reaches it: the last one to run leaves the far end at its own
+    /// end, and each run before it painted itself full on the way past. No
+    /// new revision, for the same reason `reach` opens none — the walk that
+    /// moves the selection refreshes every run it moves.
+    pub fn all(place: SelectPlace, offset: usize) {
+        let mut open = OPEN.get();
+        open.anchor = (0, 0);
+        open.cursor = (place.ordinal, offset);
+        OPEN.set(open);
+    }
+
+    /// Let the pointer go; the selection stays.
+    pub fn release() {
+        let mut open = OPEN.get();
+        open.held = false;
+        OPEN.set(open);
+    }
+
+    /// Let the selection go.
+    pub fn clear() {
+        let mut open = OPEN.get();
+        open.held = false;
+        open.revision += 1;
+        OPEN.set(open);
+        ui_lang_runtime::selection::clear();
+    }
+
+    /// The selection's near and far end, in reading order.
+    fn ends() -> (Spot, Spot) {
+        let open = OPEN.get();
+        (open.anchor.min(open.cursor), open.anchor.max(open.cursor))
+    }
+
+    /// How much of `place`'s `len` bytes the selection covers. `None` where
+    /// the window is showing another document's selection, or this run is
+    /// outside the one it is showing. The range can be EMPTY on purpose: a
+    /// run the selection ends at the very start of is inside it and covers
+    /// nothing, and a copy still walks through it to reach the runs after.
+    pub fn part(place: SelectPlace, len: usize) -> Option<std::ops::Range<usize>> {
+        if !shows(place) {
+            return None;
+        }
+        let (start, end) = ends();
+        let inside = start.0 <= place.ordinal && place.ordinal <= end.0;
+        if !inside {
+            return None;
+        }
+        let from = match place.ordinal == start.0 {
+            true => start.1.min(len),
+            false => 0,
+        };
+        let to = match place.ordinal == end.0 {
+            true => end.1.min(len),
+            false => len,
+        };
+        (from <= to).then_some(from..to)
+    }
+
+    /// Whether the selection starts in this run — where a copy starts over.
+    pub fn starts_at(place: SelectPlace) -> bool {
+        let (start, _) = ends();
+        shows(place) && start.0 == place.ordinal
+    }
+
+    /// Whether it ends in this run — where a copy is taken to the clipboard.
+    pub fn ends_at(place: SelectPlace) -> bool {
+        let (_, end) = ends();
+        shows(place) && end.0 == place.ordinal
+    }
+
+    /// Start a copy over.
+    pub fn copy_open() {
+        COPY.with_borrow_mut(String::clear);
+    }
+
+    /// Add one run's words to it, a line apart from the run before.
+    pub fn copy_add(words: &str) {
+        COPY.with_borrow_mut(|copy| {
+            let joins_a_run = !copy.is_empty() && !words.is_empty();
+            if joins_a_run {
+                copy.push('\n');
+            }
+            copy.push_str(words);
+        });
+    }
+
+    /// Take the whole thing.
+    pub fn copy_take() -> String {
+        COPY.with_borrow_mut(std::mem::take)
+    }
+}
+
 /// One selectable run of text, the state every selectable surface here
 /// shares: a paragraph laid out like the drawn one (for the code plate it IS
-/// the drawn one), the window's selection token, the drag, and the quads.
+/// the drawn one), the run's place in its document, and the quads.
 #[derive(Default)]
 struct SelectState {
     key: u64,
+    place: SelectPlace,
     paragraph: CodeParagraph,
-    token: u64,
-    anchor: usize,
-    cursor: usize,
-    dragging: bool,
-    /// The highlight quads for `anchor..cursor`, paragraph-relative. Refreshed
+    /// The quads for the part of the document's selection this run covers,
+    /// paragraph-relative, and the revision they were built at. Refreshed
     /// where the selection or the bounds move (`update`, `layout`) and never
     /// in `draw`, so a scroll with a selection open costs nothing extra.
     highlight: Vec<iced::Rectangle>,
+    revision: u64,
 }
 
 impl SelectState {
-    fn is_active(&self) -> bool {
-        ui_lang_runtime::selection::holds(self.token)
+    /// The part of the document's selection this run covers, the empty range
+    /// included — which a copy walking to the runs after needs, and a
+    /// highlight does not.
+    fn part(&self, text: &SelectText) -> Option<std::ops::Range<usize>> {
+        let part = drag::part(self.place, text.content.len())?;
+        text.content.get(part.clone()).is_some().then_some(part)
     }
 
     fn range(&self, text: &SelectText) -> Option<std::ops::Range<usize>> {
-        if !self.is_active() {
-            return None;
-        }
-        let start = self.anchor.min(self.cursor);
-        let end = self.anchor.max(self.cursor);
-        (start != end && text.content.get(start..end).is_some()).then_some(start..end)
+        self.part(text).filter(|part| !part.is_empty())
     }
 
-    fn selected<'a>(&self, text: &'a SelectText) -> Option<&'a str> {
-        text.content.get(self.range(text)?)
+    /// Whether the quads may be drawn: this run's share of the selection the
+    /// window is showing, built for the run it is showing now.
+    fn is_painting(&self) -> bool {
+        drag::shows(self.place) && self.revision == drag::revision()
     }
 
     /// The byte offset under a paragraph-relative point. cosmic-text already
     /// lands a point above the first line on it, one below the last on its
     /// end, and one past a line's right edge on that line's end — the clamps
-    /// a drag needs.
+    /// a drag needs, within a run and across them both.
     fn hit(&self, point: iced::Point, text: &SelectText) -> Option<usize> {
         let cursor = self.paragraph.buffer().hit(point.x, point.y)?;
         let line_start = text.line_starts.get(cursor.line).copied()?;
@@ -1226,6 +1426,7 @@ impl SelectState {
     /// end) has no such glyphs and draws nothing.
     fn reselect(&mut self, text: &SelectText) {
         self.highlight.clear();
+        self.revision = drag::revision();
         let Some(range) = self.range(text) else {
             return;
         };
@@ -1251,12 +1452,14 @@ impl SelectState {
         }
     }
 
-    /// A (re)laid-out paragraph: a new key drops the old text's selection,
-    /// whose offsets meant other text; the same key keeps it and refreshes
-    /// the quads where the bounds moved.
+    /// A (re)laid-out paragraph: a new key drops the old text's quads, whose
+    /// offsets meant other text — and a document is keyed by its own text, so
+    /// the selection that indexed it is nobody's document's now. The same key
+    /// keeps them and refreshes them where the bounds moved.
     fn relayout<Link>(
         &mut self,
         key: u64,
+        place: SelectPlace,
         text: iced::advanced::text::Text<
             &[iced::advanced::text::Span<'_, Link, iced::Font>],
             iced::Font,
@@ -1264,12 +1467,11 @@ impl SelectState {
         select: &SelectText,
     ) {
         use iced::advanced::text::{Difference, Paragraph as _, Text};
+        self.place = place;
         let other_text = self.key != key;
         if other_text {
             self.paragraph = CodeParagraph::with_spans(text);
             self.key = key;
-            self.token = 0;
-            self.dragging = false;
             self.highlight.clear();
             return;
         }
@@ -1297,9 +1499,9 @@ impl SelectState {
         }
     }
 
-    /// The selection's own input: press starts a drag and takes the window's
-    /// selection, the drag moves the cursor, Ctrl+A takes everything, Ctrl+C
-    /// copies, Escape lets go.
+    /// The selection's own input: a press takes the window's selection and
+    /// anchors the drag here, a move reaches the far end through here, Ctrl+A
+    /// takes the whole document, Ctrl+C copies it, Escape lets go.
     fn update<Message>(
         &mut self,
         text: &SelectText,
@@ -1312,7 +1514,6 @@ impl SelectState {
         use iced::advanced::clipboard;
         use iced::keyboard;
         use iced::mouse;
-        use ui_lang_runtime::selection;
         match event {
             iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 let Some(position) = cursor.position_in(layout.bounds()) else {
@@ -1321,59 +1522,83 @@ impl SelectState {
                 let Some(offset) = self.hit(position, text) else {
                     return;
                 };
-                self.token = selection::claim();
-                self.anchor = offset;
-                self.cursor = offset;
-                self.dragging = true;
+                drag::open(self.place, offset);
                 self.reselect(text);
                 shell.request_redraw();
             }
-            iced::Event::Mouse(mouse::Event::CursorMoved { .. }) if self.dragging => {
-                let Some(position) = cursor.position_from(layout.position()) else {
-                    return;
-                };
-                let Some(offset) = self.hit(position, text) else {
-                    return;
-                };
-                if self.cursor == offset {
+            iced::Event::Mouse(mouse::Event::CursorMoved { .. }) if drag::held(self.place) => {
+                // THE FAR END IS TAKEN BY EVERY RUN THE POINTER IS AT OR PAST,
+                // in reading order, so the last one to take it is the run the
+                // pointer is in: a run above the pointer hits its own end —
+                // cosmic-text clamps a point below the last line there — which
+                // is exactly how much of that run the selection covers. A run
+                // below the pointer leaves the end alone and only repaints the
+                // share the runs around it moved.
+                //
+                // The cursor is LANDED first because a drag owns the pointer
+                // wherever it goes: a scroller hands the content it is not
+                // under a levitating cursor, which has no position at all, and
+                // a Markdown code block is a plate inside its own horizontal
+                // scroller — a drag running past one could never reach into
+                // it, and the block would drop out of a selection that covers
+                // the paragraphs on both sides of it.
+                let pointer = cursor.land().position_from(layout.position());
+                let past_the_top =
+                    pointer.filter(|point| point.y >= 0.0 || self.place.ordinal == 0);
+                let before = self.range(text);
+                if let Some(offset) = past_the_top.and_then(|point| self.hit(point, text)) {
+                    drag::reach(self.place, offset);
+                }
+                let settled = self.range(text) == before && self.revision == drag::revision();
+                if settled {
                     return;
                 }
-                self.cursor = offset;
                 self.reselect(text);
                 shell.request_redraw();
             }
             iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
-                if self.dragging =>
+                if drag::held(self.place) =>
             {
-                self.dragging = false;
+                drag::release();
             }
             iced::Event::Keyboard(keyboard::Event::KeyPressed {
                 key,
                 physical_key,
                 modifiers,
                 ..
-            }) if self.is_active() && modifiers.command() => match key.to_latin(*physical_key) {
-                Some('a') => {
-                    self.anchor = 0;
-                    self.cursor = text.content.len();
-                    self.reselect(text);
-                    shell.capture_event();
-                    shell.request_redraw();
-                }
-                Some('c') => {
-                    if let Some(selected) = self.selected(text) {
-                        clipboard.write(clipboard::Kind::Standard, selected.to_owned());
+            }) if drag::shows(self.place) && modifiers.command() => {
+                match key.to_latin(*physical_key) {
+                    Some('a') => {
+                        drag::all(self.place, text.content.len());
+                        self.reselect(text);
+                        shell.capture_event();
+                        shell.request_redraw();
+                    }
+                    Some('c') => {
+                        let Some(part) = self.part(text) else {
+                            return;
+                        };
+                        if drag::starts_at(self.place) {
+                            drag::copy_open();
+                        }
+                        drag::copy_add(&text.content[part]);
+                        if drag::ends_at(self.place) {
+                            let copy = drag::copy_take();
+                            let copied = !copy.is_empty();
+                            if copied {
+                                clipboard.write(clipboard::Kind::Standard, copy);
+                            }
+                        }
                         shell.capture_event();
                     }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             iced::Event::Keyboard(keyboard::Event::KeyPressed {
                 key: keyboard::Key::Named(keyboard::key::Named::Escape),
                 ..
-            }) if self.is_active() => {
-                selection::clear();
-                self.dragging = false;
+            }) if drag::shows(self.place) => {
+                drag::clear();
                 self.highlight.clear();
                 shell.request_redraw();
             }
@@ -1390,7 +1615,7 @@ impl SelectState {
         ink: iced::Color,
     ) {
         use iced::advanced::Renderer as _;
-        if !self.is_active() {
+        if !self.is_painting() {
             return;
         }
         let translation = bounds.position() - iced::Point::ORIGIN;
@@ -1470,12 +1695,17 @@ fn code_text<C>(
 /// `selectable_text`; this is the same contract for per-span inks, which
 /// that wrapper's plain `Text` cannot carry). It takes the window's
 /// selection through `ui_lang_runtime::selection`, so a drag here quiets any
-/// other highlight and vice versa; Ctrl+A takes the file, Ctrl+C copies,
-/// Escape lets go. The forge reader and Markdown code blocks both draw it.
+/// other highlight and vice versa; Ctrl+A takes the document, Ctrl+C copies
+/// it, Escape lets go. The forge reader and Markdown code blocks both draw
+/// it — the reader's plate is its own document, a Markdown code block is one
+/// block of the document around it ([`CodeSelect::at`]).
 pub struct CodeSelect {
     /// Identity of the lines and their inks: a new key rebuilds the
     /// paragraph and drops the old text's selection.
     key: u64,
+    /// Where the plate sits in the document whose selection it takes part
+    /// in — a document of one until [`CodeSelect::at`] says otherwise.
+    place: SelectPlace,
     text: SelectText,
     spans: Vec<iced::advanced::text::Span<'static, (), iced::Font>>,
     /// The ink for spans without one; `None` takes the theme's text colour.
@@ -1518,14 +1748,24 @@ impl CodeSelect {
             }
         }
         content.hash(&mut hasher);
+        let key = hasher.finish();
         Self {
-            key: hasher.finish(),
+            key,
+            place: SelectPlace::block(key, 0),
             text: SelectText::new(content),
             spans,
             ink,
             metrics,
             width,
         }
+    }
+
+    /// Put the plate in a document, where a drag runs on past it: a Markdown
+    /// code block is one of its document's blocks, and the selection crosses
+    /// into the paragraphs around it.
+    pub fn at(mut self, place: SelectPlace) -> Self {
+        self.place = place;
+        self
     }
 }
 
@@ -1552,7 +1792,7 @@ impl<Message> iced::advanced::Widget<Message, iced::Theme, iced::Renderer> for C
         let state = tree.state.downcast_mut::<SelectState>();
         iced::advanced::layout::sized(limits, self.width, iced::Length::Shrink, |limits| {
             let text = code_text(self.spans.as_slice(), limits.max(), self.metrics);
-            state.relayout(self.key, text, &self.text);
+            state.relayout(self.key, self.place, text, &self.text);
             state.paragraph.min_bounds()
         })
     }
@@ -1617,10 +1857,13 @@ impl<'a, Message: 'a> From<CodeSelect> for iced::Element<'a, Message> {
 /// A rich text run that can be dragged across — iced's own `Rich` draws it
 /// (inline-code plates, link inks, link clicks all stay its), and a shadow
 /// paragraph laid out with the same spans, size, font and bounds answers
-/// where the glyphs are. One run is one selection: a drag stops at the
-/// block's edge, exactly as it does on the app's plain Ice `text`.
+/// where the glyphs are. A drag runs on past the run's edge into the rest of
+/// its document ([`SelectPlace`]); a run standing on its own is a document of
+/// one, and stops there like the app's plain Ice `text`.
 pub struct SelectRich<'a, Message> {
     key: u64,
+    /// Where the run sits in its document — see [`CodeSelect::at`].
+    place: SelectPlace,
     child: iced::Element<'a, Message>,
     text: SelectText,
     spans: std::sync::Arc<[iced::advanced::text::Span<'static, String, iced::Font>]>,
@@ -1639,13 +1882,21 @@ impl<'a, Message: 'a> SelectRich<'a, Message> {
         let content: String = spans.iter().map(|span| span.text.as_ref()).collect();
         let mut hasher = std::hash::DefaultHasher::new();
         (&content, size.0.to_bits()).hash(&mut hasher);
+        let key = hasher.finish();
         Self {
-            key: hasher.finish(),
+            key,
+            place: SelectPlace::block(key, 0),
             child: rich.into(),
             text: SelectText::new(content),
             spans,
             size,
         }
+    }
+
+    /// Put the run in a document — see [`CodeSelect::at`].
+    pub fn at(mut self, place: SelectPlace) -> Self {
+        self.place = place;
+        self
     }
 }
 
@@ -1701,7 +1952,7 @@ impl<Message> iced::advanced::Widget<Message, iced::Theme, iced::Renderer>
             wrapping: Wrapping::default(),
         };
         let state = tree.state.downcast_mut::<SelectState>();
-        state.relayout(self.key, text, &self.text);
+        state.relayout(self.key, self.place, text, &self.text);
         node
     }
 
