@@ -58,6 +58,11 @@ const NEST_STEP: f32 = 22.0;
 /// rather than line-height apart. Code lines take none — the plate must stay
 /// continuous — and a callout already carries its own tile inset.
 const BLOCK_PAD: f32 = 4.0;
+/// A heading's own room, `[above, below]` per level. A heading opens a
+/// section, so it stands off the block above it by about its own line and
+/// hugs the block it introduces (the reference: H1 `margin-top:2em`, H2
+/// `1.4em`, H3 `1em`, all `padding-bottom:3px`).
+const HEADING_PAD: [[f32; 2]; 3] = [[24.0, 8.0], [18.0, 6.0], [14.0, 4.0]];
 
 /// Where the caret is, and which palette is being painted. The whole point of
 /// carrying it into the highlighter is the marker reveal: syntax on the caret's
@@ -529,26 +534,30 @@ pub fn format(mark: &Mark, dark: bool) -> Format {
     // inset: the layout takes it from the LAST run that wants one, and a code
     // plate or callout tile further along would otherwise drop it.
     format.line_padding.left += nest(mark);
-    let gap = block_pad(mark);
-    format.line_padding.top += gap;
-    format.line_padding.bottom += gap;
+    let [above, below] = block_pad(mark);
+    format.line_padding.top += above;
+    format.line_padding.bottom += below;
     format
 }
 
-/// The vertical inset a run's line is owed, on top of whatever its paint set.
-fn block_pad(mark: &Mark) -> f32 {
+/// The vertical inset a run's line is owed, `[above, below]`, on top of
+/// whatever its paint set.
+fn block_pad(mark: &Mark) -> [f32; 2] {
     let style = match *mark {
         Mark::Indent(style)
         | Mark::Body(style)
         | Mark::ListMarker(style)
         | Mark::Marker { style, .. }
         | Mark::Tick { style, .. } => style,
-        Mark::Title => return BLOCK_PAD,
-        Mark::Fence { .. } | Mark::CodeBody => return 0.0,
+        Mark::Title => return [BLOCK_PAD; 2],
+        Mark::Fence { .. } | Mark::CodeBody => return [0.0; 2],
     };
+    if let Some(level) = style.heading {
+        return HEADING_PAD[usize::from(level).saturating_sub(1).min(2)];
+    }
     match style.callout {
-        true => 0.0,
-        false => BLOCK_PAD,
+        true => [0.0; 2],
+        false => [BLOCK_PAD; 2],
     }
 }
 
@@ -1003,5 +1012,29 @@ mod plate_probe {
         for (_, mark) in &callout {
             assert_eq!(format(mark, false).line_padding.top, 9.0, "{mark:?}");
         }
+    }
+
+    /// A heading stands off the block above it by about its own line and
+    /// hugs the one it introduces — every run of the line, marker included,
+    /// asks for the same room so the layout cannot drop it.
+    #[test]
+    fn a_heading_wears_its_own_room_above_and_below() {
+        for (line, [above, below]) in [
+            ("# One", HEADING_PAD[0]),
+            ("## Two", HEADING_PAD[1]),
+            ("### Three", HEADING_PAD[2]),
+        ] {
+            let (runs, _) = highlight(line, false, false, false);
+            for (_, mark) in &runs {
+                let f = format(mark, false);
+                assert_eq!(
+                    (f.line_padding.top, f.line_padding.bottom),
+                    (above, below),
+                    "{mark:?}"
+                );
+            }
+        }
+        assert!(HEADING_PAD[0][0] > HEADING_PAD[1][0] && HEADING_PAD[1][0] > HEADING_PAD[2][0]);
+        assert!(HEADING_PAD[2][0] > BLOCK_PAD, "an H3 still opens a section");
     }
 }
