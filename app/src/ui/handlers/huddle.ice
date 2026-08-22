@@ -32,9 +32,11 @@ on call_event(event)
   call_status = call_status_after(call_status, event)
   call_muted = keep_bool(event.kind == "connecting", false, call_muted)
   call_camera = keep_bool(event.kind == "connecting", false, call_camera)
+  call_sharing = keep_bool(event.kind == "connecting", false, call_sharing)
   call_peers = apply_call_peer(call_peers, event)
   huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)
-  call_video_live = call_video_live_after(call_peers, call_camera)
+  call_video_live = call_video_live_after(call_peers, call_camera, call_sharing)
+  huddle_stage = huddle_stage_peer(call_peers, call_sharing)
 
 // The panel draws its button only while joined; the tray row is always there.
 on toggle_call_mute
@@ -42,9 +44,23 @@ on toggle_call_mute
   call_muted = call_set_muted(!call_muted)
   huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)
 
+// THE TWO VIDEO TOGGLES ARE ONE SOURCE. Each hands back both readings because
+// starting either one ends the other — the camera and the shared screen are
+// two sources for a participant's ONE video stream, and a beacon that claimed
+// both would leave the far end guessing which picture it was looking at.
 on toggle_call_camera
-  call_camera = call_set_camera(!call_camera)
-  call_video_live = call_video_live_after(call_peers, call_camera)
+  let source = call_use_camera(!call_camera)
+  call_camera = source.camera
+  call_sharing = source.sharing
+  call_video_live = call_video_live_after(call_peers, call_camera, call_sharing)
+  huddle_stage = huddle_stage_peer(call_peers, call_sharing)
+
+on toggle_call_screen
+  let source = call_use_screen(!call_sharing)
+  call_camera = source.camera
+  call_sharing = source.sharing
+  call_video_live = call_video_live_after(call_peers, call_camera, call_sharing)
+  huddle_stage = huddle_stage_peer(call_peers, call_sharing)
 
 // POPPING OPENS A REAL WINDOW, and the window's existence IS the popped
 // state — there is no `huddle_popped` bool to keep in step with it. Docking
@@ -105,7 +121,9 @@ on leave_huddle_here
   call_status = ""
   call_muted = false
   call_camera = false
+  call_sharing = false
   call_video_live = false
+  huddle_stage = ""
   call_peers = []
   // Keep the retained roster visible if the leave is refused. The peer and
   // local mute state above are already reset, so rebuild the same projection

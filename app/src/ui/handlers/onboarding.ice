@@ -339,6 +339,14 @@ on console_opened(id)
   huddle_rows = []
   call_status = ""
   call_muted = false
+  // The video source is reset by the session's own teardown
+  // (`crate::video::reset`), so the readings of it must go with it — a
+  // "sharing" button left lit for the previous network's call has nothing
+  // behind it.
+  call_camera = false
+  call_sharing = false
+  call_video_live = false
+  huddle_stage = ""
   call_peers = []
   // An empty endpoint names no node: keep the adopted window and the
   // reset above, but launch nothing a "" could never answer.

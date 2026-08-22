@@ -8,6 +8,10 @@ state
   call_muted = false
   call_peers:[CallEvent] = []
   call_camera = false
+  call_sharing = false
   call_video_live = false
+  // Whose screen the panel stages, whole: a peer's node key, `you` for this
+  // device's own share, empty for nobody. See `huddle_stage_peer`.
+  huddle_stage = ""
   huddle_roster:[HuddleParticipant] = []
   huddle_rows:[HuddleTileRow] = []

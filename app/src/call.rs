@@ -126,10 +126,11 @@ pub(crate) fn beacon_state() {
     let Some(handles) = guard.as_ref() else {
         return;
     };
+    let source = crate::video::source();
     let _ = handles.control.send(ClientControl::Beacon {
         muted: handles.muted.load(Ordering::Relaxed),
-        camera_on: crate::video::camera_enabled(),
-        sharing: false,
+        camera_on: source == crate::video::Source::Camera,
+        sharing: source == crate::video::Source::Screen,
     });
 }
 
@@ -231,15 +232,16 @@ async fn run_session(
     let audio = AudioThread::start(muted.clone(), mic_tx, playout.clone());
     let audio_note = audio.note.clone();
 
-    // The camera leg (crate::video): its thread mirrors the audio thread's
-    // ownership rules and dies with the same teardown chain.
+    // The video leg (crate::video): camera or shared screen, one at a time.
+    // Its thread mirrors the audio thread's ownership rules and dies with the
+    // same teardown chain.
     let (video_tx, mut video_rx) = tokio::sync::mpsc::unbounded_channel::<CapturedFrame>();
     let _video_keepalive = video_tx.clone();
-    let (camera_shutdown_tx, camera_shutdown_rx) = std::sync::mpsc::channel::<()>();
-    let camera_events = events.clone();
-    let camera_thread = std::thread::Builder::new()
-        .name("huddle-camera".into())
-        .spawn(move || crate::video::camera_thread(video_tx, camera_shutdown_rx, camera_events))
+    let (capture_shutdown_tx, capture_shutdown_rx) = std::sync::mpsc::channel::<()>();
+    let capture_events = events.clone();
+    let capture_thread = std::thread::Builder::new()
+        .name("huddle-capture".into())
+        .spawn(move || crate::video::capture_thread(video_tx, capture_shutdown_rx, capture_events))
         .ok();
 
     *handles().lock().expect("call handles") = Some(Handles {
@@ -348,8 +350,8 @@ async fn run_session(
 
     *handles().lock().expect("call handles") = None;
     crate::video::reset();
-    drop(camera_shutdown_tx);
-    if let Some(thread) = camera_thread {
+    drop(capture_shutdown_tx);
+    if let Some(thread) = capture_thread {
         let _ = thread.join();
     }
     drop(audio);
@@ -672,10 +674,28 @@ pub fn apply_call_peer(peers: Vec<CallEvent>, event: CallEvent) -> Vec<CallEvent
     }
 }
 
-/// Any live camera in the call — the local one or any peer beaconing
-/// `camera_on` — gates the tile strip and its repaint tick.
-pub fn call_video_live_after(peers: Vec<CallEvent>, camera: bool) -> bool {
-    camera || peers.iter().any(|peer| peer.camera_on)
+/// Any live video in the call — this device's own source, or any peer
+/// beaconing a camera or a share — gates the tile strip and its repaint tick.
+pub fn call_video_live_after(peers: Vec<CallEvent>, camera: bool, sharing: bool) -> bool {
+    camera || sharing || peers.iter().any(|peer| peer.camera_on || peer.sharing)
+}
+
+/// WHO HOLDS THE STAGE — the one participant whose video is a screen, so the
+/// panel can show it whole instead of cropping a desktop into a 4:3 thumbnail.
+/// Empty means nobody is sharing and there is no stage.
+///
+/// A PEER'S SHARE OUTRANKS OUR OWN. Both can be true — nothing stops two
+/// people sharing at once — and of the two pictures, the one you have not
+/// already got on your screen is the one worth the space. Ours still appears
+/// (as [`crate::video::SELF_STAGE`]) when it is the only one, because a
+/// sharer with no view of what they published is sharing blind.
+pub fn huddle_stage_peer(peers: Vec<CallEvent>, local_sharing: bool) -> String {
+    let remote = peers.into_iter().find(|peer| peer.sharing);
+    match remote {
+        Some(peer) => peer.peer,
+        None if local_sharing => crate::video::SELF_STAGE.to_string(),
+        None => String::new(),
+    }
 }
 
 /// One huddle tile with its mute decision already attached.
@@ -803,6 +823,35 @@ mod tests {
         assert!(!rows[0].muted);
         assert!(rows[1].muted);
         assert!(rows[2].muted, "the local tile reads the local mute");
+    }
+
+    #[test]
+    fn the_stage_prefers_the_share_you_cannot_already_see() {
+        let sharing = |peer: &str, sharing: bool| CallEvent {
+            kind: "peer".into(),
+            peer: peer.into(),
+            sharing,
+            ..CallEvent::default()
+        };
+        // Nobody sharing: no stage, whatever the cameras are doing.
+        assert!(huddle_stage_peer(vec![sharing("aa", false)], false).is_empty());
+        // A peer's share takes it.
+        assert_eq!(
+            huddle_stage_peer(vec![sharing("aa", false), sharing("bb", true)], false),
+            "bb"
+        );
+        // Ours alone is staged too — a sharer with no view of what they
+        // published is sharing blind.
+        assert_eq!(
+            huddle_stage_peer(vec![sharing("aa", false)], true),
+            crate::video::SELF_STAGE
+        );
+        // Both at once: the picture we do NOT already have on screen wins.
+        assert_eq!(huddle_stage_peer(vec![sharing("bb", true)], true), "bb");
+        // And any live source at all lights the strip.
+        assert!(call_video_live_after(Vec::new(), false, true));
+        assert!(call_video_live_after(vec![sharing("bb", true)], false, false));
+        assert!(!call_video_live_after(vec![sharing("bb", false)], false, false));
     }
 
     #[test]

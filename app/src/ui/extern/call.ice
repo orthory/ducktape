@@ -17,12 +17,20 @@ extern crate::call
   pure apply_call_peer(peers:[CallEvent], event:CallEvent) -> [CallEvent]
   HuddleTileRow(person:HuddleParticipant, muted:bool)
   pure huddle_tile_rows(roster:[HuddleParticipant], peers:[CallEvent], local_muted:bool) -> [HuddleTileRow]
-  pure call_video_live_after(peers:[CallEvent], camera:bool) -> bool
+  pure call_video_live_after(peers:[CallEvent], camera:bool, sharing:bool) -> bool
+  pure huddle_stage_peer(peers:[CallEvent], local_sharing:bool) -> str
 
-// The camera leg — `crate::video`: capture/encode on its own thread, decoded
-// peer frames in a store the tile strip reads. `call_video_tiles` is a
-// SELF-REDRAWING widget: it repaints its own window at the capture cadence
-// via per-window redraw requests — no tick, no state, no app rebuild.
+// The video leg — `crate::video`: capture/encode on its own thread, decoded
+// peer frames in a store the surfaces read. Both surfaces are SELF-REDRAWING
+// widgets: they repaint their own window at the capture cadence via per-window
+// redraw requests — no tick, no state, no app rebuild.
+//
+// ONE SOURCE, TWO TOGGLES. The camera and the screen are two sources for one
+// stream, so each toggle hands back BOTH readings: starting a share stops the
+// camera, and the view has two buttons to draw from one answer.
 extern crate::video
-  sync call_set_camera(on:bool) -> bool
+  VideoSource(camera:bool, sharing:bool)
+  sync call_use_camera(on:bool) -> VideoSource
+  sync call_use_screen(on:bool) -> VideoSource
   component call_video_tiles() -> unit
+  component call_video_stage(peer:str) -> unit

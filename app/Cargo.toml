@@ -45,6 +45,11 @@ tokio-tungstenite = "0.24"
 # The camera leg (`src/video.rs`): capture + the pure-Rust intra-only JPEG
 # codec v1 (see the module doc for the codec seam).
 nokhwa = { version = "0.10", features = ["input-native"] }
+# The screen-share leg (`src/video.rs`): a root-window grab over X11. Already
+# in this binary under winit, and pure Rust — the portal/pipewire route would
+# put a build-time system library on every machine that builds this app, to
+# reach a compositor iced is not built for here (`x11`, no `wayland`).
+x11rb = "0.13"
 jpeg-encoder = "0.6"
 zune-jpeg = "0.4"
 # The picture viewer (`src/backend/picture.rs`) decodes to RGBA off-thread;
