@@ -625,6 +625,10 @@ fn forge_source() -> String {
 }
 
 fn seed_forge_blob(app: &mut Ducktape, scope: &str, text: String) {
+    seed_forge_file(app, scope, "probe.rs", text);
+}
+
+fn seed_forge_file(app: &mut Ducktape, scope: &str, path: &str, text: String) {
     let _ = app.__update(Ducktape::__ice_test_message_forge_code_browser_open_file(
         scope.to_owned(),
         "http://node".into(),
@@ -632,7 +636,7 @@ fn seed_forge_blob(app: &mut Ducktape, scope: &str, text: String) {
         "probe".into(),
         "1111111111111111111111111111111111111111".into(),
         String::new(),
-        "probe.rs".into(),
+        path.into(),
     ));
     let lines = text.lines().count() as i64;
     let _ = app.__update(Ducktape::__ice_test_message_forge_code_browser_file_loaded(
@@ -640,7 +644,7 @@ fn seed_forge_blob(app: &mut Ducktape, scope: &str, text: String) {
         backend::BlobView {
             repo: "probe".into(),
             rev: "1111111111111111111111111111111111111111".into(),
-            path: "probe.rs".into(),
+            path: path.into(),
             text,
             truncated: false,
             binary: false,
@@ -650,7 +654,7 @@ fn seed_forge_blob(app: &mut Ducktape, scope: &str, text: String) {
     let state = app
         .__ice_test_state_forge_code_browser(scope)
         .expect("the seeded instance answers");
-    assert_eq!(state.file_path, "probe.rs");
+    assert_eq!(state.file_path, path);
 }
 
 fn console_in_forge_tree_only() -> (Ducktape, iced::window::Id) {
@@ -1681,6 +1685,102 @@ fn probe_forge_code_selection() {
         &mut clipboard,
         &[key_press('\u{1b}', iced::keyboard::Modifiers::empty())],
         cursor,
+    );
+    let (_, released) = drawn_frame(&mut app, console, &mut renderer, cache);
+    assert!(released == quiet, "Escape must give the quiet pixels back");
+}
+
+/// A MARKDOWN BLOB'S TEXT IS DRAGGABLE TOO. A README renders as a document
+/// through `agent_markdown` (iced's markdown widget, outside Ice), so its
+/// paragraphs must prove the same contract the code plate does: a drag
+/// across a paragraph paints a selection, Ctrl+C copies the README's own
+/// words, Escape gives the quiet pixels back.
+#[test]
+fn the_forge_markdown_selects_by_drag() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(probe_forge_markdown_selection)
+        .expect("the forge markdown selection probe thread spawns")
+        .join()
+        .expect("the forge markdown selection probe thread finishes");
+}
+
+fn probe_forge_markdown_selection() {
+    let (mut app, console, scope) = console_in_forge_tree(vec![backend::TreeEntry {
+        name: "README.md".into(),
+        path: "README.md".into(),
+        kind: "file".into(),
+    }]);
+    let readme = "# Probe\n\nThe quick brown fox jumps over the lazy dog, and keeps \
+                  jumping until the paragraph wraps onto a second line of the pane.\n\n\
+                  ```rust\nlet answer = 42;\nlet other = answer + 1;\n```\n";
+    seed_forge_file(&mut app, &scope, "README.md", readme.into());
+    let mut renderer = headless_renderer();
+    let (mut cache, quiet) = drawn_frame(
+        &mut app,
+        console,
+        &mut renderer,
+        user_interface::Cache::default(),
+    );
+    let mut clipboard = RecordingClipboard::default();
+
+    // Walk press points down the document column until a drag copies: the
+    // header and spacing above the first paragraph are not the document's
+    // business to pin here, a copy is.
+    let mut copied = None;
+    for step in 0..30 {
+        let y = 190.0 + step as f32 * 8.0;
+        let from = Point::new(520.0, y);
+        let to = Point::new(640.0, y);
+        cache = walk_events(
+            &mut app,
+            console,
+            &mut renderer,
+            cache,
+            &mut clipboard,
+            &[
+                Event::Mouse(mouse::Event::CursorMoved { position: from }),
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            ],
+            mouse::Cursor::Available(from),
+        );
+        cache = walk_events(
+            &mut app,
+            console,
+            &mut renderer,
+            cache,
+            &mut clipboard,
+            &[
+                Event::Mouse(mouse::Event::CursorMoved { position: to }),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                key_press('c', iced::keyboard::Modifiers::CTRL),
+            ],
+            mouse::Cursor::Available(to),
+        );
+        if let Some(text) = clipboard.0.take() {
+            copied = Some(text);
+            break;
+        }
+    }
+    let copied = copied.expect("a drag over the document copies its text");
+    assert!(
+        readme.contains(&copied) && !copied.trim().is_empty(),
+        "the copy is the README's own words: {copied:?}"
+    );
+    let (cache, selected) = drawn_frame(&mut app, console, &mut renderer, cache);
+    assert!(
+        selected != quiet,
+        "a drag across the document must paint a selection"
+    );
+
+    let cache = walk_events(
+        &mut app,
+        console,
+        &mut renderer,
+        cache,
+        &mut clipboard,
+        &[key_press('\u{1b}', iced::keyboard::Modifiers::empty())],
+        mouse::Cursor::Available(Point::new(640.0, 300.0)),
     );
     let (_, released) = drawn_frame(&mut app, console, &mut renderer, cache);
     assert!(released == quiet, "Escape must give the quiet pixels back");

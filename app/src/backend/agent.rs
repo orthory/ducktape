@@ -1039,7 +1039,97 @@ impl AgentMarkdown {
     }
 
     fn view(&self) -> Element<'_, String> {
-        iced::widget::markdown::view(self.items.iter(), self.settings).map(|uri| uri.to_string())
+        iced::widget::markdown::view_with(self.items.iter(), self.settings, &SelectViewer)
+    }
+}
+
+/// The Markdown surface with draggable text: every paragraph and heading
+/// behind a [`SelectRich`] (one block is one selection, like the app's plain
+/// Ice `text`), every code block one [`CodeSelect`] so a drag runs across
+/// its lines. Lists, quotes and tables keep iced's default look and route
+/// their text back through here. Images keep the default.
+struct SelectViewer;
+
+impl<'a> iced::widget::markdown::Viewer<'a, String> for SelectViewer {
+    fn on_link_click(url: iced::widget::markdown::Uri) -> String {
+        url
+    }
+
+    fn heading(
+        &self,
+        settings: iced::widget::markdown::Settings,
+        level: &'a iced::widget::markdown::HeadingLevel,
+        text: &'a iced::widget::markdown::Text,
+        index: usize,
+    ) -> Element<'a, String> {
+        use iced::widget::markdown::HeadingLevel;
+        use iced::widget::{container, rich_text};
+        let size = match level {
+            HeadingLevel::H1 => settings.h1_size,
+            HeadingLevel::H2 => settings.h2_size,
+            HeadingLevel::H3 => settings.h3_size,
+            HeadingLevel::H4 => settings.h4_size,
+            HeadingLevel::H5 => settings.h5_size,
+            HeadingLevel::H6 => settings.h6_size,
+        };
+        let spans = text.spans(settings.style);
+        let rich = rich_text(spans.clone())
+            .on_link_click(Self::on_link_click)
+            .size(size);
+        let top = match index > 0 {
+            true => settings.text_size / 2.0,
+            false => iced::Pixels::ZERO,
+        };
+        container(SelectRich::new(rich, spans, size))
+            .padding(iced::padding::top(top))
+            .into()
+    }
+
+    fn paragraph(
+        &self,
+        settings: iced::widget::markdown::Settings,
+        text: &iced::widget::markdown::Text,
+    ) -> Element<'a, String> {
+        let spans = text.spans(settings.style);
+        let rich = iced::widget::rich_text(spans.clone())
+            .on_link_click(Self::on_link_click)
+            .size(settings.text_size);
+        SelectRich::new(rich, spans, settings.text_size).into()
+    }
+
+    fn code_block(
+        &self,
+        settings: iced::widget::markdown::Settings,
+        _language: Option<&'a str>,
+        _code: &'a str,
+        lines: &'a [iced::widget::markdown::Text],
+    ) -> Element<'a, String> {
+        use iced::widget::markdown::Catalog as _;
+        use iced::widget::{container, scrollable};
+        let metrics = CodeMetrics {
+            size: settings.code_size,
+            line_height: iced::advanced::text::LineHeight::default(),
+            font: settings.style.code_block_font,
+        };
+        let plate = CodeSelect::new(
+            lines.iter().map(|line| line.spans(settings.style)),
+            metrics,
+            None,
+            Length::Shrink,
+        );
+        container(
+            scrollable(container(plate).padding(settings.code_size)).direction(
+                scrollable::Direction::Horizontal(
+                    scrollable::Scrollbar::default()
+                        .width(settings.code_size / 2)
+                        .scroller_width(settings.code_size / 2),
+                ),
+            ),
+        )
+        .width(Length::Fill)
+        .padding(settings.code_size / 4)
+        .class(Theme::code_block())
+        .into()
     }
 }
 
