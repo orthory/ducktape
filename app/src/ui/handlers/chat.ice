@@ -861,9 +861,46 @@ on begin_message_edit(seq, body, rev)
 // A LINK PRESS IS A HAND-OFF TO THE OS, and nothing else: no selection, no
 // draft, no rail. Same route the page renderer's link press takes
 // (`handlers/pages.ice`), and it shares that handler's two result arms.
+// THE duck:// OPEN PLANE. A clicked link is classified ONCE — `classify_duck_link`
+// is the protocol's module table — and each kind maps onto navigation the
+// app ALREADY has: the handler a click on the screen itself would reach,
+// handed the link's field through an echo lane (the one way a handler reaches
+// another). A target that needs two steps (a repo, THEN its item or file; a
+// directory, THEN its file) parks a one-shot focus that `forge_repo_loaded` /
+// `fs_listed` consume. The protocol adds addresses, never navigation.
 on open_message_link(url)
   return if empty(url)
-  run every open_external_url(url) -> external_url_opened _ | external_url_failed _
+  let link = classify_duck_link(url)
+  match link.kind
+    DuckKind.unknown
+      error = "this link names nothing the app can open"
+    DuckKind.web
+      run every open_external_url(url) -> external_url_opened _ | external_url_failed _
+    DuckKind.page
+      run every duck_echo_str(link.page) -> open_page_search_hit(_, "") | external_url_failed _
+    DuckKind.files
+      fs_focus_path = link.path
+      shell_tab = ShellTab.files
+      run every duck_echo_str(fs_parent(link.path)) -> fs_open_dir _ | external_url_failed _
+    DuckKind.forge_repo
+      forge_focus_number = 0
+      forge_focus_path = ""
+      shell_tab = ShellTab.forge
+      run every duck_echo_str(link.repo) -> forge_open_repo _ | external_url_failed _
+    DuckKind.forge_item
+      forge_focus_number = link.number
+      forge_focus_path = ""
+      shell_tab = ShellTab.forge
+      run every duck_echo_str(link.repo) -> forge_open_repo _ | external_url_failed _
+    DuckKind.forge_blob
+      forge_focus_number = 0
+      forge_focus_path = link.path
+      shell_tab = ShellTab.forge
+      run every duck_echo_str(link.repo) -> forge_open_repo _ | external_url_failed _
+    DuckKind.channel
+      run every duck_echo_str(link.channel) -> choose_channel _ | external_url_failed _
+    DuckKind.channel_message
+      run every duck_echo_str(link.channel) -> open_chat_search_hit(_, link.seq, link.seq) | external_url_failed _
 
 // THE INSPECTOR IS THE FINALITY MARK'S TARGET. The shield in the hover bar and
 // the settled chip on my own bubble both land here, and both name the same

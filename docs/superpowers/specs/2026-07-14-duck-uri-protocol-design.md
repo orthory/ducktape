@@ -1,6 +1,10 @@
 # duck:// URI Protocol (v1)
 
 2026-07-14. Status: approved for implementation (single PR against `dev`).
+2026-08-22: the module table lives in the iced app (`app/src/backend/duck_uri.rs`,
+`classify_duck_link`); the open plane is `open_message_link` (`handlers/chat.ice`);
+`forge` gains the `/<repo>/blob/<path>[@<rev>]` row and `![…]` image embeds resolve
+through the table in the forge reader's Markdown.
 
 ## Problem
 
@@ -44,7 +48,7 @@ chat parser marks only `https?://`), so the agent runtime sees the same bytes.
 |---|---|---|---|---|
 | `page` | `/<id>` (one segment) | live store title, else raw id | `openPage` + `setScreen("pages")` | page subtree (current) |
 | `files` | `/shared/attachments/<dir>/<name>` | filename chip; `![…]` image embeds | download / inline preview (current) | committed text (current) |
-| `forge` | `/<repo>` or `/<repo>/<n>` (`n`, `seq` = decimal digits); `#<seq>` anchors a Discussion message | `<repo>` or `<repo>#<n>` | `openForgeItem({repo, number, messageSeq})` — the existing one-shot `forgeFocus` hand-off | none (nav-only) |
+| `forge` | `/<repo>` or `/<repo>/<n>` (`n`, `seq` = decimal digits); `#<seq>` anchors a Discussion message; `/<repo>/blob/<path>[@<rev>]` names a committed file (`rev` = oid or branch, default head; no dot-segments) | `<repo>` or `<repo>#<n>`; a blob `![…]` embeds the picture | `openForgeItem({repo, number, messageSeq})` — the existing one-shot `forgeFocus` hand-off; a blob opens the Code tab's reader on that file (at the tree's head — the browser does not pin `@rev`) | none (nav-only) |
 | `channel` | `/<id>` (ids may contain `:`); `#<seq>` anchors a message | `#<name>` from the store, else raw id | `selectChannel` / `focusMessage(id, seq)` (scroll+flash); `forge:<repo>:<n>` ids reroute to the forge item via the existing `forgeItemTarget` helper | none (nav-only) |
 
 Reserved names: `memory` (agent-side evidence URIs, Rust-only), every dotted

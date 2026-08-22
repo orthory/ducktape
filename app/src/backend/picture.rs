@@ -28,6 +28,10 @@ pub const MAX_PICTURE_SIDE: u32 = 2048;
 pub const FILES_SURFACE: &str = "files";
 /// The forge reader's slot.
 pub const FORGE_SURFACE: &str = "forge";
+/// How many of a Markdown document's in-repo pictures the loader fetches, in
+/// document order. ponytail: the rest keep their alt text; page them lazily
+/// if a README ever carries more.
+pub const MAX_INLINE_PICTURES: usize = 8;
 
 /// A decoded picture: its drawn dimensions (post-downscale) and the handle.
 #[derive(Clone, Debug)]
@@ -81,6 +85,13 @@ fn store() -> &'static Mutex<HashMap<&'static str, (String, Picture)>> {
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// [`decode_picture`] under `spawn_blocking` — the one way a loader decodes.
+pub async fn decode_off_thread(bytes: Vec<u8>) -> Result<Picture, String> {
+    tokio::task::spawn_blocking(move || decode_picture(&bytes))
+        .await
+        .map_err(|error| format!("picture decode task failed: {error}"))?
+}
+
 /// Decode off the runtime and park the result under `surface`, replacing
 /// whatever that surface held. Returns the drawn `(width, height)`.
 pub async fn store_picture(
@@ -88,9 +99,7 @@ pub async fn store_picture(
     path: String,
     bytes: Vec<u8>,
 ) -> Result<(u32, u32), String> {
-    let decoded = tokio::task::spawn_blocking(move || decode_picture(&bytes))
-        .await
-        .map_err(|error| format!("picture decode task failed: {error}"))??;
+    let decoded = decode_off_thread(bytes).await?;
     let dimensions = (decoded.width, decoded.height);
     park_picture(surface, path, decoded);
     Ok(dimensions)
@@ -114,6 +123,62 @@ pub fn stored_picture(surface: &str, path: &str) -> Option<Picture> {
         .get(surface)
         .filter(|(stored, _)| stored == path)
         .map(|(_, picture)| picture.clone())
+}
+
+/// Resolve a Markdown image URL against the document's place in the repo:
+/// `img/a.png` beside `docs/README.md` is `docs/img/a.png`, a leading `/` is
+/// the repo root, `.`/`..` fold, a query or fragment is dropped. Anything
+/// with a scheme (`https:`, `data:`, `mailto:`), an empty target, or a walk
+/// past the root is `None` — the viewer keeps the alt text for those.
+pub fn resolve_repo_path(doc: &str, url: &str) -> Option<String> {
+    let target = url.split(['?', '#']).next().unwrap_or_default();
+    let external = target.is_empty() || target.contains(':');
+    if external {
+        return None;
+    }
+    let rooted = target.strip_prefix('/');
+    let doc_dir = doc.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+    let mut segments: Vec<&str> = match rooted {
+        Some(_) => Vec::new(),
+        None => doc_dir.split('/').filter(|s| !s.is_empty()).collect(),
+    };
+    for segment in rooted.unwrap_or(target).split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop()?;
+            }
+            name => segments.push(name),
+        }
+    }
+    let nothing_left = segments.is_empty();
+    if nothing_left {
+        return None;
+    }
+    Some(segments.join("/"))
+}
+
+/// doc path → its in-repo pictures by resolved path. One document at a time:
+/// the reader shows one Markdown blob, and the loader replaces the whole set
+/// when the next one lands.
+fn inline_store() -> &'static Mutex<(String, HashMap<String, Picture>)> {
+    static STORE: OnceLock<Mutex<(String, HashMap<String, Picture>)>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new((String::new(), HashMap::new())))
+}
+
+/// Park a document's in-repo pictures, replacing the previous document's.
+pub(crate) fn park_inline_pictures(doc: String, pictures: HashMap<String, Picture>) {
+    *inline_store().lock().expect("inline picture store") = (doc, pictures);
+}
+
+/// `path`'s picture, only if the parked set is `doc`'s.
+pub fn inline_picture(doc: &str, path: &str) -> Option<Picture> {
+    let store = inline_store().lock().expect("inline picture store");
+    let same_doc = store.0 == doc;
+    match same_doc {
+        true => store.1.get(path).cloned(),
+        false => None,
+    }
 }
 
 /// The viewer itself: the surface's picture, contained to the pane's width
@@ -178,6 +243,36 @@ mod tests {
     fn bytes_that_are_not_a_picture_are_an_error_not_a_panic() {
         assert!(decode_picture(b"\0not a picture").is_err());
         assert!(decode_picture(b"").is_err());
+    }
+
+    #[test]
+    fn a_markdown_image_url_resolves_against_the_documents_directory() {
+        let cases = [
+            ("docs/README.md", "img/a.png", Some("docs/img/a.png")),
+            ("README.md", "./a.png", Some("a.png")),
+            ("docs/guide/x.md", "../assets/b.jpg", Some("docs/assets/b.jpg")),
+            ("docs/x.md", "/logo.png", Some("logo.png")),
+            ("x.md", "a.png?raw=1#frag", Some("a.png")),
+            ("x.md", "https://host/a.png", None),
+            ("x.md", "data:image/png;base64,AAAA", None),
+            ("x.md", "../../a.png", None),
+            ("x.md", "", None),
+            ("x.md", "./", None),
+        ];
+        for (doc, url, want) in cases {
+            assert_eq!(resolve_repo_path(doc, url).as_deref(), want, "{doc} + {url}");
+        }
+    }
+
+    #[test]
+    fn a_documents_inline_pictures_answer_only_under_that_document() {
+        let picture = decode_picture(&png(2, 2)).expect("decodes");
+        park_inline_pictures("README.md".into(), HashMap::from([("a.png".to_string(), picture)]));
+        assert!(inline_picture("README.md", "a.png").is_some());
+        assert!(inline_picture("README.md", "b.png").is_none());
+        assert!(inline_picture("docs/README.md", "a.png").is_none(), "another document's set never answers");
+        park_inline_pictures("docs/README.md".into(), HashMap::new());
+        assert!(inline_picture("README.md", "a.png").is_none(), "the next document replaces the set");
     }
 
     #[test]

@@ -757,6 +757,12 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
     file_picture = false
     file_width:i64 = 0
     file_height:i64 = 0
+    // A deep link's file — and the connection it came with, since a handler
+    // reads no prop — parked until the tree (and so `tree_rev`) lands.
+    focus_rpc = ""
+    focus_online = false
+    focus_repo = ""
+    focus_path = ""
     failed_note = ""
     opened_dir = ""
     opened_rev = ""
@@ -778,8 +784,25 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
     tree_entries = next.entries
     tree_truncated = next.truncated
     tree_phase = ForgeTreePhase.ready
+    return if empty(focus_path)
+    let path = focus_path
+    focus_path = ""
+    run every duck_echo_str(path) -> open_file(focus_rpc, focus_online, focus_repo, tree_rev, tree_path, _) | file_failed _
   on tree_failed(cause)
     tree_phase = ForgeTreePhase.failed
+  // A `duck://forge/<repo>/blob/<path>` deep link. The reader's header gates
+  // on the TREE's revision, which only this instance knows — so the file
+  // opens here, at once if the tree has landed, else from `tree_loaded`.
+  // The link's `@rev` is not honoured by the browser (it pins its head);
+  // the markdown image loader does honour it.
+  on focus_file(rpc, online, repo_now, path)
+    focus_rpc = rpc
+    focus_online = online
+    focus_repo = repo_now
+    focus_path = path
+    return if tree_phase != ForgeTreePhase.ready
+    focus_path = ""
+    run every duck_echo_str(path) -> open_file(focus_rpc, focus_online, focus_repo, tree_rev, tree_path, _) | file_failed _
   on open_file(rpc, online, repo_now, rev, dir, path)
     return if !online || empty(repo_now)
     opened_dir = dir
@@ -976,7 +999,9 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
         // listing: a README is the first file every repo page
         // opens, and the shell's agent answers already ship
         // the full iced-markdown adapter (`agent_markdown`) —
-        // this reuses it verbatim. Links route through the
+        // `forge_markdown` is that adapter told which document
+        // it is, so the in-repo pictures `forge_blob` parked for
+        // it draw in place of their alt text. Links route through the
         // same `open_message_link` seam the discussion's
         // messages already use. Markdown-vs-code is the
         // path's call (`markdown_path`) because the wire only
@@ -989,7 +1014,7 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
               pt=13.0
               pb=13.0
               gap=9.0
-            extern agent_markdown(file_text, dark) #forge-markdown -> emit(open_message_link, _)
+            extern forge_markdown(file_text, file_path, dark) #forge-markdown -> emit(open_message_link, _)
             if file_truncated
               text "This file is larger than the 64 KiB preview limit."
                 with

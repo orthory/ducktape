@@ -161,6 +161,13 @@ pub fn agent_markdown(source: String, dark: bool) -> Element<'static, String> {
     Element::new(AgentMarkdown::new(&source, dark))
 }
 
+/// The forge reader's Markdown: the same surface as [`agent_markdown`], plus
+/// the document's in-repo pictures (parked by `forge_blob` under `doc`)
+/// drawn in place of their alt text.
+pub fn forge_markdown(source: String, doc: String, dark: bool) -> Element<'static, String> {
+    Element::new(AgentMarkdown::new(&source, dark).with_doc(doc))
+}
+
 pub fn focus_agent_terminal(session: AgentTerminalSession) -> iced::Task<()> {
     terminal::focus_terminal(session.0)
 }
@@ -990,6 +997,7 @@ fn agent_terminal_notice(notice: terminal::Notice) -> AgentTerminalNotice {
 struct AgentMarkdown {
     items: Rc<[iced::widget::markdown::Item]>,
     settings: iced::widget::markdown::Settings,
+    viewer: SelectViewer,
 }
 
 impl AgentMarkdown {
@@ -1035,11 +1043,18 @@ impl AgentMarkdown {
         Self {
             items: markdown::parse(source).collect::<Vec<_>>().into(),
             settings,
+            viewer: SelectViewer { doc: None },
         }
     }
 
+    /// Draw the in-repo pictures parked under `doc` (see `picture.rs`).
+    fn with_doc(mut self, doc: String) -> Self {
+        self.viewer.doc = Some(doc);
+        self
+    }
+
     fn view(&self) -> Element<'_, String> {
-        iced::widget::markdown::view_with(self.items.iter(), self.settings, &SelectViewer)
+        iced::widget::markdown::view_with(self.items.iter(), self.settings, &self.viewer)
     }
 }
 
@@ -1047,12 +1062,48 @@ impl AgentMarkdown {
 /// behind a [`SelectRich`] (one block is one selection, like the app's plain
 /// Ice `text`), every code block one [`CodeSelect`] so a drag runs across
 /// its lines. Lists, quotes and tables keep iced's default look and route
-/// their text back through here. Images keep the default.
-struct SelectViewer;
+/// their text back through here. An image draws the picture `forge_blob`
+/// parked under `doc` for its URL as written (relative path, `duck://files`,
+/// `duck://forge/.../blob/...`), and keeps iced's default (the alt text in a
+/// plate) for everything else — including every image when there is no
+/// document, as in the agent's answers.
+struct SelectViewer {
+    doc: Option<String>,
+}
 
 impl<'a> iced::widget::markdown::Viewer<'a, String> for SelectViewer {
     fn on_link_click(url: iced::widget::markdown::Uri) -> String {
         url
+    }
+
+    fn image(
+        &self,
+        settings: iced::widget::markdown::Settings,
+        url: &'a iced::widget::markdown::Uri,
+        _title: &'a str,
+        alt: &iced::widget::markdown::Text,
+    ) -> Element<'a, String> {
+        use iced::widget::{container, image, rich_text};
+        let parked = self
+            .doc
+            .as_deref()
+            .and_then(|doc| super::picture::inline_picture(doc, url));
+        let Some(picture) = parked else {
+            return container(
+                rich_text(alt.spans(settings.style)).on_link_click(Self::on_link_click),
+            )
+            .padding(settings.spacing.0)
+            .class(<iced::Theme as iced::widget::markdown::Catalog>::code_block())
+            .into();
+        };
+        container(
+            image(picture.handle)
+                .width(Length::Fill)
+                .height(Length::Shrink)
+                .content_fit(iced::ContentFit::Contain),
+        )
+        .width(Length::Fill)
+        .into()
     }
 
     fn heading(

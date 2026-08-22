@@ -643,6 +643,23 @@ fn park_forge_picture(path: &str, rgb: [u8; 3]) {
     );
 }
 
+/// A solid 64×64 picture of one colour, parked as `doc`'s inline picture at
+/// `path` — what `forge_blob` leaves behind for a Markdown blob's image.
+fn park_inline_picture(doc: &str, path: &str, rgb: [u8; 3]) {
+    let pixels = [rgb[0], rgb[1], rgb[2], 255].repeat(64 * 64);
+    backend::park_inline_pictures(
+        doc.to_owned(),
+        std::collections::HashMap::from([(
+            path.to_owned(),
+            backend::Picture {
+                width: 64,
+                height: 64,
+                handle: iced::widget::image::Handle::from_rgba(64, 64, pixels),
+            },
+        )]),
+    );
+}
+
 /// Open `path` in the browser and land it as a picture blob through the
 /// same seam `seed_forge_file` uses for text.
 fn seed_forge_picture(app: &mut Ducktape, scope: &str, path: &str) {
@@ -1442,6 +1459,67 @@ fn probe_row_repaint() {
     );
 }
 
+/// A MARKDOWN BLOB'S INLINE PICTURE IS PROVEN BY ITS PIXELS, the same way:
+/// the document and its text never change between the two frames, only the
+/// picture parked for `logo.png` does.
+#[test]
+fn the_forge_reader_draws_a_markdown_blobs_inline_picture() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(probe_forge_inline_picture_content)
+        .expect("the forge inline picture probe thread spawns")
+        .join()
+        .expect("the forge inline picture probe thread finishes");
+}
+
+fn probe_forge_inline_picture_content() {
+    let (mut app, console, scope) = console_in_forge_tree(vec![backend::TreeEntry {
+        name: "README.md".into(),
+        path: "README.md".into(),
+        kind: "file".into(),
+    }]);
+    let mut renderer = headless_renderer();
+    let (cache, empty) = drawn_frame(
+        &mut app,
+        console,
+        &mut renderer,
+        user_interface::Cache::default(),
+    );
+
+    park_inline_picture("README.md", "./logo.png", [220, 40, 40]);
+    seed_forge_file(
+        &mut app,
+        &scope,
+        "README.md",
+        "# Probe\n\nA line before.\n\n![logo](./logo.png)\n\nA line after.\n".into(),
+    );
+    let (cache, red) = drawn_frame(&mut app, console, &mut renderer, cache);
+    assert!(
+        empty != red,
+        "a loaded markdown blob must repaint the reader out of its empty plate"
+    );
+    let (cache, red_again) = drawn_frame(&mut app, console, &mut renderer, cache);
+    assert!(
+        red == red_again,
+        "an unchanged frame must draw identical pixels — without this control \
+         the swap assertion below proves nothing"
+    );
+    let (cache, red_again) = drawn_frame(&mut app, console, &mut renderer, cache);
+    assert!(
+        red == red_again,
+        "an unchanged frame must draw identical pixels — without this control \
+         the swap assertion below proves nothing"
+    );
+
+    park_inline_picture("README.md", "./logo.png", [40, 40, 220]);
+    let (_cache, blue) = drawn_frame(&mut app, console, &mut renderer, cache);
+    assert!(
+        red != blue,
+        "a replaced inline picture must repaint — identical pixels mean the \
+         markdown viewer draws alt text, a stale handle, or no picture at all"
+    );
+}
+
 /// THE READER MUST DRAW THE PICTURE. The `picture` extern reads a handle out
 /// of a process-wide slot, so nothing in the Ice tree changes between two
 /// pictures at the same path: only the pixels can prove the extern drew the
@@ -1476,6 +1554,18 @@ fn probe_forge_picture_content() {
     assert!(
         empty != red,
         "a loaded picture must repaint the reader out of its empty plate"
+    );
+    let (cache, red_again) = drawn_frame(&mut app, console, &mut renderer, cache);
+    assert!(
+        red == red_again,
+        "an unchanged frame must draw identical pixels — without this control \
+         the swap assertion below proves nothing"
+    );
+    let (cache, red_again) = drawn_frame(&mut app, console, &mut renderer, cache);
+    assert!(
+        red == red_again,
+        "an unchanged frame must draw identical pixels — without this control \
+         the swap assertion below proves nothing"
     );
 
     // Same path, same Ice state, a different picture in the slot: only the

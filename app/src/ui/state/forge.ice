@@ -2,6 +2,9 @@ state
   forge_list_phase:ForgePhase = ForgePhase.idle
   forge_repos:[ForgeRepo] = []
   forge_repo = ""
+  // A forge deep link's second step, consumed by `forge_repo_loaded`.
+  forge_focus_number:i64 = 0
+  forge_focus_path = ""
   forge_repo_phase:ForgePhase = ForgePhase.idle
   forge_branches:[str] = []
   forge_items:[ForgeItem] = []

@@ -739,30 +739,34 @@ async fn forge_text(
         "path": &path,
     }});
     let reply = client.query("forge", &query).await?;
-    blob_view(reply, repo)
+    let view = blob_view(reply, repo)?;
+    let illustrated = markdown_path(view.path.clone()) && !view.binary;
+    if illustrated {
+        load_inline_pictures(client, &view).await;
+    }
+    Ok(view)
 }
 
-/// Page a picture blob in (1 MiB `blob_bytes` pages to eof), decode it off
-/// the runtime, park the handle. The node refuses an object past its paged
-/// cap with an empty final page — that, the app's own byte cap, and a body
-/// that does not decode all land on the binary plate, never a failed load.
-async fn forge_picture(
+/// Page one blob's bytes in through `blob_bytes` (1 MiB pages to eof).
+/// Page 1 asks by the caller's rev (a branch name or an oid); every later
+/// page asks by the exact oid page 1 answered, so a branch that moves
+/// mid-read cannot hand back pages of two different commits — and that exact
+/// oid is returned. `None` bytes: the node refused the object (past its paged
+/// cap) or it passed the app's own byte cap; either way it was not assembled.
+async fn forge_blob_bytes(
     client: &RpcClient,
-    repo: String,
-    rev: String,
-    path: String,
-) -> Result<BlobView, String> {
-    use super::picture::{FORGE_SURFACE, MAX_PICTURE_BYTES, store_picture};
+    repo: &str,
+    rev: &str,
+    path: &str,
+) -> Result<(String, Option<Vec<u8>>), String> {
+    use super::picture::MAX_PICTURE_BYTES;
     let mut bytes = Vec::new();
-    // Page 1 asks by the caller's rev (a branch name or an oid); every later
-    // page asks by the exact oid page 1 answered, so a branch that moves
-    // mid-read cannot hand back pages of two different commits.
-    let mut rev = rev;
+    let mut rev = rev.to_owned();
     loop {
         let query = serde_json::json!({ "blob_bytes": {
-            "repo": &repo,
+            "repo": repo,
             "rev": &rev,
-            "path": &path,
+            "path": path,
             "offset": bytes.len() as u64,
             "len": forge::MAX_BLOB_PAGE_BYTES as u64,
         }});
@@ -779,13 +783,29 @@ async fn forge_picture(
         let refused = page.eof && bytes.is_empty();
         let past_cap = bytes.len() > MAX_PICTURE_BYTES;
         if refused || past_cap {
-            return Ok(binary_blob(repo, rev, path, true));
+            return Ok((rev, None));
         }
         let done = page.eof || chunk.is_empty();
         if done {
-            break;
+            return Ok((rev, Some(bytes)));
         }
     }
+}
+
+/// A picture blob: page it in, decode it off the runtime, park the handle.
+/// A refused or over-cap object and a body that does not decode all land on
+/// the binary plate, never a failed load.
+async fn forge_picture(
+    client: &RpcClient,
+    repo: String,
+    rev: String,
+    path: String,
+) -> Result<BlobView, String> {
+    use super::picture::{FORGE_SURFACE, store_picture};
+    let (rev, bytes) = forge_blob_bytes(client, &repo, &rev, &path).await?;
+    let Some(bytes) = bytes else {
+        return Ok(binary_blob(repo, rev, path, true));
+    };
     match store_picture(FORGE_SURFACE, path.clone(), bytes).await {
         Ok((width, height)) => Ok(BlobView {
             repo,
@@ -800,6 +820,73 @@ async fn forge_picture(
             height: i64::from(height),
         }),
         Err(_) => Ok(binary_blob(repo, rev, path, false)),
+    }
+}
+
+/// Fetch the pictures a Markdown blob embeds and park them under the
+/// document, keyed by the image URL as written, for `forge_markdown`'s
+/// viewer. Best effort, in document order, the first `MAX_INLINE_PICTURES`:
+/// an image that does not resolve, fetch or decode simply keeps its alt text.
+/// ponytail: fetched before the text lands, so a README with eight large
+/// pictures shows late; split into its own lane if that is ever felt.
+async fn load_inline_pictures(client: &RpcClient, view: &BlobView) {
+    use super::picture::{MAX_INLINE_PICTURES, decode_off_thread, park_inline_pictures};
+    let mut wanted: Vec<String> = Vec::new();
+    for item in iced::widget::markdown::parse(&view.text) {
+        let iced::widget::markdown::Item::Image { url, .. } = item else {
+            continue;
+        };
+        let seen = wanted.contains(&url);
+        if !seen {
+            wanted.push(url);
+        }
+    }
+    wanted.truncate(MAX_INLINE_PICTURES);
+    let mut pictures = std::collections::HashMap::new();
+    for url in wanted {
+        let Some(bytes) = inline_picture_bytes(client, view, &url).await else {
+            continue;
+        };
+        let Ok(picture) = decode_off_thread(bytes).await else {
+            continue;
+        };
+        pictures.insert(url, picture);
+    }
+    park_inline_pictures(view.path.clone(), pictures);
+}
+
+/// Where an image URL's bytes live, by the duck:// module table: a
+/// `duck://forge/<repo>/blob/<path>[@rev]` is that repo's committed file, a
+/// `duck://files/...` is the attachment in duckfs, and a bare relative path
+/// is this repo's file beside the document at the document's own commit.
+/// Every other kind — a web URL, a page or channel ref, a malformed duck URI
+/// — has no bytes to fetch.
+async fn inline_picture_bytes(client: &RpcClient, view: &BlobView, url: &str) -> Option<Vec<u8>> {
+    use super::duck_uri::{DuckKind, classify_duck_link};
+    use super::picture::resolve_repo_path;
+    let link = classify_duck_link(url.to_owned());
+    match link.kind {
+        DuckKind::ForgeBlob => forge_blob_bytes(client, &link.repo, &link.rev, &link.path)
+            .await
+            .ok()
+            .and_then(|(_, bytes)| bytes),
+        DuckKind::Files => super::storage::files_read_all(client, &link.path)
+            .await
+            .ok()
+            .flatten(),
+        DuckKind::Unknown => {
+            let path = resolve_repo_path(&view.path, url)?;
+            forge_blob_bytes(client, &view.repo, &view.rev, &path)
+                .await
+                .ok()
+                .and_then(|(_, bytes)| bytes)
+        }
+        DuckKind::Web
+        | DuckKind::Page
+        | DuckKind::ForgeRepo
+        | DuckKind::ForgeItem
+        | DuckKind::Channel
+        | DuckKind::ChannelMessage => None,
     }
 }
 

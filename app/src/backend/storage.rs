@@ -251,38 +251,13 @@ async fn files_picture(
     generation: i64,
 ) -> Result<FsPreview, String> {
     use super::picture::{FILES_SURFACE, MAX_PICTURE_BYTES, store_picture};
-    // The `read` lane's own page cap (duckfs `MAX_READ_BYTES`); the node clamps
-    // anything larger, so asking for exactly it is one round-trip per MiB.
-    let page_len = (1024 * 1024).to_string();
-    let mut bytes = Vec::new();
-    loop {
-        let offset = bytes.len().to_string();
-        let reply = rpc
-            .files_get(
-                "read",
-                &[
-                    ("path", path.as_str()),
-                    ("offset", offset.as_str()),
-                    ("len", page_len.as_str()),
-                ],
-            )
-            .await?;
-        let page = base64_decode(reply["b64"].as_str().unwrap_or_default()).unwrap_or_default();
-        let eof = reply["eof"].as_bool().unwrap_or(true);
-        bytes.extend_from_slice(&page);
-        let past_cap = bytes.len() > MAX_PICTURE_BYTES;
-        if past_cap {
-            let note = format!(
-                "picture larger than the {} MiB preview limit",
-                MAX_PICTURE_BYTES >> 20
-            );
-            return Ok(binary_preview(generation, path, note));
-        }
-        let done = eof || page.is_empty();
-        if done {
-            break;
-        }
-    }
+    let Some(bytes) = files_read_all(rpc, &path).await? else {
+        let note = format!(
+            "picture larger than the {} MiB preview limit",
+            MAX_PICTURE_BYTES >> 20
+        );
+        return Ok(binary_preview(generation, path, note));
+    };
     let size = bytes.len();
     match store_picture(FILES_SURFACE, path.clone(), bytes).await {
         Ok((width, height)) => Ok(FsPreview {
@@ -300,6 +275,37 @@ async fn files_picture(
             path,
             format!("{size} binary bytes · not a decodable picture"),
         )),
+    }
+}
+
+/// Page one duckfs file in whole through the `read` lane (1 MiB pages to eof
+/// — the checkout's `read_all` shape). `None`: past the picture byte cap,
+/// not assembled.
+pub(crate) async fn files_read_all(rpc: &RpcClient, path: &str) -> Result<Option<Vec<u8>>, String> {
+    use super::picture::MAX_PICTURE_BYTES;
+    // The `read` lane's own page cap (duckfs `MAX_READ_BYTES`); the node clamps
+    // anything larger, so asking for exactly it is one round-trip per MiB.
+    let page_len = (1024 * 1024).to_string();
+    let mut bytes = Vec::new();
+    loop {
+        let offset = bytes.len().to_string();
+        let reply = rpc
+            .files_get(
+                "read",
+                &[("path", path), ("offset", offset.as_str()), ("len", page_len.as_str())],
+            )
+            .await?;
+        let page = base64_decode(reply["b64"].as_str().unwrap_or_default()).unwrap_or_default();
+        let eof = reply["eof"].as_bool().unwrap_or(true);
+        bytes.extend_from_slice(&page);
+        let past_cap = bytes.len() > MAX_PICTURE_BYTES;
+        if past_cap {
+            return Ok(None);
+        }
+        let done = eof || page.is_empty();
+        if done {
+            return Ok(Some(bytes));
+        }
     }
 }
 
