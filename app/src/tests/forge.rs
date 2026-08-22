@@ -347,8 +347,10 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
         "and opens from `tree_loaded` alone — under the tree's own revision"
     );
 
-    // The `#seq` landing: one-shot into the highlight, page snapped to the
-    // Discussion, and the highlight retired by the item's own open/close.
+    // The `#seq` landing: one-shot into the highlight, page scrolled to the
+    // row by its key — the seq, captured before it is retired, since a widget
+    // task must close the handler — and the highlight retired by the item's
+    // own open/close.
     let discussion_loaded = forge
         .split_once("on forge_discussion_loaded(next)")
         .expect("the handler")
@@ -358,9 +360,23 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
         .0;
     assert!(
         discussion_loaded.contains("return if forge_focus_seq == 0")
-            && discussion_loaded.contains("forge_linked_note = linked_note(forge_discussion, forge_focus_seq)")
-            && discussion_loaded.contains("task widget snap #workspace-tabs/content/forge/item-detail 0.0 1.0"),
-        "the discussion's load lands the seq"
+            && discussion_loaded.contains("let landed = forge_focus_seq")
+            && discussion_loaded
+                .contains("forge_linked_note = linked_note(forge_discussion, landed)")
+            && discussion_loaded.contains(
+                "task widget scroll-to-key #workspace-tabs/content/forge/item-detail landed"
+            ),
+        "the discussion's load lands the seq on its row"
+    );
+    let captured = discussion_loaded
+        .find("let landed = forge_focus_seq")
+        .expect("the capture");
+    let retired = discussion_loaded
+        .find("forge_focus_seq = 0")
+        .expect("the retirement");
+    assert!(
+        captured < retired,
+        "the key is captured before the seq is zeroed"
     );
     assert!(
         screen.contains("scroll #item-detail") && screen.contains("match linked_note\n"),

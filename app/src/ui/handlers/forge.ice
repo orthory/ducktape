@@ -134,12 +134,14 @@ on forge_discussion_loaded(next)
   forge_discussion = next.messages
   forge_discussion_members = next.members
   // A deep link's `#seq` lands here, once: the note is picked out of the list and
-  // the item's page snaps to its Discussion (the last section). An exact
-  // scroll to the row waits on a scroll-to-key for `keyed` lists.
+  // the item's page scrolls to that row — by its key in the Discussion's
+  // keyed column, landing on the row's measured top (a seq the list does not
+  // hold scrolls nowhere; the linked-note card above the list still shows it).
   return if forge_focus_seq == 0
-  forge_linked_note = linked_note(forge_discussion, forge_focus_seq)
+  let landed = forge_focus_seq
+  forge_linked_note = linked_note(forge_discussion, landed)
   forge_focus_seq = 0
-  task widget snap #workspace-tabs/content/forge/item-detail 0.0 1.0 window=window_target(console_win)
+  task widget scroll-to-key #workspace-tabs/content/forge/item-detail landed window=window_target(console_win)
 
 on forge_discussion_failed(cause)
   error = cause.message
