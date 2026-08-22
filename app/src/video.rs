@@ -685,8 +685,10 @@ pub fn call_video_stage(peer: String) -> Element<'static, ()> {
 pub const SELF_STAGE: &str = "you";
 
 /// The staged frame's size and handle: a peer's by node key, or the local
-/// preview under [`SELF_STAGE`].
-fn stage_frame(peer: &str) -> Option<(u32, u32, iced::widget::image::Handle)> {
+/// preview under [`SELF_STAGE`]. `pub(crate)` for the live huddle lane, which
+/// asks the store the same question the stage does: is this peer's picture
+/// here yet?
+pub(crate) fn stage_frame(peer: &str) -> Option<(u32, u32, iced::widget::image::Handle)> {
     let store = store().lock().expect("video store");
     let frame = match peer {
         SELF_STAGE => store.preview.as_ref(),

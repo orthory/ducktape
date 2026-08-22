@@ -31,6 +31,35 @@ make test                                    # full local gate: wasm drift + wor
 above: this list omitted it for as long as this skill claimed `app/` had been
 removed, and every QA pass that followed the list silently skipped the crate.
 
+### The huddle: three lanes, and only the last one is the whole thing
+
+A huddle is the one feature whose failure mode is BETWEEN two people, so its
+coverage is layered and the top layer has to be run by hand:
+
+```bash
+cargo test -p node-bin --test huddle_media_e2e   # two real nodes, real overlay,
+                                                 # the late-joiner deadlock and its cure
+ops/huddle-lane.sh                               # stands a two-node network up and
+                                                 # prints one command per side
+```
+
+`ops/huddle-lane.sh` is the live lane: two real nodes, one user key per side,
+and `app/src/tests/huddle_live.rs` run once per side (it is `#[ignore]`d, so it
+only runs when asked). Each side joins the huddle through the app's own
+`join_huddle`, waits for the other, publishes this box's camera and asserts the
+other side's beacon AND picture arrive. A headless box can borrow a camera:
+
+```bash
+sudo modprobe v4l2loopback devices=1 exclusive_caps=1 max_openers=8
+sudo chmod a+rw /dev/video0
+ffmpeg -re -f lavfi -i testsrc=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video0 &
+```
+
+Measured on zk-dev 2026-08-22: both sides saw the other's 640×480 picture
+about one second after joining. With the `ffmpeg` producer stopped, both sides
+fail on the picture with the beacon still true — which is what makes the
+passing run mean something.
+
 ### On macOS: raise the fd limit first
 
 ```bash

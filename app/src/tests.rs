@@ -6,6 +6,7 @@ use super::*;
 mod connection;
 mod design;
 mod forge;
+mod huddle_live;
 mod messages;
 mod pages;
 mod rooms;
