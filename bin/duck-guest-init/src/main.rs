@@ -34,6 +34,10 @@ mod manifest;
 #[path = "../../../crates/services/sandbox/src/guest_proto.rs"]
 mod guest_proto;
 
+#[allow(dead_code)]
+#[path = "../../../crates/services/sandbox/src/guest_paths.rs"]
+mod paths;
+
 use guest_proto::{Frame, encode};
 use manifest::RunManifest;
 use std::ffi::CString;
@@ -61,11 +65,9 @@ fn main() {
 }
 
 fn run() -> Result<i32, String> {
-    mount_pseudo_filesystems()?;
+    mount_base_filesystems()?;
 
-    let cmdline =
-        std::fs::read_to_string("/proc/cmdline").map_err(|e| format!("read /proc/cmdline: {e}"))?;
-    let manifest = manifest::from_cmdline(&cmdline)?;
+    let manifest = read_manifest()?;
 
     for mount in &manifest.mounts {
         mount_ext4(mount)?;
@@ -93,17 +95,48 @@ fn run() -> Result<i32, String> {
     code
 }
 
+/// read the run manifest off its own block device.
+///
+/// RAW, with no filesystem to mount, because the manifest is what says which
+/// filesystems to mount. Reading the whole device rather than the payload is
+/// deliberate: its length lives in the blob's header, so there is nothing to
+/// know before the read.
+fn read_manifest() -> Result<RunManifest, String> {
+    let device = manifest::MANIFEST_DEVICE;
+    let blob = std::fs::read(device).map_err(|e| format!("read {device}: {e}"))?;
+    manifest::decode(&blob).map_err(|e| format!("{device}: {e}"))
+}
+
 // ---------------------------------------------------------------------------
 // mounts
 // ---------------------------------------------------------------------------
 
-fn mount_pseudo_filesystems() -> Result<(), String> {
-    // devtmpfs first and non-negotiable: without it there are no /dev/vd*
-    // nodes, so every block device in the manifest is unmountable.
+/// the filesystems the rootfs itself cannot provide.
+///
+/// Two groups, in this order for two different reasons.
+///
+/// devtmpfs is FIRST and non-negotiable: without it there are no `/dev/vd*`
+/// nodes, so every block device in the manifest is unmountable.
+///
+/// The tmpfs group exists because the rootfs is READ-ONLY and shared by every
+/// concurrent run on this node, and an ordinary userland expects to write these
+/// four. A CLI that cannot then fails in whatever way it happens to fail, far
+/// from the cause — measured, as `claude` exiting 1 with
+/// `EROFS: mkdir '/tmp/claude-0'`. Each is RAM-backed and per-run, so nothing
+/// written there outlives the VM or is visible to another buyer's run; the
+/// guest's own memory cap is what bounds them.
+fn mount_base_filesystems() -> Result<(), String> {
     for (source, target, fstype) in [
         ("devtmpfs", "/dev", "devtmpfs"),
         ("proc", "/proc", "proc"),
         ("sysfs", "/sys", "sysfs"),
+        ("tmpfs", "/tmp", "tmpfs"),
+        ("tmpfs", "/run", "tmpfs"),
+        ("tmpfs", "/var/tmp", "tmpfs"),
+        // the run's HOME: a CLI's own state directory. Per-run and discarded —
+        // the credential the run actually uses is seeded into its config home
+        // inside the workspace, by the host.
+        ("tmpfs", paths::GUEST_HOME, "tmpfs"),
     ] {
         std::fs::create_dir_all(target).map_err(|e| format!("create {target}: {e}"))?;
         match mount(source, target, fstype, 0, None) {

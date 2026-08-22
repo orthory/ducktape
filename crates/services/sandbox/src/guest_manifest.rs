@@ -1,17 +1,30 @@
-//! what this VM is supposed to run, handed in on the kernel command line.
+//! what this VM is supposed to run, handed in on its own block device.
 //!
-//! The command line is the only channel available before any device is up, so
-//! the manifest rides it as one base64 token. URL-safe and unpadded on purpose:
-//! `+`, `/` and `=` all mean something to a bootloader or a shell somewhere
-//! along the way, and a cmdline token cannot contain spaces while argv and env
-//! freely do.
+//! NOT the kernel command line, which is the obvious channel and the wrong one:
+//! Firecracker caps a cmdline near 2 KiB, and a run's argv and env are written
+//! from a capability SPEC — codex's broker overrides alone measured 2094 bytes
+//! and the VMM refused to boot at all, with `Invalid cmdline capacity
+//! provided`. A cap a spec author can cross by adding one environment variable
+//! is a defect, not a budget.
+//!
+//! So the manifest rides a tiny device of its own, read RAW: no filesystem to
+//! mount, which matters because the manifest is what says which filesystems to
+//! mount. Its position is fixed ([`MANIFEST_DEVICE`]) so the guest can find it
+//! knowing nothing at all.
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use serde::{Deserialize, Serialize};
 
-/// the cmdline key the host sets and [`from_cmdline`] reads back.
-pub const CMDLINE_KEY: &str = "duck.manifest";
+/// where the manifest device always appears. Attached immediately after the
+/// root device, so its name does not move when a run's other drives change.
+pub const MANIFEST_DEVICE: &str = "/dev/vdb";
+
+/// the manifest device's size on the host. 64 KiB is far past any real argv and
+/// env, and a virtio-blk backing file must be a whole number of 512-byte
+/// sectors.
+pub const MANIFEST_DEVICE_BYTES: u64 = 64 * 1024;
+
+/// the blob's fixed header: the JSON payload's length, little-endian.
+const LENGTH_PREFIX: usize = 4;
 
 /// one block device for the guest init to mount.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,19 +66,50 @@ pub struct RunManifest {
     pub tunnel_ports: Vec<u16>,
 }
 
-pub fn encode(manifest: &RunManifest) -> String {
+/// the device's contents: a little-endian length, then that many bytes of JSON.
+///
+/// Refused rather than truncated when it does not fit: a manifest cut short
+/// reaches the guest as unparseable JSON and the operator as "the guest never
+/// dialled back", while this says what is too big and by how much, on the host,
+/// where the spec that caused it can be fixed.
+pub fn encode(manifest: &RunManifest) -> Result<Vec<u8>, String> {
     let json = serde_json::to_vec(manifest).expect("a manifest always serializes");
-    B64.encode(json)
+    let capacity = MANIFEST_DEVICE_BYTES as usize - LENGTH_PREFIX;
+    if json.len() > capacity {
+        return Err(format!(
+            "run manifest is {} bytes, over the {capacity}-byte manifest device; \
+             the run's argv and env are too large",
+            json.len()
+        ));
+    }
+    let mut blob = Vec::with_capacity(MANIFEST_DEVICE_BYTES as usize);
+    blob.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&json);
+    blob.resize(MANIFEST_DEVICE_BYTES as usize, 0);
+    Ok(blob)
 }
 
-pub fn parse(encoded: &str) -> Result<RunManifest, String> {
-    if encoded.is_empty() {
-        return Err("run manifest is empty".to_string());
+/// read a manifest back out of the device's bytes.
+///
+/// `blob` is whatever the guest read off the device — a whole sector-aligned
+/// device, not a trimmed payload — so the length prefix is what separates the
+/// manifest from the zero padding behind it.
+pub fn decode(blob: &[u8]) -> Result<RunManifest, String> {
+    if blob.len() < LENGTH_PREFIX {
+        return Err("run manifest device is empty".to_string());
     }
-    let json = B64
-        .decode(encoded)
-        .map_err(|e| format!("run manifest is not valid base64: {e}"))?;
-    let manifest: RunManifest = serde_json::from_slice(&json)
+    let (header, body) = blob.split_at(LENGTH_PREFIX);
+    let len = u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+    if len == 0 {
+        return Err("run manifest device carries no payload".to_string());
+    }
+    if len > body.len() {
+        return Err(format!(
+            "run manifest claims {len} bytes but the device holds {}",
+            body.len()
+        ));
+    }
+    let manifest: RunManifest = serde_json::from_slice(&body[..len])
         .map_err(|e| format!("run manifest is not valid JSON: {e}"))?;
     // An empty argv would boot a guest that runs nothing and then sits there
     // until the host's idle timeout — a silent hang costs a run's whole
@@ -75,15 +119,6 @@ pub fn parse(encoded: &str) -> Result<RunManifest, String> {
         return Err("run manifest carries an empty argv; there is nothing to exec".to_string());
     }
     Ok(manifest)
-}
-
-/// pull the manifest out of a whole `/proc/cmdline` string.
-pub fn from_cmdline(cmdline: &str) -> Result<RunManifest, String> {
-    let token = cmdline
-        .split_ascii_whitespace()
-        .find_map(|token| token.strip_prefix(&format!("{CMDLINE_KEY}=")))
-        .ok_or_else(|| format!("no {CMDLINE_KEY}= on the kernel command line"))?;
-    parse(token)
 }
 
 #[cfg(test)]
@@ -115,62 +150,72 @@ mod tests {
     }
 
     #[test]
-    fn a_manifest_round_trips_through_the_cmdline_encoding() {
+    fn a_manifest_round_trips_through_the_device_blob() {
         let manifest = sample();
-        let encoded = encode(&manifest);
-        assert!(
-            !encoded.contains(' '),
-            "a cmdline token must not contain spaces: {encoded}"
+        let blob = encode(&manifest).expect("encodes");
+        assert_eq!(
+            blob.len() as u64,
+            MANIFEST_DEVICE_BYTES,
+            "the blob IS the device: virtio-blk needs whole sectors"
         );
-        assert_eq!(parse(&encoded).expect("parses"), manifest);
+        assert_eq!(decode(&blob).expect("decodes"), manifest);
     }
 
-    /// The encoding must survive the bootloader and the kernel's own cmdline
-    /// splitting, so the alphabet may not contain `+`, `/` or `=`.
+    /// The guest reads the whole device, so the payload is followed by however
+    /// much zero padding the device size leaves. Only the length prefix
+    /// separates the two.
     #[test]
-    fn the_encoding_avoids_characters_the_boot_path_reinterprets() {
-        let encoded = encode(&sample());
-        for bad in ['+', '/', '=', '"', '\''] {
-            assert!(!encoded.contains(bad), "{bad:?} in {encoded}");
-        }
+    fn the_padding_behind_the_payload_is_not_part_of_it() {
+        let blob = encode(&sample()).expect("encodes");
+        let json_len = u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]) as usize;
+        assert!(
+            blob[LENGTH_PREFIX + json_len..].iter().all(|b| *b == 0),
+            "the tail must be zeros"
+        );
+        assert_eq!(decode(&blob).expect("decodes"), sample());
     }
 
-    /// The manifest arrives on the kernel command line, which the HOST writes —
-    /// but a malformed one must fail with a nameable error rather than boot a
-    /// guest that runs nothing and hangs until the idle timeout.
+    /// The host writes this device, but a guest that read a torn or blank one
+    /// must fail with a nameable error rather than run nothing and hang until
+    /// the idle timeout.
     #[test]
     fn a_malformed_manifest_is_a_named_error() {
-        assert!(parse("not-base64!!").is_err());
-        assert!(parse("").is_err());
-        assert!(parse(&B64.encode(b"{\"nope\":1}")).is_err());
+        assert!(decode(&[]).is_err(), "no device at all");
+        assert!(decode(&[0, 0, 0, 0]).is_err(), "a blank device");
+        assert!(decode(&[255, 255, 0, 0, b'{']).is_err(), "a torn payload");
+
+        let mut garbage = vec![0u8; 64];
+        let body = b"{\"nope\":1}";
+        garbage[..LENGTH_PREFIX].copy_from_slice(&(body.len() as u32).to_le_bytes());
+        garbage[LENGTH_PREFIX..LENGTH_PREFIX + body.len()].copy_from_slice(body);
+        assert!(decode(&garbage).is_err(), "well-framed but not a manifest");
     }
 
     #[test]
     fn an_empty_argv_is_refused() {
-        let err = parse(&encode(&RunManifest {
+        let blob = encode(&RunManifest {
             argv: Vec::new(),
             env: Vec::new(),
             cwd: "/workspace".into(),
             mounts: Vec::new(),
             tunnel_ports: Vec::new(),
-        }))
-        .expect_err("refused");
+        })
+        .expect("encodes");
+        let err = decode(&blob).expect_err("refused");
         assert!(err.contains("argv"), "{err}");
     }
 
+    /// The size that a kernel command line did NOT have. A manifest past the
+    /// device is refused on the host, naming the size — not truncated into a
+    /// guest that cannot say what went wrong.
     #[test]
-    fn the_manifest_is_found_among_the_other_cmdline_tokens() {
-        let manifest = sample();
-        let cmdline = format!(
-            "console=ttyS0 reboot=k panic=-1 {CMDLINE_KEY}={} pci=off",
-            encode(&manifest)
-        );
-        assert_eq!(from_cmdline(&cmdline).expect("found"), manifest);
-    }
-
-    #[test]
-    fn a_cmdline_without_a_manifest_names_what_is_missing() {
-        let err = from_cmdline("console=ttyS0 pci=off").expect_err("refused");
-        assert!(err.contains(CMDLINE_KEY), "{err}");
+    fn a_manifest_too_large_for_its_device_is_refused_on_the_host() {
+        let huge = RunManifest {
+            argv: vec!["/opt/duck/bin/codex".into()],
+            env: vec![("BIG".into(), "x".repeat(MANIFEST_DEVICE_BYTES as usize))],
+            ..sample()
+        };
+        let err = encode(&huge).expect_err("refused");
+        assert!(err.contains("too large"), "{err}");
     }
 }

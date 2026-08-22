@@ -746,6 +746,7 @@ impl CliProvider {
         let vm_config = firecracker_api::VmConfig {
             kernel: kernel.clone(),
             rootfs: rootfs.clone(),
+            manifest: run_dir.join("manifest.bin"),
             agent_volume: self.agent_volume.clone(),
             assets: run_dir.join("assets.ext4"),
             workspace: run_dir.join("workspace.ext4"),
@@ -4954,5 +4955,95 @@ format = "text"
             "the sandbox must sync its writable workspace back to the host"
         );
         std::fs::remove_dir_all(root).ok();
+    }
+
+    // ---- live model turns ---------------------------------------------------
+    //
+    // A REAL turn against the operator's own subscription, inside a real VM.
+    // What only these can prove: the credential stays on the HOST. The guest
+    // has no network device at all, so the CLI's only route to the model API is
+    // the vsock tunnel to this run's broker — it dials `127.0.0.1:<port>`,
+    // never an address it chose, and the upstream token is attached host-side.
+    // An empty answer here means the tunnel, the broker or the argv is wrong;
+    // the run cannot silently fall back to a direct connection, because there
+    // is nothing to fall back to.
+
+    /// the discovered providers against a live Firecracker backend, or `None`
+    /// when this host cannot run one (no `/dev/kvm`, no guest artifacts).
+    fn live_microvm_set() -> Option<ProviderSet> {
+        let backend = firecracker_backend();
+        if let Err(why) = backend.probe() {
+            eprintln!("skipping: {why}");
+            return None;
+        }
+        Some(
+            discover(
+                b"verify-node-000000000000000000000",
+                None,
+                backend,
+                "verify",
+            )
+            .expect("discover against the microVM backend"),
+        )
+    }
+
+    /// Both limits are REQUIRED for a VM: unlike a container, there is no
+    /// "unbounded" — the hypervisor is told exactly how many vCPUs and how much
+    /// memory to build, so a missing limit is a refusal rather than a default.
+    fn live_ctx(agent: &str) -> RunContext {
+        let mut env = vec![("TERM".to_string(), "xterm-256color".to_string())];
+        // let the operator pin a less-throttled tier without editing the test
+        if let Ok(model) = std::env::var("ANTHROPIC_MODEL") {
+            env.push(("ANTHROPIC_MODEL".to_string(), model));
+        }
+        RunContext {
+            agent_id: Some(agent.into()),
+            executing_node: Some(execution_node_id(b"verify-node-000000000000000000000")),
+            limits: BTreeMap::from([("cores".into(), 2), ("mem_gb".into(), 4)]),
+            env: env.into_iter().collect(),
+            ..RunContext::default()
+        }
+    }
+
+    async fn live_model_turn(tag: &str) {
+        let Some(set) = live_microvm_set() else { return };
+        let provider = match set.resolve(tag) {
+            Ok(provider) => provider,
+            Err(why) => {
+                eprintln!("skipping: no {tag} provider on this host: {why}");
+                return;
+            }
+        };
+        let answer = provider
+            .run(
+                "Reply with exactly one word: PONG. Nothing else.",
+                &live_ctx(&format!("verify-{tag}")),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag} model turn inside a microVM: {e}"));
+        eprintln!("--- {tag} answer ---\n{answer}\n--- end ---");
+        assert!(
+            !answer.trim().is_empty(),
+            "{tag} returned an empty answer: the guest reached the broker but \
+             the model produced nothing"
+        );
+    }
+
+    /// `#[ignore]`: spends a little claude quota, and needs `/dev/kvm`, the
+    /// guest artifacts, and a claude logged in ON THE HOST.
+    ///   DUCKTAPE_GUEST_DIR=… cargo test -p provider-host --lib -- --ignored \
+    ///     --nocapture claude_model_turn
+    #[tokio::test]
+    #[ignore = "live model turn: spends claude quota; needs /dev/kvm and a built guest rootfs"]
+    async fn claude_model_turn_in_a_microvm() {
+        live_model_turn("claude").await;
+    }
+
+    /// `#[ignore]`: spends a little codex quota, and needs `/dev/kvm`, the
+    /// guest artifacts, and `~/.codex/auth.json` on the host.
+    #[tokio::test]
+    #[ignore = "live model turn: spends codex quota; needs /dev/kvm and a built guest rootfs"]
+    async fn codex_model_turn_in_a_microvm() {
+        live_model_turn("codex").await;
     }
 }

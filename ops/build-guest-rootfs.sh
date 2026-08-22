@@ -113,10 +113,12 @@ for name in sh cat env; do
 done
 
 # ---- 5. mountpoints --------------------------------------------------------
-# The per-run devices land here. They must EXIST in the image: mounting onto a
-# missing directory fails, and the guest init reports it to a console nobody is
-# reading yet.
-mkdir -p "$TREE/duck/workspace" "$TREE/agent" "$TREE/proc" "$TREE/sys" "$TREE/dev"
+# The per-run devices land here, and so do the tmpfs mounts the init makes for
+# a read-only rootfs. They must EXIST in the image: mounting onto a missing
+# directory fails, and creating one at boot fails too — the rootfs is read-only.
+mkdir -p "$TREE/duck/workspace" "$TREE/agent" "$TREE/proc" "$TREE/sys" "$TREE/dev" \
+         "$TREE/tmp" "$TREE/run" "$TREE/var/tmp" "$TREE/root"
+chmod 1777 "$TREE/tmp" "$TREE/var/tmp"
 
 # ---- 6. the image ----------------------------------------------------------
 IMG="$OUT/rootfs.ext4"

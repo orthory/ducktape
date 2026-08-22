@@ -85,8 +85,11 @@ impl MicroVm {
         std::fs::create_dir_all(run_dir)
             .map_err(|e| format!("create run dir {}: {e}", run_dir.display()))?;
 
-        // 1. the run's two per-run block devices: the read-only inputs, and the
-        //    workspace that will be read back.
+        // 1. the run's per-run block devices: what it is supposed to run, its
+        //    read-only inputs, and the workspace that will be read back.
+        let blob = crate::guest_manifest::encode(manifest)?;
+        std::fs::write(&cfg.manifest, &blob)
+            .map_err(|e| format!("write {}: {e}", cfg.manifest.display()))?;
         crate::workspace_image::build_assets(assets, &cfg.assets, &run_dir.join("assets"))?;
         let size = crate::workspace_image::sized_for(workdir)?;
         crate::workspace_image::build(workdir, &cfg.workspace, size)?;
@@ -121,7 +124,7 @@ impl MicroVm {
         }
 
         // 3. the VMM
-        let config = firecracker_api::boot_config(cfg, manifest);
+        let config = firecracker_api::boot_config(cfg);
         let config_path = firecracker_api::write_boot_config(run_dir, &config)?;
         let firecracker = crate::host_tools::find_on_path("firecracker")
             .ok_or_else(|| "firecracker is not executable on PATH".to_string())?;

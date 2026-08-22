@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::guest_manifest::{self, GuestMount, RunManifest};
+use crate::guest_manifest::GuestMount;
 
 /// how long a run's VM may live before it is killed regardless of progress.
 /// A hung guest holds its whole memory footprint, so this is the backstop that
@@ -31,6 +31,10 @@ pub const MAX_VM_LIFETIME: std::time::Duration = std::time::Duration::from_secs(
 pub struct VmConfig {
     pub kernel: PathBuf,
     pub rootfs: PathBuf,
+    /// this run's manifest device — argv, env, cwd, mounts and tunnel ports,
+    /// written by [`crate::guest_manifest::encode`]. A device rather than the
+    /// kernel command line: see that module.
+    pub manifest: PathBuf,
     /// the persistent per-agent cache volume (`CARGO_HOME`, `RUSTUP_HOME`,
     /// `target/`). Attached, never copied back — see the spec's *Build caches*.
     /// `None` for a run that does not get one.
@@ -78,26 +82,44 @@ pub const ASSETS_MOUNTPOINT: &str = crate::guest_paths::GUEST_ASSETS;
 pub const AGENT_VOLUME_MOUNTPOINT: &str = crate::guest_paths::GUEST_AGENT_VOLUME;
 
 /// the guest device names, in the order Firecracker enumerates them.
-const DEVICE_ORDER: [&str; 4] = ["/dev/vda", "/dev/vdb", "/dev/vdc", "/dev/vdd"];
+const DEVICE_ORDER: [&str; 5] = ["/dev/vda", "/dev/vdb", "/dev/vdc", "/dev/vdd", "/dev/vde"];
 
 /// the drives for `cfg`, in attach order.
 ///
-/// MOUNT ORDER IS LOAD-BEARING: the assets image must be mounted before the
-/// workspace, because the workspace lands on the `workspace/` directory INSIDE
-/// it. Reverse them and the workspace mount is immediately shadowed by the
-/// assets mount, and the run sees an empty workspace.
+/// TWO ORDERINGS ARE LOAD-BEARING here.
+///
+/// The manifest device is attached SECOND, straight after the root device, so
+/// it is always [`crate::guest_manifest::MANIFEST_DEVICE`]. The guest reads it before
+/// it knows anything else, so its name may not move when a run gains or loses
+/// an agent volume.
+///
+/// The assets image must be mounted before the workspace, because the workspace
+/// lands on the `workspace/` directory INSIDE it. Reverse them and the
+/// workspace mount is immediately shadowed by the assets mount, and the run
+/// sees an empty workspace.
 pub fn guest_drives(cfg: &VmConfig) -> Vec<GuestDrive> {
-    let mut drives = vec![GuestDrive {
-        drive_id: "rootfs",
-        host_path: cfg.rootfs.clone(),
-        device: DEVICE_ORDER[0],
-        // the kernel mounts the root device itself; the init must not remount it
-        mountpoint: None,
-        // SHARED across every concurrent run on this node. Writable would let
-        // one buyer's run corrupt another's guest, so this is not a tuning knob.
-        read_only: true,
-        is_root: true,
-    }];
+    let mut drives = vec![
+        GuestDrive {
+            drive_id: "rootfs",
+            host_path: cfg.rootfs.clone(),
+            device: DEVICE_ORDER[0],
+            // the kernel mounts the root device itself; the init must not remount it
+            mountpoint: None,
+            // SHARED across every concurrent run on this node. Writable would let
+            // one buyer's run corrupt another's guest, so this is not a tuning knob.
+            read_only: true,
+            is_root: true,
+        },
+        GuestDrive {
+            drive_id: "manifest",
+            host_path: cfg.manifest.clone(),
+            device: DEVICE_ORDER[1],
+            // read RAW, never mounted: the manifest is what says what to mount
+            mountpoint: None,
+            read_only: true,
+            is_root: false,
+        },
+    ];
     if let Some(volume) = &cfg.agent_volume {
         drives.push(GuestDrive {
             drive_id: "agent",
@@ -158,17 +180,18 @@ pub fn manifest_mounts(cfg: &VmConfig) -> Vec<GuestMount> {
 /// processor no matter what `vcpu_count` says — `vcpu_count=4` reports "Total
 /// of 4 processors activated" with ACPI and "Total of 1" without. A node would
 /// sell four cores and deliver one, silently. The test below is the guard.
-pub fn boot_args(manifest_token: &str) -> String {
-    format!(
-        "console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=1 \
-         i8042.noaux i8042.nokbd i8042.nomux i8042.nopnp i8042.dumbkbd \
-         init=/duck-guest-init {}={manifest_token}",
-        guest_manifest::CMDLINE_KEY
-    )
+///
+/// FIXED, and short: nothing per-run rides here. The run's manifest has its own
+/// device precisely because a cmdline is capped near 2 KiB.
+pub fn boot_args() -> String {
+    "console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=1 \
+     i8042.noaux i8042.nokbd i8042.nomux i8042.nopnp i8042.dumbkbd \
+     init=/duck-guest-init"
+        .to_string()
 }
 
 /// the complete VM configuration Firecracker boots from. Pure.
-pub fn boot_config(cfg: &VmConfig, manifest: &RunManifest) -> serde_json::Value {
+pub fn boot_config(cfg: &VmConfig) -> serde_json::Value {
     let drives: Vec<serde_json::Value> = guest_drives(cfg)
         .into_iter()
         .map(|drive| {
@@ -184,7 +207,7 @@ pub fn boot_config(cfg: &VmConfig, manifest: &RunManifest) -> serde_json::Value 
     let mut config = serde_json::json!({
         "boot-source": {
             "kernel_image_path": cfg.kernel,
-            "boot_args": boot_args(&guest_manifest::encode(manifest)),
+            "boot_args": boot_args(),
         },
         "drives": drives,
         "machine-config": {
@@ -228,6 +251,7 @@ mod tests {
         VmConfig {
             kernel: "/srv/guest/vmlinux".into(),
             rootfs: "/srv/guest/rootfs.ext4".into(),
+            manifest: "/run/ducktape/run7/manifest.bin".into(),
             agent_volume: Some("/srv/agents/a1/cache.ext4".into()),
             assets: "/run/ducktape/run7/assets.ext4".into(),
             workspace: "/run/ducktape/run7/ws.ext4".into(),
@@ -238,22 +262,12 @@ mod tests {
         }
     }
 
-    fn manifest() -> RunManifest {
-        RunManifest {
-            argv: vec!["/usr/bin/claude".into(), "-p".into()],
-            env: vec![("HOME".into(), "/root".into())],
-            cwd: WORKSPACE_MOUNTPOINT.into(),
-            mounts: manifest_mounts(&cfg()),
-            tunnel_ports: vec![8931],
-        }
-    }
-
     /// `acpi=off` measures as a 69 ms win and silently drops every vCPU but the
     /// boot one, because Firecracker enumerates them through ACPI. A node would
     /// sell four cores and deliver one. This is a prohibition, so it is a test.
     #[test]
     fn the_boot_args_never_disable_acpi() {
-        let args = boot_args("token");
+        let args = boot_args();
         assert!(
             !args.contains("acpi=off"),
             "acpi=off drops all but the boot vCPU: {args}"
@@ -264,7 +278,7 @@ mod tests {
     /// whole memory footprint until the idle timeout.
     #[test]
     fn a_panicking_guest_reboots_rather_than_parking() {
-        let args = boot_args("token");
+        let args = boot_args();
         assert!(args.contains("panic=1"), "{args}");
         // `reboot=k` is what makes the guest's RESTART reach the VMM at all —
         // Firecracker has no ACPI power button.
@@ -284,9 +298,34 @@ mod tests {
                 .unwrap_or_else(|| panic!("no {id} drive"))
         };
         assert!(by_id("rootfs").is_root && by_id("rootfs").read_only);
+        assert!(by_id("manifest").read_only, "the run may not rewrite it");
         assert!(by_id("assets").read_only, "the context doc is an input");
         assert!(!by_id("workspace").read_only, "the run's output goes here");
         assert!(!by_id("agent").read_only, "the build cache is written");
+    }
+
+    /// The guest reads its manifest knowing NOTHING — before any mount, before
+    /// any device name it could look up. So the manifest device's position is a
+    /// constant on both sides, and the two must agree: a run whose agent volume
+    /// pushed the manifest to another letter would read a filesystem image as
+    /// a manifest and die naming neither.
+    #[test]
+    fn the_manifest_device_is_where_the_guest_looks_for_it() {
+        for volume in [Some("/srv/agents/a1/cache.ext4".into()), None] {
+            let with = VmConfig {
+                agent_volume: volume,
+                ..cfg()
+            };
+            let manifest = guest_drives(&with)
+                .into_iter()
+                .find(|drive| drive.drive_id == "manifest")
+                .expect("a manifest drive");
+            assert_eq!(manifest.device, crate::guest_manifest::MANIFEST_DEVICE);
+            assert_eq!(
+                manifest.mountpoint, None,
+                "the manifest is read raw; mounting it would need a manifest"
+            );
+        }
     }
 
     /// The device names shift with how many drives a run gets. The manifest's
@@ -303,9 +342,9 @@ mod tests {
         assert_eq!(
             at(&manifest_mounts(&cfg())),
             vec![
-                ("/dev/vdb".to_string(), AGENT_VOLUME_MOUNTPOINT.to_string()),
-                ("/dev/vdc".to_string(), ASSETS_MOUNTPOINT.to_string()),
-                ("/dev/vdd".to_string(), WORKSPACE_MOUNTPOINT.to_string()),
+                ("/dev/vdc".to_string(), AGENT_VOLUME_MOUNTPOINT.to_string()),
+                ("/dev/vdd".to_string(), ASSETS_MOUNTPOINT.to_string()),
+                ("/dev/vde".to_string(), WORKSPACE_MOUNTPOINT.to_string()),
             ]
         );
 
@@ -316,8 +355,8 @@ mod tests {
         assert_eq!(
             at(&manifest_mounts(&without_cache)),
             vec![
-                ("/dev/vdb".to_string(), ASSETS_MOUNTPOINT.to_string()),
-                ("/dev/vdc".to_string(), WORKSPACE_MOUNTPOINT.to_string()),
+                ("/dev/vdc".to_string(), ASSETS_MOUNTPOINT.to_string()),
+                ("/dev/vdd".to_string(), WORKSPACE_MOUNTPOINT.to_string()),
             ]
         );
     }
@@ -381,10 +420,10 @@ mod tests {
     #[test]
     fn a_run_without_a_tap_gets_no_network_device_at_all() {
         let offline = VmConfig { tap: None, ..cfg() };
-        let config = boot_config(&offline, &manifest());
+        let config = boot_config(&offline);
         assert!(config.get("network-interfaces").is_none(), "{config}");
 
-        let online = boot_config(&cfg(), &manifest());
+        let online = boot_config(&cfg());
         assert_eq!(online["network-interfaces"][0]["host_dev_name"], "dtap7");
     }
 
@@ -392,23 +431,27 @@ mod tests {
     /// hypervisor enforces, with no cgroup in between.
     #[test]
     fn the_machine_config_carries_the_runs_exact_size() {
-        let config = boot_config(&cfg(), &manifest());
+        let config = boot_config(&cfg());
         assert_eq!(config["machine-config"]["vcpu_count"], 4);
         assert_eq!(config["machine-config"]["mem_size_mib"], 8192);
         assert_eq!(config["machine-config"]["smt"], false);
     }
 
-    /// The manifest reaches the guest on the command line and nowhere else, so
-    /// it has to survive being one whitespace-delimited token.
+    /// Nothing per-run may ride the kernel command line. Firecracker caps it
+    /// near 2 KiB and a run's argv and env come from a capability SPEC —
+    /// measured, codex's broker overrides made a 2094-byte cmdline and the VMM
+    /// refused to boot with `Invalid cmdline capacity provided`. The manifest
+    /// device exists so this string can stay fixed and short.
     #[test]
-    fn the_manifest_rides_the_cmdline_as_one_token_and_parses_back() {
-        let config = boot_config(&cfg(), &manifest());
+    fn the_boot_args_carry_nothing_per_run() {
+        let config = boot_config(&cfg());
         let args = config["boot-source"]["boot_args"]
             .as_str()
             .expect("boot args");
-        assert_eq!(
-            guest_manifest::from_cmdline(args).expect("round trip"),
-            manifest()
-        );
+        assert_eq!(args, boot_args(), "the cmdline is the same for every run");
+        assert!(args.len() < 512, "{} bytes: {args}", args.len());
+        for host_path in ["/srv/agents", "/run/ducktape", "/srv/guest"] {
+            assert!(!args.contains(host_path), "{host_path} leaked into {args}");
+        }
     }
 }

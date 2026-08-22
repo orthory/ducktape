@@ -164,8 +164,8 @@ pub struct ServiceConfig {
     /// `coord.cap` delivered over its sealed `IntroReply::Admitted` ack via
     /// `save_coord_cap`.
     pub workspace: PathBuf,
-    /// the node's state root; per-service podman roots and provider state hang
-    /// off it too.
+    /// the node's state root; per-service roots and provider state hang off it
+    /// too.
     pub storage_dir: PathBuf,
     /// this network's chain id — the descriptor's own `chain_id` field (network
     /// shape) or the raw configured namespace (dev shape, which has no
@@ -307,10 +307,11 @@ fn gate_on_compute_grant(
 }
 
 /// resolve the operator's `[sandbox]` table into the compute plane: `None`
-/// (no table) = consensus-only node, no backend and no capacity; `"podman"`
-/// → `Podman` with the probed host totals, per-key overrides winning;
-/// any other runtime — "tart" and "direct" included, there is no macOS backend
-/// and no bare spawn — is a loud config error naming the audited adapter.
+/// (no table) = consensus-only node, no backend and no capacity;
+/// `"firecracker"` → the microVM backend with the probed host totals, per-key
+/// overrides winning; any other runtime — "podman", "tart" and "direct"
+/// included, there is no container backend, no macOS backend and no bare
+/// spawn — is a loud config error naming the audited adapter.
 fn resolve_sandbox(
     sandbox: Option<&SandboxToml>,
 ) -> Result<(Option<SandboxBackend>, BTreeMap<String, u64>), String> {
@@ -670,9 +671,8 @@ fn resolve_advertised(
 /// the dev-seed shape: every peer dials every other through the
 /// index-aligned `peer_addrs` list (the mesh has no address gossip).
 fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
-    // the shared half first: it owns the storage/workspace derivation (which
-    // doubles as the podman-socket base) and must run before any field of `raw`
-    // is moved out below.
+    // the shared half first: it owns the storage/workspace derivation and must
+    // run before any field of `raw` is moved out below.
     let service = service_dev_shape(&raw)?;
     // the dev shape's per-process state dir stands in as its workspace, so its
     // grant file sits beside its storage — one rule for both shapes.
@@ -1176,7 +1176,7 @@ mod tests {
              storage_dir = {:?}\n",
             dir.join("storage").to_str().expect("utf8 path")
         );
-        let sandbox = sandbox_table("podman", "docker.io/library/node:22-slim", 0, 0);
+        let sandbox = sandbox_table("firecracker", "/var/lib/ducktape/guest", 0, 0);
 
         // a sandbox table alone announces NOTHING: it says how a run would be
         // isolated, never that the user consented to run any.
@@ -1299,17 +1299,18 @@ mod tests {
 
 
         // any other runtime is a loud config error naming the one audited
-        // adapter. "tart" is in this list ON PURPOSE: the macOS backend was
-        // removed, and an operator whose node.toml still names it must be told
-        // so at boot rather than silently getting something else.
-        for runtime in ["tart", "gvisor", "direct"] {
+        // adapter. "tart" and "podman" are in this list ON PURPOSE: both
+        // backends were removed, and an operator whose node.toml still names
+        // one must be told so at boot rather than silently getting something
+        // else.
+        for runtime in ["tart", "podman", "gvisor", "direct"] {
             std::fs::write(
                 dir.join("node.toml"),
-                format!("{base}{}", sandbox_table(runtime, "img", 0, 0)),
+                format!("{base}{}", sandbox_table(runtime, "/g", 0, 0)),
             )
             .expect("write");
             let err = resolve(&dir.join("node.toml")).expect_err("unknown runtime refused");
-            assert!(err.contains("podman"), "{err}");
+            assert!(err.contains("firecracker"), "{err}");
         }
     }
 

@@ -584,7 +584,8 @@ mod tests {
         let edited = std::fs::read_to_string(dir.join("node.toml"))
             .expect("read")
             .replace("checkpoint_blocks = 32", "checkpoint_blocks = 7")
-            + "\n[sandbox]\nruntime = \"podman\"\nimage = \"img\"\ncores = 4\nmem_gb = 0\n";
+            + "\n[sandbox]\nruntime = \"firecracker\"\nkernel = \"/g/vmlinux\"\n\
+               rootfs = \"/g/rootfs.ext4\"\ncores = 4\nmem_gb = 0\n";
         std::fs::write(dir.join("node.toml"), edited).expect("write");
         let p = merged_plumbing(&dir, None, None, None, None, None, None, None, None, None)
             .expect("merge");
@@ -592,7 +593,7 @@ mod tests {
         let (raw, _) = load_node_toml(&dir.join("node.toml")).expect("reload");
         assert_eq!(raw.checkpoint_blocks, 7);
         let sandbox = raw.sandbox.expect("hand-added [sandbox] survives rewrite");
-        assert_eq!(sandbox.runtime, "podman");
+        assert_eq!(sandbox.runtime, "firecracker");
         assert_eq!(sandbox.cores, 4);
     }
 
