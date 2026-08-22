@@ -92,9 +92,23 @@ node host process
       Firecracker microVM (under its jailer)
        ├── vcpu N / mem M      demand-paged + balloon
        ├── kernel + rootfs     immutable, shared RO, per-run COW overlay
-       ├── workspace           virtiofs
+       ├── workspace           per-run ext4 block device, copied back on exit
        └── tap device ──→ host nft: public allowed, operator's private net denied
 ```
+
+Firecracker has **no shared filesystem**. Its device model is deliberately
+minimal — virtio-block, virtio-net, virtio-vsock, virtio-balloon, virtio-rng, a
+serial console, and nothing else. There is no virtio-fs, which is a direct
+consequence of the small attack surface that motivated choosing it. The
+workspace therefore rides a per-run ext4 image: built from the workdir before
+boot, attached as a block device, mounted by the guest, and copied back after
+the guest reports exit. The cost is bounded by workspace size; what it buys is
+that the guest cannot see the host filesystem at all, not even a share.
+
+This also means the guest needs a small init: mount the workspace device, exec
+the CLI with the run's env and cwd, carry stdout and stderr back over vsock as
+separate streams, report the exit code, and unmount cleanly so the image is
+consistent for copy-back. It occupies the seat `conmon` had under podman.
 
 Guest PID 1 is a thin shim that execs the agent CLI. There is no crun, no
 cgroup, no seccomp profile, no userns mapping, no masked paths — the VM boundary
