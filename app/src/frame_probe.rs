@@ -1535,6 +1535,157 @@ fn probe_forge_code_content() {
     );
 }
 
+/// THE CODE LINES ARE DRAGGABLE. Every plain Ice `text` in the app selects by
+/// drag (ducktape-ui wraps it in `selectable_text`); the reader's coloured
+/// spans render outside Ice, so they must prove the same contract: a
+/// press-drag across the pane paints a selection, Ctrl+C puts exactly the
+/// dragged text on the clipboard — line break included, the drag crossed
+/// one — and Escape gives the quiet pixels back.
+#[test]
+fn the_forge_code_lines_select_by_drag() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(probe_forge_code_selection)
+        .expect("the forge selection probe thread spawns")
+        .join()
+        .expect("the forge selection probe thread finishes");
+}
+
+#[derive(Default)]
+struct RecordingClipboard(Option<String>);
+
+impl iced::advanced::Clipboard for RecordingClipboard {
+    fn read(&self, _kind: clipboard::Kind) -> Option<String> {
+        self.0.clone()
+    }
+
+    fn write(&mut self, _kind: clipboard::Kind, contents: String) {
+        self.0 = Some(contents);
+    }
+}
+
+/// One event walk over the built tree, the way the runtime pumps input
+/// between frames; queued messages are delivered so the walk is complete.
+fn walk_events(
+    app: &mut Ducktape,
+    window: iced::window::Id,
+    renderer: &mut iced::Renderer,
+    cache: user_interface::Cache,
+    clipboard: &mut dyn iced::advanced::Clipboard,
+    events: &[Event],
+    cursor: mouse::Cursor,
+) -> user_interface::Cache {
+    let mut queued: Vec<__DucktapeMessage> = Vec::new();
+    let mut ui = UserInterface::build(app.__view(window), WINDOW, cache, renderer);
+    let _ = ui.update(events, cursor, renderer, clipboard, &mut queued);
+    let cache = ui.into_cache();
+    for message in queued {
+        let _ = app.__update(message);
+    }
+    cache
+}
+
+fn key_press(character: char, modifiers: iced::keyboard::Modifiers) -> Event {
+    use iced::keyboard::{self, Key, key};
+    let code = match character {
+        'c' => key::Code::KeyC,
+        _ => key::Code::Escape,
+    };
+    let key = match character {
+        '\u{1b}' => Key::Named(key::Named::Escape),
+        _ => Key::Character(character.to_string().into()),
+    };
+    Event::Keyboard(keyboard::Event::KeyPressed {
+        key: key.clone(),
+        modified_key: key,
+        physical_key: key::Physical::Code(code),
+        location: keyboard::Location::Standard,
+        modifiers,
+        text: None,
+        repeat: false,
+    })
+}
+
+fn probe_forge_code_selection() {
+    let (mut app, console) = console_in_forge_code();
+    let mut renderer = headless_renderer();
+    let (cache, quiet) = drawn_frame(
+        &mut app,
+        console,
+        &mut renderer,
+        user_interface::Cache::default(),
+    );
+    let mut clipboard = RecordingClipboard::default();
+
+    // Press on one code line and let go one row down — the pane sits right
+    // of the tree column, and 300 → 340 spans two of its 20 px rows. One
+    // walk per cursor position: a walk hit-tests every event against the
+    // cursor it was given, not the event's own coordinates.
+    let from = Point::new(700.0, 300.0);
+    let to = Point::new(760.0, 340.0);
+    let cache = walk_events(
+        &mut app,
+        console,
+        &mut renderer,
+        cache,
+        &mut clipboard,
+        &[
+            Event::Mouse(mouse::Event::CursorMoved { position: from }),
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+        ],
+        mouse::Cursor::Available(from),
+    );
+    let cursor = mouse::Cursor::Available(to);
+    let cache = walk_events(
+        &mut app,
+        console,
+        &mut renderer,
+        cache,
+        &mut clipboard,
+        &[
+            Event::Mouse(mouse::Event::CursorMoved { position: to }),
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+        ],
+        cursor,
+    );
+    let (cache, selected) = drawn_frame(&mut app, console, &mut renderer, cache);
+    assert!(
+        selected != quiet,
+        "a drag across the code lines must paint a selection"
+    );
+
+    let cache = walk_events(
+        &mut app,
+        console,
+        &mut renderer,
+        cache,
+        &mut clipboard,
+        &[key_press('c', iced::keyboard::Modifiers::CTRL)],
+        cursor,
+    );
+    let copied = clipboard.0.take().expect("Ctrl+C copies the dragged lines");
+    assert!(
+        copied.contains('\n'),
+        "the drag crossed a row, so the copy carries the line break: {copied:?}"
+    );
+    assert!(
+        forge_source().contains(&copied),
+        "the copy is the blob's own text: {copied:?}"
+    );
+
+    let cache = walk_events(
+        &mut app,
+        console,
+        &mut renderer,
+        cache,
+        &mut clipboard,
+        &[key_press('\u{1b}', iced::keyboard::Modifiers::empty())],
+        cursor,
+    );
+    let (_, released) = drawn_frame(&mut app, console, &mut renderer, cache);
+    assert!(released == quiet, "Escape must give the quiet pixels back");
+}
+
 fn probe() {
     let (mut app, console) = console_in_chat();
     let mut renderer = headless_renderer();
