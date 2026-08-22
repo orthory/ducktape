@@ -1549,26 +1549,24 @@ fn probe_forge_inline_picture_content() {
 /// of a process-wide slot, so nothing in the Ice tree changes between two
 /// pictures at the same path: only the pixels can prove the extern drew the
 /// slot's handle at all — and drew the CURRENT one, not a cached first.
+///
+/// Raster and vector run in ONE test, in sequence: the forge surface is one
+/// process-wide slot, and two tests parking different paths in it from
+/// parallel threads would blank each other's frames.
 #[test]
 fn the_forge_reader_draws_the_loaded_picture() {
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
-        .spawn(|| probe_forge_picture_content("logo.png", park_forge_picture))
+        .spawn(|| {
+            probe_forge_picture_content("logo.png", park_forge_picture);
+            // THE VECTOR BRANCH DRAWS TOO — resvg under the same headless
+            // renderer, the same red→blue swap with nothing in the Ice tree
+            // changed.
+            probe_forge_picture_content("logo.svg", park_forge_vector);
+        })
         .expect("the forge picture probe thread spawns")
         .join()
         .expect("the forge picture probe thread finishes");
-}
-
-/// THE VECTOR BRANCH DRAWS TOO — resvg under the same headless renderer, the
-/// same red→blue swap with nothing in the Ice tree changed.
-#[test]
-fn the_forge_reader_draws_the_loaded_vector_picture() {
-    std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
-        .spawn(|| probe_forge_picture_content("logo.svg", park_forge_vector))
-        .expect("the forge vector probe thread spawns")
-        .join()
-        .expect("the forge vector probe thread finishes");
 }
 
 fn probe_forge_picture_content(file: &str, park: fn(&str, [u8; 3])) {
