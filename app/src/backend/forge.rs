@@ -842,25 +842,28 @@ async fn load_inline_pictures(client: &RpcClient, view: &BlobView) {
         }
     }
     wanted.truncate(MAX_INLINE_PICTURES);
-    let mut pictures = std::collections::HashMap::new();
-    for url in wanted {
-        let Some(bytes) = inline_picture_bytes(client, view, &url).await else {
-            continue;
-        };
-        let Ok(picture) = decode_off_thread(bytes).await else {
-            continue;
-        };
-        pictures.insert(url, picture);
-    }
+    // Side by side, not one after another: a web picture answers on a remote
+    // host's clock, and eight of them in a row would stack eight timeouts in
+    // front of the README.
+    let fetches = wanted.into_iter().map(|url| async move {
+        let bytes = inline_picture_bytes(client, view, &url).await?;
+        let picture = decode_off_thread(bytes).await.ok()?;
+        Some((url, picture))
+    });
+    let pictures = iced::futures::future::join_all(fetches)
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
     park_inline_pictures(view.path.clone(), pictures);
 }
 
 /// Where an image URL's bytes live, by the duck:// module table: a
 /// `duck://forge/<repo>/blob/<path>[@rev]` is that repo's committed file, a
-/// `duck://files/...` is the attachment in duckfs, and a bare relative path
-/// is this repo's file beside the document at the document's own commit.
-/// Every other kind — a web URL, a page or channel ref, a malformed duck URI
-/// — has no bytes to fetch.
+/// `duck://files/...` is the attachment in duckfs, a bare relative path is
+/// this repo's file beside the document at the document's own commit, and a
+/// web URL is one capped GET. Every other kind — a page or channel ref, a
+/// malformed duck URI — has no bytes to fetch.
 async fn inline_picture_bytes(client: &RpcClient, view: &BlobView, url: &str) -> Option<Vec<u8>> {
     use super::duck_uri::{DuckKind, classify_duck_link};
     use super::picture::resolve_repo_path;
@@ -881,13 +884,57 @@ async fn inline_picture_bytes(client: &RpcClient, view: &BlobView, url: &str) ->
                 .ok()
                 .and_then(|(_, bytes)| bytes)
         }
-        DuckKind::Web
-        | DuckKind::Page
+        DuckKind::Web => web_picture_bytes(url).await,
+        DuckKind::Page
         | DuckKind::ForgeRepo
         | DuckKind::ForgeItem
         | DuckKind::Channel
         | DuckKind::ChannelMessage => None,
     }
+}
+
+/// How long a web picture may take, end to end. Shorter than the RPC
+/// client's 30 s on purpose: the README's text waits on this, and a remote
+/// host is nobody's to trust.
+const WEB_PICTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// One GET for a web picture, bounded by `MAX_PICTURE_BYTES` before the body
+/// is read (the announced length) and while it streams (an unannounced or
+/// lying one), and by `WEB_PICTURE_TIMEOUT`. `None` for any refusal — the
+/// image keeps its alt text, never an error. The app's one HTTP client for
+/// the open web, built once; the node's RPC client stays the node's.
+/// ponytail: no cache across documents and no per-host limit — a README
+/// re-fetches its pictures on every open; add a byte-keyed cache when felt.
+pub async fn web_picture_bytes(url: &str) -> Option<Vec<u8>> {
+    use super::picture::MAX_PICTURE_BYTES;
+    static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    let client = CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(WEB_PICTURE_TIMEOUT)
+                .build()
+                .ok()
+        })
+        .as_ref()?;
+    let mut response = client.get(url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let announced_past_cap = response
+        .content_length()
+        .is_some_and(|length| length > MAX_PICTURE_BYTES as u64);
+    if announced_past_cap {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        let streamed_past_cap = bytes.len() + chunk.len() > MAX_PICTURE_BYTES;
+        if streamed_past_cap {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Some(bytes)
 }
 
 fn binary_blob(repo: String, rev: String, path: String, truncated: bool) -> BlobView {

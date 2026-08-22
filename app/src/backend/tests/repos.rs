@@ -235,3 +235,67 @@ async fn a_forge_op_does_not_load_the_repo_list_for_a_closed_pane() {
     );
     assert!(data.repos.is_empty());
 }
+
+/// A WEB PICTURE IS ONE CAPPED GET. The bytes come back as served; a
+/// response that announces more than the viewer takes, one that streams more
+/// than it announced (or announced nothing), and one without a body to show
+/// all come back as `None` — the image keeps its alt text.
+#[tokio::test(flavor = "current_thread")]
+async fn a_web_picture_is_one_capped_get() {
+    use super::super::picture::MAX_PICTURE_BYTES;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 2048];
+            let read = socket.read(&mut request).await.unwrap();
+            let head = String::from_utf8_lossy(&request[..read]).into_owned();
+            let route = head.split(' ').nth(1).unwrap_or("").to_owned();
+            let (status, length, body_len): (&str, Option<usize>, usize) = match route.as_str() {
+                "/small" => ("200 OK", Some(9), 9),
+                "/announced-huge" => ("200 OK", Some(MAX_PICTURE_BYTES + 1), 0),
+                "/streamed-huge" => ("200 OK", None, MAX_PICTURE_BYTES + 1),
+                _ => ("404 Not Found", Some(0), 0),
+            };
+            let mut response = format!("HTTP/1.1 {status}\r\nConnection: close\r\n");
+            if let Some(length) = length {
+                response.push_str(&format!("Content-Length: {length}\r\n"));
+            }
+            response.push_str("\r\n");
+            socket.write_all(response.as_bytes()).await.unwrap();
+            let body = match route.as_str() {
+                "/small" => b"PNG-bytes".to_vec(),
+                _ => vec![0u8; body_len],
+            };
+            let _ = socket.write_all(&body).await;
+            let _ = socket.shutdown().await;
+        }
+    });
+    assert_eq!(
+        web_picture_bytes(&format!("{origin}/small"))
+            .await
+            .as_deref(),
+        Some(&b"PNG-bytes"[..]),
+        "a picture under the cap comes back as served"
+    );
+    assert!(
+        web_picture_bytes(&format!("{origin}/announced-huge"))
+            .await
+            .is_none(),
+        "an announced length past the cap is refused before the body"
+    );
+    assert!(
+        web_picture_bytes(&format!("{origin}/streamed-huge"))
+            .await
+            .is_none(),
+        "a body that streams past the cap is refused mid-stream"
+    );
+    assert!(
+        web_picture_bytes(&format!("{origin}/missing"))
+            .await
+            .is_none(),
+        "a miss has no picture"
+    );
+}
