@@ -448,7 +448,7 @@ pub fn apply_page_action(mut document: Content, action: PageAction) -> Content {
         let PageAction::MoveTo(cursor) = action else {
             return document;
         };
-        document.move_to(cursor);
+        crate::editor::move_to(&mut document, cursor);
         return document;
     };
     let Action::Edit(edit) = &edit_action else {
@@ -850,6 +850,24 @@ mod tests {
             selection: None,
         });
         content
+    }
+
+    /// The page's own seam: a `MoveTo` without a selection lands a bare
+    /// caret while a drag's selection still stands — a press after a drag
+    /// must not read as a drag from the old anchor.
+    #[test]
+    fn a_caret_move_without_a_selection_drops_the_page_selection() {
+        let mut document = typed("Title\nbody text", 1, 4);
+        document.move_to(Cursor {
+            position: Position { line: 1, column: 4 },
+            selection: Some(Position { line: 0, column: 0 }),
+        });
+        let landed = Cursor {
+            position: Position { line: 1, column: 2 },
+            selection: None,
+        };
+        let moved = apply_page_action(document, PageAction::MoveTo(landed));
+        assert_eq!(moved.cursor(), landed);
     }
 
     /// The buffer's exact text after one key. NOT trimmed: a carried list
