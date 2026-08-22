@@ -6,7 +6,7 @@
 
 **Architecture:** A new `SandboxBackend::Firecracker` arm drives one microVM per run over the Firecracker HTTP API on a per-run unix socket, mirroring how `podman_api` drives libpod today. Firecracker has no shared filesystem, so the workspace rides a per-run ext4 image built with `mke2fs -d` and read back with `debugfs -R rdump` — both rootless. A small static guest init mounts that image, execs the CLI, and carries stdout/stderr/exit back over vsock.
 
-**Tech Stack:** Rust (tokio, serde_json), Firecracker VMM + its jailer, `e2fsprogs` (`mke2fs`, `debugfs`), `nft`, `x86_64-unknown-linux-musl` for the guest init.
+**Tech Stack:** Rust (tokio, serde_json), Firecracker VMM v1.16.1 + its jailer, `e2fsprogs` (`mke2fs`, `debugfs`), `nft`, `x86_64-unknown-linux-musl` for the guest init.
 
 **Spec:** `docs/superpowers/specs/2026-08-22-sandbox-run-per-microvm-design.md`
 
@@ -27,13 +27,49 @@
 | `/dev/kvm` | present, `crw-rw---- root:kvm` | — |
 | CPU virtualisation | 24 cores with vmx/svm | — |
 | Nested virt | `kvm_*.nested = 1` | — |
-| **User in `kvm` group** | **NO** — group exists (gid 993), user is not a member | `sudo usermod -aG kvm $USER`, then re-login. Without it a rootless VMM cannot open `/dev/kvm`. |
-| **`firecracker` + `jailer`** | **not installed, not in apt** | Task 1 adds `ops/firecracker-setup.sh`. Not an apt package — the release is a static binary tarball, so this is the one place the apt-only preference cannot hold. |
+| User in `kvm` group | **DONE** — `usermod -aG kvm eddy` applied; `/dev/kvm` opens `O_RDWR`. Ambient after next login; `sg kvm -c '...'` picks it up now without one. | — |
+| `firecracker` + `jailer` | **DONE** — v1.16.1 installed to `~/.local/bin`, both on PATH | Not an apt package: upstream ships a static release tarball, so `ops/firecracker-setup.sh` is a deliberate exception to the apt-only preference for host tooling. |
 | `mke2fs` / `debugfs` | present (`e2fsprogs`) | — |
 | `nft` | present at `/usr/sbin/nft` | — |
 | `x86_64-unknown-linux-musl` | check `rustup target list --installed` | `rustup target add x86_64-unknown-linux-musl` |
 
 Verified live before this plan was written: `mke2fs -q -t ext4 -d <dir> -b 4096 <img> 4M` builds a populated image and `debugfs -R "cat a.txt" <img>` reads it back, both as an unprivileged user with no mount.
+
+### Measured baseline — a real microVM booted on this host
+
+Firecracker v1.16.1, the CI kernel `vmlinux-6.1.128` and the `ubuntu-24.04.squashfs`
+rootfs, `init=/bin/true`, 2 vcpu / 512 MiB:
+
+```
+[    0.000000] Linux version 6.1.128 ...
+[    1.037452] Run /bin/true as init process
+[    1.051449] Kernel panic - not syncing: Attempted to kill init! exitcode=0x0
+firecracker exit=0
+```
+
+- **kernel boot → init: 1.04 s**
+- **whole VMM lifecycle, wall: 2.28 s** (median of 3: 2.28 / 2.27 / 2.29)
+
+Take this, not the marketing figure, as the cold-boot baseline. Firecracker's
+widely-quoted ~125 ms is a *minimal* kernel with an initramfs; a full distro
+kernel with a squashfs root is an order of magnitude slower to boot, and that
+is the shape our guest rootfs actually has.
+
+**What it means for the design:** an agent run lasts minutes, so 2.3 s of boot
+is ~1-2% overhead and the backend is perfectly usable without snapshots. The
+snapshot/restore follow-on is a latency optimisation, not a prerequisite —
+treat any plan that makes it a blocker as wrong.
+
+Artifacts used (also the fastest way to get Task 8's e2e running before
+`build-guest-rootfs.sh` exists):
+
+```
+https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/x86_64/vmlinux-6.1.128
+https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/x86_64/ubuntu-24.04.squashfs
+```
+
+A `vmlinux-6.1.128.config` is published beside the kernel — the concrete
+starting point for the "build our own kernel?" open question below.
 
 ## File Structure
 
@@ -187,7 +223,7 @@ Expected: PASS. Also run `cargo check -p provider-host -p node-bin --tests` — 
 # is a deliberate exception to the apt-only rule for host tooling.
 set -euo pipefail
 
-VERSION="${FIRECRACKER_VERSION:-v1.10.1}"
+VERSION="${FIRECRACKER_VERSION:-v1.16.1}"
 ARCH="$(uname -m)"
 DEST="${DEST:-$HOME/.local/bin}"
 

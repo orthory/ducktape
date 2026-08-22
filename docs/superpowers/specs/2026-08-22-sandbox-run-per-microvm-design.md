@@ -122,10 +122,20 @@ An earlier draft proposed one long-lived VM per node with containers inside,
 because *"a VM statically takes its memory."* That is an **Apple
 Virtualization.framework** property, not a VM property. Firecracker guest memory
 is demand-faulted (a VM configured with 8 GB that touches 500 MB costs ~500 MB
-of host RSS), it ships a balloon with free-page reporting, and snapshot/restore
-brings a run to ~150 ms while COW-mapping base pages from one snapshot file
-across concurrent VMs. On Linux, per-run VMs do not carry the reservation cost
-that motivated per-node.
+of host RSS), and it ships a balloon with free-page reporting. On Linux, per-run
+VMs do not carry the reservation cost that motivated per-node.
+
+**Boot cost, measured rather than quoted.** A real microVM was booted on the
+development host to check this rather than trusting the widely-cited ~125 ms:
+Firecracker v1.16.1, a 6.1.128 kernel, a squashfs root, 2 vcpu / 512 MiB —
+**1.04 s from kernel entry to init, 2.28 s for the whole VMM lifecycle**
+(median of 3). The ~125 ms figure is a minimal kernel with an initramfs, not a
+distro kernel with a real root filesystem, which is the shape our guest has.
+
+That is still fine, and it settles a design question: an agent run lasts
+minutes, so ~2.3 s of boot is 1-2% overhead. **Snapshot/restore is a latency
+optimisation, not a prerequisite** — per-run VMs stand on their own without it,
+and any plan that makes snapshots a blocker for the backend is wrong.
 
 Per-run also means no session-affinity state and no shared kernel between
 buyers — the property namespaces cannot provide, and the reason every vendor
