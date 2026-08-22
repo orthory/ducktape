@@ -232,15 +232,13 @@ async fn seal_credential(gw_base: &str, name: &str) -> [u8; 32] {
 // identity + gateway helpers (mirror airlock_gateway_e2e / gateway_e2e)
 // ===========================================================================
 
-/// The granted leg's image, and the reason it is not the harness default: its
-/// provider script dials the loopback broker with node's global `fetch`, so it
-/// needs a `node` runtime the busybox default does not have.
-///
-/// The refusal leg never executes anything, so it boots on
-/// [`common::SANDBOX_IMAGE`] — each compute daemon fills its OWN empty podman
-/// graph root at boot, and 4 MB beats 200 MB for an image no container ever
-/// runs.
-const BROKER_IMAGE: &str = "docker.io/library/node:22-slim";
+// The granted leg used to name its own container image: its provider script
+// dials the loopback broker with node's global `fetch`, which the harness's
+// busybox default did not have. Every node now boots the same shared guest
+// rootfs, so that choice moved to where the image is built
+// (ops/build-guest-rootfs.sh) — and the per-node cost that made it a trade is
+// gone, since one read-only image serves every node instead of each compute
+// daemon filling its own graph root at boot.
 
 fn bind_auth(member: &ed25519::PrivateKey, chain: &str, node: &[u8]) -> MemberAuth {
     identity::testkit::ed_bind_auth(member, &identity::bind_preimage(chain, node, 0))
@@ -722,7 +720,7 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
     let provider = ScriptProvider::stage(fixtures.path(), true);
     let mut cluster = Cluster::new(&[0], &[0]);
     cluster.wireguard = true;
-    cluster.extra_toml = sandbox_toml(BROKER_IMAGE);
+    cluster.extra_toml = sandbox_toml();
     // the [sandbox] table is only HOW runs are isolated; the pool also
     // needs the user's compute grant. This run is pinned, not claimed from a
     // pool, so the grant announces nothing.
@@ -868,7 +866,7 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
     let provider = ScriptProvider::stage(fixtures.path(), true);
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
     cluster.wireguard = true;
-    cluster.extra_toml = sandbox_toml(BROKER_IMAGE);
+    cluster.extra_toml = sandbox_toml();
     cluster.compute_grant = Some(vec![]);
     let owner_storage = cluster.workspace(0);
     seed_claude_store(&owner_storage, CRED_NAME, "rt-delegated");

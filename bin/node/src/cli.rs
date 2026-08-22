@@ -400,20 +400,20 @@ fn cmd_keygen(args: KeyArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// gets the probe's loud error when an operator uncomments it, not a silent
 /// misconfiguration now.
 fn platform_sandbox() -> (config::SandboxToml, provider_host::SandboxBackend) {
-    // the socket is left empty here: `platform_sandbox` only writes the
-    // default [sandbox] TOML at `node init`; the real socket is named by
-    // `resolve_sandbox` from the workspace when the node actually boots.
-    let (runtime, image, backend) = (
-        "podman",
-        config::DEFAULT_PODMAN_IMAGE,
-        provider_host::SandboxBackend::Podman {
-            image: config::DEFAULT_PODMAN_IMAGE.into(),
-            socket: std::path::PathBuf::new(),
-        },
-    );
+    // This only writes the default [sandbox] TOML at `node init`. The images
+    // need not exist yet — `node init` runs before `ops/build-guest-rootfs.sh`
+    // on a fresh box, and the loud error belongs to the boot probe, where an
+    // operator who uncommented the table is standing.
+    let guest = std::path::Path::new(config::DEFAULT_GUEST_DIR);
+    let (kernel, rootfs) = (guest.join("vmlinux"), guest.join("rootfs.ext4"));
+    let backend = provider_host::SandboxBackend::Firecracker {
+        kernel: kernel.clone(),
+        rootfs: rootfs.clone(),
+    };
     let table = config::SandboxToml {
-        runtime: runtime.into(),
-        image: image.into(),
+        runtime: "firecracker".into(),
+        kernel,
+        rootfs,
         cores: 0,
         mem_gb: 0,
     };

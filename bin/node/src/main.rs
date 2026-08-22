@@ -234,11 +234,6 @@ enum Family {
     Agent(agent_cli::AgentArgs),
     /// the stdio MCP server an agent runner spawns
     Mcp,
-    /// internal: the OCI createRuntime hook that installs a sandbox run's egress
-    /// firewall. podman invokes it (via the node's --hooks-dir) with the OCI
-    /// container state on stdin; never run by hand. Hidden from help.
-    #[command(name = "__egress-hook", hide = true)]
-    EgressHook,
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -257,9 +252,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             mcp::serve();
             Ok(())
         }
-        // podman pipes the OCI state on stdin; a non-zero exit aborts the
-        // container (fail-closed), so map a hook error to a real process error.
-        Family::EgressHook => provider_host::run_egress_hook().map_err(Into::into),
+        // The `__egress-hook` subcommand lived here: an OCI createRuntime hook
+        // podman invoked to install a run's firewall inside its netns. A
+        // microVM has no netns to enter — its guest has no network device at
+        // all, and reaches this host only through a vsock tunnel the host owns
+        // both ends of — so there is no hook and nothing for one to install.
         Family::User(cmd) => userkey_cli::run(cmd),
         Family::Agent(args) => agent_cli::run(args),
         Family::Gateway(cmd) => gateway_routes::run(cmd),

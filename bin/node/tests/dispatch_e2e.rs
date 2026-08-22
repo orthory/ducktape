@@ -56,7 +56,7 @@ use agent::{ACTION_CHAT_POST, AgentMsg};
 use runs::{RunsMsg, RunsQuery, RunsReply, TurnPolicy};
 use capability::{CapabilityQuery, CapabilityReply};
 use chat::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, Mark, PostPolicy, Span};
-use common::{Cluster, SANDBOX_IMAGE, sandbox_toml, serial, skip_unless_sandboxed};
+use common::{Cluster, sandbox_toml, serial, skip_unless_sandboxed};
 use dispatch::{DispatchQuery, DispatchReply, DispatchStatus};
 
 /// convergence budget: mesh formation + leader rotation are real-time on a
@@ -490,7 +490,7 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
     // HOW a run is isolated (the table) is independent of WHETHER this node runs
     // any (the grant); the compute daemon needs both, and refuses to boot
     // without the table. Appended LAST — nothing may follow a toml table header.
-    cluster.extra_toml.extend(sandbox_toml(SANDBOX_IMAGE));
+    cluster.extra_toml.extend(sandbox_toml());
     cluster.env[0] = hermetic_env(fixtures.path(), "node0");
     cluster.env[1] = [text_provider.env(), hide_builtins(fixtures.path(), "node1")].concat();
     cluster.env[2] = [json_provider.env(), hide_builtins(fixtures.path(), "node2")].concat();
@@ -650,7 +650,7 @@ fn unannounced_capable_nodes_race_accept_and_execute_once() {
     cluster.compute_grant = Some(vec![]);
     // and the table that says HOW it isolates one. Without it the daemon exits
     // at boot and this whole scenario silently exercises nothing.
-    cluster.extra_toml.extend(sandbox_toml(SANDBOX_IMAGE));
+    cluster.extra_toml.extend(sandbox_toml());
     cluster.env[0] = hermetic_env(fixtures.path(), "node0");
     cluster.env[1] = [racer_one.env(), hide_builtins(fixtures.path(), "node1")].concat();
     cluster.env[2] = [racer_two.env(), hide_builtins(fixtures.path(), "node2")].concat();

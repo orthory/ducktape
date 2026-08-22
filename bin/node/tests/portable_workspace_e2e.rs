@@ -313,9 +313,10 @@ impl PortableProvider {
     }
 }
 
-/// the image this suite's stand-in coding agent runs in — the fuller `node`
-/// base rather than the harness default.
-const SANDBOX_IMAGE: &str = "docker.io/library/node:22-slim";
+// This suite's stand-in coding agent used to name its own container image, a
+// fuller base than the harness default. Every node now boots the same shared
+// guest rootfs, so what a run can execute is decided when that image is built
+// (ops/build-guest-rootfs.sh), not per suite.
 
 /// hermetic env for a node that must provide NOTHING (see dispatch_e2e).
 fn hermetic_env(root: &std::path::Path, name: &str) -> Vec<(String, String)> {
@@ -477,7 +478,7 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     // (nothing may follow a toml table header) — every node boots a podman
     // compute plane; nodes 0/2 stay hermetic (empty spec dir → nothing
     // discovered or announced).
-    cluster.extra_toml.extend(sandbox_toml(SANDBOX_IMAGE));
+    cluster.extra_toml.extend(sandbox_toml());
     // the pool needs the compute grant as well as the [sandbox] table, and
     // the grant is what opts these nodes into the rendezvous pool: the node
     // announces the granted tags INTERSECTED with what it discovers, so the

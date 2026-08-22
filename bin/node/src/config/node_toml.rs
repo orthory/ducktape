@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize as _;
 
 use super::DEFAULT_PRIMARY_COORDINATOR;
-use super::resolve::{DEFAULT_CHECKPOINT_BLOCKS, DEFAULT_PODMAN_IMAGE};
+use super::resolve::{DEFAULT_CHECKPOINT_BLOCKS, DEFAULT_GUEST_DIR};
 
 /// the generated defaults: a fresh init/join with no flags yields a node
 /// with every surface up. Loopback for the operator surfaces (HTTP app
@@ -107,10 +107,13 @@ pub struct NodeToml {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxToml {
-    /// the isolation adapter: `"podman"` (the only one; Linux-only).
+    /// the isolation adapter: `"firecracker"` (the only one; Linux-only).
     pub runtime: String,
-    /// the provider environment image the adapter boots.
-    pub image: String,
+    /// the guest kernel every run boots. Shared, read-only, immutable.
+    pub kernel: std::path::PathBuf,
+    /// the guest root filesystem image. Shared across every concurrent run and
+    /// attached READ-ONLY, so one buyer's run cannot corrupt another's guest.
+    pub rootfs: std::path::PathBuf,
     /// announced capacity; `0` = probe the host.
     pub cores: u64,
     /// announced capacity in GiB; `0` = probe the host.
@@ -394,9 +397,11 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
                  [sandbox]"
             );
             keyline(&mut s, "runtime", format_args!("\"{}\"", sb.runtime),
-                "isolation adapter: \"podman\" (runs never execute bare on the host)");
-            keyline(&mut s, "image", format_args!("\"{}\"", sb.image),
-                "the provider environment image");
+                "isolation adapter: \"firecracker\" (runs never execute bare on the host)");
+            keyline(&mut s, "kernel", format_args!("\"{}\"", sb.kernel.display()),
+                "the guest kernel every run boots");
+            keyline(&mut s, "rootfs", format_args!("\"{}\"", sb.rootfs.display()),
+                "the shared read-only guest root filesystem");
             keyline(&mut s, "cores", format_args!("{}", sb.cores),
                 "announced capacity; 0 = probe the host");
             keyline(&mut s, "mem_gb", format_args!("{}", sb.mem_gb),
@@ -406,10 +411,12 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
             let _ = writeln!(
                 s,
                 "\n# compute plane (off): uncomment [sandbox] to run providers on this node.\n\
-                 # runtime: \"podman\" — runs never execute bare on the host.\n\
+                 # runtime: \"firecracker\" — one microVM per run; runs never execute\n\
+                 # bare on the host. Build the two images with ops/build-guest-rootfs.sh.\n\
                  #[sandbox]\n\
-                 #runtime = \"podman\"\n\
-                 #image = \"{DEFAULT_PODMAN_IMAGE}\"\n\
+                 #runtime = \"firecracker\"\n\
+                 #kernel = \"{DEFAULT_GUEST_DIR}/vmlinux\"\n\
+                 #rootfs = \"{DEFAULT_GUEST_DIR}/rootfs.ext4\"\n\
                  #cores = 0\n\
                  #mem_gb = 0"
             );

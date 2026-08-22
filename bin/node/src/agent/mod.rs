@@ -88,34 +88,17 @@ async fn run(
         workspace,
     } = agent;
     let node_key = node_key.to_vec();
-    let backend = crate::services::podman_backend(&service, &grant.kind)?;
+    let backend = crate::services::sandbox_backend(&service)?;
+    // Fail-closed at BOOT rather than 150 s into a run: probe verifies
+    // /dev/kvm opens read-write for this process and that the guest images
+    // exist. A daemon that signals an interactive plane it cannot sandbox is
+    // worse than one that refuses to start.
+    backend.probe()?;
+    // There is no daemon to start and nothing to sweep. Each run's VMM is a
+    // child of this process spawned kill_on_drop, so a death that ran no code
+    // still takes its guests with it.
 
-    // this daemon's OWN podman service — its socket, storage root and egress
-    // hook, under `<storage>/services/agent`. Fail-closed: a start failure ends
-    // the process rather than leaving a daemon that signals an interactive
-    // plane it cannot sandbox. Held for the process's life; dropping it stops
-    // the service child.
-    let self_exe = std::env::current_exe()
-        .map_err(|error| format!("cannot resolve this daemon's own executable: {error}"))?;
-    let podman = provider_host::PodmanService::start_for(
-        &backend,
-        &crate::services::podman_data_dir(&service, &grant.kind),
-        &self_exe,
-    )
-    .await?;
-    // whatever still carries this instance's label got here through a death
-    // that ran no code — the stop path leaves none — and is destroyed, never
-    // resumed. See [`crate::services::Sweep`].
-    crate::services::sweep_own_containers(&backend, &grant, crate::services::Sweep::CrashOrphans)
-        .await;
-
-    let providers = agent_service::discover(
-        &node_key,
-        // cloned: `discover` consumes the backend, and the teardown below needs
-        // the same socket to sweep this instance's containers through.
-        backend.clone(),
-        &grant.display_id(),
-    )?;
+    let providers = agent_service::discover(&node_key, backend, &grant.display_id())?;
     let offered = providers.capabilities().len();
 
     let (events, event_rx) = tokio::sync::mpsc::channel(link::EVENT_LANE);
@@ -143,42 +126,15 @@ async fn run(
         () = link::attach(ws_url(&http_base), workspace, sessions, event_rx) => {}
         () = stop => {}
     }
-    stop_sandbox(podman, &backend, &grant).await;
-    Ok(())
-}
-
-/// Tear the sandbox down, containers FIRST.
-///
-/// Order is the whole point. Killing the `podman system service` does not stop
-/// what it created: each session container's conmon is its own parent, ignores
-/// SIGTERM, and would keep the session alive under a service that no longer
-/// exists. So this instance's containers are REMOVED here rather than left for
-/// the next start's reaper — over the socket that is still answering right now,
-/// which is the only instrument that reaches them — and only then does the
-/// service child go. Leaving them would mean a stopped daemon still holding a
-/// pty's container and a graph root until something happened to start that kind
-/// again, which on a torn-down workspace is never.
-///
-/// SIGKILL still leaves both behind, and nothing here can change that: the
-/// answer there is the next start of the same kind, where `PodmanService::claim`
-/// reaps the podman service under a root nobody holds any more and the boot
-/// sweep destroys the containers.
-async fn stop_sandbox(
-    podman: Option<provider_host::PodmanService>,
-    backend: &provider_host::SandboxBackend,
-    grant: &ServiceGrant,
-) {
-    crate::services::sweep_own_containers(backend, grant, crate::services::Sweep::Teardown).await;
-    let Some(service) = podman else {
-        // a non-Podman backend started no service.
-        return;
-    };
-    service.shutdown().await;
+    // Nothing to tear down. Every live run's VMM is a child of this process
+    // spawned kill_on_drop, so returning from here is the teardown — and that
+    // covers SIGKILL too, which the container backend's sweep could not.
     tracing::info!(
         target: "ducktape::service",
         instance = %grant.display_id(),
         "agent daemon stopped"
     );
+    Ok(())
 }
 
 /// `http(s)://host:port` → `ws(s)://host:port/v1/ws`.

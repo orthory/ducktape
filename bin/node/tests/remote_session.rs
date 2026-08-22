@@ -47,10 +47,9 @@ const FINALIZE: Duration = Duration::from_secs(60);
 /// bound (container cold-start + the mesh hop); a deadline, not a poll.
 const ECHO: Duration = Duration::from_secs(120);
 
-/// the image the scripted echo provider runs in: this suite's child is driven
-/// through a pty, so it keeps the fuller `node` base rather than the harness
-/// default.
-const SANDBOX_IMAGE: &str = "docker.io/library/node:22-slim";
+// The scripted echo provider used to name its own container image. Every node
+// now boots the same shared guest rootfs, so what a run can execute is decided
+// when that image is built (ops/build-guest-rootfs.sh), not per suite.
 
 fn bind_auth(member: &ed25519::PrivateKey, chain: &str, node: &[u8]) -> MemberAuth {
     identity::testkit::ed_bind_auth(member, &identity::bind_preimage(chain, node, 0))
@@ -267,7 +266,7 @@ fn guest_drives_a_scripted_child_on_the_host_over_the_forwarded_lane() {
     // Podman terminal plane; only the host carries the echo provider.
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
     cluster.wireguard = true;
-    cluster.extra_toml = sandbox_toml(SANDBOX_IMAGE);
+    cluster.extra_toml = sandbox_toml();
     cluster.env[1] = vec![(
         "DUCKTAPE_CAPABILITY_DIR".into(),
         spec_dir.path().display().to_string(),

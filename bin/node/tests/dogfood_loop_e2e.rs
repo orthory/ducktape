@@ -55,7 +55,7 @@ use std::time::Duration;
 use agent::{ACTION_CHAT_POST, AgentMsg, ResourceCaps};
 use capability::{CapabilityQuery, CapabilityReply};
 use chat::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, Mark, Span};
-use common::{Cluster, SANDBOX_IMAGE, poll_until, sandbox_toml, serial, skip_unless_sandboxed};
+use common::{Cluster, poll_until, sandbox_toml, serial, skip_unless_sandboxed};
 use runs::{RunOutcome, RunRecord, RunsMsg, RunsQuery, RunsReply, TurnPolicy};
 
 const CONVERGE: Duration = Duration::from_secs(180);
@@ -449,7 +449,7 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
     // HOW a run is isolated (the table) is independent of WHETHER this node runs
     // any (the grant); the compute daemon needs both and refuses to boot without
     // the table. Appended LAST — nothing may follow a toml table header.
-    cluster.extra_toml.extend(sandbox_toml(SANDBOX_IMAGE));
+    cluster.extra_toml.extend(sandbox_toml());
     cluster.env[0] = [hermetic_env(fixtures.path(), "node0"), vec![runs_root_env.clone()]].concat();
     cluster.env[1] = [
         provider.env(),

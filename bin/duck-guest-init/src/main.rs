@@ -17,13 +17,19 @@
 //!   past 120 s, an otherwise identical one exited in 428 ms. `RESTART` goes
 //!   through the `reboot=k` i8042 reset, which the VMM does observe.
 
+// Both halves of the host<->guest contract live in sandbox-host and are
+// included here verbatim rather than depended on. The host has to ENCODE the
+// manifest this parses and DECODE the frames this writes, so a second
+// definition on either side is a wire-format fork waiting to happen — while
+// PID 1 still must not carry tokio and tracing.
+//
+// Each end uses only part of each module (the guest parses manifests and
+// encodes frames; the host does the reverse), so the unused part is dead code
+// here by construction, not by oversight.
+#[allow(dead_code)]
+#[path = "../../../crates/services/sandbox/src/guest_manifest.rs"]
 mod manifest;
 
-// the vsock wire, shared with the host by including its source directly rather
-// than depending on sandbox-host — PID 1 must not carry tokio and tracing. See
-// that file's module docs.
-// Each end uses half the codec — the guest only encodes, the host only decodes
-// — so the unused half is dead code here by construction, not by oversight.
 #[allow(dead_code)]
 #[path = "../../../crates/services/sandbox/src/guest_proto.rs"]
 mod guest_proto;
@@ -32,7 +38,7 @@ use guest_proto::{Frame, encode};
 use manifest::RunManifest;
 use std::ffi::CString;
 use std::io::Write as _;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd as _, RawFd};
 
 /// exit code reported when the init itself failed, as opposed to the run. Well
 /// clear of the 0-125 a program picks and of the 128+N a signal produces.
@@ -63,6 +69,15 @@ fn run() -> Result<i32, String> {
 
     for (device, mountpoint) in &manifest.mounts {
         mount_ext4(device, mountpoint)?;
+    }
+
+    for (index, port) in manifest.tunnel_ports.iter().enumerate() {
+        // best-effort: a run whose tunnel fails to bind will fail its API calls
+        // with a clear connection error from the CLI, which is a better
+        // diagnosis than refusing to boot with none of the run's own output.
+        if let Err(e) = start_tunnel(*port, index) {
+            let _ = writeln!(std::io::stderr(), "duck-guest-init: tunnel {port}: {e}");
+        }
     }
 
     let host = connect_to_host()?;
@@ -143,24 +158,112 @@ fn unmount(mountpoint: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// the broker tunnel
+// ---------------------------------------------------------------------------
+
+/// serve `127.0.0.1:port` inside the guest and forward every connection to the
+/// host over vsock.
+///
+/// The run's CLI dials its credential broker as ordinary HTTP. With no network
+/// device there is no route out of the VM, so this is the route — and it is a
+/// better one: the far end is a socket the host process owns, not an interface,
+/// so the guest cannot reach anything else on the host by changing an address.
+/// The credential itself never enters the VM; the broker holds it and the guest
+/// carries only an opaque per-run bearer.
+fn start_tunnel(port: u16, index: usize) -> Result<(), String> {
+    bring_up_loopback()?;
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+        .map_err(|e| format!("bind 127.0.0.1:{port}: {e}"))?;
+    // the host bound its listeners in this order; the guest never names a
+    // destination, it only picks the matching vsock port.
+    let vsock_port = guest_proto::TUNNEL_PORT_BASE + index as u32;
+    std::thread::Builder::new()
+        .name(format!("tunnel-{port}"))
+        .spawn(move || {
+            for stream in listener.incoming().flatten() {
+                // one vsock connection per TCP connection: HTTP keep-alive and
+                // concurrent requests both work, and a stuck request cannot
+                // block another.
+                std::thread::spawn(move || tunnel_one(stream, vsock_port));
+            }
+        })
+        .map_err(|e| format!("spawn tunnel thread: {e}"))?;
+    Ok(())
+}
+
+fn tunnel_one(tcp: std::net::TcpStream, vsock_port: u32) {
+    let Ok(vsock) = connect_vsock(vsock_port) else {
+        return;
+    };
+    let Ok(tcp_write) = tcp.try_clone() else {
+        unsafe { libc::close(vsock) };
+        return;
+    };
+    let tcp_fd = tcp.as_raw_fd();
+    // two directions, two threads. Splicing both in one thread would deadlock
+    // the moment either side filled its buffer.
+    let up = std::thread::spawn(move || {
+        splice(tcp_fd, vsock);
+        // half-close so the far end sees EOF rather than waiting forever
+        unsafe { libc::shutdown(vsock, libc::SHUT_WR) };
+    });
+    splice(vsock, tcp_write.as_raw_fd());
+    let _ = tcp_write.shutdown(std::net::Shutdown::Write);
+    let _ = up.join();
+    unsafe { libc::close(vsock) };
+}
+
+/// copy `from` to `to` until either end closes.
+fn splice(from: RawFd, to: RawFd) {
+    let mut buf = vec![0u8; 32 * 1024];
+    loop {
+        let n = unsafe { libc::read(from, buf.as_mut_ptr().cast(), buf.len()) };
+        if n <= 0 {
+            return;
+        }
+        write_all(to, &buf[..n as usize]);
+    }
+}
+
+/// bring `lo` up. Without it, binding 127.0.0.1 succeeds and connecting to it
+/// fails with `ENETUNREACH` — a failure that reads like the broker is down.
+fn bring_up_loopback() -> Result<(), String> {
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(format!("socket: {}", std::io::Error::last_os_error()));
+    }
+    let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+    for (i, b) in b"lo".iter().enumerate() {
+        req.ifr_name[i] = *b as libc::c_char;
+    }
+    req.ifr_ifru.ifru_flags = (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+    // `as _`, not a named type: ioctl's request argument is c_ulong on glibc
+    // and c_int on musl, and this file is compiled against both — musl for the
+    // shipped guest binary, glibc for `cargo test` on the host.
+    let rc = unsafe { libc::ioctl(fd, libc::SIOCSIFFLAGS as _, &req) };
+    unsafe { libc::close(fd) };
+    if rc != 0 {
+        return Err(format!("bring up lo: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // the host connection
 // ---------------------------------------------------------------------------
 
 /// dial the host over vsock. Guest-initiated is the simpler direction: the host
-/// listens on `<uds>_1024` and Firecracker bridges this connection to it, so no
-/// in-guest listener and no connect-back race.
-fn connect_to_host() -> Result<RawFd, String> {
+/// listens on `<uds>_<port>` and Firecracker bridges this connection to it, so
+/// no in-guest listener and no connect-back race.
+fn connect_vsock(port: u32) -> Result<RawFd, String> {
     let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
     if fd < 0 {
-        return Err(format!(
-            "vsock socket: {}",
-            std::io::Error::last_os_error()
-        ));
+        return Err(format!("vsock socket: {}", std::io::Error::last_os_error()));
     }
     let mut addr: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
     addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
     addr.svm_cid = libc::VMADDR_CID_HOST;
-    addr.svm_port = guest_proto::VSOCK_PORT;
+    addr.svm_port = port;
     let rc = unsafe {
         libc::connect(
             fd,
@@ -171,9 +274,13 @@ fn connect_to_host() -> Result<RawFd, String> {
     if rc != 0 {
         let err = std::io::Error::last_os_error();
         unsafe { libc::close(fd) };
-        return Err(format!("vsock connect to host: {err}"));
+        return Err(format!("vsock connect to host port {port}: {err}"));
     }
     Ok(fd)
+}
+
+fn connect_to_host() -> Result<RawFd, String> {
+    connect_vsock(guest_proto::VSOCK_PORT)
 }
 
 fn send(fd: RawFd, frame: &Frame) {
@@ -201,9 +308,10 @@ fn send(fd: RawFd, frame: &Frame) {
 // ---------------------------------------------------------------------------
 
 fn exec_and_pump(manifest: &RunManifest, host: RawFd) -> Result<i32, String> {
+    let mut in_pipe = [0 as RawFd; 2];
     let mut out_pipe = [0 as RawFd; 2];
     let mut err_pipe = [0 as RawFd; 2];
-    for pipe in [&mut out_pipe, &mut err_pipe] {
+    for pipe in [&mut in_pipe, &mut out_pipe, &mut err_pipe] {
         if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
             return Err(format!("pipe: {}", std::io::Error::last_os_error()));
         }
@@ -216,10 +324,13 @@ fn exec_and_pump(manifest: &RunManifest, host: RawFd) -> Result<i32, String> {
     if child == 0 {
         // ---- child: never returns ----
         unsafe {
+            libc::close(in_pipe[1]);
             libc::close(out_pipe[0]);
             libc::close(err_pipe[0]);
+            libc::dup2(in_pipe[0], libc::STDIN_FILENO);
             libc::dup2(out_pipe[1], libc::STDOUT_FILENO);
             libc::dup2(err_pipe[1], libc::STDERR_FILENO);
+            libc::close(in_pipe[0]);
             libc::close(out_pipe[1]);
             libc::close(err_pipe[1]);
         }
@@ -227,10 +338,11 @@ fn exec_and_pump(manifest: &RunManifest, host: RawFd) -> Result<i32, String> {
     }
 
     unsafe {
+        libc::close(in_pipe[0]);
         libc::close(out_pipe[1]);
         libc::close(err_pipe[1]);
     }
-    pump(host, out_pipe[0], err_pipe[0]);
+    pump(host, in_pipe[1], out_pipe[0], err_pipe[0]);
     let code = wait_for(child);
     send(host, &Frame::Exit(code));
     Ok(code)
@@ -244,19 +356,6 @@ fn exec_child(manifest: &RunManifest) -> ! {
         let _ = writeln!(std::io::stderr(), "duck-guest-init: {msg}");
         unsafe { libc::_exit(INIT_FAILED) }
     };
-
-    // stdin is /dev/null: a microVM run is headless, and a CLI that blocks on a
-    // read from a terminal that will never exist hangs the run.
-    let Ok(devnull) = CString::new("/dev/null") else {
-        fail("/dev/null path")
-    };
-    let null_fd = unsafe { libc::open(devnull.as_ptr(), libc::O_RDONLY) };
-    if null_fd >= 0 {
-        unsafe {
-            libc::dup2(null_fd, libc::STDIN_FILENO);
-            libc::close(null_fd);
-        }
-    }
 
     if std::env::set_current_dir(&manifest.cwd).is_err() {
         fail(&format!("chdir {}", manifest.cwd));
@@ -288,10 +387,19 @@ fn exec_child(manifest: &RunManifest) -> ! {
     fail(&format!("execve {}", manifest.argv[0]))
 }
 
-/// forward both pipes to the host until each reaches EOF, tagging every read
-/// with the stream it came from. `poll` rather than two threads: PID 1 with two
-/// file descriptors does not need a runtime.
-fn pump(host: RawFd, out_fd: RawFd, err_fd: RawFd) {
+/// carry the run's three streams between the child and the host until both
+/// output pipes reach EOF.
+///
+/// All three directions are driven by ONE `poll`, which is what makes stdin
+/// concurrent with stdout: the run's prompt arrives on stdin and can be larger
+/// than a pipe buffer, so a guest that wrote stdin first and only then read
+/// output would deadlock against a CLI that streams before it drains.
+///
+/// `poll` rather than threads — PID 1 with four descriptors does not need a
+/// runtime.
+fn pump(host: RawFd, in_fd: RawFd, out_fd: RawFd, err_fd: RawFd) {
+    let mut stdin_fd = in_fd;
+    let mut host_buf: Vec<u8> = Vec::new();
     let mut fds = [
         libc::pollfd {
             fd: out_fd,
@@ -300,6 +408,14 @@ fn pump(host: RawFd, out_fd: RawFd, err_fd: RawFd) {
         },
         libc::pollfd {
             fd: err_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        // the host half: inbound stdin frames. Retired on EOF like the others,
+        // but it does NOT keep the loop alive — the run ends when the child's
+        // output ends, not when the host stops talking.
+        libc::pollfd {
+            fd: host,
             events: libc::POLLIN,
             revents: 0,
         },
@@ -328,19 +444,81 @@ fn pump(host: RawFd, out_fd: RawFd, err_fd: RawFd) {
             let n = unsafe { libc::read(pollfd.fd, buf.as_mut_ptr().cast(), buf.len()) };
             if n > 0 {
                 let payload = buf[..n as usize].to_vec();
-                let frame = match slot {
-                    0 => Frame::Stdout(payload),
-                    _ => Frame::Stderr(payload),
-                };
-                send(host, &frame);
+                match slot {
+                    0 => send(host, &Frame::Stdout(payload)),
+                    1 => send(host, &Frame::Stderr(payload)),
+                    // the host half carries stdin frames the other way.
+                    _ => {
+                        host_buf.extend_from_slice(&payload);
+                        feed_stdin(&mut host_buf, &mut stdin_fd);
+                    }
+                }
                 continue;
             }
-            // 0 = EOF, <0 = a broken pipe. Either way this stream is done;
+            // 0 = EOF, <0 = a broken pipe. Either way this direction is done;
             // retire it so `poll` stops reporting it ready forever.
-            unsafe { libc::close(pollfd.fd) };
+            let is_output_pipe = slot < 2;
+            if is_output_pipe {
+                unsafe { libc::close(pollfd.fd) };
+                open -= 1;
+            }
+            // The host descriptor is NOT closed here: it is the same socket
+            // `send` writes to, and the run's exit code still has to go out
+            // after the host has stopped sending stdin.
             pollfd.fd = -1;
-            open -= 1;
         }
+    }
+}
+
+/// drain whole frames out of `buf` and apply them to the child's stdin.
+///
+/// A partial frame stays in the buffer for the next read — a vsock read returns
+/// whatever happened to arrive, and the prompt routinely spans several.
+fn feed_stdin(buf: &mut Vec<u8>, stdin_fd: &mut RawFd) {
+    loop {
+        let frame = match guest_proto::decode(buf) {
+            Ok(Some(frame)) => frame,
+            // a whole frame has not arrived yet
+            Ok(None) => return,
+            // The host writes these, so a malformed one is our own bug rather
+            // than a hostile guest. Nothing useful to do mid-run: stop feeding
+            // stdin and let the child see EOF.
+            Err(e) => {
+                let _ = writeln!(std::io::stderr(), "duck-guest-init: stdin frame: {e}");
+                close_stdin(stdin_fd);
+                return;
+            }
+        };
+        match frame {
+            Frame::Stdin(bytes) => write_all(*stdin_fd, &bytes),
+            Frame::StdinEof => close_stdin(stdin_fd),
+            // The host never sends these; ignoring them keeps a host-side bug
+            // from taking the run down.
+            Frame::Stdout(_) | Frame::Stderr(_) | Frame::Exit(_) => {}
+        }
+    }
+}
+
+fn close_stdin(stdin_fd: &mut RawFd) {
+    if *stdin_fd < 0 {
+        return;
+    }
+    unsafe { libc::close(*stdin_fd) };
+    *stdin_fd = -1;
+}
+
+fn write_all(fd: RawFd, bytes: &[u8]) {
+    if fd < 0 {
+        return;
+    }
+    let mut written = 0usize;
+    while written < bytes.len() {
+        let n =
+            unsafe { libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written) };
+        if n <= 0 {
+            return;
+        }
+        written += n as usize;
     }
 }
 
