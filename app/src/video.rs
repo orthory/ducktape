@@ -30,9 +30,9 @@ use std::sync::{Mutex, OnceLock};
 use chat::call_wire::{CapturedFrame, PeerFrame};
 use iced::{Element, Rectangle, Size};
 
-/// Toggle/shutdown poll while no camera is open. With a camera open the loop
-/// paces itself at the NEGOTIATED MODE'S OWN RATE instead — the local preview
-/// runs at camera-native fps, decoupled from what the wire carries.
+/// Toggle/shutdown poll while no camera is open. WITH ONE OPEN THE LOOP KEEPS
+/// NO CLOCK AT ALL: `Camera::frame()` blocks until the device has the next
+/// frame, so the camera itself is the pace — see [`camera_thread`].
 const IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(40);
 /// The wire's send floor: at most one encoded frame per this interval
 /// (~60 fps). A camera slower than this just sends every frame; a faster one
@@ -193,13 +193,19 @@ fn decode_frame(data: &[u8]) -> Option<TileFrame> {
     })
 }
 
-/// Encode one captured RGB frame to the wire's opaque bytes. Public for the
-/// unit round-trip; the capture thread is its only product caller.
-pub(crate) fn encode_frame(rgb: &[u8], width: u16, height: u16) -> Option<Vec<u8>> {
+/// Encode one captured RGBA frame to the wire's opaque bytes (the encoder
+/// ignores the alpha channel). Public for the unit round-trip; the capture
+/// thread is its only product caller.
+///
+/// RGBA, NOT RGB, BECAUSE THE PREVIEW IS RGBA. The camera is decoded once,
+/// into the layout the renderer wants, and the wire copy borrows that — the
+/// arrangement this replaced decoded to RGB and then rebuilt a whole second
+/// RGBA image per frame, on the capture thread, in the gap between two frames.
+pub(crate) fn encode_frame(rgba: &[u8], width: u16, height: u16) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let encoder = jpeg_encoder::Encoder::new(&mut out, JPEG_QUALITY);
     encoder
-        .encode(rgb, width, height, jpeg_encoder::ColorType::Rgb)
+        .encode(rgba, width, height, jpeg_encoder::ColorType::Rgba)
         .ok()?;
     if out.len() > chat::video::MAX_FRAME_BYTES {
         return None;
@@ -207,13 +213,9 @@ pub(crate) fn encode_frame(rgb: &[u8], width: u16, height: u16) -> Option<Vec<u8
     Some(out)
 }
 
-/// The local preview mirror of a frame we just sent.
-pub(crate) fn store_preview(rgb: &[u8], width: u32, height: u32) {
-    let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
-    for pixel in rgb.chunks_exact(3) {
-        rgba.extend_from_slice(pixel);
-        rgba.push(0xff);
-    }
+/// The local preview: the camera's own pixels, taking ownership of the frame
+/// the capture pass decoded.
+pub(crate) fn store_preview(rgba: Vec<u8>, width: u32, height: u32) {
     store().lock().expect("video store").preview = Some(TileFrame {
         width,
         height,
@@ -221,108 +223,116 @@ pub(crate) fn store_preview(rgb: &[u8], width: u32, height: u32) {
     });
 }
 
+/// Open the camera, or say why. 640×480 AT ITS HIGHEST FRAME RATE — the size
+/// this module has always documented. `AbsoluteHighestFrameRate` alone meant
+/// "highest frame rate, then the HIGHEST resolution" (nokhwa-core `types.rs`),
+/// so a 720p/1080p webcam negotiated a mode whose q60 JPEG overran the mesh's
+/// ~126 KiB `MAX_FRAME_BYTES` and whose RGBA blew iced's 2 MiB upload cliff —
+/// both read as blinking. A camera with no VGA mode falls back to that same
+/// request and the capture shrink brings its frames onto the identical budget.
+///
+/// A refusal turns the toggle back off and surfaces as "live · camera: …"
+/// through the status fold; the caller has nothing to decide.
+fn open_camera(
+    events: &iced::futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
+) -> Option<nokhwa::Camera> {
+    use nokhwa::pixel_format::RgbAFormat;
+    use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType, Resolution};
+
+    let vga = RequestedFormat::new::<RgbAFormat>(RequestedFormatType::HighestResolution(
+        Resolution::new(640, 480),
+    ));
+    let any = RequestedFormat::new::<RgbAFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+    match nokhwa::Camera::new(CameraIndex::Index(0), vga)
+        .or_else(|_| nokhwa::Camera::new(CameraIndex::Index(0), any))
+        .and_then(|mut device| device.open_stream().map(|()| device))
+    {
+        Ok(device) => Some(device),
+        Err(error) => {
+            let event = crate::call::CallEvent {
+                kind: "live".into(),
+                message: format!("camera: {error}"),
+                ..crate::call::CallEvent::default()
+            };
+            let _ = events.unbounded_send(event);
+            CAMERA_ON.store(false, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
 /// The camera thread body: poll the toggle, hold the device only while on,
-/// capture at the camera's native rate, thin the encode to the wire ceiling,
+/// capture at the camera's own rate, thin the encode to the wire ceiling,
 /// hand frames to the session pump. Ends when `shutdown` drops (the
 /// session's own teardown chain).
+///
+/// THE CAMERA IS THE CLOCK, AND IT IS THE ONLY ONE. `Camera::frame()` blocks
+/// until the device has the next frame, so a loop that reads it back-to-back
+/// runs at exactly the negotiated rate, self-correcting, forever. The version
+/// this replaced ALSO slept a frame interval before that blocking read: a
+/// whole period of waiting, and then a wait for the frame after it. The
+/// driver's buffers filled while we slept, every pass then took the oldest
+/// one, and the self-view arrived a frame late and in bursts — the stutter,
+/// in a preview that never touches the network or the codec.
 pub(crate) fn camera_thread(
     frames: tokio::sync::mpsc::UnboundedSender<CapturedFrame>,
     shutdown: std::sync::mpsc::Receiver<()>,
     events: iced::futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
 ) {
-    use nokhwa::pixel_format::RgbFormat;
-    use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType, Resolution};
+    use nokhwa::pixel_format::RgbAFormat;
 
-    // The open device plus its native frame interval — the pace the loop
-    // holds while it runs.
-    let mut camera: Option<(nokhwa::Camera, std::time::Duration)> = None;
+    let mut camera: Option<nokhwa::Camera> = None;
     let started = std::time::Instant::now();
-    // The cadence is a rolling deadline: each pass waits only for whatever
-    // remains of the interval after the previous pass's work, so decode +
-    // encode time comes out of the interval instead of stretching it. A pass
-    // that overruns waits zero (recv_timeout still polls the channel) and the
-    // loop runs flat out at its real speed.
-    let mut next_capture = std::time::Instant::now();
-    // The wire thinning clock — see WIRE_INTERVAL.
+    // The wire thinning clock — see WIRE_INTERVAL. The only clock left.
     let mut last_sent: Option<std::time::Instant> = None;
     loop {
-        let wait = next_capture.saturating_duration_since(std::time::Instant::now());
-        // The shutdown sender dropping is the session ending.
-        match shutdown.recv_timeout(wait) {
+        // The shutdown sender dropping is the session ending. With a camera
+        // open this only polls — the blocking read below is the pace; with
+        // none it is the idle clock.
+        let idle_wait = match camera.is_some() {
+            true => std::time::Duration::ZERO,
+            false => IDLE_POLL,
+        };
+        match shutdown.recv_timeout(idle_wait) {
             Ok(()) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
-        // The idle pace; a pulled frame below re-arms at the camera's rate.
-        next_capture = std::time::Instant::now() + IDLE_POLL;
         if !camera_enabled() {
-            if camera.take().is_some() {
-                // Device released the moment the toggle goes off.
-            }
+            // Device released the moment the toggle goes off.
+            camera = None;
             continue;
         }
         if camera.is_none() {
-            // 640×480 AT ITS HIGHEST FRAME RATE — the size this module has
-            // always documented. `AbsoluteHighestFrameRate` alone meant
-            // "highest frame rate, then the HIGHEST resolution" (nokhwa-core
-            // `types.rs`), so a 720p/1080p webcam negotiated a mode whose q60
-            // JPEG overran the mesh's ~126 KiB `MAX_FRAME_BYTES` and whose
-            // RGBA blew iced's 2 MiB upload cliff — both read as blinking.
-            // A camera with no VGA mode falls back to that same request and
-            // the shrink below brings its frames onto the identical budget.
-            let vga = RequestedFormat::new::<RgbFormat>(RequestedFormatType::HighestResolution(
-                Resolution::new(640, 480),
-            ));
-            let any =
-                RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
-            match nokhwa::Camera::new(CameraIndex::Index(0), vga)
-                .or_else(|_| nokhwa::Camera::new(CameraIndex::Index(0), any))
-                .and_then(|mut device| device.open_stream().map(|()| device))
-            {
-                Ok(device) => {
-                    // NATIVE CADENCE: the loop runs at the negotiated mode's
-                    // own rate, so the preview is as smooth as the camera —
-                    // the wire is thinned separately by WIRE_INTERVAL. The
-                    // clamp only guards a driver reporting 0 (or nonsense).
-                    let rate = device.frame_rate().clamp(1, 240);
-                    let native = std::time::Duration::from_secs_f64(1.0 / f64::from(rate));
-                    camera = Some((device, native));
-                }
-                Err(error) => {
-                    // Surfaces as "live · camera: …" through the status fold.
-                    let event = crate::call::CallEvent {
-                        kind: "live".into(),
-                        message: format!("camera: {error}"),
-                        ..crate::call::CallEvent::default()
-                    };
-                    let _ = events.unbounded_send(event);
-                    CAMERA_ON.store(false, Ordering::Relaxed);
-                    continue;
-                }
-            }
+            camera = open_camera(&events);
+            continue;
         }
-        let Some((device, native_interval)) = camera.as_mut() else {
+        let Some(device) = camera.as_mut() else {
             continue;
         };
-        next_capture = std::time::Instant::now() + *native_interval;
         let Ok(frame) = device.frame() else {
+            // A device that stopped answering must not spin this loop: drop
+            // it, and the reopen above says why on its next attempt.
+            camera = None;
             continue;
         };
-        let Ok(decoded) = frame.decode_image::<RgbFormat>() else {
+        let Ok(decoded) = frame.decode_image::<RgbAFormat>() else {
             continue;
         };
         let (width, height) = (decoded.width(), decoded.height());
-        let rgb = decoded.into_raw();
-        let (rgb, width, height) = shrink_to_budget::<3>(rgb, width, height, CAPTURE_PIXEL_BUDGET);
-        // The preview mirrors EVERY captured frame, before and regardless of
-        // the wire: the self-view has no bandwidth to respect, and a frame
-        // the encoder refuses (over the mesh cap) must not freeze it.
-        store_preview(&rgb, width, height);
+        let rgba = decoded.into_raw();
+        let (rgba, width, height) =
+            shrink_to_budget::<4>(rgba, width, height, CAPTURE_PIXEL_BUDGET);
+        // The wire's copy only BORROWS the frame, so it is taken first and the
+        // preview then takes ownership: the self-view mirrors every captured
+        // frame regardless of the wire — it has no bandwidth to respect, and a
+        // frame the encoder refuses (over the mesh cap) must not freeze it.
         let wire_due = last_sent.is_none_or(|at| at.elapsed() >= WIRE_INTERVAL);
-        if !wire_due {
-            continue;
-        }
-        let Some(encoded) = encode_frame(&rgb, width as u16, height as u16) else {
+        let encoded = wire_due
+            .then(|| encode_frame(&rgba, width as u16, height as u16))
+            .flatten();
+        store_preview(rgba, width, height);
+        let Some(encoded) = encoded else {
             continue;
         };
         last_sent = Some(std::time::Instant::now());
@@ -362,10 +372,22 @@ pub fn call_video_tiles() -> Element<'static, ()> {
 /// into rows on the strip's width.
 const TILE_HEIGHT: f32 = 96.0;
 const TILE_GAP: f32 = 8.0;
-/// The paint ceiling while any tile is live (~60 Hz): high enough for a
-/// native-rate preview and full-rate peers; frames that didn't change
-/// between beats are Arc-cached handles the renderer draws for free.
-const REDRAW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+/// How soon after painting a live tile the surface asks to be painted again.
+///
+/// SHORTER THAN ANY DISPLAY'S FRAME, ON PURPOSE — this is not a target rate,
+/// it is "there is always a repaint owed". The window presents on vsync, so
+/// what a beat longer than a refresh period buys is a beat that drifts against
+/// it: ask again 16 ms after a frame the compositor showed 16.7 ms apart and
+/// every few frames the request lands a hair too late, waits a whole extra
+/// refresh, and shows the same picture twice — a periodic hitch on a preview
+/// whose pixels arrived on time. At 4 ms the redraw is always already owed and
+/// each vsync paints the newest camera frame in hand, which is as close to
+/// "straight from the camera" as a composited window gets.
+///
+/// It costs the huddle's own window a paint pass per refresh and no other
+/// window anything (that is what `live_surface` is for), and it parks
+/// completely when no tile is live.
+const REDRAW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(4);
 
 fn tile_count() -> usize {
     let store = store().lock().expect("video store");
@@ -449,12 +471,14 @@ mod tests {
     #[test]
     fn encode_decode_round_trips_a_synthetic_frame() {
         // A 64×48 gradient: encode must fit the mesh cap and decode back to
-        // the same dimensions with RGBA pixels.
+        // the same dimensions with RGBA pixels. Capture is RGBA end to end now
+        // — the camera decodes once, into the layout the renderer wants — and
+        // the encoder drops the alpha it is handed.
         let (width, height) = (64u16, 48u16);
-        let rgb: Vec<u8> = (0..u32::from(width) * u32::from(height))
-            .flat_map(|i| [(i % 251) as u8, (i % 83) as u8, (i % 199) as u8])
+        let rgba: Vec<u8> = (0..u32::from(width) * u32::from(height))
+            .flat_map(|i| [(i % 251) as u8, (i % 83) as u8, (i % 199) as u8, 0xff])
             .collect();
-        let encoded = encode_frame(&rgb, width, height).expect("encode");
+        let encoded = encode_frame(&rgba, width, height).expect("encode");
         assert!(encoded.len() < chat::video::MAX_FRAME_BYTES);
         let tile = decode_frame(&encoded).expect("decode");
         assert_eq!((tile.width, tile.height), (64, 48));
@@ -500,11 +524,11 @@ mod tests {
         };
         reset();
         assert_eq!(tile_count(), 0);
-        store_preview(&[10, 20, 30], 1, 1);
+        store_preview(vec![10, 20, 30, 0xff], 1, 1);
         assert_eq!(tile_count(), 1);
         let first = preview_id().expect("preview");
         assert_eq!(first, preview_id().expect("preview"));
-        store_preview(&[40, 50, 60], 1, 1);
+        store_preview(vec![40, 50, 60, 0xff], 1, 1);
         assert_ne!(first, preview_id().expect("preview"));
         reset();
         assert!(preview_id().is_none());
