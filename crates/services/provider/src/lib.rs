@@ -176,7 +176,7 @@ mod interactive;
 // below — resolve through this crate.
 pub(crate) use sandbox_host::sandbox;
 #[cfg(unix)]
-pub use sandbox_host::{GuestLayout, tap_egress_nftables};
+pub use sandbox_host::{GuestAsset, GuestLayout, tap_egress_nftables};
 #[cfg(unix)]
 pub(crate) use sandbox_host::{firecracker_api, guest_manifest, microvm};
 mod spec;
@@ -699,14 +699,15 @@ impl CliProvider {
         // path that reached the guest untranslated would point at nothing.
         let assets = self.sandbox_ro_paths(ctx, &workdir, auth)?;
         for (index, asset) in assets.iter().enumerate() {
-            let guest = match asset.is_file() {
+            let host = asset.path();
+            let guest = match host.is_file() {
                 // a FILE is the workspace-parent context doc: it lands beside
                 // the workspace so `../<name>` still resolves.
                 true => Path::new(sandbox_host::guest_paths::GUEST_ASSETS)
-                    .join(asset.file_name().unwrap_or_default()),
+                    .join(host.file_name().unwrap_or_default()),
                 false => PathBuf::from(sandbox_host::guest_paths::guest_asset_dir(index)),
             };
-            layout.map(asset, &guest);
+            layout.map(host, &guest);
         }
         let guest_workdir = PathBuf::from(sandbox_host::guest_paths::GUEST_WORKSPACE);
         // the guest cwd is known HERE and nowhere earlier — see the fn doc.
@@ -752,7 +753,7 @@ impl CliProvider {
             workspace: run_dir.join("workspace.ext4"),
             vcpus: vm_cores(&ctx.limits)?,
             mem_mib: vm_mem_mib(&ctx.limits)?,
-            vsock_uds: run_dir.join("v.sock"),
+            vsock_uds: microvm_socket(ctx)?,
             // no tap: the guest reaches this node's broker over vsock and needs
             // no interface. See the spec's egress section.
             tap: None,
@@ -866,26 +867,45 @@ impl CliProvider {
     /// which every backend already mounts, so it crosses for free). without this
     /// the file would exist on the host and simply not be there for the child —
     /// a silently unsouled agent, the one failure mode this feature must not have.
+    /// Each asset is tagged with WHAT it is, because a VM copies where a
+    /// container bind-mounted and the two kinds cost wildly different amounts:
+    /// a PATH entry hands over only the commands it offers, while a skills tree
+    /// and a context doc cross entire. See [`GuestAsset`].
     fn sandbox_ro_paths(
         &self,
         ctx: &RunContext,
         workdir: &Path,
         auth: &RunAuth<'_>,
-    ) -> Result<Vec<PathBuf>, String> {
-        let mut paths = ctx.path_entries.clone();
-        paths.extend(ctx.env.get(SKILLS_ROOT_ENV).map(PathBuf::from));
+    ) -> Result<Vec<GuestAsset>, String> {
+        let mut assets: Vec<GuestAsset> = ctx
+            .path_entries
+            .iter()
+            .cloned()
+            .map(GuestAsset::Commands)
+            .collect();
+        assets.extend(
+            ctx.env
+                .get(SKILLS_ROOT_ENV)
+                .map(|root| GuestAsset::Whole(PathBuf::from(root))),
+        );
         if ctx.context_doc.is_some()
             && let Some(doc) = self.context_target(workdir, auth.config_home)?
             && !doc.starts_with(workdir)
         {
-            paths.push(doc);
+            assets.push(GuestAsset::Whole(doc));
         }
         if self.backend.is_bare_test() {
-            return Ok(paths);
+            return Ok(assets);
         }
-        paths
+        assets
             .into_iter()
-            .map(|path| canonical_mount_path(&path, "sandbox read-only mount"))
+            .map(|asset| {
+                let canonical = canonical_mount_path(asset.path(), "sandbox read-only mount")?;
+                Ok(match asset {
+                    GuestAsset::Commands(_) => GuestAsset::Commands(canonical),
+                    GuestAsset::Whole(_) => GuestAsset::Whole(canonical),
+                })
+            })
             .collect()
     }
 
@@ -1463,18 +1483,42 @@ fn guest_argv(bin: &Path, args: &[String], layout: &GuestLayout) -> Vec<String> 
     argv
 }
 
-/// a short, per-run directory for the VM's sockets and images.
+/// the run's per-run directory for its block devices, boot config and console.
 ///
-/// Under `XDG_RUNTIME_DIR` and NOT under the node's data directory, because a
-/// unix socket path is capped near 108 bytes (`SUN_LEN`) and a data dir under a
-/// long home blows through it — the failure is `path must be shorter than
-/// SUN_LEN` at bind time, after the workspace image has already been built.
+/// ON DISK, under the system temp directory. `XDG_RUNTIME_DIR` is the obvious
+/// home for run-scoped state and it is the WRONG one for this: it is a tmpfs
+/// sized at a fraction of RAM, and a run's images are as large as the run's
+/// inputs. Measured, a run whose PATH entry was a build directory filled the
+/// whole 9.1 GB of it and died with `No space left on device` — with the node's
+/// memory as the thing consumed. Only the socket belongs there; see
+/// [`microvm_socket`].
 fn microvm_run_dir(ctx: &RunContext) -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join(format!("dt-vm-{:016x}", run_tag(ctx)));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create run dir {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+/// the run's vsock socket path, which is the ONE thing that must be short.
+///
+/// A unix socket path is capped near 108 bytes (`SUN_LEN`), and Firecracker
+/// appends `_<port>` to it. `XDG_RUNTIME_DIR` is the shortest per-user
+/// directory that exists on a normal host; the node's data directory under a
+/// long home blows straight through the cap, and the failure is
+/// `path must be shorter than SUN_LEN` at bind time — after the images have
+/// already been built.
+fn microvm_socket(ctx: &RunContext) -> Result<PathBuf, String> {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    // FNV over the run's identity: short, fixed width, and collision-avoidance
-    // between concurrent runs is all it has to do.
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = base.join(format!("dt-vm-{:016x}", run_tag(ctx)));
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("create socket dir {}: {e}", dir.display()))?;
+    Ok(dir.join("v.sock"))
+}
+
+/// FNV over the run's identity: short, fixed width, and collision-avoidance
+/// between concurrent runs is all it has to do.
+fn run_tag(ctx: &RunContext) -> u64 {
     let mut tag: u64 = 0xcbf2_9ce4_8422_2325;
     let identity = format!(
         "{}-{}",
@@ -1485,9 +1529,7 @@ fn microvm_run_dir(ctx: &RunContext) -> Result<PathBuf, String> {
         tag ^= u64::from(*byte);
         tag = tag.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    let dir = base.join(format!("dt-vm-{tag:016x}"));
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create run dir {}: {e}", dir.display()))?;
-    Ok(dir)
+    tag
 }
 
 /// the run's vcpu count.

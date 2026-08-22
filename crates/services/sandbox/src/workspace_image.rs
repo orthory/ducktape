@@ -16,6 +16,7 @@
 //! core. Do not reach for faster storage to speed this up; the spec's *Build
 //! caches* section records the measurement and the conclusion drawn from it.
 
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -132,28 +133,93 @@ pub fn read_back(image: &Path, dest: &Path) -> Result<(), String> {
 /// it being a separate device rather than part of the workspace. Handing the
 /// skills tree back to the buyer as if the run had produced it would be wrong,
 /// and on a second round trip it would nest.
-pub fn build_assets(assets: &[PathBuf], image: &Path, staging: &Path) -> Result<(), String> {
+pub fn build_assets(assets: &[GuestAsset], image: &Path, staging: &Path) -> Result<(), String> {
     let _ = std::fs::remove_dir_all(staging);
     std::fs::create_dir_all(staging.join("workspace"))
         .map_err(|e| format!("stage {}: {e}", staging.display()))?;
 
-    for (index, source) in assets.iter().enumerate() {
-        let meta = std::fs::metadata(source)
-            .map_err(|e| format!("stat asset {}: {e}", source.display()))?;
-        if meta.is_file() {
-            let name = source
-                .file_name()
-                .ok_or_else(|| format!("asset {} has no file name", source.display()))?;
-            std::fs::copy(source, staging.join(name))
-                .map_err(|e| format!("stage asset {}: {e}", source.display()))?;
-            continue;
+    for (index, asset) in assets.iter().enumerate() {
+        let target = staging.join(format!("ro{index}"));
+        match asset {
+            GuestAsset::Commands(source) => stage_commands(source, &target)?,
+            GuestAsset::Whole(source) => stage_whole(source, staging, &target)?,
         }
-        copy_tree(source, &staging.join(format!("ro{index}")))?;
     }
 
     let size = sized_for(staging)?;
     build(staging, image, size)?;
     let _ = std::fs::remove_dir_all(staging);
+    Ok(())
+}
+
+/// one read-only input, and HOW MUCH of it crosses into the guest.
+///
+/// The distinction exists because a VM copies where a container bind-mounted.
+/// Under a bind mount the size of a declared directory cost nothing, so nobody
+/// had to think about it; a copy makes it the run's latency and the node's
+/// disk, per run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuestAsset {
+    /// a PATH entry. Only the executables at its TOP LEVEL cross.
+    ///
+    /// That is not a heuristic, it is what a PATH entry means: resolution never
+    /// recurses into a subdirectory and never resolves a non-executable, so
+    /// nothing else in the tree is nameable from inside the guest. Measured on
+    /// this repo's own node binary, whose PATH entry is `target/debug`: a 39 GB
+    /// tree holding exactly ONE file — 0.95 GB — that a run could ever invoke.
+    /// Copying the tree filled a 9.1 GB tmpfs and failed the run with
+    /// `No space left on device` while copying an `.rlib`.
+    Commands(PathBuf),
+    /// a tree the run reads, or a single file: the skills root, the assembled
+    /// context doc. Copied entire — every byte of these is readable input.
+    Whole(PathBuf),
+}
+
+impl GuestAsset {
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Commands(path) | Self::Whole(path) => path,
+        }
+    }
+}
+
+/// stage the executables a PATH entry actually offers, and nothing else.
+fn stage_commands(from: &Path, to: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(to).map_err(|e| format!("create {}: {e}", to.display()))?;
+    let entries = std::fs::read_dir(from).map_err(|e| format!("read {}: {e}", from.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read {}: {e}", from.display()))?;
+        let source = entry.path();
+        // metadata(), not symlink_metadata(): a PATH directory of symlinks into
+        // a versioned store is the normal shape, and the target is the command.
+        let Ok(meta) = std::fs::metadata(&source) else {
+            continue;
+        };
+        let is_command = meta.is_file() && meta.permissions().mode() & 0o111 != 0;
+        if !is_command {
+            continue;
+        }
+        let target = to.join(entry.file_name());
+        std::fs::copy(&source, &target).map_err(|e| format!("copy {}: {e}", source.display()))?;
+    }
+    Ok(())
+}
+
+/// stage a whole input: a directory tree at `to`, or a file at the image root.
+///
+/// A file lands one level ABOVE the workspace under its own name, so a
+/// `workspace-parent` context doc still resolves as `../<name>`.
+fn stage_whole(source: &Path, staging: &Path, to: &Path) -> Result<(), String> {
+    let meta =
+        std::fs::metadata(source).map_err(|e| format!("stat asset {}: {e}", source.display()))?;
+    if !meta.is_file() {
+        return copy_tree(source, to);
+    }
+    let name = source
+        .file_name()
+        .ok_or_else(|| format!("asset {} has no file name", source.display()))?;
+    std::fs::copy(source, staging.join(name))
+        .map_err(|e| format!("stage asset {}: {e}", source.display()))?;
     Ok(())
 }
 
@@ -213,6 +279,43 @@ mod tests {
     }
 
     /// The round trip is the whole contract: what the guest writes has to come
+    /// A PATH entry offers exactly the commands at its top level. Copying the
+    /// tree instead is not merely wasteful, it is unbounded: the node's own
+    /// binary sits in a build directory whose tree measured 39 GB against the
+    /// 0.95 GB of it a run can name, and copying it filled a tmpfs and failed
+    /// the run with `No space left on device`.
+    #[test]
+    fn a_path_entry_hands_over_its_commands_and_nothing_else() {
+        let root = scratch("path-entry");
+        let from = root.join("bin");
+        std::fs::create_dir_all(from.join("deps")).expect("tree");
+        std::fs::write(from.join("tool"), b"#!/bin/sh\n").expect("command");
+        std::fs::set_permissions(from.join("tool"), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        std::fs::write(from.join("notes.txt"), b"not a command").expect("data file");
+        std::fs::write(from.join("deps").join("huge.rlib"), b"not reachable").expect("nested");
+
+        let to = root.join("staged");
+        stage_commands(&from, &to).expect("stage");
+
+        let mut staged: Vec<String> = std::fs::read_dir(&to)
+            .expect("read staged")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        staged.sort();
+        assert_eq!(
+            staged,
+            vec!["tool".to_string()],
+            "PATH resolution never recurses and never resolves a non-executable"
+        );
+        let mode = std::fs::metadata(to.join("tool"))
+            .expect("stat")
+            .permissions()
+            .mode();
+        assert!(mode & 0o111 != 0, "it must still be executable: {mode:o}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
     /// back byte-identical, with the mode bits intact — an agent run that
     /// produces an executable must not hand back a non-executable one.
     #[test]

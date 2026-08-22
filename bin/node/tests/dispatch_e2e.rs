@@ -85,35 +85,35 @@ struct ScriptProvider {
     tag: String,
     spec_dir: PathBuf,
     env_var: String,
-    script: PathBuf,
+    bin: PathBuf,
+}
+
+/// the test executor every provider here runs, as a shell one-liner: drain the
+/// payload, answer in the spec's output format.
+///
+/// It rides the spec's ARGV rather than a staged `provider.sh`, because a run
+/// executes inside a microVM that mounts nothing from the host — an executor a
+/// node lends has to already be in the guest rootfs. A host script reaches the
+/// guest as `execve /opt/duck/bin/provider.sh` and exit 126.
+fn script_provider_argv(stdout: &str) -> String {
+    // the payload is single-quoted for the shell (none of these carry a `'`)
+    // and TOML-escaped for the spec file. `\\n` is a TOML basic string's
+    // literal backslash-n, which is what printf wants.
+    let payload = stdout.replace('"', "\\\"");
+    format!(r#"["-c", "cat > /dev/null; printf '%s\\n' '{payload}'"]"#)
 }
 
 impl ScriptProvider {
     /// stage a provider under `root/<name>`: `format` is the spec's output
-    /// format and `stdout` the exact bytes the script prints (compose them to
-    /// match). the spec carries a per-provider `detect.env` name, so a node
-    /// provides this tag exactly when its process env names this script.
+    /// format and `stdout` the exact bytes it prints (compose them to match).
+    /// the spec carries a per-provider `detect.env` name, so a node provides
+    /// this tag exactly when its process env names this executor.
     fn stage(root: &std::path::Path, name: &str, tag: &str, format: &str, stdout: &str) -> Self {
         let dir = root.join(name);
         let spec_dir = dir.join("specs");
         std::fs::create_dir_all(&spec_dir).expect("provider spec dir");
-        let script = dir.join("provider.sh");
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\n\
-                 # a test executor, running in the sandbox: drain the payload\n\
-                 # and answer in the spec's output format. busybox `sh` and\n\
-                 # `cat` are the whole of its dependencies.\n\
-                 cat > /dev/null\n\
-                 printf '%s\\n' '{stdout}'\n",
-            ),
-        )
-        .expect("write provider script");
-        let mut perms = std::fs::metadata(&script).expect("script metadata").permissions();
-        use std::os::unix::fs::PermissionsExt as _;
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script, perms).expect("chmod provider script");
+        // resolved by basename to /opt/duck/bin/sh inside the guest
+        let bin = PathBuf::from("/bin/sh");
 
         let env_var = format!(
             "DUCKTAPE_TEST_{}_BIN",
@@ -130,11 +130,12 @@ impl ScriptProvider {
                  bin = \"{tag}-nonexistent-cli\"\n\
                  env = \"{env_var}\"\n\
                  [invoke]\n\
-                 args = []\n\
+                 args = {}\n\
                  prompt = \"stdin\"\n\
                  timeout_secs = 30\n\
                  [output]\n\
-                 format = \"{format}\"\n"
+                 format = \"{format}\"\n",
+                script_provider_argv(stdout)
             ),
         )
         .expect("write provider spec");
@@ -142,7 +143,7 @@ impl ScriptProvider {
             tag: tag.into(),
             spec_dir,
             env_var,
-            script,
+            bin,
         }
     }
 
@@ -156,7 +157,7 @@ impl ScriptProvider {
                 "DUCKTAPE_CAPABILITY_DIR".into(),
                 self.spec_dir.display().to_string(),
             ),
-            (self.env_var.clone(), self.script.display().to_string()),
+            (self.env_var.clone(), self.bin.display().to_string()),
         ]
     }
 

@@ -44,6 +44,7 @@ pub use host_tools::{find_on_path, find_system_tool};
 #[cfg(unix)]
 pub use microvm::{MicroVm, MicroVmIo};
 pub use sandbox::SandboxBackend;
+pub use workspace_image::GuestAsset;
 
 /// whether `p` is a file this process could exec. the shared predicate behind
 /// both PATH walks: the sandbox runtime probe here, and capability-host's

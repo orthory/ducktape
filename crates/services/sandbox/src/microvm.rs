@@ -78,7 +78,7 @@ impl MicroVm {
     pub async fn boot(
         run_dir: &Path,
         workdir: &Path,
-        assets: &[PathBuf],
+        assets: &[crate::workspace_image::GuestAsset],
         cfg: &VmConfig,
         manifest: &RunManifest,
     ) -> Result<(Self, MicroVmIo), String> {
