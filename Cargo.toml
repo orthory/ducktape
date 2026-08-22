@@ -144,6 +144,7 @@ members = [
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
     "bin/airlock-gateway",
     "bin/guest-builder",
+    "bin/duck-guest-init",
     # native desktop client — intentionally only Chat + Pages
     "app",
 ]

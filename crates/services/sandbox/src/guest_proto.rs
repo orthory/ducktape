@@ -161,7 +161,7 @@ mod tests {
             Frame::Stderr(b"two".to_vec()),
             Frame::Exit(3),
         ];
-        let mut buf: Vec<u8> = sent.iter().flat_map(|f| encode(f)).collect();
+        let mut buf: Vec<u8> = sent.iter().flat_map(encode).collect();
         let mut got = Vec::new();
         while let Some(frame) = decode(&mut buf).expect("decode") {
             got.push(frame);
