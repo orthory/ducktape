@@ -67,11 +67,24 @@ An aloop card loops device 1's playback into device 0's capture — which is wha
 picks which card a process calls `default`. Both `snd-aloop` and the v4l2 core
 live in `linux-modules-extra-$(uname -r)`.
 
-Measured on zk-dev 2026-08-22: both sides had the other's 640×480 picture and
-40+ audible mixed frames about one second after joining. Stop the `ffmpeg`
-producer and both sides fail on the picture; stop the `aplay` loops and both
-fail on the voice, beacon and picture still true. That falsifiability is what
-makes the passing run mean anything.
+`DUCKTAPE_HUDDLE_SOURCE=screen` (with a real `DISPLAY` — `Xvfb :99 -screen 0
+1280x800x24` is one) publishes that side's DESKTOP instead of its camera, and
+the far side names what it got by its size: a camera is 640×480, a desktop is
+that root window halved onto the tile budget (1280×800 → 640×400).
+
+Measured on zk-dev 2026-08-22: both sides had the other's picture and 40+
+audible mixed frames about one second after joining, camera one way and a
+shared desktop the other. Stop the `ffmpeg` producer and both sides fail on the
+picture; stop the `aplay` loops and both fail on the voice with beacon and
+picture still true. That falsifiability is what makes the passing run mean
+anything.
+
+The lane also prints how THIS side's own picture arrived — frames, mean gap,
+worst gap. Stutter is a distribution, not a rate, and only the worst gap can
+see a hole. Same box, same run: a 30 fps camera lands at 33.3 ms mean / 45.7 ms
+worst, and a 10 fps screen share at 100.0 / 117.0. A mean well above the
+source's own interval is the capture loop paying for its work AFTER the wait
+instead of inside it.
 
 ### On macOS: raise the fd limit first
 

@@ -314,9 +314,54 @@ pub(crate) fn encode_frame(rgba: &[u8], width: u16, height: u16) -> Option<Vec<u
     (out.len() <= chat::video::MAX_FRAME_BYTES).then_some(out)
 }
 
+/// How the self-view is ARRIVING: frames stored, and the worst and total gap
+/// between consecutive ones in microseconds.
+///
+/// Stutter is a distribution, not a rate — a preview averaging 30 fps with one
+/// 200 ms hole in it is the complaint, and an average alone cannot see the
+/// hole. These are the three numbers that can: count says how many frames the
+/// capture source actually delivered, `worst_gap_us` is the hole, and
+/// `total_gap_us / (count - 1)` is what the mean should have been.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PreviewPace {
+    pub frames: u64,
+    pub worst_gap_us: u64,
+    pub total_gap_us: u64,
+}
+
+static PREVIEW_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PREVIEW_WORST_GAP_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PREVIEW_TOTAL_GAP_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PREVIEW_LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// The self-view's delivery, for this process's life.
+pub(crate) fn preview_pace() -> PreviewPace {
+    PreviewPace {
+        frames: PREVIEW_FRAMES.load(Ordering::Relaxed),
+        worst_gap_us: PREVIEW_WORST_GAP_US.load(Ordering::Relaxed),
+        total_gap_us: PREVIEW_TOTAL_GAP_US.load(Ordering::Relaxed),
+    }
+}
+
+/// Fold one arrival into the pace above. The gap is measured HERE, where the
+/// frame lands in the store — the last point that belongs to capture and the
+/// first the surface can read, so a slow encode or a stalled device shows up
+/// and a busy renderer does not.
+fn note_preview_arrival() {
+    let now = std::time::Instant::now();
+    PREVIEW_FRAMES.fetch_add(1, Ordering::Relaxed);
+    let mut last = PREVIEW_LAST.lock().expect("preview pace");
+    if let Some(previous) = last.replace(now) {
+        let gap = now.duration_since(previous).as_micros() as u64;
+        PREVIEW_TOTAL_GAP_US.fetch_add(gap, Ordering::Relaxed);
+        PREVIEW_WORST_GAP_US.fetch_max(gap, Ordering::Relaxed);
+    }
+}
+
 /// The local preview: the camera's own pixels, taking ownership of the frame
 /// the capture pass decoded.
 pub(crate) fn store_preview(rgba: Vec<u8>, width: u32, height: u32) {
+    note_preview_arrival();
     store().lock().expect("video store").preview = Some(TileFrame {
         width,
         height,
@@ -550,7 +595,9 @@ fn grab(open: &mut Open) -> Result<(Vec<u8>, u32, u32), String> {
 /// The driver's buffers filled while we slept, every pass then took the oldest
 /// one, and the self-view arrived a frame late and in bursts — the stutter, in
 /// a preview that never touches the network or the codec. A screen grab is the
-/// other shape: nothing to wait on, so the wait IS the frame rate.
+/// other shape: nothing to wait on, so the wait IS the frame rate — and for
+/// that reason it is a DEADLINE the grab's own cost comes out of, not a nap
+/// laid end to end with it.
 pub(crate) fn capture_thread(
     frames: tokio::sync::mpsc::UnboundedSender<CapturedFrame>,
     shutdown: std::sync::mpsc::Receiver<()>,
@@ -560,19 +607,30 @@ pub(crate) fn capture_thread(
     let started = std::time::Instant::now();
     // The wire thinning clock — see WIRE_INTERVAL. The only other clock.
     let mut last_sent: Option<std::time::Instant> = None;
+    // The screen's next grab is a DEADLINE, not a nap — see the pace below.
+    let mut next_grab = std::time::Instant::now();
     loop {
         // The shutdown sender dropping is the session ending, and what this
         // waits is the open source's own pace.
+        //
+        // A SCREEN'S INTERVAL IS A PERIOD, NOT A NAP. Grabbing a 1280×800 root
+        // window, shrinking it and encoding it costs ~45 ms; sleeping the full
+        // interval on top of that made a 10 fps share arrive at 6.8 (measured:
+        // 146 ms mean between frames for a 100 ms interval). Waiting only what
+        // is LEFT of the period puts the cost inside the frame instead of
+        // after it, and a grab slower than the period simply runs flat out —
+        // never a catch-up burst, because the deadline cannot fall behind now.
         let pace = match &open {
             Open::None => IDLE_POLL,
             Open::Camera(_) => std::time::Duration::ZERO,
-            Open::Screen(_) => SCREEN_INTERVAL,
+            Open::Screen(_) => next_grab.saturating_duration_since(std::time::Instant::now()),
         };
         match shutdown.recv_timeout(pace) {
             Ok(()) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
+        next_grab = (next_grab + SCREEN_INTERVAL).max(std::time::Instant::now());
         let wanted = source();
         if wanted == Source::Off {
             // The device is released the moment the toggle goes off, and the
