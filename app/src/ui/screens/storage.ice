@@ -66,7 +66,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
         button -> emit(fs_open_parent)
           with
             label="Parent directory"
-            disabled=(loading || empty(path))
+            disabled=(loading || path == "/")
             w=26.0
             h=26.0
             p=0.0

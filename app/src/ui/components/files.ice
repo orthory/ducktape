@@ -140,7 +140,7 @@ component CrumbBar(path:str, meta:str)
           h=fill
           gap=6.0
           align=center
-        button -> emit(fs_open_dir, "")
+        button -> emit(fs_open_dir, "/")
           with
             label="Go to the duckfs root"
             p=0.0

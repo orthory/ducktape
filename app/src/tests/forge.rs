@@ -337,7 +337,7 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
         .expect("the handler ends")
         .0;
     assert!(
-        focus_file.contains("tree_path = fs_parent(path)")
+        focus_file.contains("tree_path = forge_parent(path)")
             && focus_file.contains("tree_rev = keep_str(!empty(rev), rev, tree_rev)")
             && focus_file.contains("run replace lane=tree forge_tree(rpc, repo_now, tree_rev, tree_path)"),
         "a focused file first moves the tree to its directory, pinned to the link's rev"

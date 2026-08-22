@@ -278,6 +278,7 @@ extern crate::backend
   pure keep_comment_text(loaded:bool, next_oid:str, current_oid:str, value:str) -> str
   pure staged_comment_drop_note(loaded:bool, next_oid:str, current_oid:str, staged:[ForgeDraftComment], error:str) -> str
   pure forge_comment_target(path:str, line:str, side:str) -> str
+  pure forge_parent(path:str) -> str
   pure forge_file_header(opened_dir:str, opened_rev:str, dir:str, rev:str, path:str) -> str
   submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:ForgeReviewVerdict, body:str, commit_oid:str, comments:[ForgeDraftComment]) -> bool ! AppError
   merge_forge_pr(rpc:str, password:str, repo:str, number:i64, source_branch:str, expected_source_oid:str, prev_target_oid:str) -> ForgeMergeOutcome ! AppError
