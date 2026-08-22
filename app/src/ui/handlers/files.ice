@@ -29,6 +29,11 @@ on fs_open_file(path)
   return if fs_loading || !connected
   fs_preview_path = path
   fs_preview_entry = fs_entry_named(fs_entries, fs_preview_path)
+  // The old body must not sit under the new path while the read is in
+  // flight — the pane would show A's text (and A's Edit button) under B.
+  fs_preview_text = ""
+  fs_preview_truncated = false
+  fs_preview_binary = false
   fs_generation = fs_generation + 1
   run replace lane=files_preview files_preview(connected_rpc, fs_preview_path, fs_generation) -> fs_previewed _ | fs_failed _
 

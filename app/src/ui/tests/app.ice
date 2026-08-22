@@ -1012,7 +1012,9 @@ test files_write_bar_clears_the_crumb_bar
         preview_binary=fs_preview_binary
         editing=fs_editing
         preview_text=fs_preview_text
+        dark=false
       events
+        open_message_link -> open_message_link _
         fs_open_dir -> fs_open_dir _
         fs_open_file -> fs_open_file _
         fs_open_parent -> fs_open_parent

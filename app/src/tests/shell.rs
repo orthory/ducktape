@@ -1389,6 +1389,69 @@ fn the_files_pane_reports_only_a_directory_it_has_listed() {
     );
 }
 
+/// THE FILES PREVIEW IS THE FORGE READER, NOT A PLAIN TEXT NODE.
+///
+/// Text files read as numbered, syntect-coloured rows through the same
+/// `forge_code` extern the forge blob pane mounts (behind the same `lazy`
+/// memo boundary), and a Markdown path reads as a document through
+/// `agent_markdown`. Pinned so the pane cannot quietly fall back to the one-ink
+/// `text preview_text` it shipped with — and so a pick clears the previous
+/// body before the read lands, instead of showing A's text under B's path.
+#[test]
+fn the_files_preview_reads_text_through_the_forge_reader() {
+    let storage = inlined(include_str!("../ui/screens/storage.ice"));
+    let files = storage
+        .split_once("component FilesScreen(")
+        .expect("the screen")
+        .1
+        .split_once("\ncomponent ")
+        .expect("the screen ends")
+        .0;
+    assert!(
+        files.contains("lazy preview_text by preview_text, preview_path, dark as cached_source"),
+        "the reader's memo boundary is the mount's lazy"
+    );
+    assert!(
+        files.contains("extern forge_code(cached_source, preview_path, dark) #fs-code"),
+        "text mounts the highlighted reader"
+    );
+    assert!(
+        files.contains("if !preview_binary && markdown_path(preview_path)")
+            && files.contains("extern agent_markdown(preview_text, dark) #fs-markdown"),
+        "a markdown path reads as a document"
+    );
+    assert!(
+        !files.contains("text preview_text\n"),
+        "no arm falls back to the one-ink text node"
+    );
+
+    let view = inlined(include_str!("../ui/view.ice"));
+    let mount = view
+        .split_once("FilesScreen new_name<->fs_new_name")
+        .expect("the mount")
+        .1
+        .split_once("\n        members:")
+        .expect("the mount ends")
+        .0;
+    assert!(mount.contains("dark\n"), "the mount hands the screen the appearance");
+    assert!(
+        mount.contains("open_message_link -> open_message_link _"),
+        "markdown links route through the shell's link seam"
+    );
+
+    let handlers = include_str!("../ui/handlers/files.ice");
+    let open_file = handlers
+        .split_once("on fs_open_file(path)")
+        .expect("the handler")
+        .1
+        .split_once("\non ")
+        .expect("the handler ends")
+        .0;
+    let cleared = open_file.find("fs_preview_text = \"\"").expect("the old body is cleared");
+    let read = open_file.find("run replace lane=files_preview").expect("the read");
+    assert!(cleared < read, "the body is cleared before the read is issued");
+}
+
 /// ESCAPE CLOSES WHAT IS ON SCREEN, AND THE THREAD RAIL IS NOT.
 ///
 /// Channel details unmounts the rail — `if active_thread_seq > 0 &&
