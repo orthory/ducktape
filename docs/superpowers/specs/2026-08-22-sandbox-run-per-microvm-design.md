@@ -92,6 +92,8 @@ node host process
       Firecracker microVM (under its jailer)
        ├── vcpu N / mem M      demand-paged + balloon
        ├── kernel + rootfs     immutable, shared RO, per-run COW overlay
+       ├── agent volume        persistent ext4, attached not copied
+       │                       (CARGO_HOME + RUSTUP_HOME + target/)
        ├── workspace           per-run ext4 block device, copied back on exit
        └── tap device ──→ host nft: public allowed, operator's private net denied
 ```
@@ -196,6 +198,92 @@ buyers — the property namespaces cannot provide, and the reason every vendor
 serving hostile multi-tenant code (Lambda, Vercel Sandbox, E2B, Fly Machines on
 Firecracker; Cloud Run and Modal on gVisor) uses a VM or a user-space kernel
 rather than namespaces alone.
+
+## Build caches: a per-agent volume, never the host's
+
+The workspace round trip above is bounded by workspace size, and for a source
+checkout that is fine. It is **not** fine for a build cache, and a Rust dev
+agent is mostly build cache. Measured on this repo:
+
+| | size | files | round trip |
+|---|---|---|---|
+| source (no `target/`) | 1.7 GB | 80,749 | **13.8 s** (`mke2fs -d` 9.1 s + `debugfs rdump` 4.7 s) |
+| `target/` | **76 GB** | 100,331 | not attempted — ~45× the source at the same rate |
+
+So `target/` cannot ride the per-run image. Neither can `~/.cargo` (13 GB here)
+or `~/.rustup` (7.9 GB). They need a device that is **attached, not copied** —
+which `virtio-blk` already gives us for free, since attaching is passing a path.
+
+**The round trip is CPU-bound, so faster storage does not help.** The host disk
+is NVMe (2.9 GB/s write, 3.0 GB/s read, O_DIRECT). Marshalling achieves 186 MB/s
+and 8,860 files/s — 6% of the disk. Re-running the same round trip against tmpfs
+instead of the NVMe moved `mke2fs -d` by 10% (9254 → 8322 ms) and made
+`debugfs rdump` *slower* (5333 → 5600 ms); `mke2fs` runs at 99% CPU on one core.
+Do not propose a storage change to speed this up.
+
+### Sharing the host's cache is an escape, not an optimisation
+
+The tempting shape — attach the operator's real `~/.cargo` and `~/.rustup`,
+read-only for safety — was tested and is wrong in both directions.
+
+**Writes reach the host, and Cargo never notices.** With a writable
+`CARGO_HOME`, appending a function to a cached extracted source
+(`registry/src/<index>/anyhow-1.0.104/src/lib.rs`) and calling it from a fresh
+project printed `anyhow::pwned() = 1337`. Cargo verifies a `.crate` tarball's
+checksum when it extracts, writes `.cargo-ok`, and never re-checks the extracted
+tree again. The tarball stays intact and passes any audit; the tree that
+actually compiles is poisoned, silently and permanently.
+
+Cheaper still: one line of `config.toml`.
+
+```toml
+[build]
+rustc-wrapper = "/path/to/evil.sh"
+```
+
+The next `cargo build` *on the host* ran it — `EVIL RAN AS eddy`. That is host
+command execution from inside the sandbox, triggered by the operator's own next
+build. `~/.cargo/bin` (19 executables the host runs directly) is a third path to
+the same place.
+
+**Read-only would stop those, and stop nothing else.** A read-only `virtio-blk`
+is a genuine boundary — Firecracker rejects the write in the VMM, so guest root
+does not help. But the leak direction is untouched: this host's `~/.cargo`
+holds `credentials.toml` (a crates.io token) and 7.2 GB of `git/` checkouts that
+may include private repositories. Read-only hands all of it to the guest.
+
+Read-only also breaks the workload. With a read-only `CARGO_HOME`, a build whose
+dependencies are all present succeeds — but adding one uncached dependency fails
+with `failed to open .../serde-1.0.229.crate: Permission denied (os error 13)`.
+An agent that cannot add a dependency is not a dev agent.
+
+### Decision: two writable devices, nothing shared
+
+```
+/dev/vda  rw   agent volume       CARGO_HOME + RUSTUP_HOME + target/
+                                  persistent; seeded once at agent creation
+/dev/vdb  rw   workspace          per-run ext4, round-tripped, ephemeral
+```
+
+The agent volume is seeded by copying a **template image**, built once in an
+empty `CARGO_HOME` from the project's `Cargo.lock` via `cargo fetch` — not
+snapshotted from the operator's home. `credentials.toml`, the private `git/`
+checkouts and `~/.cargo/bin` are therefore absent by construction rather than by
+permission bits.
+
+This deletes the threat model above instead of mitigating it. There is no shared
+surface to poison and none to leak, so no read-only enforcement is required for
+correctness; the boundary is that the files are simply different files.
+
+**Read-only base plus an overlay was considered and rejected as premature.** It
+is the standard *container image* shape (RO layers + a writable upper), but it
+is not how CI caches Rust — `actions/cache`, BuildKit cache mounts and
+cargo-chef all give a job its own cache rather than an overlay over a shared
+one. Its only benefit here is disk, and disk is what we have: a 15 GB template
+copied per agent costs 18.2 s once at agent creation (13 GB measured, `ext4`, no
+reflink) and 300 GB for 20 agents against 1.7 TB free. The upgrade path — a
+read-only base with an overlayfs upper — is recorded in *Open questions* and
+becomes worthwhile at hundreds of agents, not tens.
 
 ## Network and egress
 
@@ -350,3 +438,6 @@ inventory, not a reason to fork the design.
 - Guest kernel: build our own or track a distro's? Determines the CVE workflow.
 - Default VM size when `cores` / `mem_gb` are absent.
 - Whether the public-egress toggle defaults on or off for a fresh node.
+- When agent count reaches the hundreds, whether to replace the per-agent cache
+  copy with a read-only base image plus an overlayfs upper. Costed in *Build
+  caches* above; deliberately not built now.

@@ -1254,6 +1254,9 @@ impl PodmanService {
         // future backend fails the build until it is routed.
         let socket = match backend {
             crate::SandboxBackend::Podman { socket, .. } => socket,
+            // a microVM per run needs no daemon at all: the VMM is spawned by
+            // the run and dies with it, so there is no service to keep alive.
+            crate::SandboxBackend::Firecracker { .. } => return Ok(None),
             #[cfg(any(test, feature = "testkit"))]
             crate::SandboxBackend::Bare => return Ok(None),
         };

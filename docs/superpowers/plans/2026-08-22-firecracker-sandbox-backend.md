@@ -233,6 +233,7 @@ starting point for the "build our own kernel?" open question below.
 |---|---|
 | `crates/services/sandbox/src/firecracker_api.rs` | new — the VMM HTTP client over a per-run unix socket: machine-config, boot-source, drives, vsock, network-interface, InstanceStart. Peer of `podman_api.rs`. |
 | `crates/services/sandbox/src/workspace_image.rs` | new — build a workspace ext4 from a directory, read it back. Pure shell-outs to `mke2fs`/`debugfs`, no mounting, no root. |
+| `crates/services/sandbox/src/agent_volume.rs` | new — the persistent per-agent cache volume (`CARGO_HOME` + `RUSTUP_HOME` + `target/`): create a sparse ext4 once, seed it from a template, hand its path to the VMM. Attached, never copied back. |
 | `crates/services/sandbox/src/guest_proto.rs` | new — the vsock frame codec shared by host and guest. Pure, no I/O. |
 | `crates/services/sandbox/src/sandbox.rs` | modify — add the `Firecracker` variant and extend `probe`. |
 | `crates/services/sandbox/src/lib.rs` | modify — declare and re-export the new modules. |

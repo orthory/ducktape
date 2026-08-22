@@ -16,6 +16,9 @@ use std::path::Path;
 #[cfg(unix)]
 pub mod podman_api;
 pub mod sandbox;
+// the microVM backend's storage: shells out to e2fsprogs and walks unix modes.
+#[cfg(unix)]
+pub mod workspace_image;
 
 #[cfg(unix)]
 pub use podman_api::{PodmanService, egress_nftables, reap_by_label, run_egress_hook};
