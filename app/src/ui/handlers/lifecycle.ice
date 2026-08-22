@@ -1036,7 +1036,7 @@ on tray_reconnect
 // `copy_to_clipboard`'s shape, for the one caller that cannot pass it a
 // label: a menu row routes to a handler and carries nothing.
 on tray_copy_node_key
-  return if empty(node_key)
+  return if console_win == none || empty(node_key)
   toast = "Copied node key"
   toast_age = 0
   task clipboard write node_key
