@@ -1087,6 +1087,8 @@ test palette_backdrop_takes_the_pointer
 // a row index that drifts in codegen fails here, not silently in the menu bar.
 // The two stat rows are not commands — a reader reads them — and with no node
 // answering the icon is the grey one.
+// Only the launch window is up here, so the console's rows and the huddle's
+// are out of the menu — not disabled, absent.
 test tray_menu_contract
   preset ui_offline
   expect tray icon "../../assets/tray-offline.rgba"
@@ -1095,11 +1097,20 @@ test tray_menu_contract
   expect no tray command "Offline"
   expect tray command "Open Ducktape"
   expect tray command "Quit Ducktape"
+  expect tray item "Appearance"
+  expect no tray item "Notifications"
+  expect no tray item "Go to"
+  expect no tray item "Huddle"
+  expect no tray item "Leave huddle"
+  expect no tray item "Reconnect"
   tray choose "Open Ducktape"
 
 preset ui_tray_live
   state
     connected = true
+    // A console is up: `window_target(none)` names a fresh id, which is all
+    // the console-only rows ask of the slot.
+    console_win = some(window_target(none))
     // Refused at once, off the network — see `ui_chat_stream`. The live
     // stream's failure writes `status` (the retry arm), which is why no test
     // below reads the status row; `tray_menu_contract` does, offline.
@@ -1124,6 +1135,10 @@ test tray_menu_reads_the_state
   expect tray item "✓ Dark"
   expect no tray item "✓ Light"
   expect tray command "Mute"
+  // Not "Reconnect": the status row reads "Reconnecting…" by now (see the
+  // preset), and a text two rows carry names neither.
+  expect tray command "Copy node key"
+  expect tray item "Go to"
   tray choose "Mute"
   expect tray item "Unmute"
   expect call_muted

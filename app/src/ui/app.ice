@@ -26,6 +26,12 @@ daemon Ducktape
   // the state (the bell count, the huddle's channel, Mute/Unmute, the ✓ on
   // the appearance) is still the same command, which is what lets a test
   // choose it by its current words.
+  //
+  // A row's `when` takes it out of the menu — not disabled, gone — while
+  // there is nothing for it to do: the console's rows while only the launch
+  // window is up, the huddle's while she is not in one. The handlers keep
+  // their own guards; a native menu is its own event source and may deliver
+  // a row the frame after its reason went away.
   tray
     icon-rgba "../../assets/tray-offline.rgba" 128 128 when !connected
     icon-rgba "../../assets/tray-unread.rgba" 128 128 when bell_unread > 0
@@ -37,22 +43,22 @@ daemon Ducktape
       status
       separator
       "Open Ducktape" -> tray_open
-      tray_bell_row(bell_unread) -> tray_open_bell
-      "Go to"
+      tray_bell_row(bell_unread) -> tray_open_bell when console_win != none
+      "Go to" when console_win != none
         "Chat" -> tray_go_chat
         "Pages" -> tray_go_pages
         "Node" -> tray_go_node
         "Settings" -> tray_go_settings
       separator
-      tray_huddle_row(huddle_joined, huddle_channel_name)
+      tray_huddle_row(huddle_joined, huddle_channel_name) when huddle_joined
         keep_str(call_muted, "Unmute", "Mute") -> toggle_call_mute
         "Leave huddle" -> leave_huddle_here
       "Appearance"
         tray_choice_row("Light", appearance == Appearance.light) -> set_appearance_light
         tray_choice_row("Dark", appearance == Appearance.dark) -> set_appearance_dark
       separator
-      "Copy node key" -> tray_copy_node_key
-      "Reconnect" -> tray_reconnect
+      "Copy node key" -> tray_copy_node_key when console_win != none
+      "Reconnect" -> tray_reconnect when console_win != none
       separator
       "Quit Ducktape" -> tray_quit
   // The launch window: Discord/Steam-shaped — a small fixed column that
