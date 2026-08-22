@@ -594,11 +594,17 @@ fn a_move_off_the_agents_tab_keeps_a_live_load_that_already_answered() {
 #[test]
 fn a_failed_huddle_leave_keeps_the_retained_roster_visible() {
     let handler = inlined(include_str!("../ui/handlers/huddle.ice"));
-    let leave = handler
-        .split_once("on leave_huddle_here")
-        .expect("the leave handler exists")
-        .1;
+    let after = |marker: &str| {
+        let body = handler
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("{marker} exists"))
+            .1;
+        // ONE handler, not the rest of the file: the ack below legitimately
+        // blanks what the request must not.
+        body.split_once("\non ").map_or(body, |split| split.0).to_string()
+    };
 
+    let leave = after("on leave_huddle_here");
     assert!(leave.contains("call_peers = []"));
     assert!(
         leave.contains("huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)")
@@ -607,6 +613,19 @@ fn a_failed_huddle_leave_keeps_the_retained_roster_visible() {
         !leave.contains("huddle_rows = []"),
         "an uncommitted leave failure retains the roster, so blanking its mirror is permanent"
     );
+
+    // THE COMMITTED LEAVE IS WHAT ENDS IT. The resync behind it loads the room
+    // on screen, which the popped huddle window outlives — so the ack, not the
+    // load, has to be the thing that takes her off this device's huddle.
+    let acked = after("on huddle_left");
+    for cleared in [
+        "huddle_joined = false",
+        "huddle_roster = []",
+        "huddle_rows = []",
+        "huddle_channel = \"\"",
+    ] {
+        assert!(acked.contains(cleared), "the leave ack clears {cleared}");
+    }
 }
 
 #[test]

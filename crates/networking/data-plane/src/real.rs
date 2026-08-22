@@ -194,6 +194,9 @@ pub struct OverlaySockets {
     addresses: Arc<dyn AddressBook>,
     /// Retained for per-connect dials (see [`SocketFactory::dial_from`]).
     factory: Arc<dyn SocketFactory>,
+    /// How many arrivals this socket has dropped for an unrecognised source
+    /// — see [`OverlaySockets::note_unknown_source`].
+    unknown_sources: std::sync::atomic::AtomicU64,
 }
 
 impl OverlaySockets {
@@ -239,7 +242,36 @@ impl OverlaySockets {
             local_ip: datagram_bind.ip(),
             addresses,
             factory,
+            unknown_sources: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// An arrival from a `/128` the address book does not know. It is dropped
+    /// — that is the authentication — but it used to be dropped in COMPLETE
+    /// silence, and that silence is a failure mode of its own: a peer whose
+    /// key the tracked set does not carry (a member the view has not caught up
+    /// on, a resident dropped at a cutover) reaches our port, is discarded, and
+    /// every layer above reports health. A huddle where our frames leave and
+    /// theirs never arrive looks exactly like this and says nothing.
+    ///
+    /// Rate-limited hard: media arrives tens of times a second and an
+    /// unconditional line here would evict the ring it belongs in. First
+    /// arrival, then every 1000th, carrying the count — the counter IS the
+    /// diagnosis.
+    fn note_unknown_source(&self, src: SocketAddr) {
+        use std::sync::atomic::Ordering;
+
+        let dropped = self.unknown_sources.fetch_add(1, Ordering::Relaxed) + 1;
+        if dropped == 1 || dropped.is_multiple_of(1000) {
+            tracing::warn!(
+                target: "ducktape::plane",
+                %src,
+                dropped,
+                reason = "unknown_source",
+                "dropped an arrival from a /128 this node does not track — it \
+                 authenticates to no peer, so nothing above will ever see it"
+            );
+        }
     }
 
     /// The actually-bound datagram address (resolves an OS-assigned port).
@@ -283,7 +315,7 @@ impl DataPlaneTransport for OverlaySockets {
             // must still make progress).
             match self.addresses.peer_at(src.ip()) {
                 Some(peer) => return Ok((peer, buf[..n].to_vec())),
-                None => continue,
+                None => self.note_unknown_source(src),
             }
         }
     }
@@ -304,7 +336,7 @@ impl DataPlaneTransport for OverlaySockets {
             // drop); we never hand an unauthenticated stream to the plane.
             match self.addresses.peer_at(src.ip()) {
                 Some(peer) => return Ok((peer, stream)),
-                None => continue,
+                None => self.note_unknown_source(src),
             }
         }
     }

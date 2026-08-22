@@ -19,10 +19,15 @@
 //    instant and has none to invent: the surfaces below take `elapsed` as a
 //    STRING precisely so that case can pass "" and render LIVE with no clock.
 
-// One call-session event: fold the status prose, the peer beacons, and — on
-// every event — re-steer the fan-out set to the roster's current node keys
-// (an idle no-op between roster changes, and exactly what the fresh session
-// needs the moment it connects).
+// One call-session event: fold the status prose and the peer beacons.
+//
+// THE FAN-OUT SET IS NOT STEERED FROM HERE, and that is load-bearing. It used
+// to be re-pushed on every event, which meant it moved only when a peer beacon
+// arrived — and a beacon from a peer outside the set is dropped at our own
+// demux, so the joiner who should have re-steered it was the one peer that
+// could never reach us. The live session polls the huddle's on-chain roster
+// itself (`crate::call::steer_recipients`); the roster in THIS state belongs
+// to the channel on screen, which is not always the one being huddled in.
 on call_event(event)
   call_status = call_status_after(call_status, event)
   call_muted = keep_bool(event.kind == "connecting", false, call_muted)
@@ -30,9 +35,6 @@ on call_event(event)
   call_peers = apply_call_peer(call_peers, event)
   huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)
   call_video_live = call_video_live_after(call_peers, call_camera)
-  task call_recipients(huddle_recipient_nodes(huddle_roster)) -> call_recipients_updated
-
-on call_recipients_updated
 
 // The panel draws its button only while joined; the tray row is always there.
 on toggle_call_mute
@@ -114,4 +116,21 @@ on leave_huddle_here
   // to show. A window task is terminal, so the leave call rides beside it.
   parallel
     task window close target=window_target(huddle_win)
-    run every leave_huddle(connected_rpc, password, huddle_channel) -> chat_acked _ | mutation_failed _
+    run every leave_huddle(connected_rpc, password, huddle_channel) -> huddle_left _ | mutation_failed _
+
+// THE LEAVE'S OWN ACK, and it has to be its own: the huddle used to end on the
+// resync that follows, and a resync loads the channel ON SCREEN. `Leave` lives
+// in the popped huddle window, which floats over every other room — so the
+// resync that was supposed to notice she is gone was reading a conversation
+// that never knew she was there. Now the write that took her off the roster is
+// what takes the huddle off this device. `mutation_failed` still leaves
+// everything standing, which is why nothing here is done optimistically.
+on huddle_left(_result)
+  huddle_joined = false
+  huddle_roster = []
+  huddle_rows = []
+  huddle_channel = ""
+  huddle_channel_name = ""
+  huddle_joined_at = 0
+  mutation_phase = MutationPhase.idle
+  error = ""

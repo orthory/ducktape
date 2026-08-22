@@ -370,7 +370,6 @@ extern crate::backend
   pure page_display_title(pages:[PageItem], page:str, current:str) -> str
   pure keep_channels(loaded:bool, next:[ChatChannel], current:[ChatChannel]) -> [ChatChannel]
   pure keep_members(loaded:bool, next:[ChatMember], current:[ChatMember]) -> [ChatMember]
-  pure keep_roster(joined:bool, next:[HuddleParticipant]) -> [HuddleParticipant]
   pure keep_pages(loaded:bool, next:[PageItem], current:[PageItem]) -> [PageItem]
   pure keep_page_hits(loaded:bool, next:[PageSearchHit], current:[PageSearchHit]) -> [PageSearchHit]
   pure search_answer_stands(query:str, draft:str, searching:bool) -> bool
@@ -410,8 +409,6 @@ extern crate::backend
   pure retain_selected_comments(comments:[PageComment], selected_id:str) -> [PageComment]
   pure scope_key(scope:str, id:str) -> str
   pure reaction_palette() -> [str]
-  pure keep_participants(loaded:bool, next:[HuddleParticipant], current:[HuddleParticipant]) -> [HuddleParticipant]
-  pure huddle_recipient_nodes(roster:[HuddleParticipant]) -> [str]
   // ! HydrationError, not ! AppError: the three room-switch loaders below fail
   // with the generation of the switch they belong to, so `chat_load_failed` can
   // drop a failure the reader has already clicked past. `committed` is what
@@ -426,7 +423,10 @@ extern crate::backend
   remove_channel_member(rpc:str, password:str, channel_id:str, member_key:str) -> bool ! AppError
   join_huddle(rpc:str, password:str, channel_id:str) -> bool ! AppError
   leave_huddle(rpc:str, password:str, channel_id:str) -> bool ! AppError
-  pure huddle_self(roster:[HuddleParticipant]) -> bool
+  // Every chat load's whole answer about the huddle — including the answer
+  // "nothing, this was another channel's load and she is in a call".
+  HuddleAfterLoad(joined:bool, roster:[HuddleParticipant], channel:str, channel_name:str)
+  pure huddle_after_load(loaded:bool, joined:bool, channel:str, channel_name:str, roster:[HuddleParticipant], loaded_channel:str, loaded_channel_name:str, loaded_roster:[HuddleParticipant]) -> HuddleAfterLoad
   DmPeer(key:str, name:str, initials:str, is_agent:bool, channel_id:str)
   DmPeersData(generation:i64, peers:[DmPeer])
   load_dm_peers(rpc:str, generation:i64) -> DmPeersData ! HydrationError

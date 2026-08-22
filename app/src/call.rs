@@ -133,18 +133,46 @@ pub(crate) fn beacon_state() {
     });
 }
 
-/// Steer the fan-out set to the huddle roster's peer NODE keys (self
-/// excluded). Called wherever the roster refreshes; a missing session is a
-/// no-op.
-pub fn call_recipients(nodes: Vec<String>) -> iced::Task<()> {
-    let guard = handles().lock().expect("call handles");
-    let Some(handles) = guard.as_ref() else {
-        return iced::Task::none();
-    };
-    let _ = handles
-        .control
-        .send(ClientControl::Recipients { peers: nodes });
-    iced::Task::none()
+/// How often the live session re-reads its huddle's roster. The hub beacons
+/// at 1 Hz, so this is the same order as the presence traffic it unblocks: a
+/// peer who joins is admitted within a second of their join committing.
+const ROSTER_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Steer the fan-out set from the huddle's ON-CHAIN roster, for as long as the
+/// session lives. See [`crate::backend::huddle_fanout_nodes`] for why this is a
+/// poll and not a push: admission is roster-gated on receive, so the peer whose
+/// arrival should have re-steered the set is exactly the peer we cannot hear
+/// until it is steered.
+///
+/// Ends with the session — the pump's control receiver drops and the send
+/// fails. A failed read (node restarting, view not yet synced) keeps the last
+/// set and tries again on the next tick.
+async fn steer_recipients(
+    rpc: String,
+    channel_id: String,
+    control: tokio::sync::mpsc::UnboundedSender<ClientControl>,
+) {
+    let mut steered: Option<Vec<String>> = None;
+    loop {
+        match crate::backend::huddle_fanout_nodes(&rpc, &channel_id).await {
+            Ok(peers) if steered.as_ref() != Some(&peers) => {
+                if control
+                    .send(ClientControl::Recipients {
+                        peers: peers.clone(),
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                steered = Some(peers);
+            }
+            Ok(_) | Err(_) => {}
+        }
+        if control.is_closed() {
+            return;
+        }
+        tokio::time::sleep(ROSTER_POLL).await;
+    }
 }
 
 /// The session stream: connect, pump, and yield state the handlers fold. The
@@ -218,6 +246,14 @@ async fn run_session(
         muted: muted.clone(),
         control: control_tx.clone(),
     });
+
+    // The fan-out set is the huddle's, and the huddle's roster is on-chain —
+    // this poll is the ONLY thing that puts a later joiner into it.
+    tokio::spawn(steer_recipients(
+        rpc.clone(),
+        channel_id.clone(),
+        control_tx.clone(),
+    ));
 
     // The hub beacons our state at 1 Hz on our behalf; one push seeds it.
     beacon_state();
