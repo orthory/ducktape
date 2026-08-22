@@ -16,7 +16,8 @@
 //! to whoever is typing — the exact thing the sandbox exists to prevent, and
 //! exactly why [`crate::SandboxBackend`] cannot express one; the
 //! pty primitive underneath ([`InteractiveSession::spawn_on_pty`]) is backend
-//! agnostic only so its behavior can be unit-tested against a plain local child.
+//! agnostic only so its behavior can be unit-tested against a plain local
+//! child.
 //!
 //! There is deliberately NO idle-timeout kill here (a terminal is idle by
 //! nature): a session ends on explicit [`InteractiveSession::close`], on the
@@ -34,13 +35,13 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::net::unix::OwnedWriteHalf;
 
 use crate::broker::RunBroker;
-use crate::sandbox::{self, SandboxBackend};
+use crate::sandbox::SandboxBackend;
 use crate::{
-    BrokerKind, CliProvider, LiveChild, RunAuth, RunContext, RunHome, TartGuard,
+    BrokerKind, CliProvider, LiveChild, RunAuth, RunContext, RunHome,
     broker_provider_overrides, canonical_mount_path, configure_process_group, podman_api,
 };
 
-/// how a live interactive session carries the terminal. A Tart guest (ssh) or
+/// how a live interactive session carries the terminal. A local child or
 /// the operator's local vendor-login run uses a real pty the host holds the
 /// master of; a Podman run uses the hijacked attach stream over the node-private
 /// socket (podman allocates the container pty, the attach stream carries it
@@ -68,9 +69,6 @@ enum Transport {
 /// it in an `Arc` and pump output in one task while feeding input from another.
 pub struct InteractiveSession {
     transport: Transport,
-    /// the Tart VM guard, when the backend is Tart. Declared AFTER `transport`
-    /// so the ssh child dies before this guard's Drop stops/deletes the VM.
-    _tart: Option<TartGuard>,
     /// held for the session's lifetime: dropping the broker tears its endpoint
     /// down, and dropping the config home REMOVES it — declared last, so the
     /// child that reads it is already gone by then. a session's transcripts and
@@ -82,11 +80,10 @@ pub struct InteractiveSession {
 
 impl InteractiveSession {
     /// spawn `command` with its stdio wired to a fresh pty and keep the master.
-    /// The pty transport backs a Tart ssh session and the operator's local
-    /// vendor-login run; a Podman session uses [`Self::from_attach`] instead.
+    /// The pty transport backs the operator's local vendor-login run; a Podman
+    /// session uses [`Self::from_attach`] instead.
     fn spawn_on_pty(
         mut command: tokio::process::Command,
-        tart: Option<TartGuard>,
         broker: Option<RunBroker>,
         config_home: Option<RunHome>,
     ) -> Result<Self, String> {
@@ -119,7 +116,6 @@ impl InteractiveSession {
                 writer,
                 live: Mutex::new(live),
             },
-            _tart: tart,
             _broker: broker,
             _config_home: config_home,
         })
@@ -142,7 +138,6 @@ impl InteractiveSession {
                 client,
                 id,
             },
-            _tart: None,
             _broker: broker,
             _config_home: config_home,
         }
@@ -155,7 +150,7 @@ impl InteractiveSession {
     /// machine). Every lent agent session goes through
     /// [`CliProvider::spawn_interactive_session`], which keeps isolation.
     pub fn spawn_local(command: tokio::process::Command) -> Result<Self, String> {
-        Self::spawn_on_pty(command, None, None, None)
+        Self::spawn_on_pty(command, None, None)
     }
 
     /// read the next chunk of terminal output. `Ok(0)` means end of session.
@@ -307,13 +302,12 @@ impl InteractiveSession {
 
 impl CliProvider {
     /// spawn this capability's interactive TUI on a pty, inside the provider's
-    /// sandbox backend (Podman or Tart), from a spec with an `[interactive]`
+    /// sandbox backend, from a spec with an `[interactive]`
     /// argv. The isolation is
     /// the headless path's (a broker holding the credential, a fresh config home,
-    /// the container/VM fence); only the argv and the stdio (pty, not pipes)
-    /// differ. Podman keeps the container lifecycle on the pty child itself; Tart
-    /// spawns `sshpass ssh -tt` into a guest VM and the returned session holds
-    /// the [`TartGuard`] that stops/deletes it on drop.
+    /// the container fence); only the argv and the stdio (pty, not pipes)
+    /// differ. Podman keeps the container lifecycle on the attach stream
+    /// itself.
     pub(crate) async fn spawn_interactive_session(
         &self,
         ctx: &RunContext,
@@ -371,21 +365,6 @@ impl CliProvider {
                 Ok(InteractiveSession::from_attach(
                     attach, client, id, broker, home,
                 ))
-            }
-            SandboxBackend::Tart { .. } => {
-                // build the interactive guest plan (its script `exec`s the TUI,
-                // no rsync-back), clone/boot the VM, then attach a pty to
-                // `sshpass ssh -tt` into it. the guard rides in the session so
-                // the VM is stopped/deleted when the session ends.
-                let plan = self.tart_plan(&args, &workdir, ctx, &auth, true)?;
-                let guard = self
-                    .tart_setup(Some(&plan), ctx)
-                    .await?
-                    .ok_or_else(|| format!("{}: Tart setup returned no VM guard", self.spec.tag))?;
-                let mut command = tokio::process::Command::new("sshpass");
-                command.args(sandbox::tart_ssh_argv(&guard.ip, &plan.guest_script, true));
-                command.current_dir(&workdir);
-                InteractiveSession::spawn_on_pty(command, Some(guard), broker, home)
             }
             #[cfg(any(test, feature = "testkit"))]
             SandboxBackend::Bare => {
@@ -522,7 +501,6 @@ mod tests {
             tokio::process::Command::new("cat"),
             None,
             None,
-            None,
         )
         .expect("spawn cat on a pty");
         session.write_all(b"ping\n").await.expect("write to pty");
@@ -560,7 +538,7 @@ mod tests {
     async fn wait_child_exit_returns_while_a_grandchild_holds_the_pty() {
         let mut cmd = tokio::process::Command::new("sh");
         cmd.args(["-c", "sleep 30 & echo ready"]);
-        let session = InteractiveSession::spawn_on_pty(cmd, None, None, None)
+        let session = InteractiveSession::spawn_on_pty(cmd, None, None)
             .expect("spawn sh on a pty");
 
         // The child leader (sh) exits right after `echo ready`; the backgrounded
@@ -597,7 +575,6 @@ mod tests {
     async fn resize_sets_the_window_size() {
         let session = InteractiveSession::spawn_on_pty(
             tokio::process::Command::new("cat"),
-            None,
             None,
             None,
         )
@@ -715,7 +692,7 @@ mod tests {
             "docker.io/library/debian:13-slim",
             "cat",
         ]);
-        let session = InteractiveSession::spawn_on_pty(cmd, None, None, None)
+        let session = InteractiveSession::spawn_on_pty(cmd, None, None)
             .expect("spawn podman on a pty");
         session.write_all(b"ping\n").await.expect("write to pty");
         let seen = read_until(&session, b"ping", 60).await;
@@ -1042,7 +1019,7 @@ mod tests {
             "-c",
             "test -t 0 && printf ISATTY; sleep 1",
         ]);
-        let session = InteractiveSession::spawn_on_pty(cmd, None, None, None)
+        let session = InteractiveSession::spawn_on_pty(cmd, None, None)
             .expect("spawn podman on a pty");
         let seen = read_until(&session, b"ISATTY", 60).await;
         session.close().await;

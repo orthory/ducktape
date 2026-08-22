@@ -2,9 +2,9 @@
 //!
 //! The provider child never receives the operator's API/OAuth credential.
 //! Only this host process reads it, and serves a single-run loopback endpoint
-//! the child dials with an unrelated random bearer. Podman binds
-//! loopback; Tart binds the host side of its private NAT so the VM can reach it
-//! by a guest-only hostname.
+//! the child dials with an unrelated random bearer. A Podman run is in a
+//! private netns, so the broker binds a routable interface the container
+//! reaches as `host.containers.internal` rather than loopback.
 //!
 //! Two wire shapes ship: the OpenAI Responses API (`codex exec`, aimed by argv)
 //! and the Anthropic Messages API (`claude`, aimed by env — see
@@ -304,9 +304,9 @@ pub struct BrokerEndpoint {
 /// bind `127.0.0.1`, hand it `http://127.0.0.1:<port>`.
 ///
 /// `HostGateway(host)` is a child in a SEPARATE netns that reaches the host only
-/// through a gateway name in its `/etc/hosts` — a Tart VM guest (`ducktape-host`)
-/// or a private-netns Podman container (`host.containers.internal`, which every
-/// Podman run now uses). The broker binds a routable interface and the base_url
+/// through a gateway name in its `/etc/hosts` — a private-netns Podman
+/// container (`host.containers.internal`, which every Podman run uses). The
+/// broker binds a routable interface and the base_url
 /// names the gateway. The opaque per-run bearer still gates it; binding beyond
 /// loopback is the reachability cost of the stronger network isolation.
 #[derive(Clone, Copy)]
@@ -348,10 +348,6 @@ impl RunBroker {
         Self::start_codex(auth, url, Reachability::Loopback).await
     }
 
-    pub async fn start_for_tart(airlock: Option<AirlockConfig>) -> Result<Self, String> {
-        let (auth, url) = resolve_codex_upstream(airlock).await?;
-        Self::start_codex(auth, url, Reachability::HostGateway("ducktape-host")).await
-    }
 
     /// a private-netns Podman container reaches the loopback host only via the
     /// `host.containers.internal` gateway podman adds to its `/etc/hosts`.
@@ -1820,14 +1816,6 @@ impl RunBroker {
         Self::start_anthropic_with(auth, Reachability::Loopback, url).await
     }
 
-    /// start it for a Tart guest — bind the host gateway the guest reaches as
-    /// `ducktape-host`.
-    pub async fn start_anthropic_for_tart(
-        airlock: Option<AirlockConfig>,
-    ) -> Result<Self, String> {
-        let (auth, url) = resolve_anthropic_upstream(airlock).await?;
-        Self::start_anthropic_with(auth, Reachability::HostGateway("ducktape-host"), url).await
-    }
 
     /// start it for a private-netns Podman container (`host.containers.internal`).
     pub async fn start_anthropic_for_podman_private(

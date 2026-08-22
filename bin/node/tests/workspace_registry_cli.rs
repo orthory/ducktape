@@ -92,24 +92,20 @@ fn init_with_path(home: &Path, name: &str, path_dir: &Path) -> (String, std::pat
     (toml, workspace)
 }
 
-/// fresh-workspace compute detection: the platform adapter's runtime on PATH
-/// (a fake executable — podman on Linux, tart on macOS) makes a flagless init
-/// write a LIVE `[sandbox]` table while granting no service at all; an empty
-/// PATH keeps today's commented example.
+/// fresh-workspace compute detection: the adapter's runtime on PATH (a fake
+/// `podman`) makes a flagless init write a LIVE `[sandbox]` table while granting
+/// no service at all; an empty PATH keeps today's commented example.
 #[test]
 fn flagless_init_detects_the_platform_runtime_into_a_live_sandbox_table() {
     use std::os::unix::fs::PermissionsExt as _;
 
-    // the probe wants the platform adapter AND its hard deps executable on
-    // PATH, so the fake dir carries the full set — detection only writes a
-    // table the boot probe would accept. Podman's deps are `pasta` (the netns
-    // backend) plus `nft` + `nsenter` (the egress firewall the createRuntime
-    // hook installs); see `SandboxBackend::probe`.
-    let (runtime, fake_bins): (&str, &[&str]) = if cfg!(target_os = "macos") {
-        ("tart", &["tart"])
-    } else {
-        ("podman", &["podman", "pasta", "nft", "nsenter"])
-    };
+    // the probe wants the adapter AND its hard deps executable on PATH, so the
+    // fake dir carries the full set — detection only writes a table the boot
+    // probe would accept. Podman's deps are `pasta` (the netns backend) plus
+    // `nft` + `nsenter` (the egress firewall the createRuntime hook installs);
+    // see `SandboxBackend::probe`.
+    let (runtime, fake_bins): (&str, &[&str]) =
+        ("podman", &["podman", "pasta", "nft", "nsenter"]);
     let bins = tempfile::tempdir().expect("fake bin dir");
     for bin in fake_bins {
         let fake = bins.path().join(bin);

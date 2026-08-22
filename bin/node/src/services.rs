@@ -68,8 +68,8 @@ pub(crate) fn podman_data_dir(service: &config::ServiceConfig, kind: &str) -> Pa
 /// one from the other is a latent `bind: invalid argument` on any host with a
 /// slightly long home or network name.
 ///
-/// Non-Podman backends (Tart) are returned unchanged — a Tart run clones and
-/// deletes a VM per run, so there is no service, no socket and no shared root.
+/// Podman is the whole `SandboxBackend` enum from this crate, so this always
+/// re-roots; a future backend fails to destructure here until it is routed.
 pub(crate) fn podman_backend(
     service: &config::ServiceConfig,
     kind: &str,
@@ -84,9 +84,7 @@ pub(crate) fn podman_backend(
             service.workspace.display()
         )
     })?;
-    let provider_host::SandboxBackend::Podman { image, .. } = backend else {
-        return Ok(backend);
-    };
+    let provider_host::SandboxBackend::Podman { image, .. } = backend;
     Ok(provider_host::SandboxBackend::Podman {
         image,
         socket: provider_host::PodmanService::socket_path(
@@ -1579,9 +1577,12 @@ pub(crate) async fn sweep_own_containers(
     grant: &ServiceGrant,
     sweep: Sweep,
 ) {
-    let provider_host::SandboxBackend::Podman { socket, .. } = backend else {
-        // Tart clones and deletes a VM per run; there is no label to sweep.
-        return;
+    // one discriminant, one match, no wildcard. `Bare` does not exist from this
+    // crate (it is gated on sandbox-host's own test/testkit cfg, which node-bin
+    // never enables), so Podman is the whole enum here — and a future backend
+    // fails this match until it is routed.
+    let socket = match backend {
+        provider_host::SandboxBackend::Podman { socket, .. } => socket,
     };
     let label = provider_host::managed_label(&grant.display_id());
     // Bounded: `reap_by_label` has no timeout of its own, and a wedged podman

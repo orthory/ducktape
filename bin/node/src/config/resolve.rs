@@ -278,9 +278,6 @@ fn service_dev_shape(raw: &DevSeedToml) -> Result<ServiceConfig, String> {
 /// the podman provider image default — what `[sandbox]` generation writes
 /// into a fresh table's `image`, and the commented example's value.
 pub const DEFAULT_PODMAN_IMAGE: &str = "docker.io/library/node:22-slim";
-/// the tart provider image default — what `[sandbox]` generation writes on
-/// macOS. resolution never guesses an image: the table always carries one.
-pub const DEFAULT_TART_IMAGE: &str = "ghcr.io/cirruslabs/macos-sonoma-base:latest";
 
 /// Gate the resolved sandbox backend on the user's compute grant.
 ///
@@ -311,17 +308,16 @@ fn gate_on_compute_grant(
 /// resolve the operator's `[sandbox]` table into the compute plane: `None`
 /// (no table) = consensus-only node, no backend and no capacity; `"podman"`
 /// → `Podman` with the probed host totals, per-key overrides winning;
-/// `"tart"` → `Tart` (ephemeral macOS VMs, same capacity model); any other
-/// runtime — "direct" included, there is no bare spawn — is a loud config
-/// error naming the audited adapters.
+/// any other runtime — "tart" and "direct" included, there is no macOS backend
+/// and no bare spawn — is a loud config error naming the audited adapter.
 fn resolve_sandbox(
     sandbox: Option<&SandboxToml>,
 ) -> Result<(Option<SandboxBackend>, BTreeMap<String, u64>), String> {
     let Some(sandbox) = sandbox else {
         return Ok((None, BTreeMap::new()));
     };
-    // podman and tart share the capacity derivation: probed totals with the
-    // operator's per-key overrides (`0` = probe) winning. the map is validated
+    // capacity derivation: probed totals with the operator's per-key overrides
+    // (`0` = probe) winning. the map is validated
     // through THE consensus rule (capability::validate_resources) before it
     // leaves this boundary: a zero override would otherwise pass boot, get
     // announced, and be rejected by the module — wedging the announcer's
@@ -362,19 +358,10 @@ fn resolve_sandbox(
                 probed()?,
             ))
         }
-        "tart" => {
-            let capacity = probed()?;
-            if capacity.get("cores").copied().unwrap_or(0) < provider_host::TART_MIN_CORES {
-                return Err(format!(
-                    "sandbox capacity: Tart requires at least {} cores",
-                    provider_host::TART_MIN_CORES
-                ));
-            }
-            Ok((Some(SandboxBackend::Tart { image }), capacity))
-        }
         other => Err(format!(
-            "sandbox runtime: {other:?} is not \"podman\" or \"tart\" \
-             (provider runs never execute bare on the host)"
+            "sandbox runtime: {other:?} is not \"podman\" \
+             (the sandbox is Linux-only, and provider runs never execute bare \
+             on the host)"
         )),
     }
 }
@@ -1318,43 +1305,12 @@ mod tests {
         assert_eq!(resolved.service.sandbox_capacity.get("cores"), Some(&99));
         assert_eq!(resolved.service.sandbox_capacity.get("mem_gb"), Some(&128));
 
-        // tart ⇒ the Tart backend, probed capacity, and the minimum-cores
-        // rule enforced at this boundary.
-        std::fs::write(
-            dir.join("node.toml"),
-            format!(
-                "{base}{}",
-                sandbox_table("tart", "ghcr.io/cirruslabs/macos-sonoma-base:latest", 0, 0)
-            ),
-        )
-        .expect("write");
-        let tart = resolve(&dir.join("node.toml")).expect("tart accepted");
-        assert_eq!(
-            tart.service.sandbox,
-            Some(SandboxBackend::Tart {
-                image: "ghcr.io/cirruslabs/macos-sonoma-base:latest".into()
-            })
-        );
-        assert!(
-            ["cores", "mem_gb"]
-                .iter()
-                .all(|dimension| tart.service.sandbox_capacity.contains_key(*dimension)),
-            "both enforceable capacity dimensions ride Tart"
-        );
-        std::fs::write(
-            dir.join("node.toml"),
-            format!(
-                "{base}{}",
-                sandbox_table("tart", "ghcr.io/cirruslabs/macos-sonoma-base:latest", 1, 0)
-            ),
-        )
-        .expect("write");
-        let err = resolve(&dir.join("node.toml")).expect_err("undersized Tart capacity refused");
-        assert!(err.contains("requires at least 2 cores"), "{err}");
 
-        // any other runtime — "direct" included — is a loud config error
-        // naming the audited adapters.
-        for runtime in ["gvisor", "direct"] {
+        // any other runtime is a loud config error naming the one audited
+        // adapter. "tart" is in this list ON PURPOSE: the macOS backend was
+        // removed, and an operator whose node.toml still names it must be told
+        // so at boot rather than silently getting something else.
+        for runtime in ["tart", "gvisor", "direct"] {
             std::fs::write(
                 dir.join("node.toml"),
                 format!("{base}{}", sandbox_table(runtime, "img", 0, 0)),

@@ -107,7 +107,7 @@ pub struct NodeToml {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxToml {
-    /// the isolation adapter: `"podman"` or `"tart"`.
+    /// the isolation adapter: `"podman"` (the only one; Linux-only).
     pub runtime: String,
     /// the provider environment image the adapter boots.
     pub image: String,
@@ -394,7 +394,7 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
                  [sandbox]"
             );
             keyline(&mut s, "runtime", format_args!("\"{}\"", sb.runtime),
-                "isolation adapter: \"podman\" | \"tart\" (runs never execute bare on the host)");
+                "isolation adapter: \"podman\" (runs never execute bare on the host)");
             keyline(&mut s, "image", format_args!("\"{}\"", sb.image),
                 "the provider environment image");
             keyline(&mut s, "cores", format_args!("{}", sb.cores),
@@ -406,7 +406,7 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
             let _ = writeln!(
                 s,
                 "\n# compute plane (off): uncomment [sandbox] to run providers on this node.\n\
-                 # runtime: \"podman\" | \"tart\" — runs never execute bare on the host.\n\
+                 # runtime: \"podman\" — runs never execute bare on the host.\n\
                  #[sandbox]\n\
                  #runtime = \"podman\"\n\
                  #image = \"{DEFAULT_PODMAN_IMAGE}\"\n\

@@ -1248,8 +1248,14 @@ impl PodmanService {
         data_dir: &Path,
         self_exe: &Path,
     ) -> Result<Option<Self>, String> {
-        let crate::SandboxBackend::Podman { socket, .. } = backend else {
-            return Ok(None);
+        // one discriminant, one match: `Bare` exists only in test/testkit builds,
+        // so a `let ... else` here is irrefutable in a shipped build and
+        // refutable in a test one. Matching names both without a wildcard, so a
+        // future backend fails the build until it is routed.
+        let socket = match backend {
+            crate::SandboxBackend::Podman { socket, .. } => socket,
+            #[cfg(any(test, feature = "testkit"))]
+            crate::SandboxBackend::Bare => return Ok(None),
         };
         let podman = find_system_tool("podman")
             .ok_or_else(|| "podman is not on PATH; the sandbox cannot start its service".to_string())?;
