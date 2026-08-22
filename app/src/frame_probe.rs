@@ -638,7 +638,30 @@ fn park_forge_picture(path: &str, rgb: [u8; 3]) {
         backend::Picture {
             width: 64,
             height: 64,
-            handle: iced::widget::image::Handle::from_rgba(64, 64, pixels),
+            handle: backend::PictureHandle::Raster(iced::widget::image::Handle::from_rgba(
+                64, 64, pixels,
+            )),
+        },
+    );
+}
+
+/// A solid 64×64 VECTOR picture of one colour, parked under the forge
+/// surface as `path`'s — the SVG branch of the same viewer.
+fn park_forge_vector(path: &str, rgb: [u8; 3]) {
+    let source = format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"64\" height=\"64\">\
+         <rect width=\"64\" height=\"64\" fill=\"rgb({},{},{})\"/></svg>",
+        rgb[0], rgb[1], rgb[2]
+    );
+    backend::park_picture(
+        backend::FORGE_SURFACE,
+        path.to_owned(),
+        backend::Picture {
+            width: 64,
+            height: 64,
+            handle: backend::PictureHandle::Vector(iced::widget::svg::Handle::from_memory(
+                source.into_bytes(),
+            )),
         },
     );
 }
@@ -654,7 +677,9 @@ fn park_inline_picture(doc: &str, path: &str, rgb: [u8; 3]) {
             backend::Picture {
                 width: 64,
                 height: 64,
-                handle: iced::widget::image::Handle::from_rgba(64, 64, pixels),
+                handle: backend::PictureHandle::Raster(iced::widget::image::Handle::from_rgba(
+                64, 64, pixels,
+            )),
             },
         )]),
     );
@@ -1528,16 +1553,28 @@ fn probe_forge_inline_picture_content() {
 fn the_forge_reader_draws_the_loaded_picture() {
     std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
-        .spawn(probe_forge_picture_content)
+        .spawn(|| probe_forge_picture_content("logo.png", park_forge_picture))
         .expect("the forge picture probe thread spawns")
         .join()
         .expect("the forge picture probe thread finishes");
 }
 
-fn probe_forge_picture_content() {
+/// THE VECTOR BRANCH DRAWS TOO — resvg under the same headless renderer, the
+/// same red→blue swap with nothing in the Ice tree changed.
+#[test]
+fn the_forge_reader_draws_the_loaded_vector_picture() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| probe_forge_picture_content("logo.svg", park_forge_vector))
+        .expect("the forge vector probe thread spawns")
+        .join()
+        .expect("the forge vector probe thread finishes");
+}
+
+fn probe_forge_picture_content(file: &str, park: fn(&str, [u8; 3])) {
     let (mut app, console, scope) = console_in_forge_tree(vec![backend::TreeEntry {
-        name: "logo.png".into(),
-        path: "logo.png".into(),
+        name: file.into(),
+        path: file.into(),
         kind: "file".into(),
     }]);
     let mut renderer = headless_renderer();
@@ -1548,8 +1585,8 @@ fn probe_forge_picture_content() {
         user_interface::Cache::default(),
     );
 
-    park_forge_picture("logo.png", [220, 40, 40]);
-    seed_forge_picture(&mut app, &scope, "logo.png");
+    park(file, [220, 40, 40]);
+    seed_forge_picture(&mut app, &scope, file);
     let (cache, red) = drawn_frame(&mut app, console, &mut renderer, cache);
     assert!(
         empty != red,
@@ -1570,7 +1607,7 @@ fn probe_forge_picture_content() {
 
     // Same path, same Ice state, a different picture in the slot: only the
     // extern's draw can move these pixels.
-    park_forge_picture("logo.png", [40, 40, 220]);
+    park(file, [40, 40, 220]);
     let (_cache, blue) = drawn_frame(&mut app, console, &mut renderer, cache);
     assert!(
         red != blue,

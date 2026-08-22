@@ -50,6 +50,9 @@ zune-jpeg = "0.4"
 # The picture viewer (`src/backend/picture.rs`) decodes to RGBA off-thread;
 # iced itself stays codec-less (`image-without-codecs`).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+# The same viewer validates and measures an SVG before handing it to iced's
+# `svg` widget (resvg draws it); usvg is already in the graph under resvg.
+usvg = "0.45"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 zeroize.workspace = true
 iced = { version = "=0.14.0", default-features = false, features = ["advanced", "highlighter", "image-without-codecs", "lazy", "markdown", "svg", "tokio", "wgpu", "x11"] }
