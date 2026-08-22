@@ -137,6 +137,17 @@ fn decode_raster(bytes: &[u8]) -> Result<Picture, String> {
     let orientation = decoder
         .orientation()
         .unwrap_or(image::metadata::Orientation::NoTransforms);
+    // `ImageReader::decode` reserves the decoded size against the crate's
+    // default allocation limit before decoding; the decoder path does not,
+    // and a 65-byte PNG declaring 40000² pixels would abort the app on a
+    // 6.4 GB `vec!`. Reserve the same way.
+    let mut limits = image::Limits::default();
+    limits
+        .reserve(decoder.total_bytes())
+        .map_err(|error| error.to_string())?;
+    decoder
+        .set_limits(limits)
+        .map_err(|error| error.to_string())?;
     let decoded = image::DynamicImage::from_decoder(decoder).map_err(|error| error.to_string())?;
     let oversized = decoded.width().max(decoded.height()) > MAX_PICTURE_SIDE;
     let mut fitted = match oversized {
@@ -255,6 +266,15 @@ pub fn inline_picture(doc: &str, path: &str) -> Option<Picture> {
     }
 }
 
+/// The tallest box a raster's viewer takes in the flow. The viewer keeps
+/// every wheel event over it (zoom, even at the scale cap), so a box taller
+/// than the pane would trap the page's scroll under the picture; a bounded
+/// box leaves only the caption below it to scroll to, and a picture taller
+/// than the box is contained in it and zoomed into instead.
+/// ponytail: a fixed cap, not the pane's height — the extern cannot see the
+/// pane; a wrapper that gates the wheel on Ctrl would lift it.
+const MAX_VIEWER_HEIGHT: f32 = 560.0;
+
 /// The viewer itself: the surface's picture, centred in the pane. A raster
 /// zooms under the wheel and pans under a drag (iced's `image::viewer`); a
 /// vector is drawn contained — the viewer is raster-only. The viewer's
@@ -268,11 +288,14 @@ pub fn picture(surface: String, path: String) -> iced::Element<'static, ()> {
         return container(text("")).into();
     };
     let element = match &picture.handle {
-        PictureHandle::Raster(handle) => image::viewer(handle.clone())
-            .width(Fill)
-            .height(Shrink)
-            .content_fit(Contain)
-            .into(),
+        PictureHandle::Raster(handle) => container(
+            image::viewer(handle.clone())
+                .width(Fill)
+                .height(Shrink)
+                .content_fit(Contain),
+        )
+        .max_height(MAX_VIEWER_HEIGHT)
+        .into(),
         PictureHandle::Vector(_) => picture.element(),
     };
     container(keyed_column([(path_key(&path), element)]))
@@ -340,6 +363,43 @@ mod tests {
         spliced.extend(tiff);
         spliced.extend(&jpeg[2..]);
         spliced
+    }
+
+    /// A PNG whose header declares `side`² RGBA pixels and nothing else —
+    /// the smallest file that asks the decoder for a huge allocation.
+    fn png_declaring(side: u32) -> Vec<u8> {
+        fn crc32(data: &[u8]) -> u32 {
+            let mut crc = 0xFFFF_FFFFu32;
+            for byte in data {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = match crc & 1 {
+                        1 => 0xEDB8_8320 ^ (crc >> 1),
+                        _ => crc >> 1,
+                    };
+                }
+            }
+            !crc
+        }
+        fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+            let mut out = (data.len() as u32).to_be_bytes().to_vec();
+            out.extend(kind);
+            out.extend(data);
+            out.extend(crc32(&[&kind[..], data].concat()).to_be_bytes());
+            out
+        }
+        let mut ihdr = side.to_be_bytes().to_vec();
+        ihdr.extend(side.to_be_bytes());
+        ihdr.extend([8, 6, 0, 0, 0]);
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend(chunk(b"IHDR", &ihdr));
+        png.extend(chunk(b"IEND", &[]));
+        png
+    }
+
+    #[test]
+    fn a_picture_declaring_more_pixels_than_the_limit_is_an_error_not_an_abort() {
+        assert!(decode_picture(&png_declaring(40_000)).is_err());
     }
 
     #[test]

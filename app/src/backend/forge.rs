@@ -752,8 +752,10 @@ async fn forge_text(
 /// Page 1 asks by the caller's rev (a branch name or an oid); every later
 /// page asks by the exact oid page 1 answered, so a branch that moves
 /// mid-read cannot hand back pages of two different commits — and that exact
-/// oid is returned. `None` bytes: the node refused the object (past its paged
-/// cap) or it passed the app's own byte cap; either way it was not assembled.
+/// oid is returned. `None` bytes: the object is past the byte cap — by the
+/// size the node announces (it refuses an object past its own paged cap with
+/// an empty final page, and the two caps are one number) or by what arrived.
+/// An empty blob is `Some(empty)`, not a refusal.
 async fn forge_blob_bytes(
     client: &RpcClient,
     repo: &str,
@@ -781,9 +783,9 @@ async fn forge_blob_bytes(
         rev = page.rev;
         let chunk = super::storage::base64_decode(&page.b64).unwrap_or_default();
         bytes.extend_from_slice(&chunk);
-        let refused = page.eof && bytes.is_empty();
-        let past_cap = bytes.len() > MAX_PICTURE_BYTES;
-        if refused || past_cap {
+        let announced_past_cap = page.size > MAX_PICTURE_BYTES as i64;
+        let past_cap = announced_past_cap || bytes.len() > MAX_PICTURE_BYTES;
+        if past_cap {
             return Ok((rev, None));
         }
         let done = page.eof || chunk.is_empty();
@@ -1039,6 +1041,16 @@ pub(crate) fn blocked_picture_host(ip: IpAddr) -> bool {
         }
     }
 }
+
+/// The binary plate's line: the loader's reason when it gave one (a picture
+/// past the cap or one that did not decode), else the generic one.
+pub fn binary_note(text: String) -> String {
+    match text.is_empty() {
+        true => "This is not text — the reader shows no preview for it.".to_owned(),
+        false => text,
+    }
+}
+
 /// The binary plate with `note` as its line — why the reader shows no
 /// preview, in the reader's words.
 fn binary_blob(repo: String, rev: String, path: String, note: String) -> BlobView {
