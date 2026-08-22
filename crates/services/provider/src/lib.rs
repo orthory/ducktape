@@ -174,11 +174,11 @@ mod interactive;
 // the sandbox muscle lives in `sandbox-host` and is re-bound here so the run
 // loop's `sandbox::` paths — and every downstream import of the re-exports
 // below — resolve through this crate.
-#[cfg(unix)]
-pub(crate) use sandbox_host::{firecracker_api, guest_manifest, microvm};
+pub(crate) use sandbox_host::sandbox;
 #[cfg(unix)]
 pub use sandbox_host::{GuestLayout, tap_egress_nftables};
-pub(crate) use sandbox_host::sandbox;
+#[cfg(unix)]
+pub(crate) use sandbox_host::{firecracker_api, guest_manifest, microvm};
 mod spec;
 mod variants;
 #[cfg(unix)]
@@ -725,19 +725,7 @@ impl CliProvider {
                 (key.clone(), value)
             })
             .collect();
-        let mut translated_args: Vec<String> =
-            args.iter().map(|arg| layout.translate(arg)).collect();
-        // argv[0] is the HOST executor path; inside the guest the same CLI
-        // lives in the read-only rootfs.
-        if let Some(argv0) = translated_args.first_mut() {
-            *argv0 = guest_executor_path(&self.bin);
-        }
-
-        let manifest_argv = {
-            let mut argv = vec![guest_executor_path(&self.bin)];
-            argv.extend(translated_args.into_iter().skip(1));
-            argv
-        };
+        let manifest_argv = guest_argv(&self.bin, args, &layout);
 
         // THE paid-execution guard. Checked before the VM is booted rather than
         // after: unlike podman's `create` there is no pull to outlive a lease,
@@ -1097,11 +1085,7 @@ impl CliProvider {
     /// podman) — so a value decided once at config-home time could be stale for
     /// a later invocation of the same run. It MERGES, so each spawn adds its
     /// own key and none of them fight.
-    fn trust_guest_workdir(
-        &self,
-        auth: &RunAuth<'_>,
-        guest_workdir: &Path,
-    ) -> Result<(), String> {
+    fn trust_guest_workdir(&self, auth: &RunAuth<'_>, guest_workdir: &Path) -> Result<(), String> {
         // the same gate the rest of the claude state files carry: codex has no
         // such prompt and no such file.
         let for_claude = self.spec.isolation.broker == Some(BrokerKind::AnthropicMessages);
@@ -1460,10 +1444,22 @@ fn guest_executor_path(host_bin: &Path) -> String {
     let name = host_bin
         .file_name()
         .unwrap_or_else(|| std::ffi::OsStr::new("executor"));
-    Path::new(GUEST_BIN_DIR)
-        .join(name)
-        .display()
-        .to_string()
+    Path::new(GUEST_BIN_DIR).join(name).display().to_string()
+}
+
+/// the guest's argv: the executor's path inside the rootfs, then the spec's
+/// arguments with every host path rewritten to its guest mountpoint.
+///
+/// `args` is what follows the executable, NEVER argv[0] itself, so the guest
+/// path is prepended. Substituting `args[0]` instead silently eats the CLI's
+/// first real argument — measured, as a spec whose `args = ["-c", script]`
+/// reached the guest as `sh <script>` and made the shell open the script as a
+/// file. Only a run with no arguments at all is unaffected, which is exactly
+/// the shape the first end-to-end test had.
+fn guest_argv(bin: &Path, args: &[String], layout: &GuestLayout) -> Vec<String> {
+    let mut argv = vec![guest_executor_path(bin)];
+    argv.extend(args.iter().map(|arg| layout.translate(arg)));
+    argv
 }
 
 /// a short, per-run directory for the VM's sockets and images.
@@ -1527,7 +1523,6 @@ fn canonical_mount_path(path: &Path, purpose: &str) -> Result<PathBuf, String> {
         .map_err(|error| format!("resolve {purpose} {}: {error}", path.display()))
 }
 
-
 /// removes a run's context document on drop — every exit path (success, error,
 /// timeout, panic). only built for a doc OUTSIDE the workdir (`workspace-parent:`):
 /// it sits beside the checkout, where nothing else would ever clean it up, and a
@@ -1560,27 +1555,6 @@ fn url_port(url: &str) -> Option<u16> {
     let authority = after_scheme.split('/').next().unwrap_or("");
     authority.rsplit(':').next()?.parse().ok()
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 #[cfg(unix)]
 fn configure_process_group(command: &mut tokio::process::Command) {
@@ -1876,7 +1850,6 @@ struct GroupChild {
 }
 
 impl GroupChild {
-
     fn kill_and_wait_blocking(&mut self) {
         if self.cleaned {
             return;
@@ -2182,7 +2155,6 @@ impl RunControl {
         }
     }
 }
-
 
 /// one finished invocation: the parsed answer and its token usage.
 struct Invocation {
@@ -2945,8 +2917,9 @@ fn discover_with_sink(
             continue;
         };
         for spec in group {
-            let mut provider = CliProvider::from_spec((*spec).clone(), bin.clone(), backend.clone())
-                .with_managed_owner(managed_owner);
+            let mut provider =
+                CliProvider::from_spec((*spec).clone(), bin.clone(), backend.clone())
+                    .with_managed_owner(managed_owner);
             if let Some(t) = global_timeout {
                 provider = provider.with_timeout(t);
             }
@@ -3150,7 +3123,6 @@ format = "{format}"
         sh_provider(mock_spec(tag, tag, format), script, wd)
     }
 
-
     /// LIVE end-to-end through the REAL Podman socket path: build a provider
     /// whose executor is a tiny shell script that echoes its stdin, run it in an
     /// alpine container over the node-private socket, and confirm the prompt
@@ -3201,8 +3173,6 @@ format = "{format}"
         );
     }
 
-
-
     /// a sandbox spec with no auth section — the shape both skills tests want.
     fn sandbox_spec(tag: &str) -> CapabilitySpec {
         CapabilitySpec::parse(
@@ -3225,43 +3195,16 @@ format = "text"
         .unwrap()
     }
 
-    async fn hardware_sandbox_smoke(name: &str, backend: SandboxBackend) {
-        let root = scratch(name);
-        let bin_dir = root.join("bin");
-        let workdir = root.join("workspace");
-        std::fs::create_dir_all(&bin_dir).unwrap();
-        std::fs::create_dir_all(&workdir).unwrap();
-        let bin = fake_cli(
-            &bin_dir,
-            "sandbox-smoke",
-            r#"prompt=$(cat)
-printf '%s' "$prompt" > sandbox-marker.txt
-printf 'sandbox-ok:%s' "$prompt""#,
-        );
-        let provider = CliProvider::from_spec(sandbox_spec("hardware-smoke"), bin, backend);
-        let ctx = RunContext {
-            workdir_override: Some(workdir.clone()),
-            limits: BTreeMap::from([("cores".into(), 2), ("mem_gb".into(), 4)]),
-            executing_node: Some(execution_node_id(b"hardware-smoke")),
-            ..RunContext::default()
-        };
-
-        let answer = provider
-            .run("hardware-prompt", &ctx)
-            .await
-            .expect("real sandbox provider cycle");
-        assert_eq!(answer, "sandbox-ok:hardware-prompt");
-        assert_eq!(
-            std::fs::read_to_string(workdir.join("sandbox-marker.txt")).unwrap(),
-            "hardware-prompt",
-            "the sandbox must sync its writable workspace back to the host"
-        );
-        std::fs::remove_dir_all(root).ok();
-    }
-
-
-
-
+    /// the smoke run's whole behaviour, as a shell one-liner.
+    ///
+    /// The CLI is `sh` and not a script written here, because a microVM mounts
+    /// NOTHING from the host: an executor the node lends has to already be in
+    /// the guest rootfs, at [`GUEST_BIN_DIR`]. A test that wrote a script into a
+    /// host `bin/` directory would be testing a delivery path that does not
+    /// exist — measured, as `execve /opt/duck/bin/sandbox-smoke` and exit 126.
+    const SMOKE_SCRIPT: &str = "prompt=$(cat); \
+         printf '%s' \\\"$prompt\\\" > sandbox-marker.txt; \
+         printf 'sandbox-ok:%s' \\\"$prompt\\\"";
 
     // ---- the assembled context document (the agent's "soul") ----------------
 
@@ -3392,7 +3335,6 @@ format = "text"
         assert_eq!(out, "PROMPT", "no doc, no prepend");
     }
 
-
     // ---- the credential broker ----------------------------------------------
 
     /// a broker-backed spec: the strong auth path (and so, by the parse-time
@@ -3459,8 +3401,11 @@ broker = "anthropic-messages"
         // structurally rejected: both reach a LOOPBACK broker — the bare
         // harness directly, a microVM through the vsock tunnel.
         for backend in [SandboxBackend::Bare, firecracker_backend()] {
-            let provider =
-                CliProvider::from_spec(broker_spec("c"), PathBuf::from("/usr/bin/c"), backend.clone());
+            let provider = CliProvider::from_spec(
+                broker_spec("c"),
+                PathBuf::from("/usr/bin/c"),
+                backend.clone(),
+            );
             if let Err(e) = provider.start_broker(None).await {
                 assert!(
                     !e.contains("cannot host a credential broker"),
@@ -3737,7 +3682,10 @@ broker = "anthropic-messages"
             SandboxBackend::Bare,
         );
         provider
-            .trust_guest_workdir(&RunAuth::default(), std::path::Path::new("/ducktape/workspace"))
+            .trust_guest_workdir(
+                &RunAuth::default(),
+                std::path::Path::new("/ducktape/workspace"),
+            )
             .expect("no config home is not an error");
     }
 
@@ -3877,8 +3825,7 @@ broker = "anthropic-messages"
         // file seeded into that config home (so the CLI runs subscription mode,
         // not API mode), plus the hardening vars that keep Claude Code from
         // dialing out around the broker.
-        let provider =
-            CliProvider::from_spec(
+        let provider = CliProvider::from_spec(
             anthropic_broker_spec("cl"),
             PathBuf::from("/usr/bin/cl"),
             SandboxBackend::Bare,
@@ -4078,12 +4025,7 @@ format = "text"
         let real = fake_cli(&dir, "my-alpha", "exit 0");
         let real_os = real.into_os_string();
         let env = move |k: &str| (k == "MOCK_ALPHA_BIN").then(|| real_os.clone());
-        let set = discover_with(
-            SpecSet::from_specs(vec![spec.clone()]),
-            None,
-            &env,
-            None,
-        );
+        let set = discover_with(SpecSet::from_specs(vec![spec.clone()]), None, &env, None);
         assert_eq!(set.capabilities(), vec!["alpha"]);
 
         // ... and a dangling override is absent, not a silent PATH fallback.
@@ -4191,12 +4133,7 @@ format = "text"
         )
         .unwrap();
         let specs = SpecSet::from_specs(vec![custom]);
-        let set = discover_with(
-            specs,
-            Some(dir.into_os_string()),
-            &no_env,
-            None,
-        );
+        let set = discover_with(specs, Some(dir.into_os_string()), &no_env, None);
         assert_eq!(set.capabilities(), vec!["myllm"]);
     }
 
@@ -4464,7 +4401,7 @@ printf '{"type":"turn.completed"}\n'"#,
             ),
         );
         let provider = sh_provider(broker_spec("controlled-sleeper"), bin, "idle-control-wd")
-        .with_timeout(Duration::from_millis(200));
+            .with_timeout(Duration::from_millis(200));
         let broker = broker::RunBroker::start_for_test().await;
         let args = provider.spec.args.clone();
         let workdir = provider.workdir.clone();
@@ -4945,8 +4882,27 @@ printf '%s\n' "$PATH"
         );
     }
 
-    /// The full hardware path on a real VMM: a provider set discovered against
-    /// the microVM backend runs a CLI and its workspace comes back.
+    /// Every argument the spec declares has to arrive, in order, after the
+    /// executor. The bug this pins was invisible to a run with no arguments.
+    #[test]
+    fn the_guest_argv_prepends_the_executor_and_keeps_every_argument() {
+        let layout = GuestLayout::new(Path::new("/host/wd"), Path::new("/host/home"));
+        let argv = guest_argv(
+            Path::new("/usr/bin/claude"),
+            &["-c".to_string(), "/host/wd/script.sh".to_string()],
+            &layout,
+        );
+        assert_eq!(argv[0], "/opt/duck/bin/claude");
+        assert_eq!(argv[1], "-c", "args[0] is an ARGUMENT, not argv[0]");
+        assert_eq!(
+            argv[2], "/duck/workspace/script.sh",
+            "a host path in an argument is rewritten"
+        );
+        assert_eq!(argv.len(), 3);
+    }
+
+    /// The full hardware path on a real VMM: a spec's argv and prompt reach a
+    /// CLI inside the guest, and the file it wrote comes back on the host.
     #[tokio::test]
     #[ignore = "live: needs /dev/kvm and a built guest rootfs"]
     async fn firecracker_hardware_smoke() {
@@ -4955,6 +4911,48 @@ printf '%s\n' "$PATH"
             eprintln!("skipping: {why}");
             return;
         }
-        hardware_sandbox_smoke("firecracker-hardware", backend).await;
+
+        let root = scratch("firecracker-hardware");
+        let workdir = root.join("workspace");
+        std::fs::create_dir_all(&workdir).unwrap();
+
+        let spec = CapabilitySpec::parse(
+            &format!(
+                r#"
+spec = 1
+[capability]
+tag = "hardware-smoke"
+[detect]
+bin = "sh"
+[invoke]
+args = ["-c", "{SMOKE_SCRIPT}"]
+prompt = "stdin"
+[output]
+format = "text"
+"#
+            ),
+            "test",
+        )
+        .unwrap();
+        // resolved to /opt/duck/bin/sh inside the guest, by basename
+        let provider = CliProvider::from_spec(spec, PathBuf::from("/bin/sh"), backend);
+        let ctx = RunContext {
+            workdir_override: Some(workdir.clone()),
+            limits: BTreeMap::from([("cores".into(), 2), ("mem_gb".into(), 4)]),
+            executing_node: Some(execution_node_id(b"hardware-smoke")),
+            ..RunContext::default()
+        };
+
+        let answer = provider
+            .run("hardware-prompt", &ctx)
+            .await
+            .expect("real sandbox provider cycle");
+        assert_eq!(answer, "sandbox-ok:hardware-prompt");
+        assert_eq!(
+            std::fs::read_to_string(workdir.join("sandbox-marker.txt")).unwrap(),
+            "hardware-prompt",
+            "the sandbox must sync its writable workspace back to the host"
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 }
