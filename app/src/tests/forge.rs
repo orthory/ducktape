@@ -924,3 +924,36 @@ fn forge_empty_states_name_only_routes_that_exist() {
         "a born empty commit does not get called unborn"
     );
 }
+
+/// A PICTURE THAT DOES NOT DRAW SAYS WHY. The loader lands a picture past the
+/// byte cap or one that does not decode on the binary plate with the reason
+/// as the blob's `text`, and the plate shows that line instead of the generic
+/// "not text" one — which stays for plain binary, whose `text` is empty.
+#[test]
+fn a_picture_that_does_not_draw_says_why_on_the_binary_plate() {
+    let backend = inlined(include_str!("../backend/forge.rs"));
+    let picture = backend
+        .split_once("async fn forge_picture(")
+        .expect("the loader")
+        .1
+        .split_once("\nasync fn ")
+        .expect("the loader ends")
+        .0;
+    assert!(
+        picture.contains("MiB preview limit.")
+            && picture.contains("Err(reason) => Ok(binary_blob(")
+            && picture.contains("did not decode: {reason}"),
+        "both failures carry their reason onto the plate"
+    );
+    let screen = inlined(include_str!("../ui/screens/forge.ice"));
+    let generic = "&& file_binary && empty(file_text)\n          ForgeCodeEmpty name=file_path note=\"This is not text";
+    let reasoned = "&& file_binary && !empty(file_text)\n          ForgeCodeEmpty name=file_path note=file_text";
+    assert!(
+        screen.contains(generic),
+        "plain binary keeps the generic line"
+    );
+    assert!(
+        screen.contains(reasoned),
+        "a reasoned binary shows its reason"
+    );
+}

@@ -124,13 +124,26 @@ fn decode_vector(bytes: &[u8]) -> Result<Picture, String> {
     })
 }
 
+/// A raster decodes to RGBA the way the camera meant it: the EXIF
+/// orientation (a phone photo is stored sideways and tagged) is applied after
+/// the downscale, so the drawn size is the upright one.
 fn decode_raster(bytes: &[u8]) -> Result<Picture, String> {
-    let decoded = image::load_from_memory(bytes).map_err(|error| error.to_string())?;
+    use image::ImageDecoder;
+    let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|error| error.to_string())?
+        .into_decoder()
+        .map_err(|error| error.to_string())?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let decoded = image::DynamicImage::from_decoder(decoder).map_err(|error| error.to_string())?;
     let oversized = decoded.width().max(decoded.height()) > MAX_PICTURE_SIDE;
-    let fitted = match oversized {
+    let mut fitted = match oversized {
         true => decoded.thumbnail(MAX_PICTURE_SIDE, MAX_PICTURE_SIDE),
         false => decoded,
     };
+    fitted.apply_orientation(orientation);
     let rgba = fitted.into_rgba8();
     let (width, height) = rgba.dimensions();
     Ok(Picture {
@@ -242,17 +255,40 @@ pub fn inline_picture(doc: &str, path: &str) -> Option<Picture> {
     }
 }
 
-/// The viewer itself: the surface's picture, centred in the pane.
+/// The viewer itself: the surface's picture, centred in the pane. A raster
+/// zooms under the wheel and pans under a drag (iced's `image::viewer`); a
+/// vector is drawn contained — the viewer is raster-only. The viewer's
+/// zoom/pan state lives in the widget tree, so the element is keyed by the
+/// path: the next file opens at its own size, not at the last one's zoom.
 pub fn picture(surface: String, path: String) -> iced::Element<'static, ()> {
-    use iced::Length::Fill;
-    use iced::widget::{container, text};
+    use iced::ContentFit::Contain;
+    use iced::Length::{Fill, Shrink};
+    use iced::widget::{container, image, keyed_column, text};
     let Some(picture) = stored_picture(&surface, &path) else {
         return container(text("")).into();
     };
-    container(picture.element())
+    let element = match &picture.handle {
+        PictureHandle::Raster(handle) => image::viewer(handle.clone())
+            .width(Fill)
+            .height(Shrink)
+            .content_fit(Contain)
+            .into(),
+        PictureHandle::Vector(_) => picture.element(),
+    };
+    container(keyed_column([(path_key(&path), element)]))
         .width(Fill)
         .center_x(Fill)
         .into()
+}
+
+/// The path as a `keyed_column` key — a 64-bit hash, since iced keys are
+/// `Copy`. A collision between two paths open in one session would only
+/// carry a zoom across; it is not worth a longer key.
+fn path_key(path: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    path.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[cfg(test)]
@@ -279,6 +315,37 @@ mod tests {
         for no in ["README.md", "logo", "png", "dir.png/file", "x.png.txt", "a.xml"] {
             assert!(!picture_path(no.into()), "{no}");
         }
+    }
+
+    /// A JPEG tagged EXIF orientation 6 (stored rotated 90° CCW, to be shown
+    /// rotated 90° CW) decodes upright: a 3×2 file is a 2×3 picture.
+    fn sideways_jpeg() -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(3, 2, image::Rgb([10, 20, 30])))
+            .write_to(&mut out, image::ImageFormat::Jpeg)
+            .expect("encode");
+        let jpeg = out.into_inner();
+        // APP1 "Exif\0\0" + little-endian TIFF header + one IFD0 entry:
+        // tag 0x0112 Orientation, SHORT ×1, value 6; no next IFD.
+        let tiff: [u8; 26] = [
+            b'I', b'I', 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, // TIFF header, IFD0 at 8
+            0x01, 0x00, // one entry
+            0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, // next IFD: none
+        ];
+        let payload_len = 2 + 6 + tiff.len();
+        let mut spliced = jpeg[..2].to_vec();
+        spliced.extend([0xFF, 0xE1, (payload_len >> 8) as u8, payload_len as u8]);
+        spliced.extend(b"Exif\0\0");
+        spliced.extend(tiff);
+        spliced.extend(&jpeg[2..]);
+        spliced
+    }
+
+    #[test]
+    fn a_sideways_jpeg_decodes_upright_by_its_exif_orientation() {
+        let picture = decode_picture(&sideways_jpeg()).expect("decodes");
+        assert_eq!((picture.width, picture.height), (2, 3));
     }
 
     #[test]

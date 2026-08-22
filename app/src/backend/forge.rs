@@ -795,17 +795,21 @@ async fn forge_blob_bytes(
 
 /// A picture blob: page it in, decode it off the runtime, park the handle.
 /// A refused or over-cap object and a body that does not decode all land on
-/// the binary plate, never a failed load.
+/// the binary plate with the reason as its line, never a failed load.
 async fn forge_picture(
     client: &RpcClient,
     repo: String,
     rev: String,
     path: String,
 ) -> Result<BlobView, String> {
-    use super::picture::{FORGE_SURFACE, store_picture};
+    use super::picture::{FORGE_SURFACE, MAX_PICTURE_BYTES, store_picture};
     let (rev, bytes) = forge_blob_bytes(client, &repo, &rev, &path).await?;
     let Some(bytes) = bytes else {
-        return Ok(binary_blob(repo, rev, path, true));
+        let note = format!(
+            "This picture is larger than the {} MiB preview limit.",
+            MAX_PICTURE_BYTES >> 20
+        );
+        return Ok(binary_blob(repo, rev, path, note));
     };
     match store_picture(FORGE_SURFACE, path.clone(), bytes).await {
         Ok((width, height)) => Ok(BlobView {
@@ -820,7 +824,12 @@ async fn forge_picture(
             width: i64::from(width),
             height: i64::from(height),
         }),
-        Err(_) => Ok(binary_blob(repo, rev, path, false)),
+        Err(reason) => Ok(binary_blob(
+            repo,
+            rev,
+            path,
+            format!("This picture did not decode: {reason}."),
+        )),
     }
 }
 
@@ -1030,13 +1039,15 @@ pub(crate) fn blocked_picture_host(ip: IpAddr) -> bool {
         }
     }
 }
-fn binary_blob(repo: String, rev: String, path: String, truncated: bool) -> BlobView {
+/// The binary plate with `note` as its line — why the reader shows no
+/// preview, in the reader's words.
+fn binary_blob(repo: String, rev: String, path: String, note: String) -> BlobView {
     BlobView {
         repo,
         rev,
         path,
-        text: String::new(),
-        truncated,
+        text: note,
+        truncated: false,
         binary: true,
         lines: 0,
         picture: false,

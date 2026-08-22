@@ -270,10 +270,10 @@ async fn files_picture(
             width: i64::from(width),
             height: i64::from(height),
         }),
-        Err(_) => Ok(binary_preview(
+        Err(reason) => Ok(binary_preview(
             generation,
             path,
-            format!("{size} binary bytes · not a decodable picture"),
+            format!("{size} binary bytes · did not decode: {reason}"),
         )),
     }
 }
