@@ -239,7 +239,9 @@ async fn a_forge_op_does_not_load_the_repo_list_for_a_closed_pane() {
 /// A WEB PICTURE IS ONE CAPPED GET. The bytes come back as served; a
 /// response that announces more than the viewer takes, one that streams more
 /// than it announced (or announced nothing), and one without a body to show
-/// all come back as `None` — the image keeps its alt text.
+/// all come back as `None` — the image keeps its alt text. This drives the
+/// GET behind the host gate: the gate itself refuses loopback, which is
+/// where a test server lives.
 #[tokio::test(flavor = "current_thread")]
 async fn a_web_picture_is_one_capped_get() {
     use super::super::picture::MAX_PICTURE_BYTES;
@@ -274,28 +276,78 @@ async fn a_web_picture_is_one_capped_get() {
         }
     });
     assert_eq!(
-        web_picture_bytes(&format!("{origin}/small"))
+        fetch_picture_bytes(reqwest::Url::parse(&format!("{origin}/small")).unwrap())
             .await
             .as_deref(),
         Some(&b"PNG-bytes"[..]),
         "a picture under the cap comes back as served"
     );
     assert!(
-        web_picture_bytes(&format!("{origin}/announced-huge"))
+        fetch_picture_bytes(reqwest::Url::parse(&format!("{origin}/announced-huge")).unwrap())
             .await
             .is_none(),
         "an announced length past the cap is refused before the body"
     );
     assert!(
-        web_picture_bytes(&format!("{origin}/streamed-huge"))
+        fetch_picture_bytes(reqwest::Url::parse(&format!("{origin}/streamed-huge")).unwrap())
             .await
             .is_none(),
         "a body that streams past the cap is refused mid-stream"
     );
     assert!(
-        web_picture_bytes(&format!("{origin}/missing"))
+        fetch_picture_bytes(reqwest::Url::parse(&format!("{origin}/missing")).unwrap())
             .await
             .is_none(),
         "a miss has no picture"
+    );
+}
+
+/// A README NAMES THE URL, THE READER'S MACHINE MAKES THE REQUEST. The host
+/// gate refuses the machine itself, its link (cloud metadata), nothing and
+/// everyone — as an IP literal or as a name that resolves there — and keeps
+/// a LAN address, which is where a team's forge lives.
+#[tokio::test(flavor = "current_thread")]
+async fn a_web_picture_never_points_the_reader_at_its_own_machine() {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let blocked = [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V4(Ipv4Addr::BROADCAST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+        IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()),
+        IpAddr::V6("fe80::1".parse().unwrap()),
+    ];
+    for ip in blocked {
+        assert!(blocked_picture_host(ip), "{ip} is not a picture's address");
+    }
+    let allowed = [
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)),
+        IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)),
+        IpAddr::V4(Ipv4Addr::new(140, 82, 112, 3)),
+        IpAddr::V6("2606:4700::1".parse().unwrap()),
+    ];
+    for ip in allowed {
+        assert!(!blocked_picture_host(ip), "{ip} may serve a picture");
+    }
+    // The gate end to end, without a socket: a literal and the name that
+    // resolves to the machine are refused before any request is made.
+    assert!(
+        web_picture_bytes("http://127.0.0.1:9/logo.png")
+            .await
+            .is_none(),
+        "a loopback literal is refused"
+    );
+    assert!(
+        web_picture_bytes("http://localhost:9/logo.png")
+            .await
+            .is_none(),
+        "a name resolving to loopback is refused"
+    );
+    assert!(
+        web_picture_bytes("ftp://example.com/logo.png")
+            .await
+            .is_none(),
+        "only a web URL is fetched"
     );
 }
