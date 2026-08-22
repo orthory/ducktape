@@ -138,6 +138,11 @@ pub(crate) fn beacon_state() {
 /// at 1 Hz, so this is the same order as the presence traffic it unblocks: a
 /// peer who joins is admitted within a second of their join committing.
 const ROSTER_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+/// How many roster reads in a row have to fail before the session says so on
+/// its status line. One is nothing — a node mid-restart, a view a block
+/// behind. Three is the fan-out standing still, which is a huddle that hears
+/// nobody, and the app keeps no log for anyone to find that in.
+const ROSTER_REFUSALS_VOICED: u32 = 3;
 
 /// Steer the fan-out set from the huddle's ON-CHAIN roster, for as long as the
 /// session lives. See [`crate::backend::huddle_fanout_nodes`] for why this is a
@@ -163,29 +168,56 @@ async fn steer_recipients(
 ) {
     let mut steered: Vec<String> = Vec::new();
     let mut ever_read = false;
+    let mut refusals: u32 = 0;
     loop {
         match crate::backend::huddle_fanout_nodes(&rpc, &channel_id).await {
-            Ok(peers) if !ever_read || peers != steered => {
-                ever_read = true;
-                if control
-                    .send(ClientControl::Recipients {
-                        peers: peers.clone(),
-                    })
-                    .is_err()
+            Ok(peers) => {
+                // A read that comes back after the session complained about it
+                // takes the complaint down with it: an empty message is what
+                // the status fold reads as a plain "live".
+                let complained = refusals >= ROSTER_REFUSALS_VOICED;
+                if complained && events.send(CallEvent::of("live")).await.is_err() {
+                    return;
+                }
+                refusals = 0;
+                let moved = !ever_read || peers != steered;
+                if moved {
+                    ever_read = true;
+                    if control
+                        .send(ClientControl::Recipients {
+                            peers: peers.clone(),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    for departed in steered.iter().filter(|node| !peers.contains(node)) {
+                        crate::video::forget_peer(departed);
+                        let mut gone = CallEvent::of("gone");
+                        gone.peer = departed.clone();
+                        if events.send(gone).await.is_err() {
+                            return;
+                        }
+                    }
+                    steered = peers;
+                }
+            }
+            // A ROSTER THIS SESSION CANNOT READ IS A SILENT HUDDLE, and the app
+            // keeps no log for anyone to find it in. One reading is nothing (a
+            // node mid-restart, a view a block behind); several in a row is the
+            // fan-out standing still, which is the exact failure this whole
+            // poll exists to end — so it says so on the status line, once.
+            Err(reason) => {
+                refusals += 1;
+                if refusals == ROSTER_REFUSALS_VOICED
+                    && events
+                        .send(CallEvent::failed("live", format!("roster: {reason}")))
+                        .await
+                        .is_err()
                 {
                     return;
                 }
-                for departed in steered.iter().filter(|node| !peers.contains(node)) {
-                    crate::video::forget_peer(departed);
-                    let mut gone = CallEvent::of("gone");
-                    gone.peer = departed.clone();
-                    if events.send(gone).await.is_err() {
-                        return;
-                    }
-                }
-                steered = peers;
             }
-            Ok(_) | Err(_) => {}
         }
         if control.is_closed() {
             return;
