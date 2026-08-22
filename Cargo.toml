@@ -31,7 +31,7 @@
 #   crates/services/ — off-chain service crates: the host-side executors that
 #                      serve a consensus module without being one (compute —
 #                      the dispatch WorkSpec pool/ledger/gate; sandbox — the
-#                      node-local podman/egress/backend-probe muscle; broker —
+#                      microVM/egress/backend-probe muscle; broker —
 #                      the run-scoped credential loopback + airlock client;
 #                      provider — the executor spec layer + CliProvider run loop;
 #                      agent — the pty session daemon; airlock — the lender)

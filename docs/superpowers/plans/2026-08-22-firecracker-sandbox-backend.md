@@ -1835,7 +1835,7 @@ and never from a probe."
 - **Snapshot/restore.** Already measured (see above): restore is ~12 ms and flat in guest memory, against a 428 ms - 2 s cold boot. The backend is correct without it, so it is not a blocker for shipping — but it is the only fix for the memory-scaling cost, so it becomes a prerequisite the moment a node sells large-`mem_gb` runs at a competitive start latency. The work in that plan is **not** the restore call; it is the three costs around it: a `Uffd` memory backend so the first work is not paying lazy page faults, a build step that produces one snapshot per machine shape, and a store for the resulting memory files (~31 GB for a 1/2/4/8/16 GiB ladder) with invalidation keyed to the rootfs version.
 - **Egress logging and the public-egress toggle.** Spec step 3's remaining half.
 - ~~**Remove the podman path.**~~ DONE in this branch, not a follow-on: `PodmanService`, the libpod client, the attach framing, the OCI `createRuntime` egress hook and `pasta`/`conmon` are deleted, along with `podman_api.rs` entire. The plan had this last, "until the Firecracker path has run real work" — it has (see the table below), and keeping a second backend would have been the dual-path code this repo's instructions forbid.
-- **An interactive pty inside the guest.** The one capability lost with podman. `InteractiveSession` still exists for a local pty, but a microVM run has no guest-side pty, so an interactive session under Firecracker returns an explicit error naming what is missing rather than silently degrading. The live podman TUI suites were deleted with the backend they drove.
+- ~~**An interactive pty inside the guest.**~~ DONE in this branch, not a follow-on. Planned as the one capability lost with podman, then built: leaving a whole plane answering with an explicit error is not a finished port. `duck-guest-init` allocates the pty pair itself and pumps it against the run's existing vsock stdio; see note 9 below for why the host could not hold the master.
 
 ## Open questions carried from the spec
 
@@ -1942,6 +1942,83 @@ assumption that `args` carries argv[0]. It does not, so a spec's first real
 argument was being eaten — invisible to any run with no arguments, which is
 exactly the shape the first end-to-end test had.
 
+### 9. The interactive pty had to be allocated in the GUEST
+
+Planned as out of scope, then built, because "an interactive session returns an
+explicit error" is not a finished port — it is a whole plane dark.
+
+The reason it was not a straight lift: a pty master and its slave are two ends
+of ONE kernel object, so the podman arrangement (host holds the master, child
+holds the slave) has no translation across a hypervisor boundary. What crosses
+instead is the terminal's content. `duck-guest-init` opens the pair itself when
+the manifest says `pty`, `setsid`s the child and makes the slave its
+controlling terminal — without which there is no `SIGWINCH`, no job control and
+no `^C` — and pumps the master against the same vsock stdio the headless path
+uses. `/dev/pts` had to join the guest's base mounts; without devpts the slave
+path names nothing and the TUI never gets a terminal.
+
+Three consequences worth naming:
+
+- **A terminal has no EOF.** The headless guest closes the child's stdin on
+  `StdinEof` so a CLI blocking on EOF proceeds. Doing that to a pty would tear
+  down the session the operator is still typing into, so the pty path ignores
+  it — `^D` is a byte on the input lane like any other.
+- **One owner of the socket's write half**, which is why `Resize` could not just
+  be written from the resize handler. Every host→guest lane now funnels through
+  one bounded channel, and resize is a non-blocking `try_send` on it, because
+  the terminal plane's resize handler is synchronous and has no lock to await.
+- **`ops/build-guest-rootfs.sh` was reusing a stale init.** Its `if [[ ! -x ]]`
+  guard meant a changed `duck-guest-init` never reached the image, so the first
+  pty run booted last week's PID 1. It now always builds; cargo makes that free
+  when nothing moved.
+
+### 10. Two disk defects the full suite found, which one suite alone could not
+
+`dispatch_e2e` passed on its own and failed in the whole-workspace run, with:
+
+```
+⚠ quacker-text failed: workspace needs 9045689016 bytes of image,
+  over the 8589934592-byte cap
+```
+
+Two separate bugs, and the message hid the first one:
+
+- **The refusal named the wrong image.** There are two per run — the writable
+  workspace and the read-only asset image — and `size_or_refuse` said
+  "workspace" for both. The tree that actually blew the cap was the ASSET
+  staging tree at 2.8 GB, while the workspace it named was a few KiB. The
+  message now carries which tree and which directory.
+- **A read-only image was sized for writes.** `build_assets` reused
+  `sized_for`, whose ×3 headroom exists so a run can WRITE into its workspace.
+  Nothing ever writes to the asset image. The ×3 turned a 2.8 GB tree into an
+  8.4 GB demand and refused the run over 5.6 GB of zeroes that could not be
+  written to. It is now measured + a 20% metadata margin.
+
+Why only the full run saw it: a run's read-only inputs are its PATH commands,
+and this repo's PATH entry is `target/debug` — whose top-level executables are
+every integration-test binary. Building the whole workspace is what makes that
+directory gigabytes, so the failure needs a full build to exist at all.
+
+Underneath both, a third: **the run directory was never deleted.** Its
+workspace image, asset image and manifest outlived the VM, and the asset
+STAGING tree survived any failure on its way out via `?`. One afternoon of
+testing left **21 GB under `/tmp`** with nothing that would ever collect it — a
+node serving runs continuously fills its disk. Cleanup is now in `MicroVm`'s
+`Drop`, so a failed run cleans up too, and the staging tree is removed on every
+exit rather than only the happy one.
+
+And a fourth, which the cleanup would have turned from silent corruption into a
+crash: **the run directory's NAME was not unique.** It was an FNV hash of
+`(executing_node, run_key)` — which reads as collision avoidance and is the
+opposite, because `run_key` is optional. Every keyless run on a node hashed to
+the same name, so two concurrent ones shared a directory and overwrote each
+other's workspace image, asset image and manifest. The evidence was sitting in
+the leak: one directory held an `assets.ext4` from 21:27 beside a `manifest.bin`
+from 22:47. The name is now drawn fresh per run, the same way (and for the same
+stated reason) the run's config-home slot already was — 8 random bytes, hex, the
+same 16 characters the hash occupied so the `SUN_LEN` budget for the vsock
+socket underneath is unchanged.
+
 ### Verified end to end
 
 On a real VMM, with the operator's own subscriptions:
@@ -1952,6 +2029,9 @@ On a real VMM, with the operator's own subscriptions:
 | `firecracker_hardware_smoke` | a spec's argv and prompt reach a CLI in the guest; the file it wrote comes back |
 | `claude_model_turn_in_a_microvm` | a real claude turn through the vsock tunnel to the host broker — answered `PONG` |
 | `codex_model_turn_in_a_microvm` | the same for codex — answered `PONG` |
+| `remote_session::guest_drives_a_scripted_child_on_the_host_over_the_forwarded_lane` | a guest node directs a peer to boot a VM, a keystroke crosses the forwarded lane into the guest's pty, and the echo fans back onto the directing node's topic |
+| `sched_pinned_run` (both legs) | a lent run inside a VM reaches the host's broker over the vsock tunnel and its reply commits into the saga |
+| `portable_workspace_e2e` | the assembled soul reaches the model, the skill ro mount content-checks, and two runs chain — all attested from inside the guest and read back as committed duckfs state |
 
 The credential never enters the guest in either model turn: the guest has no
 network device at all, so the CLI's only route to the model API is the tunnel

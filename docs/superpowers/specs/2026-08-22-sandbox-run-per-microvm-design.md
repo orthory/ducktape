@@ -153,6 +153,29 @@ subsumes every item in the "inherited silently" list above. **The ideal design
 is less machinery than the one it replaces, not more.** That is the main
 argument for it.
 
+### The terminal is allocated in the guest
+
+A pty master and its slave are two ends of one kernel object. A host cannot
+hand a terminal to a process on another kernel, so the podman-era arrangement —
+the host holds the master, the child holds the slave — has no translation here,
+and an interactive session was the one capability the port initially dropped.
+
+What crosses instead is the terminal's CONTENT. `duck-guest-init` opens the pty
+pair itself when the manifest says `pty`, makes the child a session leader with
+that slave as its controlling terminal, and pumps the master against the same
+vsock stdio the headless path already uses. The operator's keystrokes arrive as
+ordinary `Stdin` frames and become terminal input; the child's output comes back
+as `Stdout` frames, with stderr merged in the way a terminal has always merged
+it. Window size is the only genuinely new thing on the wire — a `Resize` frame,
+which the guest applies to its master, and the kernel turns into the `SIGWINCH`
+the TUI redraws on.
+
+The result is that the isolation story is unchanged from the headless path: the
+credential still never enters the guest, the config home is still fresh, and the
+session still reaches its model through the host's broker over the vsock tunnel.
+Only the shape of the child's stdio differs, and that difference is one boolean
+in the manifest.
+
 ### Why per-run and not per-node
 
 An earlier draft proposed one long-lived VM per node with containers inside,
@@ -479,9 +502,6 @@ inventory, not a reason to fork the design.
 - Default VM size when `cores` / `mem_gb` are absent. Currently REFUSED rather
   than defaulted: a VM is built at a size, so a missing dimension has no
   "unlimited" to fall back to the way a container did.
-- How an interactive session works under a VM. The pty was a podman capability;
-  a microVM run has no guest-side pty, so interactive returns an explicit error
-  today rather than silently degrading.
 - Whether the public-egress toggle defaults on or off for a fresh node.
 - When agent count reaches the hundreds, whether to replace the per-agent cache
   copy with a read-only base image plus an overlayfs upper. Costed in *Build

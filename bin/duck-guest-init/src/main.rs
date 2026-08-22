@@ -512,6 +512,15 @@ fn open_pty() -> Result<(RawFd, RawFd), String> {
 /// sends is written into it. Reading the master after the last slave closes
 /// gives EIO on Linux rather than EOF — that is the end of the session, not an
 /// error to report.
+///
+/// KNOWN LIMIT: "the last slave closes" means every holder, so a TUI that exits
+/// leaving a background grandchild on the terminal keeps this open, and the
+/// exit frame waits with it. The session then ends when the operator closes it,
+/// which tears the VM down and still reads the workspace back — so the failure
+/// mode is a session that looks alive rather than a lost run. Noticing the
+/// child's exit independently needs a `signalfd` for SIGCHLD in the poll set;
+/// it is not here because PID 1 taking over signal handling deserves its own
+/// change.
 fn pump_pty(host: RawFd, master: RawFd) {
     let mut host_buf: Vec<u8> = Vec::new();
     let mut fds = [

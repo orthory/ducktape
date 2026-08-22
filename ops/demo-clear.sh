@@ -119,15 +119,12 @@ fi
 
 # ── 3. delete the workspace dir ────────────────────────────────
 if [ -d "$WSDIR" ]; then
+  # A plain rm is enough now. This used to need a `podman unshare` pass to
+  # unmount a container storage overlay left under the workspace; a run's
+  # storage is a microVM's own block device, so there is nothing under here
+  # mounted in another user namespace.
   rm -rf "$WSDIR" 2>/dev/null
-  if [ -d "$WSDIR" ] && command -v podman >/dev/null 2>&1; then
-    for overlay in "$WSDIR"/storage/services/*/podman/storage/overlay; do
-      [ -d "$overlay" ] || continue
-      podman unshare mountpoint -q "$overlay" && podman unshare umount "$overlay"
-    done
-    podman unshare rm -rf "$WSDIR" 2>/dev/null
-  fi
-  [ ! -d "$WSDIR" ] || die "could not delete $WSDIR — stop its services and remove the remaining files in their user namespace"
+  [ ! -d "$WSDIR" ] || die "could not delete $WSDIR — stop its services and remove the remaining files"
   log "deleted $WSDIR"
 fi
 
