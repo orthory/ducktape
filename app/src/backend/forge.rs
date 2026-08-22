@@ -1,5 +1,6 @@
 use super::*;
 use ::forge;
+use std::net::IpAddr;
 
 /// One forge repo row: the module's committed name and head.
 #[derive(Clone, Debug, Default, Hash, PartialEq)]
@@ -901,17 +902,48 @@ const WEB_PICTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// One GET for a web picture, bounded by `MAX_PICTURE_BYTES` before the body
 /// is read (the announced length) and while it streams (an unannounced or
 /// lying one), and by `WEB_PICTURE_TIMEOUT`. `None` for any refusal — the
-/// image keeps its alt text, never an error. The app's one HTTP client for
-/// the open web, built once; the node's RPC client stays the node's.
+/// image keeps its alt text, never an error. A README names the URL and the
+/// reader's machine makes the request, so the host is gated first
+/// ([`blocked_picture_host`]): the reader's own machine, its link, and
+/// nowhere/everywhere are not a picture's address, on the first hop or any
+/// redirect.
+pub async fn web_picture_bytes(url: &str) -> Option<Vec<u8>> {
+    let url = reqwest::Url::parse(url).ok()?;
+    let allowed = picture_host_allowed(&url).await;
+    if !allowed {
+        return None;
+    }
+    fetch_picture_bytes(url).await
+}
+
+/// The GET itself, after the host gate. The app's one HTTP client for the
+/// open web, built once; the node's RPC client stays the node's.
 /// ponytail: no cache across documents and no per-host limit — a README
 /// re-fetches its pictures on every open; add a byte-keyed cache when felt.
-pub async fn web_picture_bytes(url: &str) -> Option<Vec<u8>> {
+pub(crate) async fn fetch_picture_bytes(url: reqwest::Url) -> Option<Vec<u8>> {
     use super::picture::MAX_PICTURE_BYTES;
     static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
     let client = CLIENT
         .get_or_init(|| {
+            // A redirect is re-gated by what its URL spells: an IP literal
+            // or `localhost`. ponytail: a hop to a NAME that resolves to a
+            // blocked address is not re-resolved here (the policy is sync);
+            // resolve hops too if that is ever the concern.
+            let policy = reqwest::redirect::Policy::custom(|attempt| {
+                let literal_blocked = host_literal(attempt.url()).is_some_and(blocked_picture_host);
+                let name_is_localhost = attempt
+                    .url()
+                    .domain()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("localhost"));
+                let hop_blocked = literal_blocked || name_is_localhost;
+                match hop_blocked {
+                    true => attempt.stop(),
+                    false => attempt.follow(),
+                }
+            });
             reqwest::Client::builder()
                 .timeout(WEB_PICTURE_TIMEOUT)
+                .redirect(policy)
                 .build()
                 .ok()
         })
@@ -937,6 +969,67 @@ pub async fn web_picture_bytes(url: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// Whether a web picture may be asked of `url`'s host: an IP literal is
+/// judged as written, a name by every address it resolves to — one blocked
+/// address refuses the name (`localhost` and a metadata alias both land
+/// here). A name that does not resolve is refused too: there is nothing to
+/// fetch from.
+async fn picture_host_allowed(url: &reqwest::Url) -> bool {
+    if let Some(ip) = host_literal(url) {
+        return !blocked_picture_host(ip);
+    }
+    let Some(name) = url.domain() else {
+        return false;
+    };
+    let port = url.port_or_known_default().unwrap_or(80);
+    let Ok(addresses) = tokio::net::lookup_host((name, port)).await else {
+        return false;
+    };
+    let mut resolved = false;
+    for address in addresses {
+        resolved = true;
+        if blocked_picture_host(address.ip()) {
+            return false;
+        }
+    }
+    resolved
+}
+
+/// The host as an IP literal, if that is how the URL spells it (`[::1]`
+/// keeps its brackets in `host_str`).
+fn host_literal(url: &reqwest::Url) -> Option<IpAddr> {
+    url.host_str()?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .ok()
+}
+
+/// An address a README may not point the reader's machine at: the machine
+/// itself, its link (cloud metadata answers on 169.254.169.254), nothing,
+/// or everyone. Private ranges stay ALLOWED on purpose — a team's forge and
+/// the pictures beside its READMEs live on a LAN, and refusing them would
+/// refuse the product's own shape.
+pub(crate) fn blocked_picture_host(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unicast_link_local()
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| blocked_picture_host(IpAddr::V4(v4)))
+        }
+    }
+}
 fn binary_blob(repo: String, rev: String, path: String, truncated: bool) -> BlobView {
     BlobView {
         repo,
