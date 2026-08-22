@@ -1416,9 +1416,18 @@ fn the_files_preview_reads_text_through_the_forge_reader() {
         "text mounts the highlighted reader"
     );
     assert!(
-        files.contains("if !preview_binary && markdown_path(preview_path)")
+        files.contains("if !preview_binary && !preview_picture && markdown_path(preview_path)")
             && files.contains("extern agent_markdown(preview_text, dark) #fs-markdown"),
         "a markdown path reads as a document"
+    );
+    assert!(
+        files.contains("if preview_picture\n")
+            && files.contains("extern picture(\"files\", preview_path) #fs-picture"),
+        "a picture draws through the viewer"
+    );
+    assert!(
+        files.contains("if !preview_binary && !preview_picture && !editing && !preview_truncated"),
+        "a picture has no Edit"
     );
     assert!(
         !files.contains("text preview_text\n"),
@@ -1448,8 +1457,9 @@ fn the_files_preview_reads_text_through_the_forge_reader() {
         .expect("the handler ends")
         .0;
     let cleared = open_file.find("fs_preview_text = \"\"").expect("the old body is cleared");
+    let unpictured = open_file.find("fs_preview_picture = false").expect("the old picture flag is cleared");
     let read = open_file.find("run replace lane=files_preview").expect("the read");
-    assert!(cleared < read, "the body is cleared before the read is issued");
+    assert!(cleared < read && unpictured < read, "the body is cleared before the read is issued");
 }
 
 /// ESCAPE CLOSES WHAT IS ON SCREEN, AND THE THREAD RAIL IS NOT.

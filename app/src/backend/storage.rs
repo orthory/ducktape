@@ -91,6 +91,11 @@ pub struct FsPreview {
     pub text: String,
     pub truncated: bool,
     pub binary: bool,
+    /// The body is a decoded picture in the Files surface's slot
+    /// (`picture.rs`), drawn at `width` × `height`; `text` is empty.
+    pub picture: bool,
+    pub width: i64,
+    pub height: i64,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -180,7 +185,9 @@ pub fn size_label(bytes: i64) -> String {
     }
 }
 
-/// Read a file's head bytes for the preview pane (64 KiB window).
+/// Read a file for the preview pane. A picture (by path — `picture_path`)
+/// pages its whole body in and decodes it into the Files surface's slot;
+/// anything else reads a 64 KiB head.
 pub async fn files_preview(
     rpc: String,
     path: String,
@@ -188,35 +195,125 @@ pub async fn files_preview(
 ) -> Result<FsPreview, HydrationError> {
     async {
         let rpc = rpc_client(&rpc)?;
-        let reply = rpc
-            .files_get("read", &[("path", path.as_str()), ("len", "65536")])
-            .await?;
-        let b64 = reply["b64"].as_str().unwrap_or_default();
-        let eof = reply["eof"].as_bool().unwrap_or(true);
-        let bytes = base64_decode(b64).unwrap_or_default();
-        let (text, binary) = match String::from_utf8(bytes.clone()) {
-            Ok(text)
-                if !text
-                    .chars()
-                    .any(|c| c.is_control() && c != '\n' && c != '\t' && c != '\r') =>
-            {
-                (text, false)
-            }
-            _ => (format!("{} binary bytes", bytes.len()), true),
-        };
-        Ok(FsPreview {
-            generation,
-            path,
-            text,
-            truncated: !eof,
-            binary,
-        })
+        match super::picture::picture_path(path.clone()) {
+            true => files_picture(&rpc, path, generation).await,
+            false => files_text(&rpc, path, generation).await,
+        }
     }
     .await
     .map_err(|message: String| HydrationError {
         generation,
         message: user_error(message),
     })
+}
+
+/// The text preview: the first 64 KiB, branded binary on a control byte.
+async fn files_text(
+    rpc: &RpcClient,
+    path: String,
+    generation: i64,
+) -> Result<FsPreview, String> {
+    let reply = rpc
+        .files_get("read", &[("path", path.as_str()), ("len", "65536")])
+        .await?;
+    let b64 = reply["b64"].as_str().unwrap_or_default();
+    let eof = reply["eof"].as_bool().unwrap_or(true);
+    let bytes = base64_decode(b64).unwrap_or_default();
+    let (text, binary) = match String::from_utf8(bytes.clone()) {
+        Ok(text)
+            if !text
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t' && c != '\r') =>
+        {
+            (text, false)
+        }
+        _ => (format!("{} binary bytes", bytes.len()), true),
+    };
+    Ok(FsPreview {
+        generation,
+        path,
+        text,
+        truncated: !eof,
+        binary,
+        picture: false,
+        width: 0,
+        height: 0,
+    })
+}
+
+/// The picture preview: page the whole file through the 1 MiB `read` lane
+/// (the checkout's `read_all` shape), decode off the runtime, park the handle.
+/// A file past the byte cap or one that does not decode falls back to the
+/// binary plate with the reason as its line — never a global error.
+async fn files_picture(
+    rpc: &RpcClient,
+    path: String,
+    generation: i64,
+) -> Result<FsPreview, String> {
+    use super::picture::{FILES_SURFACE, MAX_PICTURE_BYTES, store_picture};
+    // The `read` lane's own page cap (duckfs `MAX_READ_BYTES`); the node clamps
+    // anything larger, so asking for exactly it is one round-trip per MiB.
+    let page_len = (1024 * 1024).to_string();
+    let mut bytes = Vec::new();
+    loop {
+        let offset = bytes.len().to_string();
+        let reply = rpc
+            .files_get(
+                "read",
+                &[
+                    ("path", path.as_str()),
+                    ("offset", offset.as_str()),
+                    ("len", page_len.as_str()),
+                ],
+            )
+            .await?;
+        let page = base64_decode(reply["b64"].as_str().unwrap_or_default()).unwrap_or_default();
+        let eof = reply["eof"].as_bool().unwrap_or(true);
+        bytes.extend_from_slice(&page);
+        let past_cap = bytes.len() > MAX_PICTURE_BYTES;
+        if past_cap {
+            let note = format!(
+                "picture larger than the {} MiB preview limit",
+                MAX_PICTURE_BYTES >> 20
+            );
+            return Ok(binary_preview(generation, path, note));
+        }
+        let done = eof || page.is_empty();
+        if done {
+            break;
+        }
+    }
+    let size = bytes.len();
+    match store_picture(FILES_SURFACE, path.clone(), bytes).await {
+        Ok((width, height)) => Ok(FsPreview {
+            generation,
+            path,
+            text: String::new(),
+            truncated: false,
+            binary: false,
+            picture: true,
+            width: i64::from(width),
+            height: i64::from(height),
+        }),
+        Err(_) => Ok(binary_preview(
+            generation,
+            path,
+            format!("{size} binary bytes · not a decodable picture"),
+        )),
+    }
+}
+
+fn binary_preview(generation: i64, path: String, text: String) -> FsPreview {
+    FsPreview {
+        generation,
+        path,
+        text,
+        truncated: false,
+        binary: true,
+        picture: false,
+        width: 0,
+        height: 0,
+    }
 }
 
 /// The committed snapshot window, newest first.

@@ -378,6 +378,9 @@ view
               preview_binary=fs_preview_binary
               editing=fs_editing
               preview_text=fs_preview_text
+              preview_picture=fs_preview_picture
+              preview_width=fs_preview_width
+              preview_height=fs_preview_height
               dark
             events
               open_message_link -> open_message_link _

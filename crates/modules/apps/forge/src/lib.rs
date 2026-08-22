@@ -942,31 +942,46 @@ impl Forge {
         }))
     }
 
-    fn browse_blob(&self, repo: String, rev: String, path: String) -> Result<ForgeReply, Error> {
-        let name = norm_repo(&repo)?;
-        let path = browse_path(&path, false)?;
-        let Some((repo, commit_oid)) = self.browse_revision(&name, &rev)? else {
+    /// Resolve one browse path to its blob: the exact commit, the object id
+    /// and the object's size from the odb header alone — nothing is read yet,
+    /// so each caller decides against its own cap before a byte moves.
+    fn browse_blob_header(
+        &self,
+        repo: &str,
+        rev: &str,
+        path: &str,
+    ) -> Result<(git2::Repository, Oid, Oid, i64), Error> {
+        let name = norm_repo(repo)?;
+        let Some((repo, commit_oid)) = self.browse_revision(&name, rev)? else {
             return Err(Error::Module(format!("forge: repo {name:?} is unborn")));
         };
-        let commit = bounded_commit(&repo, commit_oid)?;
-        let (parent, file_name) = path.rsplit_once('/').unwrap_or(("", path.as_str()));
-        let tree = bounded_tree_at(&repo, commit.tree_id(), parent)?;
-        let entry = tree.get_name(file_name).ok_or_else(|| {
-            Error::Module(format!("forge: no file {path:?} at revision {commit_oid}"))
-        })?;
-        if entry.kind() != Some(git2::ObjectType::Blob) {
-            return Err(Error::Module(format!("forge: path {path:?} is not a file")));
-        }
-        let odb = repo
+        // Scoped: the commit and tree guards borrow `repo`, which is moved out
+        // below once the entry id is in hand.
+        let entry_id = {
+            let commit = bounded_commit(&repo, commit_oid)?;
+            let (parent, file_name) = path.rsplit_once('/').unwrap_or(("", path));
+            let tree = bounded_tree_at(&repo, commit.tree_id(), parent)?;
+            let entry = tree.get_name(file_name).ok_or_else(|| {
+                Error::Module(format!("forge: no file {path:?} at revision {commit_oid}"))
+            })?;
+            if entry.kind() != Some(git2::ObjectType::Blob) {
+                return Err(Error::Module(format!("forge: path {path:?} is not a file")));
+            }
+            entry.id()
+        };
+        let (size, kind) = repo
             .odb()
-            .map_err(|error| Error::Module(error.to_string()))?;
-        let (size, kind) = odb
-            .read_header(entry.id())
+            .and_then(|odb| odb.read_header(entry_id))
             .map_err(|error| Error::Module(error.to_string()))?;
         if kind != git2::ObjectType::Blob {
             return Err(Error::Module(format!("forge: path {path:?} is not a blob")));
         }
-        let size = count_i64(size)?;
+        Ok((repo, commit_oid, entry_id, count_i64(size)?))
+    }
+
+    fn browse_blob(&self, repo: String, rev: String, path: String) -> Result<ForgeReply, Error> {
+        let path = browse_path(&path, false)?;
+        let (repo, commit_oid, entry_id, size) = self.browse_blob_header(&repo, &rev, &path)?;
         if usize::try_from(size).unwrap_or(usize::MAX) > MAX_BLOB_BYTES {
             return Ok(ForgeReply::Blob(BlobReply {
                 rev: commit_oid.to_string(),
@@ -977,8 +992,11 @@ impl Forge {
                 binary: false,
             }));
         }
+        let odb = repo
+            .odb()
+            .map_err(|error| Error::Module(error.to_string()))?;
         let object = odb
-            .read(entry.id())
+            .read(entry_id)
             .map_err(|error| Error::Module(error.to_string()))?;
         let readable = std::str::from_utf8(object.data())
             .ok()
@@ -994,6 +1012,53 @@ impl Forge {
             size,
             truncated: false,
             binary,
+        }))
+    }
+
+    /// One page of a blob's bytes: `[offset, offset + len)` clamped to the
+    /// object, `len` to [`MAX_BLOB_PAGE_BYTES`]. An object past
+    /// [`MAX_BLOB_BYTES_PAGED`] answers `eof` with no bytes and its true
+    /// `size` — the caller reads the refusal off the size, and the node never
+    /// loads it. ponytail: every page re-reads the whole object from the odb
+    /// (a 16 MiB blob costs 16 reads); stream it if that ever shows up.
+    fn browse_blob_bytes(
+        &self,
+        repo: String,
+        rev: String,
+        path: String,
+        offset: u64,
+        len: u64,
+    ) -> Result<ForgeReply, Error> {
+        use base64::Engine as _;
+        let path = browse_path(&path, false)?;
+        let (repo, commit_oid, entry_id, size) = self.browse_blob_header(&repo, &rev, &path)?;
+        let rev = commit_oid.to_string();
+        let too_large = usize::try_from(size).unwrap_or(usize::MAX) > MAX_BLOB_BYTES_PAGED;
+        if too_large {
+            return Ok(ForgeReply::BlobBytes(BlobBytesReply {
+                rev,
+                path,
+                b64: String::new(),
+                size,
+                eof: true,
+            }));
+        }
+        let odb = repo
+            .odb()
+            .map_err(|error| Error::Module(error.to_string()))?;
+        let object = odb
+            .read(entry_id)
+            .map_err(|error| Error::Module(error.to_string()))?;
+        let data = object.data();
+        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(data.len());
+        let len = usize::try_from(len).unwrap_or(usize::MAX).min(MAX_BLOB_PAGE_BYTES);
+        let end = start.saturating_add(len).min(data.len());
+        Ok(ForgeReply::BlobBytes(BlobBytesReply {
+            rev,
+            path,
+            b64: base64::engine::general_purpose::STANDARD.encode(&data[start..end]),
+            size,
+            eof: end == data.len(),
         }))
     }
 }
@@ -1469,6 +1534,15 @@ impl Module for Forge {
             ForgeQuery::Blob { repo, rev, path } => {
                 Ok(encode_reply(&self.browse_blob(repo, rev, path)?))
             }
+            ForgeQuery::BlobBytes {
+                repo,
+                rev,
+                path,
+                offset,
+                len,
+            } => Ok(encode_reply(
+                &self.browse_blob_bytes(repo, rev, path, offset, len)?,
+            )),
         }
     }
 
@@ -3059,6 +3133,63 @@ mod tests {
         assert_eq!(pinned.rev, first.to_string());
         assert_eq!(pinned.text, "pub fn one() {}\n");
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The picture viewer's read: pages of `blob_bytes` concatenate to the
+    /// exact object, `eof` fires on the page that reaches its end, a page past
+    /// the end is empty-and-eof, and `size` always names the whole object.
+    #[test]
+    fn blob_bytes_pages_concatenate_to_the_whole_object() {
+        use base64::Engine as _;
+        let base = tmp_base("blob-bytes");
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+        // A NUL up front makes it binary for `blob`; `blob_bytes` does not care.
+        let content = "\0PNG-ish bytes, not text, long enough to page\n";
+        seed_materialized_commit(&mut forge, 1, "demo", "logo.png", content, "main");
+        let rev = git_head_oid(&base, "demo").to_string();
+        let page = |offset: u64, len: u64| {
+            let ForgeReply::BlobBytes(page) = query_reply(
+                &forge,
+                ForgeQuery::BlobBytes {
+                    repo: "demo".into(),
+                    rev: rev.clone(),
+                    path: "logo.png".into(),
+                    offset,
+                    len,
+                },
+            )
+            .unwrap()
+            else {
+                panic!("wrong blob_bytes reply")
+            };
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(page.b64)
+                .unwrap();
+            (bytes, page.eof, page.size)
+        };
+        let total = content.len() as u64;
+        let (first, first_eof, size) = page(0, 10);
+        let (rest, rest_eof, _) = page(10, 4096);
+        assert_eq!(size, total as i64);
+        assert!(!first_eof && rest_eof);
+        assert_eq!([first, rest].concat(), content.as_bytes());
+        let (past, past_eof, _) = page(total + 5, 10);
+        assert!(past.is_empty() && past_eof, "a page past the end is empty and final");
+
+        let ForgeReply::Blob(blob) = query_reply(
+            &forge,
+            ForgeQuery::Blob {
+                repo: "demo".into(),
+                rev: rev.clone(),
+                path: "logo.png".into(),
+            },
+        )
+        .unwrap()
+        else {
+            panic!("wrong blob reply")
+        };
+        assert!(blob.binary, "the text lane still brands it binary");
         let _ = std::fs::remove_dir_all(&base);
     }
 

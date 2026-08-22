@@ -7,7 +7,7 @@
 // props, interaction-local state stays here, and only application effects leave
 // as named events.
 
-component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, bind draft:editor, preview_text:str, dark:bool)
+component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, bind draft:editor, preview_text:str, dark:bool, preview_picture:bool, preview_width:i64, preview_height:i64)
   lifetime retained
   emits
     open_message_link(str)
@@ -427,7 +427,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
                             size=12.5
                             wrap=none
                             @text-caption
-                      if !preview_binary && !editing && !preview_truncated
+                      if !preview_binary && !preview_picture && !editing && !preview_truncated
                         button "Edit" -> emit(fs_begin_edit)
                           with
                             h=22.0
@@ -485,9 +485,18 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
                             // numbered, syntect-coloured rows through
                             // `forge_code`. Binary-or-text is the wire's
                             // call; markdown-vs-code is the path's.
-                            if !preview_binary && markdown_path(preview_path)
+                            // A picture draws from the Files surface's slot
+                            // (`picture.rs`); its caption is the drawn size.
+                            if preview_picture
+                              extern picture("files", preview_path) #fs-picture
+                              text picture_caption(preview_width, preview_height)
+                                with
+                                  size=12.0
+                                  wrap=none
+                                  @text-meta
+                            if !preview_binary && !preview_picture && markdown_path(preview_path)
                               extern agent_markdown(preview_text, dark) #fs-markdown -> emit(open_message_link, _)
-                            if !preview_binary && !markdown_path(preview_path)
+                            if !preview_binary && !preview_picture && !markdown_path(preview_path)
                               lazy preview_text by preview_text, preview_path, dark as cached_source
                                 extern forge_code(cached_source, preview_path, dark) #fs-code
       if connected

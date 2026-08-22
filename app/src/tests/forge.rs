@@ -275,6 +275,35 @@ fn forge_layout_keeps_repo_navigation_compact() {
     assert_eq!(screen.matches("BackToList kind=forge_item_kind").count(), 1);
 }
 
+/// THE FORGE READER DRAWS A PICTURE THROUGH THE SAME VIEWER THE FILES PREVIEW
+/// MOUNTS. `forge_blob` decides by path and parks the decoded handle under the
+/// forge surface; the screen draws it in its own arm, and neither text arm
+/// fires for it. A pick clears the previous file's picture flag before the
+/// read, as it already does for `binary`.
+#[test]
+fn the_forge_reader_draws_a_picture_through_the_viewer() {
+    let screen = inlined(include_str!("../ui/screens/forge.ice"));
+    assert!(
+        screen.contains("extern picture(\"forge\", file_path) #forge-picture"),
+        "the reader mounts the viewer"
+    );
+    assert!(
+        screen.contains("&& !file_binary && !file_picture && markdown_path(file_path)")
+            && screen.contains("&& !file_binary && !file_picture && !markdown_path(file_path)"),
+        "neither text arm fires for a picture"
+    );
+    let open_file = screen
+        .split_once("on open_file(")
+        .expect("the handler")
+        .1
+        .split_once("\n  on ")
+        .expect("the handler ends")
+        .0;
+    let cleared = open_file.find("file_picture = false").expect("the flag is cleared");
+    let read = open_file.find("run replace lane=blob").expect("the read");
+    assert!(cleared < read, "cleared before the read is issued");
+}
+
 /// Source and patch rows are one code-reading surface. The source rows render
 /// in the backend extern `forge_code` now (syntax colour needs per-span inks
 /// Ice cannot carry), but their metrics and the diff's must not drift apart:
@@ -640,6 +669,9 @@ fn a_blob_for_another_file_does_not_paint_the_open_one() {
                 truncated: false,
                 binary: false,
                 lines: 1,
+                picture: false,
+                width: 0,
+                height: 0,
             },
         )
     };

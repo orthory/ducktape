@@ -617,6 +617,11 @@ pub struct BlobView {
     pub truncated: bool,
     pub binary: bool,
     pub lines: i64,
+    /// The blob is a decoded picture in the forge surface's slot
+    /// (`picture.rs`), drawn at `width` × `height`; `text` is empty.
+    pub picture: bool,
+    pub width: i64,
+    pub height: i64,
 }
 
 pub(crate) fn tree_data(
@@ -674,6 +679,9 @@ pub(crate) fn blob_view(reply: serde_json::Value, repo: String) -> Result<BlobVi
         truncated: blob.truncated,
         binary: blob.binary,
         lines,
+        picture: false,
+        width: 0,
+        height: 0,
     })
 }
 
@@ -699,7 +707,9 @@ pub async fn forge_tree(
     .map_err(app_error)
 }
 
-/// Read one bounded file preview at the tree's exact revision on the node.
+/// Read one file at the tree's exact revision on the node: a picture (by
+/// path — `picture_path`) pages its bytes through `blob_bytes` and decodes
+/// into the forge surface's slot; anything else is the bounded text preview.
 pub async fn forge_blob(
     rpc: String,
     repo: String,
@@ -708,16 +718,104 @@ pub async fn forge_blob(
 ) -> Result<BlobView, AppError> {
     async {
         let client = rpc_client(&rpc)?;
-        let query = serde_json::json!({ "blob": {
-            "repo": &repo,
-            "rev": &rev,
-            "path": &path,
-        }});
-        let reply = client.query("forge", &query).await?;
-        blob_view(reply, repo)
+        match super::picture::picture_path(path.clone()) {
+            true => forge_picture(&client, repo, rev, path).await,
+            false => forge_text(&client, repo, rev, path).await,
+        }
     }
     .await
     .map_err(app_error)
+}
+
+async fn forge_text(
+    client: &RpcClient,
+    repo: String,
+    rev: String,
+    path: String,
+) -> Result<BlobView, String> {
+    let query = serde_json::json!({ "blob": {
+        "repo": &repo,
+        "rev": &rev,
+        "path": &path,
+    }});
+    let reply = client.query("forge", &query).await?;
+    blob_view(reply, repo)
+}
+
+/// Page a picture blob in (1 MiB `blob_bytes` pages to eof), decode it off
+/// the runtime, park the handle. The node refuses an object past its paged
+/// cap with an empty final page — that, the app's own byte cap, and a body
+/// that does not decode all land on the binary plate, never a failed load.
+async fn forge_picture(
+    client: &RpcClient,
+    repo: String,
+    rev: String,
+    path: String,
+) -> Result<BlobView, String> {
+    use super::picture::{FORGE_SURFACE, MAX_PICTURE_BYTES, store_picture};
+    let mut bytes = Vec::new();
+    // Page 1 asks by the caller's rev (a branch name or an oid); every later
+    // page asks by the exact oid page 1 answered, so a branch that moves
+    // mid-read cannot hand back pages of two different commits.
+    let mut rev = rev;
+    loop {
+        let query = serde_json::json!({ "blob_bytes": {
+            "repo": &repo,
+            "rev": &rev,
+            "path": &path,
+            "offset": bytes.len() as u64,
+            "len": forge::MAX_BLOB_PAGE_BYTES as u64,
+        }});
+        let reply: serde_json::Value = client.query("forge", &query).await?;
+        let page = reply
+            .get("blob_bytes")
+            .cloned()
+            .ok_or_else(|| "the requested file was not found".to_string())?;
+        let page: forge::BlobBytesReply =
+            serde_json::from_value(page).map_err(|error| error.to_string())?;
+        rev = page.rev;
+        let chunk = super::storage::base64_decode(&page.b64).unwrap_or_default();
+        bytes.extend_from_slice(&chunk);
+        let refused = page.eof && bytes.is_empty();
+        let past_cap = bytes.len() > MAX_PICTURE_BYTES;
+        if refused || past_cap {
+            return Ok(binary_blob(repo, rev, path, true));
+        }
+        let done = page.eof || chunk.is_empty();
+        if done {
+            break;
+        }
+    }
+    match store_picture(FORGE_SURFACE, path.clone(), bytes).await {
+        Ok((width, height)) => Ok(BlobView {
+            repo,
+            rev,
+            path,
+            text: String::new(),
+            truncated: false,
+            binary: false,
+            lines: 0,
+            picture: true,
+            width: i64::from(width),
+            height: i64::from(height),
+        }),
+        Err(_) => Ok(binary_blob(repo, rev, path, false)),
+    }
+}
+
+fn binary_blob(repo: String, rev: String, path: String, truncated: bool) -> BlobView {
+    BlobView {
+        repo,
+        rev,
+        path,
+        text: String::new(),
+        truncated,
+        binary: true,
+        lines: 0,
+        picture: false,
+        width: 0,
+        height: 0,
+    }
 }
 
 /// True when one live update invalidates forge state: a folded forge op, a

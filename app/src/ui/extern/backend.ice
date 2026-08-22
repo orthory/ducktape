@@ -164,7 +164,7 @@ extern crate::backend
   FsEntry(key:i64, path:str, name:str, kind:str, size:i64, object:str)
   FsSnapshot(id:str, short_id:str, author:str, height:i64, message:str)
   FsListing(generation:i64, path:str, entries:[FsEntry])
-  FsPreview(generation:i64, path:str, text:str, truncated:bool, binary:bool)
+  FsPreview(generation:i64, path:str, text:str, truncated:bool, binary:bool, picture:bool, width:i64, height:i64)
   FsHistory(generation:i64, snapshots:[FsSnapshot])
   pure no_fs_entry() -> FsEntry
   pure fs_entry_named(entries:[FsEntry], path:str) -> FsEntry
@@ -260,7 +260,7 @@ extern crate::backend
   load_forge_discussion(rpc:str, channel_id:str) -> ForgeDiscussionData ! AppError
   TreeEntry(name:str, path:str, kind:str)
   ForgeTreeData(repo:str, rev:str, path:str, born:bool, entries:[TreeEntry], truncated:bool)
-  BlobView(repo:str, rev:str, path:str, text:str, truncated:bool, binary:bool, lines:i64)
+  BlobView(repo:str, rev:str, path:str, text:str, truncated:bool, binary:bool, lines:i64, picture:bool, width:i64, height:i64)
   forge_tree(rpc:str, repo:str, rev:str, path:str) -> ForgeTreeData ! AppError
   forge_blob(rpc:str, repo:str, rev:str, path:str) -> BlobView ! AppError
   ForgeDraftComment(anchor:str, path:str, line:str, side:str, body:str)
@@ -282,6 +282,9 @@ extern crate::backend
   pure diff_lines(diff:str) -> [DiffLine]
   component forge_code(source:str, path:str, dark:bool) -> unit
   pure markdown_path(path:str) -> bool
+  pure picture_path(path:str) -> bool
+  pure picture_caption(width:i64, height:i64) -> str
+  component picture(surface:str, path:str) -> unit
   pure filter_forge_items(items:[ForgeItem], tab:ForgeTab) -> [ForgeItem]
   pure forge_open_count(items:[ForgeItem], kind:str) -> i64
   pure forge_merge_note(merge_oid:str, branches:str) -> str

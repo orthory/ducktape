@@ -149,6 +149,17 @@ pub enum ForgeQuery {
         rev: String,
         path: String,
     },
+    /// one page of a file's raw bytes at the same revision boundary — the
+    /// picture viewer's read. `len` is clamped to [`MAX_BLOB_PAGE_BYTES`]; an
+    /// object past [`MAX_BLOB_BYTES_PAGED`] is refused whole (`eof` with no
+    /// bytes), never materialized.
+    BlobBytes {
+        repo: String,
+        rev: String,
+        path: String,
+        offset: u64,
+        len: u64,
+    },
 }
 
 /// the git oid hex of a repo's HEAD (a 40-char sha1 oid), or `None` on an unborn
@@ -178,6 +189,8 @@ pub enum ForgeReply {
     Tree(TreeReply),
     /// a bounded text preview (the reply to [`ForgeQuery::Blob`]).
     Blob(BlobReply),
+    /// the reply to [`ForgeQuery::BlobBytes`].
+    BlobBytes(BlobBytesReply),
 }
 
 /// Maximum entries returned by one [`ForgeQuery::Tree`] call.
@@ -186,6 +199,13 @@ pub const MAX_TREE_ENTRIES: usize = 1_000;
 pub const MAX_TREE_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum bytes materialized and returned by one [`ForgeQuery::Blob`] call.
 pub const MAX_BLOB_BYTES: usize = 64 * 1024;
+/// Maximum bytes one [`ForgeQuery::BlobBytes`] page carries (before base64) —
+/// the same page duckfs's `read` lane serves.
+pub const MAX_BLOB_PAGE_BYTES: usize = 1024 * 1024;
+/// Largest object [`ForgeQuery::BlobBytes`] will page through at all: the
+/// picture viewer's ceiling, so one path cannot make the node read a
+/// multi-hundred-MiB blob a page at a time.
+pub const MAX_BLOB_BYTES_PAGED: usize = 16 * 1024 * 1024;
 
 /// One directory at one exact commit. An unborn repo has `born == false`, an
 /// empty `rev`, and no entries; otherwise `rev` is the resolved commit oid.
@@ -224,6 +244,18 @@ pub struct BlobReply {
     pub size: i64,
     pub truncated: bool,
     pub binary: bool,
+}
+
+/// One page of raw blob bytes. `size` always describes the full object; `eof`
+/// says the page reached its end (or the object was refused — then `b64` is
+/// empty and `size` says why).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct BlobBytesReply {
+    pub rev: String,
+    pub path: String,
+    pub b64: String,
+    pub size: i64,
+    pub eof: bool,
 }
 
 /// Maximum UTF-8 bytes returned in [`PrDiff::patch`]. The limit is fixed by the
@@ -334,6 +366,13 @@ mod tests {
             rev: "1".repeat(40),
             path: "src/lib.rs".into(),
         };
+        let bytes_query = ForgeQuery::BlobBytes {
+            repo: "docs".into(),
+            rev: "1".repeat(40),
+            path: "logo.png".into(),
+            offset: 1024 * 1024,
+            len: 4096,
+        };
         for q in [
             ForgeQuery::Head,
             ForgeQuery::HeadOf {
@@ -342,6 +381,7 @@ mod tests {
             ForgeQuery::ListRepos,
             tree_query.clone(),
             blob_query,
+            bytes_query,
         ] {
             assert_eq!(decode_query(&encode_query(&q)).unwrap(), q);
         }

@@ -754,6 +754,9 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
     file_text = ""
     file_binary = false
     file_truncated = false
+    file_picture = false
+    file_width:i64 = 0
+    file_height:i64 = 0
     failed_note = ""
     opened_dir = ""
     opened_rev = ""
@@ -787,6 +790,7 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
     // `binary` would brand the next blob "not text" until its load settles.
     file_binary = false
     file_truncated = false
+    file_picture = false
     failed_note = ""
     phase = ForgeFilePhase.loading
     run replace lane=blob forge_blob(rpc, repo_now, rev, path) -> file_loaded _ | file_failed _
@@ -795,6 +799,9 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
     file_text = next.text
     file_binary = next.binary
     file_truncated = next.truncated
+    file_picture = next.picture
+    file_width = next.width
+    file_height = next.height
     phase = ForgeFilePhase.ready
   on file_failed(cause)
     phase = ForgeFilePhase.failed
@@ -948,6 +955,23 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
             with
               name=file_path
               note="This is not text — the reader shows no preview for it."
+        // A PICTURE DRAWS FROM THE FORGE SURFACE'S SLOT (`picture.rs`):
+        // `forge_blob` paged and decoded it, and the caption is the drawn
+        // size. The same viewer the Files preview mounts.
+        if phase == ForgeFilePhase.ready && !empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && !file_binary && file_picture
+          col
+            with
+              w=fill
+              px=16.0
+              pt=13.0
+              pb=13.0
+              gap=9.0
+            extern picture("forge", file_path) #forge-picture
+            text picture_caption(file_width, file_height)
+              with
+                size=11.5
+                wrap=none
+                @text-label
         // A MARKDOWN BLOB READS AS A DOCUMENT, not a line
         // listing: a README is the first file every repo page
         // opens, and the shell's agent answers already ship
@@ -957,7 +981,7 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
         // messages already use. Markdown-vs-code is the
         // path's call (`markdown_path`) because the wire only
         // says binary-or-text.
-        if phase == ForgeFilePhase.ready && !empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && !file_binary && markdown_path(file_path)
+        if phase == ForgeFilePhase.ready && !empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && !file_binary && !file_picture && markdown_path(file_path)
           col
             with
               w=fill
@@ -972,7 +996,7 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
                   size=11.5
                   wrap=none
                   @text-label
-        if phase == ForgeFilePhase.ready && !empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && !file_binary && !markdown_path(file_path)
+        if phase == ForgeFilePhase.ready && !empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && !file_binary && !file_picture && !markdown_path(file_path)
           col
             with
               w=fill
