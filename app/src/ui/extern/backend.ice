@@ -170,6 +170,7 @@ extern crate::backend
   DuckLink(kind:DuckKind, repo:str, number:i64, seq:i64, page:str, channel:str, path:str, rev:str)
   pure classify_duck_link(url:str) -> DuckLink
   pure forge_focus_kind(number:i64, path:str) -> ForgeFocus
+  pure linked_note(discussion:[ChatMessage], focus:i64) -> ChatMessage?
   duck_echo_str(value:str) -> str ! AppError
   duck_echo_i64(value:i64) -> i64 ! AppError
   pure no_fs_entry() -> FsEntry

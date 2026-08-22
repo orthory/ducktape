@@ -48,7 +48,7 @@ chat parser marks only `https?://`), so the agent runtime sees the same bytes.
 |---|---|---|---|---|
 | `page` | `/<id>` (one segment) | live store title, else raw id | `openPage` + `setScreen("pages")` | page subtree (current) |
 | `files` | `/shared/attachments/<dir>/<name>` | filename chip; `![…]` image embeds | download / inline preview (current) | committed text (current) |
-| `forge` | `/<repo>` or `/<repo>/<n>` (`n`, `seq` = decimal digits); `#<seq>` anchors a Discussion message; `/<repo>/blob/<path>[@<rev>]` names a committed file (`rev` = oid or branch, default head; no dot-segments) | `<repo>` or `<repo>#<n>`; a blob `![…]` embeds the picture | `openForgeItem({repo, number, messageSeq})` — the existing one-shot `forgeFocus` hand-off; a blob opens the Code tab's reader on that file (at the tree's head — the browser does not pin `@rev`) | none (nav-only) |
+| `forge` | `/<repo>` or `/<repo>/<n>` (`n`, `seq` = decimal digits); `#<seq>` anchors a Discussion message; `/<repo>/blob/<path>[@<rev>]` names a committed file (`rev` = exact 40-hex oid, default head; no dot-segments) | `<repo>` or `<repo>#<n>`; a blob `![…]` embeds the picture | `openForgeItem({repo, number, messageSeq})` — the existing one-shot `forgeFocus` hand-off (`#seq` highlights the Discussion note); a blob opens the Code tab's reader on that file, the tree moved to its directory at `@rev` | none (nav-only) |
 | `channel` | `/<id>` (ids may contain `:`); `#<seq>` anchors a message | `#<name>` from the store, else raw id | `selectChannel` / `focusMessage(id, seq)` (scroll+flash); `forge:<repo>:<n>` ids reroute to the forge item via the existing `forgeItemTarget` helper | none (nav-only) |
 
 Reserved names: `memory` (agent-side evidence URIs, Rust-only), every dotted

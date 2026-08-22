@@ -1243,8 +1243,9 @@ fn every_current_row_marker_rests_on_one_selection_token() {
     // directory and the open object, the tree file and the repo switcher, the
     // matrix column head, the network you picked, the nav rail tab and
     // Settings, the member whose card is open, the Explorer block you
-    // inspected. A source that drops off this list has either lost its mark or
-    // invented a second token for it; both are the bug this test exists for.
+    // inspected, the Discussion note a deep link landed on. A source that
+    // drops off this list has either lost its mark or invented a second
+    // token for it; both are the bug this test exists for.
     assert_eq!(
         carriers,
         [
@@ -1256,6 +1257,7 @@ fn every_current_row_marker_rests_on_one_selection_token() {
             "ui/components/onboarding.ice",
             "ui/components/pages.ice",
             "ui/components/shell.ice",
+            "ui/screens/forge.ice",
             "ui/screens/roster.ice",
             "ui/screens/shell.ice",
             "ui/screens/storage.ice",

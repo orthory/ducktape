@@ -17,7 +17,7 @@ enum ForgeTreePhase
   ready
   failed
 
-component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[ForgeRepo], list_phase:ForgePhase, open_repo:str, repo_menu:bool, repo_phase:ForgePhase, branches:[str], tab:ForgeTab, items:[ForgeItem], forge_item_number:i64, item_phase:ForgePhase, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:ForgeReviewVerdict, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, connected:bool, loading:bool, dark:bool)
+component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[ForgeRepo], list_phase:ForgePhase, open_repo:str, repo_menu:bool, repo_phase:ForgePhase, branches:[str], tab:ForgeTab, items:[ForgeItem], forge_item_number:i64, item_phase:ForgePhase, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:ForgeReviewVerdict, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, linked_note:ChatMessage?, connected:bool, loading:bool, dark:bool)
   emits
     forge_open_repo(str)
     forge_close_repo()
@@ -336,7 +336,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
           box w=fill h=fill p=16.0
             EmptyPlate message="Could not load this item. Go back and open it again to retry."
         if forge_item_number > 0 && item_phase == ForgePhase.ready
-          scroll
+          scroll #item-detail
             with
               dir=vertical
               w=fill
@@ -669,6 +669,18 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                         @primary_action
               col w=fill gap=9.0
                 GroupLabel label="DISCUSSION"
+                // THE NOTE A LINK LANDED ON, once, above the list. A plate on
+                // the row itself would cost every discussion row a wrapper
+                // (a conditional must sit under a layout node), which the
+                // forge PR screen's allocation ceiling refuses — so the
+                // landing is this card, and the list below stays as it was.
+                match linked_note
+                  some(note)
+                    LinkedNote note=note
+                      forward
+                        open_message_link
+                  none
+                    space w=0.0 h=0.0
                 if empty(discussion)
                   text "No discussion yet." size=12.5 @text-caption
                 keyed message in discussion by=message.seq virtual-row=44.0 w=fill gap=9.0
@@ -739,6 +751,53 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
 // directory AND revision it was opened under (`forge_file_header`), so
 // navigating away or a tree that reloaded at a newer commit retires it by
 // moving the ground under it.
+// The Discussion note a `duck://forge/<repo>/<n>#<seq>` link landed on,
+// on the one current-row plate, with its own row markup (the list's rows
+// live under a keyed lazy the note cannot share).
+component LinkedNote(note:ChatMessage)
+  emits
+    open_message_link(str)
+  box #root
+    with
+      w=fill
+      bg=selected_row
+      r=8.0
+      p=8.0
+    col w=fill gap=6.0
+      text "Linked note"
+        with
+          size=11.0
+          wrap=none
+          @text-caption
+      row
+        with
+          w=fill
+          gap=9.0
+          align=start
+        MessageAvatar initials=note.initial kind=note.avatar_kind
+        col w=fill gap=2.0
+          row
+            with
+              w=fill
+              gap=7.0
+              align=center
+            text note.author
+              with
+                size=13.0
+                wrap=none
+                font=display
+                @text-fg
+            text note.meta
+              with
+                size=11.0
+                wrap=none
+                font=code_medium
+                @text-meta
+            space w=fill
+          MessageBody message=note
+            forward
+              open_message_link
+
 component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:bool)
   emits
     open_message_link(str)
@@ -790,19 +849,24 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
     run every duck_echo_str(path) -> open_file(focus_rpc, focus_online, focus_repo, tree_rev, tree_path, _) | file_failed _
   on tree_failed(cause)
     tree_phase = ForgeTreePhase.failed
-  // A `duck://forge/<repo>/blob/<path>` deep link. The reader's header gates
-  // on the TREE's revision, which only this instance knows — so the file
-  // opens here, at once if the tree has landed, else from `tree_loaded`.
-  // The link's `@rev` is not honoured by the browser (it pins its head);
-  // the markdown image loader does honour it.
-  on focus_file(rpc, online, repo_now, path)
+  // A `duck://forge/<repo>/blob/<path>[@<rev>]` deep link. The reader's
+  // header gates on the TREE's revision and directory, which only this
+  // instance knows — so the browser first moves its tree to the file's
+  // directory (pinned to `@rev` when the link names one, else wherever the
+  // tree already is), and `tree_loaded` opens the file under that tree.
+  // One path whether or not a tree had landed yet.
+  on focus_file(rpc, online, repo_now, path, rev)
+    return if !online || empty(repo_now)
     focus_rpc = rpc
     focus_online = online
     focus_repo = repo_now
     focus_path = path
-    return if tree_phase != ForgeTreePhase.ready
-    focus_path = ""
-    run every duck_echo_str(path) -> open_file(focus_rpc, focus_online, focus_repo, tree_rev, tree_path, _) | file_failed _
+    tree_path = fs_parent(path)
+    tree_rev = keep_str(!empty(rev), rev, tree_rev)
+    tree_entries = []
+    tree_truncated = false
+    tree_phase = ForgeTreePhase.loading
+    run replace lane=tree forge_tree(rpc, repo_now, tree_rev, tree_path) -> tree_loaded _ | tree_failed _
   on open_file(rpc, online, repo_now, rev, dir, path)
     return if !online || empty(repo_now)
     opened_dir = dir

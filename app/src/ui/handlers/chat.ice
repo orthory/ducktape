@@ -885,16 +885,22 @@ on open_message_link(url)
     DuckKind.forge_repo
       forge_focus_number = 0
       forge_focus_path = ""
+      forge_focus_rev = ""
+      forge_focus_seq = 0
       shell_tab = ShellTab.forge
       run every duck_echo_str(link.repo) -> forge_open_repo _ | external_url_failed _
     DuckKind.forge_item
       forge_focus_number = link.number
       forge_focus_path = ""
+      forge_focus_rev = ""
+      forge_focus_seq = link.seq
       shell_tab = ShellTab.forge
       run every duck_echo_str(link.repo) -> forge_open_repo _ | external_url_failed _
     DuckKind.forge_blob
       forge_focus_number = 0
       forge_focus_path = link.path
+      forge_focus_rev = link.rev
+      forge_focus_seq = 0
       shell_tab = ShellTab.forge
       run every duck_echo_str(link.repo) -> forge_open_repo _ | external_url_failed _
     DuckKind.channel

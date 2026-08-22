@@ -412,7 +412,7 @@ view
         agents:
           AgentsScreen rows=agents_rows connected answered=agents_answered #agents
         forge:
-          ForgeScreen review_draft<->forge_review_draft comment_draft<->forge_comment_draft discussion_editor<->forge_discussion_editor
+          ForgeScreen review_draft<->forge_review_draft comment_draft<->forge_comment_draft discussion_editor<->forge_discussion_editor #forge
             with
               org=network_name
               about=account_bio
@@ -453,6 +453,7 @@ view
               staged_comments=forge_comment_staged
               discussion=forge_discussion
               discussion_pending=forge_discussion_pending
+              linked_note=forge_linked_note
               connected
               loading
               dark
