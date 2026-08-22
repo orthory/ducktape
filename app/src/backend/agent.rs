@@ -1043,7 +1043,11 @@ impl AgentMarkdown {
         Self {
             items: markdown::parse(source).collect::<Vec<_>>().into(),
             settings,
-            viewer: SelectViewer { doc: None },
+            viewer: SelectViewer {
+                doc: None,
+                key: document_key(source),
+                blocks: std::cell::Cell::new(0),
+            },
         }
     }
 
@@ -1054,21 +1058,52 @@ impl AgentMarkdown {
     }
 
     fn view(&self) -> Element<'_, String> {
+        // The blocks are numbered by the order the viewer is asked for them,
+        // which is the document's reading order — nested lists and quotes
+        // route their items back through the same viewer. `view` is built
+        // many times a frame (tag, layout, update, draw), so the count starts
+        // over here: the same document always numbers its blocks the same.
+        self.viewer.blocks.set(0);
         iced::widget::markdown::view_with(self.items.iter(), self.settings, &self.viewer)
     }
 }
 
 /// The Markdown surface with draggable text: every paragraph and heading
-/// behind a [`SelectRich`] (one block is one selection, like the app's plain
-/// Ice `text`), every code block one [`CodeSelect`] so a drag runs across
-/// its lines. Lists, quotes and tables keep iced's default look and route
-/// their text back through here. An image draws the picture `forge_blob`
-/// parked under `doc` for its URL as written (relative path, `duck://files`,
+/// behind a [`SelectRich`], every code block one [`CodeSelect`], and each of
+/// them numbered into ONE document ([`SelectPlace`]) — so a drag that starts
+/// in a heading and ends in a code block selects everything between them, and
+/// Ctrl+C copies the run whole. Lists, quotes and tables keep iced's default
+/// look and route their text back through here, which numbers their items in
+/// with the rest. An image draws the picture `forge_blob` parked under `doc`
+/// for its URL as written (relative path, `duck://files`,
 /// `duck://forge/.../blob/...`), and keeps iced's default (the alt text in a
 /// plate) for everything else — including every image when there is no
 /// document, as in the agent's answers.
 struct SelectViewer {
     doc: Option<String>,
+    /// The document every block of this surface shares a selection in, keyed
+    /// by its own text, and the running count that gives each block its place
+    /// in reading order.
+    key: u64,
+    blocks: std::cell::Cell<usize>,
+}
+
+impl SelectViewer {
+    /// The next block's place, in reading order.
+    fn next(&self) -> SelectPlace {
+        let ordinal = self.blocks.get();
+        self.blocks.set(ordinal + 1);
+        SelectPlace::block(self.key, ordinal)
+    }
+}
+
+/// A Markdown document's selection key: its own text. Two documents spelling
+/// the same bytes on screen at once show one selection twice — the whole cost
+/// of not threading an identity down through iced's viewer.
+fn document_key(source: &str) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    source.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl<'a> iced::widget::markdown::Viewer<'a, String> for SelectViewer {
@@ -1124,7 +1159,7 @@ impl<'a> iced::widget::markdown::Viewer<'a, String> for SelectViewer {
             true => settings.text_size / 2.0,
             false => iced::Pixels::ZERO,
         };
-        container(SelectRich::new(rich, spans, size))
+        container(SelectRich::new(rich, spans, size).at(self.next()))
             .padding(iced::padding::top(top))
             .into()
     }
@@ -1138,7 +1173,9 @@ impl<'a> iced::widget::markdown::Viewer<'a, String> for SelectViewer {
         let rich = iced::widget::rich_text(spans.clone())
             .on_link_click(Self::on_link_click)
             .size(settings.text_size);
-        SelectRich::new(rich, spans, settings.text_size).into()
+        SelectRich::new(rich, spans, settings.text_size)
+            .at(self.next())
+            .into()
     }
 
     fn code_block(
@@ -1160,7 +1197,8 @@ impl<'a> iced::widget::markdown::Viewer<'a, String> for SelectViewer {
             metrics,
             None,
             Length::Shrink,
-        );
+        )
+        .at(self.next());
         container(
             scrollable(container(plate).padding(settings.code_size)).direction(
                 scrollable::Direction::Horizontal(
