@@ -132,6 +132,45 @@ a restored snapshot is the only thing that skips memmap init. Snapshot/restore
 therefore stays a follow-on for the backend's correctness, but it is a
 **prerequisite for selling large-memory runs at a good latency**.
 
+### Where the time actually goes, and how anyone quotes ~125 ms
+
+Phase split of one cold boot, from process spawn to reap:
+
+```
+  spawn → 'Running Firecracker'     2.8 ms
+  → 'Successfully started'         18.2 ms   kernel load + KVM + devices
+  → guest reaches init            579.5 ms   guest kernel (console on)
+  → 'exiting successfully'        234.3 ms   guest halt + VMM teardown
+  → process reaped                  2.7 ms
+```
+
+**Firecracker's own work is ~21 ms.** Everything else is the guest kernel. So
+the published ~125 ms figures cannot be describing this shape at all — and they
+are not. They are **snapshot restores**, not cold boots. Measured here with
+`ops/firecracker/snapshot-bench.sh`:
+
+| Guest RAM | cold boot | snapshot restore | snapshot create | memory file |
+|---|---|---|---|---|
+| 512 MiB | 428 ms | **12 ms** | 528 ms | 513 MB |
+| 2 GiB | 656 ms | **11 ms** | 2417 ms | 2.1 GB |
+| 8 GiB | 2041 ms | **13 ms** | 12714 ms | 8.1 GB |
+
+Restore is **flat in guest memory** and 35-160× faster than a cold boot. It is
+also faster than the figure everyone quotes, which should be the tell that the
+quoted number includes work this measurement defers.
+
+**Three costs the headline hides, and they are the design's real constraints:**
+
+1. **"Resumed" is not "warm."** The `File` backend mmaps the memory file and
+   faults pages in lazily, which is exactly why restore is flat. The guest's
+   first real work pays that faulting. Production setups use the `Uffd` backend
+   to control it. Do not quote 12 ms to a buyer as a time-to-useful-work.
+2. **Snapshot creation scales badly** — 12.7 s at 8 GiB — and it writes the
+   whole guest memory to disk.
+3. **A snapshot is bound to its machine configuration**, so a node selling
+   1/2/4/8/16 GiB shapes needs one snapshot per shape: ~31 GB of memory files
+   just to hold the set. That is the storage bill for fast starts.
+
 Before/after at realistic run shapes (the cmdline saving is flat, so it matters
 proportionally less as memory grows):
 
@@ -166,6 +205,7 @@ starting point for the "build our own kernel?" open question below.
 | `bin/duck-guest-init/` | new crate — the static guest PID 1. Depends only on `sandbox-host`'s `guest_proto` (a `no-std`-friendly, dependency-light module) and libc. |
 | `ops/firecracker-setup.sh` | new — install the VMM, name the group requirement, verify `/dev/kvm` access. |
 | `ops/firecracker/boot-bench.sh` | **already committed with this plan** — the harness every boot-time number below came from. `MODE=shapes\|compare\|memory`. Re-run it after changing the kernel, the rootfs or the boot args. |
+| `ops/firecracker/snapshot-bench.sh` | **already committed with this plan** — measures snapshot create/restore and the memory file's size on disk. `MEM=<mib>`. |
 | `ops/build-guest-rootfs.sh` | new — build the shared read-only rootfs and fetch/build the guest kernel. |
 | `crates/services/provider/src/lib.rs` | modify — a `RunControl::MicroVm` arm and the boot/teardown call sites. |
 | `bin/node/src/config/resolve.rs` | modify — accept `runtime = "firecracker"`. |
@@ -1072,7 +1112,29 @@ fn pump<R: Read>(reader: &mut R, tx: &std::sync::mpsc::Sender<Frame>, wrap: fn(V
 }
 ```
 
-The `mount_workspace`, `unmount_workspace`, `connect_host` and `power_off` helpers are thin `libc` calls (`mount(2)`, `umount2(2)`, an `AF_VSOCK` connect to CID 2 on `guest_proto::VSOCK_PORT`, and `reboot(RB_POWER_OFF)`). Write them in the same file, each with a `SAFETY:` comment naming why the call is sound.
+The `mount_workspace`, `unmount_workspace`, `connect_host` and `power_off` helpers are thin `libc` calls (`mount(2)`, `umount2(2)`, an `AF_VSOCK` connect to CID 2 on `guest_proto::VSOCK_PORT`, and `reboot(2)`). Write them in the same file, each with a `SAFETY:` comment naming why the call is sound.
+
+**`power_off` must use `LINUX_REBOOT_CMD_RESTART`, not `LINUX_REBOOT_CMD_POWER_OFF`.** This was measured the hard way: Firecracker has no ACPI power button and no PM device, so `POWER_OFF` leaves the guest at `reboot: System halted` and **the VMM never exits** — the run hangs to its idle timeout with its memory still held. `RESTART` goes through the `reboot=k` i8042 reset, which Firecracker does observe, and it exits cleanly. Verified: identical guests differing only in this constant, one hung past a 120 s timeout, the other completed in 428 ms with `Firecracker exiting successfully`.
+
+Note this still works with the i8042 *probing* disabled by the tuned command line — the reset port is untouched; what we skipped was enumerating it as an input device.
+
+```rust
+/// Halt the VM so the VMM exits.
+///
+/// RESTART, not POWER_OFF. Firecracker exposes no ACPI power button, so
+/// POWER_OFF parks the guest at "reboot: System halted" and the VMM lives
+/// on — the run hangs to its idle timeout holding all of its memory.
+/// RESTART goes through the `reboot=k` i8042 reset, which the VMM watches.
+fn power_off() -> ! {
+    // SAFETY: reboot(2) with a valid command; it does not return on success,
+    // and the `loop` covers the failure path so this function's `!` holds.
+    unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_RESTART) };
+    loop {
+        // SAFETY: pause(2) takes no arguments and only blocks.
+        unsafe { libc::pause() };
+    }
+}
+```
 
 `mount_workspace` does more than the workspace. **The rootfs is mounted READ-ONLY and shared across every concurrent run**, so a guest that only mounts `/workspace` cannot write `/tmp`, `/var/tmp` or `$HOME` — and an agent CLI writes all three within seconds of starting. Mount a tmpfs over each before exec:
 
@@ -1699,7 +1761,7 @@ and never from a probe."
 
 ## Follow-on plans (not this one)
 
-- **Snapshot/restore.** Boot once, snapshot after init, restore per run with COW-mapped base pages. The backend is correct without it, so it is not a blocker — but it is the **only** fix for the memory-scaling cost measured above (a restored snapshot does not re-run memmap init), so it becomes a prerequisite the moment a node wants to sell large-`mem_gb` runs at a good latency. Measure the restore path here rather than quoting a figure; every other number in this plan was measured and two of the three quoted ones turned out wrong.
+- **Snapshot/restore.** Already measured (see above): restore is ~12 ms and flat in guest memory, against a 428 ms - 2 s cold boot. The backend is correct without it, so it is not a blocker for shipping — but it is the only fix for the memory-scaling cost, so it becomes a prerequisite the moment a node sells large-`mem_gb` runs at a competitive start latency. The work in that plan is **not** the restore call; it is the three costs around it: a `Uffd` memory backend so the first work is not paying lazy page faults, a build step that produces one snapshot per machine shape, and a store for the resulting memory files (~31 GB for a 1/2/4/8/16 GiB ladder) with invalidation keyed to the rootfs version.
 - **Egress logging and the public-egress toggle.** Spec step 3's remaining half.
 - **Remove the podman path.** Spec step 4: `PodmanService`, the libpod client, the attach framing, and `pasta`/`conmon` from the probe. Deliberately last — until the Firecracker path has run real work, podman is the working backend.
 

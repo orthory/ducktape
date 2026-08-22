@@ -154,12 +154,42 @@ it reports itself: `node 0 deferred pages initialised in 1304ms` at 16 GiB.
 `CONFIG_DEFERRED_STRUCT_PAGE_INIT` is already on and the kernel still waits for
 it before running init.
 
+**Where the ~125 ms everyone quotes actually comes from.** A phase split shows
+Firecracker's own work is ~21 ms (2.8 ms to start, 18.2 ms to load the kernel
+and configure KVM); all the rest is the guest kernel. So the published figures
+are not describing a cold boot of this shape, and they are not cold boots at
+all — they are snapshot restores. Measured here:
+
+| Guest RAM | cold boot | snapshot restore | snapshot create | memory file |
+|---|---|---|---|---|
+| 512 MiB | 428 ms | **12 ms** | 528 ms | 513 MB |
+| 2 GiB | 656 ms | **11 ms** | 2417 ms | 2.1 GB |
+| 8 GiB | 2041 ms | **13 ms** | 12714 ms | 8.1 GB |
+
+Restore is flat in guest memory and faster than the quoted figure — which is
+itself the tell that the number hides work. Three costs sit behind it, and they
+are the real design constraints: "resumed" is not "warm" (the `File` backend
+mmaps the memory file and faults lazily, which is exactly why restore is flat,
+so the guest's first work pays that cost); snapshot creation scales badly and
+writes the whole guest memory to disk; and a snapshot is bound to its machine
+configuration, so a node selling a 1/2/4/8/16 GiB ladder needs one per shape,
+about 31 GB of memory files.
+
 So the design conclusion is split rather than simple. For ordinary runs the
 overhead is negligible against a minutes-long agent invocation, and **per-run
-VMs stand on their own with no snapshot machinery**. For a node that wants to
-sell large-`mem_gb` runs, snapshot/restore stops being an optimisation and
-becomes the prerequisite for acceptable start latency — it is the only thing
-that skips memmap init.
+VMs stand on their own with no snapshot machinery**. For a node selling
+large-`mem_gb` runs, snapshot/restore stops being an optimisation and becomes
+the prerequisite for acceptable start latency — it is the only thing that skips
+memmap init — and the work it entails is the `Uffd` backend and the snapshot
+store, not the restore call itself.
+
+**One correctness fact found while measuring this, recorded here because it is
+not obvious and it hangs every run if missed:** the guest must halt with
+`LINUX_REBOOT_CMD_RESTART`, never `LINUX_REBOOT_CMD_POWER_OFF`. Firecracker
+exposes no ACPI power button, so `POWER_OFF` parks the guest at
+`reboot: System halted` and the VMM never exits — the run hangs to its idle
+timeout still holding all of its memory. `RESTART` goes through the `reboot=k`
+i8042 reset, which the VMM does observe.
 
 Per-run also means no session-affinity state and no shared kernel between
 buyers — the property namespaces cannot provide, and the reason every vendor
