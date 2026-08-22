@@ -15,9 +15,16 @@ daemon Ducktape
   font "../../../crates/design/assets/fonts/NotoColorEmoji.ttf"
   text-size 13.5
   antialiasing true
+  // The status item. A click raises THIS menu, never a window: the platform
+  // only pops a menu that has rows, so with none a press did nothing but
+  // activate the process — which read as "the app opened".
   tray
     icon-rgba "../../assets/tray.rgba" 128 128
     tooltip "Ducktape"
+    menu
+      "Open Ducktape" -> tray_open
+      separator
+      "Quit Ducktape" -> tray_quit
   // The launch window: Discord/Steam-shaped — a small fixed column that
   // signs the user in and picks a network. It opens on mount and closes when
   // the console takes over.
