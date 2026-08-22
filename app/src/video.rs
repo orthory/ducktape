@@ -564,6 +564,12 @@ pub(crate) fn capture_thread(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
         let wanted = source();
+        if wanted == Source::Off {
+            // The device is released the moment the toggle goes off, and the
+            // idle pace above becomes the toggle poll.
+            open = Open::None;
+            continue;
+        }
         if !open.is(wanted) {
             // Whatever was open is dropped HERE, by the assignment — a device
             // is never held for a source nobody asked for.
@@ -639,7 +645,14 @@ pub fn call_video_stage(peer: String) -> Element<'static, ()> {
         move |width| Size::new(width, stage_height(&sized, width)),
         // Layout follows the ASPECT and nothing else: a new frame of the same
         // shape (every frame, ten times a second) must not invalidate layout.
-        move || stage_frame(&keyed).map_or(0, |frame| u64::from(frame.0 * 10_000 + frame.1)),
+        // Packed, not arithmetic: the width comes off a PEER'S frame, and a
+        // multiply wide enough to be readable is a multiply a peer can
+        // overflow.
+        move || {
+            stage_frame(&keyed).map_or(0, |(width, height, _)| {
+                u64::from(width) << 32 | u64::from(height)
+            })
+        },
         move || stage_frame(&alive).is_some(),
         move |renderer, bounds, viewport| paint_stage(&painted, renderer, bounds, viewport),
     )
