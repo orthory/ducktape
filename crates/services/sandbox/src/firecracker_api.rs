@@ -35,6 +35,10 @@ pub struct VmConfig {
     /// `target/`). Attached, never copied back — see the spec's *Build caches*.
     /// `None` for a run that does not get one.
     pub agent_volume: Option<PathBuf>,
+    /// this run's READ-ONLY asset image: the context doc, the skills tree and
+    /// any declared host PATH directories. Mounted at [`crate::guest_paths::GUEST_ASSETS`]
+    /// and never read back.
+    pub assets: PathBuf,
     /// this run's workspace image, built by [`crate::workspace_image`] and read
     /// back after the guest exits.
     pub workspace: PathBuf,
@@ -67,16 +71,26 @@ pub struct GuestDrive {
 }
 
 /// where the guest sees the workspace. The manifest's `cwd` normally matches.
-pub const WORKSPACE_MOUNTPOINT: &str = "/workspace";
+pub const WORKSPACE_MOUNTPOINT: &str = crate::guest_paths::GUEST_WORKSPACE;
+/// where the guest sees the per-run read-only asset image.
+pub const ASSETS_MOUNTPOINT: &str = crate::guest_paths::GUEST_ASSETS;
 /// where the guest sees the persistent cache volume.
-pub const AGENT_VOLUME_MOUNTPOINT: &str = "/agent";
+pub const AGENT_VOLUME_MOUNTPOINT: &str = crate::guest_paths::GUEST_AGENT_VOLUME;
+
+/// the guest device names, in the order Firecracker enumerates them.
+const DEVICE_ORDER: [&str; 4] = ["/dev/vda", "/dev/vdb", "/dev/vdc", "/dev/vdd"];
 
 /// the drives for `cfg`, in attach order.
+///
+/// MOUNT ORDER IS LOAD-BEARING: the assets image must be mounted before the
+/// workspace, because the workspace lands on the `workspace/` directory INSIDE
+/// it. Reverse them and the workspace mount is immediately shadowed by the
+/// assets mount, and the run sees an empty workspace.
 pub fn guest_drives(cfg: &VmConfig) -> Vec<GuestDrive> {
     let mut drives = vec![GuestDrive {
         drive_id: "rootfs",
         host_path: cfg.rootfs.clone(),
-        device: "/dev/vda",
+        device: DEVICE_ORDER[0],
         // the kernel mounts the root device itself; the init must not remount it
         mountpoint: None,
         // SHARED across every concurrent run on this node. Writable would let
@@ -88,21 +102,25 @@ pub fn guest_drives(cfg: &VmConfig) -> Vec<GuestDrive> {
         drives.push(GuestDrive {
             drive_id: "agent",
             host_path: volume.clone(),
-            device: "/dev/vdb",
+            device: DEVICE_ORDER[drives.len()],
             mountpoint: Some(AGENT_VOLUME_MOUNTPOINT),
             read_only: false,
             is_root: false,
         });
     }
-    // the workspace's device name depends on whether a cache volume took vdb.
-    let workspace_device = match cfg.agent_volume {
-        Some(_) => "/dev/vdc",
-        None => "/dev/vdb",
-    };
+    drives.push(GuestDrive {
+        drive_id: "assets",
+        host_path: cfg.assets.clone(),
+        device: DEVICE_ORDER[drives.len()],
+        mountpoint: Some(ASSETS_MOUNTPOINT),
+        // the run may not edit its own context doc or skills tree
+        read_only: true,
+        is_root: false,
+    });
     drives.push(GuestDrive {
         drive_id: "workspace",
         host_path: cfg.workspace.clone(),
-        device: workspace_device,
+        device: DEVICE_ORDER[drives.len()],
         mountpoint: Some(WORKSPACE_MOUNTPOINT),
         read_only: false,
         is_root: false,
@@ -207,6 +225,7 @@ mod tests {
             kernel: "/srv/guest/vmlinux".into(),
             rootfs: "/srv/guest/rootfs.ext4".into(),
             agent_volume: Some("/srv/agents/a1/cache.ext4".into()),
+            assets: "/run/ducktape/run7/assets.ext4".into(),
             workspace: "/run/ducktape/run7/ws.ext4".into(),
             vcpus: 4,
             mem_mib: 8192,
@@ -221,6 +240,7 @@ mod tests {
             env: vec![("HOME".into(), "/root".into())],
             cwd: WORKSPACE_MOUNTPOINT.into(),
             mounts: manifest_mounts(&cfg()),
+            tunnel_ports: vec![8931],
         }
     }
 
@@ -247,29 +267,35 @@ mod tests {
         assert!(args.contains("reboot=k"), "{args}");
     }
 
-    /// The rootfs is shared by every concurrent run on the node. Writable would
-    /// let one buyer's run corrupt another's guest.
+    /// The rootfs is shared by every concurrent run on the node, and the asset
+    /// image holds inputs the run may read but must not edit. Everything the
+    /// run legitimately writes is writable.
     #[test]
-    fn the_shared_rootfs_is_read_only_and_the_run_volumes_are_not() {
+    fn only_the_devices_a_run_may_write_are_writable() {
         let drives = guest_drives(&cfg());
-        let rootfs = &drives[0];
-        assert!(rootfs.is_root && rootfs.read_only, "{rootfs:?}");
-        for drive in &drives[1..] {
-            assert!(!drive.is_root && !drive.read_only, "{drive:?}");
-        }
+        let by_id = |id: &str| {
+            drives
+                .iter()
+                .find(|drive| drive.drive_id == id)
+                .unwrap_or_else(|| panic!("no {id} drive"))
+        };
+        assert!(by_id("rootfs").is_root && by_id("rootfs").read_only);
+        assert!(by_id("assets").read_only, "the context doc is an input");
+        assert!(!by_id("workspace").read_only, "the run's output goes here");
+        assert!(!by_id("agent").read_only, "the build cache is written");
     }
 
-    /// The device names shift when a run has no cache volume. The manifest's
+    /// The device names shift with how many drives a run gets. The manifest's
     /// mountpoints must shift with them, or the guest mounts the workspace at
-    /// the cache's mountpoint and the run's output goes nowhere.
+    /// another device's mountpoint and the run's output goes nowhere.
     #[test]
-    fn the_workspace_device_tracks_whether_a_cache_volume_took_vdb() {
-        let with_cache = cfg();
+    fn the_device_names_track_how_many_drives_the_run_got() {
         assert_eq!(
-            manifest_mounts(&with_cache),
+            manifest_mounts(&cfg()),
             vec![
                 ("/dev/vdb".to_string(), AGENT_VOLUME_MOUNTPOINT.to_string()),
-                ("/dev/vdc".to_string(), WORKSPACE_MOUNTPOINT.to_string()),
+                ("/dev/vdc".to_string(), ASSETS_MOUNTPOINT.to_string()),
+                ("/dev/vdd".to_string(), WORKSPACE_MOUNTPOINT.to_string()),
             ]
         );
 
@@ -279,7 +305,32 @@ mod tests {
         };
         assert_eq!(
             manifest_mounts(&without_cache),
-            vec![("/dev/vdb".to_string(), WORKSPACE_MOUNTPOINT.to_string())]
+            vec![
+                ("/dev/vdb".to_string(), ASSETS_MOUNTPOINT.to_string()),
+                ("/dev/vdc".to_string(), WORKSPACE_MOUNTPOINT.to_string()),
+            ]
+        );
+    }
+
+    /// The workspace image is mounted ON TOP OF a directory inside the asset
+    /// image. Mount them the other way round and the assets mount shadows the
+    /// workspace, so the run starts in an empty directory and its output is
+    /// written somewhere nobody reads back.
+    #[test]
+    fn the_assets_are_mounted_before_the_workspace_that_sits_inside_them() {
+        let mounts = manifest_mounts(&cfg());
+        let assets = mounts
+            .iter()
+            .position(|(_, at)| at == ASSETS_MOUNTPOINT)
+            .expect("assets");
+        let workspace = mounts
+            .iter()
+            .position(|(_, at)| at == WORKSPACE_MOUNTPOINT)
+            .expect("workspace");
+        assert!(assets < workspace, "{mounts:?}");
+        assert!(
+            WORKSPACE_MOUNTPOINT.starts_with(ASSETS_MOUNTPOINT),
+            "the ordering only matters because of this nesting"
         );
     }
 

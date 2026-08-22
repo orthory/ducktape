@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{TcpStream, UnixListener, UnixStream};
 
 use crate::firecracker_api::{self, VmConfig};
 use crate::guest_manifest::RunManifest;
@@ -56,6 +56,16 @@ pub struct MicroVm {
     run_dir: PathBuf,
     workspace_image: PathBuf,
     console: PathBuf,
+    /// the tunnel acceptors, aborted when the VM goes away.
+    tunnels: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for MicroVm {
+    fn drop(&mut self) {
+        for tunnel in self.tunnels.drain(..) {
+            tunnel.abort();
+        }
+    }
 }
 
 impl MicroVm {
@@ -68,13 +78,16 @@ impl MicroVm {
     pub async fn boot(
         run_dir: &Path,
         workdir: &Path,
+        assets: &[PathBuf],
         cfg: &VmConfig,
         manifest: &RunManifest,
     ) -> Result<(Self, MicroVmIo), String> {
         std::fs::create_dir_all(run_dir)
             .map_err(|e| format!("create run dir {}: {e}", run_dir.display()))?;
 
-        // 1. the workspace as a block device
+        // 1. the run's two per-run block devices: the read-only inputs, and the
+        //    workspace that will be read back.
+        crate::workspace_image::build_assets(assets, &cfg.assets, &run_dir.join("assets"))?;
         let size = crate::workspace_image::sized_for(workdir)?;
         crate::workspace_image::build(workdir, &cfg.workspace, size)?;
 
@@ -83,6 +96,21 @@ impl MicroVm {
         let _ = std::fs::remove_file(&guest_socket);
         let listener = UnixListener::bind(&guest_socket)
             .map_err(|e| format!("listen on {}: {e}", guest_socket.display()))?;
+
+        // the tunnels' host ends, bound on the same schedule and for the same
+        // reason: the guest may dial them as soon as it is up.
+        //
+        // One listener per service, in the manifest's order. The guest picks a
+        // vsock port, never a destination, so this loop IS the allowlist.
+        let mut tunnels = Vec::with_capacity(manifest.tunnel_ports.len());
+        for (index, port) in manifest.tunnel_ports.iter().enumerate() {
+            let vsock_port = guest_proto::TUNNEL_PORT_BASE + index as u32;
+            let path = vsock_port_path(&cfg.vsock_uds, vsock_port);
+            let _ = std::fs::remove_file(&path);
+            let tunnel_listener = UnixListener::bind(&path)
+                .map_err(|e| format!("listen on {}: {e}", path.display()))?;
+            tunnels.push(tokio::spawn(serve_tunnel(tunnel_listener, *port)));
+        }
 
         // 3. the VMM
         let config = firecracker_api::boot_config(cfg, manifest);
@@ -114,6 +142,7 @@ impl MicroVm {
             run_dir: run_dir.to_path_buf(),
             workspace_image: cfg.workspace.clone(),
             console: console.clone(),
+            tunnels,
         };
 
         // 4. the guest dials back
@@ -170,6 +199,41 @@ impl MicroVm {
 
     pub fn run_dir(&self) -> &Path {
         &self.run_dir
+    }
+}
+
+/// the host end of one tunnel: every guest connection on this vsock port is
+/// spliced to `service_port` on this host's loopback.
+///
+/// The destination is CLOSED OVER, not read off the wire. The services bind
+/// LOOPBACK, not a routable interface, so nothing outside this process can
+/// reach them — and the guest reaches exactly this one address because it is
+/// the only address this function will ever dial. That property is what
+/// replaces the container backend's nft input chain, and it is stronger: there
+/// is no rule to get wrong, because there is no destination the guest can name.
+async fn serve_tunnel(listener: UnixListener, service_port: u16) {
+    loop {
+        let Ok((guest, _)) = listener.accept().await else {
+            return;
+        };
+        tokio::spawn(async move {
+            let Ok(service) = TcpStream::connect(("127.0.0.1", service_port)).await else {
+                return;
+            };
+            let (mut guest_read, mut guest_write) = guest.into_split();
+            let (mut broker_read, mut broker_write) = service.into_split();
+            // both directions concurrently: splicing them in sequence would
+            // deadlock as soon as either side filled its buffer.
+            let up = async {
+                let _ = tokio::io::copy(&mut guest_read, &mut broker_write).await;
+                let _ = broker_write.shutdown().await;
+            };
+            let down = async {
+                let _ = tokio::io::copy(&mut broker_read, &mut guest_write).await;
+                let _ = guest_write.shutdown().await;
+            };
+            tokio::join!(up, down);
+        });
     }
 }
 

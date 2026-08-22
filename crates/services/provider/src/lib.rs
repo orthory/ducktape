@@ -71,22 +71,30 @@ const HARD_TIMEOUT_FACTOR: u32 = 36;
 /// host escalates to SIGKILL. Podman gets the same budget for each targeted
 /// stop/wait operation; every cleanup command is itself kill-on-drop.
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
-const PODMAN_CID_POLL_INTERVAL: Duration = Duration::from_millis(25);
-// used by the socket run path (`podman_create_and_start`), which compiles on
-// every unix, so these are not gated to linux.
-/// the ownership label key every ducktape-created container carries. Its VALUE
-/// names the owning service instance, so two service daemons sharing one node's
-/// podman reap only their own containers ([`managed_label`]).
-pub const PODMAN_MANAGED_KEY: &str = "io.ducktape.managed";
-/// the owner tag for a provider built outside [`discover`] — tests and
-/// embedders. Deliberately matches no service instance, so nothing reaps it.
-const UNSCOPED_OWNER: &str = "unscoped";
-const PODMAN_NODE_LABEL: &str = "io.ducktape.node";
+/// how often the teardown paths re-check whether a process or process group is
+/// gone. Nothing to do with any particular runtime — it is the granularity of
+/// "has this pid disappeared yet", and the waits it drives are bounded by their
+/// own callers.
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// the full `key=value` ownership label for one owner tag — what a service
-/// stamps on create and the ONLY label it reaps by.
+/// the ownership tag a provider set stamps on the runs it creates. Its VALUE
+/// names the owning service instance, so a compute daemon and an agent daemon
+/// on one node stay distinguishable in logs and status.
+///
+/// It is no longer a REAPING key. Under the container backend a crashed daemon
+/// left containers behind and the label was how a successor found its own; a
+/// microVM's VMM is a child process that dies with the node, so there is
+/// nothing left over to find. The sweep that used this is gone rather than
+/// ported.
+pub const MANAGED_OWNER_KEY: &str = "io.ducktape.managed";
+
+/// the owner tag for a provider built outside [`discover`] — tests and
+/// embedders. Deliberately matches no service instance.
+const UNSCOPED_OWNER: &str = "unscoped";
+
+/// the full `key=value` ownership tag for one owner.
 pub fn managed_label(owner: &str) -> String {
-    format!("{PODMAN_MANAGED_KEY}={owner}")
+    format!("{MANAGED_OWNER_KEY}={owner}")
 }
 
 /// reserved run-local state INSIDE the run's workdir: the fresh provider config
@@ -163,18 +171,13 @@ pub use broker::{AirlockConfig, AirlockTrust, CredentialKind, ResolvedCredential
 // are a cfg(unix) dependency. all real node targets (Linux, macOS) are unix.
 #[cfg(unix)]
 mod interactive;
-// the sandbox muscle lives in `sandbox-host`; both modules are re-bound here
-// under their original names so the run loop's `podman_api::` / `sandbox::`
-// paths — and every downstream import of the re-exports below — are unchanged.
-// the libpod socket client: the sandbox drives podman over its rootless unix
-// socket, never the CLI binary. unix-only (unix-socket transport). the egress
-// ruleset generator the node's __egress-hook calls is re-exported.
+// the sandbox muscle lives in `sandbox-host` and is re-bound here so the run
+// loop's `sandbox::` paths — and every downstream import of the re-exports
+// below — resolve through this crate.
 #[cfg(unix)]
-pub(crate) use sandbox_host::podman_api;
+pub(crate) use sandbox_host::{firecracker_api, guest_manifest, microvm};
 #[cfg(unix)]
-pub use sandbox_host::podman_api::{
-    PodmanService, egress_nftables, reap_by_label, reap_service_at, run_egress_hook,
-};
+pub use sandbox_host::{GuestLayout, tap_egress_nftables};
 pub(crate) use sandbox_host::sandbox;
 mod spec;
 mod variants;
@@ -503,13 +506,22 @@ pub(crate) struct CliProvider {
     /// forwarded; stdout/stderr are still accumulated for the existing parse
     /// and error contracts.
     output_sink: Option<OutputSink>,
-    /// how the child is spawned: a rootless `Podman` container. set once at
+    /// how the child is spawned: its own Firecracker microVM. set once at
     /// discovery for the whole provider set.
     backend: SandboxBackend,
-    /// which service instance OWNS the containers this provider creates —
-    /// the value half of [`PODMAN_MANAGED_KEY`]. Set once at discovery, so a
-    /// compute daemon and (later) an agent daemon sharing one node's podman
-    /// each reap only their own.
+    /// the persistent per-agent cache volume attached to every run of this
+    /// provider (`CARGO_HOME`, `RUSTUP_HOME`, `target/`), or `None` for a
+    /// provider whose runs get none.
+    ///
+    /// ATTACHED, never copied: the workspace round trip is 13.8 s for a 1.7 GB
+    /// source tree and `target/` alone is 76 GB, so a build cache that rode the
+    /// per-run image would cost more than the run. The spec's *Build caches*
+    /// section records why this is a separate device and why it is never the
+    /// operator's own `~/.cargo`.
+    agent_volume: Option<PathBuf>,
+    /// which service instance OWNS the runs this provider creates. Set once at
+    /// discovery, so a compute daemon and (later) an agent daemon sharing one
+    /// node each reap only their own.
     managed_owner: String,
 }
 
@@ -532,6 +544,7 @@ impl CliProvider {
             timeout,
             output_sink: None,
             backend,
+            agent_volume: None,
             managed_owner: UNSCOPED_OWNER.to_string(),
         }
     }
@@ -581,13 +594,13 @@ impl CliProvider {
         ctx: &RunContext,
         auth: &RunAuth<'_>,
     ) -> Result<PreparedCommand, String> {
-        // Only the Bare test harness reaches here now: Podman is driven over
-        // its socket in [`Self::invoke`], before this seam. (`args`/`ctx`/`auth`
-        // are consumed only by the Bare arm, so in a non-test build they are
-        // legitimately unused.)
+        // Only the Bare test harness reaches here now: a microVM is booted in
+        // [`Self::invoke`], before this seam. (`args`/`ctx`/`auth` are consumed
+        // only by the Bare arm, so in a non-test build they are legitimately
+        // unused.)
         match &self.backend {
-            SandboxBackend::Podman { .. } => {
-                Err("internal error: Podman is driven over its socket, not a command".into())
+            SandboxBackend::Firecracker { .. } => {
+                Err("internal error: a microVM is booted, not spawned as a command".into())
             }
             #[cfg(any(test, feature = "testkit"))]
             SandboxBackend::Bare => {
@@ -642,157 +655,147 @@ impl CliProvider {
         Ok(cmd)
     }
 
-    /// build this run's neutral-path `SpecGenerator`, create the container over
-    /// the node-private podman socket, and start it — returning the client + the
-    /// container id. Shared by the headless [`Self::invoke`] and the interactive
-    /// session (which passes `tty = true`).
+    /// build this run's workspace image and boot its microVM, returning the VM
+    /// and its stdio.
     ///
-    /// Every host path is mounted at a NEUTRAL `/ducktape/*` guest path and every
-    /// env value / argv entry that names a host path is translated to match, so
-    /// the guest never sees the operator's real paths. Only the spec's
-    /// `[sandbox] rw_dirs` (the CLI's auth/state) cross the boundary, under
-    /// `/ducktape/home`; the node's data dir + user key stay outside (D7). The
-    /// egress firewall (broker + node RPC + public only) is installed by the
-    /// createRuntime hook keyed on the annotations [`set_egress`] adds.
+    /// Every host path the run can observe is rewritten to the guest's fixed
+    /// layout ([`GuestLayout`]), so the guest never sees the operator's real
+    /// paths. There is no mount plan to build: a microVM has no shared
+    /// filesystem, so the workspace arrives as a block device and the executor
+    /// comes from the read-only rootfs. That deletes the whole bind-mount
+    /// surface rather than configuring it.
     ///
-    /// The run-action URL is rewritten to `host.containers.internal` (the
-    /// private netns reaches the node's RPC only through that gateway); the
-    /// broker's own base_url already names it (see [`broker::Reachability`]).
     /// `args` are the FINAL executor argv (the caller has already applied
-    /// [`Self::broker_argv`] for a headless run or `interactive_argv` for a TUI);
-    /// this method only translates their paths to the neutral guest layout.
-    async fn podman_create_and_start(
+    /// [`Self::broker_argv`] for a headless run or `interactive_argv` for a
+    /// TUI); this method only translates their paths.
+    async fn microvm_boot(
         &self,
         args: &[String],
         workdir: &Path,
         ctx: &RunContext,
         auth: &RunAuth<'_>,
-        tty: bool,
-    ) -> Result<(podman_api::Podman, String), String> {
+    ) -> Result<(microvm::MicroVm, microvm::MicroVmIo), String> {
         // one discriminant, one match, no wildcard: `Bare` exists only in
         // test/testkit builds, so a `let ... else` here is irrefutable in a
         // shipped build. A future backend fails this match until it is routed.
-        let (image, socket) = match &self.backend {
-            SandboxBackend::Podman { image, socket } => (image, socket),
+        let (kernel, rootfs) = match &self.backend {
+            SandboxBackend::Firecracker { kernel, rootfs } => (kernel, rootfs),
             #[cfg(any(test, feature = "testkit"))]
             SandboxBackend::Bare => {
-                return Err("internal error: podman spawn on a non-Podman backend".into());
+                return Err("internal error: microVM boot on a non-Firecracker backend".into());
             }
         };
-        let (mut envs, rw_dirs) = self.sandbox_env_and_rw(ctx, auth)?;
-        for (key, value) in &mut envs {
-            if key == RUN_ACTION_URL_ENV {
-                *value = value.replacen(
-                    "http://127.0.0.1:",
-                    "http://host.containers.internal:",
-                    1,
-                );
-            }
-        }
-        let ro_paths = self.sandbox_ro_paths(ctx, workdir, auth)?;
-        let workdir = canonical_mount_path(workdir, "Podman workdir")?;
-        let bin_path = canonical_mount_path(&self.bin, "Podman executor")?;
-        let companion_bins = resolve_companion_bins(&bin_path, &self.spec.companions)?;
+
+        let (envs, _rw_dirs) = self.sandbox_env_and_rw(ctx, auth)?;
+        let workdir = canonical_mount_path(workdir, "microVM workdir")?;
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
-            .ok_or_else(|| "Podman run needs $HOME set to place the neutral home mount".to_string())?;
-        let home = canonical_mount_path(&home, "Podman HOME")?;
+            .unwrap_or_else(|| PathBuf::from("/nonexistent"));
 
-        let plan = podman_api::plan_mounts(
-            &workdir,
-            &bin_path,
-            &companion_bins,
-            &ro_paths,
-            &rw_dirs,
-            &home,
-        );
+        let mut layout = GuestLayout::new(&workdir, &home);
+        // the run's read-only inputs — PATH entries, the skills tree, the
+        // context doc — ride a per-run asset image. Each one's guest path is
+        // registered here so an argv or env value naming it is rewritten too; a
+        // path that reached the guest untranslated would point at nothing.
+        let assets = self.sandbox_ro_paths(ctx, &workdir, auth)?;
+        for (index, asset) in assets.iter().enumerate() {
+            let guest = match asset.is_file() {
+                // a FILE is the workspace-parent context doc: it lands beside
+                // the workspace so `../<name>` still resolves.
+                true => Path::new(sandbox_host::guest_paths::GUEST_ASSETS)
+                    .join(asset.file_name().unwrap_or_default()),
+                false => PathBuf::from(sandbox_host::guest_paths::guest_asset_dir(index)),
+            };
+            layout.map(asset, &guest);
+        }
+        let guest_workdir = PathBuf::from(sandbox_host::guest_paths::GUEST_WORKSPACE);
         // the guest cwd is known HERE and nowhere earlier — see the fn doc.
-        self.trust_guest_workdir(auth, &plan.guest_workdir)?;
-        // translate env values + argv to the neutral guest paths (HOME is set
-        // directly to the guest home; every other value is prefix-translated).
+        self.trust_guest_workdir(auth, &guest_workdir)?;
+
+        // HOME is set directly to the guest home; every other value is
+        // substring-translated so an embedded host path cannot survive.
         let translated_env: Vec<(String, String)> = envs
             .iter()
             .map(|(key, value)| {
                 let value = if key == "HOME" {
-                    plan.guest_home.display().to_string()
+                    sandbox_host::guest_paths::GUEST_HOME.to_string()
                 } else {
-                    podman_api::translate(value, &plan.mounts, &home, &plan.guest_home)
+                    layout.translate(value)
                 };
                 (key.clone(), value)
             })
             .collect();
-        let translated_args: Vec<String> = args
-            .iter()
-            .map(|arg| podman_api::translate(arg, &plan.mounts, &home, &plan.guest_home))
-            .collect();
-
-        // egress-allowed host ports: this run's broker + the node RPC. The nft
-        // hook allows exactly these on the host IP; every other host port is
-        // dropped with the rest of the private ranges.
-        let mut ports = Vec::new();
-        if let Some(broker) = auth.broker {
-            ports.extend(url_port(&broker.base_url));
-        }
-        if let Some((_, run_action)) = envs.iter().find(|(key, _)| key == RUN_ACTION_URL_ENV) {
-            ports.extend(url_port(run_action));
+        let mut translated_args: Vec<String> =
+            args.iter().map(|arg| layout.translate(arg)).collect();
+        // argv[0] is the HOST executor path; inside the guest the same CLI
+        // lives in the read-only rootfs.
+        if let Some(argv0) = translated_args.first_mut() {
+            *argv0 = guest_executor_path(&self.bin);
         }
 
-        let executing_node = ctx.executing_node.as_deref().unwrap_or("unknown");
-        let labels = vec![
-            managed_label(&self.managed_owner),
-            format!("{PODMAN_NODE_LABEL}={executing_node}"),
-        ];
+        let manifest_argv = {
+            let mut argv = vec![guest_executor_path(&self.bin)];
+            argv.extend(translated_args.into_iter().skip(1));
+            argv
+        };
 
-        let mut spec = podman_api::SpecGenerator::build(podman_api::SpecInputs {
-            image,
-            guest_bin: &plan.guest_bin,
-            guest_workdir: &plan.guest_workdir,
-            args: &translated_args,
-            env: &translated_env,
-            mounts: &plan.mounts,
-            limits: &ctx.limits,
-            labels: &labels,
-            terminal: tty,
-        });
-        spec.set_egress(&ports);
-
-        let client = podman_api::Podman::new(socket.clone());
-        let id = client.create(&spec).await?;
-        // THE paid-execution guard, and the only cancellation check between
-        // `invoke`'s entry and the output loop.
-        //
-        // `create` is not quick and not bounded by anything this run controls: a
-        // store miss makes it PULL, which is a network wait long enough to
-        // outlive a lease (the default is 64 views ≈ 64s at 1s blocks). Lose the
-        // lease inside it and the saga has already retried — another node claimed
-        // the next attempt and is running the work. `AttemptControl::cancel` sets
-        // the flag for exactly this case, but a flag nobody reads until after
-        // `start` is not a cancellation: without this check the container starts
-        // anyway and the operator pays for the same unit of work twice, invisibly
-        // — the late `OracleResult` lands as a deterministic no-op, so committed
-        // state shows one result and two invoices.
-        //
-        // Checked AFTER create rather than racing it in a `select!` on purpose:
-        // dropping the create future mid-flight can leave a container podman made
-        // and we never learn the id of, and an orphan is a worse trade than the
-        // wait. Holding the id means this can remove it.
+        // THE paid-execution guard. Checked before the VM is booted rather than
+        // after: unlike podman's `create` there is no pull to outlive a lease,
+        // so the check has nothing to race and belongs at the last moment
+        // before anything is spent.
         let cancelled = ctx
             .cancellation
             .as_ref()
             .is_some_and(RunCancellation::is_cancelled);
         if cancelled {
-            let _ = client.remove(&id).await;
             return Err(format!(
                 "{} cancelled before start (its attempt was reassigned)",
                 self.bin.display()
             ));
         }
-        if let Err(error) = client.start(&id).await {
-            // a container that never started must not linger in the node store.
-            let _ = client.remove(&id).await;
-            return Err(format!("start {} container: {error}", self.bin.display()));
+
+        let run_dir = microvm_run_dir(ctx)?;
+        let vm_config = firecracker_api::VmConfig {
+            kernel: kernel.clone(),
+            rootfs: rootfs.clone(),
+            agent_volume: self.agent_volume.clone(),
+            assets: run_dir.join("assets.ext4"),
+            workspace: run_dir.join("workspace.ext4"),
+            vcpus: vm_cores(&ctx.limits)?,
+            mem_mib: vm_mem_mib(&ctx.limits)?,
+            vsock_uds: run_dir.join("v.sock"),
+            // no tap: the guest reaches this node's broker over vsock and needs
+            // no interface. See the spec's egress section.
+            tap: None,
+        };
+        // The loopback services the guest may reach, tunnelled over vsock: this
+        // run's credential broker and, when the run has one, the node's
+        // run-action RPC. The guest serves the SAME port numbers on its own
+        // loopback, so `http://127.0.0.1:<port>` needs no rewriting on either
+        // side — which is why the container backend's
+        // `host.containers.internal` substitution is gone rather than ported.
+        //
+        // This list IS the allowlist: the host binds one vsock listener per
+        // entry and closes over the destination, so a port that is not here is
+        // not reachable from the guest by any means.
+        let mut tunnel_ports = Vec::new();
+        if let Some(broker) = auth.broker {
+            tunnel_ports.extend(url_port(&broker.base_url));
         }
-        Ok((client, id))
+        if let Some((_, run_action)) = envs.iter().find(|(key, _)| key == RUN_ACTION_URL_ENV) {
+            tunnel_ports.extend(url_port(run_action));
+        }
+        tunnel_ports.dedup();
+
+        let manifest = guest_manifest::RunManifest {
+            argv: manifest_argv,
+            env: translated_env,
+            cwd: guest_workdir.display().to_string(),
+            mounts: firecracker_api::manifest_mounts(&vm_config),
+            tunnel_ports,
+        };
+
+        microvm::MicroVm::boot(&run_dir, &workdir, &assets, &vm_config, &manifest).await
     }
 
     /// the env carried into a sandbox + the spec's `~/` rw_dirs expanded against
@@ -1128,8 +1131,8 @@ impl CliProvider {
     /// the broker reads the operator's credential HERE, in the host process, and
     /// serves an endpoint the child dials with an opaque per-run bearer; dropping
     /// it (any exit path of [`Self::run_output`]) tears the endpoint down. A
-    /// Podman run is in a private netns, so the broker binds a routable
-    /// interface the container reaches as `host.containers.internal`.
+    /// microVM run reaches it over a vsock tunnel, so it binds loopback and
+    /// stays unreachable from anywhere but this process.
     /// `airlock` is the per-run credential source — the narrowest seam that
     /// reaches broker construction (RunAuth is built AFTER the broker, from its
     /// endpoint, so it cannot carry this). `Some` pins a consensus-resolved
@@ -1143,26 +1146,16 @@ impl CliProvider {
         let Some(kind) = self.spec.isolation.broker else {
             return Ok(None);
         };
-        // every Podman run is in a private netns, so it can't reach a
-        // loopback-bound broker at 127.0.0.1; it dials `host.containers.internal`.
-        // the remaining `else` (a loopback broker) is only the test-only Bare host.
-        let podman = matches!(self.backend, SandboxBackend::Podman { .. });
+        // LOOPBACK, always. A microVM has no network device at all: the guest
+        // reaches this endpoint through a vsock tunnel whose host end dials
+        // 127.0.0.1 and nothing else. Binding a routable interface — which the
+        // container backend needed, because a private netns cannot reach host
+        // loopback — would now widen the credential endpoint's reach for no
+        // caller.
         match kind {
-            BrokerKind::CodexResponses => {
-                if podman {
-                    broker::RunBroker::start_for_podman_private(airlock).await.map(Some)
-                } else {
-                    broker::RunBroker::start(airlock).await.map(Some)
-                }
-            }
+            BrokerKind::CodexResponses => broker::RunBroker::start(airlock).await.map(Some),
             BrokerKind::AnthropicMessages => {
-                if podman {
-                    broker::RunBroker::start_anthropic_for_podman_private(airlock)
-                        .await
-                        .map(Some)
-                } else {
-                    broker::RunBroker::start_anthropic(airlock).await.map(Some)
-                }
+                broker::RunBroker::start_anthropic(airlock).await.map(Some)
             }
         }
     }
@@ -1457,6 +1450,69 @@ fn create_private_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// where the agent CLIs live inside the guest rootfs. The host executor is
+/// never handed across — the rootfs ships its own copy, built by
+/// `ops/build-guest-rootfs.sh`.
+const GUEST_BIN_DIR: &str = "/opt/duck/bin";
+
+/// the guest path for a host executor, by basename.
+fn guest_executor_path(host_bin: &Path) -> String {
+    let name = host_bin
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("executor"));
+    Path::new(GUEST_BIN_DIR)
+        .join(name)
+        .display()
+        .to_string()
+}
+
+/// a short, per-run directory for the VM's sockets and images.
+///
+/// Under `XDG_RUNTIME_DIR` and NOT under the node's data directory, because a
+/// unix socket path is capped near 108 bytes (`SUN_LEN`) and a data dir under a
+/// long home blows through it — the failure is `path must be shorter than
+/// SUN_LEN` at bind time, after the workspace image has already been built.
+fn microvm_run_dir(ctx: &RunContext) -> Result<PathBuf, String> {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    // FNV over the run's identity: short, fixed width, and collision-avoidance
+    // between concurrent runs is all it has to do.
+    let mut tag: u64 = 0xcbf2_9ce4_8422_2325;
+    let identity = format!(
+        "{}-{}",
+        ctx.executing_node.as_deref().unwrap_or("node"),
+        ctx.run_key.as_deref().unwrap_or("run")
+    );
+    for byte in identity.as_bytes() {
+        tag ^= u64::from(*byte);
+        tag = tag.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let dir = base.join(format!("dt-vm-{tag:016x}"));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create run dir {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+/// the run's vcpu count.
+///
+/// A VM has no "unlimited": every VM is given a size at configuration time, so
+/// a missing dimension is a config error rather than a value to guess from
+/// probed host totals. Under podman an absent key meant an unlimited run; that
+/// state is unrepresentable here and must not be silently invented.
+fn vm_cores(limits: &BTreeMap<String, u64>) -> Result<u32, String> {
+    let cores = limits.get("cores").copied().ok_or_else(|| {
+        "a microVM run needs an explicit `cores` limit; a VM has no unlimited size".to_string()
+    })?;
+    u32::try_from(cores.max(1)).map_err(|_| format!("cores {cores} does not fit a vcpu count"))
+}
+
+fn vm_mem_mib(limits: &BTreeMap<String, u64>) -> Result<u64, String> {
+    let gb = limits.get("mem_gb").copied().ok_or_else(|| {
+        "a microVM run needs an explicit `mem_gb` limit; a VM has no unlimited size".to_string()
+    })?;
+    Ok(gb.max(1) * 1024)
+}
+
 /// Resolve every sandbox mount before handing it to a container/VM. Relative
 /// paths and symlink aliases make containment checks lie about which host tree
 /// is exposed, so they fail before a sandbox command is built.
@@ -1640,7 +1696,7 @@ async fn wait_leader_exit_unreaped(pid: u32, label: &str) {
                 }
             }
         }
-        tokio::time::sleep(PODMAN_CID_POLL_INTERVAL).await;
+        tokio::time::sleep(PROCESS_POLL_INTERVAL).await;
     }
 }
 
@@ -1652,7 +1708,7 @@ async fn wait_process_group_gone(group: u32, label: &str) {
         if observations == 1 || observations.is_multiple_of(160) {
             eprintln!("[capability-host] waiting for {label} process group {group} to disappear");
         }
-        tokio::time::sleep(PODMAN_CID_POLL_INTERVAL).await;
+        tokio::time::sleep(PROCESS_POLL_INTERVAL).await;
     }
 }
 
@@ -1684,7 +1740,7 @@ async fn wait_tokio_child_fail_closed(
                          (attempt {failures}): {error}"
                     );
                 }
-                tokio::time::sleep(PODMAN_CID_POLL_INTERVAL).await;
+                tokio::time::sleep(PROCESS_POLL_INTERVAL).await;
             }
         }
     }
@@ -1783,7 +1839,7 @@ async fn terminate_child(
                         );
                     }
                 }
-                tokio::time::sleep(PODMAN_CID_POLL_INTERVAL).await;
+                tokio::time::sleep(PROCESS_POLL_INTERVAL).await;
             }
             let _ = wait_tokio_child_fail_closed(child, "killed provider child").await;
             *leader_reaped = true;
@@ -2047,16 +2103,22 @@ impl Drop for LiveChild {
 /// identically.
 enum RunControl {
     Local(LiveChild),
-    Container(PodmanHandle),
+    MicroVm(MicroVmHandle),
 }
 
-/// a running sandbox container: the socket client, the container id, and the
-/// background frame-demux pump. Waiting reaps it (a stopped container is always
-/// removed); terminate kills then removes it.
-struct PodmanHandle {
-    client: podman_api::Podman,
-    id: String,
+/// a running microVM: the VMM child, the guest's exit channel, the background
+/// vsock pump, and where the workspace has to be written back to.
+///
+/// There is no image to remove and no daemon to tell — the VMM is a child of
+/// this process and dies with it. Teardown is a kill; the only thing that has
+/// to happen on the SUCCESS path and not the failure path is the workspace
+/// read-back, which is why it lives in `wait_success`.
+struct MicroVmHandle {
+    vm: microvm::MicroVm,
+    exit: Option<tokio::sync::oneshot::Receiver<i32>>,
     pump: Option<tokio::task::JoinHandle<()>>,
+    /// the HOST directory the run's workspace image is walked back into.
+    workdir: PathBuf,
 }
 
 impl RunControl {
@@ -2065,9 +2127,8 @@ impl RunControl {
     async fn terminate(&mut self) {
         match self {
             RunControl::Local(live) => live.terminate().await,
-            RunControl::Container(handle) => {
-                let _ = handle.client.kill(&handle.id, "SIGKILL").await;
-                let _ = handle.client.remove(&handle.id).await;
+            RunControl::MicroVm(handle) => {
+                handle.vm.terminate().await;
                 if let Some(pump) = handle.pump.take() {
                     pump.abort();
                 }
@@ -2075,26 +2136,48 @@ impl RunControl {
         }
     }
 
-    /// wait for exit; returns `(success, exit_description)`. A container that has
-    /// exited is removed here (its output is already drained), so the success
-    /// path needs no separate cleanup.
+    /// wait for exit; returns `(success, exit_description)`.
+    ///
+    /// For a microVM this is also where the workspace comes back. It has to be
+    /// here rather than at teardown: the read-back is only meaningful once the
+    /// guest has synced, unmounted and halted, and `terminate` is the path
+    /// where none of that happened.
     async fn wait_success(&mut self, label: &str) -> std::io::Result<(bool, String)> {
         match self {
             RunControl::Local(live) => {
                 let status = live.wait_complete(label).await?;
                 Ok((status.success(), status.to_string()))
             }
-            RunControl::Container(handle) => {
-                let code = handle
-                    .client
-                    .wait(&handle.id)
-                    .await
-                    .map_err(std::io::Error::other)?;
-                let _ = handle.client.remove(&handle.id).await;
+            RunControl::MicroVm(handle) => {
+                // The guest's own exit frame, not the VMM's status: the
+                // hypervisor exits 0 for a guest that returned 1.
+                let exit = handle
+                    .exit
+                    .take()
+                    .ok_or_else(|| std::io::Error::other("microVM already waited on"))?;
+                let code = exit.await.map_err(|_| {
+                    std::io::Error::other(format!(
+                        "{label} guest halted without reporting an exit code"
+                    ))
+                })?;
                 if let Some(pump) = handle.pump.take() {
                     pump.abort();
                 }
                 Ok((code == 0, format!("exit code {code}")))
+            }
+        }
+    }
+
+    /// walk a finished run's workspace image back onto the host. Separate from
+    /// [`Self::wait_success`] so a caller that is abandoning the run does not
+    /// pay for it — and so the ordering (VMM gone, then read) is owned in one
+    /// place.
+    async fn collect_workspace(self) -> Result<(), String> {
+        match self {
+            RunControl::Local(_) => Ok(()),
+            RunControl::MicroVm(handle) => {
+                let workdir = handle.workdir.clone();
+                handle.vm.collect(&workdir).await
             }
         }
     }
@@ -2201,11 +2284,11 @@ impl CliProvider {
         if let Some(invocation) = &broker_invocation {
             invocation.arm(hard);
         }
-        // backend split. Podman drives a container over its socket; the
-        // test-only bare harness spawns a local child. Both expose the run's
-        // stdio as boxed streams so the refreshable-timeout output loop below is
-        // byte-identical, and both yield a `RunControl` that knows how to wait
-        // for exit and terminate.
+        // backend split. Firecracker boots a microVM and carries its stdio over
+        // vsock; the test-only bare harness spawns a local child. Both expose
+        // the run's stdio as boxed streams so the refreshable-timeout output
+        // loop below is byte-identical, and both yield a `RunControl` that
+        // knows how to wait for exit and terminate.
         type BoxRead = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
         type BoxWrite = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
         let (mut stdin, mut stdout_pipe, mut stderr_pipe, mut control): (
@@ -2213,23 +2296,18 @@ impl CliProvider {
             BoxRead,
             BoxRead,
             RunControl,
-        ) = if matches!(self.backend, SandboxBackend::Podman { .. }) {
+        ) = if matches!(self.backend, SandboxBackend::Firecracker { .. }) {
             let final_args = self.broker_argv(args, workdir, &auth);
-            let (client, id) = self
-                .podman_create_and_start(&final_args, workdir, ctx, &auth, false)
-                .await?;
-            let attach = client.attach(&id, false).await.map_err(|e| {
-                format!("attach {} container {}: {e}", self.bin.display(), &id[..12.min(id.len())])
-            })?;
-            let io = podman_api::headless_io(attach);
+            let (vm, io) = self.microvm_boot(&final_args, workdir, ctx, &auth).await?;
             (
                 Box::new(io.stdin),
                 Box::new(io.stdout),
                 Box::new(io.stderr),
-                RunControl::Container(PodmanHandle {
-                    client,
-                    id,
+                RunControl::MicroVm(MicroVmHandle {
+                    vm,
+                    exit: Some(io.exit),
                     pump: Some(io.pump),
+                    workdir: workdir.to_path_buf(),
                 }),
             )
         } else {
@@ -2483,6 +2561,13 @@ impl CliProvider {
                 ));
             }
         };
+        // The run is over and the VMM is gone, so the workspace image can be
+        // walked back onto the host. Done BEFORE the failure check on purpose:
+        // a run that exited non-zero still produced work — partial edits, a
+        // half-written file, a log — and throwing that away because the exit
+        // code was 1 loses the buyer's own data along with the diagnosis.
+        control.collect_workspace().await?;
+
         // an unfinished feed at this point means the child exited without
         // draining stdin — the exit status below is the primary diagnostic.
         let fed = fed.unwrap_or(Ok(()));
@@ -3004,6 +3089,22 @@ mod tests {
         None
     }
 
+    /// the microVM backend a hardware test uses, from the artifacts
+    /// `ops/build-guest-rootfs.sh` produces.
+    ///
+    /// Shaped, not probed: constructing one costs nothing and asserts nothing
+    /// about the host, so a unit test can build a provider with it while a
+    /// hardware test additionally runs [`SandboxBackend::probe`] and skips when
+    /// the images or `/dev/kvm` are absent.
+    fn firecracker_backend() -> SandboxBackend {
+        let dir = std::env::var("DUCKTAPE_GUEST_DIR")
+            .unwrap_or_else(|_| "/var/lib/ducktape/guest".into());
+        SandboxBackend::Firecracker {
+            kernel: PathBuf::from(&dir).join("vmlinux"),
+            rootfs: PathBuf::from(&dir).join("rootfs.ext4"),
+        }
+    }
+
     /// an inline mock spec: arbitrary tag and binary, one of the named
     /// output parsers, no env override.
     fn mock_spec(tag: &str, bin: &str, format: &str) -> CapabilitySpec {
@@ -3049,153 +3150,54 @@ format = "{format}"
         sh_provider(mock_spec(tag, tag, format), script, wd)
     }
 
-    /// LIVE end-to-end for the INTERACTIVE (pty) path over the socket: a shell
-    /// script standing in for a TUI (reads a line, echoes it back) is spawned as
-    /// an interactive session, then driven — write keystrokes, read the echo,
-    /// resize, close. Exercises `from_attach` + the `Transport::Socket`
-    /// read/write/resize/close over a real `terminal=true` attach stream, which
-    /// is the exact shape a lent Claude Code PTY session uses.
-    /// `#[ignore]`: needs a running podman socket at `$DUCKTAPE_PODMAN_SOCKET`.
-    #[tokio::test]
-    #[ignore = "live: needs a running podman socket at $DUCKTAPE_PODMAN_SOCKET"]
-    async fn podman_socket_interactive_session_drives_a_tty() {
-        let Ok(socket) = std::env::var("DUCKTAPE_PODMAN_SOCKET") else {
-            eprintln!("skipping: DUCKTAPE_PODMAN_SOCKET unset");
-            return;
-        };
-        let root = scratch("podman-socket-interactive");
-        // a fake TUI: read a line from the pty, echo it with a marker, loop.
-        let bin = root.join("fake-tui.sh");
-        std::fs::write(
-            &bin,
-            b"#!/bin/sh\nwhile IFS= read -r line; do echo \"TUI-SAW:$line\"; done\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt as _;
-        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&bin, perms).unwrap();
-
-        let spec = CapabilitySpec::parse(
-            r#"
-spec = 1
-[capability]
-tag = "faketui"
-[detect]
-bin = "fake-tui.sh"
-[invoke]
-args = []
-prompt = "stdin"
-[output]
-format = "text"
-[interactive]
-args = []
-"#,
-            "test",
-        )
-        .unwrap();
-        let image = std::env::var("DUCKTAPE_SANDBOX_IMAGE")
-            .unwrap_or_else(|_| "docker.io/library/alpine:latest".into());
-        let provider = CliProvider::from_spec(
-            spec,
-            bin,
-            SandboxBackend::Podman {
-                image,
-                socket: PathBuf::from(socket),
-            },
-        )
-        .with_workdir(root.join("wd"));
-        std::fs::create_dir_all(root.join("wd")).unwrap();
-
-        let ctx = RunContext {
-            executing_node: Some(execution_node_id(b"e2e-int-node")),
-            ..RunContext::default()
-        };
-        let session = provider
-            .spawn_interactive(&ctx, false)
-            .await
-            .expect("spawn interactive session over the socket");
-        // resize must not error on the socket transport (fire-and-forget).
-        session.resize(100, 40).expect("resize the socket tty");
-        session
-            .write_all(b"knock-knock\n")
-            .await
-            .expect("write keystrokes to the container pty");
-
-        // read until the fake TUI echoes our line back through the attach stream.
-        let mut seen = Vec::new();
-        let mut buf = [0u8; 4096];
-        for _ in 0..80 {
-            match tokio::time::timeout(std::time::Duration::from_secs(10), session.read(&mut buf))
-                .await
-            {
-                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-                Ok(Ok(n)) => seen.extend_from_slice(&buf[..n]),
-            }
-            if seen.windows(15).any(|w| w == b"TUI-SAW:knock-k") {
-                break;
-            }
-        }
-        session.close().await;
-        let text = String::from_utf8_lossy(&seen);
-        eprintln!("--- interactive transcript: {text:?} ---");
-        assert!(
-            text.contains("TUI-SAW:knock-knock"),
-            "the container TUI echoed our keystrokes back through the socket attach: {text:?}"
-        );
-    }
 
     /// LIVE end-to-end through the REAL Podman socket path: build a provider
     /// whose executor is a tiny shell script that echoes its stdin, run it in an
     /// alpine container over the node-private socket, and confirm the prompt
-    /// comes back. Exercises the whole rewritten headless path — spec build,
-    /// neutral-path mounts, create/start/attach/wait/remove over the socket, and
-    /// the demux-into-the-timeout-loop plumbing — against real podman.
-    /// `#[ignore]`: needs a running podman socket at `$DUCKTAPE_PODMAN_SOCKET`.
-    ///   DUCKTAPE_PODMAN_SOCKET=/run/user/1000/podman/dt-e2e.sock \
-    ///     cargo test -p provider-host --lib -- --ignored --nocapture podman_socket_echo
+    /// comes back. Exercises the whole headless path — the workspace and asset
+    /// images, the boot config, the vsock stdio, the exit frame and the
+    /// workspace read-back — against a real VMM.
+    ///
+    /// `#[ignore]`: needs `/dev/kvm` and the guest artifacts.
+    ///   DUCKTAPE_GUEST_DIR=… cargo test -p provider-host --lib -- --ignored \
+    ///     --nocapture microvm_echo
     #[tokio::test]
-    #[ignore = "live: needs a running podman socket at $DUCKTAPE_PODMAN_SOCKET"]
-    async fn podman_socket_echo_round_trips_through_invoke() {
-        let Ok(socket) = std::env::var("DUCKTAPE_PODMAN_SOCKET") else {
-            eprintln!("skipping: DUCKTAPE_PODMAN_SOCKET unset");
+    #[ignore = "live: needs /dev/kvm and a built guest rootfs"]
+    async fn microvm_echo_round_trips_through_invoke() {
+        let backend = firecracker_backend();
+        if let Err(why) = backend.probe() {
+            eprintln!("skipping: {why}");
             return;
-        };
-        // a musl-safe executor: a shell script (alpine has /bin/sh) that cats
-        // stdin. The host bin is mounted at a neutral /ducktape/bin path.
-        let root = scratch("podman-socket-echo");
-        let bin = root.join("echo-stdin.sh");
-        std::fs::write(&bin, b"#!/bin/sh\ncat\n").unwrap();
-        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
-        use std::os::unix::fs::PermissionsExt as _;
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&bin, perms).unwrap();
-
-        let image = std::env::var("DUCKTAPE_SANDBOX_IMAGE")
-            .unwrap_or_else(|_| "docker.io/library/alpine:latest".into());
+        }
+        // the executor lives in the guest ROOTFS, not on the host: the microVM
+        // mounts no host directory, so there is nothing to bind a script from.
+        // The rootfs build script installs this one.
+        let root = scratch("microvm-echo");
         let provider = CliProvider::from_spec(
-            mock_spec("echo", "echo-stdin.sh", "text"),
-            bin,
-            SandboxBackend::Podman {
-                image,
-                socket: PathBuf::from(socket),
-            },
+            mock_spec("echo", "cat", "text"),
+            // resolved to /opt/duck/bin/cat inside the guest
+            PathBuf::from("/bin/cat"),
+            backend,
         )
         .with_workdir(root.join("wd"));
         std::fs::create_dir_all(root.join("wd")).unwrap();
 
         let ctx = RunContext {
             executing_node: Some(execution_node_id(b"e2e-node")),
+            // a VM has no unlimited size; both dimensions are required.
+            limits: [("cores".to_string(), 1u64), ("mem_gb".to_string(), 1u64)]
+                .into_iter()
+                .collect(),
             ..RunContext::default()
         };
         let answer = provider
-            .run("PONG-OVER-SOCKET", &ctx)
+            .run("PONG-FROM-A-MICROVM", &ctx)
             .await
-            .expect("run over the podman socket");
-        eprintln!("--- socket echo answer: {answer:?} ---");
+            .expect("run inside a microVM");
+        eprintln!("--- microVM echo answer: {answer:?} ---");
         assert!(
-            answer.contains("PONG-OVER-SOCKET"),
-            "the container echoed the prompt back through the socket path: {answer:?}"
+            answer.contains("PONG-FROM-A-MICROVM"),
+            "the guest echoed the prompt back over vsock: {answer:?}"
         );
     }
 
@@ -3257,20 +3259,6 @@ printf 'sandbox-ok:%s' "$prompt""#,
         std::fs::remove_dir_all(root).ok();
     }
 
-    /// Real Podman gate for macOS hardware. Kept ignored because it requires a
-    /// running Podman machine and a pulled image. Run it explicitly with
-    /// `cargo test -p provider-host macos_podman_hardware_smoke -- --ignored`.
-    #[tokio::test]
-    #[ignore = "requires a live Podman machine"]
-    async fn macos_podman_hardware_smoke() {
-        let image = std::env::var("DUCKTAPE_MACOS_PODMAN_IMAGE")
-            .unwrap_or_else(|_| "docker.io/library/node:22-slim".into());
-        hardware_sandbox_smoke(
-            "macos-podman-hardware",
-            SandboxBackend::Podman { image, socket: std::path::PathBuf::from(std::env::var("DUCKTAPE_PODMAN_SOCKET").unwrap_or_default()) },
-        )
-        .await;
-    }
 
 
 
@@ -3468,15 +3456,9 @@ broker = "anthropic-messages"
     #[tokio::test]
     async fn every_backend_accepts_the_credential_broker_shape() {
         // A missing host credential may still fail startup, but no backend is
-        // structurally rejected: a Podman run reaches the broker through
-        // host.containers.internal, the bare harness through loopback.
-        for backend in [
-            SandboxBackend::Bare,
-            SandboxBackend::Podman {
-                image: "img".into(),
-                socket: std::path::PathBuf::new(),
-            },
-        ] {
+        // structurally rejected: both reach a LOOPBACK broker — the bare
+        // harness directly, a microVM through the vsock tunnel.
+        for backend in [SandboxBackend::Bare, firecracker_backend()] {
             let provider =
                 CliProvider::from_spec(broker_spec("c"), PathBuf::from("/usr/bin/c"), backend.clone());
             if let Err(e) = provider.start_broker(None).await {
@@ -4945,20 +4927,34 @@ printf '%s\n' "$PATH"
     /// the whole job: the bug it prevents costs a second paid provider call and
     /// leaves no trace in committed state.
     #[test]
-    fn a_cancelled_attempt_can_never_be_started_after_create() {
+    fn a_cancelled_attempt_can_never_boot_a_vm() {
         let src = include_str!("lib.rs");
-        let (_, after_create) = src
-            .split_once("let id = client.create(&spec).await?;")
-            .expect("the podman create call");
-        let (between, _) = after_create
-            .split_once("client.start(&id)")
-            .expect("the podman start call");
+        let (before_boot, _) = src
+            .split_once("microvm::MicroVm::boot(")
+            .expect("the microVM boot call");
+        let (_, in_this_fn) = before_boot
+            .rsplit_once("async fn microvm_boot(")
+            .expect("microvm_boot");
         assert!(
-            between.contains("RunCancellation::is_cancelled"),
-            "no cancellation check between podman create and start: a run whose \
-             lease expired during create (a store miss makes it PULL, a network \
-             wait) would start its container anyway, paying twice for work \
-             another node already claimed"
+            in_this_fn.contains("RunCancellation::is_cancelled"),
+            "no cancellation check before the VM boots: a run whose lease \
+             expired while its workspace image was being built would boot \
+             anyway, and the operator would pay twice for work another node \
+             already claimed — the late OracleResult lands as a deterministic \
+             no-op, so committed state shows one result and two invoices"
         );
+    }
+
+    /// The full hardware path on a real VMM: a provider set discovered against
+    /// the microVM backend runs a CLI and its workspace comes back.
+    #[tokio::test]
+    #[ignore = "live: needs /dev/kvm and a built guest rootfs"]
+    async fn firecracker_hardware_smoke() {
+        let backend = firecracker_backend();
+        if let Err(why) = backend.probe() {
+            eprintln!("skipping: {why}");
+            return;
+        }
+        hardware_sandbox_smoke("firecracker-hardware", backend).await;
     }
 }

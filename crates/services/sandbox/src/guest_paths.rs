@@ -12,12 +12,35 @@
 
 use std::path::{Path, PathBuf};
 
+/// the neutral root every per-run input appears under. A guest sees
+/// `/duck/workspace` and `/duck/ro0` — never a host path, so the operator's
+/// identity and layout stay hidden.
+pub const GUEST_ROOT: &str = "/duck";
+
 /// where a run's workspace always appears inside the guest.
-pub const GUEST_WORKSPACE: &str = "/workspace";
+///
+/// UNDER [`GUEST_ROOT`], not at the filesystem root, and that nesting is
+/// load-bearing: a spec whose `[context]` is `workspace-parent` writes a doc the
+/// CLI opens as `../<name>`, which only resolves if the workspace has a parent
+/// holding it. The read-only asset image is mounted at [`GUEST_ROOT`] and the
+/// workspace on top of its `workspace/` directory, which is what puts them in
+/// that relationship.
+pub const GUEST_WORKSPACE: &str = "/duck/workspace";
+
+/// where the per-run read-only asset image is mounted: the context doc, the
+/// skills tree, and any host PATH directories the run declared.
+pub const GUEST_ASSETS: &str = "/duck";
+
 /// the guest's `HOME`. The rootfs ships it; no host home is ever visible.
 pub const GUEST_HOME: &str = "/root";
+
 /// where the persistent per-agent cache volume always appears.
 pub const GUEST_AGENT_VOLUME: &str = "/agent";
+
+/// the guest directory for the Nth read-only asset a run declared.
+pub fn guest_asset_dir(index: usize) -> String {
+    format!("{GUEST_ASSETS}/ro{index}")
+}
 
 /// the host→guest path pairs for one run, longest host path first so a nested
 /// path wins over its parent.
@@ -96,6 +119,19 @@ mod tests {
         assert_eq!(l.translate("/home/operator"), GUEST_HOME);
     }
 
+    /// A `workspace-parent` context doc is opened by the CLI as `../<name>`.
+    /// If the workspace sat at the filesystem root that would resolve to `/`,
+    /// and the doc would be unreachable.
+    #[test]
+    fn the_workspace_has_a_parent_for_the_context_doc_to_live_in() {
+        let workspace = Path::new(GUEST_WORKSPACE);
+        assert_eq!(
+            workspace.parent().map(|p| p.to_string_lossy().into_owned()),
+            Some(GUEST_ASSETS.to_string()),
+            "the context doc's directory must be the workspace's parent"
+        );
+    }
+
     /// The workspace lives UNDER the home directory here, which is the normal
     /// case. If HOME won, the workspace would translate to
     /// `/root/ducktape/runs/run7/ws` — a path that does not exist in the guest,
@@ -105,7 +141,7 @@ mod tests {
         let l = layout();
         assert_eq!(
             l.translate("/home/operator/ducktape/runs/run7/ws/src/main.rs"),
-            "/workspace/src/main.rs"
+            "/duck/workspace/src/main.rs"
         );
 
         // and the same with the pairs inserted the other way round
@@ -117,7 +153,7 @@ mod tests {
         );
         assert_eq!(
             reversed.translate("/home/operator/ducktape/runs/run7/ws/src/main.rs"),
-            "/workspace/src/main.rs"
+            "/duck/workspace/src/main.rs"
         );
     }
 
@@ -128,7 +164,7 @@ mod tests {
         let l = layout();
         assert_eq!(
             l.translate("projects.\"/home/operator/ducktape/runs/run7/ws\".trust_level=\"trusted\""),
-            "projects.\"/workspace\".trust_level=\"trusted\""
+            "projects.\"/duck/workspace\".trust_level=\"trusted\""
         );
     }
 

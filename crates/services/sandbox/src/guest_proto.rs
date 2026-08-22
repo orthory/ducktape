@@ -15,9 +15,25 @@
 //! tokio, serde and tracing — while both ends still share one copy of the
 //! codec. Keep it dependency-free or that arrangement breaks.
 
-/// the guest-side vsock port the init dials. Host-side is the run's unix
-/// socket that Firecracker multiplexes onto it.
+/// the guest-side vsock port the init dials for the run's stdio. Host-side is
+/// the run's unix socket that Firecracker multiplexes onto it.
 pub const VSOCK_PORT: u32 = 1024;
+
+/// the first vsock port carrying a host tunnel; the Nth tunnelled service uses
+/// `TUNNEL_PORT_BASE + N`.
+///
+/// A run's CLI dials its credential broker — and, when it has one, the node's
+/// run-action RPC — over ordinary HTTP at `127.0.0.1:<port>`. With no tap
+/// device there is no route to the host, so the guest listens on those loopback
+/// ports and forwards each connection over vsock; the host end dials the
+/// service and splices.
+///
+/// **One vsock port per tunnelled service, assigned by the HOST.** The guest
+/// never names a destination — not in a header, not anywhere — so "which host
+/// port may this run reach" is answered entirely by which listeners the host
+/// bound. A guest that dials an unbound port gets a connect failure, not a
+/// choice. That is what replaces the container backend's nft input chain.
+pub const TUNNEL_PORT_BASE: u32 = 1025;
 
 /// the largest single frame. The guest cannot make the host allocate past it.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;

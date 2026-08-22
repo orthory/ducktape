@@ -16,7 +16,7 @@
 //! core. Do not reach for faster storage to speed this up; the spec's *Build
 //! caches* section records the measurement and the conclusion drawn from it.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// the floor: ext4 metadata plus a journal does not fit in a few hundred KiB,
@@ -119,6 +119,71 @@ pub fn read_back(image: &Path, dest: &Path) -> Result<(), String> {
     drop_lost_found(dest)
 }
 
+/// build the per-run READ-ONLY asset image: the context doc, the skills tree,
+/// and any host PATH directories the run declared.
+///
+/// Its layout mirrors the guest's: entry N of `assets` lands at `ro<N>/`, and a
+/// FILE lands at the image root under its own name — one level above the
+/// workspace, so a `workspace-parent` context doc still resolves as
+/// `../<name>`. An empty `workspace/` directory is always created, because the
+/// workspace image is mounted on top of it.
+///
+/// Never read back: nothing the run writes here survives, which is the point of
+/// it being a separate device rather than part of the workspace. Handing the
+/// skills tree back to the buyer as if the run had produced it would be wrong,
+/// and on a second round trip it would nest.
+pub fn build_assets(assets: &[PathBuf], image: &Path, staging: &Path) -> Result<(), String> {
+    let _ = std::fs::remove_dir_all(staging);
+    std::fs::create_dir_all(staging.join("workspace"))
+        .map_err(|e| format!("stage {}: {e}", staging.display()))?;
+
+    for (index, source) in assets.iter().enumerate() {
+        let meta = std::fs::metadata(source)
+            .map_err(|e| format!("stat asset {}: {e}", source.display()))?;
+        if meta.is_file() {
+            let name = source
+                .file_name()
+                .ok_or_else(|| format!("asset {} has no file name", source.display()))?;
+            std::fs::copy(source, staging.join(name))
+                .map_err(|e| format!("stage asset {}: {e}", source.display()))?;
+            continue;
+        }
+        copy_tree(source, &staging.join(format!("ro{index}")))?;
+    }
+
+    let size = sized_for(staging)?;
+    build(staging, image, size)?;
+    let _ = std::fs::remove_dir_all(staging);
+    Ok(())
+}
+
+/// copy a directory tree, preserving mode bits. Symlinks are followed rather
+/// than recreated: a link inside a staged tree would point at a HOST path that
+/// does not exist in the guest, which is a broken input rather than a preserved
+/// one.
+fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(to).map_err(|e| format!("create {}: {e}", to.display()))?;
+    let entries =
+        std::fs::read_dir(from).map_err(|e| format!("read {}: {e}", from.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("read {}: {e}", from.display()))?;
+        let source = entry.path();
+        let target = to.join(entry.file_name());
+        let meta = match std::fs::metadata(&source) {
+            Ok(meta) => meta,
+            // a dangling symlink in a skills tree is not worth failing a run
+            Err(_) => continue,
+        };
+        if meta.is_dir() {
+            copy_tree(&source, &target)?;
+            continue;
+        }
+        std::fs::copy(&source, &target)
+            .map_err(|e| format!("copy {}: {e}", source.display()))?;
+    }
+    Ok(())
+}
+
 /// `lost+found` is an ext4 artifact `mke2fs` creates, not something the run
 /// produced. Handing it back would add a directory to the buyer's workspace
 /// that nobody put there — and on a second round trip it would persist and
@@ -135,7 +200,7 @@ fn drop_lost_found(dest: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

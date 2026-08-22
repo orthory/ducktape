@@ -25,6 +25,17 @@ pub struct RunManifest {
     /// ordering contract split across two files silently mounts the workspace
     /// at the cache's mountpoint the first time that count changes.
     pub mounts: Vec<(String, String)>,
+    /// loopback ports the guest serves and forwards to the host over vsock, in
+    /// the same order the host bound its listeners: the run's credential broker
+    /// and, when the run has one, the node's run-action RPC.
+    ///
+    /// The CLI dials these as ordinary HTTP on `127.0.0.1`; it never learns the
+    /// far end is outside the VM, and the credential never enters the VM at
+    /// all. ORDER IS THE MAPPING — entry N rides vsock port
+    /// `TUNNEL_PORT_BASE + N` — so reordering this list silently connects a run
+    /// to the wrong service.
+    #[serde(default)]
+    pub tunnel_ports: Vec<u16>,
 }
 
 pub fn encode(manifest: &RunManifest) -> String {
@@ -76,6 +87,7 @@ mod tests {
                 ("/dev/vdb".into(), "/agent".into()),
                 ("/dev/vdc".into(), "/workspace".into()),
             ],
+            tunnel_ports: vec![8931, 8932],
         }
     }
 
@@ -117,6 +129,7 @@ mod tests {
             env: Vec::new(),
             cwd: "/workspace".into(),
             mounts: Vec::new(),
+            tunnel_ports: Vec::new(),
         }))
         .expect_err("refused");
         assert!(err.contains("argv"), "{err}");
