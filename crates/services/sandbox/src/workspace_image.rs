@@ -163,8 +163,7 @@ pub fn build_assets(assets: &[PathBuf], image: &Path, staging: &Path) -> Result<
 /// one.
 fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
     std::fs::create_dir_all(to).map_err(|e| format!("create {}: {e}", to.display()))?;
-    let entries =
-        std::fs::read_dir(from).map_err(|e| format!("read {}: {e}", from.display()))?;
+    let entries = std::fs::read_dir(from).map_err(|e| format!("read {}: {e}", from.display()))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("read {}: {e}", from.display()))?;
         let source = entry.path();
@@ -178,8 +177,7 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
             copy_tree(&source, &target)?;
             continue;
         }
-        std::fs::copy(&source, &target)
-            .map_err(|e| format!("copy {}: {e}", source.display()))?;
+        std::fs::copy(&source, &target).map_err(|e| format!("copy {}: {e}", source.display()))?;
     }
     Ok(())
 }
@@ -201,12 +199,9 @@ fn drop_lost_found(dest: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
-
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "ducktape-wsimg-{name}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ducktape-wsimg-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch");
         dir

@@ -92,6 +92,14 @@ impl MicroVm {
         crate::workspace_image::build(workdir, &cfg.workspace, size)?;
 
         // 2. listen BEFORE the VMM starts (see the module docs)
+        //
+        // The BASE path is Firecracker's own: it binds `uds_path` for
+        // host-initiated connections into the guest. A leftover file there
+        // from an earlier run on this run directory makes the VMM exit
+        // immediately with `Address in use`, before any guest code runs — so
+        // it is cleared here rather than left to a teardown that a crash
+        // skipped.
+        let _ = std::fs::remove_file(&cfg.vsock_uds);
         let guest_socket = vsock_port_path(&cfg.vsock_uds, guest_proto::VSOCK_PORT);
         let _ = std::fs::remove_file(&guest_socket);
         let listener = UnixListener::bind(&guest_socket)
@@ -149,7 +157,9 @@ impl MicroVm {
         let stream = match tokio::time::timeout(GUEST_CONNECT_TIMEOUT, listener.accept()).await {
             Ok(Ok((stream, _))) => stream,
             Ok(Err(e)) => {
-                return Err(vm.boot_failure(&format!("accept the guest vsock: {e}")).await);
+                return Err(vm
+                    .boot_failure(&format!("accept the guest vsock: {e}"))
+                    .await);
             }
             Err(_) => {
                 return Err(vm
@@ -283,18 +293,29 @@ async fn pump_frames(
             };
             let frame = guest_proto::encode(&Frame::Stdin(buf[..n].to_vec()));
             if write_half.write_all(&frame).await.is_err() {
-                return;
+                break;
             }
         }
         let eof = guest_proto::encode(&Frame::StdinEof);
         let _ = write_half.write_all(&eof).await;
+
+        // The prompt is sent, but this task must NOT end: it owns the write
+        // half, and Firecracker's vsock backend maps a host-side half-close
+        // onto a full connection RESET rather than a half-close. Dropping it
+        // here therefore kills the guest's output stream mid-run — measured,
+        // the guest echoed the prompt and got EPIPE, and the host saw a run
+        // that produced nothing and reported no exit code.
+        //
+        // The abort at the end of this function is what ends it, and that
+        // close is also the guest's signal that its exit frame landed.
+        std::future::pending::<()>().await
     });
 
     // guest -> host
     let mut pending: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut exit = Some(exit);
-    loop {
+    'outbound: loop {
         let n = match read_half.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
@@ -319,10 +340,16 @@ async fn pump_frames(
                         return;
                     }
                 }
+                // Last frame of the run, and closing here is the guest's
+                // signal that it may reset. Firecracker relays the guest's
+                // vsock writes asynchronously, so a guest that halted the
+                // instant after writing would lose whatever the VMM had not
+                // relayed yet — and the frame that goes missing is this one.
                 Frame::Exit(code) => {
                     if let Some(tx) = exit.take() {
                         let _ = tx.send(code);
                     }
+                    break 'outbound;
                 }
                 // the guest never sends these; a stray one is not worth failing
                 // a finished run over.
@@ -330,7 +357,11 @@ async fn pump_frames(
             }
         }
     }
+    // Awaited, not just aborted: the write half lives in that task, and the
+    // guest is blocked on this socket closing. Dropping the handle without
+    // awaiting leaves the close to whenever the runtime gets round to it.
     feed.abort();
+    let _ = feed.await;
 }
 
 #[cfg(test)]
@@ -348,12 +379,42 @@ mod tests {
         );
     }
 
+    /// The prompt is finished long before the run is, and the task that sent it
+    /// OWNS the write half. Letting it return there drops that half, and
+    /// Firecracker's vsock backend maps a host-side half-close onto a full
+    /// connection RESET rather than a half-close — measured, the guest echoed
+    /// its prompt straight into EPIPE and the run reached the operator as
+    /// "produced nothing, reported no exit code".
+    ///
+    /// Parsed from the source rather than exercised, because the behaviour
+    /// being guarded belongs to Firecracker's backend: a `UnixStream::pair`
+    /// honours the half-close, so a socketpair test passes either way and
+    /// guards nothing. What IS checkable here is the shape that avoids it.
+    #[test]
+    fn the_feed_task_parks_instead_of_returning() {
+        let src = include_str!("microvm.rs");
+        let feed = src
+            .split_once("let feed = tokio::spawn(")
+            .expect("the feed task")
+            .1
+            .split_once("\n    });")
+            .expect("the feed task is one spawn block")
+            .0;
+        assert!(
+            feed.contains("std::future::pending::<()>().await"),
+            "the feed task owns the write half and must park, never return:\n{feed}"
+        );
+    }
+
     /// A unix socket path is capped near 108 bytes. The run directory is
     /// chosen by the caller, so the constraint is documented on `boot` — this
     /// pins the arithmetic that makes it checkable.
     #[test]
     fn a_run_directory_under_xdg_runtime_stays_inside_sun_len() {
-        let path = vsock_port_path(Path::new("/run/user/1000/ducktape/run-0123456789/v.sock"), 1024);
+        let path = vsock_port_path(
+            Path::new("/run/user/1000/ducktape/run-0123456789/v.sock"),
+            1024,
+        );
         assert!(
             path.as_os_str().len() < 108,
             "{} is {} bytes",

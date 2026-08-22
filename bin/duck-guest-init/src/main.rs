@@ -63,12 +63,12 @@ fn main() {
 fn run() -> Result<i32, String> {
     mount_pseudo_filesystems()?;
 
-    let cmdline = std::fs::read_to_string("/proc/cmdline")
-        .map_err(|e| format!("read /proc/cmdline: {e}"))?;
+    let cmdline =
+        std::fs::read_to_string("/proc/cmdline").map_err(|e| format!("read /proc/cmdline: {e}"))?;
     let manifest = manifest::from_cmdline(&cmdline)?;
 
-    for (device, mountpoint) in &manifest.mounts {
-        mount_ext4(device, mountpoint)?;
+    for mount in &manifest.mounts {
+        mount_ext4(mount)?;
     }
 
     for (index, port) in manifest.tunnel_ports.iter().enumerate() {
@@ -87,8 +87,8 @@ fn run() -> Result<i32, String> {
     // host reads the image back with debugfs immediately after the VMM exits,
     // and an unflushed page cache means the run's output is simply missing.
     unsafe { libc::sync() };
-    for (_, mountpoint) in manifest.mounts.iter().rev() {
-        unmount(mountpoint);
+    for mount in manifest.mounts.iter().rev() {
+        unmount(&mount.at);
     }
     code
 }
@@ -106,27 +106,55 @@ fn mount_pseudo_filesystems() -> Result<(), String> {
         ("sysfs", "/sys", "sysfs"),
     ] {
         std::fs::create_dir_all(target).map_err(|e| format!("create {target}: {e}"))?;
-        mount(source, target, fstype, 0, None)?;
+        match mount(source, target, fstype, 0, None) {
+            Ok(()) => {}
+            // EBUSY = already mounted, which for these three is the NORMAL
+            // case, not a failure: a kernel built with CONFIG_DEVTMPFS_MOUNT
+            // mounts /dev itself before handing control to PID 1. Treating it
+            // as an error aborts the boot on a working guest — measured, on
+            // the Firecracker CI kernel, as "the guest never dialled back".
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
+            Err(e) => {
+                return Err(format!("mount {source} -> {target} ({fstype}): {e}"));
+            }
+        }
     }
     Ok(())
 }
 
-fn mount_ext4(device: &str, mountpoint: &str) -> Result<(), String> {
-    std::fs::create_dir_all(mountpoint).map_err(|e| format!("create {mountpoint}: {e}"))?;
-    mount(device, mountpoint, "ext4", 0, None)
+fn mount_ext4(m: &manifest::GuestMount) -> Result<(), String> {
+    let (device, at) = (&m.device, &m.at);
+    std::fs::create_dir_all(at).map_err(|e| format!("create {at}: {e}"))?;
+    // MS_RDONLY is mandatory for a drive the host attached read-only, not an
+    // optimization: Firecracker refuses the write, so a read-write mount fails
+    // with EACCES and the operator sees only "the guest never dialled back".
+    let flags = if m.read_only { libc::MS_RDONLY } else { 0 };
+    mount(device, at, "ext4", flags, None)
+        .map_err(|e| format!("mount {device} -> {at} (ext4): {e}"))
 }
 
+/// Returns the raw `io::Error` rather than a message, so a caller can branch on
+/// the errno — `EBUSY` means "already mounted", which is a normal outcome for
+/// the pseudo-filesystems and a failure for anything else.
 fn mount(
     source: &str,
     target: &str,
     fstype: &str,
     flags: libc::c_ulong,
     data: Option<&str>,
-) -> Result<(), String> {
-    let c_source = cstring(source)?;
-    let c_target = cstring(target)?;
-    let c_fstype = cstring(fstype)?;
-    let c_data = data.map(cstring).transpose()?;
+) -> Result<(), std::io::Error> {
+    let invalid = |what: &str| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{what} holds an interior NUL"),
+        )
+    };
+    let c_source = CString::new(source).map_err(|_| invalid(source))?;
+    let c_target = CString::new(target).map_err(|_| invalid(target))?;
+    let c_fstype = CString::new(fstype).map_err(|_| invalid(fstype))?;
+    let c_data = data
+        .map(|d| CString::new(d).map_err(|_| invalid(d)))
+        .transpose()?;
     let data_ptr = c_data
         .as_ref()
         .map_or(std::ptr::null(), |d| d.as_ptr().cast());
@@ -140,10 +168,7 @@ fn mount(
         )
     };
     if rc != 0 {
-        return Err(format!(
-            "mount {source} -> {target} ({fstype}): {}",
-            std::io::Error::last_os_error()
-        ));
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
@@ -287,13 +312,7 @@ fn send(fd: RawFd, frame: &Frame) {
     let bytes = encode(frame);
     let mut written = 0usize;
     while written < bytes.len() {
-        let n = unsafe {
-            libc::write(
-                fd,
-                bytes[written..].as_ptr().cast(),
-                bytes.len() - written,
-            )
-        };
+        let n = unsafe { libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written) };
         if n <= 0 {
             // The host hung up. Nothing to report it to, and the run's exit
             // still has to reach `halt`.
@@ -345,7 +364,35 @@ fn exec_and_pump(manifest: &RunManifest, host: RawFd) -> Result<i32, String> {
     pump(host, in_pipe[1], out_pipe[0], err_pipe[0]);
     let code = wait_for(child);
     send(host, &Frame::Exit(code));
+    wait_for_host_close(host);
     Ok(code)
+}
+
+/// block until the host closes the connection.
+///
+/// This is the run's only acknowledgement, and it is not optional. Firecracker
+/// relays the guest's vsock writes to the host socket ASYNCHRONOUSLY, so a
+/// guest that reset the instant after its last write loses whatever the VMM has
+/// not relayed yet — and the frame that goes missing is the last one, the exit
+/// code. Measured, that reaches the operator as "guest halted without reporting
+/// an exit code" on a run that in fact finished cleanly.
+///
+/// Unbounded on purpose: the host closes as soon as it has the exit frame, and
+/// if the host process dies instead, its socket closes too. There is no third
+/// outcome to time out against.
+fn wait_for_host_close(host: RawFd) {
+    let mut buf = [0u8; 256];
+    loop {
+        let n = unsafe { libc::read(host, buf.as_mut_ptr().cast(), buf.len()) };
+        if n > 0 {
+            continue;
+        }
+        let interrupted =
+            n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted;
+        if !interrupted {
+            return;
+        }
+    }
 }
 
 /// the child half of the fork. Diverges: on a successful `execve` this process
@@ -428,8 +475,8 @@ fn pump(host: RawFd, in_fd: RawFd, out_fd: RawFd, err_fd: RawFd) {
         // quiet for minutes at a time.
         let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
         if rc < 0 {
-            let interrupted = std::io::Error::last_os_error().kind()
-                == std::io::ErrorKind::Interrupted;
+            let interrupted =
+                std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted;
             if interrupted {
                 continue;
             }
@@ -513,8 +560,7 @@ fn write_all(fd: RawFd, bytes: &[u8]) {
     }
     let mut written = 0usize;
     while written < bytes.len() {
-        let n =
-            unsafe { libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written) };
+        let n = unsafe { libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written) };
         if n <= 0 {
             return;
         }
@@ -560,8 +606,4 @@ fn halt() -> ! {
     loop {
         unsafe { libc::pause() };
     }
-}
-
-fn cstring(s: &str) -> Result<CString, String> {
-    CString::new(s).map_err(|_| format!("{s:?} holds an interior NUL"))
 }

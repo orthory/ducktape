@@ -13,18 +13,33 @@ use serde::{Deserialize, Serialize};
 /// the cmdline key the host sets and [`from_cmdline`] reads back.
 pub const CMDLINE_KEY: &str = "duck.manifest";
 
+/// one block device for the guest init to mount.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestMount {
+    pub device: String,
+    pub at: String,
+    /// mount `MS_RDONLY`.
+    ///
+    /// Not cosmetic and not inferable in the guest: Firecracker refuses writes
+    /// to a drive configured `is_read_only`, so mounting one read-WRITE fails
+    /// outright with EACCES — which reaches the operator as "the guest never
+    /// dialled back", naming nothing. The host knows which drives it attached
+    /// read-only, so it says so.
+    pub read_only: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunManifest {
     pub argv: Vec<String>,
     pub env: Vec<(String, String)>,
     pub cwd: String,
-    /// `(device, mountpoint)` for each block device the host attached, in mount
-    /// order. Carried explicitly rather than inferred from a fixed `/dev/vdb`,
-    /// `/dev/vdc` ordering: the host decides how many drives a run gets (a run
-    /// with no persistent agent volume gets one fewer), and an implicit
-    /// ordering contract split across two files silently mounts the workspace
-    /// at the cache's mountpoint the first time that count changes.
-    pub mounts: Vec<(String, String)>,
+    /// each block device the host attached, in mount order. Carried explicitly
+    /// rather than inferred from a fixed `/dev/vdb`, `/dev/vdc` ordering: the
+    /// host decides how many drives a run gets (a run with no persistent agent
+    /// volume gets one fewer), and an implicit ordering contract split across
+    /// two files silently mounts the workspace at the cache's mountpoint the
+    /// first time that count changes.
+    pub mounts: Vec<GuestMount>,
     /// loopback ports the guest serves and forwards to the host over vsock, in
     /// the same order the host bound its listeners: the run's credential broker
     /// and, when the run has one, the node's run-action RPC.
@@ -84,8 +99,16 @@ mod tests {
             ],
             cwd: "/workspace".into(),
             mounts: vec![
-                ("/dev/vdb".into(), "/agent".into()),
-                ("/dev/vdc".into(), "/workspace".into()),
+                GuestMount {
+                    device: "/dev/vdb".into(),
+                    at: "/agent".into(),
+                    read_only: false,
+                },
+                GuestMount {
+                    device: "/dev/vdc".into(),
+                    at: "/duck".into(),
+                    read_only: true,
+                },
             ],
             tunnel_ports: vec![8931, 8932],
         }

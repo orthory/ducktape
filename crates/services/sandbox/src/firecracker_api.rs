@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::guest_manifest::{self, RunManifest};
+use crate::guest_manifest::{self, GuestMount, RunManifest};
 
 /// how long a run's VM may live before it is killed regardless of progress.
 /// A hung guest holds its whole memory footprint, so this is the backstop that
@@ -128,14 +128,18 @@ pub fn guest_drives(cfg: &VmConfig) -> Vec<GuestDrive> {
     drives
 }
 
-/// the `(device, mountpoint)` pairs for a run's manifest, derived from the same
-/// [`guest_drives`] list the VM is configured from.
-pub fn manifest_mounts(cfg: &VmConfig) -> Vec<(String, String)> {
+/// the mounts for a run's manifest, derived from the same [`guest_drives`] list
+/// the VM is configured from — including each drive's read-only bit, which the
+/// guest cannot infer and which Firecracker enforces at the device.
+pub fn manifest_mounts(cfg: &VmConfig) -> Vec<GuestMount> {
     guest_drives(cfg)
         .into_iter()
         .filter_map(|drive| {
-            let mountpoint = drive.mountpoint?;
-            Some((drive.device.to_string(), mountpoint.to_string()))
+            Some(GuestMount {
+                device: drive.device.to_string(),
+                at: drive.mountpoint?.to_string(),
+                read_only: drive.read_only,
+            })
         })
         .collect()
 }
@@ -290,8 +294,14 @@ mod tests {
     /// another device's mountpoint and the run's output goes nowhere.
     #[test]
     fn the_device_names_track_how_many_drives_the_run_got() {
+        let at = |mounts: &[GuestMount]| -> Vec<(String, String)> {
+            mounts
+                .iter()
+                .map(|m| (m.device.clone(), m.at.clone()))
+                .collect()
+        };
         assert_eq!(
-            manifest_mounts(&cfg()),
+            at(&manifest_mounts(&cfg())),
             vec![
                 ("/dev/vdb".to_string(), AGENT_VOLUME_MOUNTPOINT.to_string()),
                 ("/dev/vdc".to_string(), ASSETS_MOUNTPOINT.to_string()),
@@ -304,11 +314,32 @@ mod tests {
             ..cfg()
         };
         assert_eq!(
-            manifest_mounts(&without_cache),
+            at(&manifest_mounts(&without_cache)),
             vec![
                 ("/dev/vdb".to_string(), ASSETS_MOUNTPOINT.to_string()),
                 ("/dev/vdc".to_string(), WORKSPACE_MOUNTPOINT.to_string()),
             ]
+        );
+    }
+
+    /// Firecracker enforces the read-only bit AT THE DEVICE, so a guest that
+    /// mounts a read-only drive read-write fails with EACCES and dies before it
+    /// dials back. The manifest is the only channel that can tell it.
+    #[test]
+    fn the_manifest_carries_each_drives_read_only_bit() {
+        let mounts = manifest_mounts(&cfg());
+        let by_at = |at: &str| {
+            mounts
+                .iter()
+                .find(|m| m.at == at)
+                .unwrap_or_else(|| panic!("{at} is mounted"))
+                .clone()
+        };
+        assert!(by_at(ASSETS_MOUNTPOINT).read_only, "the assets are inputs");
+        assert!(!by_at(WORKSPACE_MOUNTPOINT).read_only, "output goes here");
+        assert!(
+            !by_at(AGENT_VOLUME_MOUNTPOINT).read_only,
+            "cache is written"
         );
     }
 
@@ -321,11 +352,11 @@ mod tests {
         let mounts = manifest_mounts(&cfg());
         let assets = mounts
             .iter()
-            .position(|(_, at)| at == ASSETS_MOUNTPOINT)
+            .position(|m| m.at == ASSETS_MOUNTPOINT)
             .expect("assets");
         let workspace = mounts
             .iter()
-            .position(|(_, at)| at == WORKSPACE_MOUNTPOINT)
+            .position(|m| m.at == WORKSPACE_MOUNTPOINT)
             .expect("workspace");
         assert!(assets < workspace, "{mounts:?}");
         assert!(
@@ -339,17 +370,17 @@ mod tests {
     #[test]
     fn the_root_device_is_never_handed_to_the_init_to_mount() {
         for mount in manifest_mounts(&cfg()) {
-            assert_ne!(mount.0, "/dev/vda", "the init must not mount the rootfs");
+            assert_ne!(
+                mount.device, "/dev/vda",
+                "the init must not mount the rootfs"
+            );
         }
     }
 
     /// "Offline" has to mean no interface, not an interface that cannot route.
     #[test]
     fn a_run_without_a_tap_gets_no_network_device_at_all() {
-        let offline = VmConfig {
-            tap: None,
-            ..cfg()
-        };
+        let offline = VmConfig { tap: None, ..cfg() };
         let config = boot_config(&offline, &manifest());
         assert!(config.get("network-interfaces").is_none(), "{config}");
 

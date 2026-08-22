@@ -156,5 +156,3 @@ fn probe_kvm() -> Result<(), String> {
             )
         })
 }
-
-

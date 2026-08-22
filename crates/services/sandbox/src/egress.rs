@@ -102,7 +102,9 @@ mod tests {
     #[test]
     fn the_broker_accept_precedes_the_private_range_drop() {
         let rules = ruleset();
-        let accept = rules.find("tcp dport { 8080, 9090 } accept").expect("accept");
+        let accept = rules
+            .find("tcp dport { 8080, 9090 } accept")
+            .expect("accept");
         let drop = rules.find("10.0.0.0/8").expect("private drop");
         assert!(accept < drop, "accept must precede drop:\n{rules}");
     }
@@ -136,7 +138,9 @@ mod tests {
             "{input_chain:?}"
         );
         assert!(
-            input_chain.iter().any(|l| l.trim() == "iifname \"dtap7\" drop"),
+            input_chain
+                .iter()
+                .any(|l| l.trim() == "iifname \"dtap7\" drop"),
             "the input chain must end in a drop:\n{input_chain:?}"
         );
     }

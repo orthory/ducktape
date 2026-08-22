@@ -163,7 +163,9 @@ mod tests {
     fn a_path_embedded_in_a_larger_string_is_rewritten_too() {
         let l = layout();
         assert_eq!(
-            l.translate("projects.\"/home/operator/ducktape/runs/run7/ws\".trust_level=\"trusted\""),
+            l.translate(
+                "projects.\"/home/operator/ducktape/runs/run7/ws\".trust_level=\"trusted\""
+            ),
             "projects.\"/duck/workspace\".trust_level=\"trusted\""
         );
     }

@@ -22,14 +22,17 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${OUT:-/var/lib/ducktape/guest}"
-WORK="${WORK:-${TMPDIR:-/tmp}/ducktape-guest-build}"
+# Beside the output, never under /tmp: the extracted base is ~1 GB and /tmp on
+# this class of host is both memory-backed and periodically reaped — a reaped
+# cache silently turns every rebuild into a fresh 250 MB download.
+WORK="${WORK:-$OUT/.build}"
 
 # The Firecracker CI kernel: a known-good x86_64 vmlinux with virtio-blk,
 # -net and -vsock built in. Building our own is an open question in the spec
 # (it decides the CVE workflow); tracking this one is what unblocks everything
 # else meanwhile.
-KERNEL_URL="${KERNEL_URL:-https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/x86_64/vmlinux-6.1.128}"
-BASE_URL="${BASE_URL:-https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/x86_64/ubuntu-24.04.squashfs}"
+KERNEL_URL="${KERNEL_URL:-https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/x86_64/vmlinux-6.1.128}"
+BASE_URL="${BASE_URL:-https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/x86_64/ubuntu-24.04.squashfs}"
 
 # the host binaries lent to runs. Each must be a real executable; a symlink is
 # resolved so the image carries the target, not a dangling link.

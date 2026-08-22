@@ -21,11 +21,11 @@ use std::path::Path;
 pub mod egress;
 #[cfg(unix)]
 pub mod firecracker_api;
+pub mod guest_paths;
 #[cfg(unix)]
 pub mod host_tools;
 #[cfg(unix)]
 pub mod microvm;
-pub mod guest_paths;
 pub mod sandbox;
 // the host<->guest contract. Both files are included verbatim by the guest init
 // (`#[path = ...]`) rather than depended on, so the wire format and the run
@@ -38,11 +38,11 @@ pub mod workspace_image;
 
 #[cfg(unix)]
 pub use egress::tap_egress_nftables;
+pub use guest_paths::GuestLayout;
 #[cfg(unix)]
 pub use host_tools::{find_on_path, find_system_tool};
 #[cfg(unix)]
 pub use microvm::{MicroVm, MicroVmIo};
-pub use guest_paths::GuestLayout;
 pub use sandbox::SandboxBackend;
 
 /// whether `p` is a file this process could exec. the shared predicate behind

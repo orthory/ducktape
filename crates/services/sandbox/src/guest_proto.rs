@@ -112,9 +112,10 @@ pub fn decode(buf: &mut Vec<u8>) -> Result<Option<Frame>, String> {
         TAG_STDIN => Frame::Stdin(payload),
         TAG_STDIN_EOF => Frame::StdinEof,
         TAG_EXIT => {
-            let bytes: [u8; 4] = payload.as_slice().try_into().map_err(|_| {
-                format!("guest exit frame carried {} bytes, want 4", payload.len())
-            })?;
+            let bytes: [u8; 4] = payload
+                .as_slice()
+                .try_into()
+                .map_err(|_| format!("guest exit frame carried {} bytes, want 4", payload.len()))?;
             Frame::Exit(i32::from_le_bytes(bytes))
         }
         other => return Err(format!("guest frame carried unknown tag {other}")),
