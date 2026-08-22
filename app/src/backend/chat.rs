@@ -265,6 +265,30 @@ pub fn huddle_recipient_nodes(roster: Vec<HuddleParticipant>) -> Vec<String> {
         .collect()
 }
 
+/// THE FAN-OUT SET, READ FROM CONSENSUS — the live call session's own poll
+/// (`crate::call`), not the roster on screen.
+///
+/// The hub gates admission on this set at BOTH ends: a datagram from a peer
+/// the local session does not list is dropped at demux, media and 1 Hz
+/// presence beacon alike. So a peer who joins after us has to enter the set
+/// from somewhere, and the only thing that used to re-steer it was a peer
+/// beacon — which their join could not deliver, because they were not in the
+/// set yet. Two people joining a huddle therefore heard and saw nothing of
+/// each other, forever.
+///
+/// It is read here rather than taken from `huddle_roster` because that field
+/// belongs to the channel the user is LOOKING at, which need not be the
+/// channel they are huddling in.
+pub(crate) async fn huddle_fanout_nodes(
+    rpc: &str,
+    channel_id: &str,
+) -> Result<Vec<String>, String> {
+    let client = rpc_client(rpc)?;
+    let me = local_user_key().await;
+    let (_channel, roster) = load_channel_facts(&client, channel_id, me.as_deref()).await?;
+    Ok(huddle_recipient_nodes(roster))
+}
+
 // The huddle's elapsed clock is a LOCAL session fact on a NATIVE `every 1s`
 // subscription — ui-lang ships one, so this app has no tick stream of its own.
 

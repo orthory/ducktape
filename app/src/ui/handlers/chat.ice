@@ -394,7 +394,19 @@ on join_huddle_submit
   hydration_retry_attempt = 0
   mutation_phase = MutationPhase.huddle
   error = ""
-  run every join_huddle(connected_rpc, password, active_channel) -> chat_acked _ | mutation_failed _
+  run every join_huddle(connected_rpc, password, active_channel) -> huddle_joined_ack _ | mutation_failed _
+
+// THE JOIN OPENS THE HUDDLE, because the huddle window is where the huddle IS:
+// every face, every shared screen, the mic and camera controls and Leave live
+// in it, and the header pill it docks into can show none of them. Joining and
+// then being shown a pill is how someone sits in a call watching nothing
+// happen, which is exactly what "I joined and there was no video" is. The
+// guard is `pop_huddle`'s own: a window already up is not opened twice.
+on huddle_joined_ack(_result)
+  mutation_phase = MutationPhase.idle
+  error = ""
+  return if huddle_win != none
+  task window open huddle -> huddle_opened _
 
 // Leaving is `leave_huddle_here` in handlers/huddle.ice, which leaves the
 // HUDDLE'S channel rather than the one on screen — the same button serves the
@@ -539,13 +551,17 @@ on chat_updated(next)
   active_channel_members_only = next.active_channel_members_only
   // Am I in it — see `join_huddle_submit` above. Stamp first: it reads the
   // PREVIOUS `huddle_joined`, so a refresh that finds her still in keeps the
-  // clock and one that finds her out re-takes it for the next join.
+  // clock and one that finds her out re-takes it for the next join. The load
+  // answers for the huddle only when it loaded the huddle's OWN channel —
+  // clicking a second room does not end the call she is in, and the call's
+  // media leg is subscribed on this very flag (`huddle_after_load`).
   huddle_joined_at = keep_i64(huddle_joined, huddle_joined_at, huddle_now)
-  huddle_joined = huddle_self(next.huddle_roster)
-  huddle_roster = keep_roster(huddle_joined, next.huddle_roster)
+  let huddle = huddle_after_load(true, huddle_joined, huddle_channel, huddle_channel_name, huddle_roster, active_channel, active_channel_name, next.huddle_roster)
+  huddle_joined = huddle.joined
+  huddle_roster = huddle.roster
   huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)
-  huddle_channel = keep_str(huddle_joined, active_channel, "")
-  huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
+  huddle_channel = huddle.channel
+  huddle_channel_name = huddle.channel_name
   channel_members = next.channel_members
   post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   selected_message_seq = next.selected_message_seq
@@ -610,13 +626,17 @@ on chat_hit_loaded(next)
   active_channel_members_only = next.active_channel_members_only
   // Am I in it — see `join_huddle_submit` above. Stamp first: it reads the
   // PREVIOUS `huddle_joined`, so a refresh that finds her still in keeps the
-  // clock and one that finds her out re-takes it for the next join.
+  // clock and one that finds her out re-takes it for the next join. The load
+  // answers for the huddle only when it loaded the huddle's OWN channel —
+  // clicking a second room does not end the call she is in, and the call's
+  // media leg is subscribed on this very flag (`huddle_after_load`).
   huddle_joined_at = keep_i64(huddle_joined, huddle_joined_at, huddle_now)
-  huddle_joined = huddle_self(next.huddle_roster)
-  huddle_roster = keep_roster(huddle_joined, next.huddle_roster)
+  let huddle = huddle_after_load(true, huddle_joined, huddle_channel, huddle_channel_name, huddle_roster, active_channel, active_channel_name, next.huddle_roster)
+  huddle_joined = huddle.joined
+  huddle_roster = huddle.roster
   huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)
-  huddle_channel = keep_str(huddle_joined, active_channel, "")
-  huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
+  huddle_channel = huddle.channel
+  huddle_channel_name = huddle.channel_name
   channel_members = next.channel_members
   post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   selected_message_seq = next.selected_message_seq
@@ -702,13 +722,17 @@ on channel_created(next)
   active_channel_members_only = next.active_channel_members_only
   // Am I in it — see `join_huddle_submit` above. Stamp first: it reads the
   // PREVIOUS `huddle_joined`, so a refresh that finds her still in keeps the
-  // clock and one that finds her out re-takes it for the next join.
+  // clock and one that finds her out re-takes it for the next join. The load
+  // answers for the huddle only when it loaded the huddle's OWN channel —
+  // clicking a second room does not end the call she is in, and the call's
+  // media leg is subscribed on this very flag (`huddle_after_load`).
   huddle_joined_at = keep_i64(huddle_joined, huddle_joined_at, huddle_now)
-  huddle_joined = huddle_self(next.huddle_roster)
-  huddle_roster = keep_roster(huddle_joined, next.huddle_roster)
+  let huddle = huddle_after_load(true, huddle_joined, huddle_channel, huddle_channel_name, huddle_roster, active_channel, active_channel_name, next.huddle_roster)
+  huddle_joined = huddle.joined
+  huddle_roster = huddle.roster
   huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)
-  huddle_channel = keep_str(huddle_joined, active_channel, "")
-  huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
+  huddle_channel = huddle.channel
+  huddle_channel_name = huddle.channel_name
   channel_members = next.channel_members
   post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   selected_message_seq = next.selected_message_seq

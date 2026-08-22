@@ -1273,22 +1273,65 @@ pub fn keep_members(
     if loaded { next } else { current }
 }
 
-/// The huddle roster, kept only while this device is IN the huddle. Every chat
-/// load carries the roster of the channel it loaded, so a load of any other
-/// channel must not leave the popped panel painting strangers — dropping it is
-/// the same guard `huddle_channel` itself carries.
-pub fn keep_roster(joined: bool, next: Vec<HuddleParticipant>) -> Vec<HuddleParticipant> {
-    if joined { next } else { Vec::new() }
+/// Everything a chat load says about the huddle — the one rule, in one place,
+/// for the five folds that used to spell it out in four lines each.
+///
+/// A LOAD CARRIES THE ROSTER OF THE CHANNEL IT LOADED, AND THAT IS NOT ALWAYS
+/// THE HUDDLE'S. The docked pill and the popped panel follow you onto every
+/// other room and every other screen — that is what they are FOR — so reading
+/// "am I in a huddle" off the room you happen to be looking at answered no the
+/// moment you clicked a second channel. And that answer is not cosmetic:
+/// `huddle_joined` is the media leg's subscription gate, so a channel click cut
+/// the audio and video of the call you were in, closed the window, and blanked
+/// the `huddle_channel` that `leave_huddle_here` needs — leaving you on the
+/// on-chain roster with no control left that could take you off it.
+///
+/// So: while joined, a load of ANY OTHER channel says nothing about the huddle
+/// and changes nothing about it. A load of the huddle's own channel (or any
+/// load at all while not joined) answers in full, and a resync that carried no
+/// chat at all (`loaded == false`) answers not at all.
+#[derive(Clone, Debug, Default, Hash, PartialEq)]
+pub struct HuddleAfterLoad {
+    pub joined: bool,
+    pub roster: Vec<HuddleParticipant>,
+    pub channel: String,
+    pub channel_name: String,
 }
 
-/// [`keep_roster`]'s loaded-gated half: a resync that did NOT load chat must
-/// leave the roster alone rather than blank it.
-pub fn keep_participants(
+// Eight, because the rule compares two whole huddles — the standing one and
+// the one the load carries. Folding either half into a struct only moves the
+// four names to the call site, where five folds would each build it by hand.
+#[allow(clippy::too_many_arguments)]
+pub fn huddle_after_load(
     loaded: bool,
-    next: Vec<HuddleParticipant>,
-    current: Vec<HuddleParticipant>,
-) -> Vec<HuddleParticipant> {
-    if loaded { next } else { current }
+    joined: bool,
+    channel: String,
+    channel_name: String,
+    roster: Vec<HuddleParticipant>,
+    loaded_channel: String,
+    loaded_channel_name: String,
+    loaded_roster: Vec<HuddleParticipant>,
+) -> HuddleAfterLoad {
+    let standing = HuddleAfterLoad {
+        joined,
+        roster,
+        channel,
+        channel_name,
+    };
+    let speaks_for_the_huddle = loaded && (!joined || loaded_channel == standing.channel);
+    if !speaks_for_the_huddle {
+        return standing;
+    }
+    let joined_now = huddle_self(loaded_roster.clone());
+    if !joined_now {
+        return HuddleAfterLoad::default();
+    }
+    HuddleAfterLoad {
+        joined: true,
+        roster: loaded_roster,
+        channel: loaded_channel,
+        channel_name: loaded_channel_name,
+    }
 }
 
 pub fn keep_pages(loaded: bool, next: Vec<PageItem>, current: Vec<PageItem>) -> Vec<PageItem> {

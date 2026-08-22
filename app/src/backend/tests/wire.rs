@@ -226,6 +226,104 @@ async fn one_unlock_signs_every_request_of_the_session() {
     );
 }
 
+/// THE FAN-OUT SET, READ THROUGH A REAL NODE — the poll a live call session
+/// runs once a second, and the read the whole huddle rides on. Everything
+/// downstream of it is exact: the hub parses each entry with `from_hex_32` and
+/// admits that peer's media by the key it gets, so a roster row that is not 64
+/// lowercase hex characters of NODE key is a call that stays silent with
+/// nothing to see anywhere.
+///
+/// It also pins the vocabulary that made the LIVE pill unreachable once
+/// already: `HuddleEntry.user` is the kernel's BARE user id, and a comparison
+/// against any other spelling of it marks nobody as you — which here would
+/// mean fanning this device's own media at itself and never at the peer.
+#[tokio::test(flavor = "current_thread")]
+async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
+    let storage = tempfile::tempdir().unwrap();
+    let sim = simnode::boot(
+        storage.path(),
+        "127.0.0.1:0".parse().unwrap(),
+        simnode::SimOpts {
+            auto: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let rpc = RpcClient::new(&format!("http://{}", sim.addr())).unwrap();
+    let (me, peer) = (
+        ed25519::PrivateKey::from_seed(11),
+        ed25519::PrivateKey::from_seed(12),
+    );
+    // Two people, two nodes — the huddle's roster is (user, node) pairs, and
+    // it is the NODE half the media plane speaks.
+    let (my_node, peer_node) = ([0xa1u8; 32], [0xb2u8; 32]);
+
+    submit_test(
+        &rpc,
+        &me,
+        1,
+        "chat",
+        chat::encode_msg(&ChatMsg::CreateChannel {
+            channel_id: "eng".into(),
+            name: "Engineering".into(),
+            post_policy: PostPolicy::Open,
+        }),
+    )
+    .await;
+    submit_test(
+        &rpc,
+        &me,
+        2,
+        "chat",
+        chat::encode_msg(&ChatMsg::JoinHuddle {
+            channel_id: "eng".into(),
+            node: my_node.to_vec(),
+        }),
+    )
+    .await;
+    submit_test(
+        &rpc,
+        &peer,
+        1,
+        "chat",
+        chat::encode_msg(&ChatMsg::JoinHuddle {
+            channel_id: "eng".into(),
+            node: peer_node.to_vec(),
+        }),
+    )
+    .await;
+
+    let mine = me.public_key().as_ref().to_vec();
+    let (_channel, roster) = load_channel_facts(&rpc, "eng", Some(&mine))
+        .await
+        .expect("the huddle's channel reads back");
+    assert_eq!(roster.len(), 2, "both people are on the roster");
+    assert_eq!(
+        roster.iter().filter(|row| row.is_you).count(),
+        1,
+        "exactly one row is this device's — the id vocabulary has to match"
+    );
+
+    let nodes = huddle_recipient_nodes(roster);
+    assert_eq!(
+        nodes,
+        vec![hex_encode(&peer_node)],
+        "the fan-out is the OTHER node's key: ours in it would aim this \
+         device's media at itself, and the peer's missing from it is the \
+         silence this whole poll exists to end"
+    );
+    let admissible = nodes[0].len() == 64 && nodes[0].chars().all(|c| c.is_ascii_hexdigit());
+    assert!(
+        admissible,
+        "the hub parses a recipient with `from_hex_32`; anything else is \
+         dropped and the peer is never admitted: {}",
+        nodes[0]
+    );
+    // `shutdown`, not a drop: the handle's last executor reference cannot be
+    // dropped on this async thread (see `SimHandle::shutdown`).
+    sim.shutdown();
+}
+
 #[test]
 fn post_commit_hydration_errors_are_not_retryable() {
     let error = committed_error("read failed".into());

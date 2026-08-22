@@ -188,11 +188,12 @@ on workspace_connected(next)
   // process that reconnects while already on the roster renders LIVE here;
   // without this the pill only appeared after a manual channel re-pick.
   huddle_joined_at = keep_i64(huddle_joined, huddle_joined_at, huddle_now)
-  huddle_joined = huddle_self(next.huddle_roster)
-  huddle_roster = keep_roster(huddle_joined, next.huddle_roster)
+  let huddle = huddle_after_load(true, huddle_joined, huddle_channel, huddle_channel_name, huddle_roster, active_channel, active_channel_name, next.huddle_roster)
+  huddle_joined = huddle.joined
+  huddle_roster = huddle.roster
   huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)
-  huddle_channel = keep_str(huddle_joined, active_channel, "")
-  huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
+  huddle_channel = huddle.channel
+  huddle_channel_name = huddle.channel_name
   channel_members = next.channel_members
   post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   pages = next.pages
@@ -458,11 +459,12 @@ on live_resynced(next)
   // roster it fetched finally answers "am I in it". Without these lines the
   // LIVE pill never appeared until a manual channel re-pick.
   huddle_joined_at = keep_i64(huddle_joined, huddle_joined_at, huddle_now)
-  huddle_joined = keep_bool(next.chat_loaded, huddle_self(next.huddle_roster), huddle_joined)
-  huddle_roster = keep_roster(huddle_joined, keep_participants(next.chat_loaded, next.huddle_roster, huddle_roster))
+  let huddle = huddle_after_load(next.chat_loaded, huddle_joined, huddle_channel, huddle_channel_name, huddle_roster, active_channel, active_channel_name, next.huddle_roster)
+  huddle_joined = huddle.joined
+  huddle_roster = huddle.roster
   huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)
-  huddle_channel = keep_str(huddle_joined, active_channel, "")
-  huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
+  huddle_channel = huddle.channel
+  huddle_channel_name = huddle.channel_name
   channel_members = keep_members(next.chat_loaded, next.channel_members, channel_members)
   post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   // THE READ CURSOR TAKES THE LIVE FOLD'S TWO GATES, and it has to: a

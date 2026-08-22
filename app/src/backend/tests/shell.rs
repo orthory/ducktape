@@ -103,21 +103,74 @@ fn directory_rows_are_prepared_from_the_listing() {
 }
 
 #[test]
-fn a_roster_survives_only_while_this_device_is_in_the_huddle() {
-    let roster = vec![HuddleParticipant {
+fn a_chat_load_answers_for_the_huddle_only_when_it_loaded_the_huddles_channel() {
+    let member = |is_you: bool| HuddleParticipant {
         key: "aa".into(),
         label: "aa".into(),
         initials: "A".into(),
         is_agent: false,
-        is_you: true,
+        is_you,
         joined_at: 0,
         node: "aa11".into(),
-    }];
-    assert_eq!(keep_roster(true, roster.clone()).len(), 1);
-    assert!(
-        keep_roster(false, roster).is_empty(),
-        "another channel's roster never reaches the panel"
+    };
+    let idle = HuddleAfterLoad::default();
+
+    // Not in a huddle: the loaded channel's roster is the whole answer.
+    let joined = huddle_after_load(
+        true,
+        idle.joined,
+        idle.channel.clone(),
+        idle.channel_name.clone(),
+        idle.roster.clone(),
+        "eng".into(),
+        "Engineering".into(),
+        vec![member(true)],
     );
+    assert!(joined.joined);
+    assert_eq!(joined.channel, "eng");
+    assert_eq!(joined.channel_name, "Engineering");
+    assert_eq!(joined.roster.len(), 1);
+
+    // NOW CLICK ANOTHER ROOM. Its roster is a different conversation's, and
+    // reading the huddle off it used to cut the call's media (the session is
+    // subscribed on `joined`) and blank the channel `leave_huddle_here` needs.
+    let switched = huddle_after_load(
+        true,
+        joined.joined,
+        joined.channel.clone(),
+        joined.channel_name.clone(),
+        joined.roster.clone(),
+        "general".into(),
+        "General".into(),
+        Vec::new(),
+    );
+    assert_eq!(switched, joined, "another room's load is not the huddle's");
+
+    // Back on the huddle's own channel, a roster without her ends it.
+    let left = huddle_after_load(
+        true,
+        joined.joined,
+        joined.channel.clone(),
+        joined.channel_name.clone(),
+        joined.roster.clone(),
+        "eng".into(),
+        "Engineering".into(),
+        vec![member(false)],
+    );
+    assert_eq!(left, idle);
+
+    // And a resync that carried no chat at all says nothing either way.
+    let quiet = huddle_after_load(
+        false,
+        joined.joined,
+        joined.channel.clone(),
+        joined.channel_name.clone(),
+        joined.roster.clone(),
+        "eng".into(),
+        "Engineering".into(),
+        Vec::new(),
+    );
+    assert_eq!(quiet, joined);
 }
 
 #[test]
@@ -223,12 +276,12 @@ fn the_huddle_roster_marks_the_row_this_device_holds() {
         &[
             chat::index::HuddleEntry {
                 user: hex_encode(&me),
-                node: String::new(),
+                node: "0a0a".into(),
                 joined_at: 10,
             },
             chat::index::HuddleEntry {
                 user: hex_encode(&peer),
-                node: String::new(),
+                node: "0b0b".into(),
                 joined_at: 20,
             },
         ],
@@ -239,6 +292,10 @@ fn the_huddle_roster_marks_the_row_this_device_holds() {
     assert!(!roster[1].is_you && !roster[1].is_agent);
     assert!(huddle_self(roster.clone()));
     assert!(!huddle_self(vec![roster[1].clone()]));
+    // The fan-out the live session polls for is this roster's NODE keys with
+    // our own row removed — the hub admits and fans out by node identity, and
+    // a set that carried our own key would aim this device's media at itself.
+    assert_eq!(huddle_recipient_nodes(roster), vec!["0b0b".to_string()]);
 }
 
 #[test]

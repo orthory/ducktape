@@ -1145,3 +1145,54 @@ test tray_menu_reads_the_state
   tray choose "Mute"
   expect tray item "Unmute"
   expect call_muted
+
+// A HUDDLE WITH A SCREEN ON THE STAGE, at the panel's narrowest. The controls
+// row is where a huddle goes wrong when it grows: this window is 320px at its
+// minimum, and the file above records `Leave` being pushed off the end of it
+// once already. A fourth source control is exactly that risk again, so the
+// contract is that the leave button still lands inside the panel.
+preset ui_huddle_sharing
+  state
+    // Deliberately NOT connected, and no `huddle_channel`: those two are the
+    // media leg's subscription gate, and a session opening under a mount test
+    // fires its own `connecting` event, which resets the very toggles this
+    // preset is setting.
+    connected = false
+    huddle_joined = true
+    huddle_channel_name = "eng"
+    call_status = "live"
+    call_muted = false
+    call_camera = false
+    call_sharing = true
+    call_video_live = true
+    huddle_stage = "you"
+
+test the_huddle_controls_survive_the_narrowest_panel
+  preset ui_huddle_sharing
+  viewport 320 640
+  mount
+    HuddlePanel #huddle
+      with
+        channel=huddle_channel_name
+        elapsed="01:20"
+        rows=huddle_rows
+        status=call_status
+        muted=call_muted
+        camera=call_camera
+        sharing=call_sharing
+        stage=huddle_stage
+        video_live=call_video_live
+      events
+        dock_huddle -> dock_huddle
+        huddle_go_channel -> huddle_go_channel
+        leave_huddle_here -> leave_huddle_here
+        toggle_call_mute -> toggle_call_mute
+        toggle_call_camera -> toggle_call_camera
+        toggle_call_screen -> toggle_call_screen
+  target panel = #huddle/root
+  target share = #huddle/root/share-stop
+  target leave = #huddle/root/leave
+  expect call_sharing
+  expect leave.x + leave.width <= panel.x + panel.width
+  expect share.width ~= 32.0
+  capture huddle_sharing_light

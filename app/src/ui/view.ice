@@ -83,6 +83,8 @@ view
           status=call_status
           muted=call_muted
           camera=call_camera
+          sharing=call_sharing
+          stage=huddle_stage
           video_live=call_video_live
         events
           dock_huddle -> dock_huddle
@@ -90,6 +92,7 @@ view
           leave_huddle_here -> leave_huddle_here
           toggle_call_mute -> toggle_call_mute
           toggle_call_camera -> toggle_call_camera
+          toggle_call_screen -> toggle_call_screen
     if console_win == some(window)
       WorkspaceTabs wall_now=wall_now #workspace-tabs
         with

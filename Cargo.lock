@@ -2786,6 +2786,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3303,6 +3304,7 @@ dependencies = [
  "ui-lang-components",
  "ui-lang-runtime",
  "usvg",
+ "x11rb",
  "zeroize",
  "zune-jpeg 0.4.21",
 ]
