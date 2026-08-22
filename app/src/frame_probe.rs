@@ -24,7 +24,7 @@ use iced::{Event, Point, Size, Theme};
 use iced_test::runtime::user_interface::{self, UserInterface};
 
 use super::backend;
-use super::{__DucktapeMessage, Ducktape, LiveKind, ShellTab};
+use super::{__DucktapeMessage, Ducktape, LiveKind, MessageAction, ShellTab};
 
 /// One synthetic channel's worth of scrollback — `CHAT_VIEW_PAGE_LIMIT`, the
 /// page the timeline walk asks for, so the probe measures the widest window a
@@ -1904,5 +1904,73 @@ fn probe_channel_switch() {
         "one room switch cost {per_switch} allocations, over the \
          {CHANNEL_SWITCH_REDUCER_ALLOCATION_CEILING} ceiling. The switch should clear \
          the active rich window, retain only tiny draft stores, and launch one root read."
+    );
+}
+
+/// A press on the pane beside an open message menu dismisses it — the
+/// backdrop's `dismiss`, the one exit a pointer has. The app's codegen wraps
+/// an overlay's LAYER in a press swallower (a press on a menu row's padding
+/// must not fall through to the backdrop), so a fill-sized layer covered the
+/// backdrop end to end: every press on the pane died in the swallower and
+/// Esc was the menu's only exit. Driven through the real event path — the
+/// float overlay, the swallower, the backdrop — not the reducer.
+#[test]
+fn a_press_beside_the_message_menu_dismisses_it() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(probe_message_menu_dismiss)
+        .expect("the menu dismiss probe thread spawns")
+        .join()
+        .expect("the menu dismiss probe thread finishes");
+}
+
+fn probe_message_menu_dismiss() {
+    let (mut app, console) = console_in_chat();
+    let _ = app.__update(__DucktapeMessage::OpenMessageActions(
+        ROWS,
+        "body".into(),
+        1,
+    ));
+    assert_eq!(app.message_action, MessageAction::More, "the menu is open");
+    assert_eq!(app.selected_message_seq, ROWS);
+
+    let mut renderer = headless_renderer();
+    let cache = warm_settled(
+        "the menu dismiss probe",
+        &mut app,
+        console,
+        WINDOW,
+        &mut renderer,
+        user_interface::Cache::default(),
+    );
+    // Mid-pane, well left of the 200px menu that hangs off the right edge.
+    let position = Point::new(520.0, 450.0);
+    let cursor = mouse::Cursor::Available(position);
+    let mut clipboard = clipboard::Null;
+    let mut queued: Vec<__DucktapeMessage> = Vec::new();
+    let mut ui = UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer);
+    let _ = ui.update(
+        &[
+            Event::Mouse(mouse::Event::CursorMoved { position }),
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+        ],
+        cursor,
+        &mut renderer,
+        &mut clipboard,
+        &mut queued,
+    );
+    drop(ui);
+    for message in queued {
+        let _ = app.__update(message);
+    }
+    assert_eq!(
+        app.message_action,
+        MessageAction::Toolbar,
+        "a press beside the menu must reach the backdrop's dismiss"
+    );
+    assert_eq!(
+        app.selected_message_seq, 0,
+        "the selection clears with the menu"
     );
 }

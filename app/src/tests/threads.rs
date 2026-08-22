@@ -157,9 +157,11 @@ fn thread_messages_mirror_the_main_action_system() {
         "overlay when=(thread_selected_seq > 0 && thread_message_action != MessageAction.toolbar)"
     ));
     assert!(thread.contains("dismiss=emit(clear_thread_message_selection) backdrop=transparent"));
-    assert!(thread.contains(
-        "box w=fill h=fill pt=block_action_menu_y(thread_pointer_y, thread_height) align-x=end align-y=start"
-    ));
+    // Same shape as the stream menu: the layer is the menu, the gap above it
+    // dismisses (see design.rs for why a fill layer hides the backdrop).
+    assert!(!thread.contains("box w=fill h=fill pt=block_action_menu_y"));
+    assert!(thread.contains("mouse press=emit(clear_thread_message_selection)"));
+    assert!(thread.contains("space w=fill h=block_action_menu_y(thread_pointer_y, thread_height)"));
     assert!(thread.contains("mouse press-at=thread_pointer_pressed"));
     // same seat as the message list — the rail measures itself
     assert!(thread.contains("sensor show=thread_resized resize=thread_resized"));

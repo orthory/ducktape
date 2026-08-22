@@ -833,8 +833,17 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                     content
                       space w=fill h=fill
                     layer
-                      box w=fill h=fill pt=block_action_menu_y(chat_pointer_y, chat_height) align-x=end align-y=start
+                      // THE LAYER IS THE MENU, NOT THE PANE. Codegen wraps an
+                      // overlay's layer in a press swallower (a press on a menu
+                      // row's padding must not fall through to the backdrop), so
+                      // a fill-sized layer carrying the pointer-y offset as
+                      // padding covered the backdrop end to end: every press on
+                      // the pane died in the swallower and Esc was the menu's
+                      // only exit. The offset is a pressable gap instead, routed
+                      // to the same dismiss the backdrop carries.
                         col
+                          mouse press=emit(clear_message_selection)
+                            space w=fill h=block_action_menu_y(chat_pointer_y, chat_height)
                           if message_action == MessageAction.more
                             stack
                               input "" #message-action-focus <-> message_action_focus
@@ -1694,8 +1703,11 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                 content
                   space w=fill h=fill
                 layer
-                  box w=fill h=fill pt=block_action_menu_y(thread_pointer_y, thread_height) align-x=end align-y=start
+                  // Same shape as the stream menu: the layer is the menu, the
+                  // gap above it dismisses.
                     col
+                      mouse press=emit(clear_thread_message_selection)
+                        space w=fill h=block_action_menu_y(thread_pointer_y, thread_height)
                       if thread_message_action == MessageAction.more
                         stack
                           input "" #thread-action-focus <-> message_action_focus
