@@ -1,0 +1,274 @@
+# Sandbox: one microVM per run, Linux-only
+
+Status: design, approved in discussion 2026-08-22. Supersedes the podman
+backend and the Tart (macOS) backend.
+
+## Problem
+
+The sandbox is the muscle that decides how a provider run executes. Today that
+is rootless podman driven over a node-private libpod socket. Two operator-facing
+complaints started this:
+
+1. **Host setup / dependencies.** `SandboxBackend::probe` hard-requires four
+   host binaries beyond podman itself — `pasta`, `nft`, `nsenter`, `conmon`
+   (`sandbox.rs:99`). A host missing one fails a run 156 s later with a message
+   naming none of them; the probe exists only because that failure was
+   unreadable.
+2. **Daemon lifetime.** Each service root supervises its own
+   `podman system service` child with a private socket, storage root, hooks
+   dir, an `flock` ownership file, and an orphan-reaper that SIGTERMs a dead
+   predecessor's podman (`podman_api.rs:1100-1500`, ~400 lines). On top of it
+   sits a hand-written libpod REST client and attach-frame parser
+   (`podman_api.rs`, 1825 lines total).
+
+What all of that buys, in isolation terms, is enumerated below. The short
+version: cpu quota and a memory limit are **ten lines** of the 1825
+(`podman_api.rs:470-478`).
+
+## What podman was actually giving us
+
+`SpecGenerator`'s own doc comment states the situation: *"Only the fields a
+provider run sets are present; everything else takes podman's default."* The
+audit splits three ways.
+
+### Configured deliberately
+
+| Field | Value |
+|---|---|
+| `netns` | `pasta`, so the run's host + resolver are the fixed `PASTA_HOST` / `PASTA_DNS` link-locals the egress hook keys on |
+| egress | annotation → `--hooks-dir` createRuntime hook → `nft` inside the run's netns |
+| `cap_drop` | `NET_ADMIN`, `NET_RAW` — cannot touch the firewall or open raw sockets |
+| `resource_limits` | cpu quota/period, memory limit — **only when the `cores` / `mem_gb` key is present**; absent means unlimited |
+| `mounts` | `rbind` + `ro`/`rw` |
+| `remove` | `false` — we own teardown after `wait` reads the exit code |
+
+That is the whole deliberate isolation surface: networking, two capabilities,
+two limits.
+
+### Inherited silently (podman defaults we never wrote down)
+
+Lost the moment the libpod layer goes away, with no error and no log:
+
+- the default **seccomp profile** (~50 blocked syscalls)
+- the rootless **user namespace** — container uid 0 maps to the operator's uid,
+  the rest into the subuid range. The whole "container root is not host root"
+  property lives here, computed by podman from `/etc/subuid`
+- **maskedPaths / readonlyPaths** — `/proc/kcore`, `/proc/keys`,
+  `/proc/timer_list`, `/sys/firmware`, `/sys/dev/block` masked; `/proc/sys`,
+  `/proc/sysrq-trigger`, `/proc/irq`, `/proc/bus` read-only
+- a **private cgroup namespace**
+- a **minimal `/dev`** plus a device cgroup that denies the rest
+- private pid / ipc / uts / mount namespaces
+- the default **capability bounding set** — our two drops sit *on top* of it
+  (`NET_ADMIN` is not in podman's default list at all, so that drop is
+  defence-in-depth)
+- the default **pids limit** — fork-bomb protection we never asked for
+- an image overlay rootfs, so container writes never reach the host tree
+
+### Offered and declined
+
+`read_only` rootfs, `no_new_privileges`, an explicit `pids_limit`, explicit
+`ulimits`. All still off. Turning them on is a separate decision with its own
+blast radius, not part of this change.
+
+### Documentation drift found during the audit
+
+`SpecGenerator::build`'s doc claims *"the netns is always the private
+slirp4netns with host-loopback + IPv6 off"*. The code sets `nsmode: "pasta"`,
+the module header records that slirp4netns was removed in podman 6, and nothing
+configures IPv6. The comment is stale in three ways. It is being deleted with
+the file, but it stands as a warning: **do not read the current isolation
+posture off the comments.**
+
+## Decision
+
+**One Firecracker microVM per run, Linux only. No container runtime inside the
+guest.**
+
+```
+node host process
+ ├── broker              credential holder; guest gets a random per-run bearer
+ └── per run:
+      Firecracker microVM (under its jailer)
+       ├── vcpu N / mem M      demand-paged + balloon
+       ├── kernel + rootfs     immutable, shared RO, per-run COW overlay
+       ├── workspace           virtiofs
+       └── tap device ──→ host nft: public allowed, operator's private net denied
+```
+
+Guest PID 1 is a thin shim that execs the agent CLI. There is no crun, no
+cgroup, no seccomp profile, no userns mapping, no masked paths — the VM boundary
+subsumes every item in the "inherited silently" list above. **The ideal design
+is less machinery than the one it replaces, not more.** That is the main
+argument for it.
+
+### Why per-run and not per-node
+
+An earlier draft proposed one long-lived VM per node with containers inside,
+because *"a VM statically takes its memory."* That is an **Apple
+Virtualization.framework** property, not a VM property. Firecracker guest memory
+is demand-faulted (a VM configured with 8 GB that touches 500 MB costs ~500 MB
+of host RSS), it ships a balloon with free-page reporting, and snapshot/restore
+brings a run to ~150 ms while COW-mapping base pages from one snapshot file
+across concurrent VMs. On Linux, per-run VMs do not carry the reservation cost
+that motivated per-node.
+
+Per-run also means no session-affinity state and no shared kernel between
+buyers — the property namespaces cannot provide, and the reason every vendor
+serving hostile multi-tenant code (Lambda, Vercel Sandbox, E2B, Fly Machines on
+Firecracker; Cloud Run and Modal on gVisor) uses a VM or a user-space kernel
+rather than namespaces alone.
+
+## Network and egress
+
+The guest gets a real network device and **public internet is allowed**. This
+matches every comparable vendor, and the practical argument is decisive: an
+agent CLI without `npm install` / `pip install` / `cargo fetch` / `git clone`
+cannot do the work it was sold. An allowlist of "the internet an agent needs"
+is the whole internet.
+
+The policy that matters is therefore not an allowlist of the public net but a
+**denylist of the operator's private network**, which is exactly what ships
+today:
+
+```
+allow  PASTA_HOST:{this run's broker, node RPC}
+allow  PASTA_DNS:53          scoped to that resolver, never a blanket :53,
+                             so the tailnet/LAN resolvers pasta copies into
+                             resolv.conf stay unreachable
+allow  public
+deny   LAN + tailnet (tailnet DNS included)
+```
+
+**Keep the policy; change only where it is enforced.** Today it is `nft` run
+inside the container's netns by a createRuntime hook that `nsenter`s from
+podman's rootless userns. With a microVM the same ruleset applies to the host
+side of the run's tap device — enforced entirely outside the guest, with the
+hook, `nsenter`, and `pasta` deleted.
+
+Two additions:
+
+- **Egress logging.** The operator's IP is doing the fetching; the operator must
+  be able to see what went out. Counters + a per-run summary, not per-packet.
+- **An operator toggle for `allow public`.** A node selling from a home IP may
+  want broker-only egress; a datacenter operator will not care. One rule, and
+  it makes the risk an operator decision instead of ours.
+
+### What this is not protecting against, deliberately
+
+Threat modelling here is inverted from E2B/Modal/Codespaces, where the buyer
+runs the buyer's own code and egress is a feature. Here the *operator* runs a
+*stranger's* work on the operator's machine and funds it with the operator's
+credential. Counting the actual exposure:
+
+- **Credential theft — structurally impossible.** The broker header states it:
+  *"The provider child never receives the operator's API/OAuth credential."*
+  `provider/src/lib.rs:133` scrubs `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+  `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN` from the child env, and a
+  test pins it. The guest holds a random bearer worthless off-node.
+- **Token burn — already bounded** by the broker's `MAX_REQUESTS` (4096),
+  `MAX_TOTAL_BYTES` (2 GiB), per-request/response byte caps, and concurrency.
+- **Workspace exfiltration — the buyer's own input.** Not an asset we protect.
+- **Remaining real risk: the operator's IP used as an anonymous proxy, and
+  bandwidth.** That is what the toggle and the logging address.
+
+## Resource limits
+
+`cores` → vcpu count, `mem_gb` → guest memory size, both fixed at VM
+configuration. Hard, enforced by the hypervisor, no cgroup delegation to verify
+and no controller to check. The current derivation
+(`podman_api.rs:470-478`) is replaced, not ported: quota-over-period stops being
+the representation.
+
+The absent-key case must change behaviour. Today a missing `cores`/`mem_gb`
+omits `resource_limits` entirely and the run is unlimited; a VM has no such
+state — every VM is given a size at configuration time, so "unlimited" is
+unrepresentable. The size therefore has to come from somewhere explicit: the
+operator's `[sandbox]` table. A run reaching the backend without both
+dimensions is a boot-time config error, not a value the node guesses from
+probed host totals.
+
+## macOS: dropped
+
+macOS support is **out of scope**, and the existing Tart backend is **deleted**
+rather than left in place.
+
+- It has never been validated on real hardware. The originating spec says
+  *"tart backend — needs a real Mac pass"* and defers the QA recipe to phase 2
+  (`2026-07-12-compute-capability-sandbox-design.md:126,150`); the one fix
+  branch was abandoned 23 commits behind dev.
+- Its licensing question is still open in that same spec (`:157`, "tart license
+  terms for the org size"). Tart is Fair Source, not OSI open source, and
+  commercial use above a company-size threshold needs a paid licence — exactly
+  the case for third-party operators selling compute.
+- It is clone-per-run, which is the wrong shape regardless. If macOS returns it
+  returns as per-run VMs on Virtualization.framework and shares no code with
+  this.
+- Left in place it forces every future change to the sandbox seam to be made
+  twice, for a path nobody runs.
+
+There are no live ducktape networks, so nothing regresses.
+
+Removal covers: `SandboxBackend::Tart`, `tart_plan` and the
+`/Volumes/My Shared Files` tag translation, `tart_run_root` /
+`tart_guest_workdir`, `TART_MAX_CONCURRENT` and its semaphore, `TART_MIN_CORES`,
+the `"tart"` arm of `resolve_sandbox` and `DEFAULT_TART_IMAGE`, and the
+`CliProvider` clone/set/boot/ssh/rsync lifecycle.
+
+An Apple-hypervisor note for whenever macOS returns: VZ allocates guest memory
+statically and exposes no free-page reporting, so per-run VMs there cost real
+memory per concurrent run. A Mac node sells less concurrency. That is honest
+inventory, not a reason to fork the design.
+
+## Costs accepted
+
+1. **We become a kernel distributor.** CVE tracking, kernel config, boot
+   artifacts, and a snapshot-invalidation pipeline keyed to the rootfs version.
+   This is the largest new standing cost in the design and the one most likely
+   to be underestimated.
+2. **Firecracker requires KVM.** `/dev/kvm` access, and a node running inside a
+   cloud VM needs nested virtualisation enabled.
+3. **Snapshot lifecycle** — building boot snapshots and invalidating them with
+   the rootfs.
+
+## Alternatives considered
+
+- **crun / youki directly.** Removes the daemon and three of four host binaries
+  while keeping the OCI runtime interface — which is also the industry's
+  isolation-tier seam, since `runsc` (gVisor) and `kata-runtime` are drop-in
+  replacements taking the same `config.json`. Rejected as the destination
+  because it still leaves buyers sharing a kernel, but **retained as a valid
+  waypoint**: if the kernel/rootfs/snapshot pipeline proves slow to stand up,
+  moving podman → crun first is a smaller step that deletes the daemon
+  immediately.
+- **bubblewrap.** Cannot be the answer alone: bwrap has no cgroup facility at
+  all, so it cannot express the resource limits that motivated podman.
+  `systemd-run --user --scope` + bwrap does work, but costs four host binaries
+  against crun's three and replaces one declarative `config.json` with two
+  layers of flag soup. crun already *is* the lightweight option — it is bwrap
+  plus cgroups, and it is already installed as podman's own runtime.
+- **Keeping podman, dropping only the private service.** Rejected: the CLI path
+  was deliberately removed, and the daemon is the complaint.
+- **One VM per node with containers inside.** Rejected once the Apple-specific
+  nature of static memory allocation was established. It also keeps buyers
+  sharing a kernel and adds a VM-lifecycle concern per node.
+- **Docker / containerd, gVisor as the primary, Kata.** Docker/containerd are
+  strictly heavier. gVisor and Kata are the natural upgrades *from* crun and
+  remain available at that seam if the waypoint is taken.
+
+## Sequencing
+
+1. **Delete Tart.** Pure removal, easy to review, shrinks the seam everything
+   else edits.
+2. **Firecracker backend.** The kernel / rootfs / snapshot pipeline is most of
+   this step.
+3. **Move egress to the tap device.** Same ruleset, hook and `nsenter` deleted;
+   add logging and the public-egress toggle.
+4. **Remove the podman path** — `PodmanService`, the libpod client, the attach
+   framing, `pasta` / `conmon` from the probe.
+
+## Open questions
+
+- Guest kernel: build our own or track a distro's? Determines the CVE workflow.
+- Default VM size when `cores` / `mem_gb` are absent.
+- Whether the public-egress toggle defaults on or off for a fresh node.
