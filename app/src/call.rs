@@ -148,15 +148,25 @@ const ROSTER_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 /// Ends with the session — the pump's control receiver drops and the send
 /// fails. A failed read (node restarting, view not yet synced) keeps the last
 /// set and tries again on the next tick.
+///
+/// THE POLL IS ALSO HOW A HUDDLE ENDS FOR SOMEONE. A peer who leaves simply
+/// stops beaconing, and nothing that stops arriving can announce itself: their
+/// badge, their last decoded frame and their claim on the stage would all
+/// stand for the rest of the call. The set that drops them is the one place
+/// that knows, so it says so — one `gone` event each, which the folds treat as
+/// the peer's last word.
 async fn steer_recipients(
     rpc: String,
     channel_id: String,
     control: tokio::sync::mpsc::UnboundedSender<ClientControl>,
+    mut events: iced::futures::channel::mpsc::UnboundedSender<CallEvent>,
 ) {
-    let mut steered: Option<Vec<String>> = None;
+    let mut steered: Vec<String> = Vec::new();
+    let mut ever_read = false;
     loop {
         match crate::backend::huddle_fanout_nodes(&rpc, &channel_id).await {
-            Ok(peers) if steered.as_ref() != Some(&peers) => {
+            Ok(peers) if !ever_read || peers != steered => {
+                ever_read = true;
                 if control
                     .send(ClientControl::Recipients {
                         peers: peers.clone(),
@@ -165,7 +175,15 @@ async fn steer_recipients(
                 {
                     return;
                 }
-                steered = Some(peers);
+                for departed in steered.iter().filter(|node| !peers.contains(node)) {
+                    crate::video::forget_peer(departed);
+                    let mut gone = CallEvent::of("gone");
+                    gone.peer = departed.clone();
+                    if events.send(gone).await.is_err() {
+                        return;
+                    }
+                }
+                steered = peers;
             }
             Ok(_) | Err(_) => {}
         }
@@ -255,6 +273,7 @@ async fn run_session(
         rpc.clone(),
         channel_id.clone(),
         control_tx.clone(),
+        events.clone(),
     ));
 
     // The hub beacons our state at 1 Hz on our behalf; one push seeds it.
@@ -278,6 +297,14 @@ async fn run_session(
                 Some(Ok(WsMessage::Text(text))) => {
                     match serde_json::from_str::<ServerControl>(&text) {
                         Ok(ServerControl::PeerBeacon { peer, muted, camera_on, sharing }) => {
+                            // A SOURCE THAT WENT OFF TAKES ITS LAST FRAME WITH
+                            // IT. Nothing arrives to replace a frame after the
+                            // camera stops, so the tile would hold the moment
+                            // it was turned off for the rest of the call — the
+                            // beacon is the only thing that says otherwise.
+                            if !camera_on && !sharing {
+                                crate::video::forget_peer(&peer);
+                            }
                             let event = CallEvent {
                                 kind: "peer".into(),
                                 message: String::new(),
@@ -669,6 +696,13 @@ pub fn apply_call_peer(peers: Vec<CallEvent>, event: CallEvent) -> Vec<CallEvent
             peers.push(event);
             peers
         }
+        // Someone left the huddle. A beacon is the only thing that can update
+        // a peer's row and theirs have stopped, so without this their badges,
+        // their frame and their claim on the stage outlive them.
+        "gone" => peers
+            .into_iter()
+            .filter(|peer| peer.peer != event.peer)
+            .collect(),
         "closed" | "refused" | "error" => Vec::new(),
         _ => peers,
     }
@@ -802,6 +836,14 @@ mod tests {
         let peers = apply_call_peer(peers, beacon("bb", true));
         let peers = apply_call_peer(peers, beacon("aa", false));
         assert_eq!(peers.len(), 2);
+        // A peer who left stops beaconing, so their last beacon would stand
+        // for the rest of the call; the roster poll's `gone` is what ends it.
+        let mut left = CallEvent::of("gone");
+        left.peer = "bb".into();
+        let peers = apply_call_peer(peers, left);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].peer, "aa");
+        let peers = apply_call_peer(peers, beacon("bb", true));
         let participant = |node: &str, is_you: bool| crate::backend::HuddleParticipant {
             key: node.into(),
             label: node.into(),

@@ -232,6 +232,13 @@ pub(crate) fn store_peer_frame(frame: PeerFrame) {
         .insert(peer, tile);
 }
 
+/// Drop a peer's last frame: they left the huddle, or their beacon says the
+/// source behind it is off. Frames only ever arrive, so nothing else would
+/// ever take one down.
+pub(crate) fn forget_peer(node: &str) {
+    store().lock().expect("video store").peers.remove(node);
+}
+
 fn hex_of(key: &[u8; 32]) -> String {
     let mut out = String::with_capacity(64);
     for byte in key {
