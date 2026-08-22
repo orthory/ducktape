@@ -861,7 +861,7 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
     focus_online = online
     focus_repo = repo_now
     focus_path = path
-    tree_path = fs_parent(path)
+    tree_path = forge_parent(path)
     tree_rev = keep_str(!empty(rev), rev, tree_rev)
     tree_entries = []
     tree_truncated = false

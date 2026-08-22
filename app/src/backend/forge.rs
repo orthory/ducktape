@@ -2492,6 +2492,17 @@ pub fn forge_comment_cap_reached(staged: Vec<ForgeDraftComment>) -> bool {
     staged.len() >= forge::MAX_REVIEW_COMMENTS
 }
 
+/// The directory a committed path sits in, in the forge tree's own spelling:
+/// the repository root is `""` (what `forge_tree` is asked for and echoes
+/// back), never `/` — that is duckfs's root (`fs_parent`), and a tree reply
+/// for `/` would not match the `""` the browser waits on.
+pub fn forge_parent(path: String) -> String {
+    match path.rsplit_once('/') {
+        Some((dir, _)) => dir.to_string(),
+        None => String::new(),
+    }
+}
+
 /// The reader header's path, gated on the directory AND revision the file
 /// was opened under: a preview opened in another directory or an older
 /// commit was retired by that move, so the header must not keep naming it.

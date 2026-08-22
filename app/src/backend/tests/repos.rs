@@ -351,3 +351,14 @@ async fn a_web_picture_never_points_the_reader_at_its_own_machine() {
         "only a web URL is fetched"
     );
 }
+
+/// THE FORGE TREE'S ROOT IS "", NOT "/". `fs_parent` answers for duckfs,
+/// whose root is `/`; a committed path's directory is spelled the way
+/// `forge_tree` is asked for it, so a root file's deep link lands on the
+/// tree the browser is waiting for.
+#[test]
+fn a_committed_paths_directory_is_spelled_like_the_tree() {
+    assert_eq!(forge_parent("README.md".into()), "");
+    assert_eq!(forge_parent("docs/guide.md".into()), "docs");
+    assert_eq!(forge_parent("a/b/c.rs".into()), "a/b");
+}
