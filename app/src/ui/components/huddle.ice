@@ -467,10 +467,11 @@ component HuddlePanel(channel:str, elapsed:str, rows:[HuddleTileRow], status:str
         if !empty(stage)
           extern call_video_stage(stage)
         // The video strip: every live source's latest frame (peers first,
-        // the local preview last), only while any video is on. The widget
-        // repaints itself — mounting it is the whole contract.
+        // the local preview last) EXCEPT whatever the stage above is already
+        // showing whole. The widget repaints itself — mounting it is the
+        // whole contract.
         if video_live
-          extern call_video_tiles()
+          extern call_video_tiles(stage)
         // `max-cell` owns the column count so no tile carries a width: 2
         // columns at the window's 320px minimum, 4 at 560. It is the MAX and
         // not the min because the min form stretches a lone tile across the

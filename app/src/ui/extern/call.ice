@@ -32,5 +32,5 @@ extern crate::video
   VideoSource(camera:bool, sharing:bool)
   sync call_use_camera(on:bool) -> VideoSource
   sync call_use_screen(on:bool) -> VideoSource
-  component call_video_tiles() -> unit
+  component call_video_tiles(staged:str) -> unit
   component call_video_stage(peer:str) -> unit
