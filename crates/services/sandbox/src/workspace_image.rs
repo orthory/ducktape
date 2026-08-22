@@ -75,7 +75,7 @@ fn tree_bytes(dir: &Path) -> Result<u64, String> {
 
 /// build an ext4 image of exactly `bytes` populated from `workdir`.
 pub fn build(workdir: &Path, image: &Path, bytes: u64) -> Result<(), String> {
-    let tool = crate::podman_api::find_system_tool("mke2fs")
+    let tool = crate::host_tools::find_system_tool("mke2fs")
         .ok_or_else(|| "mke2fs is not on PATH; install e2fsprogs".to_string())?;
     let blocks = bytes.div_ceil(4096);
     let out = Command::new(&tool)
@@ -97,7 +97,7 @@ pub fn build(workdir: &Path, image: &Path, bytes: u64) -> Result<(), String> {
 
 /// walk `image` back out into `dest`, which is created if absent.
 pub fn read_back(image: &Path, dest: &Path) -> Result<(), String> {
-    let tool = crate::podman_api::find_system_tool("debugfs")
+    let tool = crate::host_tools::find_system_tool("debugfs")
         .ok_or_else(|| "debugfs is not on PATH; install e2fsprogs".to_string())?;
     std::fs::create_dir_all(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
     // `rdump / <dest>` lands the image root's entries DIRECTLY in dest — no
@@ -148,8 +148,8 @@ mod tests {
     }
 
     fn have_e2fsprogs() -> bool {
-        crate::podman_api::find_system_tool("mke2fs").is_some()
-            && crate::podman_api::find_system_tool("debugfs").is_some()
+        crate::host_tools::find_system_tool("mke2fs").is_some()
+            && crate::host_tools::find_system_tool("debugfs").is_some()
     }
 
     /// The round trip is the whole contract: what the guest writes has to come

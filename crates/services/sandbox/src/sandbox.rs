@@ -18,14 +18,6 @@ use std::path::{Path, PathBuf};
 /// for the dimensions actually present on the run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxBackend {
-    Podman {
-        image: String,
-        /// the node-private rootless podman socket this backend drives (libpod
-        /// REST over a unix socket — never the `podman` CLI). Owned by the
-        /// node's [`crate::PodmanService`], isolated from any other podman on
-        /// the host.
-        socket: std::path::PathBuf,
-    },
     /// one Firecracker microVM per run: hard vcpu/memory limits enforced by the
     /// hypervisor, no container runtime inside the guest. `kernel` and `rootfs`
     /// are the immutable images every run boots from — shared read-only, never
@@ -47,7 +39,6 @@ impl SandboxBackend {
     /// the host runtime binary this adapter drives.
     pub fn runtime_bin(&self) -> &'static str {
         match self {
-            SandboxBackend::Podman { .. } => "podman",
             SandboxBackend::Firecracker { .. } => "firecracker",
             #[cfg(any(test, feature = "testkit"))]
             SandboxBackend::Bare => "sh",
@@ -58,20 +49,15 @@ impl SandboxBackend {
     /// for. Checked at boot alongside [`Self::runtime_bin`] so a host missing
     /// one fails loudly here instead of mid-run.
     ///
-    /// The pairing is load-bearing for the error message. `conmon` was once
-    /// absent from Podman's list; a host with the other three passed this
-    /// probe, ran the e2e suite, and failed 156 s later as `timed out waiting
-    /// for the agent reply to post` — a message naming neither podman nor
-    /// conmon, which reads like a product defect. A guard that reports "ready"
-    /// while the runtime cannot start a run is worse than no guard.
+    /// The pairing is load-bearing for the error message. A tool once went
+    /// missing from this list under the previous backend; a host without it
+    /// passed this probe, ran the e2e suite, and failed 156 s later as `timed
+    /// out waiting for the agent reply to post` — a message naming neither the
+    /// runtime nor the tool, which reads like a product defect. A guard that
+    /// reports "ready" while the runtime cannot start a run is worse than no
+    /// guard.
     fn required_tools(&self) -> &'static [(&'static str, &'static str)] {
         match self {
-            SandboxBackend::Podman { .. } => &[
-                ("pasta", "the netns backend — podman 6's only one"),
-                ("nft", "the egress firewall installed in each run's netns"),
-                ("nsenter", "enters that netns to install it"),
-                ("conmon", "the per-run container monitor podman spawns"),
-            ],
             SandboxBackend::Firecracker { .. } => &[
                 ("mke2fs", "builds each run's workspace block image"),
                 ("debugfs", "reads that image back after the guest exits"),
@@ -105,11 +91,11 @@ impl SandboxBackend {
     /// a silently unsandboxed / unfirewalled run.
     pub fn probe(&self) -> Result<PathBuf, String> {
         let bin = self.runtime_bin();
-        let found = find_on_path(bin).ok_or_else(|| {
+        let found = crate::host_tools::find_on_path(bin).ok_or_else(|| {
             format!("sandbox runtime {bin:?} is not executable on PATH; install it or pick a runtime this host provides")
         })?;
         for (tool, why) in self.required_tools() {
-            if crate::podman_api::find_system_tool(tool).is_none() {
+            if crate::host_tools::find_system_tool(tool).is_none() {
                 return Err(format!(
                     "{tool} is not executable on PATH or a standard sbin dir; the {bin} sandbox \
                      requires it ({why}) — install it"
@@ -123,8 +109,6 @@ impl SandboxBackend {
     /// the adapter-specific host state a tool check cannot express.
     fn probe_host_capabilities(&self) -> Result<(), String> {
         match self {
-            // podman's own daemon reports its host problems; nothing to add.
-            SandboxBackend::Podman { .. } => Ok(()),
             SandboxBackend::Firecracker { kernel, rootfs } => {
                 probe_kvm()?;
                 for (label, image) in [("kernel", kernel), ("rootfs", rootfs)] {
@@ -171,14 +155,6 @@ fn probe_kvm() -> Result<(), String> {
                  or start the node under `sg kvm`)"
             )
         })
-}
-
-/// first executable named `bin` on `PATH`, if any.
-fn find_on_path(bin: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(bin))
-        .find(|candidate| crate::is_executable(candidate))
 }
 
 

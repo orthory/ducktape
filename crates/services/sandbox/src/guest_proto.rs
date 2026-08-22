@@ -25,19 +25,36 @@ pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const TAG_STDOUT: u8 = 0;
 const TAG_STDERR: u8 = 1;
 const TAG_EXIT: u8 = 2;
+const TAG_STDIN: u8 = 3;
+const TAG_STDIN_EOF: u8 = 4;
 const HEADER_BYTES: usize = 5;
 
+/// One enum for both directions. The host sends [`Frame::Stdin`] and
+/// [`Frame::StdinEof`]; the guest sends the other three. A single codec means a
+/// single place where the wire format can drift, which is the whole reason both
+/// ends compile the same file.
+///
+/// Stdin is not optional. The run's prompt arrives on it, and it must be fed
+/// CONCURRENTLY with reading output: a prompt larger than a pipe buffer
+/// deadlocks a write-then-read guest against a CLI that streams before it
+/// drains.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
     Exit(i32),
+    Stdin(Vec<u8>),
+    /// the prompt is complete; the guest closes the child's stdin so a CLI
+    /// blocking on EOF proceeds.
+    StdinEof,
 }
 
 pub fn encode(frame: &Frame) -> Vec<u8> {
     let (tag, payload): (u8, &[u8]) = match frame {
         Frame::Stdout(bytes) => (TAG_STDOUT, bytes),
         Frame::Stderr(bytes) => (TAG_STDERR, bytes),
+        Frame::Stdin(bytes) => (TAG_STDIN, bytes),
+        Frame::StdinEof => (TAG_STDIN_EOF, &[]),
         Frame::Exit(code) => {
             let mut out = Vec::with_capacity(HEADER_BYTES + 4);
             out.push(TAG_EXIT);
@@ -76,6 +93,8 @@ pub fn decode(buf: &mut Vec<u8>) -> Result<Option<Frame>, String> {
     let frame = match tag {
         TAG_STDOUT => Frame::Stdout(payload),
         TAG_STDERR => Frame::Stderr(payload),
+        TAG_STDIN => Frame::Stdin(payload),
+        TAG_STDIN_EOF => Frame::StdinEof,
         TAG_EXIT => {
             let bytes: [u8; 4] = payload.as_slice().try_into().map_err(|_| {
                 format!("guest exit frame carried {} bytes, want 4", payload.len())
@@ -96,6 +115,8 @@ mod tests {
         for frame in [
             Frame::Stdout(b"hello".to_vec()),
             Frame::Stderr(b"warning: something".to_vec()),
+            Frame::Stdin(b"the prompt".to_vec()),
+            Frame::StdinEof,
             Frame::Exit(0),
             Frame::Exit(127),
             // a signal death arrives as a negative code; it must not be
