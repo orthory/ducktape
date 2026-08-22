@@ -892,8 +892,9 @@ mod tests {
         assert_eq!(huddle_stage_peer(vec![sharing("bb", true)], true), "bb");
         // And any live source at all lights the strip.
         assert!(call_video_live_after(Vec::new(), false, true));
-        assert!(call_video_live_after(vec![sharing("bb", true)], false, false));
-        assert!(!call_video_live_after(vec![sharing("bb", false)], false, false));
+        let live = |peers: Vec<CallEvent>| call_video_live_after(peers, false, false);
+        assert!(live(vec![sharing("bb", true)]));
+        assert!(!live(vec![sharing("bb", false)]));
     }
 
     #[test]

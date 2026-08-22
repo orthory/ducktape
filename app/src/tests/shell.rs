@@ -591,6 +591,31 @@ fn a_move_off_the_agents_tab_keeps_a_live_load_that_already_answered() {
     );
 }
 
+/// THE JOIN OPENS THE HUDDLE. Every face, every shared screen and every media
+/// control lives in the huddle window; the header pill it docks into shows
+/// none of them. A join routed back to the generic `chat_acked` leaves someone
+/// sitting in a live call watching a static pill, which is indistinguishable
+/// from a huddle that does not work — so the route is pinned here.
+#[test]
+fn joining_a_huddle_opens_the_window_that_shows_it() {
+    let handler = inlined(include_str!("../ui/handlers/chat.ice"));
+    assert!(
+        handler
+            .contains("join_huddle(connected_rpc, password, active_channel) -> huddle_joined_ack"),
+        "the join's ack is its own, not the generic one"
+    );
+    let ack = handler
+        .split_once("on huddle_joined_ack")
+        .expect("the join ack handler exists")
+        .1;
+    let ack = ack.split_once("\non ").map_or(ack, |split| split.0);
+    assert!(ack.contains("task window open huddle"));
+    assert!(
+        ack.contains("return if huddle_win != none"),
+        "a window already up is not opened twice"
+    );
+}
+
 #[test]
 fn a_failed_huddle_leave_keeps_the_retained_roster_visible() {
     let handler = inlined(include_str!("../ui/handlers/huddle.ice"));
@@ -601,7 +626,9 @@ fn a_failed_huddle_leave_keeps_the_retained_roster_visible() {
             .1;
         // ONE handler, not the rest of the file: the ack below legitimately
         // blanks what the request must not.
-        body.split_once("\non ").map_or(body, |split| split.0).to_string()
+        body.split_once("\non ")
+            .map_or(body, |split| split.0)
+            .to_string()
     };
 
     let leave = after("on leave_huddle_here");

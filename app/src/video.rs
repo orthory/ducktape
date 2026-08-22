@@ -294,7 +294,12 @@ pub(crate) fn encode_frame(rgba: &[u8], width: u16, height: u16) -> Option<Vec<u
     let mut out = Vec::new();
     let encoder = jpeg_encoder::Encoder::new(&mut out, JPEG_QUALITY);
     encoder
-        .encode(&small, width as u16, height as u16, jpeg_encoder::ColorType::Rgba)
+        .encode(
+            &small,
+            width as u16,
+            height as u16,
+            jpeg_encoder::ColorType::Rgba,
+        )
         .ok()?;
     (out.len() <= chat::video::MAX_FRAME_BYTES).then_some(out)
 }

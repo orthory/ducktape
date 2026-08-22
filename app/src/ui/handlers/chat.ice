@@ -394,7 +394,19 @@ on join_huddle_submit
   hydration_retry_attempt = 0
   mutation_phase = MutationPhase.huddle
   error = ""
-  run every join_huddle(connected_rpc, password, active_channel) -> chat_acked _ | mutation_failed _
+  run every join_huddle(connected_rpc, password, active_channel) -> huddle_joined_ack _ | mutation_failed _
+
+// THE JOIN OPENS THE HUDDLE, because the huddle window is where the huddle IS:
+// every face, every shared screen, the mic and camera controls and Leave live
+// in it, and the header pill it docks into can show none of them. Joining and
+// then being shown a pill is how someone sits in a call watching nothing
+// happen, which is exactly what "I joined and there was no video" is. The
+// guard is `pop_huddle`'s own: a window already up is not opened twice.
+on huddle_joined_ack(_result)
+  mutation_phase = MutationPhase.idle
+  error = ""
+  return if huddle_win != none
+  task window open huddle -> huddle_opened _
 
 // Leaving is `leave_huddle_here` in handlers/huddle.ice, which leaves the
 // HUDDLE'S channel rather than the one on screen — the same button serves the
