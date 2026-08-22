@@ -23,7 +23,7 @@
 //!     claude is here, until an Anthropic-side broker exists.
 //!
 //! orthogonally, [`SandboxBackend`] decides HOW the child is spawned (a
-//! resource-capped Podman container or a Tart VM — never bare on the host).
+//! resource-capped Podman container — never bare on the host).
 //! the two compose: codex under Podman gets the broker AND the jail.
 //!
 //! ## executors are data: the capability spec
@@ -71,13 +71,9 @@ const HARD_TIMEOUT_FACTOR: u32 = 36;
 /// host escalates to SIGKILL. Podman gets the same budget for each targeted
 /// stop/wait operation; every cleanup command is itself kill-on-drop.
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
-const PODMAN_CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 const PODMAN_CID_POLL_INTERVAL: Duration = Duration::from_millis(25);
-const PODMAN_RETRY_MIN: Duration = Duration::from_millis(250);
-const PODMAN_RETRY_MAX: Duration = Duration::from_secs(1);
 // used by the socket run path (`podman_create_and_start`), which compiles on
-// every unix — so these must not be gated to linux the way the old CLI
-// reaper's consts were, or macOS (a Tart host) fails to build.
+// every unix, so these are not gated to linux.
 /// the ownership label key every ducktape-created container carries. Its VALUE
 /// names the owning service instance, so two service daemons sharing one node's
 /// podman reap only their own containers ([`managed_label`]).
@@ -92,8 +88,6 @@ const PODMAN_NODE_LABEL: &str = "io.ducktape.node";
 pub fn managed_label(owner: &str) -> String {
     format!("{PODMAN_MANAGED_KEY}={owner}")
 }
-const TART_SETUP_TIMEOUT: Duration = Duration::from_secs(90);
-const TART_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// reserved run-local state INSIDE the run's workdir: the fresh provider config
 /// home lives here (see [`CliProvider::prepare_config_home`]). the provisioner's
@@ -186,7 +180,7 @@ mod spec;
 mod variants;
 #[cfg(unix)]
 pub use interactive::InteractiveSession;
-pub use sandbox_host::{SandboxBackend, TART_MIN_CORES};
+pub use sandbox_host::SandboxBackend;
 pub use spec::{BrokerKind, CapabilitySpec, ContextLocation, IsolationSpec, OutputFormat, SpecSet};
 
 /// canonical label-safe identity for the node executing a provider run.
@@ -509,8 +503,8 @@ pub(crate) struct CliProvider {
     /// forwarded; stdout/stderr are still accumulated for the existing parse
     /// and error contracts.
     output_sink: Option<OutputSink>,
-    /// how the child is spawned: rootless `Podman` or an ephemeral
-    /// Tart VM. set once at discovery for the whole provider set.
+    /// how the child is spawned: a rootless `Podman` container. set once at
+    /// discovery for the whole provider set.
     backend: SandboxBackend,
     /// which service instance OWNS the containers this provider creates —
     /// the value half of [`PODMAN_MANAGED_KEY`]. Set once at discovery, so a
@@ -587,16 +581,13 @@ impl CliProvider {
         ctx: &RunContext,
         auth: &RunAuth<'_>,
     ) -> Result<PreparedCommand, String> {
-        // Only the Bare test harness reaches here now: Podman is driven over its
-        // socket and Tart via its ssh lifecycle, both in [`Self::invoke`] before
-        // this seam. (`args`/`ctx`/`auth` are consumed only by the Bare arm, so
-        // in a non-test build they are legitimately unused.)
+        // Only the Bare test harness reaches here now: Podman is driven over
+        // its socket in [`Self::invoke`], before this seam. (`args`/`ctx`/`auth`
+        // are consumed only by the Bare arm, so in a non-test build they are
+        // legitimately unused.)
         match &self.backend {
             SandboxBackend::Podman { .. } => {
                 Err("internal error: Podman is driven over its socket, not a command".into())
-            }
-            SandboxBackend::Tart { .. } => {
-                Err("internal error: Tart command bypassed its VM lifecycle".into())
             }
             #[cfg(any(test, feature = "testkit"))]
             SandboxBackend::Bare => {
@@ -678,8 +669,15 @@ impl CliProvider {
         auth: &RunAuth<'_>,
         tty: bool,
     ) -> Result<(podman_api::Podman, String), String> {
-        let SandboxBackend::Podman { image, socket } = &self.backend else {
-            return Err("internal error: podman spawn on a non-Podman backend".into());
+        // one discriminant, one match, no wildcard: `Bare` exists only in
+        // test/testkit builds, so a `let ... else` here is irrefutable in a
+        // shipped build. A future backend fails this match until it is routed.
+        let (image, socket) = match &self.backend {
+            SandboxBackend::Podman { image, socket } => (image, socket),
+            #[cfg(any(test, feature = "testkit"))]
+            SandboxBackend::Bare => {
+                return Err("internal error: podman spawn on a non-Podman backend".into());
+            }
         };
         let (mut envs, rw_dirs) = self.sandbox_env_and_rw(ctx, auth)?;
         for (key, value) in &mut envs {
@@ -797,65 +795,11 @@ impl CliProvider {
         Ok((client, id))
     }
 
-    /// Assemble the real Tart VM boot + guest execution plan. Writable auth
-    /// directories are created before they become virtiofs sources, and the
-    /// executor is canonicalized so a Homebrew symlink cannot point outside
-    /// the read-only mount presented to the guest.
-    fn tart_plan(
-        &self,
-        args: &[String],
-        workdir: &Path,
-        ctx: &RunContext,
-        auth: &RunAuth<'_>,
-        interactive: bool,
-    ) -> Result<sandbox::TartPlan, String> {
-        let (mut envs, rw_dirs) = self.sandbox_env_and_rw(ctx, auth)?;
-        for (key, value) in &mut envs {
-            if key == RUN_ACTION_URL_ENV {
-                *value = value.replacen("http://127.0.0.1:", "http://ducktape-host:", 1);
-            }
-        }
-        for dir in &rw_dirs {
-            std::fs::create_dir_all(dir).map_err(|e| {
-                format!(
-                    "{}: create Tart auth mount {}: {e}",
-                    self.spec.tag,
-                    dir.display()
-                )
-            })?;
-        }
-        let bin = std::fs::canonicalize(&self.bin).map_err(|e| {
-            format!(
-                "{}: resolve Tart executor {}: {e}",
-                self.spec.tag,
-                self.bin.display()
-            )
-        })?;
-        static NEXT_VM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let vm = format!(
-            "ducktape-{}-{}",
-            std::process::id(),
-            NEXT_VM.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        self.trust_guest_workdir(auth, &sandbox::tart_guest_workdir(&vm))?;
-        sandbox::tart_plan(
-            &vm,
-            &bin,
-            args,
-            workdir,
-            &envs,
-            &self.sandbox_ro_paths(ctx, workdir, auth)?,
-            &rw_dirs,
-            interactive,
-        )
-    }
-
     /// the env carried into a sandbox + the spec's `~/` rw_dirs expanded against
-    /// $HOME at their identical host paths — shared by the Podman and Tart
-    /// backends. both need the CLI's auth dotfiles under a SET HOME (so the CLI
-    /// finds them at their mounted paths) while deliberately NOT carrying the
-    /// node's ambient secrets; $HOME itself is never mounted (D7). $HOME unset
-    /// is a loud error, not a silent unsandboxed fallback.
+    /// $HOME at their identical host paths. the CLI's auth dotfiles ride a SET
+    /// HOME (so the CLI finds them at their mounted paths) while deliberately
+    /// NOT carrying the node's ambient secrets; $HOME itself is never mounted
+    /// (D7). $HOME unset is a loud error, not a silent unsandboxed fallback.
     ///
     /// this env is an ALLOWLIST — a sandboxed child inherits nothing it is not
     /// handed here — so a broker's upstream credential vars are excluded by
@@ -1127,9 +1071,9 @@ impl CliProvider {
     /// rather than provenance — this deliberately does NOT claim the workdir's
     /// contents are safe:
     ///
-    /// - The child never runs on the host. `[sandbox] runtime` is `podman` or
-    ///   `tart` and there is no third arm, so the blast radius of "trusted" is
-    ///   a container or a VM this run created and destroys.
+    /// - The child never runs on the host. `[sandbox] runtime` is `podman` and
+    ///   there is no second arm, so the blast radius of "trusted" is a
+    ///   container this run created and destroys.
     /// - That sandbox has a private netns and an egress allowlist (broker +
     ///   node RPC + public), so a project hook reaches nothing the run was not
     ///   already given.
@@ -1146,11 +1090,10 @@ impl CliProvider {
     ///
     /// Keyed on the GUEST path, which is why this is not folded into
     /// [`Self::prepare_config_home`]: the key is the cwd the executor actually
-    /// starts in, that path is backend-specific (`/ducktape/workspace` for
-    /// podman, `/tmp/ducktape-<vm>/workspace` for tart), and a Tart run mints a
-    /// fresh VM name per spawn — so a value decided once at config-home time
-    /// would be stale for the second invocation of the same run. It MERGES, so
-    /// each spawn adds its own key and none of them fight.
+    /// starts in, and that path is backend-specific (`/ducktape/workspace` for
+    /// podman) — so a value decided once at config-home time could be stale for
+    /// a later invocation of the same run. It MERGES, so each spawn adds its
+    /// own key and none of them fight.
     fn trust_guest_workdir(
         &self,
         auth: &RunAuth<'_>,
@@ -1184,9 +1127,9 @@ impl CliProvider {
     /// start this run's credential broker — `None` unless the spec declares one.
     /// the broker reads the operator's credential HERE, in the host process, and
     /// serves an endpoint the child dials with an opaque per-run bearer; dropping
-    /// it (any exit path of [`Self::run_output`]) tears the endpoint down. Tart
-    /// binds the host side of its private NAT; the guest plan maps that gateway
-    /// to `ducktape-host`. Podman remains loopback-only.
+    /// it (any exit path of [`Self::run_output`]) tears the endpoint down. A
+    /// Podman run is in a private netns, so the broker binds a routable
+    /// interface the container reaches as `host.containers.internal`.
     /// `airlock` is the per-run credential source — the narrowest seam that
     /// reaches broker construction (RunAuth is built AFTER the broker, from its
     /// endpoint, so it cannot carry this). `Some` pins a consensus-resolved
@@ -1200,25 +1143,20 @@ impl CliProvider {
         let Some(kind) = self.spec.isolation.broker else {
             return Ok(None);
         };
-        let tart = matches!(self.backend, SandboxBackend::Tart { .. });
         // every Podman run is in a private netns, so it can't reach a
         // loopback-bound broker at 127.0.0.1; it dials `host.containers.internal`.
         // the remaining `else` (a loopback broker) is only the test-only Bare host.
         let podman = matches!(self.backend, SandboxBackend::Podman { .. });
         match kind {
             BrokerKind::CodexResponses => {
-                if tart {
-                    broker::RunBroker::start_for_tart(airlock).await.map(Some)
-                } else if podman {
+                if podman {
                     broker::RunBroker::start_for_podman_private(airlock).await.map(Some)
                 } else {
                     broker::RunBroker::start(airlock).await.map(Some)
                 }
             }
             BrokerKind::AnthropicMessages => {
-                if tart {
-                    broker::RunBroker::start_anthropic_for_tart(airlock).await.map(Some)
-                } else if podman {
+                if podman {
                     broker::RunBroker::start_anthropic_for_podman_private(airlock)
                         .await
                         .map(Some)
@@ -1363,186 +1301,6 @@ impl CliProvider {
         argv.extend(broker_provider_overrides(broker, workdir));
         argv.extend(args.iter().skip(1).cloned());
         argv
-    }
-
-    /// The complete Tart lifecycle up to a guest ready for work: concurrency
-    /// permit, COW clone, `tart set`, headless boot with virtiofs mounts,
-    /// `tart ip --wait`, and a real SSH readiness probe. Every failure after
-    /// clone is guarded by stop/delete cleanup; there is no bare fallback.
-    async fn tart_setup(
-        &self,
-        plan: Option<&sandbox::TartPlan>,
-        ctx: &RunContext,
-    ) -> Result<Option<TartGuard>, String> {
-        let SandboxBackend::Tart { image } = &self.backend else {
-            return Ok(None);
-        };
-        let plan = plan.ok_or_else(|| "internal error: missing Tart execution plan".to_string())?;
-        let vm = &plan.vm;
-        let set_argv = sandbox::tart_set_argv(vm, &ctx.limits)
-            .map_err(|error| format!("{}: {error}", self.spec.tag))?;
-        // WAITS if 2 tart runs are already live — this is the cap, not an error.
-        let permit = tokio::select! {
-            permit = sandbox::tart_semaphore().acquire() => permit
-                .map_err(|e| format!("{}: tart concurrency gate closed: {e}", self.spec.tag))?,
-            _ = cancellation_requested(ctx.cancellation.as_ref()) => {
-                return Err(format!("{}: Tart setup cancelled at concurrency gate", self.spec.tag));
-            }
-        };
-        // Install the guard before clone starts: a cancelled/dropped clone may
-        // have created a partial VM even when it never returns success.
-        let mut guard = TartGuard {
-            vm: vm.clone(),
-            ip: String::new(),
-            run: None,
-            setup: None,
-            vm_may_exist: false,
-            _permit: permit,
-        };
-        let clone_args = vec!["clone".into(), image.clone(), vm.clone()];
-        let output = guard
-            .setup_command(
-                "tart",
-                &clone_args,
-                ctx.cancellation.as_ref(),
-                TART_SETUP_TIMEOUT,
-                false,
-            )
-            .await
-            .map_err(|error| format!("{}: {error}", self.spec.tag))?;
-        if !output.status.success() {
-            return Err(format!(
-                "{}: `tart clone {image} {vm}` exited with {}",
-                self.spec.tag, output.status
-            ));
-        }
-
-        if let Some(set_argv) = set_argv {
-            let output = guard
-                .setup_command(
-                    "tart",
-                    &set_argv,
-                    ctx.cancellation.as_ref(),
-                    TART_SETUP_TIMEOUT,
-                    false,
-                )
-                .await
-                .map_err(|error| format!("{}: {error}", self.spec.tag))?;
-            if !output.status.success() {
-                return Err(format!(
-                    "{}: `tart set {vm}` exited with {}",
-                    self.spec.tag, output.status
-                ));
-            }
-        }
-
-        guard.run = Some(
-            GroupChild::spawn("tart", &plan.run_argv, false)
-                .map_err(|e| format!("{}: `tart run {vm}` failed to spawn: {e}", self.spec.tag))?,
-        );
-
-        let ip_args = vec!["ip".into(), vm.clone(), "--wait".into(), "60".into()];
-        let output = guard
-            .setup_command(
-                "tart",
-                &ip_args,
-                ctx.cancellation.as_ref(),
-                TART_SETUP_TIMEOUT,
-                true,
-            )
-            .await
-            .map_err(|error| format!("{}: {error}", self.spec.tag))?;
-        if !output.status.success() {
-            return Err(format!(
-                "{}: `tart ip {vm} --wait 60` exited with {}: {}",
-                self.spec.tag,
-                output.status,
-                excerpt(&String::from_utf8_lossy(&output.stderr))
-            ));
-        }
-        guard.ip = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if guard.ip.is_empty() {
-            return Err(format!(
-                "{}: `tart ip {vm}` returned no address",
-                self.spec.tag
-            ));
-        }
-
-        // A probe that TIMES OUT or refuses is "sshd isn't up yet", not "give
-        // up": the guest needs ~10s before it answers, so the first probes are
-        // expected to fail. Only two conditions end the loop early — sshpass
-        // missing (unrecoverable) and the `tart run` process dying (checked
-        // below). Every other failure is retried, carrying the last one into the
-        // timeout error for diagnosis.
-        let mut last_probe_error = String::new();
-        for attempt in 0..30 {
-            let ssh_args = sandbox::tart_ssh_argv(&guard.ip, "true", false);
-            let status = guard
-                .setup_command(
-                    "sshpass",
-                    &ssh_args,
-                    ctx.cancellation.as_ref(),
-                    TART_PROBE_TIMEOUT,
-                    false,
-                )
-                .await;
-            match status {
-                Ok(output) if output.status.success() => return Ok(Some(guard)),
-                Err(error)
-                    if error.contains("failed to spawn")
-                        && (error.contains("not found")
-                            || error.contains("No such file")
-                            || error.contains("os error 2")) =>
-                {
-                    return Err(format!(
-                        "{}: sshpass is required for Tart guest execution; install it with \
-                         `brew install cirruslabs/cli/sshpass`: {error}",
-                        self.spec.tag
-                    ));
-                }
-                Err(error) => last_probe_error = error,
-                Ok(_) => {}
-            }
-            #[cfg(unix)]
-            let run_exited = {
-                let group = guard
-                    .run
-                    .as_ref()
-                    .and_then(|run| run.process_group)
-                    .expect("Tart run has an owned process group");
-                leader_exited_unreaped(group)
-                    .map_err(|e| format!("{}: inspect `tart run {vm}`: {e}", self.spec.tag))?
-            };
-            #[cfg(not(unix))]
-            let run_exited = guard
-                .run
-                .as_mut()
-                .expect("Tart run child is installed")
-                .child
-                .as_mut()
-                .expect("Tart run process is installed")
-                .try_wait()
-                .map_err(|e| format!("{}: inspect `tart run {vm}`: {e}", self.spec.tag))?
-                .is_some();
-            if run_exited {
-                return Err(format!(
-                    "{}: `tart run {vm}` exited during boot",
-                    self.spec.tag
-                ));
-            }
-            if attempt < 29 {
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                    _ = cancellation_requested(ctx.cancellation.as_ref()) => {
-                        return Err(format!("{}: Tart SSH readiness cancelled", self.spec.tag));
-                    }
-                }
-            }
-        }
-        Err(format!(
-            "{}: Tart VM {vm} got IP {} but SSH did not become ready within 30s: {last_probe_error}",
-            self.spec.tag, guard.ip
-        ))
     }
 
     /// the run-scoped PATH: `ctx.path_entries` prepended to the inherited PATH,
@@ -1764,153 +1522,7 @@ fn url_port(url: &str) -> Option<u16> {
 
 
 
-fn kill_std_child_fail_closed(
-    child: &mut std::process::Child,
-    group: u32,
-    label: &str,
-) -> std::process::ExitStatus {
-    #[cfg(unix)]
-    let _ = signal_process_group(group, libc::SIGKILL);
-    let _ = child.kill();
-    let mut failures = 0u64;
-    loop {
-        match child.wait() {
-            Ok(status) => {
-                #[cfg(unix)]
-                wait_process_group_gone_blocking(group, label);
-                return status;
-            }
-            Err(error) => {
-                failures += 1;
-                if failures == 1 || failures.is_multiple_of(16) {
-                    eprintln!(
-                        "[capability-host] wait/reap {label} failed \
-                         (attempt {failures}): {error}"
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-    }
-}
 
-fn run_command_bounded(
-    program: &Path,
-    args: &[String],
-    timeout: Duration,
-) -> Result<String, String> {
-    use std::io::Read as _;
-
-    let display = format!("{} {}", program.display(), args.join(" "));
-    let mut command = std::process::Command::new(program);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        command.process_group(0);
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("`{display}` failed to spawn: {error}"))?;
-    let process_group = child.id();
-    // Drain both pipes immediately. Waiting first deadlocks once either stream
-    // fills its kernel pipe buffer (for example a large `podman ps` result).
-    let stdout = child.stdout.take().expect("Podman stdout was piped");
-    let stderr = child.stderr.take().expect("Podman stderr was piped");
-    let stdout = std::thread::spawn(move || {
-        let mut pipe = stdout;
-        let mut bytes = Vec::new();
-        pipe.read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let stderr = std::thread::spawn(move || {
-        let mut pipe = stderr;
-        let mut bytes = Vec::new();
-        pipe.read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let deadline = std::time::Instant::now() + timeout;
-    let mut inspect_failures = 0u64;
-    let status = loop {
-        #[cfg(unix)]
-        match leader_exited_unreaped(process_group) {
-            Ok(true) => {
-                if process_group_alive(process_group) {
-                    let _ = signal_process_group(process_group, libc::SIGKILL);
-                }
-                let status = loop {
-                    match child.wait() {
-                        Ok(status) => break status,
-                        Err(error) => {
-                            inspect_failures += 1;
-                            if inspect_failures == 1 || inspect_failures.is_multiple_of(16) {
-                                eprintln!(
-                                    "[capability-host] reap completed `{display}` \
-                                     (attempt {inspect_failures}): {error}"
-                                );
-                            }
-                            std::thread::sleep(Duration::from_millis(10));
-                        }
-                    }
-                };
-                wait_process_group_gone_blocking(process_group, &display);
-                break Ok(status);
-            }
-            Ok(false) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Ok(false) => {
-                kill_std_child_fail_closed(&mut child, process_group, &display);
-                break Err(format!("`{display}` exceeded {timeout:?}"));
-            }
-            Err(error) => {
-                // Ownership could not be verified without consuming the
-                // leader. Do not signal a numeric PGID on this path.
-                inspect_failures += 1;
-                if inspect_failures == 1 || inspect_failures.is_multiple_of(16) {
-                    eprintln!(
-                        "[capability-host] observe unreaped `{display}` \
-                         (attempt {inspect_failures}): {error}"
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-        #[cfg(not(unix))]
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Ok(None) => {
-                kill_std_child_fail_closed(&mut child, process_group, &display);
-                break Err(format!("`{display}` exceeded {timeout:?}"));
-            }
-            Err(error) => {
-                kill_std_child_fail_closed(&mut child, process_group, &display);
-                break Err(format!("inspect `{display}`: {error}"));
-            }
-        }
-    };
-    let stdout = stdout
-        .join()
-        .map_err(|_| "Podman stdout reader panicked".to_string())?
-        .map_err(|error| format!("read Podman stdout: {error}"))?;
-    let stderr = stderr
-        .join()
-        .map_err(|_| "Podman stderr reader panicked".to_string())?
-        .map_err(|error| format!("read Podman stderr: {error}"))?;
-    let status = status?;
-    if !status.success() {
-        return Err(format!(
-            "`{display}` exited with {status}: {}",
-            excerpt(&String::from_utf8_lossy(&stderr))
-        ));
-    }
-    Ok(String::from_utf8_lossy(&stdout).into_owned())
-}
 
 
 
@@ -2125,7 +1737,7 @@ async fn wait_owned_child_complete(
 /// ignored TERM. A SIGKILLed leader is always waited before return: a zombie is
 /// therefore reaped, while an uninterruptible D-state leader intentionally
 /// keeps this future (and its resource reservation) pending fail-closed. This is
-/// the local-child (Tart ssh / Bare) path; a Podman run is killed + removed over
+/// the local-child (Bare test harness) path; a Podman run is killed + removed over
 /// its socket (see [`RunControl::terminate`]), never here.
 async fn terminate_child(
     child: &mut tokio::process::Child,
@@ -2208,32 +1820,6 @@ struct GroupChild {
 }
 
 impl GroupChild {
-    fn spawn(program: &str, args: &[String], capture: bool) -> Result<Self, std::io::Error> {
-        let mut command = tokio::process::Command::new(program);
-        command
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(if capture {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stderr(if capture {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .kill_on_drop(true);
-        configure_process_group(&mut command);
-        let child = command.spawn()?;
-        let process_group = child.id();
-        Ok(Self {
-            child: Some(child),
-            process_group,
-            leader_reaped: false,
-            cleaned: false,
-        })
-    }
 
     fn kill_and_wait_blocking(&mut self) {
         if self.cleaned {
@@ -2455,7 +2041,7 @@ impl Drop for LiveChild {
 }
 
 /// how [`CliProvider::invoke`] waits for and tears down a run, unifying the two
-/// backends: a `Local` child (Tart ssh / the Bare test harness), reaped through
+/// backends: a `Local` child (the Bare test harness), reaped through
 /// its process group; or a `Container` driven over the podman socket, waited and
 /// removed through the libpod API. The output loop drives whichever one this is
 /// identically.
@@ -2514,233 +2100,6 @@ impl RunControl {
     }
 }
 
-struct SetupOutput {
-    status: std::process::ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
-/// Owns the boot process and concurrency permit for one ephemeral Tart VM.
-/// `tart run` is the foreground VM compute owner (Tart has no detached daemon
-/// in this lifecycle): its isolated process group is killed and its leader
-/// reaped before Drop performs exact stop/delete/absence cleanup. The permit is
-/// released only after `tart list --source local --quiet` proves this VM name
-/// absent, so neither compute nor a partial clone escapes the concurrency gate.
-struct TartGuard {
-    vm: String,
-    ip: String,
-    run: Option<GroupChild>,
-    setup: Option<GroupChild>,
-    vm_may_exist: bool,
-    _permit: tokio::sync::SemaphorePermit<'static>,
-}
-
-impl TartGuard {
-    async fn setup_command(
-        &mut self,
-        program: &str,
-        args: &[String],
-        cancellation: Option<&RunCancellation>,
-        timeout: Duration,
-        capture: bool,
-    ) -> Result<SetupOutput, String> {
-        if cancellation.is_some_and(RunCancellation::is_cancelled) {
-            return Err(format!(
-                "`{program} {}` cancelled before spawn",
-                args.join(" ")
-            ));
-        }
-        self.setup =
-            Some(GroupChild::spawn(program, args, capture).map_err(|error| {
-                format!("`{program} {}` failed to spawn: {error}", args.join(" "))
-        })?);
-        if program == "tart" && args.first().map(String::as_str) == Some("clone") {
-            // From this point clone may have created metadata even if its
-            // command is cancelled, dropped, or exits unsuccessfully.
-            self.vm_may_exist = true;
-        }
-        let process = self
-            .setup
-            .as_mut()
-            .expect("a Tart setup child was just installed");
-        let process_group = process.process_group;
-        let child = process
-            .child
-            .as_mut()
-            .expect("a Tart setup child was just installed");
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let stdout = tokio::spawn(async move {
-            let mut bytes = Vec::new();
-            if let Some(mut pipe) = stdout {
-                pipe.read_to_end(&mut bytes).await?;
-            }
-            Ok::<_, std::io::Error>(bytes)
-        });
-        let stderr = tokio::spawn(async move {
-            let mut bytes = Vec::new();
-            if let Some(mut pipe) = stderr {
-                pipe.read_to_end(&mut bytes).await?;
-            }
-            Ok::<_, std::io::Error>(bytes)
-        });
-
-        enum Outcome {
-            Exited(std::io::Result<std::process::ExitStatus>),
-            Cancelled,
-            TimedOut,
-        }
-        let outcome = tokio::select! {
-            status = wait_owned_child_complete(
-                child,
-                process_group,
-                program,
-                &mut process.leader_reaped,
-            ) => {
-                Outcome::Exited(status)
-            },
-            _ = cancellation_requested(cancellation) => Outcome::Cancelled,
-            _ = tokio::time::sleep(timeout) => Outcome::TimedOut,
-        };
-        if matches!(&outcome, Outcome::Cancelled | Outcome::TimedOut)
-            && let Some(process) = self.setup.as_mut()
-        {
-            if process.leader_reaped {
-                #[cfg(unix)]
-                if let Some(group) = process.process_group {
-                    wait_process_group_gone(group, program).await;
-                }
-            } else if let Some(child) = process.child.as_mut() {
-                terminate_child(child, process.process_group, &mut process.leader_reaped).await;
-            }
-            process.cleaned = true;
-        }
-        if matches!(&outcome, Outcome::Exited(Ok(_)))
-            && let Some(process) = self.setup.as_mut()
-        {
-            // wait_owned_child_complete reaped the leader and proved its exact
-            // process group gone; Drop must not inspect that stale PGID.
-            process.cleaned = true;
-        }
-        // Drop the process owner before joining pipe readers so every
-        // cancellation/timeout path has completed its kill + wait first.
-        drop(self.setup.take());
-        let stdout = stdout
-            .await
-            .map_err(|error| format!("join `{program}` stdout reader: {error}"))?
-            .map_err(|error| format!("read `{program}` stdout: {error}"))?;
-        let stderr = stderr
-            .await
-            .map_err(|error| format!("join `{program}` stderr reader: {error}"))?
-            .map_err(|error| format!("read `{program}` stderr: {error}"))?;
-        let status = match outcome {
-            Outcome::Exited(status) => status
-                .map_err(|error| format!("wait for `{program} {}`: {error}", args.join(" ")))?,
-            Outcome::Cancelled => return Err(format!("`{program} {}` cancelled", args.join(" "))),
-            Outcome::TimedOut => {
-                return Err(format!(
-                    "`{program} {}` exceeded {timeout:?}",
-                    args.join(" ")
-                ));
-            }
-        };
-        Ok(SetupOutput {
-            status,
-            stdout,
-            stderr,
-        })
-    }
-}
-
-impl Drop for TartGuard {
-    fn drop(&mut self) {
-        // If the setup future itself is dropped, kill and reap clone/set/ip/SSH
-        // before touching the partially-created VM. Drop cannot await, so this
-        // synchronous wait is deliberately fail-closed if the kernel cannot
-        // reap a killed child.
-        if let Some(mut setup) = self.setup.take() {
-            setup.kill_and_wait_blocking();
-        }
-        // Compute boundary: the foreground `tart run` leader plus every helper
-        // it spawned share this process group. SIGKILL + leader wait completes
-        // before the semaphore field can be dropped.
-        if let Some(mut run) = self.run.take() {
-            run.kill_and_wait_blocking();
-        }
-        if !self.vm_may_exist {
-            return;
-        }
-        let mut failures = 0u64;
-        let mut retry_delay = PODMAN_RETRY_MIN;
-        loop {
-            match tart_vm_absent(&self.vm) {
-                Ok(true) => break,
-                Ok(false) => {
-                    let _ = run_tart_cleanup_bounded("stop", &self.vm);
-                    let _ = run_tart_cleanup_bounded("delete", &self.vm);
-                }
-                Err(error) => {
-                    failures += 1;
-                    if failures == 1 || failures.is_multiple_of(16) {
-                        eprintln!(
-                            "[capability-host] verify Tart VM {} absence \
-                             (attempt {failures}): {error}",
-                            self.vm
-                        );
-                    }
-                }
-            }
-            match tart_vm_absent(&self.vm) {
-                Ok(true) => break,
-                Ok(false) => {
-                    failures += 1;
-                    if failures == 1 || failures.is_multiple_of(16) {
-                        eprintln!(
-                            "[capability-host] Tart VM {} still present after exact cleanup \
-                             (attempt {failures})",
-                            self.vm
-                        );
-                    }
-                }
-                Err(error) => {
-                    failures += 1;
-                    if failures == 1 || failures.is_multiple_of(16) {
-                        eprintln!(
-                            "[capability-host] Tart cleanup for {} remains unproven \
-                             (attempt {failures}): {error}",
-                            self.vm
-                        );
-                    }
-                }
-            }
-            std::thread::sleep(retry_delay);
-            retry_delay = retry_delay.saturating_mul(2).min(PODMAN_RETRY_MAX);
-        }
-    }
-}
-
-fn tart_vm_absent(vm: &str) -> Result<bool, String> {
-    let output = run_command_bounded(
-        Path::new("tart"),
-        &[
-            "list".into(),
-            "--source".into(),
-            "local".into(),
-            "--quiet".into(),
-        ],
-        PODMAN_CONTROL_TIMEOUT,
-    )?;
-    Ok(!output.lines().any(|name| name.trim() == vm))
-}
-
-fn run_tart_cleanup_bounded(action: &str, vm: &str) -> Result<(), String> {
-    run_command_bounded(
-        Path::new("tart"),
-        &[action.to_string(), vm.to_string()],
-        PODMAN_CONTROL_TIMEOUT,
-    )
-    .map(|_| ())
-}
 
 /// one finished invocation: the parsed answer and its token usage.
 struct Invocation {
@@ -2837,24 +2196,16 @@ impl CliProvider {
                 .as_ref()
                 .map(|invocation| &invocation.endpoint),
         };
-        let tart_plan = matches!(self.backend, SandboxBackend::Tart { .. })
-            .then(|| {
-                let args = self.broker_argv(args, workdir, &auth);
-                self.tart_plan(&args, workdir, ctx, &auth, false)
-            })
-            .transpose()?;
-        // Declared before the SSH child so VM stop/delete runs after the child
-        // is dropped on success, error, or timeout.
-        let tart_guard = self.tart_setup(tart_plan.as_ref(), ctx).await?;
         let idle = self.timeout;
         let hard = tokio::time::Instant::now() + idle.saturating_mul(HARD_TIMEOUT_FACTOR);
         if let Some(invocation) = &broker_invocation {
             invocation.arm(hard);
         }
-        // backend split. Podman drives a container over its socket; Tart/Bare
-        // spawn a local child. Both expose the run's stdio as boxed streams so
-        // the refreshable-timeout output loop below is byte-identical, and both
-        // yield a `RunControl` that knows how to wait for exit and terminate.
+        // backend split. Podman drives a container over its socket; the
+        // test-only bare harness spawns a local child. Both expose the run's
+        // stdio as boxed streams so the refreshable-timeout output loop below is
+        // byte-identical, and both yield a `RunControl` that knows how to wait
+        // for exit and terminate.
         type BoxRead = Box<dyn tokio::io::AsyncRead + Send + Unpin>;
         type BoxWrite = Box<dyn tokio::io::AsyncWrite + Send + Unpin>;
         let (mut stdin, mut stdout_pipe, mut stderr_pipe, mut control): (
@@ -2882,13 +2233,7 @@ impl CliProvider {
                 }),
             )
         } else {
-            let mut command = if let (Some(plan), Some(guard)) = (&tart_plan, &tart_guard) {
-                let mut command = tokio::process::Command::new("sshpass");
-                command.args(sandbox::tart_ssh_argv(&guard.ip, &plan.guest_script, false));
-                command
-            } else {
-                self.prepared_command(args, workdir, ctx, &auth)?.command
-            };
+            let mut command = self.prepared_command(args, workdir, ctx, &auth)?.command;
             command
                 .current_dir(workdir)
                 .stdin(Stdio::piped())
@@ -3855,58 +3200,6 @@ args = []
     }
 
 
-    #[test]
-    fn tart_backend_builds_a_boot_then_ssh_plan() {
-        let spec = CapabilitySpec::parse(
-            r#"
-spec = 1
-[capability]
-tag = "vm"
-[detect]
-bin = "vm"
-[invoke]
-args = []
-prompt = "stdin"
-[output]
-format = "text"
-"#,
-            "test",
-        )
-        .unwrap();
-        let root = scratch("tart-plan");
-        let bin = root.join("vm");
-        std::fs::write(&bin, b"vm").unwrap();
-        let workdir = root.join("work");
-        std::fs::create_dir_all(&workdir).unwrap();
-        let provider = CliProvider::from_spec(
-            spec,
-            bin,
-            SandboxBackend::Tart {
-                image: "ghcr.io/example/macos-base:latest".into(),
-            },
-        );
-        let ctx = RunContext {
-            limits: BTreeMap::from([("mem_gb".to_string(), 4u64)]),
-            env: BTreeMap::from([(
-                RUN_ACTION_URL_ENV.to_string(),
-                "http://127.0.0.1:4321/v1/run-action".to_string(),
-            )]),
-            ..RunContext::default()
-        };
-        let plan = provider
-            .tart_plan(&["--go".into()], &workdir, &ctx, &RunAuth::default(), false)
-            .expect("Tart plan builds");
-        assert!(plan.vm.starts_with("ducktape-"), "{}", plan.vm);
-        assert_eq!(plan.run_argv.first().map(String::as_str), Some("run"));
-        assert_eq!(plan.run_argv.last(), Some(&plan.vm));
-        assert!(!plan.guest_script.contains("ssh"));
-        assert!(plan.guest_script.contains("--go"));
-        assert!(
-            plan.guest_script
-                .contains("DUCKTAPE_RUN_ACTION_URL=http://ducktape-host:4321/v1/run-action")
-        );
-        assert!(plan.guest_script.contains("rsync -aO --delete"));
-    }
 
     /// a sandbox spec with no auth section — the shape both skills tests want.
     fn sandbox_spec(tag: &str) -> CapabilitySpec {
@@ -3979,19 +3272,6 @@ printf 'sandbox-ok:%s' "$prompt""#,
         .await;
     }
 
-    /// Real Tart gate for Apple Silicon hardware. The provider owns the full
-    /// clone → configure → boot → SSH → rsync → stop → delete lifecycle.
-    #[tokio::test]
-    #[ignore = "requires Apple Silicon, Tart, sshpass, and a pulled macOS image"]
-    async fn macos_tart_hardware_smoke() {
-        if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-            eprintln!("skipping Tart hardware smoke off Apple Silicon macOS");
-            return;
-        }
-        let image = std::env::var("DUCKTAPE_MACOS_TART_IMAGE")
-            .unwrap_or_else(|_| "ghcr.io/cirruslabs/macos-sonoma-base:latest".into());
-        hardware_sandbox_smoke("macos-tart-hardware", SandboxBackend::Tart { image }).await;
-    }
 
 
 
@@ -4188,16 +3468,13 @@ broker = "anthropic-messages"
     #[tokio::test]
     async fn every_backend_accepts_the_credential_broker_shape() {
         // A missing host credential may still fail startup, but no backend is
-        // structurally rejected: Tart now exposes the broker through its NAT
-        // gateway while Podman retains loopback.
+        // structurally rejected: a Podman run reaches the broker through
+        // host.containers.internal, the bare harness through loopback.
         for backend in [
             SandboxBackend::Bare,
             SandboxBackend::Podman {
                 image: "img".into(),
                 socket: std::path::PathBuf::new(),
-            },
-            SandboxBackend::Tart {
-                image: "ghcr.io/example/macos-base:latest".into(),
             },
         ] {
             let provider =
@@ -4407,9 +3684,9 @@ broker = "anthropic-messages"
     /// no error and no output, forever, on any unattended session.
     ///
     /// It is keyed on the GUEST cwd, so this drives the real spawn-path seam
-    /// with the two real guest layouts — and asserts that a SECOND spawn (a
-    /// Tart resume mints a fresh VM name, hence a fresh path) does not lose
-    /// the first one's answer.
+    /// and asserts that a SECOND spawn under a DIFFERENT guest cwd does not
+    /// lose the first one's answer. The seed merges by project key, so the
+    /// guarantee has to hold for any two distinct paths, whatever mints them.
     #[test]
     fn each_spawns_guest_workdir_is_trusted_and_the_previous_one_survives() {
         let provider = CliProvider::from_spec(
@@ -4447,15 +3724,15 @@ broker = "anthropic-messages"
             "without this the TUI parks on the trust prompt with no error"
         );
 
-        // a second spawn of the SAME run: Tart draws a new VM name, so a new
-        // guest path — and the seed must MERGE, not replace.
-        let tart = sandbox::tart_guest_workdir("ducktape-42-2");
+        // a second spawn of the SAME run under a different guest cwd: the seed
+        // must MERGE, not replace.
+        let second = std::path::Path::new("/ducktape/workspace-2");
         provider
-            .trust_guest_workdir(&auth, &tart)
-            .expect("the tart guest cwd is answerable too");
+            .trust_guest_workdir(&auth, second)
+            .expect("a second guest cwd is answerable too");
         let state = read();
         assert_eq!(
-            state["projects"][tart.to_string_lossy().as_ref()]["hasTrustDialogAccepted"].as_bool(),
+            state["projects"]["/ducktape/workspace-2"]["hasTrustDialogAccepted"].as_bool(),
             Some(true)
         );
         assert_eq!(
@@ -5634,7 +4911,7 @@ printf '%s\n' "$PATH"
 
     /// a run INHERITS the ambient `$HOME` — with or without a provisioned
     /// workspace mount — so the headless claude/codex CLI finds its BYO
-    /// credentials. This test covers the direct backend; Podman and Tart cross
+    /// credentials. This test covers the direct backend; Podman cross
     /// the D7 filesystem boundary only through their explicit auth and
     /// workspace mounts.
     #[tokio::test]

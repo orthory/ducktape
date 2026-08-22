@@ -99,7 +99,7 @@ restricted_args = ["--sandbox", "read-only", "--ask-for-approval", "never"]
 # Note there is deliberately NO [sandbox] rw_dirs here (it is a hard load error
 # to have both): mounting ~/.codex would put the credential back in the child
 # and quietly undo all of the above. Applies under the Direct AND Podman
-# backends; Tart is rejected loudly (a VM guest cannot reach host loopback).
+# backends.
 # Inherited by every [[variants]] tag below.
 config_home_env = "CODEX_HOME"
 broker = "codex-responses"

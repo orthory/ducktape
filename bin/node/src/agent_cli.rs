@@ -104,30 +104,19 @@ pub(crate) struct SchedArgs {
 
 /// Refuse a core count no sandbox will accept, AT SUBMIT.
 ///
-/// `--cpu 1` used to be accepted here, accepted by placement, and accepted by
-/// the lease — and refused only by the spawn, on the executing box, with
-/// `Tart requires at least 2 cores, got 1`. That is the most expensive possible
-/// place to find out: it burns every `RUN_MAX_ATTEMPTS` retry and fails the
-/// saga, having told the submitter nothing they could have acted on.
+/// A zero-core run is accepted by placement and by the lease, and refused only
+/// by the spawn on the executing box — the most expensive possible place to
+/// find out, because it burns every `RUN_MAX_ATTEMPTS` retry and fails the saga
+/// having told the submitter nothing they could act on.
 ///
-/// The floor is the shipped one ([`provider_host::TART_MIN_CORES`]), not a
-/// number invented here, so it cannot drift from the backend that enforces it.
-///
-/// ponytail: ONE floor for every backend, and podman would in fact run a
-/// single-core guest. Announcing a per-backend floor in the capability set is
-/// the fuller fix and a wire change; a flat floor costs a configuration nobody
-/// wants and removes a class of run that can only ever fail late.
+/// The floor is 1: podman runs a single-core guest happily, so zero is the only
+/// request no backend can satisfy.
 fn at_least_the_sandbox_floor(value: &str) -> Result<u64, String> {
     let cores: u64 = value
         .parse()
         .map_err(|_| format!("{value:?} is not a number of cores"))?;
-    let floor = provider_host::TART_MIN_CORES;
-    if cores < floor {
-        return Err(format!(
-            "a sandboxed run needs at least {floor} cores (a macOS/Tart executor \
-             refuses fewer, and the run would fail on its host after taking a lease) \
-             — try --cpu {floor}"
-        ));
+    if cores == 0 {
+        return Err("a sandboxed run needs at least 1 core — try --cpu 1".to_string());
     }
     Ok(cores)
 }

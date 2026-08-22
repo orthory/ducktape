@@ -83,8 +83,8 @@ restricted_args = ["--permission-mode", "plan"]
 # Note there is deliberately NO [sandbox] rw_dirs here (it is a hard load error
 # to have both): mounting ~/.claude would put the credential back in the child
 # and quietly undo all of the above — the exact regression this replaces.
-# Applies under the Direct AND Podman backends; Tart binds the host gateway the
-# guest reaches as ducktape-host. Inherited by every [[variants]] tag below.
+# Applies under the Direct AND Podman backends; a Podman run reaches the broker
+# at host.containers.internal. Inherited by every [[variants]] tag below.
 config_home_env = "CLAUDE_CONFIG_DIR"
 broker = "anthropic-messages"
 

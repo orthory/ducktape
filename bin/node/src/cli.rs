@@ -393,23 +393,24 @@ fn cmd_keygen(args: KeyArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// the platform's compute adapter — podman on Linux, tart on macOS — as the
-/// `[sandbox]` table generation writes (`0` = probe the host at boot) plus
-/// the probeable backend, so generation and detection share one choice.
+/// the compute adapter as the `[sandbox]` table generation writes it (`0` =
+/// probe the host at boot) plus the probeable backend, so generation and
+/// detection share one choice. There is one adapter: the sandbox is Linux-only.
+/// `node init` writes the block commented out, so a host that cannot run podman
+/// gets the probe's loud error when an operator uncomments it, not a silent
+/// misconfiguration now.
 fn platform_sandbox() -> (config::SandboxToml, provider_host::SandboxBackend) {
-    let (runtime, image, backend) = if cfg!(target_os = "macos") {
-        ("tart", config::DEFAULT_TART_IMAGE, provider_host::SandboxBackend::Tart {
-            image: config::DEFAULT_TART_IMAGE.into(),
-        })
-    } else {
-        // the socket is left empty here: `platform_sandbox` only writes the
-        // default [sandbox] TOML at `node init`; the real socket is named by
-        // `resolve_sandbox` from the workspace when the node actually boots.
-        ("podman", config::DEFAULT_PODMAN_IMAGE, provider_host::SandboxBackend::Podman {
+    // the socket is left empty here: `platform_sandbox` only writes the
+    // default [sandbox] TOML at `node init`; the real socket is named by
+    // `resolve_sandbox` from the workspace when the node actually boots.
+    let (runtime, image, backend) = (
+        "podman",
+        config::DEFAULT_PODMAN_IMAGE,
+        provider_host::SandboxBackend::Podman {
             image: config::DEFAULT_PODMAN_IMAGE.into(),
             socket: std::path::PathBuf::new(),
-        })
-    };
+        },
+    );
     let table = config::SandboxToml {
         runtime: runtime.into(),
         image: image.into(),

@@ -155,10 +155,10 @@ async fn start_action_server(
     signer: ed25519::PrivateKey,
     run_id: String,
 ) -> Result<RunSession, String> {
-    // Bind the host interfaces so Tart guests can reach the same run-scoped
-    // endpoint through their private NAT gateway. Direct and Podman children
-    // still receive a 127.0.0.1 URL; the 256-bit token and closed message/run
-    // scope are the boundary, not an ambient network listener.
+    // Bind the host interfaces so a child in a private netns can reach the
+    // same run-scoped endpoint through its gateway. Direct children still
+    // receive a 127.0.0.1 URL; the 256-bit token and closed message/run scope
+    // are the boundary, not an ambient network listener.
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
         .await
         .map_err(|error| format!("bind scoped action signer: {error}"))?;

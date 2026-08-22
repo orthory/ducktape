@@ -207,7 +207,7 @@ async fn stop_sandbox(
 ) {
     crate::services::sweep_own_containers(backend, grant, crate::services::Sweep::Teardown).await;
     let Some(service) = podman else {
-        // a non-Podman backend started no service (Tart deletes its VM per run).
+        // a non-Podman backend started no service.
         return;
     };
     service.shutdown().await;

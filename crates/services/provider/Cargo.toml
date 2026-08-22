@@ -17,7 +17,7 @@ futures = { workspace = true }
 # the shared capability-tag shape rule: a tag that validates at spec-parse
 # time can never bounce off the consensus registry's Announce validation.
 capability = { workspace = true }
-# the sandbox muscle: SandboxBackend + its boot probe, the Tart guest plan, and
+# the sandbox muscle: SandboxBackend + its boot probe and
 # the node-private rootless podman (libpod socket) + egress firewall. carved out
 # of this crate; re-exported from src/lib.rs so callers see no move.
 sandbox-host = { workspace = true }
