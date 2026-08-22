@@ -33,12 +33,45 @@ pub const FORGE_SURFACE: &str = "forge";
 /// if a README ever carries more.
 pub const MAX_INLINE_PICTURES: usize = 8;
 
-/// A decoded picture: its drawn dimensions (post-downscale) and the handle.
+/// What the renderer is handed: decoded RGBA for a raster, the source bytes
+/// for a vector (resvg rasterizes at draw size, so a vector is never
+/// downscaled — it has no pixels to lose).
+#[derive(Clone, Debug)]
+pub enum PictureHandle {
+    Raster(Handle),
+    Vector(iced::widget::svg::Handle),
+}
+
+/// A decoded picture: its drawn dimensions (post-downscale for a raster, the
+/// declared size for a vector) and the handle.
 #[derive(Clone, Debug)]
 pub struct Picture {
     pub width: u32,
     pub height: u32,
-    pub handle: Handle,
+    pub handle: PictureHandle,
+}
+
+impl Picture {
+    /// The picture as a widget: contained to the pane's width at its own
+    /// aspect, `Shrink` tall — every mount sits in a scroll column, where a
+    /// `Fill` height has nothing to fill.
+    pub fn element<Message: 'static>(&self) -> iced::Element<'static, Message> {
+        use iced::ContentFit::Contain;
+        use iced::Length::{Fill, Shrink};
+        use iced::widget::{image, svg};
+        match &self.handle {
+            PictureHandle::Raster(handle) => image(handle.clone())
+                .width(Fill)
+                .height(Shrink)
+                .content_fit(Contain)
+                .into(),
+            PictureHandle::Vector(handle) => svg(handle.clone())
+                .width(Fill)
+                .height(Shrink)
+                .content_fit(Contain)
+                .into(),
+        }
+    }
 }
 
 /// Does the path name a picture the viewer decodes? The extension is the
@@ -51,7 +84,7 @@ pub fn picture_path(path: String) -> bool {
     };
     matches!(
         extension.to_ascii_lowercase().as_str(),
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg"
     )
 }
 
@@ -60,10 +93,38 @@ pub fn picture_caption(width: i64, height: i64) -> String {
     format!("{width} × {height}")
 }
 
-/// Decode source bytes into an RGBA handle, downscaling past
+/// Decode source bytes into a picture: an SVG document (by its first tag —
+/// the bytes' call, not the path's) is validated and measured by usvg and
+/// kept as a vector; anything else decodes to RGBA, downscaled past
 /// [`MAX_PICTURE_SIDE`]. Pure and blocking: callers run it under
 /// `spawn_blocking`.
 pub fn decode_picture(bytes: &[u8]) -> Result<Picture, String> {
+    match looks_like_svg(bytes) {
+        true => decode_vector(bytes),
+        false => decode_raster(bytes),
+    }
+}
+
+/// An XML or `<svg` opening tag within the first bytes, after a BOM or
+/// whitespace. A non-SVG XML document then fails usvg, as it should.
+fn looks_like_svg(bytes: &[u8]) -> bool {
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(256)]);
+    let head = head.trim_start_matches('\u{feff}').trim_start();
+    head.starts_with("<svg") || head.starts_with("<?xml")
+}
+
+fn decode_vector(bytes: &[u8]) -> Result<Picture, String> {
+    let tree = usvg::Tree::from_data(bytes, &usvg::Options::default())
+        .map_err(|error| error.to_string())?;
+    let size = tree.size();
+    Ok(Picture {
+        width: size.width().round() as u32,
+        height: size.height().round() as u32,
+        handle: PictureHandle::Vector(iced::widget::svg::Handle::from_memory(bytes.to_vec())),
+    })
+}
+
+fn decode_raster(bytes: &[u8]) -> Result<Picture, String> {
     let decoded = image::load_from_memory(bytes).map_err(|error| error.to_string())?;
     let oversized = decoded.width().max(decoded.height()) > MAX_PICTURE_SIDE;
     let fitted = match oversized {
@@ -75,7 +136,7 @@ pub fn decode_picture(bytes: &[u8]) -> Result<Picture, String> {
     Ok(Picture {
         width,
         height,
-        handle: Handle::from_rgba(width, height, rgba.into_raw()),
+        handle: PictureHandle::Raster(Handle::from_rgba(width, height, rgba.into_raw())),
     })
 }
 
@@ -181,24 +242,17 @@ pub fn inline_picture(doc: &str, path: &str) -> Option<Picture> {
     }
 }
 
-/// The viewer itself: the surface's picture, contained to the pane's width
-/// at its own aspect. `Shrink` on the height is deliberate — both mounts sit
-/// in scroll columns, where a `Fill` height has nothing to fill.
+/// The viewer itself: the surface's picture, centred in the pane.
 pub fn picture(surface: String, path: String) -> iced::Element<'static, ()> {
-    use iced::Length::{Fill, Shrink};
-    use iced::widget::{container, image, text};
+    use iced::Length::Fill;
+    use iced::widget::{container, text};
     let Some(picture) = stored_picture(&surface, &path) else {
         return container(text("")).into();
     };
-    container(
-        image(picture.handle)
-            .width(Fill)
-            .height(Shrink)
-            .content_fit(iced::ContentFit::Contain),
-    )
-    .width(Fill)
-    .center_x(Fill)
-    .into()
+    container(picture.element())
+        .width(Fill)
+        .center_x(Fill)
+        .into()
 }
 
 #[cfg(test)]
@@ -219,10 +273,10 @@ mod tests {
 
     #[test]
     fn the_extension_is_the_paths_call() {
-        for yes in ["a.png", "dir/b.JPG", "c.jpeg", "d.gif", "e.webp", "f.bmp"] {
+        for yes in ["a.png", "dir/b.JPG", "c.jpeg", "d.gif", "e.webp", "f.bmp", "g.svg"] {
             assert!(picture_path(yes.into()), "{yes}");
         }
-        for no in ["a.svg", "README.md", "logo", "png", "dir.png/file", "x.png.txt"] {
+        for no in ["README.md", "logo", "png", "dir.png/file", "x.png.txt", "a.xml"] {
             assert!(!picture_path(no.into()), "{no}");
         }
     }
@@ -237,6 +291,33 @@ mod tests {
     fn an_oversized_picture_is_downscaled_to_the_side_cap_at_its_aspect() {
         let picture = decode_picture(&png(MAX_PICTURE_SIDE * 2, 10)).expect("decodes");
         assert_eq!((picture.width, picture.height), (MAX_PICTURE_SIDE, 5));
+    }
+
+    fn svg(width: u32, height: u32, fill: &str) -> Vec<u8> {
+        format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\">\
+             <rect width=\"{width}\" height=\"{height}\" fill=\"{fill}\"/></svg>"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_vector_picture_keeps_its_bytes_and_reports_its_declared_size() {
+        let picture = decode_picture(&svg(10, 4, "red")).expect("decodes");
+        assert_eq!((picture.width, picture.height), (10, 4));
+        assert!(matches!(picture.handle, PictureHandle::Vector(_)));
+        let prologue = [b"\xef\xbb\xbf<?xml version=\"1.0\"?>".as_slice(), &svg(3, 3, "blue")].concat();
+        assert!(decode_picture(&prologue).is_ok(), "a BOM and an XML prologue are still an SVG");
+        let padded = [b"  \n".as_slice(), &svg(3, 3, "blue")].concat();
+        assert!(decode_picture(&padded).is_ok(), "leading whitespace is still an SVG");
+        let raster = decode_picture(&png(2, 2)).expect("decodes");
+        assert!(matches!(raster.handle, PictureHandle::Raster(_)));
+    }
+
+    #[test]
+    fn a_vector_that_does_not_parse_is_an_error_not_a_blank() {
+        assert!(decode_picture(b"<svg xmlns=\"http://www.w3.org/2000/svg\"><rect").is_err());
+        assert!(decode_picture(b"<?xml version=\"1.0\"?><not-svg/>").is_err());
     }
 
     #[test]

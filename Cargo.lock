@@ -3301,6 +3301,7 @@ dependencies = [
  "ui-lang-build",
  "ui-lang-components",
  "ui-lang-runtime",
+ "usvg",
  "zeroize",
  "zune-jpeg 0.4.21",
 ]

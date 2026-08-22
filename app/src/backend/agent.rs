@@ -1083,7 +1083,7 @@ impl<'a> iced::widget::markdown::Viewer<'a, String> for SelectViewer {
         _title: &'a str,
         alt: &iced::widget::markdown::Text,
     ) -> Element<'a, String> {
-        use iced::widget::{container, image, rich_text};
+        use iced::widget::{container, rich_text};
         let parked = self
             .doc
             .as_deref()
@@ -1096,14 +1096,7 @@ impl<'a> iced::widget::markdown::Viewer<'a, String> for SelectViewer {
             .class(<iced::Theme as iced::widget::markdown::Catalog>::code_block())
             .into();
         };
-        container(
-            image(picture.handle)
-                .width(Length::Fill)
-                .height(Length::Shrink)
-                .content_fit(iced::ContentFit::Contain),
-        )
-        .width(Length::Fill)
-        .into()
+        container(picture.element()).width(Length::Fill).into()
     }
 
     fn heading(
