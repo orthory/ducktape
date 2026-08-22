@@ -420,6 +420,25 @@ async fn run_session(
 // audio — one OS thread owns the cpal streams (they are not Send)
 // ============================================================================
 
+/// Mixed frames that arrived carrying SOUND, for this process's life.
+///
+/// The one seam that can answer "is anybody else audible?" from outside the
+/// pump: the playout ring holds samples for ~200 ms and then forgets them, and
+/// the speaker is the only other place they go. The live huddle lane
+/// (`tests::huddle_live`) waits on this the way it waits on a decoded frame
+/// for the picture — a silent huddle is the failure it exists to catch.
+static VOICE_HEARD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Anything above this in a mixed frame is somebody talking. The far end's
+/// SILK decoder converges to near-zero on silence, so the floor only has to
+/// clear the decoder's own noise.
+const AUDIBLE: i16 = 1000;
+
+/// How many mixed frames with sound in them this process has received.
+pub(crate) fn voice_frames_heard() -> u64 {
+    VOICE_HEARD.load(Ordering::Relaxed)
+}
+
 /// The playout ring: mixed 20 ms frames in, device-rate samples out. Caps at
 /// ~200 ms and drops oldest — late audio is dead audio.
 #[derive(Default)]
@@ -431,6 +450,9 @@ const PLAYOUT_CAP: usize = FRAME_SAMPLES * 10;
 
 impl PlayoutRing {
     fn push_frame(&mut self, frame: &[i16]) {
+        if frame.iter().any(|sample| sample.abs() > AUDIBLE) {
+            VOICE_HEARD.fetch_add(1, Ordering::Relaxed);
+        }
         self.samples.extend(frame);
         while self.samples.len() > PLAYOUT_CAP {
             self.samples.pop_front();

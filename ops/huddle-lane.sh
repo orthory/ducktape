@@ -14,13 +14,29 @@
 #
 # The nodes keep running when this exits; `--stop` tears the lane down.
 #
-# A CAMERA IS THE ONE THING THIS CANNOT MINT. With no /dev/video0 the lane
-# still proves the join and the beacon; the picture assertion needs a device.
-# A headless box can borrow one:
+# DEVICES ARE THE ONE THING THIS CANNOT MINT. The lane asserts the other side
+# is seen AND heard, so each side needs a camera and a microphone. A headless
+# box can borrow both — one camera for the pair, one sound card per side
+# (`ALSA_CARD` picks which one a process calls `default`):
+#
 #   sudo modprobe v4l2loopback devices=1 exclusive_caps=1 max_openers=8
 #   sudo chmod a+rw /dev/video0
 #   ffmpeg -re -f lavfi -i testsrc=size=640x480:rate=30 -pix_fmt yuyv422 \
 #          -f v4l2 /dev/video0 &
+#
+#   sudo modprobe snd-aloop index=0,1 enable=1,1 pcm_substreams=4 id=lanea,laneb
+#   sudo chmod -R a+rw /dev/snd
+#   ffmpeg -y -f lavfi -i "sine=frequency=500:duration=600:sample_rate=48000" \
+#          -ac 2 -c:a pcm_s16le /tmp/tone.wav
+#   for card in lanea laneb; do             # LOOP them: a tone that runs out is
+#     while true; do                        # a microphone that goes dead mid-run,
+#       aplay -D hw:$card,1,0 /tmp/tone.wav # and the far side then waits on
+#     done &                                # silence for no reason
+#   done
+#
+# An aloop card loops device 1's playback into device 0's capture, which is
+# what `default` records from — so the tone above IS that side's microphone.
+# (`snd-aloop` and the v4l2 core live in linux-modules-extra-$(uname -r).)
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -111,6 +127,19 @@ for idx in 0 1; do
   log "node $idx converged"
 done
 
+# CONSENSUS UP IS NOT MEDIA UP, and handing back a lane in between is how you
+# get "the mesh overlay is not up on this node yet" thrown at a person who did
+# exactly what they were told. The call hub binds when the overlay interface
+# comes up (~12 s after boot here), and the tunnel only carries traffic once
+# the WireGuard handshake completes.
+for idx in 0 1; do
+  wait_for "$LANE/node$idx.log" "hub bound" 120 \
+    || { tail -20 "$LANE/node$idx.log" >&2; die "node $idx never bound a call hub"; }
+  wait_for "$LANE/node$idx.log" "peer handshake COMPLETE" 120 \
+    || { tail -20 "$LANE/node$idx.log" >&2; die "node $idx never handshook the overlay"; }
+  log "node $idx has a call hub on a live overlay"
+done
+
 # The channel both sides huddle in. The frameless submit lane stamps `origin`
 # as the author — this row is the room, not a person.
 create=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HTTP_A/v1/submit" \
@@ -133,17 +162,22 @@ cat <<EOF
 
 The lane is up. Run these in two terminals — one per person:
 
+  ALSA_CARD=lanea \\
   DUCKTAPE_HOME=$LANE/home-a \\
   DUCKTAPE_NODE=http://127.0.0.1:$HTTP_A \\
   DUCKTAPE_HUDDLE_PASSWORD=$PASSWORD \\
   DUCKTAPE_HUDDLE_CHANNEL=$CHANNEL \\
   cargo test -p ducktape-app -- --ignored --nocapture huddle_live
 
+  ALSA_CARD=laneb \\
   DUCKTAPE_HOME=$LANE/home-b \\
   DUCKTAPE_NODE=http://127.0.0.1:$HTTP_B \\
   DUCKTAPE_HUDDLE_PASSWORD=$PASSWORD \\
   DUCKTAPE_HUDDLE_CHANNEL=$CHANNEL \\
   cargo test -p ducktape-app -- --ignored --nocapture huddle_live
+
+(ALSA_CARD only matters on a box borrowing sound cards — see this script's
+header. On a laptop with one real microphone, drop it.)
 
 Or point the desktop app at either side with the same two env vars.
 Node logs: $LANE/node0.log, $LANE/node1.log

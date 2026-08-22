@@ -1,5 +1,5 @@
-//! THE LIVE HUDDLE LANE — ignored by default, because it needs a live node,
-//! a second person, and a camera this box may not have.
+//! THE LIVE HUDDLE LANE — ignored by default, because it needs a live node, a
+//! second person, and the camera and microphone this box may not have.
 //!
 //! Every other test of the huddle stops at a boundary: the unit suites run
 //! pure folds, and the node's `huddle_media_e2e` drives two real nodes with a
@@ -14,6 +14,11 @@
 //! `DUCKTAPE_USER_KEY` name ONE user key), and it is the roster row matching
 //! that key that a session filters itself out by. Two sessions in one process
 //! are one person twice, which is not the arrangement that broke.
+//!
+//! IT ASKS FOR EVERYTHING A HUDDLE IS: the other side's presence beacon,
+//! their picture in the store, and mixed frames with their voice in them. Two
+//! of the three passing is the exact half-working call this whole session was
+//! about — so one assertion covers all three, and the failure names which.
 //!
 //! `ops/huddle-lane.sh` stands the network up and prints the two commands.
 //! Each side runs:
@@ -105,11 +110,16 @@ async fn this_side_hears_and_sees_the_other_through_the_apps_own_leg() {
             let Some((width, height, _)) = crate::video::stage_frame(&peer) else {
                 continue;
             };
+            let heard = crate::call::voice_frames_heard();
+            if heard == 0 {
+                continue;
+            }
             // Program output, not logging: the lane is run by hand and the
             // numbers ARE the result — a picture that is 640×480 came off the
-            // far camera, not out of an empty store.
+            // far camera, and mixed frames with sound in them came off the far
+            // microphone. Neither comes out of an empty store.
             println!(
-                "peer {peer} beaconed and their picture is here: {width}x{height}, \
+                "peer {peer} is here: picture {width}x{height}, {heard} audible frames, \
                  {:?} after this side joined",
                 joined_at.elapsed()
             );
@@ -120,9 +130,10 @@ async fn this_side_hears_and_sees_the_other_through_the_apps_own_leg() {
         .await
         .unwrap_or_else(|_| {
             panic!(
-                "the other side must arrive and be seen — beacon: {seen_peer}, \
-                 picture: {} (last note: {note})",
+                "the other side must arrive, be seen AND be heard — beacon: {seen_peer}, \
+                 picture: {}, audible frames: {} (last note: {note})",
                 crate::video::stage_frame(&peer).is_some(),
+                crate::call::voice_frames_heard(),
             )
         });
 
