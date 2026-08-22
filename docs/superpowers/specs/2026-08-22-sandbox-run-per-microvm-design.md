@@ -92,11 +92,46 @@ node host process
       Firecracker microVM (under its jailer)
        ├── vcpu N / mem M      demand-paged + balloon
        ├── kernel + rootfs     immutable, shared RO, per-run COW overlay
+       ├── manifest            64 KiB raw device: argv, env, cwd, mounts, ports
        ├── agent volume        persistent ext4, attached not copied
        │                       (CARGO_HOME + RUSTUP_HOME + target/)
+       ├── assets              per-run ext4, READ-ONLY: context doc, skills,
+       │                       and each PATH entry's commands
        ├── workspace           per-run ext4 block device, copied back on exit
        └── tap device ──→ host nft: public allowed, operator's private net denied
 ```
+
+### The manifest is a device, not a kernel command line
+
+The obvious channel for "what this VM is supposed to run" is the kernel
+command line — it is available before any device is up, and it costs nothing.
+It is the wrong one. Firecracker caps a cmdline near 2 KiB, and a run's argv
+and env are written from a capability SPEC, so that cap is one a spec author
+crosses by adding an environment variable. Measured: codex's broker overrides
+made a 2094-byte cmdline and the VMM refused to boot at all with `Invalid
+cmdline capacity provided`.
+
+So the manifest gets a small device of its own, read RAW — deliberately with no
+filesystem, because the manifest is what says which filesystems to mount. It is
+attached immediately after the root device so its name never moves when a run
+gains or loses its agent volume, and a manifest too large for it is refused on
+the host, naming the size, rather than truncated into a guest that cannot say
+what went wrong.
+
+### A PATH entry is its commands, not its tree
+
+Under a container the read-only inputs were bind mounts, so the SIZE of a
+declared directory cost nothing and nobody had to think about it. A VM copies.
+The node's own binary lives in a build directory, and copying that directory
+whole measured a **39 GB tree against the 0.95 GB of it a run could ever
+name** — one file.
+
+A declared PATH entry therefore hands over the executables at its top level and
+nothing else. That is not a size heuristic: it is what a PATH entry means,
+since resolution never recurses into a subdirectory and never resolves a
+non-executable, so nothing else in the tree is nameable from inside the guest.
+A skills tree and a context doc are different — every byte of those is readable
+input — so they cross entire, and the two kinds are tagged rather than guessed.
 
 Firecracker has **no shared filesystem**. Its device model is deliberately
 minimal — virtio-block, virtio-net, virtio-vsock, virtio-balloon, virtio-rng, a
@@ -424,19 +459,29 @@ inventory, not a reason to fork the design.
 
 ## Sequencing
 
-1. **Delete Tart.** Pure removal, easy to review, shrinks the seam everything
-   else edits.
-2. **Firecracker backend.** The kernel / rootfs / snapshot pipeline is most of
-   this step.
-3. **Move egress to the tap device.** Same ruleset, hook and `nsenter` deleted;
-   add logging and the public-egress toggle.
-4. **Remove the podman path** — `PodmanService`, the libpod client, the attach
-   framing, `pasta` / `conmon` from the probe.
+1. ~~**Delete Tart.**~~ Done.
+2. ~~**Firecracker backend.**~~ Done, minus the snapshot pipeline — which is a
+   latency optimisation, not a correctness prerequisite, and is now its own
+   follow-on.
+3. **Move egress to the tap device.** Half done: the ruleset moved to
+   host-namespace tap filtering and the OCI hook and `nsenter` are deleted.
+   Logging and the public-egress toggle remain.
+4. ~~**Remove the podman path.**~~ Done, and NOT last as sequenced here — it
+   went with step 2. Keeping a second backend past the point where the first
+   one ran real work would have been the dual-path code this repo's
+   instructions forbid.
 
 ## Open questions
 
 - Guest kernel: build our own or track a distro's? Determines the CVE workflow.
-- Default VM size when `cores` / `mem_gb` are absent.
+  Currently tracking the Firecracker CI kernel (`vmlinux-6.1.128`), which is a
+  placeholder, not an answer.
+- Default VM size when `cores` / `mem_gb` are absent. Currently REFUSED rather
+  than defaulted: a VM is built at a size, so a missing dimension has no
+  "unlimited" to fall back to the way a container did.
+- How an interactive session works under a VM. The pty was a podman capability;
+  a microVM run has no guest-side pty, so interactive returns an explicit error
+  today rather than silently degrading.
 - Whether the public-egress toggle defaults on or off for a fresh node.
 - When agent count reaches the hundreds, whether to replace the per-agent cache
   copy with a read-only base image plus an overlayfs upper. Costed in *Build

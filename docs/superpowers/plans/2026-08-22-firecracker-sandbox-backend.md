@@ -1834,9 +1834,125 @@ and never from a probe."
 
 - **Snapshot/restore.** Already measured (see above): restore is ~12 ms and flat in guest memory, against a 428 ms - 2 s cold boot. The backend is correct without it, so it is not a blocker for shipping — but it is the only fix for the memory-scaling cost, so it becomes a prerequisite the moment a node sells large-`mem_gb` runs at a competitive start latency. The work in that plan is **not** the restore call; it is the three costs around it: a `Uffd` memory backend so the first work is not paying lazy page faults, a build step that produces one snapshot per machine shape, and a store for the resulting memory files (~31 GB for a 1/2/4/8/16 GiB ladder) with invalidation keyed to the rootfs version.
 - **Egress logging and the public-egress toggle.** Spec step 3's remaining half.
-- **Remove the podman path.** Spec step 4: `PodmanService`, the libpod client, the attach framing, and `pasta`/`conmon` from the probe. Deliberately last — until the Firecracker path has run real work, podman is the working backend.
+- ~~**Remove the podman path.**~~ DONE in this branch, not a follow-on: `PodmanService`, the libpod client, the attach framing, the OCI `createRuntime` egress hook and `pasta`/`conmon` are deleted, along with `podman_api.rs` entire. The plan had this last, "until the Firecracker path has run real work" — it has (see the table below), and keeping a second backend would have been the dual-path code this repo's instructions forbid.
+- **An interactive pty inside the guest.** The one capability lost with podman. `InteractiveSession` still exists for a local pty, but a microVM run has no guest-side pty, so an interactive session under Firecracker returns an explicit error naming what is missing rather than silently degrading. The live podman TUI suites were deleted with the backend they drove.
 
 ## Open questions carried from the spec
 
 - Guest kernel: build our own or track a distro's? Decides the CVE workflow. Task 8's `build-guest-rootfs.sh` needs an answer before it is more than a stub.
 - Whether the balloon device ships in v1 or waits for the snapshot work.
+
+---
+
+## Implementation notes (2026-08-22, all eight tasks landed)
+
+What the plan got wrong, and what the running code does instead. Each of these
+was found by running the thing, not by reading it, so each carries the
+measurement that forced the change.
+
+### 1. The manifest does NOT ride the kernel command line
+
+Task 4 planned one base64 token on the cmdline, "so the guest needs no second
+block device to learn what to run". Firecracker caps a cmdline near 2 KiB, and
+a run's argv and env come from a capability SPEC — so that cap is one a spec
+author crosses by adding an environment variable. Codex's broker overrides
+alone made a **2094-byte** cmdline and the VMM refused to boot:
+
+```
+Boot source error: The kernel command line is invalid:
+Invalid cmdline capacity provided.
+```
+
+The manifest now rides a 64 KiB device of its own, read RAW — no filesystem to
+mount, which matters because the manifest is what says which filesystems to
+mount. It is attached immediately after the root device so its name never moves
+when a run gains or loses its agent volume, and a manifest past the device is
+refused ON THE HOST, naming the size. The cmdline is now fixed and identical
+for every run, guarded by a test. The `base64` dependency went with the
+encoding that needed it.
+
+### 2. A PATH entry hands over its commands, not its tree
+
+Nothing in the plan accounted for the fact that a VM COPIES where a container
+bind-mounted. A declared PATH directory was copied entire into the run's
+read-only asset image. The node's own binary lives in a build directory, so a
+real run measured a **39 GB tree against the 0.95 GB of it the run could ever
+name** — one file. It filled a tmpfs and died copying an `.rlib`.
+
+An asset is now tagged with what it is. `GuestAsset::Commands` hands over the
+executables at its top level and nothing else — not a heuristic, but what a
+PATH entry means, since resolution never recurses and never resolves a
+non-executable. `GuestAsset::Whole` (the skills tree, the context doc) still
+crosses entire.
+
+### 3. The run's images do not belong on `XDG_RUNTIME_DIR`
+
+The plan put the whole run directory there for `SUN_LEN`. That directory is a
+tmpfs sized at a fraction of RAM, so a run's block devices were being built in
+the node's memory — a 9.1 GB tmpfs, filled. Only the vsock socket stays there
+now; the images, boot config and console live on disk.
+
+### 4. Firecracker's vsock maps a half-close onto a RESET
+
+The host's feed task owned the connection's write half and returned after
+sending `StdinEof`. Firecracker does not carry a host-side half-close through
+as a half-close — it resets the connection. Every frame the guest wrote after
+the prompt (its whole output and its exit code) died on `EPIPE`, and the run
+reached the operator as "produced nothing, reported no exit code".
+
+The feed task now parks until the run ends. A `UnixStream::pair` honours the
+half-close, so an integration-shaped test passes either way and guards nothing;
+the guard is a source-parsing test instead.
+
+Relatedly, the guest halted the instant it wrote its exit frame. Firecracker
+relays guest writes asynchronously, so a reset that close behind the last write
+drops whatever has not been relayed — always the last frame. The host now
+closes on `Exit` and the guest waits for that close as its acknowledgement.
+
+### 5. A read-only rootfs still needs four writable directories
+
+`/tmp`, `/run`, `/var/tmp` and the run's `HOME`. An ordinary userland expects
+to write all four, and a CLI that cannot fails in whatever way it happens to
+fail, far from the cause — measured, `claude` exiting 1 with
+`EROFS: mkdir '/tmp/claude-0'`. The init mounts a per-run tmpfs on each.
+
+### 6. A read-only DRIVE must be mounted read-only
+
+Firecracker enforces `is_read_only` at the device, so mounting one read-write
+fails outright with `EACCES` — which reaches the operator as "the guest never
+dialled back", naming nothing. The guest cannot infer the bit, so each
+manifest mount carries it.
+
+### 7. Two shipped-behaviour gaps the container backend had hidden
+
+- The workspace was never read back. `collect_workspace` now runs BEFORE the
+  exit-code check: a run that exited non-zero still produced work.
+- `ro_paths` had no delivery mechanism at all under a VM. Hence the per-run
+  asset image.
+
+### 8. Every host-script test fixture had to become spec ARGV
+
+A microVM mounts nothing from the host, so an executor a node lends has to
+already be in the guest rootfs. A staged `provider.sh` arrives as
+`execve /opt/duck/bin/provider.sh` and exit 126. The e2e fixtures
+(`dispatch_e2e`, `dogfood_loop_e2e`, the provider hardware smoke) now run
+`sh -c "<script>"` against the `sh` the rootfs ships. This also surfaced a real
+bug: `microvm_boot` substituted `args[0]` with the executor's guest path on the
+assumption that `args` carries argv[0]. It does not, so a spec's first real
+argument was being eaten — invisible to any run with no arguments, which is
+exactly the shape the first end-to-end test had.
+
+### Verified end to end
+
+On a real VMM, with the operator's own subscriptions:
+
+| test | what it proves |
+| --- | --- |
+| `microvm_echo_round_trips_through_invoke` | prompt in over vsock, output back, exit code, workspace read back |
+| `firecracker_hardware_smoke` | a spec's argv and prompt reach a CLI in the guest; the file it wrote comes back |
+| `claude_model_turn_in_a_microvm` | a real claude turn through the vsock tunnel to the host broker — answered `PONG` |
+| `codex_model_turn_in_a_microvm` | the same for codex — answered `PONG` |
+
+The credential never enters the guest in either model turn: the guest has no
+network device at all, so the CLI's only route to the model API is the tunnel
+to this run's broker, which attaches the upstream token host-side.
