@@ -34,7 +34,9 @@ on call_event(event)
 
 on call_recipients_updated
 
+// The panel draws its button only while joined; the tray row is always there.
 on toggle_call_mute
+  return if !huddle_joined
   call_muted = call_set_muted(!call_muted)
   huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)
 

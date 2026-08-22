@@ -18,11 +18,41 @@ daemon Ducktape
   // The status item. A click raises THIS menu, never a window: the platform
   // only pops a menu that has rows, so with none a press did nothing but
   // activate the process — which read as "the app opened".
+  //
+  // The icon is a state channel — grey while no node answers, a dot while
+  // the bell holds unread — and the label beside it is the bell count. The
+  // menu's two top rows are READ, not chosen: the network and the node's own
+  // status line. Everything below is a command; a row whose text moves with
+  // the state (the bell count, the huddle's channel, Mute/Unmute, the ✓ on
+  // the appearance) is still the same command, which is what lets a test
+  // choose it by its current words.
   tray
+    icon-rgba "../../assets/tray-offline.rgba" 128 128 when !connected
+    icon-rgba "../../assets/tray-unread.rgba" 128 128 when bell_unread > 0
     icon-rgba "../../assets/tray.rgba" 128 128
-    tooltip "Ducktape"
+    label tray_badge(bell_unread)
+    tooltip tray_tooltip(network_name, status)
     menu
+      keep_str(empty(network_name), "No network", network_name)
+      status
+      separator
       "Open Ducktape" -> tray_open
+      tray_bell_row(bell_unread) -> tray_open_bell
+      "Go to"
+        "Chat" -> tray_go_chat
+        "Pages" -> tray_go_pages
+        "Node" -> tray_go_node
+        "Settings" -> tray_go_settings
+      separator
+      tray_huddle_row(huddle_joined, huddle_channel_name)
+        keep_str(call_muted, "Unmute", "Mute") -> toggle_call_mute
+        "Leave huddle" -> leave_huddle_here
+      "Appearance"
+        tray_choice_row("Light", appearance == Appearance.light) -> set_appearance_light
+        tray_choice_row("Dark", appearance == Appearance.dark) -> set_appearance_dark
+      separator
+      "Copy node key" -> tray_copy_node_key
+      "Reconnect" -> tray_reconnect
       separator
       "Quit Ducktape" -> tray_quit
   // The launch window: Discord/Steam-shaped — a small fixed column that

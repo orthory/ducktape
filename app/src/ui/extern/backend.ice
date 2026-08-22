@@ -204,6 +204,11 @@ extern crate::backend
   sync current_wall_seconds() -> i64
   pure mmss(seconds:i64) -> str
   sync network_label(account_name:str, rpc:str) -> str
+  pure tray_badge(unread:i64) -> str
+  pure tray_tooltip(network:str, status:str) -> str
+  pure tray_bell_row(unread:i64) -> str
+  pure tray_huddle_row(joined:bool, channel:str) -> str
+  pure tray_choice_row(label:str, chosen:bool) -> str
   pure height_label(height:i64) -> str
   pure height_label_short(height:i64) -> str
   pure height_ago(then_height:i64, now_height:i64, wall_now:i64) -> str

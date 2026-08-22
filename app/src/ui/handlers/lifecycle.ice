@@ -981,6 +981,66 @@ on tray_open
 on tray_quit
   exit
 
+// The rest of the menu is the console's: the bell, a tab, a key. With no
+// console there is nothing to show them in, so each returns rather than
+// moving state a launch window would never draw.
+on tray_open_bell
+  return if console_win == none
+  bell_open = true
+  task window focus target=window_target(console_win)
+
+// A GO-TO ROW IS `select_shell_tab` — every retire and load that move
+// carries — beside a raise of the window the tab lives in.
+on tray_go_chat
+  return if console_win == none
+  parallel
+    task window focus target=window_target(console_win)
+    flow
+      from done ShellTab.chat
+      done -> select_shell_tab _
+
+on tray_go_pages
+  return if console_win == none
+  parallel
+    task window focus target=window_target(console_win)
+    flow
+      from done ShellTab.pages
+      done -> select_shell_tab _
+
+on tray_go_node
+  return if console_win == none
+  parallel
+    task window focus target=window_target(console_win)
+    flow
+      from done ShellTab.node
+      done -> select_shell_tab _
+
+on tray_go_settings
+  return if console_win == none
+  parallel
+    task window focus target=window_target(console_win)
+    flow
+      from done ShellTab.settings
+      done -> select_shell_tab _
+
+// `reconnect` is the band's button, and the band exists only in a console.
+// From the launch window `connect("")` would not refuse — `rpc_client("")`
+// falls back to the registry's active workspace — so the row would connect
+// to a network the reader never picked.
+on tray_reconnect
+  return if console_win == none
+  flow
+    from done true
+    done -> reconnect()
+
+// `copy_to_clipboard`'s shape, for the one caller that cannot pass it a
+// label: a menu row routes to a handler and carries nothing.
+on tray_copy_node_key
+  return if console_win == none || empty(node_key)
+  toast = "Copied node key"
+  toast_age = 0
+  task clipboard write node_key
+
 on mutation_failed(cause)
   selected_message_seq = message_seq_after_failure(selected_message_seq, mutation_phase, cause.committed)
   selected_message_rev = message_seq_after_failure(selected_message_rev, mutation_phase, cause.committed)

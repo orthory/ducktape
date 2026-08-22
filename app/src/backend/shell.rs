@@ -682,6 +682,48 @@ pub fn network_label(account_name: impl AsRef<str>, rpc: impl AsRef<str>) -> Str
     host.to_string()
 }
 
+// THE STATUS ITEM'S WORDS. Ice has no string concatenation, so every tray text
+// that joins a count or a name to a label is spelled here, beside the
+// titlebar's. A row's text is also what a test chooses it by, so each verb
+// below is a contract with `tests/app.ice`.
+
+/// The count beside the menu-bar icon: nothing at all while the bell is empty.
+pub fn tray_badge(unread: i64) -> String {
+    match unread > 0 {
+        true => unread.to_string(),
+        false => String::new(),
+    }
+}
+
+pub fn tray_tooltip(network: String, status: String) -> String {
+    match network.is_empty() {
+        true => format!("Ducktape — {status}"),
+        false => format!("{network} — {status}"),
+    }
+}
+
+pub fn tray_bell_row(unread: i64) -> String {
+    match unread > 0 {
+        true => format!("Notifications · {unread} unread"),
+        false => "Notifications".into(),
+    }
+}
+
+pub fn tray_huddle_row(joined: bool, channel: String) -> String {
+    match joined {
+        true => format!("Huddle · #{channel}"),
+        false => "Huddle".into(),
+    }
+}
+
+/// A radio row: the chosen one wears the check.
+pub fn tray_choice_row(label: String, chosen: bool) -> String {
+    match chosen {
+        true => format!("✓ {label}"),
+        false => label,
+    }
+}
+
 /// A consensus stamp at or above this is unix MILLIS, not a block height.
 ///
 /// `consensus_time` is stamped `= height` by the validator lane
