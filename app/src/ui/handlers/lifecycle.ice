@@ -969,6 +969,18 @@ on window_was_closed(id)
   return if (onboarding_win != none) || (console_win != none)
   exit
 
+// THE STATUS ITEM'S MENU. The daemon leaves with its last tracked window
+// (above), so one of the two is always there to raise; `window_target` on
+// the untracked slot names a fresh id, and focusing a window that does not
+// exist is a no-op.
+on tray_open
+  parallel
+    task window focus target=window_target(console_win)
+    task window focus target=window_target(onboarding_win)
+
+on tray_quit
+  exit
+
 on mutation_failed(cause)
   selected_message_seq = message_seq_after_failure(selected_message_seq, mutation_phase, cause.committed)
   selected_message_rev = message_seq_after_failure(selected_message_rev, mutation_phase, cause.committed)

@@ -1080,3 +1080,11 @@ test palette_backdrop_takes_the_pointer
   expect !channel_create_open
   expect !palette_open
   expect missing field
+
+// The status item's rows are commands, and a chosen row reaches its handler:
+// a row index that drifts in codegen fails here, not silently in the menu bar.
+test tray_menu_contract
+  preset ui_offline
+  expect tray command "Open Ducktape"
+  expect tray command "Quit Ducktape"
+  tray choose "Open Ducktape"
