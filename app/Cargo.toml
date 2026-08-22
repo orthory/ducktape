@@ -53,6 +53,9 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # The same viewer validates and measures an SVG before handing it to iced's
 # `svg` widget (resvg draws it); usvg is already in the graph under resvg.
 usvg = "0.45"
+# A web picture in forge Markdown is one capped GET (`web_picture_bytes`);
+# the workspace's reqwest is already in the binary under rpc-client.
+reqwest.workspace = true
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 zeroize.workspace = true
 iced = { version = "=0.14.0", default-features = false, features = ["advanced", "highlighter", "image-without-codecs", "lazy", "markdown", "svg", "tokio", "wgpu", "x11"] }
