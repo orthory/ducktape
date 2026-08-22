@@ -924,3 +924,56 @@ fn forge_empty_states_name_only_routes_that_exist() {
         "a born empty commit does not get called unborn"
     );
 }
+
+/// A PICTURE THAT DOES NOT DRAW SAYS WHY. The loader lands a picture past the
+/// byte cap or one that does not decode on the binary plate with the reason
+/// as the blob's `text`, and the plate's line is `binary_note(file_text)`:
+/// that reason, or the generic "not text" line for plain binary, whose
+/// `text` is empty. An empty blob is not "past the cap": the cap is judged by
+/// the size the node announces, never by an empty page.
+#[test]
+fn a_picture_that_does_not_draw_says_why_on_the_binary_plate() {
+    let backend = inlined(include_str!("../backend/forge.rs"));
+    let picture = backend
+        .split_once("async fn forge_picture(")
+        .expect("the loader")
+        .1
+        .split_once("\nasync fn ")
+        .expect("the loader ends")
+        .0;
+    assert!(
+        picture.contains("MiB preview limit.")
+            && picture.contains("Err(reason) => Ok(binary_blob(")
+            && picture.contains("did not decode: {reason}"),
+        "both failures carry their reason onto the plate"
+    );
+    let paging = backend
+        .split_once("async fn forge_blob_bytes(")
+        .expect("the pager")
+        .1
+        .split_once("\nasync fn ")
+        .expect("the pager ends")
+        .0;
+    assert!(
+        paging.contains("page.size > MAX_PICTURE_BYTES as i64")
+            && !paging.contains("bytes.is_empty()"),
+        "the cap is the announced size, so an empty blob is not called too large"
+    );
+    assert_eq!(
+        crate::backend::binary_note(String::new()),
+        "This is not text — the reader shows no preview for it.",
+        "plain binary keeps the generic line"
+    );
+    assert_eq!(
+        crate::backend::binary_note("why".into()),
+        "why",
+        "a reasoned binary shows its reason"
+    );
+    let screen = inlined(include_str!("../ui/screens/forge.ice"));
+    assert!(
+        screen.contains(
+            "&& file_binary\n          ForgeCodeEmpty name=file_path note=binary_note(file_text)"
+        ),
+        "the plate's line is the note"
+    );
+}

@@ -291,6 +291,7 @@ extern crate::backend
   pure markdown_path(path:str) -> bool
   pure picture_path(path:str) -> bool
   pure picture_caption(width:i64, height:i64) -> str
+  pure binary_note(text:str) -> str
   component picture(surface:str, path:str) -> unit
   pure filter_forge_items(items:[ForgeItem], tab:ForgeTab) -> [ForgeItem]
   pure forge_open_count(items:[ForgeItem], kind:str) -> i64

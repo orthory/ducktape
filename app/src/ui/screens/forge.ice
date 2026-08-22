@@ -1037,11 +1037,14 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
           ForgeCodeEmpty name="" note="This directory has entries outside the browser's display limits."
         if tree_phase == ForgeTreePhase.ready && empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && !empty(tree_entries)
           ForgeCodeEmpty name="" note="Pick a file from the tree to read it."
+        // A binary blob's `text` is the loader's reason when it has one — a
+        // picture past the byte cap or one that did not decode — and empty
+        // for plain binary; `binary_note` says the generic line for that.
         if phase == ForgeFilePhase.ready && !empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && file_binary
           ForgeCodeEmpty
             with
               name=file_path
-              note="This is not text — the reader shows no preview for it."
+              note=binary_note(file_text)
         // A PICTURE DRAWS FROM THE FORGE SURFACE'S SLOT (`picture.rs`):
         // `forge_blob` paged and decoded it, and the caption is the drawn
         // size. The same viewer the Files preview mounts.
