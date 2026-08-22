@@ -7,9 +7,10 @@
 // props, interaction-local state stays here, and only application effects leave
 // as named events.
 
-component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, bind draft:editor, preview_text:str)
+component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, bind draft:editor, preview_text:str, dark:bool)
   lifetime retained
   emits
+    open_message_link(str)
     fs_open_dir(str)
     fs_open_file(str)
     fs_open_parent()
@@ -478,12 +479,17 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
                                   size=12.0
                                   font=code
                                   @text-meta
-                            if !preview_binary
-                              text preview_text
-                                with
-                                  size=12.0
-                                  font=code
-                                  @text-fg
+                            // The same split the forge reader makes: a
+                            // Markdown path reads as a document through the
+                            // shell's `agent_markdown`, any other text as
+                            // numbered, syntect-coloured rows through
+                            // `forge_code`. Binary-or-text is the wire's
+                            // call; markdown-vs-code is the path's.
+                            if !preview_binary && markdown_path(preview_path)
+                              extern agent_markdown(preview_text, dark) #fs-markdown -> emit(open_message_link, _)
+                            if !preview_binary && !markdown_path(preview_path)
+                              lazy preview_text by preview_text, preview_path, dark as cached_source
+                                extern forge_code(cached_source, preview_path, dark) #fs-code
       if connected
         if !empty(preview_entry.path)
           ObjectPanel
