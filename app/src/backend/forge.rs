@@ -910,7 +910,6 @@ fn code_surface(source: &str, path: &str, dark: bool) -> iced::Element<'static, 
     use iced::alignment::Horizontal;
     use iced::highlighter::{Settings, Stream};
     use iced::widget::{container, row, text};
-    use std::hash::{Hash as _, Hasher as _};
 
     let (rail, gutter_ink, plain_ink) = match dark {
         true => (
@@ -940,37 +939,26 @@ fn code_surface(source: &str, path: &str, dark: bool) -> iced::Element<'static, 
         theme: code_theme(dark),
         token: code_token(path),
     });
-    // ONE paragraph for the whole blob, newline spans between the lines, so a
-    // drag runs across rows and a copy carries the line breaks. `content` is
-    // the exact text the spans spell, byte for byte: the selection's offsets
-    // index it.
-    let mut content = String::with_capacity(source.len());
-    let mut line_starts = Vec::new();
-    let mut spans: Vec<Span<'static, (), iced::Font>> = Vec::new();
-    let mut numbers = String::new();
-    for (index, line) in source.lines().enumerate() {
-        if index > 0 {
-            content.push('\n');
-            numbers.push('\n');
-            spans.push(Span::new("\n"));
-        }
-        line_starts.push(content.len());
-        content.push_str(line);
-        numbers.push_str(&(index + 1).to_string());
-        spans.extend(stream.highlight_line(line).map(|(range, highlight)| {
-            Span::new(line[range].to_string()).color(highlight.color().unwrap_or(plain_ink))
-        }));
-        stream.commit();
-    }
-    let mut hasher = std::hash::DefaultHasher::new();
-    (source, path, dark).hash(&mut hasher);
-    let code = CodeSelect {
-        key: hasher.finish(),
-        content,
-        line_starts,
-        spans,
-        ink: plain_ink,
-    };
+    // The gutter is one numbers paragraph at the plate's row pitch; the plate
+    // is one drag-selectable paragraph of the highlighted lines.
+    let lines: Vec<Vec<Span<'static, (), iced::Font>>> = source
+        .lines()
+        .map(|line| {
+            let spans = stream
+                .highlight_line(line)
+                .map(|(range, highlight)| {
+                    Span::new(line[range].to_string()).color(highlight.color().unwrap_or(plain_ink))
+                })
+                .collect();
+            stream.commit();
+            spans
+        })
+        .collect();
+    let numbers = (1..=lines.len())
+        .map(|number| number.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let code = CodeSelect::new(lines, READER_METRICS, Some(plain_ink), Length::Fill);
     let gutter = container(
         text(numbers)
             .size(CODE_SIZE)
@@ -1001,27 +989,11 @@ const CODE_FONT: iced::Font = iced::Font::with_name("Geist Mono");
 /// line of text, wrong for a file of them.
 type CodeParagraph = iced::advanced::graphics::text::Paragraph;
 
-/// The reader's code plate: the highlighted blob as one paragraph that can be
-/// dragged across, like every plain Ice `text` in the app (ducktape-ui wraps
-/// those in `selectable_text`; this is the same contract for per-span inks,
-/// which that wrapper's plain `Text` cannot carry). It takes the window's
-/// selection through `ui_lang_runtime::selection`, so a drag here quiets any
-/// other highlight and vice versa; Ctrl+A takes the file, Ctrl+C copies,
-/// Escape lets go.
-struct CodeSelect {
-    /// Identity of (blob, path, appearance): a new key rebuilds the paragraph
-    /// and drops the old blob's selection, whose offsets meant other text.
-    key: u64,
-    content: String,
-    /// Byte offset of each line's first character in `content` — what turns
-    /// the buffer's (line, index) cursor into one offset and back.
-    line_starts: Vec<usize>,
-    spans: Vec<iced::advanced::text::Span<'static, (), iced::Font>>,
-    ink: iced::Color,
-}
-
+/// One selectable run of text, the state every selectable surface here
+/// shares: a paragraph laid out like the drawn one (for the code plate it IS
+/// the drawn one), the window's selection token, the drag, and the quads.
 #[derive(Default)]
-struct CodeSelectState {
+struct SelectState {
     key: u64,
     paragraph: CodeParagraph,
     token: u64,
@@ -1034,46 +1006,46 @@ struct CodeSelectState {
     highlight: Vec<iced::Rectangle>,
 }
 
-impl CodeSelectState {
+impl SelectState {
     fn is_active(&self) -> bool {
         ui_lang_runtime::selection::holds(self.token)
     }
 
-    fn range(&self, content: &str) -> Option<std::ops::Range<usize>> {
+    fn range(&self, text: &SelectText) -> Option<std::ops::Range<usize>> {
         if !self.is_active() {
             return None;
         }
         let start = self.anchor.min(self.cursor);
         let end = self.anchor.max(self.cursor);
-        (start != end && content.get(start..end).is_some()).then_some(start..end)
+        (start != end && text.content.get(start..end).is_some()).then_some(start..end)
     }
 
-    fn selected<'a>(&self, content: &'a str) -> Option<&'a str> {
-        content.get(self.range(content)?)
+    fn selected<'a>(&self, text: &'a SelectText) -> Option<&'a str> {
+        text.content.get(self.range(text)?)
     }
 
     /// The byte offset under a paragraph-relative point. cosmic-text already
     /// lands a point above the first line on it, one below the last on its
     /// end, and one past a line's right edge on that line's end — the clamps
     /// a drag needs.
-    fn hit(&self, point: iced::Point, line_starts: &[usize]) -> Option<usize> {
+    fn hit(&self, point: iced::Point, text: &SelectText) -> Option<usize> {
         let cursor = self.paragraph.buffer().hit(point.x, point.y)?;
-        let line_start = line_starts.get(cursor.line).copied()?;
+        let line_start = text.line_starts.get(cursor.line).copied()?;
         Some(line_start + cursor.index)
     }
 
-    /// One quad per selected line, read off the laid-out glyphs: the run of
-    /// the first glyph that ends inside the selection through the last that
-    /// starts inside it. A line the selection only passes the newline of
-    /// (an empty line, or a start exactly at a line's end) has no such
-    /// glyphs and draws nothing.
-    fn reselect(&mut self, content: &str, line_starts: &[usize]) {
+    /// One quad per laid-out line the selection touches, read off its
+    /// glyphs: the run of the first glyph that ends inside the selection
+    /// through the last that starts inside it. A line the selection only
+    /// passes the newline of (an empty line, or a start exactly at a line's
+    /// end) has no such glyphs and draws nothing.
+    fn reselect(&mut self, text: &SelectText) {
         self.highlight.clear();
-        let Some(range) = self.range(content) else {
+        let Some(range) = self.range(text) else {
             return;
         };
         for run in self.paragraph.buffer().layout_runs() {
-            let Some(&line_start) = line_starts.get(run.line_i) else {
+            let Some(&line_start) = text.line_starts.get(run.line_i) else {
                 continue;
             };
             let low = range.start.saturating_sub(line_start);
@@ -1093,18 +1065,214 @@ impl CodeSelectState {
             ));
         }
     }
+
+    /// A (re)laid-out paragraph: a new key drops the old text's selection,
+    /// whose offsets meant other text; the same key keeps it and refreshes
+    /// the quads where the bounds moved.
+    fn relayout<Link>(
+        &mut self,
+        key: u64,
+        text: iced::advanced::text::Text<
+            &[iced::advanced::text::Span<'_, Link, iced::Font>],
+            iced::Font,
+        >,
+        select: &SelectText,
+    ) {
+        use iced::advanced::text::{Difference, Paragraph as _, Text};
+        let other_text = self.key != key;
+        if other_text {
+            self.paragraph = CodeParagraph::with_spans(text);
+            self.key = key;
+            self.token = 0;
+            self.dragging = false;
+            self.highlight.clear();
+            return;
+        }
+        let probe = Text {
+            content: (),
+            bounds: text.bounds,
+            size: text.size,
+            line_height: text.line_height,
+            font: text.font,
+            align_x: text.align_x,
+            align_y: text.align_y,
+            shaping: text.shaping,
+            wrapping: text.wrapping,
+        };
+        match self.paragraph.compare(probe) {
+            Difference::None => {}
+            Difference::Bounds => {
+                self.paragraph.resize(text.bounds);
+                self.reselect(select);
+            }
+            Difference::Shape => {
+                self.paragraph = CodeParagraph::with_spans(text);
+                self.reselect(select);
+            }
+        }
+    }
+
+    /// The selection's own input: press starts a drag and takes the window's
+    /// selection, the drag moves the cursor, Ctrl+A takes everything, Ctrl+C
+    /// copies, Escape lets go.
+    fn update<Message>(
+        &mut self,
+        text: &SelectText,
+        event: &iced::Event,
+        layout: iced::advanced::Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        clipboard: &mut dyn iced::advanced::Clipboard,
+        shell: &mut iced::advanced::Shell<'_, Message>,
+    ) {
+        use iced::advanced::clipboard;
+        use iced::keyboard;
+        use iced::mouse;
+        use ui_lang_runtime::selection;
+        match event {
+            iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                let Some(position) = cursor.position_in(layout.bounds()) else {
+                    return;
+                };
+                let Some(offset) = self.hit(position, text) else {
+                    return;
+                };
+                self.token = selection::claim();
+                self.anchor = offset;
+                self.cursor = offset;
+                self.dragging = true;
+                self.reselect(text);
+                shell.request_redraw();
+            }
+            iced::Event::Mouse(mouse::Event::CursorMoved { .. }) if self.dragging => {
+                let Some(position) = cursor.position_from(layout.position()) else {
+                    return;
+                };
+                let Some(offset) = self.hit(position, text) else {
+                    return;
+                };
+                if self.cursor == offset {
+                    return;
+                }
+                self.cursor = offset;
+                self.reselect(text);
+                shell.request_redraw();
+            }
+            iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+                if self.dragging =>
+            {
+                self.dragging = false;
+            }
+            iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                physical_key,
+                modifiers,
+                ..
+            }) if self.is_active() && modifiers.command() => match key.to_latin(*physical_key) {
+                Some('a') => {
+                    self.anchor = 0;
+                    self.cursor = text.content.len();
+                    self.reselect(text);
+                    shell.capture_event();
+                    shell.request_redraw();
+                }
+                Some('c') => {
+                    if let Some(selected) = self.selected(text) {
+                        clipboard.write(clipboard::Kind::Standard, selected.to_owned());
+                        shell.capture_event();
+                    }
+                }
+                _ => {}
+            },
+            iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                ..
+            }) if self.is_active() => {
+                selection::clear();
+                self.dragging = false;
+                self.highlight.clear();
+                shell.request_redraw();
+            }
+            _ => {}
+        }
+    }
+
+    /// The highlight wash under the text, clipped to what is on screen.
+    fn draw(
+        &self,
+        renderer: &mut iced::Renderer,
+        bounds: iced::Rectangle,
+        clip: iced::Rectangle,
+        ink: iced::Color,
+    ) {
+        use iced::advanced::Renderer as _;
+        if !self.is_active() {
+            return;
+        }
+        let translation = bounds.position() - iced::Point::ORIGIN;
+        let wash = ink.scale_alpha(0.28);
+        for quad in &self.highlight {
+            let Some(quad) = (*quad + translation).intersection(&clip) else {
+                continue;
+            };
+            renderer.fill_quad(
+                iced::advanced::renderer::Quad {
+                    bounds: quad,
+                    ..Default::default()
+                },
+                wash,
+            );
+        }
+    }
 }
 
-/// The one text layout the plate and the gutter agree on: the reader's
-/// pinned size at a fixed row pitch, no wrapping.
-fn code_text<C>(content: C, bounds: iced::Size) -> iced::advanced::text::Text<C, iced::Font> {
-    use iced::advanced::text::{Alignment, LineHeight, Shaping, Text, Wrapping};
+/// The text a selection indexes: the exact string the spans spell, byte
+/// for byte, and the byte offset of each line's first character — what
+/// turns the buffer's (line, index) cursor into one offset and back.
+struct SelectText {
+    content: String,
+    line_starts: Vec<usize>,
+}
+
+impl SelectText {
+    fn new(content: String) -> Self {
+        let line_starts = std::iter::once(0)
+            .chain(content.match_indices('\n').map(|(at, _)| at + 1))
+            .collect();
+        Self {
+            content,
+            line_starts,
+        }
+    }
+}
+
+/// The text layout a code plate draws with: a pinned size and row pitch in
+/// the code font, no wrapping.
+#[derive(Clone, Copy)]
+pub struct CodeMetrics {
+    pub size: iced::Pixels,
+    pub line_height: iced::advanced::text::LineHeight,
+    pub font: iced::Font,
+}
+
+/// The reader's metrics, pinned to `DiffRow`'s by the shape lint.
+const READER_METRICS: CodeMetrics = CodeMetrics {
+    size: iced::Pixels(CODE_SIZE),
+    line_height: iced::advanced::text::LineHeight::Absolute(iced::Pixels(CODE_ROW_HEIGHT)),
+    font: CODE_FONT,
+};
+
+fn code_text<C>(
+    content: C,
+    bounds: iced::Size,
+    metrics: CodeMetrics,
+) -> iced::advanced::text::Text<C, iced::Font> {
+    use iced::advanced::text::{Alignment, Shaping, Text, Wrapping};
     Text {
         content,
         bounds,
-        size: CODE_SIZE.into(),
-        line_height: LineHeight::Absolute(CODE_ROW_HEIGHT.into()),
-        font: CODE_FONT,
+        size: metrics.size,
+        line_height: metrics.line_height,
+        font: metrics.font,
         align_x: Alignment::Left,
         align_y: iced::alignment::Vertical::Top,
         shaping: Shaping::Advanced,
@@ -1112,17 +1280,81 @@ fn code_text<C>(content: C, bounds: iced::Size) -> iced::advanced::text::Text<C,
     }
 }
 
-impl iced::advanced::Widget<(), iced::Theme, iced::Renderer> for CodeSelect {
+/// A code plate: highlighted lines as one paragraph that can be dragged
+/// across, like every plain Ice `text` in the app (ducktape-ui wraps those in
+/// `selectable_text`; this is the same contract for per-span inks, which
+/// that wrapper's plain `Text` cannot carry). It takes the window's
+/// selection through `ui_lang_runtime::selection`, so a drag here quiets any
+/// other highlight and vice versa; Ctrl+A takes the file, Ctrl+C copies,
+/// Escape lets go. The forge reader and Markdown code blocks both draw it.
+pub struct CodeSelect {
+    /// Identity of the lines and their inks: a new key rebuilds the
+    /// paragraph and drops the old text's selection.
+    key: u64,
+    text: SelectText,
+    spans: Vec<iced::advanced::text::Span<'static, (), iced::Font>>,
+    /// The ink for spans without one; `None` takes the theme's text colour.
+    ink: Option<iced::Color>,
+    metrics: CodeMetrics,
+    width: iced::Length,
+}
+
+impl CodeSelect {
+    /// One plate from per-line spans, newline spans between the lines, so a
+    /// drag runs across rows and a copy carries the line breaks. `content` is
+    /// the exact text the spans spell, byte for byte: the selection's
+    /// offsets index it.
+    pub fn new<'a, Link>(
+        lines: impl IntoIterator<Item = impl AsRef<[iced::advanced::text::Span<'a, Link, iced::Font>]>>,
+        metrics: CodeMetrics,
+        ink: Option<iced::Color>,
+        width: iced::Length,
+    ) -> Self {
+        use iced::advanced::text::Span;
+        use std::hash::{Hash as _, Hasher as _};
+        let mut content = String::new();
+        let mut spans = Vec::new();
+        let mut hasher = std::hash::DefaultHasher::new();
+        for (index, line) in lines.into_iter().enumerate() {
+            if index > 0 {
+                content.push('\n');
+                spans.push(Span::new("\n"));
+            }
+            for span in line.as_ref() {
+                content.push_str(&span.text);
+                span.color
+                    .map(|color| [color.r, color.g, color.b, color.a].map(f32::to_bits))
+                    .hash(&mut hasher);
+                spans.push(
+                    Span::new(span.text.to_string())
+                        .color_maybe(span.color)
+                        .font_maybe(span.font),
+                );
+            }
+        }
+        content.hash(&mut hasher);
+        Self {
+            key: hasher.finish(),
+            text: SelectText::new(content),
+            spans,
+            ink,
+            metrics,
+            width,
+        }
+    }
+}
+
+impl<Message> iced::advanced::Widget<Message, iced::Theme, iced::Renderer> for CodeSelect {
     fn tag(&self) -> iced::advanced::widget::tree::Tag {
-        iced::advanced::widget::tree::Tag::of::<CodeSelectState>()
+        iced::advanced::widget::tree::Tag::of::<SelectState>()
     }
 
     fn state(&self) -> iced::advanced::widget::tree::State {
-        iced::advanced::widget::tree::State::new(CodeSelectState::default())
+        iced::advanced::widget::tree::State::new(SelectState::default())
     }
 
     fn size(&self) -> iced::Size<iced::Length> {
-        iced::Size::new(iced::Length::Fill, iced::Length::Shrink)
+        iced::Size::new(self.width, iced::Length::Shrink)
     }
 
     fn layout(
@@ -1131,32 +1363,11 @@ impl iced::advanced::Widget<(), iced::Theme, iced::Renderer> for CodeSelect {
         _renderer: &iced::Renderer,
         limits: &iced::advanced::layout::Limits,
     ) -> iced::advanced::layout::Node {
-        use iced::advanced::text::{Difference, Paragraph as _};
-        let state = tree.state.downcast_mut::<CodeSelectState>();
-        iced::advanced::layout::sized(limits, iced::Length::Fill, iced::Length::Shrink, |limits| {
-            let bounds = limits.max();
-            let other_blob = state.key != self.key;
-            if other_blob {
-                state.paragraph =
-                    CodeParagraph::with_spans(code_text(self.spans.as_slice(), bounds));
-                state.key = self.key;
-                state.token = 0;
-                state.dragging = false;
-                state.highlight.clear();
-                return state.paragraph.min_bounds();
-            }
-            match state.paragraph.compare(code_text((), bounds)) {
-                Difference::None => {}
-                Difference::Bounds => {
-                    state.paragraph.resize(bounds);
-                    state.reselect(&self.content, &self.line_starts);
-                }
-                Difference::Shape => {
-                    state.paragraph =
-                        CodeParagraph::with_spans(code_text(self.spans.as_slice(), bounds));
-                    state.reselect(&self.content, &self.line_starts);
-                }
-            }
+        use iced::advanced::text::Paragraph as _;
+        let state = tree.state.downcast_mut::<SelectState>();
+        iced::advanced::layout::sized(limits, self.width, iced::Length::Shrink, |limits| {
+            let text = code_text(self.spans.as_slice(), limits.max(), self.metrics);
+            state.relayout(self.key, text, &self.text);
             state.paragraph.min_bounds()
         })
     }
@@ -1169,80 +1380,11 @@ impl iced::advanced::Widget<(), iced::Theme, iced::Renderer> for CodeSelect {
         cursor: iced::mouse::Cursor,
         _renderer: &iced::Renderer,
         clipboard: &mut dyn iced::advanced::Clipboard,
-        shell: &mut iced::advanced::Shell<'_, ()>,
+        shell: &mut iced::advanced::Shell<'_, Message>,
         _viewport: &iced::Rectangle,
     ) {
-        use iced::advanced::clipboard;
-        use iced::keyboard;
-        use iced::mouse;
-        use ui_lang_runtime::selection;
-        let state = tree.state.downcast_mut::<CodeSelectState>();
-        match event {
-            iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                let Some(position) = cursor.position_in(layout.bounds()) else {
-                    return;
-                };
-                let Some(offset) = state.hit(position, &self.line_starts) else {
-                    return;
-                };
-                state.token = selection::claim();
-                state.anchor = offset;
-                state.cursor = offset;
-                state.dragging = true;
-                state.reselect(&self.content, &self.line_starts);
-                shell.request_redraw();
-            }
-            iced::Event::Mouse(mouse::Event::CursorMoved { .. }) if state.dragging => {
-                let Some(position) = cursor.position_from(layout.position()) else {
-                    return;
-                };
-                let Some(offset) = state.hit(position, &self.line_starts) else {
-                    return;
-                };
-                if state.cursor == offset {
-                    return;
-                }
-                state.cursor = offset;
-                state.reselect(&self.content, &self.line_starts);
-                shell.request_redraw();
-            }
-            iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
-                if state.dragging =>
-            {
-                state.dragging = false;
-            }
-            iced::Event::Keyboard(keyboard::Event::KeyPressed {
-                key,
-                physical_key,
-                modifiers,
-                ..
-            }) if state.is_active() && modifiers.command() => match key.to_latin(*physical_key) {
-                Some('a') => {
-                    state.anchor = 0;
-                    state.cursor = self.content.len();
-                    state.reselect(&self.content, &self.line_starts);
-                    shell.capture_event();
-                    shell.request_redraw();
-                }
-                Some('c') => {
-                    if let Some(selected) = state.selected(&self.content) {
-                        clipboard.write(clipboard::Kind::Standard, selected.to_owned());
-                        shell.capture_event();
-                    }
-                }
-                _ => {}
-            },
-            iced::Event::Keyboard(keyboard::Event::KeyPressed {
-                key: keyboard::Key::Named(keyboard::key::Named::Escape),
-                ..
-            }) if state.is_active() => {
-                selection::clear();
-                state.dragging = false;
-                state.highlight.clear();
-                shell.request_redraw();
-            }
-            _ => {}
-        }
+        let state = tree.state.downcast_mut::<SelectState>();
+        state.update(&self.text, event, layout, cursor, clipboard, shell);
     }
 
     fn mouse_interaction(
@@ -1264,41 +1406,227 @@ impl iced::advanced::Widget<(), iced::Theme, iced::Renderer> for CodeSelect {
         tree: &iced::advanced::widget::Tree,
         renderer: &mut iced::Renderer,
         _theme: &iced::Theme,
-        _style: &iced::advanced::renderer::Style,
+        style: &iced::advanced::renderer::Style,
         layout: iced::advanced::Layout<'_>,
         _cursor: iced::mouse::Cursor,
         viewport: &iced::Rectangle,
     ) {
-        use iced::advanced::Renderer as _;
         use iced::advanced::text::Renderer as _;
         let bounds = layout.bounds();
         let Some(clip) = bounds.intersection(viewport) else {
             return;
         };
-        let state = tree.state.downcast_ref::<CodeSelectState>();
-        if state.is_active() {
-            let translation = bounds.position() - iced::Point::ORIGIN;
-            let wash = self.ink.scale_alpha(0.28);
-            for quad in &state.highlight {
-                let Some(quad) = (*quad + translation).intersection(&clip) else {
-                    continue;
-                };
-                renderer.fill_quad(
-                    iced::advanced::renderer::Quad {
-                        bounds: quad,
-                        ..Default::default()
-                    },
-                    wash,
-                );
-            }
-        }
-        renderer.fill_paragraph(&state.paragraph, bounds.position(), self.ink, clip);
+        let ink = self.ink.unwrap_or(style.text_color);
+        let state = tree.state.downcast_ref::<SelectState>();
+        state.draw(renderer, bounds, clip, ink);
+        renderer.fill_paragraph(&state.paragraph, bounds.position(), ink, clip);
     }
 }
 
-impl From<CodeSelect> for iced::Element<'static, ()> {
+impl<'a, Message: 'a> From<CodeSelect> for iced::Element<'a, Message> {
     fn from(code: CodeSelect) -> Self {
         Self::new(code)
+    }
+}
+
+/// A rich text run that can be dragged across — iced's own `Rich` draws it
+/// (inline-code plates, link inks, link clicks all stay its), and a shadow
+/// paragraph laid out with the same spans, size, font and bounds answers
+/// where the glyphs are. One run is one selection: a drag stops at the
+/// block's edge, exactly as it does on the app's plain Ice `text`.
+pub struct SelectRich<'a, Message> {
+    key: u64,
+    child: iced::Element<'a, Message>,
+    text: SelectText,
+    spans: std::sync::Arc<[iced::advanced::text::Span<'static, String, iced::Font>]>,
+    size: iced::Pixels,
+}
+
+impl<'a, Message: 'a> SelectRich<'a, Message> {
+    /// `rich` must be the `Rich` built from `spans` at `size` in the
+    /// renderer's default font — the shadow paragraph mirrors those.
+    pub fn new(
+        rich: iced::widget::text::Rich<'a, String, Message>,
+        spans: std::sync::Arc<[iced::advanced::text::Span<'static, String, iced::Font>]>,
+        size: iced::Pixels,
+    ) -> Self {
+        use std::hash::{Hash as _, Hasher as _};
+        let content: String = spans.iter().map(|span| span.text.as_ref()).collect();
+        let mut hasher = std::hash::DefaultHasher::new();
+        (&content, size.0.to_bits()).hash(&mut hasher);
+        Self {
+            key: hasher.finish(),
+            child: rich.into(),
+            text: SelectText::new(content),
+            spans,
+            size,
+        }
+    }
+}
+
+impl<Message> iced::advanced::Widget<Message, iced::Theme, iced::Renderer>
+    for SelectRich<'_, Message>
+{
+    fn tag(&self) -> iced::advanced::widget::tree::Tag {
+        iced::advanced::widget::tree::Tag::of::<SelectState>()
+    }
+
+    fn state(&self) -> iced::advanced::widget::tree::State {
+        iced::advanced::widget::tree::State::new(SelectState::default())
+    }
+
+    fn children(&self) -> Vec<iced::advanced::widget::Tree> {
+        vec![iced::advanced::widget::Tree::new(&self.child)]
+    }
+
+    fn diff(&self, tree: &mut iced::advanced::widget::Tree) {
+        tree.children[0].diff(&self.child);
+    }
+
+    fn size(&self) -> iced::Size<iced::Length> {
+        self.child.as_widget().size()
+    }
+
+    fn size_hint(&self) -> iced::Size<iced::Length> {
+        self.child.as_widget().size_hint()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut iced::advanced::widget::Tree,
+        renderer: &iced::Renderer,
+        limits: &iced::advanced::layout::Limits,
+    ) -> iced::advanced::layout::Node {
+        use iced::advanced::text::{Alignment, LineHeight, Renderer as _, Shaping, Text, Wrapping};
+        let node = self
+            .child
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits);
+        // The same `Text` `Rich::layout` lays its spans out with, bounds
+        // included — it reads `limits.max()` before sizing, as this does.
+        let text = Text {
+            content: self.spans.as_ref(),
+            bounds: limits.max(),
+            size: self.size,
+            line_height: LineHeight::default(),
+            font: renderer.default_font(),
+            align_x: Alignment::Default,
+            align_y: iced::alignment::Vertical::Top,
+            shaping: Shaping::Advanced,
+            wrapping: Wrapping::default(),
+        };
+        let state = tree.state.downcast_mut::<SelectState>();
+        state.relayout(self.key, text, &self.text);
+        node
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut iced::advanced::widget::Tree,
+        layout: iced::advanced::Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn iced::advanced::widget::Operation,
+    ) {
+        self.child
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut iced::advanced::widget::Tree,
+        event: &iced::Event,
+        layout: iced::advanced::Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        renderer: &iced::Renderer,
+        clipboard: &mut dyn iced::advanced::Clipboard,
+        shell: &mut iced::advanced::Shell<'_, Message>,
+        viewport: &iced::Rectangle,
+    ) {
+        self.child.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+        let state = tree.state.downcast_mut::<SelectState>();
+        state.update(&self.text, event, layout, cursor, clipboard, shell);
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &iced::advanced::widget::Tree,
+        layout: iced::advanced::Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        viewport: &iced::Rectangle,
+        renderer: &iced::Renderer,
+    ) -> iced::mouse::Interaction {
+        let own = self.child.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        );
+        let over_a_link = own != iced::mouse::Interaction::default();
+        match (over_a_link, cursor.is_over(layout.bounds())) {
+            (true, _) => own,
+            (false, true) => iced::mouse::Interaction::Text,
+            (false, false) => own,
+        }
+    }
+
+    fn draw(
+        &self,
+        tree: &iced::advanced::widget::Tree,
+        renderer: &mut iced::Renderer,
+        theme: &iced::Theme,
+        style: &iced::advanced::renderer::Style,
+        layout: iced::advanced::Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        viewport: &iced::Rectangle,
+    ) {
+        let bounds = layout.bounds();
+        if let Some(clip) = bounds.intersection(viewport) {
+            let state = tree.state.downcast_ref::<SelectState>();
+            state.draw(renderer, bounds, clip, style.text_color);
+        }
+        self.child.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut iced::advanced::widget::Tree,
+        layout: iced::advanced::Layout<'b>,
+        renderer: &iced::Renderer,
+        viewport: &iced::Rectangle,
+        translation: iced::Vector,
+    ) -> Option<iced::advanced::overlay::Element<'b, Message, iced::Theme, iced::Renderer>> {
+        self.child.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+}
+
+impl<'a, Message: 'a> From<SelectRich<'a, Message>> for iced::Element<'a, Message> {
+    fn from(rich: SelectRich<'a, Message>) -> Self {
+        Self::new(rich)
     }
 }
 
