@@ -1,5 +1,13 @@
-//! The huddle's camera leg: capture → intra-only JPEG → the call socket's
-//! video frames, and inbound peer frames → decode → the tile strip.
+//! The huddle's video leg: capture → intra-only JPEG → the call socket's
+//! video frames, and inbound peer frames → decode → the tile strip and the
+//! stage.
+//!
+//! TWO SOURCES, ONE STREAM. A participant occupies one video flow and one
+//! tile, and the beacon's `camera_on`/`sharing` pair says which of the two the
+//! far end is looking at — so [`Source`] is one discriminant and starting
+//! either source ends the other. The camera is a device (`nokhwa`); the screen
+//! is a root-window grab over X11 (`x11rb`, already in this binary under
+//! winit — see [`ScreenSource`] for why not the portal).
 //!
 //! CODEC v1 IS BASELINE JPEG, EVERY FRAME A KEYFRAME. The wire (ws
 //! `chat::call_wire` and the mesh fragmentation in `chat::video`) treats the
@@ -16,12 +24,13 @@
 // deliberate (q60 VGA at 60 fps ≈ 2-4 MB/s per sender); wire the RateHint →
 // (fps, quality) ladder when a real WAN leg complains.
 //
-//! THREADING mirrors the audio leg: one OS thread owns the nokhwa camera
-//! (not `Send`), polls the camera toggle, opens the device only while it is
-//! on, and dies with the session's shutdown sender. Decoded peer frames land
-//! in a global store the `call_video_tiles` extern component reads; the strip
-//! is a SELF-REDRAWING widget that repaints its own window at the capture
-//! cadence — no app message, no view rebuild, no other window woken.
+//! THREADING mirrors the audio leg: one OS thread owns the open source (the
+//! nokhwa camera is not `Send`), follows the toggle, holds a source only while
+//! it is the one asked for, and dies with the session's shutdown sender.
+//! Decoded peer frames land in a global store the `call_video_tiles` and
+//! `call_video_stage` extern components read; both are SELF-REDRAWING widgets
+//! that repaint their own window at the capture cadence — no app message, no
+//! view rebuild, no other window woken.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -30,9 +39,10 @@ use std::sync::{Mutex, OnceLock};
 use chat::call_wire::{CapturedFrame, PeerFrame};
 use iced::{Element, Rectangle, Size};
 
-/// Toggle/shutdown poll while no camera is open. WITH ONE OPEN THE LOOP KEEPS
-/// NO CLOCK AT ALL: `Camera::frame()` blocks until the device has the next
-/// frame, so the camera itself is the pace — see [`camera_thread`].
+/// Toggle/shutdown poll while no source is open. WITH A CAMERA OPEN THE LOOP
+/// KEEPS NO CLOCK AT ALL: `Camera::frame()` blocks until the device has the
+/// next frame, so the camera itself is the pace. A screen grab has nothing to
+/// block on and takes [`SCREEN_INTERVAL`] instead — see [`capture_thread`].
 const IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(40);
 /// The wire's send floor: at most one encoded frame per this interval
 /// (~60 fps). A camera slower than this just sends every frame; a faster one
@@ -616,13 +626,24 @@ pub(crate) fn capture_thread(
 /// per frame. Zero tiles parks the clock; frames cannot appear without a
 /// camera beacon riding the call control channel first, and that roster
 /// message redraws the window once, which re-arms it.
-pub fn call_video_tiles() -> Element<'static, ()> {
+///
+/// `staged` names the frame the stage above is already showing whole (see
+/// [`call_video_stage`]), and the strip leaves it out: the same desktop
+/// Cover-cropped into a 128×96 plate beside its full-size self is not a second
+/// view of anything, it is a smear of somebody's wallpaper.
+pub fn call_video_tiles(staged: String) -> Element<'static, ()> {
+    let (sized, keyed, alive, painted) = (
+        staged.clone(),
+        staged.clone(),
+        staged.clone(),
+        staged.clone(),
+    );
     ui_lang_runtime::live_surface(
         REDRAW_INTERVAL,
-        |width| Size::new(width, grid_height(tile_count(), grid_columns(width))),
-        || tile_count() as u64,
-        || tile_count() > 0,
-        paint_tiles,
+        move |width| Size::new(width, grid_height(tile_count(&sized), grid_columns(width))),
+        move || tile_count(&keyed) as u64,
+        move || tile_count(&alive) > 0,
+        move |renderer, bounds, viewport| paint_tiles(&painted, renderer, bounds, viewport),
     )
     .into()
 }
@@ -738,24 +759,37 @@ const TILE_GAP: f32 = 8.0;
 /// completely when no tile is live.
 const REDRAW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(4);
 
-fn tile_count() -> usize {
+fn tile_count(staged: &str) -> usize {
     let store = store().lock().expect("video store");
-    store.peers.len() + usize::from(store.preview.is_some())
+    let peers = store
+        .peers
+        .keys()
+        .filter(|node| node.as_str() != staged)
+        .count();
+    let previewing = store.preview.is_some() && staged != SELF_STAGE;
+    peers + usize::from(previewing)
 }
 
 /// Peers in stable key order, the local preview last — the same order the
-/// row-based strip always drew. `Handle` is `Bytes`-backed (Arc) and its
-/// `Id` survives the clone, so each entry is a refcount bump that keeps
-/// pointing at the renderer's cached upload.
-fn tiles_snapshot() -> Vec<(u32, u32, iced::widget::image::Handle)> {
+/// row-based strip always drew, minus whatever the stage is showing whole.
+/// `Handle` is `Bytes`-backed (Arc) and its `Id` survives the clone, so each
+/// entry is a refcount bump that keeps pointing at the renderer's cached
+/// upload.
+fn tiles_snapshot(staged: &str) -> Vec<(u32, u32, iced::widget::image::Handle)> {
     let store = store().lock().expect("video store");
-    let mut ordered: Vec<(&String, &TileFrame)> = store.peers.iter().collect();
+    let mut ordered: Vec<(&String, &TileFrame)> = store
+        .peers
+        .iter()
+        .filter(|(node, _)| node.as_str() != staged)
+        .collect();
     ordered.sort_by(|a, b| a.0.cmp(b.0));
     let mut tiles: Vec<_> = ordered
         .into_iter()
         .map(|(_, frame)| (frame.width, frame.height, frame.handle.clone()))
         .collect();
-    if let Some(preview) = &store.preview {
+    if staged != SELF_STAGE
+        && let Some(preview) = &store.preview
+    {
         tiles.push((preview.width, preview.height, preview.handle.clone()));
     }
     tiles
@@ -775,11 +809,16 @@ fn grid_height(count: usize, columns: usize) -> f32 {
     rows as f32 * TILE_HEIGHT + (rows - 1) as f32 * TILE_GAP
 }
 
-fn paint_tiles(renderer: &mut iced::Renderer, bounds: Rectangle, viewport: &Rectangle) {
+fn paint_tiles(
+    staged: &str,
+    renderer: &mut iced::Renderer,
+    bounds: Rectangle,
+    viewport: &Rectangle,
+) {
     use iced::advanced::image::Renderer as _;
 
     let columns = grid_columns(bounds.width);
-    for (index, (width, height, handle)) in tiles_snapshot().into_iter().enumerate() {
+    for (index, (width, height, handle)) in tiles_snapshot(staged).into_iter().enumerate() {
         let cell = Rectangle {
             x: bounds.x + (index % columns) as f32 * (TILE_WIDTH + TILE_GAP),
             y: bounds.y + (index / columns) as f32 * (TILE_HEIGHT + TILE_GAP),
@@ -871,10 +910,11 @@ mod tests {
                 .as_ref()
                 .map(|frame| frame.handle.id())
         };
+        // "" is "nothing is staged" — the strip's ordinary reading.
         reset();
-        assert_eq!(tile_count(), 0);
+        assert_eq!(tile_count(""), 0);
         store_preview(vec![10, 20, 30, 0xff], 1, 1);
-        assert_eq!(tile_count(), 1);
+        assert_eq!(tile_count(""), 1);
         let first = preview_id().expect("preview");
         assert_eq!(first, preview_id().expect("preview"));
         store_preview(vec![40, 50, 60, 0xff], 1, 1);
@@ -888,6 +928,11 @@ mod tests {
         assert_eq!(stage_height(SELF_STAGE, 100.0), 50.0);
         assert!(stage_frame("a-peer-nobody-sent").is_none());
         assert_eq!(stage_height("a-peer-nobody-sent", 100.0), 0.0);
+        // ...and what the stage shows whole, the strip leaves out, so a
+        // desktop is not also a cropped plate beside itself.
+        assert_eq!(tile_count(SELF_STAGE), 0);
+        assert!(tiles_snapshot(SELF_STAGE).is_empty());
+        assert_eq!(tiles_snapshot("").len(), 1);
 
         // ONE SOURCE: starting either one ends the other, and either one off
         // is off — there is no state where both are live.
