@@ -164,10 +164,9 @@ component ShellSteps(entry:AgentChatEntry, open:bool) -> i64
         for step in entry.steps
           ShellActivityRow row=step
 
-component ShellAnswer(entry:AgentChatEntry, open:bool, dark:bool)
+component ShellAnswer(entry:AgentChatEntry, dark:bool)
   emits
     open_link(str)
-    toggle_steps(i64)
   col #root w=fill gap=7.0
     row gap=8.0 align=center
       AgentAvatar initials=agent_provider_initial(entry.provider) plate=24.0 ink=10.0
@@ -184,8 +183,6 @@ component ShellAnswer(entry:AgentChatEntry, open:bool, dark:bool)
     if entry.status == "failed"
       box pl=32.0 w=fill
         Alert.Destructive title="That run did not finish" description=entry.body
-    if !empty(entry.steps)
-      ShellSteps entry=entry open=open -> emit(toggle_steps, _)
 
 // A DETACHED TURN IS NOT A DEAD ONE. The saga is still executing on the node it
 // was pinned to; this plate is the address back to it, which is the whole
@@ -473,7 +470,7 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
                     w=fill
                     gap=20.0
                     virtual-row=64.0
-                  col w=fill
+                  col w=fill gap=7.0
                     if entry.role == "user"
                       ShellPrompt entry=entry
                     if entry.role != "user" && entry.status == "detached"
@@ -482,11 +479,25 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
                           reopen_run -> emit(shell_chat_reopen)
                           discard_run -> emit(shell_chat_discard)
                           toggle_steps -> emit(shell_chat_steps_toggled, _)
+                    // THE MEMO BOUNDARY IS THIS `lazy`: `agent_markdown`
+                    // parses the answer and syntect-colours every fenced
+                    // block on each call, and view runs on every message.
+                    // A settled answer never changes, but its id comes
+                    // back after the transcript is cleared, so the key is
+                    // what the answer draws: body, provider, status and
+                    // appearance. The lazy sits here, not in ShellAnswer:
+                    // a keyed value must be state-rooted, and a prop fed
+                    // from a row is not (E139). The steps fold stays OUT
+                    // of the memo — `steps_open` is one value for the
+                    // whole transcript, and keying on it would re-parse
+                    // every answer on one click.
                     if entry.role != "user" && entry.status != "detached"
-                      ShellAnswer entry=entry open=(steps_open == entry.id) dark=dark
-                        events
-                          open_link -> emit(shell_open_link, _)
-                          toggle_steps -> emit(shell_chat_steps_toggled, _)
+                      lazy entry by entry.body, entry.provider, entry.status, dark as settled
+                        ShellAnswer entry=settled dark=dark
+                          events
+                            open_link -> emit(shell_open_link, _)
+                      if !empty(entry.steps)
+                        ShellSteps entry=entry open=(steps_open == entry.id) -> emit(shell_chat_steps_toggled, _)
                 if chat_busy
                   box #work
                     with
@@ -513,7 +524,10 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
                         lazy row as settled
                           ShellActivityRow row=settled
                   if chat_busy
-                    extern agent_markdown(live, dark) #live-answer -> emit(shell_open_link, _)
+                    // Keyed on the stream itself: a token moves it, an
+                    // unrelated message (a keystroke, a tick) does not.
+                    lazy live by live, dark as streamed
+                      extern agent_markdown(streamed, dark) #live-answer -> emit(shell_open_link, _)
         box w=fill h=1.0 bg=separator
           space w=1.0 h=1.0
         box

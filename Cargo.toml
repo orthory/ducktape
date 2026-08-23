@@ -522,6 +522,27 @@ opt-level = 2
 [profile.dev.package.softbuffer]
 opt-level = 2
 
+# The Markdown parse and the syntect pass every fenced code block pays — the
+# agent transcript, the forge reader and the Files preview all render through
+# them, and a regex engine at opt-0 is the slowest thing on that path.
+[profile.dev.package.pulldown-cmark]
+opt-level = 2
+
+[profile.dev.package.syntect]
+opt-level = 2
+
+[profile.dev.package.iced_highlighter]
+opt-level = 2
+
+[profile.dev.package.fancy-regex]
+opt-level = 2
+
+[profile.dev.package.regex-automata]
+opt-level = 2
+
+[profile.dev.package.regex-syntax]
+opt-level = 2
+
 
 [profile.dev.package.cranelift-codegen]
 opt-level = 3

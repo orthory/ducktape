@@ -42,6 +42,9 @@ const HUDDLE_ROWS: usize = 32;
 const LONG_LIST_ROWS: usize = 2_048;
 const FILE_ROWS: usize = 256;
 const DISCUSSION_ROWS: usize = 256;
+/// Settled agent answers on the shell transcript, each carrying one fenced
+/// code block — the syntect surface repeated per row.
+const ANSWER_ROWS: usize = 20;
 /// The same interaction at four timeline sizes. A fixed-size ceiling can stay
 /// green while the frame still grows linearly, so responsiveness is the slope,
 /// not the single 256-row point.
@@ -73,6 +76,15 @@ const FRAMES: usize = 12;
 /// broad headroom. Deleting the stream's `virtual-row=` alone takes it above
 /// 27 000, still well beyond the budget.
 const KEYSTROKE_ALLOCATION_CEILING: u64 = 15_000;
+/// ALLOCATIONS PER CLICK ON AN ANSWER'S "Show what the agent did" FOLD.
+///
+/// `steps_open` is one value for the whole transcript, so it must stay OUT
+/// of the answer memo's key: the fold is drawn beside the memo, and a click
+/// rebuilds the one fold it moved while every answer's markdown is reclaimed.
+/// 7,127 measured 2026-08-23; with `steps_open` in each row's key
+/// the same click cost 197,874 (63 ms) — one full re-parse of the transcript,
+/// growing with its length.
+const STEPS_CLICK_ALLOCATION_CEILING: u64 = 10_000;
 
 struct ScreenProbe {
     label: &'static str,
@@ -158,6 +170,28 @@ const SCREEN_PROBES: &[ScreenProbe] = &[
         size: WINDOW,
         fixture: console_in_files,
         allocation_ceiling: 62_900,
+    },
+    // Every settled answer is an `agent_markdown` extern — a markdown parse
+    // plus a syntect pass over its fenced block. 6,902 measured 2026-08-23
+    // with the answer rows behind the keyed (body, provider, status, dark)
+    // lazy and their steps folds drawn beside it; 195,968 (and 332 ms a
+    // frame at dev opt-levels) with the extern called straight from view,
+    // where an UNCHANGED frame re-parsed all twenty transcripts — the F2
+    // freeze, and the negative control this ceiling sits between.
+    ScreenProbe {
+        label: "shell answers build+layout",
+        size: WINDOW,
+        fixture: console_in_shell_answers,
+        allocation_ceiling: 9_000,
+    },
+    // The Files preview reading a Markdown document of the same twenty
+    // fenced blocks through the same extern: 3,189 behind its
+    // (preview_text, preview_path, dark) lazy vs 195,246 without.
+    ScreenProbe {
+        label: "files markdown build+layout",
+        size: WINDOW,
+        fixture: console_in_files_markdown,
+        allocation_ceiling: 5_000,
     },
 ];
 
@@ -678,8 +712,8 @@ fn park_inline_picture(doc: &str, path: &str, rgb: [u8; 3]) {
                 width: 64,
                 height: 64,
                 handle: backend::PictureHandle::Raster(iced::widget::image::Handle::from_rgba(
-                64, 64, pixels,
-            )),
+                    64, 64, pixels,
+                )),
             },
         )]),
     );
@@ -853,6 +887,82 @@ fn console_in_files() -> (Ducktape, iced::window::Id) {
     (app, console)
 }
 
+/// One settled answer: a heading, a paragraph, and a fenced Rust block the
+/// markdown extern hands to syntect.
+fn probe_answer_body(index: usize) -> String {
+    let code: String = (0..24)
+        .map(|line| format!("let line_{line:02} = {index} + {line};\n"))
+        .collect();
+    format!(
+        "## Answer {index}\n\nThe run settled and committed this patch to the \
+         network.\n\n```rust\n{code}```\n\nLinks route through `open_link`.\n"
+    )
+}
+
+/// The two steps a settled answer keeps behind its fold.
+fn probe_answer_steps(index: usize) -> Vec<backend::AgentActivity> {
+    (0..2)
+        .map(|step| backend::AgentActivity {
+            id: (index * 2 + step) as i64,
+            title: format!("step {step} of answer {index}"),
+            detail: "ran the tool and read its output".into(),
+            status: "done".into(),
+        })
+        .collect()
+}
+
+/// The shell transcript after `ANSWER_ROWS` prompt/answer turns, installed
+/// through the same append seam the settle handler uses.
+fn console_in_shell_answers() -> (Ducktape, iced::window::Id) {
+    let (mut app, console) = console_on(ShellTab::Shell);
+    let mut entries = Vec::new();
+    for index in 0..ANSWER_ROWS {
+        entries = backend::agent_chat_push_user(entries, format!("prompt {index}"), "codex".into());
+        entries = backend::agent_chat_answer(
+            entries,
+            probe_answer_body(index),
+            "codex".into(),
+            "done".into(),
+            String::new(),
+            probe_answer_steps(index),
+        );
+    }
+    app.shell_chat_entries = entries;
+    assert_eq!(app.shell_chat_entries.len(), ANSWER_ROWS * 2);
+    (app, console)
+}
+
+/// The Files preview open on a Markdown document carrying every probe answer.
+fn console_in_files_markdown() -> (Ducktape, iced::window::Id) {
+    let (mut app, console) = console_on(ShellTab::Files);
+    let path = "/shared/README.md";
+    let _ = app.__update(__DucktapeMessage::FsListed(backend::FsListing {
+        generation: app.fs_generation,
+        path: "/shared".into(),
+        entries: vec![backend::FsEntry {
+            key: 0,
+            path: path.into(),
+            name: "README.md".into(),
+            kind: "file".into(),
+            size: 0,
+            object: "object-readme".into(),
+        }],
+    }));
+    let _ = app.__update(__DucktapeMessage::FsOpenFile(path.into()));
+    let _ = app.__update(__DucktapeMessage::FsPreviewed(backend::FsPreview {
+        generation: app.fs_generation,
+        path: path.into(),
+        text: (0..ANSWER_ROWS).map(probe_answer_body).collect(),
+        truncated: false,
+        binary: false,
+        picture: false,
+        width: 0,
+        height: 0,
+    }));
+    assert_eq!(app.fs_preview_path, path);
+    (app, console)
+}
+
 fn headless_renderer() -> iced::Renderer {
     static LOAD_FONTS: Once = Once::new();
     LOAD_FONTS.call_once(|| {
@@ -993,6 +1103,54 @@ fn chat_keystroke_allocations(rows: i64) -> u64 {
             .into_cache();
     }
     keystrokes.median_allocations()
+}
+
+#[test]
+fn a_steps_fold_click_rebuilds_one_answer_not_the_transcript() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(probe_steps_click)
+        .expect("the steps click probe thread spawns")
+        .join()
+        .expect("the steps click probe thread finishes");
+}
+
+/// Open a different answer's fold on every frame — each click closes the
+/// previous fold and opens the next — and measure the rebuild that follows.
+fn probe_steps_click() {
+    let (mut app, console) = console_in_shell_answers();
+    let mut renderer = headless_renderer();
+    let mut cache = warm_settled(
+        "the steps click probe",
+        &mut app,
+        console,
+        WINDOW,
+        &mut renderer,
+        user_interface::Cache::default(),
+    );
+    let answers: Vec<i64> = app
+        .shell_chat_entries
+        .iter()
+        .filter(|entry| entry.role != "user")
+        .map(|entry| entry.id)
+        .collect();
+    let mut clicks = Phase::new("steps click+rebuild");
+    for id in answers.into_iter().take(FRAMES) {
+        cache = clicks
+            .sample(|| {
+                let _ = app.__update(__DucktapeMessage::ShellChatStepsToggled(id));
+                UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer)
+            })
+            .into_cache();
+    }
+    clicks.report();
+    let allocations = clicks.median_allocations();
+    assert!(
+        allocations < STEPS_CLICK_ALLOCATION_CEILING,
+        "a steps click rebuilt in {allocations} allocations, over the \
+         {STEPS_CLICK_ALLOCATION_CEILING} ceiling. Keep `steps_open` out of the answer \
+         memo's key before changing the budget."
+    );
 }
 
 #[test]
@@ -1211,7 +1369,7 @@ fn probe_large_screens() {
     eprintln!(
         "large screen frame probes: {PAGE_ROWS} page rows, {HUDDLE_ROWS} huddle rows, \
          {LONG_LIST_ROWS} source/diff rows, {DISCUSSION_ROWS} discussion rows, \
-         {FILE_ROWS} file rows"
+         {FILE_ROWS} file rows, {ANSWER_ROWS} answer rows"
     );
     for probe in SCREEN_PROBES {
         let (app, window) = (probe.fixture)();
@@ -2002,8 +2160,7 @@ fn probe_forge_markdown_selection() {
     // block's worth is the bug pinned here — a drag used to stop dead at the
     // block it started in.
     assert!(
-        copied.contains("second line of the pane.")
-            && copied.contains("let other = answer + 1;"),
+        copied.contains("second line of the pane.") && copied.contains("let other = answer + 1;"),
         "the drag ran to the end of the document, so the copy crosses its \
          blocks: {copied:?}"
     );

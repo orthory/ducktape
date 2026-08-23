@@ -1081,7 +1081,11 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
               pt=13.0
               pb=13.0
               gap=9.0
-            extern forge_markdown(file_text, file_path, dark) #forge-markdown -> emit(open_message_link, _)
+            // The same memo boundary as the code arm below: the
+            // parse + fenced-block highlighting reruns only when the
+            // blob, path, or appearance moves.
+            lazy file_text by file_text, file_path, dark as cached_doc
+              extern forge_markdown(cached_doc, file_path, dark) #forge-markdown -> emit(open_message_link, _)
             if file_truncated
               text "This file is larger than the 64 KiB preview limit."
                 with
