@@ -86,6 +86,41 @@ worst, and a 10 fps screen share at 100.0 / 117.0. A mean well above the
 source's own interval is the capture loop paying for its work AFTER the wait
 instead of inside it.
 
+**The signing helper must be on PATH.** `join_huddle` signs through the
+`ducktape` CLI, so a lane process started with a stripped environment dies with
+"The signing helper failed to run" before it ever reaches the huddle. Put
+`target/debug` on `PATH` when you run a side under `sudo`/`env`/`ip netns exec`.
+
+#### Off loopback: the same lane across a ROUTED path
+
+Loopback hides the two things a real second machine brings — routing and a
+1500-byte MTU. Network namespaces bring both back on one box, which is as close
+as it gets without a second machine:
+
+```bash
+for ns in dtA dtB dtR; do sudo ip netns add $ns; done
+sudo ip link add vethA type veth peer name rA; sudo ip link add vethB type veth peer name rB
+sudo ip link set vethA netns dtA; sudo ip link set rA netns dtR
+sudo ip link set vethB netns dtB; sudo ip link set rB netns dtR
+sudo ip -n dtA addr add 10.10.1.2/24 dev vethA; sudo ip -n dtA link set vethA up; sudo ip -n dtA link set lo up
+sudo ip -n dtB addr add 10.10.2.2/24 dev vethB; sudo ip -n dtB link set vethB up; sudo ip -n dtB link set lo up
+sudo ip -n dtR addr add 10.10.1.1/24 dev rA; sudo ip -n dtR link set rA up
+sudo ip -n dtR addr add 10.10.2.1/24 dev rB; sudo ip -n dtR link set rB up
+sudo ip netns exec dtR sysctl -w net.ipv4.ip_forward=1
+sudo ip -n dtA route add default via 10.10.1.1; sudo ip -n dtB route add default via 10.10.2.1
+```
+
+Then give each node a config whose `listen`/`wireguard_listen` is its OWN
+namespace address (`peer_addrs` naming both), run each with `ip netns exec
+dt{A,B} …`, and run each lane side in the matching namespace. `/dev` is not
+namespaced, so the borrowed camera and sound cards still work.
+
+Measured on zk-dev 2026-08-23, two subnets and a router namespace between them:
+both sides had the other's 640×480 picture and audible frames, and the capture
+pace was unchanged (33.6 ms mean, 41.7 / 45.6 ms worst). That is JPEG frames
+fragmenting across a 1500-byte MTU with WireGuard overhead — which loopback's
+65536-byte MTU never exercises.
+
 ### On macOS: raise the fd limit first
 
 ```bash
