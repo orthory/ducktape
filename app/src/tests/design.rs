@@ -1624,6 +1624,9 @@ fn no_view_expression_hands_an_extern_a_list() {
 /// ~2.4ms per label per fresh layout against ~25us on the fast path, which is
 /// the whole half-second channel-switch freeze once a row carries five of
 /// them. The glyph goes in its own `text … font=ui` child instead.
+/// (`patches/cosmic-text` has since closed the walk itself — see
+/// `tests/font_fallback.rs` — so this sweep now guards the label shape, not
+/// the frame cost.)
 ///
 /// Scoped to labels that are ONLY symbols: prose labels (`← Threads`,
 /// `Loading older messages…`) are chrome mounted once, where the semibold the

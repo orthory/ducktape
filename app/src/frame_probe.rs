@@ -63,7 +63,7 @@ const REMOTE_BURST_ROWS: [usize; 2] = [32, 256];
 /// O(history) rebuild the probes exist to prevent.
 /// Enough passes to fill the lazy parking lot and settle the text caches.
 const WARMUP_FRAMES: usize = 4;
-const FRAMES: usize = 12;
+pub(crate) const FRAMES: usize = 12;
 
 /// ALLOCATIONS PER KEYSTROKE, AND NOTHING ELSE IS ASSERTED.
 ///
@@ -235,14 +235,14 @@ pub(crate) fn allocations() -> u64 {
 // Phases
 // ---------------------------------------------------------------------------
 
-struct Phase {
+pub(crate) struct Phase {
     label: &'static str,
     allocations: Vec<u64>,
     elapsed_us: Vec<u128>,
 }
 
 impl Phase {
-    fn new(label: &'static str) -> Self {
+    pub(crate) fn new(label: &'static str) -> Self {
         Self {
             label,
             allocations: Vec::with_capacity(FRAMES),
@@ -250,7 +250,7 @@ impl Phase {
         }
     }
 
-    fn sample<T>(&mut self, work: impl FnOnce() -> T) -> T {
+    pub(crate) fn sample<T>(&mut self, work: impl FnOnce() -> T) -> T {
         let started = std::time::Instant::now();
         let before = allocations();
         let value = work();
@@ -261,7 +261,7 @@ impl Phase {
         value
     }
 
-    fn median_allocations(&self) -> u64 {
+    pub(crate) fn median_allocations(&self) -> u64 {
         let mut sorted = self.allocations.clone();
         sorted.sort_unstable();
         sorted[sorted.len() / 2]
@@ -273,7 +273,7 @@ impl Phase {
         sorted[sorted.len() / 2]
     }
 
-    fn report(&self) {
+    pub(crate) fn report(&self) {
         eprintln!(
             "{:<28} allocs(p50)={:>7}  {:>6}us",
             self.label,
@@ -963,7 +963,7 @@ fn console_in_files_markdown() -> (Ducktape, iced::window::Id) {
     (app, console)
 }
 
-fn headless_renderer() -> iced::Renderer {
+pub(crate) fn headless_renderer() -> iced::Renderer {
     static LOAD_FONTS: Once = Once::new();
     LOAD_FONTS.call_once(|| {
         let mut fonts = iced::advanced::graphics::text::font_system()
