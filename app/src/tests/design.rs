@@ -1510,14 +1510,14 @@ fn every_repeated_component_mount_is_culled_or_argued() {
 
 /// AN OWNED LIST PARAMETER IS A DEEP CLONE, SO A VIEW MAY NOT FEED ONE.
 ///
-/// `sync`/`pure f(rows:[T])` called from a view expression clones the whole
-/// list into the call, once per frame, per call site — and if the site sits
-/// inside a `for`, once per row per frame. The fix is the borrowed parameter
-/// (`rows:&[T]`, `s:&str`, `doc:&editor`): the generated call then lends the
-/// state field for the duration of the call and nothing is cloned. Every
-/// list-taking extern a view reaches declares the borrowed form now; this is
-/// the ratchet that keeps it so — the next owned one fails here, naming the
-/// site.
+/// `sync`/`pure`/`component f(rows:[T])` called from a view expression clones
+/// the whole list into the call, once per frame, per call site — and if the
+/// site sits inside a `for`, once per row per frame. The fix is the borrowed
+/// parameter (`rows:&[T]`, `s:&str`, `doc:&editor`): the generated call then
+/// lends the state field for the duration of the call and nothing is cloned.
+/// Every list-taking extern a view reaches declares the borrowed form now;
+/// this is the ratchet that keeps it so — the next owned one fails here,
+/// naming the site.
 #[test]
 fn no_view_expression_hands_an_extern_an_owned_list() {
     let list_taking: Vec<String> = ice_sources()
@@ -1530,7 +1530,8 @@ fn no_view_expression_hands_an_extern_an_owned_list() {
                     let declaration = line
                         .trim()
                         .strip_prefix("sync ")
-                        .or_else(|| line.trim().strip_prefix("pure "))?;
+                        .or_else(|| line.trim().strip_prefix("pure "))
+                        .or_else(|| line.trim().strip_prefix("component "))?;
                     let (name, rest) = declaration.split_once('(')?;
                     let (args, _) = rest.split_once(')')?;
                     args.contains(":[").then(|| name.to_owned())
