@@ -390,7 +390,7 @@ fn a_refused_write_does_not_hand_the_baseline_someone_elses_title() {
 /// looking at an empty, fully typable document under the new page's title.
 ///
 /// One keystroke there used to reach the 900ms save tick, which wrote
-/// `page_text(page_editor)` into `active_page`. Saving an empty document
+/// `editor_text(page_editor)` into `active_page`. Saving an empty document
 /// against a real page is a `RemoveBlock` for every line it had: the page would
 /// be destroyed by the act of failing to open it, and the reader would never
 /// have seen a line of it.

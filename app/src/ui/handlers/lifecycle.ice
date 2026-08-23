@@ -311,7 +311,7 @@ on live_updated(next)
       blocks = apply_page_text(blocks, next.pages)
       block_comment_rows = page_comment_thread_rows(blocks, block_comment_threads, active_page)
       active_thread_anchor = comment_anchor_label(blocks, active_thread_target, active_page)
-      let folded_saved = refreshed_page_saved(page_editor, active_page_title, blocks, page_saved_text)
+      let folded_saved = refreshed_page_saved(editor_text(page_editor), active_page_title, blocks, page_saved_text)
       page_editor = refreshed_page_editor(page_editor, active_page_title, blocks, page_saved_text)
       page_saved_text = folded_saved
       return if !next.load_pages
@@ -544,7 +544,7 @@ on live_resynced(next)
   // canonical text only replaces the buffer when the editor is CLEAN and the
   // text actually differs — a rebuilt `Content` throws the cursor to the
   // origin, so the saved baseline and the buffer move on one shared decision.
-  let resynced_saved = refreshed_page_saved(page_editor, active_page_title, blocks, page_saved_text)
+  let resynced_saved = refreshed_page_saved(editor_text(page_editor), active_page_title, blocks, page_saved_text)
   page_editor = refreshed_page_editor(page_editor, active_page_title, blocks, page_saved_text)
   page_saved_text = resynced_saved
   // The buffer's own page follows the buffer, and only when this resync
@@ -562,7 +562,7 @@ on live_resynced(next)
   // came from the node. Claiming that as the new page's buffer hands
   // `page_autosave_tick` a fabricated document it is willing to write: the
   // page would be overwritten with a blank one it never loaded.
-  let resynced_buffer_is_clean = page_text(page_editor) == page_saved_text
+  let resynced_buffer_is_clean = editor_text(page_editor) == page_saved_text
   buffer_page = keep_str(resynced_buffer_is_clean && pages_answer_is_current, active_page, buffer_page)
   // THE RECOVERY'S TERMINAL. `mutation_failed` parks the lock at "recovering"
   // for a write the node COMMITTED and then failed to read back, and launches
@@ -961,7 +961,7 @@ subscribe
   // The page document's autosave: the editor's edits never pass through a
   // handler, so the gate IS the dirty test — the tick only exists while the
   // buffer has drifted from the last text known written.
-  every 900ms when (connected && !empty(active_page) && page_text(page_editor) != page_saved_text) -> page_autosave_tick
+  every 900ms when (connected && !empty(active_page) && editor_text(page_editor) != page_saved_text) -> page_autosave_tick
 
 // The daemon's exit rule: closing a window unregisters it, and the process
 // leaves with the last one. The handoff paths (`console_opened`,

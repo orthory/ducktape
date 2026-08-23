@@ -25,7 +25,6 @@ extern crate::pages
   pure page_opens_comments(event:PageEvent) -> bool
   pure page_history_shortcut(logical:key, physical:physical-key, modifiers:key-modifiers, ready:bool) -> str
   sync page_history_key(document:editor, action:str) -> editor
-  pure page_text(document:editor) -> str
   pure has_unclosed_fence(text:str) -> bool
   pure block_at_line_target(blocks:[PageBlock], line:i64) -> str
   PageCommentThreadRow(thread:PageCommentThread, anchor:str)

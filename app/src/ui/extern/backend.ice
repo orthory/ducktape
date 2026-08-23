@@ -477,10 +477,10 @@ extern crate::backend
   // text differs; both read the same decision so buffer and baseline move
   // together.
   sync refreshed_page_editor(document:editor, title:str, blocks:[PageBlock], saved:str) -> editor
-  pure refreshed_page_saved(document:editor, title:str, blocks:[PageBlock], saved:str) -> str
+  pure refreshed_page_saved(text:str, title:str, blocks:[PageBlock], saved:str) -> str
   pure saved_baseline(written:bool, canonical:str, submitted:str) -> str
   pure baseline_at_submitted_title(canonical:str, submitted:str) -> str
-  pure install_decision(document:editor, current_page:str, next_page:str, saved:str, canonical:str) -> bool
+  pure install_decision(text:str, current_page:str, next_page:str, saved:str, canonical:str) -> bool
   sync installed_page_editor(document:editor, install:bool, canonical:str) -> editor
   sync rolled_back_editor(document:editor, untouched:bool, canonical:str) -> editor
   pure remember_orphaned_page_comment(drafts:[str], pages:[PageItem], target:str, draft:str) -> [str]

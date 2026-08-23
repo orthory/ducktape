@@ -432,7 +432,7 @@ on pages_updated(next)
   // buffer on the SAME page is the user mid-typing through a reload, and a
   // reload must never eat keystrokes.
   let page_landing = page_document_text(next.active_page_title, next.blocks)
-  let page_install = install_decision(page_editor, buffer_page, next.active_page, page_saved_text, page_landing)
+  let page_install = install_decision(editor_text(page_editor), buffer_page, next.active_page, page_saved_text, page_landing)
   blocks = merge_pending_blocks(next.blocks, blocks, buffer_page, next.active_page, "")
   active_page = next.active_page
   active_page_title = next.active_page_title
@@ -478,7 +478,7 @@ on pages_mutated(next)
   // BEFORE the assignments so both reads see the pre-move state (the pair
   // must move on one shared decision).
   let page_landing = page_document_text(next.active_page_title, next.blocks)
-  let page_install = install_decision(page_editor, buffer_page, next.active_page, page_saved_text, page_landing)
+  let page_install = install_decision(editor_text(page_editor), buffer_page, next.active_page, page_saved_text, page_landing)
   blocks = merge_pending_blocks(next.blocks, blocks, buffer_page, next.active_page, "")
   active_page = next.active_page
   active_page_title = next.active_page_title
@@ -613,7 +613,7 @@ on page_autosave_tick
   // tick, and a second chain against the same page defeats the ordering
   // rule the awaited loop exists for (backend/document.rs).
   return if block_autosave_status == AutosaveStatus.saving
-  let text = page_text(page_editor)
+  let text = editor_text(page_editor)
   return if text == page_saved_text
   // An open ``` swallows every line under it when parsed — the save waits
   // for the close instead of writing (or refusing) a half-typed fence, and
@@ -649,7 +649,7 @@ on page_document_saved(next)
   // since the tick submitted. Otherwise the buffer is kept (the newest words
   // must survive), the baseline moves to the node's text, and the still-dirty
   // buffer re-plans on the next tick with the refusal line explaining why.
-  let untouched = page_text(page_editor) == page_inflight_text
+  let untouched = editor_text(page_editor) == page_inflight_text
   page_editor = rolled_back_editor(page_editor, untouched, next.document)
   // THE SUBMITTED TEXT, never the live buffer: she keeps typing through the
   // round trip, and `untouched` above exists because of it. Adopting her
