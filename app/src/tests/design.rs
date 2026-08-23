@@ -86,7 +86,7 @@ fn message_action_toolbar_stays_compact_and_accessible() {
         assert!(toolbar.contains(&format!("label=\"{label}\"")));
     }
     assert!(components.contains(
-        "button label=\"Open thread\" disabled=disabled p=5.0 @icon_action -> emit(open_thread_for, message.seq)"
+        "button label=\"Open thread\" p=5.0 @icon_action -> emit(open_thread_for, message.seq)"
     ));
 
     let chat = inlined(include_str!("../ui/screens/chat.ice"));

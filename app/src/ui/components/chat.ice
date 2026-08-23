@@ -656,7 +656,7 @@ component MessageContents(message:ChatMessage)
                 h=6.0
                 style=icon_tint("muted")
                 opacity=1.0
-component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabled:bool)
+component MessageCard(message:ChatMessage, selected:bool, menu_open:bool)
   emits
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
@@ -773,7 +773,6 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
                 button -> emit(add_reaction_at, message.seq, "👍")
                   with
                     label="React with 👍"
-                    disabled=disabled
                     w=27.0
                     h=25.0
                     p=4.0
@@ -788,7 +787,6 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
                 button -> emit(add_reaction_at, message.seq, "✅")
                   with
                     label="React with ✅"
-                    disabled=disabled
                     w=27.0
                     h=25.0
                     p=4.0
@@ -803,7 +801,6 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
                 button -> emit(add_reaction_at, message.seq, "👀")
                   with
                     label="React with 👀"
-                    disabled=disabled
                     w=27.0
                     h=25.0
                     p=4.0
@@ -824,7 +821,6 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
                 button -> emit(open_message_reactions, message.seq, message.body, message.rev)
                   with
                     label="Manage reactions"
-                    disabled=disabled
                     w=27.0
                     h=25.0
                     p=4.0
@@ -839,13 +835,12 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
                 button -> emit(open_thread_for, message.seq)
                   with
                     label="Open thread"
-                    disabled=disabled
                     p=5.0
                     @icon_action
                   // `color=inherit` (ducktape-ui#606): the glyph reads the
                   // same status-resolved ink the ♡ and ⋯ string labels beside
-                  // it inherit, so all three brighten and dim together — on
-                  // the button's bounds and the button's disabled status.
+                  // it inherit, so all three brighten and dim together on
+                  // the button's bounds.
                   svg icon("nav-chat") memory color=inherit
                     with
                       w=15.0
@@ -856,7 +851,6 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
                 button -> emit(open_message_actions, message.seq, message.body, message.rev)
                   with
                     label="More message actions"
-                    disabled=disabled
                     w=27.0
                     h=25.0
                     p=4.0
@@ -886,7 +880,7 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
 // `open_thread_for` is forwarded only because `MessageContents` declares it:
 // it fires from the reply pill, and a reply carries no replies
 // (`reply_count` only ever climbs on a root), so the pill never renders here.
-component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabled:bool)
+component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool)
   emits
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
@@ -983,7 +977,6 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, 
                 button -> emit(open_thread_message_reactions, message.seq, message.body, message.rev)
                   with
                     label="Manage reactions"
-                    disabled=disabled
                     w=27.0
                     h=25.0
                     p=4.0
@@ -998,7 +991,6 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, 
                 button -> emit(open_thread_message_actions, message.seq, message.body, message.rev)
                   with
                     label="More message actions"
-                    disabled=disabled
                     w=27.0
                     h=25.0
                     p=4.0

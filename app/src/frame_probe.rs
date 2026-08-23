@@ -85,6 +85,21 @@ const KEYSTROKE_ALLOCATION_CEILING: u64 = 15_000;
 /// the same click cost 197,874 (63 ms) — one full re-parse of the transcript,
 /// growing with its length.
 const STEPS_CLICK_ALLOCATION_CEILING: u64 = 10_000;
+/// ALLOCATIONS PER `loading` FLIP UNDER A POPULATED STREAM.
+///
+/// `loading` is the workspace hydration flag: a page load moves it while a
+/// full chat timeline is on screen (a reconnect empties the stream first and
+/// lands the rows with the release). It must stay OUT of the whole-timeline
+/// memo keys — the one reading inside either island was the live row's
+/// `disabled=`, and a room switch empties the stream before it raises the
+/// flag, so that dim never drew. Measured 2026-08-23 at `ROWS` with a
+/// selected row: a flip costs **7 392** allocations (0.9 ms) with the flag out
+/// of the key — the screen's own chrome rebuild — against **17 614** (6.4 ms)
+/// with it in: every message cloned into the cached element and every row
+/// rebuilt, growing with the timeline. With the rail open on `THREAD_ROWS`
+/// replies and a reply's card up: **8 535** (1.1 ms) against **18 802**
+/// (2.3 ms) with the flag in the rail's key alone.
+const LOADING_FLIP_ALLOCATION_CEILING: u64 = 10_000;
 
 struct ScreenProbe {
     label: &'static str,
@@ -1150,6 +1165,98 @@ fn probe_steps_click() {
         "a steps click rebuilt in {allocations} allocations, over the \
          {STEPS_CLICK_ALLOCATION_CEILING} ceiling. Keep `steps_open` out of the answer \
          memo's key before changing the budget."
+    );
+}
+
+#[test]
+fn a_loading_flip_leaves_the_timeline_memo_alone() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(probe_loading_flip)
+        .expect("the loading flip probe thread spawns")
+        .join()
+        .expect("the loading flip probe thread finishes");
+}
+
+/// Move the workspace `loading` flag under a populated, selected stream on
+/// every frame — a page load leaving, then its failure releasing it — and
+/// measure the rebuild that follows. The selected rows are the ones that
+/// ever read the flag, so both fixtures carry one: the stream alone, then
+/// the stream with the thread rail open and a reply's action card up.
+fn probe_loading_flip() {
+    let (app, console) = console_in_chat();
+    flip_loading_under("loading flip+rebuild (stream)", app, console);
+    let (mut app, console) = console_in_chat_thread();
+    let newest = app
+        .thread_messages
+        .last()
+        .cloned()
+        .expect("the probe drives a populated rail");
+    let _ = app.__update(__DucktapeMessage::OpenThreadMessageActions(
+        newest.seq,
+        newest.body,
+        newest.rev,
+    ));
+    assert_eq!(
+        app.thread_selected_seq, newest.seq,
+        "the rail's live row is on screen"
+    );
+    flip_loading_under("loading flip+rebuild (stream+rail)", app, console);
+}
+
+fn flip_loading_under(label: &'static str, mut app: Ducktape, console: iced::window::Id) {
+    let newest = app
+        .messages
+        .last()
+        .cloned()
+        .expect("the probe drives a populated stream");
+    let _ = app.__update(__DucktapeMessage::OpenMessageActions(
+        newest.seq,
+        newest.body,
+        newest.rev,
+    ));
+    assert_eq!(
+        app.selected_message_seq, newest.seq,
+        "the live row is on screen"
+    );
+    assert!(!app.loading, "the landing released the flag");
+    let mut renderer = headless_renderer();
+    let mut cache = warm_settled(
+        "the loading flip probe",
+        &mut app,
+        console,
+        WINDOW,
+        &mut renderer,
+        user_interface::Cache::default(),
+    );
+    let mut flips = Phase::new(label);
+    for frame in 0..FRAMES {
+        let raise = frame % 2 == 0;
+        // An empty failure message keeps the error banner out of the frame,
+        // so the delta between two frames is the flag and nothing else.
+        let flip = if raise {
+            __DucktapeMessage::ChoosePage("probe-page".into())
+        } else {
+            __DucktapeMessage::Failed(backend::AppError {
+                message: String::new(),
+                committed: false,
+            })
+        };
+        cache = flips
+            .sample(|| {
+                let _ = app.__update(flip);
+                assert_eq!(app.loading, raise, "the fixture must move the flag");
+                UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer)
+            })
+            .into_cache();
+    }
+    flips.report();
+    let allocations = flips.median_allocations();
+    assert!(
+        allocations < LOADING_FLIP_ALLOCATION_CEILING,
+        "{label}: a loading flip rebuilt in {allocations} allocations, over the \
+         {LOADING_FLIP_ALLOCATION_CEILING} ceiling. Keep `loading` out of the timeline \
+         memo keys before changing the budget."
     );
 }
 
