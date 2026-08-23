@@ -119,7 +119,7 @@ test shell_task_surface_contract
   expect shell_surface == ShellSurface.terminal
   expect missing transcript
   capture shell_terminal_light
-  resize 966 500
+  window resize 966 500
   capture shell_terminal_min_light
 
 // The state the old screen could not represent at all: a run this app stopped
@@ -423,7 +423,7 @@ test minimum_window_layout_contract
   expect content.width > 1180.0
   expect rail.background == background.color(color.rgb8(250, 250, 248))
   expect content.background == background.color(color.rgb8(253, 253, 251))
-  resize 820 540
+  window resize 820 540
   expect rail.width ~= 74.0
   expect content.x ~= rail.right + 1.0
   expect content.width > 730.0

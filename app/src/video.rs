@@ -39,6 +39,8 @@ use std::sync::{Mutex, OnceLock};
 use chat::call_wire::{CapturedFrame, PeerFrame};
 use iced::{Element, Rectangle, Size};
 
+mod live_surface;
+
 /// Toggle/shutdown poll while no source is open. WITH A CAMERA OPEN THE LOOP
 /// KEEPS NO CLOCK AT ALL: `Camera::frame()` blocks until the device has the
 /// next frame, so the camera itself is the pace. A screen grab has nothing to
@@ -696,7 +698,7 @@ pub fn call_video_tiles(staged: String) -> Element<'static, ()> {
         staged.clone(),
         staged.clone(),
     );
-    ui_lang_runtime::live_surface(
+    live_surface::live_surface(
         REDRAW_INTERVAL,
         move |width| Size::new(width, grid_height(tile_count(&sized), grid_columns(width))),
         move || tile_count(&keyed) as u64,
@@ -719,7 +721,7 @@ pub fn call_video_tiles(staged: String) -> Element<'static, ()> {
 /// one sharing — seeing your own share is how you know what you published.
 pub fn call_video_stage(peer: String) -> Element<'static, ()> {
     let (sized, keyed, alive, painted) = (peer.clone(), peer.clone(), peer.clone(), peer);
-    ui_lang_runtime::live_surface(
+    live_surface::live_surface(
         REDRAW_INTERVAL,
         move |width| Size::new(width, stage_height(&sized, width)),
         // Layout follows the ASPECT and nothing else: a new frame of the same
