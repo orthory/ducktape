@@ -535,6 +535,15 @@ fn run_node(
             public_key: status_public_key.clone(),
             ..Default::default()
         });
+        // The one moment `/v1/status` starts carrying a mesh identity, and the
+        // only wait seam a supervisor has for it. The HTTP listener binds well
+        // upstream of here, so "app surface listening" says nothing about
+        // whether the identity is there yet — a daemon started on that marker
+        // reads `public_key: ""` and exits FATAL
+        // (`services::NOT_PUBLISHED_YET`). Logged HERE rather than at a role
+        // loop's first boundary publish: this is where the key actually
+        // appears, and every role passes through it.
+        tracing::info!(target: "ducktape::node", "mesh identity published");
         // One process-wide bulk budget: the per-use planes retain separate
         // protocols, queues, sockets, and admission but cannot independently
         // saturate the same WireGuard link.

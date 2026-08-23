@@ -914,15 +914,22 @@ impl Cluster {
 
     /// spawn node `idx`'s compute daemon, when it has a grant to act under.
     ///
-    /// Waits for the node's app surface FIRST, and that is not politeness: the
-    /// daemon's opening move is a `/v1/services/hello` POST whose failure is
-    /// deliberately fatal (`run_service`: "the FIRST hello must land ... a build
-    /// mismatch or a down node is a loud exit, not a silent spin"). Only the
-    /// query lane retries. Launching both processes in the same breath therefore
-    /// killed the daemon outright whenever it won the race to the socket —
-    /// observed as `FATAL: POST http://…/v1/services/hello` — which is a
-    /// coin-flip, not a test. An operator starts a service against a node that
-    /// is already up, and so does this.
+    /// Waits for the node to PUBLISH ITS MESH IDENTITY first, and that is not
+    /// politeness: the daemon's opening move is a `/v1/services/hello` POST
+    /// whose failure is deliberately fatal (`run_service`: "the FIRST hello
+    /// must land ... a build mismatch or a down node is a loud exit, not a
+    /// silent spin"). Only the query lane retries. Launching both processes in
+    /// the same breath therefore killed the daemon outright whenever it won the
+    /// race to the socket — observed as `FATAL: POST http://…/v1/services/hello`
+    /// — which is a coin-flip, not a test. An operator starts a service against
+    /// a node that is already up, and so does this.
+    ///
+    /// "app surface listening" is the WRONG marker for it and used to be the one
+    /// waited on: the node binds its HTTP listener well before the boundary
+    /// status carries a `public_key`, so the daemon could reach a node that was
+    /// up and still read `public_key: ""` — exiting with `FATAL: this node has
+    /// not published a mesh identity yet`. `validator::run` logs the publish as
+    /// its own once-per-boot fact precisely so this wait has a seam to hold.
     ///
     /// `--config` points it at the SAME dev-shape config the node reads (a dev
     /// workspace is its `storage_dir`, which does not contain the config file,
@@ -931,7 +938,7 @@ impl Cluster {
         if self.compute_grant.is_none() {
             return;
         }
-        self.wait_marker(idx, "app surface listening", Duration::from_secs(90));
+        self.wait_marker(idx, "mesh identity published", Duration::from_secs(90));
         let id = self.peer_ids[idx];
         let cfg = self.config_path(idx);
         let log = self.dir.path().join(format!("compute{id}.log"));
@@ -959,8 +966,11 @@ impl Cluster {
     ///
     /// Called EXPLICITLY rather than folded into [`Self::spawn`] (where the
     /// compute daemon rides along) because a daemon's FIRST hello must LAND:
-    /// the node's http surface has to be listening before the daemon starts,
-    /// and only the test knows when it has waited for that.
+    /// the node has to have PUBLISHED ITS MESH IDENTITY before the daemon
+    /// starts — a listening http surface is not enough, see [`Self::spawn_compute`]
+    /// — and only the test knows when it has waited for that. Any caller that
+    /// waited on committed state has already cleared it: the identity goes out
+    /// in the startup snapshot, before the first block.
     pub fn spawn_service(&mut self, idx: usize, kind: &str) {
         let id = self.peer_ids[idx];
         // One grant per kind is the file's rule and one daemon per kind is the
