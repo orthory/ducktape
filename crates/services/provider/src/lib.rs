@@ -1584,10 +1584,16 @@ struct ContextGuard(PathBuf);
 
 impl Drop for ContextGuard {
     fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_file(&self.0) {
-            eprintln!(
-                "[capability-host] removing the run's context document {} failed: {e}",
-                self.0.display()
+        if let Err(error) = std::fs::remove_file(&self.0) {
+            // Its twin, `RunHome::drop`, has always been a `tracing::warn` —
+            // this one printed to raw stderr, which reaches neither the app's
+            // Logs tab nor `RUST_LOG`.
+            tracing::warn!(
+                target: "ducktape::provider",
+                reason = "context_doc_not_removed",
+                document = %self.0.display(),
+                %error,
+                "the run's context document outlived its run"
             );
         }
     }
@@ -2181,6 +2187,17 @@ impl RunControl {
                 if let Some(pump) = handle.pump.take() {
                     pump.abort();
                 }
+                // THE run event, and the only `info` this lane spends: one line
+                // per run, carrying the one fact every other diagnosis starts
+                // from. A run spans many blocks, so this cannot fire more than
+                // once per block per run.
+                tracing::info!(
+                    target: "ducktape::sandbox",
+                    event = "sandbox_run_finished",
+                    run = %label,
+                    exit_code = code,
+                    "the guest's child exited"
+                );
                 Ok((code == 0, format!("exit code {code}")))
             }
         }

@@ -716,7 +716,16 @@ async fn execute(
                 let (receipt, status) = match commit_result {
                     Some(Ok(receipt)) => (receipt, crate::provision::Status::Ok),
                     Some(Err(e)) => {
-                        eprintln!("[oracle] commit failed for {}: {e}", spec.run_id);
+                        // This is what a `degraded: true` run looks like from
+                        // the inside, and on raw stderr it reached no operator:
+                        // the chain says degraded, the node said nothing.
+                        tracing::warn!(
+                            target: "ducktape::compute",
+                            reason = "workspace_commit_failed",
+                            run = %spec.run_id,
+                            error = %e,
+                            "the run's workspace did not commit; delivering degraded"
+                        );
                         (
                             crate::provision::WorkspaceReceipt::commit_failed(&spec, e),
                             crate::provision::Status::Degraded,
@@ -733,7 +742,13 @@ async fn execute(
                         }
                         let error =
                             format!("commit timed out after {:?}", workspace_step_timeout());
-                        eprintln!("[oracle] commit failed for {}: {error}", spec.run_id);
+                        tracing::warn!(
+                            target: "ducktape::compute",
+                            reason = "workspace_commit_timeout",
+                            run = %spec.run_id,
+                            error = %error,
+                            "the run's workspace commit timed out; delivering degraded"
+                        );
                         (
                             crate::provision::WorkspaceReceipt::commit_failed(&spec, error),
                             crate::provision::Status::Degraded,
