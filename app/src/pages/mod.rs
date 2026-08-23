@@ -485,17 +485,6 @@ pub fn apply_page_action(mut document: Content, action: PageAction) -> Content {
     document
 }
 
-/// The document's text, for the save tick's dirty check and its plan.
-///
-/// Owned, not borrowed: the extern boundary hands state fields by value.
-/// VERBATIM: iced 0.14's `Content::text()` joins lines without inventing a
-/// trailing newline, so a trailing newline here IS a final empty line — the
-/// empty paragraph a page can end on. Trimming it made every such page dirty
-/// on open, and the resulting plan REMOVED the block.
-pub fn page_text(document: Content) -> String {
-    document.text()
-}
-
 /// Enter at the end of an UNMATCHED ``` line closes the fence: the newline is
 /// typed and a closing ``` appears below the caret, so typing continues INSIDE
 /// the fence and the save tick never reads the rest of the page as code. The
@@ -1225,11 +1214,17 @@ mod tests {
     }
 
     #[test]
-    fn page_text_keeps_a_final_empty_line_because_it_is_a_block() {
+    fn editor_text_keeps_a_final_empty_line_because_it_is_a_block() {
+        // The save tick reads the buffer VERBATIM through `editor_text`
+        // (iced's `Content::text()`): it joins lines without inventing a
+        // trailing newline, so a trailing newline IS a final empty paragraph.
         // Trimming it made every page ending on an empty paragraph dirty on
         // open — and the resulting plan REMOVED that block unprompted.
-        let content = Content::with_text("one\ntwo\n");
-        assert_eq!(page_text(content), "one\ntwo\n");
-        assert_eq!(page_text(Content::with_text("one")), "one");
+        // `: Content` is load-bearing: `Content<R = Renderer>` only takes its
+        // default renderer from an annotated binding (E0283 otherwise).
+        let content: Content = Content::with_text("one\ntwo\n");
+        assert_eq!(content.text(), "one\ntwo\n");
+        let content: Content = Content::with_text("one");
+        assert_eq!(content.text(), "one");
     }
 }

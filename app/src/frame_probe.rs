@@ -193,7 +193,7 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
-fn allocations() -> u64 {
+pub(crate) fn allocations() -> u64 {
     ALLOCATIONS.with(Cell::get)
 }
 

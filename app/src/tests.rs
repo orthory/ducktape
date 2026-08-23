@@ -8,6 +8,7 @@ mod design;
 mod forge;
 mod huddle_live;
 mod messages;
+mod page_autosave_gate;
 mod pages;
 mod rooms;
 mod sends;
@@ -370,7 +371,7 @@ fn compose(text: &str) -> iced::widget::text_editor::Content {
 
 /// The page document's text, the way the save tick reads it.
 fn page_document_text(app: &Ducktape) -> String {
-    crate::pages::page_text(app.page_editor.clone())
+    app.page_editor.text()
 }
 
 fn default_ice_color(name: &str) -> iced::Color {
@@ -554,7 +555,7 @@ fn assert_no_polling(lifecycle: &str) {
             // the page document's write gate: dirty IS the condition, so the
             // tick exists only while the buffer has drifted from the node's
             // text — not a poll, an edit-driven flush.
-            "every 900ms when (connected && !empty(active_page) && page_text(page_editor) != page_saved_text) -> page_autosave_tick",
+            "every 900ms when (connected && !empty(active_page) && editor_text(page_editor) != page_saved_text) -> page_autosave_tick",
         ]
     );
 }
