@@ -739,8 +739,8 @@ pub(super) async fn park(
     // compute daemon serves this node's assigned work and its announcements
     // over /v1, on both tiers alike.
     //
-    // No podman service here either: each service daemon starts its own under
-    // its own root (see the validator boot for the rationale).
+    // No sandbox here either: a run's VMM is a child of the service daemon that
+    // started it (see the validator boot for the rationale).
     // A resident discovers nothing and executes nothing: the compute daemon
     // does both, and reaches consensus through this node's own /v1 surface —
     // which serves a resident's committed queries and relays its submits

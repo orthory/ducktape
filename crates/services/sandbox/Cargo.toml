@@ -4,23 +4,19 @@ edition.workspace = true
 version.workspace = true
 
 # the shared sandbox muscle: HOW a node-local child is spawned in isolation.
-# the SandboxBackend seam + its boot probe, and the node-private rootless podman
-# it drives over the libpod REST socket (never the `podman` CLI) plus the egress
-# nft firewall each run's netns gets. carved out of
-# capability-host, which remains the only in-tree caller of the run path.
+# the SandboxBackend seam + its boot probe, the Firecracker microVM each run
+# gets, the workspace it is handed as a block device, and the egress nft
+# ruleset for its tap. carved out of capability-host, which remains the only
+# in-tree caller of the run path.
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-# "net" pulls tokio::net::UnixStream — the libpod socket transport; "process"
-# drives the podman host binary; "io-util" the attach-stream framing.
+# "net" pulls tokio::net::UnixStream — the guest's vsock lands on one, and so
+# does each tunnel; "process" spawns the VMM; "io-util" frames the guest stream.
 tokio = { workspace = true, features = ["process", "io-util", "net"] }
-# the pull path's lifecycle events: a once-per-image-per-store acquisition that
-# can block a run for minutes says so, on the node's stderr and in the app's log
-# ring. This crate had no logging because nothing in it could stall; the pull can.
 tracing = { workspace = true }
-# TWO calls: the `flock` that makes a service root single-owner, and the SIGTERM
-# a successor sends the podman child a dead owner left behind. Already a direct
-# dep of provider-host and bin/node.
+# opening /dev/kvm for the boot probe: group membership on paper lies until the
+# operator has re-logged in, so the probe opens the device rather than asking.
 libc = "0.2"
 
 [dev-dependencies]

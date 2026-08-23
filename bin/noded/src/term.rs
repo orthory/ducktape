@@ -5,8 +5,8 @@
 //! like the stream hub does: a member creates one over an authenticated local
 //! RPC, then drives a `codex`/`claude` CLI's native TUI over the websocket
 //! stream. The isolation lives one layer down in `provider_host`: the broker
-//! holds the credential and the Podman backend fences the filesystem, so the
-//! member typing into the container never reaches the operator's secrets.
+//! holds the credential and the microVM fences the filesystem, so the member
+//! typing into the guest never reaches the operator's secrets.
 //!
 //! Three moving parts:
 //! - [`TerminalSessions`] — the node's half of the plane: per-session metadata,
@@ -645,7 +645,7 @@ pub enum TermError {
     AtCapacity,
     /// no provider serves the requested agent tag.
     Resolve(String),
-    /// the interactive spawn itself failed (podman missing, image absent, …).
+    /// the interactive spawn itself failed (guest artifacts absent, no /dev/kvm, …).
     Spawn(String),
 }
 

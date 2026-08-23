@@ -2,7 +2,7 @@
 //!
 //! The real compute plane is a STANDALONE DAEMON now
 //! (`ducktape service run compute`), so this binary constructs no provider set,
-//! no podman service and no dispatch pool: the reactor seam below carries only
+//! and no dispatch pool: the reactor seam below carries only
 //! the `DUCKTAPE_NODED_ECHO_ORACLE` stand-in the daemon e2e drives, and a
 //! release build carries nothing at all.
 

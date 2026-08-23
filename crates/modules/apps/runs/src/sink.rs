@@ -600,8 +600,9 @@ mod tests {
     /// block, which is exactly what #860 did.
     ///
     /// The dogfood e2e (`bin/node/tests/dogfood_loop_e2e.rs`) asserts this PR
-    /// too, but skips wherever podman/pasta is absent — which is why the break
-    /// shipped. This runs anywhere `cargo test -p runs` runs.
+    /// too, but skips wherever `/dev/kvm` or the guest artifacts are absent —
+    /// which is why the break shipped. This runs anywhere `cargo test -p runs`
+    /// runs.
     #[test]
     fn the_emitted_open_pr_is_accepted_by_a_real_forge_under_a_module_origin() {
         use sdk::Module as _;

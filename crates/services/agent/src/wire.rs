@@ -162,7 +162,8 @@ pub enum Refusal {
     AtCapacity,
     /// no provider in this daemon's set serves the requested tag.
     UnknownProvider,
-    /// the interactive spawn itself failed (image absent, podman error, …).
+    /// the interactive spawn itself failed (guest artifacts absent, no
+    /// `/dev/kvm`, the guest never dialled back, …).
     SpawnFailed,
 }
 

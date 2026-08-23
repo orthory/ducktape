@@ -3,7 +3,7 @@
 //! Two verbs, one credential+targeting story:
 //!
 //! - `agent pty [<provider>] [--host-node <name>] [--cred <name>] [--cpu <n>] [--mem <gb>]`
-//!   attaches THIS terminal to a Podman-sandboxed provider running on a host
+//!   attaches THIS terminal to a provider running in a microVM on a host
 //!   node (default: this node). The CLI talks ONLY to its own node's ws surface
 //!   (`/v1/ws`); the node does the cross-node mesh. Raw terminal mode + resize
 //!   forwarding make it feel like ssh.
@@ -109,8 +109,8 @@ pub(crate) struct SchedArgs {
 /// find out, because it burns every `RUN_MAX_ATTEMPTS` retry and fails the saga
 /// having told the submitter nothing they could act on.
 ///
-/// The floor is 1: podman runs a single-core guest happily, so zero is the only
-/// request no backend can satisfy.
+/// The floor is 1: a VM is BUILT at a size, so zero vCPUs is not a smaller
+/// machine — it is not a machine.
 fn at_least_the_sandbox_floor(value: &str) -> Result<u64, String> {
     let cores: u64 = value
         .parse()

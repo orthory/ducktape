@@ -17,9 +17,10 @@ futures = { workspace = true }
 # the shared capability-tag shape rule: a tag that validates at spec-parse
 # time can never bounce off the consensus registry's Announce validation.
 capability = { workspace = true }
-# the sandbox muscle: SandboxBackend + its boot probe and
-# the node-private rootless podman (libpod socket) + egress firewall. carved out
-# of this crate; re-exported from src/lib.rs so callers see no move.
+# the sandbox muscle: SandboxBackend + its boot probe, the microVM lifecycle
+# (guest manifest, workspace image, vsock frames) and the tap's egress
+# firewall. carved out of this crate; re-exported from src/lib.rs so callers
+# see no move.
 sandbox-host = { workspace = true }
 # the run-scoped credential broker (crates/services/broker): the loopback
 # endpoint a provider child dials, and the airlock client layer behind it. the
@@ -57,8 +58,8 @@ testkit = ["sandbox-host/testkit"]
 # on too — the lockstep the feature comment above requires.
 provider-host = { path = ".", features = ["testkit"] }
 # the shared capability-skip gate: a host-probe skip must be loud AND become a
-# failure by default, or a box without podman reports two green pty proofs that
-# ran nothing (libtest captures the "skipping" line too).
+# failure by default, or a box with no /dev/kvm reports green proofs that ran
+# nothing (libtest captures the "skipping" line too).
 nettest = { path = "../../testing/nettest" }
 # `testkit` exposes RunBroker::start_for_test — the idle-control test drives a
 # real run against a broker whose upstream is a dead port.

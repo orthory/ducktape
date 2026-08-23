@@ -92,9 +92,60 @@ node host process
       Firecracker microVM (under its jailer)
        ├── vcpu N / mem M      demand-paged + balloon
        ├── kernel + rootfs     immutable, shared RO, per-run COW overlay
-       ├── workspace           virtiofs
+       ├── manifest            64 KiB raw device: argv, env, cwd, mounts, ports
+       ├── agent volume        persistent ext4, attached not copied
+       │                       (CARGO_HOME + RUSTUP_HOME + target/)
+       ├── assets              per-run ext4, READ-ONLY: context doc, skills,
+       │                       and each PATH entry's commands
+       ├── workspace           per-run ext4 block device, copied back on exit
        └── tap device ──→ host nft: public allowed, operator's private net denied
 ```
+
+### The manifest is a device, not a kernel command line
+
+The obvious channel for "what this VM is supposed to run" is the kernel
+command line — it is available before any device is up, and it costs nothing.
+It is the wrong one. Firecracker caps a cmdline near 2 KiB, and a run's argv
+and env are written from a capability SPEC, so that cap is one a spec author
+crosses by adding an environment variable. Measured: codex's broker overrides
+made a 2094-byte cmdline and the VMM refused to boot at all with `Invalid
+cmdline capacity provided`.
+
+So the manifest gets a small device of its own, read RAW — deliberately with no
+filesystem, because the manifest is what says which filesystems to mount. It is
+attached immediately after the root device so its name never moves when a run
+gains or loses its agent volume, and a manifest too large for it is refused on
+the host, naming the size, rather than truncated into a guest that cannot say
+what went wrong.
+
+### A PATH entry is its commands, not its tree
+
+Under a container the read-only inputs were bind mounts, so the SIZE of a
+declared directory cost nothing and nobody had to think about it. A VM copies.
+The node's own binary lives in a build directory, and copying that directory
+whole measured a **39 GB tree against the 0.95 GB of it a run could ever
+name** — one file.
+
+A declared PATH entry therefore hands over the executables at its top level and
+nothing else. That is not a size heuristic: it is what a PATH entry means,
+since resolution never recurses into a subdirectory and never resolves a
+non-executable, so nothing else in the tree is nameable from inside the guest.
+A skills tree and a context doc are different — every byte of those is readable
+input — so they cross entire, and the two kinds are tagged rather than guessed.
+
+Firecracker has **no shared filesystem**. Its device model is deliberately
+minimal — virtio-block, virtio-net, virtio-vsock, virtio-balloon, virtio-rng, a
+serial console, and nothing else. There is no virtio-fs, which is a direct
+consequence of the small attack surface that motivated choosing it. The
+workspace therefore rides a per-run ext4 image: built from the workdir before
+boot, attached as a block device, mounted by the guest, and copied back after
+the guest reports exit. The cost is bounded by workspace size; what it buys is
+that the guest cannot see the host filesystem at all, not even a share.
+
+This also means the guest needs a small init: mount the workspace device, exec
+the CLI with the run's env and cwd, carry stdout and stderr back over vsock as
+separate streams, report the exit code, and unmount cleanly so the image is
+consistent for copy-back. It occupies the seat `conmon` had under podman.
 
 Guest PID 1 is a thin shim that execs the agent CLI. There is no crun, no
 cgroup, no seccomp profile, no userns mapping, no masked paths — the VM boundary
@@ -102,22 +153,195 @@ subsumes every item in the "inherited silently" list above. **The ideal design
 is less machinery than the one it replaces, not more.** That is the main
 argument for it.
 
+### The terminal is allocated in the guest
+
+A pty master and its slave are two ends of one kernel object. A host cannot
+hand a terminal to a process on another kernel, so the podman-era arrangement —
+the host holds the master, the child holds the slave — has no translation here,
+and an interactive session was the one capability the port initially dropped.
+
+What crosses instead is the terminal's CONTENT. `duck-guest-init` opens the pty
+pair itself when the manifest says `pty`, makes the child a session leader with
+that slave as its controlling terminal, and pumps the master against the same
+vsock stdio the headless path already uses. The operator's keystrokes arrive as
+ordinary `Stdin` frames and become terminal input; the child's output comes back
+as `Stdout` frames, with stderr merged in the way a terminal has always merged
+it. Window size is the only genuinely new thing on the wire — a `Resize` frame,
+which the guest applies to its master, and the kernel turns into the `SIGWINCH`
+the TUI redraws on.
+
+The result is that the isolation story is unchanged from the headless path: the
+credential still never enters the guest, the config home is still fresh, and the
+session still reaches its model through the host's broker over the vsock tunnel.
+Only the shape of the child's stdio differs, and that difference is one boolean
+in the manifest.
+
 ### Why per-run and not per-node
 
 An earlier draft proposed one long-lived VM per node with containers inside,
 because *"a VM statically takes its memory."* That is an **Apple
 Virtualization.framework** property, not a VM property. Firecracker guest memory
 is demand-faulted (a VM configured with 8 GB that touches 500 MB costs ~500 MB
-of host RSS), it ships a balloon with free-page reporting, and snapshot/restore
-brings a run to ~150 ms while COW-mapping base pages from one snapshot file
-across concurrent VMs. On Linux, per-run VMs do not carry the reservation cost
-that motivated per-node.
+of host RSS), and it ships a balloon with free-page reporting. On Linux, per-run
+VMs do not carry the reservation cost that motivated per-node.
+
+**Boot cost, measured rather than quoted.** A real microVM was booted on the
+development host to check this rather than trusting the widely-cited ~125 ms:
+Firecracker v1.16.1, a 6.1.128 kernel, a squashfs root, 2 vcpu / 512 MiB —
+**1.04 s from kernel entry to init, 2.28 s for the whole VMM lifecycle**
+(median of 3). The ~125 ms figure is a minimal kernel with an initramfs, not a
+distro kernel with a real root filesystem, which is the shape our guest has.
+
+Profiling that boot then cut it by **2.84×**, to 452 ms, with two kernel command
+line changes: disabling the i8042 PS/2 controller properly (−474 ms; the usual
+`i8042.noaux` covers only the mouse port, and the kernel spends 0.458 s waiting
+out the keyboard port) and `quiet loglevel=1` (−335 ms; the baseline emits 268
+console lines and each is a synchronous write through a VMM exit). The saving is
+flat across every run shape. Detail and the full matrix live in the
+implementation plan.
+
+One tempting flag is **forbidden**: `acpi=off` looks like another 69 ms and is a
+correctness bug. Firecracker enumerates vCPUs through ACPI, so the guest boots
+with exactly one processor whatever `vcpu_count` says — `vcpu_count=4` gives
+`Total of 4 processors activated` with ACPI and `Total of 1` without. A node
+would sell four cores and deliver one, silently.
+
+**Guest memory, not boot overhead, is what actually costs.** With the tuned
+command line, wall time runs 827 ms at 512 MiB, 1.0 s at 2 GiB, 2.4 s at 8 GiB
+and 3.4 s at 16 GiB. Host-side VMM setup is flat across all of it (241 → 321 ms);
+the whole curve is the guest kernel initialising its own page structures, which
+it reports itself: `node 0 deferred pages initialised in 1304ms` at 16 GiB.
+`CONFIG_DEFERRED_STRUCT_PAGE_INIT` is already on and the kernel still waits for
+it before running init.
+
+**Where the ~125 ms everyone quotes actually comes from.** A phase split shows
+Firecracker's own work is ~21 ms (2.8 ms to start, 18.2 ms to load the kernel
+and configure KVM); all the rest is the guest kernel. So the published figures
+are not describing a cold boot of this shape, and they are not cold boots at
+all — they are snapshot restores. Measured here:
+
+| Guest RAM | cold boot | snapshot restore | snapshot create | memory file |
+|---|---|---|---|---|
+| 512 MiB | 428 ms | **12 ms** | 528 ms | 513 MB |
+| 2 GiB | 656 ms | **11 ms** | 2417 ms | 2.1 GB |
+| 8 GiB | 2041 ms | **13 ms** | 12714 ms | 8.1 GB |
+
+Restore is flat in guest memory and faster than the quoted figure — which is
+itself the tell that the number hides work. Three costs sit behind it, and they
+are the real design constraints: "resumed" is not "warm" (the `File` backend
+mmaps the memory file and faults lazily, which is exactly why restore is flat,
+so the guest's first work pays that cost); snapshot creation scales badly and
+writes the whole guest memory to disk; and a snapshot is bound to its machine
+configuration, so a node selling a 1/2/4/8/16 GiB ladder needs one per shape,
+about 31 GB of memory files.
+
+So the design conclusion is split rather than simple. For ordinary runs the
+overhead is negligible against a minutes-long agent invocation, and **per-run
+VMs stand on their own with no snapshot machinery**. For a node selling
+large-`mem_gb` runs, snapshot/restore stops being an optimisation and becomes
+the prerequisite for acceptable start latency — it is the only thing that skips
+memmap init — and the work it entails is the `Uffd` backend and the snapshot
+store, not the restore call itself.
+
+**One correctness fact found while measuring this, recorded here because it is
+not obvious and it hangs every run if missed:** the guest must halt with
+`LINUX_REBOOT_CMD_RESTART`, never `LINUX_REBOOT_CMD_POWER_OFF`. Firecracker
+exposes no ACPI power button, so `POWER_OFF` parks the guest at
+`reboot: System halted` and the VMM never exits — the run hangs to its idle
+timeout still holding all of its memory. `RESTART` goes through the `reboot=k`
+i8042 reset, which the VMM does observe.
 
 Per-run also means no session-affinity state and no shared kernel between
 buyers — the property namespaces cannot provide, and the reason every vendor
 serving hostile multi-tenant code (Lambda, Vercel Sandbox, E2B, Fly Machines on
 Firecracker; Cloud Run and Modal on gVisor) uses a VM or a user-space kernel
 rather than namespaces alone.
+
+## Build caches: a per-agent volume, never the host's
+
+The workspace round trip above is bounded by workspace size, and for a source
+checkout that is fine. It is **not** fine for a build cache, and a Rust dev
+agent is mostly build cache. Measured on this repo:
+
+| | size | files | round trip |
+|---|---|---|---|
+| source (no `target/`) | 1.7 GB | 80,749 | **13.8 s** (`mke2fs -d` 9.1 s + `debugfs rdump` 4.7 s) |
+| `target/` | **76 GB** | 100,331 | not attempted — ~45× the source at the same rate |
+
+So `target/` cannot ride the per-run image. Neither can `~/.cargo` (13 GB here)
+or `~/.rustup` (7.9 GB). They need a device that is **attached, not copied** —
+which `virtio-blk` already gives us for free, since attaching is passing a path.
+
+**The round trip is CPU-bound, so faster storage does not help.** The host disk
+is NVMe (2.9 GB/s write, 3.0 GB/s read, O_DIRECT). Marshalling achieves 186 MB/s
+and 8,860 files/s — 6% of the disk. Re-running the same round trip against tmpfs
+instead of the NVMe moved `mke2fs -d` by 10% (9254 → 8322 ms) and made
+`debugfs rdump` *slower* (5333 → 5600 ms); `mke2fs` runs at 99% CPU on one core.
+Do not propose a storage change to speed this up.
+
+### Sharing the host's cache is an escape, not an optimisation
+
+The tempting shape — attach the operator's real `~/.cargo` and `~/.rustup`,
+read-only for safety — was tested and is wrong in both directions.
+
+**Writes reach the host, and Cargo never notices.** With a writable
+`CARGO_HOME`, appending a function to a cached extracted source
+(`registry/src/<index>/anyhow-1.0.104/src/lib.rs`) and calling it from a fresh
+project printed `anyhow::pwned() = 1337`. Cargo verifies a `.crate` tarball's
+checksum when it extracts, writes `.cargo-ok`, and never re-checks the extracted
+tree again. The tarball stays intact and passes any audit; the tree that
+actually compiles is poisoned, silently and permanently.
+
+Cheaper still: one line of `config.toml`.
+
+```toml
+[build]
+rustc-wrapper = "/path/to/evil.sh"
+```
+
+The next `cargo build` *on the host* ran it — `EVIL RAN AS eddy`. That is host
+command execution from inside the sandbox, triggered by the operator's own next
+build. `~/.cargo/bin` (19 executables the host runs directly) is a third path to
+the same place.
+
+**Read-only would stop those, and stop nothing else.** A read-only `virtio-blk`
+is a genuine boundary — Firecracker rejects the write in the VMM, so guest root
+does not help. But the leak direction is untouched: this host's `~/.cargo`
+holds `credentials.toml` (a crates.io token) and 7.2 GB of `git/` checkouts that
+may include private repositories. Read-only hands all of it to the guest.
+
+Read-only also breaks the workload. With a read-only `CARGO_HOME`, a build whose
+dependencies are all present succeeds — but adding one uncached dependency fails
+with `failed to open .../serde-1.0.229.crate: Permission denied (os error 13)`.
+An agent that cannot add a dependency is not a dev agent.
+
+### Decision: two writable devices, nothing shared
+
+```
+/dev/vda  rw   agent volume       CARGO_HOME + RUSTUP_HOME + target/
+                                  persistent; seeded once at agent creation
+/dev/vdb  rw   workspace          per-run ext4, round-tripped, ephemeral
+```
+
+The agent volume is seeded by copying a **template image**, built once in an
+empty `CARGO_HOME` from the project's `Cargo.lock` via `cargo fetch` — not
+snapshotted from the operator's home. `credentials.toml`, the private `git/`
+checkouts and `~/.cargo/bin` are therefore absent by construction rather than by
+permission bits.
+
+This deletes the threat model above instead of mitigating it. There is no shared
+surface to poison and none to leak, so no read-only enforcement is required for
+correctness; the boundary is that the files are simply different files.
+
+**Read-only base plus an overlay was considered and rejected as premature.** It
+is the standard *container image* shape (RO layers + a writable upper), but it
+is not how CI caches Rust — `actions/cache`, BuildKit cache mounts and
+cargo-chef all give a job its own cache rather than an overlay over a shared
+one. Its only benefit here is disk, and disk is what we have: a 15 GB template
+copied per agent costs 18.2 s once at agent creation (13 GB measured, `ext4`, no
+reflink) and 300 GB for 20 agents against 1.7 TB free. The upgrade path — a
+read-only base with an overlayfs upper — is recorded in *Open questions* and
+becomes worthwhile at hundreds of agents, not tens.
 
 ## Network and egress
 
@@ -258,17 +482,27 @@ inventory, not a reason to fork the design.
 
 ## Sequencing
 
-1. **Delete Tart.** Pure removal, easy to review, shrinks the seam everything
-   else edits.
-2. **Firecracker backend.** The kernel / rootfs / snapshot pipeline is most of
-   this step.
-3. **Move egress to the tap device.** Same ruleset, hook and `nsenter` deleted;
-   add logging and the public-egress toggle.
-4. **Remove the podman path** — `PodmanService`, the libpod client, the attach
-   framing, `pasta` / `conmon` from the probe.
+1. ~~**Delete Tart.**~~ Done.
+2. ~~**Firecracker backend.**~~ Done, minus the snapshot pipeline — which is a
+   latency optimisation, not a correctness prerequisite, and is now its own
+   follow-on.
+3. **Move egress to the tap device.** Half done: the ruleset moved to
+   host-namespace tap filtering and the OCI hook and `nsenter` are deleted.
+   Logging and the public-egress toggle remain.
+4. ~~**Remove the podman path.**~~ Done, and NOT last as sequenced here — it
+   went with step 2. Keeping a second backend past the point where the first
+   one ran real work would have been the dual-path code this repo's
+   instructions forbid.
 
 ## Open questions
 
 - Guest kernel: build our own or track a distro's? Determines the CVE workflow.
-- Default VM size when `cores` / `mem_gb` are absent.
+  Currently tracking the Firecracker CI kernel (`vmlinux-6.1.128`), which is a
+  placeholder, not an answer.
+- Default VM size when `cores` / `mem_gb` are absent. Currently REFUSED rather
+  than defaulted: a VM is built at a size, so a missing dimension has no
+  "unlimited" to fall back to the way a container did.
 - Whether the public-egress toggle defaults on or off for a fresh node.
+- When agent count reaches the hundreds, whether to replace the per-agent cache
+  copy with a read-only base image plus an overlayfs upper. Costed in *Build
+  caches* above; deliberately not built now.

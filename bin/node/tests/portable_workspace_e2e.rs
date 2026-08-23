@@ -68,31 +68,38 @@ struct PortableProvider {
     tag: String,
     spec_dir: PathBuf,
     env_var: String,
-    script: PathBuf,
-    /// the provider NODE's `$HOME` — a fixture dir, so the spec's
-    /// `[sandbox] rw_dirs = ["portable-logs"]` (home-relative by rule) makes
-    /// the log dir the ONE host↔sandbox rw seam: the script inside podman
-    /// writes the same absolute paths the host-side assertions read.
-    home: PathBuf,
-    cwd_log: PathBuf,
-    chain_log: PathBuf,
-    skills_log: PathBuf,
-    prompt_log: PathBuf,
+    bin: PathBuf,
 }
+
+/// Where the executor records what only it can attest, one file per fact.
+///
+/// These are written INTO THE WORKSPACE and read back out of COMMITTED duckfs
+/// state, which is the only host↔guest evidence channel a microVM run has: the
+/// guest shares no filesystem with the host, so a log dir under the node's
+/// `$HOME` would simply not exist on the other side. Riding the workspace makes
+/// the evidence stronger than the old side channel, too — a line the host can
+/// read is a line that went through checkout, the run, commit and consensus.
+///
+/// They ACCUMULATE across runs for free: each run's checkout materializes the
+/// previous run's commit, so `>>` from run 2 lands after run 1's line.
+const EVIDENCE_CWD: &str = "evidence-cwd.log";
+const EVIDENCE_CHAIN: &str = "evidence-chain.log";
+const EVIDENCE_SKILLS: &str = "evidence-skills.log";
+const EVIDENCE_PROMPT: &str = "evidence-prompt.log";
 
 /// Records every per-run directory the provisioner creates under `runs_root`,
 /// sampled from the HOST while the runs are in flight.
 ///
 /// The child cannot report these. A sandboxed run's workdir is mounted at the
-/// SAME guest path for every run (`/ducktape/workspace`) — that normalization is
+/// SAME guest path for every run (`/duck/workspace`) — that normalization is
 /// the isolation working as designed, and it makes two attempts literally
-/// indistinguishable from inside the container. So the properties that are about
+/// indistinguishable from inside the guest. So the properties that are about
 /// the HOST layout (distinct per attempt, under the operator root, cleaned up
 /// afterwards) have to be observed on the host.
 ///
 /// This also makes W5 checkable at all. The old code asserted
 /// `!PathBuf::from(guest_cwd).exists()` on the host, which is vacuously true for
-/// a path that only ever existed inside a container: the cleanup poll passed
+/// a path that only ever existed inside the guest: the cleanup poll passed
 /// without ever witnessing a cleanup.
 struct RunDirs {
     seen: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<PathBuf>>>,
@@ -125,7 +132,11 @@ impl RunDirs {
                 std::thread::sleep(Duration::from_millis(20));
             }
         });
-        Self { seen, stop, handle: Some(handle) }
+        Self {
+            seen,
+            stop,
+            handle: Some(handle),
+        }
     }
 
     /// the rw run dirs (the `-ro` skill siblings excluded), sorted.
@@ -139,7 +150,12 @@ impl RunDirs {
     }
 
     fn all(&self) -> Vec<PathBuf> {
-        self.seen.lock().expect("run dir set").iter().cloned().collect()
+        self.seen
+            .lock()
+            .expect("run dir set")
+            .iter()
+            .cloned()
+            .collect()
     }
 
     fn is_ro(path: &std::path::Path) -> bool {
@@ -158,14 +174,49 @@ impl Drop for RunDirs {
     }
 }
 
-/// a log path as the CHILD must name it: `$HOME`-relative, never the host
-/// absolute path. Only the file name is shared between the two sides.
-fn guest_log(path: &std::path::Path) -> String {
-    let name = path
-        .file_name()
-        .expect("log path has a file name")
-        .to_string_lossy();
-    format!("$HOME/portable-logs/{name}")
+/// the stand-in coding agent, as a shell one-liner: KEEP the prompt it was
+/// handed (the assembled soul rides it), record the provisioned cwd, prove the
+/// prior run's artifact chained in (content-checked), prove the skill ro mount
+/// materialized (content-checked, logging the advertised ro root), write this
+/// run's artifact, answer.
+///
+/// It rides the spec's ARGV rather than a staged `provider.sh`, because a run
+/// executes inside a microVM that mounts nothing from the host — an executor a
+/// node lends has to already be in the guest rootfs. A host script reaches the
+/// guest as `execve /opt/duck/bin/provider.sh` and exit 126.
+///
+/// Every path it writes is CWD-RELATIVE, which is the workspace: that is the
+/// one directory whose contents come back to the host (as committed duckfs
+/// state, once the run commits). A host absolute path baked in here would name
+/// nothing at all inside the guest, and the run would still answer on stdout —
+/// a healthy-looking run that merely "saw no skill mount".
+fn portable_agent_body() -> String {
+    format!(
+        "cat >> {prompt}; \
+         pwd >> {cwd}; \
+         if [ -f {artifact} ] && [ \"$(cat {artifact})\" = '{body}' ]; then \
+         echo chained >> {chain}; fi; \
+         if [ \"$(cat \"$DUCKTAPE_RUN_SKILLS/{skill_name}/{skill_file}\" 2>/dev/null)\" = '{skill_body}' ]; then \
+         printf '%s\\n' \"$DUCKTAPE_RUN_SKILLS\" >> {skills}; fi; \
+         printf '%s' '{body}' > {artifact}; \
+         printf '%s\\n' 'portable run done'",
+        cwd = EVIDENCE_CWD,
+        chain = EVIDENCE_CHAIN,
+        skills = EVIDENCE_SKILLS,
+        prompt = EVIDENCE_PROMPT,
+        artifact = ARTIFACT,
+        body = ARTIFACT_BODY,
+        skill_name = SKILL_NAME,
+        skill_file = SKILL_FILE,
+        skill_body = SKILL_BODY,
+    )
+}
+
+/// a shell body as the spec's `args` array: TOML-escape it and hand it to
+/// `sh -c`.
+fn argv_literal(body: &str) -> String {
+    let escaped = body.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("[\"-c\", \"{escaped}\"]")
 }
 
 impl PortableProvider {
@@ -173,67 +224,8 @@ impl PortableProvider {
         let dir = root.join("portable-provider");
         let spec_dir = dir.join("specs");
         std::fs::create_dir_all(&spec_dir).expect("provider spec dir");
-        let home = dir.join("home");
-        let logs = home.join("portable-logs");
-        std::fs::create_dir_all(&logs).expect("provider log dir");
-        let cwd_log = logs.join("cwd.log");
-        let chain_log = logs.join("chain.log");
-        let skills_log = logs.join("skills.log");
-        // what the MODEL was actually handed: the assembled context document
-        // (the soul) plus the run's input. the old script piped stdin to
-        // /dev/null, which is exactly why a prompt could go missing unnoticed.
-        let prompt_log = logs.join("prompt.log");
-        let script = dir.join("provider.sh");
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\n\
-                 # a stand-in coding agent: KEEP the prompt it was handed (the\n\
-                 # assembled soul rides it), record the provisioned cwd, prove\n\
-                 # the prior run's artifact chained in (content-checked), prove\n\
-                 # the skill ro mount materialized (content-checked, logging the\n\
-                 # advertised ro root), write this run's artifact, answer.\n\
-                 cat >> {prompt}\n\
-                 pwd >> {cwd}\n\
-                 if [ -f {artifact} ] && [ \"$(cat {artifact})\" = '{body}' ]; then\n\
-                 \techo chained >> {chain}\n\
-                 fi\n\
-                 if [ \"$(cat \"$DUCKTAPE_RUN_SKILLS/{skill_name}/{skill_file}\" 2>/dev/null)\" = '{skill_body}' ]; then\n\
-                 \tprintf '%s\\n' \"$DUCKTAPE_RUN_SKILLS\" >> {skills}\n\
-                 fi\n\
-                 printf '%s' '{body}' > {artifact}\n\
-                 printf '%s\\n' 'portable run done'\n",
-                // $HOME-RELATIVE, not the host absolute path.
-                //
-                // The spec declares `rw_dirs = ["portable-logs"]`, which the
-                // sandbox mounts under the GUEST home — a different absolute
-                // path than the host's. `translate()` rewrites host paths in
-                // argv and env, but never inside a script FILE, so a host
-                // absolute path baked in here simply does not exist in the
-                // container: every write lands in the container's ephemeral
-                // layer and the host-side assertions read nothing. The run
-                // still answers on stdout, so it looks like a healthy run that
-                // merely "saw no skill mount".
-                //
-                // `$HOME` is the one name that means the same directory on both
-                // sides, so the seam the doc comment above promises actually
-                // holds under podman.
-                cwd = guest_log(&cwd_log),
-                chain = guest_log(&chain_log),
-                skills = guest_log(&skills_log),
-                prompt = guest_log(&prompt_log),
-                artifact = ARTIFACT,
-                body = ARTIFACT_BODY,
-                skill_name = SKILL_NAME,
-                skill_file = SKILL_FILE,
-                skill_body = SKILL_BODY,
-            ),
-        )
-        .expect("write provider script");
-        use std::os::unix::fs::PermissionsExt as _;
-        let mut perms = std::fs::metadata(&script).expect("script metadata").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script, perms).expect("chmod provider script");
+        // resolved by basename to /opt/duck/bin/sh inside the guest
+        let bin = PathBuf::from("/bin/sh");
 
         let tag = "quack-portable";
         let env_var = "DUCKTAPE_TEST_QUACK_PORTABLE_BIN".to_string();
@@ -248,13 +240,12 @@ impl PortableProvider {
                  bin = \"{tag}-nonexistent-cli\"\n\
                  env = \"{env_var}\"\n\
                  [invoke]\n\
-                 args = []\n\
+                 args = {args}\n\
                  prompt = \"stdin\"\n\
                  timeout_secs = 30\n\
                  [output]\n\
-                 format = \"text\"\n\
-                 [sandbox]\n\
-                 rw_dirs = [\"portable-logs\"]\n"
+                 format = \"text\"\n",
+                args = argv_literal(&portable_agent_body()),
             ),
         )
         .expect("write provider spec");
@@ -262,12 +253,7 @@ impl PortableProvider {
             tag: tag.into(),
             spec_dir,
             env_var,
-            script,
-            home,
-            cwd_log,
-            chain_log,
-            skills_log,
-            prompt_log,
+            bin,
         }
     }
 
@@ -277,45 +263,15 @@ impl PortableProvider {
                 "DUCKTAPE_CAPABILITY_DIR".into(),
                 self.spec_dir.display().to_string(),
             ),
-            (self.env_var.clone(), self.script.display().to_string()),
-            // the node's HOME anchors the spec's home-relative rw_dirs at the
-            // fixture log dir — the sanctioned rw seam into the sandbox.
-            ("HOME".into(), self.home.display().to_string()),
+            (self.env_var.clone(), self.bin.display().to_string()),
         ]
-    }
-
-    /// every provisioned cwd the script observed, one per run.
-    fn cwds(&self) -> Vec<String> {
-        std::fs::read_to_string(&self.cwd_log)
-            .map(|s| s.lines().map(str::to_string).collect())
-            .unwrap_or_default()
-    }
-
-    /// how many runs found the prior run's committed artifact in their mount.
-    fn chained(&self) -> usize {
-        std::fs::read_to_string(&self.chain_log)
-            .map(|s| s.lines().count())
-            .unwrap_or(0)
-    }
-
-    /// every `DUCKTAPE_RUN_SKILLS` root whose skill mount content-checked
-    /// inside the run, one per run (W6 evidence).
-    fn skill_roots(&self) -> Vec<String> {
-        std::fs::read_to_string(&self.skills_log)
-            .map(|s| s.lines().map(str::to_string).collect())
-            .unwrap_or_default()
-    }
-
-    /// everything the provider was handed on stdin, across every run — the
-    /// model's own view of the agent.
-    fn prompts(&self) -> String {
-        std::fs::read_to_string(&self.prompt_log).unwrap_or_default()
     }
 }
 
-/// the image this suite's stand-in coding agent runs in — the fuller `node`
-/// base rather than the harness default.
-const SANDBOX_IMAGE: &str = "docker.io/library/node:22-slim";
+// This suite's stand-in coding agent used to name its own image, a
+// fuller base than the harness default. Every node now boots the same shared
+// guest rootfs, so what a run can execute is decided when that image is built
+// (ops/build-guest-rootfs.sh), not per suite.
 
 /// hermetic env for a node that must provide NOTHING (see dispatch_e2e).
 fn hermetic_env(root: &std::path::Path, name: &str) -> Vec<(String, String)> {
@@ -323,7 +279,10 @@ fn hermetic_env(root: &std::path::Path, name: &str) -> Vec<(String, String)> {
     std::fs::create_dir_all(&empty).expect("empty spec dir");
     let missing = root.join(name).join("missing-executor");
     vec![
-        ("DUCKTAPE_CAPABILITY_DIR".into(), empty.display().to_string()),
+        (
+            "DUCKTAPE_CAPABILITY_DIR".into(),
+            empty.display().to_string(),
+        ),
         ("DUCKTAPE_CLAUDE_BIN".into(), missing.display().to_string()),
         ("DUCKTAPE_CODEX_BIN".into(), missing.display().to_string()),
     ]
@@ -447,6 +406,46 @@ fn artifact_stat(cluster: &Cluster, idx: usize) -> Option<u64> {
     )
 }
 
+/// one evidence file, out of the committed head — the guest's own attestation,
+/// read back on the host after it crossed commit and consensus.
+///
+/// Empty for a file the head does not carry, which is what a run that never
+/// executed (or never saw the thing it was asked to check) leaves behind.
+fn evidence(cluster: &Cluster, idx: usize, name: &str) -> String {
+    let path = format!("/shared/agent-workspaces/{AGENT_ID}/{name}");
+    let Some(size) = stat_size(cluster, idx, &path) else {
+        return String::new();
+    };
+    let Some(reply) = cluster.query(
+        idx,
+        "files",
+        &files_encode_query(&FilesQuery::Read {
+            path,
+            snapshot: None,
+            offset: 0,
+            len: size,
+        }),
+    ) else {
+        return String::new();
+    };
+    let Ok(FilesReply::Read { b64, .. }) = files_decode_reply(&reply) else {
+        return String::new();
+    };
+    STANDARD
+        .decode(b64)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_default()
+}
+
+/// every line of one evidence file — one per run that reported the fact.
+fn evidence_lines(cluster: &Cluster, idx: usize, name: &str) -> Vec<String> {
+    evidence(cluster, idx, name)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
 #[test]
 fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     if skip_unless_sandboxed(
@@ -474,16 +473,20 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     let mut cluster = Cluster::new(&[0, 1, 2], &[0, 1, 2]);
     // serving is opt-in now (default OFF): this test needs node 1 in the
     // rendezvous pool, so every node opts in. the [sandbox] table comes LAST
-    // (nothing may follow a toml table header) — every node boots a podman
+    // (nothing may follow a toml table header) — every node boots a microVM
     // compute plane; nodes 0/2 stay hermetic (empty spec dir → nothing
     // discovered or announced).
-    cluster.extra_toml.extend(sandbox_toml(SANDBOX_IMAGE));
+    cluster.extra_toml.extend(sandbox_toml());
     // the pool needs the compute grant as well as the [sandbox] table, and
     // the grant is what opts these nodes into the rendezvous pool: the node
     // announces the granted tags INTERSECTED with what it discovers, so the
     // hermetic nodes 0/2 still announce nothing.
     cluster.compute_grant = Some(vec![provider.tag.clone()]);
-    cluster.env[0] = [hermetic_env(fixtures.path(), "node0"), vec![runs_root_env.clone()]].concat();
+    cluster.env[0] = [
+        hermetic_env(fixtures.path(), "node0"),
+        vec![runs_root_env.clone()],
+    ]
+    .concat();
     cluster.env[1] = [
         provider.env(),
         hide_builtins(fixtures.path(), "node1"),
@@ -588,8 +591,12 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     assert_eq!(wait_for_reply(&cluster, 0, &run_1), "portable run done");
 
     // W6 evidence: the script content-checked the skill file under the
-    // advertised DUCKTAPE_RUN_SKILLS root before answering.
-    let roots = provider.skill_roots();
+    // advertised DUCKTAPE_RUN_SKILLS root before answering. It reaches the host
+    // as committed state, so wait for the run's commit rather than the reply.
+    let roots = poll_until("run 1's skill-mount evidence to commit", FINALIZE, || {
+        let roots = evidence_lines(&cluster, 0, EVIDENCE_SKILLS);
+        (!roots.is_empty()).then_some(roots)
+    });
     assert_eq!(roots.len(), 1, "run 1 saw its skill ro mount: {roots:?}");
 
     // THE SOUL, as the model saw it. the persona is no longer a blob resolved
@@ -597,7 +604,7 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     // replicated by consensus, materialized on node 1 (the executor), inlined by
     // the assembler, and handed to the provider on stdin. every one of those
     // links is live in this assertion.
-    let prompt = provider.prompts();
+    let prompt = evidence(&cluster, 0, EVIDENCE_PROMPT);
     assert!(
         prompt.contains(SKILL_BODY),
         "the persona must reach the model through the assembled context document: {prompt}"
@@ -653,8 +660,8 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     mention(&cluster, 0, "m2");
     let run_2 = runs::run_id_for(CHANNEL, 3, AGENT_ID);
     assert_eq!(wait_for_reply(&cluster, 2, &run_2), "portable run done");
-    poll_until("run 2's chain evidence", FINALIZE, || {
-        (provider.chained() == 1).then_some(())
+    poll_until("run 2's chain evidence to commit", FINALIZE, || {
+        (evidence_lines(&cluster, 0, EVIDENCE_CHAIN).len() == 1).then_some(())
     });
 
     // ---- the mounts themselves: two runs, two DISTINCT per-run dirs, every
@@ -665,8 +672,12 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     // GUEST-side evidence: the child ran once per run and reported a cwd. Under
     // a sandbox that cwd is the normalized guest path, identical for both runs —
     // so it proves execution happened, and nothing about the host layout.
-    let cwds = provider.cwds();
-    assert_eq!(cwds.len(), 2, "exactly one provider execution per run: {cwds:?}");
+    let cwds = evidence_lines(&cluster, 0, EVIDENCE_CWD);
+    assert_eq!(
+        cwds.len(),
+        2,
+        "exactly one provider execution per run: {cwds:?}"
+    );
 
     // HOST-side evidence: the layout properties, observed where they are true.
     let workdirs = run_dirs.workdirs();
@@ -695,8 +706,12 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     // point of the mount. (This is what silently regressed: with the evidence
     // channel broken it logged nothing, and the run still answered, which is
     // exactly the "silently unsouled agent" this feature must never ship.)
-    let roots = provider.skill_roots();
-    assert_eq!(roots.len(), 2, "both runs content-checked the skill: {roots:?}");
+    let roots = evidence_lines(&cluster, 0, EVIDENCE_SKILLS);
+    assert_eq!(
+        roots.len(),
+        2,
+        "both runs content-checked the skill: {roots:?}"
+    );
 
     // HOST side: one ro root per run, each a SIBLING of its rw mount (never
     // inside it — that is the no-leak mechanism), each cleaned up.
@@ -729,11 +744,15 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     // no correlation debris: every delivered run prunes its pending entry.
     // eventual — the reply was observed on node 2, and node 0 may still be a
     // block behind the delivery that prunes.
-    poll_until("delivered runs to prune their pending entries", FINALIZE, || {
-        let reply = cluster.query(0, "runs", &runs::encode_query(&RunsQuery::PendingRuns))?;
-        match runs::decode_reply(&reply) {
-            Ok(RunsReply::PendingRuns(pending)) => pending.is_empty().then_some(()),
-            _ => None,
-        }
-    });
+    poll_until(
+        "delivered runs to prune their pending entries",
+        FINALIZE,
+        || {
+            let reply = cluster.query(0, "runs", &runs::encode_query(&RunsQuery::PendingRuns))?;
+            match runs::decode_reply(&reply) {
+                Ok(RunsReply::PendingRuns(pending)) => pending.is_empty().then_some(()),
+                _ => None,
+            }
+        },
+    );
 }

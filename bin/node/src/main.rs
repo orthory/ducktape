@@ -234,11 +234,6 @@ enum Family {
     Agent(agent_cli::AgentArgs),
     /// the stdio MCP server an agent runner spawns
     Mcp,
-    /// internal: the OCI createRuntime hook that installs a sandbox run's egress
-    /// firewall. podman invokes it (via the node's --hooks-dir) with the OCI
-    /// container state on stdin; never run by hand. Hidden from help.
-    #[command(name = "__egress-hook", hide = true)]
-    EgressHook,
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -257,9 +252,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             mcp::serve();
             Ok(())
         }
-        // podman pipes the OCI state on stdin; a non-zero exit aborts the
-        // container (fail-closed), so map a hook error to a real process error.
-        Family::EgressHook => provider_host::run_egress_hook().map_err(Into::into),
+        // The `__egress-hook` subcommand lived here: an OCI createRuntime hook
+        // podman invoked to install a run's firewall inside its netns. A
+        // microVM has no netns to enter — its guest has no network device at
+        // all, and reaches this host only through a vsock tunnel the host owns
+        // both ends of — so there is no hook and nothing for one to install.
         Family::User(cmd) => userkey_cli::run(cmd),
         Family::Agent(args) => agent_cli::run(args),
         Family::Gateway(cmd) => gateway_routes::run(cmd),
@@ -399,9 +396,9 @@ fn run_node(
     // There is NO sandbox probe here any more, and its absence is the point:
     // this process runs nothing in a sandbox. Both planes that did — compute's
     // headless runs and agent's interactive ptys — are separate daemons that
-    // probe the runtime themselves before they signal, and start their own
-    // podman service before they serve. Probing here would have made a missing
-    // podman a fatal BOOT error on a node that never needed one.
+    // probe the runtime themselves before they signal. Probing here would have
+    // made a missing hypervisor, or a missing guest image, a fatal BOOT error
+    // on a node that never needed one.
 
     // THE MESH LISTENER, taken for a moment while a bind failure can still be
     // a sentence. Everything below this line runs inside commonware's runtime,
@@ -538,6 +535,15 @@ fn run_node(
             public_key: status_public_key.clone(),
             ..Default::default()
         });
+        // The one moment `/v1/status` starts carrying a mesh identity, and the
+        // only wait seam a supervisor has for it. The HTTP listener binds well
+        // upstream of here, so "app surface listening" says nothing about
+        // whether the identity is there yet — a daemon started on that marker
+        // reads `public_key: ""` and exits FATAL
+        // (`services::NOT_PUBLISHED_YET`). Logged HERE rather than at a role
+        // loop's first boundary publish: this is where the key actually
+        // appears, and every role passes through it.
+        tracing::info!(target: "ducktape::node", "mesh identity published");
         // One process-wide bulk budget: the per-use planes retain separate
         // protocols, queues, sockets, and admission but cannot independently
         // saturate the same WireGuard link.

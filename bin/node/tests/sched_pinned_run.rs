@@ -44,7 +44,7 @@
 //! ## what a sandboxed run costs this suite in evidence
 //!
 //! Both legs boot each node's `ducktape service run compute` daemon and execute
-//! providers INSIDE a container, so `[sandbox]` is mandatory and a host path is
+//! providers INSIDE a microVM, so `[sandbox]` is mandatory and a host path is
 //! no longer a shared surface. The granted leg counts executions on the MOCK
 //! UPSTREAM, which is host-side and outside the sandbox; the refusal leg has
 //! only committed state (see its closing assertions). A host that cannot
@@ -232,15 +232,12 @@ async fn seal_credential(gw_base: &str, name: &str) -> [u8; 32] {
 // identity + gateway helpers (mirror airlock_gateway_e2e / gateway_e2e)
 // ===========================================================================
 
-/// The granted leg's image, and the reason it is not the harness default: its
-/// provider script dials the loopback broker with node's global `fetch`, so it
-/// needs a `node` runtime the busybox default does not have.
-///
-/// The refusal leg never executes anything, so it boots on
-/// [`common::SANDBOX_IMAGE`] — each compute daemon fills its OWN empty podman
-/// graph root at boot, and 4 MB beats 200 MB for an image no container ever
-/// runs.
-const BROKER_IMAGE: &str = "docker.io/library/node:22-slim";
+// The granted leg used to name its own image: its provider executor dials the
+// loopback broker, which the harness's busybox default could not do. Every node
+// now boots the same shared guest rootfs, so that choice moved to where the
+// image is built (ops/build-guest-rootfs.sh) — and the per-node cost that made
+// it a trade is gone, since one read-only image serves every node instead of each compute
+// daemon filling its own graph root at boot.
 
 fn bind_auth(member: &ed25519::PrivateKey, chain: &str, node: &[u8]) -> MemberAuth {
     identity::testkit::ed_bind_auth(member, &identity::bind_preimage(chain, node, 0))
@@ -436,7 +433,10 @@ fn set_credential(
         },
     };
     let signature = owner
-        .sign(GATEWAY_CREDENTIAL_NS, &set_credential_preimage(&statement).unwrap())
+        .sign(
+            GATEWAY_CREDENTIAL_NS,
+            &set_credential_preimage(&statement).unwrap(),
+        )
         .as_ref()
         .to_vec();
     GatewayMsg::SetCredential {
@@ -476,8 +476,8 @@ fn node_sid(cluster: &Cluster, idx: usize, id: &str) -> String {
 
 /// Submit a bare `SagaMsg::Trigger` from node `idx` (its key stamps the origin),
 /// pinned to `target`, whose v3 envelope carries `CRED_NAME`. No demands — the
-/// smallest reliable execution shape (the cpu/mem → Podman limit-flag
-/// dimension is not exercised here).
+/// smallest reliable execution shape (the cpu/mem → VM size dimension is not
+/// exercised here).
 fn submit_sched(cluster: &Cluster, idx: usize, saga_id: &str, target: &[u8], max_attempts: u32) {
     let spec = dispatch::encode_work_spec(&dispatch::WorkSpec {
         kind: dispatch::WORK_SPEC_KIND.into(),
@@ -532,13 +532,7 @@ fn wait_terminal(cluster: &Cluster, reader: usize, saga_id: &str, budget: Durati
 /// `secret` is the node's own 0600 service-link token: `run-output:` carries
 /// provider stdout, so it is a workspace-gated topic and an un-tokened subscribe
 /// is refused.
-async fn run_output_has(
-    port: u16,
-    id: &str,
-    marker: &str,
-    secret: &str,
-    budget: Duration,
-) -> bool {
+async fn run_output_has(port: u16, id: &str, marker: &str, secret: &str, budget: Duration) -> bool {
     let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/v1/ws"))
         .await
         .expect("open run-output ws");
@@ -586,13 +580,52 @@ async fn run_output_has(
 /// seeds into `CLAUDE_CONFIG_DIR`) for the run leg, or none for the refusal leg
 /// (which never reaches execution).
 ///
-/// The script runs INSIDE the run's container, so its `stdout` is the whole of
-/// its observable behaviour: it can touch no host path (none exists in that
-/// mount namespace) and nothing beyond what the image provides. Execution
-/// counting therefore lives on the mock upstream, which is host-side.
+/// The executor runs INSIDE the run's microVM, so its `stdout` is the whole of
+/// its observable behaviour: it can touch no host path (none is mounted there)
+/// and nothing beyond what the guest rootfs provides. Execution counting
+/// therefore lives on the mock upstream, which is host-side.
 struct ScriptProvider {
     spec_dir: PathBuf,
-    script: PathBuf,
+    bin: PathBuf,
+}
+
+/// the broker leg's executor, as a shell one-liner.
+///
+/// It rides the spec's ARGV rather than a staged `provider.sh`, because a run
+/// executes inside a microVM that mounts nothing from the host — an executor a
+/// node lends has to already be in the guest rootfs. A host script reaches the
+/// guest as `execve /opt/duck/bin/provider.sh` and exit 126.
+///
+/// Absolute guest paths, not bare names: the guest inherits only the run's env,
+/// so nothing guarantees a `PATH` that finds `python3`. Everything it uses is
+/// in the rootfs `ops/build-guest-rootfs.sh` builds.
+///
+/// The guest reaches the HOST's loopback broker because `duck-guest-init`
+/// serves `127.0.0.1:<port>` inside the VM and tunnels it over vsock — the
+/// credential itself stays host-side, and this leg only ever sees the per-run
+/// bearer the broker seeded into `CLAUDE_CONFIG_DIR`.
+fn broker_leg_body() -> String {
+    // one `python3 -c` rather than curl + a JSON extractor: it keeps the whole
+    // request inside single quotes, so no shell metacharacter survives into
+    // TOML. Statements are `;`-joined (all simple, no blocks) so the arg needs
+    // no embedded newline either.
+    let python = concat!(
+        r#"import json,os,urllib.request as u; "#,
+        r#"t=json.load(open(os.environ["CLAUDE_CONFIG_DIR"]+"/.credentials.json"))["claudeAiOauth"]["accessToken"]; "#,
+        r#"b=json.dumps({"model":"claude-sonnet-5","max_tokens":16,"messages":[{"role":"user","content":"PING"}]}).encode(); "#,
+        r#"r=u.Request(os.environ["ANTHROPIC_BASE_URL"]+"/v1/messages",data=b,headers={"#,
+        r#""authorization":"Bearer "+t,"content-type":"application/json","#,
+        r#""anthropic-version":"2023-06-01","anthropic-beta":"oauth-2025-04-20"}); "#,
+        r#"print(u.urlopen(r).read().decode())"#,
+    );
+    format!("cat > /dev/null; exec /usr/bin/python3 -c '{python}'")
+}
+
+/// a shell body as the spec's `args` array: TOML-escape it and hand it to
+/// `sh -c`.
+fn argv_literal(body: &str) -> String {
+    let escaped = body.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("[\"-c\", \"{escaped}\"]")
 }
 
 impl ScriptProvider {
@@ -600,44 +633,15 @@ impl ScriptProvider {
         let dir = root.join("provider");
         let spec_dir = dir.join("specs");
         std::fs::create_dir_all(&spec_dir).expect("provider spec dir");
-        let script = dir.join("provider.sh");
+        // resolved by basename to /opt/duck/bin/sh inside the guest
+        let bin = PathBuf::from("/bin/sh");
 
-        // the broker leg runs INSIDE the podman sandbox ([`BROKER_IMAGE`]), so
-        // it dials the loopback broker with node's global fetch — the container
-        // has no curl. execution is counted host-side by the mock upstream. the
-        // refusal leg never runs, so its body only needs to be valid.
+        // the refusal leg never runs, so its body only needs to be valid.
         let body = if broker {
-            "#!/bin/sh\n\
-             set -e\n\
-             cat > /dev/null\n\
-             node -e '\n\
-             const fs = require(\"fs\");\n\
-             const creds = JSON.parse(fs.readFileSync(process.env.CLAUDE_CONFIG_DIR + \"/.credentials.json\", \"utf8\"));\n\
-             const body = {model:\"claude-sonnet-5\",max_tokens:16,messages:[{role:\"user\",content:\"PING\"}]};\n\
-             fetch(process.env.ANTHROPIC_BASE_URL + \"/v1/messages\", {\n\
-               method: \"POST\",\n\
-               headers: {\n\
-                 authorization: \"Bearer \" + creds.claudeAiOauth.accessToken,\n\
-                 \"content-type\": \"application/json\",\n\
-                 \"anthropic-version\": \"2023-06-01\",\n\
-                 \"anthropic-beta\": \"oauth-2025-04-20\",\n\
-               },\n\
-               body: JSON.stringify(body),\n\
-             }).then((r) => r.text()).then((t) => { console.log(t); });\n\
-             '\n"
-                .to_string()
+            broker_leg_body()
         } else {
-            "#!/bin/sh\n\
-             set -e\n\
-             cat > /dev/null\n\
-             printf 'unreachable\\n'\n"
-                .to_string()
+            "cat > /dev/null; printf 'unreachable\\n'".to_string()
         };
-        std::fs::write(&script, body).expect("write provider script");
-        use std::os::unix::fs::PermissionsExt as _;
-        let mut perms = std::fs::metadata(&script).expect("script metadata").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script, perms).expect("chmod provider script");
 
         // `config_home_env` is NOT optional decoration for a claude-broker spec:
         // the broker seeds the per-run bearer as a `claudeAiOauth` credentials
@@ -662,20 +666,21 @@ impl ScriptProvider {
                  bin = \"{TAG}-nonexistent-cli\"\n\
                  env = \"DUCKTAPE_TEST_SCHED_BIN\"\n\
                  [invoke]\n\
-                 args = []\n\
+                 args = {args}\n\
                  prompt = \"stdin\"\n\
                  timeout_secs = 60\n\
                  [output]\n\
                  format = \"text\"\n\
-                 {isolation}"
+                 {isolation}",
+                args = argv_literal(&body),
             ),
         )
         .expect("write provider spec");
-        Self { spec_dir, script }
+        Self { spec_dir, bin }
     }
 
     /// the env that makes a node provide the tag: the operator spec dir plus the
-    /// detect override that points at the script.
+    /// detect override that points at the guest's shell.
     fn env(&self) -> Vec<(String, String)> {
         vec![
             (
@@ -684,7 +689,7 @@ impl ScriptProvider {
             ),
             (
                 "DUCKTAPE_TEST_SCHED_BIN".into(),
-                self.script.display().to_string(),
+                self.bin.display().to_string(),
             ),
         ]
     }
@@ -706,7 +711,8 @@ fn hide_builtins(root: &Path, name: &str) -> Vec<(String, String)> {
 
 #[test]
 fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
-    if skip_unless_sandboxed("a_granted_scheduled_run_executes_against_the_mock_upstream").is_some() {
+    if skip_unless_sandboxed("a_granted_scheduled_run_executes_against_the_mock_upstream").is_some()
+    {
         return;
     }
     let _serial = serial();
@@ -715,14 +721,15 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
 
     // the credential node's loopback services live in THIS process; the node
     // subprocess reaches the gateway over host loopback, like a real deployment
-    // (the provider container shares the host netns — no private netns here).
+    // (the guest has no host network at all: `duck-guest-init` serves the
+    // broker's port on the VM's own loopback and tunnels it over vsock).
     let (gw_base, gw_port, upstream) = rt.block_on(boot_gateway_and_upstream());
     let seal_pk = rt.block_on(seal_credential(&gw_base, CRED_NAME));
 
     let provider = ScriptProvider::stage(fixtures.path(), true);
     let mut cluster = Cluster::new(&[0], &[0]);
     cluster.wireguard = true;
-    cluster.extra_toml = sandbox_toml(BROKER_IMAGE);
+    cluster.extra_toml = sandbox_toml();
     // the [sandbox] table is only HOW runs are isolated; the pool also
     // needs the user's compute grant. This run is pinned, not claimed from a
     // pool, so the grant announces nothing.
@@ -739,11 +746,11 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
     // consensus, three minutes from the actual cause. Its own marker names it
     // immediately.
     //
-    // What it covers, exactly: `PodmanService` + provider discovery. NOT the
-    // image — nothing is pulled at boot, so an unpullable tag passes this marker
-    // and fails the run ~20s later. A dead libpod socket never prints it and
-    // burns the full budget. Neither is a skip: past `probe()` this suite has
-    // declared the host capable, so an unusable sandbox is a failure.
+    // What it covers, exactly: the sandbox probe + provider discovery. NOT a
+    // bootable guest — no VM starts until a run does, so an unreadable rootfs
+    // passes this marker and fails the run seconds later. Not a skip either:
+    // past `probe()` this suite has declared the host capable, so an unusable
+    // sandbox is a failure.
     cluster.wait_compute_marker(0, "compute daemon serving", CONVERGE);
 
     // the node owns the credential: bind its key to an account, map its handle,
@@ -779,7 +786,12 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
     cluster.submit(
         0,
         "gateway",
-        &gateway::encode_msg(&signed_airlock_route(&owner, &cluster.namespace, &node_key, 1)),
+        &gateway::encode_msg(&signed_airlock_route(
+            &owner,
+            &cluster.namespace,
+            &node_key,
+            1,
+        )),
     );
     poll_until("airlock route revision 1", FINALIZE, || {
         (airlock_route_revision(&cluster, 0, owner.public_key().as_ref()) == Some(1)).then_some(())
@@ -788,7 +800,12 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
     cluster.submit(
         0,
         "gateway",
-        &gateway::encode_msg(&set_credential(&owner, &cluster.namespace, &node_key, seal_pk)),
+        &gateway::encode_msg(&set_credential(
+            &owner,
+            &cluster.namespace,
+            &node_key,
+            seal_pk,
+        )),
     );
     poll_until("the credential record to commit", FINALIZE, || {
         credential_record(&cluster, 0).filter(|r| r.seal_pk == seal_pk)
@@ -832,7 +849,10 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
         &secret,
         FINALIZE,
     ));
-    assert!(saw, "the mock upstream's reply streamed to the run-output ring");
+    assert!(
+        saw,
+        "the mock upstream's reply streamed to the run-output ring"
+    );
 
     // exactly-once, counted host-side where the sandbox boundary can't hide
     // it: one provider execution = one accepted upstream call.
@@ -868,7 +888,7 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
     let provider = ScriptProvider::stage(fixtures.path(), true);
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
     cluster.wireguard = true;
-    cluster.extra_toml = sandbox_toml(BROKER_IMAGE);
+    cluster.extra_toml = sandbox_toml();
     cluster.compute_grant = Some(vec![]);
     let owner_storage = cluster.workspace(0);
     seed_claude_store(&owner_storage, CRED_NAME, "rt-delegated");
@@ -942,7 +962,12 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
     cluster.submit(
         0,
         "gateway",
-        &gateway::encode_msg(&set_credential(&owner, &cluster.namespace, &owner_node, seal_pk)),
+        &gateway::encode_msg(&set_credential(
+            &owner,
+            &cluster.namespace,
+            &owner_node,
+            seal_pk,
+        )),
     );
     poll_until("the credential record to commit", FINALIZE, || {
         credential_record(&cluster, 1)
@@ -953,7 +978,7 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
     // TWO consents in opposite directions, and this is the first: before the
     // lender is ever dialled, node 1 decides whether it runs node 0's work at
     // all. Its default is owner-only and these are two accounts, so the run is
-    // refused HERE — no container, no gateway hop, no session. Without this
+    // refused HERE — no microVM, no gateway hop, no session. Without this
     // step the credential lane below is not even reachable.
     //
     // They COMPOSE, and this direction is where that is visible: the CREDENTIAL

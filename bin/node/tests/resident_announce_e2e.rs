@@ -17,7 +17,7 @@
 //! The offered half is a real `POST /v1/services/hello` against the resident's
 //! own app surface, refreshed on a heartbeat — a service daemon's entire
 //! contribution to THIS lane. The daemon PROCESS is deliberately not spawned:
-//! an announce test that boots a container runtime pays podman's availability
+//! an announce test that boots a sandbox pays the hypervisor's availability
 //! and startup cost for no extra signal. What a real daemon would additionally
 //! prove — that a REAL hello carries the shape this lane expects — belongs in
 //! the dispatch e2e (#826), which owns the `[sandbox]` fixture and the runtime

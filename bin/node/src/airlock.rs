@@ -38,9 +38,9 @@
 //!
 //! ## it spawns nothing
 //!
-//! No podman, no provider set, no sandbox, no reaper, no containers. A lending
-//! node is often a laptop with no container runtime at all, which is exactly
-//! why the hello path must not demand one.
+//! No provider set, no sandbox, no reaper, no VMs. A lending node is often a
+//! laptop with no hypervisor access at all — no `/dev/kvm`, no guest images —
+//! which is exactly why the hello path must not demand one.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

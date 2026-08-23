@@ -26,8 +26,8 @@
 //!   one `OracleResult` op commits PER ATTEMPT, which rules out two nodes both
 //!   believing they won one claim. It does not rule out a node that lost its
 //!   lease mid-run finishing and paying for the work anyway — that gap is a
-//!   product guard (the cancellation check between podman `create` and `start`,
-//!   held by a source lint in `provider-host`), not something committed state
+//!   product guard (the cancellation check before the VM is booted, held by a
+//!   source lint in `provider-host`), not something committed state
 //!   can show, because the late result lands as a no-op.
 //!
 //! ## the compute plane is a real, sandboxed, out-of-process one
@@ -56,7 +56,7 @@ use agent::{ACTION_CHAT_POST, AgentMsg};
 use runs::{RunsMsg, RunsQuery, RunsReply, TurnPolicy};
 use capability::{CapabilityQuery, CapabilityReply};
 use chat::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, Mark, PostPolicy, Span};
-use common::{Cluster, SANDBOX_IMAGE, sandbox_toml, serial, skip_unless_sandboxed};
+use common::{Cluster, sandbox_toml, serial, skip_unless_sandboxed};
 use dispatch::{DispatchQuery, DispatchReply, DispatchStatus};
 
 /// convergence budget: mesh formation + leader rotation are real-time on a
@@ -85,35 +85,35 @@ struct ScriptProvider {
     tag: String,
     spec_dir: PathBuf,
     env_var: String,
-    script: PathBuf,
+    bin: PathBuf,
+}
+
+/// the test executor every provider here runs, as a shell one-liner: drain the
+/// payload, answer in the spec's output format.
+///
+/// It rides the spec's ARGV rather than a staged `provider.sh`, because a run
+/// executes inside a microVM that mounts nothing from the host — an executor a
+/// node lends has to already be in the guest rootfs. A host script reaches the
+/// guest as `execve /opt/duck/bin/provider.sh` and exit 126.
+fn script_provider_argv(stdout: &str) -> String {
+    // the payload is single-quoted for the shell (none of these carry a `'`)
+    // and TOML-escaped for the spec file. `\\n` is a TOML basic string's
+    // literal backslash-n, which is what printf wants.
+    let payload = stdout.replace('"', "\\\"");
+    format!(r#"["-c", "cat > /dev/null; printf '%s\\n' '{payload}'"]"#)
 }
 
 impl ScriptProvider {
     /// stage a provider under `root/<name>`: `format` is the spec's output
-    /// format and `stdout` the exact bytes the script prints (compose them to
-    /// match). the spec carries a per-provider `detect.env` name, so a node
-    /// provides this tag exactly when its process env names this script.
+    /// format and `stdout` the exact bytes it prints (compose them to match).
+    /// the spec carries a per-provider `detect.env` name, so a node provides
+    /// this tag exactly when its process env names this executor.
     fn stage(root: &std::path::Path, name: &str, tag: &str, format: &str, stdout: &str) -> Self {
         let dir = root.join(name);
         let spec_dir = dir.join("specs");
         std::fs::create_dir_all(&spec_dir).expect("provider spec dir");
-        let script = dir.join("provider.sh");
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\n\
-                 # a test executor, running in the sandbox: drain the payload\n\
-                 # and answer in the spec's output format. busybox `sh` and\n\
-                 # `cat` are the whole of its dependencies.\n\
-                 cat > /dev/null\n\
-                 printf '%s\\n' '{stdout}'\n",
-            ),
-        )
-        .expect("write provider script");
-        let mut perms = std::fs::metadata(&script).expect("script metadata").permissions();
-        use std::os::unix::fs::PermissionsExt as _;
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script, perms).expect("chmod provider script");
+        // resolved by basename to /opt/duck/bin/sh inside the guest
+        let bin = PathBuf::from("/bin/sh");
 
         let env_var = format!(
             "DUCKTAPE_TEST_{}_BIN",
@@ -130,11 +130,12 @@ impl ScriptProvider {
                  bin = \"{tag}-nonexistent-cli\"\n\
                  env = \"{env_var}\"\n\
                  [invoke]\n\
-                 args = []\n\
+                 args = {}\n\
                  prompt = \"stdin\"\n\
                  timeout_secs = 30\n\
                  [output]\n\
-                 format = \"{format}\"\n"
+                 format = \"{format}\"\n",
+                script_provider_argv(stdout)
             ),
         )
         .expect("write provider spec");
@@ -142,7 +143,7 @@ impl ScriptProvider {
             tag: tag.into(),
             spec_dir,
             env_var,
-            script,
+            bin,
         }
     }
 
@@ -156,7 +157,7 @@ impl ScriptProvider {
                 "DUCKTAPE_CAPABILITY_DIR".into(),
                 self.spec_dir.display().to_string(),
             ),
-            (self.env_var.clone(), self.script.display().to_string()),
+            (self.env_var.clone(), self.bin.display().to_string()),
         ]
     }
 
@@ -208,12 +209,12 @@ fn boot(cluster: &mut Cluster) {
     assert_eq!(genesis[0], genesis[2], "genesis fork between nodes 0 and 2");
     for i in 0..3 {
         cluster.wait_marker(i, "converged root_hash=", CONVERGE);
-        // What this marker covers, exactly: the daemon reached `PodmanService`
-        // + provider discovery. It does NOT cover the image — nothing is pulled
-        // at boot, so an unpullable tag passes here on every node and fails the
-        // run ~20s later. A dead libpod socket does not print it at all and
-        // burns the full budget. Neither is a skip: past `probe()` this suite
-        // has declared the host capable, so an unusable sandbox is a failure.
+        // What this marker covers, exactly: the daemon reached the sandbox
+        // probe + provider discovery. It does NOT cover a bootable guest — no
+        // VM starts until a run does, so an unreadable rootfs passes here on
+        // every node and fails the run seconds later. Not a skip either: past
+        // `probe()` this suite has declared the host capable, so an unusable
+        // sandbox is a failure.
         cluster.wait_compute_marker(i, "compute daemon serving", CONVERGE);
     }
 }
@@ -490,7 +491,7 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
     // HOW a run is isolated (the table) is independent of WHETHER this node runs
     // any (the grant); the compute daemon needs both, and refuses to boot
     // without the table. Appended LAST — nothing may follow a toml table header.
-    cluster.extra_toml.extend(sandbox_toml(SANDBOX_IMAGE));
+    cluster.extra_toml.extend(sandbox_toml());
     cluster.env[0] = hermetic_env(fixtures.path(), "node0");
     cluster.env[1] = [text_provider.env(), hide_builtins(fixtures.path(), "node1")].concat();
     cluster.env[2] = [json_provider.env(), hide_builtins(fixtures.path(), "node2")].concat();
@@ -650,7 +651,7 @@ fn unannounced_capable_nodes_race_accept_and_execute_once() {
     cluster.compute_grant = Some(vec![]);
     // and the table that says HOW it isolates one. Without it the daemon exits
     // at boot and this whole scenario silently exercises nothing.
-    cluster.extra_toml.extend(sandbox_toml(SANDBOX_IMAGE));
+    cluster.extra_toml.extend(sandbox_toml());
     cluster.env[0] = hermetic_env(fixtures.path(), "node0");
     cluster.env[1] = [racer_one.env(), hide_builtins(fixtures.path(), "node1")].concat();
     cluster.env[2] = [racer_two.env(), hide_builtins(fixtures.path(), "node2")].concat();

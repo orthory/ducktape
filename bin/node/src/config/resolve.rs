@@ -164,8 +164,8 @@ pub struct ServiceConfig {
     /// `coord.cap` delivered over its sealed `IntroReply::Admitted` ack via
     /// `save_coord_cap`.
     pub workspace: PathBuf,
-    /// the node's state root; per-service podman roots and provider state hang
-    /// off it too.
+    /// the node's state root; per-service roots and provider state hang off it
+    /// too.
     pub storage_dir: PathBuf,
     /// this network's chain id — the descriptor's own `chain_id` field (network
     /// shape) or the raw configured namespace (dev shape, which has no
@@ -275,9 +275,10 @@ fn service_dev_shape(raw: &DevSeedToml) -> Result<ServiceConfig, String> {
     })
 }
 
-/// the podman provider image default — what `[sandbox]` generation writes
-/// into a fresh table's `image`, and the commented example's value.
-pub const DEFAULT_PODMAN_IMAGE: &str = "docker.io/library/node:22-slim";
+/// where `ops/build-guest-rootfs.sh` writes the kernel and rootfs by default —
+/// the paths `[sandbox]` generation puts in a fresh table and in the commented
+/// example.
+pub const DEFAULT_GUEST_DIR: &str = "/var/lib/ducktape/guest";
 
 /// Gate the resolved sandbox backend on the user's compute grant.
 ///
@@ -306,10 +307,11 @@ fn gate_on_compute_grant(
 }
 
 /// resolve the operator's `[sandbox]` table into the compute plane: `None`
-/// (no table) = consensus-only node, no backend and no capacity; `"podman"`
-/// → `Podman` with the probed host totals, per-key overrides winning;
-/// any other runtime — "tart" and "direct" included, there is no macOS backend
-/// and no bare spawn — is a loud config error naming the audited adapter.
+/// (no table) = consensus-only node, no backend and no capacity;
+/// `"firecracker"` → the microVM backend with the probed host totals, per-key
+/// overrides winning; any other runtime — "podman", "tart" and "direct"
+/// included, there is no container backend, no macOS backend and no bare
+/// spawn — is a loud config error naming the audited adapter.
 fn resolve_sandbox(
     sandbox: Option<&SandboxToml>,
 ) -> Result<(Option<SandboxBackend>, BTreeMap<String, u64>), String> {
@@ -341,25 +343,19 @@ fn resolve_sandbox(
         }
         Ok(capacity)
     };
-    let image = sandbox.image.clone();
     match sandbox.runtime.as_str() {
-        "podman" => {
-            // NO socket here. There is no node-wide podman any more: each
-            // service daemon starts its own under `<storage>/services/<kind>`,
-            // so the only honest thing this layer can say is "podman, this
-            // image". `services::podman_backend` roots it for a kind, and it is
-            // the ONLY place that does — an unrooted socket is an empty path
-            // that fails loudly rather than silently dialing someone else's.
-            Ok((
-                Some(SandboxBackend::Podman {
-                    image,
-                    socket: PathBuf::new(),
-                }),
-                probed()?,
-            ))
+        "firecracker" => {
+            // The guest images are the whole backend: one kernel and one
+            // read-only rootfs, shared by every run on this node. Both are
+            // resolved to absolute paths here so a relative one in node.toml
+            // fails at config time rather than at the first boot, where it
+            // would read as "the guest never dialled back".
+            let kernel = absolute_runtime_path(&sandbox.kernel)?;
+            let rootfs = absolute_runtime_path(&sandbox.rootfs)?;
+            Ok((Some(SandboxBackend::Firecracker { kernel, rootfs }), probed()?))
         }
         other => Err(format!(
-            "sandbox runtime: {other:?} is not \"podman\" \
+            "sandbox runtime: {other:?} is not \"firecracker\" \
              (the sandbox is Linux-only, and provider runs never execute bare \
              on the host)"
         )),
@@ -675,9 +671,8 @@ fn resolve_advertised(
 /// the dev-seed shape: every peer dials every other through the
 /// index-aligned `peer_addrs` list (the mesh has no address gossip).
 fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
-    // the shared half first: it owns the storage/workspace derivation (which
-    // doubles as the podman-socket base) and must run before any field of `raw`
-    // is moved out below.
+    // the shared half first: it owns the storage/workspace derivation and must
+    // run before any field of `raw` is moved out below.
     let service = service_dev_shape(&raw)?;
     // the dev shape's per-process state dir stands in as its workspace, so its
     // grant file sits beside its storage — one rule for both shapes.
@@ -1181,7 +1176,7 @@ mod tests {
              storage_dir = {:?}\n",
             dir.join("storage").to_str().expect("utf8 path")
         );
-        let sandbox = sandbox_table("podman", "docker.io/library/node:22-slim", 0, 0);
+        let sandbox = sandbox_table("firecracker", "/var/lib/ducktape/guest", 0, 0);
 
         // a sandbox table alone announces NOTHING: it says how a run would be
         // isolated, never that the user consented to run any.
@@ -1231,9 +1226,10 @@ mod tests {
 
     /// one `[sandbox]` line-set for the dev-seed harness shape, appended
     /// LAST (everything after a toml table header belongs to the table).
-    fn sandbox_table(runtime: &str, image: &str, cores: u64, mem_gb: u64) -> String {
+    fn sandbox_table(runtime: &str, guest_dir: &str, cores: u64, mem_gb: u64) -> String {
         format!(
-            "[sandbox]\nruntime = \"{runtime}\"\nimage = \"{image}\"\ncores = {cores}\nmem_gb = {mem_gb}\n"
+            "[sandbox]\nruntime = \"{runtime}\"\nkernel = \"{guest_dir}/vmlinux\"\n\
+             rootfs = \"{guest_dir}/rootfs.ext4\"\ncores = {cores}\nmem_gb = {mem_gb}\n"
         )
     }
 
@@ -1260,46 +1256,42 @@ mod tests {
         .expect("write");
         resolve(&dir.join("node.toml")).expect_err("flat sandbox key refused");
 
-        // podman ⇒ Podman with the table's image + probed capacity (0 = probe).
+        // firecracker ⇒ the two guest images + probed capacity (0 = probe).
         std::fs::write(
             dir.join("node.toml"),
-            format!(
-                "{base}{}",
-                sandbox_table("podman", "docker.io/library/node:22-slim", 0, 0)
-            ),
+            format!("{base}{}", sandbox_table("firecracker", "/srv/guest", 0, 0)),
         )
         .expect("write");
-        let resolved = resolve(&dir.join("node.toml")).expect("resolve podman");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve firecracker");
         assert!(
             matches!(
                 &resolved.service.sandbox,
-                Some(SandboxBackend::Podman { image, .. })
-                    if image == "docker.io/library/node:22-slim"
+                Some(SandboxBackend::Firecracker { kernel, rootfs })
+                    if kernel == Path::new("/srv/guest/vmlinux")
+                        && rootfs == Path::new("/srv/guest/rootfs.ext4")
             ),
-            "podman backend with the probed image: {:?}",
+            "firecracker backend with the configured images: {:?}",
             resolved.service.sandbox
         );
         assert!(
             resolved.service.sandbox_capacity.get("cores").copied().unwrap_or(0) >= 1,
-            "a podman node announces its probed capacity"
+            "a compute node announces its probed capacity"
         );
 
-        // an override wins over the probe; a custom image is honored.
+        // an override wins over the probe; a custom guest directory is honored.
         std::fs::write(
             dir.join("node.toml"),
-            format!(
-                "{base}{}",
-                sandbox_table("podman", "docker.io/library/rust:1", 99, 128)
-            ),
+            format!("{base}{}", sandbox_table("firecracker", "/opt/other", 99, 128)),
         )
         .expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve overrides");
         assert!(
             matches!(
                 &resolved.service.sandbox,
-                Some(SandboxBackend::Podman { image, .. }) if image == "docker.io/library/rust:1"
+                Some(SandboxBackend::Firecracker { kernel, .. })
+                    if kernel == Path::new("/opt/other/vmlinux")
             ),
-            "custom image honored: {:?}",
+            "custom guest dir honored: {:?}",
             resolved.service.sandbox
         );
         assert_eq!(resolved.service.sandbox_capacity.get("cores"), Some(&99));
@@ -1307,17 +1299,18 @@ mod tests {
 
 
         // any other runtime is a loud config error naming the one audited
-        // adapter. "tart" is in this list ON PURPOSE: the macOS backend was
-        // removed, and an operator whose node.toml still names it must be told
-        // so at boot rather than silently getting something else.
-        for runtime in ["tart", "gvisor", "direct"] {
+        // adapter. "tart" and "podman" are in this list ON PURPOSE: both
+        // backends were removed, and an operator whose node.toml still names
+        // one must be told so at boot rather than silently getting something
+        // else.
+        for runtime in ["tart", "podman", "gvisor", "direct"] {
             std::fs::write(
                 dir.join("node.toml"),
-                format!("{base}{}", sandbox_table(runtime, "img", 0, 0)),
+                format!("{base}{}", sandbox_table(runtime, "/g", 0, 0)),
             )
             .expect("write");
             let err = resolve(&dir.join("node.toml")).expect_err("unknown runtime refused");
-            assert!(err.contains("podman"), "{err}");
+            assert!(err.contains("firecracker"), "{err}");
         }
     }
 

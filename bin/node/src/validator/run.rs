@@ -363,12 +363,12 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // module notes, which is the honest diagnostic on a node whose daemon is
     // not running.
     //
-    // PODMAN IS NOT THE NODE'S ANY MORE. Both planes that used to need it are
-    // out of process: compute serves dispatch work and agent serves interactive
-    // ptys, and each daemon starts its OWN node-private podman service under its
-    // own root (`<storage>/services/<kind>/podman`). Separate roots are what make
-    // them separate failure domains — one daemon restarting can no longer take
-    // the other's containers down with a shared `kill_on_drop` service child.
+    // THE SANDBOX IS NOT THE NODE'S ANY MORE. Both planes that used to need it
+    // are out of process: compute serves dispatch work and agent serves
+    // interactive ptys. Each run's VMM is a child of the daemon that booted it,
+    // so the daemons share no sandbox state at all — a restart of one cannot
+    // reach the other's runs, which is what makes them separate failure
+    // domains without any per-service root to keep apart.
     let workers: Vec<Box<dyn host::worker::Worker>> = Vec::new();
     // the CODE readiness self-signaller for pending code swaps — verifies (or
     // fetches) the committed component bytes and emits one truthful

@@ -16,9 +16,9 @@
 //!   actor lane. A daemon holds no keypair and no mesh identity, so that path
 //!   stays node-to-node — which is what the design always said it was.
 //!
-//! What crossed is exactly the podman-touching half: provider discovery, the
-//! `PodmanService`, `spawn_interactive`, and each session's pump and reaper.
-//! That is the whole milestone — after this, `bin/node` constructs none of them.
+//! What crossed is exactly the sandbox-touching half: provider discovery,
+//! `spawn_interactive`, and each session's pump and reaper. That is the whole
+//! milestone — after this, `bin/node` constructs none of them.
 //!
 //! ## agent and compute are siblings
 //!
@@ -27,11 +27,11 @@
 //! provider/sandbox/broker libraries and spawn their own sandboxes; their bus,
 //! where they have one at all, is the chain.
 //!
-//! The one real co-tenancy hazard is podman. Two resolutions, both in force:
-//! container ownership is label-scoped to this instance
-//! (`io.ducktape.managed=agent#<hex8>`), and this daemon runs its OWN podman
-//! service under its own root — so neither reaper can see the other's
-//! containers and neither process's exit can kill the other's service child.
+//! Co-tenancy is not a hazard here, and the microVM backend is why: a run's VMM
+//! is a child of the daemon that started it and dies with it, so there is no
+//! shared daemon, no shared storage root and no shared reaper to confuse. Run
+//! ownership is still recorded per instance (`agent#<hex8>`) so a restarted
+//! daemon can tell its own leftovers from a sibling's.
 //!
 //! ## the credential path is unchanged in shape
 //!
@@ -70,8 +70,8 @@ pub(crate) struct Agent {
 /// that is an operational state, not an error.
 ///
 /// Through [`crate::services::serve_until_stopped`], which owns the runtime and
-/// arms SIGTERM/SIGINT before a line of this daemon runs: the `podman system
-/// service` started below must never outlive the process that started it.
+/// arms SIGTERM/SIGINT before a line of this daemon runs: a session's VMM is a
+/// child of this process and must never outlive it holding guest memory.
 pub(crate) fn serve(agent: Agent) -> Result<(), Box<dyn std::error::Error>> {
     crate::services::serve_until_stopped(std::future::pending(), |stop| run(agent, stop))
 }
@@ -88,34 +88,17 @@ async fn run(
         workspace,
     } = agent;
     let node_key = node_key.to_vec();
-    let backend = crate::services::podman_backend(&service, &grant.kind)?;
+    let backend = crate::services::sandbox_backend(&service)?;
+    // Fail-closed at BOOT rather than 150 s into a run: probe verifies
+    // /dev/kvm opens read-write for this process and that the guest images
+    // exist. A daemon that signals an interactive plane it cannot sandbox is
+    // worse than one that refuses to start.
+    backend.probe()?;
+    // There is no daemon to start and nothing to sweep. Each run's VMM is a
+    // child of this process spawned kill_on_drop, so a death that ran no code
+    // still takes its guests with it.
 
-    // this daemon's OWN podman service — its socket, storage root and egress
-    // hook, under `<storage>/services/agent`. Fail-closed: a start failure ends
-    // the process rather than leaving a daemon that signals an interactive
-    // plane it cannot sandbox. Held for the process's life; dropping it stops
-    // the service child.
-    let self_exe = std::env::current_exe()
-        .map_err(|error| format!("cannot resolve this daemon's own executable: {error}"))?;
-    let podman = provider_host::PodmanService::start_for(
-        &backend,
-        &crate::services::podman_data_dir(&service, &grant.kind),
-        &self_exe,
-    )
-    .await?;
-    // whatever still carries this instance's label got here through a death
-    // that ran no code — the stop path leaves none — and is destroyed, never
-    // resumed. See [`crate::services::Sweep`].
-    crate::services::sweep_own_containers(&backend, &grant, crate::services::Sweep::CrashOrphans)
-        .await;
-
-    let providers = agent_service::discover(
-        &node_key,
-        // cloned: `discover` consumes the backend, and the teardown below needs
-        // the same socket to sweep this instance's containers through.
-        backend.clone(),
-        &grant.display_id(),
-    )?;
+    let providers = agent_service::discover(&node_key, backend, &grant.display_id())?;
     let offered = providers.capabilities().len();
 
     let (events, event_rx) = tokio::sync::mpsc::channel(link::EVENT_LANE);
@@ -143,42 +126,15 @@ async fn run(
         () = link::attach(ws_url(&http_base), workspace, sessions, event_rx) => {}
         () = stop => {}
     }
-    stop_sandbox(podman, &backend, &grant).await;
-    Ok(())
-}
-
-/// Tear the sandbox down, containers FIRST.
-///
-/// Order is the whole point. Killing the `podman system service` does not stop
-/// what it created: each session container's conmon is its own parent, ignores
-/// SIGTERM, and would keep the session alive under a service that no longer
-/// exists. So this instance's containers are REMOVED here rather than left for
-/// the next start's reaper — over the socket that is still answering right now,
-/// which is the only instrument that reaches them — and only then does the
-/// service child go. Leaving them would mean a stopped daemon still holding a
-/// pty's container and a graph root until something happened to start that kind
-/// again, which on a torn-down workspace is never.
-///
-/// SIGKILL still leaves both behind, and nothing here can change that: the
-/// answer there is the next start of the same kind, where `PodmanService::claim`
-/// reaps the podman service under a root nobody holds any more and the boot
-/// sweep destroys the containers.
-async fn stop_sandbox(
-    podman: Option<provider_host::PodmanService>,
-    backend: &provider_host::SandboxBackend,
-    grant: &ServiceGrant,
-) {
-    crate::services::sweep_own_containers(backend, grant, crate::services::Sweep::Teardown).await;
-    let Some(service) = podman else {
-        // a non-Podman backend started no service.
-        return;
-    };
-    service.shutdown().await;
+    // Nothing to tear down. Every live run's VMM is a child of this process
+    // spawned kill_on_drop, so returning from here is the teardown — and that
+    // covers SIGKILL too, which the container backend's sweep could not.
     tracing::info!(
         target: "ducktape::service",
         instance = %grant.display_id(),
         "agent daemon stopped"
     );
+    Ok(())
 }
 
 /// `http(s)://host:port` → `ws(s)://host:port/v1/ws`.

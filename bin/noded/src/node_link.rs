@@ -18,9 +18,9 @@
 //! daemon needs no keypair of its own.
 //!
 //! Two things stay host-local paths rather than `/v1` calls, because they are
-//! host resources and not node state: the node-private podman socket, and the
-//! forge module's materialized bare repos (`<storage>/forge-repo`), which the
-//! worktree lane clones from directly. A daemon that drives this host's podman
+//! host resources and not node state: the guest images a run boots from, and
+//! the forge module's materialized bare repos (`<storage>/forge-repo`), which
+//! the worktree lane clones from directly. A daemon that boots this host's VMs
 //! is already on this host.
 
 use std::path::{Path, PathBuf};

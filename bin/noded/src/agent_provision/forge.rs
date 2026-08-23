@@ -451,8 +451,10 @@ fn provision_blocking(args: ProvisionArgs) -> Result<ProvisionArgs, String> {
             String::from_utf8_lossy(&present.stderr).trim()
         ));
     }
-    // A SELF-CONTAINED clone keeps `.git` inside the directory Podman already
-    // mounts. `--no-hardlinks` is load-bearing: the untrusted run must not be
+    // A SELF-CONTAINED clone keeps `.git` inside the workdir, which is the only
+    // thing that crosses into the guest (as its workspace device — a `.git`
+    // outside it would simply not be there).
+    // `--no-hardlinks` is load-bearing: the untrusted run must not be
     // able to corrupt the node's canonical object store through a shared inode.
     let cloned = git(repo_dir)
         .args(["clone", "--local", "--no-hardlinks", "--no-checkout"])

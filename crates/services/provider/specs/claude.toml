@@ -55,8 +55,8 @@ format = "json-result"
 # entirely by ENV (ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN), so the same
 # isolation applies — the credential stays in the host broker, the child gets
 # only the opaque bearer + loopback base URL, and the fresh CLAUDE_CONFIG_DIR
-# blocks any ~/.claude fallback. Pending live validation against the real claude
-# binary on a podman host (see the design spec).
+# blocks any ~/.claude fallback. Validated live against the real claude binary
+# inside a microVM (see the design spec).
 args = []
 # The RESTRICTED argv for a SHARED (command-lane) session: read-only + never
 # prompt. A shared session is driven by ordered commands, so no single member is
@@ -80,11 +80,11 @@ restricted_args = ["--permission-mode", "plan"]
 # ~/.claude/.credentials.json and must use ANTHROPIC_AUTH_TOKEN toward the broker
 # the ANTHROPIC_BASE_URL names. Without it the broker would be decorative.
 #
-# Note there is deliberately NO [sandbox] rw_dirs here (it is a hard load error
-# to have both): mounting ~/.claude would put the credential back in the child
-# and quietly undo all of the above — the exact regression this replaces.
-# Applies under the Direct AND Podman backends; a Podman run reaches the broker
-# at host.containers.internal. Inherited by every [[variants]] tag below.
+# There is no way to mount ~/.claude in instead: the spec format has no
+# [sandbox] table, and a run's microVM shares no filesystem with the host. The
+# guest reaches the host-side broker because duck-guest-init serves its port on
+# the VM's own loopback and tunnels it over vsock.
+# Inherited by every [[variants]] tag below.
 config_home_env = "CLAUDE_CONFIG_DIR"
 broker = "anthropic-messages"
 

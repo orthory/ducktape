@@ -47,50 +47,33 @@ fn daemon_for(kind: &str) -> Option<Daemon> {
     }
 }
 
-/// where one service kind keeps its private podman state: storage root, runroot
-/// and egress hooks.
-///
-/// Per-service roots rather than one shared service, and that is a
-/// failure-domain decision, not tidiness: [`provider_host::PodmanService`]
-/// supervises the service child with `kill_on_drop`, so one service between two
-/// daemons would die with whichever started it and take the other's live
-/// containers along — exactly the coupling separate processes exist to remove.
-/// The honest cost is two image stores: an image both services use is pulled
-/// into each.
-pub(crate) fn podman_data_dir(service: &config::ServiceConfig, kind: &str) -> PathBuf {
-    service.storage_dir.join("services").join(kind)
-}
+// `podman_data_dir` lived here: the per-service storage root, runroot and hooks
+// directory a private podman service needed, kept per-kind so two daemons did
+// not share a `kill_on_drop` service child. There is no service child now — a
+// run's VMM is a child of the daemon that started it — so two daemons share no
+// state at all rather than carefully sharing none.
 
-/// this service's OWN sandbox backend, with its socket named.
+/// this service's OWN sandbox backend.
 ///
-/// The socket lives in the RUNTIME dir, not under the data dir: a unix socket
-/// path is capped near 108 bytes and a workspace path is unbounded, so deriving
-/// one from the other is a latent `bind: invalid argument` on any host with a
-/// slightly long home or network name.
-///
-/// Podman is the whole `SandboxBackend` enum from this crate, so this always
-/// re-roots; a future backend fails to destructure here until it is routed.
-pub(crate) fn podman_backend(
+/// A pass-through now that every run gets its own microVM: the configured
+/// kernel and rootfs ARE the backend, and there is no per-service socket to
+/// name because there is no daemon to name it for. The container backend
+/// re-rooted the socket here, into the runtime dir rather than the data dir,
+/// because a unix socket path is capped near 108 bytes while a workspace path
+/// is unbounded. That trap did not disappear — [`provider_host::MicroVm::boot`]
+/// carries it for the per-run vsock path instead.
+pub(crate) fn sandbox_backend(
     service: &config::ServiceConfig,
-    kind: &str,
 ) -> Result<provider_host::SandboxBackend, String> {
     // the fix is already IN the file this complains about: `node init` writes
     // the whole `[sandbox]` block commented out, so "uncomment it" is a real
     // instruction rather than a spec to go and look up.
-    let backend = service.sandbox.clone().ok_or_else(|| {
+    service.sandbox.clone().ok_or_else(|| {
         format!(
             "no [sandbox] table in node.toml: this host has no configured way to isolate a run \
              — uncomment the [sandbox] block at the end of {}/node.toml, then restart the node",
             service.workspace.display()
         )
-    })?;
-    let provider_host::SandboxBackend::Podman { image, .. } = backend;
-    Ok(provider_host::SandboxBackend::Podman {
-        image,
-        socket: provider_host::PodmanService::socket_path(
-            &podman_data_dir(service, kind),
-            kind,
-        ),
     })
 }
 
@@ -1410,9 +1393,8 @@ pub(crate) type Stop = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
 /// ordering that matters exists in ONE place: the handlers are installed before
 /// `body` is even constructed, which is what closes the window in which a
 /// default-disposition SIGTERM kills a daemon that has already published a
-/// gateway route or started a `podman system service`. That orphaned service
-/// child outlives its owner at ppid 1, still answering on its socket, with its
-/// containers still running — the defect this exists to prevent. Copying the
+/// gateway route — a route file outliving its owner, pointing at a port
+/// anything may then bind, is the defect this exists to prevent. Copying the
 /// ordering into three `serve` fns is how two of them drift; a body cannot get
 /// it wrong here, because it never touches it.
 ///
@@ -1445,19 +1427,14 @@ where
 
 /// Install the stop handlers NOW and return a future that waits on them: SIGTERM
 /// is what systemd and a killed shell send, SIGINT is Ctrl-C, and SIGHUP is a
-/// dropped ssh session or a closed terminal. SIGHUP must run the same teardown:
-/// the podman service child sits in its OWN process group (so Ctrl-C cannot kill
-/// it before the container sweep), which also means the terminal's HUP no longer
-/// reaches it — without this arm, a hangup would kill the daemon at default
-/// disposition and leave the detached podman running indefinitely.
+/// dropped ssh session or a closed terminal. All three run the same teardown —
+/// a daemon that dies at signal default leaves its published gateway route
+/// pointing at a port anything may then bind.
 ///
 /// The split matters. `signal()` installs the handler when it is CALLED; the
 /// future it returns only waits. Building that future lazily inside a `select!`
 /// would leave a window between the daemon publishing something and the first
-/// poll in which a SIGTERM takes its DEFAULT disposition — killing the process
-/// with a live gateway route pointing at a port anything may then bind, or with
-/// a `podman system service` child that survives at ppid 1 with its containers
-/// still running.
+/// poll in which a SIGTERM takes its DEFAULT disposition.
 ///
 /// It must also be called INSIDE a runtime: `signal()` PANICS outside a reactor
 /// rather than returning `Err`, so hoisting this out of
@@ -1465,27 +1442,22 @@ where
 /// compile-time complaint.
 ///
 /// SIGKILL is deliberately NOT covered, and cannot be: nothing runs on a
-/// `kill -9`, so the service child and its containers survive it. The answer
-/// there is the next start of the same kind — `PodmanService::claim` reaps the
-/// podman service recorded under a root nobody holds any more, and each daemon's
-/// boot sweep ([`Sweep::CrashOrphans`]) removes its label-scoped containers over
-/// the new socket on the same graph root. That path must keep working; it is the
-/// only one a SIGKILL has.
+/// `kill -9`. What survives it is only the route file, which the next start of
+/// the same kind reclaims. A run's guest does NOT survive it — the VMM is a
+/// child of this process, so the kernel takes it down with the daemon. That is
+/// the whole reason the container era's orphan sweep is gone rather than
+/// ported.
 ///
-/// A handler that will not install is NOT fatal, but it is not harmless either:
-/// the daemon then dies at signal default with no teardown, and because podman
-/// is in its own process group the service survives that death — the SIGKILL
-/// shape, cleaned up only by the next start of this kind ([`PodmanService::
-/// claim`]'s reap plus the boot sweep). The future parks so the daemon keeps
-/// owning the process.
+/// A handler that will not install is NOT fatal: the daemon then dies at signal
+/// default with no teardown, which is the SIGKILL shape above. The future parks
+/// so the daemon keeps owning the process.
 ///
 /// The other half is deliberately NOT closed, and should stay open: tokio's
 /// handlers remain installed after these `Signal`s drop, so a SECOND SIGTERM
 /// arriving during a teardown is swallowed and SIGKILL is the operator's only
-/// escape. A teardown is one file write or one container sweep — a hang there
-/// means an unwritable workspace or a wedged podman, which is the real problem —
-/// and a SIGTERM-count escalation is not worth its complexity. Do not "finish"
-/// this.
+/// escape. A teardown is one file write — a hang there means an unwritable
+/// workspace, which is the real problem — and a SIGTERM-count escalation is not
+/// worth its complexity. Do not "finish" this.
 fn arm_stop_requested() -> impl std::future::Future<Output = ()> {
     use tokio::signal::unix::{SignalKind, signal};
     let armed = (
@@ -1510,125 +1482,12 @@ fn arm_stop_requested() -> impl std::future::Future<Output = ()> {
     }
 }
 
-/// Why a daemon is sweeping the containers carrying its own instance label —
-/// the ONE discriminant the report below branches on. The two ends of a daemon's
-/// life mean DIFFERENT things and must not be logged as one: a boot sweep
-/// destroys work a crash left running, a stop sweep is routine hygiene.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Sweep {
-    /// At BOOT. Whatever still carries this instance's label survived a death
-    /// that ran no code (SIGKILL, the OOM killer, power loss) — the stop path
-    /// leaves none. It is DESTROYED, not resumed: there is no attach path in
-    /// this tree, and a run's output lane, broker endpoint and provisioned
-    /// workspace all died with the process that owned them. The saga's lease
-    /// timeout re-leases the attempt and it executes again from the start, so
-    /// this is lost work and says so.
-    CrashOrphans,
-    /// At STOP. Our own live containers, taken down before the podman service
-    /// that hosts them — routine, and the reason a later boot can assume
-    /// anything it finds is an orphan.
-    Teardown,
-}
-
-/// What a finished sweep is worth saying. Decided here, written by
-/// [`sweep_own_containers`] — so the boot/stop distinction is checkable without
-/// a podman socket.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub(crate) enum SweepReport {
-    /// nothing carried the label: the ordinary boot, and every clean stop that
-    /// had no session running.
-    Quiet,
-    /// a crash left containers behind and their work is gone with them.
-    Destroyed(usize),
-    /// this daemon's own containers, removed on the way out.
-    Removed(usize),
-    /// the sweep itself failed. Never fatal — at boot it costs a stale
-    /// container, at stop it leaves one for the next boot to destroy.
-    Failed(String),
-}
-
-/// Decide what to say about a sweep. Pure: one discriminant, one match.
-pub(crate) fn sweep_report(sweep: Sweep, outcome: Result<usize, String>) -> SweepReport {
-    let removed = match outcome {
-        Ok(removed) => removed,
-        Err(error) => return SweepReport::Failed(error),
-    };
-    let swept_nothing = removed == 0;
-    if swept_nothing {
-        return SweepReport::Quiet;
-    }
-    match sweep {
-        Sweep::CrashOrphans => SweepReport::Destroyed(removed),
-        Sweep::Teardown => SweepReport::Removed(removed),
-    }
-}
-
-/// Remove every container carrying this instance's label, over this daemon's own
-/// podman socket.
-///
-/// The ONE sweep both daemons use, at both ends of their life — compute and
-/// agent differed only in the noun in their log line, which is not worth two
-/// copies of a rule about destroying an operator's work.
-///
-/// Best-effort by construction: a sweep failure is a line, never a boot failure
-/// and never a failed stop.
-pub(crate) async fn sweep_own_containers(
-    backend: &provider_host::SandboxBackend,
-    grant: &ServiceGrant,
-    sweep: Sweep,
-) {
-    // one discriminant, one match, no wildcard. `Bare` does not exist from this
-    // crate (it is gated on sandbox-host's own test/testkit cfg, which node-bin
-    // never enables), so Podman is the whole enum here — and a future backend
-    // fails this match until it is routed.
-    let socket = match backend {
-        provider_host::SandboxBackend::Podman { socket, .. } => socket,
-    };
-    let label = provider_host::managed_label(&grant.display_id());
-    // Bounded: `reap_by_label` has no timeout of its own, and a wedged podman
-    // socket must not hang the stop path forever — the second Ctrl-C is
-    // deliberately swallowed (see `arm_stop_requested`), so a hang here would
-    // leave SIGKILL, which orphans the detached podman group, as the only exit.
-    // 30s is load-stated: podman's default stop grace is 10s per container and
-    // one daemon's label rarely covers more than a couple of live runs, while a
-    // WEDGED socket answers nothing at any deadline — past 30s the bound costs
-    // only stop latency. Expiry maps to `SweepReport::Failed`, which both ends
-    // of the daemon's life already declare non-fatal.
-    const SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
-    let sweep_future = provider_host::reap_by_label(socket, &label);
-    let outcome = match tokio::time::timeout(SWEEP_BUDGET, sweep_future).await {
-        Ok(outcome) => outcome,
-        Err(_elapsed) => Err(format!(
-            "sweep did not finish within {}s — podman socket not answering",
-            SWEEP_BUDGET.as_secs()
-        )),
-    };
-    match sweep_report(sweep, outcome) {
-        SweepReport::Quiet => {}
-        // a crash destroyed work: once per boot, and the operator's runs are
-        // what was lost, so it is not an `info`.
-        SweepReport::Destroyed(removed) => tracing::warn!(
-            target: "ducktape::service",
-            instance = %grant.display_id(),
-            removed,
-            reason = "crash_orphans_destroyed",
-            "containers left by an earlier death were removed, not resumed — their work re-executes from the start"
-        ),
-        SweepReport::Removed(removed) => tracing::info!(
-            target: "ducktape::service",
-            instance = %grant.display_id(),
-            removed,
-            reason = "own_containers_removed",
-            "this instance's containers were removed before its sandbox service stopped"
-        ),
-        SweepReport::Failed(error) => tracing::warn!(
-            target: "ducktape::service",
-            instance = %grant.display_id(),
-            reason = "container_sweep_failed",
-            "could not sweep this instance's containers: {error}"
-        ),
-    }
-}
+// The container-sweep machinery (`Sweep`, `SweepReport`, `sweep_own_containers`)
+// lived here. It is deleted, not ported: it existed because a crashed daemon
+// left containers running under a podman service at ppid 1, so a successor had
+// to find and destroy them by label. A microVM's VMM is a child of the daemon
+// and dies with it — including on SIGKILL, which is the case the sweep was
+// written for. There is nothing left behind to sweep.
 
 /// the grant scopes a kind's daemon actually exercises — what the consent
 /// screen shows and what `service status` lists.
@@ -1701,7 +1560,7 @@ fn discover_executors(
     service: &config::ServiceConfig,
     node_key: &[u8; 32],
 ) -> Result<Vec<String>, String> {
-    let backend = podman_backend(service, kind)?;
+    let backend = sandbox_backend(service)?;
     // the same precondition the node's own boot enforces — a daemon must not
     // advertise tags it has no runnable sandbox for.
     backend.probe().map_err(|error| format!("sandbox: {error}"))?;
@@ -2165,8 +2024,8 @@ mod tests {
     /// while the production ordering was broken.
     ///
     /// The body raises a REAL SIGTERM at this process the moment it starts, i.e.
-    /// at the first instant a daemon could have published a route or started a
-    /// `podman system service`. Delete the arming and the default disposition
+    /// at the first instant a daemon could have published a route or booted a
+    /// run's VM. Delete the arming and the default disposition
     /// ends the test binary right there; hoist it out of `block_on` and
     /// `signal()` panics for want of a reactor. It then returns only because the
     /// armed handler is WIRED into the stop the body was handed — `also_stop` is
@@ -2188,8 +2047,8 @@ mod tests {
 
     /// The shape, guarded where a comment cannot reach: every daemon must ENTER
     /// through [`serve_until_stopped`]. One that builds its own runtime again is
-    /// one whose `podman system service` outlives it at ppid 1 — and no test
-    /// above would notice, because the arming it skipped still works.
+    /// one whose gateway route outlives it — and no test above would notice,
+    /// because the arming it skipped still works.
     #[test]
     fn every_daemon_enters_through_the_one_armed_entry() {
         for (daemon, source) in [
@@ -2208,30 +2067,26 @@ mod tests {
         }
     }
 
-    /// The two ends of a daemon's life are not the same event, and the log is
-    /// the only place an operator learns which one happened. A boot sweep
-    /// DESTROYS work a crash left running; a stop sweep is hygiene. Reporting
-    /// both as "reaped orphans" is what told a reader their in-flight run had
-    /// been re-adopted when it had been deleted and re-executed.
+    /// A daemon must not leave a run alive behind it, and under the microVM
+    /// backend that is a property of the code rather than of a sweep: the VMM
+    /// is spawned `kill_on_drop`, so it dies with the daemon — including on a
+    /// SIGKILL, which is the case the deleted sweep existed for.
+    ///
+    /// Guarded by parsing the source because there is no way to observe it from
+    /// a unit test: the alternative is a hardware test that SIGKILLs a daemon
+    /// and looks for stray `firecracker` processes, which is what this replaces.
     #[test]
-    fn a_boot_sweep_destroys_work_and_a_stop_sweep_does_not() {
-        assert_eq!(
-            sweep_report(Sweep::CrashOrphans, Ok(2)),
-            SweepReport::Destroyed(2),
-            "containers found at boot are lost work, not resumed work"
-        );
-        assert_eq!(
-            sweep_report(Sweep::Teardown, Ok(2)),
-            SweepReport::Removed(2),
-            "containers we take down on the way out are routine"
-        );
-        // nothing to say either way, which is the ordinary boot and most stops.
-        assert_eq!(sweep_report(Sweep::CrashOrphans, Ok(0)), SweepReport::Quiet);
-        assert_eq!(sweep_report(Sweep::Teardown, Ok(0)), SweepReport::Quiet);
-        // a sweep that could not run says so instead of claiming an empty one.
-        assert_eq!(
-            sweep_report(Sweep::Teardown, Err("no socket".into())),
-            SweepReport::Failed("no socket".into())
+    fn a_runs_vmm_cannot_outlive_the_daemon_that_spawned_it() {
+        let source = include_str!("../../../crates/services/sandbox/src/microvm.rs");
+        let (_, after_spawn) = source
+            .split_once("Command::new(&firecracker)")
+            .expect("the VMM spawn");
+        let (args, _) = after_spawn.split_once(".spawn()").expect("spawn call");
+        assert!(
+            args.contains("kill_on_drop(true)"),
+            "the VMM must die with the daemon: without kill_on_drop a SIGKILLed \
+             daemon leaves a guest holding its whole memory footprint, with no \
+             successor able to find it"
         );
     }
 

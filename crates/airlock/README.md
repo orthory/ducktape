@@ -120,7 +120,7 @@ export DUCKTAPE_AIRLOCK_ATTEST=snp                  # or tdx
 export DUCKTAPE_AIRLOCK_SNP_PRODUCT=milan           # snp: pin the platform generation
 # optional transport overrides: DUCKTAPE_AIRLOCK_SNP_VCEK=<der file> (air-gapped),
 # DUCKTAPE_AIRLOCK_PCCS_URL=<pccs> (tdx)
-# then run a claude agent through capability-host (podman) as usual — the run's
+# then run a claude agent through capability-host as usual — the run's
 # /v1/messages flow crosses the overlay to the enclave.
 ```
 
@@ -225,12 +225,12 @@ unchanged; a TEE-silicon rerun is the standing hardware TODO):
 1. `airlock-gateway serve --anthropic-base https://api.anthropic.com` (loopback).
 2. `ducktape user cred seal --credentials ~/.claude/.credentials.json --cred-kind bearer`
    — seals the current subscription access token (no rotation).
-3. A `claude` CLI inside a **podman** sandbox holding only the opaque run bearer,
+3. A `claude` CLI inside a **microVM** holding only the opaque run bearer,
    driven through `capability-host` in airlock mode
    (`DUCKTAPE_AIRLOCK_GATEWAY`/`_MEASUREMENT`/`_ATTEST`) — the ignored live test
    `claude_model_turn_through_the_broker`.
 
-`podman(claude) → capability-host broker → airlock gateway → real api.anthropic.com`
+`microVM(claude) → capability-host broker → airlock gateway → real api.anthropic.com`
 returned a real completion; the sandbox never held the credential, only the
 temp bearer.
 

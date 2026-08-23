@@ -191,44 +191,25 @@ pub struct Cluster {
 }
 
 impl Drop for Cluster {
-    /// Reap each compute daemon AND the podman service it left behind.
+    /// Kill every daemon this cluster started.
     ///
-    /// [`NodeProc::drop`] SIGKILLs, so a compute daemon never runs
-    /// [`provider_host::PodmanService`]'s `kill_on_drop` — and that service was
-    /// started `--time=0`, meaning it never idle-exits. It therefore outlives the
-    /// whole test holding ~45 MB, rooted in a tempdir that is about to vanish.
-    /// `PodmanService::claim` only reaps such an orphan when a SUCCESSOR boots on
-    /// the same root, and a torn-down cluster never gets one: left alone these
-    /// accumulate for as long as the box stays up (102 of them, ~4.5 GB, were
-    /// swept by hand once).
-    ///
-    /// Runs BEFORE the fields drop, which is the whole point — the pid file lives
-    /// in `dir`. Daemons go first so nothing re-creates a service after the sweep.
-    /// The reap is identity-verified by executable inside `provider_host`, never a
-    /// `pkill -f` pattern match (which has killed an agent's own shell here).
+    /// There is nothing to reap after them any more. A compute daemon used to
+    /// leave a `podman system service` child behind — started `--time=0` so it
+    /// never idle-exited, surviving the SIGKILL in [`NodeProc::drop`], holding
+    /// ~45 MB rooted in a tempdir about to vanish, and reaped only when a
+    /// SUCCESSOR booted on the same root, which a torn-down cluster never gets
+    /// (102 of them, ~4.5 GB, were once swept by hand). A run's VMM is a child
+    /// of its daemon spawned `kill_on_drop`, so the SIGKILL that ends the
+    /// daemon ends its guests too.
     fn drop(&mut self) {
-        // BOTH daemon sets, and both before the sweep: the implicit compute
-        // daemon `spawn` starts, and whatever `spawn_service` started by hand.
-        // A survivor of either kind could re-create a service after the sweep.
         for daemon in &mut self.daemons {
             *daemon = None; // NodeProc::drop kills + waits
         }
         for procs in &mut self.services {
             procs.clear(); // same: kill + wait
         }
-        for idx in 0..self.peer_ids.len() {
-            provider_host::reap_service_at(
-                &self.workspace(idx).join("services").join(COMPUTE_SERVICE_KIND),
-            );
-        }
     }
 }
-
-/// the service kind whose podman root this harness reaps. It is the only kind
-/// that HAS one: `airlock`, the other kind [`Cluster::spawn_service`] starts,
-/// spawns no container runtime at all — that is the whole point of the lender
-/// being a keyless plug. An `agent` daemon would need its own entry here.
-const COMPUTE_SERVICE_KIND: &str = "compute";
 
 /// One `ducktape service run <kind>` daemon attached to a node.
 struct ServiceProc {
@@ -469,13 +450,12 @@ impl NetworkShapeCluster {
     ///
     /// The daemon PROCESS is deliberately not spawned, and that is a SCOPING
     /// choice, not a limitation of the host: a daemon's entire contribution to
-    /// the announce lane is this POST, so booting a container runtime to prove
-    /// capability announcement buys no extra signal and couples this lane to
-    /// podman's availability and startup cost. What a real daemon would
-    /// additionally prove — that a REAL hello carries the shape this lane
-    /// expects — is a daemon-fixture concern, and it belongs in the dispatch
-    /// e2e (#826), which owns the `[sandbox]` fixture, the portable-podman
-    /// PATH, and the libpod pull-on-404 fix that lane actually needs.
+    /// the announce lane is this POST, so booting a sandbox to prove capability
+    /// announcement buys no extra signal and couples this lane to `/dev/kvm`
+    /// and the guest artifacts. What a real daemon would additionally prove —
+    /// that a REAL hello carries the shape this lane expects — is a
+    /// daemon-fixture concern, and it belongs in the dispatch e2e (#826), which
+    /// owns the `[sandbox]` fixture that lane actually needs.
     ///
     /// The FIRST hello is synchronous and asserted — that IS the readiness
     /// event; the refresh then rides a heartbeat thread like the daemon's.
@@ -934,15 +914,22 @@ impl Cluster {
 
     /// spawn node `idx`'s compute daemon, when it has a grant to act under.
     ///
-    /// Waits for the node's app surface FIRST, and that is not politeness: the
-    /// daemon's opening move is a `/v1/services/hello` POST whose failure is
-    /// deliberately fatal (`run_service`: "the FIRST hello must land ... a build
-    /// mismatch or a down node is a loud exit, not a silent spin"). Only the
-    /// query lane retries. Launching both processes in the same breath therefore
-    /// killed the daemon outright whenever it won the race to the socket —
-    /// observed as `FATAL: POST http://…/v1/services/hello` — which is a
-    /// coin-flip, not a test. An operator starts a service against a node that
-    /// is already up, and so does this.
+    /// Waits for the node to PUBLISH ITS MESH IDENTITY first, and that is not
+    /// politeness: the daemon's opening move is a `/v1/services/hello` POST
+    /// whose failure is deliberately fatal (`run_service`: "the FIRST hello
+    /// must land ... a build mismatch or a down node is a loud exit, not a
+    /// silent spin"). Only the query lane retries. Launching both processes in
+    /// the same breath therefore killed the daemon outright whenever it won the
+    /// race to the socket — observed as `FATAL: POST http://…/v1/services/hello`
+    /// — which is a coin-flip, not a test. An operator starts a service against
+    /// a node that is already up, and so does this.
+    ///
+    /// "app surface listening" is the WRONG marker for it and used to be the one
+    /// waited on: the node binds its HTTP listener well before the boundary
+    /// status carries a `public_key`, so the daemon could reach a node that was
+    /// up and still read `public_key: ""` — exiting with `FATAL: this node has
+    /// not published a mesh identity yet`. `validator::run` logs the publish as
+    /// its own once-per-boot fact precisely so this wait has a seam to hold.
     ///
     /// `--config` points it at the SAME dev-shape config the node reads (a dev
     /// workspace is its `storage_dir`, which does not contain the config file,
@@ -951,7 +938,7 @@ impl Cluster {
         if self.compute_grant.is_none() {
             return;
         }
-        self.wait_marker(idx, "app surface listening", Duration::from_secs(90));
+        self.wait_marker(idx, "mesh identity published", Duration::from_secs(90));
         let id = self.peer_ids[idx];
         let cfg = self.config_path(idx);
         let log = self.dir.path().join(format!("compute{id}.log"));
@@ -979,8 +966,11 @@ impl Cluster {
     ///
     /// Called EXPLICITLY rather than folded into [`Self::spawn`] (where the
     /// compute daemon rides along) because a daemon's FIRST hello must LAND:
-    /// the node's http surface has to be listening before the daemon starts,
-    /// and only the test knows when it has waited for that.
+    /// the node has to have PUBLISHED ITS MESH IDENTITY before the daemon
+    /// starts — a listening http surface is not enough, see [`Self::spawn_compute`]
+    /// — and only the test knows when it has waited for that. Any caller that
+    /// waited on committed state has already cleared it: the identity goes out
+    /// in the startup snapshot, before the first block.
     pub fn spawn_service(&mut self, idx: usize, kind: &str) {
         let id = self.peer_ids[idx];
         // One grant per kind is the file's rule and one daemon per kind is the
@@ -1292,7 +1282,7 @@ impl Cluster {
     ///
     /// The compute plane is a SEPARATE PROCESS with its own failure domain, and
     /// without this the suite has no eye on it at all: a daemon that exits at
-    /// boot — an unconfigured `[sandbox]`, a podman it cannot probe, a hello that
+    /// boot — an unconfigured `[sandbox]`, a `/dev/kvm` it cannot open, a hello that
     /// raced its node — leaves a cluster that looks perfectly healthy, because
     /// the node is. The suite then waits out a three-minute convergence budget
     /// and fails on whatever unrelated predicate it happened to be holding,
@@ -1562,32 +1552,29 @@ pub fn http_text_request(port: u16, path: &str) -> (u16, String) {
 // compute daemon needs a `[sandbox]` table (without one the daemon exits at
 // boot) AND needs to know whether this host can honour it — and the two answers
 // have to agree. They were separately copied into two test binaries, which is
-// how one of them ended up gating on `podman version` while the other gated on
-// the product's own predicate.
+// how one of them ended up gating on a runtime's version string while the other
+// gated on the product's own predicate.
 
-/// The default image a sandboxed run executes in: the SMALLEST one that proves
-/// execution end to end, since a script provider's container command is the
-/// executor itself and all it needs of an image is a `/bin/sh` for its shebang.
-///
-/// Size is not cosmetic — each compute daemon keeps its OWN private podman graph
-/// root, so a three-node cluster pulls this three times, into three empty
-/// stores, on every run. busybox is ~4 MB where `node:22-slim` is ~200 MB. A
-/// provider script that needs more than busybox (a `node` runtime, say) passes
-/// its own image to [`sandbox_toml`].
-pub const SANDBOX_IMAGE: &str = "docker.io/library/busybox:stable";
-
-/// the `[sandbox]` table a cluster node boots with, isolating every run into
-/// `image`. Appended LAST to [`Cluster::extra_toml`] — nothing may follow a toml
-/// table header.
+/// the `[sandbox]` table a cluster node boots with. Appended LAST to
+/// [`Cluster::extra_toml`] — nothing may follow a toml table header.
 ///
 /// It says only HOW a run is isolated. WHETHER this node runs any is
 /// [`Cluster::compute_grant`]; the daemon needs both, and refuses to boot
 /// without the table.
-pub fn sandbox_toml(image: &str) -> Vec<String> {
+///
+/// Every node in a cluster names the SAME two images, and that is now free
+/// rather than expensive: the guest kernel and rootfs are read-only and shared,
+/// so N nodes attach one copy. The container backend gave each daemon its own
+/// graph root, which meant a three-node cluster pulled its image three times
+/// into three empty stores on every run — the reason that helper took an image
+/// argument and defaulted to the smallest one that could work.
+pub fn sandbox_toml() -> Vec<String> {
+    let dir = std::env::var("DUCKTAPE_GUEST_DIR").unwrap_or_else(|_| GUEST_DIR.into());
     vec![
         "[sandbox]".into(),
-        "runtime = \"podman\"".into(),
-        format!("image = {image:?}"),
+        "runtime = \"firecracker\"".into(),
+        format!("kernel = {:?}", format!("{dir}/vmlinux")),
+        format!("rootfs = {:?}", format!("{dir}/rootfs.ext4")),
         "cores = 0".into(),
         "mem_gb = 0".into(),
     ]
@@ -1596,26 +1583,33 @@ pub fn sandbox_toml(image: &str) -> Vec<String> {
 /// Can this host isolate a run the way the compute daemon demands? `Some(why)`
 /// = no.
 ///
-/// Asks the PRODUCT'S OWN predicate rather than `podman version`, and the
-/// difference is not academic: podman on `PATH` is one of four things the Podman
-/// backend requires (`pasta` for the netns, `nft` + `nsenter` for the egress
-/// firewall). A box with a portable podman install has the binary on `PATH` and
-/// its helpers only inside the install prefix — `podman version` says yes, the
-/// daemon exits `FATAL: sandbox: pasta is not executable`, and a suite gated on
-/// the weaker question runs anyway and FAILS instead of skipping. Gating on
+/// Asks the PRODUCT'S OWN predicate rather than a weaker proxy, and the
+/// difference is not academic. `firecracker` on `PATH` is one of several things
+/// the backend needs — `/dev/kvm` must OPEN read-write for this process (a host
+/// can list the kvm group and still get EACCES until the next login), `mke2fs`
+/// and `debugfs` must exist, and the guest images must be built. A suite gated
+/// on the weaker question runs anyway and FAILS instead of skipping. Gating on
 /// `probe()` means a suite skips when, and only when, a real node would refuse
 /// to serve compute.
-///
-/// The image is irrelevant to the answer (`probe` checks tooling, never pulls),
-/// so this takes none.
 pub fn unsandboxable_host() -> Option<String> {
-    provider_host::SandboxBackend::Podman {
-        image: SANDBOX_IMAGE.into(),
-        socket: PathBuf::new(),
-    }
-    .probe()
-    .err()
+    guest_backend().probe().err()
 }
+
+/// the backend an e2e node is configured with: the guest artifacts
+/// `ops/build-guest-rootfs.sh` produces, overridable for a box that keeps them
+/// somewhere else.
+pub fn guest_backend() -> provider_host::SandboxBackend {
+    let dir = PathBuf::from(
+        std::env::var("DUCKTAPE_GUEST_DIR").unwrap_or_else(|_| GUEST_DIR.into()),
+    );
+    provider_host::SandboxBackend::Firecracker {
+        kernel: dir.join("vmlinux"),
+        rootfs: dir.join("rootfs.ext4"),
+    }
+}
+
+/// where the guest artifacts live by default.
+pub const GUEST_DIR: &str = "/var/lib/ducktape/guest";
 
 /// `Some(())` = this test cannot run here and the caller must return; `None` =
 /// run it.
