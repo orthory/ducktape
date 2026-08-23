@@ -495,7 +495,8 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
                                   wrap=none
                                   @text-meta
                             if !preview_binary && !preview_picture && markdown_path(preview_path)
-                              extern agent_markdown(preview_text, dark) #fs-markdown -> emit(open_message_link, _)
+                              lazy preview_text by preview_text, preview_path, dark as cached_doc
+                                extern agent_markdown(cached_doc, dark) #fs-markdown -> emit(open_message_link, _)
                             if !preview_binary && !preview_picture && !markdown_path(preview_path)
                               lazy preview_text by preview_text, preview_path, dark as cached_source
                                 extern forge_code(cached_source, preview_path, dark) #fs-code

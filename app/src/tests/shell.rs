@@ -1463,7 +1463,9 @@ fn the_files_preview_reads_text_through_the_forge_reader() {
     );
     assert!(
         files.contains("if !preview_binary && !preview_picture && markdown_path(preview_path)")
-            && files.contains("extern agent_markdown(preview_text, dark) #fs-markdown"),
+            && files
+                .contains("lazy preview_text by preview_text, preview_path, dark as cached_doc")
+            && files.contains("extern agent_markdown(cached_doc, dark) #fs-markdown"),
         "a markdown path reads as a document"
     );
     assert!(

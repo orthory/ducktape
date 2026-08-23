@@ -396,8 +396,10 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
 fn the_forge_reader_draws_a_markdown_blobs_pictures_inline() {
     let screen = inlined(include_str!("../ui/screens/forge.ice"));
     assert!(
-        screen.contains("extern forge_markdown(file_text, file_path, dark) #forge-markdown"),
-        "the markdown arm mounts the document-aware adapter"
+        screen.contains("lazy file_text by file_text, file_path, dark as cached_doc")
+            && screen
+                .contains("extern forge_markdown(cached_doc, file_path, dark) #forge-markdown"),
+        "the markdown arm mounts the document-aware adapter behind the memo boundary"
     );
     let loader = include_str!("../backend/forge.rs");
     let text_loader = loader
