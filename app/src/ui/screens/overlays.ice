@@ -344,88 +344,88 @@ component OverlayLayer(create_open:bool, members_only:bool, bind draft:str, busy
                     w=fill
                     h=shrink
                   col w=fill gap=4.0
-                      if !empty(chat_hits)
-                        box w=fill pl=4.0
-                          text "MESSAGES"
+                    if !empty(chat_hits)
+                      box w=fill pl=4.0
+                        text "MESSAGES"
+                          with
+                            size=10.0
+                            font=code_semibold
+                            @text-muted
+                      col w=fill gap=1.0
+                        for hit in chat_hits
+                          button -> emit(open_chat_search_hit, hit.channel_id, hit.root_seq, hit.seq)
                             with
-                              size=10.0
-                              font=code_semibold
-                              @text-muted
-                        col w=fill gap=1.0
-                          for hit in chat_hits
-                            button -> emit(open_chat_search_hit, hit.channel_id, hit.root_seq, hit.seq)
-                              with
-                                label="Open message"
-                                w=fill
-                                p=6.0
-                                @ghost_action
-                              col w=fill gap=1.0
-                                // `wrap=none` does not ellipsize — it lays the whole message body
-                                // out as one run and the panel edge merely clips the draw, mid-glyph
-                                // and with no marker, so a term matched late in a long message is
-                                // never on screen. `hit.text` is the FULL body (backend/chat.rs
-                                // copies it verbatim, no snippet), so the hit row has to wrap it —
-                                // the way components/chat.ice renders this same ChatSearchHit.
-                                text hit.text
-                                  with
-                                    size=13.0
-                                    wrap=word-or-glyph
-                                    @text-fg
-                                text hit.meta
-                                  with
-                                    size=11.0
-                                    wrap=none
-                                    font=code_medium
-                                    @text-muted
-                              active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
-                              hovered bg=row_hover text=fg
-                              pressed bg=accent
-                      if !empty(page_hits)
-                        box w=fill pl=4.0
-                          text "PAGES"
+                              label="Open message"
+                              w=fill
+                              p=6.0
+                              @ghost_action
+                            col w=fill gap=1.0
+                              // `wrap=none` does not ellipsize — it lays the whole message body
+                              // out as one run and the panel edge merely clips the draw, mid-glyph
+                              // and with no marker, so a term matched late in a long message is
+                              // never on screen. `hit.text` is the FULL body (backend/chat.rs
+                              // copies it verbatim, no snippet), so the hit row has to wrap it —
+                              // the way components/chat.ice renders this same ChatSearchHit.
+                              text hit.text
+                                with
+                                  size=13.0
+                                  wrap=word-or-glyph
+                                  @text-fg
+                              text hit.meta
+                                with
+                                  size=11.0
+                                  wrap=none
+                                  font=code_medium
+                                  @text-muted
+                            active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
+                            hovered bg=row_hover text=fg
+                            pressed bg=accent
+                    if !empty(page_hits)
+                      box w=fill pl=4.0
+                        text "PAGES"
+                          with
+                            size=10.0
+                            font=code_semibold
+                            @text-muted
+                      col w=fill gap=1.0
+                        for hit in page_hits
+                          button -> emit(open_page_search_hit, hit.page_id, hit.block_id)
                             with
-                              size=10.0
-                              font=code_semibold
-                              @text-muted
-                        col w=fill gap=1.0
-                          for hit in page_hits
-                            button -> emit(open_page_search_hit, hit.page_id, hit.block_id)
-                              with
-                                label="Open page"
-                                w=fill
-                                p=6.0
-                                @ghost_action
-                              col w=fill gap=1.0
-                                // Same clip as the message hits above: a block's text is arbitrary
-                                // page prose, and the match can sit anywhere in it.
-                                text hit.text
-                                  with
-                                    size=13.0
-                                    wrap=word-or-glyph
-                                    @text-fg
-                                // The metadata line names the PAGE, then the
-                                // block kind — it read a bare `Text` before,
-                                // which is true of nearly every hit and told
-                                // the reader nothing about where the match is.
-                                // Same shape as components/pages.ice renders
-                                // this same PageSearchHit.
-                                row
+                              label="Open page"
+                              w=fill
+                              p=6.0
+                              @ghost_action
+                            col w=fill gap=1.0
+                              // Same clip as the message hits above: a block's text is arbitrary
+                              // page prose, and the match can sit anywhere in it.
+                              text hit.text
+                                with
+                                  size=13.0
+                                  wrap=word-or-glyph
+                                  @text-fg
+                              // The metadata line names the PAGE, then the
+                              // block kind — it read a bare `Text` before,
+                              // which is true of nearly every hit and told
+                              // the reader nothing about where the match is.
+                              // Same shape as components/pages.ice renders
+                              // this same PageSearchHit.
+                              row
+                                with
+                                  w=fill
+                                  gap=7.0
+                                  align=center
+                                text hit.page_title
                                   with
                                     w=fill
-                                    gap=7.0
-                                    align=center
-                                  text hit.page_title
-                                    with
-                                      w=fill
-                                      size=12.0
-                                      font=code_medium
-                                      @text-muted
-                                  text hit.kind
-                                    with
-                                      size=12.0
-                                      wrap=none
-                                      font=code
-                                      @text-muted
-                              active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
-                              hovered bg=row_hover text=fg
-                              pressed bg=accent
+                                    size=12.0
+                                    font=code_medium
+                                    @text-muted
+                                text hit.kind
+                                  with
+                                    size=12.0
+                                    wrap=none
+                                    font=code
+                                    @text-muted
+                            active bg=transparent text=fg border=transparent border-w=1.0 r=8.0
+                            hovered bg=row_hover text=fg
+                            pressed bg=accent

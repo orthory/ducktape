@@ -410,7 +410,7 @@ fn the_forge_reader_draws_a_markdown_blobs_pictures_inline() {
         .expect("the loader ends")
         .0;
     assert!(
-        text_loader.contains("markdown_path(view.path.clone()) && !view.binary")
+        text_loader.contains("markdown_path(&view.path) && !view.binary")
             && text_loader.contains("load_inline_pictures(client, &view).await"),
         "pictures preload for a markdown blob and nothing else"
     );
@@ -746,15 +746,8 @@ fn forge_directory_navigation_retires_the_previous_file_preview() {
     // only while the browse stands where it was opened — same repository,
     // same directory, same commit. The app half of a navigation still only
     // reloads the tree.
-    let moved = |dir: &str, rev: &str| {
-        backend::forge_file_header(
-            "src".into(),
-            "1111".into(),
-            dir.into(),
-            rev.into(),
-            "src/lib.rs".into(),
-        )
-    };
+    let moved =
+        |dir: &str, rev: &str| backend::forge_file_header("src", "1111", dir, rev, "src/lib.rs");
     assert_eq!(moved("src", "1111"), "src/lib.rs");
     assert_eq!(moved("", "1111"), "", "leaving the directory retires it");
     assert_eq!(moved("src", "2222"), "", "a newer commit retires it");
@@ -978,12 +971,12 @@ fn a_picture_that_does_not_draw_says_why_on_the_binary_plate() {
         "the cap is the announced size, so an empty blob is not called too large"
     );
     assert_eq!(
-        crate::backend::binary_note(String::new()),
+        crate::backend::binary_note(""),
         "This is not text — the reader shows no preview for it.",
         "plain binary keeps the generic line"
     );
     assert_eq!(
-        crate::backend::binary_note("why".into()),
+        crate::backend::binary_note("why"),
         "why",
         "a reasoned binary shows its reason"
     );

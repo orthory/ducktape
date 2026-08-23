@@ -613,13 +613,13 @@ pub(crate) fn node_facts(status: &serde_json::Value) -> NodeFacts {
 /// Progress rides ONLY while `sync_in_progress`. `operations.sync` is never
 /// cleared, so printing it whenever it exists leaves a finished run's numbers
 /// on screen for good — and a reader cannot tell a live count from a fossil.
-pub fn sync_label(phase: String, applied: i64, target: i64) -> String {
+pub fn sync_label(phase: &str, applied: i64, target: i64) -> String {
     if phase.is_empty() {
         return String::new();
     }
-    let name = capitalized(&phase);
+    let name = capitalized(phase);
     let measured = applied >= 0 && target >= 0;
-    if !sync_in_progress(&phase) || !measured {
+    if !sync_in_progress(phase) || !measured {
         return name;
     }
     format!(
@@ -1100,7 +1100,7 @@ async fn agents_with_a_run_in_flight(rpc: &RpcClient) -> BTreeSet<String> {
 }
 
 /// Whether any agent is engaging work right now — the rail's Forge pulse dot.
-pub fn any_agent_active(rows: Vec<AgentRow>) -> bool {
+pub fn any_agent_active(rows: &[AgentRow]) -> bool {
     rows.iter().any(|row| row.live)
 }
 

@@ -72,10 +72,18 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
               tier
               answered=(list_phase == ForgePhase.ready)
           if empty(repos) && list_phase == ForgePhase.loading
-            box w=fill p=30.0 align-x=center
+            box
+              with
+                w=fill
+                p=30.0
+                align-x=center
               text "Loading repositories…" size=13.0 @text-meta
           if empty(repos) && list_phase == ForgePhase.failed
-            box w=fill p=30.0 align-x=center
+            box
+              with
+                w=fill
+                p=30.0
+                align-x=center
               text "Could not load repositories. Reopen Forge to try again." size=13.0 @text-meta
           // NOT `EmptyPlate`: this screen has no "new repository" button and
           // never will, because forge IS a git remote — a repo comes into
@@ -93,10 +101,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                 border=border
                 border-w=1.0
                 r=12.0
-              col
-                with
-                  gap=10.0
-                  align=center
+              col gap=10.0 align=center
                 text "No repos yet. Forge is a git remote — a repo appears when a push lands on it."
                   with
                     size=13.0
@@ -136,10 +141,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                 w=fill
                 gap=9.0
                 align=center
-              box
-                with
-                  w=fill
-                  clip=true
+              box w=fill clip=true
                 button -> emit(forge_toggle_repo_menu)
                   with
                     label="Switch repository"
@@ -330,10 +332,18 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
             // The one true sentence about it lives beside the merge
             // button, where the decision is made.
         if forge_item_number > 0 && item_phase == ForgePhase.loading
-          box w=fill h=fill p=16.0
+          box
+            with
+              w=fill
+              h=fill
+              p=16.0
             EmptyPlate message="Loading tracker item…"
         if forge_item_number > 0 && item_phase == ForgePhase.failed
-          box w=fill h=fill p=16.0
+          box
+            with
+              w=fill
+              h=fill
+              p=16.0
             EmptyPlate message="Could not load this item. Go back and open it again to retry."
         if forge_item_number > 0 && item_phase == ForgePhase.ready
           scroll #item-detail
@@ -354,10 +364,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                   w=fill
                   gap=9.0
                   align=center
-                box
-                  with
-                    w=fill
-                    clip=true
+                box w=fill clip=true
                   text forge_item_title
                     with
                       size=16.0
@@ -374,10 +381,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                   gap=10.0
                   align=center
                 if !empty(forge_item_author)
-                  box
-                    with
-                      max-w=160.0
-                      clip=true
+                  box max-w=160.0 clip=true
                     text forge_item_author
                       with
                         size=11.0
@@ -385,10 +389,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                         font=code_medium
                         @text-meta
                 if !empty(forge_item_branches)
-                  box
-                    with
-                      w=fill
-                      clip=true
+                  box w=fill clip=true
                     text forge_item_branches
                       with
                         size=12.0
@@ -502,7 +503,9 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                         h=24.0
                         p=5.0
                         @ghost_action
-                      text verdict_pick_label(review_verdict, ForgeReviewVerdict.comment, "Comment") size=13.0
+                      text verdict_pick_label(review_verdict, ForgeReviewVerdict.comment, "Comment")
+                        with
+                          size=13.0
                       active bg=surface text=fg border=card_line border-w=1.0 r=7.0
                       hovered bg=elevated text=fg
                       pressed bg=subtle text=fg
@@ -513,7 +516,9 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                         h=24.0
                         p=5.0
                         @ghost_action
-                      text verdict_pick_label(review_verdict, ForgeReviewVerdict.approve, "Approve") size=13.0
+                      text verdict_pick_label(review_verdict, ForgeReviewVerdict.approve, "Approve")
+                        with
+                          size=13.0
                       active bg=final_bg text=fg border=final_line border-w=1.0 r=7.0
                       hovered bg=success_bg text=fg
                       pressed bg=success_bg text=fg
@@ -683,7 +688,11 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                     space w=0.0 h=0.0
                 if empty(discussion)
                   text "No discussion yet." size=12.5 @text-caption
-                keyed message in discussion by=message.seq virtual-row=44.0 w=fill gap=9.0
+                keyed message in discussion by=message.seq
+                  with
+                    virtual-row=44.0
+                    w=fill
+                    gap=9.0
                   // A note is a pure function of its message, so the whole row
                   // caches under the same (seq, render_rev) key the chat
                   // stream's quiet arm uses — the live delta fold
@@ -928,7 +937,12 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
                 line-h=1.5
                 @text-label
         if tree_phase == ForgeTreePhase.failed
-          box w=fill pl=16.0 pr=16.0 pt=8.0
+          box
+            with
+              w=fill
+              pl=16.0
+              pr=16.0
+              pt=8.0
             text "Could not load code. Pick Code to try again."
               with
                 w=fill
@@ -938,7 +952,12 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
         if tree_phase == ForgeTreePhase.ready
           col w=fill
             if empty(tree_entries) && !tree_born
-              box w=fill pl=16.0 pr=16.0 pt=8.0
+              box
+                with
+                  w=fill
+                  pl=16.0
+                  pr=16.0
+                  pt=8.0
                 text "Nothing committed on this repository yet."
                   with
                     w=fill
@@ -946,7 +965,12 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
                     line-h=1.5
                     @text-label
             if empty(tree_entries) && tree_born && !tree_truncated
-              box w=fill pl=16.0 pr=16.0 pt=8.0
+              box
+                with
+                  w=fill
+                  pl=16.0
+                  pr=16.0
+                  pt=8.0
                 text "No files in this commit."
                   with
                     w=fill
@@ -954,7 +978,12 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
                     line-h=1.5
                     @text-label
             if empty(tree_entries) && tree_born && tree_truncated
-              box w=fill pl=16.0 pr=16.0 pt=8.0
+              box
+                with
+                  w=fill
+                  pl=16.0
+                  pr=16.0
+                  pt=8.0
                 text "This directory has entries that cannot be shown."
                   with
                     w=fill
@@ -1030,21 +1059,24 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
         if phase == ForgeFilePhase.failed && !empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path))
           ForgeCodeEmpty name=file_path note=failed_note
         if tree_phase == ForgeTreePhase.ready && empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && empty(tree_entries) && !tree_born
-          ForgeCodeEmpty name="" note="Nothing is committed on this repository yet, so there is no file to read."
+          ForgeCodeEmpty
+            with
+              name=""
+              note="Nothing is committed on this repository yet, so there is no file to read."
         if tree_phase == ForgeTreePhase.ready && empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && empty(tree_entries) && tree_born && !tree_truncated
           ForgeCodeEmpty name="" note="This commit has no files to read."
         if tree_phase == ForgeTreePhase.ready && empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && empty(tree_entries) && tree_born && tree_truncated
-          ForgeCodeEmpty name="" note="This directory has entries outside the browser's display limits."
+          ForgeCodeEmpty
+            with
+              name=""
+              note="This directory has entries outside the browser's display limits."
         if tree_phase == ForgeTreePhase.ready && empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && !empty(tree_entries)
           ForgeCodeEmpty name="" note="Pick a file from the tree to read it."
         // A binary blob's `text` is the loader's reason when it has one — a
         // picture past the byte cap or one that did not decode — and empty
         // for plain binary; `binary_note` says the generic line for that.
         if phase == ForgeFilePhase.ready && !empty(forge_file_header(opened_dir, opened_rev, tree_path, tree_rev, file_path)) && file_binary
-          ForgeCodeEmpty
-            with
-              name=file_path
-              note=binary_note(file_text)
+          ForgeCodeEmpty name=file_path note=binary_note(file_text)
         // A PICTURE DRAWS FROM THE FORGE SURFACE'S SLOT (`picture.rs`):
         // `forge_blob` paged and decoded it, and the caption is the drawn
         // size. The same viewer the Files preview mounts.

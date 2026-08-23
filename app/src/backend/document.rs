@@ -19,10 +19,11 @@ use crate::pages::sync::{
 /// The page's child pages, in document order. Subpages are navigation, not
 /// prose: they have no markdown spelling, so the document editor never holds
 /// them and the screen lists them underneath it instead.
-pub fn subpage_blocks(blocks: Vec<PageBlock>) -> Vec<PageBlock> {
+pub fn subpage_blocks(blocks: &[PageBlock]) -> Vec<PageBlock> {
     blocks
-        .into_iter()
+        .iter()
         .filter(|block| !crate::pages::sync::is_prose(block))
+        .cloned()
         .collect()
 }
 

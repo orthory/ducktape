@@ -16,7 +16,7 @@ pub struct NavItem {
 /// directory/directories), so both forms are stated by the caller. Every
 /// count label goes through here; a bare `format!("{n} agents")` renders the
 /// `1 agents` the register-machine subtitles used to show.
-pub fn plural(count: i64, one: String, many: String) -> String {
+pub fn plural(count: i64, one: &str, many: &str) -> String {
     let noun = if count == 1 { one } else { many };
     format!("{count} {noun}")
 }
@@ -50,34 +50,30 @@ pub fn plural(count: i64, one: String, many: String) -> String {
 /// that field — so these two counts partition the list and sum to the All chip
 /// beside them. The validator count is not lost: it is its own chip, and every
 /// row carries its role marker.
-pub fn members_summary(connected: bool, rows: Vec<MemberRow>) -> String {
+pub fn members_summary(connected: bool, rows: &[MemberRow]) -> String {
     if !connected || rows.is_empty() {
         return String::new();
     }
     let agents = rows.iter().filter(|row| row.is_agent).count();
-    let left = plural(
-        count_i64(rows.len() - agents),
-        "human".into(),
-        "humans".into(),
-    );
-    let right = plural(count_i64(agents), "agent".into(), "agents".into());
+    let left = plural(count_i64(rows.len() - agents), "human", "humans");
+    let right = plural(count_i64(agents), "agent", "agents");
     format!("{left} · {right}")
 }
 
 /// `4 agents · 2 working` — the Agents title's machine subtitle. `working` is
 /// runs in flight, not `AgentStatus::Active`: Active is the registration
 /// default and would report every registered agent as busy forever.
-pub fn agents_summary(connected: bool, rows: Vec<AgentRow>) -> String {
+pub fn agents_summary(connected: bool, rows: &[AgentRow]) -> String {
     if !connected || rows.is_empty() {
         return String::new();
     }
     let working = rows.iter().filter(|row| row.live).count();
-    let registered = plural(count_i64(rows.len()), "agent".into(), "agents".into());
+    let registered = plural(count_i64(rows.len()), "agent", "agents");
     format!("{registered} · {working} working")
 }
 
 /// `12 open · 3 settled` — the Approvals title's machine subtitle.
-pub fn proposals_summary(connected: bool, rows: Vec<ProposalRow>) -> String {
+pub fn proposals_summary(connected: bool, rows: &[ProposalRow]) -> String {
     if !connected || rows.is_empty() {
         return String::new();
     }
@@ -86,13 +82,13 @@ pub fn proposals_summary(connected: bool, rows: Vec<ProposalRow>) -> String {
 }
 
 /// `N pending` — the header count, open proposals only.
-pub fn pending_label(rows: Vec<ProposalRow>) -> String {
+pub fn pending_label(rows: &[ProposalRow]) -> String {
     format!("{} pending", rows.iter().filter(|row| row.open).count())
 }
 
 /// The settled half of the register — the RECENTLY FINALIZED column.
-pub fn settled_proposals(rows: Vec<ProposalRow>) -> Vec<ProposalRow> {
-    rows.into_iter().filter(|row| !row.open).collect()
+pub fn settled_proposals(rows: &[ProposalRow]) -> Vec<ProposalRow> {
+    rows.iter().filter(|row| !row.open).cloned().collect()
 }
 
 /// One seat per REQUIRED signature, filled for each approval already in —
@@ -121,8 +117,8 @@ pub fn tally_label(approvals: i64, required: i64) -> String {
 /// `optional_number` string (`—` when the node reports nothing). Joining the
 /// numbers instead would mean carrying them as `i64` and printing a measured
 /// `0` for "not reported".
-pub fn reading_pair(left: impl AsRef<str>, right: impl AsRef<str>) -> String {
-    format!("{} / {}", left.as_ref(), right.as_ref())
+pub fn reading_pair(left: &str, right: &str) -> String {
+    format!("{left} / {right}")
 }
 
 /// `near` one vote from quorum (or past it), else `far` — success vs meta ink.
@@ -139,7 +135,7 @@ pub fn tally_note(approvals: i64, required: i64) -> String {
     if remaining <= 0 {
         return "quorum met".into();
     }
-    let have = plural(approvals, "approval".into(), "approvals".into());
+    let have = plural(approvals, "approval", "approvals");
     format!("{have} · {remaining} more for quorum")
 }
 
@@ -152,9 +148,9 @@ pub fn approve_label(approvals: i64, required: i64) -> String {
 }
 
 /// The kind pill's two tones: an access-class action reads `access`.
-pub fn proposal_kind_tone(action: String) -> String {
+pub fn proposal_kind_tone(action: &str) -> String {
     let access = matches!(
-        action.as_str(),
+        action,
         "add_validator" | "add_resident" | "remove_validator" | "remove_resident" | "grant_client"
     );
     match access {
@@ -164,7 +160,7 @@ pub fn proposal_kind_tone(action: String) -> String {
 }
 
 /// How many proposals are still open — the count the rail pins to Approvals.
-pub fn open_proposals(rows: Vec<ProposalRow>) -> i64 {
+pub fn open_proposals(rows: &[ProposalRow]) -> i64 {
     rows.iter().filter(|row| row.open).count() as i64
 }
 
@@ -792,8 +788,7 @@ pub(crate) fn grouped_digits(value: i64) -> String {
 
 /// TWO uppercase letters for a 28px+ avatar plate: the initials of the first
 /// two words, else the first two alphanumerics of one word.
-pub fn initials_of(name: impl AsRef<str>) -> String {
-    let name = name.as_ref();
+pub fn initials_of(name: &str) -> String {
     let words: Vec<&str> = name.split_whitespace().take(2).collect();
     if words.len() == 2 {
         let letters: String = words
@@ -936,9 +931,8 @@ pub(crate) fn encode_wire(payload: &serde_json::Value) -> Vec<u8> {
 /// of the module rail, and a `?` in a circle there does not read as "unnamed",
 /// it reads as HELP. `PrincipalPlate` draws an empty string as a bare plate,
 /// which is what an identity with no name looks like.
-pub fn initial_of(name: impl AsRef<str>) -> String {
-    name.as_ref()
-        .trim()
+pub fn initial_of(name: &str) -> String {
+    name.trim()
         .chars()
         .next()
         .map(|first| first.to_uppercase().to_string())

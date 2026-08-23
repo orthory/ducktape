@@ -320,10 +320,7 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                     h=fill
                     align-x=center
                     align-y=center
-                  text "×"
-                    with
-                      size=13.0
-                      wrap=none
+                  text "×" size=13.0 wrap=none
                 active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
                 hovered bg=elevated text=fg
                 pressed bg=subtle text=fg
@@ -366,8 +363,9 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                 // second spelling of the disabled term. `active text=label`
                 // keeps the resting `label` tone the old tinted mount named;
                 // token and tone are the same hex in both palettes.
-                svg icon("plus") memory color=inherit
+                svg icon("plus") memory
                   with
+                    color=inherit
                     w=16.0
                     h=16.0
                 active bg=transparent text=label border=transparent border-w=1.0 r=5.0
@@ -389,10 +387,7 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                     h=fill
                     align-x=center
                     align-y=center
-                  text "×"
-                    with
-                      size=13.0
-                      wrap=none
+                  text "×" size=13.0 wrap=none
                 active bg=separator text=muted border=transparent border-w=1.0 r=5.0
                 hovered bg=subtle text=fg
                 pressed bg=subtle text=fg
@@ -450,7 +445,12 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                       font=code_medium
                       @text-label
             for dm in dm_rows
-              DmButton peer=dm.peer selected=(dm.peer.key == active_dm_peer) unread=dm.unread disabled=(mutation_phase != MutationPhase.idle)
+              DmButton
+                with
+                  peer=dm.peer
+                  selected=(dm.peer.key == active_dm_peer)
+                  unread=dm.unread
+                  disabled=(mutation_phase != MutationPhase.idle)
                 forward
                   choose_dm
         // No account footer: the rail's avatar and Settings already carry the
@@ -507,10 +507,7 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                   // the peer's name and moved with its length, and a long
                   // name pushed the huddle control and ⋯ past the pane's clip.
                   if !empty(active_dm.name)
-                    box
-                      with
-                        w=fill
-                        clip=true
+                    box w=fill clip=true
                       DmHeader peer=active_dm
                   if empty(active_dm.name)
                     text "#"
@@ -529,10 +526,7 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                   // could still click, and dropped ⋯ entirely. The window's
                   // `min-size` bounds the other axis; this bounds this one.
                   if empty(active_dm.name)
-                    box
-                      with
-                        w=fill
-                        clip=true
+                    box w=fill clip=true
                       text active_channel_name
                         with
                           size=14.0
@@ -613,10 +607,7 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                         h=fill
                         align-x=center
                         align-y=center
-                      text "⋯"
-                        with
-                          size=14.0
-                          wrap=none
+                      text "⋯" size=14.0 wrap=none
                     active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
                     hovered bg=elevated text=fg
                     pressed bg=subtle text=fg
@@ -649,7 +640,11 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
               // THREE SKELETON ROWS, not a centred sentence — see
               // `SkeletonRow` for the geometry they hold to.
               if connected && loading && empty(messages)
-                col w=fill gap=14.0 pt=4.0
+                col
+                  with
+                    w=fill
+                    gap=14.0
+                    pt=4.0
                   SkeletonRow
                   SkeletonRow
                   SkeletonRow
@@ -701,7 +696,11 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                     // height its content needs (still capped by the box's
                     // limits, so a long timeline scrolls exactly as before) and
                     // `align-y=end` drops that block onto the composer.
-                    box w=fill h=fill align-y=end
+                    box
+                      with
+                        w=fill
+                        h=fill
+                        align-y=end
                       scroll #message-stream
                         with
                           dir=vertical
@@ -1194,14 +1193,19 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                     shadow-blur=24.0
                   col w=fill
                     if search_phase == SearchPhase.searching
-                      col w=fill gap=14.0 p=8.0
+                      col
+                        with
+                          w=fill
+                          gap=14.0
+                          p=8.0
                         SkeletonRow
                     if search_phase == SearchPhase.done && empty(search_hits)
-                      box w=fill p=14.0 align-x=center
-                        text "No messages match"
-                          with
-                            size=12.5
-                            @text-muted
+                      box
+                        with
+                          w=fill
+                          p=14.0
+                          align-x=center
+                        text "No messages match" size=12.5 @text-muted
                     if search_phase == SearchPhase.done && !empty(search_hits)
                       scroll
                         with
@@ -1236,9 +1240,7 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                 pl=18.0
                 pr=18.0
                 pt=12.0
-              ComposerGate
-                with
-                  reason=post_refusal
+              ComposerGate reason=post_refusal
           box
             with
               w=fill
@@ -1448,7 +1450,10 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                     if !empty(channel_members)
                       col w=fill gap=1.0
                         for member in channel_members
-                          ChatMemberRow member=member disabled=(mutation_phase != MutationPhase.idle)
+                          ChatMemberRow
+                            with
+                              member=member
+                              disabled=(mutation_phase != MutationPhase.idle)
                             forward
                               remove_channel_member_submit
               box

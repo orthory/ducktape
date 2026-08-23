@@ -112,11 +112,16 @@ const SCREEN_PROBES: &[ScreenProbe] = &[
     // Each ceiling sits between the optimized baseline and the smallest
     // one-change negative control measured with this deterministic fixture:
     // 31,973 vs 233,957 allocations for restoring per-row anchor lookup.
+    // 24,063 measured 2026-08-23 at ducktape-ui af41cc28 with the screen's
+    // externs borrowing their list and string arguments (`doc_tab_rows`,
+    // `subpage_blocks`, `thread_is_resolved`, `comment_compose_hint`, and
+    // the `page_document` mount's `blocks`/`hits`): 26,542 with the same
+    // externs cloning them per frame.
     ScreenProbe {
         label: "pages comments build+layout",
         size: WINDOW,
         fixture: console_in_page_comments,
-        allocation_ceiling: 120_000,
+        allocation_ceiling: 30_000,
     },
     // 13,089 with the keyed (seq, render_rev) lazy vs 18,836 with the plain
     // row-hashing lazy vs 54,599 with no quiet-arm `lazy` at all — the
@@ -180,11 +185,20 @@ const SCREEN_PROBES: &[ScreenProbe] = &[
     // flipped order at this pin: removing the directory-row virtualization
     // is now the smallest at 63,729; restoring the selected-entry scan
     // reaches 73,453 (the per-rebuild list clone grew with the rows).
+    // Re-derived 2026-08-23 at af41cc28: 46,036 with the mount's
+    // `fs_directories(fs_entries)` and the screen's `fs_counts_summary`,
+    // `explorer_ops_at`, `markdown_path` borrowing their arguments; 51,569
+    // with them cloning — `fs_directories` alone copied every entry into the
+    // call per frame — and that clone is the control this ceiling gates.
+    // The two structural controls fell inside the noise floor at this pin
+    // and no longer gate on allocations: removing the directory-row
+    // virtualization lands at 47,478 and restoring the selected-entry scan
+    // at 46,553 (it moves layout time, 3.5 ms -> 3.9 ms, not the count).
     ScreenProbe {
         label: "files build+layout",
         size: WINDOW,
         fixture: console_in_files,
-        allocation_ceiling: 62_900,
+        allocation_ceiling: 50_000,
     },
     // Every settled answer is an `agent_markdown` extern — a markdown parse
     // plus a syntect pass over its fenced block. 6,902 measured 2026-08-23
@@ -849,7 +863,7 @@ fn console_in_forge_pr() -> (Ducktape, iced::window::Id) {
         },
     ));
     assert_eq!(
-        backend::diff_lines(app.forge_item_diff.clone()).len(),
+        backend::diff_lines(&app.forge_item_diff).len(),
         LONG_LIST_ROWS + 4
     );
     assert_eq!(app.forge_discussion.len(), DISCUSSION_ROWS);

@@ -189,10 +189,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                 // clip=true` is the bound: the box takes the row's slack and
                 // cuts the draw at its edge, the same shape the channel name
                 // sits in in chat.ice.
-                box
-                  with
-                    w=fill
-                    clip=true
+                box w=fill clip=true
                   text active_page_title
                     with
                       size=13.5
@@ -426,10 +423,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                         h=24.0
                         p=0.0
                         @icon_action
-                      text "×"
-                        with
-                          size=12.5
-                          font=ui
+                      text "×" size=12.5 font=ui
                       active bg=transparent text=muted r=6.0
                       hovered bg=fg/8 text=fg
                       pressed bg=fg/12
@@ -806,10 +800,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                           align-x=center
                           @text-muted
                     for comment_row in block_comment_rows
-                      PageCommentThreadButton
-                        with
-                          thread=comment_row.thread
-                          anchor=comment_row.anchor
+                      PageCommentThreadButton thread=comment_row.thread anchor=comment_row.anchor
                         forward
                           open_block_comment_thread
                     if block_comment_threads_has_more

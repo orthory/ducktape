@@ -3,8 +3,7 @@ use super::*;
 #[test]
 fn a_diff_paints_gutters_signs_and_kinds() {
     let rows = diff_lines(
-        "diff --git a/round.rs b/round.rs\n@@ -138,3 +138,4 @@ impl RoundState {\n ctx\n-gone\n+added\n"
-            .into(),
+        "diff --git a/round.rs b/round.rs\n@@ -138,3 +138,4 @@ impl RoundState {\n ctx\n-gone\n+added\n",
     );
     let kinds: Vec<&str> = rows.iter().map(|row| row.kind.as_str()).collect();
     assert_eq!(kinds, ["file", "hunk", "ctx", "del", "add"]);
@@ -30,35 +29,26 @@ fn a_diff_paints_gutters_signs_and_kinds() {
 
 #[test]
 fn a_changed_diff_rekeys_rows_instead_of_transferring_focus() {
-    let before = diff_lines(
-        concat!(
-            "+++ b/one.rs\n",
-            "@@ -10,1 +10,2 @@\n",
-            " kept\n",
-            "+target\n",
-        )
-        .into(),
-    );
-    let after = diff_lines(
-        concat!(
-            "+++ b/one.rs\n",
-            "@@ -10,1 +10,3 @@\n",
-            " kept\n",
-            "+unrelated\n",
-            "+target\n",
-        )
-        .into(),
-    );
-    let after_identical = diff_lines(
-        concat!(
-            "+++ b/one.rs\n",
-            "@@ -10,1 +10,3 @@\n",
-            " kept\n",
-            "+target\n",
-            "+target\n",
-        )
-        .into(),
-    );
+    let before = diff_lines(concat!(
+        "+++ b/one.rs\n",
+        "@@ -10,1 +10,2 @@\n",
+        " kept\n",
+        "+target\n",
+    ));
+    let after = diff_lines(concat!(
+        "+++ b/one.rs\n",
+        "@@ -10,1 +10,3 @@\n",
+        " kept\n",
+        "+unrelated\n",
+        "+target\n",
+    ));
+    let after_identical = diff_lines(concat!(
+        "+++ b/one.rs\n",
+        "@@ -10,1 +10,3 @@\n",
+        " kept\n",
+        "+target\n",
+        "+target\n",
+    ));
     let before_target = before
         .iter()
         .find(|row| row.text == "target")
@@ -78,15 +68,12 @@ fn a_changed_diff_rekeys_rows_instead_of_transferring_focus() {
         "even an indistinguishable inserted line cannot inherit a focused button"
     );
     assert_eq!(
-        diff_lines(
-            concat!(
-                "+++ b/one.rs\n",
-                "@@ -10,1 +10,2 @@\n",
-                " kept\n",
-                "+target\n",
-            )
-            .into()
-        ),
+        diff_lines(concat!(
+            "+++ b/one.rs\n",
+            "@@ -10,1 +10,2 @@\n",
+            " kept\n",
+            "+target\n",
+        )),
         before,
         "an unchanged patch keeps its keyed tree"
     );
@@ -99,23 +86,20 @@ fn a_changed_diff_rekeys_rows_instead_of_transferring_focus() {
 /// `(path, line, side)`, so an unanchored row cannot carry a comment.
 #[test]
 fn every_code_row_carries_its_file_and_side() {
-    let rows = diff_lines(
-        concat!(
-            "diff --git a/one.rs b/one.rs\n",
-            "--- a/one.rs\n",
-            "+++ b/one.rs\n",
-            "@@ -1,2 +1,2 @@\n",
-            " ctx\n",
-            "-gone\n",
-            "+added\n",
-            "diff --git a/two.rs b/two.rs\n",
-            "--- a/two.rs\n",
-            "+++ b/two.rs\n",
-            "@@ -10,1 +10,1 @@\n",
-            "+second\n",
-        )
-        .into(),
-    );
+    let rows = diff_lines(concat!(
+        "diff --git a/one.rs b/one.rs\n",
+        "--- a/one.rs\n",
+        "+++ b/one.rs\n",
+        "@@ -1,2 +1,2 @@\n",
+        " ctx\n",
+        "-gone\n",
+        "+added\n",
+        "diff --git a/two.rs b/two.rs\n",
+        "--- a/two.rs\n",
+        "+++ b/two.rs\n",
+        "@@ -10,1 +10,1 @@\n",
+        "+second\n",
+    ));
     let coded: Vec<(&str, &str, &str)> = rows
         .iter()
         .filter(|row| row.kind != "file" && row.kind != "hunk")
@@ -146,19 +130,16 @@ fn every_code_row_carries_its_file_and_side() {
 /// whichever file happened to come before them in the patch.
 #[test]
 fn a_deleted_files_rows_anchor_to_nothing() {
-    let rows = diff_lines(
-        concat!(
-            "diff --git a/kept.rs b/kept.rs\n",
-            "+++ b/kept.rs\n",
-            "@@ -1,1 +1,1 @@\n",
-            "+kept\n",
-            "diff --git a/dropped.rs b/dropped.rs\n",
-            "+++ /dev/null\n",
-            "@@ -1,1 +0,0 @@\n",
-            "-dropped\n",
-        )
-        .into(),
-    );
+    let rows = diff_lines(concat!(
+        "diff --git a/kept.rs b/kept.rs\n",
+        "+++ b/kept.rs\n",
+        "@@ -1,1 +1,1 @@\n",
+        "+kept\n",
+        "diff --git a/dropped.rs b/dropped.rs\n",
+        "+++ /dev/null\n",
+        "@@ -1,1 +0,0 @@\n",
+        "-dropped\n",
+    ));
     let dropped = rows
         .iter()
         .find(|row| row.text == "dropped")
@@ -179,21 +160,18 @@ fn a_deleted_files_rows_anchor_to_nothing() {
 /// produce that line.
 #[test]
 fn a_hunk_body_is_bounded_so_content_is_never_read_as_a_header() {
-    let rows = diff_lines(
-        concat!(
-            "diff --git a/notes.md b/notes.md\n",
-            "--- a/notes.md\n",
-            "+++ b/notes.md\n",
-            "@@ -1,2 +1,4 @@\n",
-            " intro\n",
-            // the patch's rendering of a source line `++ counter`
-            "+++ counter\n",
-            // and of a source line `-- dashes`
-            "--- dashes\n",
-            " outro\n",
-        )
-        .into(),
-    );
+    let rows = diff_lines(concat!(
+        "diff --git a/notes.md b/notes.md\n",
+        "--- a/notes.md\n",
+        "+++ b/notes.md\n",
+        "@@ -1,2 +1,4 @@\n",
+        " intro\n",
+        // the patch's rendering of a source line `++ counter`
+        "+++ counter\n",
+        // and of a source line `-- dashes`
+        "--- dashes\n",
+        " outro\n",
+    ));
     let coded: Vec<(&str, &str, &str)> = rows
         .iter()
         .filter(|row| row.kind != "file" && row.kind != "hunk")
@@ -216,16 +194,13 @@ fn a_hunk_body_is_bounded_so_content_is_never_read_as_a_header() {
 /// header detection inside the body.
 #[test]
 fn the_no_newline_note_consumes_no_line_and_no_budget() {
-    let rows = diff_lines(
-        concat!(
-            "+++ b/tail.rs\n",
-            "@@ -1,1 +1,2 @@\n",
-            " kept\n",
-            "+added\n",
-            "\\ No newline at end of file\n",
-        )
-        .into(),
-    );
+    let rows = diff_lines(concat!(
+        "+++ b/tail.rs\n",
+        "@@ -1,1 +1,2 @@\n",
+        " kept\n",
+        "+added\n",
+        "\\ No newline at end of file\n",
+    ));
     let added = rows
         .iter()
         .find(|row| row.text == "added")
@@ -241,7 +216,11 @@ fn the_no_newline_note_consumes_no_line_and_no_budget() {
 /// budget must read `@@ -1 +1 @@` as 1 and 1 rather than 0.
 #[test]
 fn a_comma_less_hunk_range_covers_one_line() {
-    let rows = diff_lines(concat!("+++ b/one.rs\n", "@@ -7 +7 @@\n", "+++ still content\n").into());
+    let rows = diff_lines(concat!(
+        "+++ b/one.rs\n",
+        "@@ -7 +7 @@\n",
+        "+++ still content\n"
+    ));
     let code: Vec<(&str, &str)> = rows
         .iter()
         .filter(|row| row.kind == "add")
@@ -322,7 +301,7 @@ fn staging_stops_at_the_modules_own_cap() {
         staged = stage(staged, &line.to_string(), "body");
     }
     assert_eq!(staged.len(), forge::MAX_REVIEW_COMMENTS);
-    assert!(forge_comment_cap_reached(staged.clone()));
+    assert!(forge_comment_cap_reached(&staged));
 
     let past_cap = stage(staged.clone(), "9999", "one too many");
     assert_eq!(past_cap.len(), forge::MAX_REVIEW_COMMENTS, "the cap holds");
@@ -354,16 +333,16 @@ fn dropping_one_staged_comment_leaves_the_others() {
 #[test]
 fn the_composer_opens_only_on_a_picked_line() {
     assert_eq!(
-        forge_comment_target("src/main.rs".into(), "14".into(), "new".into()),
+        forge_comment_target("src/main.rs", "14", "new"),
         "src/main.rs:14 (new)"
     );
     assert_eq!(
-        forge_comment_target(String::new(), "14".into(), "new".into()),
+        forge_comment_target("", "14", "new"),
         "",
         "no line picked, no composer"
     );
     assert_eq!(
-        forge_comment_target("src/main.rs".into(), "14".into(), "new".into()),
+        forge_comment_target("src/main.rs", "14", "new"),
         stage(Vec::new(), "14", "body")[0].anchor,
         "the composer header and the staged chip are the same anchor"
     );

@@ -39,6 +39,8 @@ use std::sync::{Mutex, OnceLock};
 use chat::call_wire::{CapturedFrame, PeerFrame};
 use iced::{Element, Rectangle, Size};
 
+mod live_surface;
+
 /// Toggle/shutdown poll while no source is open. WITH A CAMERA OPEN THE LOOP
 /// KEEPS NO CLOCK AT ALL: `Camera::frame()` blocks until the device has the
 /// next frame, so the camera itself is the pace. A screen grab has nothing to
@@ -689,19 +691,13 @@ pub(crate) fn capture_thread(
 /// [`call_video_stage`]), and the strip leaves it out: the same desktop
 /// Cover-cropped into a 128×96 plate beside its full-size self is not a second
 /// view of anything, it is a smear of somebody's wallpaper.
-pub fn call_video_tiles(staged: String) -> Element<'static, ()> {
-    let (sized, keyed, alive, painted) = (
-        staged.clone(),
-        staged.clone(),
-        staged.clone(),
-        staged.clone(),
-    );
-    ui_lang_runtime::live_surface(
+pub fn call_video_tiles(staged: &str) -> Element<'_, ()> {
+    live_surface::live_surface(
         REDRAW_INTERVAL,
-        move |width| Size::new(width, grid_height(tile_count(&sized), grid_columns(width))),
-        move || tile_count(&keyed) as u64,
-        move || tile_count(&alive) > 0,
-        move |renderer, bounds, viewport| paint_tiles(&painted, renderer, bounds, viewport),
+        move |width| Size::new(width, grid_height(tile_count(staged), grid_columns(width))),
+        move || tile_count(staged) as u64,
+        move || tile_count(staged) > 0,
+        move |renderer, bounds, viewport| paint_tiles(staged, renderer, bounds, viewport),
     )
     .into()
 }
@@ -717,23 +713,22 @@ pub fn call_video_tiles(staged: String) -> Element<'static, ()> {
 ///
 /// `peer` is the sharer's node key, or [`SELF_STAGE`] when this device is the
 /// one sharing — seeing your own share is how you know what you published.
-pub fn call_video_stage(peer: String) -> Element<'static, ()> {
-    let (sized, keyed, alive, painted) = (peer.clone(), peer.clone(), peer.clone(), peer);
-    ui_lang_runtime::live_surface(
+pub fn call_video_stage(peer: &str) -> Element<'_, ()> {
+    live_surface::live_surface(
         REDRAW_INTERVAL,
-        move |width| Size::new(width, stage_height(&sized, width)),
+        move |width| Size::new(width, stage_height(peer, width)),
         // Layout follows the ASPECT and nothing else: a new frame of the same
         // shape (every frame, ten times a second) must not invalidate layout.
         // Packed, not arithmetic: the width comes off a PEER'S frame, and a
         // multiply wide enough to be readable is a multiply a peer can
         // overflow.
         move || {
-            stage_frame(&keyed).map_or(0, |(width, height, _)| {
+            stage_frame(peer).map_or(0, |(width, height, _)| {
                 u64::from(width) << 32 | u64::from(height)
             })
         },
-        move || stage_frame(&alive).is_some(),
-        move |renderer, bounds, viewport| paint_stage(&painted, renderer, bounds, viewport),
+        move || stage_frame(peer).is_some(),
+        move |renderer, bounds, viewport| paint_stage(peer, renderer, bounds, viewport),
     )
     .into()
 }

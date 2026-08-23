@@ -38,10 +38,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
     // belong to the directory you left. The crumb has already moved, so
     // `0 files · 1 dir` beside it would be the OLD directory's tally
     // printed under the NEW directory's name.
-    CrumbBar #crumb
-      with
-        path
-        meta=fs_counts_summary(connected, listed, entries)
+    CrumbBar #crumb path meta=fs_counts_summary(connected, listed, entries)
       forward
         fs_open_dir
     // WHERE THE WRITE CONTROLS LIVE — decided here, once. The artifact's
@@ -71,10 +68,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
             h=26.0
             p=0.0
             @icon_action
-          text "↑"
-            with
-              size=12.5
-              font=ui
+          text "↑" size=12.5 font=ui
           active bg=surface text=muted border=card_line border-w=1.0 r=7.0
           hovered bg=elevated text=fg
           pressed bg=subtle
@@ -260,7 +254,11 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
         // crumb bar and the write bar above stay — they are how the reader
         // gets back out.
         if !connected
-          box w=fill h=fill p=22.0
+          box
+            with
+              w=fill
+              h=fill
+              p=22.0
             EmptyState
               with
                 title="Not connected"
@@ -502,9 +500,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
                                 extern forge_code(cached_source, preview_path, dark) #fs-code
       if connected
         if !empty(preview_entry.path)
-          ObjectPanel
-            with
-              entry=preview_entry
+          ObjectPanel entry=preview_entry
 
 component ExplorerScreen(connected_rpc:str, connected:bool, loading:bool, blocks:[ExplorerBlock], ops:[ExplorerOp], head:i64, sync_line:str)
   lifetime retained
@@ -845,10 +841,7 @@ component ExplorerScreen(connected_rpc:str, connected:bool, loading:bool, blocks
                   pr=10.0
                   gap=1.0
                 for block in blocks
-                  ExplorerBlockRow
-                    with
-                      block
-                      selected=(block.height == selected)
+                  ExplorerBlockRow block selected=(block.height == selected)
                     events
                       select_explorer_block -> select_explorer_block _
           box

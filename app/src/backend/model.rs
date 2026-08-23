@@ -398,7 +398,7 @@ pub fn near_scroll_top(relative_offset: f64) -> bool {
 /// network A's `#general` and network B's `#general` are two rooms, and the
 /// park store this replaced had to be emptied by hand on every network switch
 /// to keep one from handing its words to the other.
-pub fn composer_scope(endpoint: String, channel_id: String) -> String {
+pub fn composer_scope(endpoint: &str, channel_id: &str) -> String {
     format!("{endpoint}\u{1f}{channel_id}")
 }
 
@@ -436,7 +436,7 @@ pub fn composer_op_prefix(kind: crate::ComposerKind) -> String {
 
 /// The rail's key: a reply belongs to its THREAD, and the same seq under two
 /// rooms is two different threads.
-pub fn thread_scope(endpoint: String, channel_id: String, thread_seq: i64) -> String {
+pub fn thread_scope(endpoint: &str, channel_id: &str, thread_seq: i64) -> String {
     format!("{endpoint}\u{1f}{channel_id}#{thread_seq}")
 }
 
@@ -704,7 +704,7 @@ pub fn commented_targets_of(threads: Vec<PageCommentThread>, page_id: String) ->
 }
 
 /// The open thread's resolved flag, read off the rail's own list.
-pub fn thread_is_resolved(threads: Vec<PageCommentThread>, id: String) -> bool {
+pub fn thread_is_resolved(threads: &[PageCommentThread], id: &str) -> bool {
     threads
         .iter()
         .find(|thread| thread.id == id)
@@ -756,7 +756,7 @@ fn append_recovered_draft(drafts: &mut Vec<String>, draft: String) {
     }
 }
 
-pub fn scope_key(scope: String, id: String) -> String {
+pub fn scope_key(scope: &str, id: &str) -> String {
     format!("{scope}\0{id}")
 }
 
