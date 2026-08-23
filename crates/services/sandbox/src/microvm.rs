@@ -187,6 +187,11 @@ impl MicroVm {
         let started = std::time::Instant::now();
         std::fs::create_dir_all(run_dir)
             .map_err(|e| format!("create run dir {}: {e}", run_dir.display()))?;
+        // From here until the `MicroVm` below exists, nothing owns this
+        // directory: every `?` in the setup steps — an oversized workspace, a
+        // vsock path over SUN_LEN, a VMM that will not spawn — used to leave it
+        // behind, and a node that refuses runs leaks one per attempt.
+        let mut run_dir_guard = RunDirGuard(Some(run_dir));
 
         // 1. the run's per-run block devices: what it is supposed to run, its
         //    read-only inputs, and the workspace that will be read back.
@@ -265,6 +270,9 @@ impl MicroVm {
             "VMM spawned; waiting for the guest"
         );
 
+        // the VM owns the directory from here: its `Drop` removes it on every
+        // path out, including the boot failures below.
+        run_dir_guard.0 = None;
         let mut vm = MicroVm {
             vmm,
             run_dir: run_dir.to_path_buf(),
@@ -428,6 +436,28 @@ async fn serve_tunnel(listener: UnixListener, service_port: u16) {
 /// the run directory's own name — `/tmp/dt-vm-<slot>`, the id every one of a
 /// run's files is under. It is the join key between a log line and the scratch
 /// on disk, and it is not a path: the parent is the host's, the leaf is ours.
+/// Owns a run directory for the window in which nothing else does — from
+/// `create_dir_all` until the [`MicroVm`] that will remove it exists. Disarmed
+/// by setting its field to `None`.
+struct RunDirGuard<'a>(Option<&'a Path>);
+
+impl Drop for RunDirGuard<'_> {
+    fn drop(&mut self) {
+        let Some(run_dir) = self.0 else { return };
+        if let Err(error) = std::fs::remove_dir_all(run_dir)
+            && run_dir.exists()
+        {
+            tracing::warn!(
+                target: "ducktape::sandbox",
+                reason = "run_dir_not_removed",
+                slot = %slot_of(run_dir),
+                %error,
+                "a refused run left its directory behind"
+            );
+        }
+    }
+}
+
 fn slot_of(run_dir: &Path) -> std::borrow::Cow<'_, str> {
     run_dir.file_name().map_or(std::borrow::Cow::Borrowed("?"), |name| name.to_string_lossy())
 }

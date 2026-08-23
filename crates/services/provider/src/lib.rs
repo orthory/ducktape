@@ -761,6 +761,13 @@ impl CliProvider {
             ));
         }
 
+        // the run's SIZE is decided before any directory exists: a refusal here
+        // is the commonest one there is (a spec that named no `cores`), and it
+        // used to leave an empty run dir behind every single time — one per
+        // refused attempt, with nothing to reap them.
+        let vcpus = vm_cores(&ctx.limits)?;
+        let mem_mib = vm_mem_mib(&ctx.limits)?;
+
         // ONE slot for both directories, drawn per boot: they are two halves of
         // the same run's scratch and are removed together when the VM drops.
         let slot = run_slot();
@@ -772,8 +779,8 @@ impl CliProvider {
             agent_volume: self.agent_volume.clone(),
             assets: run_dir.join("assets.ext4"),
             workspace: run_dir.join("workspace.ext4"),
-            vcpus: vm_cores(&ctx.limits)?,
-            mem_mib: vm_mem_mib(&ctx.limits)?,
+            vcpus,
+            mem_mib,
             vsock_uds: microvm_socket(&slot)?,
             // no tap: the guest reaches this node's broker over vsock and needs
             // no interface. See the spec's egress section.
