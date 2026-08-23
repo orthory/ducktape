@@ -165,7 +165,20 @@ impl CredentialResolver for NodeCredentialResolver {
         let work = WorkRef::Saga {
             saga_id: saga_id.to_string(),
         };
-        let airlock = self.build_airlock(&record, work).await?;
+        // one line per attempt (bounded by the saga's max_attempts), because
+        // the refusal otherwise only ever appears in the saga's `error` field
+        // — which no CLI surfaces and no operator is watching.
+        let airlock = self
+            .build_airlock(&record, work)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(
+                    target: "ducktape::compute",
+                    reason = "credential_unroutable",
+                    %error,
+                    "a run's credential could not be resolved on this node"
+                );
+            })?;
         Ok(Resolved { airlock })
     }
 }
