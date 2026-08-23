@@ -128,6 +128,74 @@ fn solo_founder_invites_a_friend() {
     );
 }
 
+/// the PROMOTION twin of `cluster_e2e::reachability_plane_converges_mesh_on_boot`.
+///
+/// A fresh-booting validator targets its reachability plane at the epoch it
+/// booted into. The in-process promotion seat wires a BRAND NEW plane — the
+/// parked node's standby plane is shut down first, deliberately — and for a
+/// while it wired that plane and never targeted it. A plane with no epoch state
+/// is a black hole in BOTH directions: it drops every inbound record and advert
+/// and sends none of its own, so phase-A assembly never completes on either
+/// side and the promoted node keeps only the pre-warm tunnels it installed
+/// while parked. On a live three-node network that read as a healthy chain from
+/// the founder alone, while every op submitted at a promoted joiner timed out
+/// awaiting finalization.
+///
+/// Nothing in the tree caught it: every promotion e2e runs on the harness's
+/// `wireguard = false` default, where the plane does not exist at all. Hence
+/// this one, which is the same flow with the plane turned on.
+#[test]
+fn a_promoted_validator_converges_the_overlay_mesh() {
+    let _serial = serial();
+    // two founding validators, so the promoted joiner has to mesh with a set
+    // it never met — the live shape, and the one a single founder cannot test.
+    let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
+    // the plane exists only with wireguard on. This line IS the regression.
+    cluster.wireguard = true;
+    // hermetic: without this every node dials the LIVE public coordinator
+    // (`DEFAULT_PRIMARY_COORDINATOR`) from inside the test.
+    cluster
+        .extra_toml
+        .push("primary_coordinator = \"none\"".into());
+    cluster.spawn(0);
+    cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
+    cluster.spawn(1);
+    for i in 0..2 {
+        cluster.wait_marker(i, "converged root_hash=", CONVERGE);
+    }
+
+    let joiner = cluster.spawn_joiner(2);
+    cluster.wait_marker(joiner, "joining:", Duration::from_secs(60));
+
+    // strict majority of 2 is 2: both incumbents run the same command, the
+    // second ballot decides and executes.
+    let friend_hex = hex(&Cluster::identity(2));
+    for member in [0usize, 1] {
+        let cfg = cluster.config_file(member);
+        let (ok, out) = cluster.run_verb(&[
+            "node",
+            "member",
+            "promote",
+            &friend_hex,
+            "--config",
+            cfg.to_str().expect("utf-8 config path"),
+        ]);
+        assert!(ok, "promote via member {member} failed:\n{out}");
+    }
+
+    for i in 0..2 {
+        cluster.wait_marker(i, "cutover complete: epoch 1", CONVERGE);
+    }
+    cluster.wait_marker(joiner, "promoted: validator at epoch 1", CONVERGE);
+
+    // THE property, and the one the seat's missing `Retarget` broke: the
+    // promoted node's plane knows its epoch, so it sends its own endpoint
+    // record, completes assembly, and installs MEMBER tunnels — not the
+    // standby pre-warm set it carried in with.
+    cluster.wait_marker(joiner, "mesh verified", CONVERGE);
+    cluster.wait_marker(joiner, "tunnels applied (config accepted", CONVERGE);
+}
+
 #[test]
 fn live_quorum_admits_a_fourth_validator() {
     let _serial = serial();

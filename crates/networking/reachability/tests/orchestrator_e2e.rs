@@ -922,6 +922,56 @@ async fn duplicated_delivery_is_tolerated_end_to_end() {
 
 /// The kitchen sink: a 3-node mesh where the FIRST copy of every
 /// (sender, receiver, message kind) is lost — record, advert, request,
+/// A member that has verified its own view must still answer a peer that has
+/// not — the phase-A exchange is one-shot, and losing one half of it used to
+/// wedge that peer for the whole epoch.
+///
+/// The shape is the live one. Node 0's advert reaches node 1 late (or not at
+/// all): node 1's advert still reaches node 0, so node 0 assembles the full
+/// set, verifies, and stops gossiping records and adverts — while node 1 sits
+/// one advert short, nudging forever at a node that now drops everything it
+/// sends. On a real network the loss is not hypothetical: a member learns how
+/// to DIAL a just-promoted joiner from the very record that completes its own
+/// assembly, so its reply goes out microseconds before that link exists.
+///
+/// The heal is what closes it: a peer still gossiping phase-A at a verified
+/// node is a peer missing our half, so the next nudge sends it back.
+#[tokio::test]
+async fn a_verified_member_still_answers_a_peer_that_is_behind() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            // node 0's first four adverts toward node 1 never arrive; every
+            // other message flows. Four is past the one-shot fan-out AND the
+            // `first_contact` reply, so only a heal can deliver the fifth.
+            let dropped: Rc<Cell<usize>> = Rc::default();
+            let filter: DeliveryFilter = Rc::new(move |from, to, msg| {
+                let advert_to_the_straggler =
+                    (from, to) == (0, 1) && matches!(msg, ReachabilityMsg::Advert(_));
+                if !advert_to_the_straggler {
+                    return 1;
+                }
+                let n = dropped.get() + 1;
+                dropped.set(n);
+                usize::from(n > 4)
+            });
+            let (nodes, mut collected) =
+                spawn_mesh_filtered(&local, dir.path(), &[1, 2], vec![], filter);
+            retarget_all(&nodes, &[0, 1], &[], 1, 10).await;
+            spawn_nudgers(&local, &nodes);
+            // the straggler applies too, on the same mesh version.
+            let versions = await_applied(&mut collected, &[0, 1], 1).await;
+            assert_eq!(versions[&0], versions[&1]);
+            for (i, node) in nodes.iter().enumerate() {
+                let fake = node.effect.0.lock().unwrap();
+                assert_eq!(fake.applied.len(), 1, "node {i}: exactly one apply");
+                assert_eq!(fake.applied[0].peers.len(), 1, "node {i}: full mesh");
+            }
+        })
+        .await;
+}
+
 /// response, and ack alike. Nudge re-offers must heal every stage.
 #[tokio::test]
 async fn every_message_kind_dropped_once_still_converges() {
