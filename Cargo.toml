@@ -334,6 +334,15 @@ rand_core = "0.6.4"
 # its uninhabited extern-static type is future-incompatible with Rust. Keep the
 # API/ABI identical and patch only that declaration locally.
 block = { path = "patches/block" }
+# cosmic-text 0.15.0's font fallback only matched faces at EXACTLY the
+# requested weight before falling back to re-shaping a run against every face
+# in the database. A variable font registers once at 400 and the bundled
+# emoji/CJK fallback faces are static 400s, so every semibold/bold run with a
+# non-Latin glyph paid that walk (26us -> ~3ms per emoji paragraph), and bold
+# Latin could land on a platform face instead of Geist. The patched copy
+# matches a family at its closest weight; see patches/cosmic-text/README.md
+# for the drop condition.
+cosmic-text = { path = "patches/cosmic-text" }
 
 # dev/test builds compile wasm guests through cranelift (consensus components
 # in the kernel tests, index guests at every store open). unoptimized
