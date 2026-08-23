@@ -53,7 +53,9 @@ component GovernanceScreen(rows:[ProposalRow], voting:str, admin:bool, connected
               title="Not connected"
               description="Click the network name in the titlebar to pick or reconnect a network."
         if connected && empty(rows) && answered
-          EmptyPlate message="No proposals yet — a membership or configuration change opens the first one."
+          EmptyPlate
+            with
+              message="No proposals yet — a membership or configuration change opens the first one."
         if connected && open_proposals(rows) <= 0 && !empty(rows) && answered
           EmptyPlate message="No proposals waiting — every decision on this network is finalized."
         if connected && open_proposals(rows) > 0

@@ -714,5 +714,10 @@ view
                           w=fill
                           h=290.0
                           anchor-y=keep
-                        keyed item in bell_items by=item.seq virtual-row=58.0 w=fill p=5.0 gap=1.0
+                        keyed item in bell_items by=item.seq
+                          with
+                            virtual-row=58.0
+                            w=fill
+                            p=5.0
+                            gap=1.0
                           BellRow item=item

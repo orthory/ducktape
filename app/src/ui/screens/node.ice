@@ -110,10 +110,7 @@ component NodeScreen(node_key:str, node_data_dir:str, members_rows:[MemberRow], 
                 title="Log ring"
                 description="Live node events retained in the in-memory ring."
               col w=fill gap=9.0
-                row
-                  with
-                    w=fill
-                    align=end
+                row w=fill align=end
                   input "" #log-filter <-> node_log_filter
                     with
                       label="Filter logs"
@@ -132,7 +129,10 @@ component NodeScreen(node_key:str, node_data_dir:str, members_rows:[MemberRow], 
             col w=fill gap=13.0
               GroupLabel label="NODE"
               MemberFactRow label="public key" value=keep_str(!empty(node_key), node_key, "—")
-              MemberFactRow label="data directory" value=keep_str(!empty(node_data_dir), node_data_dir, "—")
+              MemberFactRow
+                with
+                  label="data directory"
+                  value=keep_str(!empty(node_data_dir), node_data_dir, "—")
               button "Copy node key" -> emit(copy_to_clipboard, node_key, "Node key copied")
                 with
                   disabled=empty(node_key)

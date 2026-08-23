@@ -302,9 +302,7 @@ test composer_mark_glyph_wears_button_ink
   viewport 360 160
   mount
     box #surface w=fill p=24.0
-      ComposerMarks #marks
-        with
-          disabled=false
+      ComposerMarks #marks disabled=false
         events
           mark -> open_message_link _
   target code = #surface/marks/root/code
