@@ -279,6 +279,15 @@ async fn retarget_all(
     }
 }
 
+/// How long a whole-mesh convergence may take before the test calls it hung.
+///
+/// A BACKSTOP, not a synchronizer: every wait below is driven by the
+/// orchestrator's own events and exits the moment they arrive, so this bound
+/// only turns a hang into a failure. Kept generous because the cost of a
+/// generous backstop on a healthy run is zero and the cost of a tight one is a
+/// red CI on a busy machine.
+const CONVERGE_BUDGET: Duration = Duration::from_secs(30);
+
 /// Drain collected events until every node in `want` has emitted
 /// `TunnelsApplied` for `epoch`; returns the `MeshReady` versions seen.
 /// A healthy convergence emits NO failure events — `PeerFailed` here means
@@ -290,7 +299,7 @@ async fn await_applied(
 ) -> HashMap<usize, Vec<u8>> {
     let mut versions = HashMap::new();
     let mut applied: Vec<usize> = Vec::new();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(CONVERGE_BUDGET, async {
         while applied.len() < want.len() {
             let (i, event) = collected.recv().await.expect("event stream open");
             match event {
@@ -323,6 +332,14 @@ fn spawn_nudgers(local: &LocalSet, nodes: &[TestNode]) {
         let cmd = node.cmd.clone();
         local.spawn_local(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(50));
+            // the same discipline `bin/node`'s nudger already runs under, and
+            // for the same reason. The default is `Burst`: a starved test
+            // (several single-threaded `LocalSet`s on a loaded box) comes back
+            // to a pile of missed 50 ms ticks and fires them ALL, and the nudge
+            // storm then outruns the delivery tasks it shares a thread with —
+            // convergence stops making progress instead of merely slowing down.
+            // Measured: 6 s idle, still unconverged at 60 s under 40 busy loops.
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
                 if cmd.send(ReachabilityCommand::Nudge).await.is_err() {
@@ -1098,7 +1115,7 @@ async fn await_restored(
     want: &[usize],
 ) -> HashMap<usize, (u64, usize)> {
     let mut restored = HashMap::new();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(CONVERGE_BUDGET, async {
         while restored.len() < want.len() {
             let (i, event) = collected.recv().await.expect("event stream open");
             match event {
@@ -1496,7 +1513,7 @@ async fn tampered_mesh_state_is_refused_and_live_assembly_still_converges() {
 
             let mut refused = false;
             let mut applied: HashSet<usize> = HashSet::new();
-            tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::time::timeout(CONVERGE_BUDGET, async {
                 while !refused || applied.len() < 2 {
                     let (i, event) = collected.recv().await.expect("event stream open");
                     match event {
@@ -1541,7 +1558,7 @@ async fn await_prewarmed(
 ) {
     let mut applied: HashSet<usize> = HashSet::new();
     let mut latest: HashMap<usize, usize> = HashMap::new();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(CONVERGE_BUDGET, async {
         while members.iter().any(|i| !applied.contains(i))
             || standby_want
                 .iter()
@@ -1908,7 +1925,7 @@ async fn standby_readvertisement_updates_the_endpoint_live() {
             // both members converge on the new endpoint — member 1 through
             // member 0's accept-gated relay of the fresher record.
             let moved: std::net::SocketAddr = "9.9.9.42:51820".parse().unwrap();
-            tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::time::timeout(CONVERGE_BUDGET, async {
                 loop {
                     let both = [0usize, 1].iter().all(|i| {
                         latest_config(&nodes[*i])
@@ -2070,7 +2087,7 @@ async fn standby_reboot_supersedes_its_previous_life_in_place() {
             // both members adopt the reboot's address IN PLACE — the
             // re-signed record supersedes the previous life's.
             let life2: SocketAddr = "8.8.8.40:51820".parse().unwrap();
-            tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::time::timeout(CONVERGE_BUDGET, async {
                 loop {
                     let both = [0usize, 1].iter().all(|i| {
                         latest_config(&nodes[*i])
@@ -2215,7 +2232,7 @@ async fn standby_persists_the_member_mesh_for_its_promotion_reboot() {
                 await_prewarmed(&mut collected, &[0, 1], &[(2, 2)], 1).await;
                 // the standby persists on advert acceptance; both member
                 // adverts must be on disk before this life ends.
-                tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::time::timeout(CONVERGE_BUDGET, async {
                     loop {
                         let full =
                             reachability::store::load(&dir.path().join("mesh-2.json"), CHAIN)
@@ -2598,7 +2615,7 @@ async fn standby_reboot_rendezvouses_its_endpointless_members() {
             // both member ADVERTS must reach the standby's persist file
             // before the crash — that file is everything life 2 has.
             let persist = dir.path().join("mesh-2.json");
-            tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::time::timeout(CONVERGE_BUDGET, async {
                 loop {
                     let persisted = reachability::store::load(&persist, CHAIN).ok().flatten();
                     if persisted.is_some_and(|mesh| mesh.adverts.len() == 2) {
@@ -2682,7 +2699,7 @@ async fn standby_reboot_rendezvouses_its_endpointless_members() {
 
             // the sweep rendezvouses member 0 and re-applies: its entry now
             // carries the punched address instead of sitting endpoint-less.
-            tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::time::timeout(CONVERGE_BUDGET, async {
                 loop {
                     let healed = {
                         let fake = reborn_effect.0.lock().unwrap();
