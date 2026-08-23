@@ -191,9 +191,17 @@ on console_opened(id)
   node_log_timeline = node_log_timeline_reset()
   shell_credentials_generation = shell_credentials_generation + 1
   shell_credentials = []
-  shell_credential_options = []
+  shell_identities = []
+  shell_identity_options = []
+  shell_identity = ""
+  shell_provider = "codex"
   shell_credential = ""
   shell_credentials_loading = false
+  shell_setup_open = false
+  shell_host_nodes = []
+  shell_host_node_options = ["This node"]
+  shell_host_node = "This node"
+  shell_host_node_key = ""
   shell_terminal = idle_agent_terminal()
   shell_terminal_running = false
   shell_terminal_busy = false
@@ -206,8 +214,9 @@ on console_opened(id)
   shell_chat_status = ""
   shell_chat_detail = ""
   shell_chat_live = ""
-  shell_chat_error = ""
   shell_chat_saga = ""
+  shell_detached_saga = ""
+  shell_steps_open = 0
   // The old network's history lane was invalidated above, so a socket that
   // never answers cannot keep "Load older" disabled in the new network.
   history_loading = false

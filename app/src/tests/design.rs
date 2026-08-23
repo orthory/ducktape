@@ -1427,6 +1427,9 @@ fn every_repeated_component_mount_is_culled_or_argued() {
             "screens/shell.ice",
             "keyed row in activity by=row.id #activity w=fill gap=8.0",
         ),
+        // The same cap, kept with the turn it belongs to, and drawn only for
+        // the ONE entry whose fold is open (`steps_open == entry.id`).
+        ("screens/shell.ice", "for step in entry.steps"),
         // 3. QUERY-CAPPED — whatever one query answered with. The list is
         //    replaced wholesale by the next query, never appended to.
         ("screens/chat.ice", "for hit in search_hits"),
