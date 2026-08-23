@@ -37,7 +37,7 @@ pub struct KindCount {
 /// It replaces three hand-synced conjunct arms — pages, chat and the explorer
 /// each carried their own copy, and a fourth surface would have grown a
 /// fourth.
-pub fn search_answer_stands(query: String, draft: String, searching: bool) -> bool {
+pub fn search_answer_stands(query: &str, draft: &str, searching: bool) -> bool {
     !searching && !query.is_empty() && draft.trim() == query
 }
 

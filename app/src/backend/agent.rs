@@ -380,7 +380,7 @@ pub fn agent_host_node_options(
 /// `--cred`: "THIS RUN LETS THAT NODE SPEND YOUR SUBSCRIPTION — the lender
 /// admits the executing node on YOUR grant, for this credential and this run
 /// only". A bare dropdown labelled HOST said none of that.
-pub fn agent_host_grant_note(host_node: String, credential: String) -> String {
+pub fn agent_host_grant_note(host_node: &str, credential: &str) -> String {
     let picked = host_node.trim();
     let local = picked.is_empty() || picked == LOCAL_HOST_NODE;
     if local || credential.trim().is_empty() {
@@ -393,7 +393,7 @@ pub fn agent_host_grant_note(host_node: String, credential: String) -> String {
 /// it, on whose account, and where. NOT a `*_summary`: it folds the operator's
 /// own two picks, not rows a live node delivered, so it has nothing to be
 /// honest about when the node is down — with nothing picked it already says so.
-pub fn agent_run_line(identity: String, host_node: String) -> String {
+pub fn agent_run_line(identity: &str, host_node: &str) -> String {
     let identity = identity.trim();
     if identity.is_empty() {
         return "No agent selected".into();
@@ -479,19 +479,19 @@ fn host_node_row(
     })
 }
 
-pub fn agent_provider_label(provider: String) -> String {
-    provider_title(&provider).into()
+pub fn agent_provider_label(provider: &str) -> String {
+    provider_title(provider).into()
 }
 
-pub fn agent_provider_initial(provider: String) -> String {
-    match provider.as_str() {
+pub fn agent_provider_initial(provider: &str) -> String {
+    match provider {
         "codex" => "C".into(),
         "claude" => "A".into(),
         _ => "?".into(),
     }
 }
 
-pub fn agent_register_hint(provider: String) -> String {
+pub fn agent_register_hint(provider: &str) -> String {
     format!("Register one with `ducktape user cred add {provider}`")
 }
 
@@ -502,16 +502,16 @@ pub fn agent_register_hint(provider: String) -> String {
 /// window — and a credential-less identity takes the node's local path, where
 /// the provider has no gateway credential and will ask for a login inside the
 /// session.
-pub fn agent_terminal_note(provider: String, credential: String) -> String {
+pub fn agent_terminal_note(provider: &str, credential: &str) -> String {
     if credential.trim().is_empty() {
         return format!(
             "{} runs here with no credential — it will ask you to sign in inside the session.",
-            provider_title(&provider)
+            provider_title(provider)
         );
     }
     format!(
         "A sandboxed {} session. Nothing here is durable: it ends when you close it.",
-        provider_title(&provider)
+        provider_title(provider)
     )
 }
 
@@ -519,35 +519,32 @@ pub fn agent_terminal_note(provider: String, credential: String) -> String {
 /// SHAPE of its work on screen even while the detail is closed.
 fn agent_steps_label(steps: &[AgentActivity]) -> String {
     let commands = steps.iter().filter(|step| step.title == "Command").count() as i64;
-    let steps = plural(steps.len() as i64, "step".into(), "steps".into());
+    let steps = plural(steps.len() as i64, "step", "steps");
     if commands == 0 {
         return steps;
     }
-    format!(
-        "{steps} · {}",
-        plural(commands, "command".into(), "commands".into())
-    )
+    format!("{steps} · {}", plural(commands, "command", "commands"))
 }
 
 /// The run id, short enough to sit in a line of prose and long enough to find
 /// in `ducktape` output. The dispatch half is what identifies a run; the
 /// namespace prefix in front of it is the same on every run this node submits.
-pub fn agent_run_label(saga_id: String) -> String {
+pub fn agent_run_label(saga_id: &str) -> String {
     let dispatch = saga_id
         .rsplit_once('\u{1f}')
-        .map_or(saga_id.as_str(), |(_, dispatch)| dispatch);
+        .map_or(saga_id, |(_, dispatch)| dispatch);
     format!("run {}", short_label(dispatch))
 }
 
-pub fn agent_composer_hint(provider: String) -> String {
-    format!("Message {}…", provider_title(&provider))
+pub fn agent_composer_hint(provider: &str) -> String {
+    format!("Message {}…", provider_title(provider))
 }
 
 /// What sending actually starts, before anyone sends anything. The old copy
 /// ("the run is durable, its work streams here…") described the plumbing; this
 /// says the two things that change what an operator does: WHERE the sandbox
 /// runs, and that the answer outlives the window.
-pub fn agent_task_blurb(host_node: String) -> String {
+pub fn agent_task_blurb(host_node: &str) -> String {
     let host = host_node.trim();
     let local = host.is_empty() || host == LOCAL_HOST_NODE;
     if local {
@@ -1756,11 +1753,11 @@ mod tests {
     #[test]
     fn a_peer_host_states_what_it_costs_and_the_local_one_says_nothing() {
         assert_eq!(
-            agent_host_grant_note("alice".into(), "team-codex".into()),
+            agent_host_grant_note("alice", "team-codex"),
             "alice runs this work and spends team-codex for it — this run only."
         );
-        assert!(agent_host_grant_note(LOCAL_HOST_NODE.into(), "team-codex".into()).is_empty());
-        assert!(agent_host_grant_note("alice".into(), String::new()).is_empty());
+        assert!(agent_host_grant_note(LOCAL_HOST_NODE, "team-codex").is_empty());
+        assert!(agent_host_grant_note("alice", "").is_empty());
     }
 
     /// A node that announces nothing this app can launch is not a compute
@@ -1895,7 +1892,7 @@ mod tests {
         assert_eq!(detached[1].status, "detached");
         assert_eq!(detached[1].saga_id, saga);
         assert_eq!(detached[1].steps_label, "2 steps · 1 command");
-        assert_eq!(agent_run_label(saga.clone()), "run aaaaaaaa…");
+        assert_eq!(agent_run_label(&saga), "run aaaaaaaa…");
 
         let reopened = agent_chat_drop_detached(detached);
         assert_eq!(reopened.len(), 1);

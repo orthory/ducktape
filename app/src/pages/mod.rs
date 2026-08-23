@@ -60,13 +60,13 @@ pub fn commented_lines(blocks: Vec<crate::backend::PageBlock>, targets: Vec<Stri
 /// and a snippet of the block it marks, or the page itself.
 /// The composer's own caption: where a NEW comment will anchor.
 pub fn comment_compose_hint(
-    blocks: Vec<crate::backend::PageBlock>,
-    target: String,
-    page_id: String,
+    blocks: &[crate::backend::PageBlock],
+    target: &str,
+    page_id: &str,
 ) -> String {
     format!(
         "New comment on {}",
-        comment_anchor_label(blocks, target, page_id)
+        anchor_label(&comment_anchor_labels(blocks), target, page_id)
     )
 }
 

@@ -196,7 +196,7 @@ fn composer_scope_named(app: &Ducktape, mount: &str, key: &str) -> Option<String
 /// The stream composer of the room the app is in, materializing it if needed.
 fn composer_scope(app: &mut Ducktape) -> String {
     materialize_composers(app);
-    let key = backend::composer_scope(app.connected_rpc.clone(), app.active_channel.clone());
+    let key = backend::composer_scope(&app.connected_rpc, &app.active_channel);
     composer_scope_named(app, "/composer(", &key)
         .unwrap_or_else(|| panic!("the composer for `{}` materialized", app.active_channel))
 }
@@ -205,8 +205,8 @@ fn composer_scope(app: &mut Ducktape) -> String {
 fn reply_composer_scope(app: &mut Ducktape) -> String {
     materialize_composers(app);
     let key = backend::thread_scope(
-        app.connected_rpc.clone(),
-        app.active_channel.clone(),
+        &app.connected_rpc,
+        &app.active_channel,
         app.active_thread_seq,
     );
     composer_scope_named(app, "/reply_composer(", &key).unwrap_or_else(|| {

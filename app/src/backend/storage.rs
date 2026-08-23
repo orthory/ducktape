@@ -29,24 +29,25 @@ pub fn fs_entry_named(entries: Vec<FsEntry>, path: String) -> FsEntry {
 
 /// Directory rows prepared with the listing so the keyed sidebar does not
 /// filter and clone the full entry list while building every frame.
-pub fn fs_directories(entries: Vec<FsEntry>) -> Vec<FsEntry> {
+pub fn fs_directories(entries: &[FsEntry]) -> Vec<FsEntry> {
     entries
-        .into_iter()
+        .iter()
         .filter(|entry| entry.kind == "dir")
+        .cloned()
         .collect()
 }
 
 /// What is under this crumb, counted. Ice cannot filter a list by field, so the
 /// crumb bar's two counts are pure folds over the listing it is already drawn
 /// beside — never a second `files_ls`.
-pub fn fs_dir_count(entries: Vec<FsEntry>) -> i64 {
+pub fn fs_dir_count(entries: &[FsEntry]) -> i64 {
     count_i64(entries.iter().filter(|entry| entry.kind == "dir").count())
 }
 
 /// Everything that is not a directory. `files_ls` publishes one `kind` per row
 /// and the browser draws exactly two shapes, so the complement IS the file
 /// count — no third bucket can hide here.
-pub fn fs_file_count(entries: Vec<FsEntry>) -> i64 {
+pub fn fs_file_count(entries: &[FsEntry]) -> i64 {
     count_i64(entries.iter().filter(|entry| entry.kind != "dir").count())
 }
 
@@ -57,13 +58,13 @@ pub fn fs_file_count(entries: Vec<FsEntry>) -> i64 {
 /// that directory's tally, printed under the new one's name. Same rule as the
 /// register subtitles in backend/shell.rs: say nothing rather than something
 /// false.
-pub fn fs_counts_summary(connected: bool, listed: bool, entries: Vec<FsEntry>) -> String {
+pub fn fs_counts_summary(connected: bool, listed: bool, entries: &[FsEntry]) -> String {
     if !connected || !listed || entries.is_empty() {
         return String::new();
     }
-    let file_count = fs_file_count(entries.clone());
-    let files = plural(file_count, "file".into(), "files".into());
-    let dirs = plural(fs_dir_count(entries), "dir".into(), "dirs".into());
+    let file_count = fs_file_count(entries);
+    let files = plural(file_count, "file", "files");
+    let dirs = plural(fs_dir_count(entries), "dir", "dirs");
     format!("{files} · {dirs}")
 }
 

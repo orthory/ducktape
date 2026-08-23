@@ -306,31 +306,15 @@ fn the_chat_float_stands_only_for_the_query_it_was_sent() {
 fn one_predicate_decides_whether_a_search_answer_still_stands() {
     // The answer speaks for the string it was sent for — trimmed, because that
     // is what was sent.
-    assert!(backend::search_answer_stands(
-        "zzz".into(),
-        "  zzz  ".into(),
-        false
-    ));
+    assert!(backend::search_answer_stands("zzz", "  zzz  ", false));
     // ONE MORE CHARACTER AND IT DOES NOT. No handler ran; only this comparison
     // can tell.
-    assert!(!backend::search_answer_stands(
-        "zzz".into(),
-        "zzzq".into(),
-        false
-    ));
+    assert!(!backend::search_answer_stands("zzz", "zzzq", false));
     // A ROUND TRIP IS NOT AN ANSWER — the submit's own search is still out.
-    assert!(!backend::search_answer_stands(
-        "zzz".into(),
-        "zzz".into(),
-        true
-    ));
+    assert!(!backend::search_answer_stands("zzz", "zzz", true));
     // AND AN EMPTY QUERY IS NO ANSWER AT ALL, which is what every dismissal
     // leaves behind: an emptied box must not match an emptied query.
-    assert!(!backend::search_answer_stands(
-        String::new(),
-        String::new(),
-        false
-    ));
+    assert!(!backend::search_answer_stands("", "", false));
 
     // The three arms read it, so none of them can drift from the others.
     for (source, call) in [
@@ -1087,11 +1071,11 @@ fn a_disconnected_console_reports_no_counts_at_all() {
 
     app.connected = true;
     assert_eq!(
-        backend::members_summary(app.connected, app.members_rows.clone()),
+        backend::members_summary(app.connected, &app.members_rows),
         "1 human · 0 agents"
     );
     assert_eq!(
-        backend::fs_counts_summary(app.connected, true, app.fs_entries.clone()),
+        backend::fs_counts_summary(app.connected, true, &app.fs_entries),
         "1 file · 0 dirs"
     );
     // The two registers this boot leaves EMPTY are silent while connected too —
@@ -1099,33 +1083,27 @@ fn a_disconnected_console_reports_no_counts_at_all() {
     // "No agents registered" / "No proposals yet". `a_subtitle_that_is_all_zeros_
     // says_nothing_at_all` (backend/tests.rs) is where the speaking case is
     // proved with real rows; here they are empty on purpose.
-    assert_eq!(
-        backend::agents_summary(app.connected, app.agents_rows.clone()),
-        ""
-    );
-    assert_eq!(
-        backend::proposals_summary(app.connected, app.gov_rows.clone()),
-        ""
-    );
+    assert_eq!(backend::agents_summary(app.connected, &app.agents_rows), "");
+    assert_eq!(backend::proposals_summary(app.connected, &app.gov_rows), "");
 
     // The node goes down. Everything above was a reading; none of it is one now.
     app.connected = false;
     for (screen, meta) in [
         (
             "Members",
-            backend::members_summary(app.connected, app.members_rows.clone()),
+            backend::members_summary(app.connected, &app.members_rows),
         ),
         (
             "Agents",
-            backend::agents_summary(app.connected, app.agents_rows.clone()),
+            backend::agents_summary(app.connected, &app.agents_rows),
         ),
         (
             "Approvals",
-            backend::proposals_summary(app.connected, app.gov_rows.clone()),
+            backend::proposals_summary(app.connected, &app.gov_rows),
         ),
         (
             "Files",
-            backend::fs_counts_summary(app.connected, true, app.fs_entries.clone()),
+            backend::fs_counts_summary(app.connected, true, &app.fs_entries),
         ),
     ] {
         assert_eq!(
