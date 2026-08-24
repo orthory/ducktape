@@ -20,7 +20,7 @@ use noded::projection::{BlockProjection, project_block};
 use crate::host_reads::{
     read_valset_members, read_valset_mesh_window, read_valset_residents,
 };
-use crate::{lobby, relay};
+use crate::{join_gate, relay};
 use crate::util::{fatal, hex, participant_bytes, resident_bytes};
 
 impl ValidatorRuntime<'_> {
@@ -194,7 +194,7 @@ impl ValidatorRuntime<'_> {
             if let Some(gate) = pending_gates.remove(&d.id) {
                 gating.remove(&gate.joiner);
                 let reply = match d.disposition {
-                    node::Disposition::Applied => lobby::IntroReply::Admitted {
+                    node::Disposition::Applied => join_gate::IntroReply::Admitted {
                         height: d.height,
                         cap: gate.cap,
                     },
@@ -212,14 +212,14 @@ impl ValidatorRuntime<'_> {
                             .iter()
                             .any(|r| r.as_slice() == gate.joiner.as_slice());
                         if admitted {
-                            lobby::IntroReply::Admitted {
+                            join_gate::IntroReply::Admitted {
                                 height: d.height,
                                 cap: gate.cap,
                             }
                         } else {
                             let (code, terminal) =
-                                lobby::redeem_reject_outcome(d.reason.as_deref());
-                            lobby::IntroReply::Rejected {
+                                join_gate::redeem_reject_outcome(d.reason.as_deref());
+                            join_gate::IntroReply::Rejected {
                                 code,
                                 detail: d.reason.clone().unwrap_or_else(|| {
                                     "invite redemption rejected in consensus".into()
@@ -240,7 +240,7 @@ impl ValidatorRuntime<'_> {
                 // actually waited out the cutover. every validator resolves
                 // this same Applied block in its own drain, so the widened
                 // window converges within a beat.
-                if let lobby::IntroReply::Admitted { .. } = &reply {
+                if let join_gate::IntroReply::Admitted { .. } = &reply {
                     let window = read_valset_mesh_window(node.host()).await;
                     mesh_window.track_new(mesh_oracle, mesh_book, &window);
                 }
@@ -394,8 +394,8 @@ impl ValidatorRuntime<'_> {
                     super::settle_gate(
                         gate_outcomes,
                         gate.joiner,
-                        lobby::IntroReply::Rejected {
-                            code: lobby::RejectCode::Busy,
+                        join_gate::IntroReply::Rejected {
+                            code: join_gate::RejectCode::Busy,
                             detail: "the gate could not settle in time — trying another member"
                                 .into(),
                             terminal: false,

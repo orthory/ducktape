@@ -41,7 +41,7 @@ fn network_shape_joiner_parks_until_promote() {
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
 
     // In the manual flow, the pubkey travels out-of-band
-    // and no lobby announce happens — the tokened flavor has its own e2e
+    // and no first-contact intro happens — the tokened flavor has its own e2e
     // (join_request_e2e).
     let invite = cluster.invite();
     let friend_key = cluster.join_friend_manual(&invite);

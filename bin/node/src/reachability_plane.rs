@@ -8,7 +8,7 @@ use commonware_runtime::{IoBuf, Spawner, Supervisor};
 
 use crate::config::{self, hex_bytes};
 use crate::constants::NUDGE_INTERVAL;
-use crate::lobby;
+use crate::join_gate;
 
 /// Which doorbell an intro arrived on: the DIRECT UDP listener or the
 /// COORDINATED (rendezvous-punched, resolver-socket) receiver.
@@ -28,11 +28,11 @@ pub(crate) enum IntroPath {
 /// its own socket, the coordinated receiver via `SendResolverDatagram`).
 /// Returns `false` once the plane's command channel is gone, telling the
 /// caller to exit its receive loop.
-/// the shared gate-outcome map (joiner key → its resolved [`lobby::IntroReply`]):
+/// the shared gate-outcome map (joiner key → its resolved [`join_gate::IntroReply`]):
 /// the run loop's drain WRITES the settled outcome, the intro doorbell READS it
 /// on the joiner's next retransmit and seals it back down the tunnel.
 pub(crate) type GateOutcomes =
-    std::sync::Arc<std::sync::Mutex<HashMap<Vec<u8>, lobby::IntroReply>>>;
+    std::sync::Arc<std::sync::Mutex<HashMap<Vec<u8>, join_gate::IntroReply>>>;
 
 /// the caller-side halves of the plane's lane-reclaim seam (see
 /// `wire_reachability_plane`'s `lane_reclaim`): each resolves with its half
@@ -49,7 +49,7 @@ pub(crate) type ReachLaneHandback = (
 /// next retransmit and seals back. A joiner's own plane carries `None`.
 #[derive(Clone)]
 pub(crate) struct GateHook {
-    pub(crate) forward: tokio::sync::mpsc::Sender<lobby::GateForward>,
+    pub(crate) forward: tokio::sync::mpsc::Sender<join_gate::GateForward>,
     pub(crate) outcomes: GateOutcomes,
 }
 
@@ -76,11 +76,11 @@ where
     let Ok(plaintext) = open(sealed) else {
         return true;
     };
-    let Ok(msg) = lobby::decode_intro(&plaintext) else {
+    let Ok(msg) = join_gate::decode_intro(&plaintext) else {
         return true;
     };
     let nonce = msg.nonce.clone();
-    let verified = match lobby::verify_intro(&msg, binding) {
+    let verified = match join_gate::verify_intro(&msg, binding) {
         Ok(v) => v,
         Err(_) => return true,
     };
@@ -88,8 +88,8 @@ where
     // SEALED to it, so an `Admitted`'s coordinator capability never crosses the
     // wire in the clear.
     let joiner_wg = verified.wg_public_key;
-    let sealed_reply = |reply: lobby::IntroReply| {
-        let bytes = lobby::encode_intro_ack(&lobby::IntroAck {
+    let sealed_reply = |reply: join_gate::IntroReply| {
+        let bytes = join_gate::encode_intro_ack(&join_gate::IntroAck {
             nonce: nonce.clone(),
             reply,
         });
@@ -98,7 +98,7 @@ where
     // V4 expiry, on this member's wall clock (signature-covered field).
     if nat_traversal::now_secs() >= msg.expires_unix_secs {
         if path == IntroPath::Direct {
-            ack(sealed_reply(lobby::IntroReply::Refused {
+            ack(sealed_reply(join_gate::IntroReply::Refused {
                 detail: "invite expired — ask the inviter for a fresh one".into(),
             }))
             .await;
@@ -139,9 +139,9 @@ where
             let reply = gate_reply(gate, &verified.joiner, &msg).await;
             ack(sealed_reply(reply)).await;
         }
-        Ok(Err(e)) => ack(sealed_reply(lobby::IntroReply::Refused { detail: e })).await,
+        Ok(Err(e)) => ack(sealed_reply(join_gate::IntroReply::Refused { detail: e })).await,
         Err(_) => {
-            ack(sealed_reply(lobby::IntroReply::Refused {
+            ack(sealed_reply(join_gate::IntroReply::Refused {
                 detail: "plane exited".into(),
             }))
             .await;
@@ -162,16 +162,16 @@ where
 async fn gate_reply(
     gate: Option<&GateHook>,
     joiner: &ed25519::PublicKey,
-    msg: &lobby::IntroRequest,
-) -> lobby::IntroReply {
+    msg: &join_gate::IntroRequest,
+) -> join_gate::IntroReply {
     let Some(hook) = gate else {
-        return lobby::IntroReply::Installed;
+        return join_gate::IntroReply::Installed;
     };
     let joiner_key = joiner.as_ref().to_vec();
     let settled = {
         let mut outcomes = hook.outcomes.lock().expect("gate outcomes lock");
         match outcomes.get(&joiner_key) {
-            Some(admitted @ lobby::IntroReply::Admitted { .. }) => Some(admitted.clone()),
+            Some(admitted @ join_gate::IntroReply::Admitted { .. }) => Some(admitted.clone()),
             Some(_) => outcomes.remove(&joiner_key),
             None => None,
         }
@@ -181,7 +181,7 @@ async fn gate_reply(
     }
     let _ = hook
         .forward
-        .send(lobby::GateForward {
+        .send(join_gate::GateForward {
             issuer: msg.issuer.clone(),
             nonce: msg.nonce.clone(),
             token_sig: msg.token_sig.clone(),
@@ -190,7 +190,7 @@ async fn gate_reply(
             expires_unix_secs: msg.expires_unix_secs,
         })
         .await;
-    lobby::IntroReply::Installed
+    join_gate::IntroReply::Installed
 }
 
 /// the reachability plane's thread body: derive the plane's endpoints, bind

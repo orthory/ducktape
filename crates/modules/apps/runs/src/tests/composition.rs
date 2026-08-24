@@ -155,7 +155,7 @@ fn marker_less_results_are_loud_errors_not_message_only_delivery() {
         br#"{"response_text":"nope"}"#.as_slice(),
         &[0xff, 0xfe],
     ] {
-        let err = decode_run_result_v1(raw).unwrap_err();
+        let err = decode_run_result(raw).unwrap_err();
         assert!(
             err.contains("malformed"),
             "{raw:?} must be a loud error, got {err:?}"
@@ -179,7 +179,7 @@ fn a_well_formed_runner_result_yields_its_response_text() {
     })
     .to_string();
     assert_eq!(
-        decode_run_result_v1(wrapper.as_bytes())
+        decode_run_result(wrapper.as_bytes())
             .unwrap()
             .response_text,
         "the deliverable prose"
@@ -188,7 +188,7 @@ fn a_well_formed_runner_result_yields_its_response_text() {
 
 #[test]
 fn a_broken_runner_wrapper_is_a_loud_error_not_raw_delivery() {
-    // claims the marker but the version is unknown → fail the run.
+    // claims the marker key but not the magic value → fail the run.
     let bad_version = serde_json::json!({
         "ducktape_runner_result": 99,
         "response_text": "x",
@@ -198,13 +198,13 @@ fn a_broken_runner_wrapper_is_a_loud_error_not_raw_delivery() {
         }
     })
     .to_string();
-    let err = decode_run_result_v1(bad_version.as_bytes()).unwrap_err();
-    assert!(err.contains("version 99"), "got {err:?}");
+    let err = decode_run_result(bad_version.as_bytes()).unwrap_err();
+    assert!(err.contains("marker 99"), "got {err:?}");
 
     // claims the marker but the shape is malformed → fail, never deliver
     // the raw JSON as if it were the model's prose.
     let malformed = r#"{"ducktape_runner_result":1,"response_text":42}"#;
-    let err = decode_run_result_v1(malformed.as_bytes()).unwrap_err();
+    let err = decode_run_result(malformed.as_bytes()).unwrap_err();
     assert!(err.contains("malformed"), "got {err:?}");
 }
 // ---- the forge compose lane (M1) --------------------------------------------

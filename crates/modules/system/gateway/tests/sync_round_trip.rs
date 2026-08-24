@@ -109,7 +109,6 @@ fn content_route(seed: u8) -> RouteDefinition {
 
 fn set_route(founder: &Ed, node: &[u8], revision: u64, route: Option<RouteDefinition>) -> Msg {
     let statement = RouteStatement {
-        version: 1,
         chain_id: CHAIN.into(),
         account_id: ed_pub(founder),
         name: RouteName::apex(),

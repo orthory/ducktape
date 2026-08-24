@@ -279,20 +279,15 @@ pub struct WorkerRequest {
 }
 
 /// fixed self-description for host-local worker control effects. controls are
-/// deliberately a SEPARATE wire shape from [`WorkerRequest`], so existing work
-/// requests keep their byte contract and a host that does not recognize a
-/// control effect simply leaves it unclaimed.
+/// a SEPARATE wire shape from [`WorkerRequest`]: work orders and control
+/// effects ride the same event lane, and the `kind` tag is what lets a host
+/// claim controls without try-decoding them as requests.
 pub const WORKER_CONTROL_KIND: &str = "ducktape_worker_control";
 
-/// the first host-local worker control protocol. bump before changing the
-/// meaning of any existing command.
-pub const WORKER_CONTROL_VERSION: u32 = 1;
-
-/// a versioned host-local control effect for one already-issued attempt.
+/// a host-local control effect for one already-issued attempt.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct WorkerControl {
     pub kind: String,
-    pub version: u32,
     pub command: WorkerControlCommand,
 }
 
@@ -300,7 +295,6 @@ impl WorkerControl {
     pub fn cancel_attempt(saga_id: SagaId, attempt: u32, assignee: Vec<u8>) -> Self {
         Self {
             kind: WORKER_CONTROL_KIND.into(),
-            version: WORKER_CONTROL_VERSION,
             command: WorkerControlCommand::CancelAttempt {
                 saga_id,
                 attempt,
@@ -491,12 +485,6 @@ pub fn decode_worker_control(b: &[u8]) -> Result<WorkerControl, String> {
     let control: WorkerControl = sdk::wire::decode(b)?;
     if control.kind != WORKER_CONTROL_KIND {
         return Err(format!("not a worker control (kind {:?})", control.kind));
-    }
-    if control.version != WORKER_CONTROL_VERSION {
-        return Err(format!(
-            "unsupported worker control version {}",
-            control.version
-        ));
     }
     Ok(control)
 }

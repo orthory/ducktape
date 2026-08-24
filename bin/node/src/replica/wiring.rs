@@ -19,7 +19,7 @@ use recovery::{Manifest, Recovery};
 use crate::config::{self, hex_bytes};
 use crate::constants::*;
 use crate::first_contact_join;
-use crate::lobby;
+use crate::join_gate;
 use crate::reachability_plane::{ReachLaneHandback, wire_reachability_plane};
 use crate::util::fatal;
 use crate::validator::{DrainingSlot, LaneBank, LaneSlot, ReclaimableLane};
@@ -359,7 +359,7 @@ pub(super) async fn wire(
                     // keypair rides along too: post-verify acks (and the
                     // coord cap inside an `Admitted`) come back SEALED to it.
                     let keypair = std::sync::Arc::new(keypair);
-                    let intro = lobby::encode_intro(&lobby::intro_request(
+                    let intro = join_gate::encode_intro(&join_gate::intro_request(
                         &signer,
                         &namespace,
                         token,

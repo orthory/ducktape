@@ -1785,12 +1785,4 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         &self.host
     }
 
-    /// mutably borrow the wrapped host — the activation-boundary driver uses this
-    /// to drive `Host::set_active_version` across the registry at `H` (design §4).
-    /// this sets non-hashed dual-path branch selectors only; it never mutates
-    /// hashed state (that rides the in-block System `Advance` the host drain
-    /// injects), so it cannot move the root-hash on its own.
-    pub fn host_mut(&mut self) -> &mut Host {
-        &mut self.host
-    }
 }

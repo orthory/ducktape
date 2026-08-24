@@ -5,7 +5,6 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { join } from "node:path";
 
 // Consensus rejects these handles — a seed that asks for one aborts the demo.
 // Mirrors RESERVED_ROOT_LABELS in crates/duckdns/src/wire.rs (the source
@@ -45,12 +44,14 @@ const INDEX_HTML = `<!doctype html>
 async function main() {
   const [url, nodeBin, workdir, chain, requestedHandle = "demo", userKeyArg, password = ""] = Bun.argv.slice(2);
   if (!url || !nodeBin || !workdir || !chain) {
-    throw new Error("usage: demo-gateway.mjs <http-url> <node-bin> <workdir> <chain-id> [handle] [user-key] [password]");
+    throw new Error("usage: demo-gateway.mjs <http-url> <node-bin> <workdir> <chain-id> [handle] <user-key> [password]");
   }
-  // The signing key is the local user identity demo-seed provisioned (encrypted
-  // v1) — its password unlocks each sign-* call over stdin. Fall back to the
-  // legacy in-workdir path for older callers.
-  const userKey = userKeyArg || join(workdir, "user.key");
+  // The signing key is the local user identity demo-seed provisioned
+  // (encrypted) — its password unlocks each sign-* call over stdin.
+  if (!userKeyArg) {
+    throw new Error("usage: demo-gateway.mjs <http-url> <node-bin> <workdir> <chain-id> [handle] <user-key> [password]");
+  }
+  const userKey = userKeyArg;
 
   async function post(path, body) {
     const response = await fetch(`${url}${path}`, {
@@ -147,7 +148,6 @@ async function main() {
   }
 
   const site = {
-    version: 1,
     chain_id: chain,
     account_id: accountId,
     name: { label: "site" },
@@ -165,21 +165,11 @@ async function main() {
       },
     },
   };
-  try {
-    await publish(site);
-  } catch (error) {
-    // The thrown message carries the raw HTTP body (JSON-wrapped, quotes
-    // escaped), so match only the module's rejection text.
-    if (!error.message.includes("invalid type: map, expected a sequence")) throw error;
-    // NO-BACKCOMPAT: the embedded gateway component must be regenerated for
-    // Identity's Vec<NodeView>; never retry with its stale Vec<Vec<u8>> wire.
-    console.error("[gateway] SKIPPED all routes: embedded gateway component expects Identity AccountView.nodes as byte arrays, but Identity now returns NodeView objects; regenerate crates/modules/system/gateway/component.wasm (cargo run -p guest-builder -- crates/modules/system/gateway)");
-    process.exitCode = 78;
-    return;
-  }
+  // A stale embedded gateway component is a build error, not a condition to
+  // survive: a publish rejection fails the demo loudly.
+  await publish(site);
 
   await publish({
-    version: 1,
     chain_id: chain,
     account_id: accountId,
     name: { label: "app" },
@@ -201,7 +191,6 @@ async function main() {
   // The reference app (spec §8): board.<handle>.duck — served by
   // ops/demo-kanban.mjs, reachable by any admitted member, WebSocket-realtime.
   await publish({
-    version: 1,
     chain_id: chain,
     account_id: accountId,
     name: { label: "board" },

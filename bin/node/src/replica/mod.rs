@@ -59,7 +59,7 @@ pub(crate) type OverlayCtx = overlay_net::OverlayContext<commonware_runtime::tok
 /// validator role continues with — and every other exit is
 /// `std::process::exit`.
 ///
-/// wiring (phase 6a: per-epoch channel bank, reachability standby, lobby)
+/// wiring (phase 6a: per-epoch channel bank, reachability standby, join gate)
 /// happens in [`wiring::wire`]; the resulting [`wiring::ReplicaChannels`]
 /// feed the park loop (phases 6b–6d: serve state, the loop itself,
 /// promotion) in [`park::park`].

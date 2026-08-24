@@ -20,8 +20,8 @@
 #                      system/ or apps/ implements `sdk::Module`; anything that
 #                      does not belongs somewhere else in this list. (module =
 #                      onchain, service = offchain.)
-#   crates/modules/system/ — system modules: consensus infrastructure (kv,
-#                      valset, governance, identity, lifecycle, saga,
+#   crates/modules/system/ — system modules: consensus infrastructure (acl,
+#                      kv, valset, governance, identity, lifecycle, saga,
 #                      capability, dispatch, tagging, gateway — which absorbed
 #                      the duckdns naming library it now consumes from
 #                      crates/duckdns)

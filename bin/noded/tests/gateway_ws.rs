@@ -14,7 +14,6 @@ use tower::ServiceExt as _;
 fn route_record(publisher: [u8; 32]) -> gateway::RouteRecord {
     gateway::RouteRecord {
         statement: gateway::RouteStatement {
-            version: 1,
             chain_id: "test".into(),
             account_id: vec![1; 32],
             name: gateway::RouteName::named("api"),

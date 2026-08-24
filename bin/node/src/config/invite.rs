@@ -26,7 +26,7 @@ pub fn invite_requires_reachability_defaults(_invite: &Invite) -> bool {
 
 // ============================================================================
 // invite tokens — the capability an invite blob carries. minted by a member
-// (`invite`), presented by the joiner over the lobby channel, redeemed
+// (`invite`), presented by the joiner in its sealed first-contact intro, redeemed
 // in-consensus by governance's `Redeem` op: MINTING IS THE ADMISSION
 // DECISION, redemption is mechanical and single-use. the canonical types and
 // verification live in `governance::invite` (the same code every validator's

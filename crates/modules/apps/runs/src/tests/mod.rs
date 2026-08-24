@@ -1,5 +1,5 @@
 use super::*;
-use crate::facets::{WireSink, decode_run_result_v1};
+use crate::facets::{WireSink, decode_run_result};
 use crate::response::{
     FAILURE_EXCERPT_BYTES, agent_response_from_text, failure_excerpt, parse_strict_response,
 };

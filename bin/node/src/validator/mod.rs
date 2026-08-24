@@ -530,7 +530,7 @@ pub(crate) async fn run_promoted(
     // standby plane is already shut down (orderly — its UAPI socket is
     // unlinked), so this restore rides the persisted mesh and the seat
     // starts connected. the join doorbell now rings THIS node's gate.
-    let (gate_fwd_tx, gate_fwd_rx) = tokio::sync::mpsc::channel::<crate::lobby::GateForward>(256);
+    let (gate_fwd_tx, gate_fwd_rx) = tokio::sync::mpsc::channel::<crate::join_gate::GateForward>(256);
     let gate_outcomes = GateOutcomes::default();
     let gate_fwd_keepalive = gate_fwd_tx.clone();
     let reach_cmd = match (wireguard_listen, reach_lane) {

@@ -551,7 +551,6 @@ fn ensure_airlock_route(
     // (`max_response_bytes = 0`), GET+POST, and it forwards the scoped session
     // bearer (`allow_authorization`). Request cap is the module ceiling.
     let statement = gateway::RouteStatement {
-        version: 1,
         chain_id: resolved.service.chain_id.clone(),
         account_id: account_id.to_vec(),
         name,

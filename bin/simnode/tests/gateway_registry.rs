@@ -82,7 +82,6 @@ fn statement(
     route: Option<gateway::RouteDefinition>,
 ) -> gateway::RouteStatement {
     gateway::RouteStatement {
-        version: 1,
         chain_id: CHAIN.into(),
         account_id: key.public_key().as_ref().to_vec(),
         name,

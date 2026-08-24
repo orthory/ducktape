@@ -84,8 +84,8 @@ pub struct Resolved {
     /// sealed blocks between recovery checkpoints.
     pub checkpoint_blocks: u64,
     /// the invite token a `join` stored beside the descriptor, if any — what a
-    /// parked joiner announces over the lobby channel. always `None` for the
-    /// dev shape and for manual (token-less) joins.
+    /// parked joiner announces in its first-contact intro. always `None` for
+    /// the dev shape and for manual (token-less) joins.
     pub invite_token: Option<InviteToken>,
     /// the inviter's WireGuard bootstrap a `join` stored, if any — the tunnel
     /// the joining node brings up BEFORE any p2p. always `None` for the dev

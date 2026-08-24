@@ -127,7 +127,6 @@ fn signed_loopback_route(
     allow_authorization: bool,
 ) -> GatewayMsg {
     let statement = RouteStatement {
-        version: 1,
         chain_id: chain.into(),
         account_id: member.public_key().as_ref().to_vec(),
         name: RouteName::named(name),

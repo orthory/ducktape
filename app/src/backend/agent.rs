@@ -17,7 +17,9 @@ const AGENT_CONTEXT_ROWS: usize = 32;
 const AGENT_CONTEXT_BYTES: usize = 48 * 1024;
 const LINK_TOKEN_BYTES: u64 = 4 * 1024;
 const MAX_ACTIVITY_ROWS: usize = 32;
-const RUNNER_RESULT_VERSION: u64 = 1;
+/// the fixed value of the `ducktape_runner_result` magic key — part of the
+/// wrapper's self-identifying token, never a version.
+const RUNNER_RESULT_MARKER: u64 = 1;
 /// The unpicked host: the run executes on the node the app is connected to.
 /// `app/src/ui/state/shell.ice` seeds the picker with this exact string, which
 /// a test below pins.
@@ -1006,9 +1008,9 @@ fn terminal_saga_event(view: SagaView, saga_id: &str) -> Option<AgentChatEvent> 
 fn agent_response_text(bytes: &[u8]) -> Result<String, String> {
     let result: AgentRunnerResult = serde_json::from_slice(bytes)
         .map_err(|error| format!("the runner result is malformed: {error}"))?;
-    if result.ducktape_runner_result != RUNNER_RESULT_VERSION {
+    if result.ducktape_runner_result != RUNNER_RESULT_MARKER {
         return Err(format!(
-            "runner result version {} is not supported",
+            "runner result marker {} is not the ducktape_runner_result magic",
             result.ducktape_runner_result
         ));
     }

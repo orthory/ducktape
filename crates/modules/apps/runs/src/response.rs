@@ -5,7 +5,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use files::paths::canonical as canonical_duckfs_path;
 
-use super::facets::{WireStatus, decode_run_result_v1, encode_delivery_receipt, output_ref_of};
+use super::facets::{WireStatus, decode_run_result, encode_delivery_receipt, output_ref_of};
 use super::{
     ACTION_CHAT_POST, ACTION_PAGES_COMMENT, AgentAction, AgentRecord, AgentResponse, BTreeSet,
     Block, ChatMsg, ChatQuery, ChatReply, Ctx, DelegationResult, DelegationState, DelegationStatus,
@@ -371,7 +371,7 @@ impl RunsModule {
         entry: &PendingState,
         bytes: &[u8],
     ) {
-        let result = match decode_run_result_v1(bytes) {
+        let result = match decode_run_result(bytes) {
             Ok(result) => result,
             Err(reason) => return self.fail_delegated_run(ctx, run_id, entry, reason).await,
         };
@@ -532,7 +532,7 @@ impl RunsModule {
         entry: &PendingState,
         bytes: &[u8],
     ) {
-        let result = match decode_run_result_v1(bytes) {
+        let result = match decode_run_result(bytes) {
             Ok(r) => r,
             Err(reason) => return self.fail_run(ctx, run_id, entry, reason).await,
         };

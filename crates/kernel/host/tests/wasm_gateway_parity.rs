@@ -228,7 +228,6 @@ fn statement(
     route: Option<RouteDefinition>,
 ) -> RouteStatement {
     RouteStatement {
-        version: 1,
         chain_id: CHAIN_ID.into(),
         account_id: account_id.to_vec(),
         name: match label {

@@ -10,7 +10,6 @@ fn hex(bytes: &[u8]) -> String {
 
 fn statement() -> RouteStatement {
     RouteStatement {
-        version: 1,
         chain_id: "test".into(),
         account_id: vec![1, 2],
         name: RouteName::named("api"),

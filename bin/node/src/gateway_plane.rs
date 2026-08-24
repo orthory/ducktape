@@ -1893,7 +1893,6 @@ mod tests {
         allow_upgrade: bool,
     ) -> gateway::RouteRecord {
         let statement = gateway::RouteStatement {
-            version: 1,
             chain_id: "test".into(),
             account_id: vec![1; 32],
             name: gateway::RouteName::named("api"),
@@ -2153,7 +2152,6 @@ mod tests {
         };
         let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
         let statement = gateway::RouteStatement {
-            version: 1,
             chain_id: "test".into(),
             account_id: vec![1; 32],
             name: gateway::RouteName::apex(),

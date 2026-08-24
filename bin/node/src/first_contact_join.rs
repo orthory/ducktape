@@ -41,7 +41,7 @@ use commonware_cryptography::{Signer as _, ed25519};
 use futures::StreamExt as _;
 
 use crate::config::Front;
-use crate::lobby;
+use crate::join_gate;
 
 /// how long each attempt paces a retry / waits for an ack.
 const RETRY_INTERVAL: Duration = Duration::from_secs(2);
@@ -116,7 +116,7 @@ pub enum AttemptResult {
     /// the gate refused TERMINALLY — this invite can never redeem; the whole
     /// race stops and the joiner exits (ADR R2).
     Rejected {
-        code: lobby::RejectCode,
+        code: join_gate::RejectCode,
         detail: String,
     },
     /// the attempt exhausted its window, was refused non-terminally, or the
@@ -143,7 +143,7 @@ pub enum FirstContactOutcome {
     /// a member answered a TERMINAL `Rejected` — this invite can never
     /// redeem. the caller exits loudly instead of failing over (ADR R2).
     Rejected {
-        code: lobby::RejectCode,
+        code: join_gate::RejectCode,
         detail: String,
     },
     /// every offered path was exhausted. HONEST: the caller must surface this
@@ -425,9 +425,9 @@ fn open_ack(
     keypair: &reachability::WireGuardKeypair,
     token_nonce: &[u8],
     datagram: &[u8],
-) -> Option<lobby::IntroReply> {
+) -> Option<join_gate::IntroReply> {
     let opened = keypair.open_sealed(datagram).ok()?;
-    let ack = lobby::decode_intro_ack(&opened).ok()?;
+    let ack = join_gate::decode_intro_ack(&opened).ok()?;
     if ack.nonce != token_nonce {
         return None;
     }
@@ -437,25 +437,25 @@ fn open_ack(
 /// What a decoded gate reply does to the attempt: `None` ⇒ the gate is still
 /// settling (`Installed`) — keep announcing, a later retransmit carries the
 /// outcome home; `Some` ⇒ the attempt resolved.
-fn ack_resolution(reply: lobby::IntroReply) -> Option<AttemptResult> {
+fn ack_resolution(reply: join_gate::IntroReply) -> Option<AttemptResult> {
     match reply {
-        lobby::IntroReply::Installed => None,
-        lobby::IntroReply::Admitted { height, cap } => {
+        join_gate::IntroReply::Installed => None,
+        join_gate::IntroReply::Admitted { height, cap } => {
             Some(AttemptResult::Admitted { height, cap })
         }
-        lobby::IntroReply::Rejected {
+        join_gate::IntroReply::Rejected {
             code,
             detail,
             terminal: true,
         } => Some(AttemptResult::Rejected { code, detail }),
         // a non-terminal refusal (issuer view lag, member busy) fails THIS
         // candidate over — the race tries the next one.
-        lobby::IntroReply::Rejected {
+        join_gate::IntroReply::Rejected {
             code,
             detail,
             terminal: false,
         } => Some(AttemptResult::Failed(format!("{code:?}: {detail}"))),
-        lobby::IntroReply::Refused { detail } => Some(AttemptResult::Failed(detail)),
+        join_gate::IntroReply::Refused { detail } => Some(AttemptResult::Failed(detail)),
     }
 }
 
@@ -684,7 +684,7 @@ async fn coordinated_attempt(
             Err(_) => return AttemptResult::Failed("coordinated reply dropped".into()),
         }
         // the line this codebase reserved for itself. `nonce` is the ONE id on
-        // BOTH sides of a join (lobby::IntroAck.nonce == our token_nonce), so an
+        // BOTH sides of a join (join_gate::IntroAck.nonce == our token_nonce), so an
         // inviter's log and a joiner's log can finally be read together.
         tracing::debug!(
             target: "ducktape::join",
@@ -981,7 +981,7 @@ mod tests {
         let outcome = race_first_contact(candidates, |c| async move {
             match c.endpoint.as_deref() {
                 Some("reject") => AttemptResult::Rejected {
-                    code: lobby::RejectCode::Spent,
+                    code: join_gate::RejectCode::Spent,
                     detail: "invite already redeemed".into(),
                 },
                 _ => std::future::pending::<AttemptResult>().await,
@@ -990,7 +990,7 @@ mod tests {
         .await;
         match outcome {
             FirstContactOutcome::Rejected { code, detail } => {
-                assert_eq!(code, lobby::RejectCode::Spent);
+                assert_eq!(code, join_gate::RejectCode::Spent);
                 assert!(detail.contains("already redeemed"), "{detail}");
             }
             other => panic!("expected Rejected, got {other:?}"),
@@ -1000,10 +1000,10 @@ mod tests {
     #[test]
     fn ack_resolution_maps_each_reply_to_its_attempt_step() {
         // Installed = the gate is settling: keep announcing.
-        assert_eq!(ack_resolution(lobby::IntroReply::Installed), None);
+        assert_eq!(ack_resolution(join_gate::IntroReply::Installed), None);
         // Admitted settles the attempt with the authoritative outcome.
         assert_eq!(
-            ack_resolution(lobby::IntroReply::Admitted {
+            ack_resolution(join_gate::IntroReply::Admitted {
                 height: 3,
                 cap: None
             }),
@@ -1014,26 +1014,26 @@ mod tests {
         );
         // a TERMINAL reject stops the race; a non-terminal one fails over.
         assert!(matches!(
-            ack_resolution(lobby::IntroReply::Rejected {
-                code: lobby::RejectCode::Spent,
+            ack_resolution(join_gate::IntroReply::Rejected {
+                code: join_gate::RejectCode::Spent,
                 detail: "spent".into(),
                 terminal: true,
             }),
             Some(AttemptResult::Rejected {
-                code: lobby::RejectCode::Spent,
+                code: join_gate::RejectCode::Spent,
                 ..
             })
         ));
         assert!(matches!(
-            ack_resolution(lobby::IntroReply::Rejected {
-                code: lobby::RejectCode::Busy,
+            ack_resolution(join_gate::IntroReply::Rejected {
+                code: join_gate::RejectCode::Busy,
                 detail: "settling too slowly".into(),
                 terminal: false,
             }),
             Some(AttemptResult::Failed(_))
         ));
         assert!(matches!(
-            ack_resolution(lobby::IntroReply::Refused {
+            ack_resolution(join_gate::IntroReply::Refused {
                 detail: "no".into()
             }),
             Some(AttemptResult::Failed(_))
@@ -1047,18 +1047,18 @@ mod tests {
             .unwrap()
             .0;
         let nonce = vec![9u8; 4];
-        let ack = lobby::IntroAck {
+        let ack = join_gate::IntroAck {
             nonce: nonce.clone(),
-            reply: lobby::IntroReply::Admitted {
+            reply: join_gate::IntroReply::Admitted {
                 height: 1,
                 cap: None,
             },
         };
-        let plain = lobby::encode_intro_ack(&ack);
+        let plain = join_gate::encode_intro_ack(&ack);
         let sealed = reachability::seal(&joiner.public_key().0, &plain);
         assert_eq!(
             open_ack(&joiner, &nonce, &sealed),
-            Some(lobby::IntroReply::Admitted {
+            Some(join_gate::IntroReply::Admitted {
                 height: 1,
                 cap: None
             })
@@ -1259,7 +1259,7 @@ mod tests {
                 .unwrap()
                 .0,
         );
-        let intro = lobby::encode_intro(&lobby::intro_request(
+        let intro = join_gate::encode_intro(&join_gate::intro_request(
             &joiner,
             MULE_BINDING,
             &token,
@@ -1357,12 +1357,12 @@ mod tests {
             let opened = member_wg
                 .open_sealed(&buf[..n])
                 .expect("the relayed intro is sealed to the member's WG key");
-            let request = lobby::decode_intro(&opened).expect("decodes");
+            let request = join_gate::decode_intro(&opened).expect("decodes");
             let verified =
-                lobby::verify_intro(&request, MULE_BINDING).expect("verifies against the binding");
-            let ack = lobby::encode_intro_ack(&lobby::IntroAck {
+                join_gate::verify_intro(&request, MULE_BINDING).expect("verifies against the binding");
+            let ack = join_gate::encode_intro_ack(&join_gate::IntroAck {
                 nonce: verified.nonce.to_vec(),
-                reply: lobby::IntroReply::Admitted {
+                reply: join_gate::IntroReply::Admitted {
                     height: 7,
                     cap: None,
                 },

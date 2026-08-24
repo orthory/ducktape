@@ -2,10 +2,10 @@
 //! upgrade: a member-gated proposal + simple-majority tally, and on passing,
 //! `handle_execute` emits the modreg op as a host-drained follow-up.
 //!
-//! unlike the upgrade twin (which pins against a stub), these tests register the
-//! REAL code registry: what is pinned is the whole authorization chain the live
-//! network runs — governance emits, the host stamps `Origin::Module("governance")`,
-//! modreg's origin gate accepts, and the pending swap LANDS in consensus state.
+//! these tests register the REAL code registry: what is pinned is the whole
+//! authorization chain the live network runs — governance emits, the host
+//! stamps `Origin::Module("governance")`, modreg's origin gate accepts, and
+//! the pending swap LANDS in consensus state.
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};

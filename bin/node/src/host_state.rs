@@ -1330,7 +1330,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     let mut forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
         .map_err(|e| format!("forge init: {e}"))?
         .with_chat("chat");
-    // set the dual-path branch selector to the SERVED boundary version BEFORE
     forge
         .install(&bytes, root)
         .map_err(|e| format!("forge install: {e}"))?;

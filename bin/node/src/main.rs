@@ -75,7 +75,7 @@ mod gateway_routes;
 mod host_reads;
 mod host_resources;
 mod host_state;
-mod lobby;
+mod join_gate;
 #[cfg(test)]
 mod main_tests;
 mod mcp;

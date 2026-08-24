@@ -2,10 +2,10 @@
 //! statesync/manifest service to any key WITHOUT committed standing (validators ∪
 //! residents), so a valid targeted invite alone leaks ZERO chain state.
 //!
-//! The decisive fact this pins is that TRANSPORT reachability is NOT enough. A
-//! pre-admission joiner rides the derived lobby key and an admitted resident
-//! rides it too — same peer identity on `CHANNEL_STATE_SYNC` — so a transport
-//! gate cannot tell them apart. Enforcement is a REQUEST-LEVEL real-key proof
+//! The decisive fact this pins is that TRANSPORT reachability is NOT enough:
+//! mesh admission and committed standing are separate facts — a peer the mesh
+//! authorizes may hold no standing at all — so a transport gate cannot tell
+//! them apart. Enforcement is a REQUEST-LEVEL real-key proof
 //! checked against committed standing. This test drives a peer that is EVEN MORE
 //! privileged than an invite holder — its key is in the founder's descriptor
 //! mesh (`peer_seeds`), so the mesh authorizes it and it CONNECTS — yet it holds

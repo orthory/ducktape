@@ -158,8 +158,6 @@ pub struct RouteDefinition {
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteStatement {
-    /// Signed into the preimage; publishers stamp `1` today.
-    pub version: u8,
     pub chain_id: String,
     pub account_id: Vec<u8>,
     pub name: RouteName,
@@ -604,7 +602,6 @@ pub fn is_canonical_sha256(value: &str) -> bool {
 pub fn route_signing_preimage(statement: &RouteStatement) -> Result<Vec<u8>, String> {
     validate_route_statement(statement)?;
     let mut out = Vec::new();
-    out.push(statement.version);
     push_bytes(&mut out, statement.chain_id.as_bytes());
     push_bytes(&mut out, &statement.account_id);
     push_opt_str(&mut out, statement.name.label.as_deref());

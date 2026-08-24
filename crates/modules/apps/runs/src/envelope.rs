@@ -34,15 +34,16 @@ use serde::Serialize;
 use crate::facets::WireSink;
 use crate::hex;
 
-/// the envelope marker the host worker routes on: the portable envelope shape
-/// (workspace source pin + skill refs + result contract). bumping it is a
-/// payload flag day for the worker, not for consensus state.
-pub(crate) const RUN_ENVELOPE_VERSION: u32 = 1;
+/// the fixed value of the `ducktape_run` magic key the host worker routes on.
+/// key + value together are the envelope's self-identifying magic — the digit
+/// is part of the token, like a container magic, never a version to bump.
+pub(crate) const RUN_ENVELOPE_MARKER: u32 = 1;
 
-/// the result-wrapper version a portable provider returns. carried in
-/// the envelope's `result_contract` so the worker refuses a runner-result
-/// version it cannot unwrap; the `runs` delivery path reads it back as `1`.
-pub(crate) const RUNNER_RESULT_VERSION: u32 = 1;
+/// the fixed value of the `ducktape_runner_result` magic key a portable
+/// provider's result wrapper carries. carried in the envelope's
+/// `result_contract` so the worker knows which wrapper shape to assemble;
+/// the `runs` delivery path checks it as part of the wrapper's magic.
+pub(crate) const RUNNER_RESULT_MARKER: u32 = 1;
 
 /// generic instructions for an agent whose curated skills give it no persona —
 /// the floor under an agent with no `always` skill to assemble.
@@ -297,7 +298,7 @@ fn envelope(
     portable: PortableInputs,
 ) -> String {
     serde_json::to_string(&RunEnvelope {
-        ducktape_run: RUN_ENVELOPE_VERSION,
+        ducktape_run: RUN_ENVELOPE_MARKER,
         agent_id: &agent.agent_id,
         run_id,
         agent_display_name: &agent.display_name,
@@ -309,7 +310,7 @@ fn envelope(
         skills: portable.skills,
         library_readable: agent.library_readable(),
         result_contract: ResultContractEnvelope {
-            ducktape_runner_result: RUNNER_RESULT_VERSION,
+            ducktape_runner_result: RUNNER_RESULT_MARKER,
             sink: portable.sink,
         },
     })
@@ -550,7 +551,7 @@ mod tests {
         );
         let v = parse(&payload);
 
-        assert_eq!(v["ducktape_run"], RUN_ENVELOPE_VERSION);
+        assert_eq!(v["ducktape_run"], RUN_ENVELOPE_MARKER);
         assert_eq!(v["agent_id"], "bot");
         assert_eq!(v["agent_display_name"], "BOT");
         assert_eq!(v["instructions"], DEFAULT_PROMPT);

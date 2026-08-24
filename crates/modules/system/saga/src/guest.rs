@@ -20,8 +20,8 @@
 //!   `WitStore::get` (staged-over-committed). the fold is safe for saga
 //!   SPECIFICALLY because every decision in its execute paths reads
 //!   staged-over-committed — there is no frozen-committed read anywhere in its
-//!   handle paths (contrast upgrade's `Advance`, which stays native for exactly
-//!   that reason).
+//!   handle paths (contrast lifecycle's `Advance`, which stays native for
+//!   exactly that reason).
 //! * each successful `execute` flushes the inner staging with the inner
 //!   `commit_block` — `state-set`/`state-delete` OUTER staging the host
 //!   publishes into the real store in ONE `commit_batch` at the true block

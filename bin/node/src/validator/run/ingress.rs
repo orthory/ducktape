@@ -16,7 +16,7 @@ use crate::rpc::{
     JoinRequestRecord, JoinRequestView, JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus,
 };
 use crate::util::{hex, unix_ms};
-use crate::{config, lobby, relay, relay_runtime};
+use crate::{config, join_gate, relay, relay_runtime};
 
 impl ValidatorRuntime<'_> {
     async fn refresh_operations(&self, exposition: &str) {
@@ -202,7 +202,7 @@ impl ValidatorRuntime<'_> {
     /// into `gate_outcomes`, where the doorbell answers the joiner's next
     /// retransmit). the outcome is authoritative: `Admitted` means standing
     /// is COMMITTED, `Rejected{terminal}` means stop.
-    pub(super) async fn on_gate_forward(&mut self, fwd: lobby::GateForward) {
+    pub(super) async fn on_gate_forward(&mut self, fwd: join_gate::GateForward) {
         let Self {
             context,
             node,
@@ -238,8 +238,8 @@ impl ValidatorRuntime<'_> {
             super::settle_gate(
                 gate_outcomes,
                 joiner_bytes,
-                lobby::IntroReply::Rejected {
-                    code: lobby::RejectCode::Spent,
+                join_gate::IntroReply::Rejected {
+                    code: join_gate::RejectCode::Spent,
                     detail: "invite already redeemed — an invite admits exactly one person; \
                              ask the inviter for a fresh invite"
                         .into(),
@@ -259,8 +259,8 @@ impl ValidatorRuntime<'_> {
             super::settle_gate(
                 gate_outcomes,
                 joiner_bytes,
-                lobby::IntroReply::Rejected {
-                    code: lobby::RejectCode::IssuerUnknown,
+                join_gate::IntroReply::Rejected {
+                    code: join_gate::RejectCode::IssuerUnknown,
                     detail: "the inviting member is not in this member's current view — if it \
                              was removed, this invite is dead (ask a current member for a fresh \
                              one); if it was just admitted, another member will redeem shortly"
@@ -278,7 +278,7 @@ impl ValidatorRuntime<'_> {
             super::settle_gate(
                 gate_outcomes,
                 joiner_bytes,
-                lobby::IntroReply::Admitted { height, cap: None },
+                join_gate::IntroReply::Admitted { height, cap: None },
             );
             return;
         }
@@ -321,7 +321,7 @@ impl ValidatorRuntime<'_> {
         // outcome against the frame id. `submit` returns the FrameId; the drain
         // reports its consensus fate on `pending_gates` (Applied → Admitted,
         // Rejected → mapped code, timeout → Busy) — this handler never blocks.
-        let lobby::GateForward {
+        let join_gate::GateForward {
             issuer,
             nonce,
             token_sig,
@@ -385,8 +385,8 @@ impl ValidatorRuntime<'_> {
                 super::settle_gate(
                     gate_outcomes,
                     joiner_bytes,
-                    lobby::IntroReply::Rejected {
-                        code: lobby::RejectCode::Busy,
+                    join_gate::IntroReply::Rejected {
+                        code: join_gate::RejectCode::Busy,
                         detail: format!("could not submit redemption: {e}"),
                         terminal: false,
                     },

@@ -20,7 +20,7 @@ use crate::config;
 use crate::constants::*;
 use crate::explorer::heal_index;
 use crate::host_reads::{read_valset_residents, resume_member_keys};
-use crate::lobby;
+use crate::join_gate;
 use crate::reachability_plane::{GateHook, GateOutcomes, wire_reachability_plane};
 use crate::sync::catchup::derive_pending_boot;
 use crate::sync::serve::{SyncStateRequest, drive_sync_request};
@@ -43,9 +43,9 @@ pub(super) struct PreWiring {
     pub(super) media_peers: Option<Arc<voice_plane::MediaPeers>>,
     pub(super) reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
     /// the join GATE's loop end (join ADR §4): forwarded requests arrive here…
-    pub(super) gate_fwd_rx: tokio::sync::mpsc::Receiver<lobby::GateForward>,
+    pub(super) gate_fwd_rx: tokio::sync::mpsc::Receiver<join_gate::GateForward>,
     /// …kept open by this never-sending clone even when no plane was wired…
-    pub(super) gate_fwd_keepalive: tokio::sync::mpsc::Sender<lobby::GateForward>,
+    pub(super) gate_fwd_keepalive: tokio::sync::mpsc::Sender<join_gate::GateForward>,
     /// …and settled outcomes go back through this shared map.
     pub(super) gate_outcomes: GateOutcomes,
 }
@@ -384,8 +384,7 @@ pub(super) fn wire_serve_lanes(
                 //      and validator backfill dial under their real keys —
                 //      which ARE in the valset — so they still sync; an
                 //      admitted resident's key enters residents at its Redeem
-                //      block, so it syncs the instant it is admitted, still
-                //      under the shared lobby transport key.
+                //      block, so it syncs the instant it is admitted.
                 // a failed check DROPS the request (deny-by-default, like the
                 // malformed/non-request drops), never a reply.
                 if !statesync::verify_sync_proof(requester, proof, &serve_namespace) {
@@ -707,7 +706,7 @@ pub(super) async fn wire(
     // shared map. created whether or not the plane runs — the loop's select
     // arm stays wired either way (the keepalive sender keeps it pending, not
     // None-spinning, when no doorbell exists to ring it).
-    let (gate_fwd_tx, gate_fwd_rx) = tokio::sync::mpsc::channel::<lobby::GateForward>(256);
+    let (gate_fwd_tx, gate_fwd_rx) = tokio::sync::mpsc::channel::<join_gate::GateForward>(256);
     let gate_outcomes = GateOutcomes::default();
     let reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>> =
         match wireguard_listen {

@@ -1,6 +1,6 @@
 //! the automatic half of onboarding, end to end: minting the invite IS the
 //! admission decision. a joiner holding a TOKENED invite delivers its pubkey
-//! over the lobby channel, the receiving member submits the governance
+//! in its sealed first-contact intro, the receiving member submits the governance
 //! `Redeem` op on its behalf — no approval verb, no human in the middle —
 //! and the joiner comes up as a FULL NODE (observer standing: mesh +
 //! statesync + a serving read surface). seating it in the QUORUM stays a

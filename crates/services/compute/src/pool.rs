@@ -3379,7 +3379,7 @@ format = "text"
     }
 
     #[tokio::test]
-    async fn untagged_and_unknown_version_payloads_fail_the_saga_loudly() {
+    async fn untagged_and_wrong_marker_payloads_fail_the_saga_loudly() {
         let (providers, probes) = slow_providers(Duration::from_millis(5), false);
         let (pool, mut rx) = pool_with(providers, 4);
 
@@ -3407,7 +3407,7 @@ format = "text"
         .unwrap();
         let (_, _, outcome) = next_result(&mut rx).await;
         let err = outcome.unwrap_err();
-        assert!(err.contains("version 2"), "got {err}");
+        assert!(err.contains("marker 2"), "got {err}");
         assert_eq!(
             probes.executions.load(Ordering::SeqCst),
             0,
@@ -3483,7 +3483,7 @@ format = "text"
     /// pin the assembled wire shape against `runs::RunnerResult` field-for-field
     /// (a mirror of the consumer's Deserialize). a rename in EITHER crate must
     /// fail THIS test, never production — the receipt round-trips through
-    /// `runs::decode_run_result_v1`.
+    /// `runs::decode_run_result`.
     #[test]
     fn assembled_runner_result_matches_the_runs_deserialize_contract() {
         // a mirror of runs' faceted Deserialize — a rename in EITHER crate must
@@ -3502,14 +3502,21 @@ format = "text"
             status: RunsStatus,
         }
         #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
         struct RunsWorkspaceReceipt {
             source_prefix: String,
+            source_snapshot: Option<String>,
             output_snapshot: Option<String>,
             commit_height: Option<u64>,
             rebased: bool,
             no_changes: bool,
             #[serde(default)]
             commit_error: Option<String>,
+            #[serde(default)]
+            branch: Option<String>,
+            #[serde(default)]
+            output_commit: Option<String>,
         }
         #[derive(serde::Deserialize, Default, PartialEq, Debug)]
         #[serde(tag = "mode", rename_all = "snake_case")]
@@ -3599,9 +3606,9 @@ format = "text"
         // (3) the REQUESTED-sink echo (contract §3): a Pr sink whose
         //     title/body are empty must still serialize them as PRESENT keys
         //     (runs keeps title REQUIRED on decode — the mirror has no serde
-        //     default on it), and a forge receipt carrying the additive §5
-        //     fields must still decode into runs' CURRENT mirror (unknown
-        //     fields tolerated) — the two halves of the flag-day interop.
+        //     default on it), and a forge receipt carrying the §5 fields must
+        //     decode into runs' mirror field-for-field — both mirrors are
+        //     strict, so every assembled key must be one runs knows.
         let forge_receipt = WorkspaceReceipt {
             source_prefix: "forge:app".into(),
             source_snapshot: Some("d0".repeat(20)),

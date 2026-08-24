@@ -332,7 +332,7 @@ fn pr_sink_with_source_equal_to_target_degrades_without_aborting() {
 
 #[test]
 fn malformed_facet_fails_the_run_without_aborting() {
-    // sink is not an object → decode_run_result_v1 fails → the run fails
+    // sink is not an object → decode_run_result fails → the run fails
     // deterministically (R4), never a delivery-block abort.
     let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
     let bad = serde_json::json!({
@@ -574,7 +574,7 @@ fn wire_sink_defaults_to_chain_and_decodes_a_present_pr() {
     // a MISSING sink field → Chain (internal-tag + serde default interplay).
     let no_sink = runner_wrapper("hi", serde_json::json!({}));
     assert!(matches!(
-        decode_run_result_v1(&no_sink).unwrap().sink,
+        decode_run_result(&no_sink).unwrap().sink,
         WireSink::Chain
     ));
     // a present {"mode":"pr",...} → Pr.
@@ -583,7 +583,7 @@ fn wire_sink_defaults_to_chain_and_decodes_a_present_pr() {
         serde_json::json!({"sink":{"mode":"pr","repo":"a","source_branch":"s","title":"t"}}),
     );
     assert!(matches!(
-        decode_run_result_v1(&pr).unwrap().sink,
+        decode_run_result(&pr).unwrap().sink,
         WireSink::Pr { .. }
     ));
     // an unsupported wrapper version fails to decode (R4).
@@ -592,7 +592,7 @@ fn wire_sink_defaults_to_chain_and_decodes_a_present_pr() {
         "response_text": "x",
         "workspace_receipt": {"source_prefix":"p","source_snapshot":null,"output_snapshot":null,"commit_height":null,"rebased":false,"no_changes":false}
     });
-    assert!(decode_run_result_v1(&serde_json::to_vec(&badv).unwrap()).is_err());
+    assert!(decode_run_result(&serde_json::to_vec(&badv).unwrap()).is_err());
 }
 
 /// a registry whose one agent "bot" may chat and push to "app", plus an
@@ -1112,12 +1112,12 @@ fn workspace_receipt_mirror_decodes_the_forge_fields() {
         false,
         None,
     );
-    let receipt = decode_run_result_v1(&wrapper).unwrap().workspace_receipt;
+    let receipt = decode_run_result(&wrapper).unwrap().workspace_receipt;
     assert_eq!(receipt.branch.as_deref(), Some("agent/item-7"));
     assert_eq!(receipt.output_commit.as_deref(), Some(&*"1a".repeat(20)));
 
     // absent (every pre-forge receipt): serde defaults, not an error.
-    let receipt = decode_run_result_v1(&runner_wrapper("done", serde_json::json!({})))
+    let receipt = decode_run_result(&runner_wrapper("done", serde_json::json!({})))
         .unwrap()
         .workspace_receipt;
     assert_eq!(receipt.branch, None);
