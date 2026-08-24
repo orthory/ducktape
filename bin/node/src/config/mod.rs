@@ -35,10 +35,6 @@ pub use invite::*;
 pub use node_toml::*;
 pub use resolve::*;
 
-/// the consensus scheme tag a descriptor must carry — a genesis-wide constant
-/// (see `ConsensusScheme`); anything else is a build from the future.
-pub const SCHEME_ED25519: &str = "ed25519";
-
 // hex codecs for keys, roots, and pasted blobs — the shared home is
 // duckfs-core (`to_hex`/`unhex`); these re-exports keep the long-standing
 // `config::hex_bytes`/`config::unhex` call sites working unchanged.
@@ -49,11 +45,10 @@ pub use duckfs_core::{to_hex as hex_bytes, unhex};
 // ============================================================================
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkDescriptor {
     /// human name + salt (e.g. "ducktape#a1b2c3d4"); doubles as the namespace.
     pub chain_id: String,
-    /// consensus scheme tag; must equal [`SCHEME_ED25519`] for this build.
-    pub scheme: String,
     /// genesis validator identities, hex ed25519 public keys. a SET — order
     /// never affects genesis (valset is order-independent) — kept sorted for
     /// stable file diffs.
@@ -127,8 +122,8 @@ impl NetworkDescriptor {
     }
 
     /// the namespace this network's nodes actually run under: the chain-id
-    /// plus a GENESIS FINGERPRINT (sha256 over scheme + the sorted validator
-    /// set; bootstrap hints excluded — they are advisory and legitimately
+    /// plus a GENESIS FINGERPRINT (sha256 over the sorted validator set;
+    /// bootstrap hints excluded — they are advisory and legitimately
     /// differ between members). because the namespace domain-separates the
     /// mesh handshake, the simplex scheme, and the epoch genesis floor,
     /// a member holding a STALE descriptor (e.g. it missed a pre-genesis
@@ -147,7 +142,6 @@ impl NetworkDescriptor {
         sorted.sort();
         let mut hasher = Sha256::default();
         hasher.update(b"ducktape:genesis:v1:");
-        hasher.update(self.scheme.as_bytes());
         for v in &sorted {
             hasher.update(b"\n");
             hasher.update(v.as_bytes());
@@ -899,7 +893,6 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             NetworkDescriptor {
                 chain_id: id.into(),
-                scheme: SCHEME_ED25519.into(),
                 validators: vec![],
                 bootstrap: vec![],
                 reach: vec![],
@@ -920,7 +913,6 @@ mod tests {
     fn coordination_defaults_to_private_and_parses_public() {
         let mut d = NetworkDescriptor {
             chain_id: "ducktape#a1b2c3d4".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![],
             bootstrap: vec![],
             reach: vec![],
@@ -970,7 +962,6 @@ mod tests {
         let me = ed25519::PrivateKey::from_seed(7).public_key();
         let mut d = NetworkDescriptor {
             chain_id: "ducktape#a1b2c3d4".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1066,7 +1057,6 @@ mod tests {
             std::fs::create_dir_all(&dir).expect("mk workspace");
             let d = NetworkDescriptor {
                 chain_id: chain.into(),
-                scheme: SCHEME_ED25519.into(),
                 validators: vec![hex_bytes(
                     ed25519::PrivateKey::from_seed(40).public_key().as_ref(),
                 )],
@@ -1099,7 +1089,6 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mk workspace");
         NetworkDescriptor {
             chain_id: chain.into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![],
             bootstrap: vec![],
             reach: vec![],
@@ -1154,7 +1143,6 @@ mod tests {
         let b = ed25519::PrivateKey::from_seed(2).public_key();
         let mut d = NetworkDescriptor {
             chain_id: "t#00000000".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![],
             bootstrap: vec![],
             reach: vec![],
@@ -1174,7 +1162,6 @@ mod tests {
         let a = ed25519::PrivateKey::from_seed(4).public_key();
         let d = NetworkDescriptor {
             chain_id: "dup#00000000".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(a.as_ref()), hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1192,7 +1179,6 @@ mod tests {
         let b = ed25519::PrivateKey::from_seed(6).public_key();
         let mut d = NetworkDescriptor {
             chain_id: "net#00000000".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1251,7 +1237,6 @@ mod tests {
         let dir = tmp("joinguard");
         let ours = NetworkDescriptor {
             chain_id: "home#11111111".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1287,7 +1272,6 @@ mod tests {
         // dedup must hold on the DECODED key, not the spelling.
         let d = NetworkDescriptor {
             chain_id: "case#00000000".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![lower, upper],
             bootstrap: vec![],
             reach: vec![],
@@ -1305,7 +1289,6 @@ mod tests {
         let b = ed25519::PrivateKey::from_seed(23).public_key();
         let canonical = NetworkDescriptor {
             chain_id: "canon#00000000".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(a.as_ref()), hex_bytes(b.as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1314,7 +1297,6 @@ mod tests {
         // a hand-edited twin: uppercase, whitespace, different order.
         let messy = NetworkDescriptor {
             chain_id: "canon#00000000".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![
                 format!("  {}  ", hex_bytes(b.as_ref()).to_ascii_uppercase()),
                 hex_bytes(a.as_ref()),
@@ -1344,7 +1326,6 @@ mod tests {
         let b = ed25519::PrivateKey::from_seed(25).public_key();
         let d = NetworkDescriptor {
             chain_id: "hints#00000000".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![
                 format!("{}@0.0.0.0:52200", hex_bytes(a.as_ref())),
@@ -1407,7 +1388,6 @@ mod tests {
         let a = ed25519::PrivateKey::from_seed(21).public_key();
         let mut d = NetworkDescriptor {
             chain_id: "r#00000000".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1426,7 +1406,6 @@ mod tests {
         let a = ed25519::PrivateKey::from_seed(22).public_key();
         let mut d = NetworkDescriptor {
             chain_id: "r#00000000".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1444,7 +1423,6 @@ mod tests {
         let coord = ed25519::PrivateKey::from_seed(24).public_key();
         let mut d = NetworkDescriptor {
             chain_id: "r#00000000".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1469,7 +1447,6 @@ mod tests {
         let coord = ed25519::PrivateKey::from_seed(26).public_key();
         let mut d = NetworkDescriptor {
             chain_id: "r#00000000".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1510,7 +1487,6 @@ mod tests {
         let coord = ed25519::PrivateKey::from_seed(42).public_key();
         let mut d = NetworkDescriptor {
             chain_id: "fp#00000000".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1568,7 +1544,6 @@ mod tests {
         let me = ed25519::PrivateKey::from_seed(51).public_key();
         let mut d = NetworkDescriptor {
             chain_id: "fp#00000000".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1619,7 +1594,6 @@ mod tests {
         let coord = ed25519::PrivateKey::from_seed(32).public_key();
         let base = NetworkDescriptor {
             chain_id: "fp#00000000".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(v.as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1650,7 +1624,6 @@ mod tests {
         let coord = ed25519::PrivateKey::from_seed(72).public_key();
         let mut d = NetworkDescriptor {
             chain_id: "co#00000000".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(target.as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1680,7 +1653,6 @@ mod tests {
         let a = ed25519::PrivateKey::from_seed(73).public_key();
         let mut d = NetworkDescriptor {
             chain_id: "co#00000000".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(a.as_ref())],
             bootstrap: vec![],
             reach: vec![],

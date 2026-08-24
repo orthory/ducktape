@@ -122,7 +122,7 @@ pub const INDEX_OPS_BATCH_LEN: usize = 512;
 
 /// fixed bytes prepended to every authenticated statesync request and reply:
 /// requester(32) + proof(64) + request id(8).
-pub const RPC_AUTHED_HEADER_LEN: usize = 32 + 64 + 8;
+pub const RPC_HEADER_LEN: usize = 32 + 64 + 8;
 
 /// how many boundary captures a server retains. more than one lets a second
 /// joiner start syncing without invalidating the first joiner's in-flight
@@ -794,7 +794,7 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
 
 /// exact encoded body length of a Frames response.
 ///
-/// Add RPC_AUTHED_HEADER_LEN for the complete mesh message. Saturating
+/// Add RPC_HEADER_LEN for the complete mesh message. Saturating
 /// arithmetic makes an impossible aggregate overflow fail closed at any
 /// caller comparing the result with a transport budget.
 pub fn encoded_frames_response_len(frames: &[FinalizedFrame]) -> usize {
@@ -823,7 +823,7 @@ pub fn encoded_frames_response_len(frames: &[FinalizedFrame]) -> usize {
 /// serve path that binary-searches this against a transport budget can never
 /// pick a prefix the real encode then overflows.
 ///
-/// Add RPC_AUTHED_HEADER_LEN for the complete mesh message. Saturating
+/// Add RPC_HEADER_LEN for the complete mesh message. Saturating
 /// arithmetic makes an impossible aggregate overflow fail closed.
 pub fn encoded_index_ops_response_len(rows: &[(String, Vec<u8>)]) -> usize {
     const TAG_LEN: usize = 1;
@@ -1125,16 +1125,16 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
 /// ONCE at construction; every request carries the result as its proof.
 pub const SYNC_AUTH_NAMESPACE: &[u8] = b"ducktape-statesync-auth-v1";
 
-/// the AUTHENTICATED rpc envelope (ADR §5.1 fail-closed, flag day — the
-/// unauthenticated `encode_rpc` is gone): `requester(32) ‖ proof(64) ‖
+/// the AUTHENTICATED rpc envelope (ADR §5.1 fail-closed):
+/// `requester(32) ‖ proof(64) ‖
 /// id(8 LE) ‖ body`. the codec only FRAMES bytes; the caller produces the
 /// proof ([`sign_sync_proof`]) and the server verifies it ([`verify_sync_proof`])
 /// against committed standing. `id` is requester-local (correlates replies).
 /// server replies reuse the same frame with the auth fields zero-filled — the
 /// client gates replies by transport peer and root-verifies payloads, so a
 /// reply's requester/proof are never inspected.
-pub fn encode_rpc_authed(requester: &[u8; 32], proof: &[u8; 64], id: u64, body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(RPC_AUTHED_HEADER_LEN + body.len());
+pub fn encode_rpc(requester: &[u8; 32], proof: &[u8; 64], id: u64, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(RPC_HEADER_LEN + body.len());
     out.extend_from_slice(requester);
     out.extend_from_slice(proof);
     out.extend_from_slice(&id.to_le_bytes());
@@ -1146,7 +1146,7 @@ pub fn encode_rpc_authed(requester: &[u8; 32], proof: &[u8; 64], id: u64, body: 
 /// errors `Truncated` on any buffer shorter than the 32+64+8 fixed header.
 // the 4-tuple mirrors the fixed wire layout; a named type would just indirect it.
 #[allow(clippy::type_complexity)]
-pub fn decode_rpc_authed(bytes: &[u8]) -> Result<(&[u8; 32], &[u8; 64], u64, &[u8]), WireError> {
+pub fn decode_rpc(bytes: &[u8]) -> Result<(&[u8; 32], &[u8; 64], u64, &[u8]), WireError> {
     let (requester, rest) = bytes
         .split_first_chunk::<32>()
         .ok_or(WireError::Truncated)?;
@@ -2428,19 +2428,19 @@ mod tests {
     fn rpc_envelope_round_trips() {
         let requester = [7u8; 32];
         let proof = [9u8; 64];
-        let framed = encode_rpc_authed(&requester, &proof, 99, b"body");
-        let (r, p, id, body) = decode_rpc_authed(&framed).unwrap();
+        let framed = encode_rpc(&requester, &proof, 99, b"body");
+        let (r, p, id, body) = decode_rpc(&framed).unwrap();
         assert_eq!(r, &requester);
         assert_eq!(p, &proof);
         assert_eq!(id, 99);
         assert_eq!(body, b"body");
-        assert_eq!(framed.len(), RPC_AUTHED_HEADER_LEN + body.len());
+        assert_eq!(framed.len(), RPC_HEADER_LEN + body.len());
         // anything shorter than the 32+64+8 fixed header is Truncated.
         assert!(
-            decode_rpc_authed(&framed[..32 + 64 + 7]).is_err(),
+            decode_rpc(&framed[..32 + 64 + 7]).is_err(),
             "short envelope rejects"
         );
-        assert!(decode_rpc_authed(&[]).is_err(), "empty rejects");
+        assert!(decode_rpc(&[]).is_err(), "empty rejects");
     }
 
     #[test]

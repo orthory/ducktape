@@ -523,7 +523,6 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let me = key.public_key();
     let mut descriptor = config::NetworkDescriptor {
         chain_id: chain_id.clone(),
-        scheme: config::SCHEME_ED25519.into(),
         validators: vec![hex_bytes(me.as_ref())],
         bootstrap: Vec::new(),
         reach: Vec::new(),

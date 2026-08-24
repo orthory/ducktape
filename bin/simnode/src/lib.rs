@@ -202,7 +202,7 @@ struct CommittedInfo {
     op_hash: String,
     target: String,
     /// `held` (a client submit released by this step), `oracle` (a worker
-    /// follow-up), or `peer` (a /sim/peer-block).
+    /// follow-up).
     kind: &'static str,
 }
 
@@ -225,8 +225,7 @@ struct PersonaRequest {
     persona: Persona,
 }
 
-/// one op inside a `/sim/peer-block` request — the single-op body IS one of
-/// these, and the multi-op body is an array of them.
+/// one op inside a `/sim/peer-block` request's `ops` array.
 #[derive(Deserialize)]
 struct PeerOp {
     target: String,
@@ -238,14 +237,12 @@ struct PeerOp {
 /// `hex:` origin escape is still unresolved here — the actor resolves it.
 type PeerOpWire = (String, Vec<u8>, Vec<u8>);
 
-/// `/sim/peer-block` accepts EITHER shape (additive, sim-only wire). untagged:
-/// a body with `ops` is a `Batch` (the only shape that carries it); anything
-/// else falls through to the original `Single` op. ops-wins if both are present.
+/// `/sim/peer-block`: ONE shape — `{ops:[…]}`. a single-op peer block is a
+/// one-element batch; the reply is always the per-member [`BatchInfo`].
 #[derive(Deserialize)]
-#[serde(untagged)]
-enum PeerBlockRequest {
-    Batch { ops: Vec<PeerOp> },
-    Single(PeerOp),
+#[serde(deny_unknown_fields)]
+struct PeerBlockRequest {
+    ops: Vec<PeerOp>,
 }
 
 /// one member's verdict in a `/sim/peer-block` batch reply (input order).
@@ -286,16 +283,10 @@ enum SimCommand {
         persona: Persona,
         reply: oneshot::Sender<SimSnapshot>,
     },
-    PeerBlock {
-        target: String,
-        payload: Vec<u8>,
-        origin: Vec<u8>,
-        reply: oneshot::Sender<Result<CommittedInfo, String>>,
-    },
     /// N ops committed as ONE block via the host's `submit_block` batch engine.
     /// each tuple is `(target, payload_bytes, origin_bytes)`; the `hex:` origin
-    /// escape resolves in the actor, same as the single-op path.
-    PeerBatch {
+    /// escape resolves in the actor.
+    PeerBlock {
         ops: Vec<PeerOpWire>,
         reply: oneshot::Sender<Result<BatchInfo, String>>,
     },
@@ -602,35 +593,20 @@ impl SimHandle {
     }
 
     /// commit a concurrent writer's block past any parked queue. `body` is the
-    /// `/sim/peer-block` request shape — a single `{target,payload,origin?}` op
-    /// OR a `{ops:[…]}` batch — and the reply matches (`CommittedInfo` or
-    /// `BatchInfo`).
+    /// `/sim/peer-block` request shape (`{ops:[…]}`); the reply is the
+    /// per-member `BatchInfo`.
     pub fn peer_block(&self, body: serde_json::Value) -> Result<serde_json::Value, String> {
         let request: PeerBlockRequest =
             serde_json::from_value(body).map_err(|err| err.to_string())?;
-        match request {
-            PeerBlockRequest::Single(op) => {
-                let (target, payload, origin) = encode_peer_op(op).map_err(|(_, msg)| msg)?;
-                let info = self.call(|reply| SimCommand::PeerBlock {
-                    target,
-                    payload,
-                    origin,
-                    reply,
-                })??;
-                serde_json::to_value(info).map_err(|err| err.to_string())
-            }
-            PeerBlockRequest::Batch { ops } => {
-                let mut encoded = Vec::with_capacity(ops.len());
-                for op in ops {
-                    encoded.push(encode_peer_op(op).map_err(|(_, msg)| msg)?);
-                }
-                let info = self.call(|reply| SimCommand::PeerBatch {
-                    ops: encoded,
-                    reply,
-                })??;
-                serde_json::to_value(info).map_err(|err| err.to_string())
-            }
+        let mut encoded = Vec::with_capacity(request.ops.len());
+        for op in request.ops {
+            encoded.push(encode_peer_op(op).map_err(|(_, msg)| msg)?);
         }
+        let info = self.call(|reply| SimCommand::PeerBlock {
+            ops: encoded,
+            reply,
+        })??;
+        serde_json::to_value(info).map_err(|err| err.to_string())
     }
 
     /// the current [`SimSnapshot`] as JSON, the shape `GET /sim/state` returns.
@@ -1119,27 +1095,11 @@ impl Sim {
                 *self.persona.lock().expect("persona poisoned") = persona;
                 let _ = reply.send(self.snapshot());
             }
-            SimCommand::PeerBlock {
-                target,
-                payload,
-                origin,
-                reply,
-            } => {
-                // same `hex:` origin escape as /v1/submit — a concurrent writer
-                // can also author as a raw ed25519 key; bad hex rejects the block.
-                let result = match decode_origin(origin) {
-                    Ok(origin) => {
-                        self.commit_peer(Origin::External(origin), Msg { target, payload })
-                            .await
-                    }
-                    Err(err) => Err(err),
-                };
-                let _ = reply.send(result);
-            }
-            SimCommand::PeerBatch { ops, reply } => {
+            SimCommand::PeerBlock { ops, reply } => {
                 // resolve each member's origin through the SAME `hex:` escape as
-                // the single-op lane; one bad origin rejects the whole request
-                // (before any state moves — nothing has committed yet).
+                // /v1/submit — a concurrent writer can also author as a raw
+                // ed25519 key; one bad origin rejects the whole request (before
+                // any state moves — nothing has committed yet).
                 let resolved: Result<Vec<(Origin, Msg)>, String> = ops
                     .into_iter()
                     .map(|(target, payload, origin)| {
@@ -1148,7 +1108,7 @@ impl Sim {
                     })
                     .collect();
                 let result = match resolved {
-                    Ok(ops) => self.commit_peer_batch(ops).await,
+                    Ok(ops) => self.commit_peer_block(ops).await,
                     Err(err) => Err(err),
                 };
                 let _ = reply.send(result);
@@ -1197,27 +1157,14 @@ impl Sim {
         self.committed_info(&drained, "held")
     }
 
-    /// commit a concurrent-writer block (one op, immediate), returning its
-    /// `CommittedInfo`. a rejected peer op journals its block (validator parity)
-    /// but the reply is the rejection — the same single-op convention as a held
-    /// submit.
-    async fn commit_peer(&mut self, origin: Origin, msg: Msg) -> Result<CommittedInfo, String> {
-        let (drained, events) = self.commit_block(vec![(origin, msg)]).await?;
-        self.settle(&drained, events).await;
-        match self.committed_info(&drained, "peer") {
-            Some(info) => Ok(info),
-            None => Err(Self::member_summary(&drained).err().unwrap_or_default()),
-        }
-    }
-
-    /// commit N ops as ONE block, returning per-member verdicts. the batch twin
-    /// of [`Self::commit_peer`]: `submit_decoded` each, flush into ONE batch (one
-    /// block, one root-hash, per-op isolation), and read each member's
-    /// applied/rejected disposition from the drain — the shared `project_block`
-    /// already wrote the block's one row (all members, each with its disposition)
-    /// and the per-module index feed. an empty `ops` produces no ordered frame
-    /// and so no block.
-    async fn commit_peer_batch(&mut self, ops: Vec<(Origin, Msg)>) -> Result<BatchInfo, String> {
+    /// commit N ops as ONE concurrent-writer block, returning per-member
+    /// verdicts: `submit_decoded` each, flush into ONE batch (one block, one
+    /// root-hash, per-op isolation), and read each member's applied/rejected
+    /// disposition from the drain — the shared `project_block` already wrote
+    /// the block's one row (all members, each with its disposition) and the
+    /// per-module index feed. an empty `ops` produces no ordered frame and so
+    /// no block. a rejected member still journals its block (validator parity).
+    async fn commit_peer_block(&mut self, ops: Vec<(Origin, Msg)>) -> Result<BatchInfo, String> {
         let (drained, events) = self.commit_block(ops).await?;
         self.settle(&drained, events).await;
         // the batch is ONE block: every member frame shares its height and the
@@ -1427,7 +1374,7 @@ impl Sim {
     }
 
     /// the `CommittedInfo` for an APPLIED one-op commit; `None` if the op was
-    /// rejected (the step/peer reply reports no commit, the submitter got the
+    /// rejected (the step reply reports no commit, the submitter got the
     /// rejection). `op_hash` re-stages the payload (idempotent, content-address).
     fn committed_info(
         &self,
@@ -1700,46 +1647,23 @@ async fn sim_peer_block(
     State(handle): State<ControlState>,
     Json(req): Json<PeerBlockRequest>,
 ) -> Response {
-    match req {
-        // the original single-op path: ONE block, one member (unchanged wire).
-        PeerBlockRequest::Single(op) => {
-            let (target, payload, origin) = match encode_peer_op(op) {
-                Ok(parts) => parts,
-                Err((status, msg)) => return (status, msg).into_response(),
-            };
-            match control(handle, |reply| SimCommand::PeerBlock {
-                target,
-                payload,
-                origin,
-                reply,
-            })
-            .await
-            {
-                Ok(Ok(info)) => Json(info).into_response(),
-                Ok(Err(rejection)) => (StatusCode::BAD_REQUEST, rejection).into_response(),
-                Err(resp) => resp,
-            }
+    // N members committed as ONE block via submit_block.
+    let mut encoded = Vec::with_capacity(req.ops.len());
+    for op in req.ops {
+        match encode_peer_op(op) {
+            Ok(parts) => encoded.push(parts),
+            Err((status, msg)) => return (status, msg).into_response(),
         }
-        // the multi-op path: N members committed as ONE block via submit_block.
-        PeerBlockRequest::Batch { ops } => {
-            let mut encoded = Vec::with_capacity(ops.len());
-            for op in ops {
-                match encode_peer_op(op) {
-                    Ok(parts) => encoded.push(parts),
-                    Err((status, msg)) => return (status, msg).into_response(),
-                }
-            }
-            match control(handle, |reply| SimCommand::PeerBatch {
-                ops: encoded,
-                reply,
-            })
-            .await
-            {
-                Ok(Ok(info)) => Json(info).into_response(),
-                Ok(Err(rejection)) => (StatusCode::BAD_REQUEST, rejection).into_response(),
-                Err(resp) => resp,
-            }
-        }
+    }
+    match control(handle, |reply| SimCommand::PeerBlock {
+        ops: encoded,
+        reply,
+    })
+    .await
+    {
+        Ok(Ok(info)) => Json(info).into_response(),
+        Ok(Err(rejection)) => (StatusCode::BAD_REQUEST, rejection).into_response(),
+        Err(resp) => resp,
     }
 }
 
@@ -1859,7 +1783,7 @@ mod tests {
         assert_eq!(handle.set_auto(false).unwrap_err(), "boom");
         assert_eq!(
             handle
-                .peer_block(serde_json::json!({ "target": "chat", "payload": {} }))
+                .peer_block(serde_json::json!({ "ops": [{ "target": "chat", "payload": {} }] }))
                 .unwrap_err(),
             "boom",
         );

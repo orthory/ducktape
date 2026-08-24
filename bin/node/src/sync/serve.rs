@@ -425,7 +425,7 @@ pub(crate) struct SyncIndexOps {
 }
 
 const MAX_SYNC_RESPONSE_BODY_LEN: usize =
-    MAX_MESSAGE_SIZE as usize - statesync::RPC_AUTHED_HEADER_LEN;
+    MAX_MESSAGE_SIZE as usize - statesync::RPC_HEADER_LEN;
 const _: () = assert!(MAX_SYNC_RESPONSE_BODY_LEN >= 9);
 
 /// Return the largest non-empty prefix that fits the mesh's configured message
@@ -781,7 +781,7 @@ mod tests {
 
     fn encoded_mesh_len(resp: &statesync::SyncResponse) -> usize {
         let body = statesync::encode_response(resp);
-        statesync::encode_rpc_authed(&[0; 32], &[0; 64], 7, &body).len()
+        statesync::encode_rpc(&[0; 32], &[0; 64], 7, &body).len()
     }
 
     /// N WIRE PAGES MUST NOT COST N CONSENSUS-LOOP ROUND TRIPS. The joiner
@@ -931,7 +931,7 @@ mod tests {
 
     #[test]
     fn frames_response_accepts_exact_limit_and_rejects_one_byte_over() {
-        let fixed_len = statesync::RPC_AUTHED_HEADER_LEN
+        let fixed_len = statesync::RPC_HEADER_LEN
             + statesync::encoded_frames_response_len(&[frame(1, 0)]);
         let exact_payload_len = MAX_MESSAGE_SIZE as usize - fixed_len;
 

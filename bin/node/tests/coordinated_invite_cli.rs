@@ -122,7 +122,7 @@ fn keygen(dir: &Path) -> String {
 use nettest::alloc_ports;
 
 /// recompute a founder's genesis namespace exactly as `config::genesis_namespace`
-/// does — sha256 over the scheme + sorted validator hexes, chain-id prefixed —
+/// does — sha256 over the sorted validator hexes, chain-id prefixed —
 /// so a seeded `mesh-state.json` rides the SAME chain id the running `invite`
 /// verb keys its `reachability::store::load` on. `ducktape:genesis:v1:` is a
 /// pinned domain tag; changing it is a genesis flag day the descriptor tests
@@ -135,7 +135,6 @@ fn genesis_namespace(chain_id: &str, validators_hex: &[String]) -> String {
     sorted.sort();
     let mut hasher = Sha256::default();
     hasher.update(b"ducktape:genesis:v1:");
-    hasher.update(b"ed25519");
     for v in &sorted {
         hasher.update(b"\n");
         hasher.update(v.as_bytes());

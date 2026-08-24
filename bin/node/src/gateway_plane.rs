@@ -1672,7 +1672,6 @@ mod tests {
 
         let workspace = tempfile::tempdir().unwrap();
         let routes = crate::gateway_routes::LocalRoutes {
-            version: 1,
             routes: vec![crate::gateway_routes::LocalRoute {
                 name: gateway::RouteName::named("api"),
                 port,
@@ -1814,7 +1813,6 @@ mod tests {
         let owner = account(vec![1; 32], publisher, &member);
         let workspace = tempfile::tempdir().unwrap();
         let routes = crate::gateway_routes::LocalRoutes {
-            version: 1,
             routes: vec![crate::gateway_routes::LocalRoute {
                 name: gateway::RouteName::named("api"),
                 port,
@@ -1975,7 +1973,6 @@ mod tests {
 
         let workspace = tempfile::tempdir().unwrap();
         let routes = crate::gateway_routes::LocalRoutes {
-            version: 1,
             routes: vec![crate::gateway_routes::LocalRoute {
                 name: gateway::RouteName::named("api"),
                 port,

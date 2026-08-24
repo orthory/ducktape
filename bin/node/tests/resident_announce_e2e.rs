@@ -69,7 +69,7 @@ fn opt_in_serving(cluster: &NetworkShapeCluster, idx: usize, tag: &str) {
     std::fs::write(
         workspace.join("services.toml"),
         format!(
-            "version = 1\n\n[[service]]\nkind = \"compute\"\ninstance = \"{}\"\n\
+            "[[service]]\nkind = \"compute\"\ninstance = \"{}\"\n\
              nonce = \"{}\"\ngranted_unix = 1700000000\ncapabilities = [{tag:?}]\n\
              scopes = []\n",
             "11".repeat(32),

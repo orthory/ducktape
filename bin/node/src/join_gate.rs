@@ -4,7 +4,7 @@
 //!
 //! transport: the joiner's SEALED first-contact intro ([`IntroRequest`]) IS
 //! the gate request — it rides the WireGuard-tunnel doorbell, never the mesh
-//! (the retired `lobby_identity` + `CHANNEL_LOBBY` lane is gone). every claim
+//! (a fresh joiner has no mesh standing to speak from). every claim
 //! in an intro is verified against the INVITE TOKEN it carries (issuer
 //! signature over the genesis namespace) and the joiner's proof-of-
 //! possession. the gate stays synchronous: a member runs the V1–V9 checklist,

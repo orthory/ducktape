@@ -12,9 +12,9 @@ use commonware_p2p::Ingress;
 use super::identity::load_identity;
 use super::node_toml::{DevSeedToml, NodeToml, SandboxToml};
 use super::{
-    Coordination, Front, InviteToken, NetworkDescriptor, ReachDial, SCHEME_ED25519,
-    StoredInviteWireGuard, dialable, hex_bytes, ingress_of, load_coord_cap, load_invite_fronts,
-    load_invite_token, load_invite_wireguard,
+    Coordination, Front, InviteToken, NetworkDescriptor, ReachDial, StoredInviteWireGuard,
+    dialable, hex_bytes, ingress_of, load_coord_cap, load_invite_fronts, load_invite_token,
+    load_invite_wireguard,
 };
 
 /// everything `run_node` needs, shape-independent.
@@ -227,12 +227,6 @@ pub fn resolve_service(cfg_path: &Path) -> Result<ServiceConfig, String> {
 /// wearing a different hat.
 fn load_valid_descriptor(path: &Path) -> Result<NetworkDescriptor, String> {
     let descriptor = NetworkDescriptor::load(path)?;
-    if descriptor.scheme != SCHEME_ED25519 {
-        return Err(format!(
-            "network {} uses scheme {:?}; this build runs {SCHEME_ED25519:?}",
-            descriptor.chain_id, descriptor.scheme
-        ));
-    }
     if descriptor.validator_keys()?.is_empty() {
         return Err(format!("network {} has no validators", descriptor.chain_id));
     }
@@ -820,7 +814,6 @@ mod tests {
         let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
         let d = NetworkDescriptor {
             chain_id: "net#44444444".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.public_key().as_ref())],
             bootstrap: vec![format!(
                 "{}@definitely-not-resolvable.ducktape.invalid:443",
@@ -863,7 +856,6 @@ mod tests {
         let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
         let d = NetworkDescriptor {
             chain_id: "net#33333333".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -898,7 +890,6 @@ mod tests {
         let founder = ed25519::PrivateKey::from_seed(7).public_key();
         let mut d = NetworkDescriptor {
             chain_id: "net#44444444".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(founder.as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -921,7 +912,6 @@ mod tests {
         let other = ed25519::PrivateKey::from_seed(9).public_key();
         let mut d = NetworkDescriptor {
             chain_id: "net#11223344".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![
                 hex_bytes(me.public_key().as_ref()),
                 hex_bytes(other.as_ref()),
@@ -971,7 +961,6 @@ mod tests {
         let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
         NetworkDescriptor {
             chain_id: "relative#11223344".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1069,7 +1058,6 @@ mod tests {
         let (me, _) = load_or_generate_identity(&network_dir.join("identity.key")).expect("keygen");
         NetworkDescriptor {
             chain_id: "deleted-cwd#11223344".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1128,7 +1116,6 @@ mod tests {
         let other = ed25519::PrivateKey::from_seed(3).public_key();
         let d = NetworkDescriptor {
             chain_id: "closed#00000000".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(other.as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1492,7 +1479,6 @@ mod tests {
         let founder = ed25519::PrivateKey::from_seed(11).public_key();
         NetworkDescriptor {
             chain_id: "keyless#12345678".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(founder.as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1533,40 +1519,34 @@ mod tests {
     /// against.
     ///
     /// The service path loads `network.toml` for its chain id, so it would
-    /// happily resolve a descriptor with a foreign signature scheme or an empty
-    /// validator set — and `ducktape service run compute` would then announce
-    /// capacity for a network its own node refuses to start. Both paths run
+    /// happily resolve a descriptor with an empty validator set — and
+    /// `ducktape service run compute` would then announce capacity for a
+    /// network its own node refuses to start. Both paths run
     /// [`load_valid_descriptor`], and this is what says so: weaken either
-    /// refusal and one of these four assertions goes red.
+    /// refusal and one of these assertions goes red.
     #[test]
     fn both_paths_refuse_a_descriptor_no_node_can_run() {
-        let cases = [
-            ("badscheme", "sr25519", vec![hex_bytes(ed25519::PrivateKey::from_seed(5).public_key().as_ref())], "scheme"),
-            ("novalidators", SCHEME_ED25519, vec![], "no validators"),
-        ];
-        for (slug, scheme, validators, expected) in cases {
-            let dir = tmp(slug);
-            // a REAL key on disk, so the node path fails on the descriptor
-            // rather than on a missing identity.
-            load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
-            NetworkDescriptor {
-                chain_id: format!("{slug}#12345678"),
-                scheme: scheme.into(),
-                validators,
-                bootstrap: vec![],
-                reach: vec![],
-                coordination: None,
-            }
-            .save(&dir.join("network.toml"))
-            .expect("save descriptor");
-            std::fs::write(dir.join("node.toml"), network_shape_toml(&[])).expect("write");
-
-            let node = resolve(&dir.join("node.toml")).expect_err("the node path refuses it");
-            assert!(node.contains(expected), "node path: {node}");
-            let service =
-                resolve_service(&dir.join("node.toml")).expect_err("so must the daemon path");
-            assert!(service.contains(expected), "service path: {service}");
+        let (slug, expected) = ("novalidators", "no validators");
+        let dir = tmp(slug);
+        // a REAL key on disk, so the node path fails on the descriptor
+        // rather than on a missing identity.
+        load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
+        NetworkDescriptor {
+            chain_id: format!("{slug}#12345678"),
+            validators: vec![],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
         }
+        .save(&dir.join("network.toml"))
+        .expect("save descriptor");
+        std::fs::write(dir.join("node.toml"), network_shape_toml(&[])).expect("write");
+
+        let node = resolve(&dir.join("node.toml")).expect_err("the node path refuses it");
+        assert!(node.contains(expected), "node path: {node}");
+        let service =
+            resolve_service(&dir.join("node.toml")).expect_err("so must the daemon path");
+        assert!(service.contains(expected), "service path: {service}");
     }
 
     /// the desktop shape's posture: a config with no dialable underlay host
@@ -1581,7 +1561,6 @@ mod tests {
         let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
         let d = NetworkDescriptor {
             chain_id: "net#55555555".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],

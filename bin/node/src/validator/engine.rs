@@ -69,8 +69,8 @@ impl<'a> EpochSpawner<'a> {
         // in-process `simulated::Network` (crates/kernel/consensus/tests/
         // in_process_cluster.rs) for this real encrypted-TCP transport.
         let carrier = super::DiscoveryMesh::new(slot, self.oracle.clone());
-        // V1 ed25519 — the only wired scheme; see [`consensus::ConsensusScheme`]'s
-        // rekey/respawn contract for a scheme change.
+        // ed25519 — the wired scheme; see the rekey/respawn contract in
+        // `crates/kernel/consensus/src/lib.rs` for a scheme change.
         let scheme =
             simplex_ed25519::Scheme::signer(&self.namespace, participants, self.signer.clone())
                 .expect("our key is in the validator participant set");

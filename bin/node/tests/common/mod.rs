@@ -867,7 +867,7 @@ impl Cluster {
             let _ = std::fs::remove_file(&path);
             return;
         }
-        let mut file = "version = 1\n".to_string();
+        let mut file = String::new();
         for (position, (kind, tags)) in granted.iter().enumerate() {
             let announced = tags
                 .iter()

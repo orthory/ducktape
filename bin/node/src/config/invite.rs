@@ -8,7 +8,7 @@ use commonware_cryptography::{Signer as _, ed25519};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CoordRef, Coordination, NetworkDescriptor, Reach, ReachHint, SCHEME_ED25519, decode_key,
+    CoordRef, Coordination, NetworkDescriptor, Reach, ReachHint, decode_key,
     hex_bytes, unhex,
 };
 
@@ -709,7 +709,6 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
     Ok(Invite {
         descriptor: NetworkDescriptor {
             chain_id,
-            scheme: SCHEME_ED25519.into(),
             validators,
             // a decoded invite carries dial hints as typed `reach`; `bootstrap`
             // stays empty and both feed one dial source via `reach_hints`.
@@ -795,7 +794,6 @@ mod tests {
         let issuer = ed25519::PrivateKey::from_seed(7);
         let mut d = NetworkDescriptor {
             chain_id: "ducktape#a1b2c3d4".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(issuer.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -839,7 +837,6 @@ mod tests {
         let me = issuer.public_key();
         let mut d = NetworkDescriptor {
             chain_id: "ducktape#a1b2c3d4".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -894,7 +891,6 @@ mod tests {
         let me = issuer.public_key();
         let mut d = NetworkDescriptor {
             chain_id: "ducktape#a1b2c3d4".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -939,7 +935,6 @@ mod tests {
         let issuer = ed25519::PrivateKey::from_seed(7);
         let d = NetworkDescriptor {
             chain_id: "ducktape#a1b2c3d4".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(issuer.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -965,7 +960,6 @@ mod tests {
         let issuer = ed25519::PrivateKey::from_seed(7);
         let d = NetworkDescriptor {
             chain_id: "ducktape#a1b2c3d4".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(issuer.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -994,7 +988,6 @@ mod tests {
     fn front_descriptor(issuer: &ed25519::PrivateKey) -> NetworkDescriptor {
         NetworkDescriptor {
             chain_id: "ducktape#a1b2c3d4".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(issuer.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1144,7 +1137,6 @@ mod tests {
         let issuer = ed25519::PrivateKey::from_seed(7);
         let d = NetworkDescriptor {
             chain_id: "ducktape#a1b2c3d4".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(issuer.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1188,7 +1180,6 @@ mod tests {
         let issuer = ed25519::PrivateKey::from_seed(7);
         let base = NetworkDescriptor {
             chain_id: "ducktape#a1b2c3d4".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(issuer.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1219,7 +1210,6 @@ mod tests {
     fn front_test_descriptor(issuer: &ed25519::PrivateKey) -> NetworkDescriptor {
         NetworkDescriptor {
             chain_id: "ducktape#a1b2c3d4".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(issuer.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],

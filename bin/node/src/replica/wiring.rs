@@ -52,8 +52,7 @@ pub(super) struct ReplicaChannels {
     pub(super) relay_rx: lookup::Receiver<ed25519::PublicKey>,
     /// the joiner's admission signal (join ADR §4): set by the first-contact
     /// task the moment a member's doorbell answers the gate with the
-    /// AUTHORITATIVE `Admitted` — the park loop reads it in place of the
-    /// retired `CHANNEL_LOBBY` gate FSM.
+    /// AUTHORITATIVE `Admitted` — the park loop reads it directly.
     pub(super) admitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(super) voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
     /// the mesh window tracker, genesis already tracked — the park loop

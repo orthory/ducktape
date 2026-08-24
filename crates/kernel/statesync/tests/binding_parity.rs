@@ -35,8 +35,8 @@ use statesync::dataplane::{DataPlaneSyncClient, read_frame, statesync_flow, writ
 use statesync::p2p::P2pSyncClient;
 use statesync::{
     BoundaryId, FinalizedFrame, FrameDisposition, Manifest, ManifestEntry, PayloadKind, SyncClient,
-    SyncError, SyncRequest, SyncResponse, TipCoords, decode_request, decode_rpc_authed,
-    encode_response, encode_rpc_authed,
+    SyncError, SyncRequest, SyncResponse, TipCoords, decode_request, decode_rpc,
+    encode_response, encode_rpc,
 };
 
 // ============================================================================
@@ -371,7 +371,7 @@ fn run_mesh_leg(suite: Vec<(&'static str, SyncRequest)>) -> (LegResults, Transpo
                     return;
                 };
                 let bytes: Vec<u8> = msg.into();
-                let Ok((_requester, _proof, id, body)) = decode_rpc_authed(&bytes) else {
+                let Ok((_requester, _proof, id, body)) = decode_rpc(&bytes) else {
                     continue;
                 };
                 let Ok(req) = decode_request(body) else {
@@ -380,7 +380,7 @@ fn run_mesh_leg(suite: Vec<(&'static str, SyncRequest)>) -> (LegResults, Transpo
                 let resp = encode_response(&canned_response(&req));
                 let _ = server_tx.send(
                     Recipients::One(peer),
-                    IoBuf::from(encode_rpc_authed(&[0u8; 32], &[0u8; 64], id, &resp)),
+                    IoBuf::from(encode_rpc(&[0u8; 32], &[0u8; 64], id, &resp)),
                     false,
                 );
             }

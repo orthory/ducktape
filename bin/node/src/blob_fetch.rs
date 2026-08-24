@@ -339,7 +339,7 @@ impl<S: P2pSender<PublicKey = ed25519::PublicKey>> SyncClient for ServeLaneBlobC
             };
             let (tx, rx) = tokio::sync::oneshot::channel();
             pending.lock().expect("pending blob lock").insert(id, tx);
-            let frame = statesync::encode_rpc_authed(
+            let frame = statesync::encode_rpc(
                 &requester,
                 &proof,
                 id,

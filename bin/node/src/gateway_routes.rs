@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 use crate::config;
 
 pub const FILE_NAME: &str = "gateway-routes.json";
-const FORMAT_VERSION: u8 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -21,30 +20,17 @@ pub struct LocalRoute {
     pub port: u16,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// `deny_unknown_fields` is the schema guard: a file this build does not
+/// understand is refused outright (no version field, no migrations — the
+/// remedy is re-binding the routes).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LocalRoutes {
-    pub version: u8,
     pub routes: Vec<LocalRoute>,
-}
-
-impl Default for LocalRoutes {
-    fn default() -> Self {
-        Self {
-            version: FORMAT_VERSION,
-            routes: Vec::new(),
-        }
-    }
 }
 
 impl LocalRoutes {
     fn validate(&self) -> Result<(), String> {
-        if self.version != FORMAT_VERSION {
-            return Err(format!(
-                "gateway routes: unsupported format version {}",
-                self.version
-            ));
-        }
         if self.routes.len() > gateway::MAX_ROUTES_PER_ACCOUNT {
             return Err(format!(
                 "gateway routes: at most {} local routes",

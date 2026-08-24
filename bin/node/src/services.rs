@@ -23,7 +23,6 @@ use sha2::{Digest as _, Sha256};
 use crate::config;
 
 pub const FILE_NAME: &str = "services.toml";
-const FORMAT_VERSION: u8 = 1;
 
 /// the first-party service kinds. Defined in `noded` because both the node's
 /// own surfaces (the ws service link) and this CLI must name them.
@@ -201,30 +200,19 @@ impl ServiceGrant {
     }
 }
 
-/// the whole `services.toml`.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// the whole `services.toml`. `deny_unknown_fields` is the schema guard: a
+/// file this build does not understand is refused outright (no version field,
+/// no migrations — the remedy is re-granting the services).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Services {
-    pub version: u8,
     /// the grants, kind-sorted and unique. `[[service]]` in the file.
     #[serde(default, rename = "service")]
     pub grants: Vec<ServiceGrant>,
 }
 
-impl Default for Services {
-    fn default() -> Self {
-        Self {
-            version: FORMAT_VERSION,
-            grants: Vec::new(),
-        }
-    }
-}
-
 impl Services {
     fn validate(&self) -> Result<(), String> {
-        if self.version != FORMAT_VERSION {
-            return Err(format!("services: unsupported format version {}", self.version));
-        }
         let mut previous: Option<&str> = None;
         for grant in &self.grants {
             if !kind_is_well_formed(&grant.kind) {
@@ -2227,7 +2215,6 @@ mod tests {
     #[test]
     fn a_file_the_registry_would_refuse_does_not_load() {
         let over_cap = Services {
-            version: FORMAT_VERSION,
             grants: vec![ServiceGrant {
                 kind: "compute".into(),
                 instance: "aa".repeat(32),
@@ -2247,7 +2234,6 @@ mod tests {
         );
 
         let illegal = Services {
-            version: FORMAT_VERSION,
             grants: vec![ServiceGrant {
                 kind: "compute".into(),
                 instance: "aa".repeat(32),
@@ -2271,7 +2257,6 @@ mod tests {
         // so the test above pins the bound rather than a file that could never
         // load: one under the cap is fine.
         let ok = Services {
-            version: FORMAT_VERSION,
             grants: vec![ServiceGrant {
                 kind: "compute".into(),
                 instance: "aa".repeat(32),
@@ -2781,7 +2766,6 @@ mod tests {
         assert!(grant_for(dir.path(), COMPUTE_KIND).unwrap().is_none());
 
         let services = Services {
-            version: FORMAT_VERSION,
             grants: vec![
                 grant("compute", mint_instance(&NODE_A, "compute", &NONCE)),
                 grant("storage", mint_instance(&NODE_A, "storage", &NONCE)),
@@ -2969,7 +2953,6 @@ mod tests {
         save(
             dir.path(),
             &Services {
-                version: FORMAT_VERSION,
                 grants: vec![minted.clone()],
             },
         )
@@ -3052,7 +3035,6 @@ mod tests {
 
         // unsorted / duplicate kinds
         let duplicate = Services {
-            version: FORMAT_VERSION,
             grants: vec![
                 grant("compute", [1u8; 32]),
                 grant("compute", [2u8; 32]),
@@ -3065,19 +3047,17 @@ mod tests {
         short.instance.truncate(10);
         assert!(
             Services {
-                version: FORMAT_VERSION,
                 grants: vec![short],
             }
             .validate()
             .is_err()
         );
 
-        // an unknown key never parses silently
-        std::fs::write(&path, "version = 1\nsurprise = true\n").unwrap();
+        // an unknown key never parses silently — the retired version field
+        // included.
+        std::fs::write(&path, "surprise = true\n").unwrap();
         assert!(load(dir.path()).is_err());
-
-        // a future format version is a loud refusal, not a shrug
-        std::fs::write(&path, "version = 2\n").unwrap();
+        std::fs::write(&path, "version = 1\n").unwrap();
         assert!(load(dir.path()).is_err());
     }
 }

@@ -33,8 +33,8 @@ pub mod control;
 pub mod frame;
 
 pub use assembly::{Assembly, CompleteFrame, Reassembler};
-pub use control::{CTL_VERSION, CallControl, ControlError, RATE_LADDER_KBPS, step_down, step_up};
+pub use control::{CallControl, ControlError, RATE_LADDER_KBPS, step_down, step_up};
 pub use frame::{
-    FLAG_KEYFRAME, MAX_FRAGMENT_PAYLOAD, MAX_FRAGS, MAX_FRAME_BYTES, VIDEO_HEADER_LEN,
-    VIDEO_VERSION, VideoError, VideoHeader, decode_fragment, encode_fragment, fragment_frame,
+    FLAG_KEYFRAME, MAX_FRAGMENT_PAYLOAD, MAX_FRAGS, MAX_FRAME_BYTES, VIDEO_HEADER_LEN, VideoError,
+    VideoHeader, decode_fragment, encode_fragment, fragment_frame,
 };

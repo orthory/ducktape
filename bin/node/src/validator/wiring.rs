@@ -337,7 +337,7 @@ pub(super) fn wire_serve_lanes(
                 // mesh frames ride the AUTHENTICATED rpc envelope
                 // (requester ‖ proof ‖ id ‖ body — the id correlates).
                 let Ok((requester, proof, rpc_id, body)) =
-                    statesync::decode_rpc_authed(&bytes)
+                    statesync::decode_rpc(&bytes)
                 else {
                     if let Some(attempts) = REFUSED.hit("malformed_rpc_envelope") {
                         tracing::debug!(
@@ -482,7 +482,7 @@ pub(super) fn wire_serve_lanes(
                         drive_sync_request(&mut server, &mut pager, &state_tx, req).await
                     }
                 };
-                let framed = statesync::encode_rpc_authed(
+                let framed = statesync::encode_rpc(
                     &[0u8; 32],
                     &[0u8; 64],
                     rpc_id,
