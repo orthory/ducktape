@@ -146,7 +146,24 @@ impl Drop for MicroVm {
         for tunnel in self.tunnels.drain(..) {
             tunnel.abort();
         }
-        let _ = std::fs::remove_dir_all(&self.run_dir);
+        // THE 21 GB LINE. A silent failure here is the leak this Drop exists to
+        // prevent, and it is invisible until a node's disk is full — so a
+        // removal that did not happen says so, once, with the directory that
+        // survived (a random slot id, no credential in the name).
+        // A removal that failed because the directory was already gone left no
+        // leak, so it is not news — the same test `RunHome`'s own teardown
+        // makes.
+        if let Err(error) = std::fs::remove_dir_all(&self.run_dir)
+            && self.run_dir.exists()
+        {
+            tracing::warn!(
+                target: "ducktape::sandbox",
+                reason = "run_dir_not_removed",
+                run_dir = %self.run_dir.display(),
+                %error,
+                "the run's scratch outlived its microVM"
+            );
+        }
         if let Some(socket_dir) = self.vsock_uds.parent() {
             let _ = std::fs::remove_dir_all(socket_dir);
         }
@@ -167,8 +184,14 @@ impl MicroVm {
         cfg: &VmConfig,
         manifest: &RunManifest,
     ) -> Result<(Self, MicroVmIo), String> {
+        let started = std::time::Instant::now();
         std::fs::create_dir_all(run_dir)
             .map_err(|e| format!("create run dir {}: {e}", run_dir.display()))?;
+        // From here until the `MicroVm` below exists, nothing owns this
+        // directory: every `?` in the setup steps — an oversized workspace, a
+        // vsock path over SUN_LEN, a VMM that will not spawn — used to leave it
+        // behind, and a node that refuses runs leaks one per attempt.
+        let mut run_dir_guard = RunDirGuard(Some(run_dir));
 
         // 1. the run's per-run block devices: what it is supposed to run, its
         //    read-only inputs, and the workspace that will be read back.
@@ -233,6 +256,23 @@ impl MicroVm {
             .spawn()
             .map_err(|e| format!("spawn firecracker: {e}"))?;
 
+        // per-run, so `debug`. The three numbers are the ones a run's cost and
+        // its refusals are argued from: what it was sold (vcpus/mem) and how
+        // big the image it had to build was.
+        tracing::debug!(
+            target: "ducktape::sandbox",
+            slot = %slot_of(run_dir),
+            vcpus = cfg.vcpus,
+            mem_mib = cfg.mem_mib,
+            workspace_bytes = size,
+            assets = assets.len(),
+            tunnels = manifest.tunnel_ports.len(),
+            "VMM spawned; waiting for the guest"
+        );
+
+        // the VM owns the directory from here: its `Drop` removes it on every
+        // path out, including the boot failures below.
+        run_dir_guard.0 = None;
         let mut vm = MicroVm {
             vmm,
             run_dir: run_dir.to_path_buf(),
@@ -247,15 +287,27 @@ impl MicroVm {
             Ok(Ok((stream, _))) => stream,
             Ok(Err(e)) => {
                 return Err(vm
-                    .boot_failure(&format!("accept the guest vsock: {e}"))
+                    .boot_failure("guest_vsock_accept_failed", &format!("accept the guest vsock: {e}"))
                     .await);
             }
             Err(_) => {
                 return Err(vm
-                    .boot_failure("the guest never dialled back before the boot timeout")
+                    .boot_failure(
+                        "guest_never_dialled",
+                        "the guest never dialled back before the boot timeout",
+                    )
                     .await);
             }
         };
+
+        // the boot budget this run actually spent, which is the number a slow
+        // node is diagnosed from — and the only place it is ever measured.
+        tracing::debug!(
+            target: "ducktape::sandbox",
+            slot = %slot_of(run_dir),
+            boot_ms = started.elapsed().as_millis() as u64,
+            "the guest dialled back"
+        );
 
         let io = spawn_pump(stream);
         Ok((vm, io))
@@ -272,8 +324,23 @@ impl MicroVm {
 
     /// a boot failure, with the console attached. Kills the VMM first: whatever
     /// went wrong, a guest nobody is listening to must not keep running.
-    async fn boot_failure(&mut self, what: &str) -> String {
+    ///
+    /// `reason` is the stable snake_case token the log is counted by; `what` is
+    /// the prose that reaches the caller's error string. The event is a `warn`
+    /// and not an `error` because the run is refused, not the node: the daemon
+    /// takes the next run.
+    async fn boot_failure(&mut self, reason: &'static str, what: &str) -> String {
         let _ = self.vmm.kill().await;
+        tracing::warn!(
+            target: "ducktape::sandbox",
+            reason,
+            slot = %slot_of(&self.run_dir),
+            // NOT the console tail: it is guest-authored and unbounded, and one
+            // kernel-panic trace would evict a large slice of the 4096-line
+            // ring. It rides the returned error instead, where the caller can
+            // decide.
+            "the microVM never came up; the run is refused"
+        );
         format!("{what}\nguest console:\n{}", self.console_tail())
     }
 
@@ -288,11 +355,27 @@ impl MicroVm {
             .wait()
             .await
             .map_err(|e| format!("wait for the VMM: {e}"))?;
-        crate::workspace_image::read_back(&self.workspace_image, workdir)
+        let started = std::time::Instant::now();
+        let read_back = crate::workspace_image::read_back(&self.workspace_image, workdir);
+        // the workspace round trip is the run's longest non-model step (13.8 s
+        // for a 1.7 GB tree), and it is invisible from outside — the caller
+        // only sees `collect` return. Timed here or nowhere.
+        tracing::debug!(
+            target: "ducktape::sandbox",
+            copy_back_ms = started.elapsed().as_millis() as u64,
+            ok = read_back.is_ok(),
+            "workspace read back"
+        );
+        read_back
     }
 
     /// stop the VM now. Used when the run is abandoned rather than finished.
     pub async fn terminate(&mut self) {
+        tracing::debug!(
+            target: "ducktape::sandbox",
+            reason = "run_abandoned",
+            "killing the microVM before its guest exited"
+        );
         let _ = self.vmm.kill().await;
     }
 
@@ -316,8 +399,22 @@ async fn serve_tunnel(listener: UnixListener, service_port: u16) {
             return;
         };
         tokio::spawn(async move {
-            let Ok(service) = TcpStream::connect(("127.0.0.1", service_port)).await else {
-                return;
+            let service = match TcpStream::connect(("127.0.0.1", service_port)).await {
+                Ok(service) => service,
+                // The guest asked for the one address this tunnel can dial and
+                // nothing answered. Silent, this reaches the operator as a CLI
+                // that hangs and then times out with no cause anywhere — the
+                // broker being down looks exactly like a slow model.
+                Err(error) => {
+                    tracing::warn!(
+                        target: "ducktape::sandbox",
+                        reason = "tunnel_dial_failed",
+                        service_port,
+                        %error,
+                        "a guest tunnel had nothing to connect to on this host"
+                    );
+                    return;
+                }
             };
             let (mut guest_read, mut guest_write) = guest.into_split();
             let (mut broker_read, mut broker_write) = service.into_split();
@@ -334,6 +431,39 @@ async fn serve_tunnel(listener: UnixListener, service_port: u16) {
             tokio::join!(up, down);
         });
     }
+}
+
+/// Owns a run directory for the window in which nothing else does — from
+/// `create_dir_all` until the [`MicroVm`] that will remove it exists. Disarmed
+/// by setting its field to `None`.
+struct RunDirGuard<'a>(Option<&'a Path>);
+
+impl Drop for RunDirGuard<'_> {
+    fn drop(&mut self) {
+        let Some(run_dir) = self.0 else { return };
+        if let Err(error) = std::fs::remove_dir_all(run_dir)
+            && run_dir.exists()
+        {
+            tracing::warn!(
+                target: "ducktape::sandbox",
+                reason = "run_dir_not_removed",
+                slot = %slot_of(run_dir),
+                %error,
+                "a refused run left its directory behind"
+            );
+        }
+    }
+}
+
+/// the run directory's own name — `/tmp/dt-vm-<slot>`, the id every one of a
+/// run's files is under. It is the join key between a log line and the scratch
+/// on disk, and it is not a path: the parent is the host's, the leaf is ours.
+fn slot_of(run_dir: &Path) -> std::borrow::Cow<'_, str> {
+    run_dir
+        .file_name()
+        .map_or(std::borrow::Cow::Borrowed("?"), |name| {
+            name.to_string_lossy()
+        })
 }
 
 /// Firecracker connects a guest's outbound vsock to `<uds_path>_<port>`.
@@ -445,8 +575,19 @@ async fn pump_frames(
                 Ok(Some(frame)) => frame,
                 Ok(None) => break,
                 // A guest that speaks nonsense is untrusted input, not a bug.
-                // Stop reading; the caller sees EOF and a missing exit code.
-                Err(_) => return,
+                // Stop reading; the caller sees EOF and a missing exit code —
+                // which reaches the operator as "guest halted without reporting
+                // an exit code" and, unsaid, names nothing. The arm returns, so
+                // this can fire at most once per run. No payload: the frame is
+                // guest-authored.
+                Err(_) => {
+                    tracing::warn!(
+                        target: "ducktape::sandbox",
+                        reason = "frame_decode_failed",
+                        "the guest sent a frame this host cannot parse; dropping the stream"
+                    );
+                    return;
+                }
             };
             match frame {
                 Frame::Stdout(bytes) => {
