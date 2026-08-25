@@ -36,6 +36,9 @@
 #                      provider — the executor spec layer + CliProvider run loop;
 #                      agent — the pty session daemon; airlock — the lender;
 #                      media — the huddle voice/video planes + call-socket wire)
+#   crates/topology/ — the module composition catalog: the id universe, its
+#                      wiring/config schema and the named genesis selections
+#                      every composer draws from (pure data, no deps)
 #   crates/airlock/  — the two-party execution/auth contract (see members below)
 #   crates/duckdns/  — the `.duck` account naming library: hostname grammar,
 #                      handle registry, wire types. NOT a module — the `gateway`
@@ -145,6 +148,8 @@ members = [
     # testing — dev-only shared harness helpers (raw-http client, ports,
     # poll). NOT a Module Rule surface; no shipping crate depends on it.
     "crates/testing/nettest",
+    # topology — the module composition catalog every composer draws from
+    "crates/topology",
     # noded — the daemon library behind the /v1 surface
     "crates/noded",
     # bin — runnable binaries
@@ -317,6 +322,8 @@ sandbox-host = { path = "crates/services/sandbox" }
 # duckdns is the `.duck` naming library the `gateway` module embeds and the
 # composing binaries validate names through (see the members list).
 duckdns = { path = "crates/duckdns" }
+# the module composition catalog (id universe + named genesis selections).
+topology = { path = "crates/topology" }
 duckfs-core = { path = "crates/duckfs/core" }
 duckfs-disk = { path = "crates/duckfs/disk" }
 duckfs-client = { path = "crates/duckfs/client" }

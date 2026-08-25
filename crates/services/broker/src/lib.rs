@@ -1436,15 +1436,12 @@ enum AirlockGateway {
     Remote { handle: String, via: String },
 }
 
-/// capability-host's OWN vendor tag for a credential — a MIRROR of the gateway
-/// module's `CredentialKind`. Kept separate on purpose: this crate must not
-/// depend on the gateway module crate, so the node maps between the two at the
-/// boundary when it resolves a record into a [`ResolvedCredential`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CredentialKind {
-    Claude,
-    Codex,
-}
+/// Which vendor a credential is for: the airlock contract's own vocabulary,
+/// shared by the lender, this borrower, and the session daemons. The gateway
+/// module's on-chain record carries its own codec tag for the same choice;
+/// the node maps that onto this at the boundary when it resolves a record
+/// into a [`ResolvedCredential`] — services never depend on the module crate.
+pub use airlock::wire::CredentialKind;
 
 /// A credential name resolved from consensus (the on-chain gateway record) into
 /// everything the broker needs to reach the owner's self-host gateway: WHERE it

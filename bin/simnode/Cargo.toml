@@ -26,6 +26,8 @@ path = "src/main.rs"
 # the host-side qmdb store handle injected into disk-backed modules.
 statesync = { workspace = true }
 host = { workspace = true }
+# the module composition catalog this composer draws its genesis selection from.
+topology = { workspace = true }
 sdk = { workspace = true }
 chat = { workspace = true }
 tasks = { workspace = true }

@@ -42,8 +42,8 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use provider_host::{
-    AirlockConfig, CredentialKind, InteractiveSession, Provider, ProviderSet, ResolvedCredential,
-    RunContext, WorkRef,
+    AirlockConfig, InteractiveSession, Provider, ProviderSet, ResolvedCredential, RunContext,
+    WorkRef,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -577,10 +577,7 @@ async fn reaper_fires(lifetime: Duration, cancel: oneshot::Receiver<()>) -> bool
 pub fn credential_wire(resolved: &ResolvedCredential) -> wire::Credential {
     wire::Credential {
         name: resolved.name.clone(),
-        kind: match resolved.kind {
-            CredentialKind::Claude => wire::CredentialKind::Claude,
-            CredentialKind::Codex => wire::CredentialKind::Codex,
-        },
+        kind: resolved.kind,
         authority: resolved.authority.clone(),
         via: resolved.via.clone(),
         seal_pk: resolved.seal_pk,
@@ -600,10 +597,7 @@ fn airlock_config(credential: wire::Credential) -> AirlockConfig {
     AirlockConfig::self_host(
         &ResolvedCredential {
             name: credential.name,
-            kind: match credential.kind {
-                wire::CredentialKind::Claude => CredentialKind::Claude,
-                wire::CredentialKind::Codex => CredentialKind::Codex,
-            },
+            kind: credential.kind,
             authority: credential.authority,
             via: credential.via,
             seal_pk: credential.seal_pk,
@@ -748,31 +742,5 @@ mod tests {
         let (tx, rx) = oneshot::channel::<()>();
         drop(tx);
         assert!(!reaper_fires(Duration::from_secs(1), rx).await);
-    }
-
-    #[test]
-    fn the_credential_mirror_keeps_both_vendor_arms() {
-        // a silent mis-map here would send a Claude session to a Codex gateway.
-        for (wire_kind, expected) in [
-            (wire::CredentialKind::Claude, CredentialKind::Claude),
-            (wire::CredentialKind::Codex, CredentialKind::Codex),
-        ] {
-            let resolved = ResolvedCredential {
-                name: "c".into(),
-                kind: expected,
-                authority: "a".into(),
-                via: "http://v".into(),
-                seal_pk: [7u8; 32],
-            };
-            let expected_config = AirlockConfig::self_host(&resolved, WorkRef::Direct);
-            let built = airlock_config(wire::Credential {
-                name: "c".into(),
-                kind: wire_kind,
-                authority: "a".into(),
-                via: "http://v".into(),
-                seal_pk: [7u8; 32],
-            });
-            assert_eq!(built, expected_config);
-        }
     }
 }

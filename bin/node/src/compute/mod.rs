@@ -34,7 +34,7 @@ use noded::node_link::NodeLink;
 use crate::config;
 use crate::services::ServiceGrant;
 
-mod cred;
+pub(crate) mod cred;
 mod intake;
 mod link;
 

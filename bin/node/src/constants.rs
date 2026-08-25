@@ -113,14 +113,14 @@ pub(crate) const EPOCH_CHANNEL_BANK: u64 = 16;
 /// production mesh would size this in minutes of views.
 pub(crate) const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order — the
-/// `production` selection of the single-source [`host::topology`]. pinned to the
+/// `production` selection of the single-source [`topology`]. pinned to the
 /// `host_state::ProductionModules` registry by the parity test in `host_state`;
 /// the topology's own tests pin the selection to today's 20.
 ///
 /// A module here is in the root-hash: every node must run it, agree on its root
 /// at every height, and keep doing so forever. Experiments therefore live
 /// unwired in `crates/labs` and appear in no genesis set.
-pub(crate) const MODULE_IDS: &[&str] = host::topology::PRODUCTION;
+pub(crate) const MODULE_IDS: &[&str] = topology::PRODUCTION;
 
 /// how long an app-surface submit reply may be held awaiting finalization
 /// before it errors out (the op may still land later; clients re-query on

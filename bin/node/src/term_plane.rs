@@ -731,20 +731,11 @@ fn admit_create(
     }
     Ok(AdmitOk {
         name: record.name.clone(),
-        kind: map_kind(record.kind),
+        kind: crate::compute::cred::service_kind(record.kind),
         seal_pk: record.seal_pk,
         owner_account: record.owner_account.clone(),
         limits: build_limits(cpu, mem_gb),
     })
-}
-
-/// gateway kind → capability-host kind (the two are deliberately separate types;
-/// capability-host must not depend on the gateway crate).
-fn map_kind(kind: gateway::CredentialKind) -> provider_host::CredentialKind {
-    match kind {
-        gateway::CredentialKind::Claude => provider_host::CredentialKind::Claude,
-        gateway::CredentialKind::Codex => provider_host::CredentialKind::Codex,
-    }
 }
 
 /// true when an EXPLICIT vendor provider tag contradicts the credential's kind.

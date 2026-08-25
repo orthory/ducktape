@@ -25,6 +25,8 @@ clap = { workspace = true }
 anstyle = "1.0"
 anstream = "1.0"
 host = { workspace = true }
+# the module composition catalog this composer draws its genesis selection from.
+topology = { workspace = true }
 node = { workspace = true }
 consensus = { workspace = true }
 recovery = { workspace = true }

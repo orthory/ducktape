@@ -147,7 +147,7 @@ impl NodeCredentialResolver {
         };
         let resolved = ResolvedCredential {
             name: record.name.clone(),
-            kind: map_kind(record.kind),
+            kind: service_kind(record.kind),
             authority: format!("{AIRLOCK_ROUTE}.{handle}.duck"),
             via,
             seal_pk: record.seal_pk,
@@ -193,9 +193,10 @@ fn routable(
     record.ok_or_else(|| format!("unknown credential: {credential}"))
 }
 
-/// The node owns the gateway↔capability-host credential-kind mapping, because
-/// capability-host does not depend on the gateway crate.
-fn map_kind(kind: gateway::CredentialKind) -> CredentialKind {
+/// The node owns the ONE mapping from the gateway module's on-chain credential
+/// tag to the service plane's vendor vocabulary, because no service crate
+/// depends on the gateway module crate.
+pub(crate) fn service_kind(kind: gateway::CredentialKind) -> CredentialKind {
     match kind {
         gateway::CredentialKind::Claude => CredentialKind::Claude,
         gateway::CredentialKind::Codex => CredentialKind::Codex,
@@ -250,11 +251,11 @@ mod tests {
     #[test]
     fn kinds_map_across_the_boundary() {
         assert_eq!(
-            map_kind(gateway::CredentialKind::Claude),
+            service_kind(gateway::CredentialKind::Claude),
             CredentialKind::Claude
         );
         assert_eq!(
-            map_kind(gateway::CredentialKind::Codex),
+            service_kind(gateway::CredentialKind::Codex),
             CredentialKind::Codex
         );
     }

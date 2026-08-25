@@ -160,7 +160,7 @@ use tasks::Tasks;
 use valset::Valset;
 
 // the sim's genesis sets are the `sim_base` (+ `sim_valset`) selections of the
-// single-source `host::topology` — noded's exact 14-module default plus the
+// single-source `topology` — noded's exact 14-module default plus the
 // opt-in 4 system modules. changing the daemon set changes the topology, which
 // re-pins here and at node/demo. the native genesis vec below composes these
 // same ids over native module structs (the wasm/native root split is by design).
@@ -369,11 +369,11 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
     // the status module list and the index tier both extend only under valset
     // keys; the default path stays the exact 14-module set the parity lane pins.
     let module_ids: Vec<&'static str> = if valset_keys.is_empty() {
-        host::topology::SIM_BASE.to_vec()
+        topology::SIM_BASE.to_vec()
     } else {
-        host::topology::SIM_BASE
+        topology::SIM_BASE
             .iter()
-            .chain(host::topology::SIM_VALSET)
+            .chain(topology::SIM_VALSET)
             .copied()
             .collect()
     };

@@ -2973,6 +2973,7 @@ dependencies = [
  "statesync",
  "tagging",
  "tasks",
+ "topology",
  "valset",
 ]
 
@@ -6238,6 +6239,7 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite 0.24.0",
  "toml 0.8.23",
+ "topology",
  "tracing",
  "tracing-subscriber 0.3.23",
  "valset",
@@ -6340,6 +6342,7 @@ dependencies = [
  "tasks",
  "tempfile",
  "tokio",
+ "topology",
  "tracing",
 ]
 
@@ -9012,6 +9015,7 @@ dependencies = [
  "tasks",
  "tempfile",
  "tokio",
+ "topology",
  "tracing",
  "valset",
 ]
@@ -9879,6 +9883,10 @@ dependencies = [
  "prost",
  "tonic",
 ]
+
+[[package]]
+name = "topology"
+version = "0.1.0"
 
 [[package]]
 name = "tower"

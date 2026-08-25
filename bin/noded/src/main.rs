@@ -50,10 +50,10 @@ use tagging::TaggingModule;
 use tasks::Tasks;
 
 /// every module registered at genesis, in registry order — the `sim_base`
-/// selection of the single-source [`host::topology`] (identical to simnode's
+/// selection of the single-source [`topology`] (identical to simnode's
 /// default set). status reports use this list; the genesis vec in `run_node`
 /// composes the same ids over native module structs.
-const MODULE_IDS: &[&str] = host::topology::SIM_BASE;
+const MODULE_IDS: &[&str] = topology::SIM_BASE;
 
 mod echo_oracle;
 

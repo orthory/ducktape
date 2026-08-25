@@ -64,13 +64,13 @@ fn main() {
 
     deterministic::Runner::default().start(|context| async move {
         // genesis: the module registry (would be consensus state on a real
-        // chain) — the `demo` selection of the single-source `host::topology`,
+        // chain) — the `demo` selection of the single-source `topology`,
         // composed over native module structs.
         let mut host = demo_genesis(&context, &forge_repo, &duckfs_dir).await;
 
         println!(
             "=== super-app demo — {} registered modules over one host ===",
-            host::topology::DEMO.len()
+            topology::DEMO.len()
         );
         println!("forge repo       : {}", forge_repo.display());
         println!("genesis root-hash : {:?}", host.root_hash());
@@ -525,7 +525,7 @@ fn main() {
 }
 
 /// Compose the demo's native genesis host — the `demo` selection of the
-/// single-source `host::topology`, one native module struct per id. Kept a
+/// single-source `topology`, one native module struct per id. Kept a
 /// function (not inlined in `main`) so the parity test can compose the exact
 /// same set and pin it against the topology.
 async fn demo_genesis(
@@ -644,7 +644,7 @@ mod tests {
 
     /// The demo genesis composes exactly the topology's `demo` selection — the
     /// demo analogue of node's `genesis_registry_matches_module_ids`. Adding or
-    /// dropping a module here without updating `host::topology::DEMO` fails here.
+    /// dropping a module here without updating `topology::DEMO` fails here.
     #[test]
     fn demo_genesis_matches_topology() {
         let dir = std::env::temp_dir().join(format!("ducktape-demo-topo-{}", std::process::id()));
@@ -656,11 +656,11 @@ mod tests {
             let mut got: Vec<String> = host.module_roots().into_iter().map(|(id, _)| id).collect();
             got.sort_unstable();
             let mut want: Vec<String> =
-                host::topology::DEMO.iter().map(|s| s.to_string()).collect();
+                topology::DEMO.iter().map(|s| s.to_string()).collect();
             want.sort_unstable();
             assert_eq!(
                 got, want,
-                "demo genesis set must equal host::topology::DEMO"
+                "demo genesis set must equal topology::DEMO"
             );
         });
         let _ = std::fs::remove_dir_all(&dir);

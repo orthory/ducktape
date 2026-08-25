@@ -1463,7 +1463,7 @@ mod tests {
     /// the registry ↔ topology parity pin. [`ProductionModules`] already forces
     /// genesis, restore, and state sync onto one module set at compile time;
     /// this test pins that set to `MODULE_IDS` — the `production` selection of
-    /// the single-source `host::topology` the status/index surfaces iterate — so
+    /// the single-source `topology` the status/index surfaces iterate — so
     /// adding a module to one but not the other fails here instead of silently
     /// misreporting.
     #[test]
