@@ -34,7 +34,8 @@
 #                      microVM/egress/backend-probe muscle; broker —
 #                      the run-scoped credential loopback + airlock client;
 #                      provider — the executor spec layer + CliProvider run loop;
-#                      agent — the pty session daemon; airlock — the lender)
+#                      agent — the pty session daemon; airlock — the lender;
+#                      media — the huddle voice/video planes + call-socket wire)
 #   crates/airlock/  — the two-party execution/auth contract (see members below)
 #   crates/duckdns/  — the `.duck` account naming library: hostname grammar,
 #                      handle registry, wire types. NOT a module — the `gateway`
@@ -136,6 +137,7 @@ members = [
     "crates/services/airlock",
     "crates/services/broker",
     "crates/services/compute",
+    "crates/services/media",
     "crates/services/provider",
     "crates/services/sandbox",
     # examples — demo / test scaffolding modules
@@ -308,6 +310,7 @@ agent-service = { path = "crates/services/agent" }
 airlock-service = { path = "crates/services/airlock" }
 broker-host = { path = "crates/services/broker" }
 compute-service = { path = "crates/services/compute" }
+media-service = { path = "crates/services/media" }
 provider-host = { path = "crates/services/provider" }
 sandbox-host = { path = "crates/services/sandbox" }
 # internal — cross-plane libraries: neither a consensus module nor a service.

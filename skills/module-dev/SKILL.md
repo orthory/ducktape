@@ -106,4 +106,4 @@ make wasm-modules-check                                   # 5. committed copies 
 | Guest added to root workspace members | guests are standalone BY DESIGN; membership poisons native feature unification |
 | `include_bytes!` before `make wasm-modules` | bin/node cannot compile until the component exists |
 | Rebuilding one guest's component alone | bytes are toolchain-dependent; refresh the set together or `wasm-modules-check` fails |
-| Native-only dep in the module crate | wasm32 build breaks; gate it behind the `native` feature (the `files`/`chat` shape) |
+| Native-only dep in the module crate | wasm32 build breaks; gate it behind the `native` feature (the `files` shape) |

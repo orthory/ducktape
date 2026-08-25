@@ -69,7 +69,7 @@ pub enum Service {
     /// Real-time voice channels (chat module).
     Voice = 2,
     /// Real-time camera video (chat module): encoded frames fragmented
-    /// across datagrams — see `chat::video` for the frame layer.
+    /// across datagrams — see `media_service::video` for the frame layer.
     Video = 3,
     /// Gateway reverse-proxy requests. The overlay authenticates both
     /// nodes; signed routes bind account authority, target, and access policy.

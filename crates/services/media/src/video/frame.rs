@@ -119,7 +119,7 @@ mod tests {
 
     /// pins the exact wire bytes (D1: header fields big-endian) — locks this
     /// already-BE datagram codec alongside the call-socket codec
-    /// (`chat::call_wire`) as part of the wire-standardization sweep.
+    /// ([`crate::call_wire`]) as part of the wire-standardization sweep.
     #[test]
     fn golden_header_be() {
         let header = VideoHeader {

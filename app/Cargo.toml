@@ -18,6 +18,8 @@ ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev 
 # picker: which peers can actually run an agent.
 capability.workspace = true
 chat.workspace = true
+# the huddle media planes: the call-socket framing and voice/video wire.
+media-service.workspace = true
 design.workspace = true
 ducktape-rpc.workspace = true
 forge.workspace = true

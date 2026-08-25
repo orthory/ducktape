@@ -1450,11 +1450,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "commonware-runtime",
- "data-plane",
  "guest-adapter",
  "host",
  "index-guest",
- "opus-rs",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -1463,8 +1461,6 @@ dependencies = [
  "statesync",
  "tagging",
  "tempfile",
- "thiserror 2.0.18",
- "tokio",
  "unicode-normalization",
 ]
 
@@ -3294,6 +3290,7 @@ dependencies = [
  "image",
  "inbox",
  "jpeg-encoder",
+ "media-service",
  "node",
  "nokhwa",
  "pages",
@@ -5748,6 +5745,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
+name = "media-service"
+version = "0.1.0"
+dependencies = [
+ "data-plane",
+ "opus-rs",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6202,6 +6209,7 @@ dependencies = [
  "kv",
  "libc",
  "lifecycle",
+ "media-service",
  "nat-traversal",
  "nettest",
  "node",
@@ -6271,6 +6279,7 @@ dependencies = [
  "identity",
  "inbox",
  "indexer",
+ "media-service",
  "nettest",
  "node",
  "pages",

@@ -41,7 +41,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use chat::voice::{FRAME_MILLIS, FRAME_SAMPLES, VoiceConfig, VoiceEngine};
+use media_service::voice::{FRAME_MILLIS, FRAME_SAMPLES, VoiceConfig, VoiceEngine};
 use data_plane::{
     AdmissionPolicy, DataPlane, DataPlaneTransport, DatagramFlow, DatagramPolicy, FlowId, PeerId,
     Service, SocketFactory,
@@ -650,7 +650,7 @@ async fn run_presence_session<T: DataPlaneTransport>(
 
 /// per-sending-peer receive state on the video/control flows.
 struct PeerLane {
-    reassembler: chat::video::Reassembler,
+    reassembler: media_service::video::Reassembler,
     /// last time we asked THIS peer for a keyframe (≥1 s apart).
     last_keyframe_req: Option<Instant>,
     /// `dropped_frames()` when we last inspected this peer — a keyframe ask
@@ -666,10 +666,10 @@ struct PeerLane {
 impl PeerLane {
     fn new() -> Self {
         PeerLane {
-            reassembler: chat::video::Reassembler::default(),
+            reassembler: media_service::video::Reassembler::default(),
             last_keyframe_req: None,
             last_seen_dropped: 0,
-            hint_kbps: chat::video::RATE_LADDER_KBPS[0],
+            hint_kbps: media_service::video::RATE_LADDER_KBPS[0],
             clean_windows: 0,
             window_complete: 0,
             window_dropped_base: 0,
@@ -687,8 +687,8 @@ async fn run_session<T: DataPlaneTransport>(
     ctl: DatagramFlow<T>,
     mut pcm_in: mpsc::Receiver<Vec<i16>>,
     mixed_out: mpsc::Sender<Vec<i16>>,
-    mut video_in: mpsc::Receiver<chat::call_wire::CapturedFrame>,
-    video_out: mpsc::Sender<chat::call_wire::PeerFrame>,
+    mut video_in: mpsc::Receiver<media_service::call_wire::CapturedFrame>,
+    video_out: mpsc::Sender<media_service::call_wire::PeerFrame>,
     mut control_in: mpsc::Receiver<noded::CallControlIn>,
     control_out: mpsc::Sender<noded::CallControlOut>,
     mut recipients: watch::Receiver<Vec<[u8; 32]>>,
@@ -716,7 +716,7 @@ async fn run_session<T: DataPlaneTransport>(
     let (mut muted, mut camera_on, mut sharing) = (true, false, false);
     // rate hints RECEIVED from each peer about OUR sending; effective = min.
     let mut inbound_hints: HashMap<[u8; 32], u32> = HashMap::new();
-    let mut effective_kbps: u32 = chat::video::RATE_LADDER_KBPS[0];
+    let mut effective_kbps: u32 = media_service::video::RATE_LADDER_KBPS[0];
     // ≥1 s between keyframes we ask our own encoder for.
     let mut last_encoder_kick: Option<Instant> = None;
     let mut ctl_tick = tokio::time::interval(Duration::from_secs(1));
@@ -786,7 +786,7 @@ async fn run_session<T: DataPlaneTransport>(
                 let recipients_now: Vec<PeerId> =
                     recipients.borrow().iter().map(|raw| PeerId(*raw)).collect();
                 if recipients_now.is_empty() { continue; }
-                let Ok(fragments) = chat::video::fragment_frame(
+                let Ok(fragments) = media_service::video::fragment_frame(
                     frame_no, frame.keyframe, frame.ts_ms, &frame.data,
                 ) else { continue }; // oversize/empty: drop, stay alive
                 frame_no = frame_no.wrapping_add(1);
@@ -799,22 +799,22 @@ async fn run_session<T: DataPlaneTransport>(
             }
             inbound = video.recv() => {
                 let (peer, bytes) = inbound;
-                let Ok((header, payload)) = chat::video::decode_fragment(&bytes) else { continue };
+                let Ok((header, payload)) = media_service::video::decode_fragment(&bytes) else { continue };
                 let lane = peer_lanes.entry(peer.0).or_insert_with(PeerLane::new);
                 match lane.reassembler.insert(header, payload) {
-                    chat::video::Assembly::Complete(done) => {
+                    media_service::video::Assembly::Complete(done) => {
                         lane.window_complete += 1;
                         // full lane = the webview is behind; a dropped frame
                         // is recovered by the next keyframe request from the
                         // browser decoder, so shed rather than backpressure.
-                        let _ = video_out.try_send(chat::call_wire::PeerFrame {
+                        let _ = video_out.try_send(media_service::call_wire::PeerFrame {
                             peer: peer.0,
                             keyframe: done.keyframe,
                             ts_ms: done.ts_ms,
                             data: done.data,
                         });
                     }
-                    chat::video::Assembly::Progress | chat::video::Assembly::Stale => {
+                    media_service::video::Assembly::Progress | media_service::video::Assembly::Stale => {
                         // a frame died incomplete since we last looked → ask
                         // its sender for a sync point (rate-limited). gate on
                         // the dropped counter ADVANCING so mid-frame fragments
@@ -829,9 +829,9 @@ async fn run_session<T: DataPlaneTransport>(
             }
             inbound = ctl.recv() => {
                 let (peer, bytes) = inbound;
-                let Ok(message) = chat::video::CallControl::decode(&bytes) else { continue };
+                let Ok(message) = media_service::video::CallControl::decode(&bytes) else { continue };
                 match message {
-                    chat::video::CallControl::KeyframeRequest => {
+                    media_service::video::CallControl::KeyframeRequest => {
                         // honor at most one encoder kick per second.
                         let due = last_encoder_kick
                             .is_none_or(|at| at.elapsed() >= Duration::from_secs(1));
@@ -840,22 +840,22 @@ async fn run_session<T: DataPlaneTransport>(
                             let _ = control_out.try_send(noded::CallControlOut::KeyframeRequest);
                         }
                     }
-                    chat::video::CallControl::Beacon { muted, camera_on, sharing } => {
+                    media_service::video::CallControl::Beacon { muted, camera_on, sharing } => {
                         let _ = control_out.try_send(noded::CallControlOut::PeerBeacon {
                             peer: peer.0, muted, camera_on, sharing,
                         });
                     }
-                    chat::video::CallControl::RateHint { max_kbps } => {
+                    media_service::video::CallControl::RateHint { max_kbps } => {
                         // hints outside the ladder are hostile-or-broken; clamping
                         // preserves min semantics without letting a peer push the
                         // encoder outside its envelope (a 1 kbps hint would freeze
                         // our video for every recipient via the min; a huge one
                         // would fail the encoder's configure and drop our camera).
                         let clamped = max_kbps.clamp(
-                            *chat::video::RATE_LADDER_KBPS
+                            *media_service::video::RATE_LADDER_KBPS
                                 .last()
                                 .expect("non-empty ladder"),
-                            chat::video::RATE_LADDER_KBPS[0],
+                            media_service::video::RATE_LADDER_KBPS[0],
                         );
                         inbound_hints.insert(peer.0, clamped);
                         push_effective_rate(
@@ -946,7 +946,7 @@ async fn request_keyframe_if_due<T: DataPlaneTransport>(
     {
         lane.last_keyframe_req = Some(Instant::now());
         let _ = ctl
-            .send_to(peer, &chat::video::CallControl::KeyframeRequest.encode())
+            .send_to(peer, &media_service::video::CallControl::KeyframeRequest.encode())
             .await;
     }
 }
@@ -959,7 +959,7 @@ async fn send_beacon<T: DataPlaneTransport>(
     camera_on: bool,
     sharing: bool,
 ) {
-    let frame = chat::video::CallControl::Beacon {
+    let frame = media_service::video::CallControl::Beacon {
         muted,
         camera_on,
         sharing,
@@ -985,7 +985,7 @@ fn push_effective_rate(
         .filter_map(|peer| inbound_hints.get(peer))
         .copied()
         .min()
-        .unwrap_or(chat::video::RATE_LADDER_KBPS[0]);
+        .unwrap_or(media_service::video::RATE_LADDER_KBPS[0]);
     if next != *effective_kbps {
         *effective_kbps = next;
         let _ = control_out.try_send(noded::CallControlOut::RateHint { max_kbps: next });
@@ -1010,12 +1010,12 @@ async fn evaluate_rate_windows<T: DataPlaneTransport>(
         let lossy = dropped * 10 > (complete + dropped); // >10%
         let next = if lossy {
             lane.clean_windows = 0;
-            chat::video::step_down(lane.hint_kbps)
+            media_service::video::step_down(lane.hint_kbps)
         } else {
             lane.clean_windows = lane.clean_windows.saturating_add(1);
             if lane.clean_windows >= 3 {
                 lane.clean_windows = 0;
-                chat::video::step_up(lane.hint_kbps)
+                media_service::video::step_up(lane.hint_kbps)
             } else {
                 lane.hint_kbps
             }
@@ -1025,7 +1025,7 @@ async fn evaluate_rate_windows<T: DataPlaneTransport>(
             let _ = ctl
                 .send_to(
                     PeerId(*raw),
-                    &chat::video::CallControl::RateHint { max_kbps: next }.encode(),
+                    &media_service::video::CallControl::RateHint { max_kbps: next }.encode(),
                 )
                 .await;
         }
@@ -1458,7 +1458,7 @@ mod tests {
         // video: a keyframe from A must never reach B's webview...
         session_a
             .video_in
-            .send(chat::call_wire::CapturedFrame {
+            .send(media_service::call_wire::CapturedFrame {
                 keyframe: true,
                 ts_ms: 7,
                 data: vec![0xA0; 5000],
@@ -1593,7 +1593,7 @@ mod tests {
         // a 5000-byte keyframe fragments across ≥4 datagrams.
         session_a
             .video_in
-            .send(chat::call_wire::CapturedFrame {
+            .send(media_service::call_wire::CapturedFrame {
                 keyframe: true,
                 ts_ms: 7,
                 data: keyframe_data.clone(),
@@ -1612,7 +1612,7 @@ mod tests {
         // a second (delta) frame with a different fill crosses intact too.
         session_a
             .video_in
-            .send(chat::call_wire::CapturedFrame {
+            .send(media_service::call_wire::CapturedFrame {
                 keyframe: false,
                 ts_ms: 40,
                 data: delta_data.clone(),
@@ -1643,7 +1643,7 @@ mod tests {
         let (req_a_tx, req_b_tx) = two_hubs(key_a, key_b, move |frame| {
             if !dropped_one
                 && let Ok((Service::Video, _, payload)) = data_plane::wire::decode_datagram(frame)
-                && let Ok((header, _)) = chat::video::decode_fragment(payload)
+                && let Ok((header, _)) = media_service::video::decode_fragment(payload)
                 && header.frag_index == 1
             {
                 dropped_one = true;
@@ -1674,7 +1674,7 @@ mod tests {
         // frame 0 loses a fragment (incomplete); frame 1 completes.
         session_a
             .video_in
-            .send(chat::call_wire::CapturedFrame {
+            .send(media_service::call_wire::CapturedFrame {
                 keyframe: true,
                 ts_ms: 1,
                 data: vec![0xA0; 5000],
@@ -1683,7 +1683,7 @@ mod tests {
             .expect("session a alive");
         session_a
             .video_in
-            .send(chat::call_wire::CapturedFrame {
+            .send(media_service::call_wire::CapturedFrame {
                 keyframe: false,
                 ts_ms: 2,
                 data: vec![0xB1; 5000],
@@ -1802,7 +1802,7 @@ mod tests {
         let first: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
         session_a
             .video_in
-            .send(chat::call_wire::CapturedFrame {
+            .send(media_service::call_wire::CapturedFrame {
                 keyframe: true,
                 ts_ms: 1,
                 data: first.clone(),
@@ -1842,7 +1842,7 @@ mod tests {
         let rejoined: Vec<u8> = (0..5000).map(|i| ((i * 3 + 1) % 251) as u8).collect();
         session_a2
             .video_in
-            .send(chat::call_wire::CapturedFrame {
+            .send(media_service::call_wire::CapturedFrame {
                 keyframe: true,
                 ts_ms: 2,
                 data: rejoined.clone(),
@@ -1912,7 +1912,7 @@ mod tests {
             data_plane::wire::encode_datagram(
                 Service::Voice,
                 flow,
-                &chat::video::CallControl::RateHint { max_kbps }.encode(),
+                &media_service::video::CallControl::RateHint { max_kbps }.encode(),
             )
             .expect("datagram encodes")
         };

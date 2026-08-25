@@ -30,6 +30,8 @@ statesync = { workspace = true }
 host = { workspace = true }
 sdk = { workspace = true }
 chat = { workspace = true }
+# the `/v1/call/ws` framing (the webview leg of a huddle) and the voice frame size.
+media-service = { workspace = true }
 tasks = { workspace = true }
 identity = { workspace = true }
 duckdns = { workspace = true }
