@@ -85,6 +85,21 @@ const KEYSTROKE_ALLOCATION_CEILING: u64 = 15_000;
 /// the same click cost 197,874 (63 ms) — one full re-parse of the transcript,
 /// growing with its length.
 const STEPS_CLICK_ALLOCATION_CEILING: u64 = 10_000;
+/// ALLOCATIONS PER `loading` FLIP UNDER A POPULATED STREAM.
+///
+/// `loading` is the workspace hydration flag: a page load moves it while a
+/// full chat timeline is on screen (a reconnect empties the stream first and
+/// lands the rows with the release). It must stay OUT of the whole-timeline
+/// memo keys — the one reading inside either island was the live row's
+/// `disabled=`, and a room switch empties the stream before it raises the
+/// flag, so that dim never drew. Measured 2026-08-23 at `ROWS` with a
+/// selected row: a flip costs **7 392** allocations (0.9 ms) with the flag out
+/// of the key — the screen's own chrome rebuild — against **17 614** (6.4 ms)
+/// with it in: every message cloned into the cached element and every row
+/// rebuilt, growing with the timeline. With the rail open on `THREAD_ROWS`
+/// replies and a reply's card up: **8 535** (1.1 ms) against **18 802**
+/// (2.3 ms) with the flag in the rail's key alone.
+const LOADING_FLIP_ALLOCATION_CEILING: u64 = 10_000;
 
 struct ScreenProbe {
     label: &'static str,
@@ -97,11 +112,16 @@ const SCREEN_PROBES: &[ScreenProbe] = &[
     // Each ceiling sits between the optimized baseline and the smallest
     // one-change negative control measured with this deterministic fixture:
     // 31,973 vs 233,957 allocations for restoring per-row anchor lookup.
+    // 24,063 measured 2026-08-23 at ducktape-ui af41cc28 with the screen's
+    // externs borrowing their list and string arguments (`doc_tab_rows`,
+    // `subpage_blocks`, `thread_is_resolved`, `comment_compose_hint`, and
+    // the `page_document` mount's `blocks`/`hits`): 26,542 with the same
+    // externs cloning them per frame.
     ScreenProbe {
         label: "pages comments build+layout",
         size: WINDOW,
         fixture: console_in_page_comments,
-        allocation_ceiling: 120_000,
+        allocation_ceiling: 30_000,
     },
     // 13,089 with the keyed (seq, render_rev) lazy vs 18,836 with the plain
     // row-hashing lazy vs 54,599 with no quiet-arm `lazy` at all — the
@@ -165,11 +185,20 @@ const SCREEN_PROBES: &[ScreenProbe] = &[
     // flipped order at this pin: removing the directory-row virtualization
     // is now the smallest at 63,729; restoring the selected-entry scan
     // reaches 73,453 (the per-rebuild list clone grew with the rows).
+    // Re-derived 2026-08-23 at af41cc28: 46,036 with the mount's
+    // `fs_directories(fs_entries)` and the screen's `fs_counts_summary`,
+    // `explorer_ops_at`, `markdown_path` borrowing their arguments; 51,569
+    // with them cloning — `fs_directories` alone copied every entry into the
+    // call per frame — and that clone is the control this ceiling gates.
+    // The two structural controls fell inside the noise floor at this pin
+    // and no longer gate on allocations: removing the directory-row
+    // virtualization lands at 47,478 and restoring the selected-entry scan
+    // at 46,553 (it moves layout time, 3.5 ms -> 3.9 ms, not the count).
     ScreenProbe {
         label: "files build+layout",
         size: WINDOW,
         fixture: console_in_files,
-        allocation_ceiling: 62_900,
+        allocation_ceiling: 50_000,
     },
     // Every settled answer is an `agent_markdown` extern — a markdown parse
     // plus a syntect pass over its fenced block. 6,902 measured 2026-08-23
@@ -834,7 +863,7 @@ fn console_in_forge_pr() -> (Ducktape, iced::window::Id) {
         },
     ));
     assert_eq!(
-        backend::diff_lines(app.forge_item_diff.clone()).len(),
+        backend::diff_lines(&app.forge_item_diff).len(),
         LONG_LIST_ROWS + 4
     );
     assert_eq!(app.forge_discussion.len(), DISCUSSION_ROWS);
@@ -1150,6 +1179,98 @@ fn probe_steps_click() {
         "a steps click rebuilt in {allocations} allocations, over the \
          {STEPS_CLICK_ALLOCATION_CEILING} ceiling. Keep `steps_open` out of the answer \
          memo's key before changing the budget."
+    );
+}
+
+#[test]
+fn a_loading_flip_leaves_the_timeline_memo_alone() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(probe_loading_flip)
+        .expect("the loading flip probe thread spawns")
+        .join()
+        .expect("the loading flip probe thread finishes");
+}
+
+/// Move the workspace `loading` flag under a populated, selected stream on
+/// every frame — a page load leaving, then its failure releasing it — and
+/// measure the rebuild that follows. The selected rows are the ones that
+/// ever read the flag, so both fixtures carry one: the stream alone, then
+/// the stream with the thread rail open and a reply's action card up.
+fn probe_loading_flip() {
+    let (app, console) = console_in_chat();
+    flip_loading_under("loading flip+rebuild (stream)", app, console);
+    let (mut app, console) = console_in_chat_thread();
+    let newest = app
+        .thread_messages
+        .last()
+        .cloned()
+        .expect("the probe drives a populated rail");
+    let _ = app.__update(__DucktapeMessage::OpenThreadMessageActions(
+        newest.seq,
+        newest.body,
+        newest.rev,
+    ));
+    assert_eq!(
+        app.thread_selected_seq, newest.seq,
+        "the rail's live row is on screen"
+    );
+    flip_loading_under("loading flip+rebuild (stream+rail)", app, console);
+}
+
+fn flip_loading_under(label: &'static str, mut app: Ducktape, console: iced::window::Id) {
+    let newest = app
+        .messages
+        .last()
+        .cloned()
+        .expect("the probe drives a populated stream");
+    let _ = app.__update(__DucktapeMessage::OpenMessageActions(
+        newest.seq,
+        newest.body,
+        newest.rev,
+    ));
+    assert_eq!(
+        app.selected_message_seq, newest.seq,
+        "the live row is on screen"
+    );
+    assert!(!app.loading, "the landing released the flag");
+    let mut renderer = headless_renderer();
+    let mut cache = warm_settled(
+        "the loading flip probe",
+        &mut app,
+        console,
+        WINDOW,
+        &mut renderer,
+        user_interface::Cache::default(),
+    );
+    let mut flips = Phase::new(label);
+    for frame in 0..FRAMES {
+        let raise = frame % 2 == 0;
+        // An empty failure message keeps the error banner out of the frame,
+        // so the delta between two frames is the flag and nothing else.
+        let flip = if raise {
+            __DucktapeMessage::ChoosePage("probe-page".into())
+        } else {
+            __DucktapeMessage::Failed(backend::AppError {
+                message: String::new(),
+                committed: false,
+            })
+        };
+        cache = flips
+            .sample(|| {
+                let _ = app.__update(flip);
+                assert_eq!(app.loading, raise, "the fixture must move the flag");
+                UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer)
+            })
+            .into_cache();
+    }
+    flips.report();
+    let allocations = flips.median_allocations();
+    assert!(
+        allocations < LOADING_FLIP_ALLOCATION_CEILING,
+        "{label}: a loading flip rebuilt in {allocations} allocations, over the \
+         {LOADING_FLIP_ALLOCATION_CEILING} ceiling. Keep `loading` out of the timeline \
+         memo keys before changing the budget."
     );
 }
 

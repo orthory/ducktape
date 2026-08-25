@@ -20,7 +20,7 @@
 // row can only fire these six. With 4,096 rows that used to manufacture
 // 48 callback routes per row on every unrelated rebuild. This component keeps
 // the row loop's routing surface equal to what the row can actually do.
-component MessageTimeline(messages:[ChatMessage], unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, loading:bool)
+component MessageTimeline(messages:[ChatMessage], unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64)
   emits
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
@@ -63,9 +63,9 @@ component MessageTimeline(messages:[ChatMessage], unread_boundary:i64, unread_ma
               h=1.0
               bg=brand/40
             text ""
-      // The selected row stays live because selection and loading are screen
-      // state. Quiet rows keep their own element/layout memo within the
-      // whole-timeline boundary. The plain dependency is intentional: the
+      // The selected row stays live because selection is screen state. Quiet
+      // rows keep their own element/layout memo within the whole-timeline
+      // boundary. The plain dependency is intentional: the
       // outer keyed lazy lends `messages` as a closure-local value, while the
       // compiler permits nested cheap-key capture only from app state. A live
       // batch rebuilds this bounded window once; an unchanged frame never
@@ -77,7 +77,6 @@ component MessageTimeline(messages:[ChatMessage], unread_boundary:i64, unread_ma
               message
               selected=true
               menu_open=true
-              disabled=loading
             forward
               add_reaction_at
               remove_reaction_at
@@ -93,7 +92,6 @@ component MessageTimeline(messages:[ChatMessage], unread_boundary:i64, unread_ma
                 message=cached_message
                 selected=false
                 menu_open=false
-                disabled=false
               forward
                 add_reaction_at
                 remove_reaction_at
@@ -105,7 +103,7 @@ component MessageTimeline(messages:[ChatMessage], unread_boundary:i64, unread_ma
 // Same boundary for the rail: the root, target and menu rows stay live; quiet
 // replies keep their per-row memo. Paging controls stay outside this component
 // because they are constant-size chrome, not part of the chain-fed list.
-component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_target_seq:i64, thread_selected_seq:i64, loading:bool)
+component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_target_seq:i64, thread_selected_seq:i64)
   emits
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
@@ -129,7 +127,6 @@ component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_t
             message=thread_message
             selected=(thread_message.seq == thread_target_seq)
             menu_open=(thread_message.seq == thread_selected_seq)
-            disabled=loading
           forward
             add_reaction_at
             remove_reaction_at
@@ -144,7 +141,6 @@ component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_t
               message=cached_reply
               selected=false
               menu_open=false
-              disabled=false
             forward
               add_reaction_at
               remove_reaction_at
@@ -324,10 +320,7 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                     h=fill
                     align-x=center
                     align-y=center
-                  text "×"
-                    with
-                      size=13.0
-                      wrap=none
+                  text "×" size=13.0 wrap=none
                 active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
                 hovered bg=elevated text=fg
                 pressed bg=subtle text=fg
@@ -370,8 +363,9 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                 // second spelling of the disabled term. `active text=label`
                 // keeps the resting `label` tone the old tinted mount named;
                 // token and tone are the same hex in both palettes.
-                svg icon("plus") memory color=inherit
+                svg icon("plus") memory
                   with
+                    color=inherit
                     w=16.0
                     h=16.0
                 active bg=transparent text=label border=transparent border-w=1.0 r=5.0
@@ -393,10 +387,7 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                     h=fill
                     align-x=center
                     align-y=center
-                  text "×"
-                    with
-                      size=13.0
-                      wrap=none
+                  text "×" size=13.0 wrap=none
                 active bg=separator text=muted border=transparent border-w=1.0 r=5.0
                 hovered bg=subtle text=fg
                 pressed bg=subtle text=fg
@@ -454,7 +445,12 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                       font=code_medium
                       @text-label
             for dm in dm_rows
-              DmButton peer=dm.peer selected=(dm.peer.key == active_dm_peer) unread=dm.unread disabled=(mutation_phase != MutationPhase.idle)
+              DmButton
+                with
+                  peer=dm.peer
+                  selected=(dm.peer.key == active_dm_peer)
+                  unread=dm.unread
+                  disabled=(mutation_phase != MutationPhase.idle)
                 forward
                   choose_dm
         // No account footer: the rail's avatar and Settings already carry the
@@ -511,10 +507,7 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                   // the peer's name and moved with its length, and a long
                   // name pushed the huddle control and ⋯ past the pane's clip.
                   if !empty(active_dm.name)
-                    box
-                      with
-                        w=fill
-                        clip=true
+                    box w=fill clip=true
                       DmHeader peer=active_dm
                   if empty(active_dm.name)
                     text "#"
@@ -533,10 +526,7 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                   // could still click, and dropped ⋯ entirely. The window's
                   // `min-size` bounds the other axis; this bounds this one.
                   if empty(active_dm.name)
-                    box
-                      with
-                        w=fill
-                        clip=true
+                    box w=fill clip=true
                       text active_channel_name
                         with
                           size=14.0
@@ -617,10 +607,7 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                         h=fill
                         align-x=center
                         align-y=center
-                      text "⋯"
-                        with
-                          size=14.0
-                          wrap=none
+                      text "⋯" size=14.0 wrap=none
                     active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
                     hovered bg=elevated text=fg
                     pressed bg=subtle text=fg
@@ -653,7 +640,11 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
               // THREE SKELETON ROWS, not a centred sentence — see
               // `SkeletonRow` for the geometry they hold to.
               if connected && loading && empty(messages)
-                col w=fill gap=14.0 pt=4.0
+                col
+                  with
+                    w=fill
+                    gap=14.0
+                    pt=4.0
                   SkeletonRow
                   SkeletonRow
                   SkeletonRow
@@ -705,7 +696,11 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                     // height its content needs (still capped by the box's
                     // limits, so a long timeline scrolls exactly as before) and
                     // `align-y=end` drops that block onto the composer.
-                    box w=fill h=fill align-y=end
+                    box
+                      with
+                        w=fill
+                        h=fill
+                        align-y=end
                       scroll #message-stream
                         with
                           dir=vertical
@@ -803,18 +798,31 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                           // carries the visible rows along with it.
                           // WHOLE-TIMELINE MEMO. The value stays borrowed from
                           // root state and only enters the cached element when
-                          // this cheap revision (or one of the five visible
+                          // this cheap revision (or one of the four visible
                           // screen inputs) moves. Composer edits, clocks and
                           // unrelated live planes therefore build one memo
                           // widget instead of enumerating every message.
-                          lazy messages by messages_revision, active_channel, unread_boundary, unread_marker_seq, selected_message_seq, loading as cached_messages
+                          //
+                          // `loading` STAYS OUT OF THE KEY. It is the
+                          // workspace hydration flag — a page load moves it
+                          // while a full chat timeline is on screen — and
+                          // the only thing in here that read it was the
+                          // live row's `disabled=`. A room switch and a
+                          // reconnect both empty the stream before they
+                          // raise the flag, so no row ever drew under the
+                          // chat's own load; keying on it cloned every
+                          // message for a dim that never showed. No row
+                          // reads the flag now, so the live row routes like
+                          // the quiet rows always did: the reaction handlers
+                          // keep refusing while loading; the openers never
+                          // did.
+                          lazy messages by messages_revision, active_channel, unread_boundary, unread_marker_seq, selected_message_seq as cached_messages
                             MessageTimeline
                               with
                                 messages=cached_messages
                                 unread_boundary
                                 unread_marker_seq
                                 selected_message_seq
-                                loading
                               forward
                                 add_reaction_at
                                 remove_reaction_at
@@ -1185,14 +1193,19 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                     shadow-blur=24.0
                   col w=fill
                     if search_phase == SearchPhase.searching
-                      col w=fill gap=14.0 p=8.0
+                      col
+                        with
+                          w=fill
+                          gap=14.0
+                          p=8.0
                         SkeletonRow
                     if search_phase == SearchPhase.done && empty(search_hits)
-                      box w=fill p=14.0 align-x=center
-                        text "No messages match"
-                          with
-                            size=12.5
-                            @text-muted
+                      box
+                        with
+                          w=fill
+                          p=14.0
+                          align-x=center
+                        text "No messages match" size=12.5 @text-muted
                     if search_phase == SearchPhase.done && !empty(search_hits)
                       scroll
                         with
@@ -1227,9 +1240,7 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                 pl=18.0
                 pr=18.0
                 pt=12.0
-              ComposerGate
-                with
-                  reason=post_refusal
+              ComposerGate reason=post_refusal
           box
             with
               w=fill
@@ -1439,7 +1450,10 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                     if !empty(channel_members)
                       col w=fill gap=1.0
                         for member in channel_members
-                          ChatMemberRow member=member disabled=(mutation_phase != MutationPhase.idle)
+                          ChatMemberRow
+                            with
+                              member=member
+                              disabled=(mutation_phase != MutationPhase.idle)
                             forward
                               remove_channel_member_submit
               box
@@ -1609,15 +1623,16 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                       // Reply-composer edits and unrelated app state stop at
                       // the cheap revision instead of walking every loaded
                       // reply. Paging chrome stays outside the memo, so its
-                      // busy phase does not invalidate the timeline.
-                      lazy thread_messages by thread_messages_revision, active_channel, active_thread_seq, thread_target_seq, thread_selected_seq, loading as cached_thread_messages
+                      // busy phase does not invalidate the timeline, and the
+                      // workspace `loading` flag stays out of the key for the
+                      // same reason the stream's does.
+                      lazy thread_messages by thread_messages_revision, active_channel, active_thread_seq, thread_target_seq, thread_selected_seq as cached_thread_messages
                         ThreadTimeline
                           with
                             messages=cached_thread_messages
                             active_thread_seq
                             thread_target_seq
                             thread_selected_seq
-                            loading
                           forward
                             add_reaction_at
                             remove_reaction_at

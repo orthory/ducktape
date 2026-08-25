@@ -53,15 +53,15 @@ fn the_crumb_counts_split_the_listing_in_two() {
             object: String::new(),
         })
         .collect::<Vec<_>>();
-    assert_eq!(fs_dir_count(entries.clone()), 1);
-    assert_eq!(fs_file_count(entries.clone()), 2);
+    assert_eq!(fs_dir_count(&entries), 1);
+    assert_eq!(fs_file_count(&entries), 2);
     assert_eq!(
-        fs_dir_count(entries.clone()) + fs_file_count(entries),
+        fs_dir_count(&entries) + fs_file_count(&entries),
         3,
         "every row lands in exactly one bucket"
     );
-    assert_eq!(fs_dir_count(Vec::new()), 0);
-    assert_eq!(fs_file_count(Vec::new()), 0);
+    assert_eq!(fs_dir_count(&[]), 0);
+    assert_eq!(fs_file_count(&[]), 0);
 }
 
 #[test]
@@ -97,7 +97,7 @@ fn directory_rows_are_prepared_from_the_listing() {
     };
 
     assert_eq!(
-        fs_directories(vec![entry("docs", "dir"), entry("readme", "file")]),
+        fs_directories(&[entry("docs", "dir"), entry("readme", "file")]),
         vec![entry("docs", "dir")]
     );
 }
@@ -204,21 +204,18 @@ fn the_roster_answers_admin_tier_and_filters() {
             live: true,
         },
     ];
-    assert!(members_is_admin(rows.clone()));
-    assert_eq!(member_tier(rows.clone()), "validator");
+    assert!(members_is_admin(&rows));
+    assert_eq!(member_tier(&rows), "validator");
     // the two halves of "no row for this node", kept apart: an unanswered
     // roster is unknown, an answered one without this node is a real guest.
-    assert_eq!(member_tier(Vec::new()), "");
+    assert_eq!(member_tier(&[]), "");
     let mut answered_without_this_node = rows.clone();
     answered_without_this_node[0].is_this_node = false;
-    assert_eq!(member_tier(answered_without_this_node), "guest");
-    assert_eq!(filter_members(rows.clone(), MembersFilter::Agents).len(), 1);
-    assert_eq!(filter_members(rows.clone(), MembersFilter::Humans).len(), 2);
-    assert_eq!(
-        filter_members(rows.clone(), MembersFilter::Validators).len(),
-        1
-    );
-    assert_eq!(filter_members(rows, MembersFilter::All).len(), 3);
+    assert_eq!(member_tier(&answered_without_this_node), "guest");
+    assert_eq!(filter_members(&rows, MembersFilter::Agents).len(), 1);
+    assert_eq!(filter_members(&rows, MembersFilter::Humans).len(), 2);
+    assert_eq!(filter_members(&rows, MembersFilter::Validators).len(), 1);
+    assert_eq!(filter_members(&rows, MembersFilter::All).len(), 3);
 }
 
 /// THE HEADER COUNTS THE LIST IT SITS ABOVE. `members_summary` used to fold the
@@ -245,16 +242,13 @@ fn the_members_subtitle_folds_the_rows_the_screen_lists() {
         member("bb", "resident"),
         member("triage", "agent"),
     ];
-    assert_eq!(members_summary(true, rows.clone()), "2 humans · 1 agent");
+    assert_eq!(members_summary(true, &rows), "2 humans · 1 agent");
     // singulars, and the count that used to be the whole subtitle.
-    assert_eq!(
-        members_summary(true, rows[..1].to_vec()),
-        "1 human · 0 agents"
-    );
+    assert_eq!(members_summary(true, &rows[..1]), "1 human · 0 agents");
 
     // The invariant under the wording: every number in the subtitle is a slice
     // of the list, so they add up to the row count. The valset fold never did.
-    let counted: usize = members_summary(true, rows.clone())
+    let counted: usize = members_summary(true, &rows)
         .split(" · ")
         .filter_map(|part| part.split(' ').next()?.parse::<usize>().ok())
         .sum();
@@ -595,7 +589,7 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
             action,
             drawer,
             false,
-            String::new(),
+            "",
             repo_menu,
         )
     };
@@ -765,11 +759,11 @@ fn files_base64_round_trips() {
 
 #[test]
 fn bell_severity_projects_the_kind_and_defaults_to_info() {
-    assert_eq!(bell_severity("run_failed".into()), "danger");
-    assert_eq!(bell_severity("review_requested".into()), "warning");
-    assert_eq!(bell_severity("mentioned".into()), "info");
+    assert_eq!(bell_severity("run_failed"), "danger");
+    assert_eq!(bell_severity("review_requested"), "warning");
+    assert_eq!(bell_severity("mentioned"), "info");
     // an unnamed kind is a notice, never an alarm.
-    assert_eq!(bell_severity("brand_new_kind".into()), "info");
+    assert_eq!(bell_severity("brand_new_kind"), "info");
 }
 
 #[test]
@@ -784,21 +778,18 @@ fn bell_badge_takes_the_worst_unread_severity() {
     };
 
     assert_eq!(
-        bell_worst_severity(vec![
-            item(1, "mentioned", false),
-            item(2, "run_failed", false)
-        ]),
+        bell_worst_severity(&[item(1, "mentioned", false), item(2, "run_failed", false)]),
         "danger"
     );
     // a READ error does not keep the badge red.
     assert_eq!(
-        bell_worst_severity(vec![
+        bell_worst_severity(&[
             item(1, "run_failed", true),
             item(2, "review_requested", false)
         ]),
         "warning"
     );
-    assert_eq!(bell_worst_severity(Vec::new()), "info");
+    assert_eq!(bell_worst_severity(&[]), "info");
 }
 
 /// THE TAB-SWITCH GATE. Four planes used to refetch on every tab move —

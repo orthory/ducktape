@@ -579,7 +579,7 @@ fn a_move_off_the_agents_tab_keeps_a_live_load_that_already_answered() {
         }],
     }));
     assert!(
-        backend::any_agent_active(app.agents_rows.clone()),
+        backend::any_agent_active(&app.agents_rows),
         "the move off-tab must not revoke the run's own refetch — the dot is drawn on every tab"
     );
 
@@ -1357,7 +1357,7 @@ fn the_files_pane_reports_only_a_directory_it_has_listed() {
         "the listing answered for it"
     );
     assert_eq!(
-        backend::fs_counts_summary(app.connected, true, app.fs_entries.clone()),
+        backend::fs_counts_summary(app.connected, true, &app.fs_entries),
         "0 files · 1 dir"
     );
 
@@ -1377,7 +1377,7 @@ fn the_files_pane_reports_only_a_directory_it_has_listed() {
          of `entries` on the screen is gated on it"
     );
     assert_eq!(
-        backend::fs_counts_summary(app.connected, false, app.fs_entries.clone()),
+        backend::fs_counts_summary(app.connected, false, &app.fs_entries),
         "",
         "no tally for a directory nobody has answered for"
     );
@@ -1388,7 +1388,7 @@ fn the_files_pane_reports_only_a_directory_it_has_listed() {
     let _ = app.__update(listing(app.fs_generation, "/shared/reports", Vec::new()));
     assert_eq!(app.fs_listed_path, app.fs_path);
     assert_eq!(
-        backend::fs_counts_summary(app.connected, true, app.fs_entries.clone()),
+        backend::fs_counts_summary(app.connected, true, &app.fs_entries),
         ""
     );
 
@@ -1401,7 +1401,7 @@ fn the_files_pane_reports_only_a_directory_it_has_listed() {
     ));
     assert_eq!(app.fs_listed_path, app.fs_path, "a refresh never disagrees");
     assert_eq!(
-        backend::fs_counts_summary(app.connected, true, app.fs_entries.clone()),
+        backend::fs_counts_summary(app.connected, true, &app.fs_entries),
         "1 file · 0 dirs",
         "and it speaks again as soon as there is something to count"
     );

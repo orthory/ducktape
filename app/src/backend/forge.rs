@@ -741,7 +741,7 @@ async fn forge_text(
     }});
     let reply = client.query("forge", &query).await?;
     let view = blob_view(reply, repo)?;
-    let illustrated = markdown_path(view.path.clone()) && !view.binary;
+    let illustrated = markdown_path(&view.path) && !view.binary;
     if illustrated {
         load_inline_pictures(client, &view).await;
     }
@@ -1044,10 +1044,10 @@ pub(crate) fn blocked_picture_host(ip: IpAddr) -> bool {
 
 /// The binary plate's line: the loader's reason when it gave one (a picture
 /// past the cap or one that did not decode), else the generic one.
-pub fn binary_note(text: String) -> String {
+pub fn binary_note(text: &str) -> String {
     match text.is_empty() {
         true => "This is not text — the reader shows no preview for it.".to_owned(),
-        false => text,
+        false => text.to_owned(),
     }
 }
 
@@ -2233,7 +2233,7 @@ impl<'a, Message: 'a> From<SelectRich<'a, Message>> for iced::Element<'a, Messag
 /// document rather than line-numbers. Extension-based on purpose: the wire's
 /// `binary` flag only separates text from bytes, and forge carries no
 /// language field — the path is the one discriminator the app holds.
-pub fn markdown_path(path: String) -> bool {
+pub fn markdown_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     lower.ends_with(".md") || lower.ends_with(".markdown")
 }
@@ -2245,7 +2245,7 @@ pub fn markdown_path(path: String) -> bool {
 /// lands on it. An empty Forge screen that does not say so is a dead end: it
 /// tells the reader a repo "appears here once it is created" and names no way
 /// to create one.
-pub fn forge_push_command(rpc: String) -> String {
+pub fn forge_push_command(rpc: &str) -> String {
     let endpoint = rpc.trim_end_matches('/');
     // `my-repo`, not `NAME`: `forge::norm_repo` accepts `[a-z0-9._-]` only, so
     // an uppercase placeholder pasted verbatim 404s the ref advertisement and
@@ -2253,7 +2253,7 @@ pub fn forge_push_command(rpc: String) -> String {
     format!("git remote add ducktape {endpoint}/forge/my-repo && git push ducktape main")
 }
 
-pub fn diff_lines(diff: String) -> Vec<DiffLine> {
+pub fn diff_lines(diff: &str) -> Vec<DiffLine> {
     // A patch line has no durable id. Reusing content/occurrence across two
     // patch revisions can move focus to an identical line's comment button,
     // while line-number keys can move it to unrelated content. Namespace the
@@ -2488,7 +2488,7 @@ pub fn drop_forge_comment(
 /// The staged list is at the module's per-review cap, so the composer must
 /// refuse to take another. The literal lives HERE and nowhere in `.ice`, so the
 /// gate and the module's own limit cannot drift apart.
-pub fn forge_comment_cap_reached(staged: Vec<ForgeDraftComment>) -> bool {
+pub fn forge_comment_cap_reached(staged: &[ForgeDraftComment]) -> bool {
     staged.len() >= forge::MAX_REVIEW_COMMENTS
 }
 
@@ -2509,24 +2509,28 @@ pub fn forge_parent(path: String) -> String {
 /// (Another repository is another component instance — the call site keys
 /// on the repo, so cross-repo staleness cannot arise.)
 pub fn forge_file_header(
-    opened_dir: String,
-    opened_rev: String,
-    dir: String,
-    rev: String,
-    path: String,
+    opened_dir: &str,
+    opened_rev: &str,
+    dir: &str,
+    rev: &str,
+    path: &str,
 ) -> String {
     let same_place = opened_dir == dir;
     let same_commit = opened_rev == rev;
-    if same_place && same_commit { path } else { String::new() }
+    if same_place && same_commit {
+        path.to_owned()
+    } else {
+        String::new()
+    }
 }
 
 /// The label a picked-but-unstaged line wears above the composer, empty when no
 /// line is picked — the composer keys its whole visibility on this.
-pub fn forge_comment_target(path: String, line: String, side: String) -> String {
+pub fn forge_comment_target(path: &str, line: &str, side: &str) -> String {
     if path.is_empty() {
         return String::new();
     }
-    comment_anchor(&path, &line, &side)
+    comment_anchor(path, line, side)
 }
 
 /// `src/main.rs:14 (new)` — the one place the anchor string is spelled, shared
@@ -2628,23 +2632,27 @@ fn hunk_span(line: &str) -> Option<HunkSpan> {
 }
 
 /// The tracker's Pull requests / Issues split.
-pub fn filter_forge_items(items: Vec<ForgeItem>, tab: crate::ForgeTab) -> Vec<ForgeItem> {
+pub fn filter_forge_items(items: &[ForgeItem], tab: crate::ForgeTab) -> Vec<ForgeItem> {
     let kind = match tab {
         crate::ForgeTab::Code => return Vec::new(),
         crate::ForgeTab::Pulls => "pr",
         crate::ForgeTab::Issues => "issue",
     };
-    items.into_iter().filter(|item| item.kind == kind).collect()
+    items
+        .iter()
+        .filter(|item| item.kind == kind)
+        .cloned()
+        .collect()
 }
 
 /// The tab count chips — open work only: a PR counts until it merges, an
 /// issue until it closes.
-pub fn forge_open_count(items: Vec<ForgeItem>, kind: String) -> i64 {
+pub fn forge_open_count(items: &[ForgeItem], kind: &str) -> i64 {
     count_i64(
         items
             .iter()
             .filter(|item| item.kind == kind)
-            .filter(|item| match kind.as_str() {
+            .filter(|item| match kind {
                 "pr" => item.state != "merged",
                 _ => item.state == "open",
             })
@@ -2663,7 +2671,7 @@ pub fn forge_stats(files: i64, additions: i64, deletions: i64) -> String {
 }
 
 /// The merged-state banner: the short merge oid plus the branch line.
-pub fn forge_merge_note(merge_oid: String, branches: String) -> String {
+pub fn forge_merge_note(merge_oid: &str, branches: &str) -> String {
     let short: String = merge_oid.chars().take(8).collect();
     match branches.is_empty() {
         true => format!("Merged as {short}"),
@@ -2672,8 +2680,8 @@ pub fn forge_merge_note(merge_oid: String, branches: String) -> String {
 }
 
 /// A review verdict key as its timeline verb.
-pub fn verdict_label(verdict: String) -> String {
-    match verdict.as_str() {
+pub fn verdict_label(verdict: &str) -> String {
+    match verdict {
         "approve" => "approved".into(),
         "request_changes" => "requested changes".into(),
         _ => "commented".into(),
@@ -2684,11 +2692,11 @@ pub fn verdict_label(verdict: String) -> String {
 pub fn verdict_pick_label(
     current: crate::ForgeReviewVerdict,
     key: crate::ForgeReviewVerdict,
-    label: String,
+    label: &str,
 ) -> String {
     match current == key {
         true => format!("● {label}"),
-        false => label,
+        false => label.to_owned(),
     }
 }
 

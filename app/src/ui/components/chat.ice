@@ -192,10 +192,7 @@ component ChatMemberRow(member:ChatMember, disabled:bool)
         // so the plate went red on hover while the × stayed muted, and the
         // disabled ramp never reached it either. Uncolored, the glyph inherits
         // the four lines below.
-        text "×"
-          with
-            size=13.0
-            wrap=none
+        text "×" size=13.0 wrap=none
       active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
       hovered bg=danger_bg text=fg
       pressed bg=danger_line text=fg
@@ -222,7 +219,13 @@ component ChatMemberRow(member:ChatMember, disabled:bool)
 component RichLine(block:ChatBlock)
   emits
     open_message_link(str)
-  rich-text w=fill size=13.5 line-h=1.55 wrap=word-or-glyph color=accent_fg -> emit(open_message_link, _)
+  rich-text -> emit(open_message_link, _)
+    with
+      w=fill
+      size=13.5
+      line-h=1.55
+      wrap=word-or-glyph
+      color=accent_fg
     for span in block.spans
       span span.mention bg=brand_bg px=4.0 r=4.0 font=medium color=brand
       span span.link_text link=span.link underline font=medium color=brand
@@ -242,7 +245,11 @@ component RichLine(block:ChatBlock)
 component MessageBody(message:ChatMessage)
   emits
     open_message_link(str)
-  col w=fill max-w=760.0 gap=5.0
+  col
+    with
+      w=fill
+      max-w=760.0
+      gap=5.0
     for block in message.blocks
       if block.kind == "divider"
         Separator
@@ -656,7 +663,7 @@ component MessageContents(message:ChatMessage)
                 h=6.0
                 style=icon_tint("muted")
                 opacity=1.0
-component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabled:bool)
+component MessageCard(message:ChatMessage, selected:bool, menu_open:bool)
   emits
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
@@ -678,7 +685,11 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
     // openness, handed back so the toolbar dies WITH it. Without it the next
     // mouse move erased the toolbar and left the emoji picker pointing at a
     // button that was no longer there.
-    hover tint=row_hover r=9.0 open=menu_open
+    hover
+      with
+        tint=row_hover
+        r=9.0
+        open=menu_open
       stack w=fill
         if message.deleted
           box
@@ -773,45 +784,33 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
                 button -> emit(add_reaction_at, message.seq, "👍")
                   with
                     label="React with 👍"
-                    disabled=disabled
                     w=27.0
                     h=25.0
                     p=4.0
                     @ghost_action
-                  text "👍"
-                    with
-                      size=12.5
-                      font=ui
+                  text "👍" size=12.5 font=ui
                   active bg=transparent text=muted r=6.0
                   hovered bg=elevated text=fg
                   pressed bg=subtle text=fg
                 button -> emit(add_reaction_at, message.seq, "✅")
                   with
                     label="React with ✅"
-                    disabled=disabled
                     w=27.0
                     h=25.0
                     p=4.0
                     @ghost_action
-                  text "✅"
-                    with
-                      size=12.5
-                      font=ui
+                  text "✅" size=12.5 font=ui
                   active bg=transparent text=muted r=6.0
                   hovered bg=elevated text=fg
                   pressed bg=subtle text=fg
                 button -> emit(add_reaction_at, message.seq, "👀")
                   with
                     label="React with 👀"
-                    disabled=disabled
                     w=27.0
                     h=25.0
                     p=4.0
                     @ghost_action
-                  text "👀"
-                    with
-                      size=12.5
-                      font=ui
+                  text "👀" size=12.5 font=ui
                   active bg=transparent text=muted r=6.0
                   hovered bg=elevated text=fg
                   pressed bg=subtle text=fg
@@ -824,30 +823,26 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
                 button -> emit(open_message_reactions, message.seq, message.body, message.rev)
                   with
                     label="Manage reactions"
-                    disabled=disabled
                     w=27.0
                     h=25.0
                     p=4.0
                     @ghost_action
-                  text "♡"
-                    with
-                      size=12.5
-                      font=ui
+                  text "♡" size=12.5 font=ui
                   active bg=transparent text=muted r=6.0
                   hovered bg=elevated text=fg
                   pressed bg=subtle text=fg
                 button -> emit(open_thread_for, message.seq)
                   with
                     label="Open thread"
-                    disabled=disabled
                     p=5.0
                     @icon_action
                   // `color=inherit` (ducktape-ui#606): the glyph reads the
                   // same status-resolved ink the ♡ and ⋯ string labels beside
-                  // it inherit, so all three brighten and dim together — on
-                  // the button's bounds and the button's disabled status.
-                  svg icon("nav-chat") memory color=inherit
+                  // it inherit, so all three brighten and dim together on
+                  // the button's bounds.
+                  svg icon("nav-chat") memory
                     with
+                      color=inherit
                       w=15.0
                       h=15.0
                   active bg=transparent text=muted r=6.0
@@ -856,15 +851,11 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
                 button -> emit(open_message_actions, message.seq, message.body, message.rev)
                   with
                     label="More message actions"
-                    disabled=disabled
                     w=27.0
                     h=25.0
                     p=4.0
                     @ghost_action
-                  text "⋯"
-                    with
-                      size=12.5
-                      font=ui
+                  text "⋯" size=12.5 font=ui
                   active bg=transparent text=muted r=6.0
                   hovered bg=elevated text=fg
                   pressed bg=subtle text=fg
@@ -886,7 +877,7 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabl
 // `open_thread_for` is forwarded only because `MessageContents` declares it:
 // it fires from the reply pill, and a reply carries no replies
 // (`reply_count` only ever climbs on a root), so the pill never renders here.
-component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, disabled:bool)
+component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool)
   emits
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
@@ -900,7 +891,11 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, 
     // Same draw-time hover as MessageCard — see the note there. `menu_open` is
     // a prop of its own and not `selected` because in the rail `selected` means
     // the deep-link TARGET reply, which is not the row whose menu is up.
-    hover tint=row_hover r=9.0 open=menu_open
+    hover
+      with
+        tint=row_hover
+        r=9.0
+        open=menu_open
       stack w=fill
         if message.deleted
           box
@@ -983,30 +978,22 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, 
                 button -> emit(open_thread_message_reactions, message.seq, message.body, message.rev)
                   with
                     label="Manage reactions"
-                    disabled=disabled
                     w=27.0
                     h=25.0
                     p=4.0
                     @ghost_action
-                  text "♡"
-                    with
-                      size=12.5
-                      font=ui
+                  text "♡" size=12.5 font=ui
                   active bg=transparent text=muted r=6.0
                   hovered bg=elevated text=fg
                   pressed bg=subtle text=fg
                 button -> emit(open_thread_message_actions, message.seq, message.body, message.rev)
                   with
                     label="More message actions"
-                    disabled=disabled
                     w=27.0
                     h=25.0
                     p=4.0
                     @ghost_action
-                  text "⋯"
-                    with
-                      size=12.5
-                      font=ui
+                  text "⋯" size=12.5 font=ui
                   active bg=transparent text=muted r=6.0
                   hovered bg=elevated text=fg
                   pressed bg=subtle text=fg
@@ -1067,10 +1054,7 @@ component ChatSearchResult(hit:ChatSearchHit)
 component ComposerMarks(disabled:bool)
   emits
     mark(str)
-  row #root
-    with
-      gap=2.0
-      align=center
+  row #root gap=2.0 align=center
     button -> emit(mark, "bold")
       with
         label="Bold"
@@ -1135,8 +1119,9 @@ component ComposerMarks(disabled:bool)
           h=fill
           align-x=center
           align-y=center
-        svg icon("code-brackets") #glyph memory color=inherit
+        svg icon("code-brackets") #glyph memory
           with
+            color=inherit
             w=13.0
             h=13.0
       active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
@@ -1156,8 +1141,9 @@ component ComposerMarks(disabled:bool)
           h=fill
           align-x=center
           align-y=center
-        svg icon("quote") memory color=inherit
+        svg icon("quote") memory
           with
+            color=inherit
             w=13.0
             h=13.0
       active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
@@ -1336,9 +1322,7 @@ component ChatComposer(kind:ComposerKind, compact:bool, hint:str, blocked:bool, 
               w=fill
               gap=2.0
               align=center
-            ComposerMarks
-              with
-                disabled=blocked
+            ComposerMarks disabled=blocked
               events
                 mark -> mark(_, blocked)
             space w=fill
@@ -1495,11 +1479,35 @@ component ThreadParentBlock(message:ChatMessage)
 // track grey, quiet in both themes. No spinner: `spin` is declared and never
 // driven (`overlay.ice`), so a ring here would paint a frozen arc.
 component SkeletonRow()
-  row w=fill gap=11.0 align=start
-    box w=30.0 h=30.0 bg=subtle r=15.0
+  row
+    with
+      w=fill
+      gap=11.0
+      align=start
+    box
+      with
+        w=30.0
+        h=30.0
+        bg=subtle
+        r=15.0
       space w=1.0 h=1.0
-    col w=fill gap=6.0 pt=4.0
-      box w=96.0 h=9.0 bg=subtle r=4.0
+    col
+      with
+        w=fill
+        gap=6.0
+        pt=4.0
+      box
+        with
+          w=96.0
+          h=9.0
+          bg=subtle
+          r=4.0
         space w=1.0 h=1.0
-      box w=fill max-w=420.0 h=9.0 bg=subtle r=4.0
+      box
+        with
+          w=fill
+          max-w=420.0
+          h=9.0
+          bg=subtle
+          r=4.0
         space w=1.0 h=1.0

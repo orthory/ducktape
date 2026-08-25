@@ -43,9 +43,9 @@ extern crate::backend
   pure apply_bell(items:[BellItem], delta:BellDelta) -> [BellItem]
   pure bell_unread_after(unread:i64, items:[BellItem], delta:BellDelta) -> i64
   pure bell_head(items:[BellItem]) -> i64
-  pure bell_severity(kind:str) -> str
-  pure bell_title(kind:str) -> str
-  pure bell_worst_severity(items:[BellItem]) -> str
+  pure bell_severity(kind:&str) -> str
+  pure bell_title(kind:&str) -> str
+  pure bell_worst_severity(items:&[BellItem]) -> str
   load_bell(rpc:str) -> BellData ! AppError
   mark_bell_read(rpc:str, password:str, up_to_seq:i64) -> bool ! AppError
   ForgeRefresh(repo:str, number:i64, refs_moved:bool)
@@ -80,15 +80,15 @@ extern crate::backend
   pure agent_host_node_options(rows:[AgentHostNode], provider:str, credential:str) -> [str]
   pure agent_host_node_choice(options:[str], current:str) -> str
   pure agent_host_node_key(rows:[AgentHostNode], option:str) -> str
-  pure agent_host_grant_note(host_node:str, credential:str) -> str
-  pure agent_run_line(identity:str, host_node:str) -> str
-  pure agent_provider_label(provider:str) -> str
-  pure agent_provider_initial(provider:str) -> str
-  pure agent_register_hint(provider:str) -> str
-  pure agent_composer_hint(provider:str) -> str
-  pure agent_task_blurb(host_node:str) -> str
-  pure agent_terminal_note(provider:str, credential:str) -> str
-  pure agent_run_label(saga_id:str) -> str
+  pure agent_host_grant_note(host_node:&str, credential:&str) -> str
+  pure agent_run_line(identity:&str, host_node:&str) -> str
+  pure agent_provider_label(provider:&str) -> str
+  pure agent_provider_initial(provider:&str) -> str
+  pure agent_register_hint(provider:&str) -> str
+  pure agent_composer_hint(provider:&str) -> str
+  pure agent_task_blurb(host_node:&str) -> str
+  pure agent_terminal_note(provider:&str, credential:&str) -> str
+  pure agent_run_label(saga_id:&str) -> str
   pure agent_chat_push_user(entries:[AgentChatEntry], body:str, provider:str) -> [AgentChatEntry]
   pure agent_chat_answer(entries:[AgentChatEntry], body:str, provider:str, status:str, saga_id:str, steps:[AgentActivity]) -> [AgentChatEntry]
   pure agent_chat_detach(entries:[AgentChatEntry], provider:str, saga_id:str, steps:[AgentActivity]) -> [AgentChatEntry]
@@ -106,7 +106,7 @@ extern crate::backend
   HydrationError(generation:i64, message:str)
   box-style raised_style()
   svg-style icon_tint(tone:str)
-  pure icon(name:str) -> bytes
+  pure icon(name:&str) -> bytes
   connect(rpc:str, attempt:i64, generation:i64) -> WorkspaceData ! HydrationError
   stream live_events(rpc:str) -> LiveUpdate
   pure fold_live_chat(deltas:[ChatDelta], channels:[ChatChannel], messages:[ChatMessage], thread_messages:[ChatMessage], channel_members:[ChatMember], channel_reads:[ChannelRead], dm_peers:[DmPeer], me:str, active_channel:str, active_thread_seq:i64, history_view:bool, chat_visible:bool, unread_boundary:i64, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, forge_discussion:[ChatMessage], forge_item_channel:str, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, message_edit_draft:str, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, thread_edit_draft:str) -> ChatLiveFold
@@ -150,11 +150,11 @@ extern crate::backend
   hub_state() -> HubState
   stream probe_known_networks() -> HubProbe
   pure apply_network_probe(networks:[HubNetwork], probe:HubProbe) -> [HubNetwork]
-  pure network_run_hint(row:HubNetwork) -> str
+  pure network_run_hint(row:&HubNetwork) -> str
   pure hub_entry_step(key_state:str) -> HubStep
   pure selected_network_endpoint(networks:[HubNetwork], id:str) -> str
   pure refreshed_hub_selection(networks:[HubNetwork], current:str, preselect:str) -> str
-  pure password_problem(password:str, confirm:str) -> str
+  pure password_problem(password:&str, confirm:&str) -> str
   pure without_window(current:window-id?, closed:window-id) -> window-id?
   sync window_target(current:window-id?) -> window-id
   sync window_target_unless(keep:bool, current:window-id?) -> window-id
@@ -165,10 +165,10 @@ extern crate::backend
   remember_network(rpc:str) -> bool
   forget_network(id:str, kind:str) -> bool
   restore_hidden_networks() -> bool
-  pure connection_degraded(status:str) -> bool
+  pure connection_degraded(status:&str) -> bool
   pure titlebar_inset() -> f64
   pure palette_key_action(logical:key, physical:physical-key, modifiers:key-modifiers, open:bool) -> str
-  pure topmost_overlay(tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, page_delete_armed:bool, fs_delete_target:str, forge_repo_menu:bool) -> str
+  pure topmost_overlay(tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, page_delete_armed:bool, fs_delete_target:&str, forge_repo_menu:bool) -> str
   pure escape_target(logical:key, tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, page_delete_armed:bool, fs_delete_target:str, forge_repo_menu:bool) -> str
   pure close_message_action(close:bool, current:MessageAction) -> MessageAction
   pure content_scroll_step(logical:key, modifiers:key-modifiers, overlay:str) -> f64
@@ -186,8 +186,8 @@ extern crate::backend
   duck_echo_i64(value:i64) -> i64 ! AppError
   pure no_fs_entry() -> FsEntry
   pure fs_entry_named(entries:[FsEntry], path:str) -> FsEntry
-  pure fs_directories(entries:[FsEntry]) -> [FsEntry]
-  pure fs_counts_summary(connected:bool, listed:bool, entries:[FsEntry]) -> str
+  pure fs_directories(entries:&[FsEntry]) -> [FsEntry]
+  pure fs_counts_summary(connected:bool, listed:bool, entries:&[FsEntry]) -> str
   pure fs_parent(path:str) -> str
   pure fs_child(path:str, name:str) -> str
   files_mkdir(rpc:str, path:str) -> bool ! AppError
@@ -202,21 +202,21 @@ extern crate::backend
   files_history(rpc:str, generation:i64) -> FsHistory ! HydrationError
   pure size_label(bytes:i64) -> str
   pure shell_nav(tab:ShellTab, approvals:i64, agent_live:bool) -> [NavItem]
-  pure open_proposals(rows:[ProposalRow]) -> i64
-  pure plural(count:i64, one:str, many:str) -> str
-  pure members_summary(connected:bool, rows:[MemberRow]) -> str
-  pure agents_summary(connected:bool, rows:[AgentRow]) -> str
-  pure proposals_summary(connected:bool, rows:[ProposalRow]) -> str
+  pure open_proposals(rows:&[ProposalRow]) -> i64
+  pure plural(count:i64, one:&str, many:&str) -> str
+  pure members_summary(connected:bool, rows:&[MemberRow]) -> str
+  pure agents_summary(connected:bool, rows:&[AgentRow]) -> str
+  pure proposals_summary(connected:bool, rows:&[ProposalRow]) -> str
   QuorumSeat(filled:bool)
   pure quorum_dots(approvals:i64, required:i64) -> [QuorumSeat]
   pure tally_label(approvals:i64, required:i64) -> str
-  pure reading_pair(left:str, right:str) -> str
+  pure reading_pair(left:&str, right:&str) -> str
   pure tally_tone(approvals:i64, required:i64) -> str
   pure tally_note(approvals:i64, required:i64) -> str
   pure approve_label(approvals:i64, required:i64) -> str
-  pure proposal_kind_tone(action:str) -> str
-  pure settled_proposals(rows:[ProposalRow]) -> [ProposalRow]
-  pure pending_label(rows:[ProposalRow]) -> str
+  pure proposal_kind_tone(action:&str) -> str
+  pure settled_proposals(rows:&[ProposalRow]) -> [ProposalRow]
+  pure pending_label(rows:&[ProposalRow]) -> str
   pure expires_in_blocks(deadline_height:i64, height:i64, wall_now:i64) -> str
   pure relative_time(unix_seconds:i64, wall_now:i64) -> str
   sync current_wall_seconds() -> i64
@@ -231,8 +231,8 @@ extern crate::backend
   pure height_label_short(height:i64) -> str
   pure height_ago(then_height:i64, now_height:i64, wall_now:i64) -> str
   pure doc_tabs_pruned(tabs:[str], pages:[PageItem]) -> [str]
-  pure initial_of(name:str) -> str
-  pure initials_of(name:str) -> str
+  pure initial_of(name:&str) -> str
+  pure initials_of(name:&str) -> str
   NodeLogLine(cursor:str, line:str)
   NodeLogTimelineState()
   NodeLogTimelineEvent()
@@ -248,7 +248,7 @@ extern crate::backend
   PeerRow(key:str, role:str, live:bool)
   PeersData(generation:i64, peers:[PeerRow])
   stream node_logs(rpc:str) -> NodeLogLine
-  pure sync_label(phase:str, applied:i64, target:i64) -> str
+  pure sync_label(phase:&str, applied:i64, target:i64) -> str
   stream node_status_live(rpc:str) -> NodeFacts
   stream node_peers_live(rpc:str) -> PeersData
   load_peers(rpc:str, generation:i64) -> PeersData ! HydrationError
@@ -284,36 +284,36 @@ extern crate::backend
   ForgeDraftComment(anchor:str, path:str, line:str, side:str, body:str)
   pure stage_forge_comment(staged:[ForgeDraftComment], path:str, line:str, side:str, body:str) -> [ForgeDraftComment]
   pure drop_forge_comment(staged:[ForgeDraftComment], anchor:str) -> [ForgeDraftComment]
-  pure forge_comment_cap_reached(staged:[ForgeDraftComment]) -> bool
+  pure forge_comment_cap_reached(staged:&[ForgeDraftComment]) -> bool
   pure keep_staged_comments(loaded:bool, next_oid:str, current_oid:str, staged:[ForgeDraftComment]) -> [ForgeDraftComment]
   pure keep_comment_text(loaded:bool, next_oid:str, current_oid:str, value:str) -> str
   pure staged_comment_drop_note(loaded:bool, next_oid:str, current_oid:str, staged:[ForgeDraftComment], error:str) -> str
-  pure forge_comment_target(path:str, line:str, side:str) -> str
+  pure forge_comment_target(path:&str, line:&str, side:&str) -> str
   pure forge_parent(path:str) -> str
-  pure forge_file_header(opened_dir:str, opened_rev:str, dir:str, rev:str, path:str) -> str
+  pure forge_file_header(opened_dir:&str, opened_rev:&str, dir:&str, rev:&str, path:&str) -> str
   submit_forge_review(rpc:str, password:str, repo:str, number:i64, verdict:ForgeReviewVerdict, body:str, commit_oid:str, comments:[ForgeDraftComment]) -> bool ! AppError
   merge_forge_pr(rpc:str, password:str, repo:str, number:i64, source_branch:str, expected_source_oid:str, prev_target_oid:str) -> ForgeMergeOutcome ! AppError
   forge_live_refresh(rpc:str, open_repo:str, open_item:i64, kind:LiveKind, module:str, scope:ForgeRefresh, forge_open:bool, generation:i64) -> ForgeLiveData ! HydrationError
   pure forge_live_hit(kind:LiveKind, module:str) -> bool
   pure forge_stats(files:i64, additions:i64, deletions:i64) -> str
   DiffLine(key:i64, kind:str, old_no:str, new_no:str, sign:str, text:str, path:str, side:str)
-  pure forge_push_command(rpc:str) -> str
-  pure diff_lines(diff:str) -> [DiffLine]
+  pure forge_push_command(rpc:&str) -> str
+  pure diff_lines(diff:&str) -> [DiffLine]
   component forge_code(source:str, path:str, dark:bool) -> unit
-  pure markdown_path(path:str) -> bool
+  pure markdown_path(path:&str) -> bool
   pure picture_path(path:str) -> bool
   pure picture_caption(width:i64, height:i64) -> str
-  pure binary_note(text:str) -> str
+  pure binary_note(text:&str) -> str
   component picture(surface:str, path:str) -> unit
-  pure filter_forge_items(items:[ForgeItem], tab:ForgeTab) -> [ForgeItem]
-  pure forge_open_count(items:[ForgeItem], kind:str) -> i64
-  pure forge_merge_note(merge_oid:str, branches:str) -> str
-  pure verdict_label(verdict:str) -> str
-  pure verdict_pick_label(current:ForgeReviewVerdict, key:ForgeReviewVerdict, label:str) -> str
+  pure filter_forge_items(items:&[ForgeItem], tab:ForgeTab) -> [ForgeItem]
+  pure forge_open_count(items:&[ForgeItem], kind:&str) -> i64
+  pure forge_merge_note(merge_oid:&str, branches:&str) -> str
+  pure verdict_label(verdict:&str) -> str
+  pure verdict_pick_label(current:ForgeReviewVerdict, key:ForgeReviewVerdict, label:&str) -> str
   AgentRow(id:str, name:str, initials:str, capability:str, status:str, owner_handle:str, live:bool, skill_count:i64, cap_count:i64)
   AgentsData(generation:i64, agents:[AgentRow])
   load_agents(rpc:str, generation:i64) -> AgentsData ! HydrationError
-  pure any_agent_active(rows:[AgentRow]) -> bool
+  pure any_agent_active(rows:&[AgentRow]) -> bool
   set_agent_status(rpc:str, password:str, agent_id:str, paused:bool) -> bool ! AppError
   ProposalRow(id:str, action:str, detail:str, proposer:str, status:str, deadline:i64, approvals:i64, rejections:i64, rule:str, required_yes:i64, electorate:i64, open:bool, settled_height:i64)
   GovernanceData(generation:i64, proposals:[ProposalRow])
@@ -324,13 +324,13 @@ extern crate::backend
   MemberRow(key:str, label:str, role:str, is_this_node:bool, is_agent:bool, model:str, live:bool)
   MembersData(generation:i64, members:[MemberRow])
   load_members(rpc:str, generation:i64) -> MembersData ! HydrationError
-  pure members_is_admin(rows:[MemberRow]) -> bool
-  pure member_tier(rows:[MemberRow]) -> str
-  pure filter_members(rows:[MemberRow], filter:MembersFilter) -> [MemberRow]
+  pure members_is_admin(rows:&[MemberRow]) -> bool
+  pure member_tier(rows:&[MemberRow]) -> str
+  pure filter_members(rows:&[MemberRow], filter:MembersFilter) -> [MemberRow]
   ExplorerBlock(height:i64, hash:str, commit:str, op_count:i64)
   ExplorerOp(height:i64, proposer:str, target:str, disposition:str, op_hash:str, payload:str, trace:str)
   ExplorerData(generation:i64, blocks:[ExplorerBlock], ops:[ExplorerOp])
-  pure explorer_ops_at(ops:[ExplorerOp], height:i64) -> [ExplorerOp]
+  pure explorer_ops_at(ops:&[ExplorerOp], height:i64) -> [ExplorerOp]
   load_explorer(rpc:str, generation:i64) -> ExplorerData ! HydrationError
   ExplorerHit(kind:str, code:str, title:str, snippet:str, meta:str, target:str)
   KindCount(kind:str, label:str, count:i64)
@@ -339,7 +339,7 @@ extern crate::backend
   pure doc_tabs_with(tabs:[str], page_id:str) -> [str]
   pure doc_tabs_without(tabs:[str], page_id:str) -> [str]
   DocTab(id:str, title:str, active:bool)
-  pure doc_tab_rows(tabs:[str], pages:[PageItem], active:str) -> [DocTab]
+  pure doc_tab_rows(tabs:&[str], pages:&[PageItem], active:&str) -> [DocTab]
   pure next_doc_tab(tabs:[str], closed:str, active:str) -> str
   load_doc_tabs(rpc:str) -> [str]
   load_appearance() -> Appearance
@@ -374,8 +374,8 @@ extern crate::backend
   // network switch to keep one from handing its words to the other.
   pure submit_verdict(busy:bool, connected:bool, channel:str, refusal:str, seated:bool) -> SubmitVerdict
   pure composer_op_prefix(kind:ComposerKind) -> str
-  pure composer_scope(endpoint:str, channel_id:str) -> str
-  pure thread_scope(endpoint:str, channel_id:str, thread_seq:i64) -> str
+  pure composer_scope(endpoint:&str, channel_id:&str) -> str
+  pure thread_scope(endpoint:&str, channel_id:&str, thread_seq:i64) -> str
   // The page header title of a page that
   // has only just been clicked, read from the list already in hand.
   pure page_display_title(pages:[PageItem], page:str, current:str) -> str
@@ -383,7 +383,7 @@ extern crate::backend
   pure keep_members(loaded:bool, next:[ChatMember], current:[ChatMember]) -> [ChatMember]
   pure keep_pages(loaded:bool, next:[PageItem], current:[PageItem]) -> [PageItem]
   pure keep_page_hits(loaded:bool, next:[PageSearchHit], current:[PageSearchHit]) -> [PageSearchHit]
-  pure search_answer_stands(query:str, draft:str, searching:bool) -> bool
+  pure search_answer_stands(query:&str, draft:&str, searching:bool) -> bool
   pure pages_reply_answers_current(pages:[PageItem], replied:str, current:str) -> bool
   pure keep_blocks(loaded:bool, next:[PageBlock], current:[PageBlock]) -> [PageBlock]
   pure apply_page_text(blocks:[PageBlock], delta:PagesDelta) -> [PageBlock]
@@ -395,12 +395,12 @@ extern crate::backend
   pure plane_live_hit(kind:LiveKind, module:str, want:str) -> bool
   pure agents_plane_hit(kind:LiveKind, module:str) -> bool
   pure tab_reads_plane(tab:ShellTab, plane:str) -> bool
-  pure keep_str(loaded:bool, next:str, current:str) -> str
+  pure keep_str(loaded:bool, next:&str, current:&str) -> str
   pure keep_bool(loaded:bool, next:bool, current:bool) -> bool
   pure keep_i64(loaded:bool, next:i64, current:i64) -> i64
   pure keep_strs(loaded:bool, next:[str], current:[str]) -> [str]
   pure commented_targets_of(threads:[PageCommentThread], page_id:str) -> [str]
-  pure thread_is_resolved(threads:[PageCommentThread], id:str) -> bool
+  pure thread_is_resolved(threads:&[PageCommentThread], id:&str) -> bool
   pure keep_forge_repos(loaded:bool, next:[ForgeRepo], current:[ForgeRepo]) -> [ForgeRepo]
   pure keep_branches(loaded:bool, next:[str], current:[str]) -> [str]
   pure keep_forge_items(loaded:bool, next:[ForgeItem], current:[ForgeItem]) -> [ForgeItem]
@@ -418,7 +418,7 @@ extern crate::backend
   pure retain_selected_i64(value:i64, selected_id:str) -> i64
   pure retain_selected_comment_threads(threads:[PageCommentThread], selected_id:str) -> [PageCommentThread]
   pure retain_selected_comments(comments:[PageComment], selected_id:str) -> [PageComment]
-  pure scope_key(scope:str, id:str) -> str
+  pure scope_key(scope:&str, id:&str) -> str
   pure reaction_palette() -> [str]
   // ! HydrationError, not ! AppError: the three room-switch loaders below fail
   // with the generation of the switch they belong to, so `chat_load_failed` can
@@ -471,7 +471,7 @@ extern crate::backend
   save_page_document(rpc:str, password:str, page_id:str, text:str, saved:str) -> DocumentSaveResult ! AppError
   // The buffer a page opens on: its TITLE as line 0, its blocks under it.
   pure page_document_text(title:str, blocks:[PageBlock]) -> str
-  pure subpage_blocks(blocks:[PageBlock]) -> [PageBlock]
+  pure subpage_blocks(blocks:&[PageBlock]) -> [PageBlock]
   pure count_label(count:i64) -> str
   // A live resync replaces the buffer ONLY when it is clean and the node's
   // text differs; both read the same decision so buffer and baseline move

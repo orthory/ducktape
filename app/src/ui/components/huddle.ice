@@ -341,10 +341,7 @@ component HuddlePanel(channel:str, elapsed:str, rows:[HuddleTileRow], status:str
   // No `bg=` on the root: the window's own background IS the app background
   // (`bg app_background` in app.ice), so the stage band is the bare window and
   // only the two chrome bands paint a plate over it.
-  col #root
-    with
-      w=fill
-      h=fill
+  col #root w=fill h=fill
     // BAND 1 — THE HEADER, and the ONLY place the clock and the channel are
     // named. It used to be two bands: a mono "Huddle · <channel>" title over a
     // separate clock row whose right end printed the word `live` beside a
@@ -385,10 +382,7 @@ component HuddlePanel(channel:str, elapsed:str, rows:[HuddleTileRow], status:str
         // `clip=true` ancestor cuts the overflow, which is why the channel
         // list's own rows survive the same names (their 236px pane clips).
         // Without this box the name painted straight through the dock button.
-        box
-          with
-            w=fill
-            clip=true
+        box w=fill clip=true
           row gap=3.0 align=center
             text "#"
               with
@@ -479,10 +473,7 @@ component HuddlePanel(channel:str, elapsed:str, rows:[HuddleTileRow], status:str
         // 100px-tall bar with a 34px avatar adrift in it.
         grid max-cell=168.0 gap=8.0
           for tile in rows
-            HuddleTile
-              with
-                person=tile.person
-                muted=tile.muted
+            HuddleTile person=tile.person muted=tile.muted
     box
       with
         w=fill

@@ -17,7 +17,11 @@
 //! A dropped socket is ordinary — the node restarts, the operator upgrades — so
 //! the task reconnects forever, logging attempt 1 and every Nth with an
 //! `attempts` field. An unconditional warn here would be a log bomb on a node
-//! that stays down, and the counter IS the diagnosis.
+//! that stays down, and the counter IS the diagnosis. A REFUSAL IS COUNTED AND
+//! PACED THE SAME WAY: the dial succeeded, so it is not a reconnect failure,
+//! but it does not self-heal on a fresh socket either — an unpaced redial spins
+//! on the node at full speed and writes the same line forever (118 282 of them
+//! in one afternoon, from a second daemon nobody noticed was up).
 
 use std::sync::Arc;
 
@@ -31,6 +35,12 @@ use tokio::sync::mpsc;
 pub(crate) const EVENT_LANE: usize = 1024;
 /// how many reconnect failures pass between log lines after the first.
 const LOG_EVERY: u64 = 30;
+/// whether this attempt earns a line: the first one, then every Nth. The
+/// counter IS the diagnosis, so the line carries `attempts` and the ones
+/// between it are silence, not loss.
+fn worth_logging(attempts: u64) -> bool {
+    attempts == 1 || attempts.is_multiple_of(LOG_EVERY)
+}
 /// how long to wait before redialing a node that is not answering.
 const REDIAL: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -41,7 +51,11 @@ pub(crate) async fn attach(
     sessions: Arc<Sessions>,
     mut events: mpsc::Receiver<wire::Event>,
 ) {
+    // two causes, two counters: a node that will not answer, and a node that
+    // answers and refuses. Each resets on the outcome that disproves it, so
+    // neither hides behind the other's silence.
     let mut failures: u64 = 0;
+    let mut refusals: u64 = 0;
     loop {
         match tokio_tungstenite::connect_async(&ws_url).await {
             Ok((socket, _)) => {
@@ -53,15 +67,34 @@ pub(crate) async fn attach(
                     );
                 }
                 failures = 0;
-                pump(socket, &workspace, &sessions, &mut events).await;
+                let end = pump(socket, &workspace, &sessions, &mut events).await;
                 // the connection is gone, and with it every session: the node
                 // forgot them the moment this link dropped, so a surviving pty
                 // would be a container nobody can reach, feed or close.
                 sessions.close_all().await;
+                match end {
+                    // a link that lived and dropped is the ordinary case, and
+                    // it clears the refusal streak: whatever the node objected
+                    // to, it does not object now.
+                    LinkEnd::Closed => refusals = 0,
+                    LinkEnd::Refused(detail) => {
+                        refusals += 1;
+                        if worth_logging(refusals) {
+                            tracing::error!(
+                                target: "ducktape::service",
+                                attempts = refusals,
+                                reason = "link_refused",
+                                %detail,
+                                "the node refused this agent daemon's link"
+                            );
+                        }
+                        tokio::time::sleep(REDIAL).await;
+                    }
+                }
             }
             Err(error) => {
                 failures += 1;
-                if failures == 1 || failures.is_multiple_of(LOG_EVERY) {
+                if worth_logging(failures) {
                     tracing::warn!(
                         target: "ducktape::service",
                         attempts = failures,
@@ -75,6 +108,17 @@ pub(crate) async fn attach(
     }
 }
 
+/// how one connection ended. The caller redials either way, but only one of
+/// these is ordinary — so `pump` reports which it was and the redial loop, which
+/// owns the counters and the pace, decides what to say about it.
+enum LinkEnd {
+    /// the socket closed: the node restarted, the operator upgraded, the link
+    /// simply dropped.
+    Closed,
+    /// the node refused this daemon's claim, carrying its reason.
+    Refused(String),
+}
+
 /// One connection's lifetime: claim the link, then commands in and events out
 /// until it closes. Returns so the caller redials.
 async fn pump<S>(
@@ -82,7 +126,8 @@ async fn pump<S>(
     workspace: &std::path::Path,
     sessions: &Arc<Sessions>,
     events: &mut mpsc::Receiver<wire::Event>,
-) where
+) -> LinkEnd
+where
     S: futures::Sink<
             tokio_tungstenite::tungstenite::Message,
             Error = tokio_tungstenite::tungstenite::Error,
@@ -108,7 +153,7 @@ async fn pump<S>(
                 reason = "link_token_unreadable",
                 "the agent daemon cannot present its node's service-link token: {error}"
             );
-            return;
+            return LinkEnd::Closed;
         }
     };
     let claim = serde_json::json!({
@@ -118,7 +163,7 @@ async fn pump<S>(
     })
     .to_string();
     if tx.send(Message::Text(claim)).await.is_err() {
-        return;
+        return LinkEnd::Closed;
     }
     loop {
         tokio::select! {
@@ -127,33 +172,25 @@ async fn pump<S>(
                     // a close, an error, or a frame shape we do not read:
                     // anything but a live text frame ends this connection.
                     let closed = !matches!(frame, Some(Ok(_)));
-                    if closed { return; }
+                    if closed { return LinkEnd::Closed; }
                     continue;
                 };
                 match classify(&text) {
                     Incoming::Ignore => {}
                     Incoming::Command(command) => execute(sessions, command).await,
-                    Incoming::Refused(detail) => {
-                        // the only errors this connection can earn are refusals
-                        // of its claim, and none self-heals on this socket: a
-                        // stale token needs a re-read of the node's freshly
-                        // minted one, another daemon holding the link needs that
-                        // daemon to go. Redialing is the honest retry.
-                        tracing::error!(
-                            target: "ducktape::service",
-                            reason = "link_refused",
-                            %detail,
-                            "the node refused this agent daemon's link"
-                        );
-                        return;
-                    }
+                    // the only errors this connection can earn are refusals of
+                    // its claim, and none self-heals on this socket: a stale
+                    // token needs a re-read of the node's freshly minted one,
+                    // another daemon holding the link needs that daemon to go.
+                    // Redialing is the honest retry — PACED, by the caller.
+                    Incoming::Refused(detail) => return LinkEnd::Refused(detail),
                 }
             }
             event = events.recv() => {
-                let Some(event) = event else { return };
+                let Some(event) = event else { return LinkEnd::Closed };
                 let frame = serde_json::json!({ "op": "agent_event", "event": event }).to_string();
                 if tx.send(Message::Text(frame)).await.is_err() {
-                    return;
+                    return LinkEnd::Closed;
                 }
             }
         }
@@ -294,5 +331,17 @@ mod tests {
                 "must ignore: {frame}"
             );
         }
+    }
+
+    #[test]
+    fn a_repeating_attempt_earns_the_first_line_and_every_nth() {
+        // the refusal that cost 118 282 identical ERROR lines took this path
+        // unconditionally, at redial speed, with no `attempts` on it.
+        assert!(worth_logging(1));
+        for attempts in 2..LOG_EVERY {
+            assert!(!worth_logging(attempts), "attempt {attempts} must be quiet");
+        }
+        assert!(worth_logging(LOG_EVERY));
+        assert!(worth_logging(LOG_EVERY * 2));
     }
 }

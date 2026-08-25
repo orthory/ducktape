@@ -103,7 +103,7 @@ async fn live_peer_keys(rpc: &RpcClient) -> BTreeSet<String> {
 
 /// This node holds a quorum seat — the ONE authority predicate behind the
 /// approvals gate, the members Invite button and the forge write gate.
-pub fn members_is_admin(rows: Vec<MemberRow>) -> bool {
+pub fn members_is_admin(rows: &[MemberRow]) -> bool {
     rows.iter()
         .any(|row| row.is_this_node && row.role == "validator")
 }
@@ -121,7 +121,7 @@ pub fn members_is_admin(rows: Vec<MemberRow>) -> bool {
 /// is a sound one: an answered roster always carries the chain's own
 /// validators. So a roster that DID answer and holds no row for this node is a
 /// real guest and still reads `guest` — the guest card is not collateral here.
-pub fn member_tier(rows: Vec<MemberRow>) -> String {
+pub fn member_tier(rows: &[MemberRow]) -> String {
     if rows.is_empty() {
         return String::new();
     }
@@ -131,14 +131,15 @@ pub fn member_tier(rows: Vec<MemberRow>) -> String {
 }
 
 /// The All / Humans / Agents / Validators strip.
-pub fn filter_members(rows: Vec<MemberRow>, filter: crate::MembersFilter) -> Vec<MemberRow> {
-    rows.into_iter()
+pub fn filter_members(rows: &[MemberRow], filter: crate::MembersFilter) -> Vec<MemberRow> {
+    rows.iter()
         .filter(|row| match filter {
             crate::MembersFilter::All => true,
             crate::MembersFilter::Humans => !row.is_agent,
             crate::MembersFilter::Agents => row.is_agent,
             crate::MembersFilter::Validators => row.role == "validator",
         })
+        .cloned()
         .collect()
 }
 

@@ -28,7 +28,12 @@ component ShellSurfaceButton(label:str, value:ShellSurface, selected:bool, live:
         row gap=6.0 align=center
           text label size=12.0 font=medium
           if live
-            box w=6.0 h=6.0 bg=success_dot r=3.0
+            box
+              with
+                w=6.0
+                h=6.0
+                bg=success_dot
+                r=3.0
               space w=1.0 h=1.0
         active bg=primary text=primary_fg border=primary border-w=1.0 r=8.0
         hovered bg=primary_hover text=primary_fg border=primary_hover
@@ -43,7 +48,12 @@ component ShellSurfaceButton(label:str, value:ShellSurface, selected:bool, live:
         row gap=6.0 align=center
           text label size=12.0 font=medium
           if live
-            box w=6.0 h=6.0 bg=success_dot r=3.0
+            box
+              with
+                w=6.0
+                h=6.0
+                bg=success_dot
+                r=3.0
               space w=1.0 h=1.0
         active bg=transparent text=muted border=transparent border-w=1.0 r=8.0
         hovered bg=row_hover text=fg border=border
@@ -55,10 +65,7 @@ component ShellSurfaceButton(label:str, value:ShellSurface, selected:bool, live:
 component ShellSetupToggle(open:bool)
   emits
     shell_setup_toggled
-  button #root -> emit(shell_setup_toggled)
-    with
-      label="Change who runs this work and where"
-      p=4.0
+  button #root label="Change who runs this work and where" p=4.0 -> emit(shell_setup_toggled)
     row align=center
       if open
         text "Done" size=11.5 font=medium
@@ -98,7 +105,11 @@ component ShellPick(options:[str], selected:str, hint:str, width:f64, disabled:b
           border=border
           border-w=1.0
           r=8.0
-        row w=fill gap=8.0 align=center
+        row
+          with
+            w=fill
+            gap=8.0
+            align=center
           if empty(selected)
             text hint size=12.5 @text-disabled_fg
           if !empty(selected)
@@ -126,15 +137,45 @@ component ShellPrompt(entry:AgentChatEntry)
           @text-fg
 
 component ShellActivityRow(row:AgentActivity)
-  row #root w=fill gap=10.0 align=start
+  row #root
+    with
+      w=fill
+      gap=10.0
+      align=start
     if row.status == "done"
-      box w=20.0 h=20.0 align-x=center align-y=center bg=success_bg r=6.0
-        text "✓" size=11.0 font=code_medium @text-success
+      box
+        with
+          w=20.0
+          h=20.0
+          align-x=center
+          align-y=center
+          bg=success_bg
+          r=6.0
+        text "✓"
+          with
+            size=11.0
+            font=code_medium
+            @text-success
     if row.status != "done"
-      box w=20.0 h=20.0 align-x=center align-y=center bg=warning_bg r=6.0
-        text "◌" size=11.0 font=code_medium @text-warning
+      box
+        with
+          w=20.0
+          h=20.0
+          align-x=center
+          align-y=center
+          bg=warning_bg
+          r=6.0
+        text "◌"
+          with
+            size=11.0
+            font=code_medium
+            @text-warning
     col w=fill gap=2.0
-      text row.title size=12.0 font=medium @text-fg
+      text row.title
+        with
+          size=12.0
+          font=medium
+          @text-fg
       if !empty(row.detail)
         text row.detail
           with
@@ -147,7 +188,11 @@ component ShellActivityRow(row:AgentActivity)
 // answer is the reading; one click is the whole cost of the audit trail that
 // used to be deleted on arrival.
 component ShellSteps(entry:AgentChatEntry, open:bool) -> i64
-  col #root w=fill gap=8.0 pl=32.0
+  col #root
+    with
+      w=fill
+      gap=8.0
+      pl=32.0
     button -> emit(entry.id)
       with
         label="Show what the agent did"
@@ -155,12 +200,28 @@ component ShellSteps(entry:AgentChatEntry, open:bool) -> i64
         @ghost_action
       row gap=6.0 align=center
         if open
-          text "▾" size=10.0 font=code @text-meta
+          text "▾"
+            with
+              size=10.0
+              font=code
+              @text-meta
         if !open
-          text "▸" size=10.0 font=code @text-meta
-        text entry.steps_label size=11.0 font=code @text-meta
+          text "▸"
+            with
+              size=10.0
+              font=code
+              @text-meta
+        text entry.steps_label
+          with
+            size=11.0
+            font=code
+            @text-meta
     if open
-      col w=fill gap=10.0 pl=4.0
+      col
+        with
+          w=fill
+          gap=10.0
+          pl=4.0
         for step in entry.steps
           ShellActivityRow row=step
 
@@ -169,7 +230,11 @@ component ShellAnswer(entry:AgentChatEntry, dark:bool)
     open_link(str)
   col #root w=fill gap=7.0
     row gap=8.0 align=center
-      AgentAvatar initials=agent_provider_initial(entry.provider) plate=24.0 ink=10.0
+      AgentAvatar
+        with
+          initials=agent_provider_initial(entry.provider)
+          plate=24.0
+          ink=10.0
       text agent_provider_label(entry.provider)
         with
           size=11.5
@@ -194,7 +259,11 @@ component ShellDetached(entry:AgentChatEntry, open:bool, connected:bool)
     toggle_steps(i64)
   col #root w=fill gap=7.0
     row gap=8.0 align=center
-      AgentAvatar initials=agent_provider_initial(entry.provider) plate=24.0 ink=10.0
+      AgentAvatar
+        with
+          initials=agent_provider_initial(entry.provider)
+          plate=24.0
+          ink=10.0
       text agent_provider_label(entry.provider)
         with
           size=11.5
@@ -222,8 +291,16 @@ component ShellDetached(entry:AgentChatEntry, open:bool, connected:bool)
               line-h=1.45
               wrap=word
               @text-meta
-          row w=fill gap=8.0 align=center
-            text agent_run_label(entry.saga_id) size=10.5 font=code @text-meta
+          row
+            with
+              w=fill
+              gap=8.0
+              align=center
+            text agent_run_label(entry.saga_id)
+              with
+                size=10.5
+                font=code
+                @text-meta
             space w=fill
             button "Discard" @ghost_action -> emit(discard_run)
             button "Reopen" disabled=!connected @secondary_action -> emit(reopen_run)
@@ -237,7 +314,11 @@ component ShellWelcome(provider:str, host_node:str)
       py=56.0
       gap=14.0
       align=center
-    AgentAvatar initials=agent_provider_initial(provider) plate=46.0 ink=18.0
+    AgentAvatar
+      with
+        initials=agent_provider_initial(provider)
+        plate=46.0
+        ink=18.0
     text "What should the agent do?"
       with
         size=20.0
@@ -281,7 +362,11 @@ component ShellNoCredential(provider:str)
         border=border
         border-w=1.0
         r=8.0
-      text agent_register_hint(provider) size=11.0 font=code @text-warning
+      text agent_register_hint(provider)
+        with
+          size=11.0
+          font=code
+          @text-warning
 
 component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[str], identity:str, provider:str, credential:str, host_node_options:[str], host_node:str, credentials_loading:bool, terminal:AgentTerminalSession, terminal_running:bool, terminal_busy:bool, terminal_title:str, terminal_error:str, entries:[AgentChatEntry], activity:[AgentActivity], bind draft:editor, chat_busy:bool, chat_status:str, chat_detail:str, live:str, saga_id:str, steps_open:i64, detached_saga:str, connected:bool, dark:bool)
   emits
@@ -310,11 +395,23 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
         px=22.0
         py=12.0
         bg=surface
-      row w=fill gap=14.0 align=center
+      row
+        with
+          w=fill
+          gap=14.0
+          align=center
         col w=fill gap=2.0
           row gap=9.0 align=center
-            Icon name="code-slash" tone="primary" px=18.0
-            text "Shell" size=16.0 font=display @text-primary
+            Icon
+              with
+                name="code-slash"
+                tone="primary"
+                px=18.0
+            text "Shell"
+              with
+                size=16.0
+                font=display
+                @text-primary
           row gap=5.0 align=center
             text agent_run_line(identity, host_node) size=11.5 @text-caption
             ShellSetupToggle #setup-toggle open=setup_open
@@ -340,7 +437,11 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
                 value=ShellSurface.terminal
                 selected=(surface == ShellSurface.terminal)
                 live=terminal_running
-    box w=fill h=1.0 bg=separator
+    box
+      with
+        w=fill
+        h=1.0
+        bg=separator
       space w=1.0 h=1.0
 
     // THE SETUP, open on request and while nothing is picked. Two questions,
@@ -354,8 +455,16 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
             py=12.0
             bg=bg_wash
           col w=fill gap=9.0
-            row w=fill gap=12.0 align=center
-              text "WHO RUNS IT" size=9.0 font=code_semibold @text-label
+            row
+              with
+                w=fill
+                gap=12.0
+                align=center
+              text "WHO RUNS IT"
+                with
+                  size=9.0
+                  font=code_semibold
+                  @text-label
               ShellPick #identity -> emit(shell_identity_changed, _)
                 with
                   options=identity_options
@@ -363,9 +472,17 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
                   hint="Choose a credential"
                   width=252.0
                   disabled=(!connected || credentials_loading || empty(identity_options))
-              box w=1.0 h=24.0 bg=separator
+              box
+                with
+                  w=1.0
+                  h=24.0
+                  bg=separator
                 space w=1.0 h=1.0
-              text "WHERE" size=9.0 font=code_semibold @text-label
+              text "WHERE"
+                with
+                  size=9.0
+                  font=code_semibold
+                  @text-label
               ShellPick #host-node -> emit(shell_host_node_changed, _)
                 with
                   options=host_node_options
@@ -374,23 +491,48 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
                   width=200.0
                   disabled=(!connected || credentials_loading)
               space w=fill
-              button "Refresh" disabled=(!connected || credentials_loading) @ghost_action -> emit(shell_credentials_refresh)
+              button "Refresh" -> emit(shell_credentials_refresh)
+                with
+                  disabled=(!connected || credentials_loading)
+                  @ghost_action
             if credentials_loading
               row gap=7.0 align=center
-                box w=6.0 h=6.0 bg=hint r=3.0
+                box
+                  with
+                    w=6.0
+                    h=6.0
+                    bg=hint
+                    r=3.0
                   space w=1.0 h=1.0
                 text "Reading registered credentials and announcing peers…" size=10.5 @text-meta
             if !empty(agent_host_grant_note(host_node, credential))
               row gap=7.0 align=center
-                box w=6.0 h=6.0 bg=warning_dot r=3.0
+                box
+                  with
+                    w=6.0
+                    h=6.0
+                    bg=warning_dot
+                    r=3.0
                   space w=1.0 h=1.0
                 text agent_host_grant_note(host_node, credential) size=10.5 @text-meta
-        box w=fill h=1.0 bg=separator
+        box
+          with
+            w=fill
+            h=1.0
+            bg=separator
           space w=1.0 h=1.0
 
     if !connected
-      box w=fill h=fill align-x=center align-y=center
-        EmptyState title="Not connected" description="Click the network name in the titlebar to pick or reconnect a network."
+      box
+        with
+          w=fill
+          h=fill
+          align-x=center
+          align-y=center
+        EmptyState
+          with
+            title="Not connected"
+            description="Click the network name in the titlebar to pick or reconnect a network."
 
     if connected && surface == ShellSurface.terminal
       col w=fill h=fill
@@ -400,25 +542,54 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
             px=22.0
             py=10.0
             bg=surface
-          row w=fill gap=10.0 align=center
+          row
+            with
+              w=fill
+              gap=10.0
+              align=center
             if terminal_running
-              box w=8.0 h=8.0 bg=success_dot r=4.0
+              box
+                with
+                  w=8.0
+                  h=8.0
+                  bg=success_dot
+                  r=4.0
                 space w=1.0 h=1.0
             if !terminal_running
-              box w=8.0 h=8.0 bg=presence_off r=4.0
+              box
+                with
+                  w=8.0
+                  h=8.0
+                  bg=presence_off
+                  r=4.0
                 space w=1.0 h=1.0
             col w=fill gap=2.0
               if !empty(terminal_title)
-                text terminal_title size=12.5 font=medium @text-fg
+                text terminal_title
+                  with
+                    size=12.5
+                    font=medium
+                    @text-fg
               if empty(terminal_title)
-                text "No session open" size=12.5 font=medium @text-fg
+                text "No session open"
+                  with
+                    size=12.5
+                    font=medium
+                    @text-fg
               text agent_terminal_note(provider, credential) size=10.5 @text-meta
             if !terminal_running
-              button "Open session" disabled=terminal_busy @primary_action -> emit(shell_terminal_start)
+              button "Open session" -> emit(shell_terminal_start)
+                with
+                  disabled=terminal_busy
+                  @primary_action
             if terminal_running
               button "Close session" @secondary_action -> emit(shell_terminal_stop)
         if !empty(terminal_error)
-          box w=fill px=22.0 pt=10.0
+          box
+            with
+              w=fill
+              px=22.0
+              pt=10.0
             Alert.Destructive title="The session did not open" description=terminal_error
         box
           with
@@ -447,8 +618,15 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
                     gap=9.0
                     align=center
                   space w=1.0 h=fill
-                  text "▸_" size=22.0 font=code @text-muted
-                  text "Open a session to work in the provider's own terminal." size=12.0 @text-muted
+                  text "▸_"
+                    with
+                      size=22.0
+                      font=code
+                      @text-muted
+                  text "Open a session to work in the provider's own terminal."
+                    with
+                      size=12.0
+                      @text-muted
                   space w=1.0 h=fill
 
     if connected && surface == ShellSurface.tasks
@@ -458,7 +636,12 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
             w=fill
             h=fill
             anchor-y=end
-          box w=fill px=22.0 py=26.0 align-x=center
+          box
+            with
+              w=fill
+              px=22.0
+              py=26.0
+              align-x=center
             box w=fill max-w=780.0
               col w=fill gap=20.0
                 if empty(entries) && !chat_busy && empty(credential)
@@ -474,7 +657,11 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
                     if entry.role == "user"
                       ShellPrompt entry=entry
                     if entry.role != "user" && entry.status == "detached"
-                      ShellDetached entry=entry open=(steps_open == entry.id) connected=connected
+                      ShellDetached
+                        with
+                          entry=entry
+                          open=(steps_open == entry.id)
+                          connected=connected
                         events
                           reopen_run -> emit(shell_chat_reopen)
                           discard_run -> emit(shell_chat_discard)
@@ -497,7 +684,10 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
                           events
                             open_link -> emit(shell_open_link, _)
                       if !empty(entry.steps)
-                        ShellSteps entry=entry open=(steps_open == entry.id) -> emit(shell_chat_steps_toggled, _)
+                        ShellSteps -> emit(shell_chat_steps_toggled, _)
+                          with
+                            entry=entry
+                            open=(steps_open == entry.id)
                 if chat_busy
                   box #work
                     with
@@ -509,18 +699,23 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
                       border-w=1.0
                       r=11.0
                     col w=fill gap=10.0
-                      row w=fill gap=9.0 align=center
+                      row
+                        with
+                          w=fill
+                          gap=9.0
+                          align=center
                         text "◌" size=13.0 @text-warning
                         col w=fill gap=1.0
-                          text chat_status size=12.5 font=medium @text-fg
+                          text chat_status
+                            with
+                              size=12.5
+                              font=medium
+                              @text-fg
                           if !empty(chat_detail)
                             text chat_detail size=10.5 @text-meta
                         if !empty(saga_id)
                           button "Stop watching" @ghost_action -> emit(shell_chat_detach)
-                      keyed row in activity by=row.id #activity
-                        with
-                          w=fill
-                          gap=8.0
+                      keyed row in activity by=row.id #activity w=fill gap=8.0
                         lazy row as settled
                           ShellActivityRow row=settled
                   if chat_busy
@@ -528,7 +723,11 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
                     // unrelated message (a keystroke, a tick) does not.
                     lazy live by live, dark as streamed
                       extern agent_markdown(streamed, dark) #live-answer -> emit(shell_open_link, _)
-        box w=fill h=1.0 bg=separator
+        box
+          with
+            w=fill
+            h=1.0
+            bg=separator
           space w=1.0 h=1.0
         box
           with
@@ -548,7 +747,11 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
                     border=border
                     border-w=1.0
                     r=15.0
-                  row w=fill gap=6.0 align=center
+                  row
+                    with
+                      w=fill
+                      gap=6.0
+                      align=center
                     extern rich_composer(draft, agent_composer_hint(provider), (!connected || chat_busy || empty(credential) || !empty(detached_saga)), 40.0, 150.0, 8.0) #draft -> emit(shell_composer_event, _)
                     button #send -> emit(shell_composer_event, composer_submit_event())
                       with
@@ -560,28 +763,38 @@ component ShellScreen(surface:ShellSurface, setup_open:bool, identity_options:[s
                       // message toolbar in components/chat.ice: a semibold
                       // string label sends every non-ASCII glyph down
                       // cosmic-text's walk-every-face fallback path.
-                      text "↑"
-                        with
-                          size=12.5
-                          font=ui
+                      text "↑" size=12.5 font=ui
                       active bg=primary text=primary_fg r=16.0
                       hovered bg=primary_hover text=primary_fg r=16.0
                       disabled bg=disabled text=disabled_fg r=16.0
                 // A DISABLED SEND SAYS WHY. The three reasons it can be off are
                 // three different things to do next, and the operator used to
                 // get a grey circle for all of them.
-                row w=fill gap=8.0 align=center
+                row
+                  with
+                    w=fill
+                    gap=8.0
+                    align=center
                   if empty(credential)
                     text "Pick a credential above to send a task." size=10.5 @text-meta
                   if !empty(credential) && !empty(detached_saga)
-                    text "Reopen or discard the run above before sending another." size=10.5 @text-meta
+                    text "Reopen or discard the run above before sending another."
+                      with
+                        size=10.5
+                        @text-meta
                   if !empty(credential) && empty(detached_saga) && chat_busy
-                    text "A task is running — stop watching it to send another." size=10.5 @text-meta
+                    text "A task is running — stop watching it to send another."
+                      with
+                        size=10.5
+                        @text-meta
                   space w=fill
                   // A reset would take the detached run's id with it, and that
                   // id is the only way back to a saga that is still executing.
                   // Reopen or Discard says which — a "New chat" click does not.
                   if !empty(entries)
-                    button "New chat" disabled=(chat_busy || !empty(detached_saga)) @ghost_action -> emit(shell_chat_reset)
+                    button "New chat" -> emit(shell_chat_reset)
+                      with
+                        disabled=(chat_busy || !empty(detached_saga))
+                        @ghost_action
                   if !chat_busy
                     text "Enter to send · Shift+Enter for a new line" size=10.0 @text-hint

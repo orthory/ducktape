@@ -141,10 +141,7 @@ component RepoCard(repo:ForgeRepo)
             name="branch"
             tone="muted"
             px=14.0
-        box
-          with
-            w=fill
-            clip=true
+        box w=fill clip=true
           text repo.name
             with
               size=13.5
@@ -1672,7 +1669,9 @@ component ForgeTrackerList(phase:ForgePhase, items:[ForgeItem], empty_message:st
           EmptyPlate message="Loading repository tracker…"
       ForgePhase.failed
         box w=fill p=22.0
-          EmptyPlate message="Could not load this repository. Return to all repos and open it again to retry."
+          EmptyPlate
+            with
+              message="Could not load this repository. Return to all repos and open it again to retry."
       ForgePhase.ready
         col w=fill h=fill
           if empty(items)

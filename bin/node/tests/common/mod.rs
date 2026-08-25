@@ -1153,6 +1153,14 @@ impl Cluster {
             cfg.push_str(&format!("wireguard_listen = \"127.0.0.1:{}\"\n", ports[0]));
             cfg.push_str(&format!("invite_listen = \"127.0.0.1:{}\"\n", ports[3]));
         }
+        // the joiner runs the same node.toml a member does — including whatever
+        // the test appended. Skipping it made a joiner silently diverge from the
+        // cluster it was joining (a hermetic `primary_coordinator = "none"` on
+        // the members, and a joiner still dialing the live public coordinator).
+        for line in &self.extra_toml {
+            cfg.push_str(line);
+            cfg.push('\n');
+        }
         std::fs::write(&path, cfg).expect("write joiner config");
 
         let log = self.dir.path().join(format!("node{id}.log"));

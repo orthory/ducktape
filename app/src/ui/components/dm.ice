@@ -53,7 +53,11 @@ component DmButton(peer:DmPeer, selected:bool, unread:bool, disabled:bool)
                 pr=8.0
                 pt=6.0
                 pb=6.0
-              DmRow peer=peer selected=true unread=unread
+              DmRow
+                with
+                  peer=peer
+                  selected=true
+                  unread=unread
           active bg=selected_row text=fg border=transparent border-w=1.0 r=7.0
           hovered bg=selected_row text=fg
           pressed bg=rail_hover text=fg
@@ -73,7 +77,11 @@ component DmButton(peer:DmPeer, selected:bool, unread:bool, disabled:bool)
               pr=8.0
               pt=6.0
               pb=6.0
-            DmRow peer=peer selected=false unread=unread
+            DmRow
+              with
+                peer=peer
+                selected=false
+                unread=unread
           active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
           hovered bg=rail_hover text=fg
           pressed bg=subtle text=fg

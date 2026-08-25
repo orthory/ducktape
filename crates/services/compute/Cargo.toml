@@ -27,7 +27,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 # every decision this crate makes about a run — skipped, deduped, delivered,
-# suppressed — was invisible before: no tracing, two eprintln!s.
+# suppressed — was invisible before: no tracing, two eprintln!s, and raw stderr
+# reaches neither the app's Logs tab nor RUST_LOG.
 tracing = { workspace = true }
 
 [dev-dependencies]

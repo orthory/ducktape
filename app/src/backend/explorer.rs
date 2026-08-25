@@ -152,8 +152,8 @@ pub(crate) fn explorer_trace(operations: Option<&Vec<serde_json::Value>>) -> Str
             let module = op["module"].as_str().unwrap_or("?");
             let msgs = op["emitted_msgs"].as_i64().unwrap_or(0);
             let events = op["emitted_events"].as_i64().unwrap_or(0);
-            let emitted_msgs = plural(msgs, "msg".into(), "msgs".into());
-            let emitted_events = plural(events, "event".into(), "events".into());
+            let emitted_msgs = plural(msgs, "msg", "msgs");
+            let emitted_events = plural(events, "event", "events");
             format!("{module} · {emitted_msgs} · {emitted_events}")
         })
         .collect::<Vec<_>>()
@@ -161,8 +161,11 @@ pub(crate) fn explorer_trace(operations: Option<&Vec<serde_json::Value>>) -> Str
 }
 
 /// The ops of the selected block (0 selects nothing).
-pub fn explorer_ops_at(ops: Vec<ExplorerOp>, height: i64) -> Vec<ExplorerOp> {
-    ops.into_iter().filter(|op| op.height == height).collect()
+pub fn explorer_ops_at(ops: &[ExplorerOp], height: i64) -> Vec<ExplorerOp> {
+    ops.iter()
+        .filter(|op| op.height == height)
+        .cloned()
+        .collect()
 }
 
 /// The global-key router for the command palette: platform-Command+K
@@ -225,7 +228,7 @@ pub fn topmost_overlay(
     message_action: crate::MessageAction,
     channel_settings_open: bool,
     page_delete_armed: bool,
-    fs_delete_target: String,
+    fs_delete_target: &str,
     forge_repo_menu: bool,
 ) -> String {
     let on_chat = shell_tab == crate::ShellTab::Chat;
@@ -323,7 +326,7 @@ pub fn escape_target(
         message_action,
         channel_settings_open,
         page_delete_armed,
-        fs_delete_target,
+        &fs_delete_target,
         forge_repo_menu,
     );
     // `palette_key_action` owns the palette's keys — an open palette swallows
@@ -407,7 +410,7 @@ pub fn content_scroll_step(
 
 /// True when the live connection is in a state the shell should banner:
 /// the stream is down, retrying, or a resync failed and is backing off.
-pub fn connection_degraded(status: String) -> bool {
+pub fn connection_degraded(status: &str) -> bool {
     status == "Offline"
         || status == "Sync delayed"
         || status == "Reconnecting…"

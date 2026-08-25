@@ -3298,7 +3298,7 @@ mod tests {
             }
         });
         let created = terminals
-            .create("claude", mode)
+            .create("claude", mode, crate::term::SessionSize::default())
             .await
             .expect("the daemon answered the create");
         (handle, created.session_id, link, seen)

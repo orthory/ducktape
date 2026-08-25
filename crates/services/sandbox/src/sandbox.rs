@@ -102,6 +102,17 @@ impl SandboxBackend {
             }
         }
         self.probe_host_capabilities()?;
+        // Once per DAEMON BOOT — the crate's whole `info` budget, and the only
+        // line that separates "this daemon probed green" from "this daemon
+        // never reached the probe". The FAILURE arms stay as the returned Err:
+        // the compute daemon dies on it and the operator reads it from main, so
+        // an `error!` here would double-report.
+        tracing::info!(
+            target: "ducktape::sandbox",
+            event = "sandbox_backend_ready",
+            backend = self.runtime_bin(),
+            "the sandbox backend probed green"
+        );
         Ok(found)
     }
 

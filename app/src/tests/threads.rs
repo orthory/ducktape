@@ -86,7 +86,7 @@ fn the_thread_rail_virtualizes_and_caches_its_quiet_replies() {
         "keyed thread_message in messages by=thread_message.view_key w=fill gap=3.0 virtual-row=44.0"
     ));
     assert!(chat.contains(
-        "lazy thread_messages by thread_messages_revision, active_channel, active_thread_seq, thread_target_seq, thread_selected_seq, loading as cached_thread_messages"
+        "lazy thread_messages by thread_messages_revision, active_channel, active_thread_seq, thread_target_seq, thread_selected_seq as cached_thread_messages"
     ));
     // A `lazy` subtree reads nothing but its dependency, so the quiet arm can
     // only exist because the rows that read SCREEN state — the search target
@@ -134,9 +134,7 @@ fn thread_messages_mirror_the_main_action_system() {
     // Confirmation is the pending dot disappearing, so the card needs no
     // timer or animation prop. (`card` starts right after the component name,
     // so the signature is its head.)
-    assert!(
-        card.starts_with("(message:ChatMessage, selected:bool, menu_open:bool, disabled:bool)")
-    );
+    assert!(card.starts_with("(message:ChatMessage, selected:bool, menu_open:bool)"));
     // `menu_open` cannot be `selected` here: in the rail `selected` marks the
     // deep-link TARGET reply, not the row whose action card is open.
     let chat_screen_rail = inlined(include_str!("../ui/screens/chat.ice"));

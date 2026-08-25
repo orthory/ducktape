@@ -183,7 +183,7 @@ pub fn selected_network_endpoint(networks: Vec<HubNetwork>, id: String) -> Strin
 
 /// The create ceremony's refusal, or empty when the pair is acceptable —
 /// the same floor the CLI enforces (8 scalar chars).
-pub fn password_problem(password: String, confirm: String) -> String {
+pub fn password_problem(password: &str, confirm: &str) -> String {
     if password.chars().count() < 8 {
         return "The password needs at least 8 characters.".into();
     }
@@ -281,13 +281,13 @@ pub fn apply_network_probe(networks: Vec<HubNetwork>, probe: HubProbe) -> Vec<Hu
 
 /// The command that starts a dead local network's node — the honest row
 /// subtitle, same doctrine as provisioning's `blocked` step.
-pub fn network_run_hint(row: HubNetwork) -> String {
+pub fn network_run_hint(row: &HubNetwork) -> String {
     if row.kind != "local" {
         return "node unreachable".into();
     }
     let selector = match row.chain_id.is_empty() {
-        true => row.id,
-        false => row.chain_id,
+        true => &row.id,
+        false => &row.chain_id,
     };
     format!("not running · ducktape node run -n {selector}")
 }

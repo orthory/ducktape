@@ -745,12 +745,15 @@ async fn execute(
                 let (receipt, status) = match commit_result {
                     Some(Ok(receipt)) => (receipt, crate::provision::Status::Ok),
                     Some(Err(e)) => {
+                        // This is what a `degraded: true` run looks like from
+                        // the inside, and on raw stderr it reached no operator:
+                        // the chain says degraded, the node said nothing.
                         tracing::warn!(
                             target: "ducktape::compute",
-                            run = %spec.run_id,
                             reason = "workspace_commit_failed",
+                            run = %spec.run_id,
                             error = %e,
-                            "a run's answer delivers but its workspace commit did not"
+                            "the run's workspace did not commit; delivering degraded"
                         );
                         (
                             crate::provision::WorkspaceReceipt::commit_failed(&spec, e),
@@ -770,10 +773,10 @@ async fn execute(
                             format!("commit timed out after {:?}", workspace_step_timeout());
                         tracing::warn!(
                             target: "ducktape::compute",
-                            run = %spec.run_id,
                             reason = "workspace_commit_timeout",
+                            run = %spec.run_id,
                             timeout_s = workspace_step_timeout().as_secs(),
-                            "a run's answer delivers but its workspace commit did not"
+                            "the run's workspace commit timed out; delivering degraded"
                         );
                         (
                             crate::provision::WorkspaceReceipt::commit_failed(&spec, error),

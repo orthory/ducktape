@@ -318,6 +318,12 @@ where
                     };
                     let Some(Ok((peer, msg))) = frame else { break };
                     let bytes: Vec<u8> = msg.into();
+                    tracing::trace!(
+                        target: "ducktape::reachability",
+                        peer = %hex_bytes(&peer.as_ref()[..4]),
+                        bytes = bytes.len(),
+                        "plane frame in"
+                    );
                     let deliver = reachability::ReachabilityCommand::Deliver { from: peer, bytes };
                     if cmd.send(deliver).await.is_err() {
                         break;
@@ -342,7 +348,24 @@ where
                 while let Some(event) = ev_rx.recv().await {
                     match event {
                         reachability::ReachabilityEvent::Send { to, bytes } => {
-                            let _ = tx.send(Recipients::One(to), IoBuf::from(bytes), false);
+                            // `send` is fire-and-forget and returns the
+                            // recipients it will ATTEMPT — empty means the
+                            // lane refused it outright (peer not connected,
+                            // rate-limited, sender closed). Dropping that
+                            // return silently is how a one-way plane looks
+                            // healthy from the side that is still talking.
+                            let size = bytes.len();
+                            let attempted =
+                                tx.send(Recipients::One(to.clone()), IoBuf::from(bytes), false);
+                            if attempted.is_empty() {
+                                tracing::debug!(
+                                    target: "ducktape::reachability",
+                                    node = %pump_label,
+                                    peer = %hex_bytes(&to.as_ref()[..4]),
+                                    bytes = size,
+                                    "plane send refused by the lane"
+                                );
+                            }
                         }
                         reachability::ReachabilityEvent::MeshReady { epoch, .. } => {
                             tracing::info!(
@@ -988,12 +1011,56 @@ async fn reachability_plane(
     }
 }
 
-/// how long without a completed handshake before a peer is called DARK.
+/// how long a peer may hold NO live session before it is called DARK.
 ///
-/// WireGuard rekeys well inside this (REKEY_AFTER_TIME is 120s and the timer
-/// pump drives retransmits), so exceeding it means the crypto handshake is not
-/// completing at all — not that traffic is merely idle.
-const HANDSHAKE_DARK_AFTER: Duration = Duration::from_secs(180);
+/// Measured from the last sample that SAW a session, never from the session's
+/// own age: WireGuard rejects a session older than REJECT_AFTER_TIME (180s) and
+/// boringtun then reports no handshake AT ALL rather than an old one, so an
+/// idle tunnel loses its age and its session together. Every mesh peer carries
+/// a persistent keepalive (`reachability::KEEPALIVE_SECONDS`, 25s), which
+/// re-establishes a session within a keepalive plus a handshake round trip of
+/// the lapse — a peer with none for this long is one whose handshake is
+/// FAILING, not one that idled.
+const NO_SESSION_DARK_AFTER: Duration = Duration::from_secs(180);
+
+/// one peer's liveness verdict for one sample, from [`session_verdicts`].
+pub(crate) struct PeerLiveness {
+    pub(crate) ip: std::net::Ipv6Addr,
+    pub(crate) live: bool,
+    /// the live session's age — `None` while there is no session.
+    pub(crate) session_age: Option<Duration>,
+    /// how long this peer has had no session — `None` when one was never seen.
+    pub(crate) no_session_for: Option<Duration>,
+}
+
+/// Fold one probe sample into the sampler's memory and decide each peer.
+///
+/// The memory is the whole point. `probe.peers()` reports a session's age or
+/// nothing, and "nothing" covers BOTH "never handshaked" and "the session
+/// lapsed while idle" — reading it alone calls a healthy tunnel dark for the
+/// ~20s between a lapse and the keepalive that heals it, every REJECT_AFTER_TIME.
+/// Remembering when a session was last seen is what tells those two apart.
+pub(crate) fn session_verdicts(
+    last_session: &mut HashMap<std::net::Ipv6Addr, tokio::time::Instant>,
+    now: tokio::time::Instant,
+    peers: &[(std::net::Ipv6Addr, Option<Duration>)],
+) -> Vec<PeerLiveness> {
+    peers
+        .iter()
+        .map(|(ip, session_age)| {
+            if session_age.is_some() {
+                last_session.insert(*ip, now);
+            }
+            let no_session_for = last_session.get(ip).map(|seen| now.duration_since(*seen));
+            PeerLiveness {
+                ip: *ip,
+                live: no_session_for.is_some_and(|idle| idle < NO_SESSION_DARK_AFTER),
+                session_age: *session_age,
+                no_session_for,
+            }
+        })
+        .collect()
+}
 
 /// Watch whether WireGuard handshakes actually COMPLETE, and say so on transition.
 ///
@@ -1016,6 +1083,8 @@ fn spawn_handshake_sampler(probes: overlay_net::userspace::ProbeSlot, label: Str
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // peer -> was it live at the last sample? the transition IS the event.
         let mut live: HashMap<std::net::Ipv6Addr, bool> = HashMap::new();
+        // peer -> when a session was last SEEN (see `session_verdicts`).
+        let mut last_session: HashMap<std::net::Ipv6Addr, tokio::time::Instant> = HashMap::new();
         loop {
             tick.tick().await;
             let Some(probe) = probes.get() else {
@@ -1025,17 +1094,16 @@ fn spawn_handshake_sampler(probes: overlay_net::userspace::ProbeSlot, label: Str
                 continue;
             };
             let peers = probe.peers();
-            for (ip, since) in &peers {
-                let is_live = since.is_some_and(|elapsed| elapsed < HANDSHAKE_DARK_AFTER);
-                match live.insert(*ip, is_live) {
-                    Some(was) if was == is_live => {}
+            for peer in session_verdicts(&mut last_session, tokio::time::Instant::now(), &peers) {
+                match live.insert(peer.ip, peer.live) {
+                    Some(was) if was == peer.live => {}
                     // first sight of a peer that is already handshaking, or a peer
                     // that recovered.
-                    _ if is_live => tracing::info!(
+                    _ if peer.live => tracing::info!(
                         target: "ducktape::reachability",
                         node = %label,
-                        peer_ula = %ip,
-                        since_handshake_s = since.map(|d| d.as_secs()),
+                        peer_ula = %peer.ip,
+                        since_handshake_s = peer.session_age.map(|d| d.as_secs()),
                         "peer handshake COMPLETE — the tunnel is actually carrying traffic"
                     ),
                     // first sight of a peer that has never handshaked, or one that
@@ -1044,9 +1112,9 @@ fn spawn_handshake_sampler(probes: overlay_net::userspace::ProbeSlot, label: Str
                     _ => tracing::warn!(
                         target: "ducktape::reachability",
                         node = %label,
-                        peer_ula = %ip,
-                        since_handshake_s = since.map(|d| d.as_secs()),
-                        ever_handshaked = since.is_some(),
+                        peer_ula = %peer.ip,
+                        no_session_for_s = peer.no_session_for.map(|d| d.as_secs()),
+                        ever_handshaked = peer.no_session_for.is_some(),
                         "peer DARK — its tunnel config is applied but no WireGuard \
                          handshake has completed; traffic to it is going nowhere"
                     ),
@@ -1054,6 +1122,7 @@ fn spawn_handshake_sampler(probes: overlay_net::userspace::ProbeSlot, label: Str
             }
             // a peer removed from the table (epoch change) is not a transition.
             live.retain(|ip, _| peers.iter().any(|(seen, _)| seen == ip));
+            last_session.retain(|ip, _| peers.iter().any(|(seen, _)| seen == ip));
         }
     });
 }

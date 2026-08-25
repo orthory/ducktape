@@ -86,7 +86,7 @@ fn message_action_toolbar_stays_compact_and_accessible() {
         assert!(toolbar.contains(&format!("label=\"{label}\"")));
     }
     assert!(components.contains(
-        "button label=\"Open thread\" disabled=disabled p=5.0 @icon_action -> emit(open_thread_for, message.seq)"
+        "button label=\"Open thread\" p=5.0 @icon_action -> emit(open_thread_for, message.seq)"
     ));
 
     let chat = inlined(include_str!("../ui/screens/chat.ice"));
@@ -1508,20 +1508,18 @@ fn every_repeated_component_mount_is_culled_or_argued() {
     }
 }
 
-/// EVERY EXTERN ARGUMENT IS BY VALUE, SO A LIST ARGUMENT IS A DEEP CLONE.
+/// AN OWNED LIST PARAMETER IS A DEEP CLONE, SO A VIEW MAY NOT FEED ONE.
 ///
-/// `sync`/`pure f(rows:[T])` called from a view expression clones the whole list into
-/// the call, once per frame, per call site — and if the site sits inside a
-/// `for`, once per row per frame. Feature state records three fields
-/// (`unread_marker_seq`, `has_older_history`, `rooms`) that exist only because
-/// this was measured and paid for; the fix is always the same, mirror the
-/// answer into state where the list is written.
-///
-/// So: a view may not hand a list to an extern. The ledger below is every
-/// place that still does — pre-existing, on screens whose frame cost nobody
-/// has measured. It is a ratchet, not a blessing: the next one fails.
+/// `sync`/`pure`/`component f(rows:[T])` called from a view expression clones
+/// the whole list into the call, once per frame, per call site — and if the
+/// site sits inside a `for`, once per row per frame. The fix is the borrowed
+/// parameter (`rows:&[T]`, `s:&str`, `doc:&editor`): the generated call then
+/// lends the state field for the duration of the call and nothing is cloned.
+/// Every list-taking extern a view reaches declares the borrowed form now;
+/// this is the ratchet that keeps it so — the next owned one fails here,
+/// naming the site.
 #[test]
-fn no_view_expression_hands_an_extern_a_list() {
+fn no_view_expression_hands_an_extern_an_owned_list() {
     let list_taking: Vec<String> = ice_sources()
         .into_iter()
         .filter(|(path, _)| path.replace('\\', "/").contains("/extern/"))
@@ -1532,7 +1530,8 @@ fn no_view_expression_hands_an_extern_a_list() {
                     let declaration = line
                         .trim()
                         .strip_prefix("sync ")
-                        .or_else(|| line.trim().strip_prefix("pure "))?;
+                        .or_else(|| line.trim().strip_prefix("pure "))
+                        .or_else(|| line.trim().strip_prefix("component "))?;
                     let (name, rest) = declaration.split_once('(')?;
                     let (args, _) = rest.split_once(')')?;
                     args.contains(":[").then(|| name.to_owned())
@@ -1545,56 +1544,14 @@ fn no_view_expression_hands_an_extern_a_list() {
         "the extern sweep found the declarations, not an empty file"
     );
 
-    // (file, extern). Every entry clones once per frame and predates this
-    // sweep; the sweep exists so the next one does not.
-    const ARGUED: &[(&str, &str)] = &[
-        // 1. ONCE PER FRAME — one clone of a workspace-shaped list per
-        //    rebuild. The mount file's props are the bulk of it: `view.ice`
-        //    is evaluated once, not per row.
-        ("view.ice", "member_tier"),
-        ("view.ice", "members_is_admin"),
-        ("view.ice", "bell_worst_severity"),
-        ("view.ice", "open_proposals"),
-        ("view.ice", "any_agent_active"),
-        ("screens/node.ice", "member_tier"),
-        ("screens/node.ice", "members_is_admin"),
-        ("screens/settings.ice", "member_tier"),
-        ("screens/settings.ice", "members_is_admin"),
-        ("screens/settings.ice", "members_summary"),
-        ("screens/pages.ice", "doc_tab_rows"),
-        ("screens/pages.ice", "subpage_blocks"),
-        ("screens/pages.ice", "thread_is_resolved"),
-        ("screens/pages.ice", "comment_compose_hint"),
-        ("screens/forge.ice", "forge_open_count"),
-        ("screens/forge.ice", "filter_forge_items"),
-        ("screens/forge.ice", "forge_comment_cap_reached"),
-        ("screens/storage.ice", "fs_counts_summary"),
-        ("screens/storage.ice", "explorer_ops_at"),
-        ("screens/governance.ice", "proposals_summary"),
-        ("screens/governance.ice", "open_proposals"),
-        ("screens/governance.ice", "pending_label"),
-        ("screens/governance.ice", "settled_proposals"),
-        ("screens/roster.ice", "members_summary"),
-        ("screens/roster.ice", "agents_summary"),
-        ("screens/roster.ice", "filter_members"),
-    ];
-
     let mut cloned: Vec<String> = Vec::new();
-    let mut matched: Vec<(&str, &str)> = Vec::new();
     for (path, source) in view_sources() {
         let path = path.replace('\\', "/");
         for line in inlined(&source).lines() {
             let code = code_of(line);
             for name in &list_taking {
-                if !calls(code, name) {
-                    continue;
-                }
-                match ARGUED
-                    .iter()
-                    .find(|(file, extern_name)| path.ends_with(file) && extern_name == name)
-                {
-                    Some(entry) => matched.push(*entry),
-                    None => cloned.push(format!("(\"{path}\", \"{name}\"), // {}", code.trim())),
+                if calls(code, name) {
+                    cloned.push(format!("(\"{path}\", \"{name}\"), // {}", code.trim()));
                 }
             }
         }
@@ -1602,17 +1559,11 @@ fn no_view_expression_hands_an_extern_a_list() {
 
     assert!(
         cloned.is_empty(),
-        "a view expression handed a list to an extern — the ABI is by value, so \
-         that is a deep clone of the whole list on every frame. Mirror the answer \
-         into a feature-state field written where the list is written:\n{}",
+        "a view expression handed a list to an extern that takes it by value — \
+         a deep clone of the whole list on every frame. Declare the parameter \
+         `&[T]` (and the Rust side `&[T]`) so the call borrows it instead:\n{}",
         cloned.join("\n")
     );
-    for entry in ARGUED {
-        assert!(
-            matched.contains(entry),
-            "{entry:?} argues for a call that is gone — delete the entry"
-        );
-    }
 }
 
 /// AN ICON GLYPH IS NEVER A BUTTON STRING LABEL.

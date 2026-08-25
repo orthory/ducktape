@@ -52,8 +52,8 @@ pub(crate) fn live_resync(module: &str, height: i64) -> LiveUpdate {
 /// second Vec, per icon, per frame, on a surface that mounts dozens of them
 /// outside the cached message rows. `bytes` lowers to the Vec the handle wants
 /// and the copy happens once.
-pub fn icon(name: impl AsRef<str>) -> Vec<u8> {
-    design::icons::svg(name.as_ref()).as_bytes().to_vec()
+pub fn icon(name: &str) -> Vec<u8> {
+    design::icons::svg(name).as_bytes().to_vec()
 }
 
 /// The titlebar's extra left padding. On macOS the window is drawn with a

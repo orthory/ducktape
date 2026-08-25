@@ -80,6 +80,16 @@ pub fn sized_for_read_only(dir: &Path) -> Result<u64, String> {
 /// unnamed.
 pub fn size_or_refuse(what: &str, dir: &Path, size: u64) -> Result<u64, String> {
     if size > MAX_WORKSPACE_BYTES {
+        // countable, because "this node refuses every run" and "this one tree
+        // is too big" look identical from the outside until you can count them.
+        tracing::warn!(
+            target: "ducktape::sandbox",
+            reason = "image_over_cap",
+            what,
+            size,
+            cap = MAX_WORKSPACE_BYTES,
+            "refusing to build an image over the cap"
+        );
         return Err(format!(
             "the {what} at {} need {size} bytes of image, over the \
              {MAX_WORKSPACE_BYTES}-byte cap",
@@ -112,6 +122,7 @@ fn tree_bytes(dir: &Path) -> Result<u64, String> {
 
 /// build an ext4 image of exactly `bytes` populated from `workdir`.
 pub fn build(workdir: &Path, image: &Path, bytes: u64) -> Result<(), String> {
+    let started = std::time::Instant::now();
     let tool = crate::host_tools::find_system_tool("mke2fs")
         .ok_or_else(|| "mke2fs is not on PATH; install e2fsprogs".to_string())?;
     let blocks = bytes.div_ceil(4096);
@@ -129,6 +140,13 @@ pub fn build(workdir: &Path, image: &Path, bytes: u64) -> Result<(), String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
+    // the other half of a run's fixed cost, beside the copy back.
+    tracing::debug!(
+        target: "ducktape::sandbox",
+        bytes,
+        build_ms = started.elapsed().as_millis() as u64,
+        "workspace image built"
+    );
     Ok(())
 }
 

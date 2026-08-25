@@ -31,7 +31,7 @@
 //! it and are exercised end-to-end against a live plane.
 
 use std::future::Future;
-use std::net::{SocketAddr, ToSocketAddrs as _};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs as _};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -173,30 +173,104 @@ pub struct InviterContact {
 pub fn build_candidates(inviter: Option<InviterContact>, fronts: &[Front]) -> Vec<Candidate> {
     let mut out = Vec::new();
     if let Some(inv) = inviter {
-        out.push(Candidate {
-            key: inv.key,
-            wg: inv.wg,
-            mesh_port: inv.mesh_port,
-            endpoint: inv.endpoint,
-            // the inviter advertises its intro listener explicitly; honor it.
-            intro: inv.intro,
-        });
+        push_with_offnet_twin(
+            &mut out,
+            Candidate {
+                key: inv.key,
+                wg: inv.wg,
+                mesh_port: inv.mesh_port,
+                endpoint: inv.endpoint,
+                // the inviter advertises its intro listener explicitly; honor it.
+                intro: inv.intro,
+            },
+        );
     }
     for front in fronts {
         match ed25519::PublicKey::decode(&front.member_key[..]) {
-            Ok(key) => out.push(Candidate {
-                key,
-                wg: front.wireguard_public_key,
-                mesh_port: front.mesh_port,
-                endpoint: front.endpoint.clone(),
-                // fronts advertise no separate intro listener — the direct
-                // path derives `wg_port + 1`.
-                intro: None,
-            }),
+            Ok(key) => push_with_offnet_twin(
+                &mut out,
+                Candidate {
+                    key,
+                    wg: front.wireguard_public_key,
+                    mesh_port: front.mesh_port,
+                    endpoint: front.endpoint.clone(),
+                    // fronts advertise no separate intro listener — the direct
+                    // path derives `wg_port + 1`.
+                    intro: None,
+                },
+            ),
             Err(_) => continue,
         }
     }
     out
+}
+
+/// Push `candidate`, and — when its endpoint only carries inside its own
+/// network — a COORDINATED twin of the same member beside it.
+///
+/// An invite minted on a LAN advertises its members as
+/// `endpoint: Some("192.168.0.70:51821")`, and `Some` means DIRECT. A joiner
+/// on any other network then spends the entire join window announcing intros
+/// at an address that cannot answer, and never drives the coordinated
+/// rendezvous — the very mechanic that, one layer down, already punched its
+/// WireGuard tunnel to that same member up. The endpoint says where a member
+/// is, never whether THIS joiner can get there, so the unroutable case offers
+/// both mechanics and lets the race decide.
+///
+/// The twin costs one extra concurrent attempt on a LAN join, where the
+/// direct path wins in one RTT; off the LAN it is the only path there is.
+fn push_with_offnet_twin(out: &mut Vec<Candidate>, candidate: Candidate) {
+    let reachable_only_on_its_own_network = candidate
+        .endpoint
+        .as_deref()
+        .is_some_and(endpoint_is_unroutable_offnet);
+    let twin = reachable_only_on_its_own_network.then(|| Candidate {
+        key: candidate.key.clone(),
+        wg: candidate.wg,
+        mesh_port: candidate.mesh_port,
+        // `None` IS the coordinated mechanic (see `drive_first_contact`), and
+        // an intro listener on an unreachable host is unreachable too.
+        endpoint: None,
+        intro: None,
+    });
+    // direct first: on its own LAN that is the fast path, and the race reads
+    // in the order the invite offered.
+    out.push(candidate);
+    out.extend(twin);
+}
+
+/// Could a joiner on a DIFFERENT network route to this endpoint at all?
+///
+/// True for a `host:port` whose host is an IP literal in a range that only
+/// carries inside one network: RFC1918, loopback, link-local, the CGNAT
+/// shared block, or an IPv6 ULA — which is what the overlay itself numbers
+/// out of, making such a front reachable only once the tunnel it exists to
+/// bring up is already up. A DNS name is resolved per-attempt against the
+/// joiner's own resolver and is never judged here.
+fn endpoint_is_unroutable_offnet(endpoint: &str) -> bool {
+    let Ok(address) = endpoint.parse::<SocketAddr>() else {
+        return false;
+    };
+    match address.ip() {
+        IpAddr::V4(ip) => {
+            ip.is_private() || ip.is_loopback() || ip.is_link_local() || is_v4_shared_address(ip)
+        }
+        // `Ipv6Addr::is_unique_local`/`is_unicast_link_local` are still
+        // unstable; these are the same masks the wireguard crate's endpoint
+        // policy uses.
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || (ip.segments()[0] & 0xfe00) == 0xfc00
+                || (ip.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// the 100.64.0.0/10 shared address space: a node behind a carrier NAT is no
+/// more directly reachable than one behind a home router.
+fn is_v4_shared_address(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 100 && (octets[1] & 0b1100_0000) == 64
 }
 
 /// Race `attempt` across every candidate concurrently; the FIRST to settle
@@ -909,6 +983,82 @@ mod tests {
         assert!(matches!(direct.via(), ContactVia::Direct(_)));
         let coordinated = &candidates[2];
         assert_eq!(coordinated.via(), ContactVia::Coordinated);
+    }
+
+    #[test]
+    fn a_lan_only_endpoint_also_yields_a_coordinated_twin() {
+        // the bug: an invite minted on a LAN advertises `192.168.0.70:51821`
+        // as if it were routable. A joiner on another network can never reach
+        // it, and because the endpoint is `Some` the coordinated mechanic —
+        // the one that works — was never attempted for that member.
+        let fronts = vec![front(2, Some("192.168.0.70:51821"))];
+        let candidates = build_candidates(None, &fronts);
+        assert_eq!(
+            candidates.len(),
+            2,
+            "direct attempt PLUS a coordinated twin"
+        );
+        assert_eq!(
+            candidates[0].via(),
+            ContactVia::Direct("192.168.0.70:51821".into()),
+            "the LAN fast path stays first — a joiner on that LAN still wins directly"
+        );
+        assert_eq!(candidates[1].via(), ContactVia::Coordinated);
+        assert_eq!(
+            candidates[1].key, candidates[0].key,
+            "the twin is the SAME member, reached by identity"
+        );
+    }
+
+    #[test]
+    fn a_routable_endpoint_yields_no_twin() {
+        let fronts = vec![front(2, Some("93.184.216.34:51820"))];
+        let candidates = build_candidates(None, &fronts);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "a globally routable endpoint needs no coordinator detour"
+        );
+    }
+
+    #[test]
+    fn a_lan_only_inviter_also_yields_a_coordinated_twin() {
+        let candidates = build_candidates(Some(inviter(Some("10.0.0.5:51820"))), &[]);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[1].via(), ContactVia::Coordinated);
+        assert_eq!(candidates[1].key, key(1));
+    }
+
+    #[test]
+    fn unroutable_endpoints_are_classified_by_address_family() {
+        for endpoint in [
+            "192.168.0.70:51821",
+            "10.0.0.5:51820",
+            "172.16.3.9:51820",
+            "127.0.0.1:51820",
+            "169.254.7.7:51820",
+            "100.64.1.2:51820",
+            // the overlay's own ULA — a front advertising it is reachable
+            // only once the tunnel it is supposed to bring up already exists.
+            "[fd9c:3bb:532d:2938:59d5:a3f7:cab:840d]:9010",
+            "[fe80::1]:9010",
+        ] {
+            assert!(
+                endpoint_is_unroutable_offnet(endpoint),
+                "{endpoint} is reachable only from inside its own network"
+            );
+        }
+        for endpoint in [
+            "93.184.216.34:51820",
+            "[2606:2800:220:1:248:1893:25c8:1946]:51820",
+            // a name resolves per-attempt; the joiner cannot judge it here.
+            "p2p.ducktape.byeongsu.dev:51820",
+        ] {
+            assert!(
+                !endpoint_is_unroutable_offnet(endpoint),
+                "{endpoint} must keep the direct-only path"
+            );
+        }
     }
 
     #[tokio::test]

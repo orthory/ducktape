@@ -1526,8 +1526,8 @@ pub fn keep_folded_block_texts(
         .collect()
 }
 
-pub fn keep_str(loaded: bool, next: String, current: String) -> String {
-    if loaded { next } else { current }
+pub fn keep_str(loaded: bool, next: &str, current: &str) -> String {
+    if loaded { next } else { current }.to_owned()
 }
 
 pub fn keep_forge_phase(

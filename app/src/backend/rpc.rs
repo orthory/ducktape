@@ -486,14 +486,14 @@ pub struct DocTab {
 
 /// The rendered tab strip: open tabs that still exist, titled from the page
 /// list, the active one flagged.
-pub fn doc_tab_rows(tabs: Vec<String>, pages: Vec<PageItem>, active: String) -> Vec<DocTab> {
-    tabs.into_iter()
+pub fn doc_tab_rows(tabs: &[String], pages: &[PageItem], active: &str) -> Vec<DocTab> {
+    tabs.iter()
         .filter_map(|tab| {
-            let page = pages.iter().find(|page| page.id == tab)?;
+            let page = pages.iter().find(|page| page.id == *tab)?;
             Some(DocTab {
                 title: page.title.clone(),
                 active: tab == active,
-                id: tab,
+                id: tab.clone(),
             })
         })
         .collect()

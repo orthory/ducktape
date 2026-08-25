@@ -6,7 +6,7 @@ fn the_forge_hint_is_a_command_that_actually_pushes() {
     // creates the repo, and an uppercase one 404s the ref advertisement because
     // `forge::norm_repo` accepts `[a-z0-9._-]` only — so the placeholder has to
     // be a name the reader can paste unchanged.
-    let hint = forge_push_command("http://127.0.0.1:38259".into());
+    let hint = forge_push_command("http://127.0.0.1:38259");
     assert_eq!(
         hint,
         "git remote add ducktape http://127.0.0.1:38259/forge/my-repo && git push ducktape main"
@@ -18,7 +18,7 @@ fn the_forge_hint_is_a_command_that_actually_pushes() {
         .expect("the hint names a repo");
     assert!(forge::norm_repo(placeholder).is_ok());
     // A trailing slash on the endpoint must not double up in the URL.
-    assert_eq!(forge_push_command("http://127.0.0.1:38259/".into()), hint);
+    assert_eq!(forge_push_command("http://127.0.0.1:38259/"), hint);
 }
 
 #[test]
@@ -88,11 +88,11 @@ fn the_tracker_splits_into_open_prs_and_open_issues() {
         item(3, "issue", "open"),
         item(4, "issue", "closed"),
     ];
-    assert_eq!(filter_forge_items(items.clone(), ForgeTab::Pulls).len(), 2);
-    assert_eq!(filter_forge_items(items.clone(), ForgeTab::Issues).len(), 2);
-    assert!(filter_forge_items(items.clone(), ForgeTab::Code).is_empty());
-    assert_eq!(forge_open_count(items.clone(), "pr".into()), 1);
-    assert_eq!(forge_open_count(items, "issue".into()), 1);
+    assert_eq!(filter_forge_items(&items, ForgeTab::Pulls).len(), 2);
+    assert_eq!(filter_forge_items(&items, ForgeTab::Issues).len(), 2);
+    assert!(filter_forge_items(&items, ForgeTab::Code).is_empty());
+    assert_eq!(forge_open_count(&items, "pr"), 1);
+    assert_eq!(forge_open_count(&items, "issue"), 1);
 }
 
 #[test]

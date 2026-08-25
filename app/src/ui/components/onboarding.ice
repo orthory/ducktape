@@ -61,7 +61,11 @@ component HubColumn(step:HubStep, key_state:str, networks:[HubNetwork], selected
             forward
               reveal_confirm
         HubStep.restore
-          RestoreScreen busy=busy error=error phrase_empty=restore_empty
+          RestoreScreen
+            with
+              busy=busy
+              error=error
+              phrase_empty=restore_empty
             forward
               restore_submit
               go_login
@@ -105,7 +109,11 @@ component HubColumn(step:HubStep, key_state:str, networks:[HubNetwork], selected
               copy_onboarding_invite
               enter_console
         HubStep.join
-          JoinScreen busy=busy error=error invite_empty=join_empty
+          JoinScreen
+            with
+              busy=busy
+              error=error
+              invite_empty=join_empty
             forward
               go_networks
               join_network_submit

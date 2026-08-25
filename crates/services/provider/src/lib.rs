@@ -761,6 +761,13 @@ impl CliProvider {
             ));
         }
 
+        // the run's SIZE is decided before any directory exists: a refusal here
+        // is the commonest one there is (a spec that named no `cores`), and it
+        // used to leave an empty run dir behind every single time — one per
+        // refused attempt, with nothing to reap them.
+        let vcpus = vm_cores(&ctx.limits)?;
+        let mem_mib = vm_mem_mib(&ctx.limits)?;
+
         // ONE slot for both directories, drawn per boot: they are two halves of
         // the same run's scratch and are removed together when the VM drops.
         let slot = run_slot();
@@ -772,8 +779,8 @@ impl CliProvider {
             agent_volume: self.agent_volume.clone(),
             assets: run_dir.join("assets.ext4"),
             workspace: run_dir.join("workspace.ext4"),
-            vcpus: vm_cores(&ctx.limits)?,
-            mem_mib: vm_mem_mib(&ctx.limits)?,
+            vcpus,
+            mem_mib,
             vsock_uds: microvm_socket(&slot)?,
             // no tap: the guest reaches this node's broker over vsock and needs
             // no interface. See the spec's egress section.
@@ -1584,10 +1591,16 @@ struct ContextGuard(PathBuf);
 
 impl Drop for ContextGuard {
     fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_file(&self.0) {
-            eprintln!(
-                "[capability-host] removing the run's context document {} failed: {e}",
-                self.0.display()
+        if let Err(error) = std::fs::remove_file(&self.0) {
+            // Its twin, `RunHome::drop`, has always been a `tracing::warn` —
+            // this one printed to raw stderr, which reaches neither the app's
+            // Logs tab nor `RUST_LOG`.
+            tracing::warn!(
+                target: "ducktape::provider",
+                reason = "context_doc_not_removed",
+                document = %self.0.display(),
+                %error,
+                "the run's context document outlived its run"
             );
         }
     }
@@ -2181,6 +2194,17 @@ impl RunControl {
                 if let Some(pump) = handle.pump.take() {
                     pump.abort();
                 }
+                // THE run event, and the only `info` this lane spends: one line
+                // per run, carrying the one fact every other diagnosis starts
+                // from. A run spans many blocks, so this cannot fire more than
+                // once per block per run.
+                tracing::info!(
+                    target: "ducktape::sandbox",
+                    event = "sandbox_run_finished",
+                    run = %label,
+                    exit_code = code,
+                    "the guest's child exited"
+                );
                 Ok((code == 0, format!("exit code {code}")))
             }
         }
