@@ -1437,7 +1437,7 @@ impl SimplexOrderer {
     /// enqueues onto the very FIFO the automaton peeks — all over the shared
     /// `store`.
     ///
-    /// GENERIC over the simplex scheme `S` (the [`ConsensusScheme`] seam) with
+    /// GENERIC over the simplex scheme `S` (the scheme seam) with
     /// `S::PublicKey` pinned to ed25519 — the transport identity every p2p bound in
     /// this crate keys on; only the vote/certificate signatures vary by scheme. also
     /// generic over the runtime `context` E, the `blocker` B, and the three engine

@@ -6,12 +6,6 @@ use defguard_wireguard_rs::{InterfaceConfiguration, key::Key, net::IpAddrMask, p
 
 use crate::effect::WireGuardEffect;
 
-/// Apply a validated `TunnelInstallPlan` through a `WireGuardEffect`,
-/// bringing up (or replacing) the local WireGuard interface for this one
-/// peer relationship.
-///
-/// `peer_endpoint_override`, when set, replaces the plan's statically
-/// advertised `peer_endpoint` with a different address before applying —
 /// Reduce validated plans to the plain [`PeerTunnelConfig`] parts —
 /// the plan-independent form a caller can merge with peers from OTHER
 /// sources (a restored mesh, a standby's signed record) before one
@@ -62,7 +56,7 @@ pub const TUNNEL_MTU: u32 = 1420;
 
 /// The parts-level core both appliers share: ONE interface (own overlay
 /// addresses, listen port, private key) carrying every peer relationship.
-/// [`apply_tunnel_plans`] reduces validated plans to these parts; a mesh
+/// [`plan_peer_configs`] reduces validated plans to these parts; a mesh
 /// restored from persisted state (whose plans were validated in a PREVIOUS
 /// process life and are re-derived, not re-validated) calls this directly.
 pub fn apply_peer_tunnels<E: WireGuardEffect>(
@@ -322,7 +316,7 @@ mod tests {
 
     /// a minimal two-validator handshake, direct (no relay), yielding the
     /// INITIATOR's (a's) validated install plan and a's own listen port —
-    /// everything `apply_tunnel_plan` needs.
+    /// everything `apply_peer_tunnels` needs.
     fn two_party_plan() -> (TunnelInstallPlan, u16) {
         let a = PrivateKey::from_seed(1);
         let b = PrivateKey::from_seed(2);
@@ -573,7 +567,7 @@ mod tests {
 
     #[test]
     fn plan_peer_configs_matches_the_applied_reduction() {
-        // `apply_tunnel_plans` and a caller composing over
+        // the `plan_peer_configs` + `apply_peer_tunnels` two-step and a caller composing over
         // `plan_peer_configs` must produce the same peer entries — the
         // orchestrator merges these parts with record-derived peers, and a
         // drift here would mean the merged apply diverges from the plan-only
