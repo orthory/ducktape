@@ -45,6 +45,7 @@ pub const MAX_QUERY_LIMIT: u64 = 256;
 /// one member key as queries expose it: its public key, scheme, optional
 /// human label, and the block timestamp it was admitted at.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct MemberKeyView {
     pub pubkey: Vec<u8>,
     pub kind: KeyKind,
@@ -57,6 +58,7 @@ pub struct MemberKeyView {
 /// is a per-network on-chain fact, so a device's name shows on the user's other
 /// devices connected to the same network.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct NodeView {
     pub node_key: Vec<u8>,
     pub label: Option<String>,
@@ -64,6 +66,7 @@ pub struct NodeView {
 
 /// one account record as queries expose it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AccountView {
     /// the account's stable id -- the founding member key's bytes. it need not
     /// still be a current member (the founder can be removed while others
@@ -91,6 +94,7 @@ pub struct AccountView {
 /// over the operation's preimage. the account it speaks for is resolved from
 /// this key's membership -- never carried as a spoofable payload field.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct MemberAuth {
     pub key: Vec<u8>,
     pub kind: KeyKind,
@@ -98,7 +102,7 @@ pub struct MemberAuth {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum IdentityMsg {
     /// bind the SUBMITTING NODE (the verified origin -- never a payload field)
     /// to the account that `authorizer` is a member of, consented to by that
@@ -162,7 +166,7 @@ pub enum IdentityMsg {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum IdentityQuery {
     /// every account, ascending by account id, offset+limit paginated.
     All { from: u64, limit: u64 },
@@ -177,7 +181,7 @@ pub enum IdentityQuery {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum IdentityReply {
     Accounts(Vec<AccountView>),
     Account(Option<AccountView>),

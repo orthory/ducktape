@@ -88,7 +88,7 @@ impl RouteName {
     PartialOrd,
     Ord,
 )]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RouteMethod {
     Get,
     Head,
@@ -224,7 +224,7 @@ pub struct RouteSummary {
 #[derive(
     BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq,
 )]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum CredentialKind {
     Claude,
     Codex,
@@ -383,7 +383,7 @@ fn grant_op_preimage(op: u8, statement: &CredentialGrantStatement) -> Result<Vec
 // out would only add indirection on a cold path.
 #[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayMsg {
     /// Declaratively replace the authenticated account's optional `.duck`
     /// handle. `None` unregisters it without changing Identity.
@@ -414,7 +414,7 @@ pub enum GatewayMsg {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayQuery {
     /// Resolve one `.duck` name to the stable AccountId it aliases. Node
     /// selection is deliberately absent — resolution stops at the AccountId.
@@ -437,7 +437,7 @@ pub enum GatewayQuery {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayReply {
     /// The stable AccountId a `.duck` name resolves to, or `None`.
     Resolved(Option<ResolvedAccount>),

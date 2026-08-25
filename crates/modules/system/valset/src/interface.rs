@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ValsetMsg {
     /// add a validator. `key` MUST be a 32-byte ed25519 public key; the impl
     /// rejects a malformed key with `Error::Module`. a key holding resident
@@ -28,7 +28,7 @@ pub enum ValsetMsg {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ValsetQuery {
     /// the full committed validator set.
     Validators,
@@ -46,6 +46,7 @@ pub enum ValsetQuery {
 /// 32-byte ed25519 keys, disjoint by construction (grant refuses a current
 /// validator; join promotes a resident out of its tier in the same op).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct GenerationSet {
     pub generation: u64,
     pub validators: Vec<Vec<u8>>,
@@ -53,7 +54,7 @@ pub struct GenerationSet {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ValsetReply {
     /// the committed validators, sorted (order-independent).
     Validators(Vec<Vec<u8>>),

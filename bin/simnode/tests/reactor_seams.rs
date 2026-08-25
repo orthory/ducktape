@@ -381,7 +381,7 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
         // pages
         (
             "pages",
-            json!({ "create_page": { "page_id": "p1", "title": "Sweep", "parent": null } }),
+            json!({ "create_page": { "page_id": "p1", "title": "Sweep" } }),
             Some("owner".into()),
         ),
         // agent

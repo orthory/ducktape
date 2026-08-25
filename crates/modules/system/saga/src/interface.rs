@@ -113,7 +113,7 @@ pub const MAX_CAPABILITY_BYTES: usize = 64;
     PartialOrd,
     Ord,
 )]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SagaOrigin {
     /// an external submitter, identified by (e.g.) an ed25519 id.
     External(Vec<u8>),
@@ -158,7 +158,7 @@ pub fn take_origin(cur: &mut codec::Cursor) -> Result<SagaOrigin, sdk::Error> {
 
 /// ops targeting the saga module.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SagaMsg {
     /// start a saga running the async work described by `spec`. a duplicate
     /// `saga_id` (staged or committed) is a deterministic no-op. `reply_to`
@@ -253,6 +253,7 @@ pub enum SagaMsg {
 /// and reasoning tokens are subsets of input/output respectively; totals are
 /// therefore `input_tokens + output_tokens`, never the sum of every field.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
@@ -270,6 +271,7 @@ pub struct TokenUsage {
 /// [`SagaMsg::Accept`] instead of running, and the accept's re-emitted
 /// request (now naming the winner) is the actual work order.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerRequest {
     pub saga_id: SagaId,
     pub attempt: u32,
@@ -286,6 +288,7 @@ pub const WORKER_CONTROL_KIND: &str = "ducktape_worker_control";
 
 /// a host-local control effect for one already-issued attempt.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerControl {
     pub kind: String,
     pub command: WorkerControlCommand,
@@ -307,7 +310,7 @@ impl WorkerControl {
 /// commands carried by [`WorkerControl`]. the assignee makes cancellation
 /// node-scoped; every other host treats it as a claimed no-op.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkerControlCommand {
     CancelAttempt {
         saga_id: SagaId,
@@ -322,7 +325,7 @@ pub enum WorkerControlCommand {
 #[derive(
     BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq,
 )]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SagaStatus {
     Pending,
     Done,
@@ -341,7 +344,7 @@ impl SagaStatus {
 /// how a saga ended — the callback's verdict, mirroring the terminal
 /// [`SagaStatus`] and carrying its payload.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SagaOutcome {
     /// the agreed oracle result.
     Done(Vec<u8>),
@@ -358,6 +361,7 @@ pub enum SagaOutcome {
 /// caused it. `payload` echoes the trigger's `reply_payload` so the requester
 /// can correlate without keeping a saga_id index.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SagaCallback {
     pub saga_id: SagaId,
     pub payload: Vec<u8>,
@@ -365,7 +369,7 @@ pub struct SagaCallback {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SagaQuery {
     Get {
         saga_id: SagaId,
@@ -414,6 +418,7 @@ pub enum SagaQuery {
 
 /// one page of a pending projection, plus where to resume.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PendingPage {
     /// the page's requests, ascending by saga id.
     pub requests: Vec<WorkerRequest>,
@@ -429,7 +434,7 @@ pub struct PendingPage {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 // Query replies are the public serde wire surface; keep the ergonomic variant
 // payloads instead of boxing only to shrink this in-memory enum.
 #[allow(
@@ -445,6 +450,7 @@ pub enum SagaReply {
 
 /// a saga's observable state — the full read projection.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SagaView {
     pub origin: SagaOrigin,
     pub reply_to: Option<String>,

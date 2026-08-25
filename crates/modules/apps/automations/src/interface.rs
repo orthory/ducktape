@@ -31,7 +31,7 @@ pub struct Trigger {
 
 /// what a firing rule does.
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Action {
     /// post `template` (after placeholder substitution) into `channel_id`. the
     /// module derives a deterministic `message_id` = `auto-{rule_id}-{channel}-{seq}`.
@@ -63,6 +63,7 @@ pub enum Action {
 
 /// a user-defined automation rule.
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Rule {
     pub rule_id: String,
     /// who created it, and the ONLY principal that may enable, disable, or
@@ -86,6 +87,7 @@ pub struct Rule {
 
 /// one entry in the module's bounded global run-history ring.
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RunRecord {
     pub rule_id: String,
     /// the triggering channel id.
@@ -103,7 +105,7 @@ pub struct RunRecord {
 /// the submitter IS that owner. only an external submitter may own a rule, so
 /// module and system origins are refused outright on all three.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AutomationsMsg {
     /// register a rule owned by the submitter.
     CreateRule {
@@ -123,7 +125,7 @@ pub enum AutomationsMsg {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AutomationsQuery {
     ListRules,
     GetRule {
@@ -137,7 +139,7 @@ pub enum AutomationsQuery {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AutomationsReply {
     Rules(Vec<Rule>),
     Rule(Option<Rule>),

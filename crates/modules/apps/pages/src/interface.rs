@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// [`PageMsg::CreatePage`] creates a top-level one and [`PageMsg::InsertBlock`]
 /// creates a subpage in the parent page's content flow.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum BlockKind {
     Page,
     Paragraph,
@@ -37,7 +37,7 @@ pub enum BlockKind {
 /// deliberate: browser selection offsets use UTF-16 code units, so the wire
 /// range is exactly what the editor reports even around emoji.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum InlineMark {
     Bold,
     Italic,
@@ -48,6 +48,7 @@ pub enum InlineMark {
 
 /// One half-open inline mark range (`start..end`) in UTF-16 code units.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SpanMark {
     pub start: u32,
     pub end: u32,
@@ -59,6 +60,7 @@ pub struct SpanMark {
 /// remains relative to the selected text instead of becoming a stale absolute
 /// character offset.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RelativeAnchor {
     pub start: u32,
     pub end: u32,
@@ -72,6 +74,7 @@ pub struct RelativeAnchor {
 /// `page` and `parent` are DERIVED by the module on insert/move — writers never
 /// supply them (see [`NewBlock`]).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Block {
     /// globally unique within the module — the addressable handle.
     pub id: String,
@@ -95,6 +98,7 @@ pub struct Block {
 /// `parent`/`page`/`children` are derived by the module from the insert
 /// position; `checked` starts false ([`PageMsg::SetChecked`] flips it).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct NewBlock {
     pub id: String,
     pub kind: BlockKind,
@@ -109,7 +113,7 @@ pub struct NewBlock {
 /// "first child of `parent`"; `Some(id)` == "immediately after that sibling"
 /// (the anchor must be a child of `parent`, else the op errors).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PageMsg {
     /// create a top-level page block. Subpages use `InsertBlock` with kind
     /// `Page`, so their position is part of the containing document tree.
@@ -275,7 +279,7 @@ pub fn id_is_index_safe(s: &str) -> bool {
 /// who authored a comment — derived from `Env.origin`, never a payload. own
 /// copy of chat's shape (each module's interface is self-contained).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuthorRef {
     User(Vec<u8>),
     Agent { module: String, agent_id: String },
@@ -287,6 +291,7 @@ pub enum AuthorRef {
 /// and the ordered ids of its comments (tombstoned comments stay listed until
 /// the whole thread is removed on last-live-delete).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Thread {
     pub id: String,
     pub target: String,
@@ -303,6 +308,7 @@ pub struct Thread {
 /// one comment. `deleted` tombstones content but keeps the record so ordering
 /// and the thread skeleton survive until the thread is removed.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Comment {
     pub id: String,
     pub thread_id: String,
@@ -315,6 +321,7 @@ pub struct Comment {
 
 /// a thread plus its live (non-tombstoned) comments in order.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ThreadView {
     pub thread: Thread,
     pub comments: Vec<Comment>,
@@ -333,7 +340,7 @@ pub fn decode_msg(b: &[u8]) -> Result<PageMsg, String> {
 /// thread panels, search) is served by pages' index guest on the derived
 /// tier instead.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PageQuery {
     /// One bounded page of blocks in PREORDER (root first, each block's
     /// subtree before its next sibling). `after` is the exclusive id of the
@@ -365,6 +372,7 @@ pub enum PageQuery {
 
 /// One bounded slice of a page's preorder block traversal.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PageBlockPage {
     pub blocks: Vec<Block>,
     pub next_after: Option<String>,
@@ -372,7 +380,7 @@ pub struct PageBlockPage {
 
 /// replies to a [`PageQuery`]. `Option` mirrors absence.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PageReply {
     Page(Option<PageBlockPage>),
     Block(Option<Block>),
@@ -422,7 +430,9 @@ mod interface_tests {
     #[test]
     fn target_thread_count_round_trips() {
         // the cap-probe read a module staging AddComment follow-ups runs.
-        let q = PageQuery::TargetThreadCount { target: "b1".into() };
+        let q = PageQuery::TargetThreadCount {
+            target: "b1".into(),
+        };
         assert_eq!(decode_query(&encode_query(&q)).unwrap(), q);
         let r = PageReply::TargetThreadCount(7);
         assert_eq!(decode_reply(&encode_reply(&r)).unwrap(), r);
