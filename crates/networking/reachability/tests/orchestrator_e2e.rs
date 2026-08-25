@@ -937,8 +937,6 @@ async fn duplicated_delivery_is_tolerated_end_to_end() {
     converges_despite(Rc::new(|_, _, _| 2)).await;
 }
 
-/// The kitchen sink: a 3-node mesh where the FIRST copy of every
-/// (sender, receiver, message kind) is lost — record, advert, request,
 /// A member that has verified its own view must still answer a peer that has
 /// not — the phase-A exchange is one-shot, and losing one half of it used to
 /// wedge that peer for the whole epoch.
@@ -989,6 +987,8 @@ async fn a_verified_member_still_answers_a_peer_that_is_behind() {
         .await;
 }
 
+/// The kitchen sink: a 3-node mesh where the FIRST copy of every
+/// (sender, receiver, message kind) is lost — record, advert, request,
 /// response, and ack alike. Nudge re-offers must heal every stage.
 #[tokio::test]
 async fn every_message_kind_dropped_once_still_converges() {
