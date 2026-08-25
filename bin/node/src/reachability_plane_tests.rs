@@ -163,8 +163,8 @@ async fn a_failed_verification_stays_silent() {
             open_identity,
             None,
             |b| {
-            store.lock().unwrap().push(b);
-            async {}
+                store.lock().unwrap().push(b);
+                async {}
             },
         )
         .await;
@@ -206,8 +206,8 @@ async fn an_expired_token_neither_installs_nor_tunnels() {
         open_identity,
         None,
         |b| {
-        store.lock().unwrap().push(b);
-        async {}
+            store.lock().unwrap().push(b);
+            async {}
         },
     )
     .await;

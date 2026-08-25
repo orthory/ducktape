@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use commonware_cryptography::ed25519;
-use commonware_p2p::authenticated::lookup::{self, Network};
 use commonware_p2p::Receiver as P2pReceiver;
+use commonware_p2p::authenticated::lookup::{self, Network};
 use commonware_runtime::{Clock, Quota, Spawner, Supervisor};
 use commonware_utils::ordered::Set;
 use statesync::fetch_manifest;

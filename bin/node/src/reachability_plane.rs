@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use commonware_cryptography::{Signer, ed25519};
-use commonware_p2p::{AddressableManager as _, Ingress, Receiver as P2pReceiver, Recipients, Sender as P2pSender};
+use commonware_p2p::{
+    AddressableManager as _, Ingress, Receiver as P2pReceiver, Recipients, Sender as P2pSender,
+};
 use commonware_runtime::{IoBuf, Spawner, Supervisor};
 
 use crate::config::{self, hex_bytes};
@@ -442,23 +444,19 @@ where
                             peer,
                             control_endpoint,
                         } => {
-                            let Ok(peer_pk) =
-                                <ed25519::PublicKey as commonware_codec::DecodeExt<_>>::decode(
-                                    &peer.0[..],
-                                )
-                            else {
+                            let Ok(peer_pk) = <ed25519::PublicKey as commonware_codec::DecodeExt<
+                                _,
+                            >>::decode(&peer.0[..]) else {
                                 continue;
                             };
-                            let Some(addr) = book.observe_advert(&peer_pk, control_endpoint)
-                            else {
+                            let Some(addr) = book.observe_advert(&peer_pk, control_endpoint) else {
                                 // unchanged, or pinned by a DNS hint — silent.
                                 continue;
                             };
-                            let overwrite =
-                                commonware_utils::ordered::Map::from_iter_dedup([(
-                                    peer_pk.clone(),
-                                    addr,
-                                )]);
+                            let overwrite = commonware_utils::ordered::Map::from_iter_dedup([(
+                                peer_pk.clone(),
+                                addr,
+                            )]);
                             let _ = oracle.overwrite(overwrite);
                             tracing::info!(
                                 target: "ducktape::reachability",

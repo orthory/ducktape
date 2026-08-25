@@ -146,7 +146,6 @@ fn save(workspace: &Path, routes: &LocalRoutes) -> Result<(), String> {
     Ok(())
 }
 
-
 /// the `ducktape gateway` verbs — node-local loopback route management.
 #[derive(Debug, clap::Subcommand)]
 pub(crate) enum GatewayCmd {
@@ -235,11 +234,7 @@ fn bind(args: BindArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// Register or update a node-local loopback route `name -> port` at boot — the
 /// programmatic equivalent of the `gateway-route-bind` CLI, for services the node
 /// runs itself (e.g. an embedded airlock gateway on an ephemeral port).
-pub fn register(
-    workspace: &Path,
-    name: gateway::RouteName,
-    port: u16,
-) -> Result<(), String> {
+pub fn register(workspace: &Path, name: gateway::RouteName, port: u16) -> Result<(), String> {
     if port == 0 {
         return Err("gateway route port must be non-zero".into());
     }
@@ -269,7 +264,9 @@ pub fn sweep_stale_temporaries(workspace: &Path) {
         let is_a_temp = path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(&format!(".{FILE_NAME}.")) && name.ends_with(".tmp"));
+            .is_some_and(|name| {
+                name.starts_with(&format!(".{FILE_NAME}.")) && name.ends_with(".tmp")
+            });
         if !is_a_temp || path == ours {
             continue;
         }
@@ -405,10 +402,7 @@ mod tests {
         bind(bind_args(dir.path(), Some("api"), None, 4000)).unwrap();
         let loaded = load(dir.path()).unwrap();
         assert_eq!(loaded.port(&gateway::RouteName::apex()), Some(3000));
-        assert_eq!(
-            loaded.port(&gateway::RouteName::named("api")),
-            Some(4000)
-        );
+        assert_eq!(loaded.port(&gateway::RouteName::named("api")), Some(4000));
 
         unbind(route(dir.path(), None, None)).unwrap();
         unbind(route(dir.path(), Some("api"), None)).unwrap();
@@ -447,7 +441,10 @@ mod tests {
 
         // a second daemon starts and takes it. The first must now yield.
         register(dir.path(), name.clone(), 4200).unwrap();
-        assert_eq!(reassert(dir.path(), &name, 4100).unwrap(), RouteOwner::Foreign);
+        assert_eq!(
+            reassert(dir.path(), &name, 4100).unwrap(),
+            RouteOwner::Foreign
+        );
         assert_eq!(
             load(dir.path()).unwrap().port(&name),
             Some(4200),
@@ -455,7 +452,10 @@ mod tests {
         );
 
         // ...and the first daemon's SIGTERM must not delete the survivor's entry.
-        assert_eq!(retire(dir.path(), &name, 4100).unwrap(), RouteOwner::Foreign);
+        assert_eq!(
+            retire(dir.path(), &name, 4100).unwrap(),
+            RouteOwner::Foreign
+        );
         assert_eq!(load(dir.path()).unwrap().port(&name), Some(4200));
 
         // the owner retires its own: gone, no husk file, and safe twice (the
@@ -466,7 +466,10 @@ mod tests {
         assert_eq!(retire(dir.path(), &name, 4200).unwrap(), RouteOwner::Vacant);
 
         // a hand `gateway unbind` is corrected on the next beat.
-        assert_eq!(reassert(dir.path(), &name, 4200).unwrap(), RouteOwner::Vacant);
+        assert_eq!(
+            reassert(dir.path(), &name, 4200).unwrap(),
+            RouteOwner::Vacant
+        );
         assert_eq!(load(dir.path()).unwrap().port(&name), Some(4200));
     }
 
@@ -484,7 +487,10 @@ mod tests {
 
         assert_eq!(routes.owner(&name, 4100), RouteOwner::Ours);
         assert_eq!(routes.owner(&name, 4200), RouteOwner::Foreign);
-        assert_eq!(routes.owner(&gateway::RouteName::apex(), 4100), RouteOwner::Vacant);
+        assert_eq!(
+            routes.owner(&gateway::RouteName::apex(), 4100),
+            RouteOwner::Vacant
+        );
 
         // the survivor's entry is what a foreign retire must not touch, and the
         // snapshot is the only thing that can say whose it is.
@@ -492,7 +498,9 @@ mod tests {
         assert_eq!(routes.owner(&name, 4100), RouteOwner::Foreign);
         routes.drop_route(&name);
         assert_eq!(routes.owner(&name, 4200), RouteOwner::Vacant);
-        routes.validate().expect("upsert/drop keep the sorted-unique invariant");
+        routes
+            .validate()
+            .expect("upsert/drop keep the sorted-unique invariant");
     }
 
     /// The TOCTOU is invisible to a value test — reading the file twice is only
@@ -534,10 +542,15 @@ mod tests {
 
         sweep_stale_temporaries(dir.path());
 
-        assert!(!orphan.exists(), "another process's leftover temp is reaped");
+        assert!(
+            !orphan.exists(),
+            "another process's leftover temp is reaped"
+        );
         assert!(ours.exists(), "our own in-flight temp is not");
         assert_eq!(
-            load(dir.path()).unwrap().port(&gateway::RouteName::named("airlock")),
+            load(dir.path())
+                .unwrap()
+                .port(&gateway::RouteName::named("airlock")),
             Some(4100),
             "the sweep must never touch the route file itself"
         );

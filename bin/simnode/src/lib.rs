@@ -134,6 +134,7 @@ use runs::RunsModule;
 use tagging::TaggingModule;
 // the opt-in `--with-valset` governance genesis modules (registered only under
 // the flag; the default genesis stays byte-identical without them).
+use acl::Acl;
 use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
 use futures::select;
@@ -156,7 +157,6 @@ use sdk::{Event, Module, Msg, Origin};
 use serde::{Deserialize, Serialize};
 use statesync::qmdb::QmdbStore;
 use tasks::Tasks;
-use acl::Acl;
 use valset::Valset;
 
 // the sim's genesis sets are the `sim_base` (+ `sim_valset`) selections of the

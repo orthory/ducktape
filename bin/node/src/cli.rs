@@ -125,9 +125,11 @@ fn cmd_work_revoke(args: WorkTargetArgs) -> CommandResult {
     let narrowing_one_from_anyone =
         current == WorkAdmission::Anyone && !matches!(target, AdmitTarget::Anyone);
     if narrowing_one_from_anyone {
-        return Err("this node admits anyone, so revoking one account changes nothing — \
+        return Err(
+            "this node admits anyone, so revoking one account changes nothing — \
                     run `ducktape node work revoke anyone` first"
-            .into());
+                .into(),
+        );
     }
     work_admission::save(&workspace, &current.without(target.clone()))?;
     match target {
@@ -712,8 +714,7 @@ fn cmd_invite(args: InviteArgs) -> Result<(), Box<dyn std::error::Error>> {
         + ttl_days * 24 * 60 * 60;
     // the expiry lives INSIDE the token (signed), not as a separate blob field.
     // every invite is bearer.
-    let token =
-        config::mint_invite_token(&key, descriptor.genesis_namespace().as_bytes(), expires);
+    let token = config::mint_invite_token(&key, descriptor.genesis_namespace().as_bytes(), expires);
     let blob_string = config::encode_invite(&invite_descriptor, &token, &wireguard, &fronts, &key)?;
     println!("{blob_string}");
     Ok(())
@@ -1739,9 +1740,7 @@ mod tests {
             .filter(|family| !family.is_hide_set())
             .map(|family| family.get_name().to_string())
             .collect::<BTreeSet<_>>();
-        top.extend(
-            ["help", "--help", "-h", "--version", "-V"].map(str::to_string),
-        );
+        top.extend(["help", "--help", "-h", "--version", "-V"].map(str::to_string));
         for (file, text) in [("ducktape.bash", &bash), ("ducktape.zsh", &zsh)] {
             let declared = declaration_tokens(text, "families");
             assert_same_tokens(file, "top level", &declared, &top, &top);

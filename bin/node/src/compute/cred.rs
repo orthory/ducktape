@@ -36,11 +36,11 @@
 //! and it runs in the COMPUTE DAEMON's process, so "the executing node" is the
 //! node this daemon serves.
 
-use provider_host::{AirlockConfig, CredentialKind, ResolvedCredential, WorkRef};
 use compute_service::{CredentialResolver, Resolved};
 use gateway::{CredentialRecord, GatewayQuery, GatewayReply, HandleRegistration};
 use identity::{AccountView, IdentityQuery, IdentityReply};
 use noded::node_link::NodeLink;
+use provider_host::{AirlockConfig, CredentialKind, ResolvedCredential, WorkRef};
 
 /// The gateway route label the co-hosted airlock gateway registers itself under
 /// (`bin/node/src/boot/surfaces.rs`). A resolved credential's traffic is routed
@@ -76,7 +76,9 @@ impl NodeCredentialResolver {
         let bytes = self
             .query(
                 "gateway",
-                gateway::encode_query(&GatewayQuery::Credential { name: name.to_string() }),
+                gateway::encode_query(&GatewayQuery::Credential {
+                    name: name.to_string(),
+                }),
             )
             .await?;
         match gateway::decode_reply(&bytes)? {
@@ -89,7 +91,9 @@ impl NodeCredentialResolver {
         let bytes = self
             .query(
                 "identity",
-                identity::encode_query(&IdentityQuery::OfNode { node_key: node_key.to_vec() }),
+                identity::encode_query(&IdentityQuery::OfNode {
+                    node_key: node_key.to_vec(),
+                }),
             )
             .await?;
         match identity::decode_reply(&bytes)? {
@@ -182,7 +186,10 @@ impl CredentialResolver for NodeCredentialResolver {
 ///
 /// Nor was it buying earliness. The lender's refusal lands in `start_broker`,
 /// before `invoke` spawns the sandbox and before any paid upstream call.
-fn routable(credential: &str, record: Option<CredentialRecord>) -> Result<CredentialRecord, String> {
+fn routable(
+    credential: &str,
+    record: Option<CredentialRecord>,
+) -> Result<CredentialRecord, String> {
     record.ok_or_else(|| format!("unknown credential: {credential}"))
 }
 
@@ -242,7 +249,13 @@ mod tests {
 
     #[test]
     fn kinds_map_across_the_boundary() {
-        assert_eq!(map_kind(gateway::CredentialKind::Claude), CredentialKind::Claude);
-        assert_eq!(map_kind(gateway::CredentialKind::Codex), CredentialKind::Codex);
+        assert_eq!(
+            map_kind(gateway::CredentialKind::Claude),
+            CredentialKind::Claude
+        );
+        assert_eq!(
+            map_kind(gateway::CredentialKind::Codex),
+            CredentialKind::Codex
+        );
     }
 }

@@ -16,12 +16,10 @@ use crate::constants::{DRAIN_TICK, NOP_TARGET};
 use crate::drain_actions::{
     CutoverTrigger, EpochActions, capture_breakdown, checkpoint_due, cooldown_until,
 };
-use noded::projection::{BlockProjection, project_block};
-use crate::host_reads::{
-    read_valset_members, read_valset_mesh_window, read_valset_residents,
-};
-use crate::{join_gate, relay};
+use crate::host_reads::{read_valset_members, read_valset_mesh_window, read_valset_residents};
 use crate::util::{fatal, hex, participant_bytes, resident_bytes};
+use crate::{join_gate, relay};
+use noded::projection::{BlockProjection, project_block};
 
 impl ValidatorRuntime<'_> {
     /// one drain turn: the pass over delivered finalizations, then the
@@ -34,7 +32,6 @@ impl ValidatorRuntime<'_> {
     }
 
     async fn drain_pass(&mut self) {
-
         let Self {
             context,
             node,
@@ -681,7 +678,8 @@ impl ValidatorRuntime<'_> {
                 // the gateway plane serves (and admits) exactly
                 // who the mesh tracks — follow the cutover.
                 if let Some(book) = &gateway_book {
-                    book.set_peers(plan.valset().transport_members().iter());
+                    book.peers()
+                        .set_peers(plan.valset().transport_members().iter());
                 }
                 // the media planes authenticate inbound by the same
                 // tracked set — follow the re-track too, so a
@@ -948,11 +946,16 @@ impl ValidatorRuntime<'_> {
     // quiet, never the instant a stall clears.
     async fn pump_heartbeat(&mut self) {
         let now = self.context.current();
-        let heartbeat_due = now.duration_since(self.last_flush).unwrap_or_default()
-            >= consensus::BLOCK_TIME;
+        let heartbeat_due =
+            now.duration_since(self.last_flush).unwrap_or_default() >= consensus::BLOCK_TIME;
         let ops_pending = self.node.pending_batch_len() > 0;
         let orderer_idle = self.node.orderer().pending_len() == 0;
-        match heartbeat_action(self.heartbeat_disabled, ops_pending, heartbeat_due, orderer_idle) {
+        match heartbeat_action(
+            self.heartbeat_disabled,
+            ops_pending,
+            heartbeat_due,
+            orderer_idle,
+        ) {
             HeartbeatAction::Idle => {}
             HeartbeatAction::Restamp => self.last_flush = now,
             HeartbeatAction::BeatNop => self.beat_nop(now).await,
@@ -1049,9 +1052,8 @@ impl ValidatorRuntime<'_> {
         }
         let ops_pending = self.node.pending_batch_len() > 0;
         let orderer_idle = self.node.orderer().pending_len() == 0;
-        let beat_now =
-            heartbeat_action(self.heartbeat_disabled, ops_pending, true, orderer_idle)
-                == HeartbeatAction::BeatNop;
+        let beat_now = heartbeat_action(self.heartbeat_disabled, ops_pending, true, orderer_idle)
+            == HeartbeatAction::BeatNop;
         if beat_now {
             self.beat_nop(self.context.current()).await;
         }
@@ -1145,7 +1147,8 @@ impl ValidatorRuntime<'_> {
         let Ok(bytes) = node.host().query(host::LIFECYCLE_MODULE_ID, &req).await else {
             return; // registry absent: byte-identical drain on a baseline net.
         };
-        let Ok(lifecycle::LifecycleReply::ModuleStatus { modules }) = lifecycle::decode_reply(&bytes)
+        let Ok(lifecycle::LifecycleReply::ModuleStatus { modules }) =
+            lifecycle::decode_reply(&bytes)
         else {
             return;
         };
@@ -1223,7 +1226,8 @@ impl ValidatorRuntime<'_> {
             ..
         } = self;
         let now = context.current();
-        let crank_due = now.duration_since(*last_crank).unwrap_or_default() >= consensus::BLOCK_TIME;
+        let crank_due =
+            now.duration_since(*last_crank).unwrap_or_default() >= consensus::BLOCK_TIME;
         if crank_due
             && let Some(finalized_height) = node.finalized().map(|f| f.height)
             && let Some(expiry) = saga_next_expiry(node.host()).await
@@ -1281,7 +1285,8 @@ impl ValidatorRuntime<'_> {
             ..
         } = self;
         let now = context.current();
-        let nudge_due = now.duration_since(*last_nudge).unwrap_or_default() >= consensus::BLOCK_TIME;
+        let nudge_due =
+            now.duration_since(*last_nudge).unwrap_or_default() >= consensus::BLOCK_TIME;
         if nudge_due && dispatch_pending_deliveries(node.host()).await > 0 {
             *last_nudge = now;
             let seq = *next_seq;
@@ -1495,7 +1500,8 @@ mod block_cadence_tests {
     #[test]
     fn a_sealed_block_count_alone_does_not_authorize_an_expensive_checkpoint() {
         let finished = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
-        let owed = crate::drain_actions::cooldown_until(finished, std::time::Duration::from_secs(60));
+        let owed =
+            crate::drain_actions::cooldown_until(finished, std::time::Duration::from_secs(60));
 
         // 32 blocks have sealed — the ENTIRE old trigger — but only ~30s of
         // chain has passed, which is exactly the shape that had the node
@@ -1518,7 +1524,8 @@ mod block_cadence_tests {
         ));
         // A CHEAP CHECKPOINT IS NEVER DELAYED: 25ms owes 175ms of quiet, long
         // gone by the time 32 blocks seal, so the configured cadence governs.
-        let cheap = crate::drain_actions::cooldown_until(finished, std::time::Duration::from_millis(25));
+        let cheap =
+            crate::drain_actions::cooldown_until(finished, std::time::Duration::from_millis(25));
         assert!(crate::drain_actions::checkpoint_due(
             32,
             32,
@@ -1543,7 +1550,8 @@ mod block_cadence_tests {
         let finished = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
         // the demo workspace's pre-#1023 checkpoint: 60s of loop occupancy
         // every 32 blocks (~30s of chain), i.e. it never stopped.
-        let expensive = crate::drain_actions::cooldown_until(finished, std::time::Duration::from_secs(60));
+        let expensive =
+            crate::drain_actions::cooldown_until(finished, std::time::Duration::from_secs(60));
         assert_eq!(
             expensive,
             finished + std::time::Duration::from_secs(420),
@@ -1551,7 +1559,8 @@ mod block_cadence_tests {
         );
         // post-#1023: 25ms. The hold is 175ms, far under the 32-block cadence,
         // so the configured cadence still governs and this guard is invisible.
-        let cheap = crate::drain_actions::cooldown_until(finished, std::time::Duration::from_millis(25));
+        let cheap =
+            crate::drain_actions::cooldown_until(finished, std::time::Duration::from_millis(25));
         assert_eq!(cheap, finished + std::time::Duration::from_millis(175));
     }
 

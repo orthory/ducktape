@@ -179,9 +179,7 @@ fn a_well_formed_runner_result_yields_its_response_text() {
     })
     .to_string();
     assert_eq!(
-        decode_run_result(wrapper.as_bytes())
-            .unwrap()
-            .response_text,
+        decode_run_result(wrapper.as_bytes()).unwrap().response_text,
         "the deliverable prose"
     );
 }

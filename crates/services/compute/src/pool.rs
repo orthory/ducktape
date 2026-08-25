@@ -21,9 +21,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use provider_host::{AirlockConfig, ProviderSet, RunCancellation};
 use futures::future::{BoxFuture, Either, select};
 use host::worker::{WorkOutcome, Worker};
+use provider_host::{AirlockConfig, ProviderSet, RunCancellation};
 use sdk::{Event, Msg};
 use tokio::sync::Semaphore;
 
@@ -453,37 +453,36 @@ impl DispatchPool {
                             } else {
                                 match providers.resolve(&job.capability) {
                                     Ok(provider) => match crate::envelope::prepare(&job.input) {
-                                            Ok(mut prepared) => {
+                                        Ok(mut prepared) => {
                                             prepared.ctx.run_key = Some(run_key_for(&job.saga_id));
-                                                prepared.ctx.executing_node = Some(executing_node);
-                                                prepared.ctx.limits = job.demands.clone();
-                                                prepared.ctx.cancellation =
-                                                    Some(cancellation.clone());
-                                                // resolve a named credential into
-                                                // ctx.airlock BEFORE the provider
-                                                // spawns: a refusal fails the
-                                                // attempt with no paid call.
-                                                match resolve_credential_into(
-                                                    &mut prepared,
-                                                    &job.saga_id,
-                                                    &credential_resolver,
+                                            prepared.ctx.executing_node = Some(executing_node);
+                                            prepared.ctx.limits = job.demands.clone();
+                                            prepared.ctx.cancellation = Some(cancellation.clone());
+                                            // resolve a named credential into
+                                            // ctx.airlock BEFORE the provider
+                                            // spawns: a refusal fails the
+                                            // attempt with no paid call.
+                                            match resolve_credential_into(
+                                                &mut prepared,
+                                                &job.saga_id,
+                                                &credential_resolver,
+                                            )
+                                            .await
+                                            {
+                                                Ok(()) => execute(
+                                                    &job,
+                                                    prepared,
+                                                    provider,
+                                                    &provisioner,
+                                                    &cancellation,
+                                                    permit,
                                                 )
                                                 .await
-                                                {
-                                                    Ok(()) => execute(
-                                                        &job,
-                                                        prepared,
-                                                        provider,
-                                                        &provisioner,
-                                                        &cancellation,
-                                                        permit,
-                                                    )
-                                                    .await
-                                                    .map_err(clean_error),
-                                                    Err(error) => Err(clean_error(error)),
-                                                }
+                                                .map_err(clean_error),
+                                                Err(error) => Err(clean_error(error)),
                                             }
-                                            Err(error) => Err(clean_error(error)),
+                                        }
+                                        Err(error) => Err(clean_error(error)),
                                     },
                                     Err(error) => Err(clean_error(error)),
                                 }
@@ -1259,8 +1258,9 @@ format = "text"
         let (resolver, seen) = FixedResolver::ok(sample_airlock());
         let (pool, mut rx) = pool_with(providers, 1);
         let pool = pool.with_credential_resolver(resolver);
-        let payload = crate::envelope::compose_headless("sched\u{1f}d1", "hi", Some("jess-fable-1"))
-            .into_bytes();
+        let payload =
+            crate::envelope::compose_headless("sched\u{1f}d1", "hi", Some("jess-fable-1"))
+                .into_bytes();
         pool.run(&effect_with_payload("s1", 0, Some(b"me"), &payload))
             .await
             .unwrap();
@@ -1268,7 +1268,10 @@ format = "text"
         outcome.expect("the resolved run completes");
         assert_eq!(seen.load(Ordering::SeqCst), 1, "the resolver was consulted");
         let (_input, ctx) = probes.last_run.lock().unwrap().clone().unwrap();
-        assert!(ctx.airlock.is_some(), "the resolved airlock reached the run");
+        assert!(
+            ctx.airlock.is_some(),
+            "the resolved airlock reached the run"
+        );
     }
 
     #[tokio::test]
@@ -1317,12 +1320,21 @@ format = "text"
         let (pool, mut rx) = pool_with(providers, 1);
         let pool = pool.with_credential_resolver(resolver);
         // an ordinary (credential-less) envelope.
-        pool.run(&effect_with_payload("s4", 0, Some(b"me"), &envelope_payload()))
-            .await
-            .unwrap();
+        pool.run(&effect_with_payload(
+            "s4",
+            0,
+            Some(b"me"),
+            &envelope_payload(),
+        ))
+        .await
+        .unwrap();
         let (_, _, outcome) = next_result(&mut rx).await;
         outcome.expect("an ordinary run completes untouched");
-        assert_eq!(seen.load(Ordering::SeqCst), 0, "the resolver is not consulted");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            0,
+            "the resolver is not consulted"
+        );
         let (_input, ctx) = probes.last_run.lock().unwrap().clone().unwrap();
         assert!(ctx.airlock.is_none(), "no credential ⇒ no airlock override");
     }

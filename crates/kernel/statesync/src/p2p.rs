@@ -34,8 +34,8 @@ use commonware_runtime::{Clock, IoBuf, Spawner};
 use futures::channel::oneshot;
 
 use crate::{
-    SyncClient, SyncError, SyncRequest, SyncResponse, decode_response, decode_rpc,
-    encode_request, encode_rpc,
+    SyncClient, SyncError, SyncRequest, SyncResponse, decode_response, decode_rpc, encode_request,
+    encode_rpc,
 };
 
 /// the reaper's sweep interval. a request survives at most two sweeps, so the
@@ -161,7 +161,14 @@ where
         R: Receiver<PublicKey = S::PublicKey> + Send + 'static,
     {
         Self::with_sources(
-            context, sender, receiver, vec![server], None, requester, proof, None,
+            context,
+            sender,
+            receiver,
+            vec![server],
+            None,
+            requester,
+            proof,
+            None,
         )
     }
 

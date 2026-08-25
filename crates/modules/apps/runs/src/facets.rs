@@ -174,8 +174,8 @@ pub(super) fn encode_delivery_receipt(
 ) -> String {
     // an output exists when the run produced a duckfs snapshot OR pushed a
     // forge commit; both distill into the one output_ref shape.
-    let output_ref = (receipt.output_snapshot.is_some() || receipt.output_commit.is_some())
-        .then(|| OutputRef {
+    let output_ref =
+        (receipt.output_snapshot.is_some() || receipt.output_commit.is_some()).then(|| OutputRef {
             source_prefix: &receipt.source_prefix,
             output_snapshot: receipt.output_snapshot.as_deref(),
             commit_height: receipt.commit_height,

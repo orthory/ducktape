@@ -603,6 +603,9 @@ mod tests {
             ),
         }
         .encode();
-        assert_eq!(Msg::decode(&clean), Err(WireError::BadTag(TAG_AUTH_REQUEST)));
+        assert_eq!(
+            Msg::decode(&clean),
+            Err(WireError::BadTag(TAG_AUTH_REQUEST))
+        );
     }
 }

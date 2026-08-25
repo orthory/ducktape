@@ -308,7 +308,10 @@ fn post_raw(
     body: &[u8],
 ) -> std::io::Result<(u16, serde_json::Value)> {
     let (status, raw) = nettest::try_http_bytes(port, "POST", path, content_type, body)?;
-    Ok((status, serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null)))
+    Ok((
+        status,
+        serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null),
+    ))
 }
 
 pub fn create_channel(channel: &str, name: &str) -> serde_json::Value {

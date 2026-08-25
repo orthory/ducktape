@@ -123,11 +123,7 @@ async fn run(
     let offered = providers.capabilities();
 
     let hint = Arc::new(tokio::sync::Notify::new());
-    tokio::spawn(link::attach(
-        ws_url(&http_base),
-        hint.clone(),
-        line_rx,
-    ));
+    tokio::spawn(link::attach(ws_url(&http_base), hint.clone(), line_rx));
 
     let (mut pump, mut delivered) = build_pool(&node, &service, node_key, providers).await?;
 
@@ -235,13 +231,7 @@ async fn build_pool(
     service: &config::ServiceConfig,
     node_key: Vec<u8>,
     providers: provider_host::ProviderSet,
-) -> Result<
-    (
-        intake::WorkPump,
-        tokio::sync::mpsc::Receiver<sdk::Msg>,
-    ),
-    Box<dyn std::error::Error>,
-> {
+) -> Result<(intake::WorkPump, tokio::sync::mpsc::Receiver<sdk::Msg>), Box<dyn std::error::Error>> {
     let spawn: SpawnFn = Arc::new(|kind, future| {
         match kind {
             // Queue waiters share the runtime. An admitted run gets a task of
@@ -350,7 +340,10 @@ mod tests {
         assert_eq!(ws_url("http://127.0.0.1:8844"), "ws://127.0.0.1:8844/v1/ws");
         assert_eq!(ws_url("https://node.example"), "wss://node.example/v1/ws");
         // a trailing slash must not produce a double slash in the path.
-        assert_eq!(ws_url("http://127.0.0.1:8844/"), "ws://127.0.0.1:8844/v1/ws");
+        assert_eq!(
+            ws_url("http://127.0.0.1:8844/"),
+            "ws://127.0.0.1:8844/v1/ws"
+        );
     }
 
     #[test]

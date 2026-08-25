@@ -1,17 +1,17 @@
 use super::*;
 use capability::{CapabilityQuery, CapabilityReply};
 use gateway::{CredentialKind, GatewayQuery, GatewayReply};
-use identity::{AccountView, IdentityQuery, IdentityReply};
 use iced::advanced::widget::{Operation, Tree, tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, renderer};
 use iced::futures::SinkExt as _;
 use iced::{Element, Length, Rectangle, Size, Subscription, Theme, mouse};
-use ui_lang_components::ui::terminal;
+use identity::{AccountView, IdentityQuery, IdentityReply};
 use saga::{SagaQuery, SagaReply, SagaStatus, SagaView};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use tokio_tungstenite::tungstenite::Message;
+use ui_lang_components::ui::terminal;
 
 const AGENT_CONTEXT_ROWS: usize = 32;
 const AGENT_CONTEXT_BYTES: usize = 48 * 1024;
@@ -1292,7 +1292,6 @@ fn agent_terminal_notice(notice: terminal::Notice) -> AgentTerminalNotice {
     }
 }
 
-
 struct AgentMarkdown {
     items: Rc<[iced::widget::markdown::Item]>,
     settings: iced::widget::markdown::Settings,
@@ -1604,8 +1603,6 @@ impl Widget<String, Theme, iced::Renderer> for AgentMarkdown {
             .draw(tree, renderer, theme, style, layout, cursor, viewport);
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {

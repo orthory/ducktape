@@ -320,12 +320,7 @@ fn call_ids_are_idempotent_and_completed_calls_release_the_root_slot() {
         exec(
             &mut m,
             &mut next,
-            &delegate(
-                &caller_run,
-                &format!("next-{index}"),
-                "worker",
-                "work",
-            ),
+            &delegate(&caller_run, &format!("next-{index}"), "worker", "work"),
         )
         .unwrap();
         assert_eq!(next.dispatch_msgs().len(), 1);

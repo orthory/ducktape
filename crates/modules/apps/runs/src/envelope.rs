@@ -542,13 +542,7 @@ mod tests {
     fn a_chat_envelope_carries_the_agent_identity_and_no_prompt_pin() {
         let agent = bot();
         let transcript = vec![message(1, AuthorRef::User(vec![1; 32]), "hi bot")];
-        let payload = render_payload(
-            "runs",
-            &agent,
-            &run_id("general", 1),
-            &transcript,
-            plain(),
-        );
+        let payload = render_payload("runs", &agent, &run_id("general", 1), &transcript, plain());
         let v = parse(&payload);
 
         assert_eq!(v["ducktape_run"], RUN_ENVELOPE_MARKER);
@@ -752,13 +746,7 @@ mod tests {
         let agent = bot();
 
         let chat = run_id("general", 1);
-        let v = parse(&render_payload(
-            "runs",
-            &agent,
-            &chat,
-            &[],
-            plain(),
-        ));
+        let v = parse(&render_payload("runs", &agent, &chat, &[], plain()));
         assert_eq!(v["run_id"], chat);
         assert_eq!(
             chat,
@@ -817,7 +805,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn a_job_envelope_preserves_the_job_framing() {
         let agent = bot();
@@ -850,20 +837,8 @@ mod tests {
                 "earlier reply",
             ),
         ];
-        let a = render_payload(
-            "runs",
-            &agent,
-            &run_id("general", 2),
-            &transcript,
-            plain(),
-        );
-        let b = render_payload(
-            "runs",
-            &agent,
-            &run_id("general", 2),
-            &transcript,
-            plain(),
-        );
+        let a = render_payload("runs", &agent, &run_id("general", 2), &transcript, plain());
+        let b = render_payload("runs", &agent, &run_id("general", 2), &transcript, plain());
         assert_eq!(
             a.as_bytes(),
             b.as_bytes(),
@@ -919,13 +894,7 @@ mod tests {
                 "someone else",
             ),
         ];
-        let payload = render_payload(
-            "runs",
-            &agent,
-            &run_id("general", 3),
-            &transcript,
-            plain(),
-        );
+        let payload = render_payload("runs", &agent, &run_id("general", 3), &transcript, plain());
         let conversation = parse(&payload)["conversation"]
             .as_str()
             .unwrap()
@@ -1001,13 +970,7 @@ mod tests {
     fn no_head_states_a_null_pin_not_an_absent_key() {
         // an unresolved head is an EXPLICIT null pin decision, not a missing key.
         let agent = bot();
-        let payload = render_payload(
-            "runs",
-            &agent,
-            &run_id("general", 1),
-            &[],
-            plain(),
-        );
+        let payload = render_payload("runs", &agent, &run_id("general", 1), &[], plain());
         let v = parse(&payload);
         assert_eq!(v["ducktape_run"], 1);
         assert!(

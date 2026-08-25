@@ -660,10 +660,10 @@ async fn coordinated_attempt(
         if reach
             .send(
                 reachability::ReachabilityCommand::BootstrapCoordinatedInvitePeer {
-                peer: candidate.key.clone(),
-                wireguard_public_key: wireguard::X25519PublicKey(candidate.wg),
-                intro: sealed_intro.clone(),
-                reply: reachability::CoordinatedInviteReply(reply_tx),
+                    peer: candidate.key.clone(),
+                    wireguard_public_key: wireguard::X25519PublicKey(candidate.wg),
+                    intro: sealed_intro.clone(),
+                    reply: reachability::CoordinatedInviteReply(reply_tx),
                 },
             )
             .await
@@ -1358,8 +1358,8 @@ mod tests {
                 .open_sealed(&buf[..n])
                 .expect("the relayed intro is sealed to the member's WG key");
             let request = join_gate::decode_intro(&opened).expect("decodes");
-            let verified =
-                join_gate::verify_intro(&request, MULE_BINDING).expect("verifies against the binding");
+            let verified = join_gate::verify_intro(&request, MULE_BINDING)
+                .expect("verifies against the binding");
             let ack = join_gate::encode_intro_ack(&join_gate::IntroAck {
                 nonce: verified.nonce.to_vec(),
                 reply: join_gate::IntroReply::Admitted {

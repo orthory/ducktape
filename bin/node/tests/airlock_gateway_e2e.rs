@@ -112,7 +112,15 @@ fn signed_airlock_route(
     publisher: &[u8],
     revision: u64,
 ) -> GatewayMsg {
-    signed_loopback_route(member, chain, publisher, "airlock", revision, 4 * 1024 * 1024, true)
+    signed_loopback_route(
+        member,
+        chain,
+        publisher,
+        "airlock",
+        revision,
+        4 * 1024 * 1024,
+        true,
+    )
 }
 
 /// A member-signed LoopbackHttp route. `max_response_bytes == 0` = unbounded
@@ -195,7 +203,9 @@ struct MockUpstream {
 async fn mock_oauth(State(st): State<Arc<MockUpstream>>) -> Json<serde_json::Value> {
     let mut n = st.n.lock().unwrap();
     *n += 1;
-    Json(json!({ "access_token": format!("acc-{n}"), "refresh_token": format!("ref-{n}"), "expires_in": 3600 }))
+    Json(
+        json!({ "access_token": format!("acc-{n}"), "refresh_token": format!("ref-{n}"), "expires_in": 3600 }),
+    )
 }
 
 async fn mock_messages(
@@ -211,7 +221,11 @@ async fn mock_messages(
     if got != want {
         return (axum::http::StatusCode::UNAUTHORIZED, "bad upstream bearer").into_response();
     }
-    ([("content-type", "text/event-stream")], "data: AIRLOCK-OK\n\n").into_response()
+    (
+        [("content-type", "text/event-stream")],
+        "data: AIRLOCK-OK\n\n",
+    )
+        .into_response()
 }
 
 async fn bind_and_serve(app: Router) -> String {
@@ -291,7 +305,11 @@ fn airlock_over_gateway_two_wireguard_nodes() {
             &seal_pk,
             "compute-node",
             CredentialKind::Claude,
-            &CredentialPayload::Refresh { refresh_token: "seed".into(), access_token: String::new(), expires_at: 0 },
+            &CredentialPayload::Refresh {
+                refresh_token: "seed".into(),
+                access_token: String::new(),
+                expires_at: 0,
+            },
         )
         .await
         .unwrap();
@@ -364,7 +382,12 @@ fn airlock_over_gateway_two_wireguard_nodes() {
     cluster.submit(
         0,
         "gateway",
-        &gateway::encode_msg(&signed_airlock_route(&alice, &cluster.namespace, &alice_node, 1)),
+        &gateway::encode_msg(&signed_airlock_route(
+            &alice,
+            &cluster.namespace,
+            &alice_node,
+            1,
+        )),
     );
     poll_until("airlock route revision 1", FINALIZE, || {
         (airlock_route_revision(&cluster, 1, alice.public_key().as_ref()) == Some(1)).then_some(())
@@ -413,7 +436,11 @@ fn airlock_over_gateway_two_wireguard_nodes() {
         (status, body)
     });
 
-    assert_eq!(reply.0, reqwest::StatusCode::OK, "overlay proxied call: {reply:?}");
+    assert_eq!(
+        reply.0,
+        reqwest::StatusCode::OK,
+        "overlay proxied call: {reply:?}"
+    );
     assert!(
         reply.1.contains("AIRLOCK-OK"),
         "the swapped credential's reply must return over the overlay: {reply:?}"
@@ -446,7 +473,11 @@ fn airlock_single_node_self_serves_its_own_route() {
             &seal_pk,
             "self",
             CredentialKind::Claude,
-            &CredentialPayload::Refresh { refresh_token: "seed".into(), access_token: String::new(), expires_at: 0 },
+            &CredentialPayload::Refresh {
+                refresh_token: "seed".into(),
+                access_token: String::new(),
+                expires_at: 0,
+            },
         )
         .await
         .unwrap();
@@ -502,7 +533,12 @@ fn airlock_single_node_self_serves_its_own_route() {
     cluster.submit(
         0,
         "gateway",
-        &gateway::encode_msg(&signed_airlock_route(&alice, &cluster.namespace, &alice_node, 1)),
+        &gateway::encode_msg(&signed_airlock_route(
+            &alice,
+            &cluster.namespace,
+            &alice_node,
+            1,
+        )),
     );
     poll_until("airlock route revision 1", FINALIZE, || {
         (airlock_route_revision(&cluster, 0, alice.public_key().as_ref()) == Some(1)).then_some(())
@@ -560,7 +596,11 @@ fn airlock_single_node_self_serves_its_own_route() {
         (status, String::from_utf8_lossy(&body).into_owned())
     });
 
-    assert_eq!(reply.0, reqwest::StatusCode::OK, "self-served proxied call: {reply:?}");
+    assert_eq!(
+        reply.0,
+        reqwest::StatusCode::OK,
+        "self-served proxied call: {reply:?}"
+    );
     assert!(
         reply.1.contains("AIRLOCK-OK"),
         "the swapped credential's reply must return: {reply:?}"
@@ -605,9 +645,9 @@ fn gateway_streams_and_caps_over_the_frame_wire() {
                     });
                     (
                         [("content-type", "text/event-stream")],
-                        axum::body::Body::from_stream(
-                            tokio_stream::wrappers::ReceiverStream::new(rx),
-                        ),
+                        axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(
+                            rx,
+                        )),
                     )
                 }
             };
@@ -671,9 +711,13 @@ fn gateway_streams_and_caps_over_the_frame_wire() {
     cluster.submit(
         0,
         "gateway",
-        &gateway::encode_msg(&GatewayMsg::SetHandle { handle: Some("alice".into()) }),
+        &gateway::encode_msg(&GatewayMsg::SetHandle {
+            handle: Some("alice".into()),
+        }),
     );
-    poll_until("alice.duck resolution", FINALIZE, || resolve_handle(&cluster, 0, "alice"));
+    poll_until("alice.duck resolution", FINALIZE, || {
+        resolve_handle(&cluster, 0, "alice")
+    });
 
     let workspace = cluster.workspace(0);
     for label in ["sse", "capped"] {
@@ -741,7 +785,11 @@ fn gateway_streams_and_caps_over_the_frame_wire() {
                 .expect("streamed GET through the gateway");
             assert_eq!(resp.status(), reqwest::StatusCode::OK);
             let mut stream = resp.bytes_stream();
-            let first = stream.next().await.expect("first chunk").expect("first chunk ok");
+            let first = stream
+                .next()
+                .await
+                .expect("first chunk")
+                .expect("first chunk ok");
             assert!(!first.is_empty());
             gate.notify_one(); // only now may the upstream finish
             let mut total = first.len();
@@ -751,7 +799,10 @@ fn gateway_streams_and_caps_over_the_frame_wire() {
             total
         }
     });
-    assert_eq!(total, TOTAL, "the full 6 MiB must stream through the frame wire");
+    assert_eq!(
+        total, TOTAL,
+        "the full 6 MiB must stream through the frame wire"
+    );
 
     // Sized overflow (Content-Length declared): refused BEFORE the head.
     let sized_status = rt.block_on({
@@ -796,7 +847,11 @@ fn gateway_streams_and_caps_over_the_frame_wire() {
         }
         (status, received, truncated)
     });
-    assert_eq!(status, reqwest::StatusCode::OK, "the head commits before the cap trips");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "the head commits before the cap trips"
+    );
     assert!(truncated, "an over-cap chunked body must fail closed");
     assert!(
         (1..=CHUNK).contains(&received),

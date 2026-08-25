@@ -8,7 +8,9 @@ use std::io::Write as _;
 
 use duckfs_client::api::{ApiError, NodeApi};
 use duckfs_client::http::HttpNode;
-use duckfs_core::{DiffEntry, DiffKind, EntryInfo, EntryKindWire, MAX_PAGE, MAX_READ_BYTES, SnapshotInfo};
+use duckfs_core::{
+    DiffEntry, DiffKind, EntryInfo, EntryKindWire, MAX_PAGE, MAX_READ_BYTES, SnapshotInfo,
+};
 
 use crate::fs_cli::args::{CliError, NodeAddr, resolve_node};
 use crate::fs_cli::{CatArgs, DiffArgs, HistoryArgs, LsArgs, StatArgs};

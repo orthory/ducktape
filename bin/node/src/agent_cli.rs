@@ -166,8 +166,7 @@ fn cmd_pty(args: PtyArgs, base: &str, addr: &NodeAddr) -> AgentResult {
         .enable_all()
         .build()
         .map_err(|e| format!("attach runtime: {e}"))?;
-    let outcome =
-        runtime.block_on(attach(base, &created.session_id, &created.topic, &secret));
+    let outcome = runtime.block_on(attach(base, &created.session_id, &created.topic, &secret));
     // `shutdown_background`, NOT drop: the attach loop's stdin forwarder reads
     // `tokio::io::stdin()`, which parks a BLOCKING thread on `read(0)`. On a real
     // tty that read never returns, and `abort()` cannot interrupt an OS-level
@@ -355,7 +354,6 @@ async fn attach(base: &str, session_id: &str, topic: &str, secret: &str) -> Agen
     }
 }
 
-
 /// the tty window size (cols, rows), or an 80x24 fallback when the ioctl fails.
 fn window_size(fd: i32) -> (u16, u16) {
     // SAFETY: `ws` is fully written by a successful ioctl; on failure we ignore it.
@@ -490,7 +488,6 @@ fn fresh_dispatch_id() -> String {
 // ============================================================================
 // shared resolution
 // ============================================================================
-
 
 /// the service-link secret of the node this CLI is dialling — what its ws
 /// surface admits a session's `term:<id>` topic against.
@@ -825,7 +822,9 @@ mod tests {
         })
         .to_string();
         assert!(!is_term_ended(&chunk));
-        assert!(!is_term_ended(&serde_json::json!({ "type": "heartbeat" }).to_string()));
+        assert!(!is_term_ended(
+            &serde_json::json!({ "type": "heartbeat" }).to_string()
+        ));
     }
 
     /// The node's refusal must END the attach, not be swallowed.

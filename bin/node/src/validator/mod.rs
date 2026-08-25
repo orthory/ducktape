@@ -9,8 +9,8 @@ pub(crate) mod run;
 mod wiring;
 
 use commonware_cryptography::{Signer as _, ed25519};
-use commonware_p2p::authenticated::lookup::{self, Network};
 use commonware_p2p::Ingress;
+use commonware_p2p::authenticated::lookup::{self, Network};
 use commonware_runtime::Quota;
 use recovery::{Manifest, Recovery};
 
@@ -252,12 +252,14 @@ pub(crate) async fn run_validator(
     // FETCHING source for the rest of this validator's life: a committed
     // component the local store lacks is pulled from peers (ranged, verified)
     // before a boundary can fail closed on it.
-    recovery.set_code_source(std::sync::Arc::new(crate::blob_fetch::FetchingCodeSource::new(
-        blobs.clone(),
-        blob_client.clone(),
-        crate::constants::MAX_MODULE_CODE_BYTES,
-        crate::constants::BLOB_FETCH_ATTEMPTS,
-    )));
+    recovery.set_code_source(std::sync::Arc::new(
+        crate::blob_fetch::FetchingCodeSource::new(
+            blobs.clone(),
+            blob_client.clone(),
+            crate::constants::MAX_MODULE_CODE_BYTES,
+            crate::constants::BLOB_FETCH_ATTEMPTS,
+        ),
+    ));
     // the same lane, for forge's packs: a validator that was DOWN during a push
     // was not a fanout target either, so it holds a committed head whose
     // objects never arrived — see `blob_fetch::sweep_forge_packs`.
@@ -501,7 +503,7 @@ pub(crate) async fn run_promoted(
     // the books the parked role already runs its planes over follow the
     // seat's transport union.
     if let Some(book) = &gateway_book {
-        book.set_peers(transport.iter());
+        book.peers().set_peers(transport.iter());
     }
     if let Some(book) = &media_peers {
         book.set_peers(transport.iter());
@@ -530,7 +532,8 @@ pub(crate) async fn run_promoted(
     // standby plane is already shut down (orderly — its UAPI socket is
     // unlinked), so this restore rides the persisted mesh and the seat
     // starts connected. the join doorbell now rings THIS node's gate.
-    let (gate_fwd_tx, gate_fwd_rx) = tokio::sync::mpsc::channel::<crate::join_gate::GateForward>(256);
+    let (gate_fwd_tx, gate_fwd_rx) =
+        tokio::sync::mpsc::channel::<crate::join_gate::GateForward>(256);
     let gate_outcomes = GateOutcomes::default();
     let gate_fwd_keepalive = gate_fwd_tx.clone();
     let reach_cmd = match (wireguard_listen, reach_lane) {
@@ -829,7 +832,7 @@ pub(crate) struct PromotionBaton {
     /// (`None`: no wireguard — no plane on either side — or the old plane
     /// wedged past its shutdown grace and kept its lane).
     pub(crate) reach_lane: Option<MeshChannel>,
-    pub(crate) media_peers: Option<std::sync::Arc<crate::voice_plane::MediaPeers>>,
+    pub(crate) media_peers: Option<std::sync::Arc<crate::overlay_book::OverlayPeers>>,
     pub(crate) gateway_book: Option<std::sync::Arc<crate::gateway_plane::OverlayBook>>,
     pub(crate) rpc_ingress: futures::channel::mpsc::Receiver<crate::rpc::RpcJob>,
     pub(crate) http_ingress: futures::channel::mpsc::Receiver<noded::NodeCommand>,
@@ -945,10 +948,7 @@ pub(super) struct DiscoveryMesh {
 }
 
 impl DiscoveryMesh {
-    pub(super) fn new(
-        slot: EpochChannels,
-        oracle: lookup::Oracle<ed25519::PublicKey>,
-    ) -> Self {
+    pub(super) fn new(slot: EpochChannels, oracle: lookup::Oracle<ed25519::PublicKey>) -> Self {
         let (vote, certificate, resolver, payload, fetch) = slot;
         Self {
             vote: Some(vote),
@@ -971,7 +971,9 @@ impl consensus::MeshCarrier for DiscoveryMesh {
         self.vote.take().expect("vote channel taken once")
     }
     fn certificate(&mut self) -> MeshChannel {
-        self.certificate.take().expect("certificate channel taken once")
+        self.certificate
+            .take()
+            .expect("certificate channel taken once")
     }
     fn resolver(&mut self) -> MeshChannel {
         self.resolver.take().expect("resolver channel taken once")

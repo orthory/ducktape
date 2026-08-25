@@ -35,8 +35,8 @@ use statesync::dataplane::{DataPlaneSyncClient, read_frame, statesync_flow, writ
 use statesync::p2p::P2pSyncClient;
 use statesync::{
     BoundaryId, FinalizedFrame, FrameDisposition, Manifest, ManifestEntry, PayloadKind, SyncClient,
-    SyncError, SyncRequest, SyncResponse, TipCoords, decode_request, decode_rpc,
-    encode_response, encode_rpc,
+    SyncError, SyncRequest, SyncResponse, TipCoords, decode_request, decode_rpc, encode_response,
+    encode_rpc,
 };
 
 // ============================================================================

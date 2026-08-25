@@ -1104,10 +1104,7 @@ impl FinalizedInbox {
     /// slot may have become drainable, so the owning run loop can drain
     /// event-driven instead of waiting out its periodic tick.
     pub fn set_wake(&self, wake: commonware_utils::channel::mpsc::UnboundedSender<()>) {
-        self.inner
-            .lock()
-            .expect("finalized inbox poisoned")
-            .wake = Some(wake);
+        self.inner.lock().expect("finalized inbox poisoned").wake = Some(wake);
     }
 
     /// complete an AWAITING slot with fetched bytes, off the sync reporter (from
@@ -1875,7 +1872,7 @@ where
     use commonware_parallel::Sequential;
     let finalization =
         Finalization::<S, Digest>::decode_cfg(bytes, &scheme.certificate_codec_config())
-    .map_err(|e| format!("finalization certificate does not decode: {e}"))?;
+            .map_err(|e| format!("finalization certificate does not decode: {e}"))?;
     if !finalization.verify(rng, scheme, &Sequential) {
         return Err(
             "finalization certificate does not carry the epoch quorum's signatures".to_string(),

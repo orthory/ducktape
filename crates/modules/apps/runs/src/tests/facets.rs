@@ -119,9 +119,7 @@ fn pr_sink_emits_open_pr_only_with_the_forge_push_cap() {
         forge::ForgeMsg::OpenPr {
             repo: "app".into(),
             title: "done".into(),
-            body: format!(
-                "done\n\n---\nrun: {run_id}\noutput: agent/x@{oid}\nnode: unknown"
-            ),
+            body: format!("done\n\n---\nrun: {run_id}\noutput: agent/x@{oid}\nnode: unknown"),
             source_branch: "agent/x".into(),
             target_branch: "main".into(),
         }
@@ -280,12 +278,17 @@ fn pr_sink_with_an_unborn_target_branch_degrades_without_aborting() {
         "an unborn target branch must never emit an OpenPr (no-fail rule)"
     );
     assert!(
-        breadcrumbs(&ctx)
-            .contains(&format!("run {run_id} pr sink skipped: target branch main not born")),
+        breadcrumbs(&ctx).contains(&format!(
+            "run {run_id} pr sink skipped: target branch main not born"
+        )),
         "the breadcrumb names the unborn target: {:?}",
         breadcrumbs(&ctx)
     );
-    assert_eq!(ctx.chat_msgs().len(), 1, "the run still delivers its message");
+    assert_eq!(
+        ctx.chat_msgs().len(),
+        1,
+        "the run still delivers its message"
+    );
     // the delivered-runs ring still records the run — just with no PR.
     commit(&mut m);
     let rec = &recent_runs(&m)[0];
@@ -327,7 +330,11 @@ fn pr_sink_with_source_equal_to_target_degrades_without_aborting() {
         "the breadcrumb names the malformed pair: {:?}",
         breadcrumbs(&ctx)
     );
-    assert_eq!(ctx.chat_msgs().len(), 1, "the run still delivers its message");
+    assert_eq!(
+        ctx.chat_msgs().len(),
+        1,
+        "the run still delivers its message"
+    );
 }
 
 #[test]
@@ -609,7 +616,10 @@ fn forge_push_run() -> (RunsModule, Registry, String) {
 /// focused on the committed tracker lookup that verifies the title.
 fn bind_run_to_forge_issue(m: &mut RunsModule, run_id: &str, number: u64) -> String {
     let old_dispatch = dispatch_id_for(run_id);
-    let mut entry = m.pending.remove(&old_dispatch).expect("pending fixture run");
+    let mut entry = m
+        .pending
+        .remove(&old_dispatch)
+        .expect("pending fixture run");
     entry.channel_id = format!("forge:app:{number}");
     let bound_run_id = entry.run_id();
     m.pending.insert(dispatch_id_for(&bound_run_id), entry);
@@ -1053,11 +1063,8 @@ fn saga_id_mirror_matches_the_dispatch_modules_derivation() {
     // pin the executing-node lookup's saga-id mirror against the REAL
     // dispatch module: register a recipe, dispatch, and read the saga id
     // off the emitted trigger — the mirror must derive the same id.
-    let mut d = dispatch::DispatchModule::new(
-        "dispatch",
-        "saga",
-        Box::new(sdk_testkit::MemStore::new()),
-    );
+    let mut d =
+        dispatch::DispatchModule::new("dispatch", "saga", Box::new(sdk_testkit::MemStore::new()));
     let mut ctx = CaptureCtx::new().with_origin(Origin::Module("runs".into()));
     block_on(d.execute(
         &mut ctx,
@@ -1095,8 +1102,7 @@ fn saga_id_mirror_matches_the_dispatch_modules_derivation() {
         .iter()
         .find(|m| m.target == "saga")
         .expect("the dispatch emits a saga trigger");
-    let saga::SagaMsg::Trigger { saga_id, .. } = saga::decode_msg(&trigger.payload).unwrap()
-    else {
+    let saga::SagaMsg::Trigger { saga_id, .. } = saga::decode_msg(&trigger.payload).unwrap() else {
         panic!("expected a saga trigger");
     };
     assert_eq!(saga_id, sink::saga_id_for_dispatch("runs", "d1"));

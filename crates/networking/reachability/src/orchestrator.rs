@@ -1,7 +1,7 @@
 //! The reachability orchestrator: the driver that takes epoch cutover events
 //! from the node and turns them into a live WireGuard mesh — record gossip ->
 //! signed advertisements -> `MeshView::verify` -> pairwise tunnel handshakes
-//! -> ONE `apply_tunnel_plans` call per epoch through a `WireGuardEffect`.
+//! -> ONE `apply_peer_tunnels` call per epoch through a `WireGuardEffect`.
 //!
 //! Runtime contract: the node runs [`run`] as the ROOT future of a dedicated
 //! plain-tokio runtime on its own OS thread (the same split as the node's
@@ -715,9 +715,7 @@ async fn handle_idle_socket_event(
             let _ = client.send_punch_to(peer_reflexive).await;
         }
         Ok(SocketEvent::Datagram { src, bytes }) => {
-            if let Some(datagrams) = datagrams {
-                let _ = datagrams.try_send((src, bytes));
-            }
+            offer_intro_datagram(datagrams, src, bytes);
         }
         Ok(_) => {}
         Err(_) => {
@@ -800,13 +798,32 @@ async fn rendezvous_keepalive(client: std::sync::Weak<NatClient>, keepalive: Dur
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await; // an interval's first tick fires immediately — consume it.
     let mut nonce = nat_traversal::now_secs();
+    // consecutive failures, reported at a bounded cadence (the first and
+    // every 8th after): a re-advertisement that keeps failing is the
+    // coordinator forgetting this node, which is exactly the fact the
+    // keepalive exists to prevent — never a silent miss.
+    let mut failures: u64 = 0;
     loop {
         tick.tick().await;
         let Some(client) = client.upgrade() else {
             return;
         };
         nonce = nonce.max(nat_traversal::now_secs()) + 1;
-        let _ = client.readvertise(nonce).await;
+        match client.readvertise(nonce).await {
+            Ok(()) => failures = 0,
+            Err(err) => {
+                failures += 1;
+                if failures == 1 || failures.is_multiple_of(8) {
+                    tracing::warn!(
+                        target: "ducktape::reachability",
+                        reason = "rendezvous_readvertise_failed",
+                        attempts = failures,
+                        error = %err,
+                        "coordinator re-advertisement failed"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -898,9 +915,7 @@ async fn do_resolve(
                         let _ = client.send_punch_to(peer_reflexive).await;
                     }
                     Ok(SocketEvent::Datagram { src, bytes }) => {
-                        if let Some(datagrams) = datagrams {
-                            let _ = datagrams.try_send((src, bytes));
-                        }
+                        offer_intro_datagram(datagrams, src, bytes);
                     }
                     Ok(_) => {}
                     Err(e) => return Err(format!("coordinator lookup: {e}")),
@@ -935,9 +950,7 @@ async fn do_resolve(
                         let _ = client.send_punch_to(sync_to).await;
                     }
                     Ok(SocketEvent::Datagram { src, bytes }) => {
-                        if let Some(datagrams) = datagrams {
-                            let _ = datagrams.try_send((src, bytes));
-                        }
+                        offer_intro_datagram(datagrams, src, bytes);
                     }
                     Ok(_) => {}
                     Err(e) => return Err(format!("punch recv: {e}")),
@@ -957,6 +970,36 @@ async fn do_resolve(
     Err(format!("hole-punch failed after {PUNCH_TRIES} tries"))
 }
 
+/// Hand an inbound non-rendezvous datagram (an intro, an intro ack) to the
+/// plane's intro lane. The lane is bounded and the intro protocol
+/// retransmits, so a full lane sheds the datagram — counted and reported at
+/// a bounded cadence (the first shed and every 256th after), never silently.
+/// A closed lane is the plane exiting, not a drop.
+fn offer_intro_datagram(
+    datagrams: Option<&tokio::sync::mpsc::Sender<(SocketAddr, Vec<u8>)>>,
+    src: SocketAddr,
+    bytes: Vec<u8>,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::sync::mpsc::error::TrySendError;
+    static SHED: AtomicU64 = AtomicU64::new(0);
+
+    let Some(datagrams) = datagrams else {
+        return;
+    };
+    if let Err(TrySendError::Full(_)) = datagrams.try_send((src, bytes)) {
+        let shed = SHED.fetch_add(1, Ordering::Relaxed) + 1;
+        if shed == 1 || shed.is_multiple_of(256) {
+            tracing::warn!(
+                target: "ducktape::reachability",
+                reason = "intro_lane_full",
+                shed,
+                "inbound intro datagram shed"
+            );
+        }
+    }
+}
+
 async fn send_datagram_and_recv(
     client: &NatClient,
     peer: SocketAddr,
@@ -973,9 +1016,7 @@ async fn send_datagram_and_recv(
             match client.recv_socket_event().await {
                 Ok(SocketEvent::Datagram { src, bytes }) if src == peer => return Ok(bytes),
                 Ok(SocketEvent::Datagram { src, bytes }) => {
-                    if let Some(datagrams) = datagrams {
-                        let _ = datagrams.try_send((src, bytes));
-                    }
+                    offer_intro_datagram(datagrams, src, bytes);
                 }
                 Ok(SocketEvent::Rendezvous(ClientEvent::PunchSync { peer_reflexive, .. })) => {
                     let _ = client.send_punch_to(peer_reflexive).await;
@@ -1233,7 +1274,7 @@ struct Driver<'a, E, R> {
 ///    receivers, so each side still validates the triple exactly once.
 /// 6. **Apply.** When every peer has a validated plan or a `PeerFailed`:
 ///    tear down any previous interface and make the epoch's ONE
-///    `apply_tunnel_plans` call; emit `TunnelsApplied`.
+///    `apply_peer_tunnels` call; emit `TunnelsApplied`.
 pub async fn run<E, R>(
     config: ReachabilityConfig,
     effect: E,
@@ -1652,9 +1693,7 @@ where
                 self.standby_peer_config(&signed.record),
             );
         }
-        let local_interface_ips = self
-            .overlay
-            .identity_allowed_ips(self.me);
+        let local_interface_ips = self.overlay.identity_allowed_ips(self.me);
         let peer_count = peers.len();
         // the join-window invite layer rides the restore apply too (a node
         // rebooting mid-window keeps its invite tunnel), but never enters
@@ -1718,9 +1757,7 @@ where
         PeerTunnelConfig {
             wireguard_public_key: record.wireguard_public_key,
             endpoint: record.wireguard_endpoint.map(|e| e.socket_addr()),
-            allowed_ips: self
-                .overlay
-                .identity_allowed_ips(record.validator_identity),
+            allowed_ips: self.overlay.identity_allowed_ips(record.validator_identity),
             keepalive_seconds: Some(KEEPALIVE_SECONDS),
         }
     }

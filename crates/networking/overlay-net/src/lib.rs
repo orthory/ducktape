@@ -119,11 +119,6 @@ pub struct OverlayContext<E> {
 }
 
 impl<E> OverlayContext<E> {
-    /// the TUN-backed context — every shipped caller's arm.
-    pub fn new(inner: E, router: OverlayRouter) -> Self {
-        Self::with_backend(inner, router, OverlayBackend::Passthrough)
-    }
-
     pub fn with_backend(inner: E, router: OverlayRouter, backend: OverlayBackend) -> Self {
         Self {
             inner,
@@ -312,9 +307,9 @@ impl<E: Network + Clock> Network for OverlayContext<E> {
             return Ok(OverlayListener::Os(self.inner.bind(socket).await?));
         }
         match &self.backend {
-            OverlayBackend::Passthrough => {
-                Ok(OverlayListener::Os(passthrough::bind(&self.inner, socket).await?))
-            }
+            OverlayBackend::Passthrough => Ok(OverlayListener::Os(
+                passthrough::bind(&self.inner, socket).await?,
+            )),
             OverlayBackend::Userspace { slot, .. } => Ok(OverlayListener::Virtual(
                 userspace::seam::bind(slot, socket).await?,
             )),
@@ -516,7 +511,8 @@ mod tests {
         let executor = deterministic::Runner::default();
         executor.start(|context| async move {
             let router = OverlayRouter::for_prefix48(fixture_prefix());
-            let context = OverlayContext::new(context, router);
+            let context =
+                OverlayContext::with_backend(context, router, OverlayBackend::Passthrough);
 
             // one address per arm: an overlay member /128 and a plain OS addr.
             let overlay_addr: SocketAddr = "[fda2:8ad3:eaee::42]:52200".parse().unwrap();

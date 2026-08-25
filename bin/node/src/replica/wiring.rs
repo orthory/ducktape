@@ -101,9 +101,12 @@ pub(super) async fn wire(
     overlay_slot: overlay_net::userspace::StackSlot,
 ) -> ReplicaChannels {
     if manifest.is_none() && !recovery.journal_is_empty().await {
-        fatal!(label, "recovery journal exists but the checkpoint is \
+        fatal!(
+            label,
+            "recovery journal exists but the checkpoint is \
              missing — wipe the app state and re-join (KEEP any consensus journal \
-             partitions: they are what prevents this key from double-voting)");
+             partitions: they are what prevents this key from double-voting)"
+        );
     }
     // the parked mesh identity: the GENESIS window (index 0, primary =
     // the descriptor's fingerprinted validators — byte-equal to valset's
@@ -137,8 +140,7 @@ pub(super) async fn wire(
     // a shed certificate is re-anchored by the next one's parent
     // linkage (the planner backfills the gap), so the drain never
     // blocks the peer connection.
-    let (cert_bridge_tx, cert_bridge) =
-        futures::channel::mpsc::channel::<Vec<u8>>(256);
+    let (cert_bridge_tx, cert_bridge) = futures::channel::mpsc::channel::<Vec<u8>>(256);
     // the engine-lane bank, based at the checkpoint epoch (a fresh join
     // has none — base 0). epochs BELOW the base are registered and
     // permanently black-holed, exactly the validator wiring's trick: a
@@ -151,11 +153,10 @@ pub(super) async fn wire(
         let (vote, cert, res, payload, fetch) = engine_channels(epoch);
         for ch in [vote, cert, res, payload, fetch] {
             let (_tx, mut rx) = network.register(ch, quota, MAX_BACKLOG);
-            let label: &'static str =
-                Box::leak(format!("blackhole_{ch}").into_boxed_str());
-            context.child(label).spawn(move |_ctx| async move {
-                while rx.recv().await.is_ok() {}
-            });
+            let label: &'static str = Box::leak(format!("blackhole_{ch}").into_boxed_str());
+            context
+                .child(label)
+                .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
         }
     }
     let slots = (0..EPOCH_CHANNEL_BANK)
@@ -239,8 +240,7 @@ pub(super) async fn wire(
     // plane over the same registered channel.
     let mut reach_reclaim: Option<ReachLaneHandback> = None;
     let reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>> = {
-        let (reach_tx, mut reach_rx) =
-            network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
+        let (reach_tx, mut reach_rx) = network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
         match wireguard_listen {
             Some(wg_addr) => {
                 // AMBIENT coordinator: the joiner resolves coordinated

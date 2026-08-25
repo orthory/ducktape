@@ -21,8 +21,9 @@ use commonware_cryptography::ed25519;
 /// ADR's phase 3): the client rides the node's own WireGuard underlay
 /// socket — sends go out through it directly, and receives are the
 /// underlay demux's non-WireGuard lane. `Owned` is the standalone posture
-/// (a socket of this client's own), kept for the TUN backend, whose
-/// in-device socket cannot be shared.
+/// (a socket of this client's own) — what [`NatClient::bind`] mints for a
+/// client running without an overlay plane (the simulated-NAT acceptance
+/// suite, the reflexive probes).
 pub enum NatSocket {
     Owned(UdpSocket),
     Shared {

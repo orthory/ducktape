@@ -18,7 +18,7 @@ use crate::reachability_plane::GateOutcomes;
 use crate::rpc::{JoinRequestRecord, RpcJob};
 use crate::sync::serve::SyncStateRequest;
 use crate::util::{participant_bytes, resident_bytes};
-use crate::{join_gate, relay_runtime, voice_plane};
+use crate::{join_gate, overlay_book, relay_runtime};
 
 pub(super) type ValidatorNode = node::OrderedNode<
     consensus::SimplexOrderer,
@@ -100,7 +100,7 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) mesh_window: crate::mesh_window::MeshWindowTracker,
     pub(super) mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
     pub(super) gateway_book: Option<std::sync::Arc<crate::gateway_plane::OverlayBook>>,
-    pub(super) media_peers: Option<std::sync::Arc<voice_plane::MediaPeers>>,
+    pub(super) media_peers: Option<std::sync::Arc<overlay_book::OverlayPeers>>,
     pub(super) blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
     pub(super) blob_client: crate::blob_fetch::ServeLaneBlobClient<super::MeshSender>,
     pub(super) reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
@@ -156,7 +156,7 @@ struct ValidatorRuntime<'a> {
     mesh_window: crate::mesh_window::MeshWindowTracker,
     mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
     gateway_book: Option<std::sync::Arc<crate::gateway_plane::OverlayBook>>,
-    media_peers: Option<std::sync::Arc<voice_plane::MediaPeers>>,
+    media_peers: Option<std::sync::Arc<overlay_book::OverlayPeers>>,
     blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
     blob_client: crate::blob_fetch::ServeLaneBlobClient<super::MeshSender>,
     reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,

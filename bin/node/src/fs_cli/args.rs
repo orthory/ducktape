@@ -86,7 +86,8 @@ mod tests {
     /// positional; `--message` still binds its value.
     #[test]
     fn commit_no_rebase_keeps_dir_positional() {
-        let FsCmd::Commit(a) = parse(&["commit", "--no-rebase", "wt/dir", "--message", "m"]).unwrap()
+        let FsCmd::Commit(a) =
+            parse(&["commit", "--no-rebase", "wt/dir", "--message", "m"]).unwrap()
         else {
             panic!("expected commit");
         };

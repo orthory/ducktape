@@ -11,8 +11,8 @@
 use commonware_codec::DecodeExt as _;
 use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
 use commonware_cryptography::{Signer as _, ed25519};
-use commonware_p2p::authenticated::lookup;
 use commonware_p2p::Receiver as P2pReceiver;
+use commonware_p2p::authenticated::lookup;
 use commonware_runtime::{Clock, Metrics, Spawner, Supervisor};
 use futures::{FutureExt as _, StreamExt as _};
 use recovery::{Manifest, Recovery};
@@ -86,7 +86,10 @@ async fn replica_roles(
                 .collect(),
         ),
         None => (
-            announce_targets.iter().map(|k| hex_bytes(k.as_ref())).collect(),
+            announce_targets
+                .iter()
+                .map(|k| hex_bytes(k.as_ref()))
+                .collect(),
             std::collections::BTreeSet::new(),
         ),
     }
@@ -269,7 +272,7 @@ pub(super) async fn park(
         "joining: awaiting redemption"
     );
     let media_peers = if wireguard_listen.is_some() {
-        let tracked = crate::voice_plane::MediaPeers::new(
+        let tracked = crate::overlay_book::OverlayPeers::new(
             String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
         );
         tracked.set_peers(peers.iter());
@@ -329,10 +332,10 @@ pub(super) async fn park(
     // handed to the seat if this node is promoted, so the announce keeps its
     // read-through grant across the transition.
     let gateway_book = gateway_requests.map(|requests| {
-        let book = crate::gateway_plane::OverlayBook::new(
+        let book = crate::gateway_plane::OverlayBook::new(crate::overlay_book::OverlayPeers::new(
             String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
-        );
-        book.set_peers(peers.iter());
+        ));
+        book.peers().set_peers(peers.iter());
         crate::gateway_plane::spawn(
             crate::gateway_plane::SpawnConfig {
                 label: label.clone(),
@@ -532,14 +535,7 @@ pub(super) async fn park(
             .any(|key| key.as_slice() == me_bytes.as_slice())
     });
     if let Some(ckpt) = resident_checkpoint {
-        let restored = restore_host(
-            &context,
-            &forge_repo,
-            &duckfs_dir,
-            ckpt,
-            blobs.clone(),
-        )
-        .await;
+        let restored = restore_host(&context, &forge_repo, &duckfs_dir, ckpt, blobs.clone()).await;
         let mut host = match restored {
             Ok(h) => h,
             Err(e) => {
@@ -646,7 +642,8 @@ pub(super) async fn park(
             &status_public_key,
             &announce_targets,
             serving.as_ref().map(|(h, node_r)| (*h, node_r.host())),
-        ).await;
+        )
+        .await;
         tracing::info!(
             event = "node_phase_transition",
             role = "resident",
@@ -1344,7 +1341,8 @@ pub(super) async fn park(
                     &status_public_key,
                     &announce_targets,
                     Some((*served_height, node_r.host())),
-                ).await;
+                )
+                .await;
             }
             // ---- valset orchestration (the replica mirror) --------
             //
@@ -1401,10 +1399,8 @@ pub(super) async fn park(
                         .difference(members)
                         .cloned()
                         .collect();
-                    let plan_resident_bytes: Vec<Vec<u8>> = plan_residents
-                        .iter()
-                        .map(|k| k.as_ref().to_vec())
-                        .collect();
+                    let plan_resident_bytes: Vec<Vec<u8>> =
+                        plan_residents.iter().map(|k| k.as_ref().to_vec()).collect();
                     // THE ACTIVATION CUTOVER THAT SEATS THIS KEY: promotion
                     // is decided HERE, off this node's own folded state —
                     // never by polling members, who may already be halted
@@ -1425,7 +1421,8 @@ pub(super) async fn park(
                         // index when the change committed. the epoch-plane
                         // books follow the cutover, like the validator.
                         if let Some(book) = &gateway_book {
-                            book.set_peers(plan.valset().transport_members().iter());
+                            book.peers()
+                                .set_peers(plan.valset().transport_members().iter());
                         }
                         if let Some(peers) = &media_peers {
                             peers.set_peers(plan.valset().transport_members().iter());
@@ -1433,8 +1430,7 @@ pub(super) async fn park(
                         // the follower swap: same OrderedNode, fresh
                         // orderer, cutover journaled — the epoch-local
                         // view clock restarts with the new base.
-                        let follower =
-                            consensus::FollowerOrderer::new(replica_store.clone());
+                        let follower = consensus::FollowerOrderer::new(replica_store.clone());
                         if let Err(e) = node_r
                             .cutover(
                                 follower,
@@ -1447,8 +1443,7 @@ pub(super) async fn park(
                         {
                             fatal!(label, "replica cutover journal write: {e}");
                         }
-                        replica_scheme =
-                            Some(replica_verifier(&namespace, &member_bytes));
+                        replica_scheme = Some(replica_verifier(&namespace, &member_bytes));
                         replica_epoch = plan.epoch();
                         replica_view_base = plan.cutover_app_height();
                         replica_watermark = None;
@@ -1634,8 +1629,9 @@ pub(super) async fn park(
         // same process. a quorum-widening cutover HALTS the members awaiting
         // this very node's votes, so nothing here may fetch from them.
         if let Some(seat) = seat_plan {
-            let (folded_tip, mut node_r) =
-                serving.take().expect("a seat plan only forms while serving");
+            let (folded_tip, mut node_r) = serving
+                .take()
+                .expect("a seat plan only forms while serving");
             metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Draining);
             tracing::info!(
                 event = "node_phase_transition",
@@ -1806,7 +1802,7 @@ pub(super) async fn park(
                     .filter_map(|key| ed25519::PublicKey::decode(key.as_slice()).ok())
                     .collect();
                 if let Some(book) = &gateway_book {
-                    book.set_peers(transport.iter());
+                    book.peers().set_peers(transport.iter());
                 }
                 if let Some(peers) = &media_peers {
                     peers.set_peers(transport.iter());
@@ -1885,12 +1881,14 @@ pub(super) async fn park(
                 &status_public_key,
                 &announce_targets,
                 None,
-            ).await;
+            )
+            .await;
             metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Syncing);
             replica_scheme = None;
             replica_orchestrator = None;
-            recovery_slot =
-                Some(reopen_recovery(&context, &mut recovery_reopens, &label, code_source.clone()).await);
+            recovery_slot = Some(
+                reopen_recovery(&context, &mut recovery_reopens, &label, code_source.clone()).await,
+            );
         }
         if !member_in_tip {
             // the tip names the CURRENT members — better announce
@@ -2129,10 +2127,9 @@ pub(super) async fn park(
                                 // `heal_and_backfill_index`), and it closes
                                 // at `serving = Some(..)` below.
                                 heal_and_backfill_index(&index, &client, tip, &label).await;
-                                if let Err(err) = index.apply_block_record(
-                                    tip,
-                                    boundary_block_row(tip, &root),
-                                ) {
+                                if let Err(err) =
+                                    index.apply_block_record(tip, boundary_block_row(tip, &root))
+                                {
                                     tracing::warn!(
                                         target: "ducktape::modules",
                                         node = %label,
@@ -2167,7 +2164,8 @@ pub(super) async fn park(
                                 &status_public_key,
                                 &announce_targets,
                                 serving.as_ref().map(|(h, node_r)| (*h, node_r.host())),
-                            ).await;
+                            )
+                            .await;
                             tracing::info!(
                                 event = "node_phase_transition",
                                 role = "resident",
@@ -2323,11 +2321,11 @@ pub(super) async fn park(
                         );
                         let boundary = boundary.clone();
                         let boundary_floor = match verify_manifest_floor(&namespace, &boundary) {
-                                Ok(floor) => floor,
-                                Err(e) => {
-                                    fatal!(label, "promotion floor verify: {e}");
-                                }
-                            };
+                            Ok(floor) => floor,
+                            Err(e) => {
+                                fatal!(label, "promotion floor verify: {e}");
+                            }
+                        };
                         tracing::debug!(
                             target: "ducktape::join",
                             from = boundary.height,

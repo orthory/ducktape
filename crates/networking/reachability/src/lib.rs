@@ -24,17 +24,15 @@ pub mod orchestrator;
 pub mod seal;
 pub mod store;
 
-pub use binding::{
-    active_set, admission_root, identity_of, interface_name, node_key, open_port_policy,
-    valset_root,
-};
-pub use keys::{KeyError, WireGuardKeypair};
-pub use seal::{open as open_sealed, seal};
-pub use msg::{MsgError, ReachabilityMsg};
+// the crate-root surface is exactly what consumers reach for; everything
+// else stays addressable through its module (`binding::`, `msg::`, …).
+pub use binding::{active_set, identity_of, node_key, open_port_policy};
+pub use keys::WireGuardKeypair;
+pub use msg::ReachabilityMsg;
 pub use orchestrator::{
-    CoordinatedInviteReply, EndpointResolver, HANDSHAKE_TTL_VIEWS, InstallReply,
-    KEEPALIVE_SECONDS, MeshEpochEvent, NatResolver, RENDEZVOUS_KEEPALIVE, ReachabilityCommand,
-    ReachabilityConfig, ReachabilityError, ReachabilityEvent, RendezvousStatus, Resolution,
-    StaticResolver, initiates, run,
+    CoordinatedInviteReply, EndpointResolver, InstallReply, MeshEpochEvent, NatResolver,
+    RENDEZVOUS_KEEPALIVE, ReachabilityCommand, ReachabilityConfig, ReachabilityError,
+    ReachabilityEvent, RendezvousStatus, Resolution, StaticResolver, run,
 };
-pub use store::{MESH_STORE_FORMAT, PersistedMesh, StoreError};
+pub use seal::seal;
+pub use store::PersistedMesh;

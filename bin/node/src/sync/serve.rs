@@ -424,8 +424,7 @@ pub(crate) struct SyncIndexOps {
     pub(crate) applied_height: u64,
 }
 
-const MAX_SYNC_RESPONSE_BODY_LEN: usize =
-    MAX_MESSAGE_SIZE as usize - statesync::RPC_HEADER_LEN;
+const MAX_SYNC_RESPONSE_BODY_LEN: usize = MAX_MESSAGE_SIZE as usize - statesync::RPC_HEADER_LEN;
 const _: () = assert!(MAX_SYNC_RESPONSE_BODY_LEN >= 9);
 
 /// Return the largest non-empty prefix that fits the mesh's configured message
@@ -931,8 +930,8 @@ mod tests {
 
     #[test]
     fn frames_response_accepts_exact_limit_and_rejects_one_byte_over() {
-        let fixed_len = statesync::RPC_HEADER_LEN
-            + statesync::encoded_frames_response_len(&[frame(1, 0)]);
+        let fixed_len =
+            statesync::RPC_HEADER_LEN + statesync::encoded_frames_response_len(&[frame(1, 0)]);
         let exact_payload_len = MAX_MESSAGE_SIZE as usize - fixed_len;
 
         let exact = bounded_frames_response(vec![frame(1, exact_payload_len)]);

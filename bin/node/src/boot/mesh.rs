@@ -11,9 +11,9 @@ use crate::constants::MAX_MESSAGE_SIZE;
 /// derived from the same namespace string the per-use planes' `OverlayBook`
 /// and the reachability plane use.
 fn overlay_router_for(namespace: &[u8]) -> overlay_net::OverlayRouter {
-    overlay_net::OverlayRouter::for_prefix48(wireguard::ula_v6_prefix(
-        &String::from_utf8_lossy(namespace),
-    ))
+    overlay_net::OverlayRouter::for_prefix48(wireguard::ula_v6_prefix(&String::from_utf8_lossy(
+        namespace,
+    )))
 }
 
 /// Does this node hand out an address on the real network, or only its overlay
@@ -95,8 +95,10 @@ pub(crate) struct MeshHead {
     pub(crate) sync_sources: Vec<ed25519::PublicKey>,
     pub(crate) sync_source: Option<ed25519::PublicKey>,
     pub(crate) advertised_reach: Ingress,
-    pub(crate) network:
-        Network<overlay_net::OverlayContext<commonware_runtime::tokio::Context>, ed25519::PrivateKey>,
+    pub(crate) network: Network<
+        overlay_net::OverlayContext<commonware_runtime::tokio::Context>,
+        ed25519::PrivateKey,
+    >,
     pub(crate) oracle: lookup::Oracle<ed25519::PublicKey>,
     pub(crate) quota: Quota,
 }

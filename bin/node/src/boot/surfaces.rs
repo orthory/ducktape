@@ -254,7 +254,9 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // the term plane's host side (control handler) takes a clone of the same
     // manager the http handle serves; the guest side drains the session lane.
     let http_handle = match terminals.clone() {
-        Some(manager) => http_handle.with_terminals(manager).with_session_lane(session_lane),
+        Some(manager) => http_handle
+            .with_terminals(manager)
+            .with_session_lane(session_lane),
         None => {
             drop(session_lane);
             http_handle

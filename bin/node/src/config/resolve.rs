@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use provider_host::SandboxBackend;
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_p2p::Ingress;
+use provider_host::SandboxBackend;
 
 use super::identity::load_identity;
 use super::node_toml::{DevSeedToml, NodeToml, SandboxToml};
@@ -346,7 +346,10 @@ fn resolve_sandbox(
             // would read as "the guest never dialled back".
             let kernel = absolute_runtime_path(&sandbox.kernel)?;
             let rootfs = absolute_runtime_path(&sandbox.rootfs)?;
-            Ok((Some(SandboxBackend::Firecracker { kernel, rootfs }), probed()?))
+            Ok((
+                Some(SandboxBackend::Firecracker { kernel, rootfs }),
+                probed()?,
+            ))
         }
         other => Err(format!(
             "sandbox runtime: {other:?} is not \"firecracker\" \
@@ -999,7 +1002,10 @@ mod tests {
         )
         .expect("parse dev config");
         let resolved = resolve_dev_shape(raw).expect("resolve relative storage");
-        assert_eq!(resolved.service.storage_dir, launch_cwd.join("relative/storage"));
+        assert_eq!(
+            resolved.service.storage_dir,
+            launch_cwd.join("relative/storage")
+        );
         assert!(resolved.service.storage_dir.is_absolute());
 
         let default_raw: DevSeedToml = toml::from_str(
@@ -1008,7 +1014,10 @@ mod tests {
         )
         .expect("parse default dev config");
         let default = resolve_dev_shape(default_raw).expect("resolve default storage");
-        assert_eq!(default.service.storage_dir, std::env::temp_dir().join("ducktape-8"));
+        assert_eq!(
+            default.service.storage_dir,
+            std::env::temp_dir().join("ducktape-8")
+        );
         assert!(default.service.storage_dir.is_absolute());
     }
 
@@ -1261,14 +1270,23 @@ mod tests {
             resolved.service.sandbox
         );
         assert!(
-            resolved.service.sandbox_capacity.get("cores").copied().unwrap_or(0) >= 1,
+            resolved
+                .service
+                .sandbox_capacity
+                .get("cores")
+                .copied()
+                .unwrap_or(0)
+                >= 1,
             "a compute node announces its probed capacity"
         );
 
         // an override wins over the probe; a custom guest directory is honored.
         std::fs::write(
             dir.join("node.toml"),
-            format!("{base}{}", sandbox_table("firecracker", "/opt/other", 99, 128)),
+            format!(
+                "{base}{}",
+                sandbox_table("firecracker", "/opt/other", 99, 128)
+            ),
         )
         .expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve overrides");
@@ -1283,7 +1301,6 @@ mod tests {
         );
         assert_eq!(resolved.service.sandbox_capacity.get("cores"), Some(&99));
         assert_eq!(resolved.service.sandbox_capacity.get("mem_gb"), Some(&128));
-
 
         // any other runtime is a loud config error naming the one audited
         // adapter. "tart" and "podman" are in this list ON PURPOSE: both
@@ -1544,8 +1561,7 @@ mod tests {
 
         let node = resolve(&dir.join("node.toml")).expect_err("the node path refuses it");
         assert!(node.contains(expected), "node path: {node}");
-        let service =
-            resolve_service(&dir.join("node.toml")).expect_err("so must the daemon path");
+        let service = resolve_service(&dir.join("node.toml")).expect_err("so must the daemon path");
         assert!(service.contains(expected), "service path: {service}");
     }
 
@@ -1640,7 +1656,7 @@ mod tests {
                 unspecified,
                 Some("tunnel.example.com:9999")
             )
-                .unwrap(),
+            .unwrap(),
             "tunnel.example.com",
             "a hostname override stays a hostname"
         );
@@ -1707,7 +1723,11 @@ mod tests {
         )
         .expect("write");
         let r = resolve(&dir.join("node.toml")).expect("resolve");
-        assert_eq!(r.dial_hints.len(), 1, "self is filtered, the other peer stays");
+        assert_eq!(
+            r.dial_hints.len(),
+            1,
+            "self is filtered, the other peer stays"
+        );
         assert_eq!(
             r.dial_hints[0].0,
             ed25519::PrivateKey::from_seed(0).public_key(),

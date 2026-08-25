@@ -24,7 +24,7 @@ use crate::join_gate;
 use crate::reachability_plane::{GateHook, GateOutcomes, wire_reachability_plane};
 use crate::sync::catchup::derive_pending_boot;
 use crate::sync::serve::{SyncStateRequest, drive_sync_request};
-use crate::{voice, voice_plane};
+use crate::{overlay_book, voice};
 use futures::StreamExt as _;
 use statesync::SyncServer;
 
@@ -40,7 +40,7 @@ pub(super) struct PreWiring {
     pub(super) sync_rx: super::MeshReceiver,
     pub(super) relay_tx: super::MeshSender,
     pub(super) relay_rx: super::MeshReceiver,
-    pub(super) media_peers: Option<Arc<voice_plane::MediaPeers>>,
+    pub(super) media_peers: Option<Arc<overlay_book::OverlayPeers>>,
     pub(super) reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
     /// the join GATE's loop end (join ADR §4): forwarded requests arrive here…
     pub(super) gate_fwd_rx: tokio::sync::mpsc::Receiver<join_gate::GateForward>,
@@ -159,10 +159,10 @@ pub(super) async fn finish(
     // only the process-wide bulk pacer with state sync and follows the same
     // finalized transport-member cut at boot and every epoch transition.
     let gateway_book = gateway_requests.map(|requests| {
-        let book = crate::gateway_plane::OverlayBook::new(
+        let book = crate::gateway_plane::OverlayBook::new(crate::overlay_book::OverlayPeers::new(
             String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
-        );
-        book.set_peers(
+        ));
+        book.peers().set_peers(
             initial_member_keys
                 .iter()
                 .chain(initial_resident_keys.iter()),
@@ -238,7 +238,6 @@ pub(super) async fn finish(
         relay_ingress,
     }
 }
-
 
 /// the statesync serve lanes, shared by the fresh-boot wiring and the
 /// in-process promotion seat: the ingress bridge, the SERVE task (capture
@@ -336,9 +335,7 @@ pub(super) fn wire_serve_lanes(
             while let Some((peer, bytes)) = ingress.next().await {
                 // mesh frames ride the AUTHENTICATED rpc envelope
                 // (requester ‖ proof ‖ id ‖ body — the id correlates).
-                let Ok((requester, proof, rpc_id, body)) =
-                    statesync::decode_rpc(&bytes)
-                else {
+                let Ok((requester, proof, rpc_id, body)) = statesync::decode_rpc(&bytes) else {
                     if let Some(attempts) = REFUSED.hit("malformed_rpc_envelope") {
                         tracing::debug!(
                             target: "ducktape::statesync",
@@ -657,7 +654,7 @@ pub(super) async fn wire(
         if overlay_capable {
             // tracked media set = transport members ∪ residents, refreshed
             // on every valset cutover (below, beside the statesync book).
-            let peers = voice_plane::MediaPeers::new(
+            let peers = overlay_book::OverlayPeers::new(
                 String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
             );
             peers.set_peers(

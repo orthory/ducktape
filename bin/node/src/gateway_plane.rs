@@ -27,7 +27,6 @@ use noded::{GatewayFailure, GatewayJob, GatewayResponse, NodeCommand};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-const BIND_RETRY: Duration = Duration::from_secs(3);
 const PROXY_IO_TIMEOUT: Duration = Duration::from_secs(15);
 /// Idle ceiling between BODY reads from a loopback upstream. A live SSE feed
 /// emits events/keepalives well inside this; a silent-forever upstream would
@@ -60,6 +59,9 @@ pub struct GatewayPlane;
 
 impl crate::overlay_book::Plane for GatewayPlane {
     const SERVICE: Service = Service::Gateway;
+}
+
+impl crate::overlay_book::StreamPlane for GatewayPlane {
     fn flow() -> FlowId {
         proxy_flow()
     }
@@ -203,7 +205,7 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
             service: Service::Gateway,
             pacing: StreamPacing::Shared(pacer),
             policy: StreamPolicy { accept_backlog: 16 },
-            retry: BIND_RETRY,
+            retry: crate::overlay_book::BIND_RETRY,
         };
         let (plane, service) = match bind_stream_plane(spec, factory, book).await {
             Ok(bound) => bound,
@@ -260,11 +262,27 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                 // A WebSocket upgrade is long-lived; it owns the stream and
                 // writes its own responses, so it bypasses the one-shot timeout.
                 if head.upgrade {
-                    serve_ws(&commands, &workspace, &own_node, &requester.0, &head, stream).await;
+                    serve_ws(
+                        &commands,
+                        &workspace,
+                        &own_node,
+                        &requester.0,
+                        &head,
+                        stream,
+                    )
+                    .await;
                     return;
                 }
-                serve_proxy_stream(&commands, &workspace, &own_node, &requester.0, head, None, stream)
-                    .await;
+                serve_proxy_stream(
+                    &commands,
+                    &workspace,
+                    &own_node,
+                    &requester.0,
+                    head,
+                    None,
+                    stream,
+                )
+                .await;
             });
         }
     });
@@ -827,12 +845,14 @@ async fn serve_duckfs(
             "manifest does not match the signed hash".into(),
         ));
     }
-    let manifest: gateway::RouteManifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|error| GatewayFailure::Unavailable(format!("manifest is not valid json: {error}")))?;
+    let manifest: gateway::RouteManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|error| {
+            GatewayFailure::Unavailable(format!("manifest is not valid json: {error}"))
+        })?;
     gateway::validate_manifest(&manifest).map_err(GatewayFailure::Forbidden)?;
 
-    let file =
-        gateway::manifest_file_for_path(&manifest, &head.path_and_query).map_err(GatewayFailure::NotFound)?;
+    let file = gateway::manifest_file_for_path(&manifest, &head.path_and_query)
+        .map_err(GatewayFailure::NotFound)?;
     // Serve-time cap: the file table is off consensus, so the signed response
     // cap is enforced here rather than at admission.
     if file.size > route.policy.max_response_bytes {
@@ -1013,7 +1033,9 @@ async fn authorize_ws(
 ) -> Result<String, GatewayFailure> {
     gateway::validate_proxy_request_head(head).map_err(GatewayFailure::Invalid)?;
     if !head.upgrade {
-        return Err(GatewayFailure::Invalid("gateway proxy: not an upgrade".into()));
+        return Err(GatewayFailure::Invalid(
+            "gateway proxy: not an upgrade".into(),
+        ));
     }
     let record = resolve_route(commands, &head.account_id, &head.name).await?;
     if record.statement.publisher_node.as_slice() != own_node {
@@ -1108,9 +1130,15 @@ async fn serve_ws<S>(
 async fn ws_pump<S, U>(stream: S, upstream: U)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    U: futures::Stream<Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>>
-        + futures::Sink<tokio_tungstenite::tungstenite::Message, Error = tokio_tungstenite::tungstenite::Error>
-        + Unpin
+    U: futures::Stream<
+            Item = Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
+        > + futures::Sink<
+            tokio_tungstenite::tungstenite::Message,
+            Error = tokio_tungstenite::tungstenite::Error,
+        > + Unpin
         + Send
         + 'static,
 {
@@ -1470,10 +1498,12 @@ mod tests {
     async fn streamed_response_arrives_and_zero_cap_is_unbounded() {
         use tokio::io::AsyncWriteExt as _;
         let (mut writer, mut reader) = tokio::io::duplex(64 * 1024);
-        let head = gateway::ProxyResponseHead { status: 200, headers: vec![] };
+        let head = gateway::ProxyResponseHead {
+            status: 200,
+            headers: vec![],
+        };
         let big = vec![0xABu8; 5 * 1024 * 1024]; // > the old 4 MiB buffered clamp
-        let mut frames =
-            gateway::encode_frame(&gateway::ProxyFrame::ResponseHead(head)).unwrap();
+        let mut frames = gateway::encode_frame(&gateway::ProxyFrame::ResponseHead(head)).unwrap();
         for chunk in big.chunks(gateway::MAX_CHUNK_BYTES) {
             frames.extend(
                 gateway::encode_frame(&gateway::ProxyFrame::BodyChunk(chunk.to_vec())).unwrap(),
@@ -1497,9 +1527,11 @@ mod tests {
     async fn running_cap_aborts_mid_stream() {
         use tokio::io::AsyncWriteExt as _;
         let (mut writer, mut reader) = tokio::io::duplex(64 * 1024);
-        let head = gateway::ProxyResponseHead { status: 200, headers: vec![] };
-        let mut frames =
-            gateway::encode_frame(&gateway::ProxyFrame::ResponseHead(head)).unwrap();
+        let head = gateway::ProxyResponseHead {
+            status: 200,
+            headers: vec![],
+        };
+        let mut frames = gateway::encode_frame(&gateway::ProxyFrame::ResponseHead(head)).unwrap();
         for _ in 0..4 {
             frames.extend(
                 gateway::encode_frame(&gateway::ProxyFrame::BodyChunk(vec![0u8; 1024])).unwrap(),
@@ -1522,7 +1554,10 @@ mod tests {
                 }
             }
         }
-        assert!(aborted, "exceeding the running cap must surface an error item");
+        assert!(
+            aborted,
+            "exceeding the running cap must surface an error item"
+        );
         assert!(seen <= 2048);
     }
 
@@ -1534,10 +1569,7 @@ mod tests {
             scrub_cookie_domain("s=1; Path=/; Domain=.duck; HttpOnly"),
             "s=1; Path=/; HttpOnly"
         );
-        assert_eq!(
-            scrub_cookie_domain("s=1; domain=other.duck"),
-            "s=1"
-        );
+        assert_eq!(scrub_cookie_domain("s=1; domain=other.duck"), "s=1");
         // Whitespace and casing around the attribute name must not sneak a
         // Domain through — a browser trims these and honors the attribute.
         assert_eq!(
@@ -1628,7 +1660,10 @@ mod tests {
         // A body larger than one chunk is split into multiple BodyChunk frames
         // and reassembled exactly.
         let big = vec![7u8; gateway::MAX_CHUNK_BYTES * 2 + 100];
-        let head = gateway::ProxyResponseHead { status: 200, headers: vec![] };
+        let head = gateway::ProxyResponseHead {
+            status: 200,
+            headers: vec![],
+        };
         let (_, got_body) = round_trip(head, big.clone(), (gateway::MAX_CHUNK_BYTES * 3) as u64)
             .await
             .unwrap();
@@ -1636,7 +1671,10 @@ mod tests {
 
         // A body past the caller's RUNNING cap is rejected mid-stream (the
         // head has already arrived; the failure surfaces from the body pump).
-        let head = gateway::ProxyResponseHead { status: 200, headers: vec![] };
+        let head = gateway::ProxyResponseHead {
+            status: 200,
+            headers: vec![],
+        };
         let capped = round_trip(head, vec![1u8; 5000], 1000).await;
         assert!(matches!(capped, Err(GatewayFailure::Unavailable(_))));
     }
@@ -1712,7 +1750,15 @@ mod tests {
         };
         let workspace_path = workspace.path().to_path_buf();
         tokio::spawn(async move {
-            serve_ws(&commands, &workspace_path, &publisher, &caller, &head, server).await;
+            serve_ws(
+                &commands,
+                &workspace_path,
+                &publisher,
+                &caller,
+                &head,
+                server,
+            )
+            .await;
         });
 
         // The upgrade is acknowledged with a 101, then a frame round-trips
@@ -1853,7 +1899,15 @@ mod tests {
         };
         let workspace_path = workspace.path().to_path_buf();
         tokio::spawn(async move {
-            serve_ws(&commands, &workspace_path, &publisher, &publisher, &head, server_end).await;
+            serve_ws(
+                &commands,
+                &workspace_path,
+                &publisher,
+                &publisher,
+                &head,
+                server_end,
+            )
+            .await;
         });
         let (to_browser_tx, mut to_browser_rx) = tokio::sync::mpsc::channel(8);
         let (from_browser_tx, from_browser_rx) = tokio::sync::mpsc::channel(8);
@@ -1875,8 +1929,9 @@ mod tests {
     fn admission_is_service_flow_and_member_scoped() {
         use data_plane::AdmissionPolicy as _;
         let signer = ed25519::PrivateKey::from_seed(99);
-        let book = OverlayBook::new("test".into());
-        book.set_peers(std::iter::once(&signer.public_key()));
+        let book = OverlayBook::new(crate::overlay_book::OverlayPeers::new("test".into()));
+        book.peers()
+            .set_peers(std::iter::once(&signer.public_key()));
         let peer = PeerId(signer.public_key().as_ref().try_into().unwrap());
         assert!(book.permits(peer, Service::Gateway, proxy_flow()));
         assert!(!book.permits(peer, Service::StateSync, proxy_flow()));
@@ -2242,11 +2297,21 @@ mod tests {
     #[tokio::test]
     async fn duckfs_head_verifies_signed_bytes_before_returning_no_body() {
         let mut response = serve_content_head(b"safe", b"safe").await.unwrap();
-        assert!(noded::collect_body(&mut response.body).await.unwrap().is_empty());
+        assert!(
+            noded::collect_body(&mut response.body)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(response.head.status, 200);
 
         let mut empty = serve_content_head(b"", b"").await.unwrap();
-        assert!(noded::collect_body(&mut empty.body).await.unwrap().is_empty());
+        assert!(
+            noded::collect_body(&mut empty.body)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         let error = serve_content_head(b"safe", b"evil").await.unwrap_err();
         assert!(matches!(error, GatewayFailure::Forbidden(_)));

@@ -489,7 +489,10 @@ mod tests {
         // nothing itself, so consent alone is not evidence anything can run.
         let grants = [grant("compute", &["claude", "codex"])];
         let set = announced_set(&grants, &[], &caps(8)).unwrap();
-        assert!(set.capabilities.is_empty(), "a grant without a hello offers nothing");
+        assert!(
+            set.capabilities.is_empty(),
+            "a grant without a hello offers nothing"
+        );
         assert!(set.resources.is_empty(), "empty tags force empty resources");
 
         // a daemon signals: the intersection appears, kind tag included, and
@@ -515,7 +518,10 @@ mod tests {
         let grants = [grant("agent", &["claude"]), grant("compute", &["codex"])];
         let live = [signal("agent", &["claude"]), signal("compute", &["codex"])];
         let set = announced_set(&grants, &live, &caps(4)).unwrap();
-        assert_eq!(set.capabilities, tags(&["agent", "claude", "codex", "compute"]));
+        assert_eq!(
+            set.capabilities,
+            tags(&["agent", "claude", "codex", "compute"])
+        );
     }
 
     #[test]
@@ -653,7 +659,12 @@ mod tests {
             "and the capacity with them — resources without tags is a module-level reject"
         );
         // the grant is untouched on disk: consent survives the daemon.
-        assert!(crate::services::load(workspace.path()).unwrap().grant("compute").is_some());
+        assert!(
+            crate::services::load(workspace.path())
+                .unwrap()
+                .grant("compute")
+                .is_some()
+        );
     }
 
     #[test]
@@ -771,7 +782,9 @@ mod tests {
         let live = [signal("agent", &["claude"])];
         let now = announced_set(&grants, &live, &caps(4)).unwrap();
         assert!(
-            now.capabilities.iter().all(|tag| bound.capabilities.contains(tag)),
+            now.capabilities
+                .iter()
+                .all(|tag| bound.capabilities.contains(tag)),
             "a live derivation is always a subset of the bound"
         );
         assert!(now.capabilities.len() < bound.capabilities.len());

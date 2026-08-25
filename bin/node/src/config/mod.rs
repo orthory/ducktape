@@ -216,7 +216,10 @@ impl NetworkDescriptor {
             let expected_key = decode_key(k)?;
             bootstrap_by_key.insert(
                 expected_key.as_ref().to_vec(),
-                ReachHint { expected_key, reach: Reach::Direct(addr.to_string()) },
+                ReachHint {
+                    expected_key,
+                    reach: Reach::Direct(addr.to_string()),
+                },
             );
         }
         let mut typed = Vec::new();
@@ -315,7 +318,10 @@ impl NetworkDescriptor {
                     None => continue, // unspecified ip / port 0 — advisory noise.
                 },
                 Reach::Coordinated(c) => match ingress_of(&c.coord_addr)? {
-                    Some(coord) => ReachDial::Coordinated { coord, coord_key: c.coord_key.clone() },
+                    Some(coord) => ReachDial::Coordinated {
+                        coord,
+                        coord_key: c.coord_key.clone(),
+                    },
                     None => continue,
                 },
             };
@@ -478,7 +484,11 @@ pub fn unpack_coord_cap(bytes: &[u8]) -> Result<nat_traversal::CoordCap, String>
     let not_after = u64::from_be_bytes(na);
     let issuer_sig =
         ed25519::Signature::decode(&bytes[40..]).map_err(|e| format!("coord cap sig: {e}"))?;
-    Ok(nat_traversal::CoordCap { issuer, not_after, issuer_sig })
+    Ok(nat_traversal::CoordCap {
+        issuer,
+        not_after,
+        issuer_sig,
+    })
 }
 
 pub fn save_coord_cap(dir: &Path, cap: &nat_traversal::CoordCap) -> Result<(), String> {
@@ -491,7 +501,9 @@ pub fn save_coord_cap(dir: &Path, cap: &nat_traversal::CoordCap) -> Result<(), S
         use std::os::unix::fs::OpenOptionsExt as _;
         opts.mode(0o600);
     }
-    let mut f = opts.open(&path).map_err(|e| format!("create {path:?}: {e}"))?;
+    let mut f = opts
+        .open(&path)
+        .map_err(|e| format!("create {path:?}: {e}"))?;
     f.write_all(format!("{}\n", hex_bytes(&pack_coord_cap(cap))).as_bytes())
         .map_err(|e| format!("write {path:?}: {e}"))
 }
@@ -642,7 +654,11 @@ impl ReachHint {
             Reach::Direct(a) => format!("direct:{ek}@{a}"),
             Reach::Fronted(a) => format!("fronted:{ek}@{a}"),
             Reach::Coordinated(c) => {
-                format!("coordinated:{ek}@{}#{}", c.coord_addr, hex_bytes(c.coord_key.as_ref()))
+                format!(
+                    "coordinated:{ek}@{}#{}",
+                    c.coord_addr,
+                    hex_bytes(c.coord_key.as_ref())
+                )
             }
         }
     }
@@ -669,7 +685,10 @@ impl ReachHint {
             }
             other => return Err(format!("unknown reach tag {other:?} in {s:?}")),
         };
-        Ok(Self { expected_key, reach })
+        Ok(Self {
+            expected_key,
+            reach,
+        })
     }
 }
 
@@ -995,8 +1014,8 @@ mod tests {
     fn delivered_cap_admits_the_joiner_under_private_policy() {
         use commonware_cryptography::Signer as _;
         use nat_traversal::{
-            mint_coord_cap, now_secs, sign_authenticator, verify_request, AuthPolicy, NodeKey,
-            COORD_CAP_TTL_SECS, DEFAULT_FRESHNESS_WINDOW_SECS,
+            AuthPolicy, COORD_CAP_TTL_SECS, DEFAULT_FRESHNESS_WINDOW_SECS, NodeKey, mint_coord_cap,
+            now_secs, sign_authenticator, verify_request,
         };
 
         let genesis = ed25519::PrivateKey::from_seed(1);
@@ -1114,14 +1133,26 @@ mod tests {
     fn resolve_network_reads_http_base_and_reports_a_missing_listen() {
         let root = tmp("resolve-net");
         // a workspace with a wildcard http listen resolves to a loopback base.
-        let a = write_workspace(&root, "a", "ducktape#a1b2c3d4", "0.0.0.0:9000", "0.0.0.0:8844");
+        let a = write_workspace(
+            &root,
+            "a",
+            "ducktape#a1b2c3d4",
+            "0.0.0.0:9000",
+            "0.0.0.0:8844",
+        );
         let (dir, http) = resolve_network_in(&root, "ducktape").expect("prefix resolves");
         assert_eq!(dir, a);
         assert_eq!(http.as_deref(), Some("http://127.0.0.1:8844"));
 
         // every network-shape workspace carries an http listen (the key is
         // required), so the base always resolves.
-        let b = write_workspace(&root, "b", "kitchen#99887766", "127.0.0.1:9001", "127.0.0.1:9002");
+        let b = write_workspace(
+            &root,
+            "b",
+            "kitchen#99887766",
+            "127.0.0.1:9001",
+            "127.0.0.1:9002",
+        );
         let (bdir, bhttp) = resolve_network_in(&root, "kitchen").expect("prefix resolves");
         assert_eq!(bdir, b);
         assert_eq!(bhttp.as_deref(), Some("http://127.0.0.1:9002"));
@@ -1357,8 +1388,14 @@ mod tests {
         let ek = ed25519::PrivateKey::from_seed(11).public_key();
         let ck = ed25519::PrivateKey::from_seed(12).public_key();
         let cases = [
-            ReachHint { expected_key: ek.clone(), reach: Reach::Direct("127.0.0.1:9000".into()) },
-            ReachHint { expected_key: ek.clone(), reach: Reach::Fronted("front.example.com:443".into()) },
+            ReachHint {
+                expected_key: ek.clone(),
+                reach: Reach::Direct("127.0.0.1:9000".into()),
+            },
+            ReachHint {
+                expected_key: ek.clone(),
+                reach: Reach::Fronted("front.example.com:443".into()),
+            },
             ReachHint {
                 expected_key: ek.clone(),
                 reach: Reach::Coordinated(CoordRef {
@@ -1380,7 +1417,10 @@ mod tests {
         assert!(ReachHint::parse("bogus:00@host:1").is_err(), "unknown tag");
         assert!(ReachHint::parse("direct:zz@host:1").is_err(), "bad hex key");
         // coordinated without the #coord_key delimiter:
-        assert!(ReachHint::parse("coordinated:00@host:1").is_err(), "missing #coord_key");
+        assert!(
+            ReachHint::parse("coordinated:00@host:1").is_err(),
+            "missing #coord_key"
+        );
     }
 
     #[test]
@@ -1396,7 +1436,10 @@ mod tests {
         // an existing network.toml without a [reach] array still parses (serde default),
         // and an empty reach is not serialised (skip_serializing_if).
         assert!(!d.to_toml().contains("reach"));
-        d.add_reach(&ReachHint { expected_key: a.clone(), reach: Reach::Direct("10.0.0.1:9000".into()) });
+        d.add_reach(&ReachHint {
+            expected_key: a.clone(),
+            reach: Reach::Direct("10.0.0.1:9000".into()),
+        });
         let back = NetworkDescriptor::from_toml(&d.to_toml()).expect("roundtrip");
         assert_eq!(back.reach, d.reach);
     }
@@ -1414,7 +1457,13 @@ mod tests {
         d.add_bootstrap(&a, "127.0.0.1:52200");
         let hints = d.reach_hints().expect("hints");
         assert_eq!(hints.len(), 1);
-        assert_eq!(hints[0], ReachHint { expected_key: a, reach: Reach::Direct("127.0.0.1:52200".into()) });
+        assert_eq!(
+            hints[0],
+            ReachHint {
+                expected_key: a,
+                reach: Reach::Direct("127.0.0.1:52200".into())
+            }
+        );
     }
 
     #[test]
@@ -1428,14 +1477,23 @@ mod tests {
             reach: vec![],
             coordination: None,
         };
-        d.add_reach(&ReachHint { expected_key: a.clone(), reach: Reach::Direct("1.1.1.1:1".into()) });
+        d.add_reach(&ReachHint {
+            expected_key: a.clone(),
+            reach: Reach::Direct("1.1.1.1:1".into()),
+        });
         // same expected_key, different reach — replaces, never duplicates.
         d.add_reach(&ReachHint {
             expected_key: a.clone(),
-            reach: Reach::Coordinated(CoordRef { coord_addr: "c:2".into(), coord_key: coord }),
+            reach: Reach::Coordinated(CoordRef {
+                coord_addr: "c:2".into(),
+                coord_key: coord,
+            }),
         });
         assert_eq!(d.reach.len(), 1);
-        assert!(matches!(d.reach_hints().unwrap()[0].reach, Reach::Coordinated(_)));
+        assert!(matches!(
+            d.reach_hints().unwrap()[0].reach,
+            Reach::Coordinated(_)
+        ));
         let mut sorted = d.reach.clone();
         sorted.sort();
         assert_eq!(d.reach, sorted);
@@ -1466,13 +1524,25 @@ mod tests {
 
         let hints = d.reach_hints().expect("hints");
         assert_eq!(hints.len(), 2);
-        assert!(hints.iter().any(|h| matches!(h.reach, Reach::Coordinated(_))));
+        assert!(
+            hints
+                .iter()
+                .any(|h| matches!(h.reach, Reach::Coordinated(_)))
+        );
         assert!(hints.iter().any(|h| matches!(h.reach, Reach::Direct(_))));
 
         let entries = d.reach_entries().expect("entries");
         assert_eq!(entries.len(), 2);
-        assert!(entries.iter().any(|(_, r)| matches!(r, ReachDial::Coordinated { .. })));
-        assert!(entries.iter().any(|(_, r)| matches!(r, ReachDial::Direct(_))));
+        assert!(
+            entries
+                .iter()
+                .any(|(_, r)| matches!(r, ReachDial::Coordinated { .. }))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|(_, r)| matches!(r, ReachDial::Direct(_)))
+        );
     }
 
     #[test]
@@ -1513,7 +1583,11 @@ mod tests {
                 .any(|h| matches!(&h.reach, Reach::Direct(a) if a == "203.0.113.7:52200")),
             "the founder's advertised direct route was dropped"
         );
-        assert!(hints.iter().any(|h| matches!(h.reach, Reach::Coordinated(_))));
+        assert!(
+            hints
+                .iter()
+                .any(|h| matches!(h.reach, Reach::Coordinated(_)))
+        );
 
         // a typed DIRECT hint for the same key still supersedes the bootstrap
         // Direct (the member's dial address moved) — no stale duplicate.
@@ -1605,14 +1679,20 @@ mod tests {
         with_reach.add_bootstrap(&v, "127.0.0.1:52200");
         with_reach.add_reach(&ReachHint {
             expected_key: v.clone(),
-            reach: Reach::Coordinated(CoordRef { coord_addr: "p2p:7777".into(), coord_key: coord }),
+            reach: Reach::Coordinated(CoordRef {
+                coord_addr: "p2p:7777".into(),
+                coord_key: coord,
+            }),
         });
 
         // advisory reach + bootstrap NEVER move the consensus identity.
         assert_eq!(with_reach.genesis_namespace(), ns0);
         // two descriptors differing ONLY in reach fingerprint identically.
         let mut other_reach = base.clone();
-        other_reach.add_reach(&ReachHint { expected_key: v, reach: Reach::Direct("9.9.9.9:9".into()) });
+        other_reach.add_reach(&ReachHint {
+            expected_key: v,
+            reach: Reach::Direct("9.9.9.9:9".into()),
+        });
         assert_eq!(other_reach.genesis_namespace(), ns0);
     }
 
@@ -1634,13 +1714,19 @@ mod tests {
         // key ride along for the nat client to rendezvous through.
         d.add_reach(&ReachHint {
             expected_key: target.clone(),
-            reach: Reach::Coordinated(CoordRef { coord_addr: "127.0.0.1:59999".into(), coord_key: coord.clone() }),
+            reach: Reach::Coordinated(CoordRef {
+                coord_addr: "127.0.0.1:59999".into(),
+                coord_key: coord.clone(),
+            }),
         });
         let entries = d.reach_entries().expect("resolve");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, target); // expect target key
         match &entries[0].1 {
-            ReachDial::Coordinated { coord: c, coord_key } => {
+            ReachDial::Coordinated {
+                coord: c,
+                coord_key,
+            } => {
                 assert_eq!(*c, Ingress::Socket("127.0.0.1:59999".parse().unwrap()));
                 assert_eq!(*coord_key, coord);
             }
@@ -1663,13 +1749,20 @@ mod tests {
         let entries = d.reach_entries().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, a);
-        assert!(matches!(&entries[0].1, ReachDial::Direct(i) if *i == Ingress::Socket("127.0.0.1:52200".parse().unwrap())));
+        assert!(
+            matches!(&entries[0].1, ReachDial::Direct(i) if *i == Ingress::Socket("127.0.0.1:52200".parse().unwrap()))
+        );
         // ...and an explicit reach hint for the same key wins over it (union,
         // reach-preferred), still one Direct entry.
-        d.add_reach(&ReachHint { expected_key: a.clone(), reach: Reach::Direct("127.0.0.1:52201".into()) });
+        d.add_reach(&ReachHint {
+            expected_key: a.clone(),
+            reach: Reach::Direct("127.0.0.1:52201".into()),
+        });
         let entries = d.reach_entries().unwrap();
         assert_eq!(entries.len(), 1);
-        assert!(matches!(&entries[0].1, ReachDial::Direct(i) if *i == Ingress::Socket("127.0.0.1:52201".parse().unwrap())));
+        assert!(
+            matches!(&entries[0].1, ReachDial::Direct(i) if *i == Ingress::Socket("127.0.0.1:52201".parse().unwrap()))
+        );
     }
 
     #[test]

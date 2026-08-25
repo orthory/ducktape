@@ -94,7 +94,12 @@ pub(crate) struct Airlock {
 
 /// Serve until the process is stopped.
 pub(crate) fn serve(airlock: Airlock) -> Result<(), Box<dyn std::error::Error>> {
-    let Airlock { grant, service, http_base, workspace } = airlock;
+    let Airlock {
+        grant,
+        service,
+        http_base,
+        workspace,
+    } = airlock;
     serve_until(
         grant.display_id(),
         service.storage_dir,
@@ -458,10 +463,9 @@ async fn delegated_answer(
     // for.
     let work_is_live = match saga.status {
         SagaStatus::Pending => true,
-        SagaStatus::Done
-        | SagaStatus::Failed
-        | SagaStatus::TimedOut
-        | SagaStatus::Cancelled => false,
+        SagaStatus::Done | SagaStatus::Failed | SagaStatus::TimedOut | SagaStatus::Cancelled => {
+            false
+        }
     };
     if !work_is_live {
         return refuse("delegated_work_finished");
@@ -583,7 +587,9 @@ fn undecided(reason: &'static str) -> GrantAnswer {
 fn credential_the_work_names(spec: &[u8]) -> Option<String> {
     let work = dispatch::decode_work_spec(spec).ok()?;
     let envelope = String::from_utf8(work.payload).ok()?;
-    compute_service::envelope::prepare(&envelope).ok()?.credential
+    compute_service::envelope::prepare(&envelope)
+        .ok()?
+        .credential
 }
 
 /// Condition three: is the vouched-for caller the node this saga is PINNED to?
@@ -668,7 +674,9 @@ async fn committed_credential_record(
     reader: &dyn CommittedReader,
     name: &str,
 ) -> Result<Option<CredentialRecord>, String> {
-    let request = gateway::encode_query(&GatewayQuery::Credential { name: name.to_string() });
+    let request = gateway::encode_query(&GatewayQuery::Credential {
+        name: name.to_string(),
+    });
     let bytes = reader.read("gateway", request).await?;
     match gateway::decode_reply(&bytes)? {
         GatewayReply::Credential(record) => Ok(record),
@@ -1416,7 +1424,11 @@ mod tests {
         // a store, and a services.toml that does not parse. The grant may well
         // exist; we cannot tell, so we say nothing.
         seed_credential(&storage, "owner-codex-1");
-        std::fs::write(workspace.join(crate::services::FILE_NAME), "this is not toml {{{").unwrap();
+        std::fs::write(
+            workspace.join(crate::services::FILE_NAME),
+            "this is not toml {{{",
+        )
+        .unwrap();
         assert_eq!(lending_without_a_grant(&storage, &workspace), None);
     }
 
@@ -1465,9 +1477,14 @@ mod tests {
             .lock()
             .unwrap()
             .expect("the route must be published before the daemon serves");
-        assert_ne!(served_on, 0, "a registered route names a real loopback port");
+        assert_ne!(
+            served_on, 0,
+            "a registered route names a real loopback port"
+        );
         assert_eq!(
-            crate::gateway_routes::load(&workspace).unwrap().port(&route),
+            crate::gateway_routes::load(&workspace)
+                .unwrap()
+                .port(&route),
             None,
             "a stopped daemon leaves no route pointing at a port any process may now bind"
         );

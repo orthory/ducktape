@@ -104,7 +104,10 @@ pub struct LazyVirtualListener {
     port: u16,
     /// the live leg, tagged with the stack it bound on so a rebuild
     /// (different `Arc`) is detected and re-bound.
-    leg: Option<(std::sync::Arc<super::stack::VirtualStack>, VirtualTcpListener)>,
+    leg: Option<(
+        std::sync::Arc<super::stack::VirtualStack>,
+        VirtualTcpListener,
+    )>,
 }
 
 impl LazyVirtualListener {

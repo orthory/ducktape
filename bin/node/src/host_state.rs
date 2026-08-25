@@ -4,6 +4,7 @@
 //! state into the canonical host. The live node loop only consumes the three
 //! lifecycle operations and output adapter exported below.
 
+use acl::Acl;
 use commonware_cryptography::ed25519;
 use commonware_runtime::Supervisor as _;
 use duckfs_disk::SyncScratch;
@@ -18,7 +19,6 @@ use statesync::{
     fetch_snapshot,
     qmdb::{QmdbStore, RemoteQmdbResolver},
 };
-use acl::Acl;
 use valset::Valset;
 use wasm_host::WasmModule;
 
@@ -511,11 +511,7 @@ fn governance_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
 /// and rides state-sync like any other record. idempotent: a store that
 /// already carries a config (a reopened workspace re-entering the genesis
 /// path) is left byte-untouched.
-async fn seed_store_config(
-    store: &mut dyn sdk::MerkleStore,
-    params: &[(&str, &[u8])],
-    what: &str,
-) {
+async fn seed_store_config(store: &mut dyn sdk::MerkleStore, params: &[(&str, &[u8])], what: &str) {
     let key = sdk::store_key(sdk::genesis_config::CONFIG_KEY);
     let already = store
         .get(&key)

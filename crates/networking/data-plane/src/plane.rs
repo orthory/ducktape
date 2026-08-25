@@ -96,6 +96,12 @@ struct Stats {
     malformed_datagrams: AtomicU64,
     unregistered_datagrams: AtomicU64,
     unregistered_streams: AtomicU64,
+    /// Inbound streams whose opener never completed a well-formed hello
+    /// within the handshake timeout (dropped without ack).
+    hello_failed_streams: AtomicU64,
+    /// Admitted, registered inbound streams refused because the service's
+    /// accept backlog was full (dropped without ack).
+    backlog_refused_streams: AtomicU64,
     refused_sends: AtomicU64,
     rogue_by_peer: Mutex<HashMap<PeerId, u64>>,
 }
@@ -118,6 +124,8 @@ impl Stats {
             malformed_datagrams: self.malformed_datagrams.load(Ordering::Relaxed),
             unregistered_datagrams: self.unregistered_datagrams.load(Ordering::Relaxed),
             unregistered_streams: self.unregistered_streams.load(Ordering::Relaxed),
+            hello_failed_streams: self.hello_failed_streams.load(Ordering::Relaxed),
+            backlog_refused_streams: self.backlog_refused_streams.load(Ordering::Relaxed),
             refused_sends: self.refused_sends.load(Ordering::Relaxed),
         }
     }
@@ -182,8 +190,9 @@ pub struct TrafficSnapshot {
     pub halted: bool,
 }
 
-/// A point-in-time copy of the plane's drop accounting. Rogue traffic is
-/// never silent: it lands here, attributed.
+/// A point-in-time copy of the plane's drop accounting. No drop is silent:
+/// every inbound stream or datagram the plane refuses lands in exactly one
+/// counter here (rogue traffic attributed to its peer).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StatsSnapshot {
     pub rogue_datagrams: u64,
@@ -191,6 +200,10 @@ pub struct StatsSnapshot {
     pub malformed_datagrams: u64,
     pub unregistered_datagrams: u64,
     pub unregistered_streams: u64,
+    /// Inbound streams dropped for a missing or malformed hello.
+    pub hello_failed_streams: u64,
+    /// Inbound streams dropped because the service's accept backlog was full.
+    pub backlog_refused_streams: u64,
     pub refused_sends: u64,
 }
 
@@ -250,10 +263,24 @@ struct Shared<T: DataPlaneTransport> {
     /// `Arc` so a [`PacedStream`] (which may outlive every plane handle)
     /// keeps its byte accounting attached to this plane.
     traffic: Arc<Traffic>,
+    /// The demux and accept pumps. They hold only a `Weak` back to this
+    /// state (plus the transport they block on), so the last handle's drop
+    /// runs [`Shared::drop`], which aborts them — a plane's life is exactly
+    /// the life of its handles, never extended by its own pumps.
+    pumps: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl<T: DataPlaneTransport> Drop for Shared<T> {
+    fn drop(&mut self) {
+        for pump in self.pumps.lock().expect("pumps lock").drain(..) {
+            pump.abort();
+        }
+    }
 }
 
 /// The plane. Cloneable handle; spawns its demux and acceptor loops on
-/// construction and runs until the transport closes.
+/// construction. The loops run until the transport closes or the last
+/// handle (plane, flow, or service) drops, whichever comes first.
 pub struct DataPlane<T: DataPlaneTransport> {
     shared: Arc<Shared<T>>,
 }
@@ -298,17 +325,22 @@ impl<T: DataPlaneTransport> DataPlane<T> {
         admission: Arc<dyn AdmissionPolicy>,
         pacer: BulkPacer,
     ) -> Self {
+        let transport = Arc::new(transport);
         let shared = Arc::new(Shared {
-            transport: Arc::new(transport),
+            transport: transport.clone(),
             admission,
             bucket: pacer.bucket,
             datagram_flows: Mutex::new(HashMap::new()),
             stream_services: Mutex::new(HashMap::new()),
             stats: Stats::default(),
             traffic: Arc::new(Traffic::default()),
+            pumps: Mutex::new(Vec::new()),
         });
-        tokio::spawn(demux_loop(shared.clone()));
-        tokio::spawn(accept_loop(shared.clone()));
+        let pumps = vec![
+            tokio::spawn(demux_loop(transport.clone(), Arc::downgrade(&shared))),
+            tokio::spawn(accept_loop(transport, Arc::downgrade(&shared))),
+        ];
+        *shared.pumps.lock().expect("pumps lock") = pumps;
         DataPlane { shared }
     }
 
@@ -392,14 +424,23 @@ impl<T: DataPlaneTransport> DataPlane<T> {
     }
 }
 
-async fn demux_loop<T: DataPlaneTransport>(shared: Arc<Shared<T>>) {
+/// The pumps block on the transport while holding only a `Weak` to the plane
+/// state; a receive that lands after the last handle dropped finds no plane
+/// and ends the pump (the abort in [`Shared::drop`] normally gets there
+/// first — this is the race's other arm).
+async fn demux_loop<T: DataPlaneTransport>(transport: Arc<T>, plane: Weak<Shared<T>>) {
     loop {
-        let (from, frame) = match shared.transport.recv_datagram().await {
+        let (from, frame) = match transport.recv_datagram().await {
             Ok(inbound) => inbound,
             Err(_) => {
-                shared.traffic.halted.store(true, Ordering::Relaxed);
+                if let Some(shared) = plane.upgrade() {
+                    shared.traffic.halted.store(true, Ordering::Relaxed);
+                }
                 return;
             }
+        };
+        let Some(shared) = plane.upgrade() else {
+            return;
         };
         let (service, flow, payload) = match wire::decode_datagram(&frame) {
             Ok(parts) => parts,
@@ -447,29 +488,46 @@ async fn demux_loop<T: DataPlaneTransport>(shared: Arc<Shared<T>>) {
     }
 }
 
-async fn accept_loop<T: DataPlaneTransport>(shared: Arc<Shared<T>>) {
+async fn accept_loop<T: DataPlaneTransport>(transport: Arc<T>, plane: Weak<Shared<T>>) {
     loop {
-        let (peer, stream) = match shared.transport.accept().await {
+        let (peer, stream) = match transport.accept().await {
             Ok(inbound) => inbound,
             Err(_) => {
-                shared.traffic.halted.store(true, Ordering::Relaxed);
+                if let Some(shared) = plane.upgrade() {
+                    shared.traffic.halted.store(true, Ordering::Relaxed);
+                }
                 return;
             }
         };
+        if plane.upgrade().is_none() {
+            return;
+        }
         // Per-connection task: a stalled opener must not block the acceptor.
-        tokio::spawn(handle_inbound_stream(shared.clone(), peer, stream));
+        // It, too, holds the plane weakly: a hello still pending when the
+        // last handle drops must not keep the plane's state alive.
+        tokio::spawn(handle_inbound_stream(plane.clone(), peer, stream));
     }
 }
 
 async fn handle_inbound_stream<T: DataPlaneTransport>(
-    shared: Arc<Shared<T>>,
+    plane: Weak<Shared<T>>,
     peer: PeerId,
     mut stream: T::Stream,
 ) {
-    let hello = match timeout(HANDSHAKE_TIMEOUT, wire::read_hello(&mut stream)).await {
+    let hello = timeout(HANDSHAKE_TIMEOUT, wire::read_hello(&mut stream)).await;
+    let Some(shared) = plane.upgrade() else {
+        return;
+    };
+    let hello = match hello {
         Ok(Ok(hello)) => hello,
-        // Timeout or garbage: drop without ack.
-        _ => return,
+        // Timeout or garbage: drop without ack, counted.
+        _ => {
+            shared
+                .stats
+                .hello_failed_streams
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
     };
     if !shared.admission.permits(peer, hello.service, hello.flow) {
         shared.stats.count_rogue(&shared.stats.rogue_streams, peer);
@@ -491,8 +549,14 @@ async fn handle_inbound_stream<T: DataPlaneTransport>(
     // Reserve the backlog slot BEFORE acking, so an ack always means the
     // consumer will actually see the stream.
     let Ok(slot) = sender.try_reserve() else {
+        shared
+            .stats
+            .backlog_refused_streams
+            .fetch_add(1, Ordering::Relaxed);
         return;
     };
+    // An ack the opener never reads is the opener's departure, not a drop
+    // of ours: the stream was theirs to abandon.
     if stream.write_all(&[HELLO_ACK]).await.is_err() {
         return;
     }

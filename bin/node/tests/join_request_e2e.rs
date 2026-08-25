@@ -41,15 +41,19 @@ fn a_tokened_join_redeems_itself_into_a_full_node() {
     // the redemption lands in consensus state: the friend holds RESIDENT
     // standing (a full node), while the quorum still seats only the founder.
     let expected = vec![common::unhex(&friend_key)];
-    poll_until("the redemption to grant resident standing", CONVERGE, || {
-        cluster
-            .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
-            .and_then(|raw| valset::decode_reply(&raw).ok())
-            .and_then(|r| match r {
-                ValsetReply::Residents(v) if v == expected => Some(()),
-                _ => None,
-            })
-    });
+    poll_until(
+        "the redemption to grant resident standing",
+        CONVERGE,
+        || {
+            cluster
+                .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
+                .and_then(|raw| valset::decode_reply(&raw).ok())
+                .and_then(|r| match r {
+                    ValsetReply::Residents(v) if v == expected => Some(()),
+                    _ => None,
+                })
+        },
+    );
     let validators = cluster
         .query(0, "valset", &valset::encode_query(&ValsetQuery::Validators))
         .and_then(|raw| valset::decode_reply(&raw).ok())
@@ -58,7 +62,11 @@ fn a_tokened_join_redeems_itself_into_a_full_node() {
             other => panic!("expected Validators, got {other:?}"),
         })
         .expect("valset validators readable");
-    assert_eq!(validators.len(), 1, "the quorum still seats ONLY the founder");
+    assert_eq!(
+        validators.len(),
+        1,
+        "the quorum still seats ONLY the founder"
+    );
 
     // the full node pre-syncs and serves — the whole point of the flow.
     cluster.wait_marker(1, "resident: pre-synced boundary", CONVERGE);
@@ -97,15 +105,19 @@ fn a_spent_invite_is_refused_loudly_on_both_ends() {
     cluster.spawn(1);
     cluster.wait_marker(0, "gate: redemption submitted for", Duration::from_secs(90));
     let expected = vec![common::unhex(&friend_key)];
-    poll_until("the redemption to grant resident standing", CONVERGE, || {
-        cluster
-            .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
-            .and_then(|raw| valset::decode_reply(&raw).ok())
-            .and_then(|r| match r {
-                ValsetReply::Residents(v) if v == expected => Some(()),
-                _ => None,
-            })
-    });
+    poll_until(
+        "the redemption to grant resident standing",
+        CONVERGE,
+        || {
+            cluster
+                .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
+                .and_then(|raw| valset::decode_reply(&raw).ok())
+                .and_then(|r| match r {
+                    ValsetReply::Residents(v) if v == expected => Some(()),
+                    _ => None,
+                })
+        },
+    );
 
     // second redeemer: the SAME blob under a FRESH identity — the shared-blob
     // mistake. a bearer invite (join ADR) mints the workspace locally without

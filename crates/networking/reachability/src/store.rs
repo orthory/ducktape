@@ -19,11 +19,6 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use wireguard::{EndpointAdvertisement, SignedEndpointRecord};
 
-/// Bumped whenever the on-disk layout changes shape; `load` refuses other
-/// versions (the restore is best-effort — a stale-format file just means one
-/// boot without it, then `save` rewrites the current form).
-pub const MESH_STORE_FORMAT: u32 = 1;
-
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("mesh state file {path}: {source}")]
@@ -36,8 +31,6 @@ pub enum StoreError {
         path: String,
         source: serde_json::Error,
     },
-    #[error("mesh state file {path}: format {found} (this build reads {MESH_STORE_FORMAT})")]
-    Format { path: String, found: u32 },
     #[error("mesh state file {path}: chain id {found:?} does not match {expected:?}")]
     ChainMismatch {
         path: String,
@@ -50,10 +43,13 @@ pub enum StoreError {
 
 /// The persisted mesh: every member's signed advertisement from the last
 /// epoch this node applied tunnels for (this node's own included), plus the
-/// standby records accepted by then.
+/// standby records accepted by then. no format version (flag-day rule):
+/// `deny_unknown_fields` plus the required-field set IS the schema guard —
+/// the restore is best-effort, and a file this build cannot parse just means
+/// one boot without it, then `save` rewrites the current form.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PersistedMesh {
-    pub format: u32,
     pub chain_id: String,
     pub epoch: u64,
     pub adverts: Vec<EndpointAdvertisement>,
@@ -73,7 +69,6 @@ impl PersistedMesh {
         standby_records: Vec<SignedEndpointRecord>,
     ) -> Self {
         Self {
-            format: MESH_STORE_FORMAT,
             chain_id,
             epoch,
             adverts,
@@ -103,8 +98,8 @@ pub fn save(path: &Path, mesh: &PersistedMesh) -> Result<(), StoreError> {
 }
 
 /// Read the mesh persisted at `path`; `Ok(None)` when no file exists (a
-/// first boot). Refuses — rather than degrades on — a format bump, a chain
-/// mismatch, and any advert whose owner signature fails to verify: the
+/// first boot). Refuses — rather than degrades on — an unparseable schema, a
+/// chain mismatch, and any advert whose owner signature fails to verify: the
 /// caller treats every refusal as "no restore" and says why.
 pub fn load(path: &Path, chain_id: &str) -> Result<Option<PersistedMesh>, StoreError> {
     let bytes = match std::fs::read(path) {
@@ -122,12 +117,6 @@ pub fn load(path: &Path, chain_id: &str) -> Result<Option<PersistedMesh>, StoreE
             path: path.display().to_string(),
             source,
         })?;
-    if mesh.format != MESH_STORE_FORMAT {
-        return Err(StoreError::Format {
-            path: path.display().to_string(),
-            found: mesh.format,
-        });
-    }
     if mesh.chain_id != chain_id {
         return Err(StoreError::ChainMismatch {
             path: path.display().to_string(),
@@ -254,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_the_wrong_chain_and_the_wrong_format() {
+    fn refuses_the_wrong_chain_and_an_unknown_schema() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mesh-state.json");
         save(&path, &sample()).unwrap();
@@ -263,12 +252,13 @@ mod tests {
             Err(StoreError::ChainMismatch { .. })
         ));
 
-        let mut future = sample();
-        future.format = MESH_STORE_FORMAT + 1;
-        save(&path, &future).unwrap();
+        // a file carrying a key this build does not know is refused (one boot
+        // without a restore), never partially adopted.
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replacen('{', "{\n  \"format\": 2,", 1)).unwrap();
         assert!(matches!(
             load(&path, "net#store"),
-            Err(StoreError::Format { .. })
+            Err(StoreError::Codec { .. })
         ));
     }
 

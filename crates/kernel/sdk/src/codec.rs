@@ -284,7 +284,10 @@ mod tests {
 
         // capped below the field length: rejected, and the message names the cap
         // (the recovery `record_keeps_the_operation_field_cap` contract).
-        let err = Cursor::with_cap(&out, 3).bytes("f").unwrap_err().to_string();
+        let err = Cursor::with_cap(&out, 3)
+            .bytes("f")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("field cap"), "{err}");
 
         // capped at exactly the field length: still accepted.

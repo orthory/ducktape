@@ -40,19 +40,33 @@ fn a_non_standing_peer_is_refused_statesync() {
     // give the founder REAL, servable state and a finalized boundary, so the
     // ONLY reason node 1 cannot obtain a manifest is the fail-closed refusal —
     // not a server that simply has nothing to serve yet.
-    cluster.submit(0, "directory", &encode_msg(&DirMsg::Set {
-        key: "secret".into(),
-        value: "chain-state".into(),
-    }));
-    poll_until("the founder's write to finalize", Duration::from_secs(30), || {
-        cluster
-            .query(0, "directory", &encode_query(&DirQuery::Get { key: "secret".into() }))
-            .and_then(|raw| decode_reply(&raw).ok())
-            .and_then(|r| match r {
-                DirReply::Value(Some(v)) if v == "chain-state" => Some(()),
-                _ => None,
-            })
-    });
+    cluster.submit(
+        0,
+        "directory",
+        &encode_msg(&DirMsg::Set {
+            key: "secret".into(),
+            value: "chain-state".into(),
+        }),
+    );
+    poll_until(
+        "the founder's write to finalize",
+        Duration::from_secs(30),
+        || {
+            cluster
+                .query(
+                    0,
+                    "directory",
+                    &encode_query(&DirQuery::Get {
+                        key: "secret".into(),
+                    }),
+                )
+                .and_then(|raw| decode_reply(&raw).ok())
+                .and_then(|r| match r {
+                    DirReply::Value(Some(v)) if v == "chain-state" => Some(()),
+                    _ => None,
+                })
+        },
+    );
 
     // node 1 (mesh-reachable, NON-STANDING) runs `--sync-only`: it connects to
     // the founder's statesync channel and loops `fetch_manifest`, but every

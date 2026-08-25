@@ -409,7 +409,10 @@ mod provider_control_tests {
             "http://127.0.0.1:41043/v1/control/provider-idle?token=leak",
             "http://127.0.0.1:41043/other",
         ] {
-            assert!(!provider_control_url_allowed(rejected), "accepted {rejected}");
+            assert!(
+                !provider_control_url_allowed(rejected),
+                "accepted {rejected}"
+            );
         }
         assert!(provider_control_token_allowed(&"a5".repeat(32)));
         assert!(!provider_control_token_allowed(&"A5".repeat(32)));

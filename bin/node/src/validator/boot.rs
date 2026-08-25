@@ -84,14 +84,8 @@ pub(super) async fn restore(
             (host, None, 1, (None, pos), None)
         }
         Some(manifest) => {
-            let restored = restore_host(
-                context,
-                forge_repo,
-                duckfs_dir,
-                &manifest,
-                blobs.clone(),
-            )
-            .await;
+            let restored =
+                restore_host(context, forge_repo, duckfs_dir, &manifest, blobs.clone()).await;
             let mut host = match restored {
                 Ok(h) => h,
                 Err(e) => {

@@ -135,19 +135,19 @@ fn promoted_resident_seats_in_process_and_serves() {
         "the promoted friend to serve the founder's write",
         CONVERGE,
         || {
-        cluster
-            .query(
-                1,
-                "directory",
-                &directory::encode_query(&DirQuery::Get {
-                    key: "post-promote-founder".into(),
-                }),
-            )
-            .and_then(|raw| directory::decode_reply(&raw).ok())
-            .and_then(|r| match r {
-                DirReply::Value(Some(v)) if v == "landed" => Some(()),
-                _ => None,
-            })
+            cluster
+                .query(
+                    1,
+                    "directory",
+                    &directory::encode_query(&DirQuery::Get {
+                        key: "post-promote-founder".into(),
+                    }),
+                )
+                .and_then(|raw| directory::decode_reply(&raw).ok())
+                .and_then(|r| match r {
+                    DirReply::Value(Some(v)) if v == "landed" => Some(()),
+                    _ => None,
+                })
         },
     );
     // …and the promoted friend's own ordered lane finalizes into the widened
@@ -537,9 +537,9 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     poll(
         "the resident to serve rpc status",
         Box::new(|| {
-        let st = cluster.rpc(1, serde_json::json!({ "cmd": "status" }));
-        st["ok"] == serde_json::json!(true)
-            && st["status"]["height"].as_u64().is_some_and(|h| h > 0)
+            let st = cluster.rpc(1, serde_json::json!({ "cmd": "status" }));
+            st["ok"] == serde_json::json!(true)
+                && st["status"]["height"].as_u64().is_some_and(|h| h > 0)
         }),
     );
     //     …module reads answer from the RESIDENT's surface (the tier split is
@@ -547,14 +547,14 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     poll(
         "the resident to serve valset reads",
         Box::new(|| {
-        cluster
-            .query(1, "valset", &valset::encode_query(&ValsetQuery::Residents))
-            .and_then(|raw| valset::decode_reply(&raw).ok())
+            cluster
+                .query(1, "valset", &valset::encode_query(&ValsetQuery::Residents))
+                .and_then(|raw| valset::decode_reply(&raw).ok())
                 .is_some_and(|r| {
                     matches!(
-                r,
-                ValsetReply::Residents(v) if v == vec![common::unhex(&friend_key)]
-                    )
+                    r,
+                    ValsetReply::Residents(v) if v == vec![common::unhex(&friend_key)]
+                        )
                 })
         }),
     );
@@ -591,16 +591,16 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     poll(
         "the resident to serve its own relayed write",
         Box::new(|| {
-        cluster
-            .query(
-                1,
-                "directory",
-                &directory::encode_query(&DirQuery::Get {
-                    key: "resident-writes".into(),
-                }),
-            )
-            .and_then(|raw| directory::decode_reply(&raw).ok())
-            .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "landed"))
+            cluster
+                .query(
+                    1,
+                    "directory",
+                    &directory::encode_query(&DirQuery::Get {
+                        key: "resident-writes".into(),
+                    }),
+                )
+                .and_then(|raw| directory::decode_reply(&raw).ok())
+                .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "landed"))
         }),
     );
     //     …and the follow is CONTINUOUS: a value the founder finalizes now
@@ -616,16 +616,16 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     poll(
         "the resident to serve the followed write",
         Box::new(|| {
-        cluster
-            .query(
-                1,
-                "directory",
-                &directory::encode_query(&DirQuery::Get {
-                    key: "resident-follow".into(),
-                }),
-            )
-            .and_then(|raw| directory::decode_reply(&raw).ok())
-            .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "fresh"))
+            cluster
+                .query(
+                    1,
+                    "directory",
+                    &directory::encode_query(&DirQuery::Get {
+                        key: "resident-follow".into(),
+                    }),
+                )
+                .and_then(|raw| directory::decode_reply(&raw).ok())
+                .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "fresh"))
         }),
     );
     //     …and the DERIVED tier follows the boundary too: the explorer
@@ -636,14 +636,14 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
         Box::new(|| {
             let (status, body) =
                 common::http_request(cluster.http_ports[1], "GET", "/v1/blocks", None);
-        status == 200
-            && body["blocks"].as_array().is_some_and(|rows| {
-                rows.iter().any(|b| {
-                    b["hash"] == serde_json::json!("")
-                        && b["height"].as_u64().is_some_and(|h| h > 0)
-                        && !b["commit_hash"].as_str().unwrap_or_default().is_empty()
+            status == 200
+                && body["blocks"].as_array().is_some_and(|rows| {
+                    rows.iter().any(|b| {
+                        b["hash"] == serde_json::json!("")
+                            && b["height"].as_u64().is_some_and(|h| h > 0)
+                            && !b["commit_hash"].as_str().unwrap_or_default().is_empty()
+                    })
                 })
-            })
         }),
     );
     //     …and /v1/index/* answers from healthy read models WITH pre-join
@@ -659,16 +659,16 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     poll(
         "the resident index to report folding watermarks over a backfilled feed",
         Box::new(|| {
-        let (status, index_status) =
-            common::http_request(cluster.http_ports[1], "GET", "/v1/index/status", None);
-        let watermark = index_status["modules"]["directory"].as_u64().unwrap_or(0);
-        let floor = index_status["backfilled"]["directory"].as_u64();
-        // the founder is the sync source and has folded from genesis, so it
-        // has no floor of its own to compose in: the joiner's clears outright.
-        status == 200
-            && index_status["poisoned"] == serde_json::json!(false)
-            && watermark > 0
-            && floor.is_none()
+            let (status, index_status) =
+                common::http_request(cluster.http_ports[1], "GET", "/v1/index/status", None);
+            let watermark = index_status["modules"]["directory"].as_u64().unwrap_or(0);
+            let floor = index_status["backfilled"]["directory"].as_u64();
+            // the founder is the sync source and has folded from genesis, so it
+            // has no floor of its own to compose in: the joiner's clears outright.
+            status == 200
+                && index_status["poisoned"] == serde_json::json!(false)
+                && watermark > 0
+                && floor.is_none()
         }),
     );
     //     and the op feed BELOW that boundary is really there — the whole
@@ -683,10 +683,9 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     );
     assert_eq!(status, 200, "resident op feed: {ops}");
     assert!(
-        ops["ops"]
-            .as_array()
-            .is_some_and(|rows| rows.iter().any(|r| r["payload"]["set"]["key"]
-                == serde_json::json!("pre-join"))),
+        ops["ops"].as_array().is_some_and(|rows| rows
+            .iter()
+            .any(|r| r["payload"]["set"]["key"] == serde_json::json!("pre-join"))),
         "a cleared floor promises pre-boundary rows are really there: {ops}"
     );
 
@@ -703,16 +702,16 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     poll(
         "a finalized op with the resident down",
         Box::new(|| {
-        cluster
-            .query(
-                0,
-                "directory",
-                &directory::encode_query(&DirQuery::Get {
-                    key: "resident-down-liveness".into(),
-                }),
-            )
-            .and_then(|raw| directory::decode_reply(&raw).ok())
-            .is_some_and(|r| matches!(r, DirReply::Value(Some(_))))
+            cluster
+                .query(
+                    0,
+                    "directory",
+                    &directory::encode_query(&DirQuery::Get {
+                        key: "resident-down-liveness".into(),
+                    }),
+                )
+                .and_then(|raw| directory::decode_reply(&raw).ok())
+                .is_some_and(|r| matches!(r, DirReply::Value(Some(_))))
         }),
     );
 
@@ -744,10 +743,10 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     poll(
         "the revoke to clear resident standing",
         Box::new(|| {
-        cluster
-            .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
-            .and_then(|raw| valset::decode_reply(&raw).ok())
-            .is_some_and(|r| matches!(r, ValsetReply::Residents(v) if v.is_empty()))
+            cluster
+                .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
+                .and_then(|raw| valset::decode_reply(&raw).ok())
+                .is_some_and(|r| matches!(r, ValsetReply::Residents(v) if v.is_empty()))
         }),
     );
     cluster.wait_marker(1, "joining: awaiting redemption", CONVERGE);
@@ -772,14 +771,14 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     poll(
         "the re-grant to restore resident standing",
         Box::new(|| {
-        cluster
-            .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
-            .and_then(|raw| valset::decode_reply(&raw).ok())
+            cluster
+                .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
+                .and_then(|raw| valset::decode_reply(&raw).ok())
                 .is_some_and(|r| {
                     matches!(
-                r,
-                ValsetReply::Residents(v) if v == vec![common::unhex(&friend_key)]
-                    )
+                    r,
+                    ValsetReply::Residents(v) if v == vec![common::unhex(&friend_key)]
+                        )
                 })
         }),
     );
@@ -794,16 +793,16 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     poll(
         "the re-granted resident to resume the follow",
         Box::new(|| {
-        cluster
-            .query(
-                1,
-                "directory",
-                &directory::encode_query(&DirQuery::Get {
-                    key: "post-revoke-follow".into(),
-                }),
-            )
-            .and_then(|raw| directory::decode_reply(&raw).ok())
-            .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "back"))
+            cluster
+                .query(
+                    1,
+                    "directory",
+                    &directory::encode_query(&DirQuery::Get {
+                        key: "post-revoke-follow".into(),
+                    }),
+                )
+                .and_then(|raw| directory::decode_reply(&raw).ok())
+                .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "back"))
         }),
     );
 
@@ -815,7 +814,10 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     //     nothing to fetch FROM); valset Join clears its resident standing.
     let (ok, out) = cluster.run_promote(&friend_key);
     assert!(ok, "promote failed:\n{out}");
-    assert!(out.contains("admitted"), "unexpected promote output:\n{out}");
+    assert!(
+        out.contains("admitted"),
+        "unexpected promote output:\n{out}"
+    );
     // no `admitted at epoch` marker here: that line is the COLD path's
     // manifest fetch, and a warm seat deliberately fetches nothing — its
     // own fold carries it straight to `promoted:`.

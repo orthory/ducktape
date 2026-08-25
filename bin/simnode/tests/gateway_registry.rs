@@ -365,7 +365,10 @@ fn request_cap_past_the_16_mib_ceiling_is_refused_at_admission() {
     };
     sim.submit_ok(
         "gateway",
-        signed_set_route(&key, statement(&key, &node, named("big"), 1, Some(at_ceiling))),
+        signed_set_route(
+            &key,
+            statement(&key, &node, named("big"), 1, Some(at_ceiling)),
+        ),
         Some(&node),
     );
 

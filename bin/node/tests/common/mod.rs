@@ -270,7 +270,8 @@ impl NetworkShapeCluster {
         // plane, and this harness is deliberately coordinator-free — so every
         // founder carries a distinct-port WireGuard listen.
         let wg_listen = format!("127.0.0.1:{}", alloc_ports(1)[0]);
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+            .arg("node")
             .args([
                 "init",
                 "--name",
@@ -309,7 +310,8 @@ impl NetworkShapeCluster {
     /// and return its pubkey hex — the JOIN CODE the invite locks to.
     /// `join_friend` reuses this pre-generated identity.
     pub fn keygen_friend(&self, _idx: usize) -> String {
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+            .arg("node")
             .args(["key", "--dir"])
             .arg(&self.friend_dir)
             .output()
@@ -328,7 +330,8 @@ impl NetworkShapeCluster {
     pub fn invite(&self) -> String {
         self.keygen_friend(1);
         let cfg = self.config_file(0);
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+            .arg("node")
             .args(["invite", "--config"])
             .arg(cfg)
             .output()
@@ -358,7 +361,8 @@ impl NetworkShapeCluster {
     /// `join requests` verb's JSON stdout.
     pub fn join_requests(&self) -> serde_json::Value {
         let cfg = self.config_file(0);
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+            .arg("node")
             .args(["join", "requests", "--config"])
             .arg(cfg)
             .output()
@@ -376,7 +380,8 @@ impl NetworkShapeCluster {
     /// success — the caller inspects the outcome (a targeted invite refuses a
     /// mismatched local identity at the CLI, before any node spawns).
     pub fn try_join_friend(&self, invite: &str) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+        Command::new(env!("CARGO_BIN_EXE_ducktape"))
+            .arg("node")
             .args([
                 "join",
                 invite,
@@ -429,7 +434,8 @@ impl NetworkShapeCluster {
         let log = self.dir.path().join(format!("{label}.log"));
         let out = std::fs::File::create(&log).expect("create node log");
         let err = out.try_clone().expect("clone node log handle");
-        let child = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+        let child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+            .arg("node")
             .arg("run")
             .arg("--config")
             .arg(&cfg)
@@ -505,12 +511,7 @@ impl NetworkShapeCluster {
             .spawn(move || {
                 loop {
                     std::thread::sleep(noded::services::HELLO_TTL / 3);
-                    let _ = nettest::try_http_json(
-                        port,
-                        "POST",
-                        "/v1/services/hello",
-                        Some(&body),
-                    );
+                    let _ = nettest::try_http_json(port, "POST", "/v1/services/hello", Some(&body));
                 }
             })
             .expect("spawn the hello heartbeat");
@@ -524,7 +525,11 @@ impl NetworkShapeCluster {
     /// node `idx`'s captured stdout+stderr — for a failing test to preserve
     /// evidence before the cluster tempdir (and the logs in it) is dropped.
     pub fn log_path(&self, idx: usize) -> PathBuf {
-        self.nodes[idx].as_ref().expect("node not running").log.clone()
+        self.nodes[idx]
+            .as_ref()
+            .expect("node not running")
+            .log
+            .clone()
     }
 
     /// one json-lines rpc against node `idx` — the NetworkShapeCluster
@@ -899,7 +904,8 @@ impl Cluster {
         let log = self.dir.path().join(format!("node{id}.log"));
         let out = std::fs::File::create(&log).expect("create node log");
         let err = out.try_clone().expect("clone node log handle");
-        let child = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+        let child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+            .arg("node")
             .arg("run")
             .arg("--config")
             .arg(&cfg)
@@ -977,7 +983,9 @@ impl Cluster {
         // operator's: a second `service run <kind>` beside the same node would
         // be two processes sharing one grant, which is a test bug, not a
         // scenario. Refuse it here, where the cause is visible.
-        let already_running = self.services[idx].iter().any(|service| service.kind == kind);
+        let already_running = self.services[idx]
+            .iter()
+            .any(|service| service.kind == kind);
         let compute_rides_along = kind == "compute" && self.compute_grant.is_some();
         assert!(
             !already_running && !compute_rides_along,
@@ -1031,7 +1039,12 @@ impl Cluster {
             if let Some(rest) = find_marker(&text, marker) {
                 return rest;
             }
-            let exited = service.proc.child.try_wait().expect("poll service").is_some();
+            let exited = service
+                .proc
+                .child
+                .try_wait()
+                .expect("poll service")
+                .is_some();
             if exited || Instant::now() >= deadline {
                 let verb = if exited { "exited" } else { "timed out" };
                 panic!(
@@ -1158,7 +1171,8 @@ impl Cluster {
         let log = self.dir.path().join(format!("node{id}.log"));
         let out = std::fs::File::create(&log).expect("create joiner log");
         let err = out.try_clone().expect("clone joiner log handle");
-        let child = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+        let child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+            .arg("node")
             .arg("run")
             .arg("--config")
             .arg(&path)
@@ -1230,7 +1244,8 @@ impl Cluster {
         let log = self.dir.path().join(format!("node{id}-sync.log"));
         let out = std::fs::File::create(&log).expect("create joiner log");
         let err = out.try_clone().expect("clone joiner log handle");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+            .arg("node")
             .arg("run")
             .arg("--config")
             .arg(&cfg)
@@ -1272,9 +1287,16 @@ impl Cluster {
     pub fn wait_marker(&mut self, idx: usize, marker: &str, timeout: Duration) -> String {
         // (in-seam refactor: the loop body is shared with the compute-daemon
         // twin below, so it moved to `await_marker` verbatim.)
-        match await_marker(self.nodes[idx].as_mut().expect("node is running"), marker, timeout) {
+        match await_marker(
+            self.nodes[idx].as_mut().expect("node is running"),
+            marker,
+            timeout,
+        ) {
             Ok(rest) => rest,
-            Err(why) => panic!("node {why} without printing {marker:?};\n{}", self.all_log_tails(60)),
+            Err(why) => panic!(
+                "node {why} without printing {marker:?};\n{}",
+                self.all_log_tails(60)
+            ),
         }
     }
 
@@ -1599,9 +1621,8 @@ pub fn unsandboxable_host() -> Option<String> {
 /// `ops/build-guest-rootfs.sh` produces, overridable for a box that keeps them
 /// somewhere else.
 pub fn guest_backend() -> provider_host::SandboxBackend {
-    let dir = PathBuf::from(
-        std::env::var("DUCKTAPE_GUEST_DIR").unwrap_or_else(|_| GUEST_DIR.into()),
-    );
+    let dir =
+        PathBuf::from(std::env::var("DUCKTAPE_GUEST_DIR").unwrap_or_else(|_| GUEST_DIR.into()));
     provider_host::SandboxBackend::Firecracker {
         kernel: dir.join("vmlinux"),
         rootfs: dir.join("rootfs.ext4"),

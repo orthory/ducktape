@@ -314,7 +314,9 @@ fn cmd_user_account_init(
     }
 
     // Already bound? then the bind is a no-op — just (re)assert name + handle.
-    let query = IdentityQuery::OfMember { member_key: user_pub.as_ref().to_vec() };
+    let query = IdentityQuery::OfMember {
+        member_key: user_pub.as_ref().to_vec(),
+    };
     let reply: IdentityReply = serde_json::from_value(crate::cred_cli::query_node(
         &base,
         "identity",
@@ -334,7 +336,9 @@ fn cmd_user_account_init(
         println!("bound account at height {height}");
     }
 
-    let name_msg = IdentityMsg::SetAccountName { display_name: args.name.clone() };
+    let name_msg = IdentityMsg::SetAccountName {
+        display_name: args.name.clone(),
+    };
     crate::node_http::submit(&base, "identity", &serde_json::to_value(&name_msg)?)?;
 
     let handle = args.name.to_lowercase();
@@ -580,8 +584,7 @@ fn load_or_mint_user_signer(
         return Ok((load_user_signer(key_path, stdin)?, KeyOrigin::Opened));
     }
     if let Some(parent) = key_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
     let (words, key) = mint_user_key(key_path, stdin)?;
     Ok((key, KeyOrigin::Minted(words)))
@@ -630,7 +633,7 @@ fn user_key_unlock(
     stdin: &mut impl std::io::BufRead,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let password = prompt_stdin_line(stdin, "password")?;
-            let line = read_key_line(&args.key)?;
+    let line = read_key_line(&args.key)?;
     let key = userkey::open_user_key(&line, &password)?;
     Ok(hex_bytes(key.public_key().as_ref()))
 }
@@ -649,7 +652,7 @@ fn user_key_reveal(
     stdin: &mut impl std::io::BufRead,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let password = prompt_stdin_line(stdin, "password")?;
-            let line = read_key_line(&args.key)?;
+    let line = read_key_line(&args.key)?;
     let key = userkey::open_user_key(&line, &password)?;
     let seed_bytes = key.encode();
     let seed: [u8; 32] = seed_bytes
@@ -1260,8 +1263,8 @@ mod userkey_verb_tests {
         assert_eq!(words.split_whitespace().count(), 24);
         assert_eq!(pubkey_hex.len(), 64);
         let enc = userkey::read_user_key_file(&path).unwrap();
-                assert_eq!(hex_bytes(&enc.pubkey), pubkey_hex);
-            }
+        assert_eq!(hex_bytes(&enc.pubkey), pubkey_hex);
+    }
 
     /// A key that cannot be reopened is a key the operator has LOST, and they
     /// would be holding 24 correct words while believing otherwise. The check
@@ -1322,13 +1325,8 @@ mod userkey_verb_tests {
         // the words are the ONLY copy: they must restore this exact identity.
         let restored_to = dir.path().join("restored.key");
         let mut restore_stdin = stdin_of(&[&words, "another password"]);
-        let restored = user_key_restore(
-            KeyOutArgs {
-                out: restored_to,
-            },
-            &mut restore_stdin,
-        )
-        .unwrap();
+        let restored =
+            user_key_restore(KeyOutArgs { out: restored_to }, &mut restore_stdin).unwrap();
         assert_eq!(restored, hex_bytes(minted.public_key().as_ref()));
 
         // and a SECOND run opens the same key instead of minting over it —

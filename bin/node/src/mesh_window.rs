@@ -171,7 +171,9 @@ impl MeshWindowTracker {
 /// the sync-wire window in tracker shape — the parked joiner's tip poll
 /// carries [`statesync::MeshWindowEntry`]s (statesync stays valset-agnostic);
 /// this is the one conversion back.
-pub(crate) fn window_from_sync(entries: &[statesync::MeshWindowEntry]) -> Vec<valset::GenerationSet> {
+pub(crate) fn window_from_sync(
+    entries: &[statesync::MeshWindowEntry],
+) -> Vec<valset::GenerationSet> {
     entries
         .iter()
         .map(|e| valset::GenerationSet {
@@ -254,8 +256,12 @@ mod tests {
     #[test]
     fn retained_depth_matches_lookup_tracked_peer_sets() {
         let signer = PrivateKey::decode(&[1u8; 32][..]).unwrap();
-        let cfg =
-            lookup::Config::local(signer, b"depth-pin", "127.0.0.1:0".parse().unwrap(), 1 << 20);
+        let cfg = lookup::Config::local(
+            signer,
+            b"depth-pin",
+            "127.0.0.1:0".parse().unwrap(),
+            1 << 20,
+        );
         assert_eq!(
             cfg.tracked_peer_sets.get() as u64,
             valset::RETAINED_GENERATIONS,
@@ -275,10 +281,9 @@ mod tests {
         a.track_new(&mut sink_a, &book(), &window);
         b.track_new(&mut sink_b, &book(), &window);
 
-        let primaries =
-            |r: &Recorder| -> Vec<(u64, Vec<ed25519::PublicKey>)> {
-                r.tracked.iter().map(|(i, p, _)| (*i, p.clone())).collect()
-            };
+        let primaries = |r: &Recorder| -> Vec<(u64, Vec<ed25519::PublicKey>)> {
+            r.tracked.iter().map(|(i, p, _)| (*i, p.clone())).collect()
+        };
         assert_eq!(primaries(&sink_a), primaries(&sink_b));
         assert_eq!(
             sink_a.tracked[0].2,
@@ -297,7 +302,11 @@ mod tests {
         assert_eq!(sink.tracked.len(), 1, "genesis tracks exactly once");
         let (index, primary, secondary) = &sink.tracked[0];
         assert_eq!(*index, 0);
-        assert_eq!(*primary, sorted_keys(&[2, 1]), "sorted descriptor validators");
+        assert_eq!(
+            *primary,
+            sorted_keys(&[2, 1]),
+            "sorted descriptor validators"
+        );
         assert_eq!(*secondary, sorted_keys(&[1, 7]));
     }
 

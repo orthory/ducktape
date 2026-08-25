@@ -8,7 +8,6 @@ use commonware_cryptography::{Signer as _, ed25519};
 
 use super::{hex_bytes, unhex};
 
-
 /// load the identity at `path`, or generate one there from OS randomness.
 /// returns the signer and whether it was freshly generated. written 0600 on
 /// unix — this is the NODE's identity (mesh/valset/frame-signing key) only.
@@ -156,10 +155,7 @@ mod tests {
 
     #[test]
     fn mint_bind_cert_verifies_against_module_preimage() {
-        use commonware_cryptography::{
-            Signer as _, Verifier as _,
-            ed25519::Signature,
-        };
+        use commonware_cryptography::{Signer as _, Verifier as _, ed25519::Signature};
         let user = ed25519::PrivateKey::from_seed(1);
         let node_pub = [9u8; 32];
         let cert = user
@@ -171,15 +167,15 @@ mod tests {
             .to_vec();
         let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
         let preimage = identity::bind_preimage("chain-a", &node_pub, 0);
-        assert!(user.public_key().verify(identity::IDENTITY_BIND_NS, &preimage, &sig));
+        assert!(
+            user.public_key()
+                .verify(identity::IDENTITY_BIND_NS, &preimage, &sig)
+        );
     }
 
     #[test]
     fn mint_bind_cert_is_chain_scoped() {
-        use commonware_cryptography::{
-            Signer as _, Verifier as _,
-            ed25519::Signature,
-        };
+        use commonware_cryptography::{Signer as _, Verifier as _, ed25519::Signature};
         let user = ed25519::PrivateKey::from_seed(1);
         let node_pub = [9u8; 32];
         let cert = user
@@ -192,15 +188,16 @@ mod tests {
         let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
         // a cert minted for chain-a must NOT verify against chain-b's preimage.
         let preimage_b = identity::bind_preimage("chain-b", &node_pub, 0);
-        assert!(!user.public_key().verify(identity::IDENTITY_BIND_NS, &preimage_b, &sig));
+        assert!(
+            !user
+                .public_key()
+                .verify(identity::IDENTITY_BIND_NS, &preimage_b, &sig)
+        );
     }
 
     #[test]
     fn mint_bind_cert_does_not_verify_under_unbind_namespace() {
-        use commonware_cryptography::{
-            Signer as _, Verifier as _,
-            ed25519::Signature,
-        };
+        use commonware_cryptography::{Signer as _, Verifier as _, ed25519::Signature};
         let user = ed25519::PrivateKey::from_seed(1);
         let node_pub = [9u8; 32];
         let cert = user
@@ -213,15 +210,16 @@ mod tests {
         let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
         let preimage = identity::bind_preimage("chain-a", &node_pub, 0);
         // signed under IDENTITY_BIND_NS -- must NOT verify under the unbind ns.
-        assert!(!user.public_key().verify(identity::IDENTITY_UNBIND_NS, &preimage, &sig));
+        assert!(
+            !user
+                .public_key()
+                .verify(identity::IDENTITY_UNBIND_NS, &preimage, &sig)
+        );
     }
 
     #[test]
     fn mint_unbind_cert_verifies_against_module_preimage() {
-        use commonware_cryptography::{
-            Signer as _, Verifier as _,
-            ed25519::Signature,
-        };
+        use commonware_cryptography::{Signer as _, Verifier as _, ed25519::Signature};
         let user = ed25519::PrivateKey::from_seed(2);
         let node_pub = [11u8; 32];
         let cert = user
@@ -233,15 +231,15 @@ mod tests {
             .to_vec();
         let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
         let preimage = identity::unbind_preimage("chain-a", &node_pub, 3);
-        assert!(user.public_key().verify(identity::IDENTITY_UNBIND_NS, &preimage, &sig));
+        assert!(
+            user.public_key()
+                .verify(identity::IDENTITY_UNBIND_NS, &preimage, &sig)
+        );
     }
 
     #[test]
     fn mint_unbind_cert_is_chain_scoped() {
-        use commonware_cryptography::{
-            Signer as _, Verifier as _,
-            ed25519::Signature,
-        };
+        use commonware_cryptography::{Signer as _, Verifier as _, ed25519::Signature};
         let user = ed25519::PrivateKey::from_seed(2);
         let node_pub = [11u8; 32];
         let cert = user
@@ -253,15 +251,16 @@ mod tests {
             .to_vec();
         let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
         let preimage_b = identity::unbind_preimage("chain-b", &node_pub, 3);
-        assert!(!user.public_key().verify(identity::IDENTITY_UNBIND_NS, &preimage_b, &sig));
+        assert!(
+            !user
+                .public_key()
+                .verify(identity::IDENTITY_UNBIND_NS, &preimage_b, &sig)
+        );
     }
 
     #[test]
     fn mint_unbind_cert_does_not_verify_under_bind_namespace() {
-        use commonware_cryptography::{
-            Signer as _, Verifier as _,
-            ed25519::Signature,
-        };
+        use commonware_cryptography::{Signer as _, Verifier as _, ed25519::Signature};
         let user = ed25519::PrivateKey::from_seed(2);
         let node_pub = [11u8; 32];
         let cert = user
@@ -274,7 +273,11 @@ mod tests {
         let sig = Signature::decode(cert.as_slice()).expect("valid signature encoding");
         let preimage = identity::unbind_preimage("chain-a", &node_pub, 3);
         // signed under IDENTITY_UNBIND_NS -- must NOT verify under the bind ns.
-        assert!(!user.public_key().verify(identity::IDENTITY_BIND_NS, &preimage, &sig));
+        assert!(
+            !user
+                .public_key()
+                .verify(identity::IDENTITY_BIND_NS, &preimage, &sig)
+        );
     }
 
     /// mirrors exactly what `cmd_user_sign_bind`/`cmd_user_sign_unbind` build,
@@ -295,7 +298,10 @@ mod tests {
         };
         let encoded = identity::encode_msg(&bind_msg);
         // the wire contract: a single utf-8 JSON line, decodable as-is.
-        assert_eq!(String::from_utf8(encoded.clone()).unwrap().lines().count(), 1);
+        assert_eq!(
+            String::from_utf8(encoded.clone()).unwrap().lines().count(),
+            1
+        );
         assert_eq!(identity::decode_msg(&encoded).unwrap(), bind_msg);
 
         let unbind_msg = identity::IdentityMsg::UnbindNode {
@@ -307,7 +313,10 @@ mod tests {
             ),
         };
         let encoded = identity::encode_msg(&unbind_msg);
-        assert_eq!(String::from_utf8(encoded.clone()).unwrap().lines().count(), 1);
+        assert_eq!(
+            String::from_utf8(encoded.clone()).unwrap().lines().count(),
+            1
+        );
         assert_eq!(identity::decode_msg(&encoded).unwrap(), unbind_msg);
     }
 

@@ -9,9 +9,7 @@ use sdk::Msg;
 use super::{ValidatorRuntime, graceful_checkpoint};
 use crate::config::{hex_bytes, unhex};
 use crate::constants::{GATE_SETTLE_TIMEOUT, MODULE_IDS, OPS_REFRESH_INTERVAL, SUBMIT_HOLD};
-use crate::host_reads::{
-    read_redemption_from_host, read_valset_members, read_valset_residents,
-};
+use crate::host_reads::{read_redemption_from_host, read_valset_members, read_valset_residents};
 use crate::rpc::{
     JoinRequestRecord, JoinRequestView, JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus,
 };
@@ -429,14 +427,9 @@ impl ValidatorRuntime<'_> {
         } else {
             (Vec::new(), Vec::new())
         };
-        let Some(action) = validator_relay.on_message(
-            now,
-            peer,
-            msg,
-            &members_now,
-            &residents_now,
-            relay_tx,
-        ) else {
+        let Some(action) =
+            validator_relay.on_message(now, peer, msg, &members_now, &residents_now, relay_tx)
+        else {
             return;
         };
         match action {

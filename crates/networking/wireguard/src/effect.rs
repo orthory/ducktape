@@ -7,8 +7,7 @@
 
 mod wiring;
 pub use wiring::{
-    PeerTunnelConfig, TUNNEL_MTU, apply_peer_tunnels, apply_tunnel_plan, apply_tunnel_plans,
-    plan_peer_configs, update_peer_tunnels,
+    PeerTunnelConfig, TUNNEL_MTU, apply_peer_tunnels, plan_peer_configs, update_peer_tunnels,
 };
 
 use defguard_wireguard_rs::InterfaceConfiguration;
@@ -72,7 +71,7 @@ pub struct FakeWireGuardEffect {
     /// recording its config, then clears itself. Lets tests simulate a real
     /// `configure_interface` rejection (bad config) without a real WireGuard
     /// runtime — in particular to exercise a caller's cleanup-on-failure
-    /// path (see `apply_tunnel_plan`).
+    /// path (see `apply_peer_tunnels`).
     pub reject_next_apply: bool,
 }
 

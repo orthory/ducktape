@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use duckdns::{DuckDnsName, HandleRegistration, ResolvedAccount};
 use sdk::codec::{push_bytes, push_opt_str};
-use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
 /// Commonware signing namespace for every gateway route mutation.
@@ -33,7 +33,19 @@ pub const SHA256_HEX_BYTES: usize = 64;
 
 /// The account apex (`None`) or one DNS-shaped label below it. The account is
 /// carried separately so a route name can never cross authority boundaries.
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+)]
 #[serde(deny_unknown_fields)]
 pub struct RouteName {
     pub label: Option<String>,
@@ -63,7 +75,19 @@ impl RouteName {
     }
 }
 
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteMethod {
     Get,
@@ -197,7 +221,9 @@ pub struct RouteSummary {
 /// never secret material. Grants are managed exclusively through the
 /// owner-signed [`GatewayMsg::GrantCredential`]/[`GatewayMsg::RevokeCredential`]
 /// ops, so they are never carried unsigned on [`GatewayMsg::SetCredential`].
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialKind {
     Claude,

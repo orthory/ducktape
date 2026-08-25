@@ -48,7 +48,7 @@ use data_plane::{
 };
 use tokio::sync::{mpsc, watch};
 
-use crate::voice_plane::MediaPeers;
+use crate::overlay_book::OverlayPeers;
 
 /// Inbound audio queue per flow: ~2.5 s of one speaker's frames. Overflow
 /// drops the oldest inside the flow (the plane's drop-oldest contract).
@@ -102,7 +102,7 @@ fn presence_flow(page_id: &str) -> FlowId {
 pub fn spawn_hub(
     requests: mpsc::Receiver<noded::RealtimeSessionRequest>,
     factory: Arc<dyn SocketFactory>,
-    peers: Arc<MediaPeers>,
+    peers: Arc<OverlayPeers>,
     me: [u8; 32],
     planes: data_plane::PlaneMonitor,
 ) -> std::thread::JoinHandle<()> {
@@ -256,7 +256,7 @@ const PRESENCE_OVERLAY_DOWN: &str = "the mesh overlay is not up on this node yet
 async fn hub_loop(
     mut requests: mpsc::Receiver<noded::RealtimeSessionRequest>,
     factory: Arc<dyn SocketFactory>,
-    peers: Arc<MediaPeers>,
+    peers: Arc<OverlayPeers>,
     me: [u8; 32],
     planes: data_plane::PlaneMonitor,
 ) {
@@ -325,20 +325,16 @@ async fn serve_sessions<T: DataPlaneTransport>(
                 if let Some(previous) = active_call.take() {
                     previous.teardown().await;
                 }
-                let (session, guard) = match open_session(
-                    &voice_plane,
-                    &video_plane,
-                    &flows,
-                    &request.channel_id,
-                )
-                .await
-                {
-                    Ok(opened) => opened,
-                    Err(refusal) => {
-                        let _ = request.reply.send(Err(refusal));
-                        continue;
-                    }
-                };
+                let (session, guard) =
+                    match open_session(&voice_plane, &video_plane, &flows, &request.channel_id)
+                        .await
+                    {
+                        Ok(opened) => opened,
+                        Err(refusal) => {
+                            let _ = request.reply.send(Err(refusal));
+                            continue;
+                        }
+                    };
                 if request.reply.send(Ok(session)).is_err() {
                     guard.teardown().await;
                     continue;
@@ -1039,7 +1035,9 @@ async fn evaluate_rate_windows<T: DataPlaneTransport>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use data_plane::{BoxFuture, DatagramSocket, PlaneConfig, PlaneStream, StreamListener, TransportError};
+    use data_plane::{
+        BoxFuture, DatagramSocket, PlaneConfig, PlaneStream, StreamListener, TransportError,
+    };
     use std::net::{IpAddr, SocketAddr};
 
     #[test]
@@ -1053,12 +1051,14 @@ mod tests {
         assert_eq!(decode_page_cursor(&frame), Some(cursor));
         assert!(decode_page_cursor(&frame[..8]).is_none());
         assert!(decode_page_cursor(&[9; PRESENCE_HEADER]).is_none());
-        assert!(encode_page_cursor(&noded::PageCursor {
-            block_id: Some("x".repeat(257)),
-            anchor: 0,
-            head: 0,
-        })
-        .is_none());
+        assert!(
+            encode_page_cursor(&noded::PageCursor {
+                block_id: Some("x".repeat(257)),
+                anchor: 0,
+                head: 0,
+            })
+            .is_none()
+        );
     }
 
     /// A socket factory whose binds NEVER succeed — the overlay interface that
@@ -1075,7 +1075,10 @@ mod tests {
     }
 
     impl SocketFactory for DeadFactory {
-        fn bind_udp(&self, _addr: SocketAddr) -> BoxFuture<'_, std::io::Result<Box<dyn DatagramSocket>>> {
+        fn bind_udp(
+            &self,
+            _addr: SocketAddr,
+        ) -> BoxFuture<'_, std::io::Result<Box<dyn DatagramSocket>>> {
             Box::pin(async { no_interface() })
         }
 
@@ -1107,7 +1110,7 @@ mod tests {
         tokio::spawn(hub_loop(
             requests_rx,
             Arc::new(DeadFactory),
-            crate::voice_plane::MediaPeers::new("test-namespace".into()),
+            crate::overlay_book::OverlayPeers::new("test-namespace".into()),
             [7u8; 32],
             data_plane::PlaneMonitor::default(),
         ));
@@ -1778,8 +1781,14 @@ mod tests {
 
         let session_a = open(req_a_tx.clone()).await;
         let mut session_b = open(req_b_tx.clone()).await;
-        session_a.recipients.send(vec![key_b]).expect("session a alive");
-        session_b.recipients.send(vec![key_a]).expect("session b alive");
+        session_a
+            .recipients
+            .send(vec![key_b])
+            .expect("session a alive");
+        session_b
+            .recipients
+            .send(vec![key_a])
+            .expect("session b alive");
         // gate barrier: the keyframe below is one-shot, and a roster reaches
         // BOTH admission gates (A's send side, B's receive side)
         // asynchronously — audio crossing is the proof they are open.
@@ -1808,7 +1817,10 @@ mod tests {
         // lane. Wait out two ticks (generous), then restore the roster.
         session_b.recipients.send(vec![]).expect("session b alive");
         tokio::time::sleep(Duration::from_millis(2200)).await;
-        session_b.recipients.send(vec![key_a]).expect("session b alive");
+        session_b
+            .recipients
+            .send(vec![key_a])
+            .expect("session b alive");
 
         // A rejoins with a FRESH session on the same hub: teardown + reopen
         // resets frame_no to 0.
@@ -1909,7 +1921,10 @@ mod tests {
         let hint = tokio::time::timeout(Duration::from_secs(5), next_rate_hint(&mut control_out))
             .await
             .expect("a rate hint must reach the encoder");
-        assert_eq!(hint, 300, "a 1 kbps hint must clamp up to the ladder bottom");
+        assert_eq!(
+            hint, 300,
+            "a 1 kbps hint must clamp up to the ladder bottom"
+        );
 
         voice_in
             .send((PeerId(peer), inject(4_000_000_000)))
@@ -1918,7 +1933,10 @@ mod tests {
         let hint = tokio::time::timeout(Duration::from_secs(5), next_rate_hint(&mut control_out))
             .await
             .expect("a rate hint must reach the encoder");
-        assert_eq!(hint, 1200, "a 4e9 kbps hint must clamp down to the ladder top");
+        assert_eq!(
+            hint, 1200,
+            "a 4e9 kbps hint must clamp down to the ladder top"
+        );
 
         drop(req_tx);
     }
@@ -2037,10 +2055,7 @@ mod overlay_e2e {
     fn stand_up(node_seed: u64, wg_seed: u8) -> OverlayNode {
         let node_key = ed25519::PrivateKey::from_seed(node_seed).public_key();
         let raw_key: [u8; 32] = node_key.as_ref().try_into().expect("ed25519 is 32 bytes");
-        let ula = wireguard::ula_v6_member_addr(
-            NS,
-            wireguard::ValidatorIdentity(raw_key),
-        );
+        let ula = wireguard::ula_v6_member_addr(NS, wireguard::ValidatorIdentity(raw_key));
         let mut node = OverlayNode {
             effect: UserspaceWireGuardEffect::new(tokio::runtime::Handle::current()),
             wg_secret: wg_secret(wg_seed),
@@ -2075,15 +2090,15 @@ mod overlay_e2e {
 
     /// the media peer set both hubs track: both members, so each resolves the
     /// other's `/128` (forward) and authenticates its source (reverse).
-    fn media_peers(nodes: &[&OverlayNode]) -> Arc<MediaPeers> {
-        let peers = MediaPeers::new(NS.to_string());
+    fn media_peers(nodes: &[&OverlayNode]) -> Arc<OverlayPeers> {
+        let peers = OverlayPeers::new(NS.to_string());
         peers.set_peers(nodes.iter().map(|n| &n.node_key));
         peers
     }
 
     /// spawn a hub over a node's overlay stack (its OWN runtime binds the media
     /// sockets; the stack keeps polling on this test's runtime).
-    fn spawn_over(node: &OverlayNode, peers: Arc<MediaPeers>) -> noded::CallLane {
+    fn spawn_over(node: &OverlayNode, peers: Arc<OverlayPeers>) -> noded::CallLane {
         let (req_tx, req_rx) = mpsc::channel(4);
         let factory: Arc<dyn SocketFactory> =
             Arc::new(VirtualSocketFactory::new(node.effect.stack_slot()));
