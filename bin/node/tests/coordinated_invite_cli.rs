@@ -456,7 +456,11 @@ fn a_dark_coordinator_at_boot_heals_once_it_comes_up() {
         let sock = tokio::net::UdpSocket::bind(coord_addr)
             .await
             .expect("bind the late coordinator");
-        nat_traversal::run_coordinator(sock, nat_traversal::AuthPolicy::Public).await;
+        nat_traversal::run_coordinator(
+            nat_traversal::NatSocket::Owned(sock),
+            nat_traversal::AuthPolicy::Public,
+        )
+        .await;
     });
 
     // ...and the running node registers on its own: establishment retries at

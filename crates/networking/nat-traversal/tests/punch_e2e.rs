@@ -8,7 +8,7 @@ async fn two_clients_rendezvous_through_coordinator_and_send_directly() {
     let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let coord_addr = coord_sock.local_addr().unwrap();
     tokio::spawn(run_coordinator(
-        coord_sock,
+        nat_traversal::NatSocket::Owned(coord_sock),
         nat_traversal::AuthPolicy::Public,
     ));
 

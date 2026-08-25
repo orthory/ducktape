@@ -5964,7 +5964,6 @@ dependencies = [
  "commonware-cryptography",
  "crossbeam-channel",
  "lru 0.18.1",
- "nat-traversal",
  "smallvec",
  "thiserror 2.0.18",
  "tokio",
