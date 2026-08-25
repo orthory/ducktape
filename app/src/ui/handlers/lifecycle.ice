@@ -60,7 +60,6 @@ on reconnect
   rooms = []
   dm_rows = []
   messages = []
-  messages_revision = messages_revision + 1
   has_older_history = false
   // The history lane was invalidated above, so its old socket and button state
   // end together even when that socket would never have answered.
@@ -93,7 +92,6 @@ on reconnect
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
-  thread_messages_revision = thread_messages_revision + 1
   thread_next_reply_seq = 0
   thread_has_more = false
   thread_generation = thread_generation + 1
@@ -169,7 +167,6 @@ on workspace_connected(next)
   // `chat_hit_loaded`.
   history_view = false
   messages = merge_landing_messages(next.messages, messages, active_channel, next.active_channel)
-  messages_revision = messages_revision + 1
   has_older_history = next.has_older_history || history_has_older(messages)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   active_channel = next.active_channel
@@ -273,14 +270,12 @@ on live_updated(next)
       let folded_chat = fold_live_chat(next.chat, channels, messages, thread_messages, channel_members, channel_reads, dm_peers, settings_user_key, active_channel, active_thread_seq, history_view, shell_tab == ShellTab.chat, unread_boundary, active_channel_name, active_channel_archived, active_channel_members_only, forge_discussion, forge_item_channel, selected_message_seq, selected_message_rev, message_action, message_edit_draft, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
       channels = folded_chat.channels
       messages = folded_chat.messages
-      messages_revision = keep_i64(folded_chat.messages_changed, messages_revision + 1, messages_revision)
       has_older_history = folded_chat.has_older_history
       selected_message_seq = folded_chat.selected_message_seq
       selected_message_rev = folded_chat.selected_message_rev
       message_action = folded_chat.message_action
       message_edit_draft = folded_chat.message_edit_draft
       thread_messages = folded_chat.thread_messages
-      thread_messages_revision = keep_i64(folded_chat.thread_messages_changed, thread_messages_revision + 1, thread_messages_revision)
       thread_selected_seq = folded_chat.thread_selected_seq
       thread_selected_rev = folded_chat.thread_selected_rev
       thread_message_action = folded_chat.thread_message_action
@@ -394,7 +389,6 @@ on live_resynced(next)
   // `chat_loaded` itself rather than sitting under an outer loaded-pick: most
   // resyncs are plane-only, and the merge is a full copy of the window.
   messages = resynced_messages(next.chat_loaded, next.messages, messages, active_channel, next.active_channel)
-  messages_revision = keep_i64(next.chat_loaded, messages_revision + 1, messages_revision)
   // A resync that replaced the window left the banner describing rows that are
   // no longer on screen — see `chat_hit_loaded`. One that carried no chat kept
   // the window and keeps the banner with it.
@@ -430,7 +424,6 @@ on live_resynced(next)
   thread_target_seq = refreshed_channel_value(active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), thread_target_seq)
   thread_next_reply_seq = refreshed_channel_value(active_channel, keep_str(next.chat_loaded, next.active_channel, active_channel), thread_next_reply_seq)
   thread_messages = retain_thread_messages(thread_messages, active_thread_seq)
-  thread_messages_revision = keep_i64(next.chat_loaded, thread_messages_revision + 1, thread_messages_revision)
   thread_has_more = thread_has_more && active_channel == keep_str(next.chat_loaded, next.active_channel, active_channel) && active_thread_seq > 0
   active_channel = keep_str(next.chat_loaded, next.active_channel, active_channel)
   // The one landing with NO launch behind it, so it is the one that could move
@@ -641,7 +634,6 @@ on live_thread_refreshed(next)
   return if next.channel_id != active_channel || next.root_seq != active_thread_seq
   return if thread_loading || mutation_phase != MutationPhase.idle
   thread_messages = merge_thread_refresh(next.messages, thread_messages, active_channel, next.channel_id)
-  thread_messages_revision = thread_messages_revision + 1
   let selection = message_selection_after_window(thread_messages, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
   thread_selected_seq = selection.seq
   thread_selected_rev = selection.rev

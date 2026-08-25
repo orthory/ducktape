@@ -73,7 +73,6 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   // by the next `choose_channel`/`choose_dm` or by any chat-carrying resync.
   history_view = true
   messages = []
-  messages_revision = messages_revision + 1
   channel_members = []
   let post_gate_known = !active_channel_members_only
   post_refusal = keep_str(post_gate_known, post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key), "")
@@ -101,7 +100,6 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
-  thread_messages_revision = thread_messages_revision + 1
   thread_next_reply_seq = 0
   thread_has_more = false
   thread_generation = thread_generation + 1
@@ -152,7 +150,6 @@ on choose_channel(id)
   active_channel_archived = next_channel.archived
   active_channel_members_only = next_channel.members_only
   messages = []
-  messages_revision = messages_revision + 1
   channel_members = []
   let post_gate_known = !active_channel_members_only
   post_refusal = keep_str(post_gate_known, post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key), "")
@@ -177,7 +174,6 @@ on choose_channel(id)
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
-  thread_messages_revision = thread_messages_revision + 1
   thread_next_reply_seq = 0
   thread_has_more = false
   thread_generation = thread_generation + 1
@@ -240,7 +236,6 @@ on choose_dm(peer_key)
   active_channel_archived = next_channel.archived
   active_channel_members_only = next_channel.members_only
   messages = []
-  messages_revision = messages_revision + 1
   channel_members = []
   post_refusal = ""
   has_older_history = false
@@ -263,7 +258,6 @@ on choose_dm(peer_key)
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
-  thread_messages_revision = thread_messages_revision + 1
   thread_next_reply_seq = 0
   thread_has_more = false
   thread_generation = thread_generation + 1
@@ -449,7 +443,6 @@ on composer_submitted(kind, pending_body, pending_id)
           // groups under the reader's previous message instead of drawing a
           // header that vanishes the moment the settle delta replaces it.
           messages = mark_author_runs(optimistic_message(messages, pending_body, pending_id))
-          messages_revision = messages_revision + 1
           let selection = message_selection_after_window(messages, selected_message_seq, selected_message_rev, message_action, message_edit_draft)
           selected_message_seq = selection.seq
           selected_message_rev = selection.rev
@@ -480,7 +473,6 @@ on composer_submitted(kind, pending_body, pending_id)
           hydration_generation = hydration_generation + 1
           hydration_retry_attempt = 0
           thread_messages = optimistic_thread_message(thread_messages, pending_body, pending_id)
-          thread_messages_revision = thread_messages_revision + 1
           let selection = message_selection_after_window(thread_messages, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
           thread_selected_seq = selection.seq
           thread_selected_rev = selection.rev
@@ -511,7 +503,6 @@ on message_send_failed(cause)
   // still scoped to the room ON SCREEN, which is a different question.
   return if active_channel != cause.scope_id
   messages = rollback_pending_message(messages, cause.operation_id, cause.committed)
-  messages_revision = messages_revision + 1
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   return if !cause.committed
   hydration_generation = hydration_generation + 1
@@ -533,7 +524,6 @@ on chat_updated(next)
   // renamed or archived — and nothing re-pages the list to heal it.
   channels = upsert_channel_rows(channels, next.channels)
   messages = merge_landing_messages(next.messages, messages, active_channel, next.active_channel)
-  messages_revision = messages_revision + 1
   has_older_history = next.has_older_history || history_has_older(messages)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
@@ -574,7 +564,6 @@ on chat_updated(next)
   // own box (ducktape-ui#697).
   thread_target_seq = next.thread_target_seq
   thread_messages = next.thread_messages
-  thread_messages_revision = thread_messages_revision + 1
   thread_next_reply_seq = 0
   thread_has_more = next.thread_has_more
   thread_generation = thread_generation + 1
@@ -599,7 +588,6 @@ on chat_hit_loaded(next)
   // Same fold as `chat_updated`, same loader, same reason.
   channels = upsert_channel_rows(channels, next.channels)
   messages = merge_landing_messages(next.messages, messages, active_channel, next.active_channel)
-  messages_revision = messages_revision + 1
   has_older_history = next.has_older_history || history_has_older(messages)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
@@ -649,7 +637,6 @@ on chat_hit_loaded(next)
   // own composer instance, words intact (ducktape-ui#697).
   thread_target_seq = next.thread_target_seq
   thread_messages = next.thread_messages
-  thread_messages_revision = thread_messages_revision + 1
   thread_next_reply_seq = 0
   thread_has_more = next.thread_has_more
   thread_generation = thread_generation + 1
@@ -703,7 +690,6 @@ on channel_created(next)
   history_view = false
   channels = upsert_channel_rows(channels, next.channels)
   messages = merge_landing_messages(next.messages, messages, active_channel, next.active_channel)
-  messages_revision = messages_revision + 1
   has_older_history = next.has_older_history || history_has_older(messages)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
@@ -744,7 +730,6 @@ on channel_created(next)
   // each thread's instance keeps its own words (ducktape-ui#697).
   thread_target_seq = next.thread_target_seq
   thread_messages = next.thread_messages
-  thread_messages_revision = thread_messages_revision + 1
   thread_next_reply_seq = 0
   thread_has_more = next.thread_has_more
   thread_generation = thread_generation + 1
@@ -963,7 +948,6 @@ on open_thread_for(seq)
   // vec wholesale, and a load that FAILS now leaves the root standing instead
   // of a pane that stays blank until Close.
   thread_messages = thread_root_seed(messages, thread_messages, seq)
-  thread_messages_revision = thread_messages_revision + 1
   thread_next_reply_seq = 0
   thread_has_more = false
   // A HALF-TYPED REPLY IS NOT THE PRICE OF LOOKING AT ANOTHER THREAD: each
@@ -987,7 +971,6 @@ on thread_loaded(next)
   active_thread_seq = next.root_seq
   thread_target_seq = next.target_seq
   thread_messages = merge_thread_refresh(next.messages, thread_messages, active_channel, active_channel)
-  thread_messages_revision = thread_messages_revision + 1
   let selection = message_selection_after_window(thread_messages, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
   thread_selected_seq = selection.seq
   thread_selected_rev = selection.rev
@@ -1009,7 +992,6 @@ on load_more_thread
 on thread_page_loaded(next)
   return if next.generation != thread_generation || !thread_loading
   thread_messages = append_thread_page(thread_messages, next.messages)
-  thread_messages_revision = thread_messages_revision + 1
   let selection = message_selection_after_window(thread_messages, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
   thread_selected_seq = selection.seq
   thread_selected_rev = selection.rev
@@ -1059,7 +1041,6 @@ on history_loaded(next)
   history_loading = false
   return if next.channel_id != active_channel
   messages = prepend_history(messages, next.messages)
-  messages_revision = messages_revision + 1
   let selection = message_selection_after_window(messages, selected_message_seq, selected_message_rev, message_action, message_edit_draft)
   selected_message_seq = selection.seq
   selected_message_rev = selection.rev
@@ -1093,7 +1074,6 @@ on close_thread
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
-  thread_messages_revision = thread_messages_revision + 1
   thread_next_reply_seq = 0
   thread_has_more = false
   thread_loading = false
@@ -1151,9 +1131,7 @@ on add_reaction_submit(emoji)
   hydration_retry_attempt = 0
   error = ""
   messages = reaction_applied(messages, selected_message_seq, emoji, true)
-  messages_revision = messages_revision + 1
   thread_messages = reaction_applied(thread_messages, selected_message_seq, emoji, true)
-  thread_messages_revision = thread_messages_revision + 1
   run every add_reaction(connected_rpc, password, active_channel, selected_message_seq, emoji) -> reaction_acked _ | reaction_failed _
 
 // One-tap reactions do NOT select the row: the tap is its own complete act,
@@ -1169,9 +1147,7 @@ on add_reaction_at(seq, emoji)
   hydration_retry_attempt = 0
   error = ""
   messages = reaction_applied(messages, seq, emoji, true)
-  messages_revision = messages_revision + 1
   thread_messages = reaction_applied(thread_messages, seq, emoji, true)
-  thread_messages_revision = thread_messages_revision + 1
   run every add_reaction(connected_rpc, password, active_channel, seq, emoji) -> reaction_acked _ | reaction_failed _
 
 on remove_reaction_at(seq, emoji)
@@ -1183,9 +1159,7 @@ on remove_reaction_at(seq, emoji)
   hydration_retry_attempt = 0
   error = ""
   messages = reaction_applied(messages, seq, emoji, false)
-  messages_revision = messages_revision + 1
   thread_messages = reaction_applied(thread_messages, seq, emoji, false)
-  thread_messages_revision = thread_messages_revision + 1
   run every remove_reaction(connected_rpc, password, active_channel, seq, emoji) -> reaction_acked _ | reaction_failed _
 
 // A reaction's ack has nothing to restore: the optimistic fold is already on
@@ -1242,7 +1216,6 @@ on thread_reply_send_failed(cause)
   return if active_channel != cause.scope_id
   return if !contains_pending_message(thread_messages, cause.operation_id)
   thread_messages = rollback_pending_message(thread_messages, cause.operation_id, cause.committed)
-  thread_messages_revision = thread_messages_revision + 1
   // AND IT DOES NOT MOVE THE REPLY CURSOR. A committed reply grows the loaded
   // run by exactly one row, and the fused live fold
   // already counts it when that reply's delta lands — which it does for every

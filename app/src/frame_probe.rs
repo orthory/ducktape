@@ -1433,7 +1433,6 @@ fn remote_post_burst_allocations(history_rows: i64, burst_rows: usize) -> u64 {
         "batching must preserve every delta in wire order"
     );
 
-    let revision_before = app.messages_revision;
     let mut reducer_updates = 0usize;
     let mut view_builds = 0usize;
     let mut phase = Phase::new("remote post batch reducer+rebuild");
@@ -1448,13 +1447,13 @@ fn remote_post_burst_allocations(history_rows: i64, burst_rows: usize) -> u64 {
             })
             .into_cache();
     }
+    // One reduce and one build per BATCH, not per delta. The timeline memo key
+    // used to be counted here too, off a hand-maintained `messages_revision`;
+    // since ui #783 the revision is compiler-owned and unreadable, and the
+    // property it proved is structural instead — the fold writes `messages`
+    // once per publication, and a write is what ticks the revision.
     assert_eq!(reducer_updates, expected_publications);
     assert_eq!(view_builds, expected_publications);
-    assert_eq!(
-        app.messages_revision - revision_before,
-        i64::try_from(expected_publications).expect("the publication count fits i64"),
-        "one batch advances the timeline revision once, not once per delta"
-    );
 
     let expected_hot_rows = usize::try_from(history_rows)
         .expect("the synthetic history size is non-negative")
@@ -2367,8 +2366,32 @@ fn probe() {
         cache = ui.into_cache();
 
         // One row's dependency changes — an edit landing on the stream.
-        app.messages[frame % ROWS as usize].rev += 1;
-        app.messages_revision += 1;
+        //
+        // It goes through the REDUCER, not a field poke. Since ui #783 the
+        // timeline's `lazy` keys on the compiler-owned revision of `messages`,
+        // and only generated code ticks one (ADR 0009): a probe that wrote
+        // `app.messages[i].rev` by hand would leave the revision where it was,
+        // the memo would hand back its cached subtree, and this phase would
+        // quietly measure an unchanged frame instead of a one-row rebuild.
+        let edited_seq = app.messages[frame % ROWS as usize].seq;
+        let edited_body = "edited by the frame probe";
+        let _ = app.__update(__DucktapeMessage::LiveUpdated(backend::LiveUpdate {
+            kind: LiveKind::Chat,
+            chat: vec![backend::ChatDelta::Edited {
+                channel_id: "channel-0".into(),
+                seq: edited_seq,
+                message: backend::ChatMessage {
+                    // monotonic, so every frame's edit really moves the row's
+                    // `(seq, render_rev)` key even when the loop laps `ROWS`.
+                    rev: i64::try_from(frame).expect("the frame counter fits i64") + 2,
+                    body: edited_body.into(),
+                    blocks: backend::paragraph_blocks(edited_body),
+                    meta: format!("#{edited_seq} · edited"),
+                    ..backend::ChatMessage::default()
+                },
+            }],
+            ..backend::LiveUpdate::default()
+        }));
         let ui = row_edit
             .sample(|| UserInterface::build(app.__view(console), WINDOW, cache, &mut renderer));
         cache = ui.into_cache();
