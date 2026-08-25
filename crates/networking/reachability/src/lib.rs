@@ -18,6 +18,7 @@
 //!   members)` — no allocator, no coordination, no consensus-state change.
 
 pub mod binding;
+mod epoch;
 pub mod keys;
 pub mod msg;
 pub mod orchestrator;
