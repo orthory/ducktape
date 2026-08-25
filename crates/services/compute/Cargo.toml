@@ -26,9 +26,9 @@ sdk = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
-# a degraded delivery is the pool's own decision and has to be greppable under
-# `ducktape::compute` — it used to print to raw stderr, which the app's Logs
-# tab and RUST_LOG both miss.
+# every decision this crate makes about a run — skipped, deduped, delivered,
+# suppressed — was invisible before: no tracing, two eprintln!s, and raw stderr
+# reaches neither the app's Logs tab nor RUST_LOG.
 tracing = { workspace = true }
 
 [dev-dependencies]
