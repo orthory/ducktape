@@ -1495,7 +1495,7 @@ mod tests {
     /// the two request lanes; keep them alive for the test's duration. Each
     /// forwarder relabels the frame with the SENDER's key (the overlay's
     /// source-`/128` authentication in production) and routes to the peer's
-    /// matching-service ingress by the plane header's service byte (`frame[1]`).
+    /// matching-service ingress by the plane header's service id.
     fn two_hubs(
         key_a: [u8; 32],
         key_b: [u8; 32],
@@ -1524,7 +1524,9 @@ mod tests {
                     else => break,
                 };
                 if a_to_b(&frame) {
-                    let dst = if frame.get(1) == Some(&(Service::Video as u8)) {
+                    let is_video = data_plane::wire::decode_datagram(&frame)
+                        .is_ok_and(|(service, _, _)| service == Service::Video);
+                    let dst = if is_video {
                         &b_video_in
                     } else {
                         &b_voice_in
@@ -1541,7 +1543,9 @@ mod tests {
                     Some((_to, f)) = b_video_out_rx.recv() => f,
                     else => break,
                 };
-                let dst = if frame.get(1) == Some(&(Service::Video as u8)) {
+                let is_video = data_plane::wire::decode_datagram(&frame)
+                    .is_ok_and(|(service, _, _)| service == Service::Video);
+                let dst = if is_video {
                     &a_video_in
                 } else {
                     &a_voice_in
@@ -1638,9 +1642,8 @@ mod tests {
         let mut dropped_one = false;
         let (req_a_tx, req_b_tx) = two_hubs(key_a, key_b, move |frame| {
             if !dropped_one
-                && frame.len() > 12
-                && frame[1] == Service::Video as u8
-                && let Ok((header, _)) = chat::video::decode_fragment(&frame[12..])
+                && let Ok((Service::Video, _, payload)) = data_plane::wire::decode_datagram(frame)
+                && let Ok((header, _)) = chat::video::decode_fragment(payload)
                 && header.frag_index == 1
             {
                 dropped_one = true;

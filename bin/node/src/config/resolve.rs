@@ -1210,7 +1210,7 @@ mod tests {
         std::fs::write(
             workspace.join("services.toml"),
             format!(
-                "version = 1\n\n[[service]]\nkind = \"compute\"\ninstance = \"{}\"\n\
+                "[[service]]\nkind = \"compute\"\ninstance = \"{}\"\n\
                  nonce = \"{}\"\ngranted_unix = 1700000000\ncapabilities = [{list}]\n\
                  scopes = []\n",
                 "11".repeat(32),

@@ -578,7 +578,7 @@ mod tests {
     /// watcher reads consent off disk, so a test grant IS a file.
     fn granted_workspace(grants: &[(&str, &[&str])]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("scratch workspace");
-        let mut body = String::from("version = 1\n");
+        let mut body = String::new();
         let mut sorted = grants.to_vec();
         sorted.sort_by_key(|(kind, _)| *kind);
         for (kind, capabilities) in &sorted {
