@@ -85,7 +85,7 @@ pub struct ChatMessage {
     /// the block this message settled in; 0 while pending.
     pub height: i64,
     /// that block's `consensus_time` — a block HEIGHT on a validator network
-    /// (bin/noded/src/index.rs stamps `consensus_time = height`) and unix
+    /// (crates/noded/src/index.rs stamps `consensus_time = height`) and unix
     /// MILLIS on a single-writer noded (bin/noded/src/main.rs). NEVER unix
     /// seconds: render it as a height, never as a wall clock. 0 while pending.
     pub time: i64,

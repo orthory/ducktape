@@ -470,7 +470,7 @@ fn submit(base: &str, target: &str, payload: serde_json::Value) -> AgentResult {
 ///
 /// The WIDTH is a wire contract, not a taste call. A run's live output reaches
 /// the node's ring through the ws `run_output` frame, whose admission gate
-/// (`bin/noded/src/stream.rs`) accepts an id of EXACTLY 64 ascii-hex and drops
+/// (`crates/noded/src/stream.rs`) accepts an id of EXACTLY 64 ascii-hex and drops
 /// anything else with `reason = "malformed_run_id"`; the agent data plane's
 /// `valid_event` enforces the same shape before forwarding a line to a peer.
 /// `runs::dispatch_id_for` — the chat-driven lane's id — is a hex sha256 and so

@@ -10,7 +10,7 @@
 //! same way. POST /v1/admin/shutdown is how a client retires it: no pid handshake,
 //! the port IS the daemon's identity.
 //!
-//! run: `cargo run -p noded -- [--listen 127.0.0.1:8844] [--storage <dir>]`
+//! run: `cargo run -p noded-bin -- [--listen 127.0.0.1:8844] [--storage <dir>]`
 //!
 //! without `--storage` state lives in a fresh temp dir (clean run each boot).
 //! with it, qmdb modules, the forge repo, and the per-module index persist;

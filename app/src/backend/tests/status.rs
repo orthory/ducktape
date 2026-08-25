@@ -245,7 +245,7 @@ fn a_status_without_operations_produces_unmeasured_readings() {
 /// SYNC IS READ OFF `phase`, NEVER OFF THE PRESENCE OF `sync`.
 ///
 /// `operations.sync` is set by `begin_sync` and never cleared — no writer in
-/// `bin/noded/src/metrics.rs` puts it back to `None`. A node that finished
+/// `crates/noded/src/metrics.rs` puts it back to `None`. A node that finished
 /// syncing hours ago still carries the last run's heights, so reading presence
 /// as "is syncing" paints a progress bar that never goes away.
 #[test]

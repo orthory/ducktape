@@ -107,7 +107,7 @@ pub fn managed_label(owner: &str) -> String {
 pub const RUN_RUNTIME_DIR: &str = ".ducktape-run";
 
 /// the env var the provisioner exports to point a run at its read-only W6 skills
-/// tree (`bin/noded/src/agent_provision.rs`, consumed by `bin/node`'s MCP server). the sandbox
+/// tree (`crates/noded/src/agent_provision.rs`, consumed by `bin/node`'s MCP server). the sandbox
 /// backends read it to know what to MOUNT — see [`CliProvider::sandbox_ro_paths`].
 const SKILLS_ROOT_ENV: &str = "DUCKTAPE_RUN_SKILLS";
 const RUN_ACTION_URL_ENV: &str = "DUCKTAPE_RUN_ACTION_URL";

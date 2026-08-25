@@ -180,7 +180,7 @@ Three binaries plus the desktop app are runnable:
   throwaway dev daemon with temporary storage:
 
   ```sh
-  cargo run -p noded                        # http://127.0.0.1:8844, temp storage
+  cargo run -p noded-bin                      # http://127.0.0.1:8844, temp storage
   # add -- --storage <dir> for persistent module state
   ```
 

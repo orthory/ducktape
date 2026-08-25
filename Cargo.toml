@@ -61,11 +61,14 @@
 #                      genesis set. EXCLUDED from the workspace as its own
 #                      standalone crate so its heavy deps (revm, alloy) never
 #                      tax the shipping build; gated via `make labs-gate`
+#   crates/noded/    — the node daemon library: the /v1 http+ws surface, the
+#                      actor lane, index/blob/stream lanes and the in-process
+#                      testkit — served by bin/noded, bin/node and bin/simnode
 #   bin/             — demo (in-process walkthrough), node (the `ducktape`
 #                      CLI: validator + fs verbs + mcp server), noded (the
-#                      app-facing daemon), simnode (deterministic /v1 twin),
-#                      coordinator (STUN rendezvous), guest-builder (module →
-#                      wasm component packaging tool)
+#                      app-facing daemon process), simnode (deterministic /v1
+#                      twin), coordinator (STUN rendezvous), guest-builder
+#                      (module → wasm component packaging tool)
 # the host dispatches modules over BFT consensus and composes each authenticated
 # root into the global root-hash. cosmwasm's isolation *pattern*, native rust.
 
@@ -140,6 +143,8 @@ members = [
     # testing — dev-only shared harness helpers (raw-http client, ports,
     # poll). NOT a Module Rule surface; no shipping crate depends on it.
     "crates/testing/nettest",
+    # noded — the daemon library behind the /v1 surface
+    "crates/noded",
     # bin — runnable binaries
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
     "bin/airlock-gateway",
@@ -163,7 +168,7 @@ version = "0.1.0"
 clap = { version = "4.6", features = ["derive"] }
 # the logging facade. events land in `noded::LogRing` (streamed to the app's
 # Logs tab over the ws `logs` topic) AND on stderr (tee'd to daemon.log) —
-# both gated by ONE reloadable filter, see bin/noded/src/log.rs.
+# both gated by ONE reloadable filter, see crates/noded/src/log.rs.
 tracing = "0.1"
 arrayvec = "0.7"
 crossbeam-channel = "0.5"

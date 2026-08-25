@@ -79,7 +79,7 @@ lists what is checked in and tested.
   family owns the read and checkout/status/commit/pin loop over
   `crates/duckfs/client`; its `mcp` family runs the stdio tool server. There is
   no kernel-mount verb.
-- `bin/noded`: the single embedded-host daemon behind the http/ws app surface.
+- `crates/noded`: the daemon library behind the http/ws app surface — the `/v1` router, actor lane, index/blob/stream lanes and the in-process testkit, served by `bin/noded` (the `ducktape-noded` process), `bin/node` and `bin/simnode`.
 - `bin/simnode`: deterministic scenario node — noded's `/v1` wire over a
   test-scripted block producer.
 - `bin/coordinator`: public or private rendezvous/STUN helper.

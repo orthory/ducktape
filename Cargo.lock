@@ -6297,6 +6297,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "noded-bin"
+version = "0.1.0"
+dependencies = [
+ "agent",
+ "async-trait",
+ "automations",
+ "base64 0.22.1",
+ "chat",
+ "commonware-runtime",
+ "dispatch 0.1.0",
+ "duckfs-client",
+ "files",
+ "forge",
+ "futures",
+ "gateway",
+ "git2",
+ "host",
+ "identity",
+ "inbox",
+ "indexer",
+ "nettest",
+ "node",
+ "noded",
+ "pages",
+ "runs",
+ "saga",
+ "sdk",
+ "serde_json",
+ "sha2 0.10.9",
+ "statesync",
+ "tagging",
+ "tasks",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "nokhwa"
 version = "0.10.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"

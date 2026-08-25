@@ -1683,7 +1683,7 @@ fn await_marker(proc: &mut NodeProc, marker: &str, timeout: Duration) -> Result<
 /// there is something new to read.
 ///
 /// **It is not purely event-driven, and the difference matters.**
-/// `bin/noded/src/stream.rs` also emits a byte-identical heartbeat on a 3s
+/// `crates/noded/src/stream.rs` also emits a byte-identical heartbeat on a 3s
 /// `tokio::time::interval`, and nothing in the frame distinguishes the two — so
 /// this is a ≤3s poll that additionally wakes per block. What it buys over the
 /// 300ms client-side spin it replaces is real but bounded: it cannot fire early

@@ -3,7 +3,7 @@
 //!
 //! this is the one implementation phase 3 ships (phase-4 FUSE will add a
 //! colocated-odb one behind the same trait). every method is a single
-//! request/response against the duckfs routes in `bin/noded/src/files_http.rs`:
+//! request/response against the duckfs routes in `crates/noded/src/files_http.rs`:
 //! reads are GETs with the params as the query string, staging POSTs the raw
 //! chunk bytes, and a commit POSTs the snake_case `CommitBody` and reads back the
 //! CAMELCASE `BlockSummary`. a module rejection arrives as a 400 `{"error":

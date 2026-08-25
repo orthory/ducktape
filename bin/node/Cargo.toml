@@ -108,7 +108,7 @@ hex = "0.4"
 base64 = "0.22"
 # the http/ws app surface, shared with the embedded daemon: NodeCommand lane,
 # axum router, and serve() — this binary only owns the pump-side of the lane.
-noded = { path = "../noded" }
+noded = { path = "../../crates/noded" }
 # the derived read-model tier: bin/node reuses noded's store construction and
 # /v1/index/* + /v1/blocks lanes, folds each sealed block (ops + explorer row)
 # in its drain/replay, and re-derives views from verified state at
@@ -165,7 +165,7 @@ nettest = { path = "../../crates/testing/nettest" }
 # the fs/mcp e2e harnesses drive noded's in-proc daemon testkit (was: each
 # hand-mirrored the NodeCommand actor). dev-only feature keeps it
 # out of the production `ducktape` binary build.
-noded = { path = "../noded", features = ["testkit"] }
+noded = { path = "../../crates/noded", features = ["testkit"] }
 # the ed25519 bind-auth builder, shared from identity (was: a per-suite copy).
 # dev-only feature keeps it out of the production binary build.
 identity = { workspace = true, features = ["testkit"] }

@@ -65,7 +65,7 @@ module crate:
 
 `guest-builder --index <module-dir>` writes the committed `index.wasm`; add
 the module to `INDEX_MODULES` in the Makefile and to `index_guest_wasm()` in
-`bin/noded/src/index.rs` (the bundled include_bytes registry). The fold runs
+`crates/noded/src/index.rs` (the bundled include_bytes registry). The fold runs
 ASYNC behind a fluent31 changes-mode trigger — views trail the op feed
 observably (`/v1/index/status` `fold.{module}`), never atomically.
 

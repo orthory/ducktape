@@ -162,7 +162,7 @@ test: wasm-modules-check
 # target, which links dev-dependencies, so a product path reaching for a
 # dev-only crate compiles under every test lane and breaks only the BINARY.
 # That is not hypothetical — it shipped and sat on dev for 81 commits.
-	$(CARGO) build -p noded -p simnode -p ducktape-app
+	$(CARGO) build -p noded-bin -p simnode -p ducktape-app
 
 ## rebuild every wasm guest module into its componentized artifact and refresh
 ## EVERY committed copy in one sweep (the canonical node-embedded artifact +

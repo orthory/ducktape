@@ -283,7 +283,7 @@ fn switching_panes_retires_a_stale_error_banner_on_every_tab() {
 
 /// EVERY READER OF `/v1/peers` USES THE NAMES `PeerView` SERIALIZES.
 ///
-/// `bin/noded/src/peers.rs` serves `peer` / `connected` / `role`; it has never
+/// `crates/noded/src/peers.rs` serves `peer` / `connected` / `role`; it has never
 /// served `key`, `live`, or a per-peer `height`. Reading the wrong ones does
 /// not fail — `as_str()` answers `None` and the row renders blank, zero and
 /// offline for a peer that is connected.
@@ -303,7 +303,7 @@ fn peer_readers_use_the_names_the_node_serves() {
             assert!(
                 !source.contains(wrong),
                 "{name} reads {wrong}, which `/v1/peers` does not serve — \
-                 see bin/noded/src/peers.rs for the names it does"
+                 see crates/noded/src/peers.rs for the names it does"
             );
         }
         assert!(

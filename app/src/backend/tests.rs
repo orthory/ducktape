@@ -332,7 +332,7 @@ async fn node_that_serves_its_status_once(status_body: &'static str) -> String {
 /// The next update that says something happened.
 ///
 /// THE TIP ARRIVES FIRST, EVERY BLOCK. The node sends the heartbeat on the
-/// block wake and only THEN catches its topics up (`bin/noded/src/stream.rs`,
+/// block wake and only THEN catches its topics up (`crates/noded/src/stream.rs`,
 /// the `block_rx` arm), so the head for block N is on the wire before N's ops
 /// are. A test that asserts on `live.next()` directly is asserting on that
 /// heartbeat, not on its own submit.
