@@ -23,7 +23,6 @@ use sha2::{Digest as _, Sha256};
 use crate::config;
 
 pub const FILE_NAME: &str = "services.toml";
-const FORMAT_VERSION: u8 = 1;
 
 /// the first-party service kinds. Defined in `noded` because both the node's
 /// own surfaces (the ws service link) and this CLI must name them.
@@ -201,30 +200,19 @@ impl ServiceGrant {
     }
 }
 
-/// the whole `services.toml`.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// the whole `services.toml`. `deny_unknown_fields` is the schema guard: a
+/// file this build does not understand is refused outright (no version field,
+/// no migrations — the remedy is re-granting the services).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Services {
-    pub version: u8,
     /// the grants, kind-sorted and unique. `[[service]]` in the file.
     #[serde(default, rename = "service")]
     pub grants: Vec<ServiceGrant>,
 }
 
-impl Default for Services {
-    fn default() -> Self {
-        Self {
-            version: FORMAT_VERSION,
-            grants: Vec::new(),
-        }
-    }
-}
-
 impl Services {
     fn validate(&self) -> Result<(), String> {
-        if self.version != FORMAT_VERSION {
-            return Err(format!("services: unsupported format version {}", self.version));
-        }
         let mut previous: Option<&str> = None;
         for grant in &self.grants {
             if !kind_is_well_formed(&grant.kind) {
@@ -328,8 +316,7 @@ pub fn load(workspace: &Path) -> Result<Services, String> {
         }
         Err(error) => return Err(format!("read {path:?}: {error}")),
     };
-    let services: Services =
-        toml::from_str(&text).map_err(|error| format!("{path:?}: {error}"))?;
+    let services: Services = toml::from_str(&text).map_err(|error| format!("{path:?}: {error}"))?;
     services.validate()?;
     Ok(services)
 }
@@ -615,7 +602,10 @@ fn render_build(daemon: Option<&str>, node: Option<&str>) -> String {
     };
     match Skew::between(daemon, Some(node)) {
         Skew::Matched | Skew::Unknown => daemon.to_string(),
-        Skew::Skewed => format!("{daemon} {}", paint(YELLOW, &format!("(this node: {node})"))),
+        Skew::Skewed => format!(
+            "{daemon} {}",
+            paint(YELLOW, &format!("(this node: {node})"))
+        ),
     }
 }
 
@@ -636,7 +626,10 @@ fn render_status(rows: &[ServiceRow], node_build: Option<&str>) -> String {
             paint(row.state.style(), row.state.label()),
         ));
         let fields = [
-            ("instance", row.instance.as_deref().unwrap_or("-").to_string()),
+            (
+                "instance",
+                row.instance.as_deref().unwrap_or("-").to_string(),
+            ),
             ("version", row.version.as_deref().unwrap_or("-").to_string()),
             ("build", render_build(row.build.as_deref(), node_build)),
             ("offers", join_or_dash(&row.capabilities)),
@@ -683,7 +676,10 @@ fn render_enable_summary(plan: &EnablePlan) -> String {
         ("node", format!("{} · {}", plan.chain_id, plan.node_hex8())),
         ("status", signaling),
         ("offers", offered_list(|offer| &offer.capabilities)),
-        ("grant scopes", paint(RED, &offered_list(|offer| &offer.scopes))),
+        (
+            "grant scopes",
+            paint(RED, &offered_list(|offer| &offer.scopes)),
+        ),
     ];
     let mut out = String::new();
     for (name, value) in rows {
@@ -788,9 +784,11 @@ impl WorkspaceArgs {
             // `list_workspaces` yields the node.toml PATH, not the directory —
             // this verb family wants the workspace that CONTAINS it.
             1 => Ok(config::resolve_network(&workspaces.swap_remove(0).0)?.0),
-            0 => Err("no workspace: found one with `ducktape node init --name <name>` \
+            0 => Err(
+                "no workspace: found one with `ducktape node init --name <name>` \
                       or `ducktape node join <invite>`"
-                .into()),
+                    .into(),
+            ),
             _ => Err(format!(
                 "several workspaces are registered — pick one with -n:\n{}",
                 workspaces
@@ -923,9 +921,9 @@ fn read_catalog(workspace: &Path) -> Result<Catalog, crate::node_http::ReadFailu
     use crate::node_http::ReadFailure;
     let base = config::http_base_in(workspace).map_err(ReadFailure::Rejected)?;
     let body = crate::node_http::get_json(&base, "/v1/services")?;
-    let signaling = body.get("signaling").ok_or_else(|| {
-        ReadFailure::Rejected("/v1/services carries no `signaling` field".into())
-    })?;
+    let signaling = body
+        .get("signaling")
+        .ok_or_else(|| ReadFailure::Rejected("/v1/services carries no `signaling` field".into()))?;
     Ok(Catalog {
         signaling: serde_json::from_value(signaling.clone())
             .map_err(|e| ReadFailure::Rejected(format!("unexpected /v1/services shape: {e}")))?,
@@ -1069,7 +1067,13 @@ pub(crate) fn plan_enable(
     service: &config::ServiceConfig,
     node_id: [u8; 32],
 ) -> Result<EnablePlan, String> {
-    plan_enable_from(workspace, kind, service, node_id, catalog_now(workspace).signaling)
+    plan_enable_from(
+        workspace,
+        kind,
+        service,
+        node_id,
+        catalog_now(workspace).signaling,
+    )
 }
 
 /// The decide half, with the signaling catalog SUPPLIED rather than fetched.
@@ -1541,9 +1545,7 @@ fn offered_capabilities(
     node_key: &[u8; 32],
 ) -> Result<Vec<String>, String> {
     match daemon_for(kind) {
-        Some(Daemon::Compute) | Some(Daemon::Agent) => {
-            discover_executors(kind, service, node_key)
-        }
+        Some(Daemon::Compute) | Some(Daemon::Agent) => discover_executors(kind, service, node_key),
         Some(Daemon::Airlock) | None => Ok(Vec::new()),
     }
 }
@@ -1563,13 +1565,10 @@ fn discover_executors(
     let backend = sandbox_backend(service)?;
     // the same precondition the node's own boot enforces — a daemon must not
     // advertise tags it has no runnable sandbox for.
-    backend.probe().map_err(|error| format!("sandbox: {error}"))?;
-    let providers = provider_host::discover(
-        node_key,
-        None,
-        backend,
-        kind,
-    )?;
+    backend
+        .probe()
+        .map_err(|error| format!("sandbox: {error}"))?;
+    let providers = provider_host::discover(node_key, None, backend, kind)?;
     Ok(providers.capabilities())
 }
 
@@ -1614,7 +1613,10 @@ fn send_hello(base: &str, hello: &noded::services::Hello) -> Result<Skew, String
         &serde_json::to_value(hello).unwrap(),
     )
     .map_err(|error| error.to_string())?;
-    Ok(Skew::between(&hello.build, body.get("build").and_then(|v| v.as_str())))
+    Ok(Skew::between(
+        &hello.build,
+        body.get("build").and_then(|v| v.as_str()),
+    ))
 }
 
 /// Whether the daemon and the node it signals to are the same build. ONE
@@ -1953,7 +1955,10 @@ mod tests {
 
         // a kind this node HAS heard of, just not that one: name what there is.
         let wrong = only_kind(all(), Some("airlock")).expect_err("not on this node");
-        assert!(wrong.contains("agent") && wrong.contains("compute"), "{wrong}");
+        assert!(
+            wrong.contains("agent") && wrong.contains("compute"),
+            "{wrong}"
+        );
 
         // nothing at all: the only useful answer is how to start it.
         let empty = only_kind(Vec::new(), Some("compute")).expect_err("nothing here");
@@ -2170,7 +2175,10 @@ mod tests {
             vec![hello_offering("compute", &["Claude Sonnet"])],
         )
         .expect_err("an illegal tag must refuse the plan");
-        assert!(error.contains("Claude Sonnet"), "the offending tag is named: {error}");
+        assert!(
+            error.contains("Claude Sonnet"),
+            "the offending tag is named: {error}"
+        );
     }
 
     #[test]
@@ -2227,7 +2235,6 @@ mod tests {
     #[test]
     fn a_file_the_registry_would_refuse_does_not_load() {
         let over_cap = Services {
-            version: FORMAT_VERSION,
             grants: vec![ServiceGrant {
                 kind: "compute".into(),
                 instance: "aa".repeat(32),
@@ -2247,7 +2254,6 @@ mod tests {
         );
 
         let illegal = Services {
-            version: FORMAT_VERSION,
             grants: vec![ServiceGrant {
                 kind: "compute".into(),
                 instance: "aa".repeat(32),
@@ -2271,7 +2277,6 @@ mod tests {
         // so the test above pins the bound rather than a file that could never
         // load: one under the cap is fine.
         let ok = Services {
-            version: FORMAT_VERSION,
             grants: vec![ServiceGrant {
                 kind: "compute".into(),
                 instance: "aa".repeat(32),
@@ -2281,7 +2286,8 @@ mod tests {
                 scopes: Vec::new(),
             }],
         };
-        ok.validate().expect("63 executors + the kind tag is exactly the cap");
+        ok.validate()
+            .expect("63 executors + the kind tag is exactly the cap");
     }
 
     /// Consent lands on DISK before it lands on chain, in both verbs.
@@ -2295,8 +2301,9 @@ mod tests {
     /// that interval benign: the watcher then agrees with the verb.
     #[test]
     fn both_verbs_persist_before_they_announce() {
-        let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/services.rs"))
-            .expect("this file");
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/services.rs"))
+                .expect("this file");
         for (verb, marker) in [
             ("commit_enable", "pub(crate) fn commit_enable("),
             ("disable", "fn disable(args: KindArgs)"),
@@ -2306,7 +2313,9 @@ mod tests {
                 .nth(1)
                 .and_then(|rest| rest.split("\nfn ").next())
                 .unwrap_or_else(|| panic!("{verb} has a body"));
-            let saved = body.find("save(").unwrap_or_else(|| panic!("{verb} persists"));
+            let saved = body
+                .find("save(")
+                .unwrap_or_else(|| panic!("{verb} persists"));
             let announced = body
                 .find("announce::submit(")
                 .unwrap_or_else(|| panic!("{verb} announces"));
@@ -2328,8 +2337,9 @@ mod tests {
     /// hello, and the `service list` row that would have said why.
     #[test]
     fn neither_half_of_enabling_may_abort_the_daemon() {
-        let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/services.rs"))
-            .expect("this file");
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/services.rs"))
+                .expect("this file");
         let body = source
             .split("fn offer_enable(")
             .nth(1)
@@ -2660,7 +2670,10 @@ mod tests {
         // skewed daemon out of the catalog entirely, so it could not be seen.
         let mut live = signaling("compute");
         live.build = "0.0.0-ancient".into();
-        let rows = rows(&[live], &[grant("compute", mint_instance(&NODE_A, "compute", &NONCE))]);
+        let rows = rows(
+            &[live],
+            &[grant("compute", mint_instance(&NODE_A, "compute", &NONCE))],
+        );
         assert_eq!(rows[0].state, ServiceState::Enabled);
         assert_eq!(rows[0].build.as_deref(), Some("0.0.0-ancient"));
     }
@@ -2710,7 +2723,10 @@ mod tests {
         // every input separates: node, kind and nonce each change the id.
         assert_ne!(mine, mint_instance(&NODE_B, "compute", &NONCE));
         assert_ne!(mine, mint_instance(&NODE_A, "storage", &NONCE));
-        assert_ne!(mine, mint_instance(&NODE_A, "compute", &[4u8; GRANT_NONCE_LEN]));
+        assert_ne!(
+            mine,
+            mint_instance(&NODE_A, "compute", &[4u8; GRANT_NONCE_LEN])
+        );
 
         // the domain prefix is real: the id is NOT a bare sha256 of the parts.
         let mut undomained = Sha256::new();
@@ -2781,7 +2797,6 @@ mod tests {
         assert!(grant_for(dir.path(), COMPUTE_KIND).unwrap().is_none());
 
         let services = Services {
-            version: FORMAT_VERSION,
             grants: vec![
                 grant("compute", mint_instance(&NODE_A, "compute", &NONCE)),
                 grant("storage", mint_instance(&NODE_A, "storage", &NONCE)),
@@ -2878,7 +2893,10 @@ mod tests {
             .map(|row| paint(row.state.style(), row.state.glyph()))
             .collect();
         assert_eq!(
-            styles.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            styles
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
             3,
             "signaling / enabled / enabled-but-absent must be visually distinct"
         );
@@ -2969,7 +2987,6 @@ mod tests {
         save(
             dir.path(),
             &Services {
-                version: FORMAT_VERSION,
                 grants: vec![minted.clone()],
             },
         )
@@ -3052,11 +3069,7 @@ mod tests {
 
         // unsorted / duplicate kinds
         let duplicate = Services {
-            version: FORMAT_VERSION,
-            grants: vec![
-                grant("compute", [1u8; 32]),
-                grant("compute", [2u8; 32]),
-            ],
+            grants: vec![grant("compute", [1u8; 32]), grant("compute", [2u8; 32])],
         };
         assert!(duplicate.validate().is_err());
 
@@ -3065,19 +3078,17 @@ mod tests {
         short.instance.truncate(10);
         assert!(
             Services {
-                version: FORMAT_VERSION,
                 grants: vec![short],
             }
             .validate()
             .is_err()
         );
 
-        // an unknown key never parses silently
-        std::fs::write(&path, "version = 1\nsurprise = true\n").unwrap();
+        // an unknown key never parses silently — the retired version field
+        // included.
+        std::fs::write(&path, "surprise = true\n").unwrap();
         assert!(load(dir.path()).is_err());
-
-        // a future format version is a loud refusal, not a shrug
-        std::fs::write(&path, "version = 2\n").unwrap();
+        std::fs::write(&path, "version = 1\n").unwrap();
         assert!(load(dir.path()).is_err());
     }
 }

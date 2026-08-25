@@ -1,23 +1,25 @@
 use super::*;
 use capability::{CapabilityQuery, CapabilityReply};
 use gateway::{CredentialKind, GatewayQuery, GatewayReply};
-use identity::{AccountView, IdentityQuery, IdentityReply};
 use iced::advanced::widget::{Operation, Tree, tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, renderer};
 use iced::futures::SinkExt as _;
 use iced::{Element, Length, Rectangle, Size, Subscription, Theme, mouse};
-use ui_lang_components::ui::terminal;
+use identity::{AccountView, IdentityQuery, IdentityReply};
 use saga::{SagaQuery, SagaReply, SagaStatus, SagaView};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use tokio_tungstenite::tungstenite::Message;
+use ui_lang_components::ui::terminal;
 
 const AGENT_CONTEXT_ROWS: usize = 32;
 const AGENT_CONTEXT_BYTES: usize = 48 * 1024;
 const LINK_TOKEN_BYTES: u64 = 4 * 1024;
 const MAX_ACTIVITY_ROWS: usize = 32;
-const RUNNER_RESULT_VERSION: u64 = 1;
+/// the fixed value of the `ducktape_runner_result` magic key — part of the
+/// wrapper's self-identifying token, never a version.
+const RUNNER_RESULT_MARKER: u64 = 1;
 /// The unpicked host: the run executes on the node the app is connected to.
 /// `app/src/ui/state/shell.ice` seeds the picker with this exact string, which
 /// a test below pins.
@@ -1006,9 +1008,9 @@ fn terminal_saga_event(view: SagaView, saga_id: &str) -> Option<AgentChatEvent> 
 fn agent_response_text(bytes: &[u8]) -> Result<String, String> {
     let result: AgentRunnerResult = serde_json::from_slice(bytes)
         .map_err(|error| format!("the runner result is malformed: {error}"))?;
-    if result.ducktape_runner_result != RUNNER_RESULT_VERSION {
+    if result.ducktape_runner_result != RUNNER_RESULT_MARKER {
         return Err(format!(
-            "runner result version {} is not supported",
+            "runner result marker {} is not the ducktape_runner_result magic",
             result.ducktape_runner_result
         ));
     }
@@ -1289,7 +1291,6 @@ fn agent_terminal_notice(notice: terminal::Notice) -> AgentTerminalNotice {
         title: notice.title,
     }
 }
-
 
 struct AgentMarkdown {
     items: Rc<[iced::widget::markdown::Item]>,
@@ -1602,8 +1603,6 @@ impl Widget<String, Theme, iced::Renderer> for AgentMarkdown {
             .draw(tree, renderer, theme, style, layout, cursor, viewport);
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {

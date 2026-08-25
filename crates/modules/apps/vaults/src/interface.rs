@@ -16,7 +16,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum VaultMsg {
     /// create a vault; the (verified) submitter becomes its first owner and
     /// first reader.
@@ -57,6 +57,7 @@ pub enum VaultMsg {
 
 /// one secret's stored envelope (ciphertext + audit metadata).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SecretEntry {
     pub ciphertext: Vec<u8>,
     pub version: u64,
@@ -66,6 +67,7 @@ pub struct SecretEntry {
 
 /// a vault's readable projection (metadata + secret NAMES, not values).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct VaultView {
     pub vault_id: String,
     pub name: String,
@@ -76,7 +78,7 @@ pub struct VaultView {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum VaultQuery {
     /// every vault's metadata view.
     Vaults,
@@ -87,7 +89,7 @@ pub enum VaultQuery {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum VaultReply {
     Vaults(Vec<VaultView>),
     Vault(Option<VaultView>),

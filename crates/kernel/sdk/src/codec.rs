@@ -1,7 +1,7 @@
 //! the shared snapshot-codec primitives — ONE length-prefixed LE toolkit for
 //! every module's canonical binary encoding (the `root()` preimage and the
 //! snapshot format), replacing the per-module hand-rolled copies that used to
-//! live in valset/governance/upgrade/identity/capability/saga/dispatch/….
+//! live in valset/governance/lifecycle/identity/capability/saga/dispatch/….
 //!
 //! this is deliberately dumb: writers append, the [`Cursor`] reads forward
 //! over UNTRUSTED bytes with every accessor length-checked before it reads,
@@ -284,7 +284,10 @@ mod tests {
 
         // capped below the field length: rejected, and the message names the cap
         // (the recovery `record_keeps_the_operation_field_cap` contract).
-        let err = Cursor::with_cap(&out, 3).bytes("f").unwrap_err().to_string();
+        let err = Cursor::with_cap(&out, 3)
+            .bytes("f")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("field cap"), "{err}");
 
         // capped at exactly the field length: still accepted.

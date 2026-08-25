@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 /// how a watched channel selects which agents a user post engages.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TurnPolicy {
     /// agents whose `AuthorRef::Agent` ref appears in the post's mentions.
     Mention,
@@ -41,6 +41,7 @@ pub enum TurnPolicy {
 /// one channel watch — the runs-module-side mirror of the tagging-plane
 /// subscription it was registered with (the two are staged atomically, P2).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WatchView {
     pub channel_id: String,
     pub policy: TurnPolicy,
@@ -55,6 +56,7 @@ pub struct WatchView {
 /// live in the dispatch module (`DispatchQuery::Dispatch`), keyed by
 /// `dispatch_id` under receiver "runs".
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PendingRun {
     /// `"chat\x1f{channel_id}\x1f{anchor_seq}\x1f{agent_id}"` for chat runs
     /// and `"job\x1f{job_id}\x1f{agent_id}\x1f{job_claim_height}"` for job
@@ -86,7 +88,7 @@ pub struct PendingRun {
 /// timeout, cancellation, failed validation). a degraded-but-delivered run is
 /// `Delivered` with [`RunRecord::degraded`] set.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunOutcome {
     Delivered,
     Failed,
@@ -97,6 +99,7 @@ pub enum RunOutcome {
 /// `root()`/snapshot: replay rebuilds it deterministically, and a
 /// snapshot-joined node starts with an empty ring.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RunRecord {
     pub run_id: String,
     pub agent_id: String,
@@ -128,7 +131,7 @@ pub struct RunRecord {
 pub const MAX_DELEGATION_REQUEST_ID_BYTES: usize = 64;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum DelegationStatus {
     Pending,
     Delivered,
@@ -139,6 +142,7 @@ pub enum DelegationStatus {
 /// The bounded result routed back to a caller run. It is queryable only while
 /// that root run remains live; Runs removes the whole call tree with the root.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationResult {
     pub reply_blocks: Vec<ReplyBlock>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -150,6 +154,7 @@ pub struct DelegationResult {
 /// One ephemeral caller/callee edge. This is run state, not an AgentRecord
 /// relation: both agents remain peers before and after the call.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DelegationView {
     pub delegation_id: String,
     pub request_id: String,
@@ -168,7 +173,7 @@ pub struct DelegationView {
 // ---- ops ----------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunsMsg {
     /// watch a channel under `policy` AND subscribe on the tagging plane —
     /// one atomic block (P2), so the watch and the subscription cannot drift.
@@ -280,6 +285,7 @@ pub const MAX_ACTIONS_PER_SESSION: u32 = 32;
 /// replaying validator derives byte-identical ids and no host randomness ever
 /// reaches consensus.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AgentSession {
     pub run_id: String,
     pub agent_id: String,
@@ -294,7 +300,7 @@ pub struct AgentSession {
 // ---- queries ------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunsQuery {
     /// every in-flight correlation entry, ascending by dispatch id. bounded:
     /// entries prune on delivery, and every dispatch has a deadline.
@@ -316,7 +322,7 @@ pub enum RunsQuery {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunsReply {
     PendingRuns(Vec<PendingRun>),
     Watches(Vec<WatchView>),

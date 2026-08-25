@@ -19,12 +19,12 @@ fn pages_comment_mention_dispatches_without_a_chat_watch() {
             comment_ids: vec!["comment-1".into()],
         },
         comments: vec![pages::Comment {
-                id: "comment-1".into(),
-                thread_id: "thread-1".into(),
-                author: pages::AuthorRef::User(vec![4; 32]),
-                text: "@bot review this page".into(),
-                created_at: 1,
-                edited_at: None,
+            id: "comment-1".into(),
+            thread_id: "thread-1".into(),
+            author: pages::AuthorRef::User(vec![4; 32]),
+            text: "@bot review this page".into(),
+            created_at: 1,
+            edited_at: None,
             deleted: false,
         }],
     };
@@ -119,7 +119,10 @@ fn mention_policy_engages_only_this_modules_tagged_active_agents() {
     assert_eq!(*recipe_id, recipe_id_for("bot1"));
     let envelope: serde_json::Value =
         serde_json::from_slice(payload).expect("the payload is a JSON envelope");
-    assert_eq!(envelope["ducktape_run"], crate::envelope::RUN_ENVELOPE_VERSION);
+    assert_eq!(
+        envelope["ducktape_run"],
+        crate::envelope::RUN_ENVELOPE_MARKER
+    );
     assert_eq!(envelope["agent_id"], "bot1");
     assert!(
         envelope.get("prompt_hash").is_none(),

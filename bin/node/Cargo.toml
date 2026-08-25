@@ -25,6 +25,8 @@ clap = { workspace = true }
 anstyle = "1.0"
 anstream = "1.0"
 host = { workspace = true }
+# the module composition catalog this composer draws its genesis selection from.
+topology = { workspace = true }
 node = { workspace = true }
 consensus = { workspace = true }
 recovery = { workspace = true }
@@ -54,6 +56,8 @@ compute-service = { workspace = true }
 forge = { workspace = true }
 pages = { workspace = true }
 chat = { workspace = true }
+# the huddle media planes the voice hub runs: Opus engine, video wire, call-socket framing.
+media-service = { workspace = true }
 tasks = { workspace = true }
 identity = { workspace = true }
 duckdns = { workspace = true }
@@ -108,7 +112,7 @@ hex = "0.4"
 base64 = "0.22"
 # the http/ws app surface, shared with the embedded daemon: NodeCommand lane,
 # axum router, and serve() — this binary only owns the pump-side of the lane.
-noded = { path = "../noded" }
+noded = { path = "../../crates/noded" }
 # the derived read-model tier: bin/node reuses noded's store construction and
 # /v1/index/* + /v1/blocks lanes, folds each sealed block (ops + explorer row)
 # in its drain/replay, and re-derives views from verified state at
@@ -165,7 +169,7 @@ nettest = { path = "../../crates/testing/nettest" }
 # the fs/mcp e2e harnesses drive noded's in-proc daemon testkit (was: each
 # hand-mirrored the NodeCommand actor). dev-only feature keeps it
 # out of the production `ducktape` binary build.
-noded = { path = "../noded", features = ["testkit"] }
+noded = { path = "../../crates/noded", features = ["testkit"] }
 # the ed25519 bind-auth builder, shared from identity (was: a per-suite copy).
 # dev-only feature keeps it out of the production binary build.
 identity = { workspace = true, features = ["testkit"] }
@@ -192,9 +196,9 @@ axum = "0.8"
 data-plane = { workspace = true, features = ["sim"] }
 # voice::overlay_e2e stands two userspace WireGuard overlay stacks up on
 # loopback (the crates/networking/overlay-net/tests/loopback_pair harness shape) to
-# prove huddle media crosses the REAL overlay headless — this supplies the WG
-# interface config types; the boringtun crypto rides overlay-net (a dep above).
-defguard_wireguard_rs = { workspace = true }
+# prove huddle media crosses the REAL overlay headless — this derives the
+# fixture WireGuard keypairs; the tunnel crypto rides overlay-net (a dep above).
+x25519-dalek = { workspace = true }
 # replica::tests assembles real finalization certificates (sign -> assemble)
 # to exercise the cert-lane decode + fold planner.
 commonware-parallel = { workspace = true }

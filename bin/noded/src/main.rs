@@ -10,7 +10,7 @@
 //! same way. POST /v1/admin/shutdown is how a client retires it: no pid handshake,
 //! the port IS the daemon's identity.
 //!
-//! run: `cargo run -p noded -- [--listen 127.0.0.1:8844] [--storage <dir>]`
+//! run: `cargo run -p noded-bin -- [--listen 127.0.0.1:8844] [--storage <dir>]`
 //!
 //! without `--storage` state lives in a fresh temp dir (clean run each boot).
 //! with it, qmdb modules, the forge repo, and the per-module index persist;
@@ -50,10 +50,10 @@ use tagging::TaggingModule;
 use tasks::Tasks;
 
 /// every module registered at genesis, in registry order — the `sim_base`
-/// selection of the single-source [`host::topology`] (identical to simnode's
+/// selection of the single-source [`topology`] (identical to simnode's
 /// default set). status reports use this list; the genesis vec in `run_node`
 /// composes the same ids over native module structs.
-const MODULE_IDS: &[&str] = host::topology::SIM_BASE;
+const MODULE_IDS: &[&str] = topology::SIM_BASE;
 
 mod echo_oracle;
 

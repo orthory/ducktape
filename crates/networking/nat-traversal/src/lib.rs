@@ -13,13 +13,13 @@ pub mod auth;
 pub mod client;
 pub mod coordinator;
 pub mod relay;
-// `punch` depends on `simnat::SimNat` directly in its (non-test) API, so it is
-// gated identically: available under test cfg or the `simnat` feature, never
-// pulled into a plain non-test, non-feature build (e.g. `coordinator-bin`).
-#[cfg(any(test, feature = "simnat"))]
-pub mod punch;
+// The simulation arms (`simnat`, `simnet`) are gated: available under test
+// cfg or the `simnat` feature, never pulled into a plain non-test,
+// non-feature build (e.g. `coordinator-bin`).
 #[cfg(any(test, feature = "simnat"))]
 pub mod simnat;
+#[cfg(any(test, feature = "simnat"))]
+pub mod simnet;
 pub mod wire;
 
 pub use advert::{
@@ -35,8 +35,6 @@ pub use client::{
     run_coordinator_workers_with_metrics_using,
 };
 pub use coordinator::{Coordinator, CoordinatorReplies, CoordinatorReply};
-#[cfg(any(test, feature = "simnat"))]
-pub use punch::{PunchError, PunchPlan, RebindProof, drive_rebind_reconnect, drive_simulated};
 pub use relay::{
     FRAME_READ_TIMEOUT, FrameError, MAX_FRAME_LEN, MAX_RELAY_PAYLOAD, MAX_RELAY_SESSIONS,
     MAX_SESSION_FORWARDS, MAX_SESSIONS_PER_IP, MIN_FORWARD_GAP, REASON_MALFORMED,
@@ -46,4 +44,6 @@ pub use relay::{
 };
 #[cfg(any(test, feature = "simnat"))]
 pub use simnat::SimNat;
+#[cfg(any(test, feature = "simnat"))]
+pub use simnet::{SimHandle, SimNetwork, SimSocket};
 pub use wire::{AuthRequest, Msg, NodeKey, WireError};

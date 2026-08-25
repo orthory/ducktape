@@ -1,6 +1,6 @@
 //! The huddle's media leg: the `/v1/call/ws` client the node's call hub has
 //! been serving since the webview era — mic capture in, mixed playout out,
-//! call control as json text frames. Binary framing is `chat::call_wire`, the
+//! call control as json text frames. Binary framing is `media_service::call_wire`, the
 //! single definition site; the control json mirrors `noded`'s
 //! `CallClientControl`/`CallServerControl` (tag = `type`, snake_case) — the
 //! app does not link the daemon crate, so the three-variant shapes are
@@ -17,7 +17,7 @@
 //! AUDIO THREADING: cpal streams are not `Send`, so they live on one
 //! dedicated OS thread that builds input+output and parks on a shutdown
 //! channel. Capture callbacks push mono i16 into a frame accumulator and hand
-//! full 20 ms frames (`chat::voice::FRAME_SAMPLES`) to the pump over an
+//! full 20 ms frames (`media_service::voice::FRAME_SAMPLES`) to the pump over an
 //! unbounded channel; playout callbacks drain a shared ring the pump fills
 //! from `mixed` frames. Late audio is dead audio: the ring caps at ~200 ms
 //! and drops oldest, capture frames drop when the pump is behind.
@@ -26,9 +26,9 @@ use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use chat::call_wire;
-use chat::call_wire::CapturedFrame;
-use chat::voice::FRAME_SAMPLES;
+use media_service::call_wire;
+use media_service::call_wire::CapturedFrame;
+use media_service::voice::FRAME_SAMPLES;
 use iced::futures::stream::BoxStream;
 use iced::futures::{SinkExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize};

@@ -6,9 +6,10 @@ Status: implemented protocol boundary for the validator-mesh epic. The
 advertisements, mesh versions, port policy, signed upgrade
 request/response/ack messages, replay nonces, allowed IPs, and ACK freshness.
 A successful validation emits a tunnel install plan that the
-`wireguard::effect` module converts into `defguard_wireguard_rs`
-`Peer`/`InterfaceConfiguration` values and pushes through a `WireGuardEffect`
-(deterministic fake in tests, userspace/TUN in real runs).
+`wireguard::effect` module reduces to one `InterfaceConfig` (own key, listen
+port, overlay addresses, every peer relationship) and pushes through a
+`WireGuardEffect` (deterministic fake in tests, the in-process userspace
+backend in real runs).
 
 Flag day (2026-07-11): the relay/dial-failure apparatus was deleted, so the
 endpoint-record and upgrade-response signing preimages carry fewer fields
@@ -44,12 +45,11 @@ longer verify, and the mesh-version fixed vector was recomputed.
 
 ## Rust Backend Choice
 
-The implementation uses `defguard_wireguard_rs`, not the historical
-`WireGuard/wireguard-rs` reference repository. The reason is operational:
-Defguard exposes a maintained high-level Rust API over native/kernel and
-userspace WireGuard implementations. The protocol crate does not shell out to
-`wg`; it returns typed Defguard peer/interface configuration after the validator
-mesh checks pass.
+The implementation runs WireGuard in-process on the BoringTun noise core
+(`overlay-net/userspace`), with no kernel interface, TUN device, or `wg`
+binary involved. The protocol crate itself is pure: it returns the typed
+`InterfaceConfig` after the validator mesh checks pass, and the backend
+consumes that directly.
 
 ## Trust Anchors
 

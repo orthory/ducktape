@@ -1,6 +1,6 @@
 //! Genesis-composition parity: the sim's default (and `--with-valset`) genesis
 //! sets ARE the `sim_base` (+ `sim_valset`) selections of the single-source
-//! `host::topology`, and the default set's root-hash is byte-identical to the
+//! `topology`, and the default set's root-hash is byte-identical to the
 //! pre-topology composition. The daemon parity lane pins the same `sim_base`
 //! against noded; this pins the sim composer against the topology it now draws
 //! from, and guards C4's "no construction change" invariant with a golden hash.
@@ -37,7 +37,7 @@ fn default_genesis_composes_topology_sim_base() {
     let sim = Sim::spawn(storage.path(), &[]);
     let status = sim.status();
 
-    let want: Vec<String> = host::topology::SIM_BASE.iter().map(|s| s.to_string()).collect();
+    let want: Vec<String> = topology::SIM_BASE.iter().map(|s| s.to_string()).collect();
     assert_eq!(
         module_ids(&status),
         want,
@@ -75,9 +75,9 @@ fn with_valset_genesis_appends_topology_sim_valset() {
     let sim = Sim::spawn(storage.path(), &["--with-valset", &key]);
     let status = sim.status();
 
-    let want: Vec<String> = host::topology::SIM_BASE
+    let want: Vec<String> = topology::SIM_BASE
         .iter()
-        .chain(host::topology::SIM_VALSET)
+        .chain(topology::SIM_VALSET)
         .map(|s| s.to_string())
         .collect();
     assert_eq!(

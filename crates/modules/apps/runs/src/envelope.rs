@@ -34,15 +34,16 @@ use serde::Serialize;
 use crate::facets::WireSink;
 use crate::hex;
 
-/// the envelope marker the host worker routes on: the portable envelope shape
-/// (workspace source pin + skill refs + result contract). bumping it is a
-/// payload flag day for the worker, not for consensus state.
-pub(crate) const RUN_ENVELOPE_VERSION: u32 = 1;
+/// the fixed value of the `ducktape_run` magic key the host worker routes on.
+/// key + value together are the envelope's self-identifying magic — the digit
+/// is part of the token, like a container magic, never a version to bump.
+pub(crate) const RUN_ENVELOPE_MARKER: u32 = 1;
 
-/// the result-wrapper version a portable provider returns. carried in
-/// the envelope's `result_contract` so the worker refuses a runner-result
-/// version it cannot unwrap; the `runs` delivery path reads it back as `1`.
-pub(crate) const RUNNER_RESULT_VERSION: u32 = 1;
+/// the fixed value of the `ducktape_runner_result` magic key a portable
+/// provider's result wrapper carries. carried in the envelope's
+/// `result_contract` so the worker knows which wrapper shape to assemble;
+/// the `runs` delivery path checks it as part of the wrapper's magic.
+pub(crate) const RUNNER_RESULT_MARKER: u32 = 1;
 
 /// generic instructions for an agent whose curated skills give it no persona —
 /// the floor under an agent with no `always` skill to assemble.
@@ -297,7 +298,7 @@ fn envelope(
     portable: PortableInputs,
 ) -> String {
     serde_json::to_string(&RunEnvelope {
-        ducktape_run: RUN_ENVELOPE_VERSION,
+        ducktape_run: RUN_ENVELOPE_MARKER,
         agent_id: &agent.agent_id,
         run_id,
         agent_display_name: &agent.display_name,
@@ -309,7 +310,7 @@ fn envelope(
         skills: portable.skills,
         library_readable: agent.library_readable(),
         result_contract: ResultContractEnvelope {
-            ducktape_runner_result: RUNNER_RESULT_VERSION,
+            ducktape_runner_result: RUNNER_RESULT_MARKER,
             sink: portable.sink,
         },
     })
@@ -541,16 +542,10 @@ mod tests {
     fn a_chat_envelope_carries_the_agent_identity_and_no_prompt_pin() {
         let agent = bot();
         let transcript = vec![message(1, AuthorRef::User(vec![1; 32]), "hi bot")];
-        let payload = render_payload(
-            "runs",
-            &agent,
-            &run_id("general", 1),
-            &transcript,
-            plain(),
-        );
+        let payload = render_payload("runs", &agent, &run_id("general", 1), &transcript, plain());
         let v = parse(&payload);
 
-        assert_eq!(v["ducktape_run"], RUN_ENVELOPE_VERSION);
+        assert_eq!(v["ducktape_run"], RUN_ENVELOPE_MARKER);
         assert_eq!(v["agent_id"], "bot");
         assert_eq!(v["agent_display_name"], "BOT");
         assert_eq!(v["instructions"], DEFAULT_PROMPT);
@@ -751,13 +746,7 @@ mod tests {
         let agent = bot();
 
         let chat = run_id("general", 1);
-        let v = parse(&render_payload(
-            "runs",
-            &agent,
-            &chat,
-            &[],
-            plain(),
-        ));
+        let v = parse(&render_payload("runs", &agent, &chat, &[], plain()));
         assert_eq!(v["run_id"], chat);
         assert_eq!(
             chat,
@@ -816,7 +805,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn a_job_envelope_preserves_the_job_framing() {
         let agent = bot();
@@ -849,20 +837,8 @@ mod tests {
                 "earlier reply",
             ),
         ];
-        let a = render_payload(
-            "runs",
-            &agent,
-            &run_id("general", 2),
-            &transcript,
-            plain(),
-        );
-        let b = render_payload(
-            "runs",
-            &agent,
-            &run_id("general", 2),
-            &transcript,
-            plain(),
-        );
+        let a = render_payload("runs", &agent, &run_id("general", 2), &transcript, plain());
+        let b = render_payload("runs", &agent, &run_id("general", 2), &transcript, plain());
         assert_eq!(
             a.as_bytes(),
             b.as_bytes(),
@@ -918,13 +894,7 @@ mod tests {
                 "someone else",
             ),
         ];
-        let payload = render_payload(
-            "runs",
-            &agent,
-            &run_id("general", 3),
-            &transcript,
-            plain(),
-        );
+        let payload = render_payload("runs", &agent, &run_id("general", 3), &transcript, plain());
         let conversation = parse(&payload)["conversation"]
             .as_str()
             .unwrap()
@@ -1000,13 +970,7 @@ mod tests {
     fn no_head_states_a_null_pin_not_an_absent_key() {
         // an unresolved head is an EXPLICIT null pin decision, not a missing key.
         let agent = bot();
-        let payload = render_payload(
-            "runs",
-            &agent,
-            &run_id("general", 1),
-            &[],
-            plain(),
-        );
+        let payload = render_payload("runs", &agent, &run_id("general", 1), &[], plain());
         let v = parse(&payload);
         assert_eq!(v["ducktape_run"], 1);
         assert!(

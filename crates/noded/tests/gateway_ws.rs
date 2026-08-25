@@ -5,16 +5,15 @@
 use axum::body::Body;
 use futures::{SinkExt as _, StreamExt as _};
 use http_body_util::BodyExt as _;
-use noded::{gateway_browser_router, GatewayJob, NodeCommand, NodeHandle};
+use noded::{GatewayJob, NodeCommand, NodeHandle, gateway_browser_router};
 use tokio::sync::mpsc;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tower::ServiceExt as _;
 
 fn route_record(publisher: [u8; 32]) -> gateway::RouteRecord {
     gateway::RouteRecord {
         statement: gateway::RouteStatement {
-            version: 1,
             chain_id: "test".into(),
             account_id: vec![1; 32],
             name: gateway::RouteName::named("api"),

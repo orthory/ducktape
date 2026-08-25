@@ -247,12 +247,9 @@ fn classify(text: &str) -> Incoming {
                 }
             }
         }
-        Some("error") => Incoming::Refused(
-            frame["detail"]
-                .as_str()
-                .unwrap_or("unknown")
-                .to_string(),
-        ),
+        Some("error") => {
+            Incoming::Refused(frame["detail"].as_str().unwrap_or("unknown").to_string())
+        }
         _ => Incoming::Ignore,
     }
 }

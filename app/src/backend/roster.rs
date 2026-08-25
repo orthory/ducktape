@@ -93,7 +93,7 @@ async fn live_peer_keys(rpc: &RpcClient) -> BTreeSet<String> {
         .unwrap_or_default()
         .into_iter()
         // `connected` and `peer`, NOT `live`/`key`: those are the names
-        // `PeerView` serializes (bin/noded/src/peers.rs). Reading the wrong
+        // `PeerView` serializes (crates/noded/src/peers.rs). Reading the wrong
         // ones made every lookup return null, so this set came back empty on
         // every call and every member rendered offline.
         .filter(|peer| peer["connected"].as_bool().unwrap_or(false))

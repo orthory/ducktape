@@ -7,6 +7,8 @@ version.workspace = true
 # the host-side qmdb store handle injected into disk-backed modules.
 statesync = { workspace = true }
 host = { workspace = true }
+# the module composition catalog this composer draws its genesis selection from.
+topology = { workspace = true }
 kv = { workspace = true }
 directory = { workspace = true }
 greeter = { workspace = true }

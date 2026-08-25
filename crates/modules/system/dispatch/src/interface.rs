@@ -64,7 +64,7 @@ pub const WORK_SPEC_KIND: &str = "dispatch-work-v1";
 
 /// where a recipe's runs are assigned.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Routing {
     /// each attempt is rendezvous-assigned over the capability's announced
     /// providers (saga's default capability assignment).
@@ -77,7 +77,7 @@ pub enum Routing {
 /// DETERMINISTICALLY by the dispatch module before any delivery. a closed set
 /// on purpose: each name is a checkable rule, not a config-described guess.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum OutputContract {
     /// any byte string (size-capped). the receiver interprets.
     Text,
@@ -89,6 +89,7 @@ pub enum OutputContract {
 /// capability and contract a recipe binds is part of the root-hash. `owner` is
 /// the registration origin and gates every mutation.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Recipe {
     pub recipe_id: String,
     pub owner: SagaOrigin,
@@ -113,7 +114,7 @@ pub struct Recipe {
 /// where a dispatch is in its lifecycle. every transition is an ordered op;
 /// `Delivered` is terminal.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum DispatchStatus {
     /// the saga carrying the work, awaited for its callback.
     AwaitingResult { saga_id: String },
@@ -126,6 +127,7 @@ pub enum DispatchStatus {
 
 /// a dispatch's observable state.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DispatchView {
     pub dispatch_id: String,
     pub recipe_id: String,
@@ -147,6 +149,7 @@ pub struct DispatchView {
 /// `kind` is a fixed self-description ([`WORK_SPEC_KIND`]) so this spec and
 /// foreign spec shapes can never cross-decode.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WorkSpec {
     pub kind: String,
     pub dispatch_id: String,
@@ -167,7 +170,7 @@ pub struct WorkSpec {
 
 /// Host-local admission behavior for an assigned dispatch attempt.
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdmissionPolicy {
     /// Wait for currently occupied capacity — the default: wait for capacity.
     #[default]
@@ -185,6 +188,7 @@ impl AdmissionPolicy {
 /// the delivery envelope a receiver module gets as a follow-up `Msg` from the
 /// dispatch module, one block (or more) after the outcome committed.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ResultEvent {
     pub dispatch_id: String,
     pub recipe_id: String,
@@ -196,7 +200,7 @@ pub struct ResultEvent {
 // ---- ops -----------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum DispatchMsg {
     /// register a recipe under the submitter's origin. a duplicate
     /// `recipe_id` is an error.
@@ -265,7 +269,7 @@ pub enum DispatchMsg {
 // ---- queries --------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum DispatchQuery {
     Recipe {
         recipe_id: String,
@@ -281,7 +285,7 @@ pub enum DispatchQuery {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum DispatchReply {
     Recipe(Option<Recipe>),
     Dispatch(Option<DispatchView>),

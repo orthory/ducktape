@@ -8,7 +8,7 @@
 //! (the `expect` message and the `Result<T, String>` error mapping) is one
 //! place, not eighteen.
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 
 /// serialize a wire value to its canonical serde_json bytes. infallible for the
 /// module wire types (every one derives `Serialize`); a value that cannot

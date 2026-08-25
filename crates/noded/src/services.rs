@@ -805,7 +805,7 @@ mod build_is_metadata_not_a_gate {
         // all: the file has no honest use for it, so the allowlist is empty and
         // every evasion above fails here.
         assert_eq!(
-            lines_naming_the_stamp(&read_source("bin/noded/src/stream.rs")),
+            lines_naming_the_stamp(&read_source("crates/noded/src/stream.rs")),
             Vec::<String>::new(),
             "the service-link path must not read this node's build stamp — a \
              git-absent build would refuse every link and leave the node with no \

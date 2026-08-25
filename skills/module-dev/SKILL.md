@@ -65,7 +65,7 @@ module crate:
 
 `guest-builder --index <module-dir>` writes the committed `index.wasm`; add
 the module to `INDEX_MODULES` in the Makefile and to `index_guest_wasm()` in
-`bin/noded/src/index.rs` (the bundled include_bytes registry). The fold runs
+`crates/noded/src/index.rs` (the bundled include_bytes registry). The fold runs
 ASYNC behind a fluent31 changes-mode trigger — views trail the op feed
 observably (`/v1/index/status` `fold.{module}`), never atomically.
 
@@ -106,4 +106,4 @@ make wasm-modules-check                                   # 5. committed copies 
 | Guest added to root workspace members | guests are standalone BY DESIGN; membership poisons native feature unification |
 | `include_bytes!` before `make wasm-modules` | bin/node cannot compile until the component exists |
 | Rebuilding one guest's component alone | bytes are toolchain-dependent; refresh the set together or `wasm-modules-check` fails |
-| Native-only dep in the module crate | wasm32 build breaks; gate it behind the `native` feature (the `files`/`chat` shape) |
+| Native-only dep in the module crate | wasm32 build breaks; gate it behind the `native` feature (the `files` shape) |

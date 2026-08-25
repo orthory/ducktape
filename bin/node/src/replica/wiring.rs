@@ -19,7 +19,7 @@ use recovery::{Manifest, Recovery};
 use crate::config::{self, hex_bytes};
 use crate::constants::*;
 use crate::first_contact_join;
-use crate::lobby;
+use crate::join_gate;
 use crate::reachability_plane::{ReachLaneHandback, wire_reachability_plane};
 use crate::util::fatal;
 use crate::validator::{DrainingSlot, LaneBank, LaneSlot, ReclaimableLane};
@@ -52,8 +52,7 @@ pub(super) struct ReplicaChannels {
     pub(super) relay_rx: lookup::Receiver<ed25519::PublicKey>,
     /// the joiner's admission signal (join ADR §4): set by the first-contact
     /// task the moment a member's doorbell answers the gate with the
-    /// AUTHORITATIVE `Admitted` — the park loop reads it in place of the
-    /// retired `CHANNEL_LOBBY` gate FSM.
+    /// AUTHORITATIVE `Admitted` — the park loop reads it directly.
     pub(super) admitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(super) voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
     /// the mesh window tracker, genesis already tracked — the park loop
@@ -102,9 +101,12 @@ pub(super) async fn wire(
     overlay_slot: overlay_net::userspace::StackSlot,
 ) -> ReplicaChannels {
     if manifest.is_none() && !recovery.journal_is_empty().await {
-        fatal!(label, "recovery journal exists but the checkpoint is \
+        fatal!(
+            label,
+            "recovery journal exists but the checkpoint is \
              missing — wipe the app state and re-join (KEEP any consensus journal \
-             partitions: they are what prevents this key from double-voting)");
+             partitions: they are what prevents this key from double-voting)"
+        );
     }
     // the parked mesh identity: the GENESIS window (index 0, primary =
     // the descriptor's fingerprinted validators — byte-equal to valset's
@@ -138,8 +140,7 @@ pub(super) async fn wire(
     // a shed certificate is re-anchored by the next one's parent
     // linkage (the planner backfills the gap), so the drain never
     // blocks the peer connection.
-    let (cert_bridge_tx, cert_bridge) =
-        futures::channel::mpsc::channel::<Vec<u8>>(256);
+    let (cert_bridge_tx, cert_bridge) = futures::channel::mpsc::channel::<Vec<u8>>(256);
     // the engine-lane bank, based at the checkpoint epoch (a fresh join
     // has none — base 0). epochs BELOW the base are registered and
     // permanently black-holed, exactly the validator wiring's trick: a
@@ -152,11 +153,10 @@ pub(super) async fn wire(
         let (vote, cert, res, payload, fetch) = engine_channels(epoch);
         for ch in [vote, cert, res, payload, fetch] {
             let (_tx, mut rx) = network.register(ch, quota, MAX_BACKLOG);
-            let label: &'static str =
-                Box::leak(format!("blackhole_{ch}").into_boxed_str());
-            context.child(label).spawn(move |_ctx| async move {
-                while rx.recv().await.is_ok() {}
-            });
+            let label: &'static str = Box::leak(format!("blackhole_{ch}").into_boxed_str());
+            context
+                .child(label)
+                .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
         }
     }
     let slots = (0..EPOCH_CHANNEL_BANK)
@@ -240,8 +240,7 @@ pub(super) async fn wire(
     // plane over the same registered channel.
     let mut reach_reclaim: Option<ReachLaneHandback> = None;
     let reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>> = {
-        let (reach_tx, mut reach_rx) =
-            network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
+        let (reach_tx, mut reach_rx) = network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
         match wireguard_listen {
             Some(wg_addr) => {
                 // AMBIENT coordinator: the joiner resolves coordinated
@@ -359,7 +358,7 @@ pub(super) async fn wire(
                     // keypair rides along too: post-verify acks (and the
                     // coord cap inside an `Admitted`) come back SEALED to it.
                     let keypair = std::sync::Arc::new(keypair);
-                    let intro = lobby::encode_intro(&lobby::intro_request(
+                    let intro = join_gate::encode_intro(&join_gate::intro_request(
                         &signer,
                         &namespace,
                         token,

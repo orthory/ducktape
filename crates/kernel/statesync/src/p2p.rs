@@ -34,8 +34,8 @@ use commonware_runtime::{Clock, IoBuf, Spawner};
 use futures::channel::oneshot;
 
 use crate::{
-    SyncClient, SyncError, SyncRequest, SyncResponse, decode_response, decode_rpc_authed,
-    encode_request, encode_rpc_authed,
+    SyncClient, SyncError, SyncRequest, SyncResponse, decode_response, decode_rpc, encode_request,
+    encode_rpc,
 };
 
 /// the reaper's sweep interval. a request survives at most two sweeps, so the
@@ -161,7 +161,14 @@ where
         R: Receiver<PublicKey = S::PublicKey> + Send + 'static,
     {
         Self::with_sources(
-            context, sender, receiver, vec![server], None, requester, proof, None,
+            context,
+            sender,
+            receiver,
+            vec![server],
+            None,
+            requester,
+            proof,
+            None,
         )
     }
 
@@ -259,7 +266,7 @@ where
                 // replies ride the same authed frame; the auth fields are
                 // server zero-fill (the transport-peer check above is the
                 // reply's authenticity), so only id + body matter here.
-                let Ok((_requester, _proof, id, body)) = decode_rpc_authed(&bytes) else {
+                let Ok((_requester, _proof, id, body)) = decode_rpc(&bytes) else {
                     continue;
                 };
                 let waiter = task_shared
@@ -344,7 +351,7 @@ where
                     },
                 );
             }
-            let frame = encode_rpc_authed(&requester, &proof, id, &encode_request(&req));
+            let frame = encode_rpc(&requester, &proof, id, &encode_request(&req));
             let attempted = sender.send(Recipients::One(server), IoBuf::from(frame), false);
             if attempted.is_empty() {
                 // the source is offline/unreachable right now — fail fast

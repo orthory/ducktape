@@ -105,7 +105,6 @@ fn signed_airlock_route(
     revision: u64,
 ) -> GatewayMsg {
     let statement = RouteStatement {
-        version: 1,
         chain_id: chain.into(),
         account_id: member.public_key().as_ref().to_vec(),
         name: RouteName::named("airlock"),

@@ -2,13 +2,11 @@
 //! its logical wiring, its genesis-config schema, and the named genesis
 //! selections every composer draws from.
 //!
-//! Before this module the same id lists lived in four places: node's
-//! `MODULE_IDS`, simnode's `BASE_MODULE_IDS` + `VALSET_MODULE_IDS`, the noded
-//! daemon's own `MODULE_IDS`, and demo's inline genesis vec. Each was a
-//! hand-kept `[&str; N]` count array, and drift between them was the #706
-//! accident class. Now the id universe + wiring + config live in one
-//! [`ModuleTopology`] value and each backend's genesis set is a NAMED SELECTION
-//! ([`PRODUCTION`], [`SIM_BASE`], [`SIM_VALSET`], [`DEMO`]) validated against it.
+//! No composer keeps a hand-counted id list of its own: the id universe,
+//! wiring, and config live in one [`ModuleTopology`] value, and each
+//! backend's genesis set is a NAMED SELECTION validated against it —
+//! [`PRODUCTION`] for the node, [`SIM_BASE`] and [`SIM_VALSET`] for simnode,
+//! [`DEMO`] for the demo binary.
 //!
 //! This is a plan, NOT a root-hash. Instantiation stays per-backend on purpose:
 //! node composes the selection over the wasm runtime, simnode/noded/demo compose
@@ -16,10 +14,8 @@
 //! by design. One topology never means one root-hash — it means one place the
 //! module SET (and the drift guard on it) lives.
 //!
-//! Home is `host` because every composer (node-bin, noded, simnode, demo)
-//! already depends on it, `Host::genesis` and [`crate::LIFECYCLE_MODULE_ID`]
-//! already live here, and the data is pure `&str` — host depends on no concrete
-//! module impl, so a catalog of ids introduces no crate cycle.
+//! A leaf crate with no dependencies: the catalog is pure `&'static str`, and
+//! the kernel (`host`) knows nothing of the product modules composed over it.
 
 /// A single module in the composition universe: its id plus the metadata that
 /// used to be scattered across the composer sites.

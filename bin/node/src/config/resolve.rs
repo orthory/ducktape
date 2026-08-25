@@ -5,16 +5,16 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use provider_host::SandboxBackend;
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_p2p::Ingress;
+use provider_host::SandboxBackend;
 
 use super::identity::load_identity;
 use super::node_toml::{DevSeedToml, NodeToml, SandboxToml};
 use super::{
-    Coordination, Front, InviteToken, NetworkDescriptor, ReachDial, SCHEME_ED25519,
-    StoredInviteWireGuard, dialable, hex_bytes, ingress_of, load_coord_cap, load_invite_fronts,
-    load_invite_token, load_invite_wireguard,
+    Coordination, Front, InviteToken, NetworkDescriptor, ReachDial, StoredInviteWireGuard,
+    dialable, hex_bytes, ingress_of, load_coord_cap, load_invite_fronts, load_invite_token,
+    load_invite_wireguard,
 };
 
 /// everything `run_node` needs, shape-independent.
@@ -84,8 +84,8 @@ pub struct Resolved {
     /// sealed blocks between recovery checkpoints.
     pub checkpoint_blocks: u64,
     /// the invite token a `join` stored beside the descriptor, if any — what a
-    /// parked joiner announces over the lobby channel. always `None` for the
-    /// dev shape and for manual (token-less) joins.
+    /// parked joiner announces in its first-contact intro. always `None` for
+    /// the dev shape and for manual (token-less) joins.
     pub invite_token: Option<InviteToken>,
     /// the inviter's WireGuard bootstrap a `join` stored, if any — the tunnel
     /// the joining node brings up BEFORE any p2p. always `None` for the dev
@@ -227,12 +227,6 @@ pub fn resolve_service(cfg_path: &Path) -> Result<ServiceConfig, String> {
 /// wearing a different hat.
 fn load_valid_descriptor(path: &Path) -> Result<NetworkDescriptor, String> {
     let descriptor = NetworkDescriptor::load(path)?;
-    if descriptor.scheme != SCHEME_ED25519 {
-        return Err(format!(
-            "network {} uses scheme {:?}; this build runs {SCHEME_ED25519:?}",
-            descriptor.chain_id, descriptor.scheme
-        ));
-    }
     if descriptor.validator_keys()?.is_empty() {
         return Err(format!("network {} has no validators", descriptor.chain_id));
     }
@@ -352,7 +346,10 @@ fn resolve_sandbox(
             // would read as "the guest never dialled back".
             let kernel = absolute_runtime_path(&sandbox.kernel)?;
             let rootfs = absolute_runtime_path(&sandbox.rootfs)?;
-            Ok((Some(SandboxBackend::Firecracker { kernel, rootfs }), probed()?))
+            Ok((
+                Some(SandboxBackend::Firecracker { kernel, rootfs }),
+                probed()?,
+            ))
         }
         other => Err(format!(
             "sandbox runtime: {other:?} is not \"firecracker\" \
@@ -820,7 +817,6 @@ mod tests {
         let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
         let d = NetworkDescriptor {
             chain_id: "net#44444444".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.public_key().as_ref())],
             bootstrap: vec![format!(
                 "{}@definitely-not-resolvable.ducktape.invalid:443",
@@ -863,7 +859,6 @@ mod tests {
         let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
         let d = NetworkDescriptor {
             chain_id: "net#33333333".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -898,7 +893,6 @@ mod tests {
         let founder = ed25519::PrivateKey::from_seed(7).public_key();
         let mut d = NetworkDescriptor {
             chain_id: "net#44444444".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(founder.as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -921,7 +915,6 @@ mod tests {
         let other = ed25519::PrivateKey::from_seed(9).public_key();
         let mut d = NetworkDescriptor {
             chain_id: "net#11223344".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![
                 hex_bytes(me.public_key().as_ref()),
                 hex_bytes(other.as_ref()),
@@ -971,7 +964,6 @@ mod tests {
         let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
         NetworkDescriptor {
             chain_id: "relative#11223344".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1010,7 +1002,10 @@ mod tests {
         )
         .expect("parse dev config");
         let resolved = resolve_dev_shape(raw).expect("resolve relative storage");
-        assert_eq!(resolved.service.storage_dir, launch_cwd.join("relative/storage"));
+        assert_eq!(
+            resolved.service.storage_dir,
+            launch_cwd.join("relative/storage")
+        );
         assert!(resolved.service.storage_dir.is_absolute());
 
         let default_raw: DevSeedToml = toml::from_str(
@@ -1019,7 +1014,10 @@ mod tests {
         )
         .expect("parse default dev config");
         let default = resolve_dev_shape(default_raw).expect("resolve default storage");
-        assert_eq!(default.service.storage_dir, std::env::temp_dir().join("ducktape-8"));
+        assert_eq!(
+            default.service.storage_dir,
+            std::env::temp_dir().join("ducktape-8")
+        );
         assert!(default.service.storage_dir.is_absolute());
     }
 
@@ -1069,7 +1067,6 @@ mod tests {
         let (me, _) = load_or_generate_identity(&network_dir.join("identity.key")).expect("keygen");
         NetworkDescriptor {
             chain_id: "deleted-cwd#11223344".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1128,7 +1125,6 @@ mod tests {
         let other = ed25519::PrivateKey::from_seed(3).public_key();
         let d = NetworkDescriptor {
             chain_id: "closed#00000000".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(other.as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1214,7 +1210,7 @@ mod tests {
         std::fs::write(
             workspace.join("services.toml"),
             format!(
-                "version = 1\n\n[[service]]\nkind = \"compute\"\ninstance = \"{}\"\n\
+                "[[service]]\nkind = \"compute\"\ninstance = \"{}\"\n\
                  nonce = \"{}\"\ngranted_unix = 1700000000\ncapabilities = [{list}]\n\
                  scopes = []\n",
                 "11".repeat(32),
@@ -1274,14 +1270,23 @@ mod tests {
             resolved.service.sandbox
         );
         assert!(
-            resolved.service.sandbox_capacity.get("cores").copied().unwrap_or(0) >= 1,
+            resolved
+                .service
+                .sandbox_capacity
+                .get("cores")
+                .copied()
+                .unwrap_or(0)
+                >= 1,
             "a compute node announces its probed capacity"
         );
 
         // an override wins over the probe; a custom guest directory is honored.
         std::fs::write(
             dir.join("node.toml"),
-            format!("{base}{}", sandbox_table("firecracker", "/opt/other", 99, 128)),
+            format!(
+                "{base}{}",
+                sandbox_table("firecracker", "/opt/other", 99, 128)
+            ),
         )
         .expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve overrides");
@@ -1296,7 +1301,6 @@ mod tests {
         );
         assert_eq!(resolved.service.sandbox_capacity.get("cores"), Some(&99));
         assert_eq!(resolved.service.sandbox_capacity.get("mem_gb"), Some(&128));
-
 
         // any other runtime is a loud config error naming the one audited
         // adapter. "tart" and "podman" are in this list ON PURPOSE: both
@@ -1492,7 +1496,6 @@ mod tests {
         let founder = ed25519::PrivateKey::from_seed(11).public_key();
         NetworkDescriptor {
             chain_id: "keyless#12345678".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(founder.as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1533,40 +1536,33 @@ mod tests {
     /// against.
     ///
     /// The service path loads `network.toml` for its chain id, so it would
-    /// happily resolve a descriptor with a foreign signature scheme or an empty
-    /// validator set — and `ducktape service run compute` would then announce
-    /// capacity for a network its own node refuses to start. Both paths run
+    /// happily resolve a descriptor with an empty validator set — and
+    /// `ducktape service run compute` would then announce capacity for a
+    /// network its own node refuses to start. Both paths run
     /// [`load_valid_descriptor`], and this is what says so: weaken either
-    /// refusal and one of these four assertions goes red.
+    /// refusal and one of these assertions goes red.
     #[test]
     fn both_paths_refuse_a_descriptor_no_node_can_run() {
-        let cases = [
-            ("badscheme", "sr25519", vec![hex_bytes(ed25519::PrivateKey::from_seed(5).public_key().as_ref())], "scheme"),
-            ("novalidators", SCHEME_ED25519, vec![], "no validators"),
-        ];
-        for (slug, scheme, validators, expected) in cases {
-            let dir = tmp(slug);
-            // a REAL key on disk, so the node path fails on the descriptor
-            // rather than on a missing identity.
-            load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
-            NetworkDescriptor {
-                chain_id: format!("{slug}#12345678"),
-                scheme: scheme.into(),
-                validators,
-                bootstrap: vec![],
-                reach: vec![],
-                coordination: None,
-            }
-            .save(&dir.join("network.toml"))
-            .expect("save descriptor");
-            std::fs::write(dir.join("node.toml"), network_shape_toml(&[])).expect("write");
-
-            let node = resolve(&dir.join("node.toml")).expect_err("the node path refuses it");
-            assert!(node.contains(expected), "node path: {node}");
-            let service =
-                resolve_service(&dir.join("node.toml")).expect_err("so must the daemon path");
-            assert!(service.contains(expected), "service path: {service}");
+        let (slug, expected) = ("novalidators", "no validators");
+        let dir = tmp(slug);
+        // a REAL key on disk, so the node path fails on the descriptor
+        // rather than on a missing identity.
+        load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
+        NetworkDescriptor {
+            chain_id: format!("{slug}#12345678"),
+            validators: vec![],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
         }
+        .save(&dir.join("network.toml"))
+        .expect("save descriptor");
+        std::fs::write(dir.join("node.toml"), network_shape_toml(&[])).expect("write");
+
+        let node = resolve(&dir.join("node.toml")).expect_err("the node path refuses it");
+        assert!(node.contains(expected), "node path: {node}");
+        let service = resolve_service(&dir.join("node.toml")).expect_err("so must the daemon path");
+        assert!(service.contains(expected), "service path: {service}");
     }
 
     /// the desktop shape's posture: a config with no dialable underlay host
@@ -1581,7 +1577,6 @@ mod tests {
         let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
         let d = NetworkDescriptor {
             chain_id: "net#55555555".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1661,7 +1656,7 @@ mod tests {
                 unspecified,
                 Some("tunnel.example.com:9999")
             )
-                .unwrap(),
+            .unwrap(),
             "tunnel.example.com",
             "a hostname override stays a hostname"
         );
@@ -1728,7 +1723,11 @@ mod tests {
         )
         .expect("write");
         let r = resolve(&dir.join("node.toml")).expect("resolve");
-        assert_eq!(r.dial_hints.len(), 1, "self is filtered, the other peer stays");
+        assert_eq!(
+            r.dial_hints.len(),
+            1,
+            "self is filtered, the other peer stays"
+        );
         assert_eq!(
             r.dial_hints[0].0,
             ed25519::PrivateKey::from_seed(0).public_key(),

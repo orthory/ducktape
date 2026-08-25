@@ -17,7 +17,7 @@ use crate::{NodeHandle, error_response, hex_bytes};
 // WHY as one text frame before closing.
 //
 // the binary frame layout (tag byte, header fields, BE headers/LE pcm payload
-// per D1) and its encode/decode functions live in `chat::call_wire` — the
+// per D1) and its encode/decode functions live in `media_service::call_wire` — the
 // single definition site this handler ports onto below. text frames are json
 // control: client→server `CallClientControl` (recipients / beacon /
 // keyframe_request), server→client `CallServerControl` (keyframe_request /
@@ -25,7 +25,7 @@ use crate::{NodeHandle, error_response, hex_bytes};
 //
 // the hub side lives with the mesh (validators and standing residents run one): it
 // fragments/reassembles the video ends over `Service::Video` and routes control
-// (keyframe kicks, presence beacons, rate hints — see `chat::video`).
+// (keyframe kicks, presence beacons, rate hints — see `media_service::video`).
 
 /// call-control the WEBVIEW asks the hub to act on (webview → hub).
 pub enum CallControlIn {
@@ -80,7 +80,7 @@ pub enum PresenceControlOut {
 
 /// one live huddle session's channel ends, hub ↔ websocket handler / gateway.
 pub struct CallSession {
-    /// captured mic frames, exactly [`chat::voice::FRAME_SAMPLES`] samples each.
+    /// captured mic frames, exactly [`media_service::voice::FRAME_SAMPLES`] samples each.
     pub pcm_in: tokio::sync::mpsc::Sender<Vec<i16>>,
     /// mixed playout frames at the 20 ms tick, same shape.
     pub mixed_out: tokio::sync::mpsc::Receiver<Vec<i16>>,
@@ -88,9 +88,9 @@ pub struct CallSession {
     /// (raw ed25519 bytes), steered by the client as consensus state changes.
     pub recipients: tokio::sync::watch::Sender<Vec<[u8; 32]>>,
     /// captured camera frames webview → hub (fragmented onto `Service::Video`).
-    pub video_in: tokio::sync::mpsc::Sender<chat::call_wire::CapturedFrame>,
+    pub video_in: tokio::sync::mpsc::Sender<media_service::call_wire::CapturedFrame>,
     /// reassembled peer camera frames hub → webview.
-    pub video_out: tokio::sync::mpsc::Receiver<chat::call_wire::PeerFrame>,
+    pub video_out: tokio::sync::mpsc::Receiver<media_service::call_wire::PeerFrame>,
     /// call-control webview → hub (local beacon, keyframe asks).
     pub control_in: tokio::sync::mpsc::Sender<CallControlIn>,
     /// call-control hub → webview (peer beacons, keyframe kicks, rate hints).
@@ -218,9 +218,9 @@ pub(crate) async fn call_ws(
 
 /// pump one huddle's audio, camera video, and call control between the webview
 /// websocket and the hub session. binary client frames are decoded via
-/// `chat::call_wire` and tag-dispatched: audio → `pcm_in`, captured video →
+/// `media_service::call_wire` and tag-dispatched: audio → `pcm_in`, captured video →
 /// `video_in`; the hub's `mixed_out`/`video_out`/`control_out` ends flow back
-/// as `chat::call_wire`-encoded binary + json text. text client frames steer
+/// as `media_service::call_wire`-encoded binary + json text. text client frames steer
 /// fan-out and carry beacons/keyframe asks. either side closing ends the
 /// session — dropping the ends is the teardown signal the hub watches.
 async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String) {
@@ -267,11 +267,11 @@ async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String)
         tokio::select! {
             inbound = socket.recv() => match inbound {
                 Some(Ok(Message::Binary(bytes))) => {
-                    if let Some(frame) = chat::call_wire::decode_audio(&bytes) {
+                    if let Some(frame) = media_service::call_wire::decode_audio(&bytes) {
                         // full lane = the hub is behind; late audio is dead
                         // audio, so drop the frame rather than backpressure.
                         let _ = pcm_in.try_send(frame);
-                    } else if let Some(frame) = chat::call_wire::decode_captured(&bytes) {
+                    } else if let Some(frame) = media_service::call_wire::decode_captured(&bytes) {
                         let _ = video_in.try_send(frame);
                     } // unknown/short frame — drop, stay alive
                 }
@@ -309,7 +309,7 @@ async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String)
             },
             mixed = mixed_out.recv() => match mixed {
                 Some(frame) => {
-                    let bytes = chat::call_wire::encode_audio(&frame);
+                    let bytes = media_service::call_wire::encode_audio(&frame);
                     if socket.send(Message::Binary(bytes.into())).await.is_err() {
                         break;
                     }
@@ -318,7 +318,7 @@ async fn call_session(mut socket: WebSocket, call: CallLane, channel_id: String)
             },
             video = video_out.recv() => match video {
                 Some(frame) => {
-                    let bytes = chat::call_wire::encode_peer(&frame);
+                    let bytes = media_service::call_wire::encode_peer(&frame);
                     if socket.send(Message::Binary(bytes.into())).await.is_err() {
                         break;
                     }

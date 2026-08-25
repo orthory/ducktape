@@ -27,6 +27,7 @@ pub const CODE_HASH_LEN: usize = 32;
 /// coordinates of a scheduled code swap for one module. **at most one** is ever
 /// pending per module.
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ScheduledSwap {
     pub name: String,
     pub activation_height: u64,
@@ -47,6 +48,7 @@ pub struct ScheduledSwap {
 
 /// the readable per-module projection.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ModuleCode {
     pub module_id: String,
     pub active_code_hash: Vec<u8>,
@@ -56,6 +58,7 @@ pub struct ModuleCode {
 /// one armed swap the host must realize: swap `module_id`'s registry code to
 /// `code_hash` at the boundary.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ArmedSwap {
     pub module_id: String,
     pub code_hash: Vec<u8>,
@@ -68,12 +71,15 @@ pub struct ArmedSwap {
 /// governance/system-authored, `SwapReady` is validator-authored, and `Advance`
 /// is the system-injected boundary tick.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum LifecycleMsg {
     /// install a module's INITIAL active code hash (genesis/bootstrap). rejects a
     /// re-register of a known module — code changes go through `ScheduleSwap`.
     /// `Origin::Module("governance") | System` only.
-    RegisterModule { module_id: String, code_hash: Vec<u8> },
+    RegisterModule {
+        module_id: String,
+        code_hash: Vec<u8>,
+    },
     /// schedule a height-gated code swap for a registered module.
     /// `Origin::Module | System` only.
     ScheduleSwap {
@@ -107,7 +113,7 @@ pub enum LifecycleMsg {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum LifecycleQuery {
     /// active + pending code for every registered module.
     ModuleStatus,
@@ -118,7 +124,7 @@ pub enum LifecycleQuery {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum LifecycleReply {
     ModuleStatus { modules: Vec<ModuleCode> },
     ArmedAt { swaps: Vec<ArmedSwap> },

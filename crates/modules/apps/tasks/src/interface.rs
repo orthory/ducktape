@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 // ---- task board wire (assigned-list kind) ---------------------------------
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskStatus {
     Open,
     InProgress,
@@ -30,6 +30,7 @@ pub enum TaskStatus {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Task {
     pub id: String,
     pub title: String,
@@ -39,20 +40,20 @@ pub struct Task {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskMsg {
     CreateTask { task_id: String, title: String },
     UpdateStatus { task_id: String, status: TaskStatus },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskQuery {
     List,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskReply {
     Tasks(Vec<Task>),
 }
@@ -61,7 +62,7 @@ pub enum TaskReply {
 
 /// the lifecycle of a job. `Done`, `Failed`, and `Cancelled` are terminal.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum JobStatus {
     Pending,
     Processing,
@@ -82,6 +83,7 @@ impl JobStatus {
 
 /// the winning claim on a job. `worker` is origin-derived, never caller-supplied.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Claim {
     pub worker: String,
     pub claimed_at_height: u64,
@@ -90,6 +92,7 @@ pub struct Claim {
 
 /// the claimant's reported outcome, stored once (result singularity).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct JobResult {
     pub ok: bool,
     pub payload: String,
@@ -97,6 +100,7 @@ pub struct JobResult {
 
 /// a single work item on the board.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Job {
     pub job_id: String,
     pub kind: String,
@@ -117,7 +121,7 @@ pub struct Job {
 /// write intents against the job board. all identity fields are derived from
 /// the dispatch origin inside the module -- none appear here.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum JobsMsg {
     /// post a new job (status `Pending`, attempt 0).
     Submit {
@@ -151,7 +155,7 @@ pub enum JobsMsg {
 /// the notification payload sent by the job board to each registered worker
 /// module. NOT enveloped: it is a follow-up `Msg` to a worker, never a board op.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum JobsEvent {
     /// a job was submitted. the event carries the full `spec` because it fires
     /// inside the submit cascade, where committed-only jobs queries cannot see
@@ -171,14 +175,14 @@ pub enum JobsEvent {
 /// execute() paths consume. board enumeration (status lists, the census)
 /// is the index guest's job on the derived tier.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum JobsQuery {
     Get { job_id: String },
 }
 
 /// replies to [`JobsQuery`].
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum JobsReply {
     Job(Option<Job>),
 }
@@ -188,7 +192,7 @@ pub enum JobsReply {
 /// a write op against one of the two boards. the single module `execute`
 /// decodes this and routes to the matching board.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkMsg {
     Task(TaskMsg),
     Job(JobsMsg),
@@ -196,7 +200,7 @@ pub enum WorkMsg {
 
 /// a read projection against one of the two boards.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkQuery {
     Task(TaskQuery),
     Job(JobsQuery),
@@ -204,7 +208,7 @@ pub enum WorkQuery {
 
 /// a reply from one of the two boards.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkReply {
     Task(TaskReply),
     Job(JobsReply),

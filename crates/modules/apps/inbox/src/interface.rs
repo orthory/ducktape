@@ -44,6 +44,7 @@ pub const MAX_MEMBERS: usize = 65536;
 /// gap-free within what was ever assigned (a `Clear` removes items but never
 /// rewinds the member's `next_seq`).
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Notification {
     pub seq: u64,
     /// the queue this notification belongs to, in the actor-string domain (see
@@ -65,7 +66,7 @@ pub struct Notification {
 /// name their own queue. `Deliver` is deliberately outside that gate — writing
 /// INTO a queue is the module's whole purpose and every origin may do it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum InboxMsg {
     /// enqueue a notification for `member`. accepted from ANY origin: module
     /// follow-ups are the primary writers, but an external submitter may
@@ -91,7 +92,7 @@ pub enum InboxMsg {
 /// op-feed row, so the fold consumes the exact assignment instead of
 /// re-deriving it by counting.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum InboxAssigned {
     /// `Deliver`: the notification's assigned per-member sequence.
     Delivered { seq: u64 },

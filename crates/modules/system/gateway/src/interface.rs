@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use duckdns::{DuckDnsName, HandleRegistration, ResolvedAccount};
 use sdk::codec::{push_bytes, push_opt_str};
-use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
 /// Commonware signing namespace for every gateway route mutation.
@@ -33,7 +33,19 @@ pub const SHA256_HEX_BYTES: usize = 64;
 
 /// The account apex (`None`) or one DNS-shaped label below it. The account is
 /// carried separately so a route name can never cross authority boundaries.
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+)]
 #[serde(deny_unknown_fields)]
 pub struct RouteName {
     pub label: Option<String>,
@@ -63,8 +75,20 @@ impl RouteName {
     }
 }
 
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
+#[derive(
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RouteMethod {
     Get,
     Head,
@@ -158,8 +182,6 @@ pub struct RouteDefinition {
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteStatement {
-    /// Signed into the preimage; publishers stamp `1` today.
-    pub version: u8,
     pub chain_id: String,
     pub account_id: Vec<u8>,
     pub name: RouteName,
@@ -199,8 +221,10 @@ pub struct RouteSummary {
 /// never secret material. Grants are managed exclusively through the
 /// owner-signed [`GatewayMsg::GrantCredential`]/[`GatewayMsg::RevokeCredential`]
 /// ops, so they are never carried unsigned on [`GatewayMsg::SetCredential`].
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(
+    BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq,
+)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum CredentialKind {
     Claude,
     Codex,
@@ -359,7 +383,7 @@ fn grant_op_preimage(op: u8, statement: &CredentialGrantStatement) -> Result<Vec
 // out would only add indirection on a cold path.
 #[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayMsg {
     /// Declaratively replace the authenticated account's optional `.duck`
     /// handle. `None` unregisters it without changing Identity.
@@ -390,7 +414,7 @@ pub enum GatewayMsg {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayQuery {
     /// Resolve one `.duck` name to the stable AccountId it aliases. Node
     /// selection is deliberately absent — resolution stops at the AccountId.
@@ -413,7 +437,7 @@ pub enum GatewayQuery {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayReply {
     /// The stable AccountId a `.duck` name resolves to, or `None`.
     Resolved(Option<ResolvedAccount>),
@@ -604,7 +628,6 @@ pub fn is_canonical_sha256(value: &str) -> bool {
 pub fn route_signing_preimage(statement: &RouteStatement) -> Result<Vec<u8>, String> {
     validate_route_statement(statement)?;
     let mut out = Vec::new();
-    out.push(statement.version);
     push_bytes(&mut out, statement.chain_id.as_bytes());
     push_bytes(&mut out, &statement.account_id);
     push_opt_str(&mut out, statement.name.label.as_deref());

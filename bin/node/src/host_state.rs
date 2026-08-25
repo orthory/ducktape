@@ -4,6 +4,7 @@
 //! state into the canonical host. The live node loop only consumes the three
 //! lifecycle operations and output adapter exported below.
 
+use acl::Acl;
 use commonware_cryptography::ed25519;
 use commonware_runtime::Supervisor as _;
 use duckfs_disk::SyncScratch;
@@ -18,7 +19,6 @@ use statesync::{
     fetch_snapshot,
     qmdb::{QmdbStore, RemoteQmdbResolver},
 };
-use acl::Acl;
 use valset::Valset;
 use wasm_host::WasmModule;
 
@@ -511,11 +511,7 @@ fn governance_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
 /// and rides state-sync like any other record. idempotent: a store that
 /// already carries a config (a reopened workspace re-entering the genesis
 /// path) is left byte-untouched.
-async fn seed_store_config(
-    store: &mut dyn sdk::MerkleStore,
-    params: &[(&str, &[u8])],
-    what: &str,
-) {
+async fn seed_store_config(store: &mut dyn sdk::MerkleStore, params: &[(&str, &[u8])], what: &str) {
     let key = sdk::store_key(sdk::genesis_config::CONFIG_KEY);
     let already = store
         .get(&key)
@@ -1330,7 +1326,6 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     let mut forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
         .map_err(|e| format!("forge init: {e}"))?
         .with_chat("chat");
-    // set the dual-path branch selector to the SERVED boundary version BEFORE
     forge
         .install(&bytes, root)
         .map_err(|e| format!("forge install: {e}"))?;
@@ -1409,7 +1404,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "1414242f8f4c99b29d1190e87f2a61f40b174d19351c39e4670f08a9fc72655b";
+        "d162061a62413d3987e6366ba34fe2b3fd94b97bbad284484047ee7238300113";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's store as a genesis
@@ -1468,7 +1463,7 @@ mod tests {
     /// the registry ↔ topology parity pin. [`ProductionModules`] already forces
     /// genesis, restore, and state sync onto one module set at compile time;
     /// this test pins that set to `MODULE_IDS` — the `production` selection of
-    /// the single-source `host::topology` the status/index surfaces iterate — so
+    /// the single-source `topology` the status/index surfaces iterate — so
     /// adding a module to one but not the other fails here instead of silently
     /// misreporting.
     #[test]

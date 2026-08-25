@@ -191,8 +191,7 @@ impl ValidatorRuntime<'_> {
                         // committed valset reads, like the Standing arm — the
                         // window must reflect a just-committed grant NOW, not
                         // at the epoch cutover.
-                        let (generation, mesh_window) =
-                            read_sync_mesh_window(node.host()).await;
+                        let (generation, mesh_window) = read_sync_mesh_window(node.host()).await;
                         Ok(statesync::TipCoords {
                             height: f.height,
                             root_hash: f.root_hash,

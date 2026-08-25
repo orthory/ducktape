@@ -26,8 +26,8 @@ use std::path::Path;
 
 use commonware_cryptography::Signer as _;
 
-use crate::config;
 use crate::cli_args::NodeAddr;
+use crate::config;
 use crate::userkey_cli::load_user_signer;
 
 pub(crate) type CredResult = Result<(), Box<dyn std::error::Error>>;
@@ -199,9 +199,11 @@ pub(crate) fn run(args: CredArgs, stdin: &mut impl BufRead) -> CredResult {
         CredCmd::Inspect { gateway, attest } => {
             crate::cred_seal::cmd_inspect(gateway, attest, || ctx.http_base())
         }
-        CredCmd::Seal { gateway, attest, seal } => {
-            crate::cred_seal::cmd_seal(gateway, attest, seal, || ctx.http_base())
-        }
+        CredCmd::Seal {
+            gateway,
+            attest,
+            seal,
+        } => crate::cred_seal::cmd_seal(gateway, attest, seal, || ctx.http_base()),
     }
 }
 
@@ -358,7 +360,9 @@ fn cmd_remove(ctx: &VerbCtx, name: String, stdin: &mut impl BufRead) -> CredResu
     // the tombstone is done and only the local half can remain. (A name that
     // exists but is owned by someone else still takes the submit path below and
     // gets the gateway's own refusal.)
-    let registered = query_credentials(&base)?.iter().any(|record| record.name == name);
+    let registered = query_credentials(&base)?
+        .iter()
+        .any(|record| record.name == name);
     if !registered {
         return finish_local_removal_only(&resolved.service.storage_dir, &name);
     }
@@ -541,9 +545,13 @@ fn ensure_airlock_route(
     let name = gateway::RouteName::named(crate::airlock::AIRLOCK_ROUTE);
     let existing = query_gateway(
         base,
-        &gateway::GatewayQuery::Get { account_id: account_id.to_vec(), name: name.clone() },
+        &gateway::GatewayQuery::Get {
+            account_id: account_id.to_vec(),
+            name: name.clone(),
+        },
     )?;
-    let already_published = matches!(existing, gateway::GatewayReply::Route(ref boxed) if boxed.is_some());
+    let already_published =
+        matches!(existing, gateway::GatewayReply::Route(ref boxed) if boxed.is_some());
     if already_published {
         return Ok(());
     }
@@ -551,7 +559,6 @@ fn ensure_airlock_route(
     // (`max_response_bytes = 0`), GET+POST, and it forwards the scoped session
     // bearer (`allow_authorization`). Request cap is the module ceiling.
     let statement = gateway::RouteStatement {
-        version: 1,
         chain_id: resolved.service.chain_id.clone(),
         account_id: account_id.to_vec(),
         name,
@@ -574,7 +581,10 @@ fn ensure_airlock_route(
         statement,
         authorization: gateway::MemberAuthorization {
             signer: user.public_key().as_ref().to_vec(),
-            signature: user.sign(gateway::GATEWAY_ROUTE_NS, &preimage).as_ref().to_vec(),
+            signature: user
+                .sign(gateway::GATEWAY_ROUTE_NS, &preimage)
+                .as_ref()
+                .to_vec(),
         },
     };
     let height = submit_gateway(base, &message)?;
@@ -838,7 +848,10 @@ fn query_owner_account_view(
 
 /// Resolve a grant target: a hex account id used directly, else a display name
 /// matched against the account set (ambiguity and absence are loud errors).
-pub(crate) fn resolve_account(base: &str, input: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+pub(crate) fn resolve_account(
+    base: &str,
+    input: &str,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     if let Ok(bytes) = config::unhex(input) {
         return Ok(bytes);
     }
@@ -906,9 +919,11 @@ mod tests {
             std::fs::write(&art, b"{\"token\":\"x\"}").unwrap();
         });
 
-        let outcome =
-            tokio::time::timeout(std::time::Duration::from_secs(10), pump_login(cmd, &artifact))
-                .await;
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            pump_login(cmd, &artifact),
+        )
+        .await;
 
         writer.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -980,15 +995,23 @@ mod tests {
         let present = dir.join("user.key");
         std::fs::write(&present, b"deadbeef").unwrap();
 
-        let ctx = VerbCtx { addr: NodeAddr::default(), key: Some(present.clone()) };
+        let ctx = VerbCtx {
+            addr: NodeAddr::default(),
+            key: Some(present.clone()),
+        };
         assert_eq!(ctx.key_path().unwrap(), present);
 
         let missing = dir.join("nope.key");
-        let ctx = VerbCtx { addr: NodeAddr::default(), key: Some(missing) };
+        let ctx = VerbCtx {
+            addr: NodeAddr::default(),
+            key: Some(missing),
+        };
         let err = ctx.key_path().unwrap_err().to_string();
-        assert!(err.contains("no user key at"), "expected absent-key error, got {err:?}");
+        assert!(
+            err.contains("no user key at"),
+            "expected absent-key error, got {err:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
-
 }

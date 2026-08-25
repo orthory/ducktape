@@ -33,7 +33,7 @@ use crate::tracker_iface::{RefUpdate, ReviewComment, ReviewVerdict};
 /// every variant names its target repo via `repo` (required on the wire). an
 /// empty `repo` slug maps to the `"default"` repo (see the module docstring).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ForgeMsg {
     /// the atomic multi-branch push: every [`RefUpdate`] is a per-branch CAS
     /// against that branch's COMMITTED head, and the whole list stages or the
@@ -114,7 +114,7 @@ pub enum ForgeMsg {
 
 /// reads over the repo namespace.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ForgeQuery {
     /// the canonical head of the `"default"` repo — the single-repo query
     /// (a unit variant: the bare `"head"` string on the wire).
@@ -167,7 +167,7 @@ pub enum ForgeQuery {
 /// holds while the root-hash keeps sha256-strength (the head oid is the root's
 /// preimage material).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ForgeReply {
     /// a single repo's head hex (the reply to [`ForgeQuery::Head`]/[`ForgeQuery::
     /// HeadOf`]).
@@ -210,6 +210,7 @@ pub const MAX_BLOB_BYTES_PAGED: usize = 16 * 1024 * 1024;
 /// One directory at one exact commit. An unborn repo has `born == false`, an
 /// empty `rev`, and no entries; otherwise `rev` is the resolved commit oid.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TreeReply {
     pub rev: String,
     pub born: bool,
@@ -220,6 +221,7 @@ pub struct TreeReply {
 
 /// One visible entry in a [`TreeReply`].
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TreeEntry {
     pub kind: TreeEntryKind,
     pub name: String,
@@ -228,7 +230,7 @@ pub struct TreeEntry {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TreeEntryKind {
     Dir,
     File,
@@ -237,6 +239,7 @@ pub enum TreeEntryKind {
 /// One file at one exact commit. Binary and over-limit blobs carry an empty
 /// `text`; `size` always describes the full blob.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct BlobReply {
     pub rev: String,
     pub path: String,
@@ -250,6 +253,7 @@ pub struct BlobReply {
 /// says the page reached its end (or the object was refused — then `b64` is
 /// empty and `size` says why).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct BlobBytesReply {
     pub rev: String,
     pub path: String,
@@ -279,6 +283,7 @@ pub const MAX_PR_DIFF_TREE_DEPTH: usize = 64;
 
 /// An exact source/target comparison at the committed OIDs named here.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PrDiff {
     pub source_oid: String,
     pub target_oid: String,
@@ -294,6 +299,7 @@ pub struct PrDiff {
 
 /// one repo's committed head in a [`ForgeReply::Repos`] listing.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RepoHead {
     /// the repo's normalized slug.
     pub name: String,
@@ -337,8 +343,7 @@ mod tests {
             "a push_refs without a repo key must be rejected"
         );
         // the explicit empty slug still decodes (single-repo ergonomic).
-        let empty_repo =
-            br#"{"push_refs":{"repo":"","updates":[],"pack_digest":null}}"#;
+        let empty_repo = br#"{"push_refs":{"repo":"","updates":[],"pack_digest":null}}"#;
         assert_eq!(
             decode_msg(empty_repo).unwrap(),
             ForgeMsg::PushRefs {

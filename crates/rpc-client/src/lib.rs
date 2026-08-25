@@ -118,7 +118,7 @@ pub enum ModuleEvent {
     /// The chain head, as the node's heartbeat reports it.
     ///
     /// The heartbeat rides EVERY block wake — nop fillers included, which feed
-    /// no topic at all (`bin/noded/src/stream.rs`, the `block_rx` arm) — so this
+    /// no topic at all (`crates/noded/src/stream.rs`, the `block_rx` arm) — so this
     /// is the only event that moves a follower's head on a chain whose
     /// subscribed modules are quiet. Folding an op is not a substitute: an idle
     /// chain finalizes nop blocks forever and emits no ops, which used to freeze

@@ -19,8 +19,8 @@
 //!   the agent's allowed-action set.
 //! - [`AgentQuery`] -> [`AgentReply`] — reads over the registry.
 
-use saga::SagaOrigin;
 use borsh::{BorshDeserialize, BorshSerialize};
+use saga::SagaOrigin;
 use serde::{Deserialize, Serialize};
 
 // ---- consensus constants ----------------------------------------------------
@@ -166,7 +166,10 @@ pub const KNOWN_ACTIONS: [&str; 7] = [
 /// identically. `secrets` are OPAQUE vault references (D6) — never a
 /// materialized value, never key material (D1). an empty `ResourceCaps` is the
 /// default and denies every request except a zero budget check.
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[derive(
+    BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq,
+)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceCaps {
     /// forge repos this agent may READ.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -221,8 +224,19 @@ pub(crate) fn caps_is_default(c: &ResourceCaps) -> bool {
 /// reference material. it lives in consensus (rather than in the document's own
 /// frontmatter) so "what does this agent always load" is visible to the root-hash
 /// and to the UI.
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum LoadMode {
     /// inlined verbatim into the assembled context document — the persona.
     Always,
@@ -242,6 +256,7 @@ pub enum LoadMode {
 /// deliberately a struct (not an enum): the phase-5 envelope composer reads
 /// every field straight through into a skill mount, so the same fields live here.
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SkillRef {
     pub name: String,
     pub source_prefix: String,
@@ -282,8 +297,10 @@ pub enum CapRequest<'a> {
 
 /// whether an agent may engage new runs. a paused agent never engages — but
 /// pausing does not cancel work already dispatched.
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(
+    BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq,
+)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentStatus {
     Active,
     Paused,
@@ -291,8 +308,19 @@ pub enum AgentStatus {
 
 /// Owner-assigned semantic role. General is the default; a record that omits
 /// the role is an ordinary (General) agent.
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentRole {
     #[default]
     General,
@@ -313,6 +341,7 @@ pub enum AgentRole {
 /// hash), and now commits which skill snapshots ran (pins). both are content
 /// addresses; the skill one is also editable, diffable, and reviewable.
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AgentRecord {
     pub agent_id: String,
     pub owner: SagaOrigin,
@@ -481,6 +510,10 @@ impl ResourceCaps {
 }
 
 // ---- the response wire spec ----------------------------------------------------
+// The MODEL output boundary. Every container here is lenient on purpose:
+// unknown JSON fields are ignored and every field defaults, so a model answer
+// either IS this shape or the consumer wraps it as one. Strictness lives in
+// the separate validation step (grants, caps, probes) — never in the decode.
 
 /// one reply block in this surface's OWN vocabulary — exactly the shape the
 /// strict-output instruction asks the model for. `kind` is one of
@@ -598,7 +631,7 @@ impl AgentAction {
 // ---- ops ----------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentMsg {
     /// register an agent under the submitter's origin (a non-empty external
     /// key or a module — the owner capability). a duplicate `agent_id` is an
@@ -651,7 +684,7 @@ pub enum AgentMsg {
 /// recipe stay ONE atomic unit without the registry referencing the dispatch
 /// plane.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentEvent {
     /// a new agent landed; the hook registers its recipe.
     Registered {
@@ -668,7 +701,7 @@ pub enum AgentEvent {
 // ---- queries ------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentQuery {
     Agents,
     Agent { agent_id: String },
@@ -681,7 +714,7 @@ pub enum AgentQuery {
 // the size asymmetry is accepted (mirrors the saga/reachability reply enums).
 #[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AgentReply {
     Agents(Vec<AgentRecord>),
     Agent(Option<AgentRecord>),

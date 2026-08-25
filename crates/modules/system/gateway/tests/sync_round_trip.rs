@@ -16,12 +16,12 @@ use std::collections::BTreeSet;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use gateway::{
-    CredentialGrantStatement, CredentialKind, CredentialRecord, DuckDnsName,
-    GATEWAY_CREDENTIAL_NS, GATEWAY_ROUTE_NS, Gateway, GatewayMsg, GatewayQuery, GatewayReply,
-    MemberAuthorization, RemoveCredentialStatement, RouteAudience, RouteDefinition, RouteMethod,
-    RouteName, RoutePolicy, RouteStatement, RouteTarget, SetCredentialStatement, decode_reply,
-    encode_msg, encode_query, grant_credential_preimage, remove_credential_preimage,
-    route_signing_preimage, set_credential_preimage,
+    CredentialGrantStatement, CredentialKind, CredentialRecord, DuckDnsName, GATEWAY_CREDENTIAL_NS,
+    GATEWAY_ROUTE_NS, Gateway, GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization,
+    RemoveCredentialStatement, RouteAudience, RouteDefinition, RouteMethod, RouteName, RoutePolicy,
+    RouteStatement, RouteTarget, SetCredentialStatement, decode_reply, encode_msg, encode_query,
+    grant_credential_preimage, remove_credential_preimage, route_signing_preimage,
+    set_credential_preimage,
 };
 use identity::{
     AccountView, IdentityQuery, IdentityReply, KeyKind, MemberKeyView, NodeView,
@@ -109,7 +109,6 @@ fn content_route(seed: u8) -> RouteDefinition {
 
 fn set_route(founder: &Ed, node: &[u8], revision: u64, route: Option<RouteDefinition>) -> Msg {
     let statement = RouteStatement {
-        version: 1,
         chain_id: CHAIN.into(),
         account_id: ed_pub(founder),
         name: RouteName::apex(),
@@ -120,10 +119,7 @@ fn set_route(founder: &Ed, node: &[u8], revision: u64, route: Option<RouteDefini
     let preimage = route_signing_preimage(&statement).expect("statement validates");
     let authorization = MemberAuthorization {
         signer: ed_pub(founder),
-        signature: founder
-            .sign(GATEWAY_ROUTE_NS, &preimage)
-            .as_ref()
-            .to_vec(),
+        signature: founder.sign(GATEWAY_ROUTE_NS, &preimage).as_ref().to_vec(),
     };
     gw(&GatewayMsg::SetRoute {
         statement,
@@ -289,8 +285,22 @@ fn synced_store_reconstructs_source_root_handles_routes_and_credentials() {
 
         // handle: register, then RENAME (the op log carries the old name's
         // index delete, not just inserts).
-        apply_commit(&mut src, 1, node.clone(), &founder, set_handle(Some("orthory"))).await;
-        apply_commit(&mut src, 2, node.clone(), &founder, set_handle(Some("quack"))).await;
+        apply_commit(
+            &mut src,
+            1,
+            node.clone(),
+            &founder,
+            set_handle(Some("orthory")),
+        )
+        .await;
+        apply_commit(
+            &mut src,
+            2,
+            node.clone(),
+            &founder,
+            set_handle(Some("quack")),
+        )
+        .await;
         // route: publish at revision 1, replace at revision 2 (overwrite).
         apply_commit(
             &mut src,

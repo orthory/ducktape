@@ -6,7 +6,10 @@ use tokio::net::UdpSocket;
 async fn coordinator_answers_a_bind_request() {
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = sock.local_addr().unwrap();
-    tokio::spawn(run_coordinator(sock, nat_traversal::AuthPolicy::Public));
+    tokio::spawn(run_coordinator(
+        nat_traversal::NatSocket::Owned(sock),
+        nat_traversal::AuthPolicy::Public,
+    ));
 
     let signer = ed25519::PrivateKey::from_seed(9);
     let mut key = [0; 32];

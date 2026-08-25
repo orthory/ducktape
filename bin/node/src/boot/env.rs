@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use provider_host::SandboxBackend;
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::Ingress;
+use provider_host::SandboxBackend;
 
 use crate::config::{self, Resolved, hex_bytes};
 

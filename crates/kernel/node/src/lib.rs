@@ -351,7 +351,11 @@ pub fn encode_batch(members: &[Vec<u8>]) -> Vec<u8> {
 /// overruns the buffer or exceeds [`MAX_FRAME_BYTES`]. a corrupt blob is an
 /// `Err` — the drain treats a whole undecodable batch as one Rejected block.
 pub fn decode_batch(bytes: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
-    let corrupt = || Error::Host(sdk::Error::Module("batch super-frame does not parse".into()));
+    let corrupt = || {
+        Error::Host(sdk::Error::Module(
+            "batch super-frame does not parse".into(),
+        ))
+    };
     let mut buf = bytes;
     let n = usize::try_from(get_varint(&mut buf).ok_or_else(corrupt)?).map_err(|_| corrupt())?;
     // every member costs at least one length byte, so N can never exceed the
@@ -385,9 +389,9 @@ mod batch_codec_tests {
             vec![],
             vec![b"solo".to_vec()],
             vec![
-                b"".to_vec(),           // an empty member is legal bytes.
+                b"".to_vec(), // an empty member is legal bytes.
                 b"one".to_vec(),
-                vec![7u8; 300],         // >127 bytes: a multi-byte length varint.
+                vec![7u8; 300], // >127 bytes: a multi-byte length varint.
                 b"last".to_vec(),
             ],
         ];
@@ -1168,7 +1172,9 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         participants: &[Vec<u8>],
         residents: &[Vec<u8>],
     ) -> Result<usize, Error> {
-        self.sink.cutover(epoch, view_base, participants, residents).await?;
+        self.sink
+            .cutover(epoch, view_base, participants, residents)
+            .await?;
         self.orderer = orderer;
         self.view_base = view_base;
         self.last_engine_view = None;
@@ -1783,14 +1789,5 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     /// borrow the wrapped host (queries, module_root inspection, ...).
     pub fn host(&self) -> &Host {
         &self.host
-    }
-
-    /// mutably borrow the wrapped host — the activation-boundary driver uses this
-    /// to drive `Host::set_active_version` across the registry at `H` (design §4).
-    /// this sets non-hashed dual-path branch selectors only; it never mutates
-    /// hashed state (that rides the in-block System `Advance` the host drain
-    /// injects), so it cannot move the root-hash on its own.
-    pub fn host_mut(&mut self) -> &mut Host {
-        &mut self.host
     }
 }

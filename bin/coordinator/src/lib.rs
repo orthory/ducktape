@@ -56,7 +56,7 @@ pub fn process_rss_bytes() -> Option<u64> {
 }
 
 /// The one field of `network.toml` the coordinator cares about: the genesis
-/// validators, as hex ed25519 public keys. Every other key (chain_id, scheme,
+/// validators, as hex ed25519 public keys. Every other key (chain_id,
 /// bootstrap, reach, coordination, …) is ignored — serde drops unknown fields —
 /// so a full descriptor parses here without dragging in `bin/node`.
 #[derive(Debug, Deserialize)]

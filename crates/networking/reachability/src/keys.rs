@@ -85,11 +85,9 @@ impl WireGuardKeypair {
         X25519PublicKey(x25519_dalek::PublicKey::from(&self.secret).to_bytes())
     }
 
-    /// The private key in the base64 form
-    /// `defguard_wireguard_rs::InterfaceConfiguration.prvkey` expects.
-    pub fn private_key_base64(&self) -> String {
-        use base64::Engine as _;
-        base64::engine::general_purpose::STANDARD.encode(self.secret.to_bytes())
+    /// The raw X25519 private key the interface effect installs.
+    pub fn private_key_bytes(&self) -> [u8; 32] {
+        self.secret.to_bytes()
     }
 
     /// Open a [`crate::seal`] envelope sealed to this node's WireGuard X25519
@@ -133,15 +131,7 @@ mod tests {
         let (reloaded, generated_again) = WireGuardKeypair::load_or_generate(&path).unwrap();
         assert!(!generated_again);
         assert_eq!(reloaded.public_key(), fresh.public_key());
-        assert_eq!(reloaded.private_key_base64(), fresh.private_key_base64());
-
-        // the base64 form decodes back to 32 bytes — what defguard's prvkey
-        // parser requires.
-        use base64::Engine as _;
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(fresh.private_key_base64())
-            .unwrap();
-        assert_eq!(decoded.len(), 32);
+        assert_eq!(reloaded.private_key_bytes(), fresh.private_key_bytes());
     }
 
     #[cfg(unix)]

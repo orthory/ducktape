@@ -514,10 +514,9 @@ fn suffix_catchup_applies_verifies_and_journals_served_frames() {
         let mut recovery = Recovery::open(context.child("post_catchup_ok"))
             .await
             .expect("open recovery");
-        let applied =
-            apply_suffix_frames(&mut recovery, &mut host, 0, 2, frames.clone(), None)
-                .await
-                .expect("catch up");
+        let applied = apply_suffix_frames(&mut recovery, &mut host, 0, 2, frames.clone(), None)
+            .await
+            .expect("catch up");
 
         assert_eq!(applied.applied, 2);
         assert_eq!(host.root_hash(), expected.root_hash());
@@ -542,7 +541,7 @@ fn suffix_catchup_reconciles_mixed_durability_state() {
         let base_host = mixed_durability_host(durable_store.clone(), 0);
         let base_manifest =
             Manifest::capture(&base_host, None, 0, 0, vec![test_me()], vec![], None, 0, 1)
-        .expect("base manifest");
+                .expect("base manifest");
 
         let mut expected = mixed_durability_host(TestDiskStore::default(), 0);
         let served = served_mixed_frame(&mut expected, &signer, 1, 0, 7).await;
@@ -565,10 +564,9 @@ fn suffix_catchup_reconciles_mixed_durability_state() {
             .write_manifest(&base_manifest)
             .await
             .expect("write base manifest");
-        let applied =
-            apply_suffix_frames(&mut recovery, &mut host, 0, 1, vec![served], None)
-                .await
-                .expect("catch up");
+        let applied = apply_suffix_frames(&mut recovery, &mut host, 0, 1, vec![served], None)
+            .await
+            .expect("catch up");
 
         assert_eq!(applied.applied, 1);
         assert_eq!(
@@ -594,7 +592,6 @@ fn suffix_catchup_reconciles_mixed_durability_state() {
             7,
             "disk cohort stays at its durable post-state"
         );
-
     });
 }
 
@@ -612,10 +609,9 @@ fn suffix_catchup_aborts_on_mismatched_served_seal() {
         let mut recovery = Recovery::open(context.child("post_catchup_mismatch"))
             .await
             .expect("open recovery");
-        let err =
-            apply_suffix_frames(&mut recovery, &mut host, 0, 1, vec![served], None)
-                .await
-                .expect_err("seal mismatch must abort");
+        let err = apply_suffix_frames(&mut recovery, &mut host, 0, 1, vec![served], None)
+            .await
+            .expect_err("seal mismatch must abort");
 
         assert!(
             err.contains("served seal"),
@@ -633,10 +629,9 @@ fn suffix_catchup_is_noop_when_there_is_no_gap() {
         let mut recovery = Recovery::open(context.child("post_catchup_noop"))
             .await
             .expect("open recovery");
-        let applied =
-            apply_suffix_frames(&mut recovery, &mut host, 5, 5, Vec::new(), None)
-                .await
-                .expect("noop catch up");
+        let applied = apply_suffix_frames(&mut recovery, &mut host, 5, 5, Vec::new(), None)
+            .await
+            .expect("noop catch up");
 
         assert_eq!(applied.applied, 0);
         assert_eq!(host.root_hash(), before);

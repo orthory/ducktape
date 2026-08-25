@@ -7,7 +7,7 @@
 //!
 //! **D1 (endianness):** every structural header field (`ts_ms`, and any
 //! future length/count field) is big-endian, matching the mesh leg
-//! (`chat::voice::media`, `chat::video::frame`) and the rest of the wire
+//! ([`crate::voice::media`], [`crate::video::frame`]) and the rest of the wire
 //! standardization. PCM audio samples are the payload, not a header field,
 //! and stay little-endian `i16` — this leg is browser↔node loopback only
 //! (never relayed to another node), and the browser's `Int16Array` is

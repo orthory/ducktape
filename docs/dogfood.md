@@ -18,7 +18,7 @@ and the runtime contract
   ("validator" vs "resident") the steps say so.
 - **Host `git` on `PATH`, with worktree support.** The provisioner probes
   once at construction (`git init` + `git worktree list` in a scratch dir,
-  `bin/noded/src/agent_provision/forge.rs`); a failed probe makes the forge
+  `crates/noded/src/agent_provision/forge.rs`); a failed probe makes the forge
   lane permanently unavailable, loudly. Forge repos are git-default **sha1**
   — do NOT set `init.defaultObjectFormat = sha256` host-wide; a sha256 clone
   cannot interop with the node's repos.

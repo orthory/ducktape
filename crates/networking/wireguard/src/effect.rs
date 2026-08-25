@@ -7,11 +7,8 @@
 
 mod wiring;
 pub use wiring::{
-    PeerTunnelConfig, TUNNEL_MTU, apply_peer_tunnels, apply_tunnel_plan, apply_tunnel_plans,
-    plan_peer_configs, update_peer_tunnels,
+    InterfaceConfig, PeerTunnelConfig, apply_peer_tunnels, plan_peer_configs, update_peer_tunnels,
 };
-
-use defguard_wireguard_rs::InterfaceConfiguration;
 
 /// Effect boundary between a validated WireGuard install plan and the real
 /// network stack. `create_interface`/`remove_interface` bracket the
@@ -24,7 +21,7 @@ pub trait WireGuardEffect {
     fn create_interface(&mut self) -> Result<(), Self::Error>;
 
     /// Apply (create-or-replace) the full interface configuration.
-    fn apply(&mut self, config: &InterfaceConfiguration) -> Result<(), Self::Error>;
+    fn apply(&mut self, config: &InterfaceConfig) -> Result<(), Self::Error>;
 
     /// Tear down the interface.
     fn remove_interface(&mut self) -> Result<(), Self::Error>;
@@ -46,9 +43,8 @@ pub enum FakeWireGuardEffectError {
     /// caller reconfiguring a live interface must `apply`, not re-create.
     AlreadyCreated,
     /// `apply` was rejected because `reject_next_apply` was armed. Stands in
-    /// for a real backend rejecting a config (e.g. an
-    /// `InterfaceConfiguration.prvkey` that fails to decode to a 32-byte
-    /// key) so callers can test their handling of that failure without a
+    /// for a real backend rejecting a config (a listen port it cannot
+    /// bind) so callers can test their handling of that failure without a
     /// live tunnel backend.
     Rejected,
 }
@@ -66,13 +62,13 @@ pub enum FakeWireGuardEffectError {
 pub struct FakeWireGuardEffect {
     pub create_calls: usize,
     pub remove_calls: usize,
-    pub applied: Vec<InterfaceConfiguration>,
+    pub applied: Vec<InterfaceConfig>,
     interface_live: bool,
     /// When set, the next `apply` call fails with `Rejected` instead of
     /// recording its config, then clears itself. Lets tests simulate a real
     /// `configure_interface` rejection (bad config) without a real WireGuard
     /// runtime — in particular to exercise a caller's cleanup-on-failure
-    /// path (see `apply_tunnel_plan`).
+    /// path (see `apply_peer_tunnels`).
     pub reject_next_apply: bool,
 }
 
@@ -88,7 +84,7 @@ impl WireGuardEffect for FakeWireGuardEffect {
         Ok(())
     }
 
-    fn apply(&mut self, config: &InterfaceConfiguration) -> Result<(), Self::Error> {
+    fn apply(&mut self, config: &InterfaceConfig) -> Result<(), Self::Error> {
         if !self.interface_live {
             return Err(FakeWireGuardEffectError::NotCreated);
         }
@@ -113,26 +109,25 @@ impl WireGuardEffect for FakeWireGuardEffect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use defguard_wireguard_rs::{InterfaceConfiguration, key::Key, net::IpAddrMask, peer::Peer};
+    use crate::{AllowedIp, X25519PublicKey};
     use std::net::{IpAddr, Ipv4Addr};
 
-    fn sample_config() -> InterfaceConfiguration {
-        let mut peer = Peer::new(Key::new([7u8; 32]));
-        peer.set_allowed_ips(vec![IpAddrMask::new(
-            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 2)),
-            32,
-        )]);
-        InterfaceConfiguration {
+    fn host_route(host: u8) -> AllowedIp {
+        AllowedIp::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, host)), 32).unwrap()
+    }
+
+    fn sample_config() -> InterfaceConfig {
+        InterfaceConfig {
             name: "ducktape-wg0".into(),
-            prvkey: "cHJpdmF0ZS1rZXktYmFzZTY0LXBsYWNlaG9sZGVy".into(),
-            addresses: vec![IpAddrMask::new(
-                IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
-                32,
-            )],
-            port: 51820,
-            peers: vec![peer],
-            mtu: None,
-            fwmark: None,
+            private_key: [1u8; 32],
+            listen_port: 51820,
+            addresses: vec![host_route(1)],
+            peers: vec![PeerTunnelConfig {
+                wireguard_public_key: X25519PublicKey([7u8; 32]),
+                endpoint: None,
+                allowed_ips: vec![host_route(2)],
+                keepalive_seconds: None,
+            }],
         }
     }
 
@@ -147,7 +142,7 @@ mod tests {
         assert_eq!(fake.remove_calls, 1);
         assert_eq!(fake.applied.len(), 1);
         assert_eq!(fake.applied[0].name, "ducktape-wg0");
-        assert_eq!(fake.applied[0].peers[0].public_key.as_array(), [7u8; 32]);
+        assert_eq!(fake.applied[0].peers[0].wireguard_public_key.0, [7u8; 32]);
     }
 
     #[test]

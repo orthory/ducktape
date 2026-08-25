@@ -35,10 +35,10 @@ pub use interface::*;
 // wasm32 cdylib workspace (feature `guest`), never by the native build.
 #[cfg(feature = "guest")]
 mod guest;
-// everything below is OFF-consensus and native-only: none of it touches qmdb
-// or the root-hash, and its deps (fluent31 IO, tokio, opus, the data plane)
-// cannot cross into the wasm guest — so the consensus state machine
-// above compiles for wasm32 without them.
+// everything below is OFF-consensus: none of it touches qmdb or the
+// root-hash, and the index engine's deps (fluent31 IO) cannot cross into the
+// wasm guest — so the consensus state machine above compiles for wasm32
+// without them. (The call media planes live in the `media-service` crate.)
 //
 // the derived-tier materialized view: the PURE decision core (fold + view
 // over index_guest::StateRead), compiled everywhere and unit-tested
@@ -58,23 +58,6 @@ pub mod client;
 // (feature `index-guest`), never by the native build.
 #[cfg(feature = "index-guest")]
 mod index_guest;
-// the real-time voice media engine (Opus over the data plane's datagram
-// class). Off-consensus: it touches no qmdb and no root-hash — the chat
-// module's consensus state (channels, membership) is what will drive its
-// admission and channel→flow derivation. Kept as a self-contained submodule.
-#[cfg(feature = "native")]
-pub mod voice;
-// the video call media wire (frame fragmentation/reassembly + call control)
-// over the data plane's Service::Video / Service::Voice flows. Off-consensus
-// like `voice`, for the same reason: consensus never carries media.
-#[cfg(feature = "native")]
-pub mod video;
-// the single-definition-site codec for the webview call socket
-// (`/v1/call/ws`) — audio + camera video framing shared by `noded` and the
-// app's TypeScript leg. See the module doc for the D1 (big-endian headers)
-// rule. Off-consensus, same reasoning as `voice`/`video`.
-#[cfg(feature = "native")]
-pub mod call_wire;
 
 use std::collections::BTreeSet;
 

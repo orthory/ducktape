@@ -175,7 +175,10 @@ async fn fetch_once<C: SyncClient>(
     digest: &[u8; 32],
     cap: u64,
 ) -> Result<(), BlobFetchError> {
-    let len = match client.request(SyncRequest::BlobInfo { digest: *digest }).await? {
+    let len = match client
+        .request(SyncRequest::BlobInfo { digest: *digest })
+        .await?
+    {
         SyncResponse::BlobInfo { len: Some(len) } => len,
         SyncResponse::BlobInfo { len: None } => return Err(BlobFetchError::Miss),
         SyncResponse::Error(e) => return Err(SyncError::Server(e).into()),
@@ -240,7 +243,8 @@ impl<C> FetchingCodeSource<C> {
 impl<C: SyncClient + SourceRotate> host::CodeSource for FetchingCodeSource<C> {
     async fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>> {
         let digest: [u8; 32] = code_hash.try_into().ok()?;
-        if let Err(e) = fetch_blob(&self.client, &self.local, &digest, self.cap, self.attempts).await
+        if let Err(e) =
+            fetch_blob(&self.client, &self.local, &digest, self.cap, self.attempts).await
         {
             // an honest report, not a panic: the caller (realize) fails
             // closed on the None and says which hash it needed.
@@ -339,12 +343,8 @@ impl<S: P2pSender<PublicKey = ed25519::PublicKey>> SyncClient for ServeLaneBlobC
             };
             let (tx, rx) = tokio::sync::oneshot::channel();
             pending.lock().expect("pending blob lock").insert(id, tx);
-            let frame = statesync::encode_rpc_authed(
-                &requester,
-                &proof,
-                id,
-                &statesync::encode_request(&req),
-            );
+            let frame =
+                statesync::encode_rpc(&requester, &proof, id, &statesync::encode_request(&req));
             let attempted = sender.send(Recipients::One(peer), IoBuf::from(frame), false);
             if attempted.is_empty() {
                 pending.lock().expect("pending blob lock").remove(&id);
@@ -620,7 +620,13 @@ mod tests {
         let err = fetch_blob(&client, &local, &digest, 4095, 1)
             .await
             .expect_err("over-cap must refuse");
-        assert!(matches!(err, BlobFetchError::TooLarge { len: 4096, cap: 4095 }));
+        assert!(matches!(
+            err,
+            BlobFetchError::TooLarge {
+                len: 4096,
+                cap: 4095
+            }
+        ));
     }
 
     #[test]
@@ -744,7 +750,10 @@ mod tests {
 
     #[tokio::test]
     async fn the_sweep_is_inert_without_a_forge_workspace() {
-        let dir = tempfile::Builder::new().prefix("sweep-none").tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("sweep-none")
+            .tempdir()
+            .unwrap();
         let client = StoreClient::new(vec![blobstore::BlobHandle::default()]);
         assert_eq!(
             sweep_packs_once(&client, &blobstore::BlobHandle::default(), dir.path(), "n").await,

@@ -107,7 +107,7 @@ pub fn managed_label(owner: &str) -> String {
 pub const RUN_RUNTIME_DIR: &str = ".ducktape-run";
 
 /// the env var the provisioner exports to point a run at its read-only W6 skills
-/// tree (`bin/noded/src/agent_provision.rs`, consumed by `bin/node`'s MCP server). the sandbox
+/// tree (`crates/noded/src/agent_provision.rs`, consumed by `bin/node`'s MCP server). the sandbox
 /// backends read it to know what to MOUNT — see [`CliProvider::sandbox_ro_paths`].
 const SKILLS_ROOT_ENV: &str = "DUCKTAPE_RUN_SKILLS";
 const RUN_ACTION_URL_ENV: &str = "DUCKTAPE_RUN_ACTION_URL";
@@ -166,9 +166,9 @@ fn broker_provider_overrides(broker: &broker::BrokerEndpoint, workdir: &Path) ->
 pub(crate) use broker_host as broker;
 // The airlock credential-resolution surface: a consensus-resolved credential and
 // the per-run config the broker builds from it (self-host pins the on-chain
-// seal_pk). `CredentialKind` is capability-host's OWN mirror of the gateway
-// module's enum — the node maps between them so this crate stays independent of
-// the gateway module crate.
+// seal_pk). `CredentialKind` is the airlock contract's vendor vocabulary — the
+// node maps the gateway module's on-chain tag onto it, so this crate stays
+// independent of the gateway module crate.
 pub use broker::{AirlockConfig, AirlockTrust, CredentialKind, ResolvedCredential, WorkRef};
 // interactive (pty) sessions are unix-only: they use libc pty primitives, which
 // are a cfg(unix) dependency. all real node targets (Linux, macOS) are unix.

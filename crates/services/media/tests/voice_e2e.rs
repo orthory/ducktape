@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use chat::voice::{FRAME_SAMPLES, SAMPLE_RATE, VoiceConfig, VoiceEngine};
+use media_service::voice::{FRAME_SAMPLES, SAMPLE_RATE, VoiceConfig, VoiceEngine};
 use data_plane::sim::{LinkModel, SimNet};
 use data_plane::{
     AdmissionPolicy, DataPlane, DatagramPolicy, FlowId, PeerId, PlaneConfig, Service,

@@ -15,7 +15,11 @@ pub(crate) fn submit(
     target: &str,
     payload: &serde_json::Value,
 ) -> Result<u64, Box<dyn std::error::Error>> {
-    let body = post(base, "/v1/submit", &serde_json::json!({ "target": target, "payload": payload }))?;
+    let body = post(
+        base,
+        "/v1/submit",
+        &serde_json::json!({ "target": target, "payload": payload }),
+    )?;
     serde_json::from_str::<serde_json::Value>(&body)
         .ok()
         .and_then(|v| v["height"].as_u64())
@@ -29,7 +33,11 @@ pub(crate) fn query(
     target: &str,
     query: serde_json::Value,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let body = post(base, "/v1/query", &serde_json::json!({ "target": target, "query": query }))?;
+    let body = post(
+        base,
+        "/v1/query",
+        &serde_json::json!({ "target": target, "query": query }),
+    )?;
     Ok(serde_json::from_str(&body)?)
 }
 
@@ -126,8 +134,9 @@ pub(crate) fn get_json(base: &str, path: &str) -> Result<serde_json::Value, Read
             "{path} rejected ({status}): {text}"
         )));
     }
-    serde_json::from_str(&text)
-        .map_err(|error| ReadFailure::Rejected(format!("{path} returned undecodable JSON: {error}")))
+    serde_json::from_str(&text).map_err(|error| {
+        ReadFailure::Rejected(format!("{path} returned undecodable JSON: {error}"))
+    })
 }
 
 /// POST one node-local JSON surface and return the decoded reply (the `/v1`
@@ -291,9 +300,8 @@ mod tests {
             let (mut conn, _) = listener.accept().expect("the client connects");
             let mut scratch = [0u8; 1024];
             let _ = conn.read(&mut scratch);
-            let _ = conn.write_all(
-                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\n\r\nnope",
-            );
+            let _ = conn
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\n\r\nnope");
         });
 
         let failure = get_json(&base, "/v1/status").expect_err("a 500 is an error");

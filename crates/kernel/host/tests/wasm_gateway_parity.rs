@@ -228,7 +228,6 @@ fn statement(
     route: Option<RouteDefinition>,
 ) -> RouteStatement {
     RouteStatement {
-        version: 1,
         chain_id: CHAIN_ID.into(),
         account_id: account_id.to_vec(),
         name: match label {
@@ -1119,12 +1118,12 @@ async fn handle_plane_inner(context: &deterministic::Context) {
     // whether committed state changes — root movement must agree on both sides.
     // node A is a validator bound to account A; node B a resident bound to B.
     let ops: Vec<(Vec<u8>, Option<&str>, bool)> = vec![
-        (w.node_a.clone(), Some("orthory"), true),   // validator registers
-        (w.node_b.clone(), Some("quack-2"), true),   // resident registers
-        (w.node_a.clone(), Some("orthory"), false),  // idempotent no-op
-        (w.node_a.clone(), Some("renamed"), true),   // atomic rename frees "orthory"
-        (w.node_b.clone(), None, true),              // unregister "quack-2"
-        (w.node_b.clone(), Some("orthory"), true),   // claim the freed name
+        (w.node_a.clone(), Some("orthory"), true), // validator registers
+        (w.node_b.clone(), Some("quack-2"), true), // resident registers
+        (w.node_a.clone(), Some("orthory"), false), // idempotent no-op
+        (w.node_a.clone(), Some("renamed"), true), // atomic rename frees "orthory"
+        (w.node_b.clone(), None, true),            // unregister "quack-2"
+        (w.node_b.clone(), Some("orthory"), true), // claim the freed name
     ];
 
     for (i, (who, handle, moves)) in ops.into_iter().enumerate() {

@@ -723,7 +723,7 @@ pub fn tray_choice_row(label: String, chosen: bool) -> String {
 /// A consensus stamp at or above this is unix MILLIS, not a block height.
 ///
 /// `consensus_time` is stamped `= height` by the validator lane
-/// (bin/noded/src/index.rs) and `= unix_millis()` by a single-writer noded
+/// (crates/noded/src/index.rs) and `= unix_millis()` by a single-writer noded
 /// (bin/noded/src/main.rs), and every module record time is that value. No
 /// chain reaches 10^12 blocks and no unix-millis clock has ever been below it,
 /// so the two lanes are told apart by the magnitude alone. Rendering the millis
@@ -815,7 +815,7 @@ pub fn initials_of(name: &str) -> String {
 /// In this app exactly two values qualify, both off `/v1/status`:
 /// `NodeFacts.last_finalized_at` and `operations.phase_since`. NEVER call it on
 /// a module record's time — the consensus validator stamps `consensus_time =
-/// height` (bin/noded/src/index.rs) and a single-writer noded stamps unix
+/// height` (crates/noded/src/index.rs) and a single-writer noded stamps unix
 /// MILLIS, so a record time is a block height, not seconds. Render those with
 /// [`height_ago`] / [`height_label_short`].
 pub fn relative_time(unix_seconds: i64, wall_now: i64) -> String {

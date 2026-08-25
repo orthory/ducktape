@@ -131,33 +131,6 @@ pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 /// data lane; an oversized stamp is a deterministic rejection of the op.
 pub const MAX_ASSIGNED_BYTES: usize = 4 * 1024;
 
-/// DEAD SURFACE, awaiting one deletion outside this crate's PR boundary.
-///
-/// This was the relay slot of the ENVELOPE CONTINUATION LANE, which is
-/// deleted: an op frame can no longer carry a `continue` body, so the host
-/// never derives a continuation unit and NOTHING IN THE TREE CONSTRUCTS A
-/// `Relay`. [`Ctx::relay`] is therefore `None` on every dispatch, always.
-///
-/// The lane was a consensus takeover. The host derived the continuation's
-/// dispatch origin as `Origin::Module(parent_op_target)` — an attacker-chosen
-/// string on an attacker-signed frame — so any key with submit standing
-/// reached every `Origin::Module(_)`-gated arm in the tree, valset membership
-/// included. It fired even when the parent op was rejected and even when the
-/// module id did not exist.
-///
-/// This type and [`Ctx::relay`] survive only because
-/// `crates/modules/apps/runs/src/module_impl.rs` forwards `relay()` through a
-/// `Ctx` wrapper, and that file is out of scope here (a `crates/modules/`
-/// diff is a genesis flag day). Delete that forwarder, then delete these two.
-/// `no_continuation_lane.rs` fails the build if a constructor reappears first.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Relay {
-    pub author: Origin,
-    pub parent_target: ModuleId,
-    pub parent_frame: [u8; 32],
-    pub outcome: Result<Vec<u8>, String>,
-}
-
 /// a record a module emits via [`Ctx::emit_event`]. it LEAVES the state machine
 /// (handed to the effectful node layer) and never re-enters as a follow-up. one
 /// lane, two consumer classes: observability readers, and the host-owned worker
@@ -357,13 +330,6 @@ pub trait Ctx {
     /// emit an event — leaves the state machine (observability, and the lane
     /// the host-side worker seam claims off-consensus work from).
     fn emit_event(&mut self, ev: Event);
-
-    /// DEAD SURFACE: always `None`. The envelope continuation lane that
-    /// populated it is deleted (see [`Relay`]), and nothing constructs a
-    /// `Relay`. Kept only for the `runs` forwarder; delete both together.
-    fn relay(&self) -> Option<&Relay> {
-        None
-    }
 
     /// declare this op's output. staged with the op (rolled back on
     /// rejection); capped at [`MAX_OUTPUT_BYTES`], and exceeding the cap is a

@@ -42,7 +42,10 @@ fn a_job_submit_claims_and_dispatches_with_the_spec_payload() {
     assert_eq!(*recipe_id, recipe_id_for("duck"));
     let envelope: serde_json::Value =
         serde_json::from_slice(payload).expect("the payload is a JSON envelope");
-    assert_eq!(envelope["ducktape_run"], crate::envelope::RUN_ENVELOPE_VERSION);
+    assert_eq!(
+        envelope["ducktape_run"],
+        crate::envelope::RUN_ENVELOPE_MARKER
+    );
     assert_eq!(envelope["agent_id"], "duck", "the claiming agent");
     assert!(
         envelope.get("prompt_hash").is_none(),

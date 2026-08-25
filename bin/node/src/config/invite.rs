@@ -8,8 +8,7 @@ use commonware_cryptography::{Signer as _, ed25519};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CoordRef, Coordination, NetworkDescriptor, Reach, ReachHint, SCHEME_ED25519, decode_key,
-    hex_bytes, unhex,
+    CoordRef, Coordination, NetworkDescriptor, Reach, ReachHint, decode_key, hex_bytes, unhex,
 };
 
 /// the invite blob prefix. UNVERSIONED on purpose (bootstrapping posture): the
@@ -26,7 +25,7 @@ pub fn invite_requires_reachability_defaults(_invite: &Invite) -> bool {
 
 // ============================================================================
 // invite tokens — the capability an invite blob carries. minted by a member
-// (`invite`), presented by the joiner over the lobby channel, redeemed
+// (`invite`), presented by the joiner in its sealed first-contact intro, redeemed
 // in-consensus by governance's `Redeem` op: MINTING IS THE ADMISSION
 // DECISION, redemption is mechanical and single-use. the canonical types and
 // verification live in `governance::invite` (the same code every validator's
@@ -35,8 +34,8 @@ pub fn invite_requires_reachability_defaults(_invite: &Invite) -> bool {
 // ============================================================================
 
 pub use governance::invite::{
-    INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteToken, grant_preimage,
-    sign_join_proof, verify_invite_token, verify_join_proof,
+    INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteToken, grant_preimage, sign_join_proof,
+    verify_invite_token, verify_join_proof,
 };
 
 /// mint a BEARER invite token binding an invite to `binding` (the genesis
@@ -437,8 +436,8 @@ pub fn decode_invite_at(blob: &str, now_unix_secs: u64) -> Result<Invite, String
     use base64::Engine as _;
     use commonware_cryptography::Verifier as _;
     let body = blob.trim().strip_prefix(INVITE_PREFIX).ok_or_else(|| {
-            format!("not a ducktape invite (expected {INVITE_PREFIX}...) — ask for a fresh invite")
-        })?;
+        format!("not a ducktape invite (expected {INVITE_PREFIX}...) — ask for a fresh invite")
+    })?;
     let bytes = INVITE_B64
         .decode(body)
         .map_err(|e| format!("invite is not valid base64url: {e}"))?;
@@ -560,18 +559,18 @@ fn pack_invite(
     out.push(
         u8::try_from(fronts.len()).map_err(|_| format!("too many fronts ({})", fronts.len()))?,
     );
-        for f in fronts {
-            out.extend_from_slice(&f.member_key);
-            out.extend_from_slice(&f.wireguard_public_key);
-            out.extend_from_slice(&f.mesh_port.to_le_bytes());
-            match &f.endpoint {
-                Some(endpoint) => {
-                    out.push(1);
-                    put_str_u8(&mut out, endpoint)?;
-                }
-                None => out.push(0),
+    for f in fronts {
+        out.extend_from_slice(&f.member_key);
+        out.extend_from_slice(&f.wireguard_public_key);
+        out.extend_from_slice(&f.mesh_port.to_le_bytes());
+        match &f.endpoint {
+            Some(endpoint) => {
+                out.push(1);
+                put_str_u8(&mut out, endpoint)?;
             }
+            None => out.push(0),
         }
+    }
     Ok(out)
 }
 
@@ -683,33 +682,32 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
         return Err("this invite has expired — ask for a fresh one".into());
     }
 
-        let fcount = r.u8()? as usize;
-        let mut fronts = Vec::with_capacity(fcount);
-        for _ in 0..fcount {
-            let mut member_key = [0u8; 32];
-            member_key.copy_from_slice(r.take(32)?);
-            let mut wireguard_public_key = [0u8; 32];
-            wireguard_public_key.copy_from_slice(r.take(32)?);
-            let mesh_port = u16::from_le_bytes(r.take(2)?.try_into().expect("2 bytes"));
-            let endpoint = match r.u8()? {
-                0 => None,
-                1 => Some(r.take_str_u8()?),
-                other => return Err(format!("unknown front endpoint flag {other} in invite")),
-            };
-            fronts.push(Front {
-                member_key,
-                wireguard_public_key,
-                mesh_port,
-                endpoint,
-            });
-        }
+    let fcount = r.u8()? as usize;
+    let mut fronts = Vec::with_capacity(fcount);
+    for _ in 0..fcount {
+        let mut member_key = [0u8; 32];
+        member_key.copy_from_slice(r.take(32)?);
+        let mut wireguard_public_key = [0u8; 32];
+        wireguard_public_key.copy_from_slice(r.take(32)?);
+        let mesh_port = u16::from_le_bytes(r.take(2)?.try_into().expect("2 bytes"));
+        let endpoint = match r.u8()? {
+            0 => None,
+            1 => Some(r.take_str_u8()?),
+            other => return Err(format!("unknown front endpoint flag {other} in invite")),
+        };
+        fronts.push(Front {
+            member_key,
+            wireguard_public_key,
+            mesh_port,
+            endpoint,
+        });
+    }
     if !r.done() {
         return Err("invite payload has trailing bytes".into());
     }
     Ok(Invite {
         descriptor: NetworkDescriptor {
             chain_id,
-            scheme: SCHEME_ED25519.into(),
             validators,
             // a decoded invite carries dial hints as typed `reach`; `bootstrap`
             // stays empty and both feed one dial source via `reach_hints`.
@@ -795,7 +793,6 @@ mod tests {
         let issuer = ed25519::PrivateKey::from_seed(7);
         let mut d = NetworkDescriptor {
             chain_id: "ducktape#a1b2c3d4".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(issuer.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -839,7 +836,6 @@ mod tests {
         let me = issuer.public_key();
         let mut d = NetworkDescriptor {
             chain_id: "ducktape#a1b2c3d4".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -894,7 +890,6 @@ mod tests {
         let me = issuer.public_key();
         let mut d = NetworkDescriptor {
             chain_id: "ducktape#a1b2c3d4".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -939,7 +934,6 @@ mod tests {
         let issuer = ed25519::PrivateKey::from_seed(7);
         let d = NetworkDescriptor {
             chain_id: "ducktape#a1b2c3d4".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(issuer.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -965,7 +959,6 @@ mod tests {
         let issuer = ed25519::PrivateKey::from_seed(7);
         let d = NetworkDescriptor {
             chain_id: "ducktape#a1b2c3d4".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(issuer.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -994,7 +987,6 @@ mod tests {
     fn front_descriptor(issuer: &ed25519::PrivateKey) -> NetworkDescriptor {
         NetworkDescriptor {
             chain_id: "ducktape#a1b2c3d4".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(issuer.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1045,7 +1037,7 @@ mod tests {
                 transport,
                 &policy,
             )
-                .unwrap()
+            .unwrap()
         };
         let record = EndpointRecord {
             namespace: "net#fronts".into(),
@@ -1144,7 +1136,6 @@ mod tests {
         let issuer = ed25519::PrivateKey::from_seed(7);
         let d = NetworkDescriptor {
             chain_id: "ducktape#a1b2c3d4".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(issuer.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1188,7 +1179,6 @@ mod tests {
         let issuer = ed25519::PrivateKey::from_seed(7);
         let base = NetworkDescriptor {
             chain_id: "ducktape#a1b2c3d4".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(issuer.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
@@ -1219,7 +1209,6 @@ mod tests {
     fn front_test_descriptor(issuer: &ed25519::PrivateKey) -> NetworkDescriptor {
         NetworkDescriptor {
             chain_id: "ducktape#a1b2c3d4".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(issuer.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],

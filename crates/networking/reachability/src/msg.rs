@@ -65,8 +65,8 @@ mod tests {
     use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
     use std::net::{IpAddr, Ipv4Addr};
     use wireguard::{
-        AdmissionRoot, Endpoint, EndpointRecord, PortPolicy, Root, Transport,
-        ValidatorIdentity, X25519PublicKey,
+        AdmissionRoot, Endpoint, EndpointRecord, PortPolicy, Root, Transport, ValidatorIdentity,
+        X25519PublicKey,
     };
 
     #[test]

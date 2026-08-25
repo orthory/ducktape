@@ -26,6 +26,8 @@ path = "src/main.rs"
 # the host-side qmdb store handle injected into disk-backed modules.
 statesync = { workspace = true }
 host = { workspace = true }
+# the module composition catalog this composer draws its genesis selection from.
+topology = { workspace = true }
 sdk = { workspace = true }
 chat = { workspace = true }
 tasks = { workspace = true }
@@ -57,7 +59,7 @@ blobstore = { workspace = true }
 duckfs-core = { workspace = true }
 # the sim installs the SAME subscriber the real node does (noded::log), so a
 # scenario sees the module breadcrumbs a wasm guest has no other way to emit.
-noded = { path = "../noded" }
+noded = { path = "../../crates/noded" }
 tracing = { workspace = true }
 # the replication layer: the sim actor runs on `OrderedNode<StepOrderer,
 # NullSink>` — the SAME apply/drain/projection engine the validator uses, with

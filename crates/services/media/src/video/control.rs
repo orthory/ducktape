@@ -1,8 +1,9 @@
 //! Call control datagrams — on a separate flow over `Service::Voice`, so
 //! control keeps working in an audio-only build (ADR §2). One tiny tagged
-//! frame per message: `[ver=1][tag][fields…]`, all integers BE.
+//! frame per message: `[tag][fields…]`, all integers BE. no version byte:
+//! the tag is the discriminant, and the frames are fixed shapes (flag-day
+//! rule — no in-band version).
 
-pub const CTL_VERSION: u8 = 1;
 const TAG_KEYFRAME_REQUEST: u8 = 1;
 const TAG_BEACON: u8 = 2;
 const TAG_RATE_HINT: u8 = 3;
@@ -52,8 +53,6 @@ pub enum CallControl {
 pub enum ControlError {
     #[error("control frame truncated")]
     Truncated,
-    #[error("unsupported control version {0}")]
-    BadVersion(u8),
     #[error("unknown control tag {0}")]
     UnknownTag(u8),
 }
@@ -61,20 +60,14 @@ pub enum ControlError {
 impl CallControl {
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            CallControl::KeyframeRequest => vec![CTL_VERSION, TAG_KEYFRAME_REQUEST],
+            CallControl::KeyframeRequest => vec![TAG_KEYFRAME_REQUEST],
             CallControl::Beacon {
                 muted,
                 camera_on,
                 sharing,
-            } => vec![
-                CTL_VERSION,
-                TAG_BEACON,
-                *muted as u8,
-                *camera_on as u8,
-                *sharing as u8,
-            ],
+            } => vec![TAG_BEACON, *muted as u8, *camera_on as u8, *sharing as u8],
             CallControl::RateHint { max_kbps } => {
-                let mut frame = vec![CTL_VERSION, TAG_RATE_HINT];
+                let mut frame = vec![TAG_RATE_HINT];
                 frame.extend_from_slice(&max_kbps.to_be_bytes());
                 frame
             }
@@ -82,21 +75,18 @@ impl CallControl {
     }
 
     pub fn decode(frame: &[u8]) -> Result<CallControl, ControlError> {
-        if frame.len() < 2 {
+        if frame.is_empty() {
             return Err(ControlError::Truncated);
         }
-        if frame[0] != CTL_VERSION {
-            return Err(ControlError::BadVersion(frame[0]));
-        }
-        match frame[1] {
+        match frame[0] {
             TAG_KEYFRAME_REQUEST => Ok(CallControl::KeyframeRequest),
-            TAG_BEACON if frame.len() >= 5 => Ok(CallControl::Beacon {
-                muted: frame[2] != 0,
-                camera_on: frame[3] != 0,
-                sharing: frame[4] != 0,
+            TAG_BEACON if frame.len() >= 4 => Ok(CallControl::Beacon {
+                muted: frame[1] != 0,
+                camera_on: frame[2] != 0,
+                sharing: frame[3] != 0,
             }),
-            TAG_RATE_HINT if frame.len() >= 6 => Ok(CallControl::RateHint {
-                max_kbps: u32::from_be_bytes(frame[2..6].try_into().expect("4 bytes")),
+            TAG_RATE_HINT if frame.len() >= 5 => Ok(CallControl::RateHint {
+                max_kbps: u32::from_be_bytes(frame[1..5].try_into().expect("4 bytes")),
             }),
             TAG_BEACON | TAG_RATE_HINT => Err(ControlError::Truncated),
             other => Err(ControlError::UnknownTag(other)),
@@ -144,36 +134,28 @@ mod tests {
     #[test]
     fn decode_rejects_truncated() {
         assert!(matches!(
-            CallControl::decode(&[CTL_VERSION]),
+            CallControl::decode(&[]),
             Err(ControlError::Truncated)
         ));
         assert!(matches!(
-            CallControl::decode(&[CTL_VERSION, TAG_BEACON, 1]),
+            CallControl::decode(&[TAG_BEACON, 1]),
             Err(ControlError::Truncated)
         ));
-        // 4-byte beacons (pre-share wire) are retired: short = truncated.
+        // 3-byte beacons (pre-share wire) are retired: short = truncated.
         assert!(matches!(
-            CallControl::decode(&[CTL_VERSION, TAG_BEACON, 1, 1]),
+            CallControl::decode(&[TAG_BEACON, 1, 1]),
             Err(ControlError::Truncated)
         ));
         assert!(matches!(
-            CallControl::decode(&[CTL_VERSION, TAG_RATE_HINT, 0, 0, 0]),
+            CallControl::decode(&[TAG_RATE_HINT, 0, 0, 0]),
             Err(ControlError::Truncated)
-        ));
-    }
-
-    #[test]
-    fn decode_rejects_bad_version() {
-        assert!(matches!(
-            CallControl::decode(&[7, TAG_KEYFRAME_REQUEST]),
-            Err(ControlError::BadVersion(7))
         ));
     }
 
     #[test]
     fn decode_rejects_unknown_tag() {
         assert!(matches!(
-            CallControl::decode(&[CTL_VERSION, 99]),
+            CallControl::decode(&[99]),
             Err(ControlError::UnknownTag(99))
         ));
     }

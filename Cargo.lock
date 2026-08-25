@@ -1450,11 +1450,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "commonware-runtime",
- "data-plane",
  "guest-adapter",
  "host",
  "index-guest",
- "opus-rs",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -1463,8 +1461,6 @@ dependencies = [
  "statesync",
  "tagging",
  "tempfile",
- "thiserror 2.0.18",
- "tokio",
  "unicode-normalization",
 ]
 
@@ -2876,36 +2872,9 @@ dependencies = [
  "nix",
  "parking_lot",
  "ring",
- "socket2",
- "thiserror 2.0.18",
  "tracing",
  "uniffi",
  "untrusted 0.9.0",
- "x25519-dalek",
-]
-
-[[package]]
-name = "defguard_wireguard_rs"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f4188d2edddeff6c87f01746ddd869a34ea4a5b0005909b9f8b89c806bfdd0d"
-dependencies = [
- "base64 0.22.1",
- "defguard_boringtun",
- "ipnet",
- "libc",
- "log",
- "netlink-packet-core",
- "netlink-packet-generic",
- "netlink-packet-route",
- "netlink-packet-utils",
- "netlink-packet-wireguard",
- "netlink-sys",
- "regex",
- "serde",
- "thiserror 2.0.18",
- "windows 0.62.2",
- "wireguard-nt",
  "x25519-dalek",
 ]
 
@@ -2978,6 +2947,7 @@ dependencies = [
  "statesync",
  "tagging",
  "tasks",
+ "topology",
  "valset",
 ]
 
@@ -3295,6 +3265,7 @@ dependencies = [
  "image",
  "inbox",
  "jpeg-encoder",
+ "media-service",
  "node",
  "nokhwa",
  "pages",
@@ -5203,7 +5174,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d40460c0ce33d6ce4b0630ad68ff63d6661961c48b6dba35e5a4d81cfb48222"
 dependencies = [
  "socket2",
- "widestring 1.2.1",
+ "widestring",
  "windows-registry",
  "windows-result 0.4.1",
  "windows-sys 0.61.2",
@@ -5749,6 +5720,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
+name = "media-service"
+version = "0.1.0"
+dependencies = [
+ "data-plane",
+ "opus-rs",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5984,7 +5965,6 @@ dependencies = [
  "commonware-cryptography",
  "crossbeam-channel",
  "lru 0.18.1",
- "nat-traversal",
  "smallvec",
  "thiserror 2.0.18",
  "tokio",
@@ -6041,71 +6021,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
-]
-
-[[package]]
-name = "netlink-packet-core"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3463cbb78394cb0141e2c926b93fc2197e473394b761986eca3b9da2c63ae0f4"
-dependencies = [
- "paste",
-]
-
-[[package]]
-name = "netlink-packet-generic"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f891b2e0054cac5a684a06628f59568f841c93da4e551239da6e518f539e775"
-dependencies = [
- "netlink-packet-core",
-]
-
-[[package]]
-name = "netlink-packet-route"
-version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be8919612f6028ab4eacbbfe1234a9a43e3722c6e0915e7ff519066991905092"
-dependencies = [
- "bitflags 2.13.0",
- "libc",
- "log",
- "netlink-packet-core",
-]
-
-[[package]]
-name = "netlink-packet-utils"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3176f18d11a1ae46053e59ec89d46ba318ae1343615bd3f8c908bfc84edae35c"
-dependencies = [
- "byteorder",
- "pastey",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "netlink-packet-wireguard"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb217ca08c02978c3ea5ef0f013d20c602f2a17a9f00d9e4b1518a3500c2f332"
-dependencies = [
- "bitflags 2.13.0",
- "libc",
- "log",
- "netlink-packet-core",
- "netlink-packet-generic",
-]
-
-[[package]]
-name = "netlink-sys"
-version = "0.8.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd6c30ed10fa69cc491d491b85cc971f6bdeb8e7367b7cde2ee6cc878d583fae"
-dependencies = [
- "bytes",
- "libc",
- "log",
 ]
 
 [[package]]
@@ -6183,7 +6098,6 @@ dependencies = [
  "compute-service",
  "consensus",
  "data-plane",
- "defguard_wireguard_rs",
  "directory",
  "dispatch 0.1.0",
  "duckdns",
@@ -6203,6 +6117,7 @@ dependencies = [
  "kv",
  "libc",
  "lifecycle",
+ "media-service",
  "nat-traversal",
  "nettest",
  "node",
@@ -6231,11 +6146,13 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite 0.24.0",
  "toml 0.8.23",
+ "topology",
  "tracing",
  "tracing-subscriber 0.3.23",
  "valset",
  "wasm-host",
  "wireguard",
+ "x25519-dalek",
  "zeroize",
 ]
 
@@ -6272,6 +6189,7 @@ dependencies = [
  "identity",
  "inbox",
  "indexer",
+ "media-service",
  "nettest",
  "node",
  "pages",
@@ -6295,6 +6213,45 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber 0.3.23",
+]
+
+[[package]]
+name = "noded-bin"
+version = "0.1.0"
+dependencies = [
+ "agent",
+ "async-trait",
+ "automations",
+ "base64 0.22.1",
+ "chat",
+ "commonware-runtime",
+ "dispatch 0.1.0",
+ "duckfs-client",
+ "files",
+ "forge",
+ "futures",
+ "gateway",
+ "git2",
+ "host",
+ "identity",
+ "inbox",
+ "indexer",
+ "nettest",
+ "node",
+ "noded",
+ "pages",
+ "runs",
+ "saga",
+ "sdk",
+ "serde_json",
+ "sha2 0.10.9",
+ "statesync",
+ "tagging",
+ "tasks",
+ "tempfile",
+ "tokio",
+ "topology",
+ "tracing",
 ]
 
 [[package]]
@@ -7047,10 +7004,10 @@ dependencies = [
 name = "overlay-net"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "commonware-runtime",
  "data-plane",
  "defguard_boringtun",
- "defguard_wireguard_rs",
  "governor",
  "rand_core 0.6.4",
  "smoltcp",
@@ -7176,12 +7133,6 @@ name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
-
-[[package]]
-name = "pastey"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
 
 [[package]]
 name = "peeking_take_while"
@@ -7981,7 +7932,6 @@ dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
  "commonware-cryptography",
- "defguard_wireguard_rs",
  "nat-traversal",
  "rand 0.8.6",
  "serde",
@@ -8966,6 +8916,7 @@ dependencies = [
  "tasks",
  "tempfile",
  "tokio",
+ "topology",
  "tracing",
  "valset",
 ]
@@ -9833,6 +9784,10 @@ dependencies = [
  "prost",
  "tonic",
 ]
+
+[[package]]
+name = "topology"
+version = "0.1.0"
 
 [[package]]
 name = "tower"
@@ -11265,12 +11220,6 @@ dependencies = [
 
 [[package]]
 name = "widestring"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c168940144dd21fd8046987c16a46a33d5fc84eec29ef9dcddc2ac9e31526b7c"
-
-[[package]]
-name = "widestring"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
@@ -11847,27 +11796,10 @@ version = "0.1.0"
 dependencies = [
  "commonware-codec",
  "commonware-cryptography",
- "defguard_wireguard_rs",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "wireguard-nt"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22b4dbcc6c93786cf22e420ef96e8976bfb92a455070282302b74de5848191f4"
-dependencies = [
- "bitflags 2.13.0",
- "getrandom 0.2.17",
- "ipnet",
- "libloading",
- "log",
- "thiserror 1.0.69",
- "widestring 0.4.3",
- "windows-sys 0.59.0",
 ]
 
 [[package]]

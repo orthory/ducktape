@@ -41,6 +41,7 @@ pub(crate) const MAX_SUBSCRIBERS_PER_SCOPE: usize = 8;
 /// genesis id plus the module-local entity id (an agent id, a page block id,
 /// a document id — the owning module defines the encoding).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
 pub struct EntityRef {
     pub module: String,
     pub entity: String,
@@ -52,7 +53,7 @@ pub struct EntityRef {
 /// engagement (an engaged entity's reply is itself content, and entity-,
 /// module-, and system-authored content must never re-fire).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Author {
     /// an external submitter's (non-empty) public key bytes.
     User(Vec<u8>),
@@ -70,6 +71,7 @@ pub enum Author {
 /// id and message sequence) a subscriber hands back to the source module's
 /// query surface for its domain work.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TagEvent {
     pub container: String,
     pub content_seq: u64,
@@ -82,7 +84,7 @@ pub struct TagEvent {
 // ---- ops -----------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaggingMsg {
     /// MODULE-ORIGIN ONLY: register the emitting module as a subscriber of
     /// `(source, container)`. idempotent — re-subscribing an existing
@@ -102,6 +104,7 @@ pub enum TaggingMsg {
 /// from the plane, in the same block as the content. `source` is the content module
 /// the plane verified by origin; the rest is the [`TagEvent`] verbatim.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct EngagementEvent {
     pub source: String,
     pub container: String,

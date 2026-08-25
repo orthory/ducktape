@@ -39,7 +39,7 @@
 //! nothing else — so a provider CANNOT race a push any more, and a scenario
 //! that cannot happen is not a regression this suite can hold. The property
 //! itself is covered where it lives, against the provisioner:
-//! `bin/noded/src/agent_provision/forge_tests.rs`'s
+//! `crates/noded/src/agent_provision/forge_tests.rs`'s
 //! `a_concurrent_advance_is_rebased_under_the_runs_work_and_pushed` (plus the
 //! merge-preserving and author-preservation variants beside it).
 //!

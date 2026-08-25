@@ -211,11 +211,10 @@ impl Coordinator {
         self.rejects += 1;
     }
 
-    /// Auth-bypassing seam for deterministic in-memory simulations. It is
-    /// compiled only for tests/simnat and still requires the already-verified
-    /// caller identity used by the production handler.
-    #[cfg(any(test, feature = "simnat"))]
-    pub fn handle_verified_at(
+    /// Auth-bypassing seam for this module's own ordered-state tests, which
+    /// exercise the pure handler without minting signatures.
+    #[cfg(test)]
+    pub(crate) fn handle_verified_at(
         &mut self,
         caller: NodeKey,
         from: SocketAddr,
@@ -227,7 +226,7 @@ impl Coordinator {
             .collect()
     }
 
-    #[cfg(any(test, feature = "simnat"))]
+    #[cfg(test)]
     pub(crate) fn handle_verified(
         &mut self,
         caller: NodeKey,

@@ -41,14 +41,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use chat::voice::{FRAME_MILLIS, FRAME_SAMPLES, VoiceConfig, VoiceEngine};
 use data_plane::{
     AdmissionPolicy, DataPlane, DataPlaneTransport, DatagramFlow, DatagramPolicy, FlowId, PeerId,
     Service, SocketFactory,
 };
+use media_service::voice::{FRAME_MILLIS, FRAME_SAMPLES, VoiceConfig, VoiceEngine};
 use tokio::sync::{mpsc, watch};
 
-use crate::voice_plane::MediaPeers;
+use crate::overlay_book::OverlayPeers;
 
 /// Inbound audio queue per flow: ~2.5 s of one speaker's frames. Overflow
 /// drops the oldest inside the flow (the plane's drop-oldest contract).
@@ -102,7 +102,7 @@ fn presence_flow(page_id: &str) -> FlowId {
 pub fn spawn_hub(
     requests: mpsc::Receiver<noded::RealtimeSessionRequest>,
     factory: Arc<dyn SocketFactory>,
-    peers: Arc<MediaPeers>,
+    peers: Arc<OverlayPeers>,
     me: [u8; 32],
     planes: data_plane::PlaneMonitor,
 ) -> std::thread::JoinHandle<()> {
@@ -256,7 +256,7 @@ const PRESENCE_OVERLAY_DOWN: &str = "the mesh overlay is not up on this node yet
 async fn hub_loop(
     mut requests: mpsc::Receiver<noded::RealtimeSessionRequest>,
     factory: Arc<dyn SocketFactory>,
-    peers: Arc<MediaPeers>,
+    peers: Arc<OverlayPeers>,
     me: [u8; 32],
     planes: data_plane::PlaneMonitor,
 ) {
@@ -325,20 +325,16 @@ async fn serve_sessions<T: DataPlaneTransport>(
                 if let Some(previous) = active_call.take() {
                     previous.teardown().await;
                 }
-                let (session, guard) = match open_session(
-                    &voice_plane,
-                    &video_plane,
-                    &flows,
-                    &request.channel_id,
-                )
-                .await
-                {
-                    Ok(opened) => opened,
-                    Err(refusal) => {
-                        let _ = request.reply.send(Err(refusal));
-                        continue;
-                    }
-                };
+                let (session, guard) =
+                    match open_session(&voice_plane, &video_plane, &flows, &request.channel_id)
+                        .await
+                    {
+                        Ok(opened) => opened,
+                        Err(refusal) => {
+                            let _ = request.reply.send(Err(refusal));
+                            continue;
+                        }
+                    };
                 if request.reply.send(Ok(session)).is_err() {
                     guard.teardown().await;
                     continue;
@@ -654,7 +650,7 @@ async fn run_presence_session<T: DataPlaneTransport>(
 
 /// per-sending-peer receive state on the video/control flows.
 struct PeerLane {
-    reassembler: chat::video::Reassembler,
+    reassembler: media_service::video::Reassembler,
     /// last time we asked THIS peer for a keyframe (≥1 s apart).
     last_keyframe_req: Option<Instant>,
     /// `dropped_frames()` when we last inspected this peer — a keyframe ask
@@ -670,10 +666,10 @@ struct PeerLane {
 impl PeerLane {
     fn new() -> Self {
         PeerLane {
-            reassembler: chat::video::Reassembler::default(),
+            reassembler: media_service::video::Reassembler::default(),
             last_keyframe_req: None,
             last_seen_dropped: 0,
-            hint_kbps: chat::video::RATE_LADDER_KBPS[0],
+            hint_kbps: media_service::video::RATE_LADDER_KBPS[0],
             clean_windows: 0,
             window_complete: 0,
             window_dropped_base: 0,
@@ -691,8 +687,8 @@ async fn run_session<T: DataPlaneTransport>(
     ctl: DatagramFlow<T>,
     mut pcm_in: mpsc::Receiver<Vec<i16>>,
     mixed_out: mpsc::Sender<Vec<i16>>,
-    mut video_in: mpsc::Receiver<chat::call_wire::CapturedFrame>,
-    video_out: mpsc::Sender<chat::call_wire::PeerFrame>,
+    mut video_in: mpsc::Receiver<media_service::call_wire::CapturedFrame>,
+    video_out: mpsc::Sender<media_service::call_wire::PeerFrame>,
     mut control_in: mpsc::Receiver<noded::CallControlIn>,
     control_out: mpsc::Sender<noded::CallControlOut>,
     mut recipients: watch::Receiver<Vec<[u8; 32]>>,
@@ -720,7 +716,7 @@ async fn run_session<T: DataPlaneTransport>(
     let (mut muted, mut camera_on, mut sharing) = (true, false, false);
     // rate hints RECEIVED from each peer about OUR sending; effective = min.
     let mut inbound_hints: HashMap<[u8; 32], u32> = HashMap::new();
-    let mut effective_kbps: u32 = chat::video::RATE_LADDER_KBPS[0];
+    let mut effective_kbps: u32 = media_service::video::RATE_LADDER_KBPS[0];
     // ≥1 s between keyframes we ask our own encoder for.
     let mut last_encoder_kick: Option<Instant> = None;
     let mut ctl_tick = tokio::time::interval(Duration::from_secs(1));
@@ -790,7 +786,7 @@ async fn run_session<T: DataPlaneTransport>(
                 let recipients_now: Vec<PeerId> =
                     recipients.borrow().iter().map(|raw| PeerId(*raw)).collect();
                 if recipients_now.is_empty() { continue; }
-                let Ok(fragments) = chat::video::fragment_frame(
+                let Ok(fragments) = media_service::video::fragment_frame(
                     frame_no, frame.keyframe, frame.ts_ms, &frame.data,
                 ) else { continue }; // oversize/empty: drop, stay alive
                 frame_no = frame_no.wrapping_add(1);
@@ -803,22 +799,22 @@ async fn run_session<T: DataPlaneTransport>(
             }
             inbound = video.recv() => {
                 let (peer, bytes) = inbound;
-                let Ok((header, payload)) = chat::video::decode_fragment(&bytes) else { continue };
+                let Ok((header, payload)) = media_service::video::decode_fragment(&bytes) else { continue };
                 let lane = peer_lanes.entry(peer.0).or_insert_with(PeerLane::new);
                 match lane.reassembler.insert(header, payload) {
-                    chat::video::Assembly::Complete(done) => {
+                    media_service::video::Assembly::Complete(done) => {
                         lane.window_complete += 1;
                         // full lane = the webview is behind; a dropped frame
                         // is recovered by the next keyframe request from the
                         // browser decoder, so shed rather than backpressure.
-                        let _ = video_out.try_send(chat::call_wire::PeerFrame {
+                        let _ = video_out.try_send(media_service::call_wire::PeerFrame {
                             peer: peer.0,
                             keyframe: done.keyframe,
                             ts_ms: done.ts_ms,
                             data: done.data,
                         });
                     }
-                    chat::video::Assembly::Progress | chat::video::Assembly::Stale => {
+                    media_service::video::Assembly::Progress | media_service::video::Assembly::Stale => {
                         // a frame died incomplete since we last looked → ask
                         // its sender for a sync point (rate-limited). gate on
                         // the dropped counter ADVANCING so mid-frame fragments
@@ -833,9 +829,9 @@ async fn run_session<T: DataPlaneTransport>(
             }
             inbound = ctl.recv() => {
                 let (peer, bytes) = inbound;
-                let Ok(message) = chat::video::CallControl::decode(&bytes) else { continue };
+                let Ok(message) = media_service::video::CallControl::decode(&bytes) else { continue };
                 match message {
-                    chat::video::CallControl::KeyframeRequest => {
+                    media_service::video::CallControl::KeyframeRequest => {
                         // honor at most one encoder kick per second.
                         let due = last_encoder_kick
                             .is_none_or(|at| at.elapsed() >= Duration::from_secs(1));
@@ -844,22 +840,22 @@ async fn run_session<T: DataPlaneTransport>(
                             let _ = control_out.try_send(noded::CallControlOut::KeyframeRequest);
                         }
                     }
-                    chat::video::CallControl::Beacon { muted, camera_on, sharing } => {
+                    media_service::video::CallControl::Beacon { muted, camera_on, sharing } => {
                         let _ = control_out.try_send(noded::CallControlOut::PeerBeacon {
                             peer: peer.0, muted, camera_on, sharing,
                         });
                     }
-                    chat::video::CallControl::RateHint { max_kbps } => {
+                    media_service::video::CallControl::RateHint { max_kbps } => {
                         // hints outside the ladder are hostile-or-broken; clamping
                         // preserves min semantics without letting a peer push the
                         // encoder outside its envelope (a 1 kbps hint would freeze
                         // our video for every recipient via the min; a huge one
                         // would fail the encoder's configure and drop our camera).
                         let clamped = max_kbps.clamp(
-                            *chat::video::RATE_LADDER_KBPS
+                            *media_service::video::RATE_LADDER_KBPS
                                 .last()
                                 .expect("non-empty ladder"),
-                            chat::video::RATE_LADDER_KBPS[0],
+                            media_service::video::RATE_LADDER_KBPS[0],
                         );
                         inbound_hints.insert(peer.0, clamped);
                         push_effective_rate(
@@ -950,7 +946,10 @@ async fn request_keyframe_if_due<T: DataPlaneTransport>(
     {
         lane.last_keyframe_req = Some(Instant::now());
         let _ = ctl
-            .send_to(peer, &chat::video::CallControl::KeyframeRequest.encode())
+            .send_to(
+                peer,
+                &media_service::video::CallControl::KeyframeRequest.encode(),
+            )
             .await;
     }
 }
@@ -963,7 +962,7 @@ async fn send_beacon<T: DataPlaneTransport>(
     camera_on: bool,
     sharing: bool,
 ) {
-    let frame = chat::video::CallControl::Beacon {
+    let frame = media_service::video::CallControl::Beacon {
         muted,
         camera_on,
         sharing,
@@ -989,7 +988,7 @@ fn push_effective_rate(
         .filter_map(|peer| inbound_hints.get(peer))
         .copied()
         .min()
-        .unwrap_or(chat::video::RATE_LADDER_KBPS[0]);
+        .unwrap_or(media_service::video::RATE_LADDER_KBPS[0]);
     if next != *effective_kbps {
         *effective_kbps = next;
         let _ = control_out.try_send(noded::CallControlOut::RateHint { max_kbps: next });
@@ -1014,12 +1013,12 @@ async fn evaluate_rate_windows<T: DataPlaneTransport>(
         let lossy = dropped * 10 > (complete + dropped); // >10%
         let next = if lossy {
             lane.clean_windows = 0;
-            chat::video::step_down(lane.hint_kbps)
+            media_service::video::step_down(lane.hint_kbps)
         } else {
             lane.clean_windows = lane.clean_windows.saturating_add(1);
             if lane.clean_windows >= 3 {
                 lane.clean_windows = 0;
-                chat::video::step_up(lane.hint_kbps)
+                media_service::video::step_up(lane.hint_kbps)
             } else {
                 lane.hint_kbps
             }
@@ -1029,7 +1028,7 @@ async fn evaluate_rate_windows<T: DataPlaneTransport>(
             let _ = ctl
                 .send_to(
                     PeerId(*raw),
-                    &chat::video::CallControl::RateHint { max_kbps: next }.encode(),
+                    &media_service::video::CallControl::RateHint { max_kbps: next }.encode(),
                 )
                 .await;
         }
@@ -1039,7 +1038,9 @@ async fn evaluate_rate_windows<T: DataPlaneTransport>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use data_plane::{BoxFuture, DatagramSocket, PlaneConfig, PlaneStream, StreamListener, TransportError};
+    use data_plane::{
+        BoxFuture, DatagramSocket, PlaneConfig, PlaneStream, StreamListener, TransportError,
+    };
     use std::net::{IpAddr, SocketAddr};
 
     #[test]
@@ -1053,12 +1054,14 @@ mod tests {
         assert_eq!(decode_page_cursor(&frame), Some(cursor));
         assert!(decode_page_cursor(&frame[..8]).is_none());
         assert!(decode_page_cursor(&[9; PRESENCE_HEADER]).is_none());
-        assert!(encode_page_cursor(&noded::PageCursor {
-            block_id: Some("x".repeat(257)),
-            anchor: 0,
-            head: 0,
-        })
-        .is_none());
+        assert!(
+            encode_page_cursor(&noded::PageCursor {
+                block_id: Some("x".repeat(257)),
+                anchor: 0,
+                head: 0,
+            })
+            .is_none()
+        );
     }
 
     /// A socket factory whose binds NEVER succeed — the overlay interface that
@@ -1075,7 +1078,10 @@ mod tests {
     }
 
     impl SocketFactory for DeadFactory {
-        fn bind_udp(&self, _addr: SocketAddr) -> BoxFuture<'_, std::io::Result<Box<dyn DatagramSocket>>> {
+        fn bind_udp(
+            &self,
+            _addr: SocketAddr,
+        ) -> BoxFuture<'_, std::io::Result<Box<dyn DatagramSocket>>> {
             Box::pin(async { no_interface() })
         }
 
@@ -1107,7 +1113,7 @@ mod tests {
         tokio::spawn(hub_loop(
             requests_rx,
             Arc::new(DeadFactory),
-            crate::voice_plane::MediaPeers::new("test-namespace".into()),
+            crate::overlay_book::OverlayPeers::new("test-namespace".into()),
             [7u8; 32],
             data_plane::PlaneMonitor::default(),
         ));
@@ -1455,7 +1461,7 @@ mod tests {
         // video: a keyframe from A must never reach B's webview...
         session_a
             .video_in
-            .send(chat::call_wire::CapturedFrame {
+            .send(media_service::call_wire::CapturedFrame {
                 keyframe: true,
                 ts_ms: 7,
                 data: vec![0xA0; 5000],
@@ -1492,7 +1498,7 @@ mod tests {
     /// the two request lanes; keep them alive for the test's duration. Each
     /// forwarder relabels the frame with the SENDER's key (the overlay's
     /// source-`/128` authentication in production) and routes to the peer's
-    /// matching-service ingress by the plane header's service byte (`frame[1]`).
+    /// matching-service ingress by the plane header's service id.
     fn two_hubs(
         key_a: [u8; 32],
         key_b: [u8; 32],
@@ -1521,11 +1527,9 @@ mod tests {
                     else => break,
                 };
                 if a_to_b(&frame) {
-                    let dst = if frame.get(1) == Some(&(Service::Video as u8)) {
-                        &b_video_in
-                    } else {
-                        &b_voice_in
-                    };
+                    let is_video = data_plane::wire::decode_datagram(&frame)
+                        .is_ok_and(|(service, _, _)| service == Service::Video);
+                    let dst = if is_video { &b_video_in } else { &b_voice_in };
                     let _ = dst.send((a_id, frame)).await;
                 }
             }
@@ -1538,11 +1542,9 @@ mod tests {
                     Some((_to, f)) = b_video_out_rx.recv() => f,
                     else => break,
                 };
-                let dst = if frame.get(1) == Some(&(Service::Video as u8)) {
-                    &a_video_in
-                } else {
-                    &a_voice_in
-                };
+                let is_video = data_plane::wire::decode_datagram(&frame)
+                    .is_ok_and(|(service, _, _)| service == Service::Video);
+                let dst = if is_video { &a_video_in } else { &a_voice_in };
                 let _ = dst.send((b_id, frame)).await;
             }
         });
@@ -1586,7 +1588,7 @@ mod tests {
         // a 5000-byte keyframe fragments across ≥4 datagrams.
         session_a
             .video_in
-            .send(chat::call_wire::CapturedFrame {
+            .send(media_service::call_wire::CapturedFrame {
                 keyframe: true,
                 ts_ms: 7,
                 data: keyframe_data.clone(),
@@ -1605,7 +1607,7 @@ mod tests {
         // a second (delta) frame with a different fill crosses intact too.
         session_a
             .video_in
-            .send(chat::call_wire::CapturedFrame {
+            .send(media_service::call_wire::CapturedFrame {
                 keyframe: false,
                 ts_ms: 40,
                 data: delta_data.clone(),
@@ -1635,9 +1637,8 @@ mod tests {
         let mut dropped_one = false;
         let (req_a_tx, req_b_tx) = two_hubs(key_a, key_b, move |frame| {
             if !dropped_one
-                && frame.len() > 12
-                && frame[1] == Service::Video as u8
-                && let Ok((header, _)) = chat::video::decode_fragment(&frame[12..])
+                && let Ok((Service::Video, _, payload)) = data_plane::wire::decode_datagram(frame)
+                && let Ok((header, _)) = media_service::video::decode_fragment(payload)
                 && header.frag_index == 1
             {
                 dropped_one = true;
@@ -1668,7 +1669,7 @@ mod tests {
         // frame 0 loses a fragment (incomplete); frame 1 completes.
         session_a
             .video_in
-            .send(chat::call_wire::CapturedFrame {
+            .send(media_service::call_wire::CapturedFrame {
                 keyframe: true,
                 ts_ms: 1,
                 data: vec![0xA0; 5000],
@@ -1677,7 +1678,7 @@ mod tests {
             .expect("session a alive");
         session_a
             .video_in
-            .send(chat::call_wire::CapturedFrame {
+            .send(media_service::call_wire::CapturedFrame {
                 keyframe: false,
                 ts_ms: 2,
                 data: vec![0xB1; 5000],
@@ -1778,8 +1779,14 @@ mod tests {
 
         let session_a = open(req_a_tx.clone()).await;
         let mut session_b = open(req_b_tx.clone()).await;
-        session_a.recipients.send(vec![key_b]).expect("session a alive");
-        session_b.recipients.send(vec![key_a]).expect("session b alive");
+        session_a
+            .recipients
+            .send(vec![key_b])
+            .expect("session a alive");
+        session_b
+            .recipients
+            .send(vec![key_a])
+            .expect("session b alive");
         // gate barrier: the keyframe below is one-shot, and a roster reaches
         // BOTH admission gates (A's send side, B's receive side)
         // asynchronously — audio crossing is the proof they are open.
@@ -1790,7 +1797,7 @@ mod tests {
         let first: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
         session_a
             .video_in
-            .send(chat::call_wire::CapturedFrame {
+            .send(media_service::call_wire::CapturedFrame {
                 keyframe: true,
                 ts_ms: 1,
                 data: first.clone(),
@@ -1808,7 +1815,10 @@ mod tests {
         // lane. Wait out two ticks (generous), then restore the roster.
         session_b.recipients.send(vec![]).expect("session b alive");
         tokio::time::sleep(Duration::from_millis(2200)).await;
-        session_b.recipients.send(vec![key_a]).expect("session b alive");
+        session_b
+            .recipients
+            .send(vec![key_a])
+            .expect("session b alive");
 
         // A rejoins with a FRESH session on the same hub: teardown + reopen
         // resets frame_no to 0.
@@ -1827,7 +1837,7 @@ mod tests {
         let rejoined: Vec<u8> = (0..5000).map(|i| ((i * 3 + 1) % 251) as u8).collect();
         session_a2
             .video_in
-            .send(chat::call_wire::CapturedFrame {
+            .send(media_service::call_wire::CapturedFrame {
                 keyframe: true,
                 ts_ms: 2,
                 data: rejoined.clone(),
@@ -1897,7 +1907,7 @@ mod tests {
             data_plane::wire::encode_datagram(
                 Service::Voice,
                 flow,
-                &chat::video::CallControl::RateHint { max_kbps }.encode(),
+                &media_service::video::CallControl::RateHint { max_kbps }.encode(),
             )
             .expect("datagram encodes")
         };
@@ -1909,7 +1919,10 @@ mod tests {
         let hint = tokio::time::timeout(Duration::from_secs(5), next_rate_hint(&mut control_out))
             .await
             .expect("a rate hint must reach the encoder");
-        assert_eq!(hint, 300, "a 1 kbps hint must clamp up to the ladder bottom");
+        assert_eq!(
+            hint, 300,
+            "a 1 kbps hint must clamp up to the ladder bottom"
+        );
 
         voice_in
             .send((PeerId(peer), inject(4_000_000_000)))
@@ -1918,7 +1931,10 @@ mod tests {
         let hint = tokio::time::timeout(Duration::from_secs(5), next_rate_hint(&mut control_out))
             .await
             .expect("a rate hint must reach the encoder");
-        assert_eq!(hint, 1200, "a 4e9 kbps hint must clamp down to the ladder top");
+        assert_eq!(
+            hint, 1200,
+            "a 4e9 kbps hint must clamp down to the ladder top"
+        );
 
         drop(req_tx);
     }
@@ -1981,9 +1997,10 @@ mod overlay_e2e {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     use commonware_cryptography::{Signer as _, ed25519};
-    use defguard_wireguard_rs::{InterfaceConfiguration, key::Key, net::IpAddrMask, peer::Peer};
     use overlay_net::userspace::{UserspaceWireGuardEffect, VirtualSocketFactory};
-    use wireguard::effect::WireGuardEffect;
+    use wireguard::effect::{InterfaceConfig, PeerTunnelConfig, WireGuardEffect};
+    use wireguard::{AllowedIp, X25519PublicKey};
+    use x25519_dalek::{PublicKey, StaticSecret};
 
     use super::*;
 
@@ -1996,7 +2013,7 @@ mod overlay_e2e {
     /// underlay endpoint of its bound WG socket.
     struct OverlayNode {
         effect: UserspaceWireGuardEffect,
-        wg_secret: Key,
+        wg_secret: [u8; 32],
         node_key: ed25519::PublicKey,
         raw_key: [u8; 32],
         ula: Ipv6Addr,
@@ -2005,29 +2022,36 @@ mod overlay_e2e {
 
     /// any 32 bytes are a valid X25519 secret (the curve clamps); each node
     /// needs a distinct one.
-    fn wg_secret(seed: u8) -> Key {
+    fn wg_secret(seed: u8) -> [u8; 32] {
         let mut bytes = [seed; 32];
         bytes[0] = seed.wrapping_add(1);
-        Key::new(bytes)
+        bytes
     }
 
-    fn config(node: &OverlayNode, port: u16, peers: Vec<Peer>) -> InterfaceConfiguration {
-        InterfaceConfiguration {
+    /// a member's cryptokey route: its overlay `/128`.
+    fn member_route(ula: Ipv6Addr) -> AllowedIp {
+        AllowedIp::new(IpAddr::V6(ula), 128).expect("a /128 is a valid route")
+    }
+
+    fn config(node: &OverlayNode, port: u16, peers: Vec<PeerTunnelConfig>) -> InterfaceConfig {
+        InterfaceConfig {
             name: "dt-huddle".into(),
-            prvkey: node.wg_secret.to_string(),
-            addresses: vec![IpAddrMask::new(IpAddr::V6(node.ula), 128)],
-            port,
+            private_key: node.wg_secret,
+            listen_port: port,
+            addresses: vec![member_route(node.ula)],
             peers,
-            mtu: None,
-            fwmark: None,
         }
     }
 
-    fn peer_entry(of: &OverlayNode, endpoint: Option<SocketAddr>) -> Peer {
-        let mut peer = Peer::new(of.wg_secret.public_key());
-        peer.endpoint = endpoint;
-        peer.set_allowed_ips(vec![IpAddrMask::new(IpAddr::V6(of.ula), 128)]);
-        peer
+    fn peer_entry(of: &OverlayNode, endpoint: Option<SocketAddr>) -> PeerTunnelConfig {
+        PeerTunnelConfig {
+            wireguard_public_key: X25519PublicKey(
+                PublicKey::from(&StaticSecret::from(of.wg_secret)).to_bytes(),
+            ),
+            endpoint,
+            allowed_ips: vec![member_route(of.ula)],
+            keepalive_seconds: None,
+        }
     }
 
     /// stand a node up: its overlay `/128` is `ula_v6_member_addr(NS, key)` —
@@ -2037,10 +2061,7 @@ mod overlay_e2e {
     fn stand_up(node_seed: u64, wg_seed: u8) -> OverlayNode {
         let node_key = ed25519::PrivateKey::from_seed(node_seed).public_key();
         let raw_key: [u8; 32] = node_key.as_ref().try_into().expect("ed25519 is 32 bytes");
-        let ula = wireguard::ula_v6_member_addr(
-            NS,
-            wireguard::ValidatorIdentity(raw_key),
-        );
+        let ula = wireguard::ula_v6_member_addr(NS, wireguard::ValidatorIdentity(raw_key));
         let mut node = OverlayNode {
             effect: UserspaceWireGuardEffect::new(tokio::runtime::Handle::current()),
             wg_secret: wg_secret(wg_seed),
@@ -2075,15 +2096,15 @@ mod overlay_e2e {
 
     /// the media peer set both hubs track: both members, so each resolves the
     /// other's `/128` (forward) and authenticates its source (reverse).
-    fn media_peers(nodes: &[&OverlayNode]) -> Arc<MediaPeers> {
-        let peers = MediaPeers::new(NS.to_string());
+    fn media_peers(nodes: &[&OverlayNode]) -> Arc<OverlayPeers> {
+        let peers = OverlayPeers::new(NS.to_string());
         peers.set_peers(nodes.iter().map(|n| &n.node_key));
         peers
     }
 
     /// spawn a hub over a node's overlay stack (its OWN runtime binds the media
     /// sockets; the stack keeps polling on this test's runtime).
-    fn spawn_over(node: &OverlayNode, peers: Arc<MediaPeers>) -> noded::CallLane {
+    fn spawn_over(node: &OverlayNode, peers: Arc<OverlayPeers>) -> noded::CallLane {
         let (req_tx, req_rx) = mpsc::channel(4);
         let factory: Arc<dyn SocketFactory> =
             Arc::new(VirtualSocketFactory::new(node.effect.stack_slot()));

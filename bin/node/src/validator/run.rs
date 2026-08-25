@@ -18,7 +18,7 @@ use crate::reachability_plane::GateOutcomes;
 use crate::rpc::{JoinRequestRecord, RpcJob};
 use crate::sync::serve::SyncStateRequest;
 use crate::util::{participant_bytes, resident_bytes};
-use crate::{lobby, relay_runtime, voice_plane};
+use crate::{join_gate, overlay_book, relay_runtime};
 
 pub(super) type ValidatorNode = node::OrderedNode<
     consensus::SimplexOrderer,
@@ -43,7 +43,7 @@ struct GatePending {
 
 /// write a resolved gate outcome where the intro doorbell reads it — the
 /// shared map the joiner's next retransmit is answered from (join ADR §4).
-fn settle_gate(outcomes: &GateOutcomes, joiner: Vec<u8>, reply: lobby::IntroReply) {
+fn settle_gate(outcomes: &GateOutcomes, joiner: Vec<u8>, reply: join_gate::IntroReply) {
     outcomes
         .lock()
         .expect("gate outcomes lock")
@@ -100,7 +100,7 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) mesh_window: crate::mesh_window::MeshWindowTracker,
     pub(super) mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
     pub(super) gateway_book: Option<std::sync::Arc<crate::gateway_plane::OverlayBook>>,
-    pub(super) media_peers: Option<std::sync::Arc<voice_plane::MediaPeers>>,
+    pub(super) media_peers: Option<std::sync::Arc<overlay_book::OverlayPeers>>,
     pub(super) blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
     pub(super) blob_client: crate::blob_fetch::ServeLaneBlobClient<super::MeshSender>,
     pub(super) reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
@@ -108,11 +108,11 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) sync_state_rx: futures::channel::mpsc::Receiver<SyncStateRequest>,
     /// the join GATE's forward lane from the intro doorbell (join ADR §4):
     /// verified gate requests the reachability plane rang through.
-    pub(super) gate_fwd_rx: tokio::sync::mpsc::Receiver<lobby::GateForward>,
+    pub(super) gate_fwd_rx: tokio::sync::mpsc::Receiver<join_gate::GateForward>,
     /// a never-sending clone of the forward lane's sender, held so the select
     /// arm stays PENDING (instead of None-spinning) when no reachability
     /// plane was wired to ring the doorbell.
-    pub(super) gate_fwd_keepalive: tokio::sync::mpsc::Sender<lobby::GateForward>,
+    pub(super) gate_fwd_keepalive: tokio::sync::mpsc::Sender<join_gate::GateForward>,
     /// where the drain writes each settled gate outcome; the doorbell reads
     /// it on the joiner's next retransmit.
     pub(super) gate_outcomes: GateOutcomes,
@@ -156,13 +156,13 @@ struct ValidatorRuntime<'a> {
     mesh_window: crate::mesh_window::MeshWindowTracker,
     mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
     gateway_book: Option<std::sync::Arc<crate::gateway_plane::OverlayBook>>,
-    media_peers: Option<std::sync::Arc<voice_plane::MediaPeers>>,
+    media_peers: Option<std::sync::Arc<overlay_book::OverlayPeers>>,
     blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
     blob_client: crate::blob_fetch::ServeLaneBlobClient<super::MeshSender>,
     reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
     relay_tx: super::MeshSender,
     gate_outcomes: GateOutcomes,
-    _gate_fwd_keepalive: tokio::sync::mpsc::Sender<lobby::GateForward>,
+    _gate_fwd_keepalive: tokio::sync::mpsc::Sender<join_gate::GateForward>,
     next_seq: u64,
     prev_ckpt: (Option<u64>, u64),
     signer: ed25519::PrivateKey,

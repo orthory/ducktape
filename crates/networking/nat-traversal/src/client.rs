@@ -21,10 +21,16 @@ use commonware_cryptography::ed25519;
 /// ADR's phase 3): the client rides the node's own WireGuard underlay
 /// socket — sends go out through it directly, and receives are the
 /// underlay demux's non-WireGuard lane. `Owned` is the standalone posture
-/// (a socket of this client's own), kept for the TUN backend, whose
-/// in-device socket cannot be shared.
+/// (a socket of this client's own) — what [`NatClient::bind`] mints for a
+/// client running without an overlay plane (the simulated-NAT acceptance
+/// suite, the reflexive probes).
 pub enum NatSocket {
     Owned(UdpSocket),
+    /// an endpoint of the deterministic in-process network
+    /// ([`crate::simnet`]) — the arm the simulated-NAT acceptance suite
+    /// drives the production rendezvous stack over.
+    #[cfg(any(test, feature = "simnat"))]
+    Simulated(crate::simnet::SimSocket),
     Shared {
         /// the underlay socket, for sends (concurrent-safe by itself).
         socket: Arc<UdpSocket>,
@@ -55,6 +61,8 @@ impl NatSocket {
     async fn send_to(&self, buf: &[u8], dst: SocketAddr) -> std::io::Result<usize> {
         match self {
             Self::Owned(sock) => sock.send_to(buf, dst).await,
+            #[cfg(any(test, feature = "simnat"))]
+            Self::Simulated(sock) => sock.send_to(buf, dst),
             Self::Shared { socket, local, .. } => {
                 // keyed on the socket's OWN family: production binds a real
                 // IPv4 `UnderlaySocket`, so a V4 destination is sent directly;
@@ -75,6 +83,8 @@ impl NatSocket {
     async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         match self {
             Self::Owned(sock) => sock.recv_from(buf).await,
+            #[cfg(any(test, feature = "simnat"))]
+            Self::Simulated(sock) => sock.recv_from(buf).await,
             Self::Shared { bypass, .. } => {
                 let mut lane = bypass.lock().await;
                 let (datagram, src) = lane.recv().await.ok_or_else(|| {
@@ -96,6 +106,8 @@ impl NatSocket {
     fn local_addr(&self) -> std::io::Result<SocketAddr> {
         match self {
             Self::Owned(sock) => sock.local_addr(),
+            #[cfg(any(test, feature = "simnat"))]
+            Self::Simulated(sock) => Ok(sock.local_addr()),
             Self::Shared { local, .. } => Ok(*local),
         }
     }
@@ -439,7 +451,7 @@ pub enum SocketEvent {
 /// The coordinator event loop: decode authenticated control datagrams, enforce
 /// the auth policy, feed the pure handler, and send replies. Pure rendezvous —
 /// never binds a data socket or carries peer traffic.
-pub async fn run_coordinator(sock: UdpSocket, policy: AuthPolicy) {
+pub async fn run_coordinator(sock: NatSocket, policy: AuthPolicy) {
     run_coordinator_with(sock, Coordinator::with_policy(policy)).await
 }
 
@@ -673,7 +685,7 @@ impl OrderedRequests {
 /// rendezvous state on the current-thread runtime, bounds all queues, and
 /// applies verified requests in receive order.
 pub async fn run_coordinator_workers_with_metrics(
-    sock: UdpSocket,
+    sock: NatSocket,
     policy: AuthPolicy,
     workers: usize,
     metrics: CoordinatorMetrics,
@@ -692,7 +704,7 @@ pub async fn run_coordinator_workers_with_metrics(
 /// coordinator's advert book ([`Coordinator::adverts`]) instead of the loops
 /// constructing a private one internally.
 pub async fn run_coordinator_workers_with_metrics_using(
-    sock: UdpSocket,
+    sock: NatSocket,
     mut coord: Coordinator,
     workers: usize,
     metrics: CoordinatorMetrics,
@@ -777,12 +789,12 @@ pub async fn run_coordinator_workers_with_metrics_using(
 
 /// [`run_coordinator`] with a caller-built [`Coordinator`] — the seam for a
 /// custom registration TTL or a pre-seeded book (tests, short-lived rigs).
-pub async fn run_coordinator_with(sock: UdpSocket, coord: Coordinator) {
+pub async fn run_coordinator_with(sock: NatSocket, coord: Coordinator) {
     run_coordinator_with_metrics(sock, coord, CoordinatorMetrics::default()).await
 }
 
 async fn run_coordinator_with_metrics(
-    sock: UdpSocket,
+    sock: NatSocket,
     mut coord: Coordinator,
     metrics: CoordinatorMetrics,
 ) {
@@ -908,7 +920,7 @@ mod tests {
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
         let coordinator = tokio::spawn(run_coordinator_workers_with_metrics(
-            coord_sock,
+            NatSocket::Owned(coord_sock),
             AuthPolicy::Public,
             4,
             CoordinatorMetrics::default(),
@@ -936,7 +948,7 @@ mod tests {
         let coord_addr = coord_sock.local_addr().unwrap();
         let metrics = CoordinatorMetrics::default();
         let coordinator = tokio::spawn(run_coordinator_workers_with_metrics(
-            coord_sock,
+            NatSocket::Owned(coord_sock),
             AuthPolicy::Public,
             4,
             metrics.clone(),
@@ -1016,7 +1028,7 @@ mod tests {
 
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        tokio::spawn(run_coordinator(coord_sock, policy));
+        tokio::spawn(run_coordinator(NatSocket::Owned(coord_sock), policy));
 
         // Two authorized nodes (joiners) with genesis caps.
         let a_signer = ed25519::PrivateKey::from_seed(200);
@@ -1090,7 +1102,7 @@ mod tests {
 
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        tokio::spawn(run_coordinator(coord_sock, policy));
+        tokio::spawn(run_coordinator(NatSocket::Owned(coord_sock), policy));
 
         let a_signer = ed25519::PrivateKey::from_seed(701);
         let b_signer = ed25519::PrivateKey::from_seed(702);
@@ -1140,7 +1152,10 @@ mod tests {
         // A live coordinator (the secondary).
         let live = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let live_addr = live.local_addr().unwrap();
-        tokio::spawn(run_coordinator(live, crate::auth::AuthPolicy::Public));
+        tokio::spawn(run_coordinator(
+            NatSocket::Owned(live),
+            crate::auth::AuthPolicy::Public,
+        ));
 
         // A DEAD primary: a bound socket nobody ever serves. Datagrams sent to
         // it are buffered and never answered, so the per-try budget elapses.
@@ -1170,7 +1185,10 @@ mod tests {
         // previous test this proves neither position is uniquely required.
         let live = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let live_addr = live.local_addr().unwrap();
-        tokio::spawn(run_coordinator(live, crate::auth::AuthPolicy::Public));
+        tokio::spawn(run_coordinator(
+            NatSocket::Owned(live),
+            crate::auth::AuthPolicy::Public,
+        ));
         let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = dead.local_addr().unwrap();
 
@@ -1190,7 +1208,10 @@ mod tests {
     async fn client_discovers_its_reflexive_via_coordinator() {
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        tokio::spawn(run_coordinator(coord_sock, crate::auth::AuthPolicy::Public));
+        tokio::spawn(run_coordinator(
+            NatSocket::Owned(coord_sock),
+            crate::auth::AuthPolicy::Public,
+        ));
 
         let (_, client) = public_client(3, vec![coord_addr]).await;
         let reflexive = client.discover_reflexive().await.unwrap();
@@ -1204,7 +1225,10 @@ mod tests {
     async fn discover_reflexive_ignores_forged_bind_response_from_non_coordinator() {
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        tokio::spawn(run_coordinator(coord_sock, crate::auth::AuthPolicy::Public));
+        tokio::spawn(run_coordinator(
+            NatSocket::Owned(coord_sock),
+            crate::auth::AuthPolicy::Public,
+        ));
 
         let (_, client) = public_client(4, vec![coord_addr]).await;
         let client_addr = client.local_addr().await.unwrap();
@@ -1236,7 +1260,10 @@ mod tests {
     async fn recv_punch_from_ignores_spoofed_punch_from_wrong_sender() {
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        tokio::spawn(run_coordinator(coord_sock, crate::auth::AuthPolicy::Public));
+        tokio::spawn(run_coordinator(
+            NatSocket::Owned(coord_sock),
+            crate::auth::AuthPolicy::Public,
+        ));
 
         let (a_key, a) = public_client(5, vec![coord_addr]).await;
         let (_, b) = public_client(6, vec![coord_addr]).await;
@@ -1288,7 +1315,10 @@ mod tests {
     async fn shared_transport_rides_the_given_socket_for_reflexive_and_punch() {
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        tokio::spawn(run_coordinator(coord_sock, crate::auth::AuthPolicy::Public));
+        tokio::spawn(run_coordinator(
+            NatSocket::Owned(coord_sock),
+            crate::auth::AuthPolicy::Public,
+        ));
 
         // the "underlay": a plain socket whose receive side is pumped into
         // the bypass lane wholesale — the overlay-net demux with every
@@ -1372,7 +1402,10 @@ mod tests {
     async fn dual_stack_shared_transport_reaches_a_v4_coordinator() {
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        tokio::spawn(run_coordinator(coord_sock, crate::auth::AuthPolicy::Public));
+        tokio::spawn(run_coordinator(
+            NatSocket::Owned(coord_sock),
+            crate::auth::AuthPolicy::Public,
+        ));
 
         // bind the defensive dual-stack `[::]:0` shape (a std socket handed
         // to tokio) that this test guards — production binds V4 instead.
@@ -1448,7 +1481,10 @@ mod tests {
     async fn direct_path_survives_coordinator_shutdown() {
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        let coord = tokio::spawn(run_coordinator(coord_sock, crate::auth::AuthPolicy::Public));
+        let coord = tokio::spawn(run_coordinator(
+            NatSocket::Owned(coord_sock),
+            crate::auth::AuthPolicy::Public,
+        ));
 
         let (a_key, a) = public_client(11, vec![coord_addr]).await;
         let (b_key, b) = public_client(12, vec![coord_addr]).await;
@@ -1496,7 +1532,10 @@ mod tests {
         // sends `Msg::Readvertise` over UDP and a peer re-resolves the new mapping.
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        tokio::spawn(run_coordinator(coord_sock, crate::auth::AuthPolicy::Public));
+        tokio::spawn(run_coordinator(
+            NatSocket::Owned(coord_sock),
+            crate::auth::AuthPolicy::Public,
+        ));
 
         let (a_key, a_signer) = identity(13);
         let a = NatClient::bind(a_key, vec![coord_addr], a_signer.clone(), None)
@@ -1554,7 +1593,10 @@ mod tests {
         // coordinator that answered.
         let live = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let live_addr = live.local_addr().unwrap();
-        tokio::spawn(run_coordinator(live, crate::auth::AuthPolicy::Public));
+        tokio::spawn(run_coordinator(
+            NatSocket::Owned(live),
+            crate::auth::AuthPolicy::Public,
+        ));
         let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dead_addr = dead.local_addr().unwrap();
 
@@ -1592,7 +1634,10 @@ mod tests {
     async fn socket_events_dispatch_lookup_response_and_punch_sync_and_filter_forgeries() {
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
-        tokio::spawn(run_coordinator(coord_sock, crate::auth::AuthPolicy::Public));
+        tokio::spawn(run_coordinator(
+            NatSocket::Owned(coord_sock),
+            crate::auth::AuthPolicy::Public,
+        ));
 
         let (a_key, a) = public_client(17, vec![coord_addr]).await;
         let (b_key, b) = public_client(18, vec![coord_addr]).await;

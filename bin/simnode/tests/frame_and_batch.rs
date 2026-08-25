@@ -213,7 +213,11 @@ fn a_byte_identical_frame_resubmit_is_stopped_by_the_files_cas_not_a_consensus_s
     // it JOURNALS its rejected block now (validator parity: a rejected single op
     // rides the drain and seals its own height), so the height advanced to 2. the
     // state was NOT double-committed: only the honest no-op is journaled.
-    assert_eq!(sim.status()["height"], 2, "the rejected resubmit sealed its own block");
+    assert_eq!(
+        sim.status()["height"],
+        2,
+        "the rejected resubmit sealed its own block"
+    );
 }
 
 // ── E2 — multi-op batch blocks ──────────────────────────
@@ -449,7 +453,7 @@ fn kv_set(key: &[u8], value: &[u8]) -> serde_json::Value {
     serde_json::json!({ "set": { "key": key.to_vec(), "value": value.to_vec() } })
 }
 fn create_page(id: &str) -> serde_json::Value {
-    serde_json::json!({ "create_page": { "page_id": id, "title": id, "parent": null } })
+    serde_json::json!({ "create_page": { "page_id": id, "title": id } })
 }
 fn create_task(id: &str) -> serde_json::Value {
     serde_json::json!({ "task": { "create_task": { "task_id": id, "title": id } } })
@@ -615,7 +619,8 @@ fn a_multi_module_script_converges_logically_while_qmdb_roots_split_on_block_str
     // moved to the index guest), so convergence is asserted per page the script
     // created — which names them instead of trusting a list's ordering.
     for page_id in ["p1", "p2"] {
-        let query = serde_json::json!({ "get_page": { "page_id": page_id, "after": null, "limit": 0 } });
+        let query =
+            serde_json::json!({ "get_page": { "page_id": page_id, "after": null, "limit": 0 } });
         assert_eq!(
             sim_a.query("pages", query.clone()),
             sim_b.query("pages", query),

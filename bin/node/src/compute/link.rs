@@ -77,13 +77,12 @@ pub(crate) async fn attach(
 
 /// One connection's lifetime: hints out of it, output lines into it. Returns
 /// when the socket closes, so the caller redials.
-async fn pump<S>(
-    socket: S,
-    hint: &Notify,
-    lines: &mut mpsc::Receiver<OutputLine>,
-) where
-    S: futures::Sink<tokio_tungstenite::tungstenite::Message, Error = tokio_tungstenite::tungstenite::Error>
-        + futures::Stream<
+async fn pump<S>(socket: S, hint: &Notify, lines: &mut mpsc::Receiver<OutputLine>)
+where
+    S: futures::Sink<
+            tokio_tungstenite::tungstenite::Message,
+            Error = tokio_tungstenite::tungstenite::Error,
+        > + futures::Stream<
             Item = Result<
                 tokio_tungstenite::tungstenite::Message,
                 tokio_tungstenite::tungstenite::Error,

@@ -1,9 +1,10 @@
-use super::envelope::RUNNER_RESULT_VERSION;
+use super::envelope::RUNNER_RESULT_MARKER;
 use super::{AgentResponse, Deserialize, Serialize};
 
-/// the faceted job-finalize payload envelope version (the `ducktape_delivery`
-/// wrapper every run's finalize carries).
-const DELIVERY_RECEIPT_VERSION: u32 = 1;
+/// the fixed value of the `ducktape_delivery` magic key on the faceted
+/// job-finalize payload — part of the wrapper's self-identifying token,
+/// never a version.
+const DELIVERY_RECEIPT_MARKER: u32 = 1;
 
 /// the wrapper the oracle's provisioning path returns instead of the bare
 /// response text: the model prose plus the host-assembled facets — message
@@ -30,9 +31,19 @@ pub(super) struct RunnerResult {
     pub(super) status: WireStatus,
 }
 
+/// field-for-field mirror of compute-service's assembled receipt.
+/// `deny_unknown_fields`: the receipt is this crate's contract with the
+/// assembler, and a key this build does not know is skew, never something to
+/// tolerate — the mirrors must stay provably identical.
 #[derive(Deserialize, Default, Debug)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WorkspaceReceipt {
     pub(crate) source_prefix: String,
+    /// the pinned SOURCE snapshot echoed from the envelope (contract §5 keeps
+    /// it on the receipt). decode-validated only: delivery derives everything
+    /// from the OUTPUT coordinates.
+    #[allow(dead_code)]
+    pub(crate) source_snapshot: Option<String>,
     pub(crate) output_snapshot: Option<String>,
     pub(crate) commit_height: Option<u64>,
     pub(crate) rebased: bool,
@@ -110,17 +121,17 @@ pub(super) enum WireStatus {
 // the single delivery path decodes the runner result below and applies whatever
 // facets it carries; a plain (message-only) result carries none.
 
-/// decode the full faceted [`RunnerResult`]. marker + version strict (R4): a
-/// result that is not a well-formed `ducktape_runner_result` wrapper of the
-/// understood version FAILS THE RUN, deterministically — the flat-string
-/// passthrough for marker-less bytes is gone (flag day; the oracle always
-/// wraps).
-pub(super) fn decode_run_result_v1(bytes: &[u8]) -> Result<RunnerResult, String> {
+/// decode the full faceted [`RunnerResult`]. marker strict (R4): a result
+/// that is not a well-formed `ducktape_runner_result` wrapper FAILS THE RUN,
+/// deterministically — the flat-string passthrough for marker-less bytes is
+/// gone (the oracle always wraps).
+pub(super) fn decode_run_result(bytes: &[u8]) -> Result<RunnerResult, String> {
     let result: RunnerResult = serde_json::from_slice(bytes)
         .map_err(|e| format!("runner result is malformed (no flat-payload tolerance): {e}"))?;
-    if result.ducktape_runner_result != RUNNER_RESULT_VERSION {
+    if result.ducktape_runner_result != RUNNER_RESULT_MARKER {
         return Err(format!(
-            "runner result version {} is not supported (understands {RUNNER_RESULT_VERSION})",
+            "runner result marker {} is not the ducktape_runner_result magic \
+             ({RUNNER_RESULT_MARKER})",
             result.ducktape_runner_result
         ));
     }
@@ -163,8 +174,8 @@ pub(super) fn encode_delivery_receipt(
 ) -> String {
     // an output exists when the run produced a duckfs snapshot OR pushed a
     // forge commit; both distill into the one output_ref shape.
-    let output_ref = (receipt.output_snapshot.is_some() || receipt.output_commit.is_some())
-        .then(|| OutputRef {
+    let output_ref =
+        (receipt.output_snapshot.is_some() || receipt.output_commit.is_some()).then(|| OutputRef {
             source_prefix: &receipt.source_prefix,
             output_snapshot: receipt.output_snapshot.as_deref(),
             commit_height: receipt.commit_height,
@@ -183,7 +194,7 @@ pub(super) fn encode_delivery_receipt(
     // capped by validation (MAX_REPLY_BLOCKS_BYTES + MAX_ACTIONS_BYTES) and
     // output_ref/status are tiny, so this receipt always fits by construction.
     serde_json::to_string(&DeliveryReceipt {
-        ducktape_delivery: DELIVERY_RECEIPT_VERSION,
+        ducktape_delivery: DELIVERY_RECEIPT_MARKER,
         response,
         output_ref,
         status,

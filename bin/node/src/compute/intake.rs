@@ -410,16 +410,15 @@ impl WorkPump {
             .iter()
             .map(|r| (r.saga_id.clone(), r.attempt))
             .collect();
-        let newest = assigned.iter().fold(
-            HashMap::<String, u32>::new(),
-            |mut newest, request| {
+        let newest = assigned
+            .iter()
+            .fold(HashMap::<String, u32>::new(), |mut newest, request| {
                 newest
                     .entry(request.saga_id.clone())
                     .and_modify(|attempt| *attempt = (*attempt).max(request.attempt))
                     .or_insert(request.attempt);
                 newest
-            },
-        );
+            });
         let control = self.control.clone();
         let me = &self.me;
         self.work.retain(|key, entry| {
@@ -950,7 +949,9 @@ mod tests {
         let mut pump = pump;
         pump.pool = Box::new(SkipWorker);
         assert!(
-            pump.bid(announcement("s", 0), &("s".into(), 0)).await.is_none(),
+            pump.bid(announcement("s", 0), &("s".into(), 0))
+                .await
+                .is_none(),
             "an unservable announcement produces no bid"
         );
         assert!(pump.claims.is_empty(), "a skip is never latched");
@@ -978,7 +979,11 @@ mod tests {
             &mut decided,
         );
         assert_eq!(decided.len(), 1, "admitted work goes on to the pool");
-        assert_eq!(pump.tracked(), 0, "and is tracked by `plan`, not by the gate");
+        assert_eq!(
+            pump.tracked(),
+            0,
+            "and is tracked by `plan`, not by the gate"
+        );
 
         pump.record(
             request("refused", 0),
@@ -998,7 +1003,9 @@ mod tests {
         else {
             panic!("a refused attempt must carry a due op, or the saga parks forever");
         };
-        let Ok(SagaMsg::OracleResult { outcome, attempt, .. }) = saga::decode_msg(&msg.payload)
+        let Ok(SagaMsg::OracleResult {
+            outcome, attempt, ..
+        }) = saga::decode_msg(&msg.payload)
         else {
             panic!("the refusal op must be an OracleResult");
         };
@@ -1011,7 +1018,11 @@ mod tests {
             WorkVerdict::AuthorityUnavailable,
             &mut decided,
         );
-        assert_eq!(decided.len(), 2, "an undecided attempt is dropped from the pass");
+        assert_eq!(
+            decided.len(),
+            2,
+            "an undecided attempt is dropped from the pass"
+        );
         assert!(
             !pump.work.contains_key(&("undecided".to_string(), 0)),
             "an undecided attempt is NOT tracked: nothing may burn an attempt on a read \

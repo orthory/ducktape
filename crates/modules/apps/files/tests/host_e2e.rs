@@ -36,7 +36,7 @@ fn open_host(dir: &tempfile::TempDir) -> Host {
 }
 
 /// the block-constant consensus context: height doubles as the agreed logical
-/// clock, baseline protocol version (no upgrade module registered here).
+/// clock.
 fn bctx(height: u64, origin: Origin) -> BlockContext {
     BlockContext {
         height,

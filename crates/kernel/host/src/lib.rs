@@ -37,7 +37,6 @@ use sdk::{
 };
 use sha2::{Digest, Sha256};
 
-pub mod topology;
 pub mod worker;
 
 /// compute the global root-hash over `modules` — the composition consensus

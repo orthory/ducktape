@@ -381,7 +381,7 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
         // pages
         (
             "pages",
-            json!({ "create_page": { "page_id": "p1", "title": "Sweep", "parent": null } }),
+            json!({ "create_page": { "page_id": "p1", "title": "Sweep" } }),
             Some("owner".into()),
         ),
         // agent
@@ -433,7 +433,6 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
 /// namespace. deterministic: same seed, same preimage, same signature.
 fn gateway_set_route(key: &Ed, node: &str) -> Value {
     let statement = gateway::RouteStatement {
-        version: 1,
         chain_id: "local".into(),
         account_id: key.public_key().as_ref().to_vec(),
         name: gateway::RouteName::named("api"),

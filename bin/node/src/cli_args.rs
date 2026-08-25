@@ -167,12 +167,7 @@ pub struct NodeAddr {
     #[arg(long, value_name = "HTTP-URL", global = true)]
     pub node: Option<String>,
     /// a registered workspace's chain id — resolves to its node.toml http_listen
-    #[arg(
-        short = 'n',
-        long = "network",
-        value_name = "CHAIN-ID",
-        global = true
-    )]
+    #[arg(short = 'n', long = "network", value_name = "CHAIN-ID", global = true)]
     pub network: Option<String>,
 }
 
@@ -380,10 +375,7 @@ impl NodeAddr {
     /// operator stated and BEFORE the registry inference. `fs` inside a checkout
     /// passes the `.duckfs` index's recorded url: more specific than "the one
     /// workspace registered on this box", less specific than a flag.
-    pub fn resolve_with(
-        &self,
-        context: impl FnOnce() -> Option<String>,
-    ) -> Result<String, String> {
+    pub fn resolve_with(&self, context: impl FnOnce() -> Option<String>) -> Result<String, String> {
         rung_base(self.ladder_rung(env_node(), context))
     }
 
@@ -701,14 +693,18 @@ mod tests {
         let Err(why) = rung_base(chain_id) else {
             panic!("a chain id is not an http base");
         };
-        assert!(why.contains("--node"), "it names the flag that took it: {why}");
+        assert!(
+            why.contains("--node"),
+            "it names the flag that took it: {why}"
+        );
         assert!(
             why.contains("-n/--network"),
             "and the flag that should have: {why}"
         );
 
         // the env rung is the same input by another name, and says so.
-        let Err(why) = rung_base(addr(None, None).ladder_rung(Some("mynet#d0cdf950".into()), || None))
+        let Err(why) =
+            rung_base(addr(None, None).ladder_rung(Some("mynet#d0cdf950".into()), || None))
         else {
             panic!("an env chain id is not an http base either");
         };

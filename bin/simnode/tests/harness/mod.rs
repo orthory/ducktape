@@ -248,7 +248,9 @@ impl Sim {
         )
     }
 
-    /// commit a concurrent writer's block, independent of the held queue.
+    /// commit a concurrent writer's one-op block, independent of the held
+    /// queue — a one-element `/sim/peer-block` batch whose single member must
+    /// apply. returns the `BatchInfo` reply (`height`, `root_hash`, `members`).
     pub fn peer_block(
         &self,
         target: &str,
@@ -259,12 +261,18 @@ impl Sim {
             "POST",
             "/sim/peer-block",
             Some(&serde_json::json!({
-                "target": target,
-                "payload": payload,
-                "origin": origin,
+                "ops": [{
+                    "target": target,
+                    "payload": payload,
+                    "origin": origin,
+                }],
             })),
         );
         assert_eq!(status, 200, "peer block failed: {reply}");
+        assert_eq!(
+            reply["members"][0]["disposition"], "applied",
+            "peer op rejected: {reply}"
+        );
         reply
     }
 
@@ -300,7 +308,10 @@ fn post_raw(
     body: &[u8],
 ) -> std::io::Result<(u16, serde_json::Value)> {
     let (status, raw) = nettest::try_http_bytes(port, "POST", path, content_type, body)?;
-    Ok((status, serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null)))
+    Ok((
+        status,
+        serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null),
+    ))
 }
 
 pub fn create_channel(channel: &str, name: &str) -> serde_json::Value {

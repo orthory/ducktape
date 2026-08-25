@@ -73,7 +73,7 @@ pub(crate) async fn read_sync_mesh_window(host: &Host) -> (u64, Vec<statesync::M
 
 /// read ONE committed invite redemption by token nonce — the exactly-once
 /// set's point read (committed+staged projection, between drains). an
-/// unreadable reply degrades to `None`: the lobby then simply cannot pre-empt
+/// unreadable reply degrades to `None`: the gate then simply cannot pre-empt
 /// a spent invite, and the in-consensus exactly-once check still holds.
 pub(crate) async fn read_redemption_from_host(
     host: &Host,

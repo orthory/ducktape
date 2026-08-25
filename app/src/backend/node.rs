@@ -848,7 +848,7 @@ impl SnapshotReader<PeersData> for Snapshot {
 /// names is exactly how the table came to read three the node never served.
 ///
 /// THE KEYS THE NODE ACTUALLY SERVES. This read `key`/`height`/`live` and
-/// `bin/noded/src/peers.rs` serves none of the three, so every row rendered a
+/// `crates/noded/src/peers.rs` serves none of the three, so every row rendered a
 /// blank name, a zero, and an offline dot — for peers that were connected.
 fn peer_rows(reply: &serde_json::Value) -> Vec<PeerRow> {
     reply["peers"]

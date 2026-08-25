@@ -470,8 +470,7 @@ impl ValidatorRelay {
                         // the chunks are still crossing the wire — the
                         // assembly hold earns the transfer allowance on top
                         // of the base, sized by the offered total.
-                        let deadline =
-                            now + SUBMIT_HOLD + relay::blob_transfer_allowance(total);
+                        let deadline = now + SUBMIT_HOLD + relay::blob_transfer_allowance(total);
                         self.incoming.insert(
                             frame_id,
                             IncomingBlob {

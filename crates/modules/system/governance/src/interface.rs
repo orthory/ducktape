@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 /// what a passing proposal DOES.
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum GovAction {
     /// admit a validator: emits `ValsetMsg::Join { key }` on execution.
     AddValidator { key: Vec<u8> },
@@ -88,22 +88,27 @@ pub enum GovAction {
 
 /// one non-transferable governance-share allocation.
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ShareAllocation {
     pub account_id: Vec<u8>,
     pub shares: u64,
 }
 
 /// what principal the proposal's ballot keys identify.
-#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(
+    Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq,
+)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum VoterKind {
     ValidatorNode,
     Account,
 }
 
 /// the exact decision rule frozen with a proposal.
-#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(
+    Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq,
+)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum VotingRule {
     /// Pass once `yes_power >= required_yes`; this covers validator-set
     /// snapshots and structural proposals requiring two thirds of all shares.
@@ -114,7 +119,7 @@ pub enum VotingRule {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum GovMsg {
     /// open a proposal. the verified submitter must belong to the current
     /// electorate selected by the current governance mode.
@@ -153,8 +158,10 @@ pub enum GovMsg {
 }
 
 /// a proposal's lifecycle. `Open` accepts votes; the rest are terminal.
-#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(
+    Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq,
+)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProposalStatus {
     Open,
     Passed,
@@ -163,6 +170,7 @@ pub enum ProposalStatus {
 
 /// the readable projection of one proposal.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProposalView {
     pub proposal_id: String,
     pub action: GovAction,
@@ -181,6 +189,7 @@ pub struct ProposalView {
 
 /// the current non-transferable share registry.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SharesView {
     pub active: bool,
     pub allocations: Vec<ShareAllocation>,
@@ -190,6 +199,7 @@ pub struct SharesView {
 /// the readable projection of one settled invite redemption — who invited
 /// whom, and when it landed.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RedemptionView {
     /// the redeemed token's nonce (the single-use key).
     pub nonce: Vec<u8>,
@@ -202,7 +212,7 @@ pub struct RedemptionView {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum GovQuery {
     /// every proposal, sorted by id (the roster-served enumeration — see the
     /// module doc for why this listing stays canonical).
@@ -218,7 +228,7 @@ pub enum GovQuery {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum GovReply {
     Proposals(Vec<ProposalView>),
     Proposal(Option<ProposalView>),

@@ -7,10 +7,9 @@
 //! EVERY current validator in bounded, content-addressed chunks; only after all
 //! validators acknowledge the bytes does one validator take consensus custody.
 //! the SENDING peer's transport identity is deliberately NOT consulted:
-//! residents speak from the network's DERIVED LOBBY identity (the lobby key
-//! folded into every mesh), which ANY invite holder can derive — so origin
-//! could never equal a real resident's transport peer, and a peer-vs-origin
-//! gate adds nothing anyway. the frame's OWN signature is the authorization
+//! mesh admission and submit authorization are separate facts, and a
+//! peer-vs-origin gate would fork this lane apart from the validator's local
+//! HTTP submit lane. the frame's OWN signature is the authorization
 //! AND the whole door: it binds (origin, seq, target, payload) to the origin
 //! key, so forgery is impossible, and a byte-identical replay collapses in the
 //! consensus lane's exactly-once digest gate. the door adds NO standing
@@ -23,7 +22,7 @@
 //! block's coordinates, Rejected for a deterministic no-op, Refused for door
 //! failures and expired holds.
 //!
-//! json on the wire: matches the lobby idiom. blob chunks use hex rather than a
+//! json on the wire: matches the module-interface idiom. blob chunks use hex rather than a
 //! JSON byte array so the encoded message stays below commonware's 2 MiB cap.
 
 use serde::{Deserialize, Serialize};
@@ -205,10 +204,9 @@ impl BlobAssembly {
 /// that is the WHOLE door — no standing set is consulted. any key's validly
 /// signed frame enters consensus here, exactly as it would on a validator's
 /// local HTTP submit lane; the two lanes deliberately carry one contract.
-/// the sending peer is DELIBERATELY not an argument: residents ride the
-/// network's derived lobby transport identity — derivable by any invite
-/// holder — so a peer-vs-origin check could never pass for a real resident
-/// and would gate nothing. authorization is per-module policy resolved
+/// the sending peer is DELIBERATELY not an argument: mesh admission and
+/// submit authorization are separate facts, and a peer-vs-origin check would
+/// fork the two submit lanes apart. authorization is per-module policy resolved
 /// deterministically at dispatch (the acl module's gate plus each module's
 /// own origin checks), never a transport-door decision — a door-side policy
 /// would only fork the two submit lanes apart again.

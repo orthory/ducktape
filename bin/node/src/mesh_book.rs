@@ -144,7 +144,10 @@ impl MeshAddressBook {
 
     /// the TOTAL address map for one tracked set, sorted by key (`Set`
     /// iterates ascending, so dedup construction cannot fail).
-    pub(crate) fn addressed(&self, peers: &Set<ed25519::PublicKey>) -> Map<ed25519::PublicKey, Address> {
+    pub(crate) fn addressed(
+        &self,
+        peers: &Set<ed25519::PublicKey>,
+    ) -> Map<ed25519::PublicKey, Address> {
         let entries = self.entries.read().expect("mesh book lock");
         Map::from_iter_dedup(
             peers
@@ -244,20 +247,26 @@ mod tests {
         // a hint displaces the persisted entry…
         b.seed_hint(peer.clone(), Ingress::Socket(sock(1, 2000)));
         assert_eq!(
-            b.addressed(&set(std::slice::from_ref(&peer))).get_value(&peer).cloned(),
+            b.addressed(&set(std::slice::from_ref(&peer)))
+                .get_value(&peer)
+                .cloned(),
             Some(Address::Symmetric(sock(1, 2000)))
         );
         // …a persisted entry never displaces the hint…
         b.seed_persisted(peer.clone(), sock(4, 3000));
         assert_eq!(
-            b.addressed(&set(std::slice::from_ref(&peer))).get_value(&peer).cloned(),
+            b.addressed(&set(std::slice::from_ref(&peer)))
+                .get_value(&peer)
+                .cloned(),
             Some(Address::Symmetric(sock(1, 2000)))
         );
         // …and a live advert displaces the hint.
         let changed = b.observe_advert(&peer, sock(2, 4000));
         assert_eq!(changed, Some(Address::Symmetric(sock(2, 4000))));
         assert_eq!(
-            b.addressed(&set(std::slice::from_ref(&peer))).get_value(&peer).cloned(),
+            b.addressed(&set(std::slice::from_ref(&peer)))
+                .get_value(&peer)
+                .cloned(),
             Some(Address::Symmetric(sock(2, 4000)))
         );
     }
@@ -266,12 +275,18 @@ mod tests {
     fn observe_advert_is_silent_when_the_effective_address_is_unchanged() {
         let b = book();
         let peer = key(1);
-        assert!(b.observe_advert(&peer, sock(1, 9000)).is_some(), "first move fires");
+        assert!(
+            b.observe_advert(&peer, sock(1, 9000)).is_some(),
+            "first move fires"
+        );
         assert!(
             b.observe_advert(&peer, sock(1, 9000)).is_none(),
             "re-gossip of the same endpoint is silent"
         );
-        assert!(b.observe_advert(&peer, sock(2, 9000)).is_some(), "a move fires");
+        assert!(
+            b.observe_advert(&peer, sock(2, 9000)).is_some(),
+            "a move fires"
+        );
     }
 
     #[test]
@@ -302,7 +317,12 @@ mod tests {
             "a live advert never displaces a DNS hint (per-dial re-resolution is deliberate)"
         );
         let expected = address_of(dns);
-        assert_eq!(b.addressed(&set(std::slice::from_ref(&peer))).get_value(&peer).cloned(), Some(expected));
+        assert_eq!(
+            b.addressed(&set(std::slice::from_ref(&peer)))
+                .get_value(&peer)
+                .cloned(),
+            Some(expected)
+        );
     }
 
     #[test]

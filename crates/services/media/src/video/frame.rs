@@ -1,19 +1,20 @@
 //! The video frame layer inside a data-plane datagram on `Service::Video`:
-//! a 16-byte header, then one fragment of one encoded (VP8) frame. A frame
+//! a 13-byte header, then one fragment of one encoded (VP8) frame. A frame
 //! larger than a datagram fragments across several; ANY missing fragment
 //! drops the whole frame — no retransmit, recovery is the next keyframe.
+//! no version byte: the enclosing plane datagram already names the service,
+//! and the frame is a fixed shape (flag-day rule — no in-band version).
 //!
 //! ```text
-//! offset  0        1      2..6              6..8               8..10
-//!         ver = 1  flags  frame_no (u32BE)  frag_index (u16BE) frag_count (u16BE)
-//! offset  10..14          14..16
-//!         ts_ms (u32BE)   reserved = 0
+//! offset  0      1..5              5..7               7..9
+//!         flags  frame_no (u32BE)  frag_index (u16BE) frag_count (u16BE)
+//! offset  9..13
+//!         ts_ms (u32BE)
 //! ```
 
 use data_plane::MAX_DATAGRAM_PAYLOAD;
 
-pub const VIDEO_VERSION: u8 = 1;
-pub const VIDEO_HEADER_LEN: usize = 16;
+pub const VIDEO_HEADER_LEN: usize = 13;
 /// flags bit 0: this frame is a keyframe (decoder sync point).
 pub const FLAG_KEYFRAME: u8 = 0b0000_0001;
 /// Encoded bytes per fragment: a plane datagram payload minus this header.
@@ -40,21 +41,17 @@ pub enum VideoError {
     Empty,
     #[error("video fragment truncated")]
     Truncated,
-    #[error("unsupported video version {0}")]
-    BadVersion(u8),
     #[error("inconsistent fragment header")]
     BadHeader,
 }
 
 pub fn encode_fragment(header: VideoHeader, payload: &[u8]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(VIDEO_HEADER_LEN + payload.len());
-    frame.push(VIDEO_VERSION);
     frame.push(if header.keyframe { FLAG_KEYFRAME } else { 0 });
     frame.extend_from_slice(&header.frame_no.to_be_bytes());
     frame.extend_from_slice(&header.frag_index.to_be_bytes());
     frame.extend_from_slice(&header.frag_count.to_be_bytes());
     frame.extend_from_slice(&header.ts_ms.to_be_bytes());
-    frame.extend_from_slice(&[0, 0]);
     frame.extend_from_slice(payload);
     frame
 }
@@ -63,15 +60,12 @@ pub fn decode_fragment(frame: &[u8]) -> Result<(VideoHeader, &[u8]), VideoError>
     if frame.len() < VIDEO_HEADER_LEN {
         return Err(VideoError::Truncated);
     }
-    if frame[0] != VIDEO_VERSION {
-        return Err(VideoError::BadVersion(frame[0]));
-    }
     let header = VideoHeader {
-        keyframe: frame[1] & FLAG_KEYFRAME != 0,
-        frame_no: u32::from_be_bytes(frame[2..6].try_into().expect("4 bytes")),
-        frag_index: u16::from_be_bytes(frame[6..8].try_into().expect("2 bytes")),
-        frag_count: u16::from_be_bytes(frame[8..10].try_into().expect("2 bytes")),
-        ts_ms: u32::from_be_bytes(frame[10..14].try_into().expect("4 bytes")),
+        keyframe: frame[0] & FLAG_KEYFRAME != 0,
+        frame_no: u32::from_be_bytes(frame[1..5].try_into().expect("4 bytes")),
+        frag_index: u16::from_be_bytes(frame[5..7].try_into().expect("2 bytes")),
+        frag_count: u16::from_be_bytes(frame[7..9].try_into().expect("2 bytes")),
+        ts_ms: u32::from_be_bytes(frame[9..13].try_into().expect("4 bytes")),
     };
     if header.frag_count == 0
         || header.frag_count as usize > MAX_FRAGS
@@ -125,7 +119,7 @@ mod tests {
 
     /// pins the exact wire bytes (D1: header fields big-endian) — locks this
     /// already-BE datagram codec alongside the call-socket codec
-    /// (`chat::call_wire`) as part of the wire-standardization sweep.
+    /// ([`crate::call_wire`]) as part of the wire-standardization sweep.
     #[test]
     fn golden_header_be() {
         let header = VideoHeader {
@@ -138,8 +132,7 @@ mod tests {
         assert_eq!(
             encode_fragment(header, &[0xAA]),
             vec![
-                0x01, 0x01, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
-                0x00, 0x00, 0xAA,
+                0x01, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0xAA,
             ]
         );
     }
@@ -195,25 +188,6 @@ mod tests {
         assert!(matches!(
             decode_fragment(&[1, 0, 0]),
             Err(VideoError::Truncated)
-        ));
-    }
-
-    #[test]
-    fn decode_rejects_bad_version() {
-        let mut fragment = encode_fragment(
-            VideoHeader {
-                keyframe: false,
-                frame_no: 0,
-                frag_index: 0,
-                frag_count: 1,
-                ts_ms: 0,
-            },
-            b"x",
-        );
-        fragment[0] = 7;
-        assert!(matches!(
-            decode_fragment(&fragment),
-            Err(VideoError::BadVersion(7))
         ));
     }
 

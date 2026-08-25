@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 /// messages the kv module accepts (its `execute` payload).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum KvMsg {
     Set { key: Vec<u8>, value: Vec<u8> },
 }
@@ -21,13 +21,13 @@ pub fn decode(bytes: &[u8]) -> Result<KvMsg, String> {
 
 /// read requests the kv module serves via `Module::query`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum KvQuery {
     Get { key: Vec<u8> },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum KvReply {
     Value(Option<Vec<u8>>),
 }

@@ -76,10 +76,7 @@ pub(crate) fn serve(agent: Agent) -> Result<(), Box<dyn std::error::Error>> {
     crate::services::serve_until_stopped(std::future::pending(), |stop| run(agent, stop))
 }
 
-async fn run(
-    agent: Agent,
-    stop: crate::services::Stop,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(agent: Agent, stop: crate::services::Stop) -> Result<(), Box<dyn std::error::Error>> {
     let Agent {
         grant,
         service,
@@ -157,7 +154,10 @@ mod tests {
     fn the_ws_url_tracks_the_http_scheme() {
         assert_eq!(ws_url("http://127.0.0.1:8844"), "ws://127.0.0.1:8844/v1/ws");
         assert_eq!(ws_url("https://node.example"), "wss://node.example/v1/ws");
-        assert_eq!(ws_url("http://127.0.0.1:8844/"), "ws://127.0.0.1:8844/v1/ws");
+        assert_eq!(
+            ws_url("http://127.0.0.1:8844/"),
+            "ws://127.0.0.1:8844/v1/ws"
+        );
     }
 
     #[test]

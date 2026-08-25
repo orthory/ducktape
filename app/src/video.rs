@@ -10,7 +10,7 @@
 //! winit — see [`ScreenSource`] for why not the portal).
 //!
 //! CODEC v1 IS BASELINE JPEG, EVERY FRAME A KEYFRAME. The wire (ws
-//! `chat::call_wire` and the mesh fragmentation in `chat::video`) treats the
+//! `media_service::call_wire` and the mesh fragmentation in `media_service::video`) treats the
 //! encoded bytes as opaque and both ends of the webview leg are THIS app, so
 //! the client picks the codec. Pure-Rust JPEG keeps the build free of C
 //! toolchains on every platform; intra-only means a lost frame costs nothing
@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use chat::call_wire::{CapturedFrame, PeerFrame};
+use media_service::call_wire::{CapturedFrame, PeerFrame};
 use iced::{Element, Rectangle, Size};
 
 mod live_surface;
@@ -294,7 +294,7 @@ pub(crate) fn encode_frame(rgba: &[u8], width: u16, height: u16) -> Option<Vec<u
     encoder
         .encode(rgba, width, height, jpeg_encoder::ColorType::Rgba)
         .ok()?;
-    if out.len() <= chat::video::MAX_FRAME_BYTES {
+    if out.len() <= media_service::video::MAX_FRAME_BYTES {
         return Some(out);
     }
     // OVER THE MESH CAP, so this frame cannot be sent as it is — and a source
@@ -313,7 +313,7 @@ pub(crate) fn encode_frame(rgba: &[u8], width: u16, height: u16) -> Option<Vec<u
             jpeg_encoder::ColorType::Rgba,
         )
         .ok()?;
-    (out.len() <= chat::video::MAX_FRAME_BYTES).then_some(out)
+    (out.len() <= media_service::video::MAX_FRAME_BYTES).then_some(out)
 }
 
 /// How the self-view is ARRIVING: frames stored, and the worst and total gap
@@ -922,7 +922,7 @@ mod tests {
             .flat_map(|i| [(i % 251) as u8, (i % 83) as u8, (i % 199) as u8, 0xff])
             .collect();
         let encoded = encode_frame(&rgba, width, height).expect("encode");
-        assert!(encoded.len() < chat::video::MAX_FRAME_BYTES);
+        assert!(encoded.len() < media_service::video::MAX_FRAME_BYTES);
         let tile = decode_frame(&encoded).expect("decode");
         assert_eq!((tile.width, tile.height), (64, 48));
         assert!(matches!(

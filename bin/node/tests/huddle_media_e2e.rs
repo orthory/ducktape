@@ -28,7 +28,7 @@ mod common;
 
 use std::time::Duration;
 
-use chat::call_wire::{self, CapturedFrame};
+use media_service::call_wire::{self, CapturedFrame};
 use chat::{Channel, ChatMsg, ChatQuery, ChatReply, PostPolicy};
 use common::{Cluster, hex, poll_until, serial, unhex};
 use futures::{SinkExt as _, StreamExt as _};
@@ -148,7 +148,7 @@ fn beacon_frame() -> Message {
 /// A 500 Hz square, not a constant frame: SILK's high-pass strips DC, so a
 /// steady level would decode to converged silence at the far end.
 fn loud_frame() -> Vec<i16> {
-    (0..chat::voice::FRAME_SAMPLES)
+    (0..media_service::voice::FRAME_SAMPLES)
         .map(|i| if (i / 48) % 2 == 0 { 8000 } else { -8000 })
         .collect()
 }

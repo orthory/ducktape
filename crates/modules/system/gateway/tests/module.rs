@@ -82,7 +82,6 @@ fn account(node: &[u8], signer: &ed25519::PrivateKey) -> AccountView {
 
 fn statement(account_id: Vec<u8>, node: Vec<u8>, name: RouteName, revision: u64) -> RouteStatement {
     RouteStatement {
-        version: 1,
         chain_id: "test#12345678".into(),
         account_id,
         name,

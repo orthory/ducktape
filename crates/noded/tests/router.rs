@@ -398,9 +398,7 @@ async fn peers_reports_the_direct_peer_sample() {
     // stage has the pump busy.
     let (handle, _cmd_rx, _events) = NodeHandle::channel();
     let cell = handle.status_cell();
-    cell.wire_exposition(|| {
-        "network_tracker_directory_connected{peer=\"ab\"} 1000\n".to_string()
-    });
+    cell.wire_exposition(|| "network_tracker_directory_connected{peer=\"ab\"} 1000\n".to_string());
     cell.publish_peers(noded::PeersStanding {
         validators: ["ab".to_string()].into(),
         residents: Default::default(),
@@ -538,7 +536,8 @@ async fn shutdown_acknowledges_then_signals() {
 /// would, so the admin guard's loopback check has something to read.
 fn with_peer(mut req: Request<Body>, addr: &str) -> Request<Body> {
     req.extensions_mut().insert(axum::extract::ConnectInfo(
-        addr.parse::<std::net::SocketAddr>().expect("test peer addr"),
+        addr.parse::<std::net::SocketAddr>()
+            .expect("test peer addr"),
     ));
     req
 }
@@ -644,12 +643,16 @@ async fn a_loopback_caller_without_the_operator_credential_cannot_drive_admin() 
         post("/v1/admin/shutdown", serde_json::json!({})),
         "127.0.0.1:40000",
     );
-    guessed
-        .headers_mut()
-        .insert(noded::admin::ADMIN_TOKEN_HEADER, "deadbeef".parse().unwrap());
+    guessed.headers_mut().insert(
+        noded::admin::ADMIN_TOKEN_HEADER,
+        "deadbeef".parse().unwrap(),
+    );
     let response = noded::router(handle).oneshot(guessed).await.unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(body_json(response).await["reason"], "operator_token_mismatch");
+    assert_eq!(
+        body_json(response).await["reason"],
+        "operator_token_mismatch"
+    );
 
     // and the operator still gets through — a gate that locks the owner out is
     // a worse bug than the one it closes.
@@ -834,7 +837,11 @@ async fn public_admin_enforces_the_committed_owner_pop() {
         .oneshot(post("/v1/admin/shutdown", serde_json::json!({})))
         .await
         .unwrap();
-    assert_eq!(bare.status(), StatusCode::UNAUTHORIZED, "public admin needs a signature");
+    assert_eq!(
+        bare.status(),
+        StatusCode::UNAUTHORIZED,
+        "public admin needs a signature"
+    );
 
     // signed by a non-owner (valid PoP, wrong account) ⇒ 403.
     let attacker = commonware_cryptography::ed25519::PrivateKey::from_seed(99);
@@ -849,7 +856,11 @@ async fn public_admin_enforces_the_committed_owner_pop() {
         ))
         .await
         .unwrap();
-    assert_eq!(forged.status(), StatusCode::FORBIDDEN, "a non-owner signer is refused");
+    assert_eq!(
+        forged.status(),
+        StatusCode::FORBIDDEN,
+        "a non-owner signer is refused"
+    );
 
     // the owner's signature bound to a DIFFERENT node ⇒ 401 (cross-node replay).
     let replayed = noded::router(mk_handle())
@@ -879,10 +890,14 @@ async fn public_admin_enforces_the_committed_owner_pop() {
         "127.0.0.1:40000",
     ));
     // and a smuggled owner-key header changes nothing without the signature.
-    token_only
-        .headers_mut()
-        .insert(noded::admin::ADMIN_KEY_HEADER, owner_key_hex.parse().unwrap());
-    let refused = noded::router(mk_handle()).oneshot(token_only).await.unwrap();
+    token_only.headers_mut().insert(
+        noded::admin::ADMIN_KEY_HEADER,
+        owner_key_hex.parse().unwrap(),
+    );
+    let refused = noded::router(mk_handle())
+        .oneshot(token_only)
+        .await
+        .unwrap();
     assert_eq!(
         refused.status(),
         StatusCode::UNAUTHORIZED,
@@ -949,7 +964,6 @@ async fn a_dead_actor_maps_to_service_unavailable() {
 fn gateway_route() -> gateway::RouteRecord {
     gateway::RouteRecord {
         statement: gateway::RouteStatement {
-            version: 1,
             chain_id: "test".into(),
             account_id: vec![1],
             name: gateway::RouteName::named("app"),
@@ -1030,7 +1044,14 @@ async fn gateway_proxy_resolves_the_signed_route_and_forwards_post_body() {
     let (lane, mut jobs) = tokio::sync::mpsc::channel::<noded::GatewayJob>(1);
     tokio::spawn(async move {
         let job = jobs.recv().await.expect("one gateway job");
-        let noded::GatewayJob::Http { publisher_node, head, body, reply, .. } = job else {
+        let noded::GatewayJob::Http {
+            publisher_node,
+            head,
+            body,
+            reply,
+            ..
+        } = job
+        else {
             panic!("expected an http gateway job");
         };
         assert_eq!(publisher_node, [2; 32]);
@@ -1048,7 +1069,8 @@ async fn gateway_proxy_resolves_the_signed_route_and_forwards_post_body() {
             },
             body: {
                 let (tx, rx) = tokio::sync::mpsc::channel(1);
-                tx.try_send(Ok(bytes::Bytes::from_static(br#"{"ok":true}"#))).unwrap();
+                tx.try_send(Ok(bytes::Bytes::from_static(br#"{"ok":true}"#)))
+                    .unwrap();
                 drop(tx);
                 rx
             },
@@ -1126,7 +1148,10 @@ async fn gateway_browser_proxy_is_duck_origin_scoped_and_cross_origin_safe() {
 
     tokio::spawn(async move {
         let job = jobs.recv().await.unwrap();
-        let noded::GatewayJob::Http { head, body, reply, .. } = job else {
+        let noded::GatewayJob::Http {
+            head, body, reply, ..
+        } = job
+        else {
             panic!("expected an http gateway job");
         };
         assert_eq!(head.method, gateway::RouteMethod::Post);
@@ -1142,7 +1167,8 @@ async fn gateway_browser_proxy_is_duck_origin_scoped_and_cross_origin_safe() {
             },
             body: {
                 let (tx, rx) = tokio::sync::mpsc::channel(1);
-                tx.try_send(Ok(bytes::Bytes::from_static(br#"{"ok":true}"#))).unwrap();
+                tx.try_send(Ok(bytes::Bytes::from_static(br#"{"ok":true}"#)))
+                    .unwrap();
                 drop(tx);
                 rx
             },
@@ -1414,9 +1440,7 @@ async fn upload_pack_have_round_returns_only_plain_nak() {
     }
 
     let oid = "11".repeat(20);
-    let mut request_body = pkt(
-        format!("want {oid} multi_ack_detailed side-band-64k\n").as_bytes(),
-    );
+    let mut request_body = pkt(format!("want {oid} multi_ack_detailed side-band-64k\n").as_bytes());
     request_body.extend_from_slice(b"0000");
     request_body.extend_from_slice(&pkt(format!("have {oid}\n").as_bytes()));
     request_body.extend_from_slice(b"0000");

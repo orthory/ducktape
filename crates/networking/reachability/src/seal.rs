@@ -71,7 +71,10 @@ pub fn seal(recipient_pub: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
 
 /// Open a sealed envelope with the recipient's static X25519 secret. Fails
 /// closed on truncation, a wrong key, or any tampering (the AEAD tag).
-pub fn open(recipient_secret: &x25519_dalek::StaticSecret, sealed: &[u8]) -> Result<Vec<u8>, String> {
+pub fn open(
+    recipient_secret: &x25519_dalek::StaticSecret,
+    sealed: &[u8],
+) -> Result<Vec<u8>, String> {
     let Some(rest) = sealed.get(..).filter(|s| s.len() >= SEAL_MIN_LEN) else {
         return Err("sealed envelope truncated".into());
     };
@@ -122,7 +125,10 @@ mod tests {
         let (_secret, public) = keypair(1);
         let (other_secret, _other_public) = keypair(2);
         let sealed = seal(&public, b"secret");
-        assert!(open(&other_secret, &sealed).is_err(), "a different key must fail closed");
+        assert!(
+            open(&other_secret, &sealed).is_err(),
+            "a different key must fail closed"
+        );
     }
 
     #[test]
@@ -132,7 +138,10 @@ mod tests {
         for flip in [0usize, EPHEMERAL_PUB_LEN, sealed.len() - 1] {
             let mut bad = sealed.clone();
             bad[flip] ^= 0x01;
-            assert!(open(&secret, &bad).is_err(), "flipping byte {flip} must fail closed");
+            assert!(
+                open(&secret, &bad).is_err(),
+                "flipping byte {flip} must fail closed"
+            );
         }
     }
 

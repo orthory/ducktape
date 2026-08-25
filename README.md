@@ -71,7 +71,7 @@ are open and unmerged.
 | `host::worker::Worker` · `crates/kernel/host` | `DispatchPool` | `MockOracle`, `FlakyOracle`, `EchoWorker` | host non-deterministic-effect dispatch |
 | `SyncClient` · `crates/kernel/statesync` | four fetch clients | `ChannelClient`, `StoreClient`, `LiarClient` | statesync joiner / backfill engine |
 | `DataPlaneTransport` · `crates/networking/data-plane` | `OverlaySockets` | `SimEndpoint` (feature `sim`) | overlay demux + acceptor loops |
-| `WireGuardEffect` · `crates/networking/wireguard` | defguard, userspace | `FakeWireGuardEffect` | mesh bring-up (bin/node boot) |
+| `WireGuardEffect` · `crates/networking/wireguard` | userspace | `FakeWireGuardEffect` | mesh bring-up (bin/node boot) |
 | commonware runtime `E` (`Clock` / `Storage` / `Rng`) | `tokio::Context` | `deterministic::Runner` | host, node, statesync |
 | `ObjectStore` · `crates/duckfs/core` | `DiskStore` | `MemStore` | `files` module, duckfs client |
 | `Blobs` · `blobstore` — (this campaign, PR #716 — unmerged) | `BlobHandle` (disk) | `MemBlobs` | bin/node blob_fetch/relay_runtime/explorer, statesync serve |
@@ -180,7 +180,7 @@ Three binaries plus the desktop app are runnable:
   throwaway dev daemon with temporary storage:
 
   ```sh
-  cargo run -p noded                        # http://127.0.0.1:8844, temp storage
+  cargo run -p noded-bin                      # http://127.0.0.1:8844, temp storage
   # add -- --storage <dir> for persistent module state
   ```
 

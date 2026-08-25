@@ -148,7 +148,11 @@ fn refusal_reasons_are_distinct_stable_tokens() {
     ];
     assert_eq!(
         reasons,
-        ["work_not_admitted", "work_caller_unbound", "work_policy_unreadable"]
+        [
+            "work_not_admitted",
+            "work_caller_unbound",
+            "work_policy_unreadable"
+        ]
     );
     for reason in reasons {
         assert!(
@@ -291,7 +295,8 @@ async fn a_failed_owner_read_is_unavailable_not_refused() {
 // ---------------------------------------------------------------------------
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("ducktape-work-admit-{name}-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("ducktape-work-admit-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch workspace");
     dir
@@ -302,7 +307,10 @@ fn scratch(name: &str) -> PathBuf {
 #[test]
 fn a_workspace_with_no_policy_file_runs_its_owners_work() {
     let dir = scratch("absent");
-    assert_eq!(load(&dir).expect("absent is the default"), WorkAdmission::Owner);
+    assert_eq!(
+        load(&dir).expect("absent is the default"),
+        WorkAdmission::Owner
+    );
 }
 
 /// Round trip, and `Owner` REMOVES the file: one representation per policy, no
@@ -318,7 +326,10 @@ fn the_policy_round_trips_and_owner_leaves_no_file() {
     assert_eq!(load(&dir).expect("load anyone"), WorkAdmission::Anyone);
 
     save(&dir, &WorkAdmission::Owner).expect("save owner");
-    assert!(!policy_path(&dir).exists(), "owner must leave no file behind");
+    assert!(
+        !policy_path(&dir).exists(),
+        "owner must leave no file behind"
+    );
     assert_eq!(load(&dir).expect("load owner"), WorkAdmission::Owner);
 }
 
@@ -336,7 +347,10 @@ fn revoking_the_last_account_narrows_back_to_owner() {
 fn anyone_absorbs_and_revoking_it_returns_to_owner() {
     let widened = accounts(&[FRIEND]).with(AdmitTarget::Anyone);
     assert_eq!(widened, WorkAdmission::Anyone);
-    assert_eq!(widened.with(AdmitTarget::Account(FRIEND.to_vec())), WorkAdmission::Anyone);
+    assert_eq!(
+        widened.with(AdmitTarget::Account(FRIEND.to_vec())),
+        WorkAdmission::Anyone
+    );
     assert_eq!(
         WorkAdmission::Anyone.without(AdmitTarget::Anyone),
         WorkAdmission::Owner
@@ -349,7 +363,10 @@ fn anyone_absorbs_and_revoking_it_returns_to_owner() {
 fn admit_cannot_mix_the_wildcard_with_accounts() {
     let mixed = parse(&[ANYONE.to_string(), config::hex_bytes(FRIEND)]).unwrap_err();
     assert!(mixed.contains("statement, not an entry"), "got {mixed:?}");
-    assert_eq!(parse(&[ANYONE.to_string()]).expect("bare wildcard"), WorkAdmission::Anyone);
+    assert_eq!(
+        parse(&[ANYONE.to_string()]).expect("bare wildcard"),
+        WorkAdmission::Anyone
+    );
 }
 
 /// A hand-edited file that is not hex is a loud refusal, never a silently

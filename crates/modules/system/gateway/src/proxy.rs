@@ -319,7 +319,6 @@ mod tests {
     fn record() -> RouteRecord {
         RouteRecord {
             statement: RouteStatement {
-                version: 1,
                 chain_id: "test".into(),
                 account_id: vec![1; 32],
                 name: RouteName::named("api"),

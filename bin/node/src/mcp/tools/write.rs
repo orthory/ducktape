@@ -189,10 +189,7 @@ fn duckfs_write_text(run: &Run, args: &Value) -> Result<Value> {
         )));
     }
     let refs = run.node.files("refs", &[])?;
-    let base_snapshot = refs
-        .get("head")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let base_snapshot = refs.get("head").and_then(Value::as_str).map(str::to_string);
     run.act(AgentAction::DuckfsWriteText {
         path,
         text,
@@ -228,7 +225,10 @@ mod tests {
     #[test]
     fn task_status_parses_exactly_the_three_wire_names() {
         assert_eq!(task_status_of("open").unwrap(), TaskStatus::Open);
-        assert_eq!(task_status_of("in_progress").unwrap(), TaskStatus::InProgress);
+        assert_eq!(
+            task_status_of("in_progress").unwrap(),
+            TaskStatus::InProgress
+        );
         assert_eq!(task_status_of("done").unwrap(), TaskStatus::Done);
         let err = task_status_of("Done").unwrap_err();
         assert!(

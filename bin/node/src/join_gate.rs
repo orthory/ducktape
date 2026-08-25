@@ -4,7 +4,7 @@
 //!
 //! transport: the joiner's SEALED first-contact intro ([`IntroRequest`]) IS
 //! the gate request — it rides the WireGuard-tunnel doorbell, never the mesh
-//! (the retired `lobby_identity` + `CHANNEL_LOBBY` lane is gone). every claim
+//! (a fresh joiner has no mesh standing to speak from). every claim
 //! in an intro is verified against the INVITE TOKEN it carries (issuer
 //! signature over the genesis namespace) and the joiner's proof-of-
 //! possession. the gate stays synchronous: a member runs the V1–V9 checklist,
@@ -48,47 +48,6 @@ pub enum RejectCode {
     Busy,
 }
 
-/// the verified-request carrier [`verify_join_request`] consumes (and
-/// [`verify_intro`] builds internally). NO LONGER A WIRE TYPE: the mesh
-/// `CHANNEL_LOBBY` lane it once rode is retired (join ADR §4) — the fields now
-/// only ever travel inside a sealed [`IntroRequest`].
-#[derive(Debug, Clone, PartialEq)]
-pub enum GateMsg {
-    /// joiner → member. "this key asks to join, invited by `issuer`" — the
-    /// token's fields plus the joiner key and its proof-of-possession, all raw
-    /// bytes. `expires_unix_secs` is the token's covered field.
-    /// Every invite is bearer: there is no target, the
-    /// proof binds the announcing key and single-use bounds it.
-    Request {
-        issuer: Vec<u8>,
-        nonce: Vec<u8>,
-        token_sig: Vec<u8>,
-        joiner: Vec<u8>,
-        proof: Vec<u8>,
-        expires_unix_secs: u64,
-    },
-}
-
-/// build the gate request for `token` as `joiner` — the proof binds the
-/// announced key to its secret holder. TEST-ONLY since the mesh gate lane
-/// retired (join ADR §4): production requests only ever travel inside an
-/// [`intro_request`]; the tests keep this to exercise [`verify_join_request`]
-/// without re-deriving the proof signing by hand.
-#[cfg(test)]
-pub fn gate_request(joiner: &ed25519::PrivateKey, binding: &[u8], token: &InviteToken) -> GateMsg {
-    use commonware_codec::Encode as _;
-    use commonware_cryptography::Signer as _;
-    let proof = crate::config::sign_join_proof(joiner, binding, token);
-    GateMsg::Request {
-        issuer: token.issuer.as_ref().to_vec(),
-        nonce: token.nonce.to_vec(),
-        token_sig: token.sig.encode().as_ref().to_vec(),
-        joiner: joiner.public_key().as_ref().to_vec(),
-        proof: proof.encode().as_ref().to_vec(),
-        expires_unix_secs: token.expires_unix_secs,
-    }
-}
-
 /// map a governance `Redeem` consensus-reject reason (ADR §3.2) to a gate
 /// reject code + terminal bit. these fire only on a race that slips past the
 /// member's verification filter (chiefly a nonce another joiner redeemed first).
@@ -123,18 +82,23 @@ pub struct VerifiedJoinRequest {
     pub expires_unix_secs: u64,
 }
 
-/// verify a wire join request against this network's binding: token issuer
-/// signature and the joiner's proof-of-possession. membership checks (issuer
-/// still a member? joiner already one?) are the CALLER's — they need current
-/// state, this needs only crypto.
-pub fn verify_join_request(msg: &GateMsg, binding: &[u8]) -> Result<VerifiedJoinRequest, String> {
-    let GateMsg::Request {
+/// verify an intro's join-request half against this network's binding: token
+/// issuer signature and the joiner's proof-of-possession (the WireGuard-key
+/// binding is [`verify_intro`]'s). membership checks (issuer still a member?
+/// joiner already one?) are the CALLER's — they need current state, this
+/// needs only crypto.
+pub fn verify_join_request(
+    msg: &IntroRequest,
+    binding: &[u8],
+) -> Result<VerifiedJoinRequest, String> {
+    let IntroRequest {
         issuer,
         nonce,
         token_sig,
         joiner,
         proof,
         expires_unix_secs,
+        ..
     } = msg;
     let issuer =
         ed25519::PublicKey::decode(issuer.as_slice()).map_err(|e| format!("issuer key: {e}"))?;
@@ -162,7 +126,7 @@ pub fn verify_join_request(msg: &GateMsg, binding: &[u8]) -> Result<VerifiedJoin
     if !crate::config::verify_invite_token(&token, binding) {
         return Err("invite token signature does not verify for this network".into());
     }
-    // NO expiry check here: the lobby fn stays pure crypto (same division as
+    // NO expiry check here: this fn stays pure crypto (same division as
     // the membership checks) — decode enforces wall-clock expiry, consensus
     // enforces block-time expiry.
     if !crate::config::verify_join_proof(&joiner, binding, &token, &proof) {
@@ -193,8 +157,11 @@ pub fn verify_join_request(msg: &GateMsg, binding: &[u8]) -> Result<VerifiedJoin
 /// the joiner identity: `sign(INTRO_WG_NAMESPACE, binding ‖ nonce ‖ wg_key)`.
 pub const INTRO_WG_NAMESPACE: &[u8] = b"ducktape-invite-intro-v1";
 
-/// the joiner's first-contact datagram. carries the whole lobby
-/// [`GateMsg::Request`] payload plus the WireGuard half.
+/// the joiner's first-contact datagram: the join-request fields ("this key
+/// asks to join, invited by `issuer`" — the token's fields plus the joiner
+/// key and its proof-of-possession, all raw bytes; every invite is bearer,
+/// so there is no target — the proof binds the announcing key and single-use
+/// bounds it) plus the WireGuard half.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct IntroRequest {
     pub issuer: Vec<u8>,
@@ -230,7 +197,7 @@ pub enum IntroReply {
     /// PRIVATELY and the answering member is a genesis validator — the joiner
     /// cannot receive it on the invite (its key does not exist at invite-mint
     /// time), so this reply is its only delivery channel; the seal is what
-    /// keeps it off the wire. lobby.rs stays crypto-agnostic: it moves bytes
+    /// keeps it off the wire. join_gate.rs stays crypto-agnostic: it moves bytes
     /// and never depends on the cap types.
     Admitted { height: u64, cap: Option<Vec<u8>> },
     /// the gate refused (member checklist or consensus). `terminal` ⇒ the joiner
@@ -318,17 +285,7 @@ pub struct VerifiedIntro {
 /// [`verify_join_request`].
 pub fn verify_intro(msg: &IntroRequest, binding: &[u8]) -> Result<VerifiedIntro, String> {
     use commonware_cryptography::Verifier as _;
-    let verified = verify_join_request(
-        &GateMsg::Request {
-            issuer: msg.issuer.clone(),
-            nonce: msg.nonce.clone(),
-            token_sig: msg.token_sig.clone(),
-            joiner: msg.joiner.clone(),
-            proof: msg.proof.clone(),
-            expires_unix_secs: msg.expires_unix_secs,
-        },
-        binding,
-    )?;
+    let verified = verify_join_request(msg, binding)?;
     let wg_public_key: [u8; 32] = msg
         .wg_public_key
         .as_slice()
@@ -356,17 +313,21 @@ mod tests {
 
     const BINDING: &[u8] = b"net#00000000@feedface";
 
-    /// mint a far-future bearer token — the lobby tests' default.
+    /// mint a far-future bearer token — these tests' default.
     fn mint_for(issuer: &ed25519::PrivateKey) -> InviteToken {
         mint_invite_token(issuer, BINDING, u64::MAX)
     }
+
+    /// the WireGuard key the join-request tests announce — its binding
+    /// signature is [`verify_intro`]'s to check, not [`verify_join_request`]'s.
+    const WG_KEY: [u8; 32] = [9u8; 32];
 
     #[test]
     fn a_join_request_verifies() {
         let issuer = ed25519::PrivateKey::from_seed(1);
         let joiner = ed25519::PrivateKey::from_seed(2);
         let token = mint_for(&issuer);
-        let msg = gate_request(&joiner, BINDING, &token);
+        let msg = intro_request(&joiner, BINDING, &token, WG_KEY);
 
         let verified = verify_join_request(&msg, BINDING).expect("verifies");
         assert_eq!(verified.joiner, joiner.public_key());
@@ -384,7 +345,7 @@ mod tests {
         let token = mint_for(&issuer);
         for seed in [2u64, 3, 4] {
             let joiner = ed25519::PrivateKey::from_seed(seed);
-            let msg = gate_request(&joiner, BINDING, &token);
+            let msg = intro_request(&joiner, BINDING, &token, WG_KEY);
             let v = verify_join_request(&msg, BINDING).expect("bearer verifies for any key");
             assert_eq!(v.joiner, joiner.public_key());
         }
@@ -395,7 +356,7 @@ mod tests {
         let issuer = ed25519::PrivateKey::from_seed(1);
         let joiner = ed25519::PrivateKey::from_seed(2);
         let token = mint_for(&issuer);
-        let msg = gate_request(&joiner, BINDING, &token);
+        let msg = intro_request(&joiner, BINDING, &token, WG_KEY);
 
         // another network refuses the same announce.
         assert!(verify_join_request(&msg, b"other-net").is_err());
@@ -403,24 +364,12 @@ mod tests {
         // a proof signed by a DIFFERENT key than the announced joiner fails the
         // proof-of-possession — a bearer token is not a blank cheque, the
         // announcer must hold the key it names.
-        let GateMsg::Request {
-            issuer: i,
-            nonce,
-            token_sig,
-            joiner: j,
-            expires_unix_secs,
-            ..
-        } = msg;
         let bad_proof =
             crate::config::sign_join_proof(&ed25519::PrivateKey::from_seed(3), BINDING, &token);
         use commonware_codec::Encode as _;
-        let forged = GateMsg::Request {
-            issuer: i,
-            nonce,
-            token_sig,
-            joiner: j,
+        let forged = IntroRequest {
             proof: bad_proof.encode().as_ref().to_vec(),
-            expires_unix_secs,
+            ..msg
         };
         let err = verify_join_request(&forged, BINDING).expect_err("refused");
         assert!(err.contains("proof-of-possession"), "{err}");
@@ -516,7 +465,7 @@ mod tests {
 
     #[test]
     fn an_admitted_reply_carrying_a_cap_roundtrips() {
-        // the cap is opaque bytes to lobby.rs — any blob roundtrips verbatim.
+        // the cap is opaque bytes to join_gate.rs — any blob roundtrips verbatim.
         let ack = IntroAck {
             nonce: vec![7u8; INVITE_NONCE_LEN],
             reply: IntroReply::Admitted {

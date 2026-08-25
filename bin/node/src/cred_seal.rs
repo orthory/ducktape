@@ -92,7 +92,12 @@ pub(crate) struct SealArgs {
     credentials: Option<std::path::PathBuf>,
     /// with --credentials: seal the artifact's CURRENT access token (no
     /// rotation, so the owner's own login keeps working) or its refresh token
-    #[arg(long, value_name = "KIND", default_value = "bearer", requires = "credentials")]
+    #[arg(
+        long,
+        value_name = "KIND",
+        default_value = "bearer",
+        requires = "credentials"
+    )]
     cred_kind: SealKind,
     /// seal a static access token directly (no rotation)
     #[arg(long, value_name = "TOKEN", conflicts_with = "refresh_token")]
@@ -141,8 +146,7 @@ impl AttestArgs {
                 };
                 let vcek = match &self.snp_vcek {
                     Some(path) => VcekSource::Der(
-                        std::fs::read(path)
-                            .with_context(|| format!("read {}", path.display()))?,
+                        std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
                     ),
                     None => VcekSource::Kds,
                 };
@@ -167,8 +171,7 @@ fn resolve_gateway(
         return Ok(Gateway::local(host));
     };
     let via = crate::node_http::get_json(&node_base()?, "/v1/gateway/browser")
-        .map_err(|error| format!("read this node's browser gateway base: {error}"))?
-        ["base"]
+        .map_err(|error| format!("read this node's browser gateway base: {error}"))?["base"]
         .as_str()
         .ok_or("this node serves no browser gateway, so it cannot route a .duck authority")?
         .to_string();
@@ -191,10 +194,15 @@ pub(crate) fn cmd_inspect(
     let (mrtd_hex, report_data) = airlock::verify::peek_measurement(mode, &quote)?;
     let (seal_pk, sess_pk) = attest::split_report_data(&report_data);
 
-    eprintln!("attest={mode:?} vendor={vendor} quote={} bytes", quote.len());
+    eprintln!(
+        "attest={mode:?} vendor={vendor} quote={} bytes",
+        quote.len()
+    );
     eprintln!("REPORTDATA seal_pk = {}", hex::encode(seal_pk));
     eprintln!("REPORTDATA sess_pk = {}", hex::encode(sess_pk));
-    eprintln!("--- pin the line below as --measurement (TOFU; in prod pin from the audited build) ---");
+    eprintln!(
+        "--- pin the line below as --measurement (TOFU; in prod pin from the audited build) ---"
+    );
     // stdout is the measurement alone, so `$(... cred inspect ...)` is usable.
     println!("{mrtd_hex}");
     Ok(())
@@ -260,8 +268,7 @@ fn resolve_credential(seal: &SealArgs) -> Result<CredentialPayload, Box<dyn std:
         .credentials
         .as_ref()
         .ok_or("give the secret: --credentials <path>, --access-token, or --refresh-token")?;
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let json: serde_json::Value = serde_json::from_str(&raw).context("credentials json")?;
     let oauth = &json["claudeAiOauth"];
     let field = |key: &str| -> Result<String, String> {
@@ -288,6 +295,8 @@ fn resolve_credential(seal: &SealArgs) -> Result<CredentialPayload, Box<dyn std:
 fn block_on<T>(
     future: impl std::future::Future<Output = anyhow::Result<T>>,
 ) -> Result<T, Box<dyn std::error::Error>> {
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     Ok(runtime.block_on(future)?)
 }

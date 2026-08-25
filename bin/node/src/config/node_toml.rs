@@ -358,34 +358,90 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
         "# ducktape node config (network shape) — see network.toml for the network.\n\
          # every key is required; edit values, don't delete lines (rewrites re-fill).\n",
     );
-    keyline(&mut s, "network", format_args!("\"network.toml\""),
-        "the network descriptor, beside this file");
-    keyline(&mut s, "key_file", format_args!("\"identity.key\""),
-        "this node's identity secret, beside this file");
-    keyline(&mut s, "listen", format_args!("\"{}\"", p.listen),
-        "p2p mesh listener (dual-stack)");
-    keyline(&mut s, "advertised", format_args!("\"{}\"", p.advertised),
-        "what peers dial: \"overlay\" = the chain ULA, or host:port");
-    keyline(&mut s, "storage_dir", format_args!("'{}'", p.storage_dir),
-        "chain + module state, beside this file");
-    keyline(&mut s, "http_listen", format_args!("\"{}\"", p.http_listen),
-        "HTTP app API (keep loopback)");
-    keyline(&mut s, "gateway_listen", format_args!("\"{}\"", p.gateway_listen),
-        "browser gateway; loopback only, port 0 = pick free");
-    keyline(&mut s, "rpc_listen", format_args!("\"{}\"", p.rpc_listen),
-        "local admin RPC (keep loopback)");
-    keyline(&mut s, "wireguard_listen", format_args!("\"{}\"", p.wireguard_listen),
-        "the WireGuard tunnel plane (UDP)");
-    keyline(&mut s, "invite_listen", format_args!("\"{}\"", p.invite_listen),
-        "invite intro listener (UDP; convention: wireguard port + 1)");
-    keyline(&mut s, "wireguard_advertised", format_args!("\"{}\"", p.wireguard_advertised),
-        "tunnel endpoint peers dial; \"auto\" = derive from wireguard_listen");
-    keyline(&mut s, "primary_coordinator", format_args!("\"{}\"", p.primary_coordinator),
-        "ambient rendezvous coordinator; \"none\" disables");
-    keyline(&mut s, "coordinator_relay", format_args!("\"{}\"", p.coordinator_relay),
-        "TCP first-contact fallback; \"none\" disables");
-    keyline(&mut s, "checkpoint_blocks", format_args!("{}", p.checkpoint_blocks),
-        "sealed blocks between recovery checkpoints");
+    keyline(
+        &mut s,
+        "network",
+        format_args!("\"network.toml\""),
+        "the network descriptor, beside this file",
+    );
+    keyline(
+        &mut s,
+        "key_file",
+        format_args!("\"identity.key\""),
+        "this node's identity secret, beside this file",
+    );
+    keyline(
+        &mut s,
+        "listen",
+        format_args!("\"{}\"", p.listen),
+        "p2p mesh listener (dual-stack)",
+    );
+    keyline(
+        &mut s,
+        "advertised",
+        format_args!("\"{}\"", p.advertised),
+        "what peers dial: \"overlay\" = the chain ULA, or host:port",
+    );
+    keyline(
+        &mut s,
+        "storage_dir",
+        format_args!("'{}'", p.storage_dir),
+        "chain + module state, beside this file",
+    );
+    keyline(
+        &mut s,
+        "http_listen",
+        format_args!("\"{}\"", p.http_listen),
+        "HTTP app API (keep loopback)",
+    );
+    keyline(
+        &mut s,
+        "gateway_listen",
+        format_args!("\"{}\"", p.gateway_listen),
+        "browser gateway; loopback only, port 0 = pick free",
+    );
+    keyline(
+        &mut s,
+        "rpc_listen",
+        format_args!("\"{}\"", p.rpc_listen),
+        "local admin RPC (keep loopback)",
+    );
+    keyline(
+        &mut s,
+        "wireguard_listen",
+        format_args!("\"{}\"", p.wireguard_listen),
+        "the WireGuard tunnel plane (UDP)",
+    );
+    keyline(
+        &mut s,
+        "invite_listen",
+        format_args!("\"{}\"", p.invite_listen),
+        "invite intro listener (UDP; convention: wireguard port + 1)",
+    );
+    keyline(
+        &mut s,
+        "wireguard_advertised",
+        format_args!("\"{}\"", p.wireguard_advertised),
+        "tunnel endpoint peers dial; \"auto\" = derive from wireguard_listen",
+    );
+    keyline(
+        &mut s,
+        "primary_coordinator",
+        format_args!("\"{}\"", p.primary_coordinator),
+        "ambient rendezvous coordinator; \"none\" disables",
+    );
+    keyline(
+        &mut s,
+        "coordinator_relay",
+        format_args!("\"{}\"", p.coordinator_relay),
+        "TCP first-contact fallback; \"none\" disables",
+    );
+    keyline(
+        &mut s,
+        "checkpoint_blocks",
+        format_args!("{}", p.checkpoint_blocks),
+        "sealed blocks between recovery checkpoints",
+    );
     // the [sandbox] table LAST — everything after a toml table header belongs
     // to the table, so no top-level key may follow it.
     match &p.sandbox {
@@ -396,16 +452,36 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
                  # can announce capabilities. delete the whole table for a consensus-only node.\n\
                  [sandbox]"
             );
-            keyline(&mut s, "runtime", format_args!("\"{}\"", sb.runtime),
-                "isolation adapter: \"firecracker\" (runs never execute bare on the host)");
-            keyline(&mut s, "kernel", format_args!("\"{}\"", sb.kernel.display()),
-                "the guest kernel every run boots");
-            keyline(&mut s, "rootfs", format_args!("\"{}\"", sb.rootfs.display()),
-                "the shared read-only guest root filesystem");
-            keyline(&mut s, "cores", format_args!("{}", sb.cores),
-                "announced capacity; 0 = probe the host");
-            keyline(&mut s, "mem_gb", format_args!("{}", sb.mem_gb),
-                "announced capacity (GiB); 0 = probe the host");
+            keyline(
+                &mut s,
+                "runtime",
+                format_args!("\"{}\"", sb.runtime),
+                "isolation adapter: \"firecracker\" (runs never execute bare on the host)",
+            );
+            keyline(
+                &mut s,
+                "kernel",
+                format_args!("\"{}\"", sb.kernel.display()),
+                "the guest kernel every run boots",
+            );
+            keyline(
+                &mut s,
+                "rootfs",
+                format_args!("\"{}\"", sb.rootfs.display()),
+                "the shared read-only guest root filesystem",
+            );
+            keyline(
+                &mut s,
+                "cores",
+                format_args!("{}", sb.cores),
+                "announced capacity; 0 = probe the host",
+            );
+            keyline(
+                &mut s,
+                "mem_gb",
+                format_args!("{}", sb.mem_gb),
+                "announced capacity (GiB); 0 = probe the host",
+            );
         }
         None => {
             let _ = writeln!(
@@ -615,7 +691,10 @@ mod tests {
 
     #[test]
     fn derived_relay_follows_the_coordinator() {
-        assert_eq!(derive_coordinator_relay("coord.example:3478"), "coord.example:443");
+        assert_eq!(
+            derive_coordinator_relay("coord.example:3478"),
+            "coord.example:443"
+        );
         assert_eq!(derive_coordinator_relay("none"), "none");
     }
 }

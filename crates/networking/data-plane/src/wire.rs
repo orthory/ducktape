@@ -1,37 +1,37 @@
 //! Wire encoding — the cross-node surface of the plane.
 //!
-//! Datagram frame (12-byte header, then payload):
+//! Datagram frame (9-byte header, then payload):
 //!
 //! ```text
-//! offset  0        1          2..10          10..12
-//!         ver = 1  service    flow (u64 BE)  reserved = 0
+//! offset  0          1..9
+//!         service    flow (u64 BE)
 //! ```
 //!
 //! Stream hello (one length-prefixed frame, opener → acceptor, answered by a
 //! single [`HELLO_ACK`] byte):
 //!
 //! ```text
-//! u16 BE len | ver = 1 | service | flow (u64 BE) | intent | meta (len-11 bytes)
+//! u16 BE len | service | flow (u64 BE) | intent | meta (len-10 bytes)
 //! ```
 //!
-//! `intent` and `meta` are service-defined and opaque to the plane.
+//! `intent` and `meta` are service-defined and opaque to the plane. there is
+//! no version byte: the frame is a fixed shape (flag-day rule — no in-band
+//! version), and the service id is the discriminant.
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::Service;
 use crate::flow::FlowId;
 
-pub const WIRE_VERSION: u8 = 1;
-
 /// Largest whole datagram frame. Derivation: overlay MTU 1420 (WireGuard
 /// over a 1500 underlay) − 40 (IPv6) − 8 (UDP) = 1372 UDP payload bytes.
 /// The plane never fragments — consumers must fit the payload bound.
 pub const MAX_DATAGRAM: usize = 1372;
-pub const DATAGRAM_HEADER_LEN: usize = 12;
+pub const DATAGRAM_HEADER_LEN: usize = 9;
 pub const MAX_DATAGRAM_PAYLOAD: usize = MAX_DATAGRAM - DATAGRAM_HEADER_LEN;
 
-/// Hello body length ahead of meta: ver + service + flow + intent.
-const HELLO_FIXED_LEN: usize = 11;
+/// Hello body length ahead of meta: service + flow + intent.
+const HELLO_FIXED_LEN: usize = 10;
 /// The gateway plane packs a proxied request's HEAD (method, path, and the
 /// forwarded HTTP headers) into the stream Hello's `meta`. Real HTTP heads —
 /// an airlock `/v1/messages` carries `anthropic-version`, `anthropic-beta`, the
@@ -52,8 +52,6 @@ pub enum WireError {
     MetaTooLarge { len: usize },
     #[error("frame truncated")]
     Truncated,
-    #[error("unsupported wire version {0}")]
-    BadVersion(u8),
     #[error("unknown service id {0}")]
     UnknownService(u8),
     #[error("io: {0}")]
@@ -69,10 +67,8 @@ pub fn encode_datagram(
         return Err(WireError::PayloadTooLarge { len: payload.len() });
     }
     let mut frame = Vec::with_capacity(DATAGRAM_HEADER_LEN + payload.len());
-    frame.push(WIRE_VERSION);
     frame.push(service as u8);
     frame.extend_from_slice(&flow.as_u64().to_be_bytes());
-    frame.extend_from_slice(&[0, 0]);
     frame.extend_from_slice(payload);
     Ok(frame)
 }
@@ -81,13 +77,8 @@ pub fn decode_datagram(frame: &[u8]) -> Result<(Service, FlowId, &[u8]), WireErr
     if frame.len() < DATAGRAM_HEADER_LEN {
         return Err(WireError::Truncated);
     }
-    if frame[0] != WIRE_VERSION {
-        return Err(WireError::BadVersion(frame[0]));
-    }
-    let service = Service::try_from(frame[1]).map_err(WireError::UnknownService)?;
-    let flow = FlowId::from_raw(u64::from_be_bytes(
-        frame[2..10].try_into().expect("8 bytes"),
-    ));
+    let service = Service::try_from(frame[0]).map_err(WireError::UnknownService)?;
+    let flow = FlowId::from_raw(u64::from_be_bytes(frame[1..9].try_into().expect("8 bytes")));
     Ok((service, flow, &frame[DATAGRAM_HEADER_LEN..]))
 }
 
@@ -112,7 +103,6 @@ pub async fn write_hello<W: AsyncWrite + Unpin>(
     let len = HELLO_FIXED_LEN + hello.meta.len();
     let mut frame = Vec::with_capacity(2 + len);
     frame.extend_from_slice(&(len as u16).to_be_bytes());
-    frame.push(WIRE_VERSION);
     frame.push(hello.service as u8);
     frame.extend_from_slice(&hello.flow.as_u64().to_be_bytes());
     frame.push(hello.intent);
@@ -136,16 +126,13 @@ pub async fn read_hello<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Hello, W
     }
     let mut body = vec![0u8; len];
     reader.read_exact(&mut body).await?;
-    if body[0] != WIRE_VERSION {
-        return Err(WireError::BadVersion(body[0]));
-    }
-    let service = Service::try_from(body[1]).map_err(WireError::UnknownService)?;
-    let flow = FlowId::from_raw(u64::from_be_bytes(body[2..10].try_into().expect("8 bytes")));
+    let service = Service::try_from(body[0]).map_err(WireError::UnknownService)?;
+    let flow = FlowId::from_raw(u64::from_be_bytes(body[1..9].try_into().expect("8 bytes")));
     Ok(Hello {
         service,
         flow,
-        intent: body[10],
-        meta: body[11..].to_vec(),
+        intent: body[9],
+        meta: body[10..].to_vec(),
     })
 }
 
@@ -176,13 +163,7 @@ mod tests {
             Err(WireError::Truncated)
         ));
         let mut frame = encode_datagram(Service::Voice, flow, b"x").unwrap();
-        frame[0] = 9;
-        assert!(matches!(
-            decode_datagram(&frame),
-            Err(WireError::BadVersion(9))
-        ));
-        frame[0] = WIRE_VERSION;
-        frame[1] = 250;
+        frame[0] = 250;
         assert!(matches!(
             decode_datagram(&frame),
             Err(WireError::UnknownService(250))
@@ -204,27 +185,23 @@ mod tests {
     }
 
     #[test]
-    fn service_ids_are_wire_stable() {
-        // append-only registry: these numbers are cross-node commitments.
+    fn service_ids_are_contiguous_and_ports_derive_from_them() {
+        // the registry is contiguous from 1; the well-known ports derive from
+        // the id, so both ends compute the same dial port with no signaling.
         for (service, id) in [
             (Service::StateSync, 1u8),
             (Service::Voice, 2u8),
             (Service::Video, 3u8),
-            (Service::Gateway, 6u8),
-            (Service::AgentTelemetry, 7u8),
-            (Service::ModuleCode, 8u8),
-            (Service::TermSession, 9u8),
+            (Service::Gateway, 4u8),
+            (Service::AgentTelemetry, 5u8),
+            (Service::ModuleCode, 6u8),
+            (Service::TermSession, 7u8),
         ] {
             assert_eq!(service as u8, id);
             assert_eq!(Service::try_from(id), Ok(service));
+            assert_eq!(service.overlay_stream_port(), 45800 + id as u16);
+            assert_eq!(service.overlay_datagram_port(), 45900 + id as u16);
         }
-        assert_eq!(Service::try_from(4u8), Err(4u8));
-        assert_eq!(Service::try_from(5u8), Err(5u8));
-        assert_eq!(Service::Gateway.overlay_stream_port(), 45806);
-        assert_eq!(Service::Gateway.overlay_datagram_port(), 45906);
-        assert_eq!(Service::AgentTelemetry.overlay_stream_port(), 45807);
-        assert_eq!(Service::AgentTelemetry.overlay_datagram_port(), 45907);
-        assert_eq!(Service::TermSession.overlay_stream_port(), 45809);
-        assert_eq!(Service::TermSession.overlay_datagram_port(), 45909);
+        assert_eq!(Service::try_from(8u8), Err(8u8));
     }
 }

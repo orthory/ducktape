@@ -20,8 +20,8 @@
 #                      system/ or apps/ implements `sdk::Module`; anything that
 #                      does not belongs somewhere else in this list. (module =
 #                      onchain, service = offchain.)
-#   crates/modules/system/ — system modules: consensus infrastructure (kv,
-#                      valset, governance, identity, lifecycle, saga,
+#   crates/modules/system/ — system modules: consensus infrastructure (acl,
+#                      kv, valset, governance, identity, lifecycle, saga,
 #                      capability, dispatch, tagging, gateway — which absorbed
 #                      the duckdns naming library it now consumes from
 #                      crates/duckdns)
@@ -34,7 +34,11 @@
 #                      microVM/egress/backend-probe muscle; broker —
 #                      the run-scoped credential loopback + airlock client;
 #                      provider — the executor spec layer + CliProvider run loop;
-#                      agent — the pty session daemon; airlock — the lender)
+#                      agent — the pty session daemon; airlock — the lender;
+#                      media — the huddle voice/video planes + call-socket wire)
+#   crates/topology/ — the module composition catalog: the id universe, its
+#                      wiring/config schema and the named genesis selections
+#                      every composer draws from (pure data, no deps)
 #   crates/airlock/  — the two-party execution/auth contract (see members below)
 #   crates/duckdns/  — the `.duck` account naming library: hostname grammar,
 #                      handle registry, wire types. NOT a module — the `gateway`
@@ -61,11 +65,14 @@
 #                      genesis set. EXCLUDED from the workspace as its own
 #                      standalone crate so its heavy deps (revm, alloy) never
 #                      tax the shipping build; gated via `make labs-gate`
+#   crates/noded/    — the node daemon library: the /v1 http+ws surface, the
+#                      actor lane, index/blob/stream lanes and the in-process
+#                      testkit — served by bin/noded, bin/node and bin/simnode
 #   bin/             — demo (in-process walkthrough), node (the `ducktape`
 #                      CLI: validator + fs verbs + mcp server), noded (the
-#                      app-facing daemon), simnode (deterministic /v1 twin),
-#                      coordinator (STUN rendezvous), guest-builder (module →
-#                      wasm component packaging tool)
+#                      app-facing daemon process), simnode (deterministic /v1
+#                      twin), coordinator (STUN rendezvous), guest-builder
+#                      (module → wasm component packaging tool)
 # the host dispatches modules over BFT consensus and composes each authenticated
 # root into the global root-hash. cosmwasm's isolation *pattern*, native rust.
 
@@ -133,6 +140,7 @@ members = [
     "crates/services/airlock",
     "crates/services/broker",
     "crates/services/compute",
+    "crates/services/media",
     "crates/services/provider",
     "crates/services/sandbox",
     # examples — demo / test scaffolding modules
@@ -140,6 +148,10 @@ members = [
     # testing — dev-only shared harness helpers (raw-http client, ports,
     # poll). NOT a Module Rule surface; no shipping crate depends on it.
     "crates/testing/nettest",
+    # topology — the module composition catalog every composer draws from
+    "crates/topology",
+    # noded — the daemon library behind the /v1 surface
+    "crates/noded",
     # bin — runnable binaries
     "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
     "bin/airlock-gateway",
@@ -163,7 +175,7 @@ version = "0.1.0"
 clap = { version = "4.6", features = ["derive"] }
 # the logging facade. events land in `noded::LogRing` (streamed to the app's
 # Logs tab over the ws `logs` topic) AND on stderr (tee'd to daemon.log) —
-# both gated by ONE reloadable filter, see bin/noded/src/log.rs.
+# both gated by ONE reloadable filter, see crates/noded/src/log.rs.
 tracing = "0.1"
 arrayvec = "0.7"
 crossbeam-channel = "0.5"
@@ -199,13 +211,9 @@ commonware-p2p = "2026.5.0"
 commonware-parallel = "2026.5.0"
 commonware-utils = "2026.5.0"
 commonware-actor = "2026.5.0"
-defguard_wireguard_rs = "0.10.0"
-# the userspace overlay backend (overlay-net/userspace): the SAME BoringTun
-# core the TUN path already runs (defguard_wireguard_rs's fork), used sans-io
-# (`noise::Tunn`, no device layer) — wire compat between socket-mode and
-# tun-mode nodes is by construction, not by hope. version pinned to the one
-# defguard_wireguard_rs 0.10 resolves, so both paths share one build of the
-# crypto core.
+# the userspace overlay backend (overlay-net/userspace): the BoringTun noise
+# core used sans-io (`noise::Tunn`, no device layer) — WireGuard-compatible on
+# the wire by construction.
 defguard_boringtun = "0.6.5"
 # the userspace backend's virtual host: a TUN-less TCP/UDP stack terminating
 # at the node's overlay ULA, entirely in-process. `medium-ip` because the
@@ -303,12 +311,15 @@ agent-service = { path = "crates/services/agent" }
 airlock-service = { path = "crates/services/airlock" }
 broker-host = { path = "crates/services/broker" }
 compute-service = { path = "crates/services/compute" }
+media-service = { path = "crates/services/media" }
 provider-host = { path = "crates/services/provider" }
 sandbox-host = { path = "crates/services/sandbox" }
 # internal — cross-plane libraries: neither a consensus module nor a service.
 # duckdns is the `.duck` naming library the `gateway` module embeds and the
 # composing binaries validate names through (see the members list).
 duckdns = { path = "crates/duckdns" }
+# the module composition catalog (id universe + named genesis selections).
+topology = { path = "crates/topology" }
 duckfs-core = { path = "crates/duckfs/core" }
 duckfs-disk = { path = "crates/duckfs/disk" }
 duckfs-client = { path = "crates/duckfs/client" }
