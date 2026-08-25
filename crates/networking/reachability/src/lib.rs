@@ -21,6 +21,7 @@ pub mod binding;
 pub mod keys;
 pub mod msg;
 pub mod orchestrator;
+pub mod rendezvous;
 pub mod seal;
 pub mod store;
 
@@ -30,9 +31,12 @@ pub use binding::{active_set, identity_of, node_key, open_port_policy};
 pub use keys::WireGuardKeypair;
 pub use msg::ReachabilityMsg;
 pub use orchestrator::{
-    CoordinatedInviteReply, EndpointResolver, InstallReply, MeshEpochEvent, NatResolver,
-    RENDEZVOUS_KEEPALIVE, ReachabilityCommand, ReachabilityConfig, ReachabilityError,
-    ReachabilityEvent, RendezvousStatus, Resolution, StaticResolver, run,
+    CoordinatedInviteReply, InstallReply, MeshEpochEvent, ReachabilityCommand, ReachabilityConfig,
+    ReachabilityError, ReachabilityEvent, run,
+};
+pub use rendezvous::{
+    EndpointResolver, NatResolver, RENDEZVOUS_KEEPALIVE, RendezvousStatus, Resolution,
+    StaticResolver,
 };
 pub use seal::seal;
 pub use store::PersistedMesh;
