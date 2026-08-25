@@ -318,6 +318,12 @@ where
                     };
                     let Some(Ok((peer, msg))) = frame else { break };
                     let bytes: Vec<u8> = msg.into();
+                    tracing::trace!(
+                        target: "ducktape::reachability",
+                        peer = %hex_bytes(&peer.as_ref()[..4]),
+                        bytes = bytes.len(),
+                        "plane frame in"
+                    );
                     let deliver = reachability::ReachabilityCommand::Deliver { from: peer, bytes };
                     if cmd.send(deliver).await.is_err() {
                         break;
@@ -342,7 +348,24 @@ where
                 while let Some(event) = ev_rx.recv().await {
                     match event {
                         reachability::ReachabilityEvent::Send { to, bytes } => {
-                            let _ = tx.send(Recipients::One(to), IoBuf::from(bytes), false);
+                            // `send` is fire-and-forget and returns the
+                            // recipients it will ATTEMPT — empty means the
+                            // lane refused it outright (peer not connected,
+                            // rate-limited, sender closed). Dropping that
+                            // return silently is how a one-way plane looks
+                            // healthy from the side that is still talking.
+                            let size = bytes.len();
+                            let attempted =
+                                tx.send(Recipients::One(to.clone()), IoBuf::from(bytes), false);
+                            if attempted.is_empty() {
+                                tracing::debug!(
+                                    target: "ducktape::reachability",
+                                    node = %pump_label,
+                                    peer = %hex_bytes(&to.as_ref()[..4]),
+                                    bytes = size,
+                                    "plane send refused by the lane"
+                                );
+                            }
                         }
                         reachability::ReachabilityEvent::MeshReady { epoch, .. } => {
                             tracing::info!(
