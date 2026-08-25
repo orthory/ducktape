@@ -241,6 +241,12 @@ async fn main() -> std::io::Result<()> {
             metrics_interval,
         ));
     }
-    run_coordinator_workers_with_metrics_using(sock, coord, workers, metrics).await;
+    run_coordinator_workers_with_metrics_using(
+        nat_traversal::NatSocket::Owned(sock),
+        coord,
+        workers,
+        metrics,
+    )
+    .await;
     Ok(())
 }

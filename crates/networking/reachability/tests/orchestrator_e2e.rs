@@ -536,7 +536,7 @@ async fn nat_resolver_punches_over_loopback() {
     let coord_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let coord_addr = coord_sock.local_addr().unwrap();
     tokio::spawn(nat_traversal::client::run_coordinator(
-        coord_sock,
+        nat_traversal::NatSocket::Owned(coord_sock),
         nat_traversal::AuthPolicy::Public,
     ));
 
@@ -576,7 +576,7 @@ async fn resolver_datagram_roundtrip_over_loopback() {
     let coord_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let coord_addr = coord_sock.local_addr().unwrap();
     tokio::spawn(nat_traversal::client::run_coordinator(
-        coord_sock,
+        nat_traversal::NatSocket::Owned(coord_sock),
         nat_traversal::AuthPolicy::Public,
     ));
 
@@ -655,7 +655,10 @@ async fn private_coordinator_admits_authenticated_bind() {
 
     let coord_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let coord_addr = coord_sock.local_addr().unwrap();
-    tokio::spawn(nat_traversal::run_coordinator(coord_sock, policy));
+    tokio::spawn(nat_traversal::run_coordinator(
+        nat_traversal::NatSocket::Owned(coord_sock),
+        policy,
+    ));
 
     // a genesis member: admitted by membership, no cap needed.
     let member_key = node_key_of(&member.public_key());
@@ -702,7 +705,10 @@ async fn private_coordinator_denies_uncredentialed_bind() {
 
     let coord_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let coord_addr = coord_sock.local_addr().unwrap();
-    tokio::spawn(nat_traversal::run_coordinator(coord_sock, policy));
+    tokio::spawn(nat_traversal::run_coordinator(
+        nat_traversal::NatSocket::Owned(coord_sock),
+        policy,
+    ));
 
     // the outsider authenticates (valid PoP) but carries no cap and is not a
     // genesis member: every request, BindRequest included, is dropped by the
@@ -751,7 +757,10 @@ async fn private_coordinator_cross_peer_punch() {
 
     let coord_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let coord_addr = coord_sock.local_addr().unwrap();
-    tokio::spawn(nat_traversal::run_coordinator(coord_sock, policy));
+    tokio::spawn(nat_traversal::run_coordinator(
+        nat_traversal::NatSocket::Owned(coord_sock),
+        policy,
+    ));
 
     let a_key = node_key_of(&a_signer.public_key());
     let b_key = node_key_of(&b_signer.public_key());

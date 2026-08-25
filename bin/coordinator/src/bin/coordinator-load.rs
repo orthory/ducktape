@@ -579,7 +579,7 @@ mod tests {
         let target = socket.local_addr().unwrap();
         let metrics = nat_traversal::CoordinatorMetrics::default();
         let server = tokio::spawn(nat_traversal::run_coordinator_workers_with_metrics(
-            socket,
+            nat_traversal::NatSocket::Owned(socket),
             nat_traversal::AuthPolicy::Public,
             4,
             metrics.clone(),

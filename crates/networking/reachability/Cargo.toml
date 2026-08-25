@@ -22,4 +22,14 @@ x25519-dalek = { workspace = true }
 [dev-dependencies]
 nat-traversal = { workspace = true, features = ["simnat"] }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["net", "rt", "time", "sync", "macros", "rt-multi-thread"] }
+# test-util: the simulated-NAT acceptance suite runs the resolver's real
+# timeouts on the paused clock.
+tokio = { workspace = true, features = [
+    "net",
+    "rt",
+    "time",
+    "sync",
+    "macros",
+    "rt-multi-thread",
+    "test-util",
+] }

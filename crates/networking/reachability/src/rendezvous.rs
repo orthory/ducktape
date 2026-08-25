@@ -744,7 +744,7 @@ mod tests {
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
         tokio::spawn(nat_traversal::run_coordinator(
-            coord_sock,
+            nat_traversal::NatSocket::Owned(coord_sock),
             nat_traversal::AuthPolicy::Public,
         ));
 
@@ -782,7 +782,10 @@ mod tests {
         let coord_addr = coord_sock.local_addr().unwrap();
         let coordinator =
             nat_traversal::Coordinator::with_policy_and_ttl(nat_traversal::AuthPolicy::Public, 1);
-        tokio::spawn(nat_traversal::run_coordinator_with(coord_sock, coordinator));
+        tokio::spawn(nat_traversal::run_coordinator_with(
+            nat_traversal::NatSocket::Owned(coord_sock),
+            coordinator,
+        ));
 
         // A keeps itself alive on a 300ms keepalive; X registers once and
         // goes silent.
@@ -836,7 +839,10 @@ mod tests {
         let coord_addr = coord_sock.local_addr().unwrap();
         let coordinator =
             nat_traversal::Coordinator::with_policy_and_ttl(nat_traversal::AuthPolicy::Public, 1);
-        tokio::spawn(nat_traversal::run_coordinator_with(coord_sock, coordinator));
+        tokio::spawn(nat_traversal::run_coordinator_with(
+            nat_traversal::NatSocket::Owned(coord_sock),
+            coordinator,
+        ));
 
         let (a_key, a_signer) = identity(6);
         let (x_key, x_signer) = identity(7);
@@ -921,7 +927,7 @@ mod tests {
         // The coordinator comes up LATE, on the same address...
         let coord_sock = UdpSocket::bind(coord_addr).await.unwrap();
         tokio::spawn(nat_traversal::run_coordinator(
-            coord_sock,
+            nat_traversal::NatSocket::Owned(coord_sock),
             nat_traversal::AuthPolicy::Public,
         ));
 

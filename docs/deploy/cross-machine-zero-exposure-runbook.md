@@ -76,6 +76,7 @@ This extends the current v1 live-join rig (the NAT-hairpin gotcha and the
 
 **What still needs real infra proof:** an end-to-end tunnel across two distinct,
 punchable NATs. The logic is proven at the library level by the CI simulated-NAT
-suite (`crates/networking/nat-traversal/tests/simnat_ci.rs`, Slice 3), but the real
+suite (`crates/networking/reachability/tests/rendezvous_simnat.rs`, which drives
+the production resolver over a simulated NAT topology), but the real
 cross-machine run still needs two NATs that admit a direct punched path plus a
 VPS coordinator.

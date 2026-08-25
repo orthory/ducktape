@@ -921,7 +921,10 @@ mod tests {
         let coord_addr = coord_sock.local_addr().unwrap();
         let coord = Coordinator::with_policy(policy.clone());
         let adverts = coord.adverts();
-        tokio::spawn(run_coordinator_with(coord_sock, coord));
+        tokio::spawn(run_coordinator_with(
+            crate::NatSocket::Owned(coord_sock),
+            coord,
+        ));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let relay_addr = listener.local_addr().unwrap();
