@@ -277,9 +277,24 @@ async fn build_pool(
         )),
     );
 
-    let resolver: compute_service::SharedCredentialResolver = Arc::new(
-        cred::NodeCredentialResolver::new(node.clone(), browser_gateway(node).await),
-    );
+    // `agent sched` REQUIRES a `--cred`, and a credential is routed through
+    // this node's own browser gateway — so a daemon without one can execute no
+    // scheduled run at all, while still announcing every capability it has.
+    // It learns that here, at boot, and used to say nothing: the operator's
+    // first evidence was a saga burning all three attempts on
+    // "this node has no browser gateway to route credential traffic".
+    let via = browser_gateway(node).await;
+    if via.is_none() {
+        tracing::warn!(
+            target: "ducktape::compute",
+            reason = "no_browser_gateway",
+            "this node serves no browser gateway, so every run naming a --cred \
+             will fail to resolve it (the browser gateway starts only when the \
+             node api binds a loopback address)"
+        );
+    }
+    let resolver: compute_service::SharedCredentialResolver =
+        Arc::new(cred::NodeCredentialResolver::new(node.clone(), via));
 
     let pool = DispatchPool::with_limit(
         Arc::new(providers),

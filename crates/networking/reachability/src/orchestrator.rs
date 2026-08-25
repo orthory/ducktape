@@ -88,6 +88,19 @@ pub fn initiates(local: ValidatorIdentity, peer: ValidatorIdentity) -> bool {
     local.0 < peer.0
 }
 
+/// Nudge ticks an untargeted plane is given before it is called a defect.
+///
+/// Small, because the only legitimate window is the boot race between wiring
+/// the plane and the boot `Retarget` that follows it a few statements later —
+/// anything past that never resolves on its own.
+const UNTARGETED_NUDGE_GRACE: u64 = 3;
+
+/// an identity's first four bytes, hex — the form every other plane's logs
+/// use for a peer, and short enough to read a gossip trace in a terminal.
+fn short(id: ValidatorIdentity) -> String {
+    id.0[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Everything the node resolves ONCE at boot and hands the orchestrator.
 pub struct ReachabilityConfig {
     /// The chain id — doubles as the advertisement namespace and the ULA
@@ -346,6 +359,16 @@ struct Driver<'a, E, R> {
     resolver: R,
     events: mpsc::Sender<ReachabilityEvent>,
     view: u64,
+    /// How many nudge ticks have found the plane without an epoch.
+    ///
+    /// A plane that was wired but never `Retarget`ed is a black hole in both
+    /// directions — it drops every inbound record and advert and sends none of
+    /// its own — and silence here costs a live session to diagnose from p2p
+    /// byte counters, with the symptom misread as a NAT problem.
+    untargeted_nudges: u64,
+    /// Nudge ticks since this plane started — the clock the per-peer heal
+    /// cooldown counts in (see `epoch::EpochState::request_heal`).
+    nudges: u64,
     /// A previous epoch's interface is live and must be removed before (or
     /// instead of) the next apply.
     interface_live: bool,
@@ -483,6 +506,8 @@ where
             resolver,
             events,
             view: 0,
+            untargeted_nudges: 0,
+            nudges: 0,
             interface_live: false,
             base_peers: None,
             restore_tried: false,
@@ -741,6 +766,27 @@ where
                 return Ok(None);
             }
         };
+        // the plane's one lifecycle fact per epoch, and the positive half of
+        // the `no_epoch_target` warn in `nudge`: an operator reading a node
+        // that gossips nothing needs to know whether this line ever printed.
+        match role {
+            Role::Member => tracing::info!(
+                target: "ducktape::reachability",
+                epoch = event.epoch,
+                members = identities.len(),
+                standbys = standby_ids.len(),
+                view = event.current_view,
+                "plane targeted: member at epoch"
+            ),
+            Role::Standby => tracing::info!(
+                target: "ducktape::reachability",
+                epoch = event.epoch,
+                members = identities.len(),
+                standbys = standby_ids.len(),
+                view = event.current_view,
+                "plane targeted: standby at epoch"
+            ),
+        }
         let restored_standbys = if self.restore_tried {
             Vec::new()
         } else {
@@ -1021,17 +1067,59 @@ where
     /// goes quiet once the budget is spent and re-arms only at the next
     /// epoch's `Retarget`.
     async fn nudge(&mut self, epoch: Option<&mut EpochState>) -> Result<(), ReachabilityError> {
+        self.nudges += 1;
         let Some(state) = epoch else {
+            // A few ticks of this are the boot race — the fresh-boot path
+            // sends its Retarget right after wiring, and a nudge can beat
+            // it. Past the grace it is a wiring defect: this plane will
+            // never gossip and never accept, for the life of the process.
+            self.untargeted_nudges += 1;
+            let past_grace = self.untargeted_nudges >= UNTARGETED_NUDGE_GRACE;
+            let periodic = self.untargeted_nudges.is_multiple_of(64);
+            if past_grace && (self.untargeted_nudges == UNTARGETED_NUDGE_GRACE || periodic) {
+                tracing::warn!(
+                    target: "ducktape::reachability",
+                    reason = "no_epoch_target",
+                    attempts = self.untargeted_nudges,
+                    "this reachability plane was never told its epoch — it is dropping \
+                     every record and advert it receives and sending none of its own"
+                );
+            }
             return Ok(());
         };
+        self.untargeted_nudges = 0;
         state.expire_relays(self.view);
         for (peer, msg) in state.reoffers() {
             self.send_msg(state, peer, &msg).await?;
         }
         match state.role {
-            Role::Member => self.sweep_member_rendezvous_fallback(state).await,
+            Role::Member => {
+                self.heal_behind_peers(state).await?;
+                self.sweep_member_rendezvous_fallback(state).await
+            }
             Role::Standby => self.sweep_standby_rendezvous_fallback(state).await,
         }
+    }
+
+    /// THE HEAL: a peer still gossiping phase-A at a node whose sets have
+    /// locked is a peer that never got our half. Its record and advert are
+    /// dropped by the phase gates, but the drop RECORDS the ask
+    /// (`request_heal`), and one nudge later this sends our record and
+    /// advert back.
+    ///
+    /// Without this, missing one fan-out is permanent: the exchange is
+    /// one-shot and the sender moves on. That loss is routine — a member
+    /// learns how to DIAL a promoted joiner from the very record that
+    /// completes its own assembly, so its reply goes out microseconds before
+    /// the link exists and the lane drops it; the joiner then retries
+    /// forever into a node that will not answer until the next cutover.
+    /// Rate: at most one record+advert pair per asking peer per tick, and
+    /// only to a peer that asked by gossiping at us.
+    async fn heal_behind_peers(&mut self, state: &mut EpochState) -> Result<(), ReachabilityError> {
+        for (peer, msg) in state.heal_sends(self.nudges) {
+            self.send_msg(state, peer, &msg).await?;
+        }
+        Ok(())
     }
 
     /// Retry the by-identity rendezvous fallback for any MEMBER peer that
@@ -1113,11 +1201,19 @@ where
         from: ed25519::PublicKey,
         bytes: Vec<u8>,
     ) -> Result<(), ReachabilityError> {
-        // no active epoch (pre-boot traffic) — nothing to bind it to.
+        let via = binding::identity_of(&from);
+        // no active epoch (pre-boot traffic) — nothing to bind it to. This
+        // is the INBOUND half of the black hole `no_epoch_target` warns
+        // about: past the boot race, every one of these is a message a
+        // targeted plane would have used.
         let Some(state) = epoch else {
+            tracing::debug!(
+                target: "ducktape::reachability",
+                peer = %short(via), bytes = bytes.len(),
+                "inbound dropped: this plane has no epoch"
+            );
             return Ok(());
         };
-        let via = binding::identity_of(&from);
         // membership gate on the DELIVERING identity: plane participants
         // (members + standbys), plus the configured gossip ingress — the
         // lobby key a parked standby connects under. Content signatures do
@@ -1302,6 +1398,11 @@ where
         // re-signs once it observes the boundary.
         let cutover_skew = signed.record.epoch != state.epoch;
         if cutover_skew {
+            tracing::debug!(
+                target: "ducktape::reachability",
+                peer = %short(owner), record_epoch = signed.record.epoch, epoch = state.epoch,
+                "record dropped: cutover skew"
+            );
             return Ok(());
         }
         // our own record echoed back around the relay ring.
@@ -1312,9 +1413,25 @@ where
         // re-advertisements retunnel at the next cutover.
         let record_set_open = matches!(state.phase, Phase::Records);
         if !record_set_open {
+            // this peer is behind us in phase A, which means it never got
+            // our record: answer it on the next nudge rather than going deaf.
+            state.request_heal(owner, self.nudges);
+            tracing::debug!(
+                target: "ducktape::reachability",
+                peer = %short(owner), epoch = state.epoch,
+                "record dropped: phase A already closed — healing this peer"
+            );
             return Ok(());
         }
         let admission = state.admit_record(owner, signed.clone());
+        tracing::debug!(
+            target: "ducktape::reachability",
+            peer = %short(owner), epoch = state.epoch,
+            accepted = admission.accepted(),
+            first_contact = admission == Admission::FirstContact,
+            have = state.records.len(), want = state.set.validators().len(),
+            "record in"
+        );
         if admission == Admission::FirstContact {
             // heal join-order: the member that just appeared may have missed
             // our initial fan-out.
@@ -1354,6 +1471,11 @@ where
         // cutover skew — same tolerance as records.
         let cutover_skew = advert.record.epoch != state.epoch;
         if cutover_skew {
+            tracing::debug!(
+                target: "ducktape::reachability",
+                peer = %short(owner), advert_epoch = advert.record.epoch, epoch = state.epoch,
+                "advert dropped: cutover skew"
+            );
             return Ok(());
         }
         if owner == self.me {
@@ -1363,9 +1485,28 @@ where
         // more (its retry is the next cutover).
         let advert_set_open = matches!(state.phase, Phase::Records | Phase::Adverts);
         if !advert_set_open {
+            // decided views do not change, but a peer still advertising has
+            // not assembled one — it is missing our advert. Send it back.
+            let view_decided = state.view().is_some();
+            if view_decided {
+                state.request_heal(owner, self.nudges);
+            }
+            tracing::debug!(
+                target: "ducktape::reachability",
+                peer = %short(owner), epoch = state.epoch,
+                "advert dropped: this mesh view is already verified — healing this peer"
+            );
             return Ok(());
         }
         let admission = state.admit_advert(owner, advert.clone());
+        tracing::debug!(
+            target: "ducktape::reachability",
+            peer = %short(owner), epoch = state.epoch,
+            accepted = admission.accepted(),
+            first_contact = admission == Admission::FirstContact,
+            have = state.adverts.len(), want = state.set.validators().len(),
+            "advert in"
+        );
         // heal join-order for an advert we signed before this member
         // appeared (own advert exists from the advert phase on).
         if admission == Admission::FirstContact
@@ -1848,6 +1989,11 @@ where
         );
         state.adverts.insert(self.me, advert.clone());
         state.phase = Phase::Adverts;
+        tracing::debug!(
+            target: "ducktape::reachability",
+            epoch = state.epoch, peers = state.peers.len(),
+            "phase A complete: fanning out our advert"
+        );
         self.fan_msg(state, &ReachabilityMsg::Advert(advert)).await
     }
 

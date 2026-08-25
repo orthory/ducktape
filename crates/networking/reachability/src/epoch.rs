@@ -21,6 +21,16 @@ use wireguard::{
 use crate::msg::ReachabilityMsg;
 use crate::rendezvous::{COORD_STEP_TIMEOUT, PUNCH_STEP_TIMEOUT, PUNCH_TRIES};
 
+/// Nudge ticks between two heals of the SAME peer.
+///
+/// The heal answers a peer that is behind in phase A, and the answer itself
+/// lands at a peer that may also be past its own gate — which asks it to heal
+/// us back, forever. The cooldown makes that exchange cost two messages per
+/// pair per cooldown instead of two per tick, while a genuinely-stuck peer
+/// still gets our record and advert within a few seconds (`NUDGE_INTERVAL` is
+/// 2 s in the node).
+const HEAL_COOLDOWN_NUDGES: u64 = 4;
+
 /// Minimum spacing between by-identity rendezvous-fallback attempts for the
 /// same endpoint-less peer. The nudge fires every couple of seconds and
 /// would otherwise re-attempt a stalled resolve before the resolver's own
@@ -355,6 +365,14 @@ pub(crate) struct EpochState {
     pub(crate) records: BTreeMap<ValidatorIdentity, SignedEndpointRecord>,
     pub(crate) adverts: BTreeMap<ValidatorIdentity, EndpointAdvertisement>,
     pub(crate) phase: Phase,
+    /// Peers that gossiped phase-A state at us AFTER the relevant set locked
+    /// (a record once our advert signed, an advert once the view verified) —
+    /// i.e. peers still missing our half of the exchange. The next nudge
+    /// answers them ([`Self::heal_sends`]) and clears this.
+    heal_requests: HashSet<ValidatorIdentity>,
+    /// The nudge tick each peer was last healed at — the cooldown clock that
+    /// keeps two settled nodes from healing each other every tick forever.
+    heal_backoff: HashMap<ValidatorIdentity, u64>,
     pub(crate) replay: ReplayCache,
     /// Requests that arrived before our own `MeshView` completed (the peer
     /// verified faster); drained the moment it does. Keyed by initiator so
@@ -407,6 +425,8 @@ impl EpochState {
             records,
             adverts: BTreeMap::new(),
             phase: Phase::Records,
+            heal_requests: HashSet::new(),
+            heal_backoff: HashMap::new(),
             replay: ReplayCache::default(),
             pending_requests: BTreeMap::new(),
             handshakes: HashMap::new(),
@@ -444,6 +464,41 @@ impl EpochState {
     /// This node's own signed advertisement, from the advert phase on.
     pub(crate) fn own_advert(&self) -> Option<&EndpointAdvertisement> {
         self.adverts.get(&self.me())
+    }
+
+    /// Note a peer that showed itself behind in phase A (it gossiped at a
+    /// set this node already locked), so the next nudge can answer it with
+    /// our record and advert. Cooldown-gated per peer: the first ask always
+    /// lands; after that, once per [`HEAL_COOLDOWN_NUDGES`] ticks — so two
+    /// settled nodes exchanging stale gossip fall silent instead of healing
+    /// each other every tick forever.
+    pub(crate) fn request_heal(&mut self, peer: ValidatorIdentity, nudges: u64) {
+        let due = match self.heal_backoff.get(&peer) {
+            None => true,
+            Some(last) => nudges.saturating_sub(*last) >= HEAL_COOLDOWN_NUDGES,
+        };
+        if due {
+            self.heal_requests.insert(peer);
+        }
+    }
+
+    /// The heal sends for nudge tick `nudges`: this node's record and advert
+    /// to every peer that asked (at most one pair per peer per tick — the
+    /// same rate as the phase-A gossip it stands in for), stamping each
+    /// peer's cooldown and clearing the ask set.
+    pub(crate) fn heal_sends(&mut self, nudges: u64) -> Vec<(ValidatorIdentity, ReachabilityMsg)> {
+        let mine: Vec<ReachabilityMsg> =
+            std::iter::once(ReachabilityMsg::Record(self.own_record.clone()))
+                .chain(self.own_advert().cloned().map(ReachabilityMsg::Advert))
+                .collect();
+        let asking = std::mem::take(&mut self.heal_requests);
+        for peer in &asking {
+            self.heal_backoff.insert(*peer, nudges);
+        }
+        asking
+            .iter()
+            .flat_map(|peer| mine.iter().map(|msg| (*peer, msg.clone())))
+            .collect()
     }
 
     /// The transport identity a message for `to` is sent under: a learned

@@ -366,3 +366,41 @@ async fn a_gated_intro_forwards_once_and_answers_settled_outcomes() {
         }
     ));
 }
+
+/// The handshake sampler's memory: an idle lapse is not a dark peer.
+///
+/// boringtun reports a session's age or NOTHING, and "nothing" covers both
+/// "never handshaked" and "the 180s session just expired". Reading it alone
+/// called every healthy tunnel DARK for the ~20s between a lapse and the
+/// keepalive that heals it — a warn per peer every REJECT_AFTER_TIME, on a
+/// mesh that was working.
+#[test]
+fn an_idle_session_lapse_is_not_a_dark_peer() {
+    use crate::reachability_plane::session_verdicts;
+    use std::time::Duration;
+
+    let peer: std::net::Ipv6Addr = "fd1f::1".parse().expect("ula");
+    let never: std::net::Ipv6Addr = "fd1f::2".parse().expect("ula");
+    let mut seen = std::collections::HashMap::new();
+    let t0 = tokio::time::Instant::now();
+
+    let live = session_verdicts(&mut seen, t0, &[(peer, Some(Duration::from_secs(170)))]);
+    assert!(live[0].live, "a session with an age is live");
+
+    // the session expires; the keepalive has not re-handshaked yet.
+    let lapsed = session_verdicts(&mut seen, t0 + Duration::from_secs(22), &[(peer, None)]);
+    assert!(lapsed[0].live, "a lapsed-but-healing session is not dark");
+    assert_eq!(lapsed[0].no_session_for, Some(Duration::from_secs(22)));
+
+    // ...but one that never comes back is exactly what this watch is for.
+    let dark = session_verdicts(&mut seen, t0 + Duration::from_secs(181), &[(peer, None)]);
+    assert!(!dark[0].live, "no session for a whole session generation is dark");
+
+    // a peer whose config applied and never handshaked at all is dark on sight.
+    let unseen = session_verdicts(&mut seen, t0, &[(never, None)]);
+    assert!(!unseen[0].live);
+    assert_eq!(
+        unseen[0].no_session_for, None,
+        "never handshaked, so there is no lapse to measure"
+    );
+}

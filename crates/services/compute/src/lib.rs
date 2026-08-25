@@ -92,8 +92,11 @@ pub(crate) enum Gated {
     /// not a dispatch `WorkSpec` effect — offer it to the next worker.
     NotMine,
     /// ours, deliberately not run (foreign lease, or an announcement this
-    /// host cannot serve): a claimed skip.
-    Skip,
+    /// host cannot serve): a claimed skip, carrying WHY as a stable token.
+    /// The reason rides the value because the decision is made here and the
+    /// logging belongs to the caller — and because a silent skip is
+    /// indistinguishable, from outside, from an effect that never arrived.
+    Skip(&'static str),
     /// ours, answered without touching a provider: an `Accept` claim for a
     /// servable announcement, or the error `OracleResult` for a lease that
     /// can never execute (non-utf-8 payload, unresolvable capability).
@@ -129,7 +132,7 @@ pub(crate) fn gate(
         // the lease gate, host side: someone else's assignment is a
         // claimed skip — it IS our effect type, but the assignee submits
         // the result.
-        Some(assignee) if *assignee != node_key => Gated::Skip,
+        Some(assignee) if *assignee != node_key => Gated::Skip("foreign_lease"),
         Some(_) => gate_own_lease(providers, ledger, &request, work),
         // an UNASSIGNED request is an announcement, not a work order:
         // running it would be one execution per capable node. claim it
@@ -142,10 +145,10 @@ pub(crate) fn gate(
                 AdmissionPolicy::FailFast => ledger.within_capacity(&work.demands),
             };
             if !eligible {
-                return Gated::Skip;
+                return Gated::Skip("announcement_over_capacity");
             }
             if providers.resolve(&work.capability).is_err() {
-                return Gated::Skip;
+                return Gated::Skip("announcement_capability_unresolved");
             }
             Gated::Immediate(accept_op(&request))
         }
@@ -178,7 +181,7 @@ fn gate_own_lease(
     // in the pool, while a lease this node can never fit is a Skip so it can
     // rotate. An error result would consume the attempt with a lie.
     if !ledger.within_capacity(&work.demands) {
-        return Gated::Skip;
+        return Gated::Skip("lease_over_capacity");
     }
     if work.admission == AdmissionPolicy::Queue
         && let Err(e) = providers.resolve(&work.capability)
@@ -327,7 +330,7 @@ format = "text"
         let peer = effect_for(work_spec(), Some(b"peer"));
         assert!(matches!(
             gate(&providers, b"me", &bare_ledger(), &peer),
-            Gated::Skip
+            Gated::Skip("foreign_lease")
         ));
     }
 
@@ -402,7 +405,7 @@ format = "text"
                 &bare_ledger(),
                 &effect_for(work_spec(), None)
             ),
-            Gated::Skip
+            Gated::Skip("announcement_capability_unresolved")
         ));
     }
 
@@ -493,7 +496,7 @@ format = "text"
         let spec = work_spec_with_demands(demands(&[("cores", 8)]));
         assert!(matches!(
             gate(&providers, b"me", &ledger, &effect_for(spec, Some(b"me"))),
-            Gated::Skip
+            Gated::Skip("lease_over_capacity")
         ));
     }
 
@@ -506,7 +509,7 @@ format = "text"
         let spec = work_spec_with_demands(demands(&[("cores", 8)]));
         assert!(matches!(
             gate(&providers, b"me", &ledger, &effect_for(spec, None)),
-            Gated::Skip
+            Gated::Skip("announcement_over_capacity")
         ));
     }
 
@@ -530,7 +533,7 @@ format = "text"
         ));
         assert!(matches!(
             gate(&providers, b"me", &ledger, &effect_for(spec, None)),
-            Gated::Skip
+            Gated::Skip("announcement_over_capacity")
         ));
     }
 

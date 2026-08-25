@@ -154,6 +154,18 @@ enum AttemptState {
     Delivering,
 }
 
+impl AttemptState {
+    /// the stable log token for the state a completion found when it lost the
+    /// delivery race (see [`settle_attempt`]).
+    fn token(self) -> &'static str {
+        match self {
+            AttemptState::Running => "running",
+            AttemptState::Cancelling => "attempt_cancelled",
+            AttemptState::Delivering => "attempt_already_delivering",
+        }
+    }
+}
+
 struct RunningAttempt {
     state: AttemptState,
     cancellation: RunCancellation,
@@ -539,24 +551,33 @@ async fn settle_attempt(
         Ok(output) => (Ok(output.bytes), output.usage),
         Err(error) => (Err(error), None),
     };
-    let (won_completion, queued_reservation) = {
+    // won → deliver; lost → the reason it lost. A suppressed completion is a
+    // run that finished and whose result never reaches consensus: its saga
+    // stays Pending behind an expiring lease, and nothing anywhere used to
+    // record that it happened.
+    let (suppressed, queued_reservation) = {
         let mut attempts = inflight.lock().expect("attempts lock");
         match attempts.get_mut(key) {
-            Some(running) => {
-                let won = running.state == AttemptState::Running;
-                if won {
-                    running.state = AttemptState::Delivering;
-                }
-                (won, running.reservation.take())
+            Some(running) if running.state == AttemptState::Running => {
+                running.state = AttemptState::Delivering;
+                (None, running.reservation.take())
             }
-            None => (false, None),
+            Some(running) => (Some(running.state.token()), running.reservation.take()),
+            None => (Some("attempt_not_tracked"), None),
         }
     };
     // Both the pre-handoff and admitted paths converge here. No waiter may
     // start until provider termination and late workspace cleanup have settled.
     drop(owned_reservation);
     drop(queued_reservation);
-    if won_completion {
+    let Some(reason) = suppressed else {
+        tracing::debug!(
+            target: "ducktape::compute",
+            saga = %job.saga_id,
+            attempt = job.attempt,
+            failed = outcome.is_err(),
+            "submitting an attempt's result"
+        );
         deliver(oracle_result_with_usage(
             &job.saga_id,
             job.attempt,
@@ -564,7 +585,15 @@ async fn settle_attempt(
             usage,
         ))
         .await;
-    }
+        return;
+    };
+    tracing::warn!(
+        target: "ducktape::compute",
+        saga = %job.saga_id,
+        attempt = job.attempt,
+        reason,
+        "a finished attempt's result was NOT submitted"
+    );
 }
 
 /// provision → bind → run → commit → assemble → cleanup, at the dispatch
@@ -715,7 +744,16 @@ async fn execute(
                 let (receipt, status) = match commit_result {
                     Some(Ok(receipt)) => (receipt, crate::provision::Status::Ok),
                     Some(Err(e)) => {
-                        eprintln!("[oracle] commit failed for {}: {e}", spec.run_id);
+                        // This is what a `degraded: true` run looks like from
+                        // the inside, and on raw stderr it reached no operator:
+                        // the chain says degraded, the node said nothing.
+                        tracing::warn!(
+                            target: "ducktape::compute",
+                            reason = "workspace_commit_failed",
+                            run = %spec.run_id,
+                            error = %e,
+                            "the run's workspace did not commit; delivering degraded"
+                        );
                         (
                             crate::provision::WorkspaceReceipt::commit_failed(&spec, e),
                             crate::provision::Status::Degraded,
@@ -732,7 +770,13 @@ async fn execute(
                         }
                         let error =
                             format!("commit timed out after {:?}", workspace_step_timeout());
-                        eprintln!("[oracle] commit failed for {}: {error}", spec.run_id);
+                        tracing::warn!(
+                            target: "ducktape::compute",
+                            reason = "workspace_commit_timeout",
+                            run = %spec.run_id,
+                            timeout_s = workspace_step_timeout().as_secs(),
+                            "the run's workspace commit timed out; delivering degraded"
+                        );
                         (
                             crate::provision::WorkspaceReceipt::commit_failed(&spec, error),
                             crate::provision::Status::Degraded,
@@ -803,7 +847,14 @@ impl Worker for DispatchPool {
         }
         match gate(&self.providers, &self.node_key, &self.ledger, event) {
             Gated::NotMine => Ok(WorkOutcome::NotMine),
-            Gated::Skip => Ok(WorkOutcome::Handled(None)),
+            Gated::Skip(reason) => {
+                tracing::debug!(
+                    target: "ducktape::compute",
+                    reason,
+                    "the pool claimed an effect and did not run it"
+                );
+                Ok(WorkOutcome::Handled(None))
+            }
             Gated::Immediate(msg) => Ok(WorkOutcome::Handled(Some(msg))),
             Gated::Execute(job) => {
                 let key: AttemptKey = (job.saga_id.clone(), job.attempt);
@@ -811,6 +862,16 @@ impl Worker for DispatchPool {
                 // capacity is retained while it waits for current occupancy.
                 let mut attempts = self.inflight.lock().expect("attempts lock");
                 if attempts.contains_key(&key) {
+                    // idempotent by design — but an entry that never leaves the
+                    // map swallows every later offer of the same attempt in
+                    // exactly this shape, so it is worth being able to see.
+                    tracing::debug!(
+                        target: "ducktape::compute",
+                        saga = %job.saga_id,
+                        attempt = job.attempt,
+                        reason = "attempt_already_in_flight",
+                        "the pool re-saw an attempt it is already running"
+                    );
                     return Ok(WorkOutcome::Handled(None));
                 }
                 let cancellation = RunCancellation::new();

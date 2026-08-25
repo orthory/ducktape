@@ -585,6 +585,44 @@ pub(crate) async fn run_promoted(
         _ => None,
     };
 
+    // SEAT: target the plane at the epoch this node was just promoted into —
+    // the same command the fresh-boot path sends at `wiring.rs`'s
+    // "boot: target the resume epoch's member set immediately".
+    //
+    // Without it the plane runs with no epoch state, and a plane with no epoch
+    // state is a black hole in BOTH directions: it drops every inbound record
+    // and advert, and sends none of its own. The only other member-side
+    // Retarget is staged at an epoch CUTOVER (`run/drain.rs`) — and a joiner's
+    // own promotion IS the last membership change on a network that has
+    // finished growing, so nothing would ever have followed it.
+    //
+    // What that cost, measured on a live three-node network: phase-A assembly
+    // never completed on ANY node (the founder waits for member records that
+    // are never sent), so the two promoted joiners kept only the standby
+    // pre-warm tunnels they installed while parked — toward the then-members,
+    // never toward each other. Each saw exactly one peer forever, the mesh book
+    // fell through to a derived ULA for the peer it had never heard from, and
+    // its dialer failed against that address for the life of the process. With
+    // three validators the quorum is three, so every view either joiner led was
+    // nullified and every op submitted at one of them timed out awaiting
+    // finalization — a chain that looked healthy from the founder alone.
+    //
+    // `current_view` is the freshness clock adverts expire against, so it takes
+    // the later of the seat's epoch base and its app height; neither can be
+    // ahead of the boundary this seat resumed from.
+    if let Some(cmd) = &reach_cmd {
+        let _ = cmd
+            .send(reachability::ReachabilityCommand::Retarget(
+                reachability::MeshEpochEvent {
+                    epoch,
+                    members: member_keys.clone(),
+                    standbys: resident_keys.clone(),
+                    current_view: view_base.max(height),
+                },
+            ))
+            .await;
+    }
+
     // re-derive whatever the parked fold could not have indexed — the cold
     // seat's synced boundary above all; exact indexes make this a no-op.
     crate::explorer::heal_index(&index, height, &label);

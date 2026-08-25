@@ -277,6 +277,15 @@ async fn retarget_all(
     }
 }
 
+/// How long a whole-mesh convergence may take before the test calls it hung.
+///
+/// A BACKSTOP, not a synchronizer: every wait below is driven by the
+/// orchestrator's own events and exits the moment they arrive, so this bound
+/// only turns a hang into a failure. Kept generous because the cost of a
+/// generous backstop on a healthy run is zero and the cost of a tight one is a
+/// red CI on a busy machine.
+const CONVERGE_BUDGET: Duration = Duration::from_secs(30);
+
 /// Drain collected events until every node in `want` has emitted
 /// `TunnelsApplied` for `epoch`; returns the `MeshReady` versions seen.
 /// A healthy convergence emits NO failure events — `PeerFailed` here means
@@ -288,7 +297,7 @@ async fn await_applied(
 ) -> HashMap<usize, Vec<u8>> {
     let mut versions = HashMap::new();
     let mut applied: Vec<usize> = Vec::new();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(CONVERGE_BUDGET, async {
         while applied.len() < want.len() {
             let (i, event) = collected.recv().await.expect("event stream open");
             match event {
@@ -321,6 +330,14 @@ fn spawn_nudgers(local: &LocalSet, nodes: &[TestNode]) {
         let cmd = node.cmd.clone();
         local.spawn_local(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(50));
+            // the same discipline `bin/node`'s nudger already runs under, and
+            // for the same reason. The default is `Burst`: a starved test
+            // (several single-threaded `LocalSet`s on a loaded box) comes back
+            // to a pile of missed 50 ms ticks and fires them ALL, and the nudge
+            // storm then outruns the delivery tasks it shares a thread with —
+            // convergence stops making progress instead of merely slowing down.
+            // Measured: 6 s idle, still unconverged at 60 s under 40 busy loops.
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
                 if cmd.send(ReachabilityCommand::Nudge).await.is_err() {
@@ -928,6 +945,56 @@ async fn duplicated_delivery_is_tolerated_end_to_end() {
     converges_despite(Rc::new(|_, _, _| 2)).await;
 }
 
+/// A member that has verified its own view must still answer a peer that has
+/// not — the phase-A exchange is one-shot, and losing one half of it used to
+/// wedge that peer for the whole epoch.
+///
+/// The shape is the live one. Node 0's advert reaches node 1 late (or not at
+/// all): node 1's advert still reaches node 0, so node 0 assembles the full
+/// set, verifies, and stops gossiping records and adverts — while node 1 sits
+/// one advert short, nudging forever at a node that now drops everything it
+/// sends. On a real network the loss is not hypothetical: a member learns how
+/// to DIAL a just-promoted joiner from the very record that completes its own
+/// assembly, so its reply goes out microseconds before that link exists.
+///
+/// The heal is what closes it: a peer still gossiping phase-A at a verified
+/// node is a peer missing our half, so the next nudge sends it back.
+#[tokio::test]
+async fn a_verified_member_still_answers_a_peer_that_is_behind() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            // node 0's first four adverts toward node 1 never arrive; every
+            // other message flows. Four is past the one-shot fan-out AND the
+            // `first_contact` reply, so only a heal can deliver the fifth.
+            let dropped: Rc<Cell<usize>> = Rc::default();
+            let filter: DeliveryFilter = Rc::new(move |from, to, msg| {
+                let advert_to_the_straggler =
+                    (from, to) == (0, 1) && matches!(msg, ReachabilityMsg::Advert(_));
+                if !advert_to_the_straggler {
+                    return 1;
+                }
+                let n = dropped.get() + 1;
+                dropped.set(n);
+                usize::from(n > 4)
+            });
+            let (nodes, mut collected) =
+                spawn_mesh_filtered(&local, dir.path(), &[1, 2], vec![], filter);
+            retarget_all(&nodes, &[0, 1], &[], 1, 10).await;
+            spawn_nudgers(&local, &nodes);
+            // the straggler applies too, on the same mesh version.
+            let versions = await_applied(&mut collected, &[0, 1], 1).await;
+            assert_eq!(versions[&0], versions[&1]);
+            for (i, node) in nodes.iter().enumerate() {
+                let fake = node.effect.0.lock().unwrap();
+                assert_eq!(fake.applied.len(), 1, "node {i}: exactly one apply");
+                assert_eq!(fake.applied[0].peers.len(), 1, "node {i}: full mesh");
+            }
+        })
+        .await;
+}
+
 /// The kitchen sink: a 3-node mesh where the FIRST copy of every
 /// (sender, receiver, message kind) is lost — record, advert, request,
 /// response, and ack alike. Nudge re-offers must heal every stage.
@@ -1056,7 +1123,7 @@ async fn await_restored(
     want: &[usize],
 ) -> HashMap<usize, (u64, usize)> {
     let mut restored = HashMap::new();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(CONVERGE_BUDGET, async {
         while restored.len() < want.len() {
             let (i, event) = collected.recv().await.expect("event stream open");
             match event {
@@ -1457,7 +1524,7 @@ async fn tampered_mesh_state_is_refused_and_live_assembly_still_converges() {
 
             let mut refused = false;
             let mut applied: HashSet<usize> = HashSet::new();
-            tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::time::timeout(CONVERGE_BUDGET, async {
                 while !refused || applied.len() < 2 {
                     let (i, event) = collected.recv().await.expect("event stream open");
                     match event {
@@ -1502,7 +1569,7 @@ async fn await_prewarmed(
 ) {
     let mut applied: HashSet<usize> = HashSet::new();
     let mut latest: HashMap<usize, usize> = HashMap::new();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(CONVERGE_BUDGET, async {
         while members.iter().any(|i| !applied.contains(i))
             || standby_want
                 .iter()
@@ -1869,7 +1936,7 @@ async fn standby_readvertisement_updates_the_endpoint_live() {
             // both members converge on the new endpoint — member 1 through
             // member 0's accept-gated relay of the fresher record.
             let moved: std::net::SocketAddr = "9.9.9.42:51820".parse().unwrap();
-            tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::time::timeout(CONVERGE_BUDGET, async {
                 loop {
                     let both = [0usize, 1].iter().all(|i| {
                         latest_config(&nodes[*i])
@@ -2031,7 +2098,7 @@ async fn standby_reboot_supersedes_its_previous_life_in_place() {
             // both members adopt the reboot's address IN PLACE — the
             // re-signed record supersedes the previous life's.
             let life2: SocketAddr = "8.8.8.40:51820".parse().unwrap();
-            tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::time::timeout(CONVERGE_BUDGET, async {
                 loop {
                     let both = [0usize, 1].iter().all(|i| {
                         latest_config(&nodes[*i])
@@ -2176,7 +2243,7 @@ async fn standby_persists_the_member_mesh_for_its_promotion_reboot() {
                 await_prewarmed(&mut collected, &[0, 1], &[(2, 2)], 1).await;
                 // the standby persists on advert acceptance; both member
                 // adverts must be on disk before this life ends.
-                tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::time::timeout(CONVERGE_BUDGET, async {
                     loop {
                         let full =
                             reachability::store::load(&dir.path().join("mesh-2.json"), CHAIN)
@@ -2559,7 +2626,7 @@ async fn standby_reboot_rendezvouses_its_endpointless_members() {
             // both member ADVERTS must reach the standby's persist file
             // before the crash — that file is everything life 2 has.
             let persist = dir.path().join("mesh-2.json");
-            tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::time::timeout(CONVERGE_BUDGET, async {
                 loop {
                     let persisted = reachability::store::load(&persist, CHAIN).ok().flatten();
                     if persisted.is_some_and(|mesh| mesh.adverts.len() == 2) {
@@ -2643,7 +2710,7 @@ async fn standby_reboot_rendezvouses_its_endpointless_members() {
 
             // the sweep rendezvouses member 0 and re-applies: its entry now
             // carries the punched address instead of sitting endpoint-less.
-            tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::time::timeout(CONVERGE_BUDGET, async {
                 loop {
                     let healed = {
                         let fake = reborn_effect.0.lock().unwrap();
