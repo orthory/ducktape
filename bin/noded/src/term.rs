@@ -684,6 +684,42 @@ impl TermError {
 /// [`TerminalSessions::create`] (local) or [`TerminalSessions::create_for_peer`]
 /// (mesh), executed by [`TerminalSessions::start`] — so the two entry points
 /// stay pure decisions and exactly one place performs the effects.
+/// what the operator asked this session's sandbox to be sized at — the CLI's
+/// `--cpu`/`--mem`, straight off the create body.
+///
+/// A struct rather than two adjacent `Option<u64>` parameters: swapping cores
+/// and gigabytes at a call site would build a plausible VM of the wrong shape,
+/// and nothing downstream could tell.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SessionSize {
+    pub cpu: Option<u64>,
+    pub mem_gb: Option<u64>,
+}
+
+impl SessionSize {
+    /// the limit keys the sandbox backend enforces. Absent dimensions are left
+    /// out here and filled with the defaults at the single create seam, so one
+    /// place decides what "unsized" means.
+    fn limits(self) -> BTreeMap<String, u64> {
+        let mut limits = BTreeMap::new();
+        if let Some(cores) = self.cpu {
+            limits.insert("cores".to_string(), cores);
+        }
+        if let Some(mem_gb) = self.mem_gb {
+            limits.insert("mem_gb".to_string(), mem_gb);
+        }
+        limits
+    }
+}
+
+/// the size a session's sandbox is built at when the operator named none.
+///
+/// Matches the delegated-child profile the runs module already uses
+/// (`DELEGATED_CHILD_CORES` / `_MEM_GB`): enough for one interactive CLI, and
+/// small enough that a node hosting several is not surprised.
+const DEFAULT_SESSION_CORES: u64 = 2;
+const DEFAULT_SESSION_MEM_GB: u64 = 4;
+
 struct Spawn {
     provider: String,
     mode: SessionMode,
@@ -944,11 +980,12 @@ impl TerminalSessions {
 
     // ---- creates ----------------------------------------------------------
 
-    /// create a session for `agent` on this node's agent service.
+    /// create a session for `agent` on this node's agent service, at `size`.
     pub async fn create(
         &self,
         agent: &str,
         mode: SessionMode,
+        size: SessionSize,
     ) -> Result<CreatedSession, TermError> {
         // a Shared session runs the restricted argv and fans out to peers; a
         // Single session is the solo TUI and stays node-local.
@@ -959,7 +996,7 @@ impl TerminalSessions {
             creator_node: None,
             forward: shared,
             restricted: shared,
-            limits: BTreeMap::new(),
+            limits: size.limits(),
             credential: None,
         })
         .await
@@ -1001,11 +1038,26 @@ impl TerminalSessions {
     /// timeout: a cold image pull legitimately takes minutes, and the failure
     /// mode a timeout would cover — the daemon vanishing — is already covered by
     /// [`AttachGuard`], which answers every pending create.
-    async fn start(&self, spawn: Spawn) -> Result<CreatedSession, TermError> {
+    async fn start(&self, mut spawn: Spawn) -> Result<CreatedSession, TermError> {
         let Some(link) = self.link() else {
             tracing::warn!(target: "ducktape::term", reason = "no_agent_service", "session create refused");
             return Err(TermError::NoSandbox);
         };
+        // A sandbox is BUILT at a size. Under the container backend an absent
+        // dimension meant "unlimited"; a microVM has no such state, and the
+        // provider refuses the run outright ("a microVM run needs an explicit
+        // `cores` limit"). So the ONE place a create is performed fills in
+        // whatever the operator did not name — for the local path and the peer
+        // path alike, because a `--host-node` create with no `--cpu` reaches
+        // here just as empty.
+        spawn
+            .limits
+            .entry("cores".to_string())
+            .or_insert(DEFAULT_SESSION_CORES);
+        spawn
+            .limits
+            .entry("mem_gb".to_string())
+            .or_insert(DEFAULT_SESSION_MEM_GB);
         let id = format!("{:016x}", rand::random::<u64>());
         let (reply_tx, reply_rx) = oneshot::channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -1325,7 +1377,14 @@ async fn create_local(handle: &NodeHandle, body: CreateSessionBody) -> Response 
         )
             .into_response();
     };
-    let created = match terminals.create(&body.agent, body.mode).await {
+    // the size the CLI sent rides through: it used to be decoded into `body`
+    // and then silently dropped here, so `--cpu`/`--mem` did nothing on the
+    // local path and every microVM session was refused for having no `cores`.
+    let size = SessionSize {
+        cpu: body.cpu,
+        mem_gb: body.mem_gb,
+    };
+    let created = match terminals.create(&body.agent, body.mode, size).await {
         Ok(created) => created,
         Err(err) => return err.response(),
     };
@@ -1729,6 +1788,68 @@ mod tests {
         (terminals, guard)
     }
 
+    /// like [`with_daemon`], but hands back every create the daemon received —
+    /// the only place a session's sandbox size is observable.
+    fn with_daemon_watching_creates()
+    -> (TerminalSessions, AttachGuard, mpsc::Receiver<wire::Create>) {
+        let terminals = TerminalSessions::new(
+            TermRing::default(),
+            TermCommandRing::default(),
+            Some(TEST_TOKEN.into()),
+        );
+        let (guard, mut rx) = terminals.attach(TEST_TOKEN).expect("the first attach wins");
+        let (seen_tx, seen_rx) = mpsc::channel::<wire::Create>(8);
+        let daemon = terminals.clone();
+        tokio::spawn(async move {
+            while let Some(command) = rx.recv().await {
+                if let wire::Command::TermCreate(create) = command {
+                    daemon.on_event(wire::Event::TermCreated {
+                        session: create.session.clone(),
+                    });
+                    let _ = seen_tx.send(create).await;
+                }
+            }
+        });
+        (terminals, guard, seen_rx)
+    }
+
+    #[tokio::test]
+    async fn a_session_the_operator_did_not_size_still_gets_one() {
+        // THE regression: under the microVM backend an absent `cores` is not an
+        // unlimited run, it is a refused one — `ducktape agent pty claude` died
+        // with "a microVM run needs an explicit `cores` limit" on every node,
+        // with or without `--cpu`, because nothing filled the size in.
+        let (terminals, _guard, mut creates) = with_daemon_watching_creates();
+        terminals
+            .create("claude", SessionMode::Single, SessionSize::default())
+            .await
+            .expect("the daemon answered");
+        let create = creates.recv().await.expect("the daemon saw a create");
+        assert_eq!(create.limits.get("cores"), Some(&DEFAULT_SESSION_CORES));
+        assert_eq!(create.limits.get("mem_gb"), Some(&DEFAULT_SESSION_MEM_GB));
+    }
+
+    #[tokio::test]
+    async fn the_size_the_operator_named_reaches_the_daemon() {
+        // the other half: `--cpu`/`--mem` were decoded into the create body and
+        // then dropped on the floor, so the flags did nothing at all.
+        let (terminals, _guard, mut creates) = with_daemon_watching_creates();
+        terminals
+            .create(
+                "claude",
+                SessionMode::Single,
+                SessionSize {
+                    cpu: Some(6),
+                    mem_gb: Some(12),
+                },
+            )
+            .await
+            .expect("the daemon answered");
+        let create = creates.recv().await.expect("the daemon saw a create");
+        assert_eq!(create.limits.get("cores"), Some(&6));
+        assert_eq!(create.limits.get("mem_gb"), Some(&12));
+    }
+
     #[test]
     fn creator_node_is_absent_for_a_local_or_unknown_session() {
         // the input-gate accessor is pure: an unknown id (and, by construction,
@@ -1754,7 +1875,7 @@ mod tests {
         // daemon owns a pty for it.
         let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default(), Some(TEST_TOKEN.into()));
         assert!(!terminals.has_sandbox());
-        let refused = terminals.create("claude", SessionMode::Single).await;
+        let refused = terminals.create("claude", SessionMode::Single, SessionSize::default()).await;
         assert!(matches!(refused, Err(TermError::NoSandbox)));
     }
 
@@ -1779,7 +1900,7 @@ mod tests {
     async fn a_create_completes_when_the_daemon_answers() {
         let (terminals, _guard) = with_daemon();
         let created = terminals
-            .create("claude", SessionMode::Single)
+            .create("claude", SessionMode::Single, SessionSize::default())
             .await
             .expect("the daemon answered");
         assert_eq!(created.topic, topic(&created.session_id));
@@ -1803,7 +1924,7 @@ mod tests {
 
         // no auto-answering daemon here: hold the create unanswered, exactly as
         // a slow pull would, and take the command off the link by hand.
-        let mut pending = Box::pin(terminals.create("claude", SessionMode::Single));
+        let mut pending = Box::pin(terminals.create("claude", SessionMode::Single, SessionSize::default()));
         let command = tokio::select! {
             _ = &mut pending => panic!("a create cannot complete while nothing answers it"),
             command = rx.recv() => command.expect("the create reached the link"),
@@ -1861,7 +1982,7 @@ mod tests {
         // did not mark it, the client would hang forever.
         let (terminals, _guard) = with_daemon();
         let created = terminals
-            .create("claude", SessionMode::Single)
+            .create("claude", SessionMode::Single, SessionSize::default())
             .await
             .expect("the daemon answered");
         terminals.on_event(wire::Event::TermOutput {
@@ -1885,7 +2006,7 @@ mod tests {
         // one rather than silently do nothing.
         let (terminals, _guard) = with_daemon();
         let created = terminals
-            .create("claude", SessionMode::Single)
+            .create("claude", SessionMode::Single, SessionSize::default())
             .await
             .expect("the daemon answered");
         terminals.on_event(wire::Event::TermEnded {
@@ -1901,14 +2022,14 @@ mod tests {
         // must terminate them rather than leave every attached client blocked.
         let (terminals, guard) = with_daemon();
         let created = terminals
-            .create("claude", SessionMode::Single)
+            .create("claude", SessionMode::Single, SessionSize::default())
             .await
             .expect("the daemon answered");
         drop(guard);
         assert!(terminals.0.ring.is_ended(&created.session_id));
         assert!(!terminals.has_sandbox());
         assert!(matches!(
-            terminals.create("claude", SessionMode::Single).await,
+            terminals.create("claude", SessionMode::Single, SessionSize::default()).await,
             Err(TermError::NoSandbox)
         ));
     }
@@ -1921,7 +2042,7 @@ mod tests {
         // every peer.
         let (terminals, _guard) = with_daemon();
         let created = terminals
-            .create("claude", SessionMode::Single)
+            .create("claude", SessionMode::Single, SessionSize::default())
             .await
             .expect("the daemon answered");
         let mut appends = terminals.0.ring.subscribe_appends();
@@ -1941,7 +2062,7 @@ mod tests {
     async fn a_shared_session_does_reach_the_peer_forwarder_feed() {
         let (terminals, _guard) = with_daemon();
         let created = terminals
-            .create("claude", SessionMode::Shared)
+            .create("claude", SessionMode::Shared, SessionSize::default())
             .await
             .expect("the daemon answered");
         let mut appends = terminals.0.ring.subscribe_appends();
@@ -1993,7 +2114,7 @@ mod tests {
                 }
             }
         });
-        let refused = terminals.create("claude", SessionMode::Single).await;
+        let refused = terminals.create("claude", SessionMode::Single, SessionSize::default()).await;
         let Err(TermError::Spawn(detail)) = refused else {
             panic!("a spawn failure must surface as Spawn, not another rung");
         };
