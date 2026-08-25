@@ -433,9 +433,6 @@ async fn serve_tunnel(listener: UnixListener, service_port: u16) {
     }
 }
 
-/// the run directory's own name — `/tmp/dt-vm-<slot>`, the id every one of a
-/// run's files is under. It is the join key between a log line and the scratch
-/// on disk, and it is not a path: the parent is the host's, the leaf is ours.
 /// Owns a run directory for the window in which nothing else does — from
 /// `create_dir_all` until the [`MicroVm`] that will remove it exists. Disarmed
 /// by setting its field to `None`.
@@ -458,8 +455,15 @@ impl Drop for RunDirGuard<'_> {
     }
 }
 
+/// the run directory's own name — `/tmp/dt-vm-<slot>`, the id every one of a
+/// run's files is under. It is the join key between a log line and the scratch
+/// on disk, and it is not a path: the parent is the host's, the leaf is ours.
 fn slot_of(run_dir: &Path) -> std::borrow::Cow<'_, str> {
-    run_dir.file_name().map_or(std::borrow::Cow::Borrowed("?"), |name| name.to_string_lossy())
+    run_dir
+        .file_name()
+        .map_or(std::borrow::Cow::Borrowed("?"), |name| {
+            name.to_string_lossy()
+        })
 }
 
 /// Firecracker connects a guest's outbound vsock to `<uds_path>_<port>`.
