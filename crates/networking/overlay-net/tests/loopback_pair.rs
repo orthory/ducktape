@@ -13,10 +13,11 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
-use defguard_wireguard_rs::{InterfaceConfiguration, key::Key, net::IpAddrMask, peer::Peer};
+use defguard_boringtun::x25519::{PublicKey, StaticSecret};
 use overlay_net::userspace::UserspaceWireGuardEffect;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use wireguard::effect::WireGuardEffect;
+use wireguard::effect::{InterfaceConfig, PeerTunnelConfig, WireGuardEffect};
+use wireguard::{AllowedIp, X25519PublicKey};
 
 /// a fixture chain /48 (the shape `ula_v6_prefix` mints) with per-node
 /// member /128s.
@@ -28,38 +29,45 @@ fn ula(host: u16) -> Ipv6Addr {
 /// the identity facts a peer needs to know it.
 struct Node {
     effect: UserspaceWireGuardEffect,
-    secret: Key,
+    secret: [u8; 32],
     ula: Ipv6Addr,
     /// the loopback underlay endpoint of the node's bound WG socket.
     endpoint: SocketAddr,
 }
 
-fn peer_entry(of: &Node, endpoint: Option<SocketAddr>) -> Peer {
-    let mut peer = Peer::new(of.secret.public_key());
-    peer.endpoint = endpoint;
-    peer.set_allowed_ips(vec![IpAddrMask::new(IpAddr::V6(of.ula), 128)]);
-    peer
+fn peer_entry(of: &Node, endpoint: Option<SocketAddr>) -> PeerTunnelConfig {
+    PeerTunnelConfig {
+        wireguard_public_key: public_key(&of.secret),
+        endpoint,
+        allowed_ips: vec![member_route(of.ula)],
+        keepalive_seconds: None,
+    }
 }
 
-fn config(node: &Node, port: u16, peers: Vec<Peer>) -> InterfaceConfiguration {
-    InterfaceConfiguration {
+fn config(node: &Node, port: u16, peers: Vec<PeerTunnelConfig>) -> InterfaceConfig {
+    InterfaceConfig {
         name: "dt-loopback".into(),
-        prvkey: node.secret.to_string(),
-        addresses: vec![IpAddrMask::new(IpAddr::V6(node.ula), 128)],
-        port,
+        private_key: node.secret,
+        listen_port: port,
+        addresses: vec![member_route(node.ula)],
         peers,
-        mtu: None,
-        fwmark: None,
     }
+}
+
+/// a member's cryptokey route: its overlay `/128`.
+fn member_route(ula: Ipv6Addr) -> AllowedIp {
+    AllowedIp::new(IpAddr::V6(ula), 128).expect("a /128 is a valid route")
+}
+
+fn public_key(secret: &[u8; 32]) -> X25519PublicKey {
+    X25519PublicKey(PublicKey::from(&StaticSecret::from(*secret)).to_bytes())
 }
 
 /// stand a node up through the effect boundary: create + first apply with an
 /// empty peer set and port 0 (the OS allocates), so nodes can learn each
 /// other's real underlay ports before the peered re-apply.
 fn stand_up(key_seed: u8, host: u16) -> Node {
-    let secret = Key::new(
-        defguard_boringtun_secret(key_seed), // clamped X25519 scalar bytes
-    );
+    let secret = fixture_secret(key_seed);
     let mut node = Node {
         effect: UserspaceWireGuardEffect::new(tokio::runtime::Handle::current()),
         secret,
@@ -84,7 +92,7 @@ fn stand_up(key_seed: u8, host: u16) -> Node {
 /// derive a deterministic private key from a seed byte. any 32 bytes are a
 /// valid X25519 secret (the curve clamps), so a filled array is fine for a
 /// fixture — but each node needs a distinct one.
-fn defguard_boringtun_secret(seed: u8) -> [u8; 32] {
+fn fixture_secret(seed: u8) -> [u8; 32] {
     let mut bytes = [seed; 32];
     bytes[0] = seed.wrapping_add(1); // avoid the all-equal degenerate look
     bytes
@@ -162,7 +170,11 @@ async fn handshake_and_datagram_echo() {
     // this seam existed, that distinction was observable only from tests, which is
     // why "the overlay never came up" and "the overlay is up but the peer is dark"
     // were indistinguishable in production and presented as one string.
-    let probe = a.effect.probe_slot().get().expect("a live probe after apply");
+    let probe = a
+        .effect
+        .probe_slot()
+        .get()
+        .expect("a live probe after apply");
     let peers = probe.peers();
     let (ip, since) = peers
         .iter()
@@ -481,7 +493,7 @@ async fn shared_underlay_demuxes_nat_bypass_alongside_tunnel_traffic() {
             StackSlot::new(),
             underlay.clone(),
         ),
-        secret: Key::new(defguard_boringtun_secret(0x17)),
+        secret: fixture_secret(0x17),
         ula: ula(0xa),
         endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
     };

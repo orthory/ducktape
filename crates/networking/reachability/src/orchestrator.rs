@@ -586,7 +586,7 @@ where
             update_peer_tunnels(
                 &mut self.effect,
                 self.interface.clone(),
-                self.keypair.private_key_base64(),
+                self.keypair.private_key_bytes(),
                 self.config.wireguard_port,
                 &local_interface_ips,
                 peers,
@@ -595,7 +595,7 @@ where
             apply_peer_tunnels(
                 &mut self.effect,
                 self.interface.clone(),
-                self.keypair.private_key_base64(),
+                self.keypair.private_key_bytes(),
                 self.config.wireguard_port,
                 &local_interface_ips,
                 peers,

@@ -13,7 +13,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
-use defguard_wireguard_rs::net::IpAddrMask;
 use nat_traversal::NodeKey;
 use reachability::{
     EndpointResolver as _, InstallReply, MeshEpochEvent, ReachabilityCommand, ReachabilityConfig,
@@ -21,8 +20,10 @@ use reachability::{
 };
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
-use wireguard::effect::{FakeWireGuardEffect, FakeWireGuardEffectError, WireGuardEffect};
-use wireguard::{Endpoint, PortPolicy, Transport, ValidatorIdentity, X25519PublicKey};
+use wireguard::effect::{
+    FakeWireGuardEffect, FakeWireGuardEffectError, InterfaceConfig, WireGuardEffect,
+};
+use wireguard::{AllowedIp, Endpoint, PortPolicy, Transport, ValidatorIdentity, X25519PublicKey};
 
 /// `run()` owns its effect; tests need to inspect it afterwards — a shared
 /// handle delegating to the fake underneath.
@@ -36,10 +37,7 @@ impl WireGuardEffect for SharedFake {
         self.0.lock().unwrap().create_interface()
     }
 
-    fn apply(
-        &mut self,
-        config: &defguard_wireguard_rs::InterfaceConfiguration,
-    ) -> Result<(), Self::Error> {
+    fn apply(&mut self, config: &InterfaceConfig) -> Result<(), Self::Error> {
         self.0.lock().unwrap().apply(config)
     }
 
@@ -333,11 +331,12 @@ fn spawn_nudgers(local: &LocalSet, nodes: &[TestNode]) {
     }
 }
 
-fn ula(identity: ValidatorIdentity) -> IpAddrMask {
-    IpAddrMask::new(
+fn ula(identity: ValidatorIdentity) -> AllowedIp {
+    AllowedIp::new(
         std::net::IpAddr::V6(wireguard::ula_v6_member_addr(CHAIN, identity)),
         128,
     )
+    .expect("a member /128 is a valid route")
 }
 
 #[tokio::test]
@@ -375,7 +374,7 @@ async fn three_member_mesh_converges_and_applies() {
                 assert_eq!(fake.applied.len(), 1, "node {i}: one apply");
                 let config = &fake.applied[0];
                 assert_eq!(config.name, ifname);
-                assert_eq!(config.port, 51820);
+                assert_eq!(config.listen_port, 51820);
                 // interface address: exactly this node's identity-hash /128.
                 assert_eq!(config.addresses, vec![ula(node.identity)]);
                 // the persisted keystore is what the interface runs.
@@ -383,7 +382,7 @@ async fn three_member_mesh_converges_and_applies() {
                     WireGuardKeypair::load_or_generate(&dir.path().join(format!("wg-{i}.key")))
                         .unwrap();
                 assert!(!generated, "node {i}: run() created the key");
-                assert_eq!(config.prvkey, keypair.private_key_base64());
+                assert_eq!(config.private_key, keypair.private_key_bytes());
                 // both peers present, each routing ONLY its own /128 and
                 // keyed by ITS persisted public key.
                 assert_eq!(config.peers.len(), 2);
@@ -399,7 +398,7 @@ async fn three_member_mesh_converges_and_applies() {
                         .iter()
                         .find(|p| p.allowed_ips == vec![ula(peer_node.identity)])
                         .unwrap_or_else(|| panic!("node {i}: no peer entry for node {j}"));
-                    assert_eq!(entry.public_key.as_array(), peer_keys.public_key().0);
+                    assert_eq!(entry.wireguard_public_key, peer_keys.public_key());
                     let expected = if i == 0 && j == 2 {
                         punched
                     } else {
@@ -1155,7 +1154,7 @@ async fn cold_restart_restores_the_mesh_with_no_transport_at_all() {
                         .iter()
                         .find(|p| p.allowed_ips == vec![ula(peer_node.identity)])
                         .unwrap_or_else(|| panic!("node {i}: no peer entry for node {j}"));
-                    assert_eq!(entry.public_key.as_array(), peer_keys.public_key().0);
+                    assert_eq!(entry.wireguard_public_key, peer_keys.public_key());
                     let expected = if i == 0 && j == 1 {
                         fresh_punch
                     } else {
@@ -1279,7 +1278,7 @@ async fn solo_member_cold_restart_reinstalls_the_parked_standby() {
                 .iter()
                 .find(|p| p.allowed_ips == vec![ula(nodes[1].identity)])
                 .expect("member: the parked standby is back on the interface");
-            assert_eq!(entry.public_key.as_array(), standby_keys.public_key().0);
+            assert_eq!(entry.wireguard_public_key, standby_keys.public_key());
             assert_eq!(
                 entry.endpoint,
                 Some("8.8.8.20:51820".parse().unwrap()),
@@ -1328,7 +1327,10 @@ async fn cold_restart_filters_departed_standbys() {
                 assert_eq!(restored[&i], (1, 1), "node {i}: only the member peer");
                 let config = latest_config(&nodes[i]);
                 assert_eq!(config.peers.len(), 1, "node {i}: no departed-standby entry");
-                assert_eq!(config.peers[0].allowed_ips, vec![ula(nodes[1 - i].identity)]);
+                assert_eq!(
+                    config.peers[0].allowed_ips,
+                    vec![ula(nodes[1 - i].identity)]
+                );
             }
         })
         .await;
@@ -1523,7 +1525,7 @@ async fn await_prewarmed(
 
 /// A node's LATEST applied interface config — pre-warm applies reconfigure
 /// in place, so the last config is the interface's current truth.
-fn latest_config(node: &TestNode) -> defguard_wireguard_rs::InterfaceConfiguration {
+fn latest_config(node: &TestNode) -> InterfaceConfig {
     let fake = node.effect.0.lock().unwrap();
     fake.applied
         .last()
@@ -1560,7 +1562,7 @@ async fn standby_tunnels_prewarm_before_activation() {
                     .iter()
                     .find(|p| p.allowed_ips == vec![ula(standby.identity)])
                     .unwrap_or_else(|| panic!("member {i}: no standby peer entry"));
-                assert_eq!(entry.public_key.as_array(), standby_keys.public_key().0);
+                assert_eq!(entry.wireguard_public_key, standby_keys.public_key());
                 assert_eq!(
                     entry.endpoint,
                     Some("8.8.8.30:51820".parse().unwrap()),
@@ -1693,7 +1695,7 @@ async fn prewarm_merge_keeps_the_invite_tunnels_observed_endpoints() {
                 .iter()
                 .find(|p| p.allowed_ips == vec![ula(nodes[1].identity)])
                 .expect("member: joiner peer entry");
-            assert_eq!(entry.public_key.as_array(), wg1.public_key().0);
+            assert_eq!(entry.wireguard_public_key, wg1.public_key());
             assert_eq!(
                 entry.endpoint,
                 Some(observed_joiner),
@@ -1705,7 +1707,7 @@ async fn prewarm_merge_keeps_the_invite_tunnels_observed_endpoints() {
                 .iter()
                 .find(|p| p.allowed_ips == vec![ula(nodes[0].identity)])
                 .expect("joiner: member peer entry");
-            assert_eq!(entry.public_key.as_array(), wg0.public_key().0);
+            assert_eq!(entry.wireguard_public_key, wg0.public_key());
             assert_eq!(
                 entry.endpoint,
                 Some(resolved_member),
@@ -2383,7 +2385,7 @@ async fn bootstrap_coordinated_invite_resolves_installs_and_acks() {
                 assert!(
                     last.peers
                         .iter()
-                        .any(|p| p.public_key.as_array() == [9u8; 32]),
+                        .any(|p| p.wireguard_public_key.0 == [9u8; 32]),
                     "the inviter's wireguard key is a peer on the applied interface"
                 );
             }

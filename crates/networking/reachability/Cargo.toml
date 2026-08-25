@@ -20,7 +20,6 @@ wireguard = { workspace = true }
 x25519-dalek = { workspace = true }
 
 [dev-dependencies]
-defguard_wireguard_rs = { workspace = true }
 nat-traversal = { workspace = true, features = ["simnat"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt", "time", "sync", "macros", "rt-multi-thread"] }

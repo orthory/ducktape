@@ -196,9 +196,9 @@ axum = "0.8"
 data-plane = { workspace = true, features = ["sim"] }
 # voice::overlay_e2e stands two userspace WireGuard overlay stacks up on
 # loopback (the crates/networking/overlay-net/tests/loopback_pair harness shape) to
-# prove huddle media crosses the REAL overlay headless — this supplies the WG
-# interface config types; the boringtun crypto rides overlay-net (a dep above).
-defguard_wireguard_rs = { workspace = true }
+# prove huddle media crosses the REAL overlay headless — this derives the
+# fixture WireGuard keypairs; the tunnel crypto rides overlay-net (a dep above).
+x25519-dalek = { workspace = true }
 # replica::tests assembles real finalization certificates (sign -> assemble)
 # to exercise the cert-lane decode + fold planner.
 commonware-parallel = { workspace = true }

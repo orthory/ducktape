@@ -257,14 +257,11 @@ async fn demux_pump(udp: Arc<UdpSocket>, wg_lane: WgLane, bypass: mpsc::Sender<D
 }
 
 /// one peer relationship, as the effect layer hands it to the device: the
-/// validated, decoded form of a `defguard_wireguard_rs` `Peer`.
+/// validated form of one `PeerTunnelConfig`.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PeerConfig {
     /// the peer's static X25519 public key.
     pub public_key: [u8; 32],
-    /// optional preshared key (unused by this mesh today, carried for wire
-    /// fidelity with the TUN backend).
-    pub preshared_key: Option<[u8; 32]>,
     /// where to send the peer's encrypted datagrams. `None` for a passive
     /// relationship: the endpoint is learned from the peer's first
     /// authenticated inbound datagram (WireGuard roaming), exactly as the
@@ -515,7 +512,7 @@ impl WgDevice {
                         tunn: Mutex::new(Tunn::new(
                             self.inner.secret.clone(),
                             PublicKey::from(config.public_key),
-                            config.preshared_key,
+                            None,
                             config.persistent_keepalive,
                             index,
                             None,

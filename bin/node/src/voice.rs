@@ -41,11 +41,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use media_service::voice::{FRAME_MILLIS, FRAME_SAMPLES, VoiceConfig, VoiceEngine};
 use data_plane::{
     AdmissionPolicy, DataPlane, DataPlaneTransport, DatagramFlow, DatagramPolicy, FlowId, PeerId,
     Service, SocketFactory,
 };
+use media_service::voice::{FRAME_MILLIS, FRAME_SAMPLES, VoiceConfig, VoiceEngine};
 use tokio::sync::{mpsc, watch};
 
 use crate::overlay_book::OverlayPeers;
@@ -946,7 +946,10 @@ async fn request_keyframe_if_due<T: DataPlaneTransport>(
     {
         lane.last_keyframe_req = Some(Instant::now());
         let _ = ctl
-            .send_to(peer, &media_service::video::CallControl::KeyframeRequest.encode())
+            .send_to(
+                peer,
+                &media_service::video::CallControl::KeyframeRequest.encode(),
+            )
             .await;
     }
 }
@@ -1526,11 +1529,7 @@ mod tests {
                 if a_to_b(&frame) {
                     let is_video = data_plane::wire::decode_datagram(&frame)
                         .is_ok_and(|(service, _, _)| service == Service::Video);
-                    let dst = if is_video {
-                        &b_video_in
-                    } else {
-                        &b_voice_in
-                    };
+                    let dst = if is_video { &b_video_in } else { &b_voice_in };
                     let _ = dst.send((a_id, frame)).await;
                 }
             }
@@ -1545,11 +1544,7 @@ mod tests {
                 };
                 let is_video = data_plane::wire::decode_datagram(&frame)
                     .is_ok_and(|(service, _, _)| service == Service::Video);
-                let dst = if is_video {
-                    &a_video_in
-                } else {
-                    &a_voice_in
-                };
+                let dst = if is_video { &a_video_in } else { &a_voice_in };
                 let _ = dst.send((b_id, frame)).await;
             }
         });
@@ -2002,9 +1997,10 @@ mod overlay_e2e {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     use commonware_cryptography::{Signer as _, ed25519};
-    use defguard_wireguard_rs::{InterfaceConfiguration, key::Key, net::IpAddrMask, peer::Peer};
     use overlay_net::userspace::{UserspaceWireGuardEffect, VirtualSocketFactory};
-    use wireguard::effect::WireGuardEffect;
+    use wireguard::effect::{InterfaceConfig, PeerTunnelConfig, WireGuardEffect};
+    use wireguard::{AllowedIp, X25519PublicKey};
+    use x25519_dalek::{PublicKey, StaticSecret};
 
     use super::*;
 
@@ -2017,7 +2013,7 @@ mod overlay_e2e {
     /// underlay endpoint of its bound WG socket.
     struct OverlayNode {
         effect: UserspaceWireGuardEffect,
-        wg_secret: Key,
+        wg_secret: [u8; 32],
         node_key: ed25519::PublicKey,
         raw_key: [u8; 32],
         ula: Ipv6Addr,
@@ -2026,29 +2022,36 @@ mod overlay_e2e {
 
     /// any 32 bytes are a valid X25519 secret (the curve clamps); each node
     /// needs a distinct one.
-    fn wg_secret(seed: u8) -> Key {
+    fn wg_secret(seed: u8) -> [u8; 32] {
         let mut bytes = [seed; 32];
         bytes[0] = seed.wrapping_add(1);
-        Key::new(bytes)
+        bytes
     }
 
-    fn config(node: &OverlayNode, port: u16, peers: Vec<Peer>) -> InterfaceConfiguration {
-        InterfaceConfiguration {
+    /// a member's cryptokey route: its overlay `/128`.
+    fn member_route(ula: Ipv6Addr) -> AllowedIp {
+        AllowedIp::new(IpAddr::V6(ula), 128).expect("a /128 is a valid route")
+    }
+
+    fn config(node: &OverlayNode, port: u16, peers: Vec<PeerTunnelConfig>) -> InterfaceConfig {
+        InterfaceConfig {
             name: "dt-huddle".into(),
-            prvkey: node.wg_secret.to_string(),
-            addresses: vec![IpAddrMask::new(IpAddr::V6(node.ula), 128)],
-            port,
+            private_key: node.wg_secret,
+            listen_port: port,
+            addresses: vec![member_route(node.ula)],
             peers,
-            mtu: None,
-            fwmark: None,
         }
     }
 
-    fn peer_entry(of: &OverlayNode, endpoint: Option<SocketAddr>) -> Peer {
-        let mut peer = Peer::new(of.wg_secret.public_key());
-        peer.endpoint = endpoint;
-        peer.set_allowed_ips(vec![IpAddrMask::new(IpAddr::V6(of.ula), 128)]);
-        peer
+    fn peer_entry(of: &OverlayNode, endpoint: Option<SocketAddr>) -> PeerTunnelConfig {
+        PeerTunnelConfig {
+            wireguard_public_key: X25519PublicKey(
+                PublicKey::from(&StaticSecret::from(of.wg_secret)).to_bytes(),
+            ),
+            endpoint,
+            allowed_ips: vec![member_route(of.ula)],
+            keepalive_seconds: None,
+        }
     }
 
     /// stand a node up: its overlay `/128` is `ula_v6_member_addr(NS, key)` —

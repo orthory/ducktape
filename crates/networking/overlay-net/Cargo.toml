@@ -13,12 +13,8 @@ governor = { workspace = true }
 rand_core = { workspace = true }
 
 # ── the userspace backend (ADR phase 1) ─────────────────
-# the sans-io WireGuard core: one `noise::Tunn` per peer — the same BoringTun
-# build the TUN path runs inside defguard's device layer.
+# the sans-io WireGuard core: one `noise::Tunn` per peer, no device layer.
 defguard_boringtun = { workspace = true }
-# `InterfaceConfiguration`/`Peer` — the shape `WireGuardEffect::apply` takes;
-# types only, the device layer stays unused here.
-defguard_wireguard_rs = { workspace = true }
 # the `WireGuardEffect` trait this backend implements (ADR: the orchestration
 # boundary does not move).
 wireguard = { workspace = true }
@@ -36,4 +32,6 @@ data-plane = { workspace = true }
 tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "io-util", "net"] }
 
 [dev-dependencies]
+# the `wg_interop` example speaks the `wg` tool's base64 key form on its CLI.
+base64 = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }

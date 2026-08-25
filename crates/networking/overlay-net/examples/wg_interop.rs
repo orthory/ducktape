@@ -27,11 +27,14 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
 use data_plane::SocketFactory;
-use defguard_wireguard_rs::{InterfaceConfiguration, key::Key, net::IpAddrMask, peer::Peer};
+use defguard_boringtun::x25519::{PublicKey, StaticSecret};
 use overlay_net::userspace::{UserspaceWireGuardEffect, VirtualSocketFactory};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use wireguard::effect::WireGuardEffect;
+use wireguard::effect::{InterfaceConfig, PeerTunnelConfig, WireGuardEffect};
+use wireguard::{AllowedIp, X25519PublicKey};
 
 const TCP_ECHO_PORT: u16 = 7000;
 const UDP_ECHO_PORT: u16 = 7002;
@@ -70,9 +73,9 @@ fn keygen(args: &[String]) {
     };
     let mut bytes = [seed; 32];
     bytes[0] = seed.wrapping_add(1);
-    let secret = Key::new(bytes);
-    println!("PRIV {secret}");
-    println!("PUB {}", secret.public_key());
+    let secret = StaticSecret::from(bytes);
+    println!("PRIV {}", B64.encode(secret.to_bytes()));
+    println!("PUB {}", B64.encode(PublicKey::from(&secret).to_bytes()));
 }
 
 // ── serve ───────────────────────────────────────────────
@@ -118,26 +121,36 @@ fn parse_serve(args: &[String]) -> Option<ServeArgs> {
     })
 }
 
-fn interface_config(args: &ServeArgs) -> InterfaceConfiguration {
-    let peer_key = Key::try_from(args.peer_pub.as_str()).expect("peer pubkey is valid base64");
-    let mut peer = Peer::new(peer_key);
-    peer.endpoint = args.peer_endpoint;
-    // keep the pair's NAT-ish container path warm both ways.
-    peer.persistent_keepalive_interval = Some(5);
-    peer.set_allowed_ips(vec![IpAddrMask::new(IpAddr::V6(args.peer_ula), 128)]);
-    InterfaceConfiguration {
+fn interface_config(args: &ServeArgs) -> InterfaceConfig {
+    let peer = PeerTunnelConfig {
+        wireguard_public_key: X25519PublicKey(key_bytes(&args.peer_pub, "peer pubkey")),
+        endpoint: args.peer_endpoint,
+        allowed_ips: vec![member_route(args.peer_ula)],
+        // keep the pair's NAT-ish container path warm both ways.
+        keepalive_seconds: Some(5),
+    };
+    InterfaceConfig {
         name: "dt-interop0".into(),
-        prvkey: args.prvkey.clone(),
-        addresses: vec![IpAddrMask::new(IpAddr::V6(args.ula), 128)],
-        port: args.wg_port,
+        private_key: key_bytes(&args.prvkey, "private key"),
+        listen_port: args.wg_port,
+        addresses: vec![member_route(args.ula)],
         peers: vec![peer],
-        // the same tunnel MTU production applies (`wiring::TUNNEL_MTU`) —
-        // `None` leaves the TUN at 1500, and every full-size inner packet
-        // then rides a FRAGMENTED outer UDP datagram (and overruns the
-        // userspace stack's 1420 device MTU on mixed pairs).
-        mtu: Some(wireguard::effect::TUNNEL_MTU),
-        fwmark: None,
     }
+}
+
+/// a member's cryptokey route: its overlay `/128`.
+fn member_route(ula: Ipv6Addr) -> AllowedIp {
+    AllowedIp::new(IpAddr::V6(ula), 128).expect("a /128 is a valid route")
+}
+
+/// a WireGuard key in the `wg` tool's base64 form, as the CLI carries it.
+fn key_bytes(encoded: &str, what: &str) -> [u8; 32] {
+    let bytes = B64
+        .decode(encoded)
+        .unwrap_or_else(|_| panic!("{what} is valid base64"));
+    bytes
+        .try_into()
+        .unwrap_or_else(|_| panic!("{what} is a 32-byte key"))
 }
 
 fn serve(args: &[String]) {
@@ -378,4 +391,3 @@ async fn udp_echo_client(factory: Arc<dyn SocketFactory>, own: Ipv6Addr, peer: I
         }
     }
 }
-
