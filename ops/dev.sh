@@ -17,6 +17,15 @@ WSDIR="$HOME/.ducktape/workspaces/$ID"
 log(){ printf '\033[36m[dev]\033[0m %s\n' "$*"; }
 die(){ printf '\033[31m[dev] %s\033[0m\n' "$*" >&2; exit 1; }
 
+# macOS: offer the sandbox prerequisites as an install prompt, once, up front —
+# instead of the node's boot probe refusing them one at a time later. Declining
+# (or an unfixable machine) is not fatal: the dev loop still runs, provider
+# runs are what gets refused.
+if [ "$(uname -s)" = "Darwin" ]; then
+  bash "$SCRIPT_DIR/macos-preflight.sh" --prompt \
+    || log "sandbox prerequisites incomplete — the node will refuse provider runs until they are installed"
+fi
+
 if [ ! -f "$WSDIR/node.toml" ] || [ ! -f "$WSDIR/network.toml" ] || [ -n "${DEV_RESEED:-}" ]; then
   bash "$SCRIPT_DIR/demo-seed.sh" || die "seeding the '$ID' localnet failed"
 fi

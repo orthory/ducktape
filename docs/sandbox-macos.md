@@ -15,6 +15,11 @@ macOS-specific component.
 ops/macos-preflight.sh        # GUEST_DIR=… if the images live elsewhere
 ```
 
+`make dev` runs this for you with `--prompt`: on a Mac it lists what is
+missing and asks once — "install these now? [Y/n]" — then runs the accepted
+steps (brew packages, the musl target, the shim build+sign, the guest
+images). Declining just leaves a node that refuses provider runs.
+
 It checks everything the compute plane (airlock + provider runs) needs on a
 Mac and prints the exact install command for each missing piece: Apple
 silicon/`kern.hv_support`, Xcode command line tools,
