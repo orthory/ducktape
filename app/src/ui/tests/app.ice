@@ -433,18 +433,23 @@ preset ui_launch
     hub_step = HubStep.networks
     hub_networks = []
     hub_selected = ""
+    // Ice reads extern structs but cannot construct one, so the rows come
+    // from the same `wallet_info` constructor the backend hands the list.
+    hub_wallets = [wallet_info("alice", "aabbccddeeff00112233", "encrypted", false), wallet_info("demo", "eeff0011", "encrypted", true)]
+    hub_wallet_selected = "demo"
 
-// The launch window's two load-bearing renders: the unlock ceremony's
-// password field is reachable, and an empty network list is the welcome
+// The launch window's two load-bearing renders: the wallet list's selected
+// row carries the password field, and an empty network list is the welcome
 // plate whose one CTA routes to the join flow.
-test launch_unlock_contract
+test launch_wallets_contract
   preset ui_launch
   viewport 480 680
   mount
     HubColumn #hub
       with
-        step=HubStep.unlock
-        key_state="encrypted"
+        step=HubStep.wallets
+        wallets=hub_wallets
+        wallet_selected=hub_wallet_selected
         networks=hub_networks
         selected=""
         hidden=0
@@ -460,13 +465,14 @@ test launch_unlock_contract
         restore_empty=true
         join_empty=true
       events
+        pick_wallet -> pick_wallet _
         unlock_submit -> unlock_submit _
         login_skip -> login_skip
-        create_submit -> create_submit _
+        create_submit -> create_submit _ _
         reveal_confirm -> reveal_confirm
         go_restore -> go_restore
         go_login -> go_login
-        restore_submit -> restore_submit _
+        restore_submit -> restore_submit _ _
         pick_network -> pick_network _
         open_network_submit -> open_network_submit
         forget_network_submit -> forget_network_submit _ _
@@ -474,15 +480,87 @@ test launch_unlock_contract
         restore_hidden_submit -> restore_hidden_submit
         go_join -> go_join
         go_networks -> go_networks
+        go_wallets -> go_wallets
         join_network_submit -> join_network_submit
         copy_onboarding_invite -> copy_onboarding_invite
         enter_console -> enter_console
-  target pw = #hub/root/unlock/root/unlock-password
+  target pw = #hub/root/wallets/root/wallet-row("demo")/root/wallet-password
   expect exists pw
   dispatch go_restore
   expect hub_step == HubStep.restore
   dispatch go_login
-  expect hub_step == HubStep.unlock
+  expect hub_step == HubStep.wallets
+
+// THE WALLET LIST IS THE UNLOCK SURFACE. Every wallet on the keystore is a
+// row; the selected one — the active wallet on boot — is the only one showing
+// a password field, and picking another moves the field with the selection.
+test wallet_list_contract
+  preset ui_launch
+  viewport 520 680
+  mount
+    WalletsScreen #wallets
+      with
+        wallets=hub_wallets
+        selected=hub_wallet_selected
+        busy=false
+        error=""
+      events
+        pick_wallet -> pick_wallet _
+        unlock_submit -> unlock_submit _
+        login_skip -> login_skip
+        go_restore -> go_restore
+  target list = #wallets/root
+  target demo_pw = #wallets/root/wallet-row("demo")/root/wallet-password
+  target alice_row = #wallets/root/wallet-row("alice")/root/wallet-pick
+  target alice_pw = #wallets/root/wallet-row("alice")/root/wallet-password
+  // A secure input renders no text to read back, so the draft is asserted
+  // where it lives: the row instance's own component state.
+  target alice = #wallets/root/wallet-row("alice")
+  // the active wallet is preselected: its row is the one carrying the input.
+  expect exists demo_pw
+  expect missing alice_pw
+  expect text "demo" within list
+  expect text "alice" within list
+  // the row shows the identity it signs as, shortened, never invented.
+  expect text "aabbccddeeff0011…" within list
+  // selecting the other row moves the input there.
+  click alice_row
+  expect hub_wallet_selected == "alice"
+  expect exists alice_pw
+  expect missing demo_pw
+  click alice_pw
+  type "hunter2-hunter2"
+  expect component alice.pw == "hunter2-hunter2"
+
+// A KEYSTORE THAT COULD NOT BE READ LANDS HERE, and read-only is the way out.
+// A failed `wallet list` yields an empty list, which is the create ceremony —
+// so this screen, not just the wallet list, has to carry `login_skip`, or
+// someone who HAS wallets is trapped on a mint screen by a missing binary.
+test create_screen_read_only_escape_contract
+  preset ui_launch
+  viewport 480 680
+  mount
+    CreateScreen #create
+      with
+        busy=false
+        error="the keystore listing is unreadable"
+      events
+        create_submit -> create_submit _ _
+        go_restore -> go_restore
+        login_skip -> login_skip
+  target screen = #create/root
+  target skip = #create/root/create-skip
+  target name = #create/root/wallet-name
+  expect exists skip
+  expect text "the keystore listing is unreadable" within screen
+  // the name a mint would use — `create_submit` stashes it so the network
+  // list's "signing as …" line names the wallet the session actually signs
+  // as. NOT dispatched here: `create_submit` shells a real `wallet new`.
+  expect name.value == "default"
+  // read-only signs as NOBODY: the label must not keep naming a wallet.
+  click skip
+  expect hub_wallet_selected == ""
+  expect hub_step == HubStep.networks
 
 test launch_networks_empty_contract
   preset ui_launch
@@ -491,7 +569,8 @@ test launch_networks_empty_contract
     HubColumn #hub
       with
         step=HubStep.networks
-        key_state="encrypted"
+        wallets=hub_wallets
+        wallet_selected=hub_wallet_selected
         networks=hub_networks
         selected=""
         hidden=0
@@ -507,13 +586,14 @@ test launch_networks_empty_contract
         restore_empty=true
         join_empty=true
       events
+        pick_wallet -> pick_wallet _
         unlock_submit -> unlock_submit _
         login_skip -> login_skip
-        create_submit -> create_submit _
+        create_submit -> create_submit _ _
         reveal_confirm -> reveal_confirm
         go_restore -> go_restore
         go_login -> go_login
-        restore_submit -> restore_submit _
+        restore_submit -> restore_submit _ _
         pick_network -> pick_network _
         open_network_submit -> open_network_submit
         forget_network_submit -> forget_network_submit _ _
@@ -521,6 +601,7 @@ test launch_networks_empty_contract
         restore_hidden_submit -> restore_hidden_submit
         go_join -> go_join
         go_networks -> go_networks
+        go_wallets -> go_wallets
         join_network_submit -> join_network_submit
         copy_onboarding_invite -> copy_onboarding_invite
         enter_console -> enter_console

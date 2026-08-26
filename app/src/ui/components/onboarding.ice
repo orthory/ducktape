@@ -1,5 +1,5 @@
 // THE LAUNCH WINDOW'S COLUMN. `hub_step` is the single discriminant:
-// (create | unlock) -> [reveal | restore] -> networks -> [join ->
+// (create | wallets) -> [reveal | restore] -> networks -> [join ->
 // provisioning -> live]. The console never renders here — it lives in its
 // own window, opened on a network pick.
 //
@@ -12,15 +12,16 @@
 // only resolve local handlers and declared emissions, so an app handler is
 // never named inside this file.
 
-component HubColumn(step:HubStep, key_state:str, networks:[HubNetwork], selected:str, hidden:i64, name:str, invite:str, reveal:str, steps:[ProvisionStep], step_index:i64, height:i64, tier:str, error:str, busy:bool, restore_empty:bool, join_empty:bool)
+component HubColumn(step:HubStep, wallets:[WalletInfo], wallet_selected:str, networks:[HubNetwork], selected:str, hidden:i64, name:str, invite:str, reveal:str, steps:[ProvisionStep], step_index:i64, height:i64, tier:str, error:str, busy:bool, restore_empty:bool, join_empty:bool)
   emits
+    pick_wallet(str)
     unlock_submit(str)
     login_skip
-    create_submit(str)
+    create_submit(str, str)
     reveal_confirm
     go_restore
     go_login
-    restore_submit(str)
+    restore_submit(str, str)
     pick_network(str)
     open_network_submit
     forget_network_submit(str, str)
@@ -28,6 +29,7 @@ component HubColumn(step:HubStep, key_state:str, networks:[HubNetwork], selected
     restore_hidden_submit
     go_join
     go_networks
+    go_wallets
     join_network_submit
     copy_onboarding_invite
     enter_console
@@ -41,13 +43,15 @@ component HubColumn(step:HubStep, key_state:str, networks:[HubNetwork], selected
       bg=bg_wash
     col gap=0.0
       match step
-        HubStep.unlock
-          UnlockScreen #unlock
+        HubStep.wallets
+          WalletsScreen #wallets
             with
-              key_state
+              wallets
+              selected=wallet_selected
               busy
               error
             forward
+              pick_wallet
               unlock_submit
               login_skip
               go_restore
@@ -56,6 +60,7 @@ component HubColumn(step:HubStep, key_state:str, networks:[HubNetwork], selected
             forward
               create_submit
               go_restore
+              login_skip
         HubStep.reveal
           RevealScreen words=reveal
             forward
@@ -79,6 +84,7 @@ component HubColumn(step:HubStep, key_state:str, networks:[HubNetwork], selected
               hidden
               busy
               error
+              active_wallet=wallet_selected
             forward
               pick_network
               open_network_submit
@@ -86,6 +92,7 @@ component HubColumn(step:HubStep, key_state:str, networks:[HubNetwork], selected
               connect_remote_submit
               restore_hidden_submit
               go_join
+              go_wallets
         HubStep.provisioning
           ProvisioningScreen
             with
@@ -165,76 +172,35 @@ component HubBrand(title:str, caption:str)
             align-x=center
             @text-caption
 
-// UNLOCK. Returning device: the password that opens this device's user.key
-// becomes the session's signing password. Reads never need it, so the quiet
-// way past a forgotten password stays one click.
-component UnlockScreen(key_state:str, busy:bool, error:str)
+// WALLETS. Returning device: the keystore's named identities, one row each.
+// The selected row is the one that opens — its password field is right there,
+// so choosing an identity and unlocking it is one gesture, not two screens.
+// Reads never need a wallet, so the quiet way past a forgotten password stays
+// one click.
+component WalletsScreen(wallets:[WalletInfo], selected:str, busy:bool, error:str)
   emits
+    pick_wallet(str)
     unlock_submit(str)
     login_skip
     go_restore
-  state
-    pw = ""
   col #root w=428.0 gap=0.0
-    HubBrand title="Welcome back" caption="Unlock this device's identity to sign what you do."
-    if key_state == "encrypted"
-      col w=fill gap=0.0
-        box w=fill pt=26.0
-          text "PASSWORD"
-            with
-              size=10.0
-              wrap=none
-              font=code_semibold
-              @text-label
-        box w=fill pt=8.0
-          box
-            with
-              w=fill
-              px=14.0
-              py=12.0
-              bg=surface
-              border=primary
-              border-w=1.5
-              r=10.0
-            input "" #unlock-password <-> pw
+    HubBrand title="Choose a wallet" caption="Unlock an identity to sign what you do."
+    box w=fill pt=22.0
+      scroll
+        with
+          dir=vertical
+          w=fill
+          h=300.0
+        col w=fill gap=8.0
+          for row in wallets
+            WalletRow #wallet-row(row.name)
               with
-                label="Key password"
-                hint="••••••••"
-                secure=true
-                disabled=busy
-                submit=emit(unlock_submit, pw)
-                w=fill
-                p=0.0
-                text-size=13.0
-                line-h=1.2
-                font=code
-                @control
-              active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
-              disabled value=hint
-        box w=fill pt=16.0
-          button -> emit(unlock_submit, pw)
-            with
-              label="Unlock"
-              disabled=(busy || empty(pw))
-              w=fill
-              @primary_action
-              @px-0px
-              @py-13px
-              @rounded-10px
-            text "Unlock →"
-              with
-                w=fill
-                size=13.5
-                wrap=none
-                align-x=center
-                font=display
-                @text-primary_fg
-    if key_state != "encrypted"
-      box w=fill pt=22.0
-        GateNote
-          with
-            reason="This device's user key is not usable for signing."
-            next="`ducktape user key status` explains; restore from the recovery phrase or continue read-only."
+                row
+                selected=(row.name == selected)
+                busy
+              forward
+                pick_wallet
+                unlock_submit
     box w=fill pt=18.0
       col
         with
@@ -261,14 +227,173 @@ component UnlockScreen(key_state:str, busy:bool, error:str)
           pressed bg=fg/14
     OnboardingError message=error
 
+// One wallet row: the name, the identity it signs as, and — while selected —
+// the password that opens it. The draft is component state, so every row owns
+// its own field and switching rows never carries a password across.
+// Two branches for one row, the way `NetworkRow` splits: a button's styles are
+// static, so selected and unselected are two nodes, not one with a flag.
+component WalletRow(row:WalletInfo, selected:bool, busy:bool)
+  emits
+    pick_wallet(str)
+    unlock_submit(str)
+  state
+    pw = ""
+  col #root w=fill gap=0.0
+    if selected
+      col w=fill gap=0.0
+        button -> emit(pick_wallet, row.name)
+          with
+            label=row.name
+            checked=selected
+            w=fill
+            p=0.0
+            @icon_action
+          box
+            with
+              w=fill
+              px=13.0
+              pt=11.0
+              pb=11.0
+            col w=fill gap=4.0
+              row
+                with
+                  w=fill
+                  gap=9.0
+                  align=center
+                text row.name
+                  with
+                    w=fill
+                    size=13.5
+                    wrap=none
+                    font=display
+                    @text-primary
+                if row.active
+                  text "active"
+                    with
+                      size=9.5
+                      wrap=none
+                      font=code_semibold
+                      @text-label
+              text short_pubkey(row.pubkey)
+                with
+                  w=fill
+                  size=11.0
+                  wrap=none
+                  font=code_medium
+                  @text-meta
+          active bg=selected_row text=fg border=primary border-w=1.5 r=11.0
+          hovered bg=selected_row text=fg
+          pressed bg=rail_hover text=fg
+        // One read of the state String, in exclusive arms — the ruling
+        // `ProvisionRow` states at length: two `if` blocks over the same
+        // String field move it twice and the generated Rust will not compile.
+        match row.state
+          "encrypted"
+            col w=fill gap=0.0
+              box w=fill pt=8.0
+                box
+                  with
+                    w=fill
+                    px=14.0
+                    py=12.0
+                    bg=surface
+                    border=primary
+                    border-w=1.5
+                    r=10.0
+                  input "" #wallet-password <-> pw
+                    with
+                      label="Key password"
+                      hint="••••••••"
+                      secure=true
+                      disabled=busy
+                      submit=emit(unlock_submit, pw)
+                      w=fill
+                      p=0.0
+                      text-size=13.0
+                      line-h=1.2
+                      font=code
+                      @control
+                    active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
+                    disabled value=hint
+              box w=fill pt=10.0
+                button #wallet-unlock -> emit(unlock_submit, pw)
+                  with
+                    label="Unlock"
+                    disabled=(busy || empty(pw))
+                    w=fill
+                    @primary_action
+                    @px-0px
+                    @py-13px
+                    @rounded-10px
+                  text "Unlock →"
+                    with
+                      w=fill
+                      size=13.5
+                      wrap=none
+                      align-x=center
+                      font=display
+                      @text-primary_fg
+          _
+            box w=fill pt=8.0
+              GateNote
+                with
+                  reason="This wallet's key file is not usable for signing."
+                  next="`ducktape user key status` explains; restore from the recovery phrase or continue read-only."
+    if !selected
+      button #wallet-pick -> emit(pick_wallet, row.name)
+        with
+          label=row.name
+          checked=selected
+          w=fill
+          p=0.0
+          @icon_action
+        box
+          with
+            w=fill
+            px=13.0
+            pt=11.0
+            pb=11.0
+          col w=fill gap=4.0
+            row
+              with
+                w=fill
+                gap=9.0
+                align=center
+              text row.name
+                with
+                  w=fill
+                  size=13.5
+                  wrap=none
+                  font=display
+                  @text-primary
+              if row.active
+                text "active"
+                  with
+                    size=9.5
+                    wrap=none
+                    font=code_semibold
+                    @text-label
+            text short_pubkey(row.pubkey)
+              with
+                w=fill
+                size=11.0
+                wrap=none
+                font=code_medium
+                @text-meta
+        active bg=surface text=muted border=border border-w=1.0 r=11.0
+        hovered bg=subtle text=fg
+        pressed bg=rail_hover text=fg
+
 // CREATE. First run: mint this device's identity under a password. The
 // authoritative floor lives in Rust (`password_problem` mirrors the CLI's
 // 8-char minimum); the button stays dead until the pair is acceptable.
 component CreateScreen(busy:bool, error:str)
   emits
-    create_submit(str)
+    create_submit(str, str)
     go_restore
+    login_skip
   state
+    name_draft = "default"
     pw = ""
     pw2 = ""
   col #root w=428.0 gap=0.0
@@ -277,6 +402,36 @@ component CreateScreen(busy:bool, error:str)
         title="Create your identity"
         caption="One key, generated on this device. A password seals it; 24 recovery words back it up."
     box w=fill pt=26.0
+      text "WALLET NAME"
+        with
+          size=10.0
+          wrap=none
+          font=code_semibold
+          @text-label
+    box w=fill pt=8.0
+      box
+        with
+          w=fill
+          px=14.0
+          py=12.0
+          bg=surface
+          border=primary
+          border-w=1.5
+          r=10.0
+        input "" #wallet-name <-> name_draft
+          with
+            label="Wallet name"
+            hint="lowercase letters, digits, . _ -"
+            disabled=busy
+            w=fill
+            p=0.0
+            text-size=13.0
+            line-h=1.2
+            font=code
+            @control
+          active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
+          disabled value=hint
+    box w=fill pt=14.0
       text "PASSWORD"
         with
           size=10.0
@@ -323,7 +478,7 @@ component CreateScreen(busy:bool, error:str)
             hint="again"
             secure=true
             disabled=busy
-            submit=emit(create_submit, pw)
+            submit=emit(create_submit, name_draft, pw)
             w=fill
             p=0.0
             text-size=13.0
@@ -341,10 +496,10 @@ component CreateScreen(busy:bool, error:str)
             line-h=1.4
             @text-danger_fg
     box w=fill pt=16.0
-      button -> emit(create_submit, pw)
+      button -> emit(create_submit, name_draft, pw)
         with
           label="Create identity"
-          disabled=(busy || empty(pw) || password_problem(pw, pw2) != "")
+          disabled=(busy || empty(pw) || empty(name_draft) || password_problem(pw, pw2) != "")
           w=fill
           @primary_action
           @px-0px
@@ -362,9 +517,22 @@ component CreateScreen(busy:bool, error:str)
       col
         with
           w=fill
-          gap=0.0
+          gap=8.0
           align=center
         button "Restore from recovery phrase" -> emit(go_restore)
+          with
+            disabled=busy
+            h=26.0
+            p=5.0
+            @ghost_action
+          active bg=transparent text=muted r=7.0
+          hovered bg=fg/9 text=fg
+          pressed bg=fg/14
+        // THE WAY OUT OF THIS SCREEN WITHOUT A KEY. This is where a failed
+        // `wallet list` lands someone who already HAS wallets, and without
+        // this the create ceremony is the only door — reads never needed a
+        // key, so refusing to show the network list was never honest.
+        button "Continue read-only" #create-skip -> emit(login_skip)
           with
             disabled=busy
             h=26.0
@@ -447,9 +615,10 @@ component RevealScreen(words:str)
 // RESTORE. 24 words in, a new password around them, the same pubkey out.
 component RestoreScreen(busy:bool, error:str, phrase_empty:bool)
   emits
-    restore_submit(str)
+    restore_submit(str, str)
     go_login
   state
+    name_draft = "restored"
     pw = ""
   col #root w=428.0 gap=0.0
     button -> emit(go_login)
@@ -487,6 +656,36 @@ component RestoreScreen(busy:bool, error:str, phrase_empty:bool)
           line-h=1.5
           @text-caption
     box w=fill pt=20.0
+      text "WALLET NAME"
+        with
+          size=10.0
+          wrap=none
+          font=code_semibold
+          @text-label
+    box w=fill pt=8.0
+      box
+        with
+          w=fill
+          px=14.0
+          py=12.0
+          bg=surface
+          border=primary
+          border-w=1.5
+          r=10.0
+        input "" #restore-name <-> name_draft
+          with
+            label="Wallet name"
+            hint="lowercase letters, digits, . _ -"
+            disabled=busy
+            w=fill
+            p=0.0
+            text-size=13.0
+            line-h=1.2
+            font=code
+            @control
+          active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
+          disabled value=hint
+    box w=fill pt=14.0
       text "RECOVERY PHRASE"
         with
           size=10.0
@@ -527,7 +726,7 @@ component RestoreScreen(busy:bool, error:str, phrase_empty:bool)
             hint="at least 8 characters"
             secure=true
             disabled=busy
-            submit=emit(restore_submit, pw)
+            submit=emit(restore_submit, name_draft, pw)
             w=fill
             p=0.0
             text-size=13.0
@@ -537,10 +736,10 @@ component RestoreScreen(busy:bool, error:str, phrase_empty:bool)
           active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
           disabled value=hint
     box w=fill pt=18.0
-      button -> emit(restore_submit, pw)
+      button -> emit(restore_submit, name_draft, pw)
         with
           label="Restore"
-          disabled=(busy || phrase_empty || empty(pw))
+          disabled=(busy || phrase_empty || empty(pw) || empty(name_draft))
           w=fill
           @primary_action
           @px-0px
@@ -559,12 +758,13 @@ component RestoreScreen(busy:bool, error:str, phrase_empty:bool)
 // NETWORKS. The launch window's home: every network this device knows —
 // workspaces on disk and saved remote endpoints — most recently used first.
 // An empty list is the old welcome screen wearing its real name.
-component NetworksScreen(networks:[HubNetwork], selected:str, hidden:i64, busy:bool, error:str)
+component NetworksScreen(networks:[HubNetwork], selected:str, hidden:i64, busy:bool, error:str, active_wallet:str)
   emits
     pick_network(str)
     open_network_submit
     forget_network_submit(str, str)
     go_join
+    go_wallets
     connect_remote_submit(str)
     restore_hidden_submit
   state
@@ -642,6 +842,31 @@ component NetworksScreen(networks:[HubNetwork], selected:str, hidden:i64, busy:b
               size=13.0
               line-h=1.5
               @text-caption
+        // Which identity the next console signs as, and the one click back to
+        // the wallet list. A network pick that silently signs as whoever was
+        // active last is the thing this line exists to stop.
+        box w=fill pt=12.0
+          row
+            with
+              w=fill
+              gap=9.0
+              align=center
+            text active_wallet_label(active_wallet)
+              with
+                w=fill
+                size=11.0
+                wrap=none
+                font=code_medium
+                @text-meta
+            button "Switch wallet" #switch-wallet -> emit(go_wallets)
+              with
+                disabled=busy
+                h=24.0
+                p=4.0
+                @ghost_action
+              active bg=transparent text=muted r=7.0
+              hovered bg=fg/9 text=fg
+              pressed bg=fg/14
         box w=fill pt=16.0
           scroll
             with

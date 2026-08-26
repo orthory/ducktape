@@ -388,12 +388,7 @@ pub(crate) fn parse_user_key_status(status: &str) -> Option<Vec<u8>> {
 /// user key: `$DUCKTAPE_HOME/app-prefs.json`, else `~/.ducktape/app-prefs.json`.
 /// Never wire state: purely this device's view preferences.
 fn prefs_path() -> Option<PathBuf> {
-    if let Some(root) = std::env::var_os("DUCKTAPE_HOME") {
-        return Some(PathBuf::from(root).join("app-prefs.json"));
-    }
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".ducktape/app-prefs.json"))
+    duck_home().ok().map(|home| home.join("app-prefs.json"))
 }
 
 pub(crate) fn read_prefs() -> serde_json::Value {
@@ -521,17 +516,72 @@ pub fn next_doc_tab(tabs: Vec<String>, closed: String, active: String) -> String
         .unwrap_or_default()
 }
 
+/// `$DUCKTAPE_HOME` else `~/.ducktape` — where the keystore and the prefs live.
+pub(crate) fn duck_home() -> Result<PathBuf, String> {
+    if let Some(root) = std::env::var_os("DUCKTAPE_HOME") {
+        return Ok(PathBuf::from(root));
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".ducktape"))
+        .ok_or_else(|| "cannot locate ~/.ducktape; set DUCKTAPE_USER_KEY".to_string())
+}
+
+/// the keystore's name length cap, mirrored from the CLI's `wallet::valid_name`.
+const WALLET_NAME_MAX: usize = 41;
+
+/// The keystore's name charset — `[a-z0-9][a-z0-9._-]*`, at most 41 chars —
+/// enforced HERE and not only in the CLI, because a wallet name is both an
+/// argv word and a path segment: a leading `-` smuggles a clap flag into
+/// `ducktape wallet use` (which then prints help and exits 0, so a refusal
+/// would read as a success), and a `/` or `..` walks the key path out of the
+/// keystore. The name does not have to come from a person to be untrusted —
+/// the `active` pointer file is an ordinary file anyone can garble.
+pub(crate) fn check_wallet_name(name: &str) -> Result<(), String> {
+    let mut chars = name.chars();
+    let head_ok = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    let tail_ok =
+        chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'));
+    let fits = name.len() <= WALLET_NAME_MAX;
+    if head_ok && tail_ok && fits {
+        return Ok(());
+    }
+    Err(format!(
+        "wallet name {name:?} is invalid — use [a-z0-9][a-z0-9._-]*, at most {WALLET_NAME_MAX} chars"
+    ))
+}
+
+/// One named wallet's key file inside the keystore — THE join, so the charset
+/// check lives here and every caller inherits it.
+pub(crate) fn keystore_key_path(name: &str) -> Result<PathBuf, String> {
+    check_wallet_name(name)?;
+    Ok(duck_home()?.join("keys").join(format!("{name}.key")))
+}
+
+/// The `active` pointer's wallet NAME — empty when the keystore holds none.
+/// The pointer is the one place that decides which key every keyless verb
+/// signs with, and `ducktape wallet use` is what writes it.
+pub(crate) fn active_wallet_name() -> Result<String, String> {
+    let pointer = duck_home()?.join("keys").join("active");
+    Ok(std::fs::read_to_string(&pointer)
+        .map(|name| name.trim().to_string())
+        .unwrap_or_default())
+}
+
+/// This session's signing key file: the explicit override, else the keystore's
+/// active wallet. No active wallet is a refusal, not a guess — the launch
+/// window is where one is picked.
 pub(crate) fn user_key_path() -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os("DUCKTAPE_USER_KEY") {
         return Ok(path.into());
     }
-    if let Some(root) = std::env::var_os("DUCKTAPE_HOME") {
-        return Ok(PathBuf::from(root).join("user.key"));
+    let name = active_wallet_name()?;
+    if name.is_empty() {
+        return Err("no active wallet — pick one in the launch window".to_string());
     }
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".ducktape/user.key"))
-        .ok_or_else(|| "cannot locate local user.key; set DUCKTAPE_USER_KEY".to_string())
+    keystore_key_path(&name)
 }
 
 pub(crate) fn require_encrypted_key(path: &std::path::Path) -> Result<(), String> {

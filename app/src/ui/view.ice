@@ -9,7 +9,8 @@ view
       HubColumn
         with
           step=hub_step
-          key_state=hub_key_state
+          wallets=hub_wallets
+          wallet_selected=hub_wallet_selected
           networks=hub_networks
           selected=hub_selected
           hidden=hub_hidden
@@ -25,18 +26,20 @@ view
           restore_empty=empty(restore_words)
           join_empty=empty(join_invite)
         events
+          pick_wallet -> pick_wallet _
           unlock_submit -> unlock_submit _
           login_skip -> login_skip
-          create_submit -> create_submit _
+          create_submit -> create_submit _ _
           reveal_confirm -> reveal_confirm
           go_restore -> go_restore
           go_login -> go_login
-          restore_submit -> restore_submit _
+          restore_submit -> restore_submit _ _
           pick_network -> pick_network _
           open_network_submit -> open_network_submit
           forget_network_submit -> forget_network_submit _ _
           go_join -> go_join
           go_networks -> go_networks
+          go_wallets -> go_wallets
           join_network_submit -> join_network_submit
           copy_onboarding_invite -> copy_onboarding_invite
           connect_remote_submit -> connect_remote_submit _

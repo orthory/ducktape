@@ -1,5 +1,5 @@
 // THE LAUNCH WINDOW'S HANDLERS. One `hub_step` machine inside the onboarding
-// window: loading -> (create | unlock) -> [reveal | restore] -> networks ->
+// window: loading -> (create | wallets) -> [reveal | restore] -> networks ->
 // [join -> provisioning -> live] -> console window.
 //
 // The app is a strict CLIENT, and there is no create route: founding a network
@@ -11,72 +11,93 @@
 // of a spinner on an 850ms fake clock.
 //
 // Sign-in is the SAME password every signing extern already threads: unlock
-// verifies it against user.key once (`ducktape user key unlock`), then stores
-// it in `password` for the session. Nothing new touches the wire.
+// verifies it against the SELECTED wallet once (`ducktape user key unlock`),
+// makes that wallet active (`ducktape wallet use`), then stores the password
+// in `password` for the session. Nothing new touches the wire.
 
 // The launch window is up: register it, then load everything it renders —
-// the key state, the network list, and the persisted appearance.
+// the keystore's wallets, the network list, and the persisted appearance.
 on onboarding_opened(id)
   onboarding_win = some(id)
   parallel
     run replace lane=appearance_load load_appearance() -> appearance_loaded _
     run replace lane=hub_state hub_state() -> hub_booted _
 
-// Boot answer: pick the entry step from the key state and start probing the
+// Boot answer: pick the entry step from the keystore and start probing the
 // rows. `hub_booted` OWNS the step; the refresh route below never moves it.
+// A keystore that could not be READ is not a keystore that is EMPTY: the
+// error rides the same boot answer and lands on the create screen's own plate,
+// where "Continue read-only" is the way past it.
 on hub_booted(state)
-  hub_key_state = state.key_state
   hub_hidden = state.hidden
   hub_networks = state.networks
   hub_selected = state.preselect
-  hub_step = hub_entry_step(state.key_state)
+  hub_wallets = state.wallets
+  hub_wallet_selected = preselect_wallet(state.wallets)
+  hub_step = hub_entry_step(state.wallets)
+  onboarding_error = state.wallets_error
   stream replace lane=network_probes probe_known_networks() -> network_probed _
 
-// A refresh (after forget / after a join) updates the rows where the user
-// already is — the step stays put.
+// A refresh (after forget / after a join / on the way back to the wallet
+// list) updates the rows where the user already is — the step stays put, and
+// so does the row she picked while the refresh was in flight.
 on hub_refreshed(state)
-  hub_key_state = state.key_state
   hub_hidden = state.hidden
   hub_networks = state.networks
   hub_selected = refreshed_hub_selection(state.networks, hub_selected, state.preselect)
+  hub_wallets = state.wallets
+  hub_wallet_selected = refreshed_wallet_selection(state.wallets, hub_wallet_selected, preselect_wallet(state.wallets))
+  onboarding_error = state.wallets_error
   stream replace lane=network_probes probe_known_networks() -> network_probed _
 
 on network_probed(probe)
   hub_networks = apply_network_probe(hub_networks, probe)
 
-// UNLOCK — verify the password opens user.key, then keep it as the session's
-// signing password. Optimistically stored: the failure arm clears it.
+on pick_wallet(name)
+  hub_wallet_selected = name
+
+// UNLOCK — verify the password opens the SELECTED wallet and make it the
+// active one, then keep the password as the session's signing password.
+// Optimistically stored: the failure arm clears it.
 on unlock_submit(pw)
-  return if mutation_phase != MutationPhase.idle || empty(pw)
+  return if mutation_phase != MutationPhase.idle || empty(pw) || empty(hub_wallet_selected)
   onboarding_error = ""
   password = pw
   mutation_phase = MutationPhase.onboarding
-  run every unlock_user_key(password) -> key_unlocked _ | login_failed _
+  run every unlock_wallet(hub_wallet_selected, password) -> key_unlocked _ | login_failed _
 
 on key_unlocked(_pubkey)
   mutation_phase = MutationPhase.idle
   onboarding_error = ""
   hub_step = HubStep.networks
 
-// Reads never need the password — the quiet way past a forgotten one.
+// Reads never need the password — the quiet way past a forgotten one. The
+// wallet selection goes with the password: a read-only session signs as
+// NOBODY, and leaving a name behind made the network list claim otherwise.
 on login_skip
   return if mutation_phase != MutationPhase.idle
   password = ""
+  hub_wallet_selected = ""
   onboarding_error = ""
   hub_step = HubStep.networks
 
-// CREATE — mint user.key under the new password. The confirm field is
+// CREATE — mint a named wallet under the new password. The confirm field is
 // checked in the component (`password_problem`); this only fires clean.
-on create_submit(pw)
-  return if mutation_phase != MutationPhase.idle || empty(pw)
+// The NAME is stored the same way and for the same reason as the password:
+// `key_created` carries only the words and the pubkey, and the screens past
+// the reveal — the network list's "signing as …" line — name the wallet this
+// session is about to sign as. A failed mint leaves a name that no row
+// matches, and the next refresh drops it (`refreshed_wallet_selection`).
+on create_submit(name, pw)
+  return if mutation_phase != MutationPhase.idle || empty(pw) || empty(name)
   onboarding_error = ""
   password = pw
+  hub_wallet_selected = name
   mutation_phase = MutationPhase.onboarding
-  run every create_user_key(password) -> key_created _ | login_failed _
+  run every create_user_key(name, password) -> key_created _ | login_failed _
 
 on key_created(created)
   mutation_phase = MutationPhase.idle
-  hub_key_state = "encrypted"
   reveal_words = created.words
   hub_step = HubStep.reveal
 
@@ -95,19 +116,21 @@ on go_login
   return if mutation_phase != MutationPhase.idle
   restore_words = ""
   onboarding_error = ""
-  hub_step = hub_entry_step(hub_key_state)
+  hub_step = hub_entry_step(hub_wallets)
 
-on restore_submit(pw)
-  return if mutation_phase != MutationPhase.idle || empty(restore_words) || empty(pw)
+// Same stash as `create_submit`, same reason: `key_restored` carries only a
+// pubkey, and the list it lands on names the wallet by name.
+on restore_submit(name, pw)
+  return if mutation_phase != MutationPhase.idle || empty(restore_words) || empty(pw) || empty(name)
   onboarding_error = ""
   password = pw
+  hub_wallet_selected = name
   mutation_phase = MutationPhase.onboarding
-  run every restore_user_key(restore_words, password) -> key_restored _ | login_failed _
+  run every restore_user_key(name, restore_words, password) -> key_restored _ | login_failed _
 
 on key_restored(_pubkey)
   restore_words = ""
   mutation_phase = MutationPhase.idle
-  hub_key_state = "encrypted"
   hub_step = HubStep.networks
 
 on login_failed(cause)
@@ -392,6 +415,15 @@ on go_networks
   hub_step = HubStep.networks
   run replace lane=hub_state hub_state() -> hub_refreshed _
 
+// Back to the wallet list from the network picker. Refreshed on the way in:
+// a wallet minted since boot is on disk but not in `hub_wallets`, and a list
+// that cannot show it is a list you cannot switch to it with.
+on go_wallets
+  return if mutation_phase != MutationPhase.idle
+  onboarding_error = ""
+  hub_step = HubStep.wallets
+  run replace lane=hub_state hub_state() -> hub_refreshed _
+
 on join_network_submit
   return if mutation_phase != MutationPhase.idle || empty(join_invite)
   onboarding_error = ""
@@ -453,10 +485,9 @@ on onboarding_failed(cause)
 // THE WAY BACK — the titlebar chip, Settings' Switch network, and Danger
 // Zone's forget all land here: reopen the launch window; once it is
 // registered, the console closes behind it — and the popped huddle with it,
-// since the huddle it showed belongs to the network being left. The list is
-// where it lands —
-// never the unlock ceremony again; the session's password (or the user's
-// deliberate read-only skip) survives a network switch.
+// since the huddle it showed belongs to the network being left. The network
+// list is where it lands — never the wallet list again; the session's password
+// (or the user's deliberate read-only skip) survives a network switch.
 on switch_network
   return if mutation_phase != MutationPhase.idle
   invalidate lane=page_autosave

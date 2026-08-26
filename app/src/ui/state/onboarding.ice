@@ -6,10 +6,11 @@ state
   huddle_win:window-id? = none
   network_name = ""
   hub_step:HubStep = HubStep.loading
-  hub_key_state = ""
   hub_networks:[HubNetwork] = []
   hub_selected = ""
   hub_hidden:i64 = 0
+  hub_wallets:[WalletInfo] = []
+  hub_wallet_selected = ""
   reveal_words = ""
   onboarding_name = ""
   onboarding_error = ""

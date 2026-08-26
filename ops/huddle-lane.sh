@@ -163,6 +163,7 @@ cat <<EOF
 The lane is up. Run these in two terminals — one per person:
 
   ALSA_CARD=lanea \\
+  DUCKTAPE_USER_KEY=$LANE/home-a/user.key \\
   DUCKTAPE_HOME=$LANE/home-a \\
   DUCKTAPE_NODE=http://127.0.0.1:$HTTP_A \\
   DUCKTAPE_HUDDLE_PASSWORD=$PASSWORD \\
@@ -170,6 +171,7 @@ The lane is up. Run these in two terminals — one per person:
   cargo test -p ducktape-app -- --ignored --nocapture huddle_live
 
   ALSA_CARD=laneb \\
+  DUCKTAPE_USER_KEY=$LANE/home-b/user.key \\
   DUCKTAPE_HOME=$LANE/home-b \\
   DUCKTAPE_NODE=http://127.0.0.1:$HTTP_B \\
   DUCKTAPE_HUDDLE_PASSWORD=$PASSWORD \\

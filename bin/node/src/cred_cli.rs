@@ -219,19 +219,14 @@ impl VerbCtx {
         Ok(self.addr.resolve()?)
     }
 
-    /// the user key path for the signing verbs: explicit `--key` wins, else the
-    /// canonical `<workspace>/user.key` that `account-init` mints. A MISSING key
-    /// is a loud error, never a cue to mint: cred always signs as an
-    /// already-bound account, so an absent key means the wrong `-n`, or
-    /// `account-init` was never run — silently minting a fresh unbound identity
-    /// here is exactly the footgun that let a stray path clobber a real key.
+    /// the user key path for the signing verbs: explicit `--key` wins, else
+    /// THE shared wallet resolver ($DUCKTAPE_USER_KEY, else the keystore's
+    /// active wallet). A MISSING key is a loud error, never a cue to mint:
+    /// cred always signs as an already-bound account.
     fn key_path(&self) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
         let path = match &self.key {
             Some(explicit) => explicit.clone(),
-            // the shared ladder, which already knows how to infer the lone
-            // registered workspace and how to refuse an ambiguous one — this
-            // demanded `-n` outright even on a machine with exactly one.
-            None => self.addr.workspace()?.join("user.key"),
+            None => crate::wallet::active_user_key()?,
         };
         if !path.exists() {
             return Err(format!(
@@ -440,18 +435,21 @@ fn cmd_add(
     let user = load_user_signer(&ctx.key_path()?, stdin)?;
     let user_pub = user.public_key().as_ref().to_vec();
 
-    // owner account + display name (for the default name), existing names (for
-    // the counter) — one identity query, one gateway query.
+    // owner account (bind check) + existing names (for the default's counter)
+    // — one identity query, one gateway query. The display name is needed only
+    // to DERIVE a default name; an explicit name never requires one.
     let account = query_owner_account_view(&base, &user_pub)?;
-    let display = account
-        .display_name
-        .clone()
-        .ok_or("this account has no display name — pass an explicit credential name")?;
     let existing = query_credentials(&base)?;
     let existing_names: Vec<&str> = existing.iter().map(|r| r.name.as_str()).collect();
     let name = match name {
         Some(name) => name,
-        None => derive_default_name(&display, provider, &existing_names),
+        None => {
+            let display = account
+                .display_name
+                .clone()
+                .ok_or("this account has no display name — pass an explicit credential name")?;
+            derive_default_name(&display, provider, &existing_names)
+        }
     };
     gateway::validate_credential_name(&name)?;
 

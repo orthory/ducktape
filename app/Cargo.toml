@@ -64,6 +64,12 @@ usvg = "0.45"
 # the workspace's reqwest is already in the binary under rpc-client.
 reqwest.workspace = true
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
+# The app's own diagnostics. NOTHING CONSUMES THEM YET: this binary installs no
+# tracing subscriber, so today these events go nowhere at all — every failure a
+# person must act on is a plate on screen, and that is deliberate. The events
+# are emitted anyway because `println!` is not logging and a subscriber is the
+# only missing half; when one is installed they light up without a rewrite.
+tracing.workspace = true
 zeroize.workspace = true
 iced = { version = "=0.14.0", default-features = false, features = ["advanced", "highlighter", "image-without-codecs", "lazy", "markdown", "svg", "tokio", "wgpu", "x11"] }
 ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "a64eb5f70c7cbd97136ac54b42c6ea0409c2d866", default-features = false, features = ["log-timeline", "terminal"] }

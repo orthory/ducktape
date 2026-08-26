@@ -145,21 +145,28 @@ extern crate::backend
   stream provision_progress(workspace:str, rpc:str) -> ProvisionStep
   HubNetwork(id:str, chain_id:str, name:str, endpoint:str, kind:str, last_used:i64, probed:bool, live:bool, height:i64)
   HubProbe(id:str, live:bool, height:i64)
-  HubState(key_state:str, networks:[HubNetwork], preselect:str, hidden:i64)
+  WalletInfo(name:str, pubkey:str, state:str, active:bool)
+  HubState(wallets:[WalletInfo], wallets_error:str, networks:[HubNetwork], preselect:str, hidden:i64)
   KeyCreated(words:str, pubkey:str)
   hub_state() -> HubState
   stream probe_known_networks() -> HubProbe
   pure apply_network_probe(networks:[HubNetwork], probe:HubProbe) -> [HubNetwork]
   pure network_run_hint(row:&HubNetwork) -> str
-  pure hub_entry_step(key_state:str) -> HubStep
+  pure hub_entry_step(wallets:[WalletInfo]) -> HubStep
+  pure preselect_wallet(wallets:[WalletInfo]) -> str
+  pure refreshed_wallet_selection(wallets:[WalletInfo], current:str, preselect:str) -> str
+  pure short_pubkey(pubkey:&str) -> str
+  pure active_wallet_label(name:&str) -> str
+  pure wallet_info(name:str, pubkey:str, state:str, active:bool) -> WalletInfo
   pure selected_network_endpoint(networks:[HubNetwork], id:str) -> str
   pure refreshed_hub_selection(networks:[HubNetwork], current:str, preselect:str) -> str
   pure password_problem(password:&str, confirm:&str) -> str
   pure without_window(current:window-id?, closed:window-id) -> window-id?
   sync window_target(current:window-id?) -> window-id
   sync window_target_unless(keep:bool, current:window-id?) -> window-id
-  create_user_key(password:str) -> KeyCreated ! AppError
-  restore_user_key(words:secret, password:str) -> str ! AppError
+  create_user_key(name:str, password:str) -> KeyCreated ! AppError
+  restore_user_key(name:str, words:secret, password:str) -> str ! AppError
+  unlock_wallet(name:str, password:str) -> str ! AppError
   unlock_user_key(password:str) -> str ! AppError
   lock_signer() -> bool
   remember_network(rpc:str) -> bool
