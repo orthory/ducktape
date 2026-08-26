@@ -118,6 +118,13 @@ members = [
     # node/noded/simnode/demo parse and validate `.duck` names host-side. Under
     # crates/modules/system/ it made "modules = onchain" literally false.
     "crates/duckdns",
+    # keystore — the device keystore (`keys/<name>.key` + the active pointer)
+    # and the argon2id/AEAD seal under it. Same standing, same reason: its two
+    # consumers are the CLI and the desktop app, which share nothing else. It
+    # sat inside bin/node until the app's only route to it was spawning
+    # `ducktape` over pipes, making "can the app find a binary?" a precondition
+    # for opening your own key.
+    "crates/keystore",
     "crates/duckfs/core",
     "crates/duckfs/disk",
     "crates/duckfs/client",
@@ -318,6 +325,8 @@ sandbox-host = { path = "crates/services/sandbox" }
 # duckdns is the `.duck` naming library the `gateway` module embeds and the
 # composing binaries validate names through (see the members list).
 duckdns = { path = "crates/duckdns" }
+# the device keystore, linked by both the CLI and the desktop app.
+keystore = { path = "crates/keystore" }
 # the module composition catalog (id universe + named genesis selections).
 topology = { path = "crates/topology" }
 duckfs-core = { path = "crates/duckfs/core" }

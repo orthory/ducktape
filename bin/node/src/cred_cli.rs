@@ -226,7 +226,7 @@ impl VerbCtx {
     fn key_path(&self) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
         let path = match &self.key {
             Some(explicit) => explicit.clone(),
-            None => crate::wallet::active_user_key()?,
+            None => keystore::wallet::active_user_key()?,
         };
         if !path.exists() {
             return Err(format!(

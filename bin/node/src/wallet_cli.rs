@@ -4,7 +4,9 @@
 
 use std::path::Path;
 
-use crate::{userkey_cli, wallet};
+use keystore::wallet;
+
+use crate::userkey_cli;
 
 type CommandResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -169,12 +171,12 @@ mod tests {
         let (words, pubkey) = wallet_new(duck, "alice", &mut stdin).unwrap();
         assert_eq!(words.split_whitespace().count(), 24);
         assert_eq!(pubkey.len(), 64);
-        assert_eq!(crate::wallet::active_name(duck).as_deref(), Some("alice"));
+        assert_eq!(keystore::wallet::active_name(duck).as_deref(), Some("alice"));
 
         // a second new does NOT steal active.
         let mut stdin = Cursor::new("password-123\n");
         wallet_new(duck, "bob", &mut stdin).unwrap();
-        assert_eq!(crate::wallet::active_name(duck).as_deref(), Some("alice"));
+        assert_eq!(keystore::wallet::active_name(duck).as_deref(), Some("alice"));
 
         // refuse duplicates and bad names.
         let mut stdin = Cursor::new("password-123\n");
@@ -184,7 +186,7 @@ mod tests {
 
         // use flips the pointer.
         wallet_use(duck, "bob").unwrap();
-        assert_eq!(crate::wallet::active_name(duck).as_deref(), Some("bob"));
+        assert_eq!(keystore::wallet::active_name(duck).as_deref(), Some("bob"));
 
         // import round-trips the mnemonic into the SAME pubkey.
         let mut stdin = Cursor::new(format!("{words}\npassword-456\n"));
