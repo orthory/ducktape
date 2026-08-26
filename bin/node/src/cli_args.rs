@@ -504,9 +504,11 @@ pub struct AdmitArgs {
 pub struct JoinCmd {
     #[command(subcommand)]
     pub query: Option<JoinQuery>,
-    /// the one-line invite blob a member minted
-    #[arg(value_name = "INVITE-BLOB")]
-    pub blob: Option<String>,
+    /// the invite blob a member minted. several shell words are joined back
+    /// together (a paste split by spaces still works); omitted entirely, the
+    /// blob is read from stdin — paste it at the prompt and press Enter.
+    #[arg(value_name = "INVITE-BLOB", num_args = 0..)]
+    pub blob: Vec<String>,
     /// materialize here instead of the registry dir named by the chain id
     #[arg(long, value_name = "DIR")]
     pub dir: Option<PathBuf>,
