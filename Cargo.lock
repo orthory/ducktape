@@ -85,6 +85,7 @@ dependencies = [
  "borsh",
  "commonware-cryptography",
  "futures",
+ "guest-adapter",
  "host",
  "identity",
  "sdk",
@@ -4536,6 +4537,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "valset",
+ "vaults",
  "wasm-host",
 ]
 
@@ -5417,6 +5419,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "commonware-runtime",
+ "guest-adapter",
  "host",
  "sdk",
  "sdk-testkit",
@@ -6062,7 +6065,6 @@ dependencies = [
 name = "node-bin"
 version = "0.1.0"
 dependencies = [
- "acl",
  "agent",
  "agent-service",
  "airlock",
@@ -10451,6 +10453,7 @@ dependencies = [
  "commonware-codec",
  "commonware-cryptography",
  "futures",
+ "guest-adapter",
  "host",
  "sdk",
  "serde",

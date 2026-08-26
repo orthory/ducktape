@@ -197,10 +197,11 @@ BUILDER_MODULES := \
   crates/modules/apps/inbox crates/modules/apps/pages crates/modules/apps/agent \
   crates/modules/apps/automations crates/modules/apps/runs \
   crates/modules/apps/tasks crates/modules/apps/chat crates/modules/apps/files \
+  crates/modules/apps/vaults \
   crates/modules/system/tagging crates/modules/system/dispatch \
   crates/modules/system/capability crates/modules/system/identity \
   crates/modules/system/gateway crates/modules/system/governance \
-  crates/modules/system/saga
+  crates/modules/system/saga crates/modules/system/acl crates/modules/system/kv
 
 # Modules that additionally ship an INDEX guest (src/index_guest.rs behind the
 # `index-guest` feature): guest-builder --index writes the canonical
