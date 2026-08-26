@@ -30,22 +30,15 @@ pub struct HubProbe {
     pub height: i64,
 }
 
-/// One wallet row the launch window lists — `ducktape wallet list --json`,
-/// verbatim. `state` is the key file's own reading (`encrypted` |
-/// `unreadable`), so a row says whether it can sign before anyone types a
-/// password into it.
-#[derive(Clone, Debug, Hash, PartialEq, serde::Deserialize)]
+/// One wallet row the launch window lists, straight off `keystore::wallet`.
+/// `state` is the key file's own reading (`encrypted` | `unreadable`), so a
+/// row says whether it can sign before anyone types a password into it.
+#[derive(Clone, Debug, Hash, PartialEq)]
 pub struct WalletInfo {
     pub name: String,
     pub pubkey: String,
     pub state: String,
     pub active: bool,
-}
-
-/// The keystore's rows, straight off the CLI's `--json`. `None` is a shape the
-/// app does not recognize; an empty list is a keystore with nothing in it.
-pub(crate) fn parse_wallet_rows(json: &str) -> Option<Vec<WalletInfo>> {
-    serde_json::from_str(json).ok()
 }
 
 /// A row, built. Ice reads extern structs but cannot construct one, so the
@@ -316,17 +309,11 @@ fn env_key_override() -> bool {
     std::env::var_os("DUCKTAPE_USER_KEY").is_some()
 }
 
-/// The keystore read is on the launch window's critical path: it decides
-/// whether the first screen is the create ceremony or the wallet list, and
-/// nothing renders until it answers. 10s, not `CLI_TIMEOUT`'s 120 — a wedged
-/// binary must become a visible refusal, not two minutes of `loading`.
-const WALLET_LIST_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// The keystore's rows. `DUCKTAPE_USER_KEY` bypasses the keystore with one
 /// synthetic row so rigs and huddle lanes get the same single screen.
 /// A failure is returned, never flattened to an empty list: "no wallets" sends
 /// the launch window to the create ceremony, and sending someone who HAS
-/// wallets there because the CLI was missing is a lie with no way back.
+/// wallets there because a directory would not read is a lie with no way back.
 async fn wallet_rows() -> Result<Vec<WalletInfo>, String> {
     if env_key_override() {
         return Ok(vec![WalletInfo {
@@ -336,14 +323,16 @@ async fn wallet_rows() -> Result<Vec<WalletInfo>, String> {
             active: true,
         }]);
     }
-    let listed = tokio::time::timeout(
-        WALLET_LIST_TIMEOUT,
-        ducktape_cli_raw(&["wallet", "list", "--json"], None, Vec::new()),
-    )
-    .await
-    .map_err(|_| "listing the keystore timed out".to_string())?;
-    let stdout = listed?;
-    parse_wallet_rows(&stdout).ok_or_else(|| "the keystore listing is unreadable".to_string())
+    let listed = keystore::wallet::list(&duck_home()?)?;
+    Ok(listed
+        .into_iter()
+        .map(|row| WalletInfo {
+            name: row.name,
+            pubkey: row.pubkey,
+            state: row.state.to_string(),
+            active: row.active,
+        })
+        .collect())
 }
 
 /// The named wallet's key file — `env` names the override path, and only while
@@ -369,26 +358,22 @@ fn active_or_env_wallet() -> Result<String, String> {
 }
 
 pub async fn hub_state() -> HubState {
-    // `wallet list` is ALSO the CLI pre-warm, and it is now awaited rather
-    // than fired and forgotten. On macOS the FIRST exec of a freshly built
-    // binary pays Gatekeeper's whole-file assessment — measured 3.2 s on an
-    // M-series mini for the ~1 GB debug `ducktape`, 0.01 s once cached — and
-    // every rebuild mints a new binary, so every `make dev` session's first
-    // unlock (or first signed write) ate it. Paying it HERE means the launch
-    // window wears the wait once, on a screen that has nothing to type into
-    // yet, instead of on the user's first click. It is also what runs the
-    // keystore's legacy `user.key` adoption on a first post-upgrade boot.
+    // This read is also what runs the keystore's legacy `user.key` adoption on
+    // a first post-upgrade boot, and it is a directory listing rather than a
+    // subprocess now — so the macOS Gatekeeper assessment the launch window
+    // used to absorb here (3.2 s on a freshly built ~1 GB debug `ducktape`)
+    // simply is not paid: nothing on the key path execs anything.
     let (wallets, wallets_error) = match wallet_rows().await {
         Ok(rows) => (rows, String::new()),
         Err(cause) => {
-            // The detail carries the CLI's stderr, which can name a path — it
-            // reaches the screen, never the log ring. The token is the fact.
+            // The detail can name a path — it reaches the screen, never the
+            // log ring. The token is the fact.
             tracing::warn!(
                 target: "ducktape::app",
                 reason = "wallet_list_failed",
                 "the keystore listing failed; the launch window shows the refusal"
             );
-            (Vec::new(), cause)
+            (Vec::new(), user_error(cause))
         }
     };
     let networks = known_networks();
@@ -462,7 +447,7 @@ pub fn probe_known_networks() -> iced::futures::stream::BoxStream<'static, HubPr
 }
 
 /// One bounded status read: the height when the node answers, `None` when it
-/// does not. 3s, not `RPC_TIMEOUT` — a liveness dot must not hang the list.
+/// does not. 3s — a liveness dot must not hang the list.
 async fn probe_endpoint(endpoint: &str) -> Option<i64> {
     if endpoint.is_empty() {
         return None;
@@ -532,26 +517,36 @@ pub async fn forget_network(id: String, kind: String) -> bool {
     write_prefs(&prefs)
 }
 
-/// `wallet new <name>` — mint a named wallet under `password`. Returns the 24
-/// recovery words and pubkey; the fresh wallet becomes the active one and the
-/// in-process key cache is refreshed, so the new identity signs without a
-/// restart.
+/// Run one keystore ceremony OFF the async runtime.
 ///
-/// THE WORDS COME BACK FIRST. Once `wallet new` returns, a sealed key exists on
-/// disk whose ONLY backup is the phrase in this stdout — an error after that
-/// point destroys the phrase and leaves the key. So the pointer write is not
-/// allowed to fail this call: it degrades to a warning, and the user lands on
-/// a wallet that is minted but not active, which the list can still fix.
+/// Every one of them spends an argon2id pass over 64 MiB — 200-400 ms of
+/// memory-hard work. On a tokio worker that is 400 ms during which the UI's
+/// other tasks do not run, and this app's tasks are what repaint it.
+async fn in_the_keystore<T: Send + 'static>(
+    ceremony: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(ceremony)
+        .await
+        .map_err(|_| "the keystore operation did not finish".to_string())?
+}
+
+/// Mint a named wallet under `password`. Returns the 24 recovery words and
+/// pubkey; the fresh wallet becomes the active one and the in-process key
+/// cache is refreshed, so the new identity signs without a restart.
+///
+/// THE WORDS COME BACK FIRST. Once the mint returns, a sealed key exists on
+/// disk whose ONLY backup is the phrase in that first field — an error after
+/// that point destroys the phrase and leaves the key. So the pointer write is
+/// not allowed to fail this call: it degrades to a warning, and the user lands
+/// on a wallet that is minted but not active, which the list can still fix.
 pub async fn create_user_key(name: String, password: String) -> Result<KeyCreated, AppError> {
     let created = async {
-        check_wallet_name(&name)?;
-        let stdout = ducktape_cli(&["wallet", "new", &name], None, password).await?;
-        let mut lines = stdout.lines().filter(|line| !line.trim().is_empty()).rev();
-        let pubkey = lines.next().unwrap_or_default().trim().to_string();
-        let words = lines.next().unwrap_or_default().trim().to_string();
-        if words.split_whitespace().count() != 24 {
-            return Err("the key tool did not return a 24-word recovery phrase".to_string());
-        }
+        let duck = duck_home()?;
+        let minting = {
+            let (name, password) = (name.clone(), Zeroizing::new(password));
+            in_the_keystore(move || keystore::wallet::create(&duck, &name, &password))
+        };
+        let (words, pubkey) = minting.await?;
         Ok(KeyCreated { words, pubkey })
     }
     .await
@@ -567,15 +562,15 @@ pub async fn create_user_key(name: String, password: String) -> Result<KeyCreate
     Ok(created)
 }
 
-/// `wallet import <name>` — re-seal an identity from its 24 words under a new
-/// password. Returns the pubkey.
+/// Re-seal an identity from its 24 words under a new password. Returns the
+/// pubkey — the same identity those words were minted as.
 pub async fn restore_user_key(
     name: String,
     words: ui_lang_runtime::Secret,
-    mut password: String,
+    password: String,
 ) -> Result<String, AppError> {
     async {
-        check_wallet_name(&name)?;
+        let duck = duck_home()?;
         let normalized = Zeroizing::new(
             words
                 .expose()
@@ -586,14 +581,11 @@ pub async fn restore_user_key(
         if normalized.split(' ').count() != 24 {
             return Err("a recovery phrase is exactly 24 words".to_string());
         }
-        let password_line = secret_line(&password);
-        password.zeroize();
-        let input = secret_line(&normalized)?
-            .into_iter()
-            .chain(password_line?)
-            .collect::<Vec<u8>>();
-        let stdout = ducktape_cli_raw(&["wallet", "import", &name], None, input).await?;
-        let pubkey = last_line(&stdout)?;
+        let importing = {
+            let (name, password) = (name.clone(), Zeroizing::new(password));
+            in_the_keystore(move || keystore::wallet::import(&duck, &name, &normalized, &password))
+        };
+        let pubkey = importing.await?;
         activate_wallet(&name).await?;
         set_local_user_key(hex_decode(&pubkey).ok()).await;
         Ok(pubkey)
@@ -602,17 +594,20 @@ pub async fn restore_user_key(
     .map_err(app_error)
 }
 
-/// Unlock the NAMED wallet: a decrypt probe that succeeds iff `password` opens
-/// it, followed by the pointer write that makes it the wallet every keyless
-/// verb signs with. The pubkey the probe just proved seeds the in-process
-/// identity cache — without it the first hydrate pays a `user key status`
-/// subprocess to re-read what this derivation already paid 64 MiB to learn.
+/// Unlock the NAMED wallet: a decrypt that succeeds iff `password` opens it,
+/// followed by the pointer write that makes it the wallet this device signs
+/// with. The pubkey the decrypt just proved seeds the in-process identity
+/// cache — without it the first hydrate re-reads what this derivation already
+/// paid 64 MiB to learn.
 pub async fn unlock_wallet(name: String, password: String) -> Result<String, AppError> {
     async {
         let path = wallet_key_path(&name)?;
-        let stdout =
-            ducktape_cli(&["user", "key", "unlock", "--key"], Some(&path), password).await?;
-        let pubkey = last_line(&stdout)?;
+        require_password(&password)?;
+        let opening = {
+            let password = Zeroizing::new(password);
+            in_the_keystore(move || keystore::userkey::open_user_key_at(&path, &password))
+        };
+        let pubkey = hex_encode(opening.await?.public_key().as_ref());
         activate_wallet(&name).await?;
         set_local_user_key(hex_decode(&pubkey).ok()).await;
         Ok(pubkey)
@@ -621,16 +616,14 @@ pub async fn unlock_wallet(name: String, password: String) -> Result<String, App
     .map_err(app_error)
 }
 
-/// `wallet use <name>` — the active pointer write. The env override names no
-/// keystore row, so it has no pointer to move.
+/// The active-pointer write. The env override names no keystore row, so it has
+/// no pointer to move.
 async fn activate_wallet(name: &str) -> Result<(), String> {
-    check_wallet_name(name)?;
+    keystore::wallet::valid_name(name)?;
     if env_key_override() && name == ENV_WALLET {
         return Ok(());
     }
-    ducktape_cli_raw(&["wallet", "use", name], None, Vec::new())
-        .await
-        .map(|_| ())
+    keystore::wallet::activate(&duck_home()?, name)
 }
 
 /// The console's Settings re-unlock, which knows a password and nothing else:
@@ -638,100 +631,6 @@ async fn activate_wallet(name: &str) -> Result<(), String> {
 pub async fn unlock_user_key(password: String) -> Result<String, AppError> {
     let name = active_or_env_wallet().map_err(app_error)?;
     unlock_wallet(name, password).await
-}
-
-/// One secret as the CLI's stdin field: the bytes plus the newline, refusing
-/// embedded delimiters the same way `password_line` does.
-fn secret_line(value: &str) -> Result<Vec<u8>, String> {
-    let invalid = value.len() > 16 * 1024
-        || value
-            .as_bytes()
-            .iter()
-            .any(|byte| matches!(byte, 0 | b'\n' | b'\r'));
-    if invalid {
-        return Err("a secret field is too long or contains a line delimiter".into());
-    }
-    if value.is_empty() {
-        return Err("enter the key password".into());
-    }
-    let mut line = Vec::with_capacity(value.len() + 1);
-    line.extend_from_slice(value.as_bytes());
-    line.push(b'\n');
-    Ok(line)
-}
-
-fn last_line(stdout: &str) -> Result<String, String> {
-    stdout
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .map(|line| line.trim().to_string())
-        .ok_or_else(|| "the key tool returned nothing".to_string())
-}
-
-async fn ducktape_cli(
-    args: &[&str],
-    path: Option<&Path>,
-    password: String,
-) -> Result<String, String> {
-    let mut password = password;
-    let input = secret_line(&password);
-    password.zeroize();
-    ducktape_cli_raw(args, path, input?).await
-}
-
-/// Run `ducktape <args…> [path]` with secrets piped over stdin (the CLI's only
-/// secret channel), returning full stdout. `path` is the trailing argument the
-/// `user key` verbs take after their `--out`/`--key` flag; the `wallet` verbs
-/// name their key by wallet name and pass `None`.
-async fn ducktape_cli_raw(
-    args: &[&str],
-    path: Option<&Path>,
-    input: Vec<u8>,
-) -> Result<String, String> {
-    let input = Zeroizing::new(input);
-    // The VERB names itself in a refusal, not the argv: `--key`/`--json` are
-    // plumbing the person reading the error did not type and cannot act on.
-    let verb = args
-        .iter()
-        .take_while(|arg| !arg.starts_with('-'))
-        .copied()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let mut command = tokio::process::Command::new(ducktape_binary());
-    command
-        .args(args)
-        .args(path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = command.spawn().map_err(|error| {
-        format!(
-            "could not start the ducktape key tool ({error}); build node-bin or set DUCKTAPE_BIN"
-        )
-    })?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "ducktape key tool stdin is unavailable".to_string())?;
-    stdin
-        .write_all(&input)
-        .await
-        .map_err(|error| format!("could not reach the ducktape key tool: {error}"))?;
-    drop(stdin);
-    let output = tokio::time::timeout(CLI_TIMEOUT, child.wait_with_output())
-        .await
-        .map_err(|_| format!("ducktape {verb} timed out"))?
-        .map_err(|error| format!("ducktape {verb} failed: {error}"))?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "ducktape {verb} refused: {}",
-            bounded_detail(&detail)
-        ));
-    }
-    String::from_utf8(output.stdout).map_err(|_| "the key tool returned non-UTF-8".into())
 }
 
 fn unix_now() -> i64 {
@@ -791,32 +690,21 @@ mod tests {
         );
     }
 
-    /// `wallet list --json` verbatim, extra fields and all.
+    /// A wallet name is a path segment: `..` or `/` would walk the key file
+    /// out of the keystore. The check lives in `keystore_key_path`, so a name
+    /// that never passed through a person — the `active` pointer file's
+    /// contents — is gated on the same terms.
     #[test]
-    fn wallet_rows_parse_the_list_json() {
-        let json = r#"[{"name":"demo","pubkey":"ab","state":"encrypted","active":true,"path":"/x/demo.key"}]"#;
-        let rows = parse_wallet_rows(json).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].name, "demo");
-        assert!(rows[0].active);
-        assert!(parse_wallet_rows("not json").is_none());
-    }
-
-    /// A wallet name is an argv word AND a path segment. Both readings are
-    /// refused before either one is built: a leading `-` would be read as a
-    /// clap flag (`wallet use -h` prints help and exits 0 — a refusal wearing
-    /// a success), and `..`/`/` would walk the key path out of the keystore.
-    /// The check lives in `keystore_key_path`, so a name that never passed
-    /// through a person — the `active` pointer file's contents — is gated too.
-    #[test]
-    fn a_wallet_name_is_never_a_flag_or_a_path() {
+    fn a_wallet_name_is_never_a_path() {
         for name in ["env", "default", "alice2", "a.b_c-d", "0"] {
-            assert!(check_wallet_name(name).is_ok(), "{name} should be valid");
+            assert!(
+                keystore::wallet::valid_name(name).is_ok(),
+                "{name} should be valid"
+            );
         }
         let refused = [
             "",
             "-h",
-            "--json",
             "..",
             "../x",
             "a/b",
@@ -825,9 +713,8 @@ mod tests {
             ".hidden",
         ];
         for name in refused {
-            assert!(check_wallet_name(name).is_err(), "{name} should be refused");
             // both the wallet-facing join and the pointer-derived one, which
-            // is what every signer spawn and `user_key_state` resolve through.
+            // is what every unlock and `user_key_state` resolve through.
             assert!(wallet_key_path(name).is_err(), "{name} built a path");
             let refusal = keystore_key_path(name).expect_err("built a path");
             assert!(
@@ -835,8 +722,8 @@ mod tests {
                 "unnamed refusal: {refusal}"
             );
         }
-        assert!(check_wallet_name(&"a".repeat(41)).is_ok());
-        assert!(check_wallet_name(&"a".repeat(42)).is_err());
+        assert!(keystore::wallet::valid_name(&"a".repeat(41)).is_ok());
+        assert!(keystore::wallet::valid_name(&"a".repeat(42)).is_err());
     }
 
     /// A row's pubkey is shortened, never invented.

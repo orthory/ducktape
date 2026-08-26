@@ -230,6 +230,67 @@ fn account_init_target_in(duck: &Path, display_name: &str) -> Result<AccountInit
     Ok(AccountInitKey::Active(active_key_path(duck)?))
 }
 
+// ============================================================================
+// the wallet ceremonies — mint, import, activate
+// ============================================================================
+
+/// Mint a named wallet under `password`. Returns `(24 words, pubkey-hex)`.
+///
+/// THE WORDS ARE THE ONLY BACKUP. Once this returns, a sealed key exists whose
+/// sole recovery path is the phrase in the first field — so the pointer write
+/// that follows is deliberately NOT allowed to fail the call.
+pub fn create(duck: &Path, name: &str, password: &str) -> Result<(String, String), String> {
+    let path = new_wallet_path(duck, name)?;
+    let (words, key) = userkey::mint_user_key(&path, password)?;
+    activate_first_wallet(duck, name)?;
+    use commonware_cryptography::Signer as _;
+    Ok((words, hex(key.public_key().as_ref())))
+}
+
+/// Restore a named wallet from its 24 words, sealed under a fresh `password`.
+/// Returns the pubkey-hex — the same identity the words were minted as.
+pub fn import(duck: &Path, name: &str, mnemonic: &str, password: &str) -> Result<String, String> {
+    let path = new_wallet_path(duck, name)?;
+    let key = userkey::restore_user_key_at(&path, mnemonic, password)?;
+    activate_first_wallet(duck, name)?;
+    use commonware_cryptography::Signer as _;
+    Ok(hex(key.public_key().as_ref()))
+}
+
+/// The active-pointer write, with the legacy adoption in front of it — what
+/// `ducktape wallet use <name>` and the launch window's row pick both perform.
+pub fn activate(duck: &Path, name: &str) -> Result<(), String> {
+    adopt_legacy(duck)?;
+    set_active(duck, name)
+}
+
+/// validate the name, run adoption, and refuse an occupied slot loudly —
+/// `write_user_key_new` would refuse too, but with an io error instead of
+/// the wallet's own vocabulary.
+fn new_wallet_path(duck: &Path, name: &str) -> Result<PathBuf, String> {
+    valid_name(name)?;
+    adopt_legacy(duck)?;
+    let path = key_file(duck, name);
+    if path.exists() {
+        return Err(format!(
+            "wallet {name:?} already exists — pick another name"
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    Ok(path)
+}
+
+/// the first wallet in an empty keystore becomes active; later mints never
+/// steal the pointer.
+fn activate_first_wallet(duck: &Path, name: &str) -> Result<(), String> {
+    if active_name(duck).is_some() {
+        return Ok(());
+    }
+    set_active(duck, name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +342,41 @@ mod tests {
         assert!(rows[0].active && !rows[1].active);
         assert_eq!(rows[0].pubkey, alpha_pub);
         assert_eq!(rows[0].state, "encrypted");
+    }
+
+    /// The ceremonies, driven the way the desktop app drives them — a name and
+    /// a password, no pipe. The first mint takes the pointer, a later one does
+    /// not steal it, and an import of the first wallet's words reproduces its
+    /// identity exactly.
+    #[test]
+    fn create_import_activate_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let duck = dir.path();
+
+        let (words, pubkey) = create(duck, "alice", "password-123").unwrap();
+        assert_eq!(words.split_whitespace().count(), 24);
+        assert_eq!(pubkey.len(), 64);
+        assert_eq!(active_name(duck).as_deref(), Some("alice"));
+
+        create(duck, "bob", "password-123").unwrap();
+        assert_eq!(active_name(duck).as_deref(), Some("alice"));
+
+        assert!(create(duck, "alice", "password-123").is_err());
+        assert!(create(duck, "Alice", "password-123").is_err());
+
+        activate(duck, "bob").unwrap();
+        assert_eq!(active_name(duck).as_deref(), Some("bob"));
+
+        let imported = import(duck, "alice2", &words, "password-456").unwrap();
+        assert_eq!(imported, pubkey);
+        assert_eq!(
+            list(duck)
+                .unwrap()
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alice", "alice2", "bob"]
+        );
     }
 
     #[test]

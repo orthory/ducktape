@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use commonware_codec::{DecodeExt as _, Encode as _};
+use commonware_codec::Encode as _;
 use commonware_cryptography::{Signer as _, ed25519};
 
 use keystore::userkey;
@@ -470,32 +470,11 @@ fn with_prompt<T>(field: &str, is_tty: bool, read: impl FnOnce() -> T) -> T {
 
 /// [`read_stdin_line`] fronted by the tty prompt/mask wrapper — the entry point
 /// every secret-bearing verb reads its fields through.
-fn prompt_stdin_line(stdin: &mut impl std::io::BufRead, field: &str) -> Result<String, String> {
+pub(crate) fn prompt_stdin_line(
+    stdin: &mut impl std::io::BufRead,
+    field: &str,
+) -> Result<String, String> {
     with_prompt(field, stdin_is_tty(), || read_stdin_line(stdin, field))
-}
-
-/// the password floor for newly encrypted keys,
-/// enforced before any file is touched. counts scalar chars, not bytes, so a
-/// multi-byte-but-short password isn't laundered past the floor.
-const MIN_PASSWORD_LEN: usize = 8;
-
-fn check_password_len(password: &str) -> Result<(), String> {
-    if password.chars().count() < MIN_PASSWORD_LEN {
-        return Err(format!(
-            "password must be at least {MIN_PASSWORD_LEN} characters"
-        ));
-    }
-    Ok(())
-}
-
-/// `path`'s raw trimmed encrypted line.
-fn read_key_line(path: &std::path::Path) -> Result<String, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("read {path:?}: {e}"))?;
-    let line = text.trim();
-    if line.is_empty() {
-        return Err(format!("{path:?} is empty"));
-    }
-    Ok(line.to_string())
 }
 
 /// Resolve the user signer from an encrypted key. Password is stdin's first
@@ -505,8 +484,7 @@ pub(crate) fn load_user_signer(
     stdin: &mut impl std::io::BufRead,
 ) -> Result<ed25519::PrivateKey, Box<dyn std::error::Error>> {
     let password = prompt_stdin_line(stdin, "password")?;
-    let line = read_key_line(key_path)?;
-    Ok(userkey::open_user_key(&line, &password)?)
+    Ok(userkey::open_user_key_at(key_path, &password)?)
 }
 
 /// `user-key init` core — see [`cmd_user_key_init`] for the print contract.
@@ -519,69 +497,15 @@ fn user_key_init(
     Ok((words, hex_bytes(key.public_key().as_ref())))
 }
 
-/// Generate a fresh seed, seal it under a password read from `stdin`, write it
-/// to `out` (refusing to overwrite), and hand back the words AND the signer.
-///
-/// The signer comes back so a caller that mints does not have to re-read the
-/// file with a password it would have to ask for a SECOND time — the shape
-/// that made "mint it if absent" impossible to offer here before.
+/// Read the password from `stdin`, then mint — the ceremony itself
+/// ([`userkey::mint_user_key`]) is the library's, because the desktop app
+/// performs the same one without a pipe to read it from.
 pub(crate) fn mint_user_key(
     out: &std::path::Path,
     stdin: &mut impl std::io::BufRead,
 ) -> Result<(String, ed25519::PrivateKey), Box<dyn std::error::Error>> {
     let password = prompt_stdin_line(stdin, "password")?;
-    check_password_len(&password)?;
-
-    let mut seed = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
-    let words = userkey::mnemonic_of_seed(&seed);
-    let line = userkey::seal_user_key(&seed, &password)?;
-    userkey::write_user_key_new(out, &line)?;
-
-    let key = ed25519::PrivateKey::decode(seed.as_slice()).expect("32 random bytes decode");
-    verify_the_key_reopens(out, &password, &key)?;
-    Ok((words, key))
-}
-
-/// Read the key back and open it, before telling anyone it exists.
-///
-/// The failure this prevents is SILENT and TOTAL: the operator is shown 24
-/// words, writes them down, and the file those words are supposed to unlock
-/// cannot be opened by anything, ever. Nothing later in the flow would notice —
-/// the mnemonic is correct, the file is present and well-formed, and the first
-/// symptom is a wrong-password error at some unrelated moment weeks later.
-///
-/// It is not hypothetical. Sealing runs a 64 MiB argon2id buffer through the
-/// host's memory, and on the machine this was written on a byte-identical
-/// `seal_with` call produced a DIFFERENT ciphertext roughly 1 run in 240 under
-/// parallel load — a silent bit flip on non-ECC memory. A short disk write
-/// would land the same way. One extra argon2 pass, once, at the only moment a
-/// key is irreplaceable, is the cheapest insurance in this file.
-///
-/// The unusable file is REMOVED on failure, because leaving it behind is worse
-/// than not writing it: `write_user_key_new` refuses to overwrite, so a
-/// corrupt key would block the retry that would have fixed it.
-fn verify_the_key_reopens(
-    path: &std::path::Path,
-    password: &str,
-    expected: &ed25519::PrivateKey,
-) -> Result<(), String> {
-    let reopened = read_key_line(path)
-        .and_then(|line| userkey::open_user_key(&line, password).map_err(|e| e.to_string()));
-    let intact = reopened
-        .as_ref()
-        .is_ok_and(|key| key.public_key() == expected.public_key());
-    if intact {
-        return Ok(());
-    }
-    let _ = std::fs::remove_file(path);
-    Err(format!(
-        "the key just written to {} does not open with the password that sealed it, so it \
-         has been removed rather than left unusable — this is a corrupted write (failing \
-         memory or a full/faulty disk), not a wrong password. Run the command again; if it \
-         happens twice, the host is at fault.",
-        path.display()
-    ))
+    Ok(userkey::mint_user_key(out, &password)?)
 }
 
 /// Open `key_path`, or MINT it when there is nothing there yet.
@@ -624,14 +548,7 @@ pub(crate) fn restore_user_key_at(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mnemonic = prompt_stdin_line(stdin, "mnemonic")?;
     let password = prompt_stdin_line(stdin, "password")?;
-    check_password_len(&password)?;
-
-    let seed = userkey::seed_of_mnemonic(&mnemonic)?;
-    let line = userkey::seal_user_key(&seed, &password)?;
-    userkey::write_user_key_new(out, &line)?;
-
-    let key = ed25519::PrivateKey::decode(seed.as_slice())
-        .map_err(|e| format!("restored seed is not a valid ed25519 secret: {e}"))?;
+    let key = userkey::restore_user_key_at(out, &mnemonic, &password)?;
     Ok(hex_bytes(key.public_key().as_ref()))
 }
 
@@ -657,8 +574,7 @@ fn user_key_unlock(
     stdin: &mut impl std::io::BufRead,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let password = prompt_stdin_line(stdin, "password")?;
-    let line = read_key_line(&args.key)?;
-    let key = userkey::open_user_key(&line, &password)?;
+    let key = userkey::open_user_key_at(&args.key, &password)?;
     Ok(hex_bytes(key.public_key().as_ref()))
 }
 
@@ -676,8 +592,7 @@ fn user_key_reveal(
     stdin: &mut impl std::io::BufRead,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let password = prompt_stdin_line(stdin, "password")?;
-    let line = read_key_line(&args.key)?;
-    let key = userkey::open_user_key(&line, &password)?;
+    let key = userkey::open_user_key_at(&args.key, &password)?;
     let seed_bytes = key.encode();
     let seed: [u8; 32] = seed_bytes
         .as_ref()
@@ -1211,6 +1126,9 @@ mod webauthn_challenge_tests {
 #[cfg(test)]
 mod userkey_verb_tests {
     use super::*;
+    // the tests still build signers straight out of seed bytes; the verbs
+    // themselves get theirs from `keystore` now.
+    use commonware_codec::DecodeExt as _;
     use std::io::Cursor;
 
     /// a Parser wrapper so tests can exercise the derived verb SHAPE (kebab
@@ -1288,43 +1206,6 @@ mod userkey_verb_tests {
         assert_eq!(pubkey_hex.len(), 64);
         let enc = userkey::read_user_key_file(&path).unwrap();
         assert_eq!(hex_bytes(&enc.pubkey), pubkey_hex);
-    }
-
-    /// A key that cannot be reopened is a key the operator has LOST, and they
-    /// would be holding 24 correct words while believing otherwise. The check
-    /// runs at mint time and refuses rather than reporting success — and it
-    /// takes the unusable file with it, because `write_user_key_new` will not
-    /// overwrite and a corpse there would block the retry that fixes this.
-    #[test]
-    fn a_key_that_does_not_reopen_is_refused_and_not_left_behind() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("user.key");
-
-        // a real minted key verifies — the check is not vacuous.
-        let mut stdin = stdin_of(&["correct horse battery"]);
-        let (_, key) = mint_user_key(&path, &mut stdin).expect("a good seal verifies");
-        assert!(verify_the_key_reopens(&path, "correct horse battery", &key).is_ok());
-
-        // now corrupt the sealed line the way a bit flip would, and the same
-        // check must refuse it and remove it.
-        let flipped = {
-            let line = std::fs::read_to_string(&path).unwrap();
-            let mut bytes = line.trim().as_bytes().to_vec();
-            let last = bytes.len() - 1;
-            bytes[last] = if bytes[last] == b'A' { b'B' } else { b'A' };
-            String::from_utf8(bytes).unwrap()
-        };
-        std::fs::write(&path, &flipped).unwrap();
-        let why = verify_the_key_reopens(&path, "correct horse battery", &key)
-            .expect_err("a corrupted key must not pass");
-        assert!(
-            why.contains("not a wrong password"),
-            "it must not send the reader hunting for a typo: {why}"
-        );
-        assert!(
-            !path.exists(),
-            "an unusable key file must not be left to block the retry"
-        );
     }
 
     /// `load_or_mint_user_signer` mints a fresh key when the path is absent —

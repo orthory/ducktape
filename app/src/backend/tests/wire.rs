@@ -157,73 +157,71 @@ async fn a_search_that_lost_a_source_says_which_one() {
     );
 }
 
+/// The key file's own reading, WITHOUT its password — what the launch window
+/// and the identity cache both resolve through. A plaintext or garbled file is
+/// not "a key we could not open", it is not a key.
 #[test]
-fn signer_requires_the_encrypted_v1_key_format() {
-    assert_eq!(password_line("secret").unwrap(), b"secret\n");
-    assert!(password_line("").is_err());
-    assert!(password_line("bad\nsecret").is_err());
-
+fn the_identity_reads_without_the_password_and_a_non_v1_file_does_not() {
     let directory = tempfile::tempdir().unwrap();
     let key = directory.path().join("user.key");
-    std::fs::write(&key, format!("{ENCRYPTED_KEY_PREFIX}ciphertext")).unwrap();
-    require_encrypted_key(&key).unwrap();
-    std::fs::write(&key, "plaintext-key").unwrap();
-    assert!(require_encrypted_key(&key).is_err());
+    let (_, minted) = keystore::userkey::mint_user_key(&key, "password-123").unwrap();
 
-    let public_key = "ab".repeat(32);
-    assert_eq!(
-        parse_user_key_status(&format!("encrypted {public_key}\n")),
-        Some(vec![0xab; 32])
-    );
-    assert!(parse_user_key_status("absent\n").is_none());
-    assert!(parse_user_key_status(&format!("plaintext {public_key}\n")).is_none());
+    let read = keystore::userkey::read_user_key_file(&key).expect("an encrypted v1 file parses");
+    assert_eq!(read.pubkey, minted.public_key().as_ref());
+
+    std::fs::write(&key, "plaintext-key").unwrap();
+    assert!(keystore::userkey::read_user_key_file(&key).is_err());
+    std::fs::write(&key, format!("{ENCRYPTED_KEY_PREFIX}not-base64!!")).unwrap();
+    assert!(keystore::userkey::read_user_key_file(&key).is_err());
 }
 
-/// THE session property on the app's side of the pipe: ONE unlock, then a
-/// frame per request line, each answering ITS OWN request in order. The child
-/// this drives is a stub, but the contract is the real one — a stray or
-/// mispaired line here would mean the app submits the frame for another
-/// operation, and the argon2id pass it skips is the whole point of the
-/// session (a per-op process paid it on every reaction tap).
+/// THE session property, now that the key opens in THIS process: ONE argon2id
+/// pass, then a real signed frame per write — each carrying its OWN payload
+/// and verifying under this device's identity.
+///
+/// The stub-child version of this test could only ever check that request and
+/// answer lines stayed paired on a pipe. `decode_frame` checks the signature,
+/// which is the property that actually matters: a frame the node accepts as
+/// authored by this key. A mispaired payload here would mean the app submits
+/// one operation's bytes under another's receipt.
 #[tokio::test(flavor = "current_thread")]
 async fn one_unlock_signs_every_request_of_the_session() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let directory = tempfile::tempdir().unwrap();
     let key = directory.path().join("user.key");
-    std::fs::write(&key, format!("{ENCRYPTED_KEY_PREFIX}ciphertext")).unwrap();
-    // The stub signer: records its unlock, then echoes each request's payload
-    // back as the frame — so the answer names the request it belongs to.
-    let unlocks = directory.path().join("unlocks");
-    let binary = directory.path().join("stub-signer");
-    std::fs::write(
-        &binary,
-        format!(
-            "#!/bin/sh\necho unlock >> {}\nread password\n\
-             while read -r target seq payload; do echo \"$payload\"; done\n",
-            unlocks.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (_, minted) = keystore::userkey::mint_user_key(&key, "password-123").unwrap();
 
-    let mut signer = super::rpc::Signer::unlock(binary, key, Zeroizing::new("secret".into()))
+    let signer = super::rpc::Signer::unlock(key.clone(), Zeroizing::new("password-123".into()))
         .await
-        .expect("the stub signer starts");
+        .expect("the minted key opens under the password that sealed it");
     for op in 0..5u8 {
-        let payload = hex_encode(&[op, op, op]);
-        let frame = signer
-            .sign(&format!("chat {op} {payload}\n"))
-            .await
-            .expect("a frame per request");
-        assert_eq!(frame, vec![op, op, op], "request {op} got another's frame");
+        let frame = signer.sign("chat", op as u64, &[op, op, op]);
+        let (origin, message) = node::decode_frame(&frame).expect("the frame verifies");
+        assert_eq!(message.target, "chat");
+        assert_eq!(
+            message.payload,
+            vec![op, op, op],
+            "request {op} got another's payload"
+        );
+        let sdk::Origin::External(author) = origin else {
+            panic!("a user-signed frame is external authorship");
+        };
+        assert_eq!(author, minted.public_key().as_ref());
     }
 
-    assert_eq!(
-        std::fs::read_to_string(&unlocks).unwrap(),
-        "unlock\n",
-        "five signed writes, one key open"
+    // A wrong password is refused, and an empty one names the locked state
+    // rather than reporting a bad key.
+    assert!(
+        super::rpc::Signer::unlock(key.clone(), Zeroizing::new("wrong-password".into()))
+            .await
+            .is_err()
     );
+    // `.map(drop)` because a `Signer` deliberately has no `Debug` — the whole
+    // point of the type is that the opened key does not get printed anywhere.
+    let locked = super::rpc::Signer::unlock(key, Zeroizing::new(String::new()))
+        .await
+        .map(drop)
+        .expect_err("an empty password cannot open anything");
+    assert!(locked.contains("locked"), "{locked}");
 }
 
 /// THE FAN-OUT SET, READ THROUGH A REAL NODE — the poll a live call session

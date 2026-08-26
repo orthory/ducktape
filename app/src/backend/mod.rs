@@ -1,8 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -12,13 +10,15 @@ use ::chat::index::{ChatViewQuery, ChatViewReply, MsgRow};
 // through `/v1/index/chat/view`, off the node's select loop. A dispatch query
 // import reappearing is the signal that one crawled back onto it.
 use ::chat::{ChatMsg, PostPolicy};
+// this device's signing key, opened in-process by `keystore` and signing op
+// frames through `::node::encode_frame` — see `rpc::Signer`.
+use commonware_cryptography::{Signer as _, ed25519};
 use ducktape_rpc::{Client as RpcClient, ModuleEvent, Status as NodeStatus};
 use iced::futures::{FutureExt as _, StreamExt as _};
 use pages::index::{PageRow, PagesViewQuery, PagesViewReply, ThreadRow};
 use pages::{BlockKind, NewBlock, PageMsg, PageQuery, PageReply};
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 use tokio::sync::OwnedSemaphorePermit;
-use zeroize::{Zeroize as _, Zeroizing};
+use zeroize::Zeroizing;
 
 // chat's client view model is module-owned (`chat::client`) — the rendered
 // row types, the composer parsing, the optimistic merges, and the op-delta
@@ -44,10 +44,8 @@ pub use inbox::client::{BellDelta, BellItem, apply_bell_items as fold_bell_items
 pub use pages::client::PagesDelta;
 const DEFAULT_RPC: &str = "http://127.0.0.1:8844";
 const MAX_SIGNED_PAYLOAD_BYTES: usize = 23 * 1024;
-const MAX_KEY_FILE_BYTES: u64 = 64 * 1024;
 const MAX_FRAME_HEX_BYTES: usize = 3 * 1024 * 1024;
 const ENCRYPTED_KEY_PREFIX: &str = "ducktape-user-key-v1:";
-const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// `node init` mints a key and writes a workspace; `node join` fetches an
 /// invite's fronts. Both are slower than an rpc round-trip and both are
 /// interactive-blocking, so they get their own ceiling.
