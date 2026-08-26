@@ -378,18 +378,6 @@ block = { path = "patches/block" }
 # for the drop condition.
 cosmic-text = { path = "patches/cosmic-text" }
 
-# ui-lang-runtime's macOS tray init creates the muda status-item menu with no
-# main-thread guard, and muda asserts rather than failing off-main. Generated
-# app boot runs on worker threads in every Ice semantic test and frame probe,
-# so the entire `cargo test -p ducktape-app` lane dies at construction on
-# macOS — the platform the app ships on — leaving its perf gates dark. The
-# patched copy refuses tray init off the main thread as a stderr'd no-op
-# (the module's existing failure shape). Drop this patch and the
-# patches/ui-lang-runtime directory when the guard lands in ducktape-ui and
-# the pin moves past it.
-[patch."https://github.com/byeongsu-hong/ducktape-ui.git"]
-ui-lang-runtime = { path = "patches/ui-lang-runtime" }
-
 # dev/test builds compile wasm guests through cranelift (consensus components
 # in the kernel tests, index guests at every store open). unoptimized
 # cranelift is 10-30x slower — enough that a fleet of e2e daemons booting
