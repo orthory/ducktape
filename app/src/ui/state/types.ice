@@ -50,7 +50,7 @@ enum ForgePhase
 enum HubStep
   loading
   create
-  unlock
+  wallets
   reveal
   restore
   networks
