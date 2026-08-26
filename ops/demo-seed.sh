@@ -161,12 +161,12 @@ submit(){ # submit <module> <payload-json>
 log "seeding modules…"
 
 # pages — the Pages surface: a welcome page with a few blocks
-submit pages '{"create_page":{"page_id":"welcome","title":"Welcome to Ducktape","parent":null}}'
+submit pages '{"create_page":{"page_id":"welcome","title":"Welcome to Ducktape"}}'
 submit pages '{"insert_block":{"parent":"welcome","after":null,"block":{"id":"w-h","kind":"heading2","text":"This is a demo network"}}}'
 submit pages '{"insert_block":{"parent":"welcome","after":"w-h","block":{"id":"w-p","kind":"paragraph","text":"Everything here was preloaded by make demo-seed. Poke around — chat, tasks, pages, agents."}}}'
 submit pages '{"insert_block":{"parent":"welcome","after":"w-p","block":{"id":"w-t1","kind":"todo","text":"Open the general channel"}}}'
 submit pages '{"insert_block":{"parent":"welcome","after":"w-t1","block":{"id":"w-t2","kind":"todo","text":"Check the tasks board"}}}'
-submit pages '{"create_page":{"page_id":"runbook","title":"Team Runbook","parent":null}}'
+submit pages '{"create_page":{"page_id":"runbook","title":"Team Runbook"}}'
 submit pages '{"insert_block":{"parent":"runbook","after":null,"block":{"id":"rb-p","kind":"paragraph","text":"How we ship: branch off dev, PR, review, merge."}}}'
 
 # chat — channels + messages + a reaction + an agent mention
@@ -189,7 +189,7 @@ submit tasks '{"task":{"update_status":{"task_id":"t2","status":"in_progress"}}}
 submit tasks '{"task":{"update_status":{"task_id":"t3","status":"done"}}}'
 
 # agent — register a demo agent, watch general for @mentions, then mention it
-submit agent '{"register_agent":{"agent_id":"quackbot","display_name":"Quackbot","capability":"mock-llm-1","prompt_hash":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7],"allowed_actions":["chat.post","tasks.create"]}}'
+submit agent '{"register_agent":{"agent_id":"quackbot","display_name":"Quackbot","capability":"mock-llm-1","recipe_hash":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7],"allowed_actions":["chat.post","tasks.create"]}}'
 submit runs '{"watch_channel":{"channel_id":"general","policy":"mention"}}'
 submit chat '{"post_message":{"channel_id":"general","message_id":"g4","blocks":[{"paragraph":[{"text":"hey ","marks":[]},{"text":"@quackbot","marks":[{"mention":{"agent":{"module":"runs","agent_id":"quackbot"}}}]},{"text":" can you follow up?","marks":[]}]}],"thread":null,"as_agent":null}}'
 
