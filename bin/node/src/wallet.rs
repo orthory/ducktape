@@ -52,6 +52,7 @@ pub(crate) fn valid_name(name: &str) -> Result<(), String> {
 
 /// Fold arbitrary display text into the wallet-name charset: lowercase,
 /// runs of other characters collapse to one `-`, trimmed, truncated.
+/// Output always satisfies `valid_name`.
 pub(crate) fn sanitize_name(raw: &str) -> String {
     let mut out = String::new();
     for c in raw.chars() {
@@ -64,6 +65,7 @@ pub(crate) fn sanitize_name(raw: &str) -> String {
         }
     }
     let out = out.trim_matches('-').to_string();
+    let out = out.trim_start_matches(&['.',  '_', '-'][..]).to_string();
     let mut out = match out.is_empty() {
         true => "default".to_string(),
         false => out,
@@ -218,6 +220,9 @@ mod tests {
         assert!(valid_name("../evil").is_err());
         assert!(valid_name(&"x".repeat(60)).is_err());
         assert_eq!(sanitize_name("Byeongsu Hong!"), "byeongsu-hong");
+        assert_eq!(sanitize_name(".hidden"), "hidden");
+        assert_eq!(sanitize_name("__"), "default");
+        assert!(valid_name(&sanitize_name(".hidden")).is_ok());
     }
 
     #[test]
