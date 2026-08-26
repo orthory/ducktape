@@ -71,19 +71,28 @@ on key_unlocked(_pubkey)
   onboarding_error = ""
   hub_step = HubStep.networks
 
-// Reads never need the password — the quiet way past a forgotten one.
+// Reads never need the password — the quiet way past a forgotten one. The
+// wallet selection goes with the password: a read-only session signs as
+// NOBODY, and leaving a name behind made the network list claim otherwise.
 on login_skip
   return if mutation_phase != MutationPhase.idle
   password = ""
+  hub_wallet_selected = ""
   onboarding_error = ""
   hub_step = HubStep.networks
 
 // CREATE — mint a named wallet under the new password. The confirm field is
 // checked in the component (`password_problem`); this only fires clean.
+// The NAME is stored the same way and for the same reason as the password:
+// `key_created` carries only the words and the pubkey, and the screens past
+// the reveal — the network list's "signing as …" line — name the wallet this
+// session is about to sign as. A failed mint leaves a name that no row
+// matches, and the next refresh drops it (`refreshed_wallet_selection`).
 on create_submit(name, pw)
   return if mutation_phase != MutationPhase.idle || empty(pw) || empty(name)
   onboarding_error = ""
   password = pw
+  hub_wallet_selected = name
   mutation_phase = MutationPhase.onboarding
   run every create_user_key(name, password) -> key_created _ | login_failed _
 
@@ -109,10 +118,13 @@ on go_login
   onboarding_error = ""
   hub_step = hub_entry_step(hub_wallets)
 
+// Same stash as `create_submit`, same reason: `key_restored` carries only a
+// pubkey, and the list it lands on names the wallet by name.
 on restore_submit(name, pw)
   return if mutation_phase != MutationPhase.idle || empty(restore_words) || empty(pw) || empty(name)
   onboarding_error = ""
   password = pw
+  hub_wallet_selected = name
   mutation_phase = MutationPhase.onboarding
   run every restore_user_key(name, restore_words, password) -> key_restored _ | login_failed _
 

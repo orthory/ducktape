@@ -19,7 +19,12 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ID="${DEMO_WORKSPACE_ID:-demo}"
-DUCK="$HOME/.ducktape"
+# The SAME root the CLI resolves (`wallet::duck_root`) and the app resolves
+# (`duck_home`). Hardcoding `$HOME` split the two under DUCKTAPE_HOME: the
+# guard below and the gateway's signing key looked at `$HOME/.ducktape/keys`
+# while `wallet new` minted into `$DUCKTAPE_HOME/keys`, so a second run died
+# on "already exists" and the gateway signed with the wrong key.
+DUCK="${DUCKTAPE_HOME:-$HOME/.ducktape}"
 WSDIR="$DUCK/workspaces/$ID"
 REG="$DUCK/registry.json"
 ORIGIN="demo"   # external author stamped on seeded ops (chat rejects an empty author)
@@ -230,11 +235,12 @@ cat <<EOF
 $(printf '\033[32m[demo-seed] done.\033[0m')
 Open the Ducktape app and it boots into the "$ID" workspace, preloaded.
 
-To WRITE (send a message, add a reaction, edit): the app signs with your local
-user key, so unlock it once — open the connection panel (bottom-left of the
-sidebar), type the key password, and click Connect.
+To WRITE (send a message, add a reaction, edit): the app signs with a wallet
+from your keystore. The launch window opens on the wallet list — pick the
+"demo" row, type its password into that row, and Unlock. That also makes it
+the active wallet, so the next launch opens on it.
 
-  key password: $DEMO_PASSWORD   (the "demo" wallet — pick it in the app's wallet list)
+  wallet: demo   password: $DEMO_PASSWORD
 
 EOF
 

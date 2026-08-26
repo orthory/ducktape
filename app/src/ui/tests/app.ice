@@ -550,9 +550,16 @@ test create_screen_read_only_escape_contract
         login_skip -> login_skip
   target screen = #create/root
   target skip = #create/root/create-skip
+  target name = #create/root/wallet-name
   expect exists skip
   expect text "the keystore listing is unreadable" within screen
+  // the name a mint would use — `create_submit` stashes it so the network
+  // list's "signing as …" line names the wallet the session actually signs
+  // as. NOT dispatched here: `create_submit` shells a real `wallet new`.
+  expect name.value == "default"
+  // read-only signs as NOBODY: the label must not keep naming a wallet.
   click skip
+  expect hub_wallet_selected == ""
   expect hub_step == HubStep.networks
 
 test launch_networks_empty_contract
