@@ -6,7 +6,7 @@
 # install: put this file on your $fpath as `_ducktape`, then `autoload -U _ducktape`.
 
 _ducktape() {
-    local families=(node user gateway fs service agent mcp help --help -h --version -V)
+    local families=(node user wallet gateway fs service agent mcp help --help -h --version -V)
 
     local node_verbs=(run key init invite admit join list status peers resident member work help)
     local node_resident=(accept remove)
@@ -19,6 +19,8 @@ _ducktape() {
     local user_cred=(add list remove grant revoke inspect seal)
     local user_verbs=(key sign-bind sign-unbind sign-possession sign-add-member sign-remove-member sign-gateway-route sign-frame sign-admin webauthn-challenge p256-payload cred account-init help)
     local user_flags=(--path --method --statement --possession --out --key --node -n --network --account-id --chain-id --new-key --new-kind --node-key --node-pub --target-key --nonce --name --json --label --host --remote --attest --pccs-url --snp-product --snp-vcek --vendor --measurement --credentials --cred-kind --access-token --refresh-token)
+    local wallet_verbs=(new import list use help)
+    local wallet_flags=(--json)
     local gateway_verbs=(bind unbind list help)
     local gateway_flags=(--workspace -n --network --label --port)
     local fs_verbs=(ls cat stat history diff checkout status commit pin help)
@@ -53,6 +55,7 @@ _ducktape() {
                 *)    compadd -- $user_verbs $user_flags ;;
             esac
             ;;
+        wallet)  compadd -- $wallet_verbs $wallet_flags ;;
         gateway) compadd -- $gateway_verbs $gateway_flags ;;
         fs)      compadd -- $fs_verbs $fs_flags ;;
         service)
