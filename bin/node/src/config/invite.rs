@@ -435,7 +435,12 @@ pub fn decode_invite(blob: &str) -> Result<Invite, String> {
 pub fn decode_invite_at(blob: &str, now_unix_secs: u64) -> Result<Invite, String> {
     use base64::Engine as _;
     use commonware_cryptography::Verifier as _;
-    let body = blob.trim().strip_prefix(INVITE_PREFIX).ok_or_else(|| {
+    // a pasted blob routinely arrives wrapped: terminals and chat clients
+    // insert newlines and spaces mid-blob. neither the 🦆 prefix nor the
+    // base64url alphabet contains whitespace, so stripping ALL of it is
+    // lossless — do it here so every decode path tolerates a wrapped paste.
+    let compact: String = blob.chars().filter(|c| !c.is_whitespace()).collect();
+    let body = compact.strip_prefix(INVITE_PREFIX).ok_or_else(|| {
         format!("not a ducktape invite (expected {INVITE_PREFIX}...) — ask for a fresh invite")
     })?;
     let bytes = INVITE_B64
@@ -882,6 +887,35 @@ mod tests {
             !verify_join_proof(&thief, binding.as_bytes(), &invite.token, &proof),
             "a substituted key fails the proof"
         );
+    }
+
+    #[test]
+    fn a_line_wrapped_paste_decodes() {
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let me = issuer.public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            validators: vec![hex_bytes(me.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+        };
+        d.add_bootstrap(&me, "127.0.0.1:52200");
+        let blob = encode_test_invite(&d, &issuer, None);
+
+        // re-wrap the blob the way a terminal paste arrives: hard-wrapped
+        // lines mid-body, stray spaces, and surrounding blank space.
+        let mut wrapped = String::from("  \n");
+        for (i, c) in blob.chars().enumerate() {
+            wrapped.push(c);
+            if i % 41 == 40 {
+                wrapped.push('\n');
+            }
+        }
+        wrapped.push_str(" \n");
+
+        let invite = decode_invite(&wrapped).expect("wrapped paste decodes");
+        assert_eq!(invite.descriptor.chain_id, d.chain_id);
     }
 
     #[test]
