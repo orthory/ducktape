@@ -9,8 +9,19 @@ same `<uds>_<port>` socket convention, the same Firecracker-schema config
 JSON. The shim (`bin/duck-vz-shim`, ~300 lines of Swift) is the only
 macOS-specific component.
 
-Requirements: Apple silicon, macOS 13+, Xcode command line tools,
-`brew install e2fsprogs squashfs`, `rustup target add aarch64-unknown-linux-musl`.
+## Prerequisites — one pass
+
+```sh
+ops/macos-preflight.sh        # GUEST_DIR=… if the images live elsewhere
+```
+
+It checks everything the compute plane (airlock + provider runs) needs on a
+Mac and prints the exact install command for each missing piece: Apple
+silicon/`kern.hv_support`, Xcode command line tools,
+`brew install e2fsprogs squashfs` (e2fsprogs is keg-only — the node searches
+the standard Homebrew prefixes itself, do not add it to PATH),
+`rustup target add aarch64-unknown-linux-musl`, the signed shim, and the
+guest images. Exit 0 means the node's boot probe will pass.
 
 ## Bring-up on a Mac
 
