@@ -17,6 +17,13 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 GUEST_DIR="${GUEST_DIR:-$HOME/.ducktape/guest}"
+
+# brew lives outside a non-login shell's PATH (ssh commands, make, cron), so
+# look for it at the standard prefixes rather than reporting a Homebrew that
+# is in fact installed as missing.
+for prefix in /opt/homebrew /usr/local; do
+  [[ -x "$prefix/bin/brew" ]] && PATH="$PATH:$prefix/bin:$prefix/sbin"
+done
 PROMPT=0
 [[ "${1:-}" == "--prompt" ]] && PROMPT=1
 
@@ -71,8 +78,13 @@ if command -v brew >/dev/null; then
   else
     miss "squashfs (guest rootfs build)" "brew install squashfs" "brew install squashfs"
   fi
+  if command -v zstd >/dev/null || [[ -x "$PREFIX/bin/zstd" ]]; then
+    ok "zstd (unpacks the Kata VM kernel bundle)"
+  else
+    miss "zstd (guest kernel fetch)" "brew install zstd" "brew install zstd"
+  fi
 else
-  miss "Homebrew" 'see https://brew.sh — then: brew install e2fsprogs squashfs'
+  miss "Homebrew" 'see https://brew.sh — then: brew install e2fsprogs squashfs zstd'
 fi
 
 # ---- rust -------------------------------------------------------------------

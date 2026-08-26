@@ -11,11 +11,10 @@
 //! - **Returning from `main` panics the kernel.** Every path ends at
 //!   [`halt`], including every failure path. A guest that dies without halting
 //!   hangs its run until the host's idle timeout, holding all of its memory.
-//! - **`RESTART`, never `POWER_OFF`.** Firecracker exposes no ACPI power
-//!   button, so `LINUX_REBOOT_CMD_POWER_OFF` parks the guest at
-//!   `reboot: System halted` and the VMM never exits. Measured: one guest hung
-//!   past 120 s, an otherwise identical one exited in 428 ms. `RESTART` goes
-//!   through the `reboot=k` i8042 reset, which the VMM does observe.
+//! - **The HOST picks the halt method** (`DUCK_HALT=poweroff` on the kernel
+//!   command line, or absent): the two VMMs are exact opposites about what
+//!   ends a VM, and getting it wrong is a hang on one and a boot loop on the
+//!   other — see [`halt`].
 
 // Both halves of the host<->guest contract live in sandbox-host and are
 // included here verbatim rather than depended on. The host has to ENCODE the
@@ -851,9 +850,27 @@ fn wait_for(child: libc::pid_t) -> i32 {
 // ---------------------------------------------------------------------------
 
 /// stop the VM. Diverges — PID 1 has nowhere to return to.
+///
+/// HOW to stop is the hypervisor's contract, so the HOST says which, via the
+/// kernel command line: an unrecognized `NAME=value` boot parameter lands in
+/// PID 1's environment, so `DUCK_HALT=poweroff` reaches this env read with no
+/// /proc and no extra device. The two VMMs are exact opposites here, measured
+/// on both:
+/// - Firecracker (x86): POWER_OFF is `reboot: System halted` and the VMM
+///   never exits (no ACPI); RESTART goes through the `reboot=k` i8042 reset
+///   the VMM watches for. One guest hung past 120 s on POWER_OFF; an
+///   otherwise identical one exited in 428 ms on RESTART.
+/// - Virtualization.framework (arm64): RESTART actually REBOOTS the guest —
+///   the run's init came back up, redialled a consumed listener, and the VM
+///   boot-looped forever; POWER_OFF is PSCI SYSTEM_OFF, which is what stops
+///   the VM and lets the shim exit.
 fn halt() -> ! {
-    // RESTART, not POWER_OFF: see the module docs. `reboot=k` on the kernel
-    // command line turns this into the i8042 reset the VMM watches for.
+    let poweroff = std::env::var_os("DUCK_HALT").is_some_and(|v| v == "poweroff");
+    if poweroff {
+        unsafe { libc::reboot(libc::RB_POWER_OFF) };
+        // fall through: a kernel without a wired power-off path returns here,
+        // and on such a machine RESTART is the next-best exit signal.
+    }
     unsafe { libc::reboot(libc::RB_AUTOBOOT) };
     // Only reachable if reboot(2) itself failed, which means this is not PID 1
     // or the kernel refused. Spin rather than return into a kernel panic.

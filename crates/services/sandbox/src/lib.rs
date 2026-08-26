@@ -40,7 +40,7 @@ pub mod workspace_image;
 pub use egress::tap_egress_nftables;
 pub use guest_paths::GuestLayout;
 #[cfg(unix)]
-pub use host_tools::{find_on_path, find_system_tool};
+pub use host_tools::{find_executable, find_on_path, find_system_tool};
 #[cfg(unix)]
 pub use microvm::{MicroVm, MicroVmIo};
 pub use sandbox::{SandboxBackend, Vmm};

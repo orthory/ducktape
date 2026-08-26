@@ -112,10 +112,19 @@ async fn smoke() -> Result<(), String> {
     tokio::io::copy(&mut io.stderr, &mut stderr)
         .await
         .map_err(|e| format!("read guest stderr: {e}"))?;
-    let exit = io
-        .exit
-        .await
-        .map_err(|_| "the guest halted without reporting an exit code".to_string())?;
+    // On a post-boot failure the console is the only witness, and the VM's
+    // Drop removes it with the run dir — so read it BEFORE bailing out.
+    let console_tail = || {
+        let raw = std::fs::read_to_string(vm.run_dir().join("console.log")).unwrap_or_default();
+        let tail: Vec<&str> = raw.lines().rev().take(25).collect();
+        tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+    };
+    let exit = io.exit.await.map_err(|_| {
+        format!(
+            "the guest halted without reporting an exit code\nguest console:\n{}",
+            console_tail()
+        )
+    })?;
 
     print!("{}", String::from_utf8_lossy(&stdout));
     eprint!("{}", String::from_utf8_lossy(&stderr));
