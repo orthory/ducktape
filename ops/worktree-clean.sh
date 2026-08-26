@@ -29,7 +29,10 @@ for arg in "$@"; do
   esac
 done
 
-PRIMARY="$(pwd -P)"
+# The MAIN checkout, from git itself (always the first entry) — `pwd` would
+# nominate the primary for sweeping whenever this runs from inside a worktree,
+# leaving only the live-process refusal between it and removal.
+PRIMARY="$(git worktree list --porcelain | awk '/^worktree /{print $2; exit}')"
 say() { [ "$YES" = 1 ] && echo "  $*" || echo "  [dry-run] $*"; }
 run() { [ "$YES" = 1 ] && "$@"; }
 
@@ -77,9 +80,17 @@ while read -r wt; do
   ahead=$(git -C "$wt" rev-list --count origin/dev..HEAD 2>/dev/null || echo 1)
   live=$(pids_under "$wt" | wc -w)
 
-  # The two refusals that make this safe to run without reading the code.
+  # The refusals that make this safe to run without reading the code.
   if [ "$ahead" != "0" ] && ! squash_merged "$wt" "$branch"; then
     echo "- SKIP $branch — $ahead commit(s) not in dev, no merged PR at this HEAD"; continue
+  fi
+  # A worktree parked exactly at dev HEAD with a branch that was NEVER PUSHED
+  # is indistinguishable from a merged one by ancestry — but "merged" here
+  # means a PR happened, and a PR means a push. No origin/<branch> = a
+  # freshly created worktree someone is about to work in; one was swept
+  # mid-setup exactly this way (2026-08-26). Not this script's to reap.
+  if [ "$ahead" = "0" ] && ! git -C "$wt" rev-parse --verify --quiet "origin/$branch" >/dev/null; then
+    echo "- SKIP $branch — never pushed; a just-created worktree looks merged"; continue
   fi
   if [ "$dirty" != "0" ]; then
     echo "- SKIP $(basename "$wt") — $dirty uncommitted change(s)"; continue
