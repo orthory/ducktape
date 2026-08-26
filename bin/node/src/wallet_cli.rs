@@ -59,11 +59,8 @@ fn wallet_new(
     name: &str,
     stdin: &mut impl std::io::BufRead,
 ) -> Result<(String, String), Box<dyn std::error::Error>> {
-    let path = new_wallet_path(duck, name)?;
-    let (words, key) = userkey_cli::mint_user_key(&path, stdin)?;
-    activate_first_wallet(duck, name)?;
-    use commonware_cryptography::Signer as _;
-    Ok((words, crate::config::hex_bytes(key.public_key().as_ref())))
+    let password = userkey_cli::prompt_stdin_line(stdin, "password")?;
+    Ok(wallet::create(duck, name, &password)?)
 }
 
 fn cmd_import(duck: &Path, name: &str, stdin: &mut impl std::io::BufRead) -> CommandResult {
@@ -77,38 +74,9 @@ fn wallet_import(
     name: &str,
     stdin: &mut impl std::io::BufRead,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let path = new_wallet_path(duck, name)?;
-    let pubkey = userkey_cli::restore_user_key_at(&path, stdin)?;
-    activate_first_wallet(duck, name)?;
-    Ok(pubkey)
-}
-
-/// validate the name, run adoption, and refuse an occupied slot loudly —
-/// `write_user_key_new` would refuse too, but with an io error instead of
-/// the wallet's own vocabulary.
-fn new_wallet_path(
-    duck: &Path,
-    name: &str,
-) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
-    wallet::valid_name(name)?;
-    wallet::adopt_legacy(duck)?;
-    let path = wallet::key_file(duck, name);
-    if path.exists() {
-        return Err(format!("wallet {name:?} already exists — pick another name").into());
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-    }
-    Ok(path)
-}
-
-/// the first wallet in an empty keystore becomes active; later mints never
-/// steal the pointer.
-fn activate_first_wallet(duck: &Path, name: &str) -> Result<(), String> {
-    if wallet::active_name(duck).is_some() {
-        return Ok(());
-    }
-    wallet::set_active(duck, name)
+    let mnemonic = userkey_cli::prompt_stdin_line(stdin, "mnemonic")?;
+    let password = userkey_cli::prompt_stdin_line(stdin, "password")?;
+    Ok(wallet::import(duck, name, &mnemonic, &password)?)
 }
 
 fn cmd_list(duck: &Path, json: bool) -> CommandResult {
@@ -152,8 +120,7 @@ fn cmd_use(duck: &Path, name: &str) -> CommandResult {
 }
 
 fn wallet_use(duck: &Path, name: &str) -> Result<(), String> {
-    wallet::adopt_legacy(duck)?;
-    wallet::set_active(duck, name)
+    wallet::activate(duck, name)
 }
 
 #[cfg(test)]

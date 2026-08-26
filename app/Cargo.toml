@@ -32,6 +32,18 @@ git2 = { version = "0.19", default-features = false, features = ["vendored-libgi
 governance.workspace = true
 identity.workspace = true
 inbox.workspace = true
+# THE device keystore, linked rather than spawned. Opening your own key is the
+# app's own business: it used to reach argon2id by starting `ducktape` and
+# piping to it, which made "can this process find a binary on disk?" a
+# precondition for unlocking a wallet — and the sentence a person got when it
+# could not was about checking their install.
+keystore.workspace = true
+# the signed op frame `/v1/submit/frame` takes. Signing one is the other half
+# of holding the key in-process; `node::encode_frame` is the ONE encoder, and a
+# second implementation of a machine wire format is not a thing to write.
+node.workspace = true
+# the ed25519 signer `keystore` hands back and `node::encode_frame` signs with.
+commonware-cryptography.workspace = true
 pages.workspace = true
 saga.workspace = true
 # RUNTIME, not dev-only: `local_member` derives the signing identity through
@@ -83,7 +95,6 @@ commonware-cryptography.workspace = true
 # `iced_runtime`. The explicit test-only ui-lang runtime feature below keeps
 # that renderer out of the product dependency surface.
 iced_test = "=0.14.0"
-node.workspace = true
 simnode = { path = "../bin/simnode" }
 tempfile.workspace = true
 ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "a64eb5f70c7cbd97136ac54b42c6ea0409c2d866", version = "=0.1.0", default-features = false, features = ["test-runtime"] }

@@ -3263,6 +3263,7 @@ dependencies = [
  "image",
  "inbox",
  "jpeg-encoder",
+ "keystore",
  "media-service",
  "node",
  "nokhwa",

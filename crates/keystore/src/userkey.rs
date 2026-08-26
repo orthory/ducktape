@@ -315,14 +315,34 @@ pub fn open_user_key(line: &str, password: &str) -> Result<ed25519::PrivateKey, 
     Ok(key)
 }
 
-/// Read and validate an encrypted v1 key file.
-pub fn read_user_key_file(path: &Path) -> Result<EncryptedUserKey, String> {
+/// The largest a key file is allowed to be before it is refused unread. One
+/// encrypted line is ~180 bytes; the cap exists because this path is handed
+/// paths from a pointer file and a `--key` flag, and slurping an arbitrary
+/// file into memory is not a thing a key reader should be able to be asked to
+/// do.
+pub const MAX_KEY_FILE_BYTES: u64 = 64 * 1024;
+
+/// `path`'s trimmed contents, refusing an oversized or empty file.
+fn read_key_line(path: &Path) -> Result<String, String> {
+    let oversized = std::fs::metadata(path)
+        .map_err(|e| format!("read {path:?}: {e}"))?
+        .len()
+        > MAX_KEY_FILE_BYTES;
+    if oversized {
+        return Err(format!("{path:?} is too large to be a key file"));
+    }
     let text = std::fs::read_to_string(path).map_err(|e| format!("read {path:?}: {e}"))?;
     let line = text.trim();
     if line.is_empty() {
         return Err(format!("{path:?} is empty"));
     }
-    parse_encrypted(line).map_err(|error| format!("{path:?}: {error}"))
+    Ok(line.to_string())
+}
+
+/// Read and validate an encrypted v1 key file.
+pub fn read_user_key_file(path: &Path) -> Result<EncryptedUserKey, String> {
+    let line = read_key_line(path)?;
+    parse_encrypted(&line).map_err(|error| format!("{path:?}: {error}"))
 }
 
 /// the 24-word BIP39 mnemonic encoding `seed`'s raw bytes as entropy (with
@@ -374,6 +394,116 @@ pub fn write_user_key_new(path: &Path, line: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ============================================================================
+// the ceremonies — mint, restore, open
+// ============================================================================
+//
+// A ceremony is the whole ordered act, not a primitive: mint = generate +
+// seal + write + PROVE IT REOPENS, restore = validate the checksum + re-seal.
+// They live here rather than in either caller because both a CLI verb and a
+// desktop app perform them, and a second implementation of "mint an identity"
+// is the one duplication whose divergence is unrecoverable — the failure is a
+// key whose 24 words do not open it, discovered weeks later.
+//
+// They take a `password: &str` rather than a stdin handle: reading a secret is
+// the CALLER's business (a terminal line, a text field), and threading a
+// `BufRead` through here is what kept the app on the outside of a pipe.
+
+/// the password floor for newly encrypted keys, enforced before any file is
+/// touched. counts scalar chars, not bytes, so a multi-byte-but-short
+/// password isn't laundered past the floor.
+pub const MIN_PASSWORD_LEN: usize = 8;
+
+pub fn check_password_len(password: &str) -> Result<(), String> {
+    if password.chars().count() < MIN_PASSWORD_LEN {
+        return Err(format!(
+            "password must be at least {MIN_PASSWORD_LEN} characters"
+        ));
+    }
+    Ok(())
+}
+
+/// Open the encrypted key AT `path` under `password` — the signing seat every
+/// caller takes before it can sign anything.
+pub fn open_user_key_at(path: &Path, password: &str) -> Result<ed25519::PrivateKey, String> {
+    open_user_key(&read_key_line(path)?, password)
+}
+
+/// Generate a fresh seed, seal it under `password`, write it to `path`
+/// (refusing to overwrite), and hand back the 24 words AND the signer.
+///
+/// The signer comes back so a caller that mints does not have to re-read the
+/// file with a password it would have to ask for a SECOND time.
+pub fn mint_user_key(path: &Path, password: &str) -> Result<(String, ed25519::PrivateKey), String> {
+    check_password_len(password)?;
+
+    let mut seed = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut seed);
+    let words = mnemonic_of_seed(&seed);
+    let line = seal_user_key(&seed, password)?;
+    write_user_key_new(path, &line)?;
+
+    let key = ed25519::PrivateKey::decode(seed.as_slice()).expect("32 random bytes decode");
+    verify_the_key_reopens(path, password, &key)?;
+    Ok((words, key))
+}
+
+/// Re-seal an identity from its 24 words at `path`, returning the signer.
+pub fn restore_user_key_at(
+    path: &Path,
+    mnemonic: &str,
+    password: &str,
+) -> Result<ed25519::PrivateKey, String> {
+    check_password_len(password)?;
+
+    let seed = seed_of_mnemonic(mnemonic)?;
+    let line = seal_user_key(&seed, password)?;
+    write_user_key_new(path, &line)?;
+
+    ed25519::PrivateKey::decode(seed.as_slice())
+        .map_err(|e| format!("restored seed is not a valid ed25519 secret: {e}"))
+}
+
+/// Read the key back and open it, before telling anyone it exists.
+///
+/// The failure this prevents is SILENT and TOTAL: the operator is shown 24
+/// words, writes them down, and the file those words are supposed to unlock
+/// cannot be opened by anything, ever. Nothing later in the flow would notice —
+/// the mnemonic is correct, the file is present and well-formed, and the first
+/// symptom is a wrong-password error at some unrelated moment weeks later.
+///
+/// It is not hypothetical. Sealing runs a 64 MiB argon2id buffer through the
+/// host's memory, and on the machine this was written on a byte-identical
+/// `seal_with` call produced a DIFFERENT ciphertext roughly 1 run in 240 under
+/// parallel load — a silent bit flip on non-ECC memory. A short disk write
+/// would land the same way. One extra argon2 pass, once, at the only moment a
+/// key is irreplaceable, is the cheapest insurance in this file.
+///
+/// The unusable file is REMOVED on failure, because leaving it behind is worse
+/// than not writing it: `write_user_key_new` refuses to overwrite, so a
+/// corrupt key would block the retry that would have fixed it.
+fn verify_the_key_reopens(
+    path: &Path,
+    password: &str,
+    expected: &ed25519::PrivateKey,
+) -> Result<(), String> {
+    let reopened = open_user_key_at(path, password);
+    let intact = reopened
+        .as_ref()
+        .is_ok_and(|key| key.public_key() == expected.public_key());
+    if intact {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(path);
+    Err(format!(
+        "the key just written to {} does not open with the password that sealed it, so it \
+         has been removed rather than left unusable — this is a corrupted write (failing \
+         memory or a full/faulty disk), not a wrong password. Run the command again; if it \
+         happens twice, the host is at fault.",
+        path.display()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,6 +528,69 @@ mod tests {
         blob[SALT_LEN + 4..SALT_LEN + 8].copy_from_slice(&t_cost.to_le_bytes());
         blob[SALT_LEN + 8..SALT_LEN + 12].copy_from_slice(&p_cost.to_le_bytes());
         format!("{USER_KEY_ENCRYPTED_PREFIX}{}", B64.encode(blob))
+    }
+
+    /// A key that cannot be reopened is a key the operator has LOST, and they
+    /// would be holding 24 correct words while believing otherwise. The check
+    /// runs at mint time and refuses rather than reporting success — and it
+    /// takes the unusable file with it, because `write_user_key_new` will not
+    /// overwrite and a corpse there would block the retry that fixes this.
+    #[test]
+    fn a_key_that_does_not_reopen_is_refused_and_not_left_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user.key");
+
+        // a real minted key verifies — the check is not vacuous.
+        let (_, key) = mint_user_key(&path, "correct horse battery").expect("a good seal verifies");
+        assert!(verify_the_key_reopens(&path, "correct horse battery", &key).is_ok());
+
+        // now corrupt the sealed line the way a bit flip would, and the same
+        // check must refuse it and remove it.
+        let flipped = {
+            let line = std::fs::read_to_string(&path).unwrap();
+            let mut bytes = line.trim().as_bytes().to_vec();
+            let last = bytes.len() - 1;
+            bytes[last] = if bytes[last] == b'A' { b'B' } else { b'A' };
+            String::from_utf8(bytes).unwrap()
+        };
+        std::fs::write(&path, &flipped).unwrap();
+        let why = verify_the_key_reopens(&path, "correct horse battery", &key)
+            .expect_err("a corrupted key must not pass");
+        assert!(
+            why.contains("not a wrong password"),
+            "it must not send the reader hunting for a typo: {why}"
+        );
+        assert!(
+            !path.exists(),
+            "an unusable key file must not be left to block the retry"
+        );
+    }
+
+    /// The ceremonies round-trip WITHOUT a pipe: mint hands back the words and
+    /// a live signer, restore rebuilds the identical identity from those words,
+    /// and both refuse a password under the floor before touching a file.
+    #[test]
+    fn mint_and_restore_round_trip_through_the_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let minted = dir.path().join("minted.key");
+        let (words, key) = mint_user_key(&minted, "password-123").unwrap();
+        assert_eq!(words.split_whitespace().count(), 24);
+
+        let restored_path = dir.path().join("restored.key");
+        let restored = restore_user_key_at(&restored_path, &words, "another-password").unwrap();
+        assert_eq!(restored.public_key(), key.public_key());
+
+        // and it opens under the password it was re-sealed with, not the first.
+        let opened = open_user_key_at(&restored_path, "another-password").unwrap();
+        assert_eq!(opened.public_key(), key.public_key());
+        assert!(open_user_key_at(&restored_path, "password-123").is_err());
+
+        // the floor is enforced before anything is written.
+        let short = dir.path().join("short.key");
+        assert!(mint_user_key(&short, "pw").is_err());
+        assert!(!short.exists());
+        assert!(restore_user_key_at(&short, &words, "pw").is_err());
+        assert!(!short.exists());
     }
 
     #[test]
