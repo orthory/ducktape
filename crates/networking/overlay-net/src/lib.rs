@@ -281,20 +281,29 @@ impl<E: Network + Clock> Network for OverlayContext<E> {
     type Listener = OverlayListener<E::Listener>;
 
     async fn bind(&self, socket: SocketAddr) -> Result<Self::Listener, Error> {
-        // socket mode's mesh listener (ADR phase 3): an unspecified-address
-        // bind means "accept from anywhere" — but a tunnel-carried inbound
-        // connection terminates in the virtual stack, which the OS listener
-        // can never see. so the wildcard bind carries BOTH: the OS socket
-        // for the underlay, plus a lazy virtual leg at the node's own ULA
-        // on the same port (lazy: the stack exists only while a tunnel is
-        // applied, and is replaced on interface rebuilds). a node with no
-        // underlay ingress at all keeps only the virtual leg — no kernel
-        // socket exists to receive (or to alarm the host firewall about).
+        // socket mode's mesh listener (ADR phase 3): a tunnel-carried inbound
+        // connection terminates in the virtual stack, which an OS listener can
+        // never see. so an UNDERLAY bind carries BOTH: the OS socket for the
+        // underlay, plus a lazy virtual leg at the node's own ULA on the same
+        // port (lazy: the stack exists only while a tunnel is applied, and is
+        // replaced on interface rebuilds). a node with no underlay ingress at
+        // all keeps only the virtual leg — no kernel socket exists to receive
+        // (or to alarm the host firewall about).
+        //
+        // The ADDRESS FAMILY decides this, never how the operator spelled
+        // `listen`. Gating the virtual leg on the wildcard meant a node pinned
+        // to one interface (`listen = "192.168.0.70:9010"`) got the kernel
+        // socket alone — and since every peer's fallthrough address for it is
+        // its ULA, it was unreachable over the overlay, silently, and only for
+        // the peers that could not route its LAN. It is also what
+        // `boot::mesh::binds_an_os_mesh_socket` has always predicted: that
+        // preflight reads `advertised` and `overlay_enabled` and never
+        // `listen`, so a bind that consulted `listen` disagreed with it.
         if let OverlayBackend::Userspace {
             slot,
             underlay_ingress,
         } = &self.backend
-            && socket.ip().is_unspecified()
+            && !self.router.is_overlay(&socket)
         {
             let virt = userspace::seam::LazyVirtualListener::new(slot.clone(), socket.port());
             if !underlay_ingress {
@@ -303,6 +312,8 @@ impl<E: Network + Clock> Network for OverlayContext<E> {
             let os = self.inner.bind(socket).await?;
             return Ok(OverlayListener::Dual(os, virt));
         }
+        // passthrough mode reaches here: no virtual stack exists to give a
+        // second leg to, so an underlay bind is the OS socket and nothing more.
         if !self.router.is_overlay(&socket) {
             return Ok(OverlayListener::Os(self.inner.bind(socket).await?));
         }
@@ -500,6 +511,67 @@ mod tests {
         assert!(!router.is_overlay(&public_v6));
         let v4: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         assert!(!router.is_overlay(&v4));
+    }
+
+    /// A mesh listener pinned to ONE concrete interface must still answer at
+    /// this node's own ULA.
+    ///
+    /// The regression: the virtual leg was gated on `listen` being the
+    /// wildcard, so an operator who wrote `listen = "192.168.0.70:9010"` got
+    /// a kernel socket alone. Every peer's fallthrough address for that node
+    /// IS its ULA, so it went unreachable over the overlay — silently, and
+    /// only for peers that could not route its LAN.
+    #[test]
+    fn a_concrete_underlay_bind_still_carries_the_virtual_leg() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let context = OverlayContext::with_backend(
+                context,
+                OverlayRouter::for_prefix48(fixture_prefix()),
+                OverlayBackend::Userspace {
+                    slot: userspace::StackSlot::new(),
+                    underlay_ingress: true,
+                },
+            );
+            let wildcard: SocketAddr = "[::]:9010".parse().unwrap();
+            let one_interface: SocketAddr = "127.0.0.1:9011".parse().unwrap();
+            for addr in [wildcard, one_interface] {
+                let listener = context.bind(addr).await.expect("bind through the seam");
+                assert!(
+                    matches!(listener, OverlayListener::Dual(..)),
+                    "{addr} must carry the OS leg AND the virtual one"
+                );
+            }
+        });
+    }
+
+    /// ...and with no underlay ingress it keeps the virtual leg ALONE, on a
+    /// concrete `listen` exactly as on the wildcard. `boot::mesh::
+    /// binds_an_os_mesh_socket` predicts the kernel socket from `advertised`
+    /// and `overlay_enabled` only; a bind that consulted `listen` too would
+    /// disagree with its own preflight.
+    #[test]
+    fn an_overlay_only_node_opens_no_kernel_socket_on_either_spelling() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let context = OverlayContext::with_backend(
+                context,
+                OverlayRouter::for_prefix48(fixture_prefix()),
+                OverlayBackend::Userspace {
+                    slot: userspace::StackSlot::new(),
+                    underlay_ingress: false,
+                },
+            );
+            let wildcard: SocketAddr = "[::]:9012".parse().unwrap();
+            let one_interface: SocketAddr = "127.0.0.1:9013".parse().unwrap();
+            for addr in [wildcard, one_interface] {
+                let listener = context.bind(addr).await.expect("bind through the seam");
+                assert!(
+                    matches!(listener, OverlayListener::OverlayOnly(..)),
+                    "{addr} must open no kernel socket"
+                );
+            }
+        });
     }
 
     /// both routing arms carry a live connection end-to-end through the
