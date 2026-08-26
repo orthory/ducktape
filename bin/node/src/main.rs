@@ -101,6 +101,7 @@ mod validator;
 mod voice;
 mod voice_plane;
 mod wallet;
+mod wallet_cli;
 mod work_admission;
 use crate::util::fatal;
 use config::Resolved;
@@ -222,6 +223,9 @@ enum Family {
     /// user-identity keys and signing (init/restore, sign-*, account-init, ...)
     #[command(subcommand)]
     User(userkey_cli::UserCmd),
+    /// named user-key wallets: mint, import, list, switch the active one
+    #[command(subcommand)]
+    Wallet(wallet_cli::WalletCmd),
     /// local loopback bindings for signed gateway routes
     #[command(subcommand)]
     Gateway(gateway_routes::GatewayCmd),
@@ -259,6 +263,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // all, and reaches this host only through a vsock tunnel the host owns
         // both ends of — so there is no hook and nothing for one to install.
         Family::User(cmd) => userkey_cli::run(cmd),
+        Family::Wallet(cmd) => wallet_cli::run(cmd),
         Family::Agent(args) => agent_cli::run(args),
         Family::Gateway(cmd) => gateway_routes::run(cmd),
         Family::Service(cmd) => services::run(cmd),

@@ -509,7 +509,7 @@ fn user_key_init(
 /// The signer comes back so a caller that mints does not have to re-read the
 /// file with a password it would have to ask for a SECOND time — the shape
 /// that made "mint it if absent" impossible to offer here before.
-fn mint_user_key(
+pub(crate) fn mint_user_key(
     out: &std::path::Path,
     stdin: &mut impl std::io::BufRead,
 ) -> Result<(String, ed25519::PrivateKey), Box<dyn std::error::Error>> {
@@ -601,9 +601,9 @@ fn cmd_user_key_init(args: KeyOutArgs, stdin: &mut impl std::io::BufRead) -> Com
     Ok(())
 }
 
-/// `user-key restore` core — see [`cmd_user_key_restore`].
-fn user_key_restore(
-    args: KeyOutArgs,
+/// restore core over an explicit destination — `wallet import` reuses it.
+pub(crate) fn restore_user_key_at(
+    out: &std::path::Path,
     stdin: &mut impl std::io::BufRead,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mnemonic = prompt_stdin_line(stdin, "mnemonic")?;
@@ -612,11 +612,19 @@ fn user_key_restore(
 
     let seed = userkey::seed_of_mnemonic(&mnemonic)?;
     let line = userkey::seal_user_key(&seed, &password)?;
-    userkey::write_user_key_new(&args.out, &line)?;
+    userkey::write_user_key_new(out, &line)?;
 
     let key = ed25519::PrivateKey::decode(seed.as_slice())
         .map_err(|e| format!("restored seed is not a valid ed25519 secret: {e}"))?;
     Ok(hex_bytes(key.public_key().as_ref()))
+}
+
+/// `user-key restore` core — see [`cmd_user_key_restore`].
+fn user_key_restore(
+    args: KeyOutArgs,
+    stdin: &mut impl std::io::BufRead,
+) -> Result<String, Box<dyn std::error::Error>> {
+    restore_user_key_at(&args.out, stdin)
 }
 
 /// `user-key restore --out <path>` — stdin: mnemonic line, then password
