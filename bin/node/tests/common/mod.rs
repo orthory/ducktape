@@ -1598,11 +1598,16 @@ pub fn http_text_request(port: u16, path: &str) -> (u16, String) {
 /// graph root, which meant a three-node cluster pulled its image three times
 /// into three empty stores on every run — the reason that helper took an image
 /// argument and defaulted to the smallest one that could work.
+///
+/// The runtime is the platform's own hypervisor flavor — the same choice
+/// [`guest_backend`] probes with — so the daemon this table boots is the one
+/// the capability gate just proved can run.
 pub fn sandbox_toml() -> Vec<String> {
     let dir = std::env::var("DUCKTAPE_GUEST_DIR").unwrap_or_else(|_| GUEST_DIR.into());
+    let runtime = provider_host::Vmm::platform_default().config_token();
     vec![
         "[sandbox]".into(),
-        "runtime = \"firecracker\"".into(),
+        format!("runtime = {runtime:?}"),
         format!("kernel = {:?}", format!("{dir}/vmlinux")),
         format!("rootfs = {:?}", format!("{dir}/rootfs.ext4")),
         "cores = 0".into(),
