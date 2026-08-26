@@ -9,8 +9,10 @@ use std::path::PathBuf;
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{Signer as _, ed25519};
 
+use keystore::userkey;
+
 use crate::cli_args::NodeAddr;
-use crate::{config, userkey};
+use crate::config;
 use config::hex_bytes;
 
 type CommandResult = Result<(), Box<dyn std::error::Error>>;
@@ -303,15 +305,15 @@ fn cmd_user_account_init(
     // the key: explicit --key, else THE shared wallet resolver — the active
     // wallet, or (empty keystore only) a fresh wallet named after --name.
     let target = match args.key {
-        Some(explicit) => crate::wallet::AccountInitKey::Active(explicit),
+        Some(explicit) => keystore::wallet::AccountInitKey::Active(explicit),
         None => match std::env::var_os("DUCKTAPE_USER_KEY") {
-            Some(path) => crate::wallet::AccountInitKey::Active(path.into()),
-            None => crate::wallet::account_init_target(&args.name)?,
+            Some(path) => keystore::wallet::AccountInitKey::Active(path.into()),
+            None => keystore::wallet::account_init_target(&args.name)?,
         },
     };
     let (key_path, minted_wallet) = match target {
-        crate::wallet::AccountInitKey::Active(path) => (path, None),
-        crate::wallet::AccountInitKey::Mint { path, name } => (path, Some(name)),
+        keystore::wallet::AccountInitKey::Active(path) => (path, None),
+        keystore::wallet::AccountInitKey::Mint { path, name } => (path, Some(name)),
     };
     let (user, origin) = load_or_mint_user_signer(&key_path, stdin)?;
     let user_pub = user.public_key();
@@ -320,7 +322,7 @@ fn cmd_user_account_init(
     if let KeyOrigin::Minted(words) = origin {
         let wallet_name = minted_wallet.as_deref().unwrap_or("(explicit path)");
         if let Some(name) = &minted_wallet {
-            crate::wallet::set_active(&crate::wallet::duck_root()?, name)?;
+            keystore::wallet::set_active(&keystore::wallet::duck_root()?, name)?;
         }
         println!("a new wallet {wallet_name:?} was minted at {}", key_path.display());
         println!("write these 24 words down — they are the only way to restore it:");

@@ -1,0 +1,31 @@
+[package]
+name = "keystore"
+edition.workspace = true
+version.workspace = true
+
+# The device keystore: `<duck>/keys/<name>.key` + the `active` pointer, and the
+# argon2id/XChaCha20-Poly1305 seal underneath them.
+#
+# NOT a consensus module — no `sdk::Module` impl, no MODULE_ID, no guest wasm.
+# It lives beside `crates/airlock` and `crates/duckdns` for the same reason
+# those do: its consumers span programs that share nothing else. It was part of
+# node-bin until the desktop app's only way to reach it was to SPAWN `ducktape`
+# and pipe to it — which made "can the app find a binary on disk?" a
+# precondition for a person opening their own key. Both the CLI and the app
+# link it now.
+#
+# The dependency set is the point: argon2 + AEAD + ed25519 + encoding, and
+# nothing else. A GUI can link this without a validator arriving behind it.
+[dependencies]
+argon2 = { workspace = true }
+base64 = "0.22"
+# the 24-word recovery phrase a restore reads and a mint reveals.
+bip39 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+commonware-codec = { workspace = true }
+commonware-cryptography = { workspace = true }
+rand = "0.8"
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

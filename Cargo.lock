@@ -5361,6 +5361,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "keystore"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "base64 0.22.1",
+ "bip39",
+ "chacha20poly1305",
+ "commonware-codec",
+ "commonware-cryptography",
+ "rand 0.8.6",
+ "tempfile",
+ "zeroize",
+]
+
+[[package]]
 name = "khronos-egl"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6107,6 +6122,7 @@ dependencies = [
  "host",
  "identity",
  "indexer",
+ "keystore",
  "libc",
  "lifecycle",
  "media-service",

@@ -6,16 +6,25 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::{config, userkey};
+use crate::userkey;
 
 /// the active-pointer file inside `keys/` — one line, the wallet's name.
-pub(crate) const ACTIVE_FILE: &str = "active";
+pub const ACTIVE_FILE: &str = "active";
+
+/// Lowercase hex for a listed pubkey.
+///
+/// Local on purpose: the formatter this used to call lives in the node
+/// binary, and depending on that binary's crate is the coupling this one was
+/// extracted to shed.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 
 const MAX_NAME_LEN: usize = 41;
 
 /// `$DUCKTAPE_HOME` when set (tests, portable setups, huddle lanes), else
 /// `~/.ducktape` — the directory `keys/` lives under.
-pub(crate) fn duck_root() -> Result<PathBuf, String> {
+pub fn duck_root() -> Result<PathBuf, String> {
     if let Some(home) = std::env::var_os("DUCKTAPE_HOME") {
         return Ok(PathBuf::from(home));
     }
@@ -24,16 +33,16 @@ pub(crate) fn duck_root() -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join(".ducktape"))
 }
 
-pub(crate) fn keys_dir(duck: &Path) -> PathBuf {
+pub fn keys_dir(duck: &Path) -> PathBuf {
     duck.join("keys")
 }
 
-pub(crate) fn key_file(duck: &Path, name: &str) -> PathBuf {
+pub fn key_file(duck: &Path, name: &str) -> PathBuf {
     keys_dir(duck).join(format!("{name}.key"))
 }
 
 /// `[a-z0-9][a-z0-9._-]{0,40}` — filesystem-safe, lowercase, never a path.
-pub(crate) fn valid_name(name: &str) -> Result<(), String> {
+pub fn valid_name(name: &str) -> Result<(), String> {
     let mut chars = name.chars();
     let head_ok = chars
         .next()
@@ -53,7 +62,7 @@ pub(crate) fn valid_name(name: &str) -> Result<(), String> {
 /// Fold arbitrary display text into the wallet-name charset: lowercase,
 /// runs of other characters collapse to one `-`, trimmed, truncated.
 /// Output always satisfies `valid_name`.
-pub(crate) fn sanitize_name(raw: &str) -> String {
+pub fn sanitize_name(raw: &str) -> String {
     let mut out = String::new();
     for c in raw.chars() {
         let c = c.to_ascii_lowercase();
@@ -79,7 +88,7 @@ pub(crate) fn sanitize_name(raw: &str) -> String {
 /// and point `active` at it. A rename keeps a symlinked user.key working
 /// (the link itself moves). After this, nothing reads `<duck>/user.key`
 /// again — the old path is replaced, not tolerated.
-pub(crate) fn adopt_legacy(duck: &Path) -> Result<(), String> {
+pub fn adopt_legacy(duck: &Path) -> Result<(), String> {
     let keys = keys_dir(duck);
     if keys.exists() {
         return Ok(());
@@ -97,7 +106,7 @@ pub(crate) fn adopt_legacy(duck: &Path) -> Result<(), String> {
 
 /// One listed wallet. `state` is `"encrypted"` for a parseable key file and
 /// `"unreadable"` for anything else (the app renders its refusal plate).
-pub(crate) struct WalletRow {
+pub struct WalletRow {
     pub name: String,
     pub path: PathBuf,
     pub pubkey: String,
@@ -108,7 +117,7 @@ pub(crate) struct WalletRow {
 /// Every `keys/*.key`, sorted by name, with the active flag applied.
 /// Runs the legacy adoption first, so the first keystore touch after an
 /// upgrade converts the old layout.
-pub(crate) fn list(duck: &Path) -> Result<Vec<WalletRow>, String> {
+pub fn list(duck: &Path) -> Result<Vec<WalletRow>, String> {
     adopt_legacy(duck)?;
     let keys = keys_dir(duck);
     let mut rows = Vec::new();
@@ -127,7 +136,7 @@ pub(crate) fn list(duck: &Path) -> Result<Vec<WalletRow>, String> {
             continue;
         };
         let (pubkey, state) = match userkey::read_user_key_file(&path) {
-            Ok(enc) => (config::hex_bytes(&enc.pubkey), "encrypted"),
+            Ok(enc) => (hex(&enc.pubkey), "encrypted"),
             Err(_) => (String::new(), "unreadable"),
         };
         rows.push(WalletRow {
@@ -143,7 +152,7 @@ pub(crate) fn list(duck: &Path) -> Result<Vec<WalletRow>, String> {
 }
 
 /// The `active` pointer's content, when present and non-empty.
-pub(crate) fn active_name(duck: &Path) -> Option<String> {
+pub fn active_name(duck: &Path) -> Option<String> {
     let text = std::fs::read_to_string(keys_dir(duck).join(ACTIVE_FILE)).ok()?;
     let name = text.trim();
     if name.is_empty() {
@@ -154,7 +163,7 @@ pub(crate) fn active_name(duck: &Path) -> Option<String> {
 
 /// Point `active` at `name` — which must exist. Atomic (tmp + rename) so a
 /// concurrent reader never sees a torn pointer.
-pub(crate) fn set_active(duck: &Path, name: &str) -> Result<(), String> {
+pub fn set_active(duck: &Path, name: &str) -> Result<(), String> {
     valid_name(name)?;
     if !key_file(duck, name).exists() {
         return Err(format!("no wallet named {name:?} — see `ducktape wallet list`"));
@@ -168,7 +177,7 @@ pub(crate) fn set_active(duck: &Path, name: &str) -> Result<(), String> {
 
 /// The active wallet's key file, after the adoption move. The errors ARE
 /// the onboarding: each names the command that fixes it.
-pub(crate) fn active_key_path(duck: &Path) -> Result<PathBuf, String> {
+pub fn active_key_path(duck: &Path) -> Result<PathBuf, String> {
     adopt_legacy(duck)?;
     let rows = list(duck)?;
     if rows.is_empty() {
@@ -189,7 +198,7 @@ pub(crate) fn active_key_path(duck: &Path) -> Result<PathBuf, String> {
 /// THE key resolver every keyless CLI verb signs through:
 /// `$DUCKTAPE_USER_KEY` (the rig/scripted override), else the keystore's
 /// active wallet.
-pub(crate) fn active_user_key() -> Result<PathBuf, String> {
+pub fn active_user_key() -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os("DUCKTAPE_USER_KEY") {
         return Ok(path.into());
     }
@@ -200,12 +209,12 @@ pub(crate) fn active_user_key() -> Result<PathBuf, String> {
 /// active wallet when the keystore has any; a NAMED mint only into an
 /// empty keystore. Minting beside existing wallets is exactly the
 /// silently-minted-stranger footgun this module exists to kill.
-pub(crate) enum AccountInitKey {
+pub enum AccountInitKey {
     Active(PathBuf),
     Mint { path: PathBuf, name: String },
 }
 
-pub(crate) fn account_init_target(display_name: &str) -> Result<AccountInitKey, String> {
+pub fn account_init_target(display_name: &str) -> Result<AccountInitKey, String> {
     account_init_target_in(&duck_root()?, display_name)
 }
 
@@ -233,7 +242,14 @@ mod tests {
         let path = key_file(duck, name);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         crate::userkey::write_user_key_new(&path, &line).unwrap();
-        crate::config::hex_bytes(&crate::userkey::read_user_key_file(&path).unwrap().pubkey)
+        // hex, inline: the one formatter this test wanted lived in the node
+        // binary, and borrowing it back would undo the point of the move.
+        crate::userkey::read_user_key_file(&path)
+            .unwrap()
+            .pubkey
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 
     #[test]
