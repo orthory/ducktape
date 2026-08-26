@@ -324,6 +324,7 @@ pub(crate) fn encode_frame(rgba: &[u8], width: u16, height: u16) -> Option<Vec<u
 /// hole. These are the three numbers that can: count says how many frames the
 /// capture source actually delivered, `worst_gap_us` is the hole, and
 /// `total_gap_us / (count - 1)` is what the mean should have been.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PreviewPace {
     pub frames: u64,
@@ -337,6 +338,7 @@ static PREVIEW_TOTAL_GAP_US: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 static PREVIEW_LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
 /// The self-view's delivery, for this process's life.
+#[cfg(test)]
 pub(crate) fn preview_pace() -> PreviewPace {
     PreviewPace {
         frames: PREVIEW_FRAMES.load(Ordering::Relaxed),

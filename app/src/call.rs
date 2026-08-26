@@ -435,6 +435,7 @@ static VOICE_HEARD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 const AUDIBLE: i16 = 1000;
 
 /// How many mixed frames with sound in them this process has received.
+#[cfg(test)]
 pub(crate) fn voice_frames_heard() -> u64 {
     VOICE_HEARD.load(Ordering::Relaxed)
 }

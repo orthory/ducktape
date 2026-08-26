@@ -2931,7 +2931,6 @@ dependencies = [
  "commonware-runtime",
  "directory",
  "dispatch 0.1.0",
- "duckdns",
  "files",
  "forge",
  "futures",
@@ -3202,7 +3201,6 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "sha2 0.10.9",
 ]
 
 [[package]]
@@ -3219,7 +3217,6 @@ dependencies = [
  "sdk-testkit",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
 ]
@@ -5424,7 +5421,6 @@ dependencies = [
  "sdk",
  "sdk-testkit",
  "serde",
- "serde_json",
  "sha2 0.10.9",
  "statesync",
 ]
@@ -5519,8 +5515,6 @@ dependencies = [
  "sdk",
  "sdk-testkit",
  "serde",
- "serde_json",
- "sha2 0.10.9",
  "statesync",
  "valset",
 ]
@@ -6078,7 +6072,6 @@ dependencies = [
  "anyhow",
  "argon2",
  "async-trait",
- "automations",
  "axum",
  "base64 0.22.1",
  "bip39",
@@ -6094,14 +6087,12 @@ dependencies = [
  "commonware-p2p",
  "commonware-parallel",
  "commonware-runtime",
- "commonware-storage",
  "commonware-utils",
  "compute-service",
  "consensus",
  "data-plane",
  "directory",
  "dispatch 0.1.0",
- "duckdns",
  "duckfs-client",
  "duckfs-core",
  "duckfs-disk",
@@ -6113,9 +6104,7 @@ dependencies = [
  "hex",
  "host",
  "identity",
- "inbox",
  "indexer",
- "kv",
  "libc",
  "lifecycle",
  "media-service",
@@ -6142,7 +6131,6 @@ dependencies = [
  "tagging",
  "tasks",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tokio-tungstenite 0.24.0",
@@ -6164,7 +6152,6 @@ dependencies = [
  "agent",
  "agent-service",
  "async-trait",
- "automations",
  "axum",
  "base64 0.22.1",
  "blobstore",
@@ -6176,10 +6163,8 @@ dependencies = [
  "commonware-runtime",
  "compute-service",
  "dispatch 0.1.0",
- "duckdns",
  "duckfs-client",
  "duckfs-core",
- "files",
  "flate2",
  "forge",
  "futures",
@@ -6188,12 +6173,10 @@ dependencies = [
  "host",
  "http-body-util",
  "identity",
- "inbox",
  "indexer",
  "media-service",
  "nettest",
  "node",
- "pages",
  "provider-host",
  "rand 0.8.6",
  "reqwest 0.12.28",
@@ -7583,10 +7566,8 @@ name = "provider-host"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "axum",
  "broker-host",
  "capability",
- "futures",
  "libc",
  "nettest",
  "provider-host",
@@ -7596,7 +7577,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "tokio-stream",
  "toml 0.8.23",
  "tracing",
 ]
@@ -7930,7 +7910,6 @@ dependencies = [
 name = "reachability"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
  "chacha20poly1305",
  "commonware-cryptography",
  "nat-traversal",
@@ -8499,7 +8478,6 @@ dependencies = [
 name = "sandbox-host"
 version = "0.1.0"
 dependencies = [
- "libc",
  "serde",
  "serde_json",
  "tempfile",
@@ -8890,7 +8868,6 @@ dependencies = [
  "commonware-cryptography",
  "commonware-runtime",
  "dispatch 0.1.0",
- "duckdns",
  "duckfs-core",
  "files",
  "forge",
