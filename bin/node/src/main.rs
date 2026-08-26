@@ -98,6 +98,7 @@ mod userkey;
 mod userkey_cli;
 mod util;
 mod validator;
+mod wallet;
 mod voice;
 mod voice_plane;
 mod work_admission;
