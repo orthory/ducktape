@@ -92,13 +92,6 @@ Run the workspace tests:
 cargo test --workspace
 ```
 
-Run the in-process super-app demo — registers the platform and product modules
-together and shows their roots moving under one composed root-hash:
-
-```sh
-cargo run -p demo
-```
-
 Run the real-socket cluster e2e — REAL node processes over localhost TCP,
 driven through the rpc: BFT convergence, a chat product loop, a governance
 vote, a live epoch cutover, a crash-fault liveness check, and a sync-only
@@ -112,7 +105,7 @@ Run the joiner state-sync proof — a fresh joiner rebuilds every module and
 lands on the source root-hash:
 
 ```sh
-cargo test -p demo --test network_joiner_full
+cargo test -p node-bin --test network_joiner_full
 ```
 
 Run everything the repo can verify locally (the wasm-artifact drift gate, the

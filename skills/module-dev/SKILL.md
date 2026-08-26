@@ -76,9 +76,8 @@ observably (`/v1/index/status` `fold.{module}`), never atomically.
 | `bin/node` | production set: native + wasm tenants | `constants.rs`: `MODULE_IDS` (bump the `[..; N]` literal). `host_state.rs`: ~10 sites — grep an existing module id and mirror EVERY hit (`include_bytes!`, id const, `genesis_<id>_wasm`, `seeded_lifecycle`, `seed_genesis_components`, `ProductionModules` field, `compose`, `genesis_host`, `restore_host`, `sync_all_modules`). `Cargo.toml` dep. |
 | `bin/noded` | daemon, composes native instances | grep `"tasks"`: id list, `use`, construct, register |
 | `bin/simnode` | deterministic /v1 twin | same shape as noded |
-| `bin/demo` | in-process walkthrough | same shape |
 
-noded/simnode/demo run a SUBSET — a wasm-only tenant (e.g. `vaults`) appears
+noded/simnode run a SUBSET — a wasm-only tenant (e.g. `vaults`) appears
 in `bin/node` alone. Decide whether the module belongs in the daemon/sim lanes;
 if it should be testable in sim-lane or visible in the app, it does.
 
@@ -101,7 +100,7 @@ make wasm-modules-check                                   # 5. committed copies 
 
 | Mistake | Reality |
 |---|---|
-| Registering only in `bin/node` | noded/simnode/demo compose their own instances; the module is invisible in daemon/sim lanes |
+| Registering only in `bin/node` | noded/simnode compose their own instances; the module is invisible in daemon/sim lanes |
 | Array `[..; N]` length left stale after adding/removing a module | the declared length must equal the contents or the build fails (the auto-merge count trap) |
 | Guest added to root workspace members | guests are standalone BY DESIGN; membership poisons native feature unification |
 | `include_bytes!` before `make wasm-modules` | bin/node cannot compile until the component exists |
