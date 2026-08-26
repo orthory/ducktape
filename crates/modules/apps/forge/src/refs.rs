@@ -10,15 +10,23 @@
 //! the phase-1 determinism invariant carries over PER BRANCH: consensus only
 //! ever gates on a compare-and-swap against a branch's COMMITTED head; packs,
 //! closures, and descent checks stay node-local catch-up, never accept/reject.
+//!
+//! the CAS gate and the staged fates are the pure consensus half (the wasm
+//! guest runs them); publishing to the on-disk git ref and materializing packs
+//! is the `native` substrate's half.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "native")]
 use std::path::Path;
 
-use git2::{Oid, Repository};
+#[cfg(feature = "native")]
+use git2::Repository;
 use sdk::Error;
 
 use crate::codec::{self, Reader};
+#[cfg(feature = "native")]
 use crate::git;
+use crate::oid::{OID_RAW_LEN, Oid};
 use crate::tracker_iface::MAX_BRANCH_BYTES;
 
 /// the protected default branch's SHORT name.
@@ -34,6 +42,7 @@ pub(crate) fn is_protected_branch(branch: &str) -> bool {
 }
 
 /// a branch short name to its full refname.
+#[cfg(feature = "native")]
 pub fn full_ref(short: &str) -> String {
     format!("{}{short}", git::HEADS_PREFIX)
 }
@@ -102,6 +111,8 @@ pub struct RepoState {
     /// are not yet installed on the on-disk ref, per branch.
     pub pending: BTreeMap<String, (Oid, [u8; 32])>,
     /// one-shot warn guard per branch (reset when its target changes/clears).
+    /// only materialization (the git substrate) reads it.
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
     warned: BTreeSet<String>,
 }
 
@@ -128,8 +139,7 @@ pub fn take_pending(r: &mut Reader) -> Result<PendingMap, Error> {
     for _ in 0..count {
         let branch = r.str_()?;
         norm_branch(&branch)?;
-        let oid = Oid::from_bytes(r.take(git::OID_RAW_LEN)?)
-            .map_err(|e| Error::Module(format!("forge pending: {e}")))?;
+        let oid = Oid::from_bytes(r.take(OID_RAW_LEN)?)?;
         if oid.is_zero() {
             return Err(Error::Module(format!(
                 "forge pending: branch {branch} carries a zero oid"
@@ -153,6 +163,17 @@ impl RepoState {
     pub fn with_refs(refs: BTreeMap<String, Oid>) -> Self {
         Self {
             refs,
+            ..Default::default()
+        }
+    }
+
+    /// a state mid-block: the committed branch map with this block's staged
+    /// fates already on it — how a per-dispatch runtime re-enters a block it
+    /// started in an earlier dispatch.
+    pub fn staged_over(refs: BTreeMap<String, Oid>, staged: BTreeMap<String, StagedRef>) -> Self {
+        Self {
+            refs,
+            staged,
             ..Default::default()
         }
     }
@@ -183,6 +204,25 @@ impl RepoState {
         }
     }
 
+    /// the branch map as it will read once this block's staged fates publish:
+    /// every packed head on, every deleted branch off. the pure half of
+    /// [`RepoState::publish`] — what a per-dispatch runtime hands the next
+    /// dispatch as the committed-so-far map.
+    pub fn published_refs(&self) -> BTreeMap<String, Oid> {
+        let mut refs = self.refs.clone();
+        for (branch, fate) in &self.staged {
+            match fate {
+                StagedRef::Packed(oid, _) => {
+                    refs.insert(branch.clone(), *oid);
+                }
+                StagedRef::Delete => {
+                    refs.remove(branch);
+                }
+            }
+        }
+        refs
+    }
+
     /// stage one CAS-guarded branch update — the SOLE consensus gate of the
     /// push path. `prev` must equal the branch's COMMITTED head (`None` ==
     /// unborn); `new: None` deletes. one staged fate per branch per block: a
@@ -209,9 +249,9 @@ impl RepoState {
         let fate = match new {
             None => {
                 if is_protected_branch(branch) {
-                    return Err(Error::Module(
-                        format!("forge: protected branch {branch:?} cannot be deleted"),
-                    ));
+                    return Err(Error::Module(format!(
+                        "forge: protected branch {branch:?} cannot be deleted"
+                    )));
                 }
                 if prev.is_none() {
                     return Err(Error::Module(format!(
@@ -234,6 +274,7 @@ impl RepoState {
     /// publish every staged branch (the `commit_block` half): publish packed
     /// heads to the committed map + record their materialization targets, or
     /// unbind deletes, then attempt node-local catch-up opportunistically.
+    #[cfg(feature = "native")]
     pub fn publish(
         &mut self,
         base: &Path,
@@ -273,6 +314,7 @@ impl RepoState {
     /// unconditionally once the closure
     /// verifies. absent/corrupt packs are SAFE no-ops (root already reflects
     /// the committed head) that warn once. NEVER touches `refs`/`root()`.
+    #[cfg(feature = "native")]
     pub fn materialize(
         &mut self,
         base: &Path,
@@ -286,8 +328,9 @@ impl RepoState {
         let mut done = Vec::new();
         for (branch, (head, digest)) in &self.pending {
             let refname = full_ref(branch);
-            let prior =
-                git::resolve_ref(&repo, &refname).map_err(|e| Error::Module(e.to_string()))?;
+            let prior = git::resolve_ref(&repo, &refname)
+                .map_err(|e| Error::Module(e.to_string()))?
+                .map(Oid::from);
             if prior == Some(*head) {
                 done.push(branch.clone());
                 continue;
@@ -342,6 +385,7 @@ impl RepoState {
 /// require the full closure of `head`, optionally require fast-forward, then
 /// move the ref. any failure is returned so the caller can turn
 /// it into a safe no-op.
+#[cfg(feature = "native")]
 fn install_and_advance(
     repo: &Repository,
     refname: &str,
@@ -351,23 +395,24 @@ fn install_and_advance(
     require_ff: bool,
 ) -> Result<(), Error> {
     git::install_pack(repo, pack).map_err(|e| Error::Module(e.to_string()))?;
-    git::verify_closure(repo, head).map_err(|e| Error::Module(e.to_string()))?;
+    git::verify_closure(repo, head.into()).map_err(|e| Error::Module(e.to_string()))?;
     if require_ff && let Some(prior) = prior {
-        let ff =
-            git::is_descendant(repo, head, prior).map_err(|e| Error::Module(e.to_string()))?;
+        let ff = git::is_descendant(repo, head.into(), prior.into())
+            .map_err(|e| Error::Module(e.to_string()))?;
         if !ff {
             return Err(Error::Module(format!(
                 "head does not fast-forward on-disk ref {prior}"
             )));
         }
     }
-    git::update_ref(repo, refname, head).map_err(|e| Error::Module(e.to_string()))?;
+    git::update_ref(repo, refname, head.into()).map_err(|e| Error::Module(e.to_string()))?;
     Ok(())
 }
 
 /// open the per-repo libgit2 repository at `base/<name>`, initializing a fresh
 /// sha1 repo there if the dir has no `.git` yet. node-local: the dir path is
 /// not consensus state, only the committed branch oids it yields are.
+#[cfg(feature = "native")]
 pub fn open_or_init_repo(base: &Path, name: &str) -> Result<Repository, Error> {
     let dir = base.join(name);
     let repo = if dir.join(".git").exists() {
@@ -388,8 +433,20 @@ mod tests {
             assert!(norm_branch(ok).is_ok(), "{ok:?} must be accepted");
         }
         for bad in [
-            "", "/x", "x/", "a//b", "-x", ".x", "a/.hidden", "a/-b", "x.lock", "a/b.lock",
-            "a b", "a:b", "a~b", "café",
+            "",
+            "/x",
+            "x/",
+            "a//b",
+            "-x",
+            ".x",
+            "a/.hidden",
+            "a/-b",
+            "x.lock",
+            "a/b.lock",
+            "a b",
+            "a:b",
+            "a~b",
+            "café",
         ] {
             assert!(norm_branch(bad).is_err(), "{bad:?} must be rejected");
         }
@@ -400,8 +457,8 @@ mod tests {
     #[test]
     fn stage_update_cas_and_protection_rules() {
         let mut st = RepoState::default();
-        let a = Oid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
-        let b = Oid::from_str("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        let a = Oid::from_hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let b = Oid::from_hex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
         let digest = [7u8; 32];
 
         let mut missing_pack = RepoState::default();
@@ -442,5 +499,16 @@ mod tests {
         st2.stage_update("feat", Some(a), None, None).unwrap();
         assert_eq!(st2.effective_head("feat"), None, "staged delete shadows");
         assert_eq!(st2.effective_head("main"), Some(a));
+        let published = st2.published_refs();
+        assert!(
+            !published.contains_key("feat"),
+            "a staged delete publishes off"
+        );
+        assert_eq!(published.get("main"), Some(&a));
+        assert_eq!(
+            st.published_refs().get("main"),
+            Some(&b),
+            "a packed head publishes on"
+        );
     }
 }

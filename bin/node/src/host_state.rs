@@ -8,7 +8,7 @@ use commonware_cryptography::ed25519;
 use commonware_runtime::Supervisor as _;
 use duckfs_disk::SyncScratch;
 use files::{Files, FilesOdbBacking};
-use forge::Forge;
+use forge::ForgeOdbBacking;
 use host::Host;
 use lifecycle::Lifecycle;
 use recovery::Manifest;
@@ -224,6 +224,15 @@ const FILES_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/apps/files/component.wasm");
 const FILES_MODULE_ID: &str = "files";
 
+/// forge: the guest runs the pure consensus core (the CAS gate, ownership,
+/// the tracker) over the host state lane while the HOST keeps the git
+/// substrate — repos, packs, materialization — behind a [`ForgeOdbBacking`]
+/// (`WasmModule::with_odb`). Its module root is the native composition over
+/// born branches + tracker.
+const FORGE_WASM_COMPONENT: &[u8] =
+    include_bytes!("../../../crates/modules/apps/forge/component.wasm");
+const FORGE_MODULE_ID: &str = "forge";
+
 /// genesis-seed the code registry: every wasm tenant's initial active code
 /// hash, identical on every node (the embedded components ARE the hashes'
 /// preimages). shared by the genesis / restore / state-sync host builders so
@@ -333,6 +342,12 @@ async fn seeded_lifecycle(store: Box<dyn sdk::MerkleStore>) -> Lifecycle {
     .await
     .expect("genesis lifecycle seed stages");
     reg.seed(
+        FORGE_MODULE_ID,
+        sha2::Sha256::digest(FORGE_WASM_COMPONENT).to_vec(),
+    )
+    .await
+    .expect("genesis lifecycle seed stages");
+    reg.seed(
         ACL_MODULE_ID,
         sha2::Sha256::digest(ACL_WASM_COMPONENT).to_vec(),
     )
@@ -369,6 +384,7 @@ pub(super) fn seed_genesis_components(blobs: &blobstore::BlobHandle) {
     blobs.put_chunk(RUNS_WASM_COMPONENT.to_vec());
     blobs.put_chunk(DISPATCH_WASM_COMPONENT.to_vec());
     blobs.put_chunk(FILES_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(FORGE_WASM_COMPONENT.to_vec());
     blobs.put_chunk(ACL_WASM_COMPONENT.to_vec());
 }
 
@@ -494,6 +510,19 @@ fn files_wasm(dir: std::path::PathBuf) -> Result<WasmModule, sdk::Error> {
     WasmModule::with_odb(FILES_MODULE_ID, FILES_WASM_COMPONENT, Box::new(backing))
 }
 
+/// forge at its GENESIS code over the host-side git substrate at `repo`.
+/// `open` re-adopts every on-disk repo's committed branches, the catch-up
+/// map, and the tracker file. forge shares the blob plane so a Push's
+/// packfile (staged on the blob lane before submit) can materialize locally;
+/// the pack never touches root.
+fn forge_wasm(
+    repo: std::path::PathBuf,
+    blobs: blobstore::BlobHandle,
+) -> Result<WasmModule, sdk::Error> {
+    let backing = ForgeOdbBacking::open(FORGE_MODULE_ID, repo, blobs)?;
+    WasmModule::with_odb(FORGE_MODULE_ID, FORGE_WASM_COMPONENT, Box::new(backing))
+}
+
 /// identity at its GENESIS code over the host-constructed store (same three
 /// store lifecycles as [`pages_wasm`]). the per-network chain id every signed
 /// certificate preimage folds in is a `__config` STORE RECORD, seeded at
@@ -557,7 +586,7 @@ async fn seed_store_config(store: &mut dyn sdk::MerkleStore, params: &[(&str, &[
 struct ProductionModules {
     pages: WasmModule,
     chat: WasmModule,
-    forge: Forge,
+    forge: WasmModule,
     valset: Valset,
     acl: WasmModule,
     governance: WasmModule,
@@ -692,11 +721,7 @@ pub(super) async fn genesis_host(
         QmdbStore::init(context.child("inbox"), "inbox").await,
     ));
     seed_genesis_components(&blobs);
-    // forge shares the blob plane so a Push's packfile (staged on the blob
-    // lane before submit) can materialize locally; the pack never touches root.
-    let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
-        .expect("forge init")
-        .with_chat("chat");
+    let forge = forge_wasm(forge_repo.to_path_buf(), blobs).expect("forge init");
     // the membership registry is NATIVE but store-backed like lifecycle:
     // genesis-seed the validator set from config — deterministic and identical
     // on every node, so membership is IN consensus state from block zero (the
@@ -720,9 +745,7 @@ pub(super) async fn genesis_host(
     // tagging/capability, and deliberately EMPTY at genesis: an empty table
     // is allow-all, so a fresh network admits any validly signed frame to any
     // module and the table exists only for governance to tighten later.
-    let acl_table = acl_wasm(Box::new(
-        QmdbStore::init(context.child("acl"), "acl").await,
-    ));
+    let acl_table = acl_wasm(Box::new(QmdbStore::init(context.child("acl"), "acl").await));
     ProductionModules {
         pages,
         chat,
@@ -860,10 +883,7 @@ pub(super) async fn restore_host(
         QmdbStore::init(context.child("tagging"), "tagging").await,
     ));
     seed_genesis_components(&blobs);
-    // forge shares the blob plane (see genesis_host) for Push materialization.
-    let forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
-        .map_err(|e| format!("forge: {e}"))?
-        .with_chat("chat");
+    let forge = forge_wasm(forge_repo.to_path_buf(), blobs).map_err(|e| format!("forge: {e}"))?;
     let snapshot_of = |id: &str| -> Result<(&[u8], StateRoot), String> {
         let bytes = manifest
             .snapshot(id)
@@ -881,9 +901,7 @@ pub(super) async fn restore_host(
         Box::new(QmdbStore::init(context.child("valset"), "valset").await),
     );
     // the submit-policy table reopens the same way (empty store = allow-all).
-    let acl_table = acl_wasm(Box::new(
-        QmdbStore::init(context.child("acl"), "acl").await,
-    ));
+    let acl_table = acl_wasm(Box::new(QmdbStore::init(context.child("acl"), "acl").await));
 
     // the lifecycle module-code registry reopens like the other store-backed
     // tenants (its store carries the genesis seeds and every committed swap);
@@ -1339,10 +1357,9 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
     runs.install(&bytes, root)
         .map_err(|e| format!("runs install: {e}"))?;
 
-    let (bytes, root) = snapshot_of("forge").await?;
-    let mut forge = Forge::with_blobs("forge", forge_repo.to_path_buf(), blobs)
-        .map_err(|e| format!("forge init: {e}"))?
-        .with_chat("chat");
+    let (bytes, root) = snapshot_of(FORGE_MODULE_ID).await?;
+    let mut forge =
+        forge_wasm(forge_repo.to_path_buf(), blobs).map_err(|e| format!("forge init: {e}"))?;
     forge
         .install(&bytes, root)
         .map_err(|e| format!("forge install: {e}"))?;
@@ -1421,7 +1438,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "bb5657ad499d8422d0e5762bb4eddc65f3f01331f96d0d777e6586e201dd016c";
+        "3dff07e927044a1a65313c5118a2aaf85ee581b518bd5bec818c3cb7b835bb64";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's store as a genesis

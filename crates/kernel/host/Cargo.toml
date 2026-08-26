@@ -81,6 +81,11 @@ files = { workspace = true }
 # the vaults whole-state parity proof stands the native module beside its
 # wasm port and cross-installs snapshots between the runtimes.
 vaults = { workspace = true }
+# the forge root-continuity proof stands the native module beside its wasm port
+# over the git substrate; `testkit` builds the real git history + packs the
+# push ops need.
+forge = { workspace = true, features = ["testkit"] }
+blobstore = { workspace = true }
 tempfile = "3"
 commonware-cryptography = { workspace = true }
 commonware-runtime = { workspace = true }

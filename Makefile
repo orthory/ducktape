@@ -197,7 +197,7 @@ BUILDER_MODULES := \
   crates/modules/apps/inbox crates/modules/apps/pages crates/modules/apps/agent \
   crates/modules/apps/automations crates/modules/apps/runs \
   crates/modules/apps/tasks crates/modules/apps/chat crates/modules/apps/files \
-  crates/modules/apps/vaults \
+  crates/modules/apps/vaults crates/modules/apps/forge \
   crates/modules/system/tagging crates/modules/system/dispatch \
   crates/modules/system/capability crates/modules/system/identity \
   crates/modules/system/gateway crates/modules/system/governance \

@@ -28,15 +28,14 @@
 use std::collections::BTreeMap;
 
 use chat::AuthorRef;
-use git2::Oid;
 use sdk::{Error, Msg, Origin};
 
 use crate::codec::{self, Reader};
-use crate::git;
+use crate::oid::{OID_RAW_LEN, Oid};
 use crate::tracker_iface::{
-    channel_id_for, DiffSide, ItemDetail, ItemKind, ItemState, ItemSummary, ReviewComment,
-    ReviewVerdict, ReviewView, MAX_BODY_BYTES, MAX_PATH_BYTES, MAX_REVIEWS_PER_ITEM,
-    MAX_REVIEW_COMMENTS, MAX_REVIEW_COMMENT_BYTES, MAX_TITLE_BYTES,
+    DiffSide, ItemDetail, ItemKind, ItemState, ItemSummary, MAX_BODY_BYTES, MAX_PATH_BYTES,
+    MAX_REVIEW_COMMENT_BYTES, MAX_REVIEW_COMMENTS, MAX_REVIEWS_PER_ITEM, MAX_TITLE_BYTES,
+    ReviewComment, ReviewVerdict, ReviewView, channel_id_for,
 };
 
 /// the canonical-bytes header: magic + layout version. the disk file, the
@@ -102,8 +101,8 @@ pub struct RepoTracker {
     /// the principal that owns this repo — `None` until a push births it.
     /// pinned by the BIRTHING push and never reassigned; only this principal
     /// may move a protected branch (`main`/`dev`) afterwards. see
-    /// [`crate::Forge::stage_push_refs`] for why authorization is the whole of
-    /// protected-branch safety.
+    /// [`crate::state::ForgeState::stage_push_refs`] for why authorization is
+    /// the whole of protected-branch safety.
     pub owner: Option<Vec<u8>>,
     /// the LAST assigned number; 0 = none yet. the next item gets `+1`.
     pub last_number: u64,
@@ -176,7 +175,7 @@ pub fn parse_hex_oid(s: &str, field: &str) -> Result<Oid, Error> {
             s.len()
         )));
     }
-    Oid::from_str(&s.to_ascii_lowercase()).map_err(|e| Error::Module(e.to_string()))
+    Oid::from_hex(&s.to_ascii_lowercase())
 }
 
 impl Tracker {
@@ -304,7 +303,11 @@ impl Tracker {
                 "forge: a merged pull request cannot change state".into(),
             ));
         }
-        let target = if open { ItemState::Open } else { ItemState::Closed };
+        let target = if open {
+            ItemState::Open
+        } else {
+            ItemState::Closed
+        };
         if item.state == target {
             return Ok(None);
         }
@@ -460,9 +463,11 @@ impl Tracker {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        let body = bytes.strip_prefix(TRACKER_MAGIC.as_slice()).ok_or_else(|| {
-            Error::Module("forge tracker: bad magic (not a TRK1 container)".into())
-        })?;
+        let body = bytes
+            .strip_prefix(TRACKER_MAGIC.as_slice())
+            .ok_or_else(|| {
+                Error::Module("forge tracker: bad magic (not a TRK1 container)".into())
+            })?;
         let mut r = Reader::new(body);
         let repo_count = r.u32()?;
         let mut repos = BTreeMap::new();
@@ -545,18 +550,24 @@ fn decode_author(r: &mut Reader) -> Result<AuthorRef, Error> {
 
 fn encode_item(out: &mut Vec<u8>, item: &Item) {
     codec::put_u64(out, item.number);
-    codec::put_u8(out, match item.kind {
-        ItemKind::Issue => 0,
-        ItemKind::Pr => 1,
-    });
+    codec::put_u8(
+        out,
+        match item.kind {
+            ItemKind::Issue => 0,
+            ItemKind::Pr => 1,
+        },
+    );
     codec::put_str(out, &item.title);
     codec::put_str(out, &item.body);
     encode_author(out, &item.author);
-    codec::put_u8(out, match item.state {
-        ItemState::Open => 0,
-        ItemState::Closed => 1,
-        ItemState::Merged => 2,
-    });
+    codec::put_u8(
+        out,
+        match item.state {
+            ItemState::Open => 0,
+            ItemState::Closed => 1,
+            ItemState::Merged => 2,
+        },
+    );
     codec::put_u64(out, item.created_at);
     codec::put_u64(out, item.updated_at);
     codec::put_u64(out, item.sys_seq);
@@ -573,24 +584,30 @@ fn encode_item(out: &mut Vec<u8>, item: &Item) {
         codec::put_u32(out, item.reviews.len() as u32);
         for review in &item.reviews {
             encode_author(out, &review.author);
-            codec::put_u8(out, match review.verdict {
-                ReviewVerdict::Approve => 0,
-                ReviewVerdict::RequestChanges => 1,
-                ReviewVerdict::Comment => 2,
-            });
+            codec::put_u8(
+                out,
+                match review.verdict {
+                    ReviewVerdict::Approve => 0,
+                    ReviewVerdict::RequestChanges => 1,
+                    ReviewVerdict::Comment => 2,
+                },
+            );
             codec::put_str(out, &review.body);
             // commit_oid is stored normalized 40-hex; re-encode raw.
-            let oid = Oid::from_str(&review.commit_oid).expect("stored normalized");
+            let oid = Oid::from_hex(&review.commit_oid).expect("stored normalized");
             out.extend_from_slice(oid.as_bytes());
             codec::put_u64(out, review.created_at);
             codec::put_u32(out, review.comments.len() as u32);
             for c in &review.comments {
                 codec::put_str(out, &c.path);
                 codec::put_u32(out, c.line);
-                codec::put_u8(out, match c.side {
-                    DiffSide::Old => 0,
-                    DiffSide::New => 1,
-                });
+                codec::put_u8(
+                    out,
+                    match c.side {
+                        DiffSide::Old => 0,
+                        DiffSide::New => 1,
+                    },
+                );
                 codec::put_str(out, &c.body);
             }
         }
@@ -636,10 +653,7 @@ fn decode_item(r: &mut Reader) -> Result<Item, Error> {
         item.target_branch = Some(r.str_()?);
         item.merge_oid = match r.u8()? {
             0 => None,
-            1 => Some(
-                Oid::from_bytes(r.take(git::OID_RAW_LEN)?)
-                    .map_err(|e| Error::Module(e.to_string()))?,
-            ),
+            1 => Some(Oid::from_bytes(r.take(OID_RAW_LEN)?)?),
             t => return Err(Error::Module(format!("forge tracker: bad merge tag {t}"))),
         };
         let n_reviews = r.u32()?;
@@ -649,15 +663,10 @@ fn decode_item(r: &mut Reader) -> Result<Item, Error> {
                 0 => ReviewVerdict::Approve,
                 1 => ReviewVerdict::RequestChanges,
                 2 => ReviewVerdict::Comment,
-                t => {
-                    return Err(Error::Module(format!(
-                        "forge tracker: bad verdict tag {t}"
-                    )))
-                }
+                t => return Err(Error::Module(format!("forge tracker: bad verdict tag {t}"))),
             };
             let body = r.str_()?;
-            let commit = Oid::from_bytes(r.take(git::OID_RAW_LEN)?)
-                .map_err(|e| Error::Module(e.to_string()))?;
+            let commit = Oid::from_bytes(r.take(OID_RAW_LEN)?)?;
             let created_at = r.u64()?;
             let n_comments = r.u32()?;
             let mut comments = Vec::with_capacity(n_comments.min(1024) as usize);
@@ -667,9 +676,7 @@ fn decode_item(r: &mut Reader) -> Result<Item, Error> {
                 let side = match r.u8()? {
                     0 => DiffSide::Old,
                     1 => DiffSide::New,
-                    t => {
-                        return Err(Error::Module(format!("forge tracker: bad side tag {t}")))
-                    }
+                    t => return Err(Error::Module(format!("forge tracker: bad side tag {t}"))),
                 };
                 let body = r.str_()?;
                 comments.push(ReviewComment {
@@ -712,7 +719,13 @@ pub fn create_channel_msg(chat_target: &str, repo: &str, number: u64) -> Msg {
 
 /// a one-line system message into an item's discussion channel ("closed",
 /// "reopened", "merged", "approved these changes", ...).
-pub fn system_line_msg(chat_target: &str, repo: &str, number: u64, message_id: String, text: &str) -> Msg {
+pub fn system_line_msg(
+    chat_target: &str,
+    repo: &str,
+    number: u64,
+    message_id: String,
+    text: &str,
+) -> Msg {
     Msg {
         target: chat_target.to_string(),
         payload: chat::encode_msg(&chat::ChatMsg::PostMessage {
@@ -737,7 +750,15 @@ mod tests {
     fn numbering_is_shared_and_sequential() {
         let mut t = Tracker::default();
         let a = t
-            .open_item("demo", ItemKind::Issue, "one".into(), String::new(), user(1), 10, None)
+            .open_item(
+                "demo",
+                ItemKind::Issue,
+                "one".into(),
+                String::new(),
+                user(1),
+                10,
+                None,
+            )
             .unwrap();
         let b = t
             .open_item(
@@ -751,9 +772,21 @@ mod tests {
             )
             .unwrap();
         let c = t
-            .open_item("other", ItemKind::Issue, "own space".into(), String::new(), user(1), 12, None)
+            .open_item(
+                "other",
+                ItemKind::Issue,
+                "own space".into(),
+                String::new(),
+                user(1),
+                12,
+                None,
+            )
             .unwrap();
-        assert_eq!((a, b, c), (1, 2, 1), "shared per-repo space, per-repo counters");
+        assert_eq!(
+            (a, b, c),
+            (1, 2, 1),
+            "shared per-repo space, per-repo counters"
+        );
     }
 
     #[test]
@@ -770,27 +803,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(t.set_state("demo", 1, false, 2).unwrap(), Some("closed"));
-        assert_eq!(t.set_state("demo", 1, false, 3).unwrap(), None, "no-op repeat");
+        assert_eq!(
+            t.set_state("demo", 1, false, 3).unwrap(),
+            None,
+            "no-op repeat"
+        );
         assert_eq!(t.set_state("demo", 1, true, 4).unwrap(), Some("reopened"));
-        let merge = Oid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let merge = Oid::from_hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
         t.merge_pr("demo", 1, merge, 5).unwrap();
-        assert!(t.set_state("demo", 1, true, 6).is_err(), "merged is terminal");
-        assert!(t.merge_pr("demo", 1, merge, 7).is_err(), "double merge rejected");
+        assert!(
+            t.set_state("demo", 1, true, 6).is_err(),
+            "merged is terminal"
+        );
+        assert!(
+            t.merge_pr("demo", 1, merge, 7).is_err(),
+            "double merge rejected"
+        );
         let d = t.get("demo", 1).unwrap();
         assert_eq!(d.summary.state, ItemState::Merged);
-        assert_eq!(d.merge_oid.as_deref(), Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert_eq!(
+            d.merge_oid.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
     }
 
     #[test]
     fn edit_is_author_only() {
         let mut t = Tracker::default();
-        t.open_item("demo", ItemKind::Issue, "t".into(), "b".into(), user(1), 1, None)
-            .unwrap();
-        assert!(t
-            .edit_item("demo", 1, &user(2), Some("x".into()), None, 2)
-            .is_err());
-        t.edit_item("demo", 1, &user(1), Some("new title".into()), Some("new body".into()), 3)
-            .unwrap();
+        t.open_item(
+            "demo",
+            ItemKind::Issue,
+            "t".into(),
+            "b".into(),
+            user(1),
+            1,
+            None,
+        )
+        .unwrap();
+        assert!(
+            t.edit_item("demo", 1, &user(2), Some("x".into()), None, 2)
+                .is_err()
+        );
+        t.edit_item(
+            "demo",
+            1,
+            &user(1),
+            Some("new title".into()),
+            Some("new body".into()),
+            3,
+        )
+        .unwrap();
         let d = t.get("demo", 1).unwrap();
         assert_eq!(d.summary.title, "new title");
         assert_eq!(d.body, "new body");
@@ -799,8 +861,16 @@ mod tests {
     #[test]
     fn canonical_bytes_round_trip() {
         let mut t = Tracker::default();
-        t.open_item("demo", ItemKind::Issue, "issue".into(), "body".into(), user(1), 1, None)
-            .unwrap();
+        t.open_item(
+            "demo",
+            ItemKind::Issue,
+            "issue".into(),
+            "body".into(),
+            user(1),
+            1,
+            None,
+        )
+        .unwrap();
         t.open_item(
             "demo",
             ItemKind::Pr,
@@ -852,8 +922,16 @@ mod tests {
         // space is consensus state: reusing #1 after a rebuild would relink
         // old channels).
         let mut t2 = Tracker::default();
-        t2.open_item("demo", ItemKind::Issue, "x".into(), String::new(), user(1), 1, None)
-            .unwrap();
+        t2.open_item(
+            "demo",
+            ItemKind::Issue,
+            "x".into(),
+            String::new(),
+            user(1),
+            1,
+            None,
+        )
+        .unwrap();
         assert!(!t2.is_empty());
     }
 }

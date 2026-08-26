@@ -3,9 +3,24 @@ name = "forge"
 edition.workspace = true
 version.workspace = true
 
-# a git-backed module: state is a real git repo, root() is sha256 of its HEAD
-# sha1 oid. libgit2 is VENDORED (built from source) so the node binary is
-# self-contained — no host `git` install needed.
+# a git-backed module: the consensus core (the CAS gate, ownership, the
+# tracker) is pure and runs native OR as a wasm guest; the git substrate
+# (real repos via VENDORED libgit2, so the node binary is self-contained — no
+# host `git` install needed) is native-only, behind the `native` feature.
+[features]
+default = ["native"]
+# the on-disk git substrate: the `Forge` module, its `ForgeOdbBacking` twin for
+# the wasm tenant, snapshot packing, and materialization.
+native = ["dep:git2", "dep:blobstore", "dep:tracing", "dep:wasm-host"]
+# the wasm-guest port: the pure `ForgeState` core over the host state lane +
+# object plane. non-default and wasm-only (the guest-adapter bindings compile
+# only for wasm32-unknown-unknown).
+guest = ["dep:guest-adapter"]
+# the git-history/packfile builder (`forge::testkit`). no extra deps beyond
+# the substrate, but gating keeps it out of the shipped binary, exactly as
+# identity/noded do with theirs.
+testkit = ["native"]
+
 [dependencies]
 base64 = { workspace = true }
 sdk = { workspace = true }
@@ -13,9 +28,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # the node-local blob store forge fetches Push packfiles from by digest. the
 # same node-local receipt lane the daemon and the files module share; the
-# packfile bytes never enter consensus (see the `PushRefs` op in lib.rs).
-blobstore = { workspace = true }
-# sha2 rehashes the 20-byte sha1 HEAD oid into a 32-byte StateRoot (always used).
+# packfile bytes never enter consensus (see the `PushRefs` op in state.rs).
+blobstore = { workspace = true, optional = true }
+# sha2 composes the state root over the 20-byte sha1 oids (always used).
 sha2 = { workspace = true }
 # chat's WIRE TYPES only: forge opens one hidden discussion channel per
 # issue/PR (`forge:<repo>:<n>`) and posts state-change system lines into it via
@@ -24,21 +39,22 @@ sha2 = { workspace = true }
 chat = { workspace = true }
 # identity's WIRE TYPES only: forge resolves a ref-moving origin to the account
 # it belongs to, so the SAME human's node-key `git push` and user-key app merge
-# land on one owner principal (see `Forge::principal_of_origin`).
+# land on one owner principal (see `ForgeState::principal_of_origin`).
 identity = { workspace = true }
 async-trait = { workspace = true }
 # the node's log plane — `materialize`'s pack-missing / refused-advance warnings
 # must reach the app's Logs tab and `RUST_LOG`, which a `println!` never does.
-tracing = { workspace = true }
+tracing = { workspace = true, optional = true }
 # vendored libgit2 (built via cmake + cc). default-features=false drops the
 # ssh/https transport (openssl/libssh2) — forge only touches local repos.
-git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
-
-[features]
-# the git-history/packfile builder (`forge::testkit`). no extra deps — git2 is
-# already a production dependency — but gating keeps it out of the shipped
-# binary, exactly as identity/noded do with theirs.
-testkit = []
+git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"], optional = true }
+# the kernel host: `ForgeOdbBacking` implements its `OdbBacking` trait. native
+# feature only; no cycle — wasm-host has no forge dep.
+wasm-host = { workspace = true, optional = true }
+# wasm-only, behind `guest`: the port harness (WitCtx / host imports). a
+# standalone-workspace path crate, pulled only when the `guest` feature builds
+# for wasm32 — never by the native gate.
+guest-adapter = { path = "../../../guests/guest-adapter", optional = true }
 
 [dev-dependencies]
 # forge's OWN integration tests need `forge::testkit`, and a crate does not

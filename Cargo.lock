@@ -3772,6 +3772,7 @@ dependencies = [
  "forge",
  "futures",
  "git2",
+ "guest-adapter",
  "host",
  "identity",
  "sdk",
@@ -3780,6 +3781,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tracing",
+ "wasm-host",
 ]
 
 [[package]]
@@ -4507,6 +4509,7 @@ dependencies = [
  "async-trait",
  "automations",
  "base64 0.22.1",
+ "blobstore",
  "capability",
  "chat",
  "commonware-cryptography",
@@ -4515,6 +4518,7 @@ dependencies = [
  "dispatch 0.1.0",
  "duckdns",
  "files",
+ "forge",
  "futures",
  "gateway",
  "governance",
