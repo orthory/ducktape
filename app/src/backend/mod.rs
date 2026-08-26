@@ -46,10 +46,6 @@ const DEFAULT_RPC: &str = "http://127.0.0.1:8844";
 const MAX_SIGNED_PAYLOAD_BYTES: usize = 23 * 1024;
 const MAX_FRAME_HEX_BYTES: usize = 3 * 1024 * 1024;
 const ENCRYPTED_KEY_PREFIX: &str = "ducktape-user-key-v1:";
-/// `node init` mints a key and writes a workspace; `node join` fetches an
-/// invite's fronts. Both are slower than an rpc round-trip and both are
-/// interactive-blocking, so they get their own ceiling.
-const CLI_TIMEOUT: Duration = Duration::from_secs(120);
 /// How many one-second polls the provisioning screen waits before it says the
 /// node is not running and names the command that starts it.
 const PROVISION_PATIENCE: u32 = 8;

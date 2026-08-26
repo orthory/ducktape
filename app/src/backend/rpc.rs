@@ -541,9 +541,9 @@ pub(crate) fn user_error(message: String) -> String {
     if key_unreadable {
         return "This device's user key is missing or unreadable. Check Settings.".into();
     }
-    // The only surviving subprocesses are node control — `node join`/`invite`
-    // and the agent verbs. Nothing on the key path execs anything any more, so
-    // this sentence must not claim a signing helper.
+    // The only surviving subprocess is the agent pty. Keys, signing, run
+    // scheduling, invite minting and joining a network all happen in this
+    // process now, so this sentence must not claim any of them.
     let cli_missing = message.contains("DUCKTAPE_BIN");
     if cli_missing {
         return "Ducktape's command-line tool could not start. Check the ducktape install in \

@@ -5,8 +5,7 @@
 
 use std::path::PathBuf;
 
-use commonware_codec::DecodeExt as _;
-use commonware_cryptography::{Signer as _, ed25519};
+use commonware_cryptography::Signer as _;
 
 use crate::cli_args::{
     AdmitArgs, InitArgs, InviteArgs, JoinCmd, JoinQuery, KeyArgs, MemberCmd, OpCmd, PubkeyArgs,
@@ -395,54 +394,23 @@ fn cmd_keygen(args: KeyArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// the compute adapter as the `[sandbox]` table generation writes it (`0` =
-/// probe the host at boot) plus the probeable backend, so generation and
-/// detection share one choice. One adapter per OS: Firecracker on Linux, the
-/// vz shim on macOS. `node init` writes the block commented out, so a host
-/// that cannot run a microVM gets the probe's loud error when an operator
-/// uncomments it, not a silent misconfiguration now.
-fn platform_sandbox() -> (config::SandboxToml, provider_host::SandboxBackend) {
-    // This only writes the default [sandbox] TOML at `node init`. The images
-    // need not exist yet — `node init` runs before `ops/build-guest-rootfs.sh`
-    // on a fresh box, and the loud error belongs to the boot probe, where an
-    // operator who uncommented the table is standing.
-    let vmm = provider_host::Vmm::platform_default();
-    let guest = std::path::Path::new(config::DEFAULT_GUEST_DIR);
-    let (kernel, rootfs) = (guest.join("vmlinux"), guest.join("rootfs.ext4"));
-    let backend = provider_host::SandboxBackend::MicroVm {
-        vmm,
-        kernel: kernel.clone(),
-        rootfs: rootfs.clone(),
-    };
-    let table = config::SandboxToml {
-        runtime: vmm.config_token().into(),
-        kernel,
-        rootfs,
-        cores: 0,
-        mem_gb: 0,
-    };
-    (table, backend)
-}
-
-/// fresh-workspace compute detection (`init`, `join`): the platform adapter's
-/// runtime binary on PATH ⇒ a live `[sandbox]` table, with a stderr note;
-/// absent ⇒ `None` (today's commented example).
+/// fresh-workspace compute detection with the operator note (`init`; `join`
+/// says it from the library's answer). The probe and the table it writes come
+/// from `config::platform_sandbox`, so a host can never be probed for one thing
+/// and configured for another.
 ///
 /// The table says only HOW runs would be isolated on this host — it grants
 /// nothing. Whether this node runs a compute service at all is the user's
-/// `ducktape service enable compute`, so detection can stay eager: it makes
-/// the interactive terminal plane work out of the box and leaves the compute
-/// plane dark until someone consents to it.
+/// `ducktape service enable compute`, so detection can stay eager: it makes the
+/// interactive terminal plane work out of the box and leaves the compute plane
+/// dark until someone consents to it.
 fn detect_platform_sandbox() -> Option<config::SandboxToml> {
-    let (table, backend) = platform_sandbox();
-    let Ok(runtime_path) = backend.probe() else {
-        return None;
-    };
+    let (table, found) = config::detect_platform_sandbox()?;
     eprintln!(
         "compute plane: {} found at {} — writing a live [sandbox] table \
          (announce stays off; delete the table for a consensus-only node)",
         table.runtime,
-        runtime_path.display()
+        found.display()
     );
     Some(table)
 }
@@ -1567,120 +1535,54 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
     // argv words are rejoined (a blob pasted unquoted splits on its wrapped
     // spaces); no argv at all reads the blob from stdin. decode strips ALL
     // whitespace, so both paths tolerate a line-wrapped paste verbatim.
+    //
+    // READING the blob is what stays here: a terminal prompt is the CLI's
+    // business, and it is exactly what `join_workspace` refuses to know about.
     let blob = match args.blob.is_empty() {
         false => args.blob.concat(),
         true => read_invite_blob_from_stdin()?,
     };
-    let invite = config::decode_invite(&blob)?;
-    let mut descriptor = invite.descriptor.clone();
-    let explicit_dir = args.dir.is_some();
-    // same default as `init`: without `--dir` the workspace materializes in
-    // the registry under its chain id (known here from the invite), so the
-    // joined node is `-n <chain-id>`-addressable. a re-join for the same
-    // chain lands in the same dir and reuses its identity, as before.
-    let dir = match args.dir {
-        Some(dir) => dir,
-        None => config::default_workspace_dir(&descriptor.chain_id)?,
-    };
-    std::fs::create_dir_all(&dir)?;
-    // mint (or reuse) this workspace dir's identity. Every invite is bearer
-    // (invites are bearer credentials): there is no target to match, so any freshly minted
-    // key may redeem — the OOB "hand the inviter your join code first" step is
-    // gone. The redeeming key is bound by the join proof and the token is
-    // single-use, so a paste simply admits whoever runs it.
-    let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
-    let me_hex = hex_bytes(key.public_key().as_ref());
-    config::guard_join_descriptor(&dir, &descriptor)?;
-    // plumbing merges: explicit flags win, an existing node.toml's values
-    // (network shape only — a dev-seed or incomplete file aborts) survive,
-    // working defaults fill the rest. computed BEFORE anything lands on disk
-    // so a corrupt existing node.toml aborts the join without leaving a
-    // partially written dir.
     let net = &args.plumbing;
-    let fresh_workspace = !dir.join("node.toml").exists();
-    let mut plumbing = config::merged_plumbing(
-        &dir,
-        net.listen.as_deref(),
-        net.advertised.as_deref(),
-        net.http.as_deref(),
-        net.gateway.as_deref(),
-        net.rpc.as_deref(),
-        net.wireguard_listen.as_deref(),
-        net.invite_listen.as_deref(),
-        net.primary_coordinator.as_deref(),
-        net.wireguard_advertised.as_deref(),
-    )?;
-    // a FRESH joining workspace gets the same compute detection as init: the
-    // platform runtime on PATH ⇒ a live [sandbox] table (announce stays off),
-    // so agent runs and the terminal plane work without a config edit. a
-    // re-join over an existing node.toml keeps the operator's choice.
-    if fresh_workspace {
-        plumbing.sandbox = detect_platform_sandbox();
-    }
-    if config::invite_requires_reachability_defaults(&invite) {
-        // a WireGuard or Coordinated invite makes the reachability plane the
-        // dial path: fold the inviter's (and every offered front's) overlay
-        // ULA into this joiner's reach hints so the mesh can dial them the
-        // moment a tunnel is up.
-        {
-            let wg = &invite.wireguard;
-            let issuer_identity =
-                wireguard::ValidatorIdentity::try_from(invite.token.issuer.as_ref())
-                    .map_err(|e| format!("inviter identity: {e:?}"))?;
-            let inviter_ula =
-                wireguard::ula_v6_member_addr(&descriptor.genesis_namespace(), issuer_identity);
-            descriptor.add_reach_route(&config::ReachHint {
-                expected_key: invite.token.issuer.clone(),
-                reach: config::Reach::Direct(format!("[{inviter_ula}]:{}", wg.mesh_port)),
-            });
-        }
-        for front in &invite.fronts {
-            let Ok(member) = ed25519::PublicKey::decode(&front.member_key[..]) else {
-                continue;
-            };
-            let Ok(identity) = wireguard::ValidatorIdentity::try_from(&front.member_key[..]) else {
-                continue;
-            };
-            let ula = wireguard::ula_v6_member_addr(&descriptor.genesis_namespace(), identity);
-            descriptor.add_reach_route(&config::ReachHint {
-                expected_key: member,
-                reach: config::Reach::Direct(format!("[{ula}]:{}", front.mesh_port)),
-            });
-        }
-    }
-    descriptor.save(&dir.join("network.toml"))?;
-    // identity was minted + target-checked at the top of the join.
-    config::write_node_toml(&dir, &plumbing)?;
-    // the capability the joining node redeems automatically; a re-join with a
-    // fresh invite replaces a stale/spent one.
-    config::save_invite_token(&dir, &invite.token)?;
-    // the offered fronts, kept beside the token so `run_node` can race the
-    // whole union of first-contact paths. Empty clears any stale set.
-    config::save_invite_fronts(&dir, &invite.fronts)?;
-    {
-        // the tunnel bootstrap the joining node dials BEFORE any p2p (always
-        // present); kept beside the token so `run_node` brings the
-        // interface up first.
-        config::save_invite_wireguard(&dir, &invite.token.issuer, &invite.wireguard)?;
-        // mint the WireGuard identity NOW so the run's plane and intro
-        // announcer read one settled key file instead of racing to create it.
-        reachability::WireGuardKeypair::load_or_generate(&dir.join("wireguard.key"))
-            .map_err(|e| format!("wireguard key: {e}"))?;
+    let overrides = config::PlumbingOverrides {
+        listen: net.listen.clone(),
+        advertised: net.advertised.clone(),
+        http: net.http.clone(),
+        gateway: net.gateway.clone(),
+        rpc: net.rpc.clone(),
+        primary_coordinator: net.primary_coordinator.clone(),
+        wireguard_listen: net.wireguard_listen.clone(),
+        wireguard_advertised: net.wireguard_advertised.clone(),
+        invite_listen: net.invite_listen.clone(),
+    };
+    let joined = config::join_workspace(&blob, args.dir.clone(), &overrides)?;
+
+    if let Some(runtime) = &joined.compute_runtime {
+        eprintln!(
+            "compute plane: {runtime} found — writing a live [sandbox] table \
+             (announce stays off; delete the table for a consensus-only node)"
+        );
     }
     eprintln!(
-        "{} identity {me_hex}",
-        if generated { "generated" } else { "reusing" }
+        "{} identity {}",
+        if joined.generated {
+            "generated"
+        } else {
+            "reusing"
+        },
+        joined.identity
     );
     eprintln!(
         "workspace for {} written to {}",
-        descriptor.chain_id,
-        dir.display()
+        joined.chain_id,
+        joined.dir.display()
     );
-    let selector = match explicit_dir {
-        true => format!("--config {}/node.toml", dir.display()),
-        false => format!("-n '{}'", descriptor.chain_id),
+    // a workspace put where the operator asked is addressed by its file; one
+    // that landed in the registry is addressed by its chain id.
+    let selector = match &args.dir {
+        Some(_) => format!("--config {}/node.toml", joined.dir.display()),
+        None => format!("-n '{}'", joined.chain_id),
     };
-    if descriptor.validators.contains(&me_hex) {
+    if joined.is_member {
         eprintln!("this identity is a member — start: ducktape node run {selector}");
     } else {
         eprintln!(
@@ -1688,56 +1590,12 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
              this invite automatically: the node joins the network's VPN, syncs state, and \
              comes up as a full node. no approval step follows (minting the invite WAS the \
              approval); a member can later promote it into the quorum with \
-             `ducktape node member promote {me_hex}`."
+             `ducktape node member promote {}`.",
+            joined.identity
         );
     }
-    println!("{me_hex}");
+    println!("{}", joined.identity);
     Ok(())
-}
-
-#[cfg(test)]
-mod sandbox_detection_tests {
-    use crate::config;
-
-    /// The table `node init` would write and the backend the probe would test
-    /// must name ONE runtime and ONE pair of images. They are produced together
-    /// by [`super::platform_sandbox`] precisely so a host can never be probed
-    /// for one thing and configured for another — a drift that would surface as
-    /// a boot error on a machine whose images are exactly where init said.
-    ///
-    /// This is the hermetic half of detection. The other half — a live table
-    /// actually landing in node.toml — is not fakeable and must not be: the
-    /// probe opens `/dev/kvm` and stats both images, so it answers about the
-    /// real host. `workspace_registry_cli` pins the outcome an unprovisioned
-    /// host gets.
-    #[test]
-    fn the_written_table_and_the_probed_backend_name_one_runtime() {
-        let (table, backend) = super::platform_sandbox();
-        let (vmm, kernel, rootfs) = match &backend {
-            provider_host::SandboxBackend::MicroVm {
-                vmm,
-                kernel,
-                rootfs,
-            } => (vmm, kernel, rootfs),
-            // `Bare` exists only when provider-host is built with its testkit
-            // feature, which cargo's feature unification can switch on from
-            // another crate in the same invocation. So this arm has to exist
-            // without being required — hence the allow, not a `#[cfg]` (the
-            // feature belongs to a DIFFERENT crate and is not nameable here).
-            #[allow(unreachable_patterns)]
-            other => panic!("the platform adapter is a microVM, got {other:?}"),
-        };
-        assert_eq!(table.runtime, vmm.config_token());
-        assert_eq!((&table.kernel, &table.rootfs), (kernel, rootfs));
-
-        let guest = std::path::Path::new(config::DEFAULT_GUEST_DIR);
-        assert_eq!(table.kernel, guest.join("vmlinux"));
-        assert_eq!(table.rootfs, guest.join("rootfs.ext4"));
-
-        // `0` is "probe the host at boot", not "no cores" — a written table
-        // must not pin this box's CPU/RAM into a config that travels.
-        assert_eq!((table.cores, table.mem_gb), (0, 0));
-    }
 }
 
 #[cfg(test)]

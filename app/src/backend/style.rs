@@ -274,14 +274,6 @@ pub(crate) fn block_move(
     }
 }
 
-pub(crate) fn bounded_detail(value: &str) -> String {
-    let value = value.trim();
-    if value.is_empty() {
-        return "no detail".into();
-    }
-    value.chars().take(300).collect()
-}
-
 pub(crate) fn next_sequence() -> u64 {
     static SEQUENCE: OnceLock<AtomicU64> = OnceLock::new();
     SEQUENCE

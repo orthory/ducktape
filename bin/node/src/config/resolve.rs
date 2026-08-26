@@ -9,12 +9,14 @@ use commonware_cryptography::{Signer as _, ed25519};
 use commonware_p2p::Ingress;
 use provider_host::{SandboxBackend, Vmm};
 
-use super::identity::load_identity;
-use super::node_toml::{DevSeedToml, NodeToml, SandboxToml};
-use super::{
-    Coordination, Front, InviteToken, NetworkDescriptor, ReachDial, StoredInviteWireGuard,
-    dialable, hex_bytes, ingress_of, load_coord_cap, load_invite_fronts, load_invite_token,
-    load_invite_wireguard,
+use workspace_config::identity::load_identity;
+use workspace_config::node_toml::{
+    DevSeedToml, NodeToml, RawNodeToml, SandboxToml, load_raw_node_toml,
+};
+use workspace_config::{
+    Coordination, DEFAULT_CHECKPOINT_BLOCKS, Front, InviteToken, NetworkDescriptor, ReachDial,
+    StoredInviteWireGuard, dialable, hex_bytes, ingress_of, load_coord_cap, load_invite_fronts,
+    load_invite_token, load_invite_wireguard,
 };
 
 /// everything `run_node` needs, shape-independent.
@@ -202,8 +204,8 @@ pub struct ServiceConfig {
 /// workspace whose `identity.key` is absent or unreadable still resolves, which
 /// is exactly the property `the_service_path_never_reads_the_node_key` pins.
 pub fn resolve_service(cfg_path: &Path) -> Result<ServiceConfig, String> {
-    match super::node_toml::load_raw_node_toml(cfg_path)? {
-        (super::node_toml::RawNodeToml::Network(raw), _) => {
+    match load_raw_node_toml(cfg_path)? {
+        (RawNodeToml::Network(raw), _) => {
             let base = absolute_runtime_path(cfg_path.parent().unwrap_or_else(|| Path::new(".")))?;
             // the descriptor is read for its chain id alone — the validator set,
             // the reach hints and the genesis fingerprint are consensus facts a
@@ -214,7 +216,7 @@ pub fn resolve_service(cfg_path: &Path) -> Result<ServiceConfig, String> {
             let descriptor = load_valid_descriptor(&base.join(&raw.network))?;
             service_network_shape(&base, &raw, &descriptor)
         }
-        (super::node_toml::RawNodeToml::DevSeed(raw), _) => service_dev_shape(&raw),
+        (RawNodeToml::DevSeed(raw), _) => service_dev_shape(&raw),
     }
 }
 
@@ -268,11 +270,6 @@ fn service_dev_shape(raw: &DevSeedToml) -> Result<ServiceConfig, String> {
         sandbox_capacity,
     })
 }
-
-/// where `ops/build-guest-rootfs.sh` writes the kernel and rootfs by default —
-/// the paths `[sandbox]` generation puts in a fresh table and in the commented
-/// example.
-pub const DEFAULT_GUEST_DIR: &str = "/var/lib/ducktape/guest";
 
 /// Gate the resolved sandbox backend on the user's compute grant.
 ///
@@ -364,10 +361,6 @@ fn resolve_sandbox(
     ))
 }
 
-/// default recovery checkpoint cadence: small enough that boot replay stays
-/// cheap, large enough that snapshotting the in-memory cohort is amortized.
-pub const DEFAULT_CHECKPOINT_BLOCKS: u64 = 32;
-
 fn absolute_runtime_path(path: &Path) -> Result<PathBuf, String> {
     if path.is_absolute() {
         return Ok(path.to_path_buf());
@@ -397,12 +390,12 @@ fn dev_storage_dir(raw: &DevSeedToml) -> Result<PathBuf, String> {
 /// [`resolve_service`]'s own halves produce, so every fact both processes need
 /// is computed in exactly one place.
 pub fn resolve(cfg_path: &Path) -> Result<Resolved, String> {
-    match super::node_toml::load_raw_node_toml(cfg_path)? {
-        (super::node_toml::RawNodeToml::Network(raw), _) => {
+    match load_raw_node_toml(cfg_path)? {
+        (RawNodeToml::Network(raw), _) => {
             let base = absolute_runtime_path(cfg_path.parent().unwrap_or_else(|| Path::new(".")))?;
             resolve_network_shape(&base, raw)
         }
-        (super::node_toml::RawNodeToml::DevSeed(raw), _) => resolve_dev_shape(raw),
+        (RawNodeToml::DevSeed(raw), _) => resolve_dev_shape(raw),
     }
 }
 

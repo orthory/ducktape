@@ -303,14 +303,9 @@ mod tests {
         let path = key_file(duck, name);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         crate::userkey::write_user_key_new(&path, &line).unwrap();
-        // hex, inline: the one formatter this test wanted lived in the node
-        // binary, and borrowing it back would undo the point of the move.
-        crate::userkey::read_user_key_file(&path)
-            .unwrap()
-            .pubkey
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
+        // through the SAME formatter `list` renders a row's pubkey with, so a
+        // test expectation cannot agree with a spelling the product does not use.
+        hex(&crate::userkey::read_user_key_file(&path).unwrap().pubkey)
     }
 
     #[test]
