@@ -532,6 +532,12 @@ pub(crate) fn positive_sequence(value: i64) -> Result<u64, String> {
 /// Cause before symptom. The AEAD cannot tell a wrong password from a damaged
 /// file, so the password sentence has to serve both — but it must be REACHED,
 /// and a broader test placed above it swallows the case it was written for.
+///
+/// THE ORDER IS THE CONTRACT, and the tests beside this pin every overlap that
+/// decides one. It is not a hypothetical: a helper-name test used to sit on top
+/// here, and because every refusal a helper reported arrived WRAPPED in text
+/// naming the helper, it swallowed the two specific branches beneath it — a
+/// wrong password was reported to the user as a broken install.
 pub(crate) fn user_error(message: String) -> String {
     let password_refused = message.contains("corrupt or wrong password");
     if password_refused {
@@ -541,12 +547,16 @@ pub(crate) fn user_error(message: String) -> String {
     if key_unreadable {
         return "This device's user key is missing or unreadable. Check Settings.".into();
     }
-    // The only surviving subprocess is the agent pty. Keys, signing, run
+    // The only surviving subprocess is the agent pty — keys, signing, run
     // scheduling, invite minting and joining a network all happen in this
-    // process now, so this sentence must not claim any of them.
-    let cli_missing = message.contains("DUCKTAPE_BIN");
-    if cli_missing {
-        return "Ducktape's command-line tool could not start. Check the ducktape install in \
+    // process now — so this branch matches the ONE sentence that path writes
+    // (`start_agent_terminal`), and names no tool it did not start. Matching
+    // `DUCKTAPE_BIN` instead, as this did, matched nothing at all: every
+    // message that used to carry the variable's name was deleted along with
+    // the subprocess that produced it.
+    let helper_cannot_start = message.contains("could not start the ducktape");
+    if helper_cannot_start {
+        return "Ducktape's helper program could not start. Check the ducktape install in \
                 Settings."
             .into();
     }
@@ -586,4 +596,72 @@ pub(crate) fn number_i64(value: u64) -> i64 {
 
 pub(crate) fn count_i64(value: usize) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::user_error;
+
+    /// EVERY refusal a helper reported used to arrive WRAPPED in text naming
+    /// that helper — `Signer::reap` built "ducktape signer refused the
+    /// transaction: {stderr}" precisely so the stderr survived the trip — so a
+    /// helper-name test on top swallowed every specific cause beneath it, and
+    /// the two branches written for exactly those causes were dead code. The
+    /// signer is gone, but the shape that made this possible is not: anything
+    /// that wraps a cause in context re-creates it. This pins the order.
+    #[test]
+    fn the_cause_outranks_the_context_that_carried_it() {
+        assert_eq!(
+            user_error(
+                "could not start the ducktape agent terminal: FATAL: corrupt or wrong password"
+                    .into()
+            ),
+            "That password did not open this device's key. Check it and try again."
+        );
+        assert_eq!(
+            user_error(
+                "the keystore operation did not finish: local user key is unreadable".into()
+            ),
+            "This device's user key is missing or unreadable. Check Settings."
+        );
+    }
+
+    /// The install sentence must be REACHABLE, and it is the one thing this
+    /// function still says about a subprocess. The app has exactly one left —
+    /// the agent pty — and matching on the variable name `DUCKTAPE_BIN`, as
+    /// this branch did, matched nothing: every message carrying it was deleted
+    /// with the subprocess that wrote it.
+    #[test]
+    fn a_helper_that_cannot_start_names_no_particular_tool() {
+        assert_eq!(
+            user_error(
+                "could not start the ducktape agent terminal: Could not start Claude · raw \
+                 session: No such file or directory (os error 2)"
+                    .into()
+            ),
+            "Ducktape's helper program could not start. Check the ducktape install in Settings."
+        );
+    }
+
+    /// A node that went quiet is not the same event as a helper that would not
+    /// start, and both are reached only after the key causes above them.
+    #[test]
+    fn a_slow_node_keeps_its_own_sentence() {
+        assert_eq!(
+            user_error("submit timed out awaiting finalization".into()),
+            "The node did not answer in time. Retry in a moment."
+        );
+        assert_eq!(
+            user_error("the node sent this at line 4: invalid type".into()),
+            "The node sent a reply this app could not read. Reload and retry."
+        );
+    }
+
+    /// The contract the whole function exists to keep: a module's own sentence
+    /// is already addressed to this person, so it passes through untouched.
+    #[test]
+    fn a_module_sentence_flows_through_untouched() {
+        let own = "That channel no longer exists.";
+        assert_eq!(user_error(own.into()), own);
+    }
 }

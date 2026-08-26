@@ -176,8 +176,18 @@ pub async fn start_agent_terminal(
     let working_directory =
         std::env::current_dir().map_err(|error| AppError::from(error.to_string()))?;
     let title = format!("{} · raw session", provider_title(provider));
+    // The pty is the app's LAST subprocess, so it is also the last place a
+    // missing `ducktape` on disk can surface — and the widget's own refusal
+    // ("Could not start Claude · raw session: No such file or directory")
+    // names the session, not the install. Say which program was not there;
+    // `user_error` turns this into the one install sentence.
     let session = terminal::spawn_session(program, args, working_directory, title.clone())
-        .map_err(|error| AppError::from(error.message))?;
+        .map_err(|error| {
+            AppError::from(format!(
+                "could not start the ducktape agent terminal: {}",
+                error.message
+            ))
+        })?;
 
     Ok(AgentTerminalStarted {
         session: AgentTerminalSession(session),
