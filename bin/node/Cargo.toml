@@ -164,6 +164,11 @@ objc2-foundation = { version = "0.3", features = ["NSProcessInfo", "NSString"] }
 [dev-dependencies]
 # the shared raw-http/port/poll harness helpers (was: a per-suite copy each).
 nettest = { path = "../../crates/testing/nettest" }
+# the network_joiner_full statesync proof composes the reference modules too —
+# a joiner must rebuild EVERY module shape, example ones included. (The test
+# moved here from bin/demo when that walkthrough crate was deleted.)
+greeter = { workspace = true }
+kv = { workspace = true }
 # the fs/mcp e2e harnesses drive noded's in-proc daemon testkit (was: each
 # hand-mirrored the NodeCommand actor). dev-only feature keeps it
 # out of the production `ducktape` binary build.

@@ -68,7 +68,7 @@
 #   crates/noded/    — the node daemon library: the /v1 http+ws surface, the
 #                      actor lane, index/blob/stream lanes and the in-process
 #                      testkit — served by bin/noded, bin/node and bin/simnode
-#   bin/             — demo (in-process walkthrough), node (the `ducktape`
+#   bin/             — node (the `ducktape`
 #                      CLI: validator + fs verbs + mcp server), noded (the
 #                      app-facing daemon process), simnode (deterministic /v1
 #                      twin), coordinator (STUN rendezvous), guest-builder
@@ -115,7 +115,7 @@ members = [
     # duckdns — the `.duck` naming library, same standing for the same reason.
     # NOT a consensus module (no `sdk::Module`, no MODULE_ID, no guest wasm):
     # `gateway` absorbed the onchain half and embeds this registry, while
-    # node/noded/simnode/demo parse and validate `.duck` names host-side. Under
+    # node/noded/simnode parse and validate `.duck` names host-side. Under
     # crates/modules/system/ it made "modules = onchain" literally false.
     "crates/duckdns",
     # keystore — the device keystore (`keys/<name>.key` + the active pointer)
@@ -164,7 +164,7 @@ members = [
     # noded — the daemon library behind the /v1 surface
     "crates/noded",
     # bin — runnable binaries
-    "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
+    "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
     "bin/airlock-gateway",
     "bin/guest-builder",
     "bin/duck-guest-init",
