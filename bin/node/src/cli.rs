@@ -397,23 +397,25 @@ fn cmd_keygen(args: KeyArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 /// the compute adapter as the `[sandbox]` table generation writes it (`0` =
 /// probe the host at boot) plus the probeable backend, so generation and
-/// detection share one choice. There is one adapter: the sandbox is Linux-only.
-/// `node init` writes the block commented out, so a host that cannot run a
-/// microVM gets the probe's loud error when an operator uncomments it, not a
-/// silent misconfiguration now.
+/// detection share one choice. One adapter per OS: Firecracker on Linux, the
+/// vz shim on macOS. `node init` writes the block commented out, so a host
+/// that cannot run a microVM gets the probe's loud error when an operator
+/// uncomments it, not a silent misconfiguration now.
 fn platform_sandbox() -> (config::SandboxToml, provider_host::SandboxBackend) {
     // This only writes the default [sandbox] TOML at `node init`. The images
     // need not exist yet — `node init` runs before `ops/build-guest-rootfs.sh`
     // on a fresh box, and the loud error belongs to the boot probe, where an
     // operator who uncommented the table is standing.
+    let vmm = provider_host::Vmm::platform_default();
     let guest = std::path::Path::new(config::DEFAULT_GUEST_DIR);
     let (kernel, rootfs) = (guest.join("vmlinux"), guest.join("rootfs.ext4"));
-    let backend = provider_host::SandboxBackend::Firecracker {
+    let backend = provider_host::SandboxBackend::MicroVm {
+        vmm,
         kernel: kernel.clone(),
         rootfs: rootfs.clone(),
     };
     let table = config::SandboxToml {
-        runtime: "firecracker".into(),
+        runtime: vmm.config_token().into(),
         kernel,
         rootfs,
         cores: 0,
@@ -1614,17 +1616,21 @@ mod sandbox_detection_tests {
     #[test]
     fn the_written_table_and_the_probed_backend_name_one_runtime() {
         let (table, backend) = super::platform_sandbox();
-        let (kernel, rootfs) = match &backend {
-            provider_host::SandboxBackend::Firecracker { kernel, rootfs } => (kernel, rootfs),
+        let (vmm, kernel, rootfs) = match &backend {
+            provider_host::SandboxBackend::MicroVm {
+                vmm,
+                kernel,
+                rootfs,
+            } => (vmm, kernel, rootfs),
             // `Bare` exists only when provider-host is built with its testkit
             // feature, which cargo's feature unification can switch on from
             // another crate in the same invocation. So this arm has to exist
             // without being required — hence the allow, not a `#[cfg]` (the
             // feature belongs to a DIFFERENT crate and is not nameable here).
             #[allow(unreachable_patterns)]
-            other => panic!("the Linux adapter is Firecracker, got {other:?}"),
+            other => panic!("the platform adapter is a microVM, got {other:?}"),
         };
-        assert_eq!(table.runtime, "firecracker");
+        assert_eq!(table.runtime, vmm.config_token());
         assert_eq!((&table.kernel, &table.rootfs), (kernel, rootfs));
 
         let guest = std::path::Path::new(config::DEFAULT_GUEST_DIR);

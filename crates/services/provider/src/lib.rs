@@ -22,7 +22,7 @@
 //!     filesystem to mount an auth dir from.
 //!
 //! orthogonally, [`SandboxBackend`] decides HOW the child is spawned (its own
-//! Firecracker microVM — never bare on the host).
+//! microVM — never bare on the host).
 //! the two compose: codex in a microVM gets the broker AND the jail.
 //!
 //! ## executors are data: the capability spec
@@ -186,7 +186,7 @@ mod spec;
 mod variants;
 #[cfg(unix)]
 pub use interactive::InteractiveSession;
-pub use sandbox_host::SandboxBackend;
+pub use sandbox_host::{SandboxBackend, Vmm};
 pub use spec::{BrokerKind, CapabilitySpec, ContextLocation, IsolationSpec, OutputFormat, SpecSet};
 
 /// canonical label-safe identity for the node executing a provider run.
@@ -505,7 +505,7 @@ pub(crate) struct CliProvider {
     /// forwarded; stdout/stderr are still accumulated for the existing parse
     /// and error contracts.
     output_sink: Option<OutputSink>,
-    /// how the child is spawned: its own Firecracker microVM. set once at
+    /// how the child is spawned: its own microVM. set once at
     /// discovery for the whole provider set.
     backend: SandboxBackend,
     /// the persistent per-agent cache volume attached to every run of this
@@ -617,7 +617,7 @@ impl CliProvider {
         // only by the Bare arm, so in a non-test build they are legitimately
         // unused.)
         match &self.backend {
-            SandboxBackend::Firecracker { .. } => {
+            SandboxBackend::MicroVm { .. } => {
                 Err("internal error: a microVM is booted, not spawned as a command".into())
             }
             #[cfg(any(test, feature = "testkit"))]
@@ -697,11 +697,15 @@ impl CliProvider {
         // one discriminant, one match, no wildcard: `Bare` exists only in
         // test/testkit builds, so a `let ... else` here is irrefutable in a
         // shipped build. A future backend fails this match until it is routed.
-        let (kernel, rootfs) = match &self.backend {
-            SandboxBackend::Firecracker { kernel, rootfs } => (kernel, rootfs),
+        let (vmm, kernel, rootfs) = match &self.backend {
+            SandboxBackend::MicroVm {
+                vmm,
+                kernel,
+                rootfs,
+            } => (*vmm, kernel, rootfs),
             #[cfg(any(test, feature = "testkit"))]
             SandboxBackend::Bare => {
-                return Err("internal error: microVM boot on a non-Firecracker backend".into());
+                return Err("internal error: microVM boot on a non-microVM backend".into());
             }
         };
 
@@ -773,6 +777,7 @@ impl CliProvider {
         let slot = run_slot();
         let run_dir = microvm_run_dir(&slot)?;
         let vm_config = firecracker_api::VmConfig {
+            vmm,
             kernel: kernel.clone(),
             rootfs: rootfs.clone(),
             manifest: run_dir.join("manifest.bin"),
@@ -2337,7 +2342,7 @@ impl CliProvider {
             BoxRead,
             BoxRead,
             RunControl,
-        ) = if matches!(self.backend, SandboxBackend::Firecracker { .. }) {
+        ) = if matches!(self.backend, SandboxBackend::MicroVm { .. }) {
             let final_args = self.broker_argv(args, workdir, &auth);
             let (vm, io) = self
                 .microvm_boot(&final_args, workdir, ctx, &auth, GuestStdio::Pipes)
@@ -3143,7 +3148,8 @@ mod tests {
     fn firecracker_backend() -> SandboxBackend {
         let dir = std::env::var("DUCKTAPE_GUEST_DIR")
             .unwrap_or_else(|_| "/var/lib/ducktape/guest".into());
-        SandboxBackend::Firecracker {
+        SandboxBackend::MicroVm {
+            vmm: sandbox_host::Vmm::Firecracker,
             kernel: PathBuf::from(&dir).join("vmlinux"),
             rootfs: PathBuf::from(&dir).join("rootfs.ext4"),
         }

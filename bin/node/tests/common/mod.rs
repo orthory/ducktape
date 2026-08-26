@@ -1629,9 +1629,11 @@ pub fn unsandboxable_host() -> Option<String> {
 /// `ops/build-guest-rootfs.sh` produces, overridable for a box that keeps them
 /// somewhere else.
 pub fn guest_backend() -> provider_host::SandboxBackend {
+    let vmm = provider_host::Vmm::platform_default();
     let dir =
         PathBuf::from(std::env::var("DUCKTAPE_GUEST_DIR").unwrap_or_else(|_| GUEST_DIR.into()));
-    provider_host::SandboxBackend::Firecracker {
+    provider_host::SandboxBackend::MicroVm {
+        vmm,
         kernel: dir.join("vmlinux"),
         rootfs: dir.join("rootfs.ext4"),
     }

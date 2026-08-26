@@ -8,7 +8,18 @@
 use std::path::{Path, PathBuf};
 
 /// the sbin dirs a non-root `PATH` usually omits, searched after `PATH`.
-const FALLBACK_DIRS: [&str; 4] = ["/usr/sbin", "/sbin", "/usr/bin", "/bin"];
+/// The Homebrew entries are macOS: `e2fsprogs` is keg-only there, so `mke2fs`
+/// and `debugfs` live under the keg's own `sbin` and never reach `PATH` at
+/// all. Dirs that do not exist on this OS cost one failed stat each.
+const FALLBACK_DIRS: [&str; 7] = [
+    "/usr/sbin",
+    "/sbin",
+    "/usr/bin",
+    "/bin",
+    "/opt/homebrew/opt/e2fsprogs/sbin",
+    "/usr/local/opt/e2fsprogs/sbin",
+    "/opt/homebrew/sbin",
+];
 
 /// resolve a system tool by `PATH`, then by [`FALLBACK_DIRS`].
 pub fn find_system_tool(bin: &str) -> Option<PathBuf> {

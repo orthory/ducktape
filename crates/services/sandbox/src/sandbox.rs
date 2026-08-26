@@ -10,18 +10,66 @@
 
 use std::path::{Path, PathBuf};
 
+/// which VMM boots a run's microVM. The run lifecycle — images, vsock frames,
+/// manifest, teardown — is identical either way; the flavor decides only the
+/// hypervisor binary, its boot arguments and what the host probe must verify.
+/// One flavor per OS: Firecracker needs KVM, the vz shim needs
+/// Virtualization.framework.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Vmm {
+    /// `firecracker` on Linux, over `/dev/kvm`.
+    Firecracker,
+    /// `duck-vz-shim` on macOS (`bin/duck-vz-shim`): a thin Swift wrapper over
+    /// Virtualization.framework that consumes the same Firecracker-schema
+    /// config JSON and bridges guest vsock ports to the same `<uds>_<port>`
+    /// unix sockets, so the host side of a run is byte-identical.
+    Vz,
+}
+
+impl Vmm {
+    /// the host VMM binary this flavor execs.
+    pub fn host_bin(&self) -> &'static str {
+        match self {
+            Vmm::Firecracker => "firecracker",
+            Vmm::Vz => "duck-vz-shim",
+        }
+    }
+
+    /// the `[sandbox] runtime` token that names this flavor in node.toml —
+    /// shared by config resolution and the `node init` table writer so the two
+    /// can never drift.
+    pub fn config_token(&self) -> &'static str {
+        match self {
+            Vmm::Firecracker => "firecracker",
+            Vmm::Vz => "vz",
+        }
+    }
+
+    /// the flavor this OS boots — the ONE place the OS→hypervisor decision
+    /// lives, so `node init`, the e2e harness and the smoke example cannot
+    /// drift apart.
+    pub fn platform_default() -> Self {
+        if cfg!(target_os = "macos") {
+            Vmm::Vz
+        } else {
+            Vmm::Firecracker
+        }
+    }
+}
+
 /// how a provider child is spawned — always inside an isolation adapter; a
 /// bare host spawn is unrepresentable here by design ("nothing ever runs
-/// directly on the node"). `Firecracker` gives each run its own microVM. a node
+/// directly on the node"). `MicroVm` gives each run its own microVM. a node
 /// sandboxes EVERY run it makes — demandless ones included — because a
 /// sandboxed node sandboxes everything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxBackend {
-    /// one Firecracker microVM per run: hard vcpu/memory limits enforced by the
+    /// one microVM per run: hard vcpu/memory limits enforced by the
     /// hypervisor, no container runtime inside the guest. `kernel` and `rootfs`
     /// are the immutable images every run boots from — shared read-only, never
-    /// written by a run.
-    Firecracker {
+    /// written by a run. `vmm` picks the hypervisor for this OS.
+    MicroVm {
+        vmm: Vmm,
         kernel: std::path::PathBuf,
         rootfs: std::path::PathBuf,
     },
@@ -38,7 +86,7 @@ impl SandboxBackend {
     /// the host runtime binary this adapter drives.
     pub fn runtime_bin(&self) -> &'static str {
         match self {
-            SandboxBackend::Firecracker { .. } => "firecracker",
+            SandboxBackend::MicroVm { vmm, .. } => vmm.host_bin(),
             #[cfg(any(test, feature = "testkit"))]
             SandboxBackend::Bare => "sh",
         }
@@ -57,10 +105,20 @@ impl SandboxBackend {
     /// guard.
     fn required_tools(&self) -> &'static [(&'static str, &'static str)] {
         match self {
-            SandboxBackend::Firecracker { .. } => &[
+            // no `nft` under vz: a macOS guest gets no tap device at all — it
+            // reaches the host over vsock only, so there is no interface to
+            // firewall and nothing nftables-shaped on the OS anyway.
+            SandboxBackend::MicroVm {
+                vmm: Vmm::Firecracker,
+                ..
+            } => &[
                 ("mke2fs", "builds each run's workspace block image"),
                 ("debugfs", "reads that image back after the guest exits"),
                 ("nft", "the egress firewall on the run's tap device"),
+            ],
+            SandboxBackend::MicroVm { vmm: Vmm::Vz, .. } => &[
+                ("mke2fs", "builds each run's workspace block image"),
+                ("debugfs", "reads that image back after the guest exits"),
             ],
             #[cfg(any(test, feature = "testkit"))]
             SandboxBackend::Bare => &[],
@@ -101,7 +159,7 @@ impl SandboxBackend {
                 ));
             }
         }
-        self.probe_host_capabilities()?;
+        self.probe_host_capabilities(&found)?;
         // Once per DAEMON BOOT — the crate's whole `info` budget, and the only
         // line that separates "this daemon probed green" from "this daemon
         // never reached the probe". The FAILURE arms stay as the returned Err:
@@ -116,15 +174,24 @@ impl SandboxBackend {
         Ok(found)
     }
 
-    /// the adapter-specific host state a tool check cannot express.
-    fn probe_host_capabilities(&self) -> Result<(), String> {
+    /// the adapter-specific host state a tool check cannot express. `runtime`
+    /// is the resolved VMM binary, which the vz probe inspects for its
+    /// entitlement.
+    fn probe_host_capabilities(&self, runtime: &Path) -> Result<(), String> {
         match self {
-            SandboxBackend::Firecracker { kernel, rootfs } => {
-                probe_kvm()?;
+            SandboxBackend::MicroVm {
+                vmm,
+                kernel,
+                rootfs,
+            } => {
+                match vmm {
+                    Vmm::Firecracker => probe_kvm()?,
+                    Vmm::Vz => probe_vz(runtime)?,
+                }
                 for (label, image) in [("kernel", kernel), ("rootfs", rootfs)] {
                     if !image.is_file() {
                         return Err(format!(
-                            "the Firecracker {label} image is missing or not a file; build it with \
+                            "the microVM {label} image is missing or not a file; build it with \
                              ops/build-guest-rootfs.sh, or point [sandbox] at one that exists"
                         ));
                     }
@@ -165,4 +232,53 @@ fn probe_kvm() -> Result<(), String> {
                  or start the node under `sg kvm`)"
             )
         })
+}
+
+/// the vz backend's host state: Hypervisor.framework support, and the shim
+/// binary carrying the virtualization entitlement.
+///
+/// The entitlement is checked HERE because a shim without it fails at
+/// `VZVirtualMachine` creation — a per-run error deep in the boot path that
+/// names Virtualization.framework internals — while the fix (re-run the shim's
+/// build script, which codesigns) belongs at daemon boot, in front of an
+/// operator.
+#[cfg(target_os = "macos")]
+fn probe_vz(shim: &Path) -> Result<(), String> {
+    let hv = std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", "kern.hv_support"])
+        .output()
+        .map_err(|e| format!("run sysctl kern.hv_support: {e}"))?;
+    let supported = String::from_utf8_lossy(&hv.stdout).trim() == "1";
+    if !supported {
+        return Err(
+            "this Mac reports no Hypervisor.framework support (kern.hv_support != 1); \
+             the vz sandbox needs Apple silicon or a VT-x Mac"
+                .into(),
+        );
+    }
+    let entitlements = std::process::Command::new("/usr/bin/codesign")
+        .args(["--display", "--entitlements", "-", "--xml"])
+        .arg(shim)
+        .output()
+        .map_err(|e| format!("run codesign on {}: {e}", shim.display()))?;
+    let mut signed = entitlements.stdout;
+    signed.extend_from_slice(&entitlements.stderr);
+    let entitled = String::from_utf8_lossy(&signed).contains("com.apple.security.virtualization");
+    if !entitled {
+        return Err(format!(
+            "{} is not signed with the com.apple.security.virtualization entitlement, so \
+             Virtualization.framework will refuse it; rebuild it with bin/duck-vz-shim/build.sh \
+             (which codesigns)",
+            shim.display()
+        ));
+    }
+    Ok(())
+}
+
+/// the vz backend exists only where Virtualization.framework does.
+#[cfg(not(target_os = "macos"))]
+fn probe_vz(_shim: &Path) -> Result<(), String> {
+    Err("the vz sandbox runs only on macOS (it drives Virtualization.framework); \
+         on Linux use runtime = \"firecracker\""
+        .into())
 }
