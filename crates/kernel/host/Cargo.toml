@@ -78,6 +78,9 @@ automations = { workspace = true }
 # its wasm port side by side. files needs an on-disk odb dir (tempfile).
 runs = { workspace = true }
 files = { workspace = true }
+# the vaults whole-state parity proof stands the native module beside its
+# wasm port and cross-installs snapshots between the runtimes.
+vaults = { workspace = true }
 tempfile = "3"
 commonware-cryptography = { workspace = true }
 commonware-runtime = { workspace = true }

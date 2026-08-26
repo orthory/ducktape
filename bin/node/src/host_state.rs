@@ -4,7 +4,6 @@
 //! state into the canonical host. The live node loop only consumes the three
 //! lifecycle operations and output adapter exported below.
 
-use acl::Acl;
 use commonware_cryptography::ed25519;
 use commonware_runtime::Supervisor as _;
 use duckfs_disk::SyncScratch;
@@ -105,6 +104,14 @@ const TASKS_MODULE_ID: &str = "tasks";
 const TAGGING_WASM_COMPONENT: &[u8] =
     include_bytes!("../../../crates/modules/system/tagging/component.wasm");
 const TAGGING_MODULE_ID: &str = "tagging";
+/// acl — a STORE-BACKED tenant like tagging/capability: the submit-policy
+/// table rides a host-constructed qmdb store and the wasm root is the store's
+/// merkle root. the kernel drain's standing gate consults it per external op
+/// through the ordinary module query lane, which the guest serves
+/// staged-over-committed exactly as the native module did.
+const ACL_WASM_COMPONENT: &[u8] =
+    include_bytes!("../../../crates/modules/system/acl/component.wasm");
+const ACL_MODULE_ID: &str = "acl";
 /// capability — a STORE-BACKED tenant like pages/chat: the provider registry
 /// rides a host-constructed qmdb store and the wasm root is the store's
 /// merkle root. no per-network config (the valset sibling id is compiled into
@@ -325,6 +332,12 @@ async fn seeded_lifecycle(store: Box<dyn sdk::MerkleStore>) -> Lifecycle {
     )
     .await
     .expect("genesis lifecycle seed stages");
+    reg.seed(
+        ACL_MODULE_ID,
+        sha2::Sha256::digest(ACL_WASM_COMPONENT).to_vec(),
+    )
+    .await
+    .expect("genesis lifecycle seed stages");
     reg.finish_seed()
         .await
         .expect("genesis lifecycle seeds commit");
@@ -356,6 +369,7 @@ pub(super) fn seed_genesis_components(blobs: &blobstore::BlobHandle) {
     blobs.put_chunk(RUNS_WASM_COMPONENT.to_vec());
     blobs.put_chunk(DISPATCH_WASM_COMPONENT.to_vec());
     blobs.put_chunk(FILES_WASM_COMPONENT.to_vec());
+    blobs.put_chunk(ACL_WASM_COMPONENT.to_vec());
 }
 
 /// the reference wasm module at its GENESIS code. restarted/synced nodes still
@@ -400,6 +414,14 @@ fn tagging_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
 fn capability_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
     WasmModule::with_store(CAPABILITY_MODULE_ID, CAPABILITY_WASM_COMPONENT, store)
         .expect("embedded capability component loads")
+}
+
+/// acl at its GENESIS code over the host-constructed store (same three store
+/// lifecycles as [`pages_wasm`]). deliberately EMPTY at genesis: an empty
+/// policy table is allow-all, and only governance follow-ups tighten it.
+fn acl_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
+    WasmModule::with_store(ACL_MODULE_ID, ACL_WASM_COMPONENT, store)
+        .expect("embedded acl component loads")
 }
 
 /// saga at its GENESIS code (adapter-ported) over the host-constructed store.
@@ -537,7 +559,7 @@ struct ProductionModules {
     chat: WasmModule,
     forge: Forge,
     valset: Valset,
-    acl: Acl,
+    acl: WasmModule,
     governance: WasmModule,
     lifecycle: Lifecycle,
     hello_wasm: WasmModule,
@@ -694,14 +716,13 @@ pub(super) async fn genesis_host(
         .finish_seed()
         .await
         .expect("genesis valset seed commits");
-    // the submit-policy federation is NATIVE and store-backed like valset,
-    // and deliberately EMPTY at genesis: an empty table is allow-all, so a
-    // fresh network admits any validly signed frame to any module and the
-    // table exists only for governance to tighten later.
-    let acl_table = Acl::new(
-        "acl",
-        Box::new(QmdbStore::init(context.child("acl"), "acl").await),
-    );
+    // the submit-policy federation is a STORE-BACKED wasm tenant like
+    // tagging/capability, and deliberately EMPTY at genesis: an empty table
+    // is allow-all, so a fresh network admits any validly signed frame to any
+    // module and the table exists only for governance to tighten later.
+    let acl_table = acl_wasm(Box::new(
+        QmdbStore::init(context.child("acl"), "acl").await,
+    ));
     ProductionModules {
         pages,
         chat,
@@ -860,10 +881,9 @@ pub(super) async fn restore_host(
         Box::new(QmdbStore::init(context.child("valset"), "valset").await),
     );
     // the submit-policy table reopens the same way (empty store = allow-all).
-    let acl_table = Acl::new(
-        "acl",
-        Box::new(QmdbStore::init(context.child("acl"), "acl").await),
-    );
+    let acl_table = acl_wasm(Box::new(
+        QmdbStore::init(context.child("acl"), "acl").await,
+    ));
 
     // the lifecycle module-code registry reopens like the other store-backed
     // tenants (its store carries the genesis seeds and every committed swap);
@@ -1215,18 +1235,15 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient>(
 
     // the submit-policy table joins like the other store-backed tenants.
     let (target, resolver) = fetch_target("acl").await?;
-    let acl_table = Acl::new(
-        "acl",
-        Box::new(
-            QmdbStore::sync_from(
-                scratch_context.child(child_label("acl")),
-                "acl",
-                target,
-                resolver,
-            )
-            .await?,
-        ),
-    );
+    let acl_table = acl_wasm(Box::new(
+        QmdbStore::sync_from(
+            scratch_context.child(child_label("acl")),
+            "acl",
+            target,
+            resolver,
+        )
+        .await?,
+    ));
 
     let (target, resolver) = fetch_target("saga").await?;
     let saga = saga_wasm(Box::new(
@@ -1404,7 +1421,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "d162061a62413d3987e6366ba34fe2b3fd94b97bbad284484047ee7238300113";
+        "bb5657ad499d8422d0e5762bb4eddc65f3f01331f96d0d777e6586e201dd016c";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's store as a genesis
