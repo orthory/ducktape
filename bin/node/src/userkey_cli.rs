@@ -65,8 +65,8 @@ pub(crate) struct AccountInitArgs {
     name: String,
     #[command(flatten)]
     addr: NodeAddr,
-    /// path to the user key file (defaults to the network workspace's
-    /// `user.key`, minting it there if absent — the canonical per-network key)
+    /// path to the user key file (defaults to the active wallet, minting one
+    /// named after --name into an empty keystore)
     #[arg(long, value_name = "PATH")]
     key: Option<PathBuf>,
 }
@@ -300,15 +300,29 @@ fn cmd_user_account_init(
     // `ducktape node run` (same ladder) is happy with.
     let dir = args.addr.workspace()?;
     let resolved = config::resolve(&dir.join("node.toml"))?;
-    // default the key to the network's canonical `<workspace>/user.key`, so a
-    // later `cred add -n <net>` (no `--key`) finds the very key this bind used.
-    let key_path = args.key.unwrap_or_else(|| dir.join("user.key"));
+    // the key: explicit --key, else THE shared wallet resolver — the active
+    // wallet, or (empty keystore only) a fresh wallet named after --name.
+    let target = match args.key {
+        Some(explicit) => crate::wallet::AccountInitKey::Active(explicit),
+        None => match std::env::var_os("DUCKTAPE_USER_KEY") {
+            Some(path) => crate::wallet::AccountInitKey::Active(path.into()),
+            None => crate::wallet::account_init_target(&args.name)?,
+        },
+    };
+    let (key_path, minted_wallet) = match target {
+        crate::wallet::AccountInitKey::Active(path) => (path, None),
+        crate::wallet::AccountInitKey::Mint { path, name } => (path, Some(name)),
+    };
     let (user, origin) = load_or_mint_user_signer(&key_path, stdin)?;
     let user_pub = user.public_key();
     // the mnemonic BEFORE the submits: they take a block each, and a person
     // who ^Cs on a slow chain must still have the only copy of their seed.
     if let KeyOrigin::Minted(words) = origin {
-        println!("a new user key was minted at {}", key_path.display());
+        let wallet_name = minted_wallet.as_deref().unwrap_or("(explicit path)");
+        if let Some(name) = &minted_wallet {
+            crate::wallet::set_active(&crate::wallet::duck_root()?, name)?;
+        }
+        println!("a new wallet {wallet_name:?} was minted at {}", key_path.display());
         println!("write these 24 words down — they are the only way to restore it:");
         println!("{words}");
     }
@@ -1311,11 +1325,10 @@ mod userkey_verb_tests {
         );
     }
 
-    /// `account-init`'s `--key` help promises "minting it there if absent".
-    /// It did not: a fresh workspace answered the first command a new operator
-    /// ever runs with `FATAL: read ".../user.key": No such file or directory`,
-    /// and nothing on that path mentioned `user key init`. One password, one
-    /// mint, and the words that come back are the real seed.
+    /// `load_or_mint_user_signer` mints a fresh key when the path is absent —
+    /// the shared primitive both `account-init`'s wallet resolver and
+    /// `wallet new` rely on. One password, one mint, and the words that come
+    /// back are the real seed.
     #[test]
     fn account_init_mints_the_user_key_when_the_workspace_has_none() {
         let dir = tempfile::tempdir().unwrap();
