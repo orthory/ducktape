@@ -239,8 +239,8 @@ impl MicroVm {
         let config = firecracker_api::boot_config(cfg, &listen_ports);
         let config_path = firecracker_api::write_boot_config(run_dir, &config)?;
         let vmm_bin = cfg.vmm.host_bin();
-        let vmm_path = crate::host_tools::find_on_path(vmm_bin)
-            .ok_or_else(|| format!("{vmm_bin} is not executable on PATH"))?;
+        let vmm_path = crate::host_tools::find_executable(vmm_bin)
+            .ok_or_else(|| format!("{vmm_bin} is not executable on PATH or a standard bin dir"))?;
         let console = run_dir.join("console.log");
         let console_file = std::fs::File::create(&console)
             .map_err(|e| format!("create {}: {e}", console.display()))?;

@@ -148,8 +148,11 @@ impl SandboxBackend {
     /// a silently unsandboxed / unfirewalled run.
     pub fn probe(&self) -> Result<PathBuf, String> {
         let bin = self.runtime_bin();
-        let found = crate::host_tools::find_on_path(bin).ok_or_else(|| {
-            format!("sandbox runtime {bin:?} is not executable on PATH; install it or pick a runtime this host provides")
+        let found = crate::host_tools::find_executable(bin).ok_or_else(|| {
+            format!(
+                "sandbox runtime {bin:?} is not executable on PATH or a standard bin dir; \
+                 install it or pick a runtime this host provides"
+            )
         })?;
         for (tool, why) in self.required_tools() {
             if crate::host_tools::find_system_tool(tool).is_none() {

@@ -199,9 +199,14 @@ pub fn manifest_mounts(cfg: &VmConfig) -> Vec<GuestMount> {
 /// `pci=off`: Virtualization.framework attaches its virtio devices over PCI,
 /// so that flag would boot a guest that finds no disks at all.
 ///
-/// Both: `panic=1` so a guest panic REBOOTS rather than sitting at the kernel
-/// prompt burning the run's whole idle timeout while holding all of its
-/// memory.
+/// Halting is where the two flavors are OPPOSITES, measured on both. Under
+/// Firecracker, `panic=1` + `reboot=k` make both a panic and the init's
+/// RESTART exit the VMM. Under Virtualization.framework a reboot actually
+/// REBOOTS — the first live run boot-looped forever redialling a consumed
+/// vsock listener — so the vz cmdline says `DUCK_HALT=poweroff` (an
+/// unrecognized NAME=value boot param lands in PID 1's environment), the init
+/// powers off via PSCI, and `panic=` stays default so a panicking guest PARKS
+/// for the host's timeout to reap instead of boot-looping.
 ///
 /// FIXED, and short: nothing per-run rides here. The run's manifest has its own
 /// device precisely because a cmdline is capped near 2 KiB.
@@ -211,8 +216,8 @@ pub fn boot_args(vmm: Vmm) -> String {
              i8042.noaux i8042.nokbd i8042.nomux i8042.nopnp i8042.dumbkbd \
              init=/duck-guest-init"
             .to_string(),
-        Vmm::Vz => "console=hvc0 root=/dev/vda ro reboot=k panic=1 quiet loglevel=1 \
-             init=/duck-guest-init"
+        Vmm::Vz => "console=hvc0 root=/dev/vda ro quiet loglevel=1 \
+             DUCK_HALT=poweroff init=/duck-guest-init"
             .to_string(),
     }
 }
@@ -315,19 +320,27 @@ mod tests {
         }
     }
 
-    /// A guest panic must reboot, not park at the prompt holding the run's
-    /// whole memory footprint until the idle timeout. Both flavors: the vz
-    /// shim's delegate sees a guest-initiated reboot as a stop, which is what
-    /// ends the run.
+    /// Under Firecracker a guest panic must reboot, not park: `reboot=k` is
+    /// what makes both the panic path and the init's RESTART reach the VMM at
+    /// all (no ACPI power button).
     #[test]
-    fn a_panicking_guest_reboots_rather_than_parking() {
-        for vmm in [Vmm::Firecracker, Vmm::Vz] {
-            let args = boot_args(vmm);
-            assert!(args.contains("panic=1"), "{args}");
-            // `reboot=k` is what makes the guest's RESTART reach the VMM at
-            // all — neither VMM exposes an ACPI power button.
-            assert!(args.contains("reboot=k"), "{args}");
-        }
+    fn a_panicking_firecracker_guest_reboots_rather_than_parking() {
+        let args = boot_args(Vmm::Firecracker);
+        assert!(args.contains("panic=1"), "{args}");
+        assert!(args.contains("reboot=k"), "{args}");
+    }
+
+    /// Under Virtualization.framework a reboot actually REBOOTS the guest —
+    /// the first live run boot-looped forever redialling a consumed vsock
+    /// listener. So the vz guest must be told to POWER OFF (`DUCK_HALT`,
+    /// which an unrecognized NAME=value boot param delivers into PID 1's
+    /// environment), and a panic must NOT auto-reboot into that same loop.
+    #[test]
+    fn a_vz_guest_powers_off_and_never_auto_reboots() {
+        let args = boot_args(Vmm::Vz);
+        assert!(args.contains("DUCK_HALT=poweroff"), "{args}");
+        assert!(!args.contains("reboot=k"), "{args}");
+        assert!(!args.contains("panic="), "a panic must park, not boot-loop: {args}");
     }
 
     /// The two flavors present different virtual hardware, and each of these
