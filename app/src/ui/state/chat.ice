@@ -2,9 +2,6 @@ state
   channels:[ChatChannel] = []
   rooms:[ChatSidebarRow] = []
   messages:[ChatMessage] = []
-  // Renderer invalidation for the whole-timeline lazy island. Domain handlers
-  // advance it only when the corresponding owned window changes.
-  messages_revision:i64 = 0
   chat_generation:i64 = 0
   channel_reads:[ChannelRead] = []
   unread_boundary:i64 = 0
@@ -27,7 +24,6 @@ state
   active_thread_seq:i64 = 0
   thread_target_seq:i64 = 0
   thread_messages:[ChatMessage] = []
-  thread_messages_revision:i64 = 0
   thread_next_reply_seq:i64 = 0
   thread_has_more = false
   thread_loading = false

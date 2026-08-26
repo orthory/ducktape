@@ -85,8 +85,11 @@ fn the_thread_rail_virtualizes_and_caches_its_quiet_replies() {
     assert!(chat.contains(
         "keyed thread_message in messages by=thread_message.view_key w=fill gap=3.0 virtual-row=44.0"
     ));
+    // No hand revision in the key: since ui #783 the rail's `lazy` keys on the
+    // compiler-owned revision of `thread_messages` itself, so a writer that
+    // forgets to bump anything can no longer leave stale pixels behind.
     assert!(chat.contains(
-        "lazy thread_messages by thread_messages_revision, active_channel, active_thread_seq, thread_target_seq, thread_selected_seq as cached_thread_messages"
+        "lazy thread_messages by active_channel, active_thread_seq, thread_target_seq, thread_selected_seq as cached_thread_messages"
     ));
     // A `lazy` subtree reads nothing but its dependency, so the quiet arm can
     // only exist because the rows that read SCREEN state — the search target

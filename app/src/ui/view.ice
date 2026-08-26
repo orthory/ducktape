@@ -199,7 +199,6 @@ view
               call_muted
               huddle_popped
               messages
-              messages_revision
               has_older_history
               history_view
               history_loading
@@ -212,7 +211,6 @@ view
               active_thread_seq
               thread_target_seq
               thread_messages
-              thread_messages_revision
               thread_selected_seq
               thread_selected_rev
               thread_message_action

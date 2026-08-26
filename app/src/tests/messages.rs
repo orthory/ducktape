@@ -1,51 +1,5 @@
 use super::*;
 
-#[test]
-fn every_timeline_writer_advances_its_render_revision() {
-    let mut writers = 0;
-    for (path, source) in ice_sources() {
-        if !path.contains("/handlers/") {
-            continue;
-        }
-        let source = format!("\n{source}");
-        for handler in source.split("\non ").skip(1) {
-            let body = handler.split("\non ").next().unwrap_or(handler);
-            let name = body.lines().next().unwrap_or("<unknown handler>");
-            for (state, revision) in [
-                ("messages", "messages_revision"),
-                ("thread_messages", "thread_messages_revision"),
-            ] {
-                let writes_state = body.lines().any(|line| {
-                    line.split("//")
-                        .next()
-                        .unwrap_or_default()
-                        .trim_start()
-                        .starts_with(&format!("{state} = "))
-                });
-                if !writes_state {
-                    continue;
-                }
-                writers += 1;
-                let advances_revision = body.lines().any(|line| {
-                    line.split("//")
-                        .next()
-                        .unwrap_or_default()
-                        .trim_start()
-                        .starts_with(&format!("{revision} = "))
-                });
-                assert!(
-                    advances_revision,
-                    "{path}: `{name}` writes `{state}` without advancing `{revision}`; the whole-list lazy would keep stale pixels"
-                );
-            }
-        }
-    }
-    assert!(
-        writers >= 20,
-        "the ratchet found the production timeline writers"
-    );
-}
-
 /// The picker-dismissal bug in one contract: an in-flight reaction must not
 /// take the global mutation lock. A locked picker's disabled cells capture
 /// no press, so the SECOND click of a picking session fell through to the
