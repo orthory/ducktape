@@ -107,7 +107,8 @@ pub struct NodeToml {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxToml {
-    /// the isolation adapter: `"firecracker"` (the only one; Linux-only).
+    /// the isolation adapter: `"firecracker"` (Linux) or `"vz"` (macOS) — one
+    /// microVM per run either way.
     pub runtime: String,
     /// the guest kernel every run boots. Shared, read-only, immutable.
     pub kernel: std::path::PathBuf,
@@ -456,7 +457,7 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
                 &mut s,
                 "runtime",
                 format_args!("\"{}\"", sb.runtime),
-                "isolation adapter: \"firecracker\" (runs never execute bare on the host)",
+                "isolation adapter: \"firecracker\" on Linux, \"vz\" on macOS (runs never execute bare on the host)",
             );
             keyline(
                 &mut s,
@@ -484,13 +485,16 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
             );
         }
         None => {
+            // the commented-out template names THIS OS's adapter, so
+            // uncommenting it on the machine `node init` ran on is enough.
+            let runtime = provider_host::Vmm::platform_default().config_token();
             let _ = writeln!(
                 s,
                 "\n# compute plane (off): uncomment [sandbox] to run providers on this node.\n\
-                 # runtime: \"firecracker\" — one microVM per run; runs never execute\n\
+                 # runtime: \"{runtime}\" — one microVM per run; runs never execute\n\
                  # bare on the host. Build the two images with ops/build-guest-rootfs.sh.\n\
                  #[sandbox]\n\
-                 #runtime = \"firecracker\"\n\
+                 #runtime = \"{runtime}\"\n\
                  #kernel = \"{DEFAULT_GUEST_DIR}/vmlinux\"\n\
                  #rootfs = \"{DEFAULT_GUEST_DIR}/rootfs.ext4\"\n\
                  #cores = 0\n\

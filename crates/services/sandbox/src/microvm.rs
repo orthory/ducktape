@@ -220,7 +220,10 @@ impl MicroVm {
         // reason: the guest may dial them as soon as it is up.
         //
         // One listener per service, in the manifest's order. The guest picks a
-        // vsock port, never a destination, so this loop IS the allowlist.
+        // vsock port, never a destination, so this loop IS the allowlist —
+        // and `listen_ports` is its transcript, handed to the vz shim, which
+        // must declare each guest-outbound port to Virtualization.framework.
+        let mut listen_ports = vec![guest_proto::VSOCK_PORT];
         let mut tunnels = Vec::with_capacity(manifest.tunnel_ports.len());
         for (index, port) in manifest.tunnel_ports.iter().enumerate() {
             let vsock_port = guest_proto::TUNNEL_PORT_BASE + index as u32;
@@ -229,18 +232,25 @@ impl MicroVm {
             let tunnel_listener = UnixListener::bind(&path)
                 .map_err(|e| format!("listen on {}: {e}", path.display()))?;
             tunnels.push(tokio::spawn(serve_tunnel(tunnel_listener, *port)));
+            listen_ports.push(vsock_port);
         }
 
         // 3. the VMM
-        let config = firecracker_api::boot_config(cfg);
+        let config = firecracker_api::boot_config(cfg, &listen_ports);
         let config_path = firecracker_api::write_boot_config(run_dir, &config)?;
-        let firecracker = crate::host_tools::find_on_path("firecracker")
-            .ok_or_else(|| "firecracker is not executable on PATH".to_string())?;
+        let vmm_bin = cfg.vmm.host_bin();
+        let vmm_path = crate::host_tools::find_on_path(vmm_bin)
+            .ok_or_else(|| format!("{vmm_bin} is not executable on PATH"))?;
         let console = run_dir.join("console.log");
         let console_file = std::fs::File::create(&console)
             .map_err(|e| format!("create {}: {e}", console.display()))?;
-        let vmm = tokio::process::Command::new(&firecracker)
-            .arg("--no-api")
+        let mut command = tokio::process::Command::new(&vmm_path);
+        // `--no-api` is Firecracker's own flag (the config-file boot leaves its
+        // HTTP API off); the shim's whole interface is the config file.
+        if cfg.vmm == crate::sandbox::Vmm::Firecracker {
+            command.arg("--no-api");
+        }
+        let vmm = command
             .arg("--config-file")
             .arg(&config_path)
             .stdin(Stdio::null())

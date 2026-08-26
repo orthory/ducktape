@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_p2p::Ingress;
-use provider_host::SandboxBackend;
+use provider_host::{SandboxBackend, Vmm};
 
 use super::identity::load_identity;
 use super::node_toml::{DevSeedToml, NodeToml, SandboxToml};
@@ -302,10 +302,10 @@ fn gate_on_compute_grant(
 
 /// resolve the operator's `[sandbox]` table into the compute plane: `None`
 /// (no table) = consensus-only node, no backend and no capacity;
-/// `"firecracker"` → the microVM backend with the probed host totals, per-key
-/// overrides winning; any other runtime — "podman", "tart" and "direct"
-/// included, there is no container backend, no macOS backend and no bare
-/// spawn — is a loud config error naming the audited adapter.
+/// `"firecracker"` (Linux) or `"vz"` (macOS) → the microVM backend with the
+/// probed host totals, per-key overrides winning; any other runtime —
+/// "podman", "tart" and "direct" included, there is no container backend and
+/// no bare spawn — is a loud config error naming the audited adapters.
 fn resolve_sandbox(
     sandbox: Option<&SandboxToml>,
 ) -> Result<(Option<SandboxBackend>, BTreeMap<String, u64>), String> {
@@ -337,26 +337,31 @@ fn resolve_sandbox(
         }
         Ok(capacity)
     };
-    match sandbox.runtime.as_str() {
-        "firecracker" => {
-            // The guest images are the whole backend: one kernel and one
-            // read-only rootfs, shared by every run on this node. Both are
-            // resolved to absolute paths here so a relative one in node.toml
-            // fails at config time rather than at the first boot, where it
-            // would read as "the guest never dialled back".
-            let kernel = absolute_runtime_path(&sandbox.kernel)?;
-            let rootfs = absolute_runtime_path(&sandbox.rootfs)?;
-            Ok((
-                Some(SandboxBackend::Firecracker { kernel, rootfs }),
-                probed()?,
-            ))
+    let vmm = match sandbox.runtime.as_str() {
+        "firecracker" => Vmm::Firecracker,
+        "vz" => Vmm::Vz,
+        other => {
+            return Err(format!(
+                "sandbox runtime: {other:?} is not \"firecracker\" (Linux) or \"vz\" (macOS) \
+                 — provider runs never execute bare on the host"
+            ));
         }
-        other => Err(format!(
-            "sandbox runtime: {other:?} is not \"firecracker\" \
-             (the sandbox is Linux-only, and provider runs never execute bare \
-             on the host)"
-        )),
-    }
+    };
+    // The guest images are the whole backend: one kernel and one read-only
+    // rootfs, shared by every run on this node. Both are resolved to absolute
+    // paths here so a relative one in node.toml fails at config time rather
+    // than at the first boot, where it would read as "the guest never dialled
+    // back".
+    let kernel = absolute_runtime_path(&sandbox.kernel)?;
+    let rootfs = absolute_runtime_path(&sandbox.rootfs)?;
+    Ok((
+        Some(SandboxBackend::MicroVm {
+            vmm,
+            kernel,
+            rootfs,
+        }),
+        probed()?,
+    ))
 }
 
 /// default recovery checkpoint cadence: small enough that boot replay stays
@@ -1262,11 +1267,31 @@ mod tests {
         assert!(
             matches!(
                 &resolved.service.sandbox,
-                Some(SandboxBackend::Firecracker { kernel, rootfs })
+                Some(SandboxBackend::MicroVm { vmm: Vmm::Firecracker, kernel, rootfs })
                     if kernel == Path::new("/srv/guest/vmlinux")
                         && rootfs == Path::new("/srv/guest/rootfs.ext4")
             ),
             "firecracker backend with the configured images: {:?}",
+            resolved.service.sandbox
+        );
+
+        // the macOS runtime resolves the same shape with the vz flavor; the
+        // OS gate lives in the boot probe, not in config resolution, so a
+        // node.toml can be written on either OS and fail loudly on the wrong
+        // one.
+        std::fs::write(
+            dir.join("node.toml"),
+            format!("{base}{}", sandbox_table("vz", "/srv/guest", 0, 0)),
+        )
+        .expect("write");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve vz");
+        assert!(
+            matches!(
+                &resolved.service.sandbox,
+                Some(SandboxBackend::MicroVm { vmm: Vmm::Vz, kernel, .. })
+                    if kernel == Path::new("/srv/guest/vmlinux")
+            ),
+            "vz backend with the configured images: {:?}",
             resolved.service.sandbox
         );
         assert!(
@@ -1293,7 +1318,7 @@ mod tests {
         assert!(
             matches!(
                 &resolved.service.sandbox,
-                Some(SandboxBackend::Firecracker { kernel, .. })
+                Some(SandboxBackend::MicroVm { kernel, .. })
                     if kernel == Path::new("/opt/other/vmlinux")
             ),
             "custom guest dir honored: {:?}",

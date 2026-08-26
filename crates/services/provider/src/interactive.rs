@@ -435,7 +435,7 @@ impl CliProvider {
         let args = interactive_argv(base, &auth, &workdir, self.spec.isolation.broker);
 
         match &self.backend {
-            SandboxBackend::Firecracker { .. } => {
+            SandboxBackend::MicroVm { .. } => {
                 let (vm, io) = self
                     .microvm_boot(&args, &workdir, ctx, &auth, crate::GuestStdio::Pty)
                     .await?;

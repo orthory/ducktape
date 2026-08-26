@@ -19,6 +19,9 @@ tracing = { workspace = true }
 [dev-dependencies]
 # the service-root singleton test claims a real directory twice.
 tempfile = "3"
+# the vm-smoke example needs a runtime of its own; the library stays
+# runtime-agnostic.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [features]
 # the test-harness `SandboxBackend::Bare` spawn. a `cfg(test)` gate cannot cross
