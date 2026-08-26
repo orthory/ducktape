@@ -203,10 +203,9 @@ submit automations '{"create_rule":{"rule_id":"deploy-watch","trigger":{"channel
 #   • site — a NETWORK-hosted static app, served from DuckFS by consensus
 #   • app  — a USER-hosted app the gateway proxies to a node-local server
 #   • board — the network-visible kanban reference app
-# Sign the routes with the identity we just provisioned. When the key already
-# existed, we don't hold its password, so pass an empty one — the helper then
-# fails to sign and routes are skipped (non-fatal); chat/tasks/pages are already
-# durable regardless.
+# Sign the routes with the demo wallet the seed itself minted — the seed
+# always holds its password, so the sign step always runs (though failure is
+# non-fatal; chat/tasks/pages are already durable regardless).
 GATEWAY_ROUTES=3
 GATEWAY_PW="$DEMO_PASSWORD"
 bun "$SCRIPT_DIR/demo-gateway.mjs" "$URL" "$NODE_BIN" "$WSDIR" "$CHAIN" "$ID" "$USERKEY" "$GATEWAY_PW"
