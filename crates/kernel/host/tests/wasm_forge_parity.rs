@@ -1,0 +1,728 @@
+//! the ROOT-CONTINUITY proof for forge: the forge guest component over
+//! `WasmModule::with_odb(ForgeOdbBacking)` and the native `Forge` module over
+//! the same git substrate are BYTE-IDENTICAL block-by-block. forge's root is
+//! the composition over born branches + tracker on BOTH runtimes — the cutover
+//! changes the executor, not one committed byte — and this proof pins that:
+//! the same op stream commits the identical forge root after EVERY block from
+//! genesis, the same query replies (including the odb-reading browse lane),
+//! the same rejections, the same committed-only mid-block sibling reads, the
+//! same chat follow-ups, and snapshot containers that install across runtimes.
+//!
+//! packs ride a shared blob store on both sides, so materialization (the
+//! host-side half of the wasm tenant, driven from the block's ref targets)
+//! is under test too: the on-disk objects behind a pushed head must arrive on
+//! the wasm substrate exactly as the native `commit_block` installs them.
+
+use futures::executor::block_on;
+
+use forge::testkit::{PackedCommit, history};
+use forge::{
+    Forge, ForgeMsg, ForgeOdbBacking, ForgeQuery, RefUpdate, ReviewVerdict, encode_msg,
+    encode_query,
+};
+use host::{BlockContext, Host, MemberOutcome};
+use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
+use sha2::{Digest as _, Sha256};
+use wasm_host::WasmModule;
+
+const FORGE: &str = "forge";
+const CHAT: &str = "chat";
+const REPO: &str = "demo";
+
+/// GENERATED artifact — built from the module crate's guest port by
+/// guest-builder (`make wasm-modules`); committed so this proof is
+/// self-contained (the same fixture the node embeds).
+const FORGE_WASM: &[u8] = include_bytes!("fixtures/forge.component.wasm");
+
+// ---- the two runtimes over their own git substrates ------------------------
+
+/// a native `Forge` over `dir`, beside the two siblings the parity matrix
+/// needs: a [`Recorder`] registered as `chat` (the discussion-channel
+/// follow-up target) and a [`QueryProbe`] (the mid-block committed-read
+/// prober). genesis only REGISTERS, so a fresh dir starts at `StateRoot::ZERO`.
+fn native_host(dir: &tempfile::TempDir, blobs: blobstore::BlobHandle) -> Host {
+    let forge = Forge::with_blobs(FORGE, dir.path().join(FORGE), blobs)
+        .expect("open native forge")
+        .with_chat(CHAT);
+    Host::genesis(vec![
+        Box::new(forge),
+        Box::new(Recorder::new(CHAT)),
+        Box::new(QueryProbe::new()),
+    ])
+    .expect("native genesis")
+}
+
+/// the wasm `forge` tenant: the forge guest over a `ForgeOdbBacking` on `dir`
+/// — the exact `WasmModule::with_odb` composition bin/node uses — beside the
+/// SAME two native siblings.
+fn wasm_forge(dir: &tempfile::TempDir, blobs: blobstore::BlobHandle) -> WasmModule {
+    let backing =
+        ForgeOdbBacking::open(FORGE, dir.path().join(FORGE), blobs).expect("open odb backing");
+    WasmModule::with_odb(FORGE, FORGE_WASM, Box::new(backing)).expect("load component")
+}
+
+fn wasm_host(dir: &tempfile::TempDir, blobs: blobstore::BlobHandle) -> Host {
+    Host::genesis(vec![
+        Box::new(wasm_forge(dir, blobs)),
+        Box::new(Recorder::new(CHAT)),
+        Box::new(QueryProbe::new()),
+    ])
+    .expect("wasm genesis")
+}
+
+/// the consensus context for one block: both runtimes must see the identical env.
+fn block(height: u64, origin: Origin) -> BlockContext {
+    BlockContext {
+        height,
+        consensus_time: 1_000 + height,
+        origin,
+    }
+}
+
+fn owner() -> Origin {
+    Origin::External(vec![0xA1; 32])
+}
+
+fn stranger() -> Origin {
+    Origin::External(vec![0xB2; 32])
+}
+
+// ---- root + reply comparison seams ------------------------------------------
+
+fn all_roots(h: &Host) -> Vec<(ModuleId, StateRoot)> {
+    h.module_roots()
+}
+
+fn forge_root(h: &Host) -> StateRoot {
+    h.module_root(FORGE).expect("forge registered")
+}
+
+/// the read matrix: every query family, including the absent shapes and the
+/// odb-reading browse lane (served host-side off the git substrate on the wasm
+/// side). a query on a not-yet-existing item is a deterministic `Err`, so error
+/// PARITY is as much the claim as reply parity.
+fn replies(h: &Host) -> Vec<Vec<u8>> {
+    let queries = [
+        ForgeQuery::Head,
+        ForgeQuery::HeadOf { repo: REPO.into() },
+        ForgeQuery::HeadOf {
+            repo: "absent".into(),
+        },
+        ForgeQuery::ListRepos,
+        ForgeQuery::ListRefs { repo: REPO.into() },
+        ForgeQuery::ListItems { repo: REPO.into() },
+        ForgeQuery::GetItem {
+            repo: REPO.into(),
+            number: 1,
+        },
+        ForgeQuery::GetItem {
+            repo: REPO.into(),
+            number: 2,
+        },
+        ForgeQuery::GetItem {
+            repo: REPO.into(),
+            number: 9,
+        },
+        ForgeQuery::PrDiff {
+            repo: REPO.into(),
+            number: 2,
+        },
+        ForgeQuery::Tree {
+            repo: REPO.into(),
+            rev: String::new(),
+            path: String::new(),
+        },
+        ForgeQuery::Blob {
+            repo: REPO.into(),
+            rev: String::new(),
+            path: "README.md".into(),
+        },
+        ForgeQuery::BlobBytes {
+            repo: REPO.into(),
+            rev: String::new(),
+            path: "feature.txt".into(),
+            offset: 0,
+            len: 64,
+        },
+    ];
+    queries
+        .iter()
+        .map(|q| match block_on(h.query(FORGE, &encode_query(q))) {
+            Ok(bytes) => bytes,
+            Err(e) => format!("ERR:{e}").into_bytes(),
+        })
+        .collect()
+}
+
+fn assert_lockstep(native: &Host, wasm: &Host, at: &str) {
+    assert_eq!(all_roots(native), all_roots(wasm), "roots diverge {at}");
+    assert_eq!(replies(native), replies(wasm), "replies diverge {at}");
+}
+
+// ---- op builders ----------------------------------------------------------------
+
+fn op(msg: &ForgeMsg) -> Msg {
+    Msg {
+        target: FORGE.into(),
+        payload: encode_msg(msg),
+    }
+}
+
+fn update(branch: &str, prev: Option<&PackedCommit>, new: Option<&PackedCommit>) -> RefUpdate {
+    RefUpdate {
+        ref_name: branch.into(),
+        prev_oid: prev.map(|c| c.head.clone()),
+        new_oid: new.map(|c| c.head.clone()),
+    }
+}
+
+fn push(updates: Vec<RefUpdate>, pack: Option<[u8; 32]>) -> Msg {
+    op(&ForgeMsg::PushRefs {
+        repo: REPO.into(),
+        updates,
+        pack_digest: pack.map(|d| d.to_vec()),
+    })
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// drive one single-op block through BOTH hosts and require the same verdict.
+/// a rejection's native reason must appear in the wasm reason — the wasm
+/// runtime wraps the reason in its wit-error rendering, so containment (not
+/// equality) is the cross-runtime claim.
+fn submit_both(native: &mut Host, wasm: &mut Host, height: u64, origin: Origin, msg: Msg) -> bool {
+    let n = block_on(native.submit_at(block(height, origin.clone()), msg.clone()));
+    let w = block_on(wasm.submit_at(block(height, origin), msg));
+    match (n, w) {
+        (Ok(_), Ok(_)) => true,
+        (Err(n), Err(w)) => {
+            assert_reason_contained(&reason_of(n), &reason_of(w), height);
+            false
+        }
+        (n, w) => panic!("verdicts diverge at block {height}: native {n:?} vs wasm {w:?}"),
+    }
+}
+
+fn reason_of(err: host::SubmitError) -> String {
+    match err {
+        host::SubmitError::Rejected(Error::Module(reason)) => reason,
+        other => panic!("expected a module rejection, got {other:?}"),
+    }
+}
+
+fn assert_reason_contained(native: &str, wasm: &str, height: u64) {
+    // the wit rendering is a debug-escaped string: undo the quote escaping so
+    // a reason that names a repo (`"demo"`) is comparable; a batch member's
+    // reason additionally carries the `Module(..)` rendering on both sides,
+    // so the native needle is its inner text.
+    let wasm = wasm.replace("\\\"", "\"");
+    let native = native
+        .strip_prefix("Module(")
+        .and_then(|inner| inner.strip_suffix(')'))
+        .unwrap_or(native);
+    assert!(
+        wasm.contains(native),
+        "rejections diverge at block {height}: native {native:?} vs wasm {wasm:?}"
+    );
+}
+
+// ---- sibling modules (kept native on both hosts) ----------------------------
+
+/// the discussion-channel follow-up target: appends every payload it receives
+/// to its committed log, so its root MOVES exactly when forge emitted a chat
+/// follow-up. registered as `chat` in BOTH hosts — a missing or different
+/// emission on the wasm side diverges this module's root.
+struct Recorder {
+    id: ModuleId,
+    committed: Vec<Vec<u8>>,
+    staged: Vec<Vec<u8>>,
+}
+
+impl Recorder {
+    fn new(id: &str) -> Self {
+        Self {
+            id: id.into(),
+            committed: Vec::new(),
+            staged: Vec::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl Module for Recorder {
+    fn id(&self) -> ModuleId {
+        self.id.clone()
+    }
+    fn root(&self) -> StateRoot {
+        let mut h = Sha256::new();
+        for payload in &self.committed {
+            h.update((payload.len() as u64).to_le_bytes());
+            h.update(payload);
+        }
+        StateRoot(h.finalize().into())
+    }
+    async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
+        self.staged.push(msg.payload.clone());
+        Ok(())
+    }
+    async fn commit_block(&mut self) -> Result<(), Error> {
+        self.committed.append(&mut self.staged);
+        Ok(())
+    }
+    async fn abort_block(&mut self) -> Result<(), Error> {
+        self.staged.clear();
+        Ok(())
+    }
+}
+
+/// a mid-block query prober: `execute` host-routes its payload as a forge
+/// query (`Ctx::query` → the committed-only lane) and STAGES the reply;
+/// `commit_block` commits it, so the probe's root commits to the exact bytes
+/// it saw mid-block. a divergent committed-only read diverges the probe roots.
+struct QueryProbe {
+    staged: Option<Vec<u8>>,
+    committed: Vec<u8>,
+}
+
+impl QueryProbe {
+    fn new() -> Self {
+        Self {
+            staged: None,
+            committed: Vec::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl Module for QueryProbe {
+    fn id(&self) -> ModuleId {
+        "probe".into()
+    }
+    fn root(&self) -> StateRoot {
+        StateRoot(Sha256::digest(&self.committed).into())
+    }
+    async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
+        self.staged = Some(ctx.query(FORGE, &msg.payload).await?);
+        Ok(())
+    }
+    async fn commit_block(&mut self) -> Result<(), Error> {
+        if let Some(reply) = self.staged.take() {
+            self.committed = reply;
+        }
+        Ok(())
+    }
+    async fn abort_block(&mut self) -> Result<(), Error> {
+        self.staged = None;
+        Ok(())
+    }
+}
+
+fn probe_op(q: &ForgeQuery) -> Msg {
+    Msg {
+        target: "probe".into(),
+        payload: encode_query(q),
+    }
+}
+
+// ============================================================================
+// the full matrix, block-by-block root equality
+// ============================================================================
+
+/// pushes (birth, advance, multi-branch, delete), the tracker (issue, PR,
+/// review, merge, edit, close), owner-gated + CAS rejections, a multi-op block
+/// with a same-branch conflict, and a mid-block sibling read — driven through
+/// BOTH runtimes, asserting the forge root is byte-identical after EVERY block
+/// from genesis and every query reply matches.
+#[test]
+fn full_matrix_roots_identical_block_by_block() {
+    let dir_n = tempfile::tempdir().unwrap();
+    let dir_w = tempfile::tempdir().unwrap();
+    // one blob store on both sides: the packs are node-local possession, and
+    // both substrates must materialize the same objects.
+    let blobs = blobstore::BlobHandle::default();
+    let commits = history(
+        "parity",
+        &[
+            (1, "README.md", "hello\n", "birth"),
+            (2, "README.md", "hello again\n", "advance"),
+            (3, "feature.txt", "feature body\n", "feature"),
+            (4, "merged.txt", "merged\n", "merge"),
+        ],
+    );
+    let packs: Vec<[u8; 32]> = commits
+        .iter()
+        .map(|c| blobs.put_chunk(c.pack.clone()))
+        .collect();
+    let (c1, c2, c3, c4) = (&commits[0], &commits[1], &commits[2], &commits[3]);
+
+    let mut native = native_host(&dir_n, blobs.clone());
+    let mut wasm = wasm_host(&dir_w, blobs);
+
+    // ROOT CONTINUITY from block zero: both sides commit to the SAME empty
+    // namespace, so the roots are EQUAL (and ZERO).
+    assert_eq!(forge_root(&native), StateRoot::ZERO);
+    assert_lockstep(&native, &wasm, "at genesis");
+    // the host sees the wasm tenant exactly as it saw native forge: snapshot
+    // bytes (one self-contained container), never a resolver lane.
+    assert!(!native.resolver_backed_ids().contains(FORGE));
+    assert!(!wasm.resolver_backed_ids().contains(FORGE));
+
+    // the accepted stream — every block here moves the forge root.
+    let accepted: Vec<(u64, Origin, Msg)> = vec![
+        // birth: main at c1 (the owner pins).
+        (
+            1,
+            owner(),
+            push(vec![update("main", None, Some(c1))], Some(packs[0])),
+        ),
+        // advance main c1 → c2.
+        (
+            2,
+            owner(),
+            push(vec![update("main", Some(c1), Some(c2))], Some(packs[1])),
+        ),
+        // one atomic multi-branch push: dev born at c2, feature born at c3.
+        (
+            3,
+            owner(),
+            push(
+                vec![
+                    update("dev", None, Some(c2)),
+                    update("feature", None, Some(c3)),
+                ],
+                Some(packs[2]),
+            ),
+        ),
+        // the tracker: an issue (#1) — emits the discussion-channel follow-up.
+        (
+            4,
+            stranger(),
+            op(&ForgeMsg::OpenIssue {
+                repo: REPO.into(),
+                title: "first issue".into(),
+                body: "body".into(),
+            }),
+        ),
+        // a PR (#2) feature → dev.
+        (
+            5,
+            stranger(),
+            op(&ForgeMsg::OpenPr {
+                repo: REPO.into(),
+                title: "review me".into(),
+                body: String::new(),
+                source_branch: "feature".into(),
+                target_branch: "dev".into(),
+            }),
+        ),
+        // a review on #2.
+        (
+            6,
+            owner(),
+            op(&ForgeMsg::SubmitReview {
+                repo: REPO.into(),
+                number: 2,
+                verdict: ReviewVerdict::Approve,
+                body: "lgtm".into(),
+                commit_oid: hex(&c3.head),
+                comments: Vec::new(),
+            }),
+        ),
+        // the owner merges #2: dev c2 → c4 (the client-computed merge).
+        (
+            7,
+            owner(),
+            op(&ForgeMsg::MergePr {
+                repo: REPO.into(),
+                number: 2,
+                prev_target_oid: hex(&c2.head),
+                expected_source_oid: hex(&c3.head),
+                merge_oid: hex(&c4.head),
+                pack_digest: hex(&packs[3]),
+            }),
+        ),
+        // edit + close the issue (author-only).
+        (
+            8,
+            stranger(),
+            op(&ForgeMsg::EditItem {
+                repo: REPO.into(),
+                number: 1,
+                title: Some("first issue, retitled".into()),
+                body: None,
+            }),
+        ),
+        (
+            9,
+            stranger(),
+            op(&ForgeMsg::SetItemState {
+                repo: REPO.into(),
+                number: 1,
+                open: false,
+            }),
+        ),
+        // delete the merged feature branch (object-free: no pack).
+        (
+            10,
+            owner(),
+            push(vec![update("feature", Some(c3), None)], None),
+        ),
+    ];
+    for (height, origin, msg) in accepted {
+        let before = forge_root(&native);
+        assert!(
+            submit_both(&mut native, &mut wasm, height, origin, msg),
+            "block {height} must apply"
+        );
+        assert_ne!(forge_root(&native), before, "forge root stuck at {height}");
+        assert_lockstep(&native, &wasm, &format!("after block {height}"));
+    }
+
+    // the REJECTION matrix: every verdict identical, no root movement.
+    let rejected: Vec<(u64, Origin, Msg)> = vec![
+        // a non-owner moving a protected branch.
+        (
+            11,
+            stranger(),
+            push(vec![update("main", Some(c2), Some(c3))], Some(packs[2])),
+        ),
+        // a stale CAS on main.
+        (
+            12,
+            owner(),
+            push(vec![update("main", Some(c1), Some(c3))], Some(packs[2])),
+        ),
+        // a stranger editing someone else's issue.
+        (
+            13,
+            owner(),
+            op(&ForgeMsg::EditItem {
+                repo: REPO.into(),
+                number: 1,
+                title: Some("hijack".into()),
+                body: None,
+            }),
+        ),
+        // re-merging a merged PR.
+        (
+            14,
+            owner(),
+            op(&ForgeMsg::MergePr {
+                repo: REPO.into(),
+                number: 2,
+                prev_target_oid: hex(&c4.head),
+                expected_source_oid: hex(&c3.head),
+                merge_oid: hex(&c4.head),
+                pack_digest: hex(&packs[3]),
+            }),
+        ),
+        // a PR from a deleted (unborn) branch.
+        (
+            15,
+            owner(),
+            op(&ForgeMsg::OpenPr {
+                repo: REPO.into(),
+                title: "dangling".into(),
+                body: String::new(),
+                source_branch: "feature".into(),
+                target_branch: "dev".into(),
+            }),
+        ),
+    ];
+    for (height, origin, msg) in rejected {
+        let before = forge_root(&native);
+        assert!(
+            !submit_both(&mut native, &mut wasm, height, origin, msg),
+            "block {height} must reject"
+        );
+        assert_eq!(
+            forge_root(&native),
+            before,
+            "a rejection moved the root at {height}"
+        );
+        assert_lockstep(&native, &wasm, &format!("after rejected block {height}"));
+    }
+
+    // a MULTI-OP block: the block-scratch lane. member 0 re-births feature at
+    // c3, member 1 moves main c2 → c3 (a different branch, applies), member 2
+    // moves feature AGAIN in the same block (one fate per branch per block —
+    // rejected), member 3 reads dev's head mid-block through the probe
+    // (committed-only: c4 on both sides).
+    let ops = vec![
+        (
+            owner(),
+            push(vec![update("feature", None, Some(c3))], Some(packs[2])),
+        ),
+        (
+            owner(),
+            push(vec![update("main", Some(c2), Some(c3))], Some(packs[2])),
+        ),
+        (
+            owner(),
+            push(vec![update("feature", Some(c3), Some(c4))], Some(packs[3])),
+        ),
+        (owner(), probe_op(&ForgeQuery::HeadOf { repo: REPO.into() })),
+    ];
+    let n = block_on(native.submit_block(block(16, owner()), ops.clone())).expect("native block");
+    let w = block_on(wasm.submit_block(block(16, owner()), ops)).expect("wasm block");
+    for (i, (n, w)) in n.members.iter().zip(w.members.iter()).enumerate() {
+        match (n, w) {
+            (MemberOutcome::Applied { .. }, MemberOutcome::Applied { .. }) => {}
+            (MemberOutcome::Rejected { reason: rn }, MemberOutcome::Rejected { reason: rw }) => {
+                assert_reason_contained(rn, rw, 16 + i as u64);
+            }
+            (n, w) => panic!("member {i} verdicts diverge: native {n:?} vs wasm {w:?}"),
+        }
+    }
+    assert!(matches!(n.members[0], MemberOutcome::Applied { .. }));
+    assert!(matches!(n.members[1], MemberOutcome::Applied { .. }));
+    assert!(matches!(n.members[2], MemberOutcome::Rejected { .. }));
+    assert!(matches!(n.members[3], MemberOutcome::Applied { .. }));
+    assert_lockstep(&native, &wasm, "after the multi-op block");
+
+    // the browse lane read REAL objects: every pushed head materialized on
+    // both substrates (the wasm side through the block's ref targets).
+    let tree = block_on(native.query(
+        FORGE,
+        &encode_query(&ForgeQuery::Tree {
+            repo: REPO.into(),
+            rev: String::new(),
+            path: String::new(),
+        }),
+    ))
+    .expect("tree");
+    let listing = String::from_utf8(tree).unwrap();
+    assert!(
+        listing.contains("merged.txt"),
+        "dev head not materialized: {listing}"
+    );
+
+    // SNAPSHOT INTERCHANGE: the wasm tenant's container installs into a fresh
+    // native module and the native container into a fresh wasm tenant, each
+    // landing at the shared root with identical replies.
+    let (n_snap, _) = native.capture_current_snapshot(16, || std::time::Duration::ZERO);
+    let (w_snap, _) = wasm.capture_current_snapshot(16, || std::time::Duration::ZERO);
+    let root = forge_root(&native);
+    let n_bytes = snapshot_bytes(&n_snap.module(FORGE).expect("forge entry").state_sync);
+    let w_bytes = snapshot_bytes(&w_snap.module(FORGE).expect("forge entry").state_sync);
+    let empty = blobstore::BlobHandle::default();
+
+    let dir_fresh_n = tempfile::tempdir().unwrap();
+    let mut fresh_native = Forge::with_blobs(FORGE, dir_fresh_n.path().join(FORGE), empty.clone())
+        .expect("fresh native");
+    fresh_native
+        .install(&w_bytes, root)
+        .expect("the wasm container installs natively");
+    assert_eq!(fresh_native.root(), root);
+
+    let dir_fresh_w = tempfile::tempdir().unwrap();
+    let mut fresh_wasm = wasm_forge(&dir_fresh_w, empty);
+    fresh_wasm
+        .install(&n_bytes, root)
+        .expect("the native container installs into the wasm tenant");
+    assert_eq!(fresh_wasm.root(), root);
+    let q = encode_query(&ForgeQuery::ListRefs { repo: REPO.into() });
+    assert_eq!(
+        block_on(fresh_native.query(&q)).expect("native refs"),
+        block_on(fresh_wasm.query(&q)).expect("wasm refs"),
+        "replies diverge over the installed snapshots"
+    );
+    // a container under the wrong root is refused whole.
+    let mut bogus = wasm_forge(
+        &tempfile::tempdir().unwrap(),
+        blobstore::BlobHandle::default(),
+    );
+    assert!(bogus.install(&n_bytes, StateRoot::ZERO).is_err());
+    assert_eq!(bogus.root(), StateRoot::ZERO);
+
+    // REOPEN: the wasm substrate re-adopts its on-disk state at the same root.
+    drop(wasm);
+    let reopened = wasm_host(&dir_w, blobstore::BlobHandle::default());
+    assert_eq!(
+        forge_root(&reopened),
+        root,
+        "the reopened wasm tenant rewound"
+    );
+    assert_eq!(replies(&native), replies(&reopened));
+}
+
+fn snapshot_bytes(handle: &StateSyncHandle) -> Vec<u8> {
+    match handle {
+        StateSyncHandle::SnapshotBytes(b) => b.clone(),
+        other => panic!("expected snapshot bytes, got {other:?}"),
+    }
+}
+
+// ============================================================================
+// pack possession is per-node, root is not
+// ============================================================================
+
+/// a wasm tenant whose blob store LACKS the pack commits the SAME root as one
+/// that holds it (the fork-safety invariant), records the head as a catch-up
+/// target, and materializes it once the pack arrives on a later forge block.
+#[test]
+fn a_wasm_tenant_without_the_pack_reaches_the_same_root_then_catches_up() {
+    let dir_full = tempfile::tempdir().unwrap();
+    let dir_bare = tempfile::tempdir().unwrap();
+    let full = blobstore::BlobHandle::default();
+    let bare = blobstore::BlobHandle::default();
+    let commits = history("possession", &[(1, "README.md", "hello\n", "birth")]);
+    let c1 = &commits[0];
+    let pack = full.put_chunk(c1.pack.clone());
+
+    let mut with_pack = wasm_host(&dir_full, full);
+    let mut without = wasm_host(&dir_bare, bare.clone());
+    let birth = push(vec![update("main", None, Some(c1))], Some(pack));
+    block_on(with_pack.submit_at(block(1, owner()), birth.clone())).expect("with pack");
+    block_on(without.submit_at(block(1, owner()), birth)).expect("without pack");
+    assert_eq!(
+        forge_root(&with_pack),
+        forge_root(&without),
+        "pack possession leaked into the root"
+    );
+    assert_ne!(forge_root(&without), StateRoot::ZERO);
+
+    // the catch-up map is the node's pull handle — readable without the module.
+    assert_eq!(
+        forge::pending_digests(&dir_bare.path().join(FORGE)).unwrap(),
+        vec![pack]
+    );
+    assert!(
+        forge::pending_digests(&dir_full.path().join(FORGE))
+            .unwrap()
+            .is_empty()
+    );
+    let tree = ForgeQuery::Tree {
+        repo: REPO.into(),
+        rev: String::new(),
+        path: String::new(),
+    };
+    let not_yet = block_on(without.query(FORGE, &encode_query(&tree)));
+    let materialized = block_on(with_pack.query(FORGE, &encode_query(&tree))).expect("tree");
+    assert_ne!(
+        not_yet.ok(),
+        Some(materialized.clone()),
+        "objects appeared from nowhere"
+    );
+
+    // the pack arrives out of band; the next forge block catches the ref up.
+    bare.put_chunk(c1.pack.clone());
+    let touch = op(&ForgeMsg::OpenIssue {
+        repo: REPO.into(),
+        title: "nudge".into(),
+        body: String::new(),
+    });
+    block_on(without.submit_at(block(2, owner()), touch)).expect("nudge");
+    assert!(
+        forge::pending_digests(&dir_bare.path().join(FORGE))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        block_on(without.query(FORGE, &encode_query(&tree))).expect("tree"),
+        materialized,
+        "the caught-up substrate serves the same tree"
+    );
+}

@@ -107,7 +107,7 @@ pub const MAX_STORE_READS: usize = 4096;
 /// (the files guest) ever accrue against it; every other tenant leaves it at 0.
 pub const MAX_OBJECT_READS: usize = 4096;
 
-/// the host-side content-addressed object store a wasm files tenant reads from
+/// the host-side content-addressed object store a wasm odb tenant reads from
 /// and stages puts against. Task 1 ships only the trait + the plumbing that
 /// routes the object imports here; NO backing is wired (`WasmModule::odb` is
 /// `None`), so every read that misses the same-dispatch put overlay answers
@@ -128,23 +128,56 @@ pub trait HostOdb {
     fn stage_put(&mut self, kind: u8, body: &[u8]) -> [u8; 32];
 }
 
-/// the host-side substrate a ROOT-CONTINUOUS files tenant ([`StateBacking::Odb`])
-/// delegates its committed surface to — a native duckfs `Fs` over its disk odb +
-/// durable refs file (Task 4), or the in-memory mock the kernel tests drive.
+/// the host-side substrate a ROOT-CONTINUOUS tenant ([`StateBacking::Odb`])
+/// delegates its committed surface to — a native content-addressed substrate
+/// (duckfs `Fs` over its disk odb + durable refs file, forge over its git
+/// repos), or the in-memory mock the kernel tests drive.
 ///
-/// the crux is `root()` = `StateRoot(sha256(refs_bytes()))` — the canonical refs
-/// image, NOT the host-KV encoding — so a wasm files tenant's root-hash is
-/// byte-identical to native files' `sha256(encode_refs)` and the cutover moves
-/// no root. the guest sees the refs image through the ordinary `state-*` lane
-/// under [`REFS_KEY`] (state-get serves the committed image staged-over, state-set
-/// stages a new one); the object plane rides [`HostOdb`] (the supertrait). at the
-/// block boundary the kernel drives the two boundary hooks in the duckfs
-/// durability order — staged objects published FIRST, then the refs image adopted
-/// — the crash-safety contract Task 4 realizes on disk (native `module.rs:368-427`).
+/// the crux is root continuity: by default `root()` =
+/// `StateRoot(sha256(refs_bytes()))` — the canonical refs image, NOT the
+/// host-KV encoding — so a wasm files tenant's root-hash is byte-identical to
+/// native files' `sha256(encode_refs)` and the cutover moves no root. a
+/// substrate whose native root is a different fold of the same image overrides
+/// [`OdbBacking::root`] (and the install gate + sync handle that follow from
+/// it). the guest sees the refs image through the ordinary `state-*` lane under
+/// [`REFS_KEY`] (state-get serves the committed image staged-over, state-set
+/// stages a new one); the object plane rides [`HostOdb`] (the supertrait). at
+/// the block boundary the kernel drives the two boundary hooks in the duckfs
+/// durability order — staged objects published FIRST, then the refs image
+/// adopted — the crash-safety contract a disk backing realizes.
 pub trait OdbBacking: HostOdb {
     /// the committed refs image — the `root()` preimage and the snapshot bytes.
     /// byte-identical to native `Fs::snapshot_refs` / `encode_refs`.
     fn refs_bytes(&self) -> Vec<u8>;
+    /// the committed root. the default is the canonical `sha256(refs_bytes())`;
+    /// a substrate whose native root folds the image differently (a
+    /// domain-separated composition) overrides it so the cutover keeps the
+    /// native root byte-identical. moves only when the backing adopts a new
+    /// image (commit/install).
+    fn root(&self) -> StateRoot {
+        StateRoot(sha256_array(&self.refs_bytes()))
+    }
+    /// verify-then-adopt a peer/checkpoint snapshot under the root gate. the
+    /// default verifies `sha256(bytes) == expected` and adopts the bytes as
+    /// the refs image; a substrate with a self-contained container (image +
+    /// objects) overrides it with its own parse-verify-install. committed
+    /// state stays untouched on any error.
+    fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), SdkError> {
+        if StateRoot(sha256_array(bytes)) != expected {
+            return Err(SdkError::Module("snapshot root mismatch".into()));
+        }
+        self.adopt_refs(bytes)
+    }
+    /// how a joiner obtains this substrate's committed state. the default is
+    /// the duckfs object-possession lane (the refs image plus a `GetObjects`
+    /// walk over [`OdbBacking::serve_sync`]); a substrate that ships one
+    /// self-contained container answers `SnapshotBytes`.
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, SdkError> {
+        Ok(StateSyncHandle::ResolverBacked {
+            backend: "duckfs-odb".into(),
+            detail: "refs image + GetObjects fetch to full object possession".into(),
+        })
+    }
     /// adopt a refs image as the new committed refs (the root moves here). the
     /// image is consensus-validated (a committed block's staged refs) or
     /// root-verified (an installed snapshot); the backing swaps + durably saves
@@ -185,14 +218,16 @@ pub trait OdbBacking: HostOdb {
     fn durable_commit_height(&self) -> Option<u64>;
 }
 
-/// the single reserved state-lane key an ODB-backed (files) tenant reads and
-/// writes its whole refs image under. the guest loads the committed refs via
-/// `state-get(REFS_KEY)` and stages a new image via `state-set(REFS_KEY, ..)`;
-/// the host seeds each execute round's committed view with exactly this one
-/// entry (= `backing.refs_bytes()`) and, at commit, adopts the staged value.
-/// reuses the `__state` single-value whole-state convention — but `root()` is
-/// `sha256(refs_bytes)`, NOT the KV encoding, so there is no `__root` twin. the
-/// files guest (Task 3) MUST read/write refs under this exact key.
+/// the single reserved state-lane key an ODB-backed tenant (files, forge)
+/// reads and writes its whole refs image under. the guest loads the committed
+/// image via `state-get(REFS_KEY)` and stages a new one via
+/// `state-set(REFS_KEY, ..)`; the host seeds each execute round's committed
+/// view with exactly this one entry (= `backing.refs_bytes()`) and, at commit,
+/// adopts the staged value. any OTHER key the guest stages is block-local
+/// scratch: dropped at the boundary, never adopted. reuses the `__state`
+/// single-value whole-state convention — but `root()` is the backing's fold
+/// of the image, NOT the KV encoding, so there is no `__root` twin. every odb
+/// guest MUST read/write its image under this exact key.
 pub const REFS_KEY: &[u8] = b"__state";
 
 /// trap message for a read the memo cannot answer yet. never surfaces to
@@ -667,8 +702,8 @@ impl WasmModule {
             StateBacking::Store { .. } => {
                 panic!("a store-backed wasm module has no byte snapshot — sync the store")
             }
-            // the refs image IS the snapshot (native `Fs::snapshot_refs`) — the
-            // exact `root()` preimage, shipped over the duckfs-odb resolver lane.
+            // the refs image IS the snapshot — the exact `root()` preimage; how
+            // it ships is the backing's `state_sync_handle`.
             StateBacking::Odb { backing } => backing.refs_bytes(),
         }
     }
@@ -695,14 +730,11 @@ impl WasmModule {
                 "a store-backed wasm module adopts state through its injected store, not install"
                     .into(),
             )),
-            // verify-then-adopt the refs image (native `Fs::install_refs`): check
-            // the root here, then hand the verified bytes to the backing. the
-            // backing does not re-verify, so the root check is load-bearing.
+            // verify-then-adopt under the backing's own root gate (the default
+            // checks `sha256(bytes)` against the refs image; a container-shaped
+            // substrate parses and verifies its own composition).
             StateBacking::Odb { backing } => {
-                if StateRoot(sha256_array(bytes)) != expected {
-                    return Err(SdkError::Module("snapshot root mismatch".into()));
-                }
-                backing.adopt_refs(bytes)?;
+                backing.install(bytes, expected)?;
                 self.staged.clear();
                 Ok(())
             }
@@ -928,10 +960,10 @@ impl Module for WasmModule {
         match &self.backing {
             StateBacking::Map { committed } => Self::root_of(committed),
             StateBacking::Store { store } => store.root(),
-            // the ROOT-CONTINUITY crux: sha256 over the canonical refs image,
-            // byte-identical to native files' `sha256(encode_refs)`. moves only
+            // the ROOT-CONTINUITY crux: the backing's own fold of the canonical
+            // refs image, byte-identical to the native module's root. moves only
             // when the backing adopts a new image (commit/install).
-            StateBacking::Odb { backing } => StateRoot(sha256_array(&backing.refs_bytes())),
+            StateBacking::Odb { backing } => backing.root(),
         }
     }
 
@@ -960,13 +992,11 @@ impl Module for WasmModule {
                 backend: "qmdb".into(),
                 detail: "serve_sync answers qmdb op-range requests (statesync wire)".into(),
             }),
-            // byte-identical to native files' handle: the joiner fetches the refs
-            // image then walks `missing_objects` -> `GetObjects` -> ingest over
-            // `serve_sync` to full possession — no qmdb op-range target.
-            StateBacking::Odb { .. } => Ok(StateSyncHandle::ResolverBacked {
-                backend: "duckfs-odb".into(),
-                detail: "refs image + GetObjects fetch to full object possession".into(),
-            }),
+            // byte-identical to the native module's handle: by default the
+            // joiner fetches the refs image then walks `missing_objects` ->
+            // `GetObjects` -> ingest over `serve_sync` to full possession; a
+            // container-shaped substrate ships its snapshot bytes instead.
+            StateBacking::Odb { backing } => backing.state_sync_handle(),
         }
     }
 

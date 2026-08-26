@@ -113,9 +113,6 @@ pub fn update_ref(repo: &Repository, name: &str, target: Oid) -> Result<(), git2
     Ok(())
 }
 
-/// the raw width of a sha1 oid — the snapshot's head-oid header size.
-pub const OID_RAW_LEN: usize = 20;
-
 /// the ref namespace forge manages — every branch lives under it and the wire
 /// carries SHORT names ("main", "feature/x"); this prefix is a local detail.
 pub const HEADS_PREFIX: &str = "refs/heads/";

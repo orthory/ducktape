@@ -1,0 +1,1242 @@
+//! forge's CONSENSUS core — the branch map of every repo plus the tracker, and
+//! the block-scoped staging every [`ForgeMsg`] decides against. this is the ONE
+//! implementation of forge's accept/reject logic: the native module drives it
+//! over its disk substrate and the wasm guest drives it over the host state
+//! lane, so both runtimes stage the identical fate for the identical op.
+//!
+//! nothing here touches a git object database, a file, or a clock: a decision
+//! is a pure function of (committed state, block scratch, env, op). the module
+//! also owns the byte contracts the two runtimes meet at:
+//!
+//! * the **state image** — born repos' branch maps + the tracker, the whole of
+//!   committed consensus state as one value. the guest reads it under the host
+//!   state lane and writes the chained image back after every dispatch; the
+//!   host substrate adopts the block's final image at commit.
+//! * the **block scratch** — the fates staged so far this block, each with the
+//!   committed head it shadows. a per-dispatch runtime rebuilds the native
+//!   mid-block [`RepoState`] (committed refs + staged fates) from image +
+//!   scratch, so the one-fate-per-branch rule and every committed-only check
+//!   read exactly as they do on the block-spanning native struct.
+//! * the **ref target** — one packed head's `(repo, branch, head, pack)`,
+//!   staged as a block-scoped object so the host substrate learns which pack
+//!   materializes a head the image only names. deletes carry no target.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use identity::{IdentityQuery, IdentityReply};
+use sdk::{Ctx, Error, Origin, StateRoot};
+use sha2::{Digest, Sha256};
+
+use crate::codec::{self, Reader};
+use crate::oid::{OID_RAW_LEN, Oid};
+use crate::refs::{INTEGRATION_BRANCH, RepoState, StagedRef, is_protected_branch, norm_branch};
+use crate::tracker::{self, Tracker, author_from_origin, parse_hex_oid};
+use crate::{
+    ForgeMsg, ItemKind, MAX_REFS_PER_PUSH, RefUpdate, ReviewVerdict, decode_msg, norm_repo,
+};
+
+/// the Identity module's genesis-constant id — the account registry every
+/// forge principal resolves through. mirrors `bin/node/src/host_state.rs`'s
+/// `IDENTITY_MODULE_ID`; it is not a per-network choice, so it is not a knob.
+const IDENTITY_MODULE: &str = "identity";
+
+/// the domain tag folding the tracker's canonical-bytes hash into the root
+/// preimage — separates it from the branch material.
+const TRACKER_ROOT_DOMAIN: &[u8] = b"ducktape.forge.tracker.v1\x00";
+
+/// the domain tag forge's root preimage is separated under — a fixed constant
+/// hashed over the folded preimage in [`compose_state_root`].
+const FORGE_ROOT_DOMAIN: &[u8] = b"ducktape.forge.multirepo.v1\x00";
+
+/// the 4-byte magic the state image leads with.
+const IMAGE_MAGIC: &[u8; 4] = b"FGI1";
+
+/// the 4-byte magic the block scratch leads with.
+const BLOCK_SCRATCH_MAGIC: &[u8; 4] = b"FGB1";
+
+/// the object-plane kind tag of a [`RefTarget`] — the only object kind forge
+/// stages. a host substrate handed any other tag is wired to the wrong guest.
+pub const REF_TARGET_KIND: u8 = 1;
+
+/// the composition [`StateRoot`] over the whole forge state: every born branch
+/// of every repo (callers pass repos SORTED by name; branch maps are sorted
+/// `BTreeMap`s) folded with the tracker's canonical-bytes hash, then
+/// domain-separated under [`FORGE_ROOT_DOMAIN`]. the empty state ->
+/// [`StateRoot::ZERO`] (the empty-genesis root). see the composition invariant
+/// in the crate doc.
+pub fn compose_state_root<'a>(
+    repos: impl Iterator<Item = (&'a str, &'a BTreeMap<String, Oid>)>,
+    tracker: &Tracker,
+) -> StateRoot {
+    let mut h = Sha256::new();
+    let mut any = false;
+    for (name, refs) in repos {
+        if refs.is_empty() {
+            continue;
+        }
+        any = true;
+        // name/branch lengths are cap-bounded (64 / 128 bytes), so the u32
+        // casts never truncate.
+        h.update((name.len() as u32).to_le_bytes());
+        h.update(name.as_bytes());
+        h.update((refs.len() as u32).to_le_bytes());
+        for (branch, head) in refs {
+            h.update((branch.len() as u32).to_le_bytes());
+            h.update(branch.as_bytes());
+            h.update(head.as_bytes()); // 20 raw sha1 bytes
+        }
+    }
+    if !tracker.is_empty() {
+        any = true;
+        h.update(TRACKER_ROOT_DOMAIN);
+        h.update(Sha256::digest(tracker.canonical_bytes()));
+    }
+    if !any {
+        return StateRoot::ZERO;
+    }
+    let inner: [u8; 32] = h.finalize().into();
+    let mut outer = Sha256::new();
+    outer.update(FORGE_ROOT_DOMAIN);
+    outer.update(inner);
+    StateRoot(outer.finalize().into())
+}
+
+/// parse exactly `OID_RAW_LEN` (20) raw sha1 bytes into an `Oid`, with a
+/// deterministic module error naming the field on any other length.
+fn parse_oid(bytes: &[u8], field: &str) -> Result<Oid, Error> {
+    if bytes.len() != OID_RAW_LEN {
+        return Err(Error::Module(format!(
+            "forge: {field} must be {OID_RAW_LEN} bytes, got {}",
+            bytes.len()
+        )));
+    }
+    Oid::from_bytes(bytes)
+}
+
+/// parse a 32-byte pack digest from raw wire bytes.
+fn parse_digest(bytes: &[u8]) -> Result<[u8; 32], Error> {
+    bytes.try_into().map_err(|_| {
+        Error::Module(format!(
+            "forge: pack_digest must be 32 bytes, got {}",
+            bytes.len()
+        ))
+    })
+}
+
+/// parse a 64-char sha256 hex digest (the app-facing MergePr lane).
+fn parse_hex_digest(s: &str) -> Result<[u8; 32], Error> {
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(Error::Module(
+            "forge: pack_digest must be 64 hex chars".into(),
+        ));
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
+            .map_err(|e| Error::Module(e.to_string()))?;
+    }
+    Ok(out)
+}
+
+/// the push-side owner gate: a push may move `main`/`dev` only for the
+/// principal that owns the repo. every other branch is open to any member.
+fn require_owner_for_protected(
+    repo: &str,
+    owner: &[u8],
+    principal: &[u8],
+    updates: &[RefUpdate],
+) -> Result<(), Error> {
+    let moves_protected = updates.iter().any(|u| is_protected_branch(&u.ref_name));
+    if moves_protected && owner != principal {
+        return Err(Error::Module(format!(
+            "forge: only the owner of repo {repo:?} may move a protected branch"
+        )));
+    }
+    Ok(())
+}
+
+/// CAS every update of ONE atomic push onto `state`. detached from the repo map
+/// so the caller decides whether a birthing repo's entry survives a refusal.
+fn stage_updates(
+    state: &mut RepoState,
+    updates: &[RefUpdate],
+    digest: Option<[u8; 32]>,
+) -> Result<(), Error> {
+    for u in updates {
+        let prev = u
+            .prev_oid
+            .as_deref()
+            .map(|b| parse_oid(b, "prev_oid"))
+            .transpose()?;
+        let new = u
+            .new_oid
+            .as_deref()
+            .map(|b| parse_oid(b, "new_oid"))
+            .transpose()?;
+        state.stage_update(
+            &u.ref_name,
+            prev,
+            new,
+            new.is_some().then(|| digest.unwrap()),
+        )?;
+    }
+    Ok(())
+}
+
+/// the consensus state plus this block's staging: the repo namespace (keyed by
+/// normalized slug, SORTED so `root()` composes order-independently), the
+/// COMMITTED tracker, and the block-scratch tracker (clone-on-write on the
+/// first tracker mutation of a block; swapped in at commit, dropped at abort).
+#[derive(Default)]
+pub struct ForgeState {
+    pub repos: BTreeMap<String, RepoState>,
+    pub tracker: Tracker,
+    pub staged_tracker: Option<Tracker>,
+}
+
+impl ForgeState {
+    /// the composed state root over COMMITTED state — pure, no IO.
+    pub fn root(&self) -> StateRoot {
+        let entries = self.repos.iter().map(|(n, s)| (n.as_str(), &s.refs));
+        compose_state_root(entries, &self.tracker)
+    }
+
+    /// the tracker as THIS BLOCK sees it (read-your-writes).
+    pub fn tracker_view(&self) -> &Tracker {
+        self.staged_tracker.as_ref().unwrap_or(&self.tracker)
+    }
+
+    /// clone-on-write access to the block-scratch tracker.
+    fn staged_tracker_mut(&mut self) -> &mut Tracker {
+        self.staged_tracker
+            .get_or_insert_with(|| self.tracker.clone())
+    }
+
+    /// swap the block-scratch tracker in as committed; `true` when a tracker
+    /// mutation was staged this block (the caller persists it).
+    pub fn commit_tracker(&mut self) -> bool {
+        match self.staged_tracker.take() {
+            Some(staged) => {
+                self.tracker = staged;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// discard everything staged — no ref moved, tracker unchanged, `root()`
+    /// unchanged.
+    pub fn abort(&mut self) {
+        for state in self.repos.values_mut() {
+            state.abort();
+        }
+        self.staged_tracker = None;
+    }
+
+    /// apply one write op. Git writes stage pure per-branch CAS updates;
+    /// tracker ops mutate the block-scratch tracker and emit chat follow-ups
+    /// (at `chat_target`; `None` opens no discussion channels) that commit
+    /// atomically with the block. never opens a Git repo.
+    pub async fn apply(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        payload: &[u8],
+        chat_target: Option<&str>,
+    ) -> Result<(), Error> {
+        let now = ctx.env().consensus_time;
+        match decode_msg(payload).map_err(Error::Module)? {
+            ForgeMsg::PushRefs {
+                repo,
+                updates,
+                pack_digest,
+            } => {
+                let name = norm_repo(&repo)?;
+                let principal = Self::principal_of_origin(ctx).await?;
+                self.stage_push_refs(&name, principal, updates, pack_digest)
+            }
+            ForgeMsg::OpenIssue { repo, title, body } => {
+                let name = norm_repo(&repo)?;
+                let author = author_from_origin(&ctx.env().origin)?;
+                let number = self.staged_tracker_mut().open_item(
+                    &name,
+                    ItemKind::Issue,
+                    title,
+                    body,
+                    author,
+                    now,
+                    None,
+                )?;
+                if let Some(chat) = chat_target {
+                    ctx.emit_msg(tracker::create_channel_msg(chat, &name, number));
+                }
+                Ok(())
+            }
+            ForgeMsg::OpenPr {
+                repo,
+                title,
+                body,
+                source_branch,
+                target_branch,
+            } => {
+                let name = norm_repo(&repo)?;
+                let author = author_from_origin(&ctx.env().origin)?;
+                let target = if target_branch.is_empty() {
+                    INTEGRATION_BRANCH.to_string()
+                } else {
+                    target_branch
+                };
+                norm_branch(&source_branch)?;
+                norm_branch(&target)?;
+                if source_branch == target {
+                    return Err(Error::Module(
+                        "forge: a pull request needs distinct source and target branches".into(),
+                    ));
+                }
+                // both branches must be BORN in committed state — a PR from a
+                // branch nobody pushed is meaningless, and the checks read
+                // agreed state only.
+                let state = self
+                    .repos
+                    .get(&name)
+                    .ok_or_else(|| Error::Module(format!("forge: no repo {name:?}")))?;
+                for (label, branch) in [("source", &source_branch), ("target", &target)] {
+                    if !state.refs.contains_key(branch.as_str()) {
+                        return Err(Error::Module(format!(
+                            "forge: {label} branch {branch:?} is not born in repo {name:?}"
+                        )));
+                    }
+                }
+                let number = self.staged_tracker_mut().open_item(
+                    &name,
+                    ItemKind::Pr,
+                    title,
+                    body,
+                    author,
+                    now,
+                    Some((source_branch, target)),
+                )?;
+                if let Some(chat) = chat_target {
+                    ctx.emit_msg(tracker::create_channel_msg(chat, &name, number));
+                }
+                Ok(())
+            }
+            ForgeMsg::EditItem {
+                repo,
+                number,
+                title,
+                body,
+            } => {
+                let name = norm_repo(&repo)?;
+                let editor = author_from_origin(&ctx.env().origin)?;
+                self.staged_tracker_mut()
+                    .edit_item(&name, number, &editor, title, body, now)
+            }
+            ForgeMsg::SetItemState { repo, number, open } => {
+                let name = norm_repo(&repo)?;
+                // DELIBERATELY open to any authenticated member: closing and
+                // reopening is triage, `Merged` is terminal and refused below,
+                // and the inverse op is one message away. the binding is here
+                // for its AUTHENTICATION effect only.
+                let _closer = author_from_origin(&ctx.env().origin)?;
+                if let Some(verb) = self
+                    .staged_tracker_mut()
+                    .set_state(&name, number, open, now)?
+                {
+                    self.emit_system_line(
+                        ctx,
+                        chat_target,
+                        &name,
+                        number,
+                        &format!("{verb} this"),
+                    )?;
+                }
+                Ok(())
+            }
+            ForgeMsg::MergePr {
+                repo,
+                number,
+                prev_target_oid,
+                expected_source_oid,
+                merge_oid,
+                pack_digest,
+            } => {
+                let name = norm_repo(&repo)?;
+                let principal = Self::principal_of_origin(ctx).await?;
+                let prev_target = parse_hex_oid(&prev_target_oid, "prev_target_oid")?;
+                let expected_source = parse_hex_oid(&expected_source_oid, "expected_source_oid")?;
+                let merge = parse_hex_oid(&merge_oid, "merge_oid")?;
+                let digest = parse_hex_digest(&pack_digest)?;
+
+                // the PR must be an open PR; pull its branches.
+                let (source, target) = self.tracker_view().pr_branches(&name, number)?;
+                self.require_merge_owner(&name, &target, &principal)?;
+
+                // double CAS on COMMITTED refs: the target must not have moved
+                // under the merger, and the merge must have been computed
+                // against the CURRENT source head (a force-push between compute
+                // and submit rejects deterministically).
+                let state = self
+                    .repos
+                    .get_mut(&name)
+                    .ok_or_else(|| Error::Module(format!("forge: no repo {name:?}")))?;
+                if state.refs.get(&source).copied() != Some(expected_source) {
+                    return Err(Error::Module(
+                        "forge: pull request source branch moved; recompute the merge".into(),
+                    ));
+                }
+                state.stage_update(&target, Some(prev_target), Some(merge), Some(digest))?;
+                self.staged_tracker_mut()
+                    .merge_pr(&name, number, merge, now)?;
+                self.emit_system_line(ctx, chat_target, &name, number, "merged this pull request")?;
+                Ok(())
+            }
+            ForgeMsg::SubmitReview {
+                repo,
+                number,
+                verdict,
+                body,
+                commit_oid,
+                comments,
+            } => {
+                let name = norm_repo(&repo)?;
+                let author = author_from_origin(&ctx.env().origin)?;
+                self.staged_tracker_mut().submit_review(
+                    &name,
+                    number,
+                    author,
+                    verdict,
+                    body,
+                    &commit_oid,
+                    comments,
+                    now,
+                )?;
+                let line = match verdict {
+                    ReviewVerdict::Approve => Some("approved these changes"),
+                    ReviewVerdict::RequestChanges => Some("requested changes"),
+                    ReviewVerdict::Comment => None,
+                };
+                if let Some(text) = line {
+                    self.emit_system_line(ctx, chat_target, &name, number, text)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// emit a system line into an item's discussion channel (no-op without a
+    /// chat target). the message id is minted from the item's own monotonic
+    /// counter, so it is deterministic and collision-free.
+    fn emit_system_line(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        chat_target: Option<&str>,
+        repo: &str,
+        number: u64,
+        text: &str,
+    ) -> Result<(), Error> {
+        let Some(chat) = chat_target else {
+            return Ok(());
+        };
+        let message_id = self
+            .staged_tracker_mut()
+            .next_sys_message_id(repo, number)?;
+        ctx.emit_msg(tracker::system_line_msg(
+            chat, repo, number, message_id, text,
+        ));
+        Ok(())
+    }
+
+    /// the Identity ACCOUNT id a key belongs to, or `None`.
+    ///
+    /// a host with no identity module at all (the minimal test hosts) has no
+    /// accounts, so nothing resolves — the only tolerated query failures are
+    /// exactly "that module is not here".
+    async fn identity_account(
+        ctx: &dyn Ctx,
+        query: IdentityQuery,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        let reply = match ctx
+            .query(IDENTITY_MODULE, &identity::encode_query(&query))
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(Error::UnknownModule(_) | Error::QueryUnsupported) => return Ok(None),
+            Err(other) => return Err(other),
+        };
+        match identity::decode_reply(&reply).map_err(Error::Module)? {
+            IdentityReply::Account(account) => Ok(account.map(|a| a.account_id)),
+            other => Err(Error::Module(format!(
+                "forge: identity answered an account query with {other:?}"
+            ))),
+        }
+    }
+
+    /// the PRINCIPAL a ref-moving op speaks for.
+    ///
+    /// the two ref-move doors sign under DIFFERENT key domains: `git push`
+    /// rides the NODE key (bin/noded's smart-HTTP lane submits, and the
+    /// validator ingress discards the claimed origin and re-signs with the node
+    /// key), while the app's merge is signed by the USER key. collapsing both
+    /// through Identity onto ONE account id is what lets the same human push
+    /// from the CLI and merge the PR from the app — a raw-key owner would
+    /// refuse the second.
+    ///
+    /// a key Identity knows nothing about is its OWN principal. that keeps a
+    /// single-operator or identity-less network self-consistent and does not
+    /// widen the gate: an unbound key still only ever matches itself.
+    async fn principal_of_origin(ctx: &dyn Ctx) -> Result<Vec<u8>, Error> {
+        let Origin::External(key) = &ctx.env().origin else {
+            return Err(Error::Module(
+                "forge: a ref-moving op requires an authenticated external origin".into(),
+            ));
+        };
+        if key.is_empty() {
+            return Err(Error::Module(
+                "forge: a ref-moving op requires an authenticated external origin".into(),
+            ));
+        }
+        let as_member = Self::identity_account(
+            ctx,
+            IdentityQuery::OfMember {
+                member_key: key.clone(),
+            },
+        )
+        .await?;
+        if let Some(account) = as_member {
+            return Ok(account);
+        }
+        let as_node = Self::identity_account(
+            ctx,
+            IdentityQuery::OfNode {
+                node_key: key.clone(),
+            },
+        )
+        .await?;
+        Ok(as_node.unwrap_or_else(|| key.clone()))
+    }
+
+    /// stage an atomic multi-branch push: validate the update list, settle
+    /// ownership, then CAS every branch. PURE and deterministic — no repo
+    /// opened, nothing installed, no ref moves (see
+    /// [`RepoState::stage_update`]).
+    ///
+    /// OWNERSHIP is the whole of protected-branch safety, and it has to be:
+    /// consensus CANNOT check ref descendancy, because a validator may not hold
+    /// the objects (that is forge's determinism invariant). without this gate
+    /// any member CAS-moves `main` to arbitrary bytes naming a pack it
+    /// legitimately holds, `materialize` then refuses forever, and `snapshot()`
+    /// errors on every node — one signed op stops the network checkpointing and
+    /// admitting joiners.
+    ///
+    /// the push that BIRTHS a repo pins its owner; afterwards only that owner
+    /// may move `main`/`dev`. FEATURE branches stay force-pushable by any
+    /// member — the GitHub flow this module documents, and what the dogfood
+    /// loop's second node pushes under its own key.
+    fn stage_push_refs(
+        &mut self,
+        name: &str,
+        principal: Vec<u8>,
+        updates: Vec<RefUpdate>,
+        pack_digest: Option<Vec<u8>>,
+    ) -> Result<(), Error> {
+        if updates.is_empty() {
+            return Err(Error::Module("forge: push carries no ref updates".into()));
+        }
+        if updates.len() > MAX_REFS_PER_PUSH {
+            return Err(Error::Module(format!(
+                "forge: too many ref updates ({}, max {MAX_REFS_PER_PUSH})",
+                updates.len()
+            )));
+        }
+        let mut seen = BTreeSet::new();
+        for u in &updates {
+            norm_branch(&u.ref_name)?;
+            if !seen.insert(u.ref_name.as_str()) {
+                return Err(Error::Module(format!(
+                    "forge: duplicate ref update for branch {:?}",
+                    u.ref_name
+                )));
+            }
+        }
+        let digest = pack_digest.as_deref().map(parse_digest).transpose()?;
+        if updates.iter().any(|u| u.new_oid.is_some()) && digest.is_none() {
+            return Err(Error::Module(
+                "forge: a push that sets heads needs a pack_digest".into(),
+            ));
+        }
+
+        // one discriminant: the repo either has an owner or this push births it.
+        // the CAS runs AFTER, so a stale prev_oid from the rightful owner still
+        // reports the non-fast-forward, not an authorization refusal.
+        match self.tracker_view().owner(name).map(<[u8]>::to_vec) {
+            None => self.staged_tracker_mut().claim_owner(name, principal),
+            Some(owner) => require_owner_for_protected(name, &owner, &principal, &updates)?,
+        }
+
+        // a repo the push BIRTHS is only inserted once EVERY CAS succeeded —
+        // `abort_block` drops staged fates but never a map entry, so inserting
+        // first would leave a phantom repo behind a rejected push (visible to
+        // `ListRepos`, and gone again after a restart re-adopt).
+        match self.repos.remove(name) {
+            Some(mut state) => {
+                let staged = stage_updates(&mut state, &updates, digest);
+                self.repos.insert(name.to_string(), state);
+                staged
+            }
+            None => {
+                let mut state = RepoState::default();
+                stage_updates(&mut state, &updates, digest)?;
+                self.repos.insert(name.to_string(), state);
+                Ok(())
+            }
+        }
+    }
+
+    /// refuse a merge onto a PROTECTED target branch from anyone but the repo
+    /// owner. `MergePr` is a SECOND raw ref-move door: `merge_oid` is
+    /// client-computed and its parentage is unverifiable in consensus, and
+    /// `OpenPr` lets any member open a PR onto `main` — so gating `PushRefs`
+    /// alone would close nothing.
+    fn require_merge_owner(&self, name: &str, target: &str, principal: &[u8]) -> Result<(), Error> {
+        if !is_protected_branch(target) {
+            return Ok(());
+        }
+        if self.tracker_view().owner(name) != Some(principal) {
+            return Err(Error::Module(format!(
+                "forge: only the owner of repo {name:?} may merge onto protected branch \
+                 {target:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    // ---- the state image ----------------------------------------------------
+
+    /// the COMMITTED state as one image — the substrate's view of the block
+    /// boundary, and what a per-dispatch runtime reads at a block's first
+    /// dispatch.
+    pub fn committed_image(&self) -> Vec<u8> {
+        encode_image(
+            self.repos.iter().map(|(n, s)| (n.as_str(), &s.refs)),
+            &self.tracker,
+        )
+    }
+
+    /// the state as it will read once this block publishes — every staged
+    /// fate on the branch maps and the block's tracker view — as one image.
+    /// what a per-dispatch runtime chains to the next dispatch and, at the
+    /// block boundary, hands the substrate to adopt.
+    pub fn published_image(&self) -> Vec<u8> {
+        let published: BTreeMap<&str, BTreeMap<String, Oid>> = self
+            .repos
+            .iter()
+            .map(|(n, s)| (n.as_str(), s.published_refs()))
+            .collect();
+        encode_image(
+            published.iter().map(|(n, refs)| (*n, refs)),
+            self.tracker_view(),
+        )
+    }
+
+    /// re-enter a block mid-way: the chained image (committed ⊕ the fates so
+    /// far) and the block scratch (those fates with the committed heads they
+    /// shadow) rebuild the native mid-block shape — committed refs with every
+    /// staged branch reverted to its committed head, the fates staged on top,
+    /// and the tracker as the block sees it. a repo the scratch names but the
+    /// image omits is one whose last branch is staged for deletion.
+    pub fn from_lane(image: Image, scratch: BlockScratch) -> Self {
+        let Image {
+            repos: mut images,
+            tracker,
+        } = image;
+        let mut repos = BTreeMap::new();
+        for (name, fates) in scratch {
+            let mut refs = images.remove(&name).unwrap_or_default();
+            let mut staged = BTreeMap::new();
+            for (branch, (prev, fate)) in fates {
+                match prev {
+                    Some(head) => {
+                        refs.insert(branch.clone(), head);
+                    }
+                    None => {
+                        refs.remove(&branch);
+                    }
+                }
+                staged.insert(branch, fate);
+            }
+            repos.insert(name, RepoState::staged_over(refs, staged));
+        }
+        for (name, refs) in images {
+            repos.insert(name, RepoState::with_refs(refs));
+        }
+        Self {
+            repos,
+            tracker,
+            staged_tracker: None,
+        }
+    }
+
+    /// this block's scratch: every staged fate with the committed head it
+    /// shadows (`None` = unborn), per repo. only repos with a staged fate
+    /// appear.
+    pub fn block_scratch(&self) -> BlockScratch {
+        self.repos
+            .iter()
+            .filter(|(_, state)| !state.staged.is_empty())
+            .map(|(name, state)| {
+                let fates = state
+                    .staged
+                    .iter()
+                    .map(|(branch, fate)| {
+                        (branch.clone(), (state.refs.get(branch).copied(), *fate))
+                    })
+                    .collect();
+                (name.clone(), fates)
+            })
+            .collect()
+    }
+
+    /// the packed heads staged since `before` (an earlier scratch of this
+    /// block) — the ref targets ONE dispatch adds. the one-fate-per-branch rule
+    /// makes every staged branch appear in exactly one dispatch's set.
+    pub fn ref_targets_since(&self, before: &BlockScratch) -> Vec<RefTarget> {
+        let mut targets = Vec::new();
+        for (name, state) in &self.repos {
+            for (branch, fate) in &state.staged {
+                let already_staged = before
+                    .get(name)
+                    .is_some_and(|fates| fates.contains_key(branch));
+                if already_staged {
+                    continue;
+                }
+                if let StagedRef::Packed(head, pack) = fate {
+                    targets.push(RefTarget {
+                        repo: name.clone(),
+                        branch: branch.clone(),
+                        head: *head,
+                        pack: *pack,
+                    });
+                }
+            }
+        }
+        targets
+    }
+
+    /// the fates a block's final image + its ref targets stage over the
+    /// COMMITTED state — how the substrate turns an adopted image back into the
+    /// per-branch publish it would have run natively. every target IS a packed
+    /// fate (its head must be the image's head for that branch); every
+    /// committed branch the image drops is a delete; a head the image moves
+    /// without a target is a runtime bug and refuses deterministically.
+    pub fn fates_for_image(
+        &self,
+        image: &Image,
+        targets: Vec<RefTarget>,
+    ) -> Result<BTreeMap<String, BTreeMap<String, StagedRef>>, Error> {
+        let mut fates: BTreeMap<String, BTreeMap<String, StagedRef>> = BTreeMap::new();
+        for target in targets {
+            let image_head = image
+                .repos
+                .get(&target.repo)
+                .and_then(|refs| refs.get(&target.branch))
+                .copied();
+            if image_head != Some(target.head) {
+                return Err(Error::Module(format!(
+                    "forge: ref target {}/{} names head {} but the image commits {:?}",
+                    target.repo, target.branch, target.head, image_head
+                )));
+            }
+            fates
+                .entry(target.repo)
+                .or_default()
+                .insert(target.branch, StagedRef::Packed(target.head, target.pack));
+        }
+        for (name, state) in &self.repos {
+            let new_refs = image.repos.get(name);
+            for (branch, head) in &state.refs {
+                let dropped = new_refs.is_none_or(|refs| !refs.contains_key(branch));
+                if dropped {
+                    fates
+                        .entry(name.clone())
+                        .or_default()
+                        .insert(branch.clone(), StagedRef::Delete);
+                    continue;
+                }
+                let moved_without_target = new_refs
+                    .and_then(|refs| refs.get(branch))
+                    .is_some_and(|new| new != head)
+                    && !fates
+                        .get(name)
+                        .is_some_and(|repo| repo.contains_key(branch));
+                if moved_without_target {
+                    return Err(Error::Module(format!(
+                        "forge: image moves {name}/{branch} without a ref target"
+                    )));
+                }
+            }
+        }
+        for (name, refs) in &image.repos {
+            for branch in refs.keys() {
+                let born_without_target = !self
+                    .repos
+                    .get(name)
+                    .is_some_and(|state| state.refs.contains_key(branch))
+                    && !fates
+                        .get(name)
+                        .is_some_and(|repo| repo.contains_key(branch));
+                if born_without_target {
+                    return Err(Error::Module(format!(
+                        "forge: image births {name}/{branch} without a ref target"
+                    )));
+                }
+            }
+        }
+        Ok(fates)
+    }
+}
+
+/// the decoded state image: born repos' branch maps + the tracker.
+#[derive(Default, Debug, PartialEq, Eq)]
+pub struct Image {
+    pub repos: BTreeMap<String, BTreeMap<String, Oid>>,
+    pub tracker: Tracker,
+}
+
+impl Image {
+    /// the composed root the image commits to — the same fold the substrate
+    /// computes over its resident maps.
+    pub fn root(&self) -> StateRoot {
+        compose_state_root(
+            self.repos.iter().map(|(n, refs)| (n.as_str(), refs)),
+            &self.tracker,
+        )
+    }
+}
+
+/// encode a state image: `FGI1 ++ u32(repo_count) ++ per BORN repo sorted by
+/// name (u32 name_len ++ name ++ u32 ref_count ++ per branch sorted (u32
+/// branch_len ++ branch ++ oid[20])) ++ u32(tracker_len) ++ tracker`. only born
+/// repos are carried — exactly the root's preimage material.
+pub fn encode_image<'a>(
+    repos: impl Iterator<Item = (&'a str, &'a BTreeMap<String, Oid>)>,
+    tracker: &Tracker,
+) -> Vec<u8> {
+    let born: Vec<(&str, &BTreeMap<String, Oid>)> =
+        repos.filter(|(_, refs)| !refs.is_empty()).collect();
+    let mut out = IMAGE_MAGIC.to_vec();
+    codec::put_u32(&mut out, born.len() as u32);
+    for (name, refs) in born {
+        codec::put_str(&mut out, name);
+        codec::put_u32(&mut out, refs.len() as u32);
+        for (branch, oid) in refs {
+            codec::put_str(&mut out, branch);
+            out.extend_from_slice(oid.as_bytes());
+        }
+    }
+    codec::put_bytes(&mut out, &tracker.canonical_bytes());
+    out
+}
+
+/// decode a state image from bytes the host lane carried: every field is
+/// bounds-checked and every name/branch re-validated, so a corrupt lane fails
+/// closed instead of re-genesis-ing the module.
+pub fn decode_image(bytes: &[u8]) -> Result<Image, Error> {
+    let body = bytes
+        .strip_prefix(IMAGE_MAGIC.as_slice())
+        .ok_or_else(|| Error::Module("forge image: missing the FGI1 magic".into()))?;
+    let mut r = Reader::new(body);
+    let count = r.u32()?;
+    let mut repos = BTreeMap::new();
+    for _ in 0..count {
+        let name = norm_repo(&r.str_()?)?;
+        let ref_count = r.u32()?;
+        if ref_count == 0 {
+            return Err(Error::Module(format!(
+                "forge image: repo {name} carries no branches"
+            )));
+        }
+        let mut refs = BTreeMap::new();
+        for _ in 0..ref_count {
+            let branch = r.str_()?;
+            norm_branch(&branch)?;
+            let oid = Oid::from_bytes(r.take(OID_RAW_LEN)?)?;
+            if oid.is_zero() {
+                return Err(Error::Module(format!(
+                    "forge image: branch {branch} of {name} carries a zero oid"
+                )));
+            }
+            if refs.insert(branch, oid).is_some() {
+                return Err(Error::Module(format!(
+                    "forge image: duplicate branch in repo {name}"
+                )));
+            }
+        }
+        if repos.insert(name.clone(), refs).is_some() {
+            return Err(Error::Module(format!("forge image: duplicate repo {name}")));
+        }
+    }
+    let tracker_len = r.u32()? as usize;
+    let tracker = Tracker::decode(r.take(tracker_len)?)?;
+    if !r.done() {
+        return Err(Error::Module(
+            "forge image: trailing bytes after the container".into(),
+        ));
+    }
+    Ok(Image { repos, tracker })
+}
+
+// ---- the block scratch --------------------------------------------------------
+
+/// per repo, per staged branch: the committed head it shadows (`None` =
+/// unborn) and the staged fate.
+pub type BlockScratch = BTreeMap<String, BTreeMap<String, (Option<Oid>, StagedRef)>>;
+
+/// encode a block scratch: `FGB1 ++ u32(repo_count) ++ per repo (u32 name_len
+/// ++ name ++ u32 fate_count ++ per branch (u32 branch_len ++ branch ++ prev
+/// tag (0 | 1 ++ oid[20]) ++ fate tag (0 delete | 1 ++ oid[20] ++
+/// digest[32])))`.
+pub fn encode_block_scratch(scratch: &BlockScratch) -> Vec<u8> {
+    let mut out = BLOCK_SCRATCH_MAGIC.to_vec();
+    codec::put_u32(&mut out, scratch.len() as u32);
+    for (name, fates) in scratch {
+        codec::put_str(&mut out, name);
+        codec::put_u32(&mut out, fates.len() as u32);
+        for (branch, (prev, fate)) in fates {
+            codec::put_str(&mut out, branch);
+            match prev {
+                None => codec::put_u8(&mut out, 0),
+                Some(oid) => {
+                    codec::put_u8(&mut out, 1);
+                    out.extend_from_slice(oid.as_bytes());
+                }
+            }
+            match fate {
+                StagedRef::Delete => codec::put_u8(&mut out, 0),
+                StagedRef::Packed(oid, digest) => {
+                    codec::put_u8(&mut out, 1);
+                    out.extend_from_slice(oid.as_bytes());
+                    out.extend_from_slice(digest);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// decode a block scratch the host lane carried back — the same fail-closed
+/// posture as [`decode_image`].
+pub fn decode_block_scratch(bytes: &[u8]) -> Result<BlockScratch, Error> {
+    let body = bytes
+        .strip_prefix(BLOCK_SCRATCH_MAGIC.as_slice())
+        .ok_or_else(|| Error::Module("forge block scratch: missing the FGB1 magic".into()))?;
+    let mut r = Reader::new(body);
+    let count = r.u32()?;
+    let mut scratch = BlockScratch::new();
+    for _ in 0..count {
+        let name = norm_repo(&r.str_()?)?;
+        let fate_count = r.u32()?;
+        let mut fates = BTreeMap::new();
+        for _ in 0..fate_count {
+            let branch = r.str_()?;
+            norm_branch(&branch)?;
+            let prev = match r.u8()? {
+                0 => None,
+                1 => Some(Oid::from_bytes(r.take(OID_RAW_LEN)?)?),
+                t => {
+                    return Err(Error::Module(format!(
+                        "forge block scratch: bad prev tag {t}"
+                    )));
+                }
+            };
+            let fate = match r.u8()? {
+                0 => StagedRef::Delete,
+                1 => {
+                    let oid = Oid::from_bytes(r.take(OID_RAW_LEN)?)?;
+                    let digest: [u8; 32] = r
+                        .take(32)?
+                        .try_into()
+                        .expect("take(32) yields exactly 32 bytes");
+                    StagedRef::Packed(oid, digest)
+                }
+                t => {
+                    return Err(Error::Module(format!(
+                        "forge block scratch: bad fate tag {t}"
+                    )));
+                }
+            };
+            if fates.insert(branch, (prev, fate)).is_some() {
+                return Err(Error::Module(format!(
+                    "forge block scratch: duplicate branch in repo {name}"
+                )));
+            }
+        }
+        if scratch.insert(name.clone(), fates).is_some() {
+            return Err(Error::Module(format!(
+                "forge block scratch: duplicate repo {name}"
+            )));
+        }
+    }
+    if !r.done() {
+        return Err(Error::Module(
+            "forge block scratch: trailing bytes after the container".into(),
+        ));
+    }
+    Ok(scratch)
+}
+
+// ---- the ref target -----------------------------------------------------------
+
+/// one packed head a block stages: the pack that materializes it, keyed by the
+/// branch it moves. the object-plane record a per-dispatch runtime hands the
+/// substrate at the block boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefTarget {
+    pub repo: String,
+    pub branch: String,
+    pub head: Oid,
+    pub pack: [u8; 32],
+}
+
+/// `u32 repo_len ++ repo ++ u32 branch_len ++ branch ++ oid[20] ++ digest[32]`.
+pub fn encode_ref_target(target: &RefTarget) -> Vec<u8> {
+    let mut out = Vec::new();
+    codec::put_str(&mut out, &target.repo);
+    codec::put_str(&mut out, &target.branch);
+    out.extend_from_slice(target.head.as_bytes());
+    out.extend_from_slice(&target.pack);
+    out
+}
+
+pub fn decode_ref_target(bytes: &[u8]) -> Result<RefTarget, Error> {
+    let mut r = Reader::new(bytes);
+    let repo = norm_repo(&r.str_()?)?;
+    let branch = r.str_()?;
+    norm_branch(&branch)?;
+    let head = Oid::from_bytes(r.take(OID_RAW_LEN)?)?;
+    let pack: [u8; 32] = r
+        .take(32)?
+        .try_into()
+        .expect("take(32) yields exactly 32 bytes");
+    if !r.done() {
+        return Err(Error::Module(
+            "forge ref target: trailing bytes after the record".into(),
+        ));
+    }
+    Ok(RefTarget {
+        repo,
+        branch,
+        head,
+        pack,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tracker_iface::ItemKind;
+    use chat::AuthorRef;
+
+    fn oid(c: char) -> Oid {
+        Oid::from_hex(&c.to_string().repeat(40)).unwrap()
+    }
+
+    fn state_with(repos: &[(&str, &[(&str, Oid)])]) -> ForgeState {
+        let mut state = ForgeState::default();
+        for (name, refs) in repos {
+            let refs = refs.iter().map(|(b, o)| (b.to_string(), *o)).collect();
+            state
+                .repos
+                .insert(name.to_string(), RepoState::with_refs(refs));
+        }
+        state
+    }
+
+    #[test]
+    fn image_round_trips_and_carries_only_born_repos() {
+        let mut state = state_with(&[
+            ("alpha", &[("main", oid('a')), ("dev", oid('b'))]),
+            ("unborn", &[]),
+        ]);
+        state
+            .tracker
+            .open_item(
+                "alpha",
+                ItemKind::Issue,
+                "t".into(),
+                String::new(),
+                AuthorRef::User(vec![1]),
+                1,
+                None,
+            )
+            .unwrap();
+        let image = decode_image(&state.committed_image()).unwrap();
+        assert_eq!(image.repos.len(), 1, "unborn repos are not carried");
+        assert_eq!(image.repos["alpha"]["main"], oid('a'));
+        assert_eq!(image.tracker, state.tracker);
+        assert_eq!(
+            image.root(),
+            state.root(),
+            "the image commits to the resident root"
+        );
+        assert!(decode_image(b"nope").is_err());
+        let mut truncated = state.committed_image();
+        truncated.pop();
+        assert!(decode_image(&truncated).is_err());
+    }
+
+    #[test]
+    fn lane_re_entry_rebuilds_the_native_mid_block_shape() {
+        // block start: alpha/main = a committed; dispatch 1 pushes main a->b and
+        // births beta/main = c, deletes alpha/feat.
+        let mut state = state_with(&[("alpha", &[("main", oid('a')), ("feat", oid('f'))])]);
+        let before = state.block_scratch();
+        assert!(before.is_empty());
+        state
+            .repos
+            .get_mut("alpha")
+            .unwrap()
+            .stage_update("main", Some(oid('a')), Some(oid('b')), Some([1; 32]))
+            .unwrap();
+        state
+            .repos
+            .get_mut("alpha")
+            .unwrap()
+            .stage_update("feat", Some(oid('f')), None, None)
+            .unwrap();
+        state
+            .repos
+            .entry("beta".into())
+            .or_default()
+            .stage_update("main", None, Some(oid('c')), Some([2; 32]))
+            .unwrap();
+        let targets = state.ref_targets_since(&before);
+        assert_eq!(
+            targets.len(),
+            2,
+            "one target per packed head, none for the delete"
+        );
+
+        // the lane carries the chained image + the scratch to dispatch 2.
+        let image = decode_image(&state.published_image()).unwrap();
+        assert_eq!(image.repos["alpha"]["main"], oid('b'));
+        assert!(!image.repos["alpha"].contains_key("feat"));
+        assert_eq!(image.repos["beta"]["main"], oid('c'));
+        let scratch = decode_block_scratch(&encode_block_scratch(&state.block_scratch())).unwrap();
+        let reentered = ForgeState::from_lane(image, scratch);
+
+        // committed refs are the pre-block ones; the fates sit on top.
+        let alpha = &reentered.repos["alpha"];
+        assert_eq!(alpha.refs["main"], oid('a'));
+        assert_eq!(alpha.refs["feat"], oid('f'));
+        assert_eq!(alpha.staged["main"], StagedRef::Packed(oid('b'), [1; 32]));
+        assert_eq!(alpha.staged["feat"], StagedRef::Delete);
+        let beta = &reentered.repos["beta"];
+        assert!(beta.refs.is_empty(), "a birthed repo has no committed refs");
+        assert_eq!(beta.staged["main"], StagedRef::Packed(oid('c'), [2; 32]));
+        // the one-fate rule holds across the re-entry, exactly as natively.
+        assert!(
+            reentered.repos["alpha"].refs.get("main").copied() == Some(oid('a'))
+                && ForgeState::from_lane(
+                    decode_image(&reentered.published_image()).unwrap(),
+                    reentered.block_scratch()
+                )
+                .repos["alpha"]
+                    .staged
+                    .contains_key("main")
+        );
+        // nothing new was staged since the scratch was taken.
+        assert!(
+            reentered
+                .ref_targets_since(&reentered.block_scratch())
+                .is_empty()
+        );
+        // and the chained image is stable across re-entry.
+        assert_eq!(reentered.published_image(), state.published_image());
+    }
+
+    #[test]
+    fn fates_for_image_mirror_the_native_publish() {
+        let committed = state_with(&[("alpha", &[("main", oid('a')), ("feat", oid('f'))])]);
+        let image = Image {
+            repos: BTreeMap::from([
+                (
+                    "alpha".to_string(),
+                    BTreeMap::from([("main".to_string(), oid('b'))]),
+                ),
+                (
+                    "beta".to_string(),
+                    BTreeMap::from([("main".to_string(), oid('c'))]),
+                ),
+            ]),
+            tracker: Tracker::default(),
+        };
+        let targets = vec![
+            RefTarget {
+                repo: "alpha".into(),
+                branch: "main".into(),
+                head: oid('b'),
+                pack: [1; 32],
+            },
+            RefTarget {
+                repo: "beta".into(),
+                branch: "main".into(),
+                head: oid('c'),
+                pack: [2; 32],
+            },
+        ];
+        let fates = committed.fates_for_image(&image, targets.clone()).unwrap();
+        assert_eq!(fates["alpha"]["main"], StagedRef::Packed(oid('b'), [1; 32]));
+        assert_eq!(fates["alpha"]["feat"], StagedRef::Delete);
+        assert_eq!(fates["beta"]["main"], StagedRef::Packed(oid('c'), [2; 32]));
+
+        // a moved head with no target, a birthed branch with no target, and a
+        // target disagreeing with the image all refuse.
+        assert!(committed.fates_for_image(&image, Vec::new()).is_err());
+        let mut wrong = targets.clone();
+        wrong[0].head = oid('9');
+        assert!(committed.fates_for_image(&image, wrong).is_err());
+        assert!(
+            committed
+                .fates_for_image(&image, targets[..1].to_vec())
+                .is_err()
+        );
+
+        // a same-head re-push is a packed fate too (native re-records the pack).
+        let same = Image {
+            repos: BTreeMap::from([(
+                "alpha".to_string(),
+                BTreeMap::from([
+                    ("main".to_string(), oid('a')),
+                    ("feat".to_string(), oid('f')),
+                ]),
+            )]),
+            tracker: Tracker::default(),
+        };
+        let repush = vec![RefTarget {
+            repo: "alpha".into(),
+            branch: "main".into(),
+            head: oid('a'),
+            pack: [3; 32],
+        }];
+        let fates = committed.fates_for_image(&same, repush).unwrap();
+        assert_eq!(fates["alpha"]["main"], StagedRef::Packed(oid('a'), [3; 32]));
+        assert!(!fates["alpha"].contains_key("feat"));
+    }
+
+    #[test]
+    fn ref_target_round_trips() {
+        let target = RefTarget {
+            repo: "alpha".into(),
+            branch: "feature/x".into(),
+            head: oid('d'),
+            pack: [9; 32],
+        };
+        assert_eq!(
+            decode_ref_target(&encode_ref_target(&target)).unwrap(),
+            target
+        );
+        let mut extra = encode_ref_target(&target);
+        extra.push(0);
+        assert!(decode_ref_target(&extra).is_err());
+    }
+}
