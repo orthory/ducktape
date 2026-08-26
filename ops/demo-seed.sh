@@ -23,7 +23,7 @@ DUCK="$HOME/.ducktape"
 WSDIR="$DUCK/workspaces/$ID"
 REG="$DUCK/registry.json"
 ORIGIN="demo"   # external author stamped on seeded ops (chat rejects an empty author)
-USERKEY="$DUCK/user.key"          # the app signs writes with THIS local key
+USERKEY="$DUCK/keys/demo.key"     # the app signs writes with THIS local key
 DEMO_PASSWORD="${DEMO_KEY_PASSWORD:-ducktape}"  # unlock password for the demo identity
 
 log(){ printf '\033[36m[demo-seed]\033[0m %s\n' "$*"; }
@@ -95,21 +95,18 @@ JS
 log "registered '$ID' (chain $CHAIN) — set as active workspace"
 
 # ── 3b. user identity ──────────────────────────────────────────
-# The app signs every write (send a message, add a reaction, edit, create a
-# channel) with a local user key it READS from $HOME/.ducktape/user.key — it
-# never mints one itself. Without it, the demo is read-only: the first reaction
-# fails with "cannot read local user key". Provision one so the demo is
-# writable out of the box. Channels are `open`, so any identity may post — no
-# membership step is needed. An EXISTING key is never overwritten (it may be
-# your real identity); we only report how to unlock it.
+# The app signs writes with a wallet from the keystore. The demo gets its
+# OWN named wallet ("demo", password $DEMO_PASSWORD) so the seed always
+# holds the signing password: the old "existing key, unknown password,
+# routes skipped" branch cannot happen. The user's other wallets are
+# untouched; the seed never flips the active pointer — the app's wallet
+# list is where the demo identity gets picked.
 if [ -e "$USERKEY" ]; then
-  KEY_PROVISIONED=0
-  log "user key already present at $USERKEY — unlock it with its own password"
+  log "demo wallet already present at $USERKEY"
 else
-  printf '%s\n' "$DEMO_PASSWORD" | "$NODE_BIN" user key init --out "$USERKEY" >/dev/null \
-    || die "could not create the demo user key at $USERKEY"
-  KEY_PROVISIONED=1
-  log "created a demo user identity at $USERKEY (password: $DEMO_PASSWORD)"
+  printf '%s\n' "$DEMO_PASSWORD" | "$NODE_BIN" wallet new demo >/dev/null \
+    || die "could not mint the demo wallet"
+  log "minted the demo wallet (password: $DEMO_PASSWORD)"
 fi
 
 # ── 4. start the node, wait for its http surface ───────────────
@@ -211,25 +208,16 @@ submit automations '{"create_rule":{"rule_id":"deploy-watch","trigger":{"channel
 # fails to sign and routes are skipped (non-fatal); chat/tasks/pages are already
 # durable regardless.
 GATEWAY_ROUTES=3
-GATEWAY_PW=""
-[ "${KEY_PROVISIONED:-0}" -eq 1 ] && GATEWAY_PW="$DEMO_PASSWORD"
+GATEWAY_PW="$DEMO_PASSWORD"
 bun "$SCRIPT_DIR/demo-gateway.mjs" "$URL" "$NODE_BIN" "$WSDIR" "$CHAIN" "$ID" "$USERKEY" "$GATEWAY_PW"
 gateway_status=$?
 # Route publishing is a demo garnish — its failure never kills the seed. The
 # core workspace (chat, tasks, pages, identity) is committed before this runs.
 case "$gateway_status" in
   0) ;;
-  # name the LIKELY cause here too, not just in the closing banner: an operator
-  # reading the log tail should not have to reach the end to learn that an
-  # empty signing password (an existing key we hold no password for) is the
-  # overwhelmingly common reason, not helper drift.
   *)
     GATEWAY_ROUTES=0
-    if [ "${KEY_PROVISIONED:-0}" -eq 1 ]; then
-      log "gateway routes skipped (exit $gateway_status) — see $WSDIR/seed.log"
-    else
-      log "gateway routes skipped (exit $gateway_status) — demo-seed holds no password for the existing $USERKEY, so the helper signed with an empty one; see $WSDIR/seed.log"
-    fi
+    log "gateway routes skipped (exit $gateway_status) — see $WSDIR/seed.log"
     ;;
 esac
 
@@ -246,44 +234,16 @@ Open the Ducktape app and it boots into the "$ID" workspace, preloaded.
 To WRITE (send a message, add a reaction, edit): the app signs with your local
 user key, so unlock it once — open the connection panel (bottom-left of the
 sidebar), type the key password, and click Connect.
-EOF
 
-if [ "${KEY_PROVISIONED:-0}" -eq 1 ]; then
-cat <<EOF
-  key password: $DEMO_PASSWORD   (a fresh demo identity demo-seed just created)
+  key password: $DEMO_PASSWORD   (the "demo" wallet — pick it in the app's wallet list)
 
 EOF
-else
-cat <<EOF
-  key password: (your existing $USERKEY — demo-seed left it untouched)
-
-EOF
-fi
 
 if [ "$GATEWAY_ROUTES" -eq 0 ]; then
 cat <<EOF
 Gateway web apps were not published — see $WSDIR/seed.log for the exact
 rejection. This is a demo garnish only: chat, tasks, pages and your identity are
 all live.
-$(if [ "${KEY_PROVISIONED:-0}" -eq 1 ]; then
-cat <<'INNER'
-
-demo-seed minted this key and signed with it, so this is not a key problem —
-the route helper is out of step with the current gateway/duckdns wire.
-INNER
-else
-cat <<INNER
-
-Almost certainly your key, not the helper: demo-seed did not create $USERKEY, so
-it does not hold your password and passed an empty one — the helper cannot sign
-the routes with that. A raw-hex PLAINTEXT key fails here for the same reason, and
-is the same thing that makes the app refuse in-app writes with only the Settings
-PLAINTEXT warning to point at it.
-
-Re-run against a workspace with no user key (or move $USERKEY aside) to get the
-routes; nothing else in the seed depends on them.
-INNER
-fi)
 EOF
 else
 cat <<EOF
