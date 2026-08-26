@@ -126,21 +126,47 @@ func dialHostSocket(path: String) -> Int32? {
     return fd
 }
 
+/// the fds we bridge must be BLOCKING: the pump below treats a failed read as
+/// EOF, and the fd Virtualization.framework hands over arrives O_NONBLOCK —
+/// left as-is, the very first empty read (EAGAIN) tears the whole connection
+/// down, which reaches the host as "guest halted without reporting an exit
+/// code" (measured on the first real boot).
+func makeBlocking(_ fd: Int32) {
+    let flags = fcntl(fd, F_GETFL)
+    if flags >= 0 {
+        _ = fcntl(fd, F_SETFL, flags & ~O_NONBLOCK)
+    }
+}
+
 /// splice one direction until EOF or error, then half-close the destination so
 /// the far side sees EOF. 64 KiB to match the host pump's read granularity.
+///
+/// Explicit pointer scopes, NEVER `&buffer[i]`: Swift's inout-to-pointer on an
+/// array ELEMENT may hand `write` a pointer to a one-byte temporary, so every
+/// byte after the first is garbage — measured as the guest decoding a 95 MB
+/// frame length out of a StdinEof frame and dropping the stream.
 func pump(from src: Int32, to dst: Int32) {
     var buffer = [UInt8](repeating: 0, count: 64 * 1024)
     while true {
-        let n = read(src, &buffer, buffer.count)
+        let n = buffer.withUnsafeMutableBytes { raw in
+            read(src, raw.baseAddress, raw.count)
+        }
         if n < 0 && errno == EINTR { continue }
         if n <= 0 { break }
         var written = 0
-        while written < n {
-            let w = write(dst, &buffer[written], n - written)
-            if w < 0 && errno == EINTR { continue }
-            if w <= 0 { return }
-            written += w
+        var stalled = false
+        buffer.withUnsafeBytes { raw in
+            while written < n {
+                let w = write(dst, raw.baseAddress!.advanced(by: written), n - written)
+                if w < 0 && errno == EINTR { continue }
+                if w <= 0 {
+                    stalled = true
+                    return
+                }
+                written += w
+            }
         }
+        if stalled { return }
     }
     shutdown(dst, SHUT_WR)
 }
@@ -157,6 +183,8 @@ final class Bridge {
         self.connection = connection
         self.hostFd = hostFd
         let guestFd = connection.fileDescriptor
+        makeBlocking(guestFd)
+        makeBlocking(hostFd)
         pending.enter()
         Thread.detachNewThread { [self] in
             pump(from: guestFd, to: hostFd)

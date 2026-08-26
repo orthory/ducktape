@@ -85,6 +85,7 @@ dependencies = [
  "borsh",
  "commonware-cryptography",
  "futures",
+ "guest-adapter",
  "host",
  "identity",
  "sdk",
@@ -2542,7 +2543,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e75b2483e97a5a7da73ac68a05b629f9c53cff58d8ed1c77866079e18b00dba5"
 dependencies = [
  "digest 0.10.7",
- "spin 0.10.0",
+ "spin 0.10.1",
 ]
 
 [[package]]
@@ -4542,6 +4543,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "valset",
+ "vaults",
  "wasm-host",
 ]
 
@@ -5438,6 +5440,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "commonware-runtime",
+ "guest-adapter",
  "host",
  "sdk",
  "sdk-testkit",
@@ -6083,7 +6086,6 @@ dependencies = [
 name = "node-bin"
 version = "0.1.0"
 dependencies = [
- "acl",
  "agent",
  "agent-service",
  "airlock",
@@ -9065,9 +9067,9 @@ dependencies = [
 
 [[package]]
 name = "spin"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5fe4ccb98d9c292d56fec89a5e07da7fc4cf0dc11e156b41793132775d3e591"
+checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
 
 [[package]]
 name = "spinning_top"
@@ -10086,7 +10088,6 @@ dependencies = [
 [[package]]
 name = "ui-lang-runtime"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=a64eb5f70c7cbd97136ac54b42c6ea0409c2d866#a64eb5f70c7cbd97136ac54b42c6ea0409c2d866"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -10482,6 +10483,7 @@ dependencies = [
  "commonware-codec",
  "commonware-cryptography",
  "futures",
+ "guest-adapter",
  "host",
  "sdk",
  "serde",

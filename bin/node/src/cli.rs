@@ -1488,21 +1488,60 @@ fn cmd_member_status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-/// `join <invite blob> [--dir <dir>] [--listen a] [--advertised a] [--http a]
-/// [--rpc a] [--wireguard-listen a] [--wireguard-advertised host:port]
-/// [--invite-listen a]
+/// read a pasted invite blob from stdin: every line up to EOF or the first
+/// empty line after content. A terminal paste may arrive wrapped across
+/// several lines; the decoder strips the whitespace, so the lines are simply
+/// collected. The prompt goes to stderr (stdout stays program output).
+fn read_invite_blob_from_stdin() -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::IsTerminal as _;
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        eprintln!("paste the invite blob (wrapped lines are fine), then press Enter:");
+    }
+    let collected = collect_blob_lines(stdin.lock())?;
+    if collected.is_empty() {
+        return Err("join needs an invite blob (or a `requests`/`state` subcommand)".into());
+    }
+    Ok(collected)
+}
+
+/// gather blob lines from any reader: stop at EOF, or at the first empty line
+/// once some content has arrived (the Enter that ends an interactive paste).
+fn collect_blob_lines(reader: impl std::io::BufRead) -> std::io::Result<String> {
+    let mut collected = String::new();
+    for line in reader.lines() {
+        let line = line?;
+        let paste_finished = line.trim().is_empty() && !collected.is_empty();
+        if paste_finished {
+            break;
+        }
+        collected.push_str(line.trim());
+    }
+    Ok(collected)
+}
+
+/// `join [invite blob...] [--dir <dir>] [--listen a] [--advertised a]
+/// [--http a] [--rpc a] [--wireguard-listen a]
+/// [--wireguard-advertised host:port] [--invite-listen a]
 /// [--primary-coordinator host:port|none]` — materialize a workspace
 /// from an invite: descriptor + identity (kept across re-joins) + node
 /// config, defaulting into the registry dir named by the invite's chain id.
-/// prints this identity for the inviter's pre-genesis `admit`.
+/// With no blob argv the blob is read from stdin (interactive paste prompt,
+/// or a pipe). prints this identity for the inviter's pre-genesis `admit`.
 /// `--primary-coordinator` is node-local plumbing ONLY — it never touches
 /// the invite or the joined descriptor (the coordinator is always ambient,
 /// per docs/superpowers/specs/2026-07-08-fully-nated-inviter-design.md).
 fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
-    let blob = args
-        .blob
-        .as_deref()
-        .ok_or("join needs an invite blob (or a `requests`/`state` subcommand)")?;
+    // argv words are rejoined (a blob pasted unquoted splits on its wrapped
+    // spaces); no argv at all reads the blob from stdin. decode strips ALL
+    // whitespace, so both paths tolerate a line-wrapped paste verbatim.
+    //
+    // READING the blob is what stays here: a terminal prompt is the CLI's
+    // business, and it is exactly what `join_workspace` refuses to know about.
+    let blob = match args.blob.is_empty() {
+        false => args.blob.concat(),
+        true => read_invite_blob_from_stdin()?,
+    };
     let net = &args.plumbing;
     let overrides = config::PlumbingOverrides {
         listen: net.listen.clone(),
@@ -1515,7 +1554,7 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
         wireguard_advertised: net.wireguard_advertised.clone(),
         invite_listen: net.invite_listen.clone(),
     };
-    let joined = config::join_workspace(blob, args.dir.clone(), &overrides)?;
+    let joined = config::join_workspace(&blob, args.dir.clone(), &overrides)?;
 
     if let Some(runtime) = &joined.compute_runtime {
         eprintln!(
@@ -1575,6 +1614,19 @@ mod json_output_tests {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+
+    #[test]
+    fn blob_lines_join_a_wrapped_paste_and_stop_at_the_closing_enter() {
+        let pasted = "\n  \n\u{1f986}DWRlbW8j\nMGZiZGQ5\n ZTUB \n\nnot-part-of-the-blob\n";
+        let collected = super::collect_blob_lines(pasted.as_bytes()).expect("collect");
+        assert_eq!(collected, "\u{1f986}DWRlbW8jMGZiZGQ5ZTUB");
+    }
+
+    #[test]
+    fn blob_lines_are_empty_on_empty_input() {
+        let collected = super::collect_blob_lines("\n \n".as_bytes()).expect("collect");
+        assert_eq!(collected, "");
+    }
 
     fn completions() -> (String, String) {
         let bash = std::fs::read_to_string(concat!(

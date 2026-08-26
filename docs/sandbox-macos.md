@@ -23,7 +23,7 @@ images). Declining just leaves a node that refuses provider runs.
 It checks everything the compute plane (airlock + provider runs) needs on a
 Mac and prints the exact install command for each missing piece: Apple
 silicon/`kern.hv_support`, Xcode command line tools,
-`brew install e2fsprogs squashfs` (e2fsprogs is keg-only — the node searches
+`brew install e2fsprogs squashfs zstd` (e2fsprogs is keg-only — the node searches
 the standard Homebrew prefixes itself, do not add it to PATH),
 `rustup target add aarch64-unknown-linux-musl`, the signed shim, and the
 guest images. Exit 0 means the node's boot probe will pass.
@@ -74,18 +74,30 @@ entitlement (re-run `build.sh` — it codesigns), `kern.hv_support`, `mke2fs` /
   produces nothing); fetch the linux/arm64 build of an agent CLI and put it
   on PATH before running `build-guest-rootfs.sh`.
 
-## Known unknowns for the first Mac run
+## What the first Mac run taught (all fixed in-tree)
 
-The Rust host side and the config contract are covered by unit tests +
-the Linux smoke; these three are what only a Mac can confirm, in the order
-they would bite:
+The bring-up on an M4 Mac mini (macOS 26.5) turned every "known unknown"
+into a measured fact:
 
-1. the CI kernel asset boots under `VZLinuxBootLoader` (the aarch64
-   `vmlinux-6.1.128` is an arm64 boot Image, which is the format VZ wants —
-   if not, set `KERNEL_URL` to an uncompressed arm64 `Image` build with
-   virtio-blk/vsock and `hvc` console built in);
-2. a guest `reboot` reaches the shim as `guestDidStop` (how `panic=1` ends a
-   run);
-3. vsock throughput/half-close behavior under the shim's fd bridging.
+1. **The Firecracker CI kernel cannot work under VZ** — it is virtio-MMIO
+   only, VZ attaches virtio over PCI, and the boot is a silent black hole
+   (no console, no disks). `build-guest-rootfs.sh` therefore extracts the
+   Kata Containers VM kernel on macOS (virtio-pci + -mmio, no-initrd boot,
+   57 ms to init) and refuses any macOS kernel without `virtio_pci` in it.
+2. **A guest reboot really REBOOTS under VZ** (no `guestDidStop`) — the
+   init's Firecracker-style RESTART exit boot-looped the VM forever. The
+   host now tells the guest how to die: the vz cmdline carries
+   `DUCK_HALT=poweroff` and the init powers off via PSCI, which is what
+   stops the VM. `panic=` stays default on vz so a panicking guest parks
+   for the host's timeout instead of boot-looping.
+3. **The shim's fd bridging had two real bugs**, both visible only live:
+   VZ hands over `O_NONBLOCK` fds (EAGAIN read as EOF), and Swift's
+   `&buffer[i]` inout-to-pointer corrupted every write past byte one (the
+   guest decoded a 95 MB frame length out of a StdinEof frame).
+4. **A CLT install can be internally skewed** — SPM aborted outright and
+   the newest SDK was unparseable by its own compiler. `build.sh` now uses
+   bare `swiftc` and walks the installed SDKs newest-first until one
+   builds.
 
-`vm_smoke` exercises 1 and 2; a real run through a node exercises 3.
+End-to-end proof: `vm_smoke: OK` on the Mac — boot, manifest, mounts, stdio
+frames over vsock, exit code, power-off, workspace read-back.

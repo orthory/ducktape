@@ -34,7 +34,7 @@ sdk = { workspace = true }
 statesync = { workspace = true }
 directory = { workspace = true }
 # the production module set: system infrastructure + every product module.
-acl = { workspace = true }
+# (acl composes as a wasm tenant; its crate is embedded via component.wasm.)
 valset = { workspace = true }
 governance = { workspace = true }
 # the resident-accept verb drives governance ops through the local rpc.

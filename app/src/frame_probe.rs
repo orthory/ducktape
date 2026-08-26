@@ -2164,10 +2164,16 @@ fn probe_forge_code_selection() {
         &mut renderer,
         cache,
         &mut clipboard,
-        &[key_press('c', iced::keyboard::Modifiers::CTRL)],
+        // COMMAND, not CTRL: the copy handler matches `modifiers.command()`,
+        // which is the platform's own copy chord — Cmd on macOS, Ctrl
+        // elsewhere. A hardcoded CTRL only copies where CTRL is that chord.
+        &[key_press('c', iced::keyboard::Modifiers::COMMAND)],
         cursor,
     );
-    let copied = clipboard.0.take().expect("Ctrl+C copies the dragged lines");
+    let copied = clipboard
+        .0
+        .take()
+        .expect("the copy chord copies the dragged lines");
     assert!(
         copied.contains('\n'),
         "the drag crossed a row, so the copy carries the line break: {copied:?}"
@@ -2256,7 +2262,7 @@ fn probe_forge_markdown_selection() {
             &[
                 Event::Mouse(mouse::Event::CursorMoved { position: to }),
                 Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-                key_press('c', iced::keyboard::Modifiers::CTRL),
+                key_press('c', iced::keyboard::Modifiers::COMMAND),
             ],
             mouse::Cursor::Available(to),
         );

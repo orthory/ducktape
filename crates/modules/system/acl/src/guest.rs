@@ -1,0 +1,30 @@
+//! the wasm port of this module, built the ADAPTER
+//! way: the NATIVE `acl` crate is compiled to wasm32 unmodified and adapted
+//! to the `ducktape:module` world through `guest-adapter`, so the module's
+//! logic is single-sourced (a behavior change in the native crate IS the wasm
+//! change).
+//!
+//! ## the drain gate rides the query lane
+//!
+//! acl only HOLDS policy; the enforcement point is the kernel host's drain,
+//! which consults `AclQuery::PolicyFor` before every `Origin::External` op
+//! reaches its target. as a wasm tenant that consultation is a host-routed
+//! guest query per gated op. the port stays equivalent because the native
+//! query reads staged-over-committed store state — exactly the view the
+//! host's staged overlay serves a guest — and policy writes are governance
+//! module-origin follow-ups whose origin gate reads the wit `env.origin`
+//! verbatim.
+
+use crate::{Acl, DEFAULT_ACL_ID};
+
+use guest_adapter::WitStore;
+
+// store-backed port: no snapshot — the host owns the real qmdb store and the
+// module is rebuilt fresh per dispatch (see `guest_adapter::store_guest!`).
+// no genesis config: the policy table is EMPTY (= allow-all) at genesis and
+// only tightens through governance follow-ups.
+guest_adapter::store_guest! {
+    id: DEFAULT_ACL_ID,
+    module: Acl,
+    new: Acl::new(DEFAULT_ACL_ID, Box::new(WitStore)),
+}

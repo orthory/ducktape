@@ -34,15 +34,24 @@ WORK="${WORK:-$OUT/.build}"
 ARCH="$(uname -m)"
 [[ "$ARCH" == "arm64" ]] && ARCH=aarch64
 
-# macOS: e2fsprogs is keg-only in Homebrew, so mke2fs never reaches PATH.
-export PATH="$PATH:/opt/homebrew/opt/e2fsprogs/sbin:/usr/local/opt/e2fsprogs/sbin:/opt/homebrew/sbin"
+# macOS: e2fsprogs is keg-only in Homebrew, so mke2fs never reaches PATH —
+# and in a non-login shell (ssh command, make, cron) brew's own bin dirs
+# don't either.
+export PATH="$PATH:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/opt/homebrew/opt/e2fsprogs/sbin:/usr/local/opt/e2fsprogs/sbin"
 
-# The Firecracker CI kernel: a known-good vmlinux with virtio-blk, -net and
-# -vsock built in (the aarch64 build is an arm64 boot Image, which is also
-# what VZLinuxBootLoader consumes). Building our own is an open question in
-# the spec (it decides the CVE workflow); tracking this one is what unblocks
-# everything else meanwhile.
-KERNEL_URL="${KERNEL_URL:-https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/$ARCH/vmlinux-6.1.128}"
+# The guest kernel differs per HYPERVISOR, not per taste: Firecracker attaches
+# virtio over MMIO and its CI kernel carries only those drivers, while
+# Virtualization.framework attaches virtio over PCI — measured, the CI kernel
+# under VZ boots to a silent black hole (no console, no disks, no vsock). So
+# Linux fetches the Firecracker CI kernel and macOS extracts the Kata
+# Containers VM kernel (virtio-pci and -mmio both built in, boots a rootfs
+# with no initrd). `KERNEL_URL` overrides either. Building our own kernel is
+# an open question in the spec (it decides the CVE workflow); tracking these
+# is what unblocks everything else meanwhile.
+KERNEL_URL="${KERNEL_URL:-}"
+[[ "$(uname -s)" == "Linux" && -z "$KERNEL_URL" ]] \
+  && KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/$ARCH/vmlinux-6.1.128"
+KATA_VERSION="${KATA_VERSION:-4.1.0}"
 BASE_URL="${BASE_URL:-https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/$ARCH/ubuntu-24.04.squashfs}"
 
 # the host binaries lent to runs. Each must be a real executable; a symlink is
@@ -59,10 +68,49 @@ command -v unsquashfs >/dev/null || { echo "unsquashfs not found; install squash
 mkdir -p "$OUT" "$WORK"
 
 # ---- 1. the kernel ---------------------------------------------------------
+# extract the plain VM kernel out of Kata's static release bundle. The
+# tarball is ~600 MB for a ~40 MB kernel, so it is cached in WORK; the plain
+# kernel is the one whose name is bare `vmlinux-<version>` (the gpu/debug/
+# dragonball variants carry suffixes).
+fetch_kata_kernel() {
+  command -v zstd >/dev/null || { echo "zstd not found; install zstd (brew install zstd)" >&2; exit 1; }
+  local kata_arch=amd64
+  [[ "$ARCH" == "aarch64" ]] && kata_arch=arm64
+  local tarball="$WORK/kata-static-$KATA_VERSION-$kata_arch.tar.zst"
+  if [[ ! -f "$tarball" ]]; then
+    say "fetching the Kata VM kernel bundle ($kata_arch)"
+    curl -fsSL "https://github.com/kata-containers/kata-containers/releases/download/$KATA_VERSION/kata-static-$KATA_VERSION-$kata_arch.tar.zst" \
+      -o "$tarball.part"
+    mv "$tarball.part" "$tarball"
+  fi
+  local member
+  member=$(zstd -dc "$tarball" | tar -tf - | grep -E 'share/kata-containers/vmlinux-[0-9]+\.[0-9.]+-[0-9]+$' | head -1)
+  [[ -n "$member" ]] || { echo "no plain vmlinux in the Kata bundle" >&2; exit 1; }
+  say "extracting $(basename "$member")"
+  zstd -dc "$tarball" | tar -xf - -C "$WORK" "$member"
+  install -m 0644 "$WORK/$member" "$OUT/vmlinux"
+}
+
 if [[ ! -f "$OUT/vmlinux" ]]; then
-  say "fetching the guest kernel"
-  curl -fsSL "$KERNEL_URL" -o "$OUT/vmlinux.part"
-  mv "$OUT/vmlinux.part" "$OUT/vmlinux"
+  if [[ -n "$KERNEL_URL" ]]; then
+    say "fetching the guest kernel"
+    curl -fsSL "$KERNEL_URL" -o "$OUT/vmlinux.part"
+    mv "$OUT/vmlinux.part" "$OUT/vmlinux"
+  else
+    fetch_kata_kernel
+  fi
+fi
+# On macOS the kernel MUST speak virtio-pci — without it every VZ device is
+# invisible and the boot is a silent hang, which is the single most
+# expensive failure to diagnose from outside. Refuse it here, where the fix
+# (delete the kernel, rerun, or point KERNEL_URL at a PCI-capable one) is
+# printable.
+# `grep -c`, not `-q`: -q closes the pipe on the first match, strings dies
+# of SIGPIPE, and under `pipefail` a KERNEL THAT PASSES gets refused (141).
+if [[ "$(uname -s)" == "Darwin" ]] && [[ "$(strings "$OUT/vmlinux" | grep -c virtio_pci)" == "0" ]]; then
+  echo "$OUT/vmlinux has no virtio-pci support and cannot see any VZ device;" >&2
+  echo "remove it and re-run (Kata kernel), or set KERNEL_URL to a PCI-capable kernel" >&2
+  exit 1
 fi
 say "kernel: $(du -h "$OUT/vmlinux" | cut -f1)"
 
