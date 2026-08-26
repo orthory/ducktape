@@ -681,6 +681,34 @@ impl Client {
         Ok(receipt.height)
     }
 
+    /// Submit one module op over the FRAMELESS lane, answering the height of
+    /// the block that included it.
+    ///
+    /// The distinction from [`Client::submit_frame`] is authorship, and it is
+    /// load-bearing: this node re-signs the op with ITS OWN key, so the
+    /// committed origin is the node rather than the person at the keyboard.
+    /// That is right for an op the NODE is the actor of — a run pinned to it,
+    /// whose saga id is namespaced under its own actor string — and wrong for
+    /// anything a user authors, which must carry the user's signature.
+    pub async fn submit(&self, target: &str, payload: serde_json::Value) -> Result<u64> {
+        let response = self
+            .http
+            .post(self.url("v1/submit")?)
+            .json(&serde_json::json!({ "target": target, "payload": payload }))
+            .send()
+            .await
+            .map_err(|error| Error::new(format!("transaction submission failed: {error}")))?;
+        if !response.status().is_success() {
+            return Err(response_error(response).await);
+        }
+        #[derive(Deserialize)]
+        struct Receipt {
+            height: u64,
+        }
+        let receipt: Receipt = decode_json(response).await?;
+        Ok(receipt.height)
+    }
+
     /// Connect to the node stream and subscribe to committed module changes.
     pub async fn module_events(
         &self,

@@ -840,31 +840,7 @@ async fn run_agent_chat(
         .send(chat_status("Scheduling", "Submitting a durable agent run"))
         .await
         .map_err(|_| "the chat view closed".to_string())?;
-    let output = tokio::process::Command::new(ducktape_binary())
-        .args(agent_sched_args(
-            &rpc, provider, credential, &host_node, &prompt,
-        ))
-        .kill_on_drop(true)
-        .output()
-        .await
-        .map_err(|error| format!("could not run the ducktape agent command: {error}"))?;
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if message.is_empty() {
-            format!("the agent command exited with {}", output.status)
-        } else {
-            clip_text(&message, 2_000)
-        });
-    }
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|_| "the agent command returned a non-UTF-8 run id".to_string())?;
-    let saga_id = stdout
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .map(str::trim)
-        .ok_or_else(|| "the agent command returned no run id".to_string())?
-        .to_string();
+    let saga_id = schedule_agent_run(&rpc, provider, credential, &host_node, &prompt).await?;
     sender
         .send(AgentChatEvent {
             id: 1,
@@ -1151,26 +1127,133 @@ fn agent_pty_args(rpc: &str, provider: &str, credential: &str, host_node: &str) 
     args
 }
 
-fn agent_sched_args(
+/// Submit ONE durable, node-pinned run and answer its saga id.
+///
+/// The saga id is minted HERE and never read back off anything: it is
+/// `namespaced_id` over the pinning node's own actor string, so the run's
+/// address is known before the op is submitted. That is also why the trigger
+/// goes over the FRAMELESS lane — `/v1/submit` re-signs with the node's key, so
+/// the committed origin matches the namespace the id was built under. A
+/// user-signed frame would land the same run under a different actor, where
+/// nothing that later looks for it would find it.
+async fn schedule_agent_run(
     rpc: &str,
     provider: &str,
     credential: &str,
     host_node: &str,
     prompt: &str,
-) -> Vec<String> {
-    let mut args = vec![
-        "agent".into(),
-        "sched".into(),
-        provider.into(),
-        "--cred".into(),
-        credential.into(),
-        "--node".into(),
-        rpc.into(),
-    ];
-    push_host_node(&mut args, host_node);
-    args.push("--".into());
-    args.push(prompt.into());
-    args
+) -> Result<String, String> {
+    let client = rpc_client(rpc)?;
+    let own_node = hex_decode(&client.status().await?.public_key)?;
+    let target = pin_target(&own_node, host_node)?;
+    refuse_a_host_that_cannot_run_this(&client, &target, provider).await?;
+
+    let (saga_id, trigger) = compose_run_trigger(
+        &own_node,
+        target,
+        provider,
+        credential,
+        prompt,
+        fresh_dispatch_id(),
+    );
+    let payload = serde_json::to_value(&trigger)
+        .map_err(|error| format!("the run could not be composed: {error}"))?;
+    client.submit("saga", payload).await?;
+    Ok(saga_id)
+}
+
+/// Which node the run is PINNED to: the host the operator picked, else the node
+/// this app is dialling. The pin is what scopes the credential draw, so an
+/// unpicked host must mean THIS node — never "unpinned".
+fn pin_target(own_node: &[u8], host_node: &str) -> Result<Vec<u8>, String> {
+    match host_node.trim() {
+        "" => Ok(own_node.to_vec()),
+        picked => hex_decode(picked),
+    }
+}
+
+/// Build the run's saga id and the trigger that carries it. Pure: it decides,
+/// and the caller submits.
+fn compose_run_trigger(
+    own_node: &[u8],
+    target: Vec<u8>,
+    provider: &str,
+    credential: &str,
+    prompt: &str,
+    dispatch_id: String,
+) -> (String, saga::SagaMsg) {
+    let saga_id = saga::namespaced_id(
+        &sdk::Origin::External(own_node.to_vec()),
+        &format!("sched\u{1f}{dispatch_id}"),
+    );
+    let spec = dispatch::WorkSpec {
+        kind: dispatch::WORK_SPEC_KIND.to_string(),
+        dispatch_id,
+        capability: provider.to_string(),
+        payload: run_envelope::compose_headless(&saga_id, prompt, Some(credential)).into_bytes(),
+        demands: BTreeMap::new(),
+        admission: dispatch::AdmissionPolicy::Queue,
+    };
+    let trigger = saga::SagaMsg::Trigger {
+        saga_id: saga_id.clone(),
+        spec: dispatch::encode_work_spec(&spec),
+        reply_to: None,
+        reply_payload: Vec::new(),
+        deadline: None,
+        max_attempts: AGENT_RUN_MAX_ATTEMPTS,
+        lease_views: None,
+        capability: Some(provider.to_string()),
+        demands: BTreeMap::new(),
+        pinned_assignee: Some(target),
+    };
+    (saga_id, trigger)
+}
+
+/// How many times the saga re-dispatches a run before giving up. The same
+/// figure the CLI's `sched` submits — a run that dies to a transient placement
+/// failure should not need a person to notice.
+const AGENT_RUN_MAX_ATTEMPTS: u32 = 3;
+
+/// A fresh dispatch id: 32 random bytes as 64 hex chars — what
+/// `run-output:<id>` keys on, and what `dispatch_id_from_saga` reads back out
+/// of the saga id.
+fn fresh_dispatch_id() -> String {
+    let mut bytes = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+    hex_encode(&bytes)
+}
+
+/// Fail EARLY when the registry knows the target advertises no matching
+/// provider.
+///
+/// An empty announcement is NOT a failure: a node that has never announced, or
+/// is offline right now, executes the run on reconnect — that durability is
+/// the whole contract of a pinned run, so the saga is left to carry it. Only a
+/// node that announces a provider set WITHOUT this one is a mistake worth
+/// stopping for, and stopping here saves burning every retry to find out on a
+/// box nobody is watching.
+async fn refuse_a_host_that_cannot_run_this(
+    client: &RpcClient,
+    target: &[u8],
+    provider: &str,
+) -> Result<(), String> {
+    let query = capability::CapabilityQuery::Node {
+        node: target.to_vec(),
+    };
+    let reply: capability::CapabilityReply = client.query("capability", &query).await?;
+    let capability::CapabilityReply::Node(announced) = reply else {
+        return Err("the capability registry answered something unreadable".into());
+    };
+    let announces_nothing = announced.is_empty();
+    let announces_others_but_not_this =
+        !announces_nothing && !announced.iter().any(|tag| tag == provider);
+    if announces_others_but_not_this {
+        return Err(format!(
+            "That host runs no {provider} provider (it offers: {}).",
+            announced.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 /// Where the durable run actually lives, said the way the operator picked it —
@@ -1622,32 +1705,77 @@ mod tests {
                 "team-codex",
             ]
         );
-        let sched = agent_sched_args("http://node", "claude", "team-claude", "", "hello");
-        assert_eq!(sched.last().map(String::as_str), Some("hello"));
-        assert_eq!(
-            &sched[..8],
-            [
-                "agent",
-                "sched",
-                "claude",
-                "--cred",
-                "team-claude",
-                "--node",
-                "http://node",
-                "--"
-            ]
-        );
     }
 
-    /// `--node` and `--host-node` are different questions: the first is who the
-    /// CLI dials, the second is who executes. An unpicked host must emit NO
-    /// flag — the argv above, byte for byte — or every default run silently
-    /// changes shape.
+    /// A scheduled run's ADDRESS is minted before it is submitted, and every
+    /// later half of the run reads it back out of the saga id: the live output
+    /// topic is `run-output:<dispatch>`, and the committed result is
+    /// `SagaQuery::Get(saga_id)`. This pins that round trip.
+    ///
+    /// The namespace is the pinning node's own actor string, which is why the
+    /// trigger goes over the frameless `/v1/submit` (the node re-signs, so the
+    /// committed origin matches). Submitting it as a user-signed frame instead
+    /// would land the run under a different actor, where nothing looking for it
+    /// would ever find it.
     #[test]
-    fn a_picked_host_node_is_the_only_thing_that_adds_the_flag() {
-        let peer = "b".repeat(64);
+    fn a_scheduled_run_carries_its_own_address_and_pin() {
+        let own = vec![0xaau8; 32];
+        let dispatch_id = "cd".repeat(32);
+
+        let (saga_id, trigger) = compose_run_trigger(
+            &own,
+            own.clone(),
+            "claude",
+            "team-claude",
+            "hello",
+            dispatch_id.clone(),
+        );
+        assert_eq!(dispatch_id_from_saga(&saga_id).unwrap(), dispatch_id);
+
+        let saga::SagaMsg::Trigger {
+            capability,
+            pinned_assignee,
+            max_attempts,
+            spec,
+            ..
+        } = trigger
+        else {
+            panic!("scheduling submits a Trigger");
+        };
+        assert_eq!(capability.as_deref(), Some("claude"));
+        assert_eq!(pinned_assignee.as_deref(), Some(own.as_slice()));
+        assert_eq!(max_attempts, AGENT_RUN_MAX_ATTEMPTS);
+
+        // the payload the executing host actually reads.
+        let spec = dispatch::decode_work_spec(&spec).expect("a work spec");
+        assert_eq!(spec.dispatch_id, dispatch_id);
+        assert_eq!(spec.capability, "claude");
+        let envelope: serde_json::Value = serde_json::from_slice(&spec.payload).unwrap();
+        assert_eq!(envelope["credential"], "team-claude");
+        assert_eq!(envelope["instructions"], "hello");
+        assert_eq!(envelope["run_id"], saga_id.as_str());
+    }
+
+    /// "Which node do I dial" and "which node RUNS this" are different
+    /// questions. An unpicked host means THIS node — never unpinned — because
+    /// the pin is what scopes the credential draw: a run with no assignee is a
+    /// run any host could present as its reason for spending your subscription.
+    #[test]
+    fn an_unpicked_host_pins_the_run_to_this_node() {
+        let own = vec![0xaau8; 32];
+        let peer_hex = "b".repeat(64);
+        let peer = vec![0xbbu8; 32];
+
+        for blank in ["", "   "] {
+            assert_eq!(pin_target(&own, blank).unwrap(), own);
+        }
+        assert_eq!(pin_target(&own, &peer_hex).unwrap(), peer);
+        assert_eq!(pin_target(&own, &format!("  {peer_hex}  ")).unwrap(), peer);
+        assert!(pin_target(&own, "not-a-key").is_err());
+
+        // the pty argv keeps its own flag discipline — it is still a CLI.
         assert_eq!(
-            agent_pty_args("http://node", "codex", "team-codex", &peer),
+            agent_pty_args("http://node", "codex", "team-codex", &peer_hex),
             [
                 "agent",
                 "pty",
@@ -1657,32 +1785,12 @@ mod tests {
                 "--cred",
                 "team-codex",
                 "--host-node",
-                peer.as_str(),
-            ]
-        );
-        assert_eq!(
-            agent_sched_args("http://node", "claude", "team-claude", &peer, "hello"),
-            [
-                "agent",
-                "sched",
-                "claude",
-                "--cred",
-                "team-claude",
-                "--node",
-                "http://node",
-                "--host-node",
-                peer.as_str(),
-                "--",
-                "hello",
+                peer_hex.as_str(),
             ]
         );
         for blank in ["", "   "] {
             assert!(
                 !agent_pty_args("http://node", "codex", "team-codex", blank)
-                    .contains(&"--host-node".to_string())
-            );
-            assert!(
-                !agent_sched_args("http://node", "claude", "team-claude", blank, "hello")
                     .contains(&"--host-node".to_string())
             );
         }

@@ -22,6 +22,10 @@ futures = { workspace = true }
 host = { workspace = true }
 saga = { workspace = true }
 sdk = { workspace = true }
+# the run envelope's magic + headless composer. The SCHEMA is shared with
+# programs that must not link this crate (a GUI submitting a run would drag
+# provider-host and the microVM sandbox in behind it); the READER stays here.
+run-envelope = { workspace = true }
 # the run envelope is JSON (see src/envelope.rs).
 serde = { workspace = true }
 serde_json = { workspace = true }
