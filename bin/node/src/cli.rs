@@ -578,10 +578,81 @@ fn cmd_invite(args: InviteArgs) -> Result<(), Box<dyn std::error::Error>> {
         // risk — single-use + sealing cover interception).
         None => config::DEFAULT_INVITE_TTL_DAYS,
     };
+    let (blob, notes) = mint_invite_blob(&args.selector.config_path()?, ttl_days)?;
+    for note in notes {
+        eprintln!("[invite] {note}");
+    }
+    println!("{blob}");
+    Ok(())
+}
+
+/// What the mint could not do, said once. A note is never a failure — an
+/// invite with no member fronts still admits a joiner through the inviter's own
+/// paths — but it changes what the blob can do, so it must reach SOMEBODY.
+///
+/// It rides back as a value rather than being printed here because this core
+/// now has two callers with opposite output surfaces: a CLI whose diagnostics
+/// are stderr, and a running daemon where `eprintln!` reaches neither the Logs
+/// tab nor `RUST_LOG`.
+pub(crate) enum InviteNote {
+    /// mesh state exists but names no other member.
+    MeshHasNoOtherMembers(std::path::PathBuf),
+    /// this member has never persisted mesh state.
+    NoMeshStateYet(std::path::PathBuf),
+    /// mesh state is present and unreadable.
+    MeshStateUnreadable(std::path::PathBuf, String),
+}
+
+impl InviteNote {
+    /// the stable snake_case token a log line counts.
+    pub(crate) fn reason(&self) -> &'static str {
+        match self {
+            InviteNote::MeshHasNoOtherMembers(_) => "invite_mesh_has_no_other_members",
+            InviteNote::NoMeshStateYet(_) => "invite_no_mesh_state",
+            InviteNote::MeshStateUnreadable(_, _) => "invite_mesh_state_unreadable",
+        }
+    }
+}
+
+impl std::fmt::Display for InviteNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InviteNote::MeshHasNoOtherMembers(path) => write!(
+                f,
+                "persisted mesh at {} holds no other members — the invite carries only the \
+                 inviter's own paths",
+                path.display()
+            ),
+            InviteNote::NoMeshStateYet(path) => write!(
+                f,
+                "no persisted mesh state at {} — the invite carries no member fronts (only the \
+                 inviter's own paths); mint again once the mesh has peers",
+                path.display()
+            ),
+            InviteNote::MeshStateUnreadable(path, why) => write!(
+                f,
+                "mesh state at {} unreadable ({why}) — the invite carries no member fronts",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// Mint one bearer invite from the workspace `cfg_path` names, answering the
+/// paste blob and whatever the mint could not do.
+///
+/// Public to the crate because the RUNNING daemon mints too: `/v1/invite` is
+/// wired to this at boot (see `boot`), so the desktop app asks the node that
+/// owns these files instead of starting a second process to race it over them.
+pub(crate) fn mint_invite_blob(
+    cfg_path: &std::path::Path,
+    ttl_days: u64,
+) -> Result<(String, Vec<InviteNote>), Box<dyn std::error::Error>> {
     if ttl_days == 0 {
         return Err("--ttl-days must be at least 1".into());
     }
-    let cfg_path = args.selector.config_path()?;
+    let mut notes = Vec::new();
+    let cfg_path = cfg_path.to_path_buf();
     let (raw, base) = config::load_node_toml(&cfg_path)?;
     let descriptor_path = base.join(&raw.network);
     let mut descriptor = config::NetworkDescriptor::load(&descriptor_path)?;
@@ -673,28 +744,19 @@ fn cmd_invite(args: InviteArgs) -> Result<(), Box<dyn std::error::Error>> {
         Ok(Some(mesh)) => {
             let fronts = config::fronts_from_adverts(&mesh.adverts, &own);
             if fronts.is_empty() {
-                eprintln!(
-                    "[invite] persisted mesh at {} holds no other members — the invite \
-                     carries only the inviter's own paths",
-                    mesh_state_file.display()
-                );
+                notes.push(InviteNote::MeshHasNoOtherMembers(mesh_state_file.clone()));
             }
             fronts
         }
         Ok(None) => {
-            eprintln!(
-                "[invite] no persisted mesh state at {} — the invite carries no member \
-                 fronts (only the inviter's own paths); mint again once the mesh has peers",
-                mesh_state_file.display()
-            );
+            notes.push(InviteNote::NoMeshStateYet(mesh_state_file.clone()));
             Vec::new()
         }
         Err(e) => {
-            eprintln!(
-                "[invite] mesh state at {} unreadable ({e}) — the invite carries no member \
-                 fronts",
-                mesh_state_file.display()
-            );
+            notes.push(InviteNote::MeshStateUnreadable(
+                mesh_state_file.clone(),
+                e.to_string(),
+            ));
             Vec::new()
         }
     };
@@ -718,8 +780,7 @@ fn cmd_invite(args: InviteArgs) -> Result<(), Box<dyn std::error::Error>> {
     // every invite is bearer.
     let token = config::mint_invite_token(&key, descriptor.genesis_namespace().as_bytes(), expires);
     let blob_string = config::encode_invite(&invite_descriptor, &token, &wireguard, &fronts, &key)?;
-    println!("{blob_string}");
-    Ok(())
+    Ok((blob_string, notes))
 }
 
 /// `admit <hex pubkey> [--config node.toml]` — pre-genesis membership: add an
