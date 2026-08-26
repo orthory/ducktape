@@ -7,7 +7,6 @@ version.workspace = true
 sdk = { workspace = true }
 serde = { workspace = true }
 async-trait = { workspace = true }
-serde_json = { workspace = true }
 # the logical-key -> store-key hash (sha256); the store itself is injected.
 sha2 = { workspace = true }
 

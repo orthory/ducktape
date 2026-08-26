@@ -15,9 +15,6 @@ serde_json = { workspace = true }
 # does each tunnel; "process" spawns the VMM; "io-util" frames the guest stream.
 tokio = { workspace = true, features = ["process", "io-util", "net"] }
 tracing = { workspace = true }
-# opening /dev/kvm for the boot probe: group membership on paper lies until the
-# operator has re-logged in, so the probe opens the device rather than asking.
-libc = "0.2"
 
 [dev-dependencies]
 # the service-root singleton test claims a real directory twice.

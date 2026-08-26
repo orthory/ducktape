@@ -32,7 +32,6 @@ consensus = { workspace = true }
 recovery = { workspace = true }
 sdk = { workspace = true }
 statesync = { workspace = true }
-kv = { workspace = true }
 directory = { workspace = true }
 # the production module set: system infrastructure + every product module.
 acl = { workspace = true }
@@ -60,7 +59,6 @@ chat = { workspace = true }
 media-service = { workspace = true }
 tasks = { workspace = true }
 identity = { workspace = true }
-duckdns = { workspace = true }
 gateway = { workspace = true }
 # the airlock contract: `server` supplies the GrantCheck type the lender daemon
 # injects (src/airlock.rs), `client` + `verify` the enclave-facing credential
@@ -70,8 +68,6 @@ airlock = { path = "../../crates/airlock", features = ["client", "server", "veri
 # the lender's disk-backed credential store: opened by the `service run airlock`
 # daemon, and written by `user cred add`.
 airlock-service = { workspace = true }
-automations = { workspace = true }
-inbox = { workspace = true }
 files = { workspace = true }
 # duckfs reusable core and disk scratch helpers; the `files` crate above remains
 # the consensus module adapter.
@@ -103,7 +99,6 @@ overlay-net = { workspace = true }
 futures = "0.3"
 bytes = "1"
 serde_json = { workspace = true }
-thiserror = { workspace = true }
 # the airlock client/verify surface is anyhow-typed and reports measurements as
 # hex; both already ride in on the airlock dependency above.
 anyhow = "1"
@@ -128,7 +123,6 @@ commonware-runtime = { workspace = true }
 commonware-cryptography = { workspace = true }
 commonware-p2p = { workspace = true }
 commonware-consensus = { workspace = true }
-commonware-storage = { workspace = true }
 commonware-utils = { workspace = true }
 commonware-codec = { workspace = true }
 
