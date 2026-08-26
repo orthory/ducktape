@@ -613,13 +613,14 @@ pub fn router(handle: NodeHandle) -> Router {
         // ---- duckfs workspace RPC (the jobs/sandbox seam) ----
         // managed checkouts under the injected root: create, commit (409 on a
         // structured conflict), delete. `None` root → 503.
+        // ---- admission ----
+        // minting an invite is a WRITE to this node's own descriptor and a read
+        // of its persisted mesh — the daemon that owns those files does it.
+        .route("/v1/invite", post(mint_invite))
         // ---- interactive terminal sessions (node-local, off-chain) ----
         // create returns {session_id, topic}; output rides the ws `term:<id>`
         // topic. same trusted-local gate as the other mutating /v1 routes (see
         // term.rs). close is idempotent.
-        // minting an invite is a WRITE to this node's own descriptor and a read
-        // of its persisted mesh — the daemon that owns those files does it.
-        .route("/v1/invite", post(mint_invite))
         .route("/v1/term/sessions", post(term::create_session))
         .route("/v1/term/sessions/{id}/close", post(term::close_session))
         // ---- service signaling (node-local, off-chain, volatile) ----
@@ -884,6 +885,17 @@ const INVITE_TTL_DAYS: std::ops::RangeInclusive<u64> = 1..=365;
 ///
 /// 503 when the embedder wired no minter — a daemon with no workspace has no
 /// descriptor to fold a hint into.
+///
+/// AUTH: the same trusted-local gate as every other mutating `/v1/` route —
+/// `origin_guard::guard` plus its CORS allowlist, and no bearer token (see the
+/// AUTH note in `term.rs` and the `origin_guard` module doc). A bearer invite
+/// is a real capability, so state the comparison rather than leave it implied:
+/// this route is strictly WEAKER than `/v1/submit`, which sits on the same
+/// surface and forges arbitrary consensus ops under this node's own key.
+/// Anything that can reach one can reach the other, and neither is a boundary
+/// this daemon can hold against a local process that can read its key off disk.
+/// Exposing the http listener past loopback is what widens this, for every
+/// route at once.
 async fn mint_invite(
     State(handle): State<NodeHandle>,
     body: Option<Json<serde_json::Value>>,
