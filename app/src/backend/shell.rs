@@ -359,8 +359,8 @@ pub(crate) fn forgotten_workspaces() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// What `node init` / `node join` hand back: the network's id, where it
-/// materialized, and the endpoint this app should connect to.
+/// What a join hands back: the network's id, where it materialized, and the
+/// endpoint this app should connect to.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct WorkspaceInit {
     pub chain_id: String,
@@ -368,30 +368,35 @@ pub struct WorkspaceInit {
     pub rpc: String,
 }
 
-/// Materialize this device's workspace from an invite blob:
-/// `ducktape node join <blob>`.
+/// Materialize this device's workspace from an invite blob, in this process.
+///
+/// Joining is the one node operation with no daemon to ask — it is what BRINGS
+/// a workspace into existence — so it is a library call
+/// ([`workspace_config::join_workspace`]) rather than an endpoint. It writes a
+/// directory, mints two keys and runs argon2-free but still blocking file work,
+/// hence `spawn_blocking`.
 pub async fn join_network(blob: ui_lang_runtime::Secret) -> Result<WorkspaceInit, AppError> {
     async {
-        let blob = blob.expose().trim();
+        let blob = blob.expose().trim().to_string();
         let valid = !blob.is_empty()
             && blob.len() <= 64 * 1024
             && !blob.chars().any(|character| character == '\0');
         if !valid {
             return Err("invite must be between 1 and 65536 bytes".into());
         }
-        // `join` reports progress on stderr, so the workspace it materialized
-        // is identified by diffing the registry around the call.
-        let before: BTreeSet<String> = registered_workspaces()
-            .into_iter()
-            .map(|(chain_id, _)| chain_id)
-            .collect();
-        ducktape_cli(&["node", "join", blob]).await?;
-        let chain_id = registered_workspaces()
-            .into_iter()
-            .map(|(chain_id, _)| chain_id)
-            .find(|chain_id| !before.contains(chain_id))
-            .ok_or_else(|| "the invite did not materialize a workspace".to_string())?;
-        workspace_init(&chain_id)
+        let joining = tokio::task::spawn_blocking(move || {
+            workspace_config::join_workspace(&blob, None, &Default::default())
+        });
+        let joined = joining
+            .await
+            .map_err(|_| "joining this network did not finish".to_string())??;
+        let rpc = workspace_endpoint(&joined.dir)
+            .ok_or_else(|| "the new workspace has no node.toml http_listen".to_string())?;
+        Ok(WorkspaceInit {
+            chain_id: joined.chain_id,
+            workspace: joined.dir.display().to_string(),
+            rpc,
+        })
     }
     .await
     .map_err(app_error)
@@ -432,54 +437,6 @@ fn workspace_rpc(selector: &str) -> Result<String, String> {
         .find(|(dir_name, dir)| matches_selector(dir_name, dir))
         .and_then(|(_, dir)| workspace_endpoint(&dir))
         .ok_or_else(|| format!("no local workspace named {selector:?} to mint an invite from"))
-}
-
-/// The workspace facts of a freshly registered chain id.
-fn workspace_init(chain_id: &str) -> Result<WorkspaceInit, String> {
-    let (chain_id, dir) = registered_workspaces()
-        .into_iter()
-        .find(|(id, _)| id == chain_id)
-        .ok_or_else(|| format!("{chain_id} is not in the workspace registry"))?;
-    let rpc = workspace_endpoint(&dir)
-        .ok_or_else(|| "the new workspace has no node.toml http_listen".to_string())?;
-    Ok(WorkspaceInit {
-        chain_id,
-        workspace: dir.display().to_string(),
-        rpc,
-    })
-}
-
-/// Run one `ducktape` verb and return its stdout's last non-empty line — the
-/// CLI's machine value (diagnostics ride stderr).
-async fn ducktape_cli(args: &[&str]) -> Result<String, String> {
-    // Name the `<noun> <verb>` head only. The tail is values, and `node join`
-    // carries the whole invite blob — hundreds of characters that, echoed into
-    // the banner's fixed column, push the CLI's actual reason off the bottom.
-    let verb = args[..args.len().min(2)].join(" ");
-    let mut command = tokio::process::Command::new(ducktape_binary());
-    command.args(args).kill_on_drop(true);
-    let output = tokio::time::timeout(CLI_TIMEOUT, command.output())
-        .await
-        .map_err(|_| format!("ducktape {verb} timed out"))?
-        .map_err(|error| {
-            format!(
-                "could not start the ducktape CLI ({error}); build node-bin or set DUCKTAPE_BIN"
-            )
-        })?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "ducktape {verb} refused: {}",
-            bounded_detail(&detail)
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .map(|line| line.trim().to_string())
-        .ok_or_else(|| format!("ducktape {verb} returned nothing"))
 }
 
 /// One provisioning step. `state` is `done` | `running` | `pending` | `blocked`.

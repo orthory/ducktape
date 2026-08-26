@@ -4,16 +4,16 @@
 //
 // The app is a strict CLIENT, and there is no create route: founding a network
 // is `ducktape node init` on the node, where the coordinator and the rest of the
-// network shape are chosen. `join_network` shells out to `ducktape node join`,
-// which materializes a workspace on disk and then EXITS. Nothing here starts a
-// daemon, so `provision_progress` steps 4-5 are a real `/v1/status` poll and a
-// stalled node reports `blocked` carrying the command that starts it, instead
-// of a spinner on an 850ms fake clock.
+// network shape are chosen. `join_network` runs the join ceremony IN THIS
+// PROCESS (the `workspace-config` library), materializing a workspace on disk.
+// Nothing here starts a daemon, so `provision_progress` steps 4-5 are a real
+// `/v1/status` poll and a stalled node reports `blocked` carrying the command
+// that starts it, instead of a spinner on an 850ms fake clock.
 //
 // Sign-in is the SAME password every signing extern already threads: unlock
-// verifies it against the SELECTED wallet once (`ducktape user key unlock`),
-// makes that wallet active (`ducktape wallet use`), then stores the password
-// in `password` for the session. Nothing new touches the wire.
+// opens the SELECTED wallet's key with the keystore library once, makes that
+// wallet active, then stores the password in `password` for the session.
+// Nothing new touches the wire.
 
 // The launch window is up: register it, then load everything it renders —
 // the keystore's wallets, the network list, and the persisted appearance.

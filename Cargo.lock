@@ -3286,6 +3286,7 @@ dependencies = [
  "ui-lang-components",
  "ui-lang-runtime",
  "usvg",
+ "workspace-config",
  "x11rb",
  "zeroize",
  "zune-jpeg 0.4.21",
@@ -6162,6 +6163,7 @@ dependencies = [
  "valset",
  "wasm-host",
  "wireguard",
+ "workspace-config",
  "x25519-dalek",
  "zeroize",
 ]
@@ -11916,6 +11918,30 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser 0.251.0",
+]
+
+[[package]]
+name = "workspace-config"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "commonware-codec",
+ "commonware-cryptography",
+ "commonware-p2p",
+ "commonware-utils",
+ "duckfs-core",
+ "governance",
+ "identity",
+ "nat-traversal",
+ "rand 0.8.6",
+ "reachability",
+ "sandbox-host",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml 0.8.23",
+ "tracing",
+ "wireguard",
 ]
 
 [[package]]

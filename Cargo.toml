@@ -129,6 +129,10 @@ members = [
     # reader links provider-host and with it the microVM sandbox, which a GUI
     # submitting a run must not.
     "crates/run-envelope",
+    # A workspace on disk (identity, network.toml, node.toml, the invite codec)
+    # and the join ceremony that writes one. Split from bin/node because
+    # joining is the one node operation with no running node to ask.
+    "crates/workspace-config",
     "crates/duckfs/core",
     "crates/duckfs/disk",
     "crates/duckfs/client",
@@ -334,6 +338,9 @@ keystore = { path = "crates/keystore" }
 # the run envelope's magic + headless composer, linked by the CLI, the compute
 # service and the desktop app.
 run-envelope = { path = "crates/run-envelope" }
+# a ducktape workspace on disk + the join ceremony, linked by the CLI and the
+# desktop app.
+workspace-config = { path = "crates/workspace-config" }
 # the module composition catalog (id universe + named genesis selections).
 topology = { path = "crates/topology" }
 duckfs-core = { path = "crates/duckfs/core" }
