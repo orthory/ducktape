@@ -76,14 +76,23 @@ coordinator-smoke:
 ifeq ($(UNAME_S),Darwin)
 # Build cargo-ice from the same ducktape-ui rev as the app. A global cargo-ice
 # can parse a different language than the compiler in app/Cargo.toml.
+#
+# The install source is the orthory fork's `ice-install/<rev>` branch: that
+# rev with the example members dropped from the workspace, cargo-ice sources
+# untouched. `cargo install --git` resolves the package's whole workspace and
+# clones every member's git dependency before building anything, so installing
+# from the upstream workspace fetches libraries only the examples use. Keying
+# the branch on ICE_REV makes the pairing self-enforcing: bumping the rev in
+# app/Cargo.toml fails this recipe until the matching branch is pushed
+# (rebase the prune commit onto the new rev as `ice-install/<new-rev>`).
 ICE_REV = $(shell sed -n 's/.*ducktape-ui.git", rev = "\([^"]*\)".*/\1/p' app/Cargo.toml | head -n1)
 ICE_ROOT = $(CURDIR)/target/cargo-ice/$(ICE_REV)
 ICE_BIN = $(ICE_ROOT)/bin/cargo-ice
 
 $(ICE_BIN):
 	CARGO_TARGET_DIR="$(CURDIR)/target/cargo-ice-build" $(CARGO) install cargo-ice \
-		--git https://github.com/byeongsu-hong/ducktape-ui.git \
-		--rev "$(ICE_REV)" --locked --root "$(ICE_ROOT)"
+		--git https://github.com/orthory/ducktape-ui.git \
+		--branch "ice-install/$(ICE_REV)" --locked --root "$(ICE_ROOT)"
 
 ## build the signed-ad-hoc Ducktape.app and DMG under target/ice-bundle
 app: $(ICE_BIN)
