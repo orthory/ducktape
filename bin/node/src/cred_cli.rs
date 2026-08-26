@@ -435,18 +435,21 @@ fn cmd_add(
     let user = load_user_signer(&ctx.key_path()?, stdin)?;
     let user_pub = user.public_key().as_ref().to_vec();
 
-    // owner account + display name (for the default name), existing names (for
-    // the counter) — one identity query, one gateway query.
+    // owner account (bind check) + existing names (for the default's counter)
+    // — one identity query, one gateway query. The display name is needed only
+    // to DERIVE a default name; an explicit name never requires one.
     let account = query_owner_account_view(&base, &user_pub)?;
-    let display = account
-        .display_name
-        .clone()
-        .ok_or("this account has no display name — pass an explicit credential name")?;
     let existing = query_credentials(&base)?;
     let existing_names: Vec<&str> = existing.iter().map(|r| r.name.as_str()).collect();
     let name = match name {
         Some(name) => name,
-        None => derive_default_name(&display, provider, &existing_names),
+        None => {
+            let display = account
+                .display_name
+                .clone()
+                .ok_or("this account has no display name — pass an explicit credential name")?;
+            derive_default_name(&display, provider, &existing_names)
+        }
     };
     gateway::validate_credential_name(&name)?;
 
