@@ -75,8 +75,14 @@ pub(crate) async fn attach(
                 match end {
                     // a link that lived and dropped is the ordinary case, and
                     // it clears the refusal streak: whatever the node objected
-                    // to, it does not object now.
-                    LinkEnd::Closed => refusals = 0,
+                    // to, it does not object now. Redialed on the same pace as
+                    // everything else: pump can return immediately (the node
+                    // restarting mid-accept), and an unpaced success path
+                    // dials at connect latency — a port-eating storm.
+                    LinkEnd::Closed => {
+                        refusals = 0;
+                        tokio::time::sleep(REDIAL).await;
+                    }
                     LinkEnd::Refused(detail) => {
                         refusals += 1;
                         if worth_logging(refusals) {
@@ -168,32 +174,59 @@ where
     loop {
         tokio::select! {
             frame = rx.next() => {
-                let Some(Ok(Message::Text(text))) = frame else {
-                    // a close, an error, or a frame shape we do not read:
-                    // anything but a live text frame ends this connection.
-                    let closed = !matches!(frame, Some(Ok(_)));
-                    if closed { return LinkEnd::Closed; }
-                    continue;
-                };
-                match classify(&text) {
-                    Incoming::Ignore => {}
-                    Incoming::Command(command) => execute(sessions, command).await,
-                    // the only errors this connection can earn are refusals of
-                    // its claim, and none self-heals on this socket: a stale
-                    // token needs a re-read of the node's freshly minted one,
-                    // another daemon holding the link needs that daemon to go.
-                    // Redialing is the honest retry — PACED, by the caller.
-                    Incoming::Refused(detail) => return LinkEnd::Refused(detail),
+                if let Some(end) = serve_frame(frame, sessions).await {
+                    return end;
                 }
             }
             event = events.recv() => {
-                let Some(event) = event else { return LinkEnd::Closed };
+                // a closed lane ends the LANE, not the link: commands still
+                // arrive on this socket, and treating the lane's end as a
+                // dropped connection made every successful dial return
+                // instantly — an unpaced redial storm.
+                let Some(event) = event else { break };
                 let frame = serde_json::json!({ "op": "agent_event", "event": event }).to_string();
                 if tx.send(Message::Text(frame)).await.is_err() {
                     return LinkEnd::Closed;
                 }
             }
         }
+    }
+    // the event lane is closed for the daemon's lifetime; commands in, nothing
+    // out, until the socket itself ends.
+    loop {
+        if let Some(end) = serve_frame(rx.next().await, sessions).await {
+            return end;
+        }
+    }
+}
+
+/// One server frame: perform a command, ignore hub chatter. `Some` when the
+/// connection is finished — a close, an error, or the node refusing our claim.
+async fn serve_frame(
+    frame: Option<
+        Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
+    >,
+    sessions: &Arc<Sessions>,
+) -> Option<LinkEnd> {
+    use tokio_tungstenite::tungstenite::Message;
+    let Some(Ok(Message::Text(text))) = frame else {
+        // a frame shape we do not read is a live socket; a close or an error
+        // is not.
+        let closed = !matches!(frame, Some(Ok(_)));
+        return closed.then_some(LinkEnd::Closed);
+    };
+    match classify(&text) {
+        Incoming::Ignore => None,
+        Incoming::Command(command) => {
+            execute(sessions, command).await;
+            None
+        }
+        // the only errors this connection can earn are refusals of its claim,
+        // and none self-heals on this socket: a stale token needs a re-read of
+        // the node's freshly minted one, another daemon holding the link needs
+        // that daemon to go. Redialing is the honest retry — PACED, by the
+        // caller.
+        Incoming::Refused(detail) => Some(LinkEnd::Refused(detail)),
     }
 }
 
