@@ -10056,7 +10056,6 @@ dependencies = [
 [[package]]
 name = "ui-lang-runtime"
 version = "0.1.0"
-source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=a64eb5f70c7cbd97136ac54b42c6ea0409c2d866#a64eb5f70c7cbd97136ac54b42c6ea0409c2d866"
 dependencies = [
  "accesskit",
  "accesskit_unix",
