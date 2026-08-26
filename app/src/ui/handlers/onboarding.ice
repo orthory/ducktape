@@ -25,6 +25,9 @@ on onboarding_opened(id)
 
 // Boot answer: pick the entry step from the keystore and start probing the
 // rows. `hub_booted` OWNS the step; the refresh route below never moves it.
+// A keystore that could not be READ is not a keystore that is EMPTY: the
+// error rides the same boot answer and lands on the create screen's own plate,
+// where "Continue read-only" is the way past it.
 on hub_booted(state)
   hub_hidden = state.hidden
   hub_networks = state.networks
@@ -32,19 +35,19 @@ on hub_booted(state)
   hub_wallets = state.wallets
   hub_wallet_selected = preselect_wallet(state.wallets)
   hub_step = hub_entry_step(state.wallets)
+  onboarding_error = state.wallets_error
   stream replace lane=network_probes probe_known_networks() -> network_probed _
 
 // A refresh (after forget / after a join / on the way back to the wallet
-// list) updates the rows where the user already is — the step stays put.
-// The wallet selection is re-preselected rather than kept: every route into
-// this handler lands somewhere other than the wallet list, and a freshly
-// minted wallet is the one the list should open on next time.
+// list) updates the rows where the user already is — the step stays put, and
+// so does the row she picked while the refresh was in flight.
 on hub_refreshed(state)
   hub_hidden = state.hidden
   hub_networks = state.networks
   hub_selected = refreshed_hub_selection(state.networks, hub_selected, state.preselect)
   hub_wallets = state.wallets
-  hub_wallet_selected = preselect_wallet(state.wallets)
+  hub_wallet_selected = refreshed_wallet_selection(state.wallets, hub_wallet_selected, preselect_wallet(state.wallets))
+  onboarding_error = state.wallets_error
   stream replace lane=network_probes probe_known_networks() -> network_probed _
 
 on network_probed(probe)

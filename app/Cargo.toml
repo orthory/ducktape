@@ -64,6 +64,11 @@ usvg = "0.45"
 # the workspace's reqwest is already in the binary under rpc-client.
 reqwest.workspace = true
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
+# The app's own diagnostics. It runs no subscriber of its own — these events
+# reach a terminal only under `RUST_LOG` on a `ducktape-app` started from one —
+# but a dropped keystore read has to be greppable somewhere, and `println!`
+# is not logging.
+tracing.workspace = true
 zeroize.workspace = true
 iced = { version = "=0.14.0", default-features = false, features = ["advanced", "highlighter", "image-without-codecs", "lazy", "markdown", "svg", "tokio", "wgpu", "x11"] }
 ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "a64eb5f70c7cbd97136ac54b42c6ea0409c2d866", default-features = false, features = ["log-timeline", "terminal"] }

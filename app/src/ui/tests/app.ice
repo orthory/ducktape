@@ -532,6 +532,29 @@ test wallet_list_contract
   type "hunter2-hunter2"
   expect component alice.pw == "hunter2-hunter2"
 
+// A KEYSTORE THAT COULD NOT BE READ LANDS HERE, and read-only is the way out.
+// A failed `wallet list` yields an empty list, which is the create ceremony —
+// so this screen, not just the wallet list, has to carry `login_skip`, or
+// someone who HAS wallets is trapped on a mint screen by a missing binary.
+test create_screen_read_only_escape_contract
+  preset ui_launch
+  viewport 480 680
+  mount
+    CreateScreen #create
+      with
+        busy=false
+        error="the keystore listing is unreadable"
+      events
+        create_submit -> create_submit _ _
+        go_restore -> go_restore
+        login_skip -> login_skip
+  target screen = #create/root
+  target skip = #create/root/create-skip
+  expect exists skip
+  expect text "the keystore listing is unreadable" within screen
+  click skip
+  expect hub_step == HubStep.networks
+
 test launch_networks_empty_contract
   preset ui_launch
   viewport 480 680

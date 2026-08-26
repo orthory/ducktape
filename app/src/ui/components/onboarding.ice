@@ -60,6 +60,7 @@ component HubColumn(step:HubStep, wallets:[WalletInfo], wallet_selected:str, net
             forward
               create_submit
               go_restore
+              login_skip
         HubStep.reveal
           RevealScreen words=reveal
             forward
@@ -390,6 +391,7 @@ component CreateScreen(busy:bool, error:str)
   emits
     create_submit(str, str)
     go_restore
+    login_skip
   state
     name_draft = "default"
     pw = ""
@@ -515,9 +517,22 @@ component CreateScreen(busy:bool, error:str)
       col
         with
           w=fill
-          gap=0.0
+          gap=8.0
           align=center
         button "Restore from recovery phrase" -> emit(go_restore)
+          with
+            disabled=busy
+            h=26.0
+            p=5.0
+            @ghost_action
+          active bg=transparent text=muted r=7.0
+          hovered bg=fg/9 text=fg
+          pressed bg=fg/14
+        // THE WAY OUT OF THIS SCREEN WITHOUT A KEY. This is where a failed
+        // `wallet list` lands someone who already HAS wallets, and without
+        // this the create ceremony is the only door — reads never needed a
+        // key, so refusing to show the network list was never honest.
+        button "Continue read-only" #create-skip -> emit(login_skip)
           with
             disabled=busy
             h=26.0

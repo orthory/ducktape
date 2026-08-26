@@ -146,7 +146,7 @@ extern crate::backend
   HubNetwork(id:str, chain_id:str, name:str, endpoint:str, kind:str, last_used:i64, probed:bool, live:bool, height:i64)
   HubProbe(id:str, live:bool, height:i64)
   WalletInfo(name:str, pubkey:str, state:str, active:bool)
-  HubState(wallets:[WalletInfo], networks:[HubNetwork], preselect:str, hidden:i64)
+  HubState(wallets:[WalletInfo], wallets_error:str, networks:[HubNetwork], preselect:str, hidden:i64)
   KeyCreated(words:str, pubkey:str)
   hub_state() -> HubState
   stream probe_known_networks() -> HubProbe
@@ -154,6 +154,7 @@ extern crate::backend
   pure network_run_hint(row:&HubNetwork) -> str
   pure hub_entry_step(wallets:[WalletInfo]) -> HubStep
   pure preselect_wallet(wallets:[WalletInfo]) -> str
+  pure refreshed_wallet_selection(wallets:[WalletInfo], current:str, preselect:str) -> str
   pure short_pubkey(pubkey:&str) -> str
   pure active_wallet_label(name:&str) -> str
   pure wallet_info(name:str, pubkey:str, state:str, active:bool) -> WalletInfo

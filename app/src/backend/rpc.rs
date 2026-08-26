@@ -527,8 +527,36 @@ pub(crate) fn duck_home() -> Result<PathBuf, String> {
         .ok_or_else(|| "cannot locate ~/.ducktape; set DUCKTAPE_USER_KEY".to_string())
 }
 
-/// One named wallet's key file inside the keystore.
+/// the keystore's name length cap, mirrored from the CLI's `wallet::valid_name`.
+const WALLET_NAME_MAX: usize = 41;
+
+/// The keystore's name charset — `[a-z0-9][a-z0-9._-]*`, at most 41 chars —
+/// enforced HERE and not only in the CLI, because a wallet name is both an
+/// argv word and a path segment: a leading `-` smuggles a clap flag into
+/// `ducktape wallet use` (which then prints help and exits 0, so a refusal
+/// would read as a success), and a `/` or `..` walks the key path out of the
+/// keystore. The name does not have to come from a person to be untrusted —
+/// the `active` pointer file is an ordinary file anyone can garble.
+pub(crate) fn check_wallet_name(name: &str) -> Result<(), String> {
+    let mut chars = name.chars();
+    let head_ok = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    let tail_ok =
+        chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'));
+    let fits = name.len() <= WALLET_NAME_MAX;
+    if head_ok && tail_ok && fits {
+        return Ok(());
+    }
+    Err(format!(
+        "wallet name {name:?} is invalid — use [a-z0-9][a-z0-9._-]*, at most {WALLET_NAME_MAX} chars"
+    ))
+}
+
+/// One named wallet's key file inside the keystore — THE join, so the charset
+/// check lives here and every caller inherits it.
 pub(crate) fn keystore_key_path(name: &str) -> Result<PathBuf, String> {
+    check_wallet_name(name)?;
     Ok(duck_home()?.join("keys").join(format!("{name}.key")))
 }
 
