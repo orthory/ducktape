@@ -617,6 +617,9 @@ pub fn router(handle: NodeHandle) -> Router {
         // create returns {session_id, topic}; output rides the ws `term:<id>`
         // topic. same trusted-local gate as the other mutating /v1 routes (see
         // term.rs). close is idempotent.
+        // minting an invite is a WRITE to this node's own descriptor and a read
+        // of its persisted mesh — the daemon that owns those files does it.
+        .route("/v1/invite", post(mint_invite))
         .route("/v1/term/sessions", post(term::create_session))
         .route("/v1/term/sessions/{id}/close", post(term::close_session))
         // ---- service signaling (node-local, off-chain, volatile) ----
@@ -862,6 +865,65 @@ async fn log_filter(body: String) -> Response {
     match crate::log::set_filter(body.trim()) {
         Ok(()) => (StatusCode::OK, body).into_response(),
         Err(err) => error_response(StatusCode::BAD_REQUEST, &err),
+    }
+}
+
+/// The invite TTL bounds, in days. A zero-day invite is expired the moment it
+/// is pasted; a decade-long bearer credential is not an invite, it is a key
+/// left under the mat.
+const INVITE_TTL_DAYS: std::ops::RangeInclusive<u64> = 1..=365;
+
+/// POST /v1/invite `{"ttl_days": N}` — mint one bearer invite and answer
+/// `{"invite": "🦆…"}`.
+///
+/// The RUNNING node mints it because minting is a write to the node's OWN
+/// files: it folds this member's dial hint into the network descriptor and
+/// saves it, and it reads the persisted mesh state for the member fronts a
+/// joiner brings its tunnel up against. Doing that from a second process races
+/// the daemon over both.
+///
+/// 503 when the embedder wired no minter — a daemon with no workspace has no
+/// descriptor to fold a hint into.
+async fn mint_invite(
+    State(handle): State<NodeHandle>,
+    body: Option<Json<serde_json::Value>>,
+) -> Response {
+    let requested = body
+        .as_ref()
+        .and_then(|Json(value)| value["ttl_days"].as_u64())
+        .unwrap_or(*INVITE_TTL_DAYS.start());
+    if !INVITE_TTL_DAYS.contains(&requested) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "ttl_days must be between {} and {}",
+                INVITE_TTL_DAYS.start(),
+                INVITE_TTL_DAYS.end()
+            ),
+        );
+    }
+    // the mint reads and rewrites files; it does not belong on a runtime worker.
+    let cell = handle.status_cell();
+    let minting = tokio::task::spawn_blocking(move || cell.mint_invite(requested)).await;
+    let Ok(minted) = minting else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the invite mint panicked",
+        );
+    };
+    let Some(minted) = minted else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no invite minter is wired on this daemon",
+        );
+    };
+    match minted {
+        Ok(invite) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "invite": invite })),
+        )
+            .into_response(),
+        Err(why) => error_response(StatusCode::BAD_REQUEST, &why),
     }
 }
 

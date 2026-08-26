@@ -709,6 +709,32 @@ impl Client {
         Ok(receipt.height)
     }
 
+    /// Mint one bearer invite valid for `ttl_days` and answer the paste blob.
+    ///
+    /// The NODE mints it, not the caller: minting folds this member's dial hint
+    /// into the network descriptor and SAVES it, and reads the persisted mesh
+    /// state for the member fronts a joiner can bring its tunnel up against —
+    /// both files the running daemon owns. A daemon with no workspace (an
+    /// embedder that wired no minter) answers 503.
+    pub async fn mint_invite(&self, ttl_days: u64) -> Result<String> {
+        let response = self
+            .http
+            .post(self.url("v1/invite")?)
+            .json(&serde_json::json!({ "ttl_days": ttl_days }))
+            .send()
+            .await
+            .map_err(|error| Error::new(format!("minting an invite failed: {error}")))?;
+        if !response.status().is_success() {
+            return Err(response_error(response).await);
+        }
+        #[derive(Deserialize)]
+        struct Minted {
+            invite: String,
+        }
+        let minted: Minted = decode_json(response).await?;
+        Ok(minted.invite)
+    }
+
     /// Connect to the node stream and subscribe to committed module changes.
     pub async fn module_events(
         &self,

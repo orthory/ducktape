@@ -397,16 +397,41 @@ pub async fn join_network(blob: ui_lang_runtime::Secret) -> Result<WorkspaceInit
     .map_err(app_error)
 }
 
-/// Mint a single-use bearer invite for a workspace: `ducktape node invite`
-/// prints the `🦆…` blob on stdout. This WRITES (it folds this member's dial
-/// hint into the descriptor), so it is not a read-only probe.
+/// Mint a single-use bearer invite for a workspace — the `🦆…` paste blob.
+///
+/// The RUNNING node mints it (`POST /v1/invite`), because minting is a WRITE
+/// to that node's own files: it folds this member's dial hint into the network
+/// descriptor and saves it, and reads the persisted mesh state for the member
+/// fronts the blob carries. Asking the daemon that owns those files is the
+/// difference between one writer and two racing ones.
+///
+/// The cost of that choice, stated: a workspace whose node is stopped can no
+/// longer mint from here. An invite names paths a joiner must be able to reach,
+/// so a network nobody is serving has nothing useful to hand out anyway.
 pub async fn mint_invite(workspace: String, ttl_days: i64) -> Result<String, AppError> {
-    async {
-        let ttl = ttl_days.clamp(1, 365).to_string();
-        ducktape_cli(&["node", "invite", "-n", &workspace, "--ttl-days", &ttl]).await
+    let minted: Result<String, String> = async {
+        let endpoint = workspace_rpc(&workspace)?;
+        let ttl = ttl_days.clamp(1, 365) as u64;
+        Ok(rpc_client(&endpoint)?.mint_invite(ttl).await?)
     }
-    .await
-    .map_err(app_error)
+    .await;
+    minted.map_err(app_error)
+}
+
+/// The endpoint serving a workspace named by directory OR by chain id — the
+/// same two spellings the CLI's `-n` selector takes, because the callers that
+/// used to pass one to `-n` now need a URL instead.
+fn workspace_rpc(selector: &str) -> Result<String, String> {
+    let selector = selector.trim();
+    let matches_selector = |dir_name: &str, dir: &Path| {
+        dir_name == selector
+            || node_dir_value(dir, "network.toml", "chain_id").as_deref() == Some(selector)
+    };
+    registered_workspaces()
+        .into_iter()
+        .find(|(dir_name, dir)| matches_selector(dir_name, dir))
+        .and_then(|(_, dir)| workspace_endpoint(&dir))
+        .ok_or_else(|| format!("no local workspace named {selector:?} to mint an invite from"))
 }
 
 /// The workspace facts of a freshly registered chain id.

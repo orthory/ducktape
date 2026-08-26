@@ -1512,3 +1512,64 @@ async fn fs_workspace_commit_rejects_a_bad_slug() {
     let body = body_json(response).await;
     assert_eq!(body["error"], "invalid workspace id");
 }
+
+/// The invite route, end to end through the real router.
+///
+/// Three properties, and each one is a way an operator gets hurt without it: a
+/// daemon with no workspace must SAY it cannot mint rather than 500 or hang; a
+/// nonsense TTL must be refused before the mint touches the descriptor (the
+/// mint SAVES that file, so a refusal afterwards is a write nobody asked for);
+/// and a successful mint must answer the blob itself, because the caller pastes
+/// what comes back.
+#[tokio::test]
+async fn the_invite_route_mints_refuses_and_says_when_it_cannot() {
+    let body_of = |response: axum::response::Response| async move {
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("a bounded body");
+        String::from_utf8(bytes.to_vec()).expect("utf-8")
+    };
+    let post = |app: axum::Router, body: &'static str| async move {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/invite")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .expect("a request"),
+        )
+        .await
+        .expect("a response")
+    };
+
+    // no minter wired: the honest answer is "this daemon does not do that".
+    let (handle, _cmds, _events) = NodeHandle::channel();
+    let unwired = post(noded::router(handle), r#"{"ttl_days":7}"#).await;
+    assert_eq!(unwired.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body_of(unwired).await.contains("no invite minter"));
+
+    // wired: the TTL reaches the minter, and the blob comes back whole.
+    let (handle, _cmds, _events) = NodeHandle::channel();
+    handle
+        .status_cell()
+        .wire_invite_minter(|ttl_days| Ok(format!("duck-invite-for-{ttl_days}-days")));
+    let app = noded::router(handle);
+
+    let minted = post(app.clone(), r#"{"ttl_days":7}"#).await;
+    assert_eq!(minted.status(), StatusCode::OK);
+    assert!(body_of(minted).await.contains("duck-invite-for-7-days"));
+
+    // a TTL outside the bounds never reaches the minter — which means the
+    // descriptor is never rewritten for a request that was going to be refused.
+    for refused in [r#"{"ttl_days":0}"#, r#"{"ttl_days":4000}"#] {
+        let response = post(app.clone(), refused).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{refused}");
+        assert!(body_of(response).await.contains("ttl_days"));
+    }
+
+    // no body at all is the shortest TTL, not an error: a caller that does not
+    // care gets the least dangerous invite.
+    let defaulted = post(app, "{}").await;
+    assert_eq!(defaulted.status(), StatusCode::OK);
+    assert!(body_of(defaulted).await.contains("for-1-days"));
+}

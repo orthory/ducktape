@@ -284,7 +284,7 @@ fn run_node_verb(args: cli_args::RunArgs) -> Result<(), Box<dyn std::error::Erro
     let workspace = cfg_path.parent().unwrap_or(std::path::Path::new("."));
     noded::log::init(Some(log_ring.clone()), Some(workspace.join("daemon.log")));
 
-    run_node(config::resolve(&cfg_path)?, sync_only, log_ring)
+    run_node(config::resolve(&cfg_path)?, cfg_path, sync_only, log_ring)
 }
 
 /// stand up the real-socket node from `cfg` and run it until killed (validator)
@@ -319,6 +319,10 @@ fn gateway_can_start(
 
 fn run_node(
     resolved: Resolved,
+    // this daemon's own `node.toml` — kept whole rather than re-derived from
+    // `Resolved`, because the invite mint reads and REWRITES the descriptor
+    // beside it (see the `/v1/invite` wiring below).
+    cfg_path: std::path::PathBuf,
     sync_only: bool,
     log_ring: noded::LogRing,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -534,6 +538,24 @@ fn run_node(
         stream_hub.wire_metrics(&metrics);
         let exposition_context = context.child("exposition");
         status.wire_exposition(move || exposition_context.encode());
+        // `/v1/invite` — the daemon mints its own invites. Minting FOLDS this
+        // member's dial hint into the network descriptor and saves it, and
+        // reads the persisted mesh for the fronts the blob carries: both are
+        // this process's files, so a second process doing it races us over
+        // them. The route hands the work to a blocking thread.
+        let invite_config = cfg_path.clone();
+        status.wire_invite_minter(move |ttl_days| {
+            let (blob, notes) =
+                cli::mint_invite_blob(&invite_config, ttl_days).map_err(|why| why.to_string())?;
+            for note in notes {
+                tracing::warn!(
+                    target: "ducktape::join",
+                    reason = note.reason(),
+                    "the minted invite carries fewer paths than a full mesh would give it"
+                );
+            }
+            Ok(blob)
+        });
         status.publish(noded::NodeStatus {
             version: env!("CARGO_PKG_VERSION").into(),
             public_key: status_public_key.clone(),

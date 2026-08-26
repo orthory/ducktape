@@ -93,7 +93,20 @@ struct StatusCellInner {
     /// and the ws metrics topic all read it directly; the registry is shared
     /// state, so encoding it never needs the actor.
     exposition: std::sync::OnceLock<Arc<dyn Fn() -> String + Send + Sync>>,
+    /// the invite minter — wired once at boot by an embedder that owns a
+    /// workspace (its `node.toml`, descriptor, identity and WireGuard key).
+    ///
+    /// Minting an invite is the RUNNING node's business twice over: it folds
+    /// this member's dial hint into the descriptor and SAVES it, and it reads
+    /// the persisted mesh state for the fronts a joiner can bring its tunnel up
+    /// against. A second process doing that races the daemon over its own
+    /// files. Unwired (simnode, an embedder with no workspace), `/v1/invite`
+    /// answers 503 — the same shape as an unwired exposition.
+    invite_minter: std::sync::OnceLock<Arc<InviteMinter>>,
 }
+
+/// Mint one bearer invite valid for `ttl_days`, answering the paste blob.
+pub type InviteMinter = dyn Fn(u64) -> Result<String, String> + Send + Sync;
 
 impl StatusCell {
     /// publish a complete snapshot — one whole-struct swap.
@@ -146,6 +159,27 @@ impl StatusCell {
     /// handle whose embedder registers no metrics — the routes answer 503).
     pub fn exposition(&self) -> Option<String> {
         self.inner.exposition.get().map(|encode| encode())
+    }
+
+    /// wire the invite minter. once per process; a second wiring is a
+    /// programming error.
+    pub fn wire_invite_minter(
+        &self,
+        mint: impl Fn(u64) -> Result<String, String> + Send + Sync + 'static,
+    ) {
+        if self.inner.invite_minter.set(Arc::new(mint)).is_err() {
+            panic!("status cell invite minter wired twice");
+        }
+    }
+
+    /// One freshly minted invite blob, or `None` when no minter is wired (an
+    /// embedder with no workspace to mint from — the route answers 503).
+    ///
+    /// Blocking: the mint reads and REWRITES the descriptor and reads the
+    /// persisted mesh state, so a caller on an async runtime owes this a
+    /// blocking thread.
+    pub fn mint_invite(&self, ttl_days: u64) -> Option<Result<String, String>> {
+        self.inner.invite_minter.get().map(|mint| mint(ttl_days))
     }
 
     /// the current status: the last-published boundary facts, with live
