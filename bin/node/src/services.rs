@@ -2084,7 +2084,7 @@ mod tests {
     fn a_runs_vmm_cannot_outlive_the_daemon_that_spawned_it() {
         let source = include_str!("../../../crates/services/sandbox/src/microvm.rs");
         let (_, after_spawn) = source
-            .split_once("Command::new(&firecracker)")
+            .split_once("Command::new(&vmm_path)")
             .expect("the VMM spawn");
         let (args, _) = after_spawn.split_once(".spawn()").expect("spawn call");
         assert!(
