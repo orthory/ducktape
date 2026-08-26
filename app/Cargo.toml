@@ -44,6 +44,14 @@ keystore.workspace = true
 node.workspace = true
 # the ed25519 signer `keystore` hands back and `node::encode_frame` signs with.
 commonware-cryptography.workspace = true
+# scheduling a durable agent run in-process: the work spec the saga carries and
+# the run envelope's headless composer. `run-envelope` is the SCHEMA only —
+# reaching the composer through `compute-service` would link provider-host and
+# the microVM sandbox into a GUI.
+dispatch.workspace = true
+run-envelope.workspace = true
+# the 32 random bytes of a fresh dispatch id.
+rand.workspace = true
 pages.workspace = true
 saga.workspace = true
 # RUNTIME, not dev-only: `local_member` derives the signing identity through

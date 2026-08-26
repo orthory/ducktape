@@ -27,15 +27,12 @@ use serde_json::Value;
 use crate::provision::{PortablePlan, RoMount, Sink};
 use crate::workspace_source::WireWorkspace;
 
-/// the fixed value of the `ducktape_run` magic key. key + value together are
-/// the envelope's self-identifying token — the digit is part of the magic,
-/// like a container magic, never a version to bump.
-pub const RUN_ENVELOPE_MARKER: u64 = 1;
-/// the fixed value of the `ducktape_runner_result` magic key — the SINGLE
-/// owner across this crate. the provisioning wrapper's
-/// [`crate::provision::assemble_runner_result`] stamps it and the accept
-/// slice validates the envelope requests it. never redeclare a second const.
-pub const RUNNER_RESULT_MARKER: u64 = 1;
+// The magic and the headless composer live in `run-envelope`: the SCHEMA is
+// shared with programs that cannot link this crate (the desktop app would drag
+// provider-host and the microVM sandbox in behind it). Re-exported here so
+// every existing `envelope::RUN_ENVELOPE_MARKER` path still resolves — this
+// crate remains the single owner of what READS one.
+pub use run_envelope::{RUN_ENVELOPE_MARKER, RUNNER_RESULT_MARKER, compose_headless};
 
 /// the wire shape shared by supported envelopes. field ORDER is the composer's
 /// business (committed bytes); decoding here is by name.
@@ -198,35 +195,6 @@ pub fn prepare(input: &str) -> Result<Prepared, String> {
         workspace,
         credential: envelope.credential,
     })
-}
-
-/// Compose the ONE payload shape a headless `sched` run carries: a minimal
-/// valid run envelope with the prompt as its instructions, a fresh per-run
-/// duckfs workspace (no pinned snapshot — a headless prompt has no workspace to
-/// resume), no skills, no chat contract, and the given credential name. The CLI
-/// builder calls this so the envelope schema lives in exactly one place.
-pub fn compose_headless(run_id: &str, prompt: &str, credential: Option<&str>) -> String {
-    let mut envelope = serde_json::json!({
-        "ducktape_run": RUN_ENVELOPE_MARKER,
-        "agent_id": "sched",
-        "agent_display_name": "sched",
-        "run_id": run_id,
-        "instructions": prompt,
-        "contract": "",
-        "conversation": "",
-        "workspace": {
-            "kind": "duckfs",
-            "source_prefix": "/shared/agent-workspaces/sched",
-            "source_snapshot": null,
-        },
-        "skills": [],
-        "library_readable": false,
-        "result_contract": { "ducktape_runner_result": RUNNER_RESULT_MARKER },
-    });
-    if let Some(credential) = credential {
-        envelope["credential"] = serde_json::Value::String(credential.to_string());
-    }
-    serde_json::to_string(&envelope).expect("a headless envelope always serializes")
 }
 
 /// ACCEPT a portable envelope and surface its pinned plan, without

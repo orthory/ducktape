@@ -2057,6 +2057,7 @@ dependencies = [
  "futures",
  "host",
  "provider-host",
+ "run-envelope",
  "saga",
  "sdk",
  "serde",
@@ -3251,6 +3252,7 @@ dependencies = [
  "commonware-cryptography",
  "cpal",
  "design",
+ "dispatch 0.1.0",
  "ducktape-rpc",
  "forge",
  "gateway",
@@ -3267,7 +3269,9 @@ dependencies = [
  "node",
  "nokhwa",
  "pages",
+ "rand 0.8.6",
  "reqwest 0.12.28",
+ "run-envelope",
  "saga",
  "sdk",
  "serde",
@@ -8261,6 +8265,13 @@ dependencies = [
  "spki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "run-envelope"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
