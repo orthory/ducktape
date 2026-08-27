@@ -43,7 +43,8 @@ pub enum StoreError {
 
 /// The persisted mesh: every member's signed advertisement from the last
 /// epoch this node applied tunnels for (this node's own included), plus the
-/// standby records accepted by then. no format version (flag-day rule):
+/// post-lock member re-advertisements and the standby records accepted by
+/// then. no format version (flag-day rule):
 /// `deny_unknown_fields` plus the required-field set IS the schema guard —
 /// the restore is best-effort, and a file this build cannot parse just means
 /// one boot without it, then `save` rewrites the current form.
@@ -53,6 +54,12 @@ pub struct PersistedMesh {
     pub chain_id: String,
     pub epoch: u64,
     pub adverts: Vec<EndpointAdvertisement>,
+    /// Post-lock member re-advertisements accepted by the persisting epoch:
+    /// a member's fresh life, signed after the epoch locked its mesh. On
+    /// restore, the higher record nonce per member wins between these and
+    /// the adverts — the fresh life's tunnel parts are the ones worth
+    /// re-applying.
+    pub member_records: Vec<SignedEndpointRecord>,
     /// The pre-warm layer's accepted standby records (member side). These
     /// persist because a parked resident cannot re-introduce itself to a
     /// member that forgot its WireGuard key: its invite token was consumed
@@ -66,12 +73,14 @@ impl PersistedMesh {
         chain_id: String,
         epoch: u64,
         adverts: Vec<EndpointAdvertisement>,
+        member_records: Vec<SignedEndpointRecord>,
         standby_records: Vec<SignedEndpointRecord>,
     ) -> Self {
         Self {
             chain_id,
             epoch,
             adverts,
+            member_records,
             standby_records,
         }
     }
@@ -131,7 +140,7 @@ pub fn load(path: &Path, chain_id: &str) -> Result<Option<PersistedMesh>, StoreE
             });
         }
     }
-    for record in &mesh.standby_records {
+    for record in mesh.member_records.iter().chain(&mesh.standby_records) {
         if record.verify().is_err() {
             return Err(StoreError::BadSignature {
                 path: path.display().to_string(),
@@ -182,7 +191,7 @@ mod tests {
         EndpointAdvertisement::sign(record, MeshVersion([7; 32]), &signer)
     }
 
-    fn standby_record(seed: u64, octet: u8) -> SignedEndpointRecord {
+    fn signed_record(seed: u64, octet: u8) -> SignedEndpointRecord {
         let (record, signer) = record_of(seed, octet);
         SignedEndpointRecord::sign(record, &signer)
     }
@@ -192,7 +201,8 @@ mod tests {
             "net#store".into(),
             3,
             vec![advert(1, 10), advert(2, 20)],
-            vec![standby_record(3, 30)],
+            vec![signed_record(4, 40)],
+            vec![signed_record(3, 30)],
         )
     }
 
@@ -218,6 +228,24 @@ mod tests {
         // longer covers what the file claims.
         let text = std::fs::read_to_string(&path).unwrap();
         std::fs::write(&path, text.replace("\"epoch\": 3", "\"epoch\": 4")).unwrap();
+
+        assert!(matches!(
+            load(&path, "net#store"),
+            Err(StoreError::BadSignature { .. })
+        ));
+    }
+
+    #[test]
+    fn refuses_a_tampered_member_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mesh-state.json");
+        save(&path, &sample()).unwrap();
+
+        // redirect the re-advertised member record's endpoint (its address
+        // is unique to it in the file): the owner signature no longer
+        // covers the claim.
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replace("8.8.8.40", "8.8.8.41")).unwrap();
 
         assert!(matches!(
             load(&path, "net#store"),

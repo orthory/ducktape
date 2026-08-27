@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use commonware_cryptography::ed25519;
 use wireguard::effect::PeerTunnelConfig;
 use wireguard::{
-    ActiveValidatorSet, EndpointAdvertisement, EndpointRecord, MeshView, ReplayCache,
+    ActiveValidatorSet, EndpointAdvertisement, EndpointRecord, MeshVersion, MeshView, ReplayCache,
     SignedEndpointRecord, TunnelInstallPlan, TunnelUpgradeAck, TunnelUpgradeRequest,
     TunnelUpgradeResponse, ValidatorIdentity,
 };
@@ -158,6 +158,38 @@ impl Admission {
             Admission::Stale => false,
         }
     }
+}
+
+/// What a member's record gossip means for an epoch whose record set may
+/// already be locked, decided by [`EpochState::judge_member_record`] and
+/// dispatched by the orchestrator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MemberRecordVerdict {
+    /// The record set is still open: plain phase-A admission by nonce.
+    Assembling,
+    /// At or below the nonce this epoch locked for the owner: the owner is
+    /// still assembling its own phase A and never got our half — heal it.
+    Behind,
+    /// Above the locked nonce: the owner signed a new record within the
+    /// epoch (a restart, an address rebind) — re-tunnel it in place, as a
+    /// layer over the applied base; the next cutover folds it back into a
+    /// verified mesh.
+    Readvertised,
+}
+
+/// Whether this node's own record is the one its peers locked into the
+/// epoch's mesh version, or a fresh life signed after that lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnRecordStanding {
+    /// The peers' locked set carries this record (or the epoch is still
+    /// assembling toward that): the settled phases re-offer nothing.
+    Locked,
+    /// This record post-dates the set the peers locked — this node adopted
+    /// their view after re-assembling mid-epoch. Every settled-phase nudge
+    /// keeps offering the record so every peer eventually re-tunnels this
+    /// node; receivers dedup by nonce, so a peer that holds it already
+    /// drops the re-offer silently.
+    Live,
 }
 
 /// Store `value` under `owner` iff its `nonce` beats the held item's.
@@ -343,6 +375,17 @@ pub(crate) struct EpochState {
     /// resolved, overlay route derived) — merged over the interface's base
     /// peers on every change.
     pub(crate) prewarm_peers: BTreeMap<ValidatorIdentity, PeerTunnelConfig>,
+    /// Members' post-lock re-advertisements: an owner-signed record whose
+    /// nonce beats what this epoch locked for the owner (a restart, an
+    /// address rebind), accepted under the live supersession rule and kept
+    /// BESIDE the locked set — the locked mesh version never recomputes
+    /// mid-epoch. Persisted with the mesh so a cold restart restores the
+    /// member's current life, not the one the epoch happened to lock.
+    pub(crate) readvertised: BTreeMap<ValidatorIdentity, SignedEndpointRecord>,
+    /// The tunnel parts derived from accepted re-advertisements — merged
+    /// over the interface's base peers on every push, above the base and
+    /// below nothing (a member is never in the pre-warm layer).
+    pub(crate) readvertised_peers: BTreeMap<ValidatorIdentity, PeerTunnelConfig>,
     /// Standby-directed sends route to the transport identity that DELIVERED
     /// the standby's record when that identity is not a member (the lobby
     /// ingress a parked joiner connects under, or the standby's own key) —
@@ -360,6 +403,9 @@ pub(crate) struct EpochState {
     /// standby role this field is its only home (a standby is never part of
     /// the member record set).
     pub(crate) own_record: SignedEndpointRecord,
+    /// Where `own_record` stands against the mesh version the peers locked
+    /// (see [`OwnRecordStanding`]).
+    pub(crate) own_standing: OwnRecordStanding,
     /// Owner-signed records as they arrived (our own included) — the form
     /// that can be re-gossiped to peers the owner has no link to.
     pub(crate) records: BTreeMap<ValidatorIdentity, SignedEndpointRecord>,
@@ -419,9 +465,12 @@ impl EpochState {
             prewarm_nonces: BTreeMap::new(),
             standby_records: BTreeMap::new(),
             prewarm_peers: BTreeMap::new(),
+            readvertised: BTreeMap::new(),
+            readvertised_peers: BTreeMap::new(),
             routes: HashMap::new(),
             nonce: own_record.record.nonce,
             own_record,
+            own_standing: OwnRecordStanding::Locked,
             records,
             adverts: BTreeMap::new(),
             phase: Phase::Records,
@@ -622,6 +671,79 @@ impl EpochState {
         admit(&mut self.prewarm_nonces, owner, nonce, |held| *held, nonce)
     }
 
+    /// What a member's record gossip means once the record set may be
+    /// locked. In [`Phase::Records`] the set is still open — plain phase-A
+    /// admission decides. After that, the nonce this epoch locked for the
+    /// owner splits the world: at or below it the owner is behind (still
+    /// assembling, missing our half); above it the owner signed a new life
+    /// within the epoch and gets re-tunneled in place.
+    pub(crate) fn judge_member_record(
+        &self,
+        owner: ValidatorIdentity,
+        nonce: u64,
+    ) -> MemberRecordVerdict {
+        if matches!(self.phase, Phase::Records) {
+            return MemberRecordVerdict::Assembling;
+        }
+        // Post-lock, every member's record is known (that is the lock's own
+        // gate), so a missing entry cannot happen; treat it as phase-A lag
+        // rather than a fresh life over a set that never held the owner.
+        let beats_lock = self
+            .known_records()
+            .get(&owner)
+            .is_some_and(|locked| nonce > locked.nonce);
+        if beats_lock {
+            MemberRecordVerdict::Readvertised
+        } else {
+            MemberRecordVerdict::Behind
+        }
+    }
+
+    /// A member's post-lock re-advertisement: stored beside the locked set
+    /// iff its nonce beats the held re-advertisement — the same live
+    /// supersession rule as the pre-warm layer (re-offers are routine and
+    /// drop silently).
+    pub(crate) fn admit_readvertisement(
+        &mut self,
+        owner: ValidatorIdentity,
+        signed: SignedEndpointRecord,
+    ) -> Admission {
+        let nonce = signed.record.nonce;
+        admit(
+            &mut self.readvertised,
+            owner,
+            nonce,
+            |held| held.record.nonce,
+            signed,
+        )
+    }
+
+    /// A peer signed a new record: its previous life's rendezvous-fallback
+    /// budget does not bind the new one — the fallback may be exactly what
+    /// reaches the new life.
+    pub(crate) fn reset_rendezvous_budget(&mut self, peer: ValidatorIdentity) {
+        self.rendezvous_attempted.remove(&peer);
+    }
+
+    /// The single mesh version EVERY peer's advert commits to, when they
+    /// all agree. When it also differs from the version this node computes,
+    /// the peers locked this epoch's mesh over a record this node no longer
+    /// holds — its own previous life. `None` while any peer's advert is
+    /// missing, when the peers disagree among themselves, or with no peers
+    /// at all.
+    pub(crate) fn peers_locked_version(&self) -> Option<MeshVersion> {
+        let mut agreed: Option<MeshVersion> = None;
+        for peer in &self.peers {
+            let advert = self.adverts.get(peer)?;
+            match agreed {
+                None => agreed = Some(advert.mesh_version),
+                Some(version) if advert.mesh_version == version => {}
+                Some(_) => return None,
+            }
+        }
+        agreed
+    }
+
     /// The identities an accepted gossip item floods onward to: every peer
     /// and standby except the item's owner and the link that delivered it.
     pub(crate) fn flood_targets(
@@ -721,7 +843,21 @@ impl EpochState {
         phase_sends
             .into_iter()
             .chain(self.prewarm_reoffers())
+            .chain(self.live_record_reoffers())
             .collect()
+    }
+
+    /// While this node's own record post-dates the version its peers locked
+    /// ([`OwnRecordStanding::Live`]), every nudge keeps offering it to every
+    /// peer: an adopted view proves the peers settled without this record,
+    /// and only their acceptance of it re-tunnels this node. Receivers dedup
+    /// by nonce, so the steady re-offer costs a silent drop once accepted.
+    fn live_record_reoffers(&self) -> Vec<(ValidatorIdentity, ReachabilityMsg)> {
+        if self.own_standing == OwnRecordStanding::Locked {
+            return Vec::new();
+        }
+        let own = ReachabilityMsg::Record(self.own_record.clone());
+        self.peers.iter().map(|peer| (*peer, own.clone())).collect()
     }
 
     fn standby_reoffers(&self) -> Vec<(ValidatorIdentity, ReachabilityMsg)> {
@@ -1356,6 +1492,151 @@ mod tests {
         assert!(
             state.claim_rendezvous_attempt(identity(&me), t3),
             "budgets are per peer"
+        );
+    }
+
+    #[test]
+    fn a_member_record_is_judged_by_phase_then_by_the_locked_nonce() {
+        let (me, peer_a, peer_b) = (signer(1), signer(2), signer(3));
+        let mut state = epoch(&me, Role::Member, &[&me, &peer_a, &peer_b], &[]);
+        let a = identity(&peer_a);
+        let set = state.set.clone();
+        state.admit_record(a, record(&peer_a, &set, 2, 100));
+        assert_eq!(
+            state.judge_member_record(a, 101),
+            MemberRecordVerdict::Assembling,
+            "the record set is still open — plain phase-A admission decides"
+        );
+        state.phase = Phase::Adverts;
+        assert_eq!(state.judge_member_record(a, 99), MemberRecordVerdict::Behind);
+        assert_eq!(
+            state.judge_member_record(a, 100),
+            MemberRecordVerdict::Behind,
+            "the locked nonce itself is a routine re-offer, not a fresh life"
+        );
+        assert_eq!(
+            state.judge_member_record(a, 101),
+            MemberRecordVerdict::Readvertised
+        );
+        assert_eq!(
+            state.judge_member_record(identity(&peer_b), 500),
+            MemberRecordVerdict::Behind,
+            "an owner the locked set never held cannot re-tunnel over it"
+        );
+    }
+
+    #[test]
+    fn a_readvertisement_supersedes_by_nonce_beside_the_locked_set() {
+        let (me, peer) = (signer(1), signer(2));
+        let mut state = epoch(&me, Role::Member, &[&me, &peer], &[]);
+        let p = identity(&peer);
+        let set = state.set.clone();
+        state.admit_record(p, record(&peer, &set, 2, 100));
+        state.phase = Phase::Adverts;
+        assert!(
+            state
+                .admit_readvertisement(p, record(&peer, &set, 2, 101))
+                .accepted()
+        );
+        assert_eq!(
+            state.admit_readvertisement(p, record(&peer, &set, 2, 101)),
+            Admission::Stale,
+            "the fresh life's steady re-offer drops silently"
+        );
+        assert_eq!(
+            state.admit_readvertisement(p, record(&peer, &set, 2, 102)),
+            Admission::Superseded,
+            "an even fresher life supersedes in place"
+        );
+        assert_eq!(
+            state.records[&p].record.nonce,
+            100,
+            "the locked set never moves — the mesh version stands"
+        );
+    }
+
+    #[test]
+    fn a_new_life_gets_a_fresh_rendezvous_budget() {
+        let (me, peer) = (signer(1), signer(2));
+        let mut state = epoch(&me, Role::Member, &[&me, &peer], &[]);
+        let p = identity(&peer);
+        let t0 = Instant::now();
+        assert!(state.claim_rendezvous_attempt(p, t0));
+        assert!(
+            !state.claim_rendezvous_attempt(p, t0),
+            "the backoff still binds the SAME life"
+        );
+        state.reset_rendezvous_budget(p);
+        assert!(
+            state.claim_rendezvous_attempt(p, t0),
+            "a re-advertised life is resolved fresh"
+        );
+    }
+
+    #[test]
+    fn peers_locked_version_needs_every_peer_on_one_version() {
+        let (me, peer_a, peer_b) = (signer(1), signer(2), signer(3));
+        let mut state = epoch(&me, Role::Member, &[&me, &peer_a, &peer_b], &[]);
+        let set = state.set.clone();
+        let advert = |s, nonce, version| {
+            EndpointAdvertisement::sign(record(s, &set, 2, nonce).record, version, s)
+        };
+        assert_eq!(state.peers_locked_version(), None, "no adverts at all");
+        state.admit_advert(identity(&peer_a), advert(&peer_a, 100, VERSION));
+        assert_eq!(
+            state.peers_locked_version(),
+            None,
+            "a peer's advert is still missing"
+        );
+        state.admit_advert(identity(&peer_b), advert(&peer_b, 100, VERSION));
+        assert_eq!(state.peers_locked_version(), Some(VERSION), "unanimous");
+        // this node's own advert never weighs in — only the PEERS' lock
+        // counts, since a disagreement with it is the very signal.
+        state
+            .adverts
+            .insert(state.me(), advert(&me, 100, MeshVersion([8; 32])));
+        assert_eq!(state.peers_locked_version(), Some(VERSION));
+        state.admit_advert(
+            identity(&peer_b),
+            advert(&peer_b, 101, MeshVersion([8; 32])),
+        );
+        assert_eq!(
+            state.peers_locked_version(),
+            None,
+            "the peers disagree among themselves"
+        );
+    }
+
+    #[test]
+    fn a_live_own_record_keeps_reoffering_in_the_settled_phase() {
+        let (me, peer) = (signer(1), signer(2));
+        let mut state = epoch(&me, Role::Member, &[&me, &peer], &[]);
+        let set = state.set.clone();
+        state.admit_record(identity(&peer), record(&peer, &set, 2, 100));
+        let records: Vec<EndpointRecord> = state.known_records().into_values().collect();
+        state.phase = Phase::Applied {
+            view: MeshView {
+                active_set: set,
+                mesh_version: VERSION,
+                records,
+            },
+        };
+        assert!(
+            state.reoffers().is_empty(),
+            "a settled epoch with a locked own record re-offers nothing"
+        );
+        state.own_standing = OwnRecordStanding::Live;
+        let offers = state.reoffers();
+        assert_eq!(offers.len(), 1, "the fresh own record, to every peer");
+        let (target, msg) = &offers[0];
+        assert_eq!(*target, identity(&peer));
+        assert!(
+            matches!(
+                msg,
+                ReachabilityMsg::Record(signed)
+                    if signed.record.nonce == state.own_record.record.nonce
+            ),
+            "the adopted node's fresh record rides every nudge until the peers hold it"
         );
     }
 }

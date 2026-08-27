@@ -385,12 +385,42 @@ reroutes the pair through a third party.
   lifetime is the epoch tuple).
 - Nodes store a bounded replay cache keyed by `(identity, epoch, nonce)` until
   the epoch expires.
-- A node rejects older protocol versions unless explicitly configured for a
-  one-epoch migration window.
 - A valset cutover revokes tunnels for validators not present in the new epoch.
 - A validator that remains in the set must rotate its WireGuard session key at
   epoch cutover or prove the previous key is still authorized by a fresh signed
   advertisement for the new mesh version.
+- A cutover reconfigures the live interface in place rather than rebuilding
+  it: a tunnel whose configuration is unchanged keeps its WireGuard sessions
+  across the boundary, and a membership change elsewhere in the set never
+  drops an established pair.
+
+## Live Re-advertisement and Mid-Epoch Rejoin
+
+The record set a mesh version locks is immutable for the epoch, but members
+are not: a member can restart or rebind its address mid-epoch. Two mechanisms
+cover this without ever recomputing a locked version:
+
+- **Live re-advertisement.** A `SignedEndpointRecord` whose nonce is above
+  the one the epoch locked for its owner is a fresh life, not a stale
+  duplicate. Receivers accept it under the same higher-nonce supersession
+  rule as every other gossip item, re-point the owner's tunnel in place as a
+  layer over the applied base, and flood it onward (accept-gated). A record
+  nonce at or below the locked one instead marks the owner as behind in
+  assembly and triggers the heal-back of the receiver's own record and
+  advertisement. Accepted re-advertisements persist with the mesh, so a cold
+  restart restores each member's current life rather than the one the epoch
+  happened to lock.
+- **Adoption of the peers' locked view.** A member that re-assembles
+  mid-epoch (a restart) signs a fresh record, so the set it can lock never
+  hashes to the version its peers locked. When every peer's advertisement
+  commits to one identical mesh version that differs from the local
+  computation, the node adopts the peers' lock outright: their owner-signed,
+  epoch-bound records install as the applied base with freshly resolved
+  endpoints (exactly like the cold-restart restore), and the node keeps
+  re-offering its own fresh record until every peer re-tunnels it through
+  the live re-advertisement path. Without a unanimous peer version — several
+  nodes re-assembling at once — the epoch fails and the next cutover
+  reassembles from scratch.
 
 ## State-Sync Authorization
 
@@ -418,6 +448,8 @@ Possession of a tunnel never bypasses module/root/kind checks.
   changes, and signatures excluded from the preimage.
 - Upgrade request/response/ack fail when request hash, response hash, policy
   hash, valset root, expiry, or identities do not match.
+- A member record whose nonce beats the epoch's locked record re-tunnels its
+  owner in place; a nonce at or below the locked one heals the owner instead.
 - Overlay route validation rejects default routes, stolen peer routes, and
   routes outside the mesh CIDR for both requested and accepted allowed IPs.
 - Epoch cutover removes departed validators and rotates or revalidates retained
