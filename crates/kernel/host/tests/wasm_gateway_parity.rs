@@ -36,9 +36,7 @@ use gateway::{
     encode_query, route_signing_preimage,
 };
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
-use identity::{
-    IDENTITY_BIND_NS, Identity, IdentityMsg, KeyKind, MemberAuth, MemberProof, bind_preimage,
-};
+use identity::{IDENTITY_BIND_NS, Identity, IdentityMsg, KeyScheme, MemberAuth, bind_preimage};
 use sdk::{Error, MerkleStore as _, Msg, Origin, StateRoot};
 use statesync::qmdb::QmdbStore;
 use valset::{Valset, ValsetMsg, encode_msg as valset_encode_msg};
@@ -149,13 +147,11 @@ fn ed_pub(k: &Ed) -> Vec<u8> {
 fn bind(founder: &Ed, node: &[u8]) -> Msg {
     let auth = MemberAuth {
         key: ed_pub(founder),
-        kind: KeyKind::Ed25519,
-        proof: MemberProof::Signature {
-            sig: founder
-                .sign(IDENTITY_BIND_NS, &bind_preimage(CHAIN_ID, node, 0))
-                .as_ref()
-                .to_vec(),
-        },
+        scheme: KeyScheme::Ed25519,
+        proof: founder
+            .sign(IDENTITY_BIND_NS, &bind_preimage(CHAIN_ID, node, 0))
+            .as_ref()
+            .to_vec(),
     };
     Msg {
         target: "identity".into(),

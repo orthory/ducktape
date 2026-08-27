@@ -14,7 +14,7 @@ use governance::{
 };
 use host::{BlockContext, Host, SubmitError};
 use identity::{
-    AccountView, IdentityQuery, IdentityReply, KeyKind, MemberKeyView,
+    AccountView, IdentityQuery, IdentityReply, KeyScheme, MemberKeyView,
     decode_query as identity_decode_query, encode_reply as identity_encode_reply,
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
@@ -46,7 +46,7 @@ impl IdentityStub {
         let account = self.accounts.get_mut(account_id).expect("account exists");
         account.member_keys.push(MemberKeyView {
             pubkey: key.clone(),
-            kind: KeyKind::Ed25519,
+            scheme: KeyScheme::Ed25519,
             label: None,
             added_at: 0,
         });
@@ -72,7 +72,7 @@ impl IdentityStub {
                     nonce: 0,
                     member_keys: vec![MemberKeyView {
                         pubkey: account_id,
-                        kind: KeyKind::Ed25519,
+                        scheme: KeyScheme::Ed25519,
                         label: None,
                         added_at: 0,
                     }],
@@ -155,11 +155,11 @@ async fn share_host() -> (Host, [Vec<u8>; 4], [Vec<u8>; 3]) {
     let host = Host::genesis(vec![
         Box::new(valset),
         Box::new(Governance::new(
-                "governance",
-                Box::new(MemStore::new()),
-                "valset",
-                "identity",
-            )),
+            "governance",
+            Box::new(MemStore::new()),
+            "valset",
+            "identity",
+        )),
         Box::new(identity),
     ])
     .expect("genesis");
@@ -788,8 +788,8 @@ fn an_account_revote_overwrites_its_node_ballots_not_doubles_them() {
                 approve: true,
             },
         )
-            .await
-            .expect("first vote");
+        .await
+        .expect("first vote");
         submit(
             &mut host,
             &accounts[0],
@@ -799,8 +799,8 @@ fn an_account_revote_overwrites_its_node_ballots_not_doubles_them() {
                 approve: false,
             },
         )
-            .await
-            .expect("re-vote");
+        .await
+        .expect("re-vote");
 
         let view = proposal(&host, "p").await;
         assert_eq!(
@@ -845,8 +845,8 @@ fn an_account_vote_overwrites_its_nodes_direct_ballot() {
                 approve: true,
             },
         )
-            .await
-            .expect("node vote");
+        .await
+        .expect("node vote");
         // …then the owning account votes the other way: nodes[0]'s ballot flips
         // (overwritten by node key) and nodes[1] gains its ballot.
         submit(
@@ -858,8 +858,8 @@ fn an_account_vote_overwrites_its_nodes_direct_ballot() {
                 approve: false,
             },
         )
-            .await
-            .expect("account vote");
+        .await
+        .expect("account vote");
 
         let view = proposal(&host, "p").await;
         assert_eq!(
@@ -936,8 +936,8 @@ fn two_member_keys_of_one_account_share_the_same_node_ballots() {
                 approve: true,
             },
         )
-            .await
-            .expect("founding-key vote");
+        .await
+        .expect("founding-key vote");
         submit(
             &mut host,
             &second_key,
@@ -947,8 +947,8 @@ fn two_member_keys_of_one_account_share_the_same_node_ballots() {
                 approve: false,
             },
         )
-            .await
-            .expect("second-member-key vote");
+        .await
+        .expect("second-member-key vote");
 
         let view = proposal(&host, "p").await;
         assert_eq!(

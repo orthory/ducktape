@@ -21,7 +21,7 @@ use acl::{Acl, AclMsg, Standing};
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use futures::executor::block_on;
 use host::{BlockContext, Host, SubmitError};
-use identity::{Identity, IdentityMsg, KeyKind, MemberAuth, MemberProof};
+use identity::{Identity, IdentityMsg, KeyScheme, MemberAuth};
 use sdk::{Error, Msg, Origin};
 use sdk_testkit::MemStore;
 use valset::{Valset, ValsetMsg};
@@ -40,7 +40,10 @@ fn key_bytes(k: &PrivateKey) -> Vec<u8> {
 /// identity plane — the production system-module shape in miniature.
 async fn gate_host() -> Host {
     let mut valset = Valset::new("valset", Box::new(MemStore::new()));
-    valset.seed(key_bytes(&keypair(1))).await.expect("seed valset");
+    valset
+        .seed(key_bytes(&keypair(1)))
+        .await
+        .expect("seed valset");
     valset.finish_seed().await.expect("seed valset");
     Host::genesis(vec![
         Box::new(valset),
@@ -259,13 +262,11 @@ fn user_standing_resolves_through_the_identity_account_plane() {
         let preimage = identity::bind_preimage(CHAIN, &node_key, 0);
         let auth = MemberAuth {
             key: key_bytes(&founder),
-            kind: KeyKind::Ed25519,
-            proof: MemberProof::Signature {
-                sig: founder
-                    .sign(identity::IDENTITY_BIND_NS, &preimage)
-                    .as_ref()
-                    .to_vec(),
-            },
+            scheme: KeyScheme::Ed25519,
+            proof: founder
+                .sign(identity::IDENTITY_BIND_NS, &preimage)
+                .as_ref()
+                .to_vec(),
         };
         submit(
             &mut host,

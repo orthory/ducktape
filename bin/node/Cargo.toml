@@ -59,6 +59,8 @@ chat = { workspace = true }
 media-service = { workspace = true }
 tasks = { workspace = true }
 identity = { workspace = true }
+# the passkey enrollment challenge — the same bytes `KeyScheme::Secp256r1` verifies.
+keyscheme = { workspace = true }
 gateway = { workspace = true }
 # the airlock contract: `server` supplies the GrantCheck type the lender daemon
 # injects (src/airlock.rs), `client` + `verify` the enclave-facing credential

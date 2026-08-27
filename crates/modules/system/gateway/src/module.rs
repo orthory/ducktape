@@ -56,8 +56,8 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use duckdns::{HandleRegistration, ResolvedAccount, validate_handle};
 use identity::{
-    AccountView, IdentityQuery, IdentityReply, KeyKind, MemberProof,
-    decode_reply as identity_decode_reply, encode_query as identity_encode_query, verify_authority,
+    AccountView, IdentityQuery, IdentityReply, KeyScheme, decode_reply as identity_decode_reply,
+    encode_query as identity_encode_query,
 };
 use sdk::{
     Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
@@ -76,8 +76,8 @@ use crate::{
     RemoveCredentialStatement, RouteName, RouteRecord, RouteStatement, RouteSummary,
     SetCredentialStatement, decode_msg, decode_query, encode_reply, grant_credential_preimage,
     remove_credential_preimage, revoke_credential_preimage, route_signing_preimage,
-    set_credential_preimage, validate_account_id, validate_authorization,
-    validate_credential_name, validate_route_statement,
+    set_credential_preimage, validate_account_id, validate_authorization, validate_credential_name,
+    validate_route_statement,
 };
 
 /// route-record byte ceiling, enforced at every staged route write on top of
@@ -261,7 +261,10 @@ impl Gateway {
 
     /// the per-account route-name roster, sorted (apex before labels).
     async fn route_roster(&self, account: &[u8]) -> Result<Vec<RouteName>, Error> {
-        Ok(self.load(&route_roster_key(account)).await?.unwrap_or_default())
+        Ok(self
+            .load(&route_roster_key(account))
+            .await?
+            .unwrap_or_default())
     }
 
     async fn credential_record(&self, name: &str) -> Result<Option<CredentialRecord>, Error> {
@@ -466,26 +469,20 @@ impl Gateway {
                 "gateway: route account does not own the publisher node".into(),
             ));
         }
-        let signer_is_current = account
-            .member_keys
-            .iter()
-            .any(|member| member.pubkey == authorization.signer && member.kind == KeyKind::Ed25519);
+        let signer_is_current = account.member_keys.iter().any(|member| {
+            member.pubkey == authorization.signer && member.scheme == KeyScheme::Ed25519
+        });
         if !signer_is_current {
             return Err(Error::Module(
                 "gateway: signer is not a current Ed25519 account member".into(),
             ));
         }
         let preimage = route_signing_preimage(&statement).map_err(Error::Module)?;
-        let proof = MemberProof::Signature {
-            sig: authorization.signature.clone(),
-        };
-        if !verify_authority(
-            KeyKind::Ed25519,
+        if !KeyScheme::Ed25519.verify(
             &authorization.signer,
-            None,
             GATEWAY_ROUTE_NS,
             &preimage,
-            &proof,
+            &authorization.signature,
         ) {
             return Err(Error::Module(
                 "gateway: route signature does not verify".into(),
@@ -503,12 +500,13 @@ impl Gateway {
 
         let existing = self.route_record(&account_id, &name).await?;
         // the revision chain: 1 for a fresh name, current + 1 for a replace.
-        let expected = match &existing {
-            None => 1,
-            Some(current) => current.statement.revision.checked_add(1).ok_or_else(|| {
-                Error::Module("gateway: route revision is exhausted".to_string())
-            })?,
-        };
+        let expected =
+            match &existing {
+                None => 1,
+                Some(current) => current.statement.revision.checked_add(1).ok_or_else(|| {
+                    Error::Module("gateway: route revision is exhausted".to_string())
+                })?,
+            };
         if record.statement.revision != expected {
             return Err(Error::Module(format!(
                 "gateway: route revision must be {expected}, got {}",
@@ -569,25 +567,19 @@ impl Gateway {
                 "gateway: credential owner does not own the publisher node".into(),
             ));
         }
-        let signer_is_current = account
-            .member_keys
-            .iter()
-            .any(|member| member.pubkey == authorization.signer && member.kind == KeyKind::Ed25519);
+        let signer_is_current = account.member_keys.iter().any(|member| {
+            member.pubkey == authorization.signer && member.scheme == KeyScheme::Ed25519
+        });
         if !signer_is_current {
             return Err(Error::Module(
                 "gateway: signer is not a current Ed25519 account member".into(),
             ));
         }
-        let proof = MemberProof::Signature {
-            sig: authorization.signature.clone(),
-        };
-        if !verify_authority(
-            KeyKind::Ed25519,
+        if !KeyScheme::Ed25519.verify(
             &authorization.signer,
-            None,
             GATEWAY_CREDENTIAL_NS,
             preimage,
-            &proof,
+            &authorization.signature,
         ) {
             return Err(Error::Module(
                 "gateway: credential signature does not verify".into(),
@@ -888,9 +880,14 @@ impl Module for Gateway {
                 validate_account_id(&account_id).map_err(Error::Module)?;
                 let mut routes = Vec::new();
                 for name in self.route_roster(&account_id).await? {
-                    let record = self.route_record(&account_id, &name).await?.ok_or_else(|| {
-                        Error::Module("gateway: route roster carries a name with no record".into())
-                    })?;
+                    let record = self
+                        .route_record(&account_id, &name)
+                        .await?
+                        .ok_or_else(|| {
+                            Error::Module(
+                                "gateway: route roster carries a name with no record".into(),
+                            )
+                        })?;
                     let Some(route) = record.statement.route.as_ref() else {
                         continue;
                     };

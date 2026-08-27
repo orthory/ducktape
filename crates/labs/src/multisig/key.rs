@@ -12,10 +12,9 @@
 //!
 //! ## why this key is NOT a Ducktape member key
 //!
-//! It never enters consensus. `crates/modules/system/identity/src/scheme.rs` keeps a
-//! deliberately CLOSED `KeyKind` enum and warns that adding `Secp256k1` would
-//! require hand-rolling commonware's signing preimage inside a consensus module
-//! — "a correctness footgun". We do not add it. This key's only verifier is
+//! It never enters consensus. `keyscheme::KeyScheme::Secp256k1` does exist for
+//! account member keys (an EIP-191 `personal_sign` over a namespaced
+//! preimage), but this key is never registered as one. Its only verifier is
 //! Ethereum's `ecrecover`, reached through the Safe contract; consensus merely
 //! orders the signatures it produces.
 //!
@@ -99,7 +98,11 @@ mod tests {
         let mut b = [7u8; 32];
         b[31] ^= 1;
 
-        assert_eq!(owner_address(&a), owner_address(&a), "same seed, same address");
+        assert_eq!(
+            owner_address(&a),
+            owner_address(&a),
+            "same seed, same address"
+        );
         assert_ne!(
             owner_address(&a),
             owner_address(&b),

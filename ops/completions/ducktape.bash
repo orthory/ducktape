@@ -20,8 +20,8 @@ _ducktape() {
 
     local user_key="init restore unlock reveal status"
     local user_cred="add list remove grant revoke inspect seal"
-    local user_verbs="key sign-bind sign-unbind sign-possession sign-add-member sign-remove-member sign-gateway-route sign-frame sign-admin webauthn-challenge p256-payload cred account-init help"
-    local user_flags="--path --method --statement --possession --out --key --node -n --network --account-id --chain-id --new-key --new-kind --node-key --node-pub --target-key --nonce --name --json --label --host --remote --attest --pccs-url --snp-product --snp-vcek --vendor --measurement --credentials --cred-kind --access-token --refresh-token"
+    local user_verbs="key sign-bind sign-unbind sign-possession sign-add-member sign-remove-member sign-gateway-route sign-frame sign-admin webauthn-challenge cred account-init help"
+    local user_flags="--path --method --statement --possession --out --key --node -n --network --account-id --chain-id --new-key --new-scheme --node-key --node-pub --target-key --nonce --name --json --label --host --remote --attest --pccs-url --snp-product --snp-vcek --vendor --measurement --credentials --cred-kind --access-token --refresh-token"
     local wallet_verbs="new import list use help"
     local wallet_flags="--json"
     local gateway_verbs="bind unbind list help"

@@ -204,8 +204,9 @@ async fn a_tampered_frame_is_refused_before_it_reaches_the_actor() {
     let signer = commonware_cryptography::ed25519::PrivateKey::from_seed(42);
     let op = chat_op();
     let mut frame = node::encode_frame(&signer, 1, &op);
-    // flip one byte of the PAYLOAD: the signature binds (origin, seq, target,
-    // payload), so the frame no longer verifies — and the actor never sees it.
+    // flip one byte of the PAYLOAD: the proof binds (scheme, origin, seq,
+    // target, payload), so the frame no longer verifies — and the actor never
+    // sees it.
     // located by SEARCHING for the payload rather than counting back from the
     // tail: an offset measured against the frame's trailer silently slides onto
     // a structural byte when the layout gains a field, and the refusal becomes
@@ -225,7 +226,7 @@ async fn a_tampered_frame_is_refused_before_it_reaches_the_actor() {
     let body = body_json(response).await;
     let err = body["error"].as_str().expect("a verbatim refusal");
     assert!(
-        err.contains("signature"),
+        err.contains("proof does not bind"),
         "the refusal names the cause: {err}"
     );
 }
@@ -765,7 +766,7 @@ fn spawn_owner_actor(mut cmds: mpsc::Receiver<NodeCommand>, node_key: Vec<u8>, o
                     nonce: 0,
                     member_keys: vec![identity::MemberKeyView {
                         pubkey: owner_key.clone(),
-                        kind: identity::KeyKind::Ed25519,
+                        scheme: identity::KeyScheme::Ed25519,
                         label: None,
                         added_at: 0,
                     }],

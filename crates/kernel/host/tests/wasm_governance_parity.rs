@@ -28,16 +28,12 @@
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PrivateKey;
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
-use governance::invite::{
-    INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteToken, sign_join_proof,
-};
+use governance::invite::{INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteToken, sign_join_proof};
 use governance::{
     GovAction, GovMsg, GovQuery, Governance, ShareAllocation, encode_msg, encode_query,
 };
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
-use identity::{
-    IDENTITY_BIND_NS, Identity, IdentityMsg, KeyKind, MemberAuth, MemberProof, bind_preimage,
-};
+use identity::{IDENTITY_BIND_NS, Identity, IdentityMsg, KeyScheme, MemberAuth, bind_preimage};
 use lifecycle::{
     Lifecycle, LifecycleQuery, LifecycleReply, decode_reply as lifecycle_decode_reply,
     encode_query as lifecycle_encode_query,
@@ -232,13 +228,11 @@ fn redeem(issuer: &Ed, nonce: [u8; INVITE_NONCE_LEN], binding: &[u8], joiner: &E
 fn bind(founder: &Ed, node: &[u8]) -> Msg {
     let auth = MemberAuth {
         key: ed_pub(founder),
-        kind: KeyKind::Ed25519,
-        proof: MemberProof::Signature {
-            sig: founder
-                .sign(IDENTITY_BIND_NS, &bind_preimage(CHAIN_ID, node, 0))
-                .as_ref()
-                .to_vec(),
-        },
+        scheme: KeyScheme::Ed25519,
+        proof: founder
+            .sign(IDENTITY_BIND_NS, &bind_preimage(CHAIN_ID, node, 0))
+            .as_ref()
+            .to_vec(),
     };
     Msg {
         target: "identity".into(),
@@ -995,14 +989,14 @@ async fn share_mode_inner(context: &deterministic::Context) {
             block(1, Origin::External(a_pub.clone())),
             bind(&founder_a, &a_pub),
         )
-            .await
-            .expect("bind A");
+        .await
+        .expect("bind A");
         host.submit_at(
             block(2, Origin::External(b_pub.clone())),
             bind(&founder_b, &b_pub),
         )
-            .await
-            .expect("bind B");
+        .await
+        .expect("bind B");
     }
     assert_eq!(root_of(&native), n0);
     assert_eq!(root_of(&wasm), w0);
