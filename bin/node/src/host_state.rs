@@ -80,24 +80,30 @@ impl host::ModuleFactory for WasmModuleFactory {
     }
 }
 
-/// read every genesis component out of the bundle dir, verify it against the
-/// descriptor's hash, and put it in the (persistent) blob store — the
-/// founder's, a reopened workspace's, and a joiner's one source of genesis
-/// bytes. idempotent: a chunk the store already holds is not re-read. a
-/// missing or tampered file refuses by module id, because the operator's next
-/// move is to look at that directory.
+/// read every genesis component the blob store lacks out of the bundle dir,
+/// verify it against the descriptor's hash, and put it in the (persistent)
+/// blob store. returns the ids the bundle has NO file for — the boot
+/// resolution order is blob → bundle → mesh → fail-closed, and only the
+/// caller knows whether it has a mesh: a founder / reopened workspace refuses
+/// on any ([`seed_complete_bundle`]), a joiner fetches them
+/// (`FetchingCodeSource`; the composer sha256-checks every fetched byte).
+/// idempotent: a chunk the store already holds is not re-read. a tampered
+/// file, or any read failure other than absence, refuses by module id.
 pub(super) fn seed_bundle(
     blobs: &blobstore::BlobHandle,
     genesis: &GenesisModules,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let mut seeded = 0usize;
+    let mut missing = Vec::new();
     for (id, want) in &genesis.hashes {
         if blobs.has_chunk(want) {
             continue;
         }
         let path = component_path(&genesis.bundle_dir, id);
-        let bytes = std::fs::read(&path)
-            .map_err(|e| format!("module {id}: read {}: {e}", path.display()))?;
+        let Some(bytes) = read_component(&path).map_err(|e| format!("module {id}: {e}"))? else {
+            missing.push(id.clone());
+            continue;
+        };
         let got: [u8; 32] = sha2::Sha256::digest(&bytes).into();
         let matches_descriptor = got == *want;
         if !matches_descriptor {
@@ -123,7 +129,38 @@ pub(super) fn seed_bundle(
             "genesis bundle seeded into the blob store"
         );
     }
-    Ok(())
+    Ok(missing)
+}
+
+/// a component file's bytes; `None` when the bundle has no file at `path`.
+/// any other failure names the path (the operator's next move is to look at
+/// that directory).
+fn read_component(path: &std::path::Path) -> Result<Option<Vec<u8>>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) => match e.kind() {
+            std::io::ErrorKind::NotFound => Ok(None),
+            other => Err(format!("read {} ({other:?}): {e}", path.display())),
+        },
+    }
+}
+
+/// [`seed_bundle`] for a node with no mesh to fetch from — a founder, or a
+/// workspace reopening its checkpoint: every genesis component must be in the
+/// bundle, and a gap is a refusal naming the ids and the directory.
+fn seed_complete_bundle(
+    blobs: &blobstore::BlobHandle,
+    genesis: &GenesisModules,
+) -> Result<(), String> {
+    let missing = seed_bundle(blobs, genesis)?;
+    let bundle_is_complete = missing.is_empty();
+    if bundle_is_complete {
+        return Ok(());
+    }
+    Err(format!(
+        "genesis bundle {} has no component for {missing:?} (expected <id>.component.wasm) — fail-closed",
+        genesis.bundle_dir.display()
+    ))
 }
 
 /// the host-side disk substrates the odb-backed tenants open over.
@@ -195,7 +232,7 @@ pub(super) async fn genesis_host(
     blobs: blobstore::BlobHandle,
     genesis: &GenesisModules,
 ) -> Host {
-    seed_bundle(&blobs, genesis).expect("genesis bundle");
+    seed_complete_bundle(&blobs, genesis).expect("genesis bundle");
     let validators: Vec<Vec<u8>> = genesis_validators
         .iter()
         .map(|k| k.as_ref().to_vec())
@@ -232,7 +269,7 @@ pub(super) async fn restore_host(
     blobs: blobstore::BlobHandle,
     genesis: &GenesisModules,
 ) -> Result<Host, String> {
-    seed_bundle(&blobs, genesis)?;
+    seed_complete_bundle(&blobs, genesis)?;
     let code = BlobCodeSource(std::sync::Arc::new(blobs.clone()));
     let mut stores = canonical_stores(context);
     let mut snapshots = |id: &'static str| -> BoxFut<'_, Result<Snapshot, String>> {
@@ -421,7 +458,21 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
         duckfs_dir,
         blobs,
     } = substrates;
-    seed_bundle(&blobs, genesis)?;
+    // a joiner's workspace has no bundle (`node join` writes none): whatever
+    // the blob store and the bundle lack, `FetchingCodeSource` below fetches
+    // off the mesh, and the composer sha256-checks every fetched byte against
+    // `genesis.hashes` — the same trust as a bundled file.
+    let missing = seed_bundle(&blobs, genesis)?;
+    let bundle_is_complete = missing.is_empty();
+    if !bundle_is_complete {
+        tracing::info!(
+            target: "ducktape::boot",
+            missing = missing.len(),
+            ids = ?missing,
+            bundle = %genesis.bundle_dir.display(),
+            "genesis components absent from the bundle; fetching them from the mesh"
+        );
+    }
     let entry_root = |module: &str| -> Result<StateRoot, String> {
         Ok(manifest
             .entry(module)
@@ -783,9 +834,10 @@ mod tests {
         assert_eq!(native_by_host, ["lifecycle", "valset"]);
     }
 
-    /// the bundle is the founder's ONLY source of genesis bytes: every file
-    /// must hash to the descriptor's entry and land in the blob store, and a
-    /// mismatch names its module instead of seeding.
+    /// every bundled file must hash to the descriptor's entry and land in the
+    /// blob store; a mismatch names its module instead of seeding; a file the
+    /// bundle lacks is REPORTED (a joiner fetches it), and a founder /
+    /// reopened workspace refuses on it by name.
     #[test]
     fn seed_bundle_verifies_every_component_against_the_descriptor() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -800,7 +852,8 @@ mod tests {
             bundle_dir: dir.path().to_path_buf(),
         };
         let blobs = blobstore::BlobHandle::default();
-        seed_bundle(&blobs, &genesis).expect("seed");
+        let missing = seed_bundle(&blobs, &genesis).expect("seed");
+        assert!(missing.is_empty(), "{missing:?}");
         assert!(blobs.has_chunk(&hashes["pages"]));
 
         std::fs::write(dir.path().join("pages.component.wasm"), b"tampered").expect("write");
@@ -808,8 +861,18 @@ mod tests {
         assert!(err.contains("pages"), "{err}");
 
         std::fs::remove_file(dir.path().join("pages.component.wasm")).expect("remove");
-        let err = seed_bundle(&blobstore::BlobHandle::default(), &genesis).unwrap_err();
+        let missing =
+            seed_bundle(&blobstore::BlobHandle::default(), &genesis).expect("absence is reported");
+        assert_eq!(missing, ["pages"]);
+        let err = seed_complete_bundle(&blobstore::BlobHandle::default(), &genesis).unwrap_err();
         assert!(err.contains("pages"), "{err}");
+        assert!(err.contains(&dir.path().display().to_string()), "{err}");
+        // a chunk the store already holds needs no file at all.
+        assert!(
+            seed_bundle(&blobs, &genesis)
+                .expect("seeded store")
+                .is_empty()
+        );
     }
 
     /// THE consensus pin: the production genesis root hash is a constant.
