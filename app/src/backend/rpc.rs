@@ -224,9 +224,39 @@ impl Signer {
 }
 
 async fn sign_frame(target: &str, payload: &[u8], password: String) -> Result<Vec<u8>, String> {
+    let session = seated_signer(password).await?;
+    let signer = session.as_ref().expect("the session was seated above");
+    Ok(signer.sign(target, next_sequence(), payload))
+}
+
+/// The member consent an identity `AddKey` ticket carries: this device's key
+/// signs the module's own `add_key_preimage` for `new_key` at its current
+/// `generation` on `chain_id` — the same seat [`sign_frame`] uses, so a ticket
+/// costs no argon2 pass of its own.
+pub(crate) async fn sign_add_key_consent(
+    password: String,
+    chain_id: &str,
+    new_key: &[u8],
+    generation: u64,
+) -> Result<identity::Authorizer, String> {
+    let session = seated_signer(password).await?;
+    let signer = session.as_ref().expect("the session was seated above");
+    Ok(workspace_config::ed25519_authorizer(
+        &signer.key,
+        chain_id,
+        identity::KeyScheme::Ed25519,
+        new_key,
+        generation,
+    ))
+}
+
+/// The session seat, opened under `password` if it is not already: the lock
+/// is what makes the seat singular — a burst of reactions opens the key once
+/// between them instead of racing five argon2 passes into it.
+async fn seated_signer(
+    password: String,
+) -> Result<tokio::sync::MutexGuard<'static, Option<Signer>>, String> {
     let password = Zeroizing::new(password);
-    // The lock is what makes the seat singular: a burst of reactions opens the
-    // key once between them instead of racing five argon2 passes into it.
     let mut session = SIGNER.lock().await;
     let seated = session
         .as_ref()
@@ -234,8 +264,7 @@ async fn sign_frame(target: &str, payload: &[u8], password: String) -> Result<Ve
     if !seated {
         *session = Some(Signer::unlock(user_key_path()?, password).await?);
     }
-    let signer = session.as_ref().expect("the session was seated above");
-    Ok(signer.sign(target, next_sequence(), payload))
+    Ok(session)
 }
 
 /// Retire the session signer — the `Lock` button's other half. Clearing

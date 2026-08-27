@@ -88,6 +88,10 @@ struct StatusCellInner {
     /// (they move mid-stage, exactly when no boundary publish can happen).
     /// unwired (simnode), the published operations serve as-is.
     operations: std::sync::OnceLock<Arc<std::sync::RwLock<OperationalStatus>>>,
+    /// the chain id — a boot-time fact, wired once and overlaid on every read
+    /// so no boundary publish has to remember it. Unwired = the published
+    /// (empty) value serves as-is.
+    chain_id: std::sync::OnceLock<String>,
     /// the live OpenMetrics exposition source — a registry encoder wired once
     /// at boot (the commonware context's `encode`). `/metrics`, `/v1/peers`,
     /// and the ws metrics topic all read it directly; the registry is shared
@@ -116,6 +120,12 @@ impl StatusCell {
             .snapshot
             .write()
             .expect("status snapshot lock poisoned") = status;
+    }
+
+    /// wire the chain id this daemon serves — once, at boot; a second call is
+    /// ignored (the first boot fact wins, like every other `OnceLock` here).
+    pub fn wire_chain_id(&self, chain_id: String) {
+        let _ = self.inner.chain_id.set(chain_id);
     }
 
     /// publish the peers standing — one whole-struct swap, same contract as
@@ -191,6 +201,9 @@ impl StatusCell {
             .read()
             .expect("status snapshot lock poisoned")
             .clone();
+        if let Some(chain_id) = self.inner.chain_id.get() {
+            status.chain_id = chain_id.clone();
+        }
         if let Some(operations) = self.inner.operations.get() {
             status.operations = operations
                 .read()
@@ -504,5 +517,29 @@ impl NodeHandle {
         cmds.send(cmd)
             .await
             .map_err(|_| error_response(StatusCode::SERVICE_UNAVAILABLE, "node actor is gone"))
+    }
+}
+
+#[cfg(test)]
+mod status_cell_tests {
+    use super::*;
+
+    /// The chain id is a boot fact, not a boundary fact: a role loop publishes
+    /// whole snapshots with an empty `chain_id`, and a reader still sees the
+    /// wired one every time.
+    #[test]
+    fn a_wired_chain_id_survives_every_boundary_publish() {
+        let cell = StatusCell::default();
+        assert_eq!(cell.current().chain_id, "", "unwired: the published value");
+        cell.wire_chain_id("mynet#d0cdf950".into());
+        cell.publish(NodeStatus {
+            version: "0.1.0".into(),
+            chain_id: String::new(),
+            ..Default::default()
+        });
+        assert_eq!(cell.current().chain_id, "mynet#d0cdf950");
+        // the first boot fact wins.
+        cell.wire_chain_id("other".into());
+        assert_eq!(cell.current().chain_id, "mynet#d0cdf950");
     }
 }
