@@ -72,6 +72,11 @@ pub enum SandboxBackend {
         vmm: Vmm,
         kernel: std::path::PathBuf,
         rootfs: std::path::PathBuf,
+        /// the operator's agent CLIs, filled by `ducktape agent install`. This
+        /// directory is BOTH what the node announces from and what
+        /// [`crate::executor_image`] derives the guest's copy from, so a node
+        /// can no longer advertise a capability its guest cannot exec.
+        executors: std::path::PathBuf,
     },
     /// test-harness spawn: the bin exec'd directly, compiled ONLY into test
     /// builds so the run loop stays testable without a container runtime on the
@@ -322,6 +327,7 @@ mod tests {
             vmm: Vmm::platform_default(),
             kernel: dir.path().join("vmlinux"),
             rootfs: dir.path().join("rootfs.ext4"),
+            executors: dir.path().join("executors"),
         };
         let error = backend.probe_images().expect_err("absent images must refuse");
         assert!(error.contains("kernel"), "names which image: {error}");

@@ -1642,6 +1642,9 @@ pub fn guest_backend() -> provider_host::SandboxBackend {
         vmm,
         kernel: dir.join("vmlinux"),
         rootfs: dir.join("rootfs.ext4"),
+        // the operator's own installed CLIs, exactly as a real node resolves
+        // them: an e2e run execs what this box actually has.
+        executors: workspace_config::executor_dir().expect("executor dir"),
     }
 }
 

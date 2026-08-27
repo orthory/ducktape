@@ -31,6 +31,16 @@ pub const GUEST_WORKSPACE: &str = "/duck/workspace";
 /// skills tree, and any host PATH directories the run declared.
 pub const GUEST_ASSETS: &str = "/duck";
 
+/// where the agent CLI a run executes appears inside the guest.
+///
+/// A MOUNTPOINT the rootfs ships empty, not a directory it fills. The CLIs used
+/// to be baked into the shared rootfs, which made installing one a full image
+/// rebuild and made the image's contents a third place to keep in step with the
+/// executors directory and the host `PATH`. They now ride their own read-only
+/// image, built from that directory and attached per run — so what a node
+/// announces and what a run can exec are the same bytes by construction.
+pub const GUEST_BIN_DIR: &str = "/opt/duck/bin";
+
 /// the guest's `HOME`. The rootfs ships it; no host home is ever visible.
 pub const GUEST_HOME: &str = "/root";
 

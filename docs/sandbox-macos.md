@@ -38,6 +38,10 @@ INSTALL=~/bin bin/duck-vz-shim/build.sh        # ~/bin must be on PATH
 #    with rust-lld, no musl toolchain needed)
 OUT=~/.ducktape/guest ops/build-guest-rootfs.sh
 
+# 2b. the agent CLIs this host lends to runs (a checklist of what is missing,
+#     with each download's url and expected sha256)
+ducktape agent install
+
 # 3. the smoke: one microVM end to end — boot, stdio, exit code, workspace
 #    read-back. This is the first thing to run and the thing to bisect with.
 cargo run -p sandbox-host --example vm_smoke -- \
@@ -69,10 +73,12 @@ entitlement (re-run `build.sh` — it codesigns), `kern.hv_support`, `mke2fs` /
   Virtualization.framework wants each guest-outbound port declared, while
   Firecracker forwards any port by convention and rejects unknown config
   fields.
-- **Executors must be Linux aarch64 ELF binaries.** The rootfs build refuses
-  a Mach-O host CLI (it would fail at exec inside the guest as a run that
-  produces nothing); fetch the linux/arm64 build of an agent CLI and put it
-  on PATH before running `build-guest-rootfs.sh`.
+- **Executors must be Linux aarch64 ELF binaries**, and they do not come from
+  the host `PATH` — a Mac's own `claude`/`codex` is Mach-O and the guest cannot
+  exec it at all. `ducktape agent install <name>` fetches the pinned linux/arm64
+  build into `~/.ducktape/executors`, and the node derives a read-only image
+  from that directory and mounts it at `/opt/duck/bin` for each run. The rootfs
+  carries no CLI, so installing one needs no image rebuild.
 
 ## What the first Mac run taught (all fixed in-tree)
 

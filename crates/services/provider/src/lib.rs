@@ -697,12 +697,13 @@ impl CliProvider {
         // one discriminant, one match, no wildcard: `Bare` exists only in
         // test/testkit builds, so a `let ... else` here is irrefutable in a
         // shipped build. A future backend fails this match until it is routed.
-        let (vmm, kernel, rootfs) = match &self.backend {
+        let (vmm, kernel, rootfs, executors) = match &self.backend {
             SandboxBackend::MicroVm {
                 vmm,
                 kernel,
                 rootfs,
-            } => (*vmm, kernel, rootfs),
+                executors,
+            } => (*vmm, kernel, rootfs, executors),
             #[cfg(any(test, feature = "testkit"))]
             SandboxBackend::Bare => {
                 return Err("internal error: microVM boot on a non-microVM backend".into());
@@ -784,6 +785,10 @@ impl CliProvider {
             agent_volume: self.agent_volume.clone(),
             assets: run_dir.join("assets.ext4"),
             workspace: run_dir.join("workspace.ext4"),
+            // Derived here, per boot, rather than at discovery: an operator who
+            // installs a CLI mid-life expects the next run to have it, and the
+            // check is two stats when the image is already current.
+            executors: sandbox_host::executor_image::ensure(executors)?,
             vcpus,
             mem_mib,
             vsock_uds: microvm_socket(&slot)?,
@@ -1473,10 +1478,11 @@ fn create_private_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// where the agent CLIs live inside the guest rootfs. The host executor is
-/// never handed across — the rootfs ships its own copy, built by
-/// `ops/build-guest-rootfs.sh`.
-const GUEST_BIN_DIR: &str = "/opt/duck/bin";
+/// where the agent CLIs appear inside the guest: a read-only image built from
+/// the operator's executors directory and mounted there for the run. The host
+/// executor file is never handed across — only its NAME, which is the same on
+/// both sides because both come from that one directory.
+const GUEST_BIN_DIR: &str = sandbox_host::guest_paths::GUEST_BIN_DIR;
 
 /// the guest path for a host executor, by basename.
 fn guest_executor_path(host_bin: &Path) -> String {
@@ -2904,6 +2910,10 @@ fn excerpt(s: &str) -> String {
 /// exactly that label ([`reap_by_label`]), so one service can never sweep
 /// another's containers. (Each daemon also has its own private graph root, so
 /// this is the second line of defence, not the only one.)
+/// where [`discover`] looks for an executor: a PATH-shaped search list, and the
+/// env lookup permitted alongside it. Both are the backend's answer, together.
+type ExecutorLookup<'a> = (Option<OsString>, &'a dyn Fn(&str) -> Option<OsString>);
+
 pub fn discover(
     node_identity: &[u8],
     output_sink: Option<OutputSink>,
@@ -2916,10 +2926,25 @@ pub fn discover(
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .map(Duration::from_secs);
+    // WHERE AN EXECUTOR IS LOOKED FOR IS THE BACKEND'S QUESTION, because a run
+    // executes wherever the backend puts it. A microVM run execs the guest's
+    // copy of the CLI, so the ONLY directory whose contents this node may
+    // announce is the one that copy is built from — announcing the host `PATH`
+    // is what let a Mac advertise `claude` (a Mach-O binary its guest could not
+    // exec) while its image carried only `codex`.
+    //
+    // The `env` override goes with it: a spec's `DUCKTAPE_<X>_BIN` names a HOST
+    // path, which is meaningless to a guest, and honouring one here would
+    // re-open exactly that gap.
+    let (lookup, env): ExecutorLookup<'_> = match &backend {
+        SandboxBackend::MicroVm { executors, .. } => (Some(executors.into()), &|_| None),
+        #[cfg(any(test, feature = "testkit"))]
+        SandboxBackend::Bare => (std::env::var_os("PATH"), &|k| std::env::var_os(k)),
+    };
     Ok(discover_with_sink(
         specs,
-        std::env::var_os("PATH"),
-        &|k| std::env::var_os(k),
+        lookup,
+        env,
         timeout,
         output_sink,
         backend,
@@ -3015,6 +3040,12 @@ fn discover_with_sink(
 /// naming every affected tag + absent capabilities, never a silent fallback
 /// to PATH — the operator said "use this", and this does not exist), else
 /// the first executable `detect.bin` on `path`.
+///
+/// `path` is a PATH-shaped search list, and WHICH list is the backend's call
+/// ([`discover`]): the operator's executors directory under a microVM, the host
+/// `PATH` under the bare test backend. Under a microVM the env override is
+/// disabled at the call site rather than here, because "no host path can name a
+/// guest executor" is a fact about the backend, not about this resolution.
 fn resolve_bin(
     group: &[&CapabilitySpec],
     path: Option<&OsStr>,
@@ -3146,6 +3177,22 @@ mod tests {
     /// hardware test additionally runs [`SandboxBackend::probe`] and skips when
     /// the images or `/dev/kvm` are absent.
     fn firecracker_backend() -> SandboxBackend {
+        firecracker_backend_with(installed_executor_dir())
+    }
+
+    /// this operator's own executors directory, resolved the way
+    /// `workspace-config` resolves it for a real node.
+    fn installed_executor_dir() -> PathBuf {
+        let home = std::env::var("DUCKTAPE_HOME")
+            .unwrap_or_else(|_| format!("{}/.ducktape", std::env::var("HOME").unwrap()));
+        PathBuf::from(
+            std::env::var("DUCKTAPE_EXECUTOR_DIR").unwrap_or_else(|_| format!("{home}/executors")),
+        )
+    }
+
+    /// the live backend with an explicit executors directory — the one whose
+    /// contents the guest finds at `/opt/duck/bin`.
+    fn firecracker_backend_with(executors: PathBuf) -> SandboxBackend {
         let dir = std::env::var("DUCKTAPE_GUEST_DIR").unwrap_or_else(|_| {
             let home = std::env::var("DUCKTAPE_HOME")
                 .unwrap_or_else(|_| format!("{}/.ducktape", std::env::var("HOME").unwrap()));
@@ -3155,7 +3202,69 @@ mod tests {
             vmm: sandbox_host::Vmm::Firecracker,
             kernel: PathBuf::from(&dir).join("vmlinux"),
             rootfs: PathBuf::from(&dir).join("rootfs.ext4"),
+            executors,
         }
+    }
+
+    /// an executors directory holding symlinks to the named host tools.
+    ///
+    /// The guest's `/opt/duck/bin` is an image built from the executors
+    /// directory, so a live test that execs an ordinary tool by basename must
+    /// put that tool in one — which is the mechanism itself under test, not a
+    /// workaround for it. The symlinks point into the guest's own rootfs
+    /// (`/bin/sh` resolves there as readily as here), so the image stays a few
+    /// kilobytes.
+    fn executors_of(test: &str, tools: &[&str]) -> PathBuf {
+        let dir = scratch(test).join("executors");
+        std::fs::create_dir_all(&dir).expect("executors dir");
+        for tool in tools {
+            std::os::unix::fs::symlink(format!("/bin/{tool}"), dir.join(tool)).expect("symlink");
+        }
+        dir
+    }
+
+    /// A microVM node announces what its GUEST can exec, never what its host
+    /// happens to have installed.
+    ///
+    /// This is the defect the executors image exists to end. The node used to
+    /// resolve capabilities against the host `PATH` while a run exec'd the
+    /// guest's own copy of the CLI, so the two could disagree completely — a
+    /// Mac measured with `claude` on its PATH and `codex` in its image
+    /// advertised exactly the one it could not run. The host running this test
+    /// may well have both CLIs on its PATH; an empty executors directory must
+    /// still announce nothing.
+    #[test]
+    fn a_microvm_node_announces_its_guest_and_never_the_host_path() {
+        let empty = scratch("announce-empty").join("executors");
+        std::fs::create_dir_all(&empty).expect("executors dir");
+        let announced = discover(b"n", None, firecracker_backend_with(empty), "test")
+            .expect("discover")
+            .capabilities();
+        assert!(
+            announced.is_empty(),
+            "an empty executors directory announces nothing, whatever is on PATH: {announced:?}"
+        );
+
+        // and the same directory, filled, announces the bundle it holds.
+        // Real files, not symlinks: a spec's companions are resolved beside the
+        // executor's CANONICAL path, which is what `agent install` writes and
+        // what a self-locating CLI needs to find its own sibling.
+        let installed = scratch("announce-installed").join("executors");
+        std::fs::create_dir_all(&installed).expect("executors dir");
+        for name in ["codex", "codex-code-mode-host"] {
+            std::fs::copy("/bin/true", installed.join(name)).expect("copy");
+        }
+        let announced = discover(b"n", None, firecracker_backend_with(installed), "test")
+            .expect("discover")
+            .capabilities();
+        assert!(
+            announced.iter().any(|tag| tag == "codex"),
+            "an installed executor bundle is announced: {announced:?}"
+        );
+        assert!(
+            !announced.iter().any(|tag| tag == "claude"),
+            "a CLI that is only on the host PATH is not: {announced:?}"
+        );
     }
 
     /// an inline mock spec: arbitrary tag and binary, one of the named
@@ -3215,18 +3324,18 @@ format = "{format}"
     #[tokio::test]
     #[ignore = "live: needs /dev/kvm and a built guest rootfs"]
     async fn microvm_echo_round_trips_through_invoke() {
-        let backend = firecracker_backend();
+        // the executor rides its own read-only image, not the host: the microVM
+        // mounts no host directory, so there is nothing to bind a script from.
+        let backend = firecracker_backend_with(executors_of("microvm-echo-bin", &["cat"]));
         if let Err(why) = backend.probe() {
             eprintln!("skipping: {why}");
             return;
         }
-        // the executor lives in the guest ROOTFS, not on the host: the microVM
-        // mounts no host directory, so there is nothing to bind a script from.
-        // The rootfs build script installs this one.
         let root = scratch("microvm-echo");
         let provider = CliProvider::from_spec(
             mock_spec("echo", "cat", "text"),
-            // resolved to /opt/duck/bin/cat inside the guest
+            // resolved by basename to /opt/duck/bin/cat, which is where the
+            // executors image the backend above names gets mounted.
             PathBuf::from("/bin/cat"),
             backend,
         )
@@ -5007,12 +5116,74 @@ printf '%s\n' "$PATH"
         }
     }
 
+    /// The production shape end to end: the operator's OWN installed CLI, in an
+    /// image derived from their executors directory, exec'd inside the guest.
+    ///
+    /// The live tests around this one put a symlink to a rootfs tool in a
+    /// scratch directory — enough to prove the mount, not enough to prove the
+    /// thing an operator actually gets: a 300 MB `mke2fs -d` of real binaries,
+    /// attached to a rootfs that carries no CLI at all. `--version` because it
+    /// needs no credential and no network: the question here is whether the
+    /// bytes exec, not what they do.
+    #[tokio::test]
+    #[ignore = "live: needs /dev/kvm, a built guest rootfs, and `ducktape agent install codex`"]
+    async fn the_installed_cli_execs_from_its_derived_image() {
+        let backend = firecracker_backend();
+        if let Err(why) = backend.probe() {
+            eprintln!("skipping: {why}");
+            return;
+        }
+        let executors = installed_executor_dir();
+        let bin = executors.join("codex");
+        if !bin.is_file() {
+            eprintln!("skipping: no codex in {}", executors.display());
+            return;
+        }
+
+        let root = scratch("installed-cli");
+        std::fs::create_dir_all(root.join("wd")).unwrap();
+        let spec = CapabilitySpec::parse(
+            r#"
+spec = 1
+[capability]
+tag = "installed-cli"
+[detect]
+bin = "codex"
+[invoke]
+args = ["--version"]
+prompt = "stdin"
+[output]
+format = "text"
+"#,
+            "test",
+        )
+        .unwrap();
+        let provider = CliProvider::from_spec(spec, bin, backend).with_workdir(root.join("wd"));
+
+        let ctx = RunContext {
+            executing_node: Some(execution_node_id(b"installed-cli")),
+            limits: [("cores".to_string(), 1u64), ("mem_gb".to_string(), 1u64)]
+                .into_iter()
+                .collect(),
+            ..RunContext::default()
+        };
+        let answer = provider
+            .run("", &ctx)
+            .await
+            .expect("the installed CLI runs inside a microVM");
+        eprintln!("--- installed CLI answer: {answer:?} ---");
+        assert!(
+            answer.contains("codex"),
+            "the guest exec'd the codex from the executors image: {answer:?}"
+        );
+    }
+
     /// The full hardware path on a real VMM: a spec's argv and prompt reach a
     /// CLI inside the guest, and the file it wrote comes back on the host.
     #[tokio::test]
     #[ignore = "live: needs /dev/kvm and a built guest rootfs"]
     async fn firecracker_hardware_smoke() {
-        let backend = firecracker_backend();
+        let backend = firecracker_backend_with(executors_of("firecracker-hardware-bin", &["sh"]));
         if let Err(why) = backend.probe() {
             eprintln!("skipping: {why}");
             return;
@@ -5040,7 +5211,8 @@ format = "text"
             "test",
         )
         .unwrap();
-        // resolved to /opt/duck/bin/sh inside the guest, by basename
+        // resolved by basename to /opt/duck/bin/sh, which is where the
+        // executors image the backend above names gets mounted.
         let provider = CliProvider::from_spec(spec, PathBuf::from("/bin/sh"), backend);
         let ctx = RunContext {
             workdir_override: Some(workdir.clone()),

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # make dev — the desktop-app dev loop against the seeded "demo" localnet.
 #
-# Offers this host's setup as two prompts up front (which agent CLIs the guest
-# image should carry, and on macOS the sandbox prerequisites), rebuilds that
-# image when a CLI is newer than it, then ensures the "demo" workspace exists
+# Offers this host's setup as two prompts up front (which agent CLIs this node
+# lends to runs, and on macOS the sandbox prerequisites), then ensures the
+# "demo" workspace exists
 # (first run seeds it via ops/demo-seed.sh; DEV_RESEED=1 forces a fresh seed),
 # starts its node when nothing is serving
 # the workspace's http endpoint, initializes its forge with ducktape's own
@@ -45,21 +45,6 @@ fi
 if [ "$(uname -s)" = "Darwin" ]; then
   bash "$SCRIPT_DIR/macos-preflight.sh" --prompt \
     || log "sandbox prerequisites incomplete — the node will refuse provider runs until they are installed"
-fi
-
-# The image bakes the agent CLIs in at BUILD time, so one installed after the
-# image was built reaches no run until the image is rebuilt. Anything in the
-# executors directory newer than the image is, by definition, not in it — and
-# finding that out as "the run produced nothing" is the whole failure this
-# checks for. (A machine with no image yet is not stale: on macOS the preflight
-# above just built one, and on Linux there is nothing to refresh.)
-GUEST_DIR="${GUEST_DIR:-$HOME/.ducktape/guest}"
-EXEC_DIR="${DUCKTAPE_EXECUTOR_DIR:-$HOME/.ducktape/executors}"
-if [ -f "$GUEST_DIR/rootfs.ext4" ] &&
-   [ -n "$(find "$EXEC_DIR" -type f -newer "$GUEST_DIR/rootfs.ext4" 2>/dev/null | head -1)" ]; then
-  log "an agent CLI is newer than the guest image — rebuilding it"
-  OUT="$GUEST_DIR" bash "$SCRIPT_DIR/build-guest-rootfs.sh" ||
-    log "guest image rebuild failed — runs keep using the previous image"
 fi
 
 if [ ! -f "$WSDIR/node.toml" ] || [ ! -f "$WSDIR/network.toml" ] || [ -n "${DEV_RESEED:-}" ]; then

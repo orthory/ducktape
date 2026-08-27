@@ -59,6 +59,21 @@ pub fn default_guest_dir() -> Result<PathBuf, String> {
     Ok(ducktape_home()?.join("guest"))
 }
 
+/// where `ducktape agent install` puts the agent CLIs this host can lend to a
+/// run: `$DUCKTAPE_EXECUTOR_DIR`, else `<ducktape_home>/executors`.
+///
+/// NOT a `[sandbox]` key, unlike the kernel and rootfs paths beside it. Those
+/// name build outputs a node may legitimately be pointed at; this names the one
+/// place an operator installs into, and a per-node override would be a second
+/// answer to "which CLIs does this machine have" — the question the whole
+/// executors design exists to have exactly one answer to.
+pub fn executor_dir() -> Result<PathBuf, String> {
+    if let Some(dir) = std::env::var_os("DUCKTAPE_EXECUTOR_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    Ok(ducktape_home()?.join("executors"))
+}
+
 /// default recovery checkpoint cadence: small enough that boot replay stays
 /// cheap, large enough that snapshotting the in-memory cohort is amortized.
 pub const DEFAULT_CHECKPOINT_BLOCKS: u64 = 32;
