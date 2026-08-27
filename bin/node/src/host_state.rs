@@ -464,7 +464,11 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
     // `genesis.hashes` — the same trust as a bundled file.
     let missing = seed_bundle(&blobs, genesis)?;
     let bundle_is_complete = missing.is_empty();
-    if !bundle_is_complete {
+    // this runs inside the replica's forever-retry loop; the ids do not change
+    // between attempts, so the fact is logged once (attempt 1), never per try.
+    let first_attempt = attempt <= 1;
+    let announces_missing = !bundle_is_complete && first_attempt;
+    if announces_missing {
         tracing::info!(
             target: "ducktape::boot",
             missing = missing.len(),
