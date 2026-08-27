@@ -14,17 +14,15 @@
 //! which is what lets a joiner's wasm guest read its chain id from the
 //! synced store.
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use identity::{
     IDENTITY_ADD_MEMBER_NS, IDENTITY_BIND_NS, IDENTITY_UNBIND_NS, Identity, IdentityMsg,
-    IdentityQuery, IdentityReply, KeyKind, MemberAuth, MemberProof, add_member_preimage,
-    bind_preimage, decode_reply, encode_msg, encode_query, unbind_preimage,
+    IdentityQuery, IdentityReply, KeyScheme, MemberAuth, add_member_preimage, bind_preimage,
+    decode_reply, encode_msg, encode_query, unbind_preimage,
 };
 use sdk::{Env, MerkleStore as _, Module, Msg, Origin, StateRoot};
 use sdk_testkit::TestCtx;
-use sha2::{Digest as _, Sha256};
 use statesync::qmdb::QmdbStore;
 
 const CHAIN: &str = "sync-chain";
@@ -42,44 +40,21 @@ fn ed_pub(k: &Ed) -> Vec<u8> {
 fn ed_auth(k: &Ed, ns: &[u8], preimage: &[u8]) -> MemberAuth {
     MemberAuth {
         key: ed_pub(k),
-        kind: KeyKind::Ed25519,
-        proof: MemberProof::Signature {
-            sig: k.sign(ns, preimage).as_ref().to_vec(),
-        },
+        scheme: KeyScheme::Ed25519,
+        proof: keyscheme::testkit::ed25519_proof(k, ns, preimage),
     }
 }
 
 // a WebAuthn passkey, synthesized exactly as an authenticator would produce
-// it (identity's own test recipe; RFC-6979 p256 signing is deterministic).
+// it (keyscheme's testkit recipe; RFC-6979 p256 signing is deterministic).
 fn wa_key(seed: u8) -> p256::ecdsa::SigningKey {
-    p256::ecdsa::SigningKey::from_slice(&[seed; 32]).expect("valid scalar")
+    keyscheme::testkit::passkey(seed)
 }
 fn wa_pub(k: &p256::ecdsa::SigningKey) -> Vec<u8> {
-    k.verifying_key().to_sec1_bytes().to_vec()
+    keyscheme::testkit::passkey_pubkey(k)
 }
-fn wa_proof(k: &p256::ecdsa::SigningKey, rp_id: &str, ns: &[u8], preimage: &[u8]) -> MemberProof {
-    use p256::ecdsa::{Signature, signature::Signer as _};
-    let mut chal = Sha256::new();
-    chal.update(ns);
-    chal.update(preimage);
-    let challenge = chal.finalize();
-    let client_data_json = format!(
-        r#"{{"type":"webauthn.get","challenge":"{}","origin":"https://ducktape.local"}}"#,
-        URL_SAFE_NO_PAD.encode(challenge)
-    )
-    .into_bytes();
-    let mut authenticator_data = Vec::new();
-    authenticator_data.extend_from_slice(&Sha256::digest(rp_id.as_bytes()));
-    authenticator_data.push(0x01); // User Present
-    authenticator_data.extend_from_slice(&0u32.to_be_bytes());
-    let mut signed = authenticator_data.clone();
-    signed.extend_from_slice(&Sha256::digest(&client_data_json));
-    let sig: Signature = k.sign(&signed);
-    MemberProof::Webauthn {
-        authenticator_data,
-        client_data_json,
-        signature: sig.to_bytes().to_vec(),
-    }
+fn wa_proof(k: &p256::ecdsa::SigningKey, rp_id: &str, ns: &[u8], preimage: &[u8]) -> Vec<u8> {
+    keyscheme::testkit::passkey_proof(k, rp_id, ns, preimage, true)
 }
 
 fn identity_msg(m: &IdentityMsg) -> Msg {
@@ -118,7 +93,12 @@ const QUERIES: [&str; 6] = [
     "of-member-passkey",
 ];
 
-async fn replies(m: &Identity, account_id: &[u8], nodes: [&[u8]; 2], passkey: &[u8]) -> Vec<IdentityReply> {
+async fn replies(
+    m: &Identity,
+    account_id: &[u8],
+    nodes: [&[u8]; 2],
+    passkey: &[u8],
+) -> Vec<IdentityReply> {
     let queries = [
         encode_query(&IdentityQuery::All { from: 0, limit: 16 }),
         encode_query(&IdentityQuery::Get {
@@ -186,16 +166,21 @@ fn synced_store_reconstructs_source_root_accounts_and_indexes() {
             }),
         )
         .await;
-        // admit the WebAuthn passkey (rp-pinned member meta rides the record).
-        let preimage =
-            add_member_preimage(CHAIN, &account_id, &wa_pub(&passkey), KeyKind::WebauthnP256, 1);
+        // admit the WebAuthn passkey (its scheme rides the member meta).
+        let preimage = add_member_preimage(
+            CHAIN,
+            &account_id,
+            &wa_pub(&passkey),
+            KeyScheme::Secp256r1,
+            1,
+        );
         apply_commit(
             &mut src,
             2,
             Origin::External(node_a.to_vec()),
             identity_msg(&IdentityMsg::AddMemberKey {
                 new_key: wa_pub(&passkey),
-                new_kind: KeyKind::WebauthnP256,
+                new_scheme: KeyScheme::Secp256r1,
                 new_label: Some("phone".into()),
                 possession: wa_proof(&passkey, "ducktape", IDENTITY_ADD_MEMBER_NS, &preimage),
                 authorizer: ed_auth(&founder, IDENTITY_ADD_MEMBER_NS, &preimage),

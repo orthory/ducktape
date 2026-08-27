@@ -1,8 +1,8 @@
 //! qmdb-backed ACCOUNT registry: an umbrella over a person's keys and nodes.
 //!
 //! an ACCOUNT is keyed by its FOUNDING key (`account_id` = the first member
-//! key). it collects many MEMBER KEYS of different schemes (an ed25519 seed
-//! key, a WebAuthn passkey, a native P-256 key -- see [`KeyKind`]), shares one
+//! key). it collects many MEMBER KEYS of different schemes (an ed25519 device
+//! key, an Ethereum wallet, a WebAuthn passkey -- see [`KeyScheme`]), shares one
 //! display name across them, and owns many NODES (each a workspace's
 //! mesh/valset identity). every state-changing op is authorized by a MEMBER
 //! KEY, captured as a [`MemberAuth`]: the account it speaks for is resolved
@@ -38,7 +38,7 @@
 //!   [`MAX_ACCOUNTS`]) -- the ONE enumeration read. it stays canonical
 //!   because identity's reads are consumed in-consensus (governance resolves
 //!   actors/shares through them at execute time) and by the operator CLIs;
-//!   the id-length bound is structural ([`KeyKind::pubkey_wellformed`] admits
+//!   the id-length bound is structural ([`KeyScheme::pubkey_wellformed`] admits
 //!   nothing past a 65-byte SEC1 point).
 //!
 //! `OfNode`/`OfMember` are canonical POINT READS over the index records
@@ -74,11 +74,9 @@
 mod interface;
 pub use interface::*;
 
-// the pluggable member-key verifier: "(kind, pubkey, proof) -> valid?" for
-// every scheme an account can collect. flattened at the crate root so the wire
-// types (`KeyKind`, `MemberProof`) and the account logic share one vocabulary.
-mod scheme;
-pub use scheme::{KeyKind, MemberProof, verify_authority, webauthn_challenge, webauthn_rp_id_hash};
+// the one verifier every member proof rides — shared with the kernel frame
+// codec, so an account key and a frame origin are verified identically.
+pub use keyscheme::KeyScheme;
 
 // test-only member-auth builders (beside `IDENTITY_BIND_NS`). dev-only: gated so
 // a shipping build never compiles the ed25519 signing helpers into itself.
@@ -148,12 +146,8 @@ const ACCOUNT_ROSTER_KEY: &[u8] = b"accounts";
 /// repeated. serialized verbatim inside [`AccountRecord`].
 #[derive(Debug, Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 struct MemberMeta {
-    kind: KeyKind,
+    scheme: KeyScheme,
     label: Option<String>,
-    /// `SHA-256(rp_id)` a WebAuthn member's later assertions must carry in
-    /// authenticatorData -- pins the passkey to the RP it enrolled under.
-    /// `Some` iff `kind == WebauthnP256`.
-    rp_id_hash: Option<[u8; 32]>,
     added_at: u64,
 }
 
@@ -335,19 +329,16 @@ impl Identity {
             .member_keys
             .get(&auth.key)
             .ok_or_else(|| Error::Module("authorizer is not a member of this account".into()))?;
-        if meta.kind != auth.kind {
+        let scheme_matches_registration = meta.scheme == auth.scheme;
+        if !scheme_matches_registration {
             return Err(Error::Module(
-                "authorizer kind does not match its registered kind".into(),
+                "authorizer scheme does not match its registered scheme".into(),
             ));
         }
-        if !verify_authority(
-            auth.kind,
-            &auth.key,
-            meta.rp_id_hash.as_ref(),
-            namespace,
-            preimage,
-            &auth.proof,
-        ) {
+        if !auth
+            .scheme
+            .verify(&auth.key, namespace, preimage, &auth.proof)
+        {
             return Err(Error::Module(
                 "authorizer certificate does not verify".into(),
             ));
@@ -367,7 +358,7 @@ impl Identity {
                 .iter()
                 .map(|(pubkey, meta)| MemberKeyView {
                     pubkey: pubkey.clone(),
-                    kind: meta.kind,
+                    scheme: meta.scheme,
                     label: meta.label.clone(),
                     added_at: meta.added_at,
                 })
@@ -421,12 +412,12 @@ impl Module for Identity {
             } => self.unbind_node(ctx, node_key, authorizer).await,
             IdentityMsg::AddMemberKey {
                 new_key,
-                new_kind,
+                new_scheme,
                 new_label,
                 possession,
                 authorizer,
             } => {
-                self.add_member_key(ctx, new_key, new_kind, new_label, possession, authorizer)
+                self.add_member_key(ctx, new_key, new_scheme, new_label, possession, authorizer)
                     .await
             }
             IdentityMsg::RemoveMemberKey {
@@ -526,9 +517,9 @@ impl Identity {
                 (account_id, record)
             }
             None => {
-                if !authorizer.kind.pubkey_wellformed(&authorizer.key) {
+                if !authorizer.scheme.pubkey_wellformed(&authorizer.key) {
                     return Err(Error::Module(
-                        "founding key is malformed for its kind".into(),
+                        "founding key is malformed for its scheme".into(),
                     ));
                 }
                 if self.account(&authorizer.key).await?.is_some() {
@@ -536,18 +527,12 @@ impl Identity {
                         "account id already exists but its founding key is not a member".into(),
                     ));
                 }
-                let rp_id_hash = if authorizer.kind.expects_rp_id_hash() {
-                    webauthn_rp_id_hash(&authorizer.proof)
-                } else {
-                    None
-                };
                 let mut member_keys = BTreeMap::new();
                 member_keys.insert(
                     authorizer.key.clone(),
                     MemberMeta {
-                        kind: authorizer.kind,
+                        scheme: authorizer.scheme,
                         label: None,
-                        rp_id_hash,
                         added_at: ctx.env().consensus_time,
                     },
                 );
@@ -593,7 +578,9 @@ impl Identity {
                 Err(position) => position,
             };
             if roster.len() >= MAX_ACCOUNTS {
-                return Err(Error::Module(format!("account cap reached ({MAX_ACCOUNTS})")));
+                return Err(Error::Module(format!(
+                    "account cap reached ({MAX_ACCOUNTS})"
+                )));
             }
             roster.insert(position, account_id.clone());
             self.store_bounded(
@@ -648,9 +635,9 @@ impl Identity {
         &mut self,
         ctx: &mut dyn Ctx,
         new_key: Vec<u8>,
-        new_kind: KeyKind,
+        new_scheme: KeyScheme,
         new_label: Option<String>,
-        possession: MemberProof,
+        possession: Vec<u8>,
         authorizer: MemberAuth,
     ) -> Result<(), Error> {
         Self::origin_key(ctx)?;
@@ -661,9 +648,9 @@ impl Identity {
             .ok_or_else(|| Error::Module("authorizer belongs to no account".into()))?;
         let mut record = self.stored_account(&account_id).await?;
 
-        if !new_kind.pubkey_wellformed(&new_key) {
+        if !new_scheme.pubkey_wellformed(&new_key) {
             return Err(Error::Module(
-                "new member key is malformed for its kind".into(),
+                "new member key is malformed for its scheme".into(),
             ));
         }
         if record.member_keys.contains_key(&new_key) {
@@ -682,37 +669,21 @@ impl Identity {
             &self.chain_id,
             &account_id,
             &new_key,
-            new_kind,
+            new_scheme,
             record.nonce,
         );
         // existing member consents ...
         Self::authorize(&record, IDENTITY_ADD_MEMBER_NS, &preimage, &authorizer)?;
-        // ... and the new key proves it holds itself (no rp pin yet -- the
-        // proof establishes it).
-        if !verify_authority(
-            new_kind,
-            &new_key,
-            None,
-            IDENTITY_ADD_MEMBER_NS,
-            &preimage,
-            &possession,
-        ) {
+        // ... and the new key proves it holds itself.
+        if !new_scheme.verify(&new_key, IDENTITY_ADD_MEMBER_NS, &preimage, &possession) {
             return Err(Error::Module("possession proof does not verify".into()));
         }
-        let rp_id_hash = if new_kind.expects_rp_id_hash() {
-            Some(webauthn_rp_id_hash(&possession).ok_or_else(|| {
-                Error::Module("webauthn possession proof carries no rp id hash".into())
-            })?)
-        } else {
-            None
-        };
 
         record.member_keys.insert(
             new_key.clone(),
             MemberMeta {
-                kind: new_kind,
+                scheme: new_scheme,
                 label,
-                rp_id_hash,
                 added_at: ctx.env().consensus_time,
             },
         );
@@ -846,7 +817,6 @@ impl Identity {
         record.updated_at = ctx.env().consensus_time;
         self.store_account(&account_id, &record)
     }
-
 }
 
 /// trim an optional profile field: `None` or empty-after-trim -> cleared
