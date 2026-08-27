@@ -137,7 +137,7 @@ mod git;
 /// `pack_closure_many` is the self-contained closure; `pack_delta` bounds it
 /// by the client's common bases (the incremental fetch answer).
 #[cfg(feature = "native")]
-pub use git::{pack_closure_many, pack_delta};
+pub use git::{list_branches, pack_closure_many, pack_delta};
 pub mod oid;
 pub use oid::Oid;
 #[cfg(feature = "native")]

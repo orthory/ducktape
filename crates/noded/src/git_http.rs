@@ -207,6 +207,59 @@ fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+/// the heads an advertisement offers — NOT the same set for the two services.
+///
+/// PUSH advertises forge's COMMITTED heads: the client builds its ref commands
+/// against what it is shown and consensus gates each as a CAS against the
+/// committed head, so advertising anything else mints a doomed push.
+///
+/// FETCH advertises what this node can actually SERVE — its ON-DISK refs. the
+/// two diverge on a node whose objects have not caught up yet (a resident, or
+/// a validator that was down for the push: see `RepoState::materialize`), and
+/// there, offering the committed head is worse than offering the older one.
+/// `git clone` wants every ref it was shown, the pack builder cannot walk an
+/// oid whose objects are missing, and the error takes the WHOLE clone down —
+/// not just the branch that lagged. an older head is what any mirror serves,
+/// and the node's pack sweep catches it up within a tick.
+async fn advertised_refs(
+    handle: &NodeHandle,
+    repo: &str,
+    service: GitService,
+) -> Result<Vec<forge::RefHead>, Response> {
+    match service {
+        GitService::Receive => forge_refs(handle, repo).await,
+        GitService::Upload => servable_refs(handle, repo)
+            .map_err(|why| error_response(StatusCode::INTERNAL_SERVER_ERROR, &why)),
+    }
+}
+
+/// the fetch half of [`advertised_refs`], reading the same on-disk repo
+/// [`build_upload_pack`] packs from.
+fn servable_refs(handle: &NodeHandle, repo: &str) -> Result<Vec<forge::RefHead>, String> {
+    let Some(base) = handle.forge_repo.as_deref() else {
+        return Err("forge repo path not configured on this node".into());
+    };
+    on_disk_refs(base, repo).map_err(|e| format!("read forge refs: {e}"))
+}
+
+/// this node's on-disk branches for `repo`. a repo dir nothing has
+/// materialized here yet is an empty listing, which advertises as an empty
+/// repository — the same answer an unborn repo gives.
+fn on_disk_refs(base: &std::path::Path, repo: &str) -> Result<Vec<forge::RefHead>, git2::Error> {
+    let dir = base.join(repo);
+    if !dir.join(".git").exists() {
+        return Ok(Vec::new());
+    }
+    let repo = git2::Repository::open(&dir)?;
+    Ok(forge::list_branches(&repo)?
+        .into_iter()
+        .map(|(name, head)| forge::RefHead {
+            name,
+            head: head.to_string(),
+        })
+        .collect())
+}
+
 /// query the forge module for a repo's committed branches (`[]` == unborn).
 /// errors surface as an http `Response` so callers can early-return them.
 async fn forge_refs(handle: &NodeHandle, repo: &str) -> Result<Vec<forge::RefHead>, Response> {
@@ -302,9 +355,8 @@ impl GitService {
 }
 
 /// GET /forge/{repo}/info/refs?service=… — the smart-HTTP ref advertisement a
-/// `git push`/`git clone` fetches FIRST to learn the remote's current head. the
-/// advertised head is forge's COMMITTED head (from the actor lane, so it matches
-/// consensus); the fetch POST then serves the matching objects off disk. both
+/// `git push`/`git clone` fetches FIRST to learn the remote's current head.
+/// which heads those are differs per service (see [`advertised_refs`]). both
 /// receive-pack (push) and upload-pack (fetch) are served — the v0 banner we
 /// send makes git speak the classic protocol for the follow-up POST even when it
 /// probed with `Git-Protocol: version=2`.
@@ -337,7 +389,7 @@ pub(crate) async fn git_info_refs(
 /// oid so `git clone` resolves the default branch to check out. capabilities
 /// ride the first emitted line after a NUL, per the v0 protocol.
 async fn git_advertise_refs(handle: &NodeHandle, repo: &str, service: GitService) -> Response {
-    let refs = match forge_refs(handle, repo).await {
+    let refs = match advertised_refs(handle, repo, service).await {
         Ok(refs) => refs,
         Err(resp) => return resp,
     };
@@ -761,6 +813,39 @@ mod upload_pack_tests {
         assert!(parsed.done);
         assert!(parsed.side_band);
         assert_eq!(parsed.haves, vec![HAVE.to_string()]);
+    }
+
+    /// a fetch advertisement offers exactly what this node can pack: nothing
+    /// for a repo it has never materialized, and afterwards the ON-DISK heads
+    /// — never a committed head whose objects have not arrived, which would
+    /// take the whole clone down instead of just lagging one branch.
+    #[test]
+    fn on_disk_refs_offer_only_the_branches_this_node_can_pack() {
+        let base = tempfile::tempdir().unwrap();
+        assert!(
+            on_disk_refs(base.path(), "demo").unwrap().is_empty(),
+            "a repo nothing materialized here advertises as empty"
+        );
+
+        let repo = git2::Repository::init(base.path().join("demo")).unwrap();
+        let sig = git2::Signature::now("test", "test@example.com").unwrap();
+        let blob = repo.blob(b"one").unwrap();
+        let mut tb = repo.treebuilder(None).unwrap();
+        tb.insert("a.txt", blob, 0o100644).unwrap();
+        let tree = repo.find_tree(tb.write().unwrap()).unwrap();
+        let head = repo
+            .commit(Some("refs/heads/main"), &sig, &sig, "one", &tree, &[])
+            .unwrap();
+        repo.reference("refs/heads/feature/x", head, true, "test")
+            .unwrap();
+
+        let refs = on_disk_refs(base.path(), "demo").unwrap();
+
+        let names: Vec<&str> = refs.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["feature/x", "main"], "every born branch, sorted");
+        for r in &refs {
+            assert_eq!(r.head, head.to_string(), "at its on-disk oid");
+        }
     }
 
     /// two commits at the origin; a client that has the first must get a pack
