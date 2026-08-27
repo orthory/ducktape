@@ -87,6 +87,15 @@ pub use duckfs_core::{to_hex as hex_bytes, unhex};
 // the network descriptor — network.toml, the shareable genesis artifact.
 // ============================================================================
 
+/// one genesis module: the consensus-visible id and the sha256 (hex) of the
+/// component bytes every node seeds into the code registry at block zero.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleCode {
+    pub id: String,
+    pub code_hash: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkDescriptor {
@@ -112,6 +121,11 @@ pub struct NetworkDescriptor {
     /// NOT part of `genesis_namespace` (validator identity only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordination: Option<String>,
+    /// the genesis wasm set: `(id, sha256 hex)` per wasm tenant, sorted by id.
+    /// IN the genesis fingerprint — a node built against different components
+    /// is a different network, never a block-0 fork. the bytes travel
+    /// out-of-band (the workspace bundle, the blob plane).
+    pub modules: Vec<ModuleCode>,
 }
 
 impl NetworkDescriptor {
@@ -126,6 +140,10 @@ impl NetworkDescriptor {
             *v = v.trim().to_ascii_lowercase();
         }
         d.validators.sort();
+        for m in &mut d.modules {
+            m.code_hash = m.code_hash.trim().to_ascii_lowercase();
+        }
+        d.modules.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(d)
     }
 
@@ -165,12 +183,13 @@ impl NetworkDescriptor {
     }
 
     /// the namespace this network's nodes actually run under: the chain-id
-    /// plus a GENESIS FINGERPRINT (sha256 over the sorted validator set;
-    /// bootstrap hints excluded — they are advisory and legitimately
-    /// differ between members). because the namespace domain-separates the
-    /// mesh handshake, the simplex scheme, and the epoch genesis floor,
-    /// a member holding a STALE descriptor (e.g. it missed a pre-genesis
-    /// `admit` and kept the old validator list) cannot even connect — genesis
+    /// plus a GENESIS FINGERPRINT (sha256 over the sorted validator set +
+    /// the sorted `id=code_hash` module lines; bootstrap hints excluded — they
+    /// are advisory and legitimately differ between members). because the
+    /// namespace domain-separates the mesh handshake, the simplex scheme, and
+    /// the epoch genesis floor, a member holding a STALE descriptor (e.g. it
+    /// missed a pre-genesis `admit` and kept the old validator list, or was
+    /// built against a different wasm set) cannot even connect — genesis
     /// divergence is a loud connectivity failure, never a silent state fork.
     pub fn genesis_namespace(&self) -> String {
         use commonware_cryptography::{Hasher as _, Sha256};
@@ -189,11 +208,39 @@ impl NetworkDescriptor {
             hasher.update(b"\n");
             hasher.update(v.as_bytes());
         }
+        let mut modules: Vec<&ModuleCode> = self.modules.iter().collect();
+        modules.sort_by(|a, b| a.id.cmp(&b.id));
+        for m in modules {
+            hasher.update(b"\n");
+            hasher.update(m.id.as_bytes());
+            hasher.update(b"=");
+            hasher.update(m.code_hash.trim().to_ascii_lowercase().as_bytes());
+        }
         let digest = hasher.finalize();
         // 128 bits: a 32-bit suffix is grindable (~2^32 hashes finds an
         // admitted key that leaves the fingerprint unchanged, resurrecting
         // the silent stale-descriptor fork this exists to prevent).
         format!("{}@{}", self.chain_id, hex_bytes(&digest.as_ref()[..16]))
+    }
+
+    /// the genesis code hashes, decoded: `id -> sha256`. a hash that is not 32
+    /// bytes of hex names its module in the error.
+    pub fn module_hashes(&self) -> Result<std::collections::BTreeMap<String, [u8; 32]>, String> {
+        let mut out = std::collections::BTreeMap::new();
+        for m in &self.modules {
+            let bytes =
+                unhex(&m.code_hash).map_err(|e| format!("module {} code_hash: {e}", m.id))?;
+            let digest: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| format!("module {} code_hash is not 32 bytes", m.id))?;
+            if out.insert(m.id.clone(), digest).is_some() {
+                return Err(format!(
+                    "duplicate module {} in network {}",
+                    m.id, self.chain_id
+                ));
+            }
+        }
+        Ok(out)
     }
 
     /// bootstrap entries as dial INGRESSES. an IP literal becomes a socket
@@ -968,6 +1015,7 @@ mod tests {
                 bootstrap: vec![],
                 reach: vec![],
                 coordination: None,
+                modules: Vec::new(),
             }
             .save(&dir.join("network.toml"))
             .unwrap();
@@ -988,6 +1036,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         // default (field unset) -> Private
         assert_eq!(d.coordination(), Coordination::Private);
@@ -1037,6 +1086,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
 
         d.apply_primary_coordinator(&me, "p2p.ducktape.byeongsu.dev:3478")
@@ -1134,6 +1184,7 @@ mod tests {
                 bootstrap: vec![],
                 reach: vec![],
                 coordination: None,
+                modules: Vec::new(),
             };
             d.save(&dir.join("network.toml")).expect("save");
         }
@@ -1164,6 +1215,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         }
         .save(&dir.join("network.toml"))
         .expect("save descriptor");
@@ -1230,6 +1282,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         d.admit(&a);
         d.admit(&b);
@@ -1249,6 +1302,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         assert!(
             d.validator_keys().is_err(),
@@ -1266,6 +1320,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         let founder_only = d.genesis_namespace();
         assert!(founder_only.starts_with("net#00000000@"));
@@ -1284,6 +1339,66 @@ mod tests {
         let mut reversed = d.clone();
         reversed.validators.reverse();
         assert_eq!(reversed.genesis_namespace(), d.genesis_namespace());
+    }
+
+    fn modules_fixture() -> Vec<ModuleCode> {
+        vec![
+            ModuleCode {
+                id: "pages".into(),
+                code_hash: "11".repeat(32),
+            },
+            ModuleCode {
+                id: "chat".into(),
+                code_hash: "22".repeat(32),
+            },
+        ]
+    }
+
+    #[test]
+    fn genesis_namespace_fingerprints_the_module_hashes() {
+        let a = ed25519::PrivateKey::from_seed(5).public_key();
+        let mut d = NetworkDescriptor {
+            chain_id: "net#00000000".into(),
+            validators: vec![hex_bytes(a.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            modules: modules_fixture(),
+        };
+        let base = d.genesis_namespace();
+        // a different component for one module is a different network.
+        d.modules[0].code_hash = "33".repeat(32);
+        assert_ne!(d.genesis_namespace(), base);
+        // order-independent: canonical over the id-sorted list.
+        let mut reversed = d.clone();
+        reversed.modules.reverse();
+        assert_eq!(reversed.genesis_namespace(), d.genesis_namespace());
+    }
+
+    #[test]
+    fn descriptor_without_modules_does_not_parse() {
+        let text = "chain_id = \"net#00000000\"\nvalidators = []\n";
+        let err = NetworkDescriptor::from_toml(text).unwrap_err();
+        assert!(err.contains("modules"), "{err}");
+    }
+
+    #[test]
+    fn module_hashes_decode_and_refuse_bad_lengths() {
+        let mut d = NetworkDescriptor {
+            chain_id: "n".into(),
+            validators: vec![],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            modules: modules_fixture(),
+        };
+        let map = d.module_hashes().unwrap();
+        assert_eq!(map["pages"], [0x11u8; 32]);
+        d.modules.push(ModuleCode {
+            id: "x".into(),
+            code_hash: "ab".into(),
+        });
+        assert!(d.module_hashes().unwrap_err().contains("x"));
     }
 
     #[test]
@@ -1324,6 +1439,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         // empty dir: anything goes.
         assert!(guard_join_descriptor(&dir, &ours).is_ok());
@@ -1359,6 +1475,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         assert!(
             d.validator_keys().is_err(),
@@ -1376,6 +1493,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         // a hand-edited twin: uppercase, whitespace, different order.
         let messy = NetworkDescriptor {
@@ -1387,6 +1505,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         // identical decoded sets MUST run under the identical namespace.
         assert_eq!(messy.genesis_namespace(), canonical.genesis_namespace());
@@ -1417,6 +1536,7 @@ mod tests {
             ],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         let entries = d.bootstrap_entries().expect("well-formed hints parse");
         assert_eq!(
@@ -1484,6 +1604,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         // an existing network.toml without a [reach] array still parses (serde default),
         // and an empty reach is not serialised (skip_serializing_if).
@@ -1505,6 +1626,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         d.add_bootstrap(&a, "127.0.0.1:52200");
         let hints = d.reach_hints().expect("hints");
@@ -1528,6 +1650,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         d.add_reach(&ReachHint {
             expected_key: a.clone(),
@@ -1561,6 +1684,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         d.add_reach(&ReachHint {
             expected_key: a.clone(),
@@ -1613,6 +1737,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         d.add_bootstrap(&me, "203.0.113.7:52200");
         d.add_reach(&ReachHint {
@@ -1674,6 +1799,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         d.add_bootstrap(&me, "203.0.113.7:52200");
         // the EXACT derivation cmd_join uses for the inviter's tunnel route.
@@ -1724,6 +1850,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         let ns0 = base.genesis_namespace();
 
@@ -1760,6 +1887,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         // a coordinated hint routes through the coordinator, but the identity
         // we expect end-to-end is the TARGET; the coordinator's own ingress and
@@ -1795,6 +1923,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         // a bootstrap hint alone synthesises a Direct reach ingress...
         d.add_bootstrap(&a, "127.0.0.1:52200");

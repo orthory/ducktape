@@ -810,6 +810,15 @@ mod tests {
         dir
     }
 
+    /// a stand-in genesis module set for the network-shape descriptors these
+    /// tests resolve: a descriptor with NO modules is not a runnable network.
+    fn fake_modules() -> Vec<crate::config::ModuleCode> {
+        vec![crate::config::ModuleCode {
+            id: "pages".into(),
+            code_hash: "11".repeat(32),
+        }]
+    }
+
     #[test]
     fn a_hostname_advertised_boots_without_dns_and_stays_a_hostname() {
         // the tunnel case: a stable name whose IP moves (or does not resolve
@@ -826,6 +835,7 @@ mod tests {
             )],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         };
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
@@ -865,6 +875,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         };
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
@@ -899,6 +910,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         };
         d.add_bootstrap(&founder, "203.0.113.7:41000");
         d.save(&dir.join("network.toml")).expect("save");
@@ -924,6 +936,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         };
         d.add_bootstrap(&other, "127.0.0.1:52200");
         d.save(&dir.join("network.toml")).expect("save descriptor");
@@ -970,6 +983,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         }
         .save(&dir.join("network.toml"))
         .expect("save descriptor");
@@ -1073,6 +1087,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         }
         .save(&network_dir.join("network.toml"))
         .expect("save descriptor");
@@ -1131,6 +1146,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         };
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
@@ -1525,6 +1541,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         }
         .save(&dir.join("network.toml"))
         .expect("save descriptor");
@@ -1579,6 +1596,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         }
         .save(&dir.join("network.toml"))
         .expect("save descriptor");
@@ -1606,6 +1624,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         };
         d.save(&dir.join("network.toml")).expect("save");
 

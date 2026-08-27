@@ -719,6 +719,7 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
             bootstrap: Vec::new(),
             reach,
             coordination,
+            modules: Vec::new(),
         },
         token,
         wireguard,
@@ -802,6 +803,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         d.apply_primary_coordinator(&issuer.public_key(), "p2p.ducktape.byeongsu.dev:3478")
             .expect("coordinator hint");
@@ -845,6 +847,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         d.add_bootstrap(&me, "127.0.0.1:52200");
         // decode NORMALISES bootstrap hints into typed Direct reach hints, so
@@ -899,6 +902,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         d.add_bootstrap(&me, "127.0.0.1:52200");
         let blob = encode_test_invite(&d, &issuer, None);
@@ -928,6 +932,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         d.add_bootstrap(&me, "127.0.0.1:52200");
         let binding = d.genesis_namespace();
@@ -975,6 +980,7 @@ mod tests {
             // a `None` source resolves to Private, so it decodes as an EXPLICIT
             // "private" (semantically identical — see `coordination()`).
             coordination: Some("private".into()),
+            modules: Vec::new(),
         };
         let wg = InviteWireGuard {
             public_key: [42u8; 32],
@@ -997,6 +1003,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: Some("private".into()),
+            modules: Vec::new(),
         };
         let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes(), u64::MAX);
         let mut bytes = pack_invite(&d, &token, &coordinated_test_wg(), &[]).unwrap();
@@ -1025,6 +1032,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: Some("private".into()),
+            modules: Vec::new(),
         }
     }
 
@@ -1174,6 +1182,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         // the token carries its OWN expiry now (no separate blob param).
         let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes(), 1_000);
@@ -1217,6 +1226,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         for (mode, expect) in [
             ("public", Coordination::Public),
@@ -1247,6 +1257,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         }
     }
 

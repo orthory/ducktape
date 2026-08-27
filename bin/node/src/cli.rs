@@ -500,6 +500,7 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         bootstrap: Vec::new(),
         reach: Vec::new(),
         coordination: None,
+        modules: Vec::new(),
     };
     if let Some(addr) = config::dialable(Some(&plumbing.advertised), &plumbing.listen)? {
         descriptor.add_bootstrap(&me, &addr);
