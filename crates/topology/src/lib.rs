@@ -17,6 +17,26 @@
 //! A leaf crate with no dependencies: the catalog is pure `&'static str`, and
 //! the kernel (`host`) knows nothing of the product modules composed over it.
 
+/// Where a module's CODE comes from: compiled into the binary, or a wasm
+/// component the code registry (lifecycle) can swap at a height boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Code {
+    Native,
+    Wasm,
+}
+
+/// Where a module's COMMITTED state lives — the substrate `root()` is computed
+/// from. One per module by definition (`wasm_host::StateBacking` is an enum).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backing {
+    /// host-KV map; root = sha256(canonical kv); rides the snapshot lane.
+    Map,
+    /// host-constructed authenticated store (qmdb); root = store merkle root.
+    Store,
+    /// host-side disk substrate (duckfs odb / git); root = sha256(refs image).
+    Odb,
+}
+
 /// A single module in the composition universe: its id plus the metadata that
 /// used to be scattered across the composer sites.
 pub struct ModuleSpec {
@@ -36,6 +56,13 @@ pub struct ModuleSpec {
     /// the wasm `__config` store) — this is only the schema of WHICH modules are
     /// network-bound and on WHICH keys.
     pub config: &'static [&'static str],
+    /// Where this module's code comes from.
+    pub code: Code,
+    /// Where this module's committed state lives.
+    pub backing: Backing,
+    /// the guest's query lane is COMMITTED-ONLY regardless of caller
+    /// (`WasmModule::with_committed_queries`). dispatch only.
+    pub committed_queries: bool,
 }
 
 /// The module composition topology: the id universe (with per-module wiring +
@@ -68,6 +95,15 @@ impl ModuleTopology {
     pub fn config(&self, id: &str) -> &'static [&'static str] {
         self.spec(id).map(|m| m.config).unwrap_or(&[])
     }
+
+    /// the `code == Wasm` ids of `selection`, in selection order.
+    pub fn wasm_ids(&self, selection: &[&'static str]) -> Vec<&'static str> {
+        selection
+            .iter()
+            .copied()
+            .filter(|id| self.spec(id).is_some_and(|m| m.code == Code::Wasm))
+            .collect()
+    }
 }
 
 /// genesis-config key: the per-network invite namespace (governance verifies
@@ -81,40 +117,36 @@ const CHAIN_ID: &[&str] = &[CONFIG_CHAIN_ID];
 const INVITE: &[&str] = &[CONFIG_INVITE];
 const NONE: &[&str] = &[];
 
+const fn store(id: &'static str, wiring: &'static [&'static str], config: &'static [&'static str]) -> ModuleSpec {
+    ModuleSpec { id, wiring, config, code: Code::Wasm, backing: Backing::Store, committed_queries: false }
+}
+
 /// The module id universe with per-module wiring + config. Alphabetical by id
 /// (order here is documentation only — selections carry the composer orders).
 const MODULES: &[ModuleSpec] = &[
-    // the submit-policy federation: allow-all at genesis (an empty table),
-    // governance-tightened. the kernel host's dispatch gate reads it and
-    // resolves principals against valset/identity itself, so the native
-    // struct takes no sibling constructor args (wiring stays empty).
-    ModuleSpec { id: "acl", wiring: NONE, config: NONE },
-    ModuleSpec { id: "agent", wiring: &["saga", "runs"], config: NONE },
-    ModuleSpec { id: "automations", wiring: &["chat", "tasks", "inbox"], config: NONE },
-    ModuleSpec { id: "capability", wiring: NONE, config: NONE },
-    ModuleSpec { id: "chat", wiring: &["tagging"], config: NONE },
-    ModuleSpec { id: "directory", wiring: NONE, config: NONE },
-    ModuleSpec { id: "dispatch", wiring: &["saga"], config: NONE },
-    ModuleSpec { id: "files", wiring: NONE, config: NONE },
-    ModuleSpec { id: "forge", wiring: &["chat"], config: NONE },
-    ModuleSpec { id: "gateway", wiring: &["identity"], config: CHAIN_ID },
-    ModuleSpec { id: "governance", wiring: &["valset", "lifecycle", "identity"], config: INVITE },
-    ModuleSpec { id: "greeter", wiring: NONE, config: NONE },
-    ModuleSpec { id: "hello", wiring: NONE, config: NONE },
-    ModuleSpec { id: "identity", wiring: NONE, config: CHAIN_ID },
-    ModuleSpec { id: "inbox", wiring: NONE, config: NONE },
-    ModuleSpec { id: "kv", wiring: NONE, config: NONE },
-    ModuleSpec { id: "lifecycle", wiring: &["valset"], config: NONE },
-    ModuleSpec { id: "pages", wiring: &["tagging"], config: NONE },
-    ModuleSpec {
-        id: "runs",
-        wiring: &["chat", "saga", "tagging", "dispatch", "agent", "tasks", "files", "pages"],
-        config: NONE,
-    },
-    ModuleSpec { id: "saga", wiring: NONE, config: NONE },
-    ModuleSpec { id: "tagging", wiring: &["runs"], config: NONE },
-    ModuleSpec { id: "tasks", wiring: NONE, config: NONE },
-    ModuleSpec { id: "valset", wiring: NONE, config: NONE },
+    store("acl", NONE, NONE),
+    store("agent", &["saga", "runs"], NONE),
+    store("automations", &["chat", "tasks", "inbox"], NONE),
+    store("capability", NONE, NONE),
+    store("chat", &["tagging"], NONE),
+    ModuleSpec { id: "directory", wiring: NONE, config: NONE, code: Code::Wasm, backing: Backing::Map, committed_queries: false },
+    ModuleSpec { id: "dispatch", wiring: &["saga"], config: NONE, code: Code::Wasm, backing: Backing::Store, committed_queries: true },
+    ModuleSpec { id: "files", wiring: NONE, config: NONE, code: Code::Wasm, backing: Backing::Odb, committed_queries: false },
+    ModuleSpec { id: "forge", wiring: &["chat"], config: NONE, code: Code::Wasm, backing: Backing::Odb, committed_queries: false },
+    store("gateway", &["identity"], CHAIN_ID),
+    store("governance", &["valset", "lifecycle", "identity"], INVITE),
+    ModuleSpec { id: "greeter", wiring: NONE, config: NONE, code: Code::Native, backing: Backing::Map, committed_queries: false },
+    ModuleSpec { id: "hello", wiring: NONE, config: NONE, code: Code::Wasm, backing: Backing::Map, committed_queries: false },
+    store("identity", NONE, CHAIN_ID),
+    store("inbox", NONE, NONE),
+    ModuleSpec { id: "kv", wiring: NONE, config: NONE, code: Code::Native, backing: Backing::Store, committed_queries: false },
+    ModuleSpec { id: "lifecycle", wiring: &["valset"], config: NONE, code: Code::Native, backing: Backing::Store, committed_queries: false },
+    store("pages", &["tagging"], NONE),
+    ModuleSpec { id: "runs", wiring: &["chat", "saga", "tagging", "dispatch", "agent", "tasks", "files", "pages"], config: NONE, code: Code::Wasm, backing: Backing::Map, committed_queries: false },
+    store("saga", NONE, NONE),
+    store("tagging", &["runs"], NONE),
+    store("tasks", NONE, NONE),
+    ModuleSpec { id: "valset", wiring: NONE, config: NONE, code: Code::Native, backing: Backing::Store, committed_queries: false },
 ];
 
 /// node's production genesis set (21), in status-report order — every node runs
@@ -357,5 +389,25 @@ mod tests {
         assert!(TOPOLOGY.spec("chat").is_some());
         assert!(TOPOLOGY.spec("not-a-module").is_none());
         assert_eq!(TOPOLOGY.wiring("not-a-module"), NONE);
+    }
+
+    /// The shape table is consensus-adjacent: a wrong `backing` composes the
+    /// wrong root, a wrong `code` sends a native module to the wasm loader.
+    #[test]
+    fn shape_table_pins_native_odb_map_and_committed_queries() {
+        let native: Vec<&str> = MODULES.iter().filter(|m| m.code == Code::Native).map(|m| m.id).collect();
+        assert_eq!(sorted(&native), ["greeter", "kv", "lifecycle", "valset"]);
+        let odb: Vec<&str> = MODULES.iter().filter(|m| m.backing == Backing::Odb).map(|m| m.id).collect();
+        assert_eq!(sorted(&odb), ["files", "forge"]);
+        let map: Vec<&str> = MODULES.iter().filter(|m| m.backing == Backing::Map).map(|m| m.id).collect();
+        assert_eq!(sorted(&map), ["directory", "greeter", "hello", "runs"]);
+        let committed: Vec<&str> = MODULES.iter().filter(|m| m.committed_queries).map(|m| m.id).collect();
+        assert_eq!(committed, ["dispatch"]);
+    }
+
+    #[test]
+    fn wasm_ids_selects_only_wasm_specs_in_selection_order() {
+        let ids = TOPOLOGY.wasm_ids(SIM_VALSET);
+        assert_eq!(ids, ["acl", "governance"]);
     }
 }
