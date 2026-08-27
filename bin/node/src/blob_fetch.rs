@@ -88,6 +88,79 @@ pub fn serve_blob_range(
     }
 }
 
+/// the digest of the pack this node last staged to answer a forge object
+/// request, per repo. one slot per repo, replaced (and the old bytes released)
+/// as the next answer lands — serving catch-up must not grow this node's
+/// store one pack per request.
+pub type ServedPacks = Arc<Mutex<HashMap<String, [u8; 32]>>>;
+
+/// answer a peer's [`SyncRequest::ForgeObjects`]: build the pack that carries
+/// `head`'s objects (bounded by the `bases` the peer already holds), stage it,
+/// and hand back the digest so the peer pulls the bytes over the ranged lane.
+///
+/// this is the half that makes a committed head recoverable after the PUSHED
+/// pack is gone from every store. pack bytes are not reproducible, so the
+/// digest consensus pinned names exactly one node's file; the objects behind
+/// it live on every node that materialized the head, and any of them can
+/// rebuild an equivalent pack here.
+///
+/// `None` is an honest miss — this node does not hold the head either. it
+/// never packs a walk it has not itself committed to (see
+/// [`forge::build_objects`]), so the lane cannot be turned into an amplifier.
+pub fn serve_forge_objects(
+    forge_repo: &std::path::Path,
+    blobs: &blobstore::BlobHandle,
+    served: &ServedPacks,
+    repo: &str,
+    head: [u8; statesync::FORGE_OID_LEN],
+    bases: &[[u8; statesync::FORGE_OID_LEN]],
+) -> SyncResponse {
+    let miss = SyncResponse::ForgeObjects { digest: None };
+    let (Ok(name), Ok(head)) = (forge::norm_repo(repo), forge::Oid::from_bytes(&head)) else {
+        return miss;
+    };
+    let bases: Vec<forge::Oid> = bases
+        .iter()
+        .filter_map(|base| forge::Oid::from_bytes(base).ok())
+        .collect();
+    let built = match forge::build_objects(forge_repo, &name, head, &bases) {
+        Ok(Some(pack)) => pack,
+        Ok(None) => return miss,
+        Err(e) => {
+            tracing::debug!(
+                target: "ducktape::forge",
+                reason = "objects_build_failed",
+                repo = %name,
+                head = %head,
+                error = %e,
+                "could not build the objects a peer asked for"
+            );
+            return miss;
+        }
+    };
+    let digest = blobs.put_chunk(built);
+    if let Some(previous) = record_served(served, name, digest) {
+        // a requester mid-pull of the released digest misses, retries, and is
+        // handed this one — the conversation is per-attempt anyway.
+        blobs.forget(&previous);
+    }
+    SyncResponse::ForgeObjects {
+        digest: Some(digest),
+    }
+}
+
+/// take the repo's one served-pack slot, returning the digest this answer
+/// SUPERSEDES and whose bytes the caller must release. re-serving the same
+/// pack (same head, same bases) supersedes nothing — releasing it there would
+/// throw away the very bytes just handed out.
+fn record_served(served: &ServedPacks, repo: String, digest: [u8; 32]) -> Option<[u8; 32]> {
+    served
+        .lock()
+        .expect("served packs poisoned")
+        .insert(repo, digest)
+        .filter(|previous| *previous != digest)
+}
+
 // ---- the ranged requester ----------------------------------------------------
 
 /// why one blob fetch conversation failed. `Miss` and `Transport` are
@@ -453,8 +526,8 @@ async fn sweep_packs_once<C: SyncClient + SourceRotate>(
 ) -> usize {
     // a corrupt map is forge's own fail-stop at boot; from out here it is just
     // a sweep with nothing it can act on.
-    let outstanding = match forge::pending_digests(forge_repo) {
-        Ok(digests) => digests,
+    let outstanding = match forge::pending_branches(forge_repo) {
+        Ok(branches) => branches,
         Err(e) => {
             tracing::debug!(
                 target: "ducktape::forge",
@@ -467,43 +540,166 @@ async fn sweep_packs_once<C: SyncClient + SourceRotate>(
         }
     };
     let mut pulled = 0usize;
-    for digest in outstanding {
-        if blobs.has_chunk(&digest) {
+    for pending in outstanding {
+        if blobs.has_chunk(&pending.digest) {
             continue; // held already; forge materializes it on its own.
         }
-        if let Err(e) = fetch_blob(
+        // the pushed pack first: it is the exact answer, and while any node
+        // still holds those bytes this costs one ranged pull.
+        let by_digest = fetch_blob(
             client,
             blobs,
-            &digest,
+            &pending.digest,
             MAX_FORGE_PACK_BYTES,
             crate::constants::BLOB_FETCH_ATTEMPTS,
         )
-        .await
-        {
-            // every tick retries, so this is per-attempt noise, not a failure:
-            // the branch simply stays behind one more tick.
-            tracing::debug!(
+        .await;
+        if by_digest.is_ok() {
+            pulled += 1;
+            tracing::info!(
                 target: "ducktape::forge",
                 node = %label,
-                reason = "pack_fetch_failed",
-                error = %e,
-                "pack sweep could not pull a committed head's objects"
+                repo = %pending.repo,
+                branch = %pending.branch,
+                "pulled a forge pack this node was missing"
             );
             continue;
         }
-        pulled += 1;
-        tracing::info!(
-            target: "ducktape::forge",
-            node = %label,
-            "pulled a forge pack this node was missing"
-        );
+        // nobody answers for those bytes any more. the OBJECTS still exist on
+        // every peer that materialized the head, so ask one to rebuild them.
+        match fetch_forge_objects(client, blobs, forge_repo, &pending).await {
+            Ok(()) => {
+                pulled += 1;
+                tracing::info!(
+                    target: "ducktape::forge",
+                    node = %label,
+                    repo = %pending.repo,
+                    branch = %pending.branch,
+                    head = %pending.head,
+                    "a peer rebuilt the objects for a head whose pack is gone"
+                );
+            }
+            Err(e) => {
+                // every tick retries, so this is per-attempt noise, not a
+                // failure: the branch stays behind one more tick.
+                tracing::debug!(
+                    target: "ducktape::forge",
+                    node = %label,
+                    reason = "objects_fetch_failed",
+                    repo = %pending.repo,
+                    branch = %pending.branch,
+                    error = %e,
+                    "neither the pushed pack nor a rebuilt one arrived"
+                );
+            }
+        }
     }
     pulled
+}
+
+/// pull the objects a committed head needs from a peer that materialized it,
+/// rotating sources like every other fetch here.
+///
+/// the two steps have to ride ONE source: the peer answers with the digest of
+/// a pack IT staged, and no other node has those bytes. `fetch_blob`'s loop
+/// rotates between attempts and holds a source within one, so the ask and the
+/// ranged pull sit together inside a single attempt.
+async fn fetch_forge_objects<C: SyncClient + SourceRotate>(
+    client: &C,
+    blobs: &blobstore::BlobHandle,
+    forge_repo: &std::path::Path,
+    pending: &forge::PendingBranch,
+) -> Result<(), BlobFetchError> {
+    let mut bases = forge::on_disk_heads(forge_repo, &pending.repo).unwrap_or_default();
+    bases.truncate(statesync::MAX_FORGE_BASES);
+    let mut last = BlobFetchError::Miss;
+    for _ in 0..crate::constants::BLOB_FETCH_ATTEMPTS.max(1) {
+        match objects_once(client, blobs, forge_repo, pending, &bases).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                client.rotate_source();
+                last = e;
+            }
+        }
+    }
+    Err(last)
+}
+
+/// one source conversation: ask for the objects, pull the pack the peer
+/// staged, install it, and release the courier bytes.
+///
+/// no trust attaches to which peer answered — [`forge::install_objects`]
+/// re-hashes every object as it indexes and then demands the full closure of
+/// the head consensus committed, so a lying peer lands nothing.
+async fn objects_once<C: SyncClient>(
+    client: &C,
+    blobs: &blobstore::BlobHandle,
+    forge_repo: &std::path::Path,
+    pending: &forge::PendingBranch,
+    bases: &[forge::Oid],
+) -> Result<(), BlobFetchError> {
+    let request = SyncRequest::ForgeObjects {
+        repo: pending.repo.clone(),
+        head: *pending.head.as_bytes(),
+        bases: bases.iter().map(|base| *base.as_bytes()).collect(),
+    };
+    let digest = match client.request(request).await? {
+        SyncResponse::ForgeObjects {
+            digest: Some(digest),
+        } => digest,
+        SyncResponse::ForgeObjects { digest: None } => return Err(BlobFetchError::Miss),
+        SyncResponse::Error(e) => return Err(SyncError::Server(e).into()),
+        other => return Err(SyncError::UnexpectedResponse(other.kind_name()).into()),
+    };
+    fetch_once(client, blobs, &digest, MAX_FORGE_PACK_BYTES).await?;
+    let Some(pack) = blobs.get_chunk(&digest) else {
+        return Err(BlobFetchError::Miss);
+    };
+    let installed = forge::install_objects(forge_repo, &pending.repo, pending.head, &pack);
+    // the pack was a courier: the objects live in the odb now, and its digest
+    // is this peer's alone — nothing will ever ask for it again.
+    blobs.forget(&digest);
+    installed.map_err(|_| BlobFetchError::Corrupt)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// serving catch-up must not grow this node's store one pack per request:
+    /// each answer supersedes the repo's previous one, and re-serving the
+    /// SAME pack must supersede nothing (releasing it would throw away the
+    /// bytes just handed out).
+    #[test]
+    fn each_served_pack_supersedes_only_the_repos_previous_one() {
+        let served: ServedPacks = Default::default();
+
+        assert_eq!(
+            record_served(&served, "demo".into(), [1u8; 32]),
+            None,
+            "the first answer for a repo supersedes nothing"
+        );
+        assert_eq!(
+            record_served(&served, "demo".into(), [2u8; 32]),
+            Some([1u8; 32]),
+            "the next answer releases the one it replaced"
+        );
+        assert_eq!(
+            record_served(&served, "demo".into(), [2u8; 32]),
+            None,
+            "re-serving the same pack must not release it"
+        );
+        assert_eq!(
+            record_served(&served, "other".into(), [3u8; 32]),
+            None,
+            "repos hold their own slot"
+        );
+        assert_eq!(
+            record_served(&served, "demo".into(), [4u8; 32]),
+            Some([2u8; 32]),
+            "and each slot still tracks its own repo"
+        );
+    }
 
     /// a test [`SyncClient`] answering the ranged lane from a rotating list of
     /// per-source stores — the serve functions ARE the server, so every test

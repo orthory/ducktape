@@ -198,6 +198,30 @@ impl BlobStore {
         self.chunks.contains_key(digest) || self.disk_chunk(digest).is_some()
     }
 
+    /// drop a blob this node staged — out of the memory map, and off disk
+    /// when a root holds it. best-effort: a failed unlink leaves the blob
+    /// exactly where it was, which is the behaviour that existed before.
+    ///
+    /// the ONLY removal on this store, and deliberately a primitive rather
+    /// than a gc: nothing HERE decides what is spent. the plane that put the
+    /// bytes in does — forge releases a push pack once it has materialized
+    /// the objects, and the forge object lane releases the answer it
+    /// superseded. that keeps the crate a dumb receipt store (see the scope
+    /// note at the top) while giving its writers a way to not leak forever.
+    pub fn forget(&mut self, digest: &[u8; 32]) {
+        if let Some(bytes) = self.chunks.remove(digest) {
+            // only DISK-BACKED entries are queued and counted; a memory-only
+            // blob was never in either structure.
+            if let Some(at) = self.cache_order.iter().position(|queued| queued == digest) {
+                self.cache_order.remove(at);
+                self.cache_bytes -= bytes.len();
+            }
+        }
+        if let Some(root) = &self.root {
+            let _ = std::fs::remove_file(root.join(hex(digest)));
+        }
+    }
+
     /// the disk fallback: read `<root>/<hex>` and REVERIFY the content hash.
     /// content-addressed blobs are self-verifying — a corrupt or truncated
     /// file is treated as absent (with a warning), never served.
@@ -256,6 +280,11 @@ impl BlobHandle {
             .lock()
             .expect("blob store poisoned")
             .read_range(digest, offset, len)
+    }
+
+    /// see [`BlobStore::forget`].
+    pub fn forget(&self, digest: &[u8; 32]) {
+        self.0.lock().expect("blob store poisoned").forget(digest)
     }
 
     /// the write-through root, when persistent — where staging slots live.
@@ -511,13 +540,55 @@ mod tests {
         );
     }
 
+    /// `forget` has to release BOTH copies — the disk file and the cached
+    /// bytes — or a "released" blob keeps answering from memory and keeps
+    /// occupying the cache budget it was counted against.
+    #[test]
+    fn forget_releases_the_disk_copy_and_the_cache_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let store = BlobHandle::persistent(root.path()).unwrap();
+        let spent = store.put_chunk(b"spent".to_vec());
+        let kept = store.put_chunk(b"kept".to_vec());
+        assert!(root.path().join(hex(&spent)).exists());
+
+        store.forget(&spent);
+
+        assert!(!store.has_chunk(&spent), "gone from memory AND disk");
+        assert_eq!(store.get_chunk(&spent), None);
+        assert!(!root.path().join(hex(&spent)).exists(), "file unlinked");
+        assert_eq!(
+            store.get_chunk(&kept).as_deref(),
+            Some(b"kept".as_slice()),
+            "forgetting one blob leaves its neighbours alone"
+        );
+        // re-putting after a forget must land a fresh file, not a ghost.
+        assert_eq!(store.put_chunk(b"spent".to_vec()), spent);
+        assert!(store.has_chunk(&spent));
+    }
+
+    /// forgetting a memory-only blob (no root, so nothing was ever queued in
+    /// the eviction order) must not corrupt the cache accounting.
+    #[test]
+    fn forget_on_a_memory_only_store_drops_the_blob() {
+        let store = BlobHandle::default();
+        let digest = store.put_chunk(b"ephemeral".to_vec());
+
+        store.forget(&digest);
+
+        assert!(!store.has_chunk(&digest));
+        let next = store.put_chunk(b"after".to_vec());
+        assert_eq!(store.get_chunk(&next).as_deref(), Some(b"after".as_slice()));
+    }
+
     #[test]
     fn a_memory_only_store_never_evicts() {
         // no root: the map IS the store, so the cache budget must not apply —
         // every blob stays readable no matter how many follow it.
         let store = BlobHandle::default();
         let payload = |seed: u8| vec![seed; 1024 * 1024];
-        let digests: Vec<_> = (0..=64u8).map(|seed| store.put_chunk(payload(seed))).collect();
+        let digests: Vec<_> = (0..=64u8)
+            .map(|seed| store.put_chunk(payload(seed)))
+            .collect();
         for (seed, digest) in digests.iter().enumerate() {
             assert_eq!(
                 store.get_chunk(digest).as_deref(),

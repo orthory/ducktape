@@ -363,7 +363,37 @@ pub enum SyncRequest {
         offset: u64,
         len: u64,
     },
+    /// ask a peer to PRODUCE the git objects a forge branch head needs, and
+    /// answer with the digest of the pack it staged — the catch-up lane for a
+    /// node whose committed head runs ahead of its objects.
+    ///
+    /// the blob lanes above fetch bytes a peer already HOLDS, keyed by the
+    /// digest consensus pinned. that is exact but brittle: pack bytes are not
+    /// reproducible, so only a node holding that very pack can answer, and a
+    /// head whose pack no node kept can never be explained. this lane asks for
+    /// the OBJECTS instead — any peer that materialized `head` can build them
+    /// — and the answer needs no trust: the requester installs the pack (which
+    /// re-hashes every object) and then demands the full closure of `head`,
+    /// an oid consensus already committed. a lying peer fails that check.
+    ///
+    /// `bases` are the requester's own on-disk heads, so the answer is bounded
+    /// to what actually moved. the pack itself travels over
+    /// [`SyncRequest::BlobRange`] like any other large artifact.
+    ForgeObjects {
+        repo: String,
+        head: [u8; FORGE_OID_LEN],
+        bases: Vec<[u8; FORGE_OID_LEN]>,
+    },
 }
+
+/// a raw git sha1 oid — forge's object format, and the only oid width this
+/// lane carries. named here so the codec's bounds read as intent.
+pub const FORGE_OID_LEN: usize = 20;
+
+/// the most on-disk heads a [`SyncRequest::ForgeObjects`] may name. the bases
+/// only narrow the answer, so a requester never needs many; the cap is what
+/// stops a forged count from driving a large allocation.
+pub const MAX_FORGE_BASES: usize = 64;
 
 impl SyncRequest {
     /// the request's kind as a wire-stable snake_case label — the
@@ -380,6 +410,7 @@ impl SyncRequest {
             Self::Blob { .. } => "blob",
             Self::BlobInfo { .. } => "blob_info",
             Self::BlobRange { .. } => "blob_range",
+            Self::ForgeObjects { .. } => "forge_objects",
         }
     }
 }
@@ -474,6 +505,13 @@ pub enum SyncResponse {
     BlobRange {
         bytes: Option<Vec<u8>>,
     },
+    /// the [`SyncRequest::ForgeObjects`] answer: the digest of the pack this
+    /// node staged for the asked head, `None` when it cannot build one (it
+    /// does not hold that head's objects either). the requester pulls the
+    /// bytes over the ranged blob lane and verifies them against the head.
+    ForgeObjects {
+        digest: Option<[u8; 32]>,
+    },
 }
 
 impl SyncResponse {
@@ -489,6 +527,7 @@ impl SyncResponse {
             Self::Blob { .. } => "Blob",
             Self::BlobInfo { .. } => "BlobInfo",
             Self::BlobRange { .. } => "BlobRange",
+            Self::ForgeObjects { .. } => "ForgeObjects",
             Self::Error(_) => "Error",
         }
     }
@@ -579,6 +618,15 @@ pub fn encode_request(req: &SyncRequest) -> Vec<u8> {
             out.extend_from_slice(&offset.to_le_bytes());
             out.extend_from_slice(&len.to_le_bytes());
         }
+        SyncRequest::ForgeObjects { repo, head, bases } => {
+            out.push(9u8);
+            wire::put_str(&mut out, repo);
+            out.extend_from_slice(head);
+            out.extend_from_slice(&(bases.len() as u32).to_le_bytes());
+            for base in bases {
+                out.extend_from_slice(base);
+            }
+        }
     }
     out
 }
@@ -625,6 +673,21 @@ pub fn decode_request(bytes: &[u8]) -> Result<SyncRequest, WireError> {
             offset: wire::take_u64(&mut buf)?,
             len: wire::take_u64(&mut buf)?,
         },
+        9 => {
+            let repo = wire::take_str(&mut buf)?;
+            let head = wire::take_array::<FORGE_OID_LEN>(&mut buf)?;
+            let count = wire::take_u32(&mut buf)? as usize;
+            if count > MAX_FORGE_BASES {
+                return Err(WireError::Codec(format!(
+                    "forge base count {count} exceeds the {MAX_FORGE_BASES} cap"
+                )));
+            }
+            let mut bases = Vec::with_capacity(count);
+            for _ in 0..count {
+                bases.push(wire::take_array::<FORGE_OID_LEN>(&mut buf)?);
+            }
+            SyncRequest::ForgeObjects { repo, head, bases }
+        }
         other => return Err(WireError::BadTag("SyncRequest", other)),
     };
     wire::expect_empty(buf)?;
@@ -755,6 +818,16 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
                 Some(b) => {
                     out.push(1);
                     wire::put_bytes(&mut out, b);
+                }
+                None => out.push(0),
+            }
+        }
+        SyncResponse::ForgeObjects { digest } => {
+            out.push(11u8);
+            match digest {
+                Some(d) => {
+                    out.push(1);
+                    out.extend_from_slice(d);
                 }
                 None => out.push(0),
             }
@@ -1112,6 +1185,13 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 0 => None,
                 1 => Some(wire::take_bytes(&mut buf)?.to_vec()),
                 t => return Err(WireError::BadTag("blob range presence", t)),
+            },
+        },
+        11 => SyncResponse::ForgeObjects {
+            digest: match wire::take_u8(&mut buf)? {
+                0 => None,
+                1 => Some(wire::take_array::<32>(&mut buf)?),
+                t => return Err(WireError::BadTag("forge objects presence", t)),
             },
         },
         other => return Err(WireError::BadTag("SyncResponse", other)),
@@ -1515,6 +1595,11 @@ impl SyncServer {
             | SyncRequest::BlobInfo { .. }
             | SyncRequest::BlobRange { .. } => {
                 return Err("blob requests are answered by the host layer".into());
+            }
+            // likewise the forge object lane: the host builds the pack from
+            // its own git substrate, which this server cannot see.
+            SyncRequest::ForgeObjects { .. } => {
+                return Err("forge object requests are answered by the host layer".into());
             }
             SyncRequest::Frames {
                 after_height,
@@ -2235,9 +2320,55 @@ mod tests {
                 after: None,
             },
             SyncRequest::Blob { digest: [7u8; 32] },
+            SyncRequest::ForgeObjects {
+                repo: "ducktape".into(),
+                head: [9u8; FORGE_OID_LEN],
+                bases: vec![[1u8; FORGE_OID_LEN], [2u8; FORGE_OID_LEN]],
+            },
+            SyncRequest::ForgeObjects {
+                repo: String::new(),
+                head: [9u8; FORGE_OID_LEN],
+                bases: Vec::new(),
+            },
         ] {
             let bytes = encode_request(&req);
             assert_eq!(decode_request(&bytes).unwrap(), req);
+        }
+    }
+
+    /// the base list is attacker-chosen, so its count must be capped BEFORE
+    /// it sizes an allocation — and a truncated tail must reject rather than
+    /// decode a short list.
+    #[test]
+    fn forge_object_request_rejects_an_oversized_base_count() {
+        let mut framed = encode_request(&SyncRequest::ForgeObjects {
+            repo: "demo".into(),
+            head: [9u8; FORGE_OID_LEN],
+            bases: Vec::new(),
+        });
+        let count_at = framed.len() - 4;
+        framed[count_at..].copy_from_slice(&(MAX_FORGE_BASES as u32 + 1).to_le_bytes());
+        assert!(decode_request(&framed).is_err(), "count past the cap");
+
+        let mut truncated = encode_request(&SyncRequest::ForgeObjects {
+            repo: "demo".into(),
+            head: [9u8; FORGE_OID_LEN],
+            bases: vec![[1u8; FORGE_OID_LEN]],
+        });
+        truncated.truncate(truncated.len() - 1);
+        assert!(decode_request(&truncated).is_err(), "short base tail");
+    }
+
+    #[test]
+    fn forge_object_response_round_trips_hit_and_miss() {
+        for resp in [
+            SyncResponse::ForgeObjects {
+                digest: Some([3u8; 32]),
+            },
+            SyncResponse::ForgeObjects { digest: None },
+        ] {
+            let bytes = encode_response(&resp);
+            assert_eq!(decode_response(&bytes).unwrap(), resp);
         }
     }
 

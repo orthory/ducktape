@@ -628,16 +628,15 @@ fn the_catch_up_map_clears_on_arrival_and_a_corrupt_one_is_fail_stop() {
 }
 
 #[test]
-fn pending_digests_is_the_node_side_pull_handle() {
+fn pending_branches_is_the_node_side_pull_handle() {
     // the node's blob plane reads this WITHOUT opening the module: node-local
     // possession must never ride the deterministic `Module` surface, because a
     // block that could read it would fork.
     let (src_dir, _src, cap) = source_one("digests-src");
     let dir = tmp_repo("digests");
 
-    assert_eq!(
-        forge::pending_digests(&dir).unwrap(),
-        Vec::<[u8; 32]>::new(),
+    assert!(
+        forge::pending_branches(&dir).unwrap().is_empty(),
         "a workspace with no file is not an error",
     );
 
@@ -647,10 +646,13 @@ fn pending_digests_is_the_node_side_pull_handle() {
     push(&mut node, None, &cap.head, &digest);
 
     let want: [u8; 32] = digest.clone().try_into().unwrap();
+    let outstanding = forge::pending_branches(&dir).unwrap();
+    assert_eq!(outstanding.len(), 1, "one branch is waiting");
     assert_eq!(
-        forge::pending_digests(&dir).unwrap(),
-        vec![want],
-        "the outstanding pack is visible from outside the module",
+        (outstanding[0].digest, outstanding[0].head.as_bytes().as_slice()),
+        (want, cap.head.as_slice()),
+        "the outstanding pack AND the head it explains are both visible from \
+         outside the module",
     );
 
     // and it goes quiet once the objects land.
@@ -658,7 +660,7 @@ fn pending_digests_is_the_node_side_pull_handle() {
     cap.stash(&arrived);
     let mut caught_up = Forge::with_blobs("forge", dir.clone(), arrived).unwrap();
     caught_up.materialize().unwrap();
-    assert!(forge::pending_digests(&dir).unwrap().is_empty());
+    assert!(forge::pending_branches(&dir).unwrap().is_empty());
 
     let _ = std::fs::remove_dir_all(&src_dir);
     let _ = std::fs::remove_dir_all(&dir);

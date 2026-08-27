@@ -335,36 +335,47 @@ impl RepoState {
                 done.push(branch.clone());
                 continue;
             }
-            let Some(pack) = blobs.get_chunk(digest) else {
+            // the pack named by the push is the fast route to the objects, not
+            // the only one: the node's object catch-up lane pulls them from a
+            // peer that may never have held this exact pack (pack bytes are
+            // not reproducible, so a peer rebuilds its own). install what we
+            // hold, then let the CLOSURE decide — a branch whose objects
+            // arrived by any route materializes without this digest ever
+            // turning up.
+            let held_pack = blobs.get_chunk(digest);
+            if let Some(pack) = &held_pack
+                && let Err(why) = git::install_pack(&repo, pack)
+            {
                 if self.warned.insert(branch.clone()) {
                     tracing::warn!(
                         target: "ducktape::forge",
-                        reason = "pack_missing",
+                        reason = "pack_unreadable",
+                        repo = %name,
+                        branch = %branch,
+                        head = %head,
+                        why = %why,
+                        "materialize: the held pack would not install"
+                    );
+                }
+                continue;
+            }
+            if let Err(why) =
+                advance_ref(&repo, &refname, *head, prior, is_protected_branch(branch))
+            {
+                // the two reasons stay distinct: nothing to work with at all
+                // versus objects that are present but refused.
+                let reason = match held_pack {
+                    Some(_) => "materialize_refused",
+                    None => "pack_missing",
+                };
+                if self.warned.insert(branch.clone()) {
+                    tracing::warn!(
+                        target: "ducktape::forge",
+                        reason,
                         repo = %name,
                         branch = %branch,
                         head = %head,
                         digest = %crate::hex(digest),
-                        "materialize: on-disk ref stays behind; root already reflects the \
-                         committed head"
-                    );
-                }
-                continue;
-            };
-            if let Err(why) = install_and_advance(
-                &repo,
-                &refname,
-                *head,
-                prior,
-                &pack,
-                is_protected_branch(branch),
-            ) {
-                if self.warned.insert(branch.clone()) {
-                    tracing::warn!(
-                        target: "ducktape::forge",
-                        reason = "materialize_refused",
-                        repo = %name,
-                        branch = %branch,
-                        head = %head,
                         why = %why,
                         "materialize: leaving the on-disk ref behind; root already correct"
                     );
@@ -381,20 +392,18 @@ impl RepoState {
     }
 }
 
-/// the pure git side of one branch's materialize attempt: install the pack,
-/// require the full closure of `head`, optionally require fast-forward, then
-/// move the ref. any failure is returned so the caller can turn
-/// it into a safe no-op.
+/// the pure git side of one branch's materialize attempt: require the full
+/// closure of `head` to be present, optionally require fast-forward, then move
+/// the ref. any failure is returned so the caller can turn it into a safe
+/// no-op — and the closure check is what makes the objects' ROUTE irrelevant.
 #[cfg(feature = "native")]
-fn install_and_advance(
+fn advance_ref(
     repo: &Repository,
     refname: &str,
     head: Oid,
     prior: Option<Oid>,
-    pack: &[u8],
     require_ff: bool,
 ) -> Result<(), Error> {
-    git::install_pack(repo, pack).map_err(|e| Error::Module(e.to_string()))?;
     git::verify_closure(repo, head.into()).map_err(|e| Error::Module(e.to_string()))?;
     if require_ff && let Some(prior) = prior {
         let ff = git::is_descendant(repo, head.into(), prior.into())

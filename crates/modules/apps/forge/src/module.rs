@@ -155,26 +155,127 @@ pub fn compact_repos(base: &std::path::Path, min_packs: usize) -> Result<usize, 
     Ok(reclaimed)
 }
 
-/// every pack digest a forge workspace is still waiting on, read from
+/// build the pack a peer needs to reach `head` in `repo`, bounded by the
+/// `bases` it says it already holds — the SERVE half of the object catch-up
+/// lane, and the reason a head stays recoverable after the pack that pushed
+/// it is gone from every store.
+///
+/// `None` when this node cannot answer: no such repo here, or `head` is not
+/// one of the branch heads it holds. that guard is the whole anti-amplifier:
+/// a peer can only make this node pack history it has itself materialized,
+/// never an arbitrary walk of its object database.
+pub fn build_objects(
+    base: &std::path::Path,
+    repo: &str,
+    head: Oid,
+    bases: &[Oid],
+) -> Result<Option<Vec<u8>>, Error> {
+    let name = norm_repo(repo)?;
+    let dir = base.join(&name);
+    if !dir.join(".git").exists() {
+        return Ok(None);
+    }
+    let repo = git::open(&dir).map_err(|e| Error::Module(format!("forge: open {name:?}: {e}")))?;
+    let want: git2::Oid = head.into();
+    let serves_head = git::list_branches(&repo)
+        .map_err(|e| Error::Module(format!("forge: read refs of {name:?}: {e}")))?
+        .iter()
+        .any(|(_, oid)| *oid == want);
+    if !serves_head {
+        return Ok(None);
+    }
+    // a base this node never saw cannot bound the walk (and must not error) —
+    // the same filter the git fetch lane applies to a client's haves.
+    let known: Vec<git2::Oid> = bases
+        .iter()
+        .map(|base| git2::Oid::from(*base))
+        .filter(|base| repo.find_commit(*base).is_ok())
+        .collect();
+    let pack = match known.is_empty() {
+        true => git::pack_closure_many(&repo, &[want]),
+        false => git::pack_delta(&repo, &[want], &known),
+    };
+    pack.map(Some)
+        .map_err(|e| Error::Module(format!("forge: pack {name:?}: {e}")))
+}
+
+/// this node's own branch heads for `repo` — what a catch-up request sends as
+/// its bases, so the answer carries only what actually moved. a repo nothing
+/// has materialized here yet simply has none.
+pub fn on_disk_heads(base: &std::path::Path, repo: &str) -> Result<Vec<Oid>, Error> {
+    let name = norm_repo(repo)?;
+    let dir = base.join(&name);
+    if !dir.join(".git").exists() {
+        return Ok(Vec::new());
+    }
+    let repo = git::open(&dir).map_err(|e| Error::Module(format!("forge: open {name:?}: {e}")))?;
+    Ok(git::list_branches(&repo)
+        .map_err(|e| Error::Module(format!("forge: read refs of {name:?}: {e}")))?
+        .into_iter()
+        .map(|(_, oid)| Oid::from(oid))
+        .collect())
+}
+
+/// install objects a peer built, and prove they close `head` — the RECEIVE
+/// half of the same lane.
+///
+/// no trust attaches to which peer answered: indexing re-hashes every object
+/// in the pack, and the closure check pins the result to an oid consensus has
+/// already committed. this NEVER moves a ref — forge's own `materialize` does
+/// that at its next block boundary, once the closure is there.
+pub fn install_objects(
+    base: &std::path::Path,
+    repo: &str,
+    head: Oid,
+    pack: &[u8],
+) -> Result<(), Error> {
+    let name = norm_repo(repo)?;
+    let repo = refs::open_or_init_repo(base, &name)?;
+    git::install_pack(&repo, pack)
+        .map_err(|e| Error::Module(format!("forge: install objects for {name:?}: {e}")))?;
+    git::verify_closure(&repo, head.into())
+        .map_err(|e| Error::Module(format!("forge: objects do not close {head}: {e}")))
+}
+
+/// one branch a forge workspace is still waiting on.
+///
+/// the digest is the pack the push named — exact, and the cheap route while
+/// some node still holds those bytes. the head is what makes the branch
+/// recoverable WITHOUT them: any peer that materialized it can rebuild the
+/// objects, and the requester verifies the result against this very oid,
+/// which consensus already committed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingBranch {
+    pub repo: String,
+    pub branch: String,
+    pub head: Oid,
+    pub digest: [u8; 32],
+}
+
+/// every branch a forge workspace is still waiting on, read from
 /// [`PENDING_FILE`] WITHOUT opening the module.
 ///
 /// this is the node's pull handle. the catch-up map is node-local possession,
 /// never consensus state, so it deliberately does NOT ride the deterministic
 /// `Module` surface — a block that could read it would fork. the node's blob
-/// plane sweeps this out of band, fetches the bytes, and forge picks them up
-/// from its own blob store on its next `commit_block`; nothing here mutates.
+/// plane sweeps this out of band, fetches the objects, and forge picks them up
+/// on its next `commit_block`; nothing here mutates.
 ///
 /// a workspace with nothing outstanding has no file, which is `Ok(vec![])`.
-pub fn pending_digests(base: &std::path::Path) -> Result<Vec<[u8; 32]>, Error> {
-    let mut digests: Vec<[u8; 32]> = read_pending(base)?
-        .into_values()
-        .flat_map(|pending| pending.into_values().map(|(_, digest)| digest))
-        .collect();
-    // one pack can be the target of several branches (a push moving two refs
-    // to the same closure); fetch it once.
-    digests.sort_unstable();
-    digests.dedup();
-    Ok(digests)
+pub fn pending_branches(base: &std::path::Path) -> Result<Vec<PendingBranch>, Error> {
+    Ok(read_pending(base)?
+        .into_iter()
+        .flat_map(|(repo, pending)| {
+            pending
+                .into_iter()
+                .map(move |(branch, (head, digest))| PendingBranch {
+                    repo: repo.clone(),
+                    branch,
+                    head,
+                    digest,
+                })
+        })
+        .collect())
 }
 
 pub struct Forge {
@@ -2908,6 +3009,108 @@ mod tests {
         assert_eq!(git_head_oid(&base, "demo"), head, "the ref never moved");
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&source_base);
+    }
+
+    /// the oldest commit reachable from `head` — the "behind" position a
+    /// catch-up test starts a second workspace at.
+    fn root_commit(base: &std::path::Path, head: Oid) -> git2::Oid {
+        let repo = refs::open_or_init_repo(base, "demo").unwrap();
+        let mut commit = repo.find_commit(head.into()).unwrap();
+        while commit.parent_count() > 0 {
+            commit = commit.parent(0).unwrap();
+        }
+        commit.id()
+    }
+
+    /// the objects can arrive by ANY route — the catch-up lane pulls them
+    /// from a peer that never held the pushed pack. materialize must then
+    /// advance the ref on the closure alone, with that digest nowhere.
+    #[test]
+    fn a_head_whose_objects_arrived_elsewhere_materializes_without_its_pack() {
+        let base = tmp_base("materialize-any-route");
+        let source_base = tmp_base("materialize-any-route-source");
+        let head = seed_pushed_packs(&base, &source_base);
+        // rewind the ref: every object is here, the branch just has not been
+        // moved onto the committed head yet.
+        let repo = refs::open_or_init_repo(&base, "demo").unwrap();
+        let behind = repo
+            .find_commit(head.into())
+            .unwrap()
+            .parent(0)
+            .unwrap()
+            .id();
+        git::update_ref(&repo, &refs::full_ref(MAIN_BRANCH), behind).unwrap();
+
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+        forge
+            .state
+            .repos
+            .get_mut("demo")
+            .expect("the on-disk repo is adopted")
+            .adopt_pending(refs::PendingMap::from([(
+                MAIN_BRANCH.to_string(),
+                (head, [7u8; 32]),
+            )]));
+        // nothing in the blob store answers for that digest, and nothing ever will.
+        forge.materialize().unwrap();
+
+        assert_eq!(
+            git_head_oid(&base, "demo"),
+            head,
+            "the ref advanced on the closure alone"
+        );
+        assert!(
+            pending_branches(&base).unwrap().is_empty(),
+            "the branch is no longer waiting on anything"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&source_base);
+    }
+
+    /// the lane end to end, without a mesh: a node holding the head builds the
+    /// objects a behind node is missing, bounded by what that node already
+    /// has, and the behind node installs them and proves the closure.
+    #[test]
+    fn a_holder_rebuilds_exactly_the_objects_a_behind_node_is_missing() {
+        let base = tmp_base("objects-holder");
+        let source_base = tmp_base("objects-holder-source");
+        let behind = tmp_base("objects-behind");
+        let head = seed_pushed_packs(&base, &source_base);
+
+        // the behind node holds only the root commit.
+        let first = root_commit(&base, head);
+        let holder = refs::open_or_init_repo(&base, "demo").unwrap();
+        let seed = git::pack_closure_many(&holder, &[first]).unwrap();
+        let catching_up = refs::open_or_init_repo(&behind, "demo").unwrap();
+        git::install_pack(&catching_up, &seed).unwrap();
+        git::update_ref(&catching_up, &refs::full_ref(MAIN_BRANCH), first).unwrap();
+
+        let bases = on_disk_heads(&behind, "demo").unwrap();
+        assert_eq!(bases, vec![Oid::from(first)], "its own head is the base");
+        let bounded = build_objects(&base, "demo", head, &bases)
+            .unwrap()
+            .expect("the holder serves a head it holds");
+        let whole = build_objects(&base, "demo", head, &[]).unwrap().unwrap();
+        assert!(
+            bounded.len() < whole.len(),
+            "the base bounds the answer ({} vs {} bytes)",
+            bounded.len(),
+            whole.len()
+        );
+
+        install_objects(&behind, "demo", head, &bounded).expect("the closure lands");
+
+        // and the guard: a commit this node holds but does NOT serve as a
+        // branch head is not packable — the lane is not a general odb reader.
+        assert!(
+            build_objects(&base, "demo", Oid::from(first), &[])
+                .unwrap()
+                .is_none(),
+            "only branch heads are servable"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&source_base);
+        let _ = std::fs::remove_dir_all(&behind);
     }
 
     /// a packfile is named for its contents, so when one installed pack
