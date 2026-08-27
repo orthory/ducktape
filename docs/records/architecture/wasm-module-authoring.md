@@ -5,11 +5,13 @@ How to write, build, and live-update a Ducktape wasm module. The runtime is
 the `ducktape:module` WIT world (`crates/kernel/module-guest/wit/module.wit`);
 the reference modules are `crates/guests/hello-wasm`,
 `crates/guests/hello-wasm-replacement` (its live-update target), and
-`crates/guests/sibling-wasm` (the cross-module-read reference). The first
-REAL production tenant is `crates/guests/directory-wasm` — the wasm port of
-the `directory` module, bytes-compatible with the native implementation it
-replaced (same root, same snapshot encoding: the cutover left the root-hash
-untouched).
+`crates/guests/sibling-wasm` (the cross-module-read reference) — kernel test
+fixtures, in no genesis set. The first wasm port of a native module is
+`crates/examples/directory` (`src/guest.rs`), bytes-compatible with the native
+implementation it replaced (same root, same snapshot encoding); it stays in
+`topology::PRODUCTION` as the e2e lane's write tenant. The node binary embeds
+no component: the founder bundles every wasm tenant's `component.wasm` into
+the workspace `modules/` dir, and the network descriptor commits its sha256.
 
 ## The model (design-B: host-owned state, guest as pure logic)
 
@@ -103,9 +105,10 @@ cargo build --target wasm32-unknown-unknown --release
 wasm-tools component new target/wasm32-unknown-unknown/release/hello_wasm.wasm -o component.wasm
 ```
 
-The committed copies of one module's component MUST stay byte-identical (the
-node embeds the canonical artifact — its sha256 is the genesis-seeded active
-hash — and the kernel test fixtures pin the same bytes). Component bytes are
+The committed copies of one module's component MUST stay byte-identical
+(nothing is embedded: the founder bundles the canonical artifact and the
+descriptor commits its sha256 as the genesis-seeded active hash; the kernel
+test fixtures — the node pins' bundle — carry the same bytes). Component bytes are
 toolchain-dependent, so `wasm-modules-check` gates mutual consistency, not
 reproducibility; refresh the whole set together with `make wasm-modules` and
 commit it as one change. The check rides the pre-push `make test` gate.

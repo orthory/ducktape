@@ -681,7 +681,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "3dff07e927044a1a65313c5118a2aaf85ee581b518bd5bec818c3cb7b835bb64";
+        "f052878c0abaac71c5df39a0c63674e07ffd1c78fa3035801cad871ea50be01b";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's store as a genesis
@@ -788,7 +788,7 @@ mod tests {
                     let manifest =
                         Manifest::capture(&host, None, 0, 0, Vec::new(), Vec::new(), None, 0, 1)
                             .expect("capture");
-                    let captured = admitted_restore_snapshot(&manifest, "hello").expect("hello");
+                    let captured = admitted_restore_snapshot(&manifest, "runs").expect("runs");
                     assert!(
                         captured.is_some(),
                         "a captured Map tenant restores its bytes"
@@ -884,7 +884,7 @@ mod tests {
     /// It is the only ABSOLUTE one in the tree, and until it existed every claim
     /// that "the root hash did not move" was relative and therefore weak.
     /// `bin/simnode/tests/topology_set.rs` pins the 14-module NATIVE sim
-    /// composition — which excludes `capability`, `hello`, `governance` and
+    /// composition — which excludes `capability`, `directory`, `governance` and
     /// `lifecycle`, and is not what a node runs. And `git diff crates/modules/`
     /// on a committed tree is EMPTY BY CONSTRUCTION, so quoting it proves
     /// nothing at all. Neither would have noticed a module's bytes changing.

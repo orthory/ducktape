@@ -1,12 +1,12 @@
 ---
 name: module-dev
-description: Use when creating a new ducktape consensus module, porting a native module to a wasm guest, or wiring a module into the genesis set — MODULE_IDS, host_state, crates/guests, Makefile wasm-modules. Also when a module change breaks the root-hash, the registry parity test, include_bytes compilation, or wasm-modules-check.
+description: Use when creating a new ducktape consensus module, porting a native module to a wasm guest, or wiring a module into the genesis set — topology::PRODUCTION, host_state, crates/guests, Makefile wasm-modules. Also when a module change breaks the root-hash pin, the registry parity test, a missing component in the fixtures/modules dir, or wasm-modules-check.
 ---
 
 # Module development — the end-to-end wiring runbook
 
 A module is four layers: native crate (the logic) → wasm guest (the packaging)
-→ registration (across FOUR bins, not one) → proofs (parity + fixtures).
+→ registration (the topology, then THREE bins) → proofs (parity + fixtures).
 
 **REQUIRED BACKGROUND:** `docs/records/architecture/wasm-module-authoring.md`
 — the guest contract (host-owned state, sibling reads, live update, the
@@ -15,8 +15,9 @@ External/third-party authoring rides `ducktape-quack`, not this path.
 
 ## Decide first: genesis registration is a root-hash break
 
-A module in `MODULE_IDS` joins the genesis set: every existing workspace fails
-closed, dev networks re-genesis. Post-genesis admission (lifecycle
+A module in `topology::PRODUCTION` (`bin/node`'s `MODULE_IDS` IS that
+selection) joins the genesis set: every existing workspace fails closed, dev
+networks re-genesis, and `GENESIS_ROOT_HASH` moves. Post-genesis admission (lifecycle
 `ScheduleRegister`) exists, but the recovery/state-sync composers still
 enumerate a fixed module set, so restore past an admitted module's first
 checkpoint fails closed. A new module today ⇒ a new genesis — get that agreed
@@ -69,11 +70,11 @@ the module to `INDEX_MODULES` in the Makefile and to `index_guest_wasm()` in
 ASYNC behind a fluent31 changes-mode trigger — views trail the op feed
 observably (`/v1/index/status` `fold.{module}`), never atomically.
 
-## 3. Registration — four bins compose modules
+## 3. Registration — the topology, then three bins
 
 | Bin | Runs | What to touch |
 |---|---|---|
-| `bin/node` | production set: native + wasm tenants | `constants.rs`: `MODULE_IDS` (bump the `[..; N]` literal). `host_state.rs`: ~10 sites — grep an existing module id and mirror EVERY hit (`include_bytes!`, id const, `genesis_<id>_wasm`, `seeded_lifecycle`, `seed_genesis_components`, `ProductionModules` field, `compose`, `genesis_host`, `restore_host`, `sync_all_modules`). `Cargo.toml` dep. |
+| `bin/node` | production set: native + wasm tenants | `crates/topology/src/lib.rs`: a `ModuleSpec` row in `MODULES` (`code`/`backing`/wiring) and the id in `PRODUCTION`; `host_state` composes genesis/restore/sync from that selection — nothing to mirror there. A native tenant also needs the `Cargo.toml` dep. The component is NOT embedded: it lives in the kernel fixtures dir (the pins' bundle) and the founder's `modules/` dir, hashed into the descriptor at `node init`. |
 | `bin/noded` | daemon, composes native instances | grep `"tasks"`: id list, `use`, construct, register |
 | `bin/simnode` | deterministic /v1 twin | same shape as noded |
 
@@ -81,18 +82,19 @@ noded/simnode run a SUBSET — a wasm-only tenant (e.g. `vaults`) appears
 in `bin/node` alone. Decide whether the module belongs in the daemon/sim lanes;
 if it should be testable in sim-lane or visible in the app, it does.
 
-A new module joins `MODULE_IDS`; keep its declared `[..; N]` length equal to
-its contents (the auto-merge count trap).
+A new module joins `topology::PRODUCTION`; update the topology's count and
+membership pins and `host_state.rs`'s `GENESIS_ROOT_HASH` in the SAME commit
+(the failing pin prints the new hex) and name the flag day in the message.
 
 ## 4. Gates — ordering is load-bearing
 
 ```
 cargo test -p <id>                                        # 1. native logic
 cargo run -p guest-builder -- crates/modules/<plane>/<id> # 2. catches native-dep leaks
-make wasm-modules                                         # 3. BEFORE bin/node compiles —
-                                                          #    include_bytes! needs the artifact
+make wasm-modules                                         # 3. BEFORE the node pins run —
+                                                          #    the fixtures dir needs the artifact
 cargo check --workspace --all-targets                     # 4. registry parity test gates
-cargo clippy -p <id> --tests --no-deps                    #    constants↔live-module drift
+cargo clippy -p <id> --tests --no-deps                    #    topology↔composed-host drift
 make wasm-modules-check                                   # 5. committed copies byte-identical
 ```
 
@@ -101,8 +103,8 @@ make wasm-modules-check                                   # 5. committed copies 
 | Mistake | Reality |
 |---|---|
 | Registering only in `bin/node` | noded/simnode compose their own instances; the module is invisible in daemon/sim lanes |
-| Array `[..; N]` length left stale after adding/removing a module | the declared length must equal the contents or the build fails (the auto-merge count trap) |
+| Topology pins or `GENESIS_ROOT_HASH` left stale after adding/removing a module | `cargo test -p topology` and the root-hash pin fail; update both in the same commit |
 | Guest added to root workspace members | guests are standalone BY DESIGN; membership poisons native feature unification |
-| `include_bytes!` before `make wasm-modules` | bin/node cannot compile until the component exists |
+| Node pins run before `make wasm-modules` | the fixtures dir lacks the component; `hash_bundle` refuses by name |
 | Rebuilding one guest's component alone | bytes are toolchain-dependent; refresh the set together or `wasm-modules-check` fails |
 | Native-only dep in the module crate | wasm32 build breaks; gate it behind the `native` feature (the `files` shape) |
