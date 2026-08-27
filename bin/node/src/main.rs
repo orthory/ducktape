@@ -701,7 +701,7 @@ fn run_node(
                 storage_for_sync,
                 recovery,
                 &manifest,
-                forge_repo,
+                forge_repo.clone(),
                 duckfs_dir,
             )
             .await;
@@ -734,6 +734,7 @@ fn run_node(
                 stream_hub,
                 index,
                 code_stage_requests,
+                forge_repo,
                 blobs,
                 overlay_slot,
                 bulk_pacer,

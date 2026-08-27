@@ -90,6 +90,9 @@ pub(super) async fn finish(
     gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
     gateway_workspace: std::path::PathBuf,
+    // forge's git substrate — the serve lane builds a peer's catch-up objects
+    // straight off it (see `blob_fetch::serve_forge_objects`).
+    forge_repo: std::path::PathBuf,
     blobs: noded::blobs::BlobHandle,
     initial_member_keys: Vec<ed25519::PublicKey>,
     initial_resident_keys: Vec<ed25519::PublicKey>,
@@ -196,6 +199,7 @@ pub(super) async fn finish(
             .chain(initial_resident_keys.iter())
             .cloned()
             .collect(),
+        forge_repo,
         blobs,
         sync_monitor,
         sync_tx,
@@ -256,6 +260,7 @@ pub(super) fn wire_serve_lanes(
     signer: &ed25519::PrivateKey,
     namespace: &[u8],
     initial_transport: Vec<ed25519::PublicKey>,
+    forge_repo: std::path::PathBuf,
     blobs: noded::blobs::BlobHandle,
     sync_monitor: statesync::monitor::ServeMonitor,
     sync_tx: super::MeshSender,
@@ -300,6 +305,9 @@ pub(super) fn wire_serve_lanes(
     let blob_peers: Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>> =
         Arc::new(std::sync::RwLock::new(initial_transport));
     let sync_blobs = blobs;
+    // one staged catch-up pack per repo, replaced as the next answer lands —
+    // see `blob_fetch::serve_forge_objects`.
+    let served_packs: blob_fetch::ServedPacks = Default::default();
     // the serve-lane blob co-client: this validator's own fetch side of the
     // blob lane. sends ride a sender clone under this node's OWN standing
     // proof (a validator's key is in the committed valset); answers route
@@ -468,6 +476,18 @@ pub(super) fn wire_serve_lanes(
                         offset,
                         len,
                     } => blob_fetch::serve_blob_range(&sync_blobs, &digest, offset, len),
+                    // forge object catch-up: also host state, built off this
+                    // node's own git substrate — SyncServer cannot see it.
+                    statesync::SyncRequest::ForgeObjects { repo, head, bases } => {
+                        blob_fetch::serve_forge_objects(
+                            &forge_repo,
+                            &sync_blobs,
+                            &served_packs,
+                            &repo,
+                            head,
+                            &bases,
+                        )
+                    }
                     req => {
                         // renew the sync retention lease: this node is
                         // actively serving a syncer, so the drain defers

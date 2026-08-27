@@ -178,6 +178,7 @@ pub(crate) async fn run_validator(
         gateway_requests,
         gateway_commands.clone(),
         gateway_workspace.clone(),
+        forge_repo.clone(),
         blobs.clone(),
         initial_member_keys,
         initial_resident_keys,
@@ -392,6 +393,9 @@ pub(crate) async fn run_promoted(
     stream_hub: noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
     code_stage_requests: tokio::sync::mpsc::Receiver<noded::CodeStageRequest>,
+    // forge's git substrate: the seat's serve lane builds a peer's catch-up
+    // objects off it, exactly as the fresh-boot lane does.
+    forge_repo: std::path::PathBuf,
     blobs: noded::blobs::BlobHandle,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
@@ -494,6 +498,7 @@ pub(crate) async fn run_promoted(
         &signer,
         &namespace,
         transport.iter().cloned().collect(),
+        forge_repo.clone(),
         blobs.clone(),
         sync_monitor,
         sync_tx,

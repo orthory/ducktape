@@ -109,6 +109,14 @@ fn full_suite() -> Vec<(&'static str, SyncRequest)> {
             },
         ),
         (
+            "ForgeObjects",
+            SyncRequest::ForgeObjects {
+                repo: "ducktape".into(),
+                head: [6u8; statesync::FORGE_OID_LEN],
+                bases: vec![[5u8; statesync::FORGE_OID_LEN]],
+            },
+        ),
+        (
             "FramesInvertedRange (protocol-error probe)",
             SyncRequest::Frames {
                 after_height: 99,
@@ -163,6 +171,11 @@ fn canned_response(req: &SyncRequest) -> SyncResponse {
                 roots: vec![("kv".into(), StateRoot([5u8; 32]))],
                 root_hash: StateRoot([6u8; 32]),
             }],
+        },
+        // the forge object lane: the head's low byte stands in for "which
+        // pack did the host stage", so the two bindings must agree on it.
+        SyncRequest::ForgeObjects { head, .. } => SyncResponse::ForgeObjects {
+            digest: Some([head[0]; 32]),
         },
         SyncRequest::IndexOps {
             boundary, after, ..
