@@ -11,10 +11,11 @@
 //! whether the native registries seed from [`Bindings`] or reopen as committed
 //! is the [`Boot`] mode.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use sdk::{MerkleStore, Module, StateRoot};
+use sha2::Digest as _;
 use topology::{Backing, Code, ModuleSpec, TOPOLOGY};
 use wasm_host::WasmModule;
 
@@ -51,7 +52,11 @@ pub struct Bindings<'a> {
     /// the genesis validator set (32-byte ed25519 keys) valset seeds from.
     pub validators: &'a [Vec<u8>],
     /// module id → the sha256 of its genesis component: the code source is
-    /// asked for these bytes, and lifecycle seeds its registry with them.
+    /// asked for these bytes (and the bytes are checked against the hash), and
+    /// lifecycle seeds its registry with them. PRECONDITION: the key set is
+    /// EXACTLY the selection's wasm ids (`TOPOLOGY.wasm_ids(selection)`) —
+    /// every entry lands in the lifecycle root, so a stray extra key would
+    /// move the genesis root; [`compose`] refuses any drift by name.
     pub code_hashes: &'a BTreeMap<String, [u8; 32]>,
 }
 
@@ -70,7 +75,8 @@ pub enum Boot<'a> {
     },
 }
 
-/// compose `selection` in order: every id must be in the topology.
+/// compose `selection` in order: every id must be in the topology, and
+/// `bindings.code_hashes` must key exactly the selection's wasm ids.
 pub async fn compose(
     selection: &[&'static str],
     code: &dyn host::CodeSource,
@@ -79,14 +85,40 @@ pub async fn compose(
     bindings: &Bindings<'_>,
     mut boot: Boot<'_>,
 ) -> Result<Vec<Box<dyn Module>>, String> {
-    let mut out = Vec::with_capacity(selection.len());
-    for id in selection {
-        let spec = TOPOLOGY
-            .spec(id)
-            .ok_or_else(|| format!("module {id} is not in the topology"))?;
+    let specs = selection
+        .iter()
+        .map(|id| {
+            TOPOLOGY
+                .spec(id)
+                .ok_or_else(|| format!("module {id} is not in the topology"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    check_code_hash_keys(selection, bindings.code_hashes)?;
+    let mut out = Vec::with_capacity(specs.len());
+    for spec in specs {
         out.push(compose_module(spec, code, stores, substrates, bindings, &mut boot).await?);
     }
     Ok(out)
+}
+
+/// the `code_hashes` key set is EXACTLY the selection's wasm ids: every entry
+/// seeds the lifecycle registry (a stray key moves the genesis root) and every
+/// wasm tenant needs one (a missing key cannot compose). named both ways.
+fn check_code_hash_keys(
+    selection: &[&'static str],
+    code_hashes: &BTreeMap<String, [u8; 32]>,
+) -> Result<(), String> {
+    let wanted: BTreeSet<&str> = TOPOLOGY.wasm_ids(selection).into_iter().collect();
+    let given: BTreeSet<&str> = code_hashes.keys().map(String::as_str).collect();
+    let missing: Vec<&str> = wanted.difference(&given).copied().collect();
+    let extra: Vec<&str> = given.difference(&wanted).copied().collect();
+    let is_exact = missing.is_empty() && extra.is_empty();
+    if is_exact {
+        return Ok(());
+    }
+    Err(format!(
+        "code_hashes must key exactly the selection's wasm modules: missing {missing:?}, extra {extra:?}"
+    ))
 }
 
 /// compose ONE module from its topology spec.
@@ -175,6 +207,18 @@ async fn wasm(
             crate::hex_bytes(hash)
         )
     })?;
+    // a code source is a lookup, not a guarantee: the bytes are re-hashed here
+    // exactly as the host's swap path re-checks them, so a lying source (a dir
+    // keyed by filename, a stale blob) can never seat code whose `code_hash()`
+    // disagrees with the lifecycle entry seeded from the same map.
+    let matches_hash = sha2::Sha256::digest(&bytes)[..] == hash[..];
+    if !matches_hash {
+        return Err(format!(
+            "module {} code bytes do not match its genesis hash {} — fail-closed",
+            spec.id,
+            crate::hex_bytes(hash)
+        ));
+    }
     let loaded = match spec.backing {
         Backing::Map => WasmModule::from_bytes(spec.id, &bytes),
         Backing::Store => {

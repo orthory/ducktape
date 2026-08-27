@@ -110,6 +110,14 @@ fn composes_wasm_store_map_and_native_over_injected_stores() {
                 genesis.module_code_hash("acl").unwrap(),
                 by_id["acl"].to_vec()
             );
+            // acl and governance are both store-backed and empty at genesis
+            // EXCEPT for governance's seeded `__config` record — the only
+            // thing that can set their roots apart.
+            assert_ne!(
+                genesis.module_root("governance"),
+                genesis.module_root("acl"),
+                "governance's genesis config was seeded into its store"
+            );
             let genesis_root = genesis.root_hash();
             let runs_root = genesis.module_root("runs").unwrap();
             drop(genesis);
@@ -146,10 +154,11 @@ fn composes_wasm_store_map_and_native_over_injected_stores() {
 }
 
 #[test]
-fn a_wasm_module_without_a_code_hash_is_refused_by_id() {
+fn code_hash_drift_and_unknown_ids_are_refused_by_name() {
     run(|context, dir| {
         Box::pin(async move {
             let (by_id, by_hash) = hashes(&["acl"]);
+            let (with_extra, _) = hashes(&["acl", "governance"]);
             let code = DirSource(fixtures(), by_hash);
             let bindings = Bindings {
                 invite: b"t",
@@ -203,6 +212,80 @@ fn a_wasm_module_without_a_code_hash_is_refused_by_id() {
             assert!(
                 err.contains("not-a-module"),
                 "an unknown id is refused by name: {err}"
+            );
+            // a stray extra hash would seed the lifecycle registry (and move
+            // the genesis root) for a module the selection never composes.
+            let extra = Bindings {
+                code_hashes: &with_extra,
+                ..bindings
+            };
+            let Err(err) = compose(
+                &["acl"],
+                &code,
+                &mut stores,
+                &substrates,
+                &extra,
+                Boot::Genesis,
+            )
+            .await
+            else {
+                panic!("an extra code hash composed");
+            };
+            assert!(
+                err.contains("governance"),
+                "the extra key is refused by name: {err}"
+            );
+        })
+    });
+}
+
+/// a code source is a lookup, not a guarantee: bytes that do not hash to the
+/// genesis entry never seat, or the running code and the lifecycle registry
+/// would silently disagree.
+#[test]
+fn a_code_source_whose_bytes_miss_the_hash_is_refused() {
+    run(|context, dir| {
+        Box::pin(async move {
+            let (by_id, mut by_hash) = hashes(&["acl"]);
+            // the liar answers acl's hash with governance's component.
+            by_hash.insert(by_id["acl"], "governance");
+            let liar = DirSource(fixtures(), by_hash);
+            let bindings = Bindings {
+                invite: b"t",
+                chain_id: "t",
+                validators: &[],
+                code_hashes: &by_id,
+            };
+            let substrates = Substrates {
+                forge_repo: dir.join("forge"),
+                duckfs_dir: dir.join("duckfs"),
+                blobs: blobstore::BlobHandle::default(),
+            };
+            let mut stores =
+                |id: &'static str| -> BoxFut<'_, Result<Box<dyn MerkleStore>, String>> {
+                    let context = context.child(id);
+                    Box::pin(async move {
+                        Ok(
+                            Box::new(statesync::qmdb::QmdbStore::init(context, id).await)
+                                as Box<dyn MerkleStore>,
+                        )
+                    })
+                };
+            let Err(err) = compose(
+                &["acl"],
+                &liar,
+                &mut stores,
+                &substrates,
+                &bindings,
+                Boot::Genesis,
+            )
+            .await
+            else {
+                panic!("mismatched code bytes composed");
+            };
+            assert!(
+                err.contains("acl") && err.contains("do not match"),
+                "the mismatch is refused by module name: {err}"
             );
         })
     });
