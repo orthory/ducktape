@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 
 use wireguard::effect::{PeerTunnelConfig, plan_peer_configs};
 use wireguard::{
-    EndpointAdvertisement, EndpointRecord, MeshView, MeshVersion, TunnelInstallPlan, UpgradeError,
+    EndpointAdvertisement, EndpointRecord, MeshVersion, MeshView, TunnelInstallPlan, UpgradeError,
     ValidatorIdentity, X25519PublicKey, compute_mesh_version,
 };
 
@@ -121,8 +121,7 @@ impl Driver {
             state.phase = Phase::Failed;
             self.emit(ReachabilityEvent::EpochFailed {
                 epoch,
-                reason: "mesh verification: version mismatch with no unanimous peer version"
-                    .into(),
+                reason: "mesh verification: version mismatch with no unanimous peer version".into(),
             });
             return;
         };

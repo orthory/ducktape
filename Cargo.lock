@@ -6018,6 +6018,7 @@ name = "nat-traversal"
 version = "0.1.0"
 dependencies = [
  "arrayvec",
+ "borsh",
  "commonware-codec",
  "commonware-cryptography",
  "crossbeam-channel",
@@ -6084,6 +6085,8 @@ dependencies = [
 name = "netstack-machine"
 version = "0.1.0"
 dependencies = [
+ "borsh",
+ "commonware-codec",
  "commonware-cryptography",
  "nat-traversal",
  "serde",
@@ -11878,6 +11881,7 @@ dependencies = [
 name = "wireguard"
 version = "0.1.0"
 dependencies = [
+ "borsh",
  "commonware-codec",
  "commonware-cryptography",
  "serde",

@@ -1,0 +1,85 @@
+root event = Event
+root effects = Vec<Effect>
+root observation = ReachabilityEvent
+() = Primitive(0)
+AllowedIp = Struct { fields: NamedFields([("addr", "IpAddr"), ("cidr", "u8")]) }
+CmdToken = Struct { fields: UnnamedFields(["u64"]) }
+Ed25519PublicKey = Struct { fields: UnnamedFields(["[u8; 32]"]) }
+Effect = Enum { tag_width: 1, variants: [(0, "MeshSend", "Effect__MeshSend"), (1, "Observe", "Effect__Observe"), (2, "WgApply", "Effect__WgApply"), (3, "WgRemove", "Effect__WgRemove"), (4, "ResolveStart", "Effect__ResolveStart"), (5, "RendezvousStart", "Effect__RendezvousStart"), (6, "UdpSend", "Effect__UdpSend"), (7, "UdpSendAwait", "Effect__UdpSendAwait"), (8, "ReplyInstall", "Effect__ReplyInstall"), (9, "ReplyIntro", "Effect__ReplyIntro"), (10, "Persist", "Effect__Persist")] }
+Effect__MeshSend = Struct { fields: NamedFields([("to", "Ed25519PublicKey"), ("bytes", "Vec<u8>")]) }
+Effect__Observe = Struct { fields: UnnamedFields(["ReachabilityEvent"]) }
+Effect__Persist = Struct { fields: NamedFields([("bytes", "Vec<u8>")]) }
+Effect__RendezvousStart = Struct { fields: NamedFields([("req", "ReqId"), ("peer", "NodeKey")]) }
+Effect__ReplyInstall = Struct { fields: NamedFields([("token", "CmdToken"), ("outcome", "Result<(), String>")]) }
+Effect__ReplyIntro = Struct { fields: NamedFields([("token", "CmdToken"), ("outcome", "Result<Vec<u8>, String>")]) }
+Effect__ResolveStart = Struct { fields: NamedFields([("req", "ReqId"), ("peer", "NodeKey"), ("advertised", "SocketAddr")]) }
+Effect__UdpSend = Struct { fields: NamedFields([("endpoint", "SocketAddr"), ("bytes", "Vec<u8>")]) }
+Effect__UdpSendAwait = Struct { fields: NamedFields([("req", "ReqId"), ("endpoint", "SocketAddr"), ("bytes", "Vec<u8>"), ("timeout_ms", "u64")]) }
+Effect__WgApply = Struct { fields: NamedFields([("req", "ReqId"), ("bring_up", "bool"), ("peers", "Vec<PeerTunnelConfig>")]) }
+Effect__WgRemove = Struct { fields: Empty }
+Event = Enum { tag_width: 1, variants: [(0, "Retarget", "Event__Retarget"), (1, "Deliver", "Event__Deliver"), (2, "ViewTick", "Event__ViewTick"), (3, "Nudge", "Event__Nudge"), (4, "InstallInvitePeer", "Event__InstallInvitePeer"), (5, "BootstrapCoordinatedInvitePeer", "Event__BootstrapCoordinatedInvitePeer"), (6, "SendResolverDatagram", "Event__SendResolverDatagram"), (7, "Resolved", "Event__Resolved"), (8, "RendezvousResolved", "Event__RendezvousResolved"), (9, "DatagramReplied", "Event__DatagramReplied"), (10, "WgApplied", "Event__WgApplied"), (11, "Shutdown", "Event__Shutdown")] }
+Event__BootstrapCoordinatedInvitePeer = Struct { fields: NamedFields([("token", "CmdToken"), ("peer", "Ed25519PublicKey"), ("wireguard_public_key", "X25519PublicKey"), ("intro", "Vec<u8>")]) }
+Event__DatagramReplied = Struct { fields: NamedFields([("req", "ReqId"), ("outcome", "Result<Vec<u8>, String>")]) }
+Event__Deliver = Struct { fields: NamedFields([("from", "Ed25519PublicKey"), ("bytes", "Vec<u8>")]) }
+Event__InstallInvitePeer = Struct { fields: NamedFields([("token", "CmdToken"), ("peer", "Ed25519PublicKey"), ("wireguard_public_key", "X25519PublicKey"), ("endpoint", "SocketAddr")]) }
+Event__Nudge = Struct { fields: Empty }
+Event__RendezvousResolved = Struct { fields: NamedFields([("req", "ReqId"), ("outcome", "Result<SocketAddr, String>")]) }
+Event__Resolved = Struct { fields: NamedFields([("req", "ReqId"), ("outcome", "Result<Resolution, String>")]) }
+Event__Retarget = Struct { fields: NamedFields([("event", "MeshEpochEvent"), ("persisted", "Option<Vec<u8>>")]) }
+Event__SendResolverDatagram = Struct { fields: NamedFields([("endpoint", "SocketAddr"), ("bytes", "Vec<u8>")]) }
+Event__Shutdown = Struct { fields: Empty }
+Event__ViewTick = Struct { fields: UnnamedFields(["u64"]) }
+Event__WgApplied = Struct { fields: NamedFields([("req", "ReqId"), ("outcome", "Result<(), String>")]) }
+IpAddr = Enum { tag_width: 1, variants: [(0, "V4", "IpAddr__V4"), (1, "V6", "IpAddr__V6")] }
+IpAddr__V4 = Struct { fields: UnnamedFields(["Ipv4Addr"]) }
+IpAddr__V6 = Struct { fields: UnnamedFields(["Ipv6Addr"]) }
+Ipv4Addr = Struct { fields: NamedFields([("octets", "[u8; 4]")]) }
+Ipv6Addr = Struct { fields: NamedFields([("octets", "[u8; 16]")]) }
+MeshEpochEvent = Struct { fields: NamedFields([("epoch", "u64"), ("members", "Vec<Ed25519PublicKey>"), ("standbys", "Vec<Ed25519PublicKey>"), ("current_view", "u64")]) }
+MeshVersion = Struct { fields: UnnamedFields(["[u8; 32]"]) }
+NodeKey = Struct { fields: UnnamedFields(["[u8; 32]"]) }
+Option<SocketAddr> = Enum { tag_width: 1, variants: [(0, "None", "()"), (1, "Some", "SocketAddr")] }
+Option<Vec<u8>> = Enum { tag_width: 1, variants: [(0, "None", "()"), (1, "Some", "Vec<u8>")] }
+Option<u16> = Enum { tag_width: 1, variants: [(0, "None", "()"), (1, "Some", "u16")] }
+PeerTunnelConfig = Struct { fields: NamedFields([("wireguard_public_key", "X25519PublicKey"), ("endpoint", "Option<SocketAddr>"), ("allowed_ips", "Vec<AllowedIp>"), ("keepalive_seconds", "Option<u16>")]) }
+ReachabilityEvent = Enum { tag_width: 1, variants: [(0, "Send", "ReachabilityEvent__Send"), (1, "MeshReady", "ReachabilityEvent__MeshReady"), (2, "TunnelsApplied", "ReachabilityEvent__TunnelsApplied"), (3, "PeerFailed", "ReachabilityEvent__PeerFailed"), (4, "EpochFailed", "ReachabilityEvent__EpochFailed"), (5, "MeshRestored", "ReachabilityEvent__MeshRestored"), (6, "RestoreFailed", "ReachabilityEvent__RestoreFailed"), (7, "PersistFailed", "ReachabilityEvent__PersistFailed"), (8, "StandbyTunnelsApplied", "ReachabilityEvent__StandbyTunnelsApplied"), (9, "MeshAdopted", "ReachabilityEvent__MeshAdopted"), (10, "PeerReadvertised", "ReachabilityEvent__PeerReadvertised"), (11, "PeerEndpointResolved", "ReachabilityEvent__PeerEndpointResolved"), (12, "InvitePeerInstalled", "ReachabilityEvent__InvitePeerInstalled"), (13, "ControlEndpointObserved", "ReachabilityEvent__ControlEndpointObserved")] }
+ReachabilityEvent__ControlEndpointObserved = Struct { fields: NamedFields([("peer", "ValidatorIdentity"), ("control_endpoint", "SocketAddr")]) }
+ReachabilityEvent__EpochFailed = Struct { fields: NamedFields([("epoch", "u64"), ("reason", "String")]) }
+ReachabilityEvent__InvitePeerInstalled = Struct { fields: NamedFields([("peer", "Ed25519PublicKey"), ("interface", "String")]) }
+ReachabilityEvent__MeshAdopted = Struct { fields: NamedFields([("epoch", "u64"), ("version", "MeshVersion"), ("peers", "u64")]) }
+ReachabilityEvent__MeshReady = Struct { fields: NamedFields([("epoch", "u64"), ("version", "MeshVersion")]) }
+ReachabilityEvent__MeshRestored = Struct { fields: NamedFields([("epoch", "u64"), ("interface", "String"), ("peers", "u64")]) }
+ReachabilityEvent__PeerEndpointResolved = Struct { fields: NamedFields([("peer", "Ed25519PublicKey"), ("endpoint", "SocketAddr")]) }
+ReachabilityEvent__PeerFailed = Struct { fields: NamedFields([("peer", "Ed25519PublicKey"), ("reason", "String")]) }
+ReachabilityEvent__PeerReadvertised = Struct { fields: NamedFields([("peer", "Ed25519PublicKey"), ("interface", "String")]) }
+ReachabilityEvent__PersistFailed = Struct { fields: NamedFields([("reason", "String")]) }
+ReachabilityEvent__RestoreFailed = Struct { fields: NamedFields([("reason", "String")]) }
+ReachabilityEvent__Send = Struct { fields: NamedFields([("to", "Ed25519PublicKey"), ("bytes", "Vec<u8>")]) }
+ReachabilityEvent__StandbyTunnelsApplied = Struct { fields: NamedFields([("epoch", "u64"), ("interface", "String"), ("peers", "u64")]) }
+ReachabilityEvent__TunnelsApplied = Struct { fields: NamedFields([("epoch", "u64"), ("interface", "String"), ("peers", "u64")]) }
+ReqId = Struct { fields: UnnamedFields(["u64"]) }
+Resolution = Enum { tag_width: 1, variants: [(0, "Advertised", "Resolution__Advertised"), (1, "Punched", "Resolution__Punched")] }
+Resolution__Advertised = Struct { fields: Empty }
+Resolution__Punched = Struct { fields: UnnamedFields(["SocketAddr"]) }
+Result<(), String> = Enum { tag_width: 1, variants: [(1, "Ok", "()"), (0, "Err", "String")] }
+Result<Resolution, String> = Enum { tag_width: 1, variants: [(1, "Ok", "Resolution"), (0, "Err", "String")] }
+Result<SocketAddr, String> = Enum { tag_width: 1, variants: [(1, "Ok", "SocketAddr"), (0, "Err", "String")] }
+Result<Vec<u8>, String> = Enum { tag_width: 1, variants: [(1, "Ok", "Vec<u8>"), (0, "Err", "String")] }
+SocketAddr = Enum { tag_width: 1, variants: [(0, "V4", "SocketAddrV4"), (1, "V6", "SocketAddrV6")] }
+SocketAddrV4 = Struct { fields: NamedFields([("ip", "Ipv4Addr"), ("port", "u16")]) }
+SocketAddrV6 = Struct { fields: NamedFields([("ip", "Ipv6Addr"), ("port", "u16")]) }
+String = Sequence { length_width: 4, length_range: 0..=4294967295, elements: "u8" }
+ValidatorIdentity = Struct { fields: UnnamedFields(["[u8; 32]"]) }
+Vec<AllowedIp> = Sequence { length_width: 4, length_range: 0..=4294967295, elements: "AllowedIp" }
+Vec<Ed25519PublicKey> = Sequence { length_width: 4, length_range: 0..=4294967295, elements: "Ed25519PublicKey" }
+Vec<Effect> = Sequence { length_width: 4, length_range: 0..=4294967295, elements: "Effect" }
+Vec<PeerTunnelConfig> = Sequence { length_width: 4, length_range: 0..=4294967295, elements: "PeerTunnelConfig" }
+Vec<u8> = Sequence { length_width: 4, length_range: 0..=4294967295, elements: "u8" }
+X25519PublicKey = Struct { fields: UnnamedFields(["[u8; 32]"]) }
+[u8; 16] = Sequence { length_width: 0, length_range: 16..=16, elements: "u8" }
+[u8; 32] = Sequence { length_width: 0, length_range: 32..=32, elements: "u8" }
+[u8; 4] = Sequence { length_width: 0, length_range: 4..=4, elements: "u8" }
+bool = Primitive(1)
+u16 = Primitive(2)
+u64 = Primitive(8)
+u8 = Primitive(1)

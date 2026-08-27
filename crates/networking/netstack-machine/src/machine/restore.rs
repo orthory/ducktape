@@ -12,7 +12,7 @@
 //! same fate they had while the old blocking restore held the command
 //! queue — and the nudge re-offers heal whatever that window cost.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
 use commonware_cryptography::ed25519;
@@ -117,7 +117,7 @@ impl Driver {
         // the BOOT epoch's members gate the restore: a departed member's
         // tunnel is dead weight, an arrival has no persisted record (its
         // tunnel assembles live). Signatures were verified by the decode.
-        let member_pk_of: HashMap<ValidatorIdentity, ed25519::PublicKey> = event
+        let member_pk_of: BTreeMap<ValidatorIdentity, ed25519::PublicKey> = event
             .members
             .iter()
             .map(|pk| (binding::identity_of(pk), pk.clone()))
@@ -152,7 +152,7 @@ impl Driver {
         // WireGuard key (invite token consumed at admission, every remaining
         // transport rides this overlay), so only this reinstall lets its
         // ongoing handshake retries land again after a reboot.
-        let standby_ids: HashSet<ValidatorIdentity> = event
+        let standby_ids: BTreeSet<ValidatorIdentity> = event
             .standbys
             .iter()
             .map(binding::identity_of)
@@ -353,7 +353,7 @@ impl Driver {
             .filter(|id| !identities.contains(id))
             .collect();
         let set = binding::active_set(&self.config.chain_id, event.epoch, identities.clone())?;
-        let pk_of: HashMap<ValidatorIdentity, ed25519::PublicKey> = event
+        let pk_of: BTreeMap<ValidatorIdentity, ed25519::PublicKey> = event
             .members
             .iter()
             .chain(event.standbys.iter())
