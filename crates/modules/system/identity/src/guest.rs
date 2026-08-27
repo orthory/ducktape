@@ -17,10 +17,10 @@
 //! FRESH per dispatch over the exact production builder chain, cross-dispatch
 //! read-your-writes comes from the host's outer staged overlay via
 //! `WitStore::get`, and each successful `execute` flushes the inner staging
-//! with the inner `commit_block`. the `BindNode` member gate (valset
-//! validators ∪ residents) resolves through the runtime's memoized replay,
-//! and every member proof verifies IN the guest through `keyscheme` —
-//! pure-Rust p256/k256 and commonware ed25519, deterministic on wasm32.
+//! with the inner `commit_block`. every add-key consent verifies IN the guest
+//! through `keyscheme` — pure-Rust p256/k256 and commonware ed25519,
+//! deterministic on wasm32. identity reads no sibling: admission is open, and
+//! the ACL policy on the `identity` target is the operator's knob.
 //!
 //! ## the genesis-config chain id
 //!
@@ -32,9 +32,7 @@
 //! — and every dispatch reads it back through
 //! [`guest_adapter::store_genesis_chain_id`] and constructs the native module
 //! with it. the config is consensus state in the store's merkle root from
-//! genesis, and it rides state-sync like any other record. the valset sibling
-//! id is genesis-constant wiring (identical on every network), so it stays
-//! compiled in like every other port's sibling ids.
+//! genesis, and it rides state-sync like any other record.
 
 use crate::Identity;
 use guest_adapter::WitStore;
@@ -42,10 +40,6 @@ use guest_adapter::WitStore;
 /// the genesis-constant id this module registers under (the native twin's id:
 /// `Env::me` and follow-up routing must read identically to ported logic).
 const MODULE_ID: &str = "identity";
-/// the sibling id this instance gates binds through — EXACTLY the production
-/// wiring (`bin/node/src/host_state.rs`): the valset module whose validators ∪
-/// residents union admits a bind origin.
-const VALSET_ID: &str = "valset";
 
 // store-backed port: no snapshot — the host owns the real qmdb store and the
 // module is rebuilt fresh per dispatch (see `guest_adapter::store_guest!`).
@@ -56,7 +50,6 @@ guest_adapter::store_guest! {
     new: Identity::new(
         MODULE_ID,
         Box::new(WitStore),
-        Some(VALSET_ID.into()),
         guest_adapter::store_genesis_chain_id("identity")?,
     ),
 }

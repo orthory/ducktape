@@ -285,14 +285,13 @@ fn run_node(
         // stages what clients POST).
         let op_blobs = blobs.clone();
         let files = Files::open("files", duckfs_dir).expect("duckfs open");
-        // the deterministic user->nodes binding registry. the single-node
-        // daemon carries no valset (ungated binds) and no chain (dev-only,
-        // chain-unscoped certs are an acceptable surface here). It also owns
-        // the canonical account display name. store-backed like chat/pages.
+        // the account registry (numbered principals over key associations).
+        // the single-node daemon carries no chain id (dev-only: chain-unscoped
+        // add-key consents are an acceptable surface here). store-backed like
+        // chat/pages.
         let identity = Identity::new(
             "identity",
             Box::new(QmdbStore::init(context.child("identity"), "identity").await),
-            None,
             String::new(),
         );
         // the MERGED gateway owns both the `.duck` handle plane and the route
@@ -302,7 +301,6 @@ fn run_node(
             "gateway",
             Box::new(QmdbStore::init(context.child("gateway"), "gateway").await),
             "identity",
-            None,
             "local",
         );
         let mut host = Host::genesis(vec![

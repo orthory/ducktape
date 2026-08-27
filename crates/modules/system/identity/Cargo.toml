@@ -20,7 +20,6 @@ serde_json = { workspace = true }
 # the store-record codec: compact, canonical, deterministic — the same
 # envelope the derived tier's fold feed already uses. wire stays sdk::wire.
 borsh = { workspace = true }
-valset = { workspace = true }
 keyscheme = { workspace = true }
 # the `testkit` feature's ed25519 signing helpers.
 commonware-cryptography = { workspace = true }

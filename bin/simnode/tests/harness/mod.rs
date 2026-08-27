@@ -332,16 +332,48 @@ pub fn post_message(channel: &str, message_id: &str, text: &str) -> serde_json::
     })
 }
 
-/// a `MemberAuth` JSON whose ed25519 `key` consents to `preimage` under the
-/// identity bind namespace — the shared member-auth builder the bound and
-/// governed scenarios reuse (identity binds, gateway routes, share adoption).
-/// the ed25519 signing + `MemberAuth` shape now live ONCE in `identity::testkit`;
-/// this wraps it back to the untyped JSON the sim's `/v1/submit` lane takes (the
-/// serde shape is byte-identical to the hand-rolled json).
-pub fn ed_bind_auth(
-    key: &commonware_cryptography::ed25519::PrivateKey,
-    preimage: &[u8],
+/// the sim's identity chain id — `Identity::new(.., String::new())`: the
+/// simulator has no chain, so every add-key consent signs over "".
+pub const IDENTITY_CHAIN: &str = "";
+
+/// the `hex:` origin escape naming a REAL ed25519 key as the submit origin —
+/// the only way a json-string origin lane can found an account whose member
+/// can later sign (an ASCII origin like `"a"*32` is well-formed for ed25519
+/// but holds no secret, so it can found but never consent).
+pub fn key_origin(key: &commonware_cryptography::ed25519::PrivateKey) -> String {
+    use commonware_cryptography::Signer as _;
+    let hex: String = key
+        .public_key()
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("hex:{hex}")
+}
+
+/// the `Create` op founding an account for the submit ORIGIN (declared
+/// ed25519, so a 32-byte origin — an ASCII stand-in or a real key via
+/// [`key_origin`] — founds; anything else is refused as malformed). the
+/// message shape lives ONCE in `identity::testkit`; this wraps it back to the
+/// untyped JSON the sim's `/v1/submit` lane takes.
+pub fn create(name: &str) -> serde_json::Value {
+    serde_json::to_value(identity::testkit::create(name)).expect("Create serializes")
+}
+
+/// the `AddKey` op admitting `new_key` (the op's ORIGIN) into ed25519
+/// `member`'s account, consented to at `generation` on the sim's chain. the
+/// consent is single-use: acceptance advances `new_key`'s generation.
+pub fn add_ed25519_key(
+    member: &commonware_cryptography::ed25519::PrivateKey,
+    new_key: &[u8],
+    generation: u64,
 ) -> serde_json::Value {
-    serde_json::to_value(identity::testkit::ed_bind_auth(key, preimage))
-        .expect("MemberAuth serializes")
+    serde_json::to_value(identity::testkit::add_ed25519_key(
+        member,
+        IDENTITY_CHAIN,
+        new_key,
+        generation,
+        None,
+    ))
+    .expect("AddKey serializes")
 }

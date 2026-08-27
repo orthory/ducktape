@@ -524,10 +524,11 @@ fn forge_wasm(
 }
 
 /// identity at its GENESIS code over the host-constructed store (same three
-/// store lifecycles as [`pages_wasm`]). the per-network chain id every signed
-/// certificate preimage folds in is a `__config` STORE RECORD, seeded at
-/// genesis by [`seed_store_config`]; the submit-door client ACL and both
-/// ownership indexes are ordinary store records in the same root.
+/// store lifecycles as [`pages_wasm`]). the per-network chain id every
+/// add-key consent preimage folds in is a `__config` STORE RECORD, seeded at
+/// genesis by [`seed_store_config`]; the account records, the key index and
+/// the per-key generation counters are ordinary store records in the same
+/// root.
 fn identity_wasm(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
     WasmModule::with_store(IDENTITY_MODULE_ID, IDENTITY_WASM_COMPONENT, store)
         .expect("embedded identity component loads")
@@ -794,11 +795,11 @@ pub(super) async fn genesis_host(
         // (first-claim work items). store-backed over the host-constructed
         // qmdb store — one record per task/job, so capture is O(1).
         tasks,
-        // the deterministic user->nodes binding registry: certificates are
-        // chain-scoped (this network's chain id, riding its store-seeded
-        // GENESIS CONFIG), member-gated binds via valset, and account display
-        // names have this single canonical owner. store-backed over the
-        // host-constructed qmdb store.
+        // the account registry: numbered principals over key associations.
+        // add-key consents are chain-scoped (this network's chain id, riding
+        // its store-seeded GENESIS CONFIG); no node is ever bound to an
+        // account — attribution is a user-signed origin resolved by `OfKey`.
+        // store-backed over the host-constructed qmdb store.
         identity,
         // the MERGED gateway: the whole `.duck` name → AccountId → route
         // pipeline in ONE module — the route plane PLUS the optional human-name
@@ -1438,7 +1439,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "3dff07e927044a1a65313c5118a2aaf85ee581b518bd5bec818c3cb7b835bb64";
+        "0565894d14031a10bc40904f5c39ac4f091addd3a879eab6830292b99ded4377";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's store as a genesis

@@ -1,6 +1,6 @@
 //! Non-transferable account shares through a real Host. The validator-mode
 //! electorate adopts one explicit allocation; later proposals freeze account
-//! power, so two nodes owned by one account share one ballot and later share
+//! power, so two keys of one account cast ONE account ballot and later share
 //! changes cannot rewrite an open proposal's decision boundary.
 
 use std::collections::BTreeMap;
@@ -14,7 +14,7 @@ use governance::{
 };
 use host::{BlockContext, Host, SubmitError};
 use identity::{
-    AccountView, IdentityQuery, IdentityReply, KeyScheme, MemberKeyView,
+    AccountView, IdentityQuery, IdentityReply, KeyScheme, KeyView, account_principal,
     decode_query as identity_decode_query, encode_reply as identity_encode_reply,
 };
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
@@ -30,68 +30,44 @@ fn key(seed: u8) -> Vec<u8> {
         .to_vec()
 }
 
+/// a read-only identity: accounts by number, each owning its member keys —
+/// the real module's `OfKey` index, without the admission ceremony.
 struct IdentityStub {
-    accounts: BTreeMap<Vec<u8>, AccountView>,
-    by_node: BTreeMap<Vec<u8>, Vec<u8>>,
-    /// member key -> account id. seeded with each account's founding key
-    /// (member key == account id); [`Self::add_member`] extends an account
-    /// with a second key, mirroring the real module's member index.
-    by_member: BTreeMap<Vec<u8>, Vec<u8>>,
+    accounts: BTreeMap<u64, AccountView>,
+    by_key: BTreeMap<Vec<u8>, u64>,
 }
 
 impl IdentityStub {
-    /// register an EXTRA member key on an existing account — the "one human,
-    /// two devices" shape the overwrite-dedup tests exercise.
-    fn add_member(&mut self, account_id: &[u8], key: Vec<u8>) {
-        let account = self.accounts.get_mut(account_id).expect("account exists");
-        account.member_keys.push(MemberKeyView {
-            pubkey: key.clone(),
-            scheme: KeyScheme::Ed25519,
-            label: None,
-            added_at: 0,
-        });
-        self.by_member.insert(key, account_id.to_vec());
-    }
-
-    fn new(entries: Vec<(Vec<u8>, Vec<Vec<u8>>)>) -> Self {
+    /// `entries`: account number → its member keys.
+    fn new(entries: Vec<(u64, Vec<Vec<u8>>)>) -> Self {
         let mut accounts = BTreeMap::new();
-        let mut by_node = BTreeMap::new();
-        let mut by_member = BTreeMap::new();
-        for (account_id, nodes) in entries {
-            for node in &nodes {
-                by_node.insert(node.clone(), account_id.clone());
+        let mut by_key = BTreeMap::new();
+        for (number, mut keys) in entries {
+            keys.sort();
+            for key in &keys {
+                by_key.insert(key.clone(), number);
             }
-            by_member.insert(account_id.clone(), account_id.clone());
             accounts.insert(
-                account_id.clone(),
+                number,
                 AccountView {
-                    account_id: account_id.clone(),
-                    display_name: None,
-                    avatar: None,
-                    bio: None,
-                    nonce: 0,
-                    member_keys: vec![MemberKeyView {
-                        pubkey: account_id,
-                        scheme: KeyScheme::Ed25519,
-                        label: None,
-                        added_at: 0,
-                    }],
-                    nodes: nodes
+                    number,
+                    name: format!("account-{number}"),
+                    keys: keys
                         .into_iter()
-                        .map(|node_key| identity::NodeView {
-                            node_key,
+                        .map(|pubkey| KeyView {
+                            scheme: KeyScheme::Ed25519,
+                            pubkey,
                             label: None,
+                            added_at: 0,
                         })
                         .collect(),
+                    avatar: None,
+                    bio: None,
                     updated_at: 0,
                 },
             );
         }
-        Self {
-            accounts,
-            by_node,
-            by_member,
-        }
+        Self { accounts, by_key }
     }
 }
 
@@ -114,43 +90,46 @@ impl Module for IdentityStub {
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        let account = match identity_decode_query(req).map_err(Error::Module)? {
-            IdentityQuery::Get { account_id } => self.accounts.get(&account_id).cloned(),
-            IdentityQuery::OfNode { node_key } => self
-                .by_node
-                .get(&node_key)
-                .and_then(|account_id| self.accounts.get(account_id))
-                .cloned(),
-            IdentityQuery::OfMember { member_key } => self
-                .by_member
-                .get(&member_key)
-                .and_then(|account_id| self.accounts.get(account_id))
-                .cloned(),
-            IdentityQuery::All { .. } => {
-                return Ok(identity_encode_reply(&IdentityReply::Accounts(
-                    self.accounts.values().cloned().collect(),
-                )));
+        let reply = match identity_decode_query(req).map_err(Error::Module)? {
+            IdentityQuery::All { from, limit } => IdentityReply::Accounts(
+                self.accounts
+                    .range(from..)
+                    .take(limit as usize)
+                    .map(|(_, account)| account.clone())
+                    .collect(),
+            ),
+            IdentityQuery::Get { number } => {
+                IdentityReply::Account(self.accounts.get(&number).cloned())
+            }
+            IdentityQuery::OfKey { key } => IdentityReply::Account(
+                self.by_key
+                    .get(&key)
+                    .and_then(|number| self.accounts.get(number))
+                    .cloned(),
+            ),
+            IdentityQuery::KeyGen { key } => {
+                IdentityReply::Gen(u64::from(self.by_key.contains_key(&key)))
             }
         };
-        Ok(identity_encode_reply(&IdentityReply::Account(account)))
+        Ok(identity_encode_reply(&reply))
     }
 }
 
-async fn share_host() -> (Host, [Vec<u8>; 4], [Vec<u8>; 3]) {
-    let nodes = [key(1), key(2), key(3), key(4)];
-    let accounts = [key(11), key(12), key(13)];
+/// validators = keys[0..3]; account 1 holds keys[0] and keys[1] ("one human,
+/// two devices"), account 2 holds keys[2], account 3 holds keys[3] (not a
+/// validator).
+async fn share_host() -> (Host, [Vec<u8>; 4], [u64; 3]) {
+    let keys = [key(1), key(2), key(3), key(4)];
+    let accounts = [1, 2, 3];
     let mut valset = Valset::new("valset", Box::new(MemStore::new()));
-    for node in &nodes[..3] {
+    for node in &keys[..3] {
         valset.seed(node.clone()).await.expect("seed valset");
     }
     valset.finish_seed().await.expect("seed valset");
     let identity = IdentityStub::new(vec![
-        (
-            accounts[0].clone(),
-            vec![nodes[0].clone(), nodes[1].clone()],
-        ),
-        (accounts[1].clone(), vec![nodes[2].clone()]),
-        (accounts[2].clone(), vec![nodes[3].clone()]),
+        (accounts[0], vec![keys[0].clone(), keys[1].clone()]),
+        (accounts[1], vec![keys[2].clone()]),
+        (accounts[2], vec![keys[3].clone()]),
     ]);
     let host = Host::genesis(vec![
         Box::new(valset),
@@ -163,7 +142,7 @@ async fn share_host() -> (Host, [Vec<u8>; 4], [Vec<u8>; 3]) {
         Box::new(identity),
     ])
     .expect("genesis");
-    (host, nodes, accounts)
+    (host, keys, accounts)
 }
 
 async fn submit(host: &mut Host, node: &[u8], at: u64, msg: GovMsg) -> Result<(), SubmitError> {
@@ -212,13 +191,13 @@ async fn shares(host: &Host) -> governance::SharesView {
 #[test]
 fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
     block_on(async {
-        let (mut host, nodes, accounts) = share_host().await;
+        let (mut host, keys, accounts) = share_host().await;
         let defaults = shares(&host).await;
         assert!(!defaults.active, "validator ballots are the default mode");
         assert!(defaults.allocations.is_empty());
         submit(
             &mut host,
-            &nodes[0],
+            &keys[0],
             0,
             GovMsg::Propose {
                 proposal_id: "premature-share-mode".into(),
@@ -230,22 +209,22 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         .expect_err("share mode requires a configured registry");
         let initial = vec![
             ShareAllocation {
-                account_id: accounts[2].clone(),
+                account_id: accounts[2],
                 shares: 10,
             },
             ShareAllocation {
-                account_id: accounts[0].clone(),
+                account_id: accounts[0],
                 shares: 60,
             },
             ShareAllocation {
-                account_id: accounts[1].clone(),
+                account_id: accounts[1],
                 shares: 30,
             },
         ];
 
         submit(
             &mut host,
-            &nodes[0],
+            &keys[0],
             1,
             GovMsg::Propose {
                 proposal_id: "adopt".into(),
@@ -257,7 +236,7 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         )
         .await
         .expect("propose adoption");
-        for (node, at) in [(&nodes[0], 2), (&nodes[1], 3)] {
+        for (node, at) in [(&keys[0], 2), (&keys[1], 3)] {
             submit(
                 &mut host,
                 node,
@@ -275,11 +254,11 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         assert_eq!(
             adoption.votes.len(),
             2,
-            "nodes sharing an account still have separate ballots in validator mode"
+            "two validator keys of one account are two node ballots in validator mode"
         );
         submit(
             &mut host,
-            &nodes[2],
+            &keys[2],
             4,
             GovMsg::Execute {
                 proposal_id: "adopt".into(),
@@ -291,23 +270,41 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         let adopted = shares(&host).await;
         assert!(adopted.active);
         assert_eq!(adopted.total, 100);
-        let mut sorted_accounts = accounts.to_vec();
-        sorted_accounts.sort();
         assert_eq!(
             adopted
                 .allocations
                 .iter()
-                .map(|allocation| allocation.account_id.clone())
+                .map(|allocation| allocation.account_id)
                 .collect::<Vec<_>>(),
-            sorted_accounts,
-            "the adoption action is normalized by account id"
+            accounts.to_vec(),
+            "the adoption action is normalized by account number"
+        );
+
+        // a key that belongs to no account has no share-mode standing at all.
+        let err = submit(
+            &mut host,
+            &key(200),
+            4,
+            GovMsg::Propose {
+                proposal_id: "stranger".into(),
+                action: GovAction::Signal {
+                    text: "nope".into(),
+                },
+                voting_period: 20,
+            },
+        )
+        .await
+        .expect_err("a key of no account cannot propose in share mode");
+        assert!(
+            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("no Identity account")),
+            "rejection names the missing account, got {err:?}"
         );
 
         // Open a signal before changing C's shares. Its 60/30/10 electorate
         // must remain unchanged after the structural update lands.
         submit(
             &mut host,
-            &nodes[0],
+            &keys[0],
             5,
             GovMsg::Propose {
                 proposal_id: "signal".into(),
@@ -321,12 +318,12 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         .expect("shareholder signal");
         submit(
             &mut host,
-            &nodes[0],
+            &keys[0],
             6,
             GovMsg::Propose {
                 proposal_id: "raise-c".into(),
                 action: GovAction::SetShares {
-                    account_id: accounts[2].clone(),
+                    account_id: accounts[2],
                     shares: 20,
                 },
                 voting_period: 20,
@@ -335,10 +332,10 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         .await
         .expect("structural proposal");
 
-        // A owns two validator nodes but only one 60-share ballot. Its second
-        // node overwrites the same principal and cannot reach the 67-share
+        // account 1 has two keys but only one 60-share ballot. Its second key
+        // overwrites the same principal and cannot reach the 67-share
         // structural threshold by itself.
-        for (node, at) in [(&nodes[0], 7), (&nodes[1], 8)] {
+        for (node, at) in [(&keys[0], 7), (&keys[1], 8)] {
             submit(
                 &mut host,
                 node,
@@ -354,9 +351,9 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         let structural = proposal(&host, "raise-c").await;
         assert_eq!(structural.voter_kind, VoterKind::Account);
         assert_eq!(
-            structural.votes.len(),
-            1,
-            "two nodes share one account ballot"
+            structural.votes,
+            vec![(account_principal(accounts[0]), true)],
+            "two keys of one account cast ONE account ballot"
         );
         assert_eq!(
             structural.voting_rule,
@@ -364,7 +361,7 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         );
         submit(
             &mut host,
-            &nodes[0],
+            &keys[0],
             9,
             GovMsg::Execute {
                 proposal_id: "raise-c".into(),
@@ -375,7 +372,7 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
 
         submit(
             &mut host,
-            &nodes[2],
+            &keys[2],
             10,
             GovMsg::Vote {
                 proposal_id: "raise-c".into(),
@@ -386,7 +383,7 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         .expect("account B vote");
         submit(
             &mut host,
-            &nodes[2],
+            &keys[2],
             11,
             GovMsg::Execute {
                 proposal_id: "raise-c".into(),
@@ -406,16 +403,16 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
             signal
                 .electorate
                 .iter()
-                .find(|(account, _)| account == &accounts[2])
+                .find(|(account, _)| account == &account_principal(accounts[2]))
                 .map(|(_, power)| *power),
             Some(10),
             "an open proposal keeps its proposal-time share snapshot"
         );
 
-        // A's second node flips A's ballot rather than adding another one.
+        // account 1's second key flips its ballot rather than adding another.
         submit(
             &mut host,
-            &nodes[0],
+            &keys[0],
             12,
             GovMsg::Vote {
                 proposal_id: "signal".into(),
@@ -426,7 +423,7 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         .expect("A yes");
         submit(
             &mut host,
-            &nodes[1],
+            &keys[1],
             13,
             GovMsg::Vote {
                 proposal_id: "signal".into(),
@@ -434,10 +431,10 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
             },
         )
         .await
-        .expect("A flips through another node");
+        .expect("account 1 flips through its other key");
         submit(
             &mut host,
-            &nodes[2],
+            &keys[2],
             14,
             GovMsg::Vote {
                 proposal_id: "signal".into(),
@@ -448,7 +445,7 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         .expect("B yes");
         submit(
             &mut host,
-            &nodes[3],
+            &keys[3],
             15,
             GovMsg::Vote {
                 proposal_id: "signal".into(),
@@ -460,7 +457,7 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         assert_eq!(proposal(&host, "signal").await.votes.len(), 3);
         submit(
             &mut host,
-            &nodes[0],
+            &keys[0],
             26,
             GovMsg::Execute {
                 proposal_id: "signal".into(),
@@ -476,7 +473,7 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         // The current share electorate can restore the default validator mode.
         submit(
             &mut host,
-            &nodes[0],
+            &keys[0],
             27,
             GovMsg::Propose {
                 proposal_id: "validator-mode".into(),
@@ -486,7 +483,7 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         )
         .await
         .expect("propose validator mode");
-        for (node, at) in [(&nodes[0], 28), (&nodes[2], 29)] {
+        for (node, at) in [(&keys[0], 28), (&keys[2], 29)] {
             submit(
                 &mut host,
                 node,
@@ -501,7 +498,7 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         }
         submit(
             &mut host,
-            &nodes[2],
+            &keys[2],
             30,
             GovMsg::Execute {
                 proposal_id: "validator-mode".into(),
@@ -513,10 +510,11 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         assert!(!inactive.active);
         assert_eq!(inactive.total, 110, "switching modes retains allocations");
 
-        // In validator mode, the two nodes owned by A again count separately.
+        // In validator mode, account 1's two validator keys again count
+        // separately.
         submit(
             &mut host,
-            &nodes[0],
+            &keys[0],
             31,
             GovMsg::Propose {
                 proposal_id: "validator-signal".into(),
@@ -541,7 +539,7 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
             validator_signal.voting_rule,
             VotingRule::Threshold { required_yes: 2 }
         );
-        for (node, at) in [(&nodes[0], 32), (&nodes[1], 33)] {
+        for (node, at) in [(&keys[0], 32), (&keys[1], 33)] {
             submit(
                 &mut host,
                 node,
@@ -557,7 +555,7 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         assert_eq!(proposal(&host, "validator-signal").await.votes.len(), 2);
         submit(
             &mut host,
-            &nodes[2],
+            &keys[2],
             34,
             GovMsg::Execute {
                 proposal_id: "validator-signal".into(),
@@ -569,7 +567,7 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         // The validator electorate can enable the retained account registry.
         submit(
             &mut host,
-            &nodes[0],
+            &keys[0],
             35,
             GovMsg::Propose {
                 proposal_id: "share-mode".into(),
@@ -579,7 +577,7 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         )
         .await
         .expect("propose share mode");
-        for (node, at) in [(&nodes[0], 36), (&nodes[1], 37)] {
+        for (node, at) in [(&keys[0], 36), (&keys[1], 37)] {
             submit(
                 &mut host,
                 node,
@@ -594,7 +592,7 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
         }
         submit(
             &mut host,
-            &nodes[2],
+            &keys[2],
             38,
             GovMsg::Execute {
                 proposal_id: "share-mode".into(),
@@ -606,116 +604,109 @@ fn shares_are_account_scoped_weighted_and_frozen_per_proposal() {
     });
 }
 
-// ── account-signed governance frames (ADR A1) ──
+// ── validator mode seats node keys, never accounts ──
 //
-// admit/promote/demote/leave now arrive as account-signed frames on the public
-// surface: the verified origin is an account MEMBER key, and the module
-// authorizes it by resolving that key to the account's committed bound nodes
-// and checking their valset standing. In `share_host`, the IdentityStub uses
-// account_id == member key, and each account owns the nodes listed at genesis.
+// a node key is never an account: in validator mode the submitter must ITSELF
+// be a member node, its ballot is its own, and belonging to an account changes
+// nothing — no fan-out to the account's other keys, no account principal.
 
 #[test]
-fn an_account_member_key_proposes_and_its_vote_casts_all_its_bound_node_ballots() {
+fn validator_mode_keys_a_ballot_by_node_even_for_an_account_key() {
     block_on(async {
-        // validators = nodes[0..3]; account[0] owns nodes[0]+nodes[1],
-        // account[1] owns nodes[2]. Default (validator) mode: N validators = N
-        // votes, ballots node-keyed.
-        let (mut host, nodes, accounts) = share_host().await;
-
-        // account[0] (a member KEY, never a node key) opens a proposal.
+        // keys[0] and keys[1] are both validators AND both keys of account 1.
+        let (mut host, keys, accounts) = share_host().await;
         submit(
             &mut host,
-            &accounts[0],
+            &keys[0],
             1,
             GovMsg::Propose {
-                proposal_id: "acct-signal".into(),
+                proposal_id: "node-signal".into(),
                 action: GovAction::Signal { text: "hi".into() },
                 voting_period: 50,
             },
         )
         .await
-        .expect("an account member with bound-node standing may propose");
+        .expect("a member node proposes");
 
-        let opened = proposal(&host, "acct-signal").await;
+        let opened = proposal(&host, "node-signal").await;
         assert_eq!(opened.voter_kind, VoterKind::ValidatorNode);
         assert_eq!(
-            opened.proposer, accounts[0],
-            "the proposer is recorded as the ACCOUNT, not a node key"
+            opened.proposer, keys[0],
+            "the proposer is the node key, not account 1's principal"
         );
-        // the frozen electorate is still the three validator NODES.
         let mut electorate: Vec<Vec<u8>> =
             opened.electorate.iter().map(|(k, _)| k.clone()).collect();
         electorate.sort();
-        let mut want = vec![nodes[0].clone(), nodes[1].clone(), nodes[2].clone()];
+        let mut want = vec![keys[0].clone(), keys[1].clone(), keys[2].clone()];
         want.sort();
-        assert_eq!(electorate, want);
-
-        // ONE account-signed Vote casts BOTH of account[0]'s bound member
-        // nodes' ballots — the exact power it held when each node voted itself.
-        submit(
-            &mut host,
-            &accounts[0],
-            2,
-            GovMsg::Vote {
-                proposal_id: "acct-signal".into(),
-                approve: true,
-            },
-        )
-        .await
-        .expect("account vote");
-        let voted = proposal(&host, "acct-signal").await;
-        let mut yes_nodes: Vec<Vec<u8>> = voted
-            .votes
-            .iter()
-            .filter(|(_, y)| *y)
-            .map(|(k, _)| k.clone())
-            .collect();
-        yes_nodes.sort();
-        let mut expect_nodes = vec![nodes[0].clone(), nodes[1].clone()];
-        expect_nodes.sort();
         assert_eq!(
-            yes_nodes, expect_nodes,
-            "one account op casts every bound electorate node's ballot"
+            electorate, want,
+            "the electorate is the three validator nodes"
+        );
+        assert!(
+            !opened
+                .electorate
+                .iter()
+                .any(|(k, _)| k == &account_principal(accounts[0])),
+            "no account principal seats a validator-mode electorate"
         );
 
-        // account[1] adds its node's yes → 3 of 3, a Signal needs a majority.
+        // keys[0]'s ballot is its own — keys[1] gains nothing from sharing
+        // the account.
         submit(
             &mut host,
-            &accounts[1],
-            3,
+            &keys[0],
+            2,
             GovMsg::Vote {
-                proposal_id: "acct-signal".into(),
+                proposal_id: "node-signal".into(),
                 approve: true,
             },
         )
         .await
-        .expect("second account vote");
+        .expect("node vote");
+        assert_eq!(
+            proposal(&host, "node-signal").await.votes,
+            vec![(keys[0].clone(), true)],
+            "one node key, one ballot"
+        );
         submit(
             &mut host,
-            &nodes[0],
-            4,
-            GovMsg::Execute {
-                proposal_id: "acct-signal".into(),
+            &keys[1],
+            3,
+            GovMsg::Vote {
+                proposal_id: "node-signal".into(),
+                approve: true,
             },
         )
         .await
-        .expect("execute");
+        .expect("second node vote");
+        assert_eq!(proposal(&host, "node-signal").await.votes.len(), 2);
+        submit(
+            &mut host,
+            &keys[2],
+            4,
+            GovMsg::Execute {
+                proposal_id: "node-signal".into(),
+            },
+        )
+        .await
+        .expect("2 of 3 passes");
         assert_eq!(
-            proposal(&host, "acct-signal").await.status,
+            proposal(&host, "node-signal").await.status,
             ProposalStatus::Passed
         );
     });
 }
 
 #[test]
-fn a_key_with_no_bound_member_node_is_refused() {
+fn a_non_validator_key_is_refused_in_validator_mode() {
     block_on(async {
-        // account[2] owns nodes[3], which is NOT in the validator set — so it
-        // holds no governance standing and cannot open a proposal.
-        let (mut host, _nodes, accounts) = share_host().await;
+        // keys[3] is account 3's key but no validator: its account buys it
+        // no standing.
+        let (mut host, keys, _accounts) = share_host().await;
         let err = submit(
             &mut host,
-            &accounts[2],
+            &keys[3],
             1,
             GovMsg::Propose {
                 proposal_id: "no-standing".into(),
@@ -726,18 +717,16 @@ fn a_key_with_no_bound_member_node_is_refused() {
             },
         )
         .await
-        .expect_err("a key whose only bound node is not a validator has no standing");
+        .expect_err("an account key that is no validator cannot propose");
         assert!(
-            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("standing")),
-            "rejection names the missing standing, got {err:?}"
+            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("member node")),
+            "rejection names the missing membership, got {err:?}"
         );
 
-        // and a total stranger (no account at all → its own node key, not a
-        // member) is likewise refused.
-        let stranger = key(200);
+        // a total stranger (no account, no seat) is refused the same way.
         let err = submit(
             &mut host,
-            &stranger,
+            &key(200),
             2,
             GovMsg::Propose {
                 proposal_id: "stranger".into(),
@@ -749,226 +738,38 @@ fn a_key_with_no_bound_member_node_is_refused() {
         )
         .await
         .expect_err("a non-member stranger cannot propose");
-        assert!(matches!(err, SubmitError::Rejected(Error::Module(_))));
-    });
-}
-
-// ── ballot overwrite-dedup (review M2): one node, one ballot, whoever casts it ──
-//
-// Node-keyed (validator-mode) ballots must stay exactly-once per node no matter
-// which principal form casts or re-casts them: the account, the node itself, or
-// a second member key of the same account. Re-voting OVERWRITES by node key.
-
-/// (a) an account re-votes: still a single ballot per bound node, carrying the
-/// LATEST direction.
-#[test]
-fn an_account_revote_overwrites_its_node_ballots_not_doubles_them() {
-    block_on(async {
-        // account[0] owns validator nodes[0] + nodes[1].
-        let (mut host, _nodes, accounts) = share_host().await;
-        submit(
-            &mut host,
-            &accounts[0],
-            1,
-            GovMsg::Propose {
-                proposal_id: "p".into(),
-                action: GovAction::Signal { text: "x".into() },
-                voting_period: 100,
-            },
-        )
-        .await
-        .expect("propose");
-
-        submit(
-            &mut host,
-            &accounts[0],
-            2,
-            GovMsg::Vote {
-                proposal_id: "p".into(),
-                approve: true,
-            },
-        )
-        .await
-        .expect("first vote");
-        submit(
-            &mut host,
-            &accounts[0],
-            3,
-            GovMsg::Vote {
-                proposal_id: "p".into(),
-                approve: false,
-            },
-        )
-        .await
-        .expect("re-vote");
-
-        let view = proposal(&host, "p").await;
-        assert_eq!(
-            view.votes.len(),
-            2,
-            "one ballot per bound node, never doubled"
-        );
         assert!(
-            view.votes.iter().all(|(_, approve)| !approve),
-            "the re-vote overwrote both node ballots: {:?}",
-            view.votes
+            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("member node")),
+            "rejection names the missing membership, got {err:?}"
         );
-    });
-}
 
-/// (b) a node votes directly, then its owner account votes: the node's ballot is
-/// OVERWRITTEN, not doubled.
-#[test]
-fn an_account_vote_overwrites_its_nodes_direct_ballot() {
-    block_on(async {
-        let (mut host, nodes, accounts) = share_host().await;
+        // and neither can vote on an open proposal.
         submit(
             &mut host,
-            &nodes[0],
-            1,
+            &keys[0],
+            3,
             GovMsg::Propose {
                 proposal_id: "p".into(),
                 action: GovAction::Signal { text: "x".into() },
-                voting_period: 100,
+                voting_period: 20,
             },
         )
         .await
         .expect("propose");
-
-        // nodes[0] casts its own ballot (a node stays a first-class actor)…
-        submit(
+        let err = submit(
             &mut host,
-            &nodes[0],
-            2,
+            &keys[3],
+            4,
             GovMsg::Vote {
                 proposal_id: "p".into(),
                 approve: true,
             },
         )
         .await
-        .expect("node vote");
-        // …then the owning account votes the other way: nodes[0]'s ballot flips
-        // (overwritten by node key) and nodes[1] gains its ballot.
-        submit(
-            &mut host,
-            &accounts[0],
-            3,
-            GovMsg::Vote {
-                proposal_id: "p".into(),
-                approve: false,
-            },
-        )
-        .await
-        .expect("account vote");
-
-        let view = proposal(&host, "p").await;
-        assert_eq!(
-            view.votes.len(),
-            2,
-            "nodes[0] was overwritten, not doubled: {:?}",
-            view.votes
-        );
-        for (node, approve) in &view.votes {
-            assert!(
-                !approve,
-                "ballot for {node:?} carries the account's later direction"
-            );
-        }
-    });
-}
-
-/// (c) two member keys of ONE account vote: both resolve to the same node
-/// ballots — no double count, latest direction wins.
-#[test]
-fn two_member_keys_of_one_account_share_the_same_node_ballots() {
-    block_on(async {
-        // rebuild share_host's shape, with a SECOND member key on account[0].
-        let nodes = [key(1), key(2), key(3), key(4)];
-        let accounts = [key(11), key(12), key(13)];
-        let second_key = key(21);
-        let mut identity = IdentityStub::new(vec![
-            (
-                accounts[0].clone(),
-                vec![nodes[0].clone(), nodes[1].clone()],
-            ),
-            (accounts[1].clone(), vec![nodes[2].clone()]),
-            (accounts[2].clone(), vec![nodes[3].clone()]),
-        ]);
-        identity.add_member(&accounts[0], second_key.clone());
-        let mut valset = Valset::new("valset", Box::new(MemStore::new()));
-        for node in &nodes[..3] {
-            valset.seed(node.clone()).await.expect("seed valset");
-        }
-        valset.finish_seed().await.expect("seed valset");
-        let mut host = Host::genesis(vec![
-            Box::new(valset),
-            Box::new(Governance::new(
-                "governance",
-                Box::new(MemStore::new()),
-                "valset",
-                "identity",
-            )),
-            Box::new(identity),
-        ])
-        .expect("genesis");
-
-        submit(
-            &mut host,
-            &accounts[0],
-            1,
-            GovMsg::Propose {
-                proposal_id: "p".into(),
-                action: GovAction::Signal { text: "x".into() },
-                voting_period: 100,
-            },
-        )
-        .await
-        .expect("propose");
-
-        // founding key votes yes, the second device's key votes no: SAME two
-        // node ballots, overwritten — never four.
-        submit(
-            &mut host,
-            &accounts[0],
-            2,
-            GovMsg::Vote {
-                proposal_id: "p".into(),
-                approve: true,
-            },
-        )
-        .await
-        .expect("founding-key vote");
-        submit(
-            &mut host,
-            &second_key,
-            3,
-            GovMsg::Vote {
-                proposal_id: "p".into(),
-                approve: false,
-            },
-        )
-        .await
-        .expect("second-member-key vote");
-
-        let view = proposal(&host, "p").await;
-        assert_eq!(
-            view.votes.len(),
-            2,
-            "both keys cast the SAME node ballots: {:?}",
-            view.votes
-        );
-        let mut balloted: Vec<Vec<u8>> = view.votes.iter().map(|(k, _)| k.clone()).collect();
-        balloted.sort();
-        let mut expect = vec![nodes[0].clone(), nodes[1].clone()];
-        expect.sort();
-        assert_eq!(
-            balloted, expect,
-            "ballots are keyed by the account's bound nodes"
-        );
+        .expect_err("a non-validator key holds no ballot");
         assert!(
-            view.votes.iter().all(|(_, approve)| !approve),
-            "the later member key's direction won: {:?}",
-            view.votes
+            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("frozen electorate")),
+            "rejection names the electorate, got {err:?}"
         );
     });
 }

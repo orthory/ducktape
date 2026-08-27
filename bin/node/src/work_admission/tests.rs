@@ -5,65 +5,63 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 
-const OWNER: &[u8] = b"owner-account";
-const FRIEND: &[u8] = b"friend-account";
-const STRANGER: &[u8] = b"stranger-account";
+const OWNER: u64 = 1;
+const FRIEND: u64 = 2;
+const STRANGER: u64 = 3;
 
-fn accounts(ids: &[&[u8]]) -> WorkAdmission {
-    WorkAdmission::Accounts(ids.iter().map(|id| id.to_vec()).collect())
+fn accounts(numbers: &[u64]) -> WorkAdmission {
+    WorkAdmission::Accounts(numbers.iter().copied().collect())
 }
 
-fn caller(id: &[u8]) -> WorkCaller {
-    WorkCaller::Account(id.to_vec())
+fn caller(number: u64) -> WorkCaller {
+    WorkCaller::Account(number)
 }
 
 // ---------------------------------------------------------------------------
 // the pure decision
 // ---------------------------------------------------------------------------
 
-/// The default. A node runs its owner's work and refuses everyone else — the
-/// whole point, and the one assertion a forced-open `verdict` must redden.
+/// The default admits NO account: a node runs its own work and nothing else
+/// until its operator names someone — the one assertion a forced-open
+/// `verdict` must redden.
 #[test]
-fn the_default_admits_the_owner_and_refuses_a_stranger() {
-    let policy = WorkAdmission::Owner;
+fn the_default_admits_only_this_node() {
+    let policy = WorkAdmission::default();
     assert_eq!(
-        verdict(&policy, Some(OWNER), &caller(OWNER)),
+        verdict(&policy, &WorkCaller::ThisNode),
         WorkVerdict::Admitted
     );
     assert_eq!(
-        verdict(&policy, Some(OWNER), &caller(STRANGER)),
+        verdict(&policy, &caller(OWNER)),
+        WorkVerdict::Refused(WorkRefusal::NotAdmitted)
+    );
+    assert_eq!(
+        verdict(&policy, &caller(STRANGER)),
         WorkVerdict::Refused(WorkRefusal::NotAdmitted)
     );
 }
 
-/// An admitted account is admitted, and the owner still is — an `Accounts`
-/// policy ADDS, it never replaces the implicit owner. Same shape as
-/// `gateway::credential_use_allowed`.
+/// An admitted account is admitted; an unnamed one is not. Same shape as
+/// `gateway::credential_use_allowed`: explicit grantees, nobody implicit.
 #[test]
-fn an_admitted_account_is_admitted_and_the_owner_stays_implicit() {
-    let policy = accounts(&[FRIEND]);
+fn an_admitted_account_is_admitted_and_an_unnamed_one_is_not() {
+    let policy = accounts(&[OWNER, FRIEND]);
+    assert_eq!(verdict(&policy, &caller(FRIEND)), WorkVerdict::Admitted);
+    assert_eq!(verdict(&policy, &caller(OWNER)), WorkVerdict::Admitted);
     assert_eq!(
-        verdict(&policy, Some(OWNER), &caller(FRIEND)),
-        WorkVerdict::Admitted
-    );
-    assert_eq!(
-        verdict(&policy, Some(OWNER), &caller(OWNER)),
-        WorkVerdict::Admitted
-    );
-    assert_eq!(
-        verdict(&policy, Some(OWNER), &caller(STRANGER)),
+        verdict(&policy, &caller(STRANGER)),
         WorkVerdict::Refused(WorkRefusal::NotAdmitted)
     );
 }
 
-/// This node's own submissions never consult anything: no policy, no owner, no
-/// identity read. It is what keeps a single-node workspace and the whole
-/// pre-`account-init` window working.
+/// This node's own submissions never consult anything: no policy, no identity
+/// read. It is what keeps a single-node workspace and an account-less node
+/// working.
 #[test]
-fn our_own_work_needs_no_policy_and_no_owner() {
-    for policy in [WorkAdmission::Owner, accounts(&[FRIEND])] {
+fn our_own_work_needs_no_policy() {
+    for policy in [WorkAdmission::default(), accounts(&[FRIEND])] {
         assert_eq!(
-            verdict(&policy, None, &WorkCaller::ThisNode),
+            verdict(&policy, &WorkCaller::ThisNode),
             WorkVerdict::Admitted
         );
     }
@@ -75,11 +73,7 @@ fn our_own_work_needs_no_policy_and_no_owner() {
 #[test]
 fn a_module_triggered_saga_is_admitted_and_that_is_the_named_residual() {
     assert_eq!(
-        verdict(
-            &WorkAdmission::Owner,
-            Some(OWNER),
-            &WorkCaller::NotAnAccountOrigin
-        ),
+        verdict(&WorkAdmission::default(), &WorkCaller::NotAnAccountOrigin),
         WorkVerdict::Admitted
     );
 }
@@ -90,7 +84,7 @@ fn a_module_triggered_saga_is_admitted_and_that_is_the_named_residual() {
 #[test]
 fn an_unresolved_caller_is_unavailable_not_refused() {
     assert_eq!(
-        verdict(&WorkAdmission::Owner, Some(OWNER), &WorkCaller::Unresolved),
+        verdict(&WorkAdmission::default(), &WorkCaller::Unresolved),
         WorkVerdict::AuthorityUnavailable
     );
 }
@@ -102,39 +96,34 @@ fn an_unresolved_caller_is_unavailable_not_refused() {
 fn anyone_admits_even_when_the_caller_cannot_be_resolved() {
     for caller in [
         WorkCaller::Unresolved,
-        WorkCaller::NodeWithoutAccount,
+        WorkCaller::KeyWithoutAccount,
+        WorkCaller::PeerNode,
         caller(STRANGER),
     ] {
-        assert_eq!(
-            verdict(&WorkAdmission::Anyone, None, &caller),
-            WorkVerdict::Admitted
-        );
+        assert_eq!(verdict(&WorkAdmission::Anyone, &caller), WorkVerdict::Admitted);
     }
 }
 
-/// A node bound to no account cannot be named by any admission, so it gets its
-/// OWN reason: the operator's fix is `user account-init` there, not
-/// `node work admit` here.
+/// A key on no account cannot be named by any admission, so it gets its OWN
+/// reason: the fix is to submit as an account, not `node work admit` here.
 #[test]
-fn a_node_with_no_account_is_refused_with_its_own_reason() {
+fn a_key_with_no_account_is_refused_with_its_own_reason() {
     assert_eq!(
-        verdict(
-            &WorkAdmission::Owner,
-            Some(OWNER),
-            &WorkCaller::NodeWithoutAccount
-        ),
+        verdict(&WorkAdmission::default(), &WorkCaller::KeyWithoutAccount),
         WorkVerdict::Refused(WorkRefusal::CallerUnbound)
     );
 }
 
-/// A node with no owner yet admits nobody but itself — an unresolvable owner
-/// must never match an account, or the bootstrap window would admit everyone.
+/// A mesh peer is a node, never an account: under an account policy it is
+/// simply not admitted, however the policy is filled.
 #[test]
-fn an_ownerless_node_admits_no_account() {
-    assert_eq!(
-        verdict(&WorkAdmission::Owner, None, &caller(OWNER)),
-        WorkVerdict::Refused(WorkRefusal::NotAdmitted)
-    );
+fn a_peer_node_is_not_admitted_by_any_account_policy() {
+    for policy in [WorkAdmission::default(), accounts(&[OWNER, FRIEND])] {
+        assert_eq!(
+            verdict(&policy, &WorkCaller::PeerNode),
+            WorkVerdict::Refused(WorkRefusal::NotAdmitted)
+        );
+    }
 }
 
 /// Every refusal token is stable, distinct, and snake_case; none of them can
@@ -166,34 +155,6 @@ fn refusal_reasons_are_distinct_stable_tokens() {
 // attribution
 // ---------------------------------------------------------------------------
 
-/// The two sources a lane can offer, and the one origin shape that is not
-/// attributable. A new `SagaOrigin` variant fails the build in `attributable`
-/// rather than defaulting to admitted.
-#[test]
-fn only_an_external_origin_and_a_mesh_peer_are_attributable() {
-    let external = SagaOrigin::External(b"peer-node".to_vec());
-    assert!(matches!(
-        attributable(&WorkSource::Saga(&external)),
-        Attributable::Node(key) if key == b"peer-node"
-    ));
-    assert!(matches!(
-        attributable(&WorkSource::Peer(b"peer-node")),
-        Attributable::Node(key) if key == b"peer-node"
-    ));
-    assert!(matches!(
-        attributable(&WorkSource::Saga(&SagaOrigin::Module("dispatch".into()))),
-        Attributable::No
-    ));
-    assert!(matches!(
-        attributable(&WorkSource::Saga(&SagaOrigin::System)),
-        Attributable::No
-    ));
-}
-
-// ---------------------------------------------------------------------------
-// the zero-read path
-// ---------------------------------------------------------------------------
-
 /// a reader that fails the test if anything reads through it.
 struct NoReads;
 
@@ -204,11 +165,81 @@ impl CommittedReader for NoReads {
     }
 }
 
+/// a reader that answers `OfKey` from a fixed key→account table.
+struct KeyTable(Vec<(Vec<u8>, u64)>);
+
+#[async_trait::async_trait]
+impl CommittedReader for KeyTable {
+    async fn read(&self, _target: &str, request: Vec<u8>) -> Result<Vec<u8>, String> {
+        let identity::IdentityQuery::OfKey { key } =
+            identity::decode_query(&request).expect("an identity query")
+        else {
+            panic!("work admission asks only OfKey");
+        };
+        let account = self
+            .0
+            .iter()
+            .find(|(member, _)| *member == key)
+            .map(|(_, number)| account_view(*number));
+        Ok(identity::encode_reply(&identity::IdentityReply::Account(
+            account,
+        )))
+    }
+}
+
+fn account_view(number: u64) -> identity::AccountView {
+    identity::AccountView {
+        number,
+        name: "someone".into(),
+        keys: Vec::new(),
+        avatar: None,
+        bio: None,
+        updated_at: 0,
+    }
+}
+
+/// The attribution table: a user key resolves to its account, a stranger key
+/// to none, a mesh peer is a node, a module saga is not attributable, and this
+/// node is itself. A new `SagaOrigin` variant fails the build in
+/// `resolve_caller` rather than defaulting to admitted.
+#[tokio::test]
+async fn a_source_resolves_to_exactly_one_caller() {
+    let me = b"this-node";
+    let table = KeyTable(vec![(b"friend-key".to_vec(), FRIEND)]);
+    let friend = SagaOrigin::External(b"friend-key".to_vec());
+    assert_eq!(
+        resolve_caller(&table, me, WorkSource::Saga(&friend)).await,
+        WorkCaller::Account(FRIEND)
+    );
+    let stranger = SagaOrigin::External(b"stranger-key".to_vec());
+    assert_eq!(
+        resolve_caller(&table, me, WorkSource::Saga(&stranger)).await,
+        WorkCaller::KeyWithoutAccount
+    );
+    assert_eq!(
+        resolve_caller(&NoReads, me, WorkSource::Peer(b"peer-node")).await,
+        WorkCaller::PeerNode
+    );
+    let module = SagaOrigin::Module("dispatch".into());
+    assert_eq!(
+        resolve_caller(&NoReads, me, WorkSource::Saga(&module)).await,
+        WorkCaller::NotAnAccountOrigin
+    );
+    assert_eq!(
+        resolve_caller(&NoReads, me, WorkSource::Saga(&SagaOrigin::System)).await,
+        WorkCaller::NotAnAccountOrigin
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the zero-read path
+// ---------------------------------------------------------------------------
+
 /// **This node's own work costs ZERO committed reads.** Not an optimization: a
-/// read here would make a single-node workspace — and every node in the window
-/// before `user account-init` — depend on an identity module that has nothing
-/// to say yet. The reader panics, so a reintroduced owner lookup fails loudly
-/// instead of quietly hanging a create.
+/// read here would make a single-node workspace — and every node whose
+/// operator holds no account — depend on an identity module that has nothing
+/// to say. The reader panics, so a reintroduced lookup fails loudly instead of
+/// quietly hanging a create.
 #[tokio::test]
 async fn our_own_work_makes_no_committed_read() {
     let dir = scratch("noreads");
@@ -222,7 +253,7 @@ async fn our_own_work_makes_no_committed_read() {
         admit(&NoReads, &dir, me, WorkSource::Peer(me)).await,
         WorkVerdict::Admitted
     );
-    // and a module-triggered saga names no node at all, so it reads nothing either.
+    // and a module-triggered saga names no key at all, so it reads nothing either.
     let module = SagaOrigin::Module("dispatch".into());
     assert_eq!(
         admit(&NoReads, &dir, me, WorkSource::Saga(&module)).await,
@@ -242,51 +273,54 @@ async fn an_unreadable_policy_refuses_without_reading_anything() {
     );
 }
 
-/// a reader that answers the CALLER lookup and fails the OWNER lookup — the
-/// asymmetric half-failure, which is the one a two-state verdict reports as
-/// "not admitted".
-struct OwnerReadFails {
-    me: Vec<u8>,
-}
+/// a reader whose identity read fails outright.
+struct KeyReadFails;
 
 #[async_trait::async_trait]
-impl CommittedReader for OwnerReadFails {
+impl CommittedReader for KeyReadFails {
     async fn read(&self, _target: &str, request: Vec<u8>) -> Result<Vec<u8>, String> {
-        let identity::IdentityQuery::OfNode { node_key } =
+        let identity::IdentityQuery::OfKey { .. } =
             identity::decode_query(&request).expect("an identity query")
         else {
-            panic!("work admission asks only OfNode");
+            panic!("work admission asks only OfKey");
         };
-        if node_key == self.me {
-            return Err("identity module did not answer".into());
-        }
-        Ok(identity::encode_reply(&identity::IdentityReply::Account(
-            Some(identity::AccountView {
-                account_id: b"caller-account".to_vec(),
-                display_name: None,
-                avatar: None,
-                bio: None,
-                nonce: 0,
-                member_keys: Vec::new(),
-                nodes: Vec::new(),
-                updated_at: 0,
-            }),
-        )))
+        Err("identity module did not answer".into())
     }
 }
 
-/// **A failed OWNER read is not a refusal either.** The owner is half the
-/// comparison for an account caller, so folding its failure into
-/// `work_not_admitted` would tell the operator to admit an account that might
-/// already BE the owner — the exact misdiagnosis `GrantAnswer`'s third state
-/// exists to prevent, one read over.
+/// **A failed key read is not a refusal.** Folding it into `work_not_admitted`
+/// would tell the operator to admit an account that might already be admitted
+/// — the exact misdiagnosis `GrantAnswer`'s third state exists to prevent.
 #[tokio::test]
-async fn a_failed_owner_read_is_unavailable_not_refused() {
-    let dir = scratch("ownerfail");
-    let reader = OwnerReadFails { me: b"me".to_vec() };
+async fn a_failed_key_read_is_unavailable_not_refused() {
+    let dir = scratch("keyfail");
+    admit_account_fixture(&dir, FRIEND).expect("policy");
+    let external = SagaOrigin::External(b"friend-key".to_vec());
     assert_eq!(
-        admit(&reader, &dir, b"me", WorkSource::Peer(b"stranger")).await,
+        admit(&KeyReadFails, &dir, b"me", WorkSource::Saga(&external)).await,
         WorkVerdict::AuthorityUnavailable
+    );
+}
+
+/// The end-to-end shape on the saga lane: an admitted account's user-signed
+/// saga runs, a stranger account's does not.
+#[tokio::test]
+async fn an_admitted_accounts_saga_runs_and_a_strangers_does_not() {
+    let dir = scratch("saga");
+    admit_account_fixture(&dir, FRIEND).expect("policy");
+    let table = KeyTable(vec![
+        (b"friend-key".to_vec(), FRIEND),
+        (b"stranger-key".to_vec(), STRANGER),
+    ]);
+    let friend = SagaOrigin::External(b"friend-key".to_vec());
+    assert_eq!(
+        admit(&table, &dir, b"me", WorkSource::Saga(&friend)).await,
+        WorkVerdict::Admitted
+    );
+    let stranger = SagaOrigin::External(b"stranger-key".to_vec());
+    assert_eq!(
+        admit(&table, &dir, b"me", WorkSource::Saga(&stranger)).await,
+        WorkVerdict::Refused(WorkRefusal::NotAdmitted)
     );
 }
 
@@ -305,63 +339,65 @@ fn scratch(name: &str) -> PathBuf {
 /// A missing file IS the default — the `services.toml` convention, and what
 /// makes this change additive to every existing workspace.
 #[test]
-fn a_workspace_with_no_policy_file_runs_its_owners_work() {
+fn a_workspace_with_no_policy_file_runs_only_its_own_work() {
     let dir = scratch("absent");
     assert_eq!(
         load(&dir).expect("absent is the default"),
-        WorkAdmission::Owner
+        WorkAdmission::default()
     );
 }
 
-/// Round trip, and `Owner` REMOVES the file: one representation per policy, no
-/// husk to read stale.
+/// Round trip, and the default REMOVES the file: one representation per
+/// policy, no husk to read stale.
 #[test]
-fn the_policy_round_trips_and_owner_leaves_no_file() {
+fn the_policy_round_trips_and_the_default_leaves_no_file() {
     let dir = scratch("roundtrip");
     let policy = accounts(&[FRIEND, STRANGER]);
     save(&dir, &policy).expect("save");
     assert_eq!(load(&dir).expect("load"), policy);
+    let text = std::fs::read_to_string(policy_path(&dir)).expect("read");
+    assert!(text.contains("\"2\""), "entries are decimal numbers: {text}");
 
     save(&dir, &WorkAdmission::Anyone).expect("save anyone");
     assert_eq!(load(&dir).expect("load anyone"), WorkAdmission::Anyone);
 
-    save(&dir, &WorkAdmission::Owner).expect("save owner");
+    save(&dir, &WorkAdmission::default()).expect("save default");
     assert!(
         !policy_path(&dir).exists(),
-        "owner must leave no file behind"
+        "the default must leave no file behind"
     );
-    assert_eq!(load(&dir).expect("load owner"), WorkAdmission::Owner);
+    assert_eq!(load(&dir).expect("load default"), WorkAdmission::default());
 }
 
-/// Revoking the last account narrows back to `Owner`, so `admit = []` can never
-/// be written — one representation, no third state a reader could invent.
+/// Revoking the last account narrows back to the default, so `admit = []` is
+/// never written — one representation, no third state a reader could invent.
 #[test]
-fn revoking_the_last_account_narrows_back_to_owner() {
-    let policy = accounts(&[FRIEND]).without(AdmitTarget::Account(FRIEND.to_vec()));
-    assert_eq!(policy, WorkAdmission::Owner);
+fn revoking_the_last_account_narrows_back_to_the_default() {
+    let policy = accounts(&[FRIEND]).without(AdmitTarget::Account(FRIEND));
+    assert_eq!(policy, WorkAdmission::default());
     assert!(policy.entries().is_empty());
 }
 
 /// `anyone` absorbs and `revoke anyone` narrows all the way back.
 #[test]
-fn anyone_absorbs_and_revoking_it_returns_to_owner() {
+fn anyone_absorbs_and_revoking_it_returns_to_the_default() {
     let widened = accounts(&[FRIEND]).with(AdmitTarget::Anyone);
     assert_eq!(widened, WorkAdmission::Anyone);
     assert_eq!(
-        widened.with(AdmitTarget::Account(FRIEND.to_vec())),
+        widened.with(AdmitTarget::Account(FRIEND)),
         WorkAdmission::Anyone
     );
     assert_eq!(
         WorkAdmission::Anyone.without(AdmitTarget::Anyone),
-        WorkAdmission::Owner
+        WorkAdmission::default()
     );
 }
 
-/// The wildcard is a STATEMENT, not an entry: mixing it with account ids is a
-/// refusal at parse, not a silently-widened policy.
+/// The wildcard is a STATEMENT, not an entry: mixing it with account numbers
+/// is a refusal at parse, not a silently-widened policy.
 #[test]
 fn admit_cannot_mix_the_wildcard_with_accounts() {
-    let mixed = parse(&[ANYONE.to_string(), config::hex_bytes(FRIEND)]).unwrap_err();
+    let mixed = parse(&[ANYONE.to_string(), FRIEND.to_string()]).unwrap_err();
     assert!(mixed.contains("statement, not an entry"), "got {mixed:?}");
     assert_eq!(
         parse(&[ANYONE.to_string()]).expect("bare wildcard"),
@@ -369,13 +405,15 @@ fn admit_cannot_mix_the_wildcard_with_accounts() {
     );
 }
 
-/// A hand-edited file that is not hex is a loud refusal, never a silently
-/// dropped entry — a dropped entry would read as "admitted" going one way and
-/// "refused" going the other.
+/// A hand-edited entry that is not a number (or is 0) is a loud refusal,
+/// never a silently dropped entry — a dropped entry would read as "admitted"
+/// going one way and "refused" going the other.
 #[test]
-fn a_non_hex_admit_entry_is_refused() {
-    let error = parse(&["not-hex".to_string()]).unwrap_err();
-    assert!(error.contains("not a hex account id"), "got {error:?}");
+fn a_non_numeric_admit_entry_is_refused() {
+    let error = parse(&["not-a-number".to_string()]).unwrap_err();
+    assert!(error.contains("not an account number"), "got {error:?}");
+    let zero = parse(&["0".to_string()]).unwrap_err();
+    assert!(zero.contains("no account"), "got {zero:?}");
 }
 
 /// An unknown key in the file is a decode error, not tolerance.
@@ -449,9 +487,10 @@ fn both_lanes_route_through_one_verdict() {
 
 /// **The premise the whole module rests on.** `/v1/submit` must keep discarding
 /// the caller's claimed origin and re-signing with the node's own key: that is
-/// what makes a saga's committed `External` origin a DERIVED node identity
-/// rather than an asserted one. If this lane ever stamped a caller-supplied
-/// origin, the compute-lane admission would silently become decorative.
+/// what makes a node-authored saga's committed `External` origin a DERIVED
+/// node identity rather than an asserted one. If this lane ever stamped a
+/// caller-supplied origin, the compute-lane admission would silently become
+/// decorative.
 #[test]
 fn the_submit_lane_still_resigns_with_the_node_key() {
     let code = source("src/validator/run/ingress.rs");

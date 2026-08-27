@@ -60,8 +60,8 @@ const MAX_EVENT_BYTES: usize = 64 * 1024;
 const DIAL_RETRY: Duration = Duration::from_secs(3);
 
 /// guest→host directed create/close request, one request → one reply. Carries
-/// NO creator field — the host derives the creator from the mesh-authenticated
-/// requesting peer node (identity `OfNode`), never from client-supplied bytes.
+/// NO creator field — the host knows the creator as the mesh-authenticated
+/// requesting peer node, never from client-supplied bytes.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum SessionControlRequest {
@@ -599,7 +599,7 @@ async fn serve_create(
             return refused(reason, &detail);
         }
     };
-    let authority = match owner_airlock_authority(&control.commands, &admit.owner_account).await {
+    let authority = match owner_airlock_authority(&control.commands, admit.owner_account).await {
         Ok(authority) => authority,
         Err(detail) => return refused("unknown_credential", &detail),
     };
@@ -677,7 +677,7 @@ struct AdmitOk {
     name: String,
     kind: provider_host::CredentialKind,
     seal_pk: [u8; 32],
-    owner_account: Vec<u8>,
+    owner_account: u64,
     limits: std::collections::BTreeMap<String, u64>,
 }
 
@@ -733,7 +733,7 @@ fn admit_create(
         name: record.name.clone(),
         kind: crate::compute::cred::service_kind(record.kind),
         seal_pk: record.seal_pk,
-        owner_account: record.owner_account.clone(),
+        owner_account: record.owner_account,
         limits: build_limits(cpu, mem_gb),
     })
 }
@@ -1072,7 +1072,7 @@ async fn credential_record(
 /// gateway, resolved from the owner account's `.duck` handle registration.
 async fn owner_airlock_authority(
     commands: &fmpsc::Sender<NodeCommand>,
-    owner_account: &[u8],
+    owner_account: u64,
 ) -> Result<String, String> {
     // the registrations query is paginated and the module HARD-CAPS a page at
     // MAX_QUERY_LIMIT (a larger `limit` is rejected outright), so page through in
@@ -1095,7 +1095,7 @@ async fn owner_airlock_authority(
         };
         let owned = page
             .iter()
-            .find(|registration| registration.account_id.as_slice() == owner_account);
+            .find(|registration| registration.account_id == owner_account);
         if let Some(registration) = owned {
             return Ok(format!("airlock.{}.duck", registration.handle));
         }
@@ -1193,17 +1193,17 @@ mod tests {
 
     fn rec(
         name: &str,
-        owner: &[u8],
-        grants: &[&[u8]],
+        owner: u64,
+        grants: &[u64],
         kind: gateway::CredentialKind,
     ) -> gateway::CredentialRecord {
         gateway::CredentialRecord {
             name: name.into(),
-            owner_account: owner.to_vec(),
+            owner_account: owner,
             publisher_node: vec![9u8; 32],
             kind,
             seal_pk: [1u8; 32],
-            grants: grants.iter().map(|g| g.to_vec()).collect(),
+            grants: grants.iter().copied().collect(),
         }
     }
 
@@ -1217,13 +1217,7 @@ mod tests {
     /// this host's — and it refuses at `/session`, before the sandbox spawns.
     #[test]
     fn admit_gates_on_sandbox_credential_and_kind_but_never_on_who_is_asking() {
-        let owner = b"owner-acct".to_vec();
-        let claude = rec(
-            "c1",
-            &owner,
-            &[b"someone-else"],
-            gateway::CredentialKind::Claude,
-        );
+        let claude = rec("c1", 1, &[2], gateway::CredentialKind::Claude);
 
         // no sandbox → refused before any credential decision.
         assert_eq!(
@@ -1259,8 +1253,7 @@ mod tests {
     /// stranger can say to this host.
     #[test]
     fn a_remote_creator_cannot_ask_this_host_for_any_size_it_likes() {
-        let owner = b"owner-acct".to_vec();
-        let claude = rec("c1", &owner, &[], gateway::CredentialKind::Claude);
+        let claude = rec("c1", 1, &[], gateway::CredentialKind::Claude);
 
         // at the ceiling is fine; a step past it is refused, per knob.
         assert!(
@@ -1303,8 +1296,7 @@ mod tests {
 
     #[test]
     fn admit_maps_limits_and_kind() {
-        let owner = b"owner".to_vec();
-        let codex = rec("x", &owner, &[], gateway::CredentialKind::Codex);
+        let codex = rec("x", 1, &[], gateway::CredentialKind::Codex);
         let ok = admit_create("codex", Some(&codex), Some(3), Some(8), true).unwrap();
         assert_eq!(ok.limits.get("cores"), Some(&3));
         assert_eq!(ok.limits.get("mem_gb"), Some(&8));
@@ -1319,43 +1311,14 @@ mod tests {
         assert!(!input_permitted(None, PeerId([7u8; 32])));
     }
 
-    /// a fake identity module: answers `OfNode` by mapping a node key to an
-    /// account id derived from it, so two different nodes are two different
-    /// accounts. Runs until the command channel closes.
-    async fn answer_identity(mut rx: fmpsc::Receiver<NodeCommand>) {
-        use futures::StreamExt as _;
-        while let Some(command) = rx.next().await {
-            let NodeCommand::Query { req, reply, .. } = command else {
-                continue;
-            };
-            let identity::IdentityQuery::OfNode { node_key } =
-                identity::decode_query(&req).expect("an identity query")
-            else {
-                continue;
-            };
-            let view = identity::AccountView {
-                account_id: node_key.iter().map(|b| b ^ 0xaa).collect(),
-                display_name: None,
-                avatar: None,
-                bio: None,
-                nonce: 0,
-                member_keys: Vec::new(),
-                nodes: Vec::new(),
-                updated_at: 0,
-            };
-            let _ = reply.send(Ok(identity::encode_reply(
-                &identity::IdentityReply::Account(Some(view)),
-            )));
-        }
-    }
-
     /// **The work-admission call site, behaviourally.**
     ///
-    /// A mesh peer whose account this node does not admit is refused at the
-    /// door — before the credential record is read, before any host capability
-    /// is disclosed. This is the hole #833 left open: without it, "a grant lends
-    /// to that account's node for whatever workload it runs" means any admitted
-    /// member naming any registered credential gets a container here.
+    /// A mesh peer is a node, never an account, so under the default policy it
+    /// is refused at the door — before the credential record is read, before
+    /// any host capability is disclosed, and with ZERO identity reads (the
+    /// command channel has no reader). This is the hole #833 left open:
+    /// without it, any admitted member naming any registered credential gets a
+    /// container here.
     #[tokio::test]
     async fn a_peer_this_node_does_not_admit_is_refused_before_any_credential_read() {
         let workspace =
@@ -1363,8 +1326,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&workspace);
         std::fs::create_dir_all(&workspace).expect("scratch workspace");
 
-        let (commands, rx) = fmpsc::channel(4);
-        let identity = tokio::spawn(answer_identity(rx));
+        let (commands, _no_reads) = fmpsc::channel(4);
         let control = Arc::new(ControlState {
             // a live manager would still never be reached: the refusal is
             // upstream of every host-capability question.
@@ -1401,10 +1363,10 @@ mod tests {
             "a refusal never echoes the account that would have been accepted: {detail:?}"
         );
 
-        // and the SAME peer is served once its account is admitted — the policy
-        // is re-read per create, so no restart is involved.
-        let admitted: Vec<u8> = [9u8; 32].iter().map(|b| b ^ 0xaa).collect();
-        crate::work_admission::admit_account_fixture(&workspace, &admitted).expect("save policy");
+        // and the SAME peer is served once the operator admits anyone — the
+        // only policy a peer NODE can be admitted by, re-read per create, so no
+        // restart is involved.
+        crate::work_admission::admit_anyone_fixture(&workspace).expect("save policy");
         let (server, mut caller) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
             let _ = serve_control(server, PeerId([9u8; 32]), control).await;
@@ -1430,7 +1392,6 @@ mod tests {
             "an admitted peer passes the door and is refused only on this host's own capability"
         );
         let _ = std::fs::remove_dir_all(&workspace);
-        identity.abort();
     }
 
     #[tokio::test]

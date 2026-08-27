@@ -1,8 +1,12 @@
-//! User identity lifecycle and signing command surface.
+//! User key lifecycle and signing command surface.
 //!
 //! These commands are synchronous operator tooling. Keeping them outside the
 //! live node entrypoint makes their stdin-only secret handling and output
 //! contracts independently testable without mixing them into runtime boot.
+//! Account membership (create, add/remove keys, name, profile) is the
+//! `ducktape account` family ([`crate::account_cli`]); this family is the KEY:
+//! its encrypted file, and the signatures it produces over other planes'
+//! artifacts (gateway routes, submit frames, admin requests, credentials).
 
 use std::path::PathBuf;
 
@@ -11,7 +15,6 @@ use commonware_cryptography::{Signer as _, ed25519};
 
 use keystore::userkey;
 
-use crate::cli_args::NodeAddr;
 use crate::config;
 use config::hex_bytes;
 
@@ -29,16 +32,6 @@ type CommandResult = Result<(), Box<dyn std::error::Error>>;
 pub(crate) enum UserCmd {
     /// encrypted user key lifecycle
     Key(UserKeyArgs),
-    /// mint a bind certificate binding a node to this user identity
-    SignBind(NodeBindArgs),
-    /// mint an unbind certificate evicting a node from this user identity
-    SignUnbind(NodeBindArgs),
-    /// print a new ed25519 device's possession proof over the add-member preimage
-    SignPossession(PossessionArgs),
-    /// consent (as an existing member) to admitting a new account key
-    SignAddMember(AddMemberArgs),
-    /// evict a member key from the account
-    SignRemoveMember(RemoveMemberArgs),
     /// sign one canonical gateway route statement
     SignGatewayRoute(GatewayRouteArgs),
     /// unlock the key once, then wrap each requested module op payload in a
@@ -46,40 +39,8 @@ pub(crate) enum UserCmd {
     SignFrame(FrameArgs),
     /// sign one owner control-plane request (the `/v1/admin` per-request PoP)
     SignAdmin(AdminArgs),
-    /// print the base64url WebAuthn challenge a passkey must sign to join
-    WebauthnChallenge(EnrollArgs),
     /// named, grantable API credentials co-hosted through this node's gateway
     Cred(crate::cred_cli::CredArgs),
-    /// bind this user key to an account on the local node and name it — one
-    /// command for the bind + display name + `.duck` handle a fresh operator
-    /// otherwise had to submit by hand
-    AccountInit(AccountInitArgs),
-}
-
-/// `user account-init --name <name> [-n <chain-id> | --node <url>]` — the
-/// one-shot account setup for an operator running their own node.
-#[derive(Debug, clap::Args)]
-pub(crate) struct AccountInitArgs {
-    /// the account's human-readable display name (also the default `.duck` handle)
-    #[arg(long, value_name = "NAME")]
-    name: String,
-    #[command(flatten)]
-    addr: NodeAddr,
-    /// path to the user key file (defaults to the active wallet, minting one
-    /// named after --name into an empty keystore)
-    #[arg(long, value_name = "PATH")]
-    key: Option<PathBuf>,
-}
-
-/// What [`load_or_mint_user_signer`] had to do to produce a signer — ONE
-/// discriminant, so the ceremony below is a `match` and not a bool the caller
-/// threads through.
-enum KeyOrigin {
-    /// the key file was already there; the password opened it.
-    Opened,
-    /// there was no key: a fresh seed was generated and sealed, and these are
-    /// the 24 words that are the ONLY way back to it.
-    Minted(String),
 }
 
 /// `user key` lifecycle subcommands.
@@ -117,86 +78,6 @@ pub(crate) struct KeyPathArgs {
     /// path to the user key file
     #[arg(long, value_name = "PATH")]
     key: PathBuf,
-}
-
-/// bind/unbind a node to this user identity — identical flag shape for both.
-#[derive(Debug, clap::Args)]
-pub(crate) struct NodeBindArgs {
-    /// path to the user key file
-    #[arg(long, value_name = "PATH")]
-    key: PathBuf,
-    /// the network's chain id
-    #[arg(long = "chain-id", value_name = "ID")]
-    chain_id: String,
-    /// the hex node pubkey to bind/unbind
-    #[arg(long = "node-pub", value_name = "HEX")]
-    node_pub: String,
-    /// monotonic per-account nonce
-    #[arg(long, value_name = "N")]
-    nonce: u64,
-}
-
-#[derive(Debug, clap::Args)]
-pub(crate) struct PossessionArgs {
-    /// path to the user key file
-    #[arg(long, value_name = "PATH")]
-    key: PathBuf,
-    /// the network's chain id
-    #[arg(long = "chain-id", value_name = "ID")]
-    chain_id: String,
-    /// the account id (hex) this device is joining
-    #[arg(long = "account-id", value_name = "HEX")]
-    account_id: String,
-    /// monotonic per-account nonce
-    #[arg(long, value_name = "N")]
-    nonce: u64,
-}
-
-#[derive(Debug, clap::Args)]
-pub(crate) struct AddMemberArgs {
-    /// path to the LOCAL member's user key file
-    #[arg(long, value_name = "PATH")]
-    key: PathBuf,
-    /// the network's chain id
-    #[arg(long = "chain-id", value_name = "ID")]
-    chain_id: String,
-    /// the account id (hex) the new key joins
-    #[arg(long = "account-id", value_name = "HEX")]
-    account_id: String,
-    /// the new key (hex) being admitted
-    #[arg(long = "new-key", value_name = "HEX")]
-    new_key: String,
-    /// the new key's scheme: ed25519 | secp256k1 (wallet) | secp256r1 (passkey)
-    #[arg(long = "new-scheme", value_name = "SCHEME")]
-    new_scheme: String,
-    /// monotonic per-account nonce
-    #[arg(long, value_name = "N")]
-    nonce: u64,
-    /// optional human label for the new key
-    #[arg(long, value_name = "S")]
-    label: Option<String>,
-    /// the new key's possession proof (hex proof bytes, in its scheme's encoding)
-    #[arg(long, value_name = "HEX")]
-    possession: String,
-}
-
-#[derive(Debug, clap::Args)]
-pub(crate) struct RemoveMemberArgs {
-    /// path to the LOCAL member's user key file
-    #[arg(long, value_name = "PATH")]
-    key: PathBuf,
-    /// the network's chain id
-    #[arg(long = "chain-id", value_name = "ID")]
-    chain_id: String,
-    /// the account id (hex) to evict from
-    #[arg(long = "account-id", value_name = "HEX")]
-    account_id: String,
-    /// the member key (hex) to evict
-    #[arg(long = "target-key", value_name = "HEX")]
-    target_key: String,
-    /// monotonic per-account nonce
-    #[arg(long, value_name = "N")]
-    nonce: u64,
 }
 
 #[derive(Debug, clap::Args)]
@@ -241,24 +122,6 @@ pub(crate) struct AdminArgs {
     node_key: String,
 }
 
-/// the pure enrollment-preimage verbs (no key, no signing): they only compute
-/// the bytes a joining key must sign, so they share one flag shape.
-#[derive(Debug, clap::Args)]
-pub(crate) struct EnrollArgs {
-    /// the network's chain id
-    #[arg(long = "chain-id", value_name = "ID")]
-    chain_id: String,
-    /// the account id (hex) the new key joins
-    #[arg(long = "account-id", value_name = "HEX")]
-    account_id: String,
-    /// the new key (hex) being enrolled
-    #[arg(long = "new-key", value_name = "HEX")]
-    new_key: String,
-    /// monotonic per-account nonce
-    #[arg(long, value_name = "N")]
-    nonce: u64,
-}
-
 /// Run one verb of the `ducktape user` family. secrets cross via stdin only
 /// (see the module header), so `run` opens stdin once and every handler reads
 /// its secret fields from it — never from `cmd`.
@@ -266,103 +129,11 @@ pub(super) fn run(cmd: UserCmd) -> CommandResult {
     let mut stdin = std::io::BufReader::new(std::io::stdin());
     match cmd {
         UserCmd::Key(args) => cmd_user_key(args, &mut stdin),
-        UserCmd::SignBind(args) => cmd_user_sign_bind(args, &mut stdin),
-        UserCmd::SignUnbind(args) => cmd_user_sign_unbind(args, &mut stdin),
-        UserCmd::SignPossession(args) => cmd_user_sign_possession(args, &mut stdin),
-        UserCmd::SignAddMember(args) => cmd_user_sign_add_member(args, &mut stdin),
-        UserCmd::SignRemoveMember(args) => cmd_user_sign_remove_member(args, &mut stdin),
         UserCmd::SignGatewayRoute(args) => cmd_user_sign_gateway_route(args, &mut stdin),
         UserCmd::SignFrame(args) => cmd_user_sign_frame(args, &mut stdin),
         UserCmd::SignAdmin(args) => cmd_user_sign_admin(args, &mut stdin),
-        UserCmd::WebauthnChallenge(args) => cmd_user_webauthn_challenge(args),
         UserCmd::Cred(args) => crate::cred_cli::run(args, &mut stdin),
-        UserCmd::AccountInit(args) => cmd_user_account_init(args, &mut stdin),
     }
-}
-
-/// `user account-init` — bind the user key to an account on the local node,
-/// set its display name, and register its `.duck` handle, in one command.
-/// Idempotent: a key already bound to an account skips the bind and only
-/// (re)asserts name + handle. Replaces the hand-built `sign-bind` + two raw
-/// `/v1/submit` calls a fresh operator used to run.
-fn cmd_user_account_init(
-    args: AccountInitArgs,
-    stdin: &mut impl std::io::BufRead,
-) -> CommandResult {
-    use identity::{IdentityMsg, IdentityQuery, IdentityReply};
-
-    let base = args.addr.resolve()?;
-    // THE shared node-addressing ladder, not a fourth hand-rolled copy of it:
-    // this used to demand `-n/--network` outright, so the very first command a
-    // new operator runs refused a machine with exactly one registered
-    // workspace — the one shape `node init` had just left behind, and the one
-    // `ducktape node run` (same ladder) is happy with.
-    let dir = args.addr.workspace()?;
-    let resolved = config::resolve(&dir.join("node.toml"))?;
-    // the key: explicit --key, else THE shared wallet resolver — the active
-    // wallet, or (empty keystore only) a fresh wallet named after --name.
-    let target = match args.key {
-        Some(explicit) => keystore::wallet::AccountInitKey::Active(explicit),
-        None => match std::env::var_os("DUCKTAPE_USER_KEY") {
-            Some(path) => keystore::wallet::AccountInitKey::Active(path.into()),
-            None => keystore::wallet::account_init_target(&args.name)?,
-        },
-    };
-    let (key_path, minted_wallet) = match target {
-        keystore::wallet::AccountInitKey::Active(path) => (path, None),
-        keystore::wallet::AccountInitKey::Mint { path, name } => (path, Some(name)),
-    };
-    let (user, origin) = load_or_mint_user_signer(&key_path, stdin)?;
-    let user_pub = user.public_key();
-    // the mnemonic BEFORE the submits: they take a block each, and a person
-    // who ^Cs on a slow chain must still have the only copy of their seed.
-    if let KeyOrigin::Minted(words) = origin {
-        let wallet_name = minted_wallet.as_deref().unwrap_or("(explicit path)");
-        if let Some(name) = &minted_wallet {
-            keystore::wallet::set_active(&keystore::wallet::duck_root()?, name)?;
-        }
-        println!(
-            "a new wallet {wallet_name:?} was minted at {}",
-            key_path.display()
-        );
-        println!("write these 24 words down — they are the only way to restore it:");
-        println!("{words}");
-    }
-
-    // Already bound? then the bind is a no-op — just (re)assert name + handle.
-    let query = IdentityQuery::OfMember {
-        member_key: user_pub.as_ref().to_vec(),
-    };
-    let reply: IdentityReply = serde_json::from_value(crate::cred_cli::query_node(
-        &base,
-        "identity",
-        serde_json::to_value(&query)?,
-    )?)?;
-    let already_bound = matches!(reply, IdentityReply::Account(Some(_)));
-
-    if !already_bound {
-        let node_pub = resolved.signer.public_key();
-        let authorizer = config::ed25519_member_auth(
-            &user,
-            identity::IDENTITY_BIND_NS,
-            &identity::bind_preimage(&resolved.service.chain_id, node_pub.as_ref(), 0),
-        );
-        let msg = IdentityMsg::BindNode { authorizer };
-        let height = crate::node_http::submit(&base, "identity", &serde_json::to_value(&msg)?)?;
-        println!("bound account at height {height}");
-    }
-
-    let name_msg = IdentityMsg::SetAccountName {
-        display_name: args.name.clone(),
-    };
-    crate::node_http::submit(&base, "identity", &serde_json::to_value(&name_msg)?)?;
-
-    let handle = args.name.to_lowercase();
-    let handle_msg = serde_json::json!({ "set_handle": { "handle": handle } });
-    crate::node_http::submit(&base, "gateway", &handle_msg)?;
-
-    println!("account {} ready (handle {}.duck)", args.name, handle);
-    Ok(())
 }
 
 // ============================================================================
@@ -508,28 +279,6 @@ pub(crate) fn mint_user_key(
     Ok(userkey::mint_user_key(out, &password)?)
 }
 
-/// Open `key_path`, or MINT it when there is nothing there yet.
-///
-/// Only `account-init` calls this, and that is the whole rule: creating the
-/// account IS the verb whose job is to bring an identity into existence, so an
-/// absent key there is the ordinary first run rather than a mistake. Everywhere
-/// else — `cred`, every `sign-*` — an absent key stays a loud error, because
-/// those verbs sign AS an already-bound account and a silently minted stranger
-/// would be a fresh unbound identity wearing the right path.
-fn load_or_mint_user_signer(
-    key_path: &std::path::Path,
-    stdin: &mut impl std::io::BufRead,
-) -> Result<(ed25519::PrivateKey, KeyOrigin), Box<dyn std::error::Error>> {
-    if key_path.exists() {
-        return Ok((load_user_signer(key_path, stdin)?, KeyOrigin::Opened));
-    }
-    if let Some(parent) = key_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-    }
-    let (words, key) = mint_user_key(key_path, stdin)?;
-    Ok((key, KeyOrigin::Minted(words)))
-}
-
 /// `user-key init --out <path>` — stdin: password. Generates a fresh seed,
 /// writes the encrypted shape (refuses to overwrite via `create_new`), and prints the 24-word
 /// mnemonic line THEN the pubkey-hex line — pubkey is the LAST stdout line
@@ -636,70 +385,6 @@ fn cmd_user_key(args: UserKeyArgs, stdin: &mut impl std::io::BufRead) -> Command
     }
 }
 
-/// `user-sign-bind` core — see [`cmd_user_sign_bind`].
-fn user_sign_bind(
-    args: NodeBindArgs,
-    stdin: &mut impl std::io::BufRead,
-) -> Result<String, Box<dyn std::error::Error>> {
-    use identity::{IdentityMsg, encode_msg};
-
-    let node_pub = config::decode_key(&args.node_pub)?;
-
-    let user = load_user_signer(&args.key, stdin)?;
-    let authorizer = config::ed25519_member_auth(
-        &user,
-        identity::IDENTITY_BIND_NS,
-        &identity::bind_preimage(&args.chain_id, node_pub.as_ref(), args.nonce),
-    );
-    let msg = IdentityMsg::BindNode { authorizer };
-    Ok(String::from_utf8(encode_msg(&msg)).expect("json is utf-8"))
-}
-
-/// `user-sign-bind --key <path> --chain-id <id> --node-pub <hex> --nonce <n>`
-/// — mint a bind certificate binding `node-pub` to the user identity at
-/// `--key` (decrypted with stdin's password line), at `chain-id`/`nonce`,
-/// and print the ready-to-submit `IdentityMsg::BindNode` JSON as the last
-/// (only) stdout line. `user_key` rides the payload — the node being bound is
-/// the verified submit ORIGIN, never a payload field; the module resolves it
-/// from the rpc transport, not from this CLI.
-fn cmd_user_sign_bind(args: NodeBindArgs, stdin: &mut impl std::io::BufRead) -> CommandResult {
-    println!("{}", user_sign_bind(args, stdin)?);
-    Ok(())
-}
-
-/// `user-sign-unbind` core — see [`cmd_user_sign_unbind`].
-fn user_sign_unbind(
-    args: NodeBindArgs,
-    stdin: &mut impl std::io::BufRead,
-) -> Result<String, Box<dyn std::error::Error>> {
-    use identity::{IdentityMsg, encode_msg};
-
-    let node_pub = config::decode_key(&args.node_pub)?;
-
-    let user = load_user_signer(&args.key, stdin)?;
-    let authorizer = config::ed25519_member_auth(
-        &user,
-        identity::IDENTITY_UNBIND_NS,
-        &identity::unbind_preimage(&args.chain_id, node_pub.as_ref(), args.nonce),
-    );
-    let msg = IdentityMsg::UnbindNode {
-        node_key: node_pub.as_ref().to_vec(),
-        authorizer,
-    };
-    Ok(String::from_utf8(encode_msg(&msg)).expect("json is utf-8"))
-}
-
-/// `user-sign-unbind --key <path> --chain-id <id> --node-pub <hex> --nonce <n>`
-/// — mint an unbind certificate evicting `node-pub` from the user identity at
-/// `--key`, and print the ready-to-submit `IdentityMsg::UnbindNode` JSON as
-/// the last stdout line. `node_key` (not `user_key`) rides the payload:
-/// unbind carries no origin restriction — a surviving device evicts a lost
-/// one by naming it directly, identified via the existing binding.
-fn cmd_user_sign_unbind(args: NodeBindArgs, stdin: &mut impl std::io::BufRead) -> CommandResult {
-    println!("{}", user_sign_unbind(args, stdin)?);
-    Ok(())
-}
-
 /// Sign one canonical gateway route and return a ready-to-submit `GatewayMsg`.
 /// This remains a namespace-specific oracle: the CLI parses and validates the
 /// complete bounded route before the user key signs it.
@@ -777,18 +462,39 @@ fn user_sign_frame(
     // would blow past OS argv limits.
     let user = load_user_signer(&args.key, stdin)?;
     while let Some(request) = read_frame_request(stdin)? {
-        let frame = node::encode_frame(
-            &user,
-            request.seq,
-            &sdk::Msg {
-                target: request.target,
-                payload: request.payload,
-            },
-        );
+        let frame = user_frame_at(&user, request.seq, &request.target, request.payload);
         writeln!(out, "{}", hex_bytes(&frame))?;
         out.flush()?;
     }
     Ok(())
+}
+
+/// ONE module op wrapped in a frame `user` signed — the bytes every
+/// user-authored submit in this binary POSTs to `/v1/submit/frame`
+/// ([`crate::node_http::submit_frame`]). The frame's verified signer becomes
+/// the op's `Origin::External`, which is how an identity, gateway or saga op
+/// is attributed to `user`'s account. `seq` is the frame's ordering/dedup
+/// tie-breaker: a fresh one per call, so resubmitting the same payload never
+/// trips the consensus lane's content-digest replay guard.
+pub(crate) fn user_frame(user: &ed25519::PrivateKey, target: &str, payload: Vec<u8>) -> Vec<u8> {
+    let seq = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    user_frame_at(user, seq, target, payload)
+}
+
+/// [`user_frame`] at an explicit `seq` — the `sign-frame` verb takes the seq
+/// off its request line so a caller holding one signer can order its own frames.
+fn user_frame_at(user: &ed25519::PrivateKey, seq: u64, target: &str, payload: Vec<u8>) -> Vec<u8> {
+    node::encode_frame(
+        user,
+        seq,
+        &sdk::Msg {
+            target: target.to_string(),
+            payload,
+        },
+    )
 }
 
 /// `user-sign-frame --key <path>` — stdin: one password line, then one
@@ -850,228 +556,6 @@ fn cmd_user_sign_admin(args: AdminArgs, stdin: &mut impl std::io::BufRead) -> Co
     Ok(())
 }
 
-/// parse a `--new-scheme` flag value into a [`identity::KeyScheme`]. the CLI's
-/// own key is always ed25519; `secp256k1`/`secp256r1` name the scheme of a
-/// DIFFERENT key being admitted (whose possession proof comes from that key's
-/// holder -- a wallet's `personal_sign`, or the FIDO2 transport for a passkey).
-fn parse_scheme(s: &str) -> Result<identity::KeyScheme, Box<dyn std::error::Error>> {
-    match s {
-        "ed25519" => Ok(identity::KeyScheme::Ed25519),
-        "secp256k1" | "wallet" => Ok(identity::KeyScheme::Secp256k1),
-        "secp256r1" | "passkey" => Ok(identity::KeyScheme::Secp256r1),
-        other => Err(format!(
-            "unknown key scheme {other:?} (want ed25519|secp256k1|wallet|secp256r1|passkey)"
-        )
-        .into()),
-    }
-}
-
-/// `user-sign-possession` core — see [`cmd_user_sign_possession`].
-fn user_sign_possession(
-    args: PossessionArgs,
-    stdin: &mut impl std::io::BufRead,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let account_id = config::unhex(&args.account_id)?;
-
-    // this key proves it holds itself over the add-member preimage; its own
-    // pubkey is `new_key`, and the node's user key is ed25519.
-    let user = load_user_signer(&args.key, stdin)?;
-    let new_key = user.public_key().as_ref().to_vec();
-    let preimage = identity::add_member_preimage(
-        &args.chain_id,
-        &account_id,
-        &new_key,
-        identity::KeyScheme::Ed25519,
-        args.nonce,
-    );
-    let proof = config::ed25519_possession(&user, identity::IDENTITY_ADD_MEMBER_NS, &preimage);
-    Ok(proof.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-/// `user-sign-possession --key <path> --chain-id <id> --account-id <hex> --nonce <n>`
-/// — for a NEW ed25519 device joining an existing account: print the hex
-/// possession proof this device signs over the add-member preimage (pair its
-/// `user-key status` pubkey with it). the existing member then feeds both to
-/// `user-sign-add-member`.
-fn cmd_user_sign_possession(
-    args: PossessionArgs,
-    stdin: &mut impl std::io::BufRead,
-) -> CommandResult {
-    println!("{}", user_sign_possession(args, stdin)?);
-    Ok(())
-}
-
-/// `user-sign-add-member` core — see [`cmd_user_sign_add_member`].
-fn user_sign_add_member(
-    args: AddMemberArgs,
-    stdin: &mut impl std::io::BufRead,
-) -> Result<String, Box<dyn std::error::Error>> {
-    use identity::{IdentityMsg, encode_msg};
-
-    let account_id = config::unhex(&args.account_id)?;
-    let new_key = config::unhex(&args.new_key)?;
-    let new_scheme = parse_scheme(&args.new_scheme)?;
-    let new_label = args.label;
-    let possession = config::unhex(&args.possession)
-        .map_err(|e| format!("--possession is not hex proof bytes: {e}"))?;
-
-    // the local user key is an existing member; it consents to admitting the
-    // new key over the same preimage the new key proved possession of.
-    let user = load_user_signer(&args.key, stdin)?;
-    let preimage = identity::add_member_preimage(
-        &args.chain_id,
-        &account_id,
-        &new_key,
-        new_scheme,
-        args.nonce,
-    );
-    let authorizer =
-        config::ed25519_member_auth(&user, identity::IDENTITY_ADD_MEMBER_NS, &preimage);
-    let msg = IdentityMsg::AddMemberKey {
-        new_key,
-        new_scheme,
-        new_label,
-        possession,
-        authorizer,
-    };
-    Ok(String::from_utf8(encode_msg(&msg)).expect("json is utf-8"))
-}
-
-/// `user-sign-add-member --key <path> --chain-id <id> --account-id <hex>
-/// --new-key <hex> --new-scheme <ed25519|secp256k1|secp256r1> --nonce <n>
-/// --possession <hex> [--label <s>]` — the LOCAL user key (an existing
-/// member) consents to admitting `new-key`; `--possession` is that key's own
-/// proof bytes (from `user-sign-possession`, a wallet's `personal_sign`, or
-/// the FIDO2 transport's assertion envelope for a passkey). prints the
-/// ready-to-submit `IdentityMsg::AddMemberKey` JSON.
-fn cmd_user_sign_add_member(
-    args: AddMemberArgs,
-    stdin: &mut impl std::io::BufRead,
-) -> CommandResult {
-    println!("{}", user_sign_add_member(args, stdin)?);
-    Ok(())
-}
-
-/// `user-sign-remove-member` core — see [`cmd_user_sign_remove_member`].
-fn user_sign_remove_member(
-    args: RemoveMemberArgs,
-    stdin: &mut impl std::io::BufRead,
-) -> Result<String, Box<dyn std::error::Error>> {
-    use identity::{IdentityMsg, encode_msg};
-
-    let account_id = config::unhex(&args.account_id)?;
-    let target_key = config::unhex(&args.target_key)?;
-
-    let user = load_user_signer(&args.key, stdin)?;
-    let preimage =
-        identity::remove_member_preimage(&args.chain_id, &account_id, &target_key, args.nonce);
-    let authorizer =
-        config::ed25519_member_auth(&user, identity::IDENTITY_REMOVE_MEMBER_NS, &preimage);
-    let msg = IdentityMsg::RemoveMemberKey {
-        target_key,
-        authorizer,
-    };
-    Ok(String::from_utf8(encode_msg(&msg)).expect("json is utf-8"))
-}
-
-/// `user-sign-remove-member --key <path> --chain-id <id> --account-id <hex>
-/// --target-key <hex> --nonce <n>` — the LOCAL user key (a member) evicts
-/// `target-key` from the account. prints the ready-to-submit
-/// `IdentityMsg::RemoveMemberKey` JSON. any member may remove any member
-/// except the last one.
-fn cmd_user_sign_remove_member(
-    args: RemoveMemberArgs,
-    stdin: &mut impl std::io::BufRead,
-) -> CommandResult {
-    println!("{}", user_sign_remove_member(args, stdin)?);
-    Ok(())
-}
-
-/// `user-webauthn-challenge` core — see [`cmd_user_webauthn_challenge`].
-fn user_webauthn_challenge(args: EnrollArgs) -> Result<String, Box<dyn std::error::Error>> {
-    use base64::Engine as _;
-
-    let account_id = config::unhex(&args.account_id)?;
-    let new_key = config::unhex(&args.new_key)?;
-
-    // the exact bytes the on-chain verifier will demand the passkey signed:
-    // SHA256(ADD_MEMBER_NS ‖ add_member_preimage(...)). one source of truth
-    // with `KeyScheme::Secp256r1.verify` — no drift between enroll and verify.
-    let preimage = identity::add_member_preimage(
-        &args.chain_id,
-        &account_id,
-        &new_key,
-        identity::KeyScheme::Secp256r1,
-        args.nonce,
-    );
-    let challenge = keyscheme::webauthn_challenge(identity::IDENTITY_ADD_MEMBER_NS, &preimage);
-    // base64url (no pad) — WebAuthn's native challenge encoding, so the phone
-    // page passes it straight into `navigator.credentials.get({ challenge })`.
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(challenge))
-}
-
-/// `user-webauthn-challenge --chain-id <id> --account-id <hex> --new-key <hex>
-/// --nonce <n>` — print the base64url WebAuthn challenge a passkey must sign to
-/// join `account-id` as `new-key` at `nonce`. Pure computation (no key, no
-/// signing): the phone's `get()` signs this, and the resulting assertion feeds
-/// `user-sign-add-member --possession`. Keeping the preimage math in the node
-/// (not the web page) is why "core in node" — the page never reconstructs it.
-fn cmd_user_webauthn_challenge(args: EnrollArgs) -> CommandResult {
-    println!("{}", user_webauthn_challenge(args)?);
-    Ok(())
-}
-
-#[cfg(test)]
-mod webauthn_challenge_tests {
-    use super::*;
-
-    fn challenge(chain: &str, account_hex: &str, new_hex: &str, nonce: u64) -> String {
-        user_webauthn_challenge(EnrollArgs {
-            chain_id: chain.to_string(),
-            account_id: account_hex.to_string(),
-            new_key: new_hex.to_string(),
-            nonce,
-        })
-        .unwrap()
-    }
-
-    #[test]
-    fn challenge_matches_the_on_chain_verifier_math() {
-        use base64::Engine as _;
-        let account_id = [0xabu8; 33];
-        let new_key = [0xcdu8; 33];
-        let account_hex: String = account_id.iter().map(|b| format!("{b:02x}")).collect();
-        let new_hex: String = new_key.iter().map(|b| format!("{b:02x}")).collect();
-
-        let got = challenge("team#abcd", &account_hex, &new_hex, 5);
-
-        // recompute via identity's PUBLIC surface — the exact functions the
-        // verifier uses. if the verb and the verifier ever diverge, an enrolled
-        // passkey would sign a challenge the chain then rejects.
-        let expected =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(keyscheme::webauthn_challenge(
-                identity::IDENTITY_ADD_MEMBER_NS,
-                &identity::add_member_preimage(
-                    "team#abcd",
-                    &account_id,
-                    &new_key,
-                    identity::KeyScheme::Secp256r1,
-                    5,
-                ),
-            ));
-        assert_eq!(got, expected);
-    }
-
-    #[test]
-    fn challenge_binds_chain_account_key_and_nonce() {
-        let base = challenge("c", "aa", "bb", 0);
-        assert_ne!(base, challenge("d", "aa", "bb", 0), "chain must move it");
-        assert_ne!(base, challenge("c", "cc", "bb", 0), "account must move it");
-        assert_ne!(base, challenge("c", "aa", "cc", 0), "new key must move it");
-        assert_ne!(base, challenge("c", "aa", "bb", 1), "nonce must move it");
-    }
-}
-
 #[cfg(test)]
 mod userkey_verb_tests {
     use super::*;
@@ -1110,34 +594,25 @@ mod userkey_verb_tests {
         userkey::write_user_key_new(path, &line).unwrap();
     }
 
-    fn pubkey_of(seed: &[u8; 32]) -> String {
-        hex_bytes(
-            ed25519::PrivateKey::decode(seed.as_slice())
-                .unwrap()
-                .public_key()
-                .as_ref(),
-        )
-    }
-
     /// clap derives every verb's kebab name from its CamelCase variant; pin
     /// the exact prior spellings so a rename can't silently break a caller.
+    /// The account verbs (`account-init`, `sign-bind`, the member family) are
+    /// gone on purpose: membership lives under `ducktape account`.
     #[test]
     fn verb_names_keep_prior_kebab_spelling() {
         use clap::CommandFactory as _;
         let cmd = TestUserCli::command();
         for name in [
             "key",
-            "sign-bind",
-            "sign-unbind",
-            "sign-possession",
-            "sign-add-member",
-            "sign-remove-member",
             "sign-gateway-route",
             "sign-frame",
             "sign-admin",
-            "webauthn-challenge",
+            "cred",
         ] {
             assert!(cmd.find_subcommand(name).is_some(), "verb {name} missing");
+        }
+        for gone in ["account-init", "sign-bind", "sign-add-member"] {
+            assert!(cmd.find_subcommand(gone).is_none(), "verb {gone} lingers");
         }
     }
 
@@ -1154,42 +629,6 @@ mod userkey_verb_tests {
         assert_eq!(pubkey_hex.len(), 64);
         let enc = userkey::read_user_key_file(&path).unwrap();
         assert_eq!(hex_bytes(&enc.pubkey), pubkey_hex);
-    }
-
-    /// `load_or_mint_user_signer` mints a fresh key when the path is absent —
-    /// the shared primitive both `account-init`'s wallet resolver and
-    /// `wallet new` rely on. One password, one mint, and the words that come
-    /// back are the real seed.
-    #[test]
-    fn account_init_mints_the_user_key_when_the_workspace_has_none() {
-        let dir = tempfile::tempdir().unwrap();
-        // deliberately a path whose PARENT does not exist either.
-        let path = dir.path().join("fresh-workspace").join("user.key");
-
-        let mut mint_stdin = stdin_of(&["correct horse battery"]);
-        let (minted, origin) = load_or_mint_user_signer(&path, &mut mint_stdin).unwrap();
-        let KeyOrigin::Minted(words) = origin else {
-            panic!("an absent key must be minted, not opened");
-        };
-        assert_eq!(words.split_whitespace().count(), 24);
-        assert!(path.exists(), "the key lands at the path the caller named");
-
-        // the words are the ONLY copy: they must restore this exact identity.
-        let restored_to = dir.path().join("restored.key");
-        let mut restore_stdin = stdin_of(&[&words, "another password"]);
-        let restored =
-            user_key_restore(KeyOutArgs { out: restored_to }, &mut restore_stdin).unwrap();
-        assert_eq!(restored, hex_bytes(minted.public_key().as_ref()));
-
-        // and a SECOND run opens the same key instead of minting over it —
-        // one password line, no mnemonic, the same identity.
-        let mut reopen_stdin = stdin_of(&["correct horse battery"]);
-        let (reopened, origin) = load_or_mint_user_signer(&path, &mut reopen_stdin).unwrap();
-        assert!(
-            matches!(origin, KeyOrigin::Opened),
-            "an existing key is opened, never re-minted"
-        );
-        assert_eq!(reopened.public_key(), minted.public_key());
     }
 
     #[test]
@@ -1304,52 +743,6 @@ mod userkey_verb_tests {
     }
 
     #[test]
-    fn sign_bind_decodes_and_wrong_password_fails() {
-        let dir = tempfile::tempdir().unwrap();
-        let seed = [77u8; 32];
-        // an arbitrary but VALID ed25519 point — a public key derived from a
-        // seed, not raw bytes (not every 32-byte string is on-curve).
-        let node_pub_hex = pubkey_of(&[100u8; 32]);
-
-        let key_path = dir.path().join("user.key");
-        let line = userkey::seal_user_key(&seed, "a password").unwrap();
-        userkey::write_user_key_new(&key_path, &line).unwrap();
-        let mut stdin = stdin_of(&["a password"]);
-        let json = user_sign_bind(
-            NodeBindArgs {
-                key: key_path.clone(),
-                chain_id: "test-chain".to_string(),
-                node_pub: node_pub_hex.clone(),
-                nonce: 0,
-            },
-            &mut stdin,
-        )
-        .unwrap();
-
-        match identity::decode_msg(json.as_bytes()).unwrap() {
-            identity::IdentityMsg::BindNode { authorizer } => {
-                assert_eq!(authorizer.key, pubkey_bytes(&seed));
-                assert_eq!(authorizer.scheme, identity::KeyScheme::Ed25519);
-            }
-            other => panic!("expected BindNode, got {other:?}"),
-        }
-
-        let mut bad_stdin = stdin_of(&["wrong password"]);
-        assert!(
-            user_sign_bind(
-                NodeBindArgs {
-                    key: key_path,
-                    chain_id: "test-chain".to_string(),
-                    node_pub: node_pub_hex,
-                    nonce: 0,
-                },
-                &mut bad_stdin,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
     fn sign_gateway_route_is_namespace_scoped_strict_and_decodable() {
         let dir = tempfile::tempdir().unwrap();
         let seed = [81u8; 32];
@@ -1358,7 +751,7 @@ mod userkey_verb_tests {
         let signer = ed25519::PrivateKey::decode(seed.as_slice()).unwrap();
         let statement = gateway::RouteStatement {
             chain_id: "test-chain".into(),
-            account_id: signer.public_key().as_ref().to_vec(),
+            account_id: 7,
             name: gateway::RouteName::named("api"),
             publisher_node: pubkey_bytes(&[82u8; 32]),
             revision: 1,
@@ -1414,27 +807,23 @@ mod userkey_verb_tests {
         );
     }
 
+    /// `user_frame` is THE submit envelope every account/cred/sched verb POSTs:
+    /// its verified origin is the user key, the payload rides verbatim, and
+    /// two frames over the same payload differ (fresh seq) so a resubmit is
+    /// never a replay.
     #[test]
-    fn sign_unbind_decodes() {
-        let dir = tempfile::tempdir().unwrap();
-        let seed = [88u8; 32];
-        let node_pub_hex = pubkey_of(&[101u8; 32]);
-
-        let key_path = dir.path().join("user.key");
-        write_encrypted(&key_path, &seed);
-        let mut stdin = stdin_of(&[TEST_PASSWORD]);
-        let json = user_sign_unbind(
-            NodeBindArgs {
-                key: key_path,
-                chain_id: "test-chain".to_string(),
-                node_pub: node_pub_hex,
-                nonce: 1,
-            },
-            &mut stdin,
-        )
-        .unwrap();
-
-        assert!(identity::decode_msg(json.as_bytes()).is_ok());
+    fn user_frame_is_signed_by_the_user_and_carries_the_payload_verbatim() {
+        let signer = ed25519::PrivateKey::decode([7u8; 32].as_slice()).unwrap();
+        let payload = b"{\"create\":{\"name\":\"a\",\"scheme\":\"ed25519\"}}".to_vec();
+        let frame = user_frame(&signer, "identity", payload.clone());
+        let (origin, msg) = node::decode_frame(&frame).expect("frame verifies");
+        assert_eq!(
+            origin,
+            sdk::Origin::External(signer.public_key().as_ref().to_vec())
+        );
+        assert_eq!(msg.target, "identity");
+        assert_eq!(msg.payload, payload);
+        assert_ne!(frame, user_frame(&signer, "identity", payload));
     }
 
     fn pubkey_bytes(seed: &[u8; 32]) -> Vec<u8> {

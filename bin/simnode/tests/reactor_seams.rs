@@ -23,8 +23,7 @@
 mod harness;
 
 use commonware_cryptography::Signer as _;
-use harness::{Sim, create_channel, ed_bind_auth, post_message};
-use identity::bind_preimage;
+use harness::{Sim, create, create_channel, key_origin, post_message};
 use serde_json::{Value, json};
 
 type Ed = commonware_cryptography::ed25519::PrivateKey;
@@ -297,9 +296,9 @@ fn a_callback_that_would_wedge_a_saga_is_rejected_at_trigger_time() {
 
 /// one op per registered module the sim can reach over /v1/submit, in a fixed
 /// order. `chat` cascades a `TagEvent` into `tagging`; `runs` subscribes through
-/// `tagging` too; `identity`'s bind founds the account `duckdns` then claims a
-/// handle on, and `gateway` publishes a member-signed route from that same
-/// just-bound publisher node. no op here produces a CROSS-block follow-up (the
+/// `tagging` too; `identity`'s Create founds the account `duckdns` then claims a
+/// handle on, and `gateway` publishes a member-signed route for that same
+/// just-founded account. no op here produces a CROSS-block follow-up (the
 /// fire-and-forget saga trigger's effect is dropped — no worker — and no
 /// dispatch result lands), so auto and stepped commit the identical block per op.
 ///
@@ -308,11 +307,13 @@ fn a_callback_that_would_wedge_a_saga_is_rejected_at_trigger_time() {
 /// determinism is repo-internal — its own e2e owns it, and it stays out of this
 /// cross-dir root-hash-equality assertion). `gateway` was the third until its
 /// SetRoute MemberAuthorization ceremony joined the sweep here — a route the
-/// account's founding Ed25519 member signs, keyed on the just-bound node.
+/// account's founding Ed25519 member signs AND submits (the origin is the key).
 fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
     let node = "n".repeat(32);
     let key = Ed::from_seed(7);
-    let preimage = bind_preimage("", node.as_bytes(), 0);
+    // the account's founding key is the origin of every identity/gateway op:
+    // the `hex:` escape names the real key, so it is a member that can sign.
+    let origin = key_origin(&key);
     let spec = echo_work_spec();
     vec![
         // chat — and, via the post's TagEvent, tagging.
@@ -401,40 +402,35 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
             json!({ "watch_channel": { "channel_id": "general", "policy": "mention" } }),
             Some("owner".into()),
         ),
-        // identity — bind_node founds the account (deterministic ed25519 consent).
-        (
-            "identity",
-            json!({ "bind_node": { "authorizer": ed_bind_auth(&key, &preimage) } }),
-            Some(node.clone()),
-        ),
-        // duckdns — claim a handle on the just-bound account (32-byte origin).
+        // identity — Create founds account 1 for the key (the origin).
+        ("identity", create("alice"), Some(origin.clone())),
+        // duckdns — claim a handle on the just-founded account (a member origin).
         (
             "gateway",
             json!({ "set_handle": { "handle": "alice" } }),
-            Some(node.clone()),
+            Some(origin.clone()),
         ),
-        // gateway — the account's founding key signs a route from the just-bound
-        // publisher node. the sim wires `Gateway::new(.., None, "local")` (no
-        // valset), so the only ceremony is: the publisher node is bound to the
-        // account (the identity op above), and a current Ed25519 member signs.
+        // gateway — the account's founding key signs a route naming `node` as
+        // its publisher. the sim wires `Gateway::new(.., None, "local")` (no
+        // valset), so the only ceremony is: the origin is a member of the
+        // route's account, and a current Ed25519 member signs.
         (
             "gateway",
             gateway_set_route(&key, &node),
-            Some(node.clone()),
+            Some(origin.clone()),
         ),
     ]
 }
 
-/// a gateway `SetRoute` op, member-signed. the route names the account founded
-/// by `key`'s bind (its `account_id` is that key's pubkey) and the publisher
-/// `node` the identity op bound to it; the `MemberAuthorization` is `key`'s
-/// ed25519 signature over the route-signing preimage under `GATEWAY_ROUTE_NS` —
-/// the same member-consent shape `ed_bind_auth` builds, keyed on the gateway
-/// namespace. deterministic: same seed, same preimage, same signature.
+/// a gateway `SetRoute` op, member-signed. the route names account 1 (the one
+/// `key`'s Create founded) and the publisher `node` the account vouches for;
+/// the `MemberAuthorization` is `key`'s ed25519 signature over the
+/// route-signing preimage under `GATEWAY_ROUTE_NS`. deterministic: same seed,
+/// same preimage, same signature.
 fn gateway_set_route(key: &Ed, node: &str) -> Value {
     let statement = gateway::RouteStatement {
         chain_id: "local".into(),
-        account_id: key.public_key().as_ref().to_vec(),
+        account_id: 1,
         name: gateway::RouteName::named("api"),
         publisher_node: node.as_bytes().to_vec(),
         revision: 1,

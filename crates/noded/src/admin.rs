@@ -54,18 +54,21 @@
 //!
 //! a per-request proof-of-possession (PoP) by the owner account's key, verified
 //! statelessly against a PUBLIC pin — the coordinator auth pattern (#197). the
-//! owner is a CHAIN FACT: the committed `BindNode` that maps THIS node's key to
-//! an account (identity `OfNode`); the request's key must be one of that
+//! owner is the OPERATOR's statement plus a chain fact: identity binds no node
+//! to an account, so the node boots with the operator's own wallet key
+//! ([`AdminConfig::owner_key`]) and the account THAT key is on (identity
+//! `OfKey`) owns the control plane; the request's key must be one of that
 //! account's member keys.
 //!
 //! ## the bootstrap window
 //!
-//! a `Public` node with NO committed owner yet (fresh network, before the first
-//! `BindNode`) has nobody to authenticate against, so admin falls back to the
-//! operator gate until the first bind commits — never drivable off-box with no
-//! check at all, collapsing to the full owner gate the instant ownership exists.
-//! the embedded single-writer daemon (`node_key = None`, no consensus) can only
-//! ever be operator-gated.
+//! a `Public` node whose operator key is on NO account yet (fresh network,
+//! before `ducktape account create`) has nobody to authenticate against, so
+//! admin falls back to the operator gate until the account exists — never
+//! drivable off-box with no check at all, collapsing to the full owner gate
+//! the instant the account does. the embedded single-writer daemon
+//! (`node_key = None`, no consensus) and a host with no wallet
+//! (`owner_key = None`) can only ever be operator-gated.
 //!
 //! ## the PoP wire (mirrors `nat-traversal::auth`)
 //!
@@ -180,10 +183,16 @@ impl AdminExposure {
 #[derive(Clone, Debug)]
 pub struct AdminConfig {
     pub exposure: AdminExposure,
-    /// this node's own consensus key — the subject of the `BindNode` that names
-    /// its owner. `None` on the embedded daemon (no consensus, no owner on
-    /// chain): admin stays operator-gated there.
+    /// this node's own consensus key — the salt every owner PoP is bound to,
+    /// so a signature for one node never replays against another. `None` on
+    /// the embedded daemon (no consensus): admin stays operator-gated there.
     pub node_key: Option<Vec<u8>>,
+    /// the LOCAL user key whose account owns this node's control plane — the
+    /// operator's active wallet key, read from the keystore at boot. Identity
+    /// binds no node to an account, so ownership is the operator's own
+    /// statement: "the account my key is on drives this node". `None` = no
+    /// wallet on this host, admin stays operator-gated.
+    pub owner_key: Option<Vec<u8>>,
     /// identity module id ownership resolves against.
     pub identity_module: String,
     /// this boot's operator credential ([`mint_operator_token`]). `None` FAILS
@@ -197,6 +206,7 @@ impl Default for AdminConfig {
         Self {
             exposure: AdminExposure::default(),
             node_key: None,
+            owner_key: None,
             identity_module: DEFAULT_IDENTITY_MODULE.to_string(),
             operator_token: None,
         }
@@ -329,7 +339,7 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 }
 
 /// decode an even-length lowercase/uppercase hex string to bytes.
-fn from_hex(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn from_hex(s: &str) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
         return None;
     }
@@ -339,22 +349,22 @@ fn from_hex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// the outcome of resolving this node's committed owner.
+/// the outcome of resolving this node's owning account.
 enum OwnerResolve {
-    /// this node's key is bound to an account; these are its member keys.
+    /// the operator's key is on an account; these are its member keys.
     Owned(Vec<Vec<u8>>),
-    /// no `BindNode` names this node yet — the bootstrap window.
+    /// the operator's key is on no account yet — the bootstrap window.
     NoOwner,
     /// the identity module could not be reached (actor gone / not registered).
     Unavailable,
 }
 
-/// resolve the account that owns `node_key` from committed state, over the same
-/// actor query lane every read uses. NEVER trusts the connection — ownership is
-/// read from `identity` `OfNode`.
-async fn resolve_owner(handle: &NodeHandle, identity_module: &str, node_key: &[u8]) -> OwnerResolve {
-    let req = identity::encode_query(&identity::IdentityQuery::OfNode {
-        node_key: node_key.to_vec(),
+/// resolve the account the operator's `owner_key` belongs to from committed
+/// state, over the same actor query lane every read uses. NEVER trusts the
+/// connection — membership is read from `identity` `OfKey`.
+async fn resolve_owner(handle: &NodeHandle, identity_module: &str, owner_key: &[u8]) -> OwnerResolve {
+    let req = identity::encode_query(&identity::IdentityQuery::OfKey {
+        key: owner_key.to_vec(),
     });
     let (reply, rx) = futures::channel::oneshot::channel();
     if handle
@@ -376,10 +386,13 @@ async fn resolve_owner(handle: &NodeHandle, identity_module: &str, node_key: &[u
     };
     match identity::decode_reply(&bytes) {
         Ok(identity::IdentityReply::Account(Some(view))) => {
-            OwnerResolve::Owned(view.member_keys.into_iter().map(|m| m.pubkey).collect())
+            OwnerResolve::Owned(view.keys.into_iter().map(|key| key.pubkey).collect())
         }
         Ok(identity::IdentityReply::Account(None)) => OwnerResolve::NoOwner,
-        _ => OwnerResolve::Unavailable,
+        Ok(identity::IdentityReply::Accounts(_)) | Ok(identity::IdentityReply::Gen(_)) => {
+            OwnerResolve::Unavailable
+        }
+        Err(_) => OwnerResolve::Unavailable,
     }
 }
 
@@ -552,10 +565,13 @@ async fn admit_public(
     cfg: &AdminConfig,
     presented: &Presented,
 ) -> Result<(), AdminRefusal> {
-    let Some(node_key) = cfg.node_key.as_deref() else {
+    // both halves or neither: the node key salts the PoP, the owner key names
+    // the account that may present one.
+    let (Some(node_key), Some(owner_key)) = (cfg.node_key.as_deref(), cfg.owner_key.as_deref())
+    else {
         return admit_operator(cfg, presented);
     };
-    match resolve_owner(handle, &cfg.identity_module, node_key).await {
+    match resolve_owner(handle, &cfg.identity_module, owner_key).await {
         OwnerResolve::Unavailable => Err(AdminRefusal::OwnerUnresolved),
         OwnerResolve::NoOwner => admit_operator(cfg, presented),
         OwnerResolve::Owned(members) => admit_owner(&members, node_key, presented),
@@ -584,7 +600,7 @@ fn admit_operator(cfg: &AdminConfig, presented: &Presented) -> Result<(), AdminR
 }
 
 /// the owner PoP gate: the request must carry a fresh signature by a key that
-/// is a member of the account owning this node, bound to THIS node's key.
+/// is a member of the operator's account, bound to THIS node's key.
 fn admit_owner(
     members: &[Vec<u8>],
     node_key: &[u8],

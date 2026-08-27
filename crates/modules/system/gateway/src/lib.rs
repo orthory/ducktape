@@ -1,13 +1,14 @@
 //! The `.duck` gateway: the whole **name → AccountId → route** pipeline as one
 //! consensus module.
 //!
-//! An Identity account signs one monotonic route from its apex or a single
-//! service label to a typed upstream target plus an invocation policy, AND —
-//! as the handle plane absorbed from duckdns — an optional human `.duck` name
-//! aliasing its stable AccountId. Resolution stops at the AccountId; this
-//! module stores no node address, local port, browser session, content bytes,
-//! or transport state. `.duck` is Ducktape presentation syntax, never installed
-//! into the host DNS stack.
+//! An Identity account (a NUMBER; the frame origin is one of its user keys)
+//! signs one monotonic route from its apex or a single service label to a
+//! typed upstream target plus an invocation policy, AND — as the handle plane
+//! absorbed from duckdns — an optional human `.duck` name aliasing its account
+//! number. Resolution stops at the account; this module stores no node
+//! address, local port, browser session, content bytes, or transport state.
+//! `.duck` is Ducktape presentation syntax, never installed into the host DNS
+//! stack.
 
 mod frames;
 mod interface;

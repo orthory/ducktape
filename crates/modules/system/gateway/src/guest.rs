@@ -15,9 +15,9 @@
 //! (`WasmModule::with_store`). there is NO per-dispatch snapshot: the store
 //! IS the state and the wasm root is the store's Merkle root. see the `pages`
 //! guest port for the staging-contract argument; gateway rides the identical
-//! seams, and every execute's SIBLING reads — the valset standing gate
-//! (validators ∪ residents) and the identity `OfNode` account derivation plus
-//! current-member check — resolve through the runtime's memoized replay.
+//! seams, and every execute's SIBLING read — the identity `OfKey` account
+//! derivation plus current-member check — resolves through the runtime's
+//! memoized replay.
 //!
 //! ## the genesis-config chain id
 //!
@@ -36,12 +36,10 @@ use guest_adapter::WitStore;
 /// the genesis-constant id this module registers under (the native twin's id:
 /// `Env::me` and follow-up routing must read identically to ported logic).
 const MODULE_ID: &str = "gateway";
-/// the sibling ids this instance reads through host-routed queries — EXACTLY
+/// the sibling id this instance reads through host-routed queries — EXACTLY
 /// the production wiring (`bin/node/src/host_state.rs`): the identity module
-/// that resolves the publisher node to its account, and the valset module that
-/// gates mutations to members.
+/// that resolves the origin key to its account.
 const IDENTITY_ID: &str = "identity";
-const VALSET_ID: &str = "valset";
 
 // store-backed port: no snapshot — the host owns the real qmdb store and the
 // module is rebuilt fresh per dispatch (see `guest_adapter::store_guest!`).
@@ -53,7 +51,6 @@ guest_adapter::store_guest! {
         MODULE_ID,
         Box::new(WitStore),
         IDENTITY_ID,
-        Some(VALSET_ID.into()),
         guest_adapter::store_genesis_chain_id("gateway")?,
     ),
 }

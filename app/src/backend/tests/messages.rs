@@ -2,8 +2,9 @@ use super::*;
 
 #[test]
 fn a_dm_id_is_pair_derived_and_cannot_be_forged() {
+    // the viewer's key, and a peer's ACCOUNT NUMBER as the directory keys it.
     let a = "aa".repeat(32);
-    let b = "bb".repeat(32);
+    let b = "42".to_string();
     assert_eq!(
         dm_channel_id(a.clone(), b.clone()),
         dm_channel_id(b.clone(), a.clone()),

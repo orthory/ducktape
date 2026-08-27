@@ -356,9 +356,10 @@ impl NodeHandle {
     }
 
     /// configure the owner-gated control namespace (ADR A2/A5). the full node
-    /// passes its own consensus key (the `BindNode` subject ownership resolves
-    /// against) and the exposure the operator chose; a handle that leaves this
-    /// at the default has no minted credential and so refuses all of admin.
+    /// passes its own consensus key (the salt every owner PoP is bound to),
+    /// the operator's wallet key (whose account owns the plane) and the
+    /// exposure the operator chose; a handle that leaves this at the default
+    /// has no minted credential and so refuses all of admin.
     pub fn with_admin(mut self, admin: crate::admin::AdminConfig) -> Self {
         self.admin = admin;
         self

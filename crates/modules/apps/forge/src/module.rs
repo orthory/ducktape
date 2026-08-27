@@ -1648,20 +1648,17 @@ mod tests {
         sdk::Origin::External(user_key(b))
     }
 
-    /// an `identity` query handler that answers EVERY account lookup with the
-    /// same account — i.e. this key is bound to it, whichever key domain the
-    /// caller asked about.
-    fn identity_of(account_id: Vec<u8>) -> impl FnMut(&[u8]) -> Result<Vec<u8>, Error> {
+    /// an `identity` query handler that answers EVERY key lookup with the same
+    /// account — i.e. whichever key asked, it is a member of `number`.
+    fn identity_of(number: u64) -> impl FnMut(&[u8]) -> Result<Vec<u8>, Error> {
         move |_req| {
             Ok(identity::encode_reply(&IdentityReply::Account(Some(
                 identity::AccountView {
-                    account_id: account_id.clone(),
-                    display_name: None,
+                    number,
+                    name: "acct".into(),
+                    keys: Vec::new(),
                     avatar: None,
                     bio: None,
-                    nonce: 0,
-                    member_keys: Vec::new(),
-                    nodes: Vec::new(),
                     updated_at: 0,
                 },
             ))))
@@ -2400,23 +2397,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    // the node-key push and the user-key merge sign under DIFFERENT key
-    // domains; Identity collapses both onto one account, so the human who
-    // pushed from the CLI can merge from the app.
+    // two keys of one association (a laptop key pushing, a phone key merging)
+    // collapse onto one account principal, so the human who pushed from the
+    // CLI can merge from the app.
     #[test]
-    fn a_node_key_and_a_member_key_of_one_account_share_the_owner() {
+    fn two_keys_of_one_account_share_the_owner() {
         let base = tmp_base("owner-account");
         let mut forge = Forge::init("forge", base.clone()).unwrap();
-        let account = vec![0xACu8; 32];
-        let node_key = vec![0xB0u8; 32];
+        let account = 7u64;
+        let laptop_key = vec![0xB0u8; 32];
 
-        let mut node = ctx_with_origin(1, sdk::Origin::External(node_key))
-            .on_query("identity", identity_of(account.clone()));
-        push(&mut forge, &mut node, "demo", "main", None, oid('a')).expect("node births the repo");
+        let mut laptop = ctx_with_origin(1, sdk::Origin::External(laptop_key))
+            .on_query("identity", identity_of(account));
+        push(&mut forge, &mut laptop, "demo", "main", None, oid('a'))
+            .expect("the laptop key births the repo");
 
         // a DIFFERENT key, same account -> same principal -> allowed.
-        let mut member =
-            ctx_with_origin(2, user_origin(5)).on_query("identity", identity_of(account.clone()));
+        let mut member = ctx_with_origin(2, user_origin(5)).on_query("identity", identity_of(account));
         push(
             &mut forge,
             &mut member,
@@ -2427,7 +2424,7 @@ mod tests {
         )
         .expect("the same account's member key moves main");
 
-        // a key bound to NO account is its own principal -> refused.
+        // a key of NO account is its own principal -> refused.
         let mut outsider = ctx_with_origin(3, user_origin(7)).on_query("identity", |_: &[u8]| {
             Ok(identity::encode_reply(&IdentityReply::Account(None)))
         });
@@ -2439,7 +2436,7 @@ mod tests {
             Some(oid('b')),
             oid('c'),
         )
-        .expect_err("an unbound key is not the owner");
+        .expect_err("an account-less key is not the owner");
         assert!(err.to_string().contains("only the owner"), "{err}");
 
         let _ = std::fs::remove_dir_all(&base);

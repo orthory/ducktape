@@ -338,15 +338,12 @@ mod tests {
         let sig_start = tampered.len() - 64;
         tampered[sig_start] ^= 0x01;
 
-        // it fails at signature verification, NOT as a parse error: a genuine
+        // it fails at proof verification, NOT as a parse error: a genuine
         // junk envelope errors with different wording.
         let junk = verify_relay_submit(b"not a frame").unwrap_err();
         let err = verify_relay_submit(&tampered).unwrap_err();
-        assert_ne!(
-            err, junk,
-            "tamper must fail at the signature, not the parser"
-        );
-        assert!(err.contains("signature"), "{err}");
+        assert_ne!(err, junk, "tamper must fail at the proof, not the parser");
+        assert!(err.contains("frame proof does not bind"), "{err}");
     }
 
     #[test]

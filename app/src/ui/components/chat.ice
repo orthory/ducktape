@@ -1168,9 +1168,9 @@ component ComposerMarks(disabled:bool)
 //
 // `me` is `settings_user_key` — full-hex, from `SettingsFacts`, which is what a
 // `ChatMember.key` carries. There was no such fact when this component landed:
-// `account_id` is a short_label of the identity module's ACCOUNT id and cannot
-// be compared with a membership row, so the key was added to SettingsFacts
-// rather than guessed at from the account card.
+// the account card carries the identity module's ACCOUNT NUMBER, not a key,
+// and cannot be compared with a membership row, so the key was added to
+// SettingsFacts rather than guessed at from the account card.
 component ComposerGate(reason:str)
   col #root w=fill
     match reason
