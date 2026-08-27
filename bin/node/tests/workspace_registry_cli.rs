@@ -3,14 +3,21 @@
 //! `-n/--network <chain-id>` selector find it. pure-CLI: no node is booted,
 //! no socket is bound — `DUCKTAPE_HOME` points every run at a temp registry.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// the checked-in `<id>.component.wasm` set — `node init` hashes a directory of
+/// these into the descriptor, so a CLI test that founds a network needs one.
+fn fixtures() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../crates/kernel/host/tests/fixtures")
+}
 
 fn ducktape(home: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .arg("node")
         .args(args)
         .env("DUCKTAPE_HOME", home)
+        .env("DUCKTAPE_MODULES_DIR", fixtures())
         .output()
         .expect("run ducktape")
 }
@@ -76,6 +83,7 @@ fn init_with_path(home: &Path, name: &str, path_dir: &Path) -> (String, std::pat
     let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .args(["node", "init", "--name", name, "--primary-coordinator", "none"])
         .env("DUCKTAPE_HOME", home)
+        .env("DUCKTAPE_MODULES_DIR", fixtures())
         .env("PATH", path_dir)
         .output()
         .expect("run ducktape");
@@ -146,6 +154,7 @@ fn ducktape_raw(home: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .args(args)
         .env("DUCKTAPE_HOME", home)
+        .env("DUCKTAPE_MODULES_DIR", fixtures())
         .output()
         .expect("run ducktape")
 }
@@ -208,4 +217,52 @@ fn one_registered_workspace_needs_no_selector_in_any_family() {
         "an ambiguous registry names its candidates: {stderr}"
     );
     assert!(stderr.contains("-n"), "and the flag that picks one: {stderr}");
+}
+
+/// `--modules <dir>` is how a founder pins its genesis wasm set: every
+/// component in the directory is hashed INTO the descriptor and copied into
+/// `<workspace>/modules`, the bundle the node seeds its blobstore from at boot.
+/// The copy and the hash must be the same bytes, or the node refuses its own
+/// workspace on the next start.
+#[test]
+fn init_writes_module_hashes_and_the_bundle() {
+    use sha2::Digest as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .args(["node", "init", "--name", "bundled", "--primary-coordinator", "none", "--dir"])
+        .arg(&ws)
+        .args(["--listen", "127.0.0.1:0", "--advertised", "127.0.0.1:1", "--modules"])
+        .arg(fixtures())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let d = workspace_config::NetworkDescriptor::load(&ws.join("network.toml")).unwrap();
+    let ids: Vec<&str> = d.modules.iter().map(|m| m.id.as_str()).collect();
+    let mut want = topology::TOPOLOGY.wasm_ids(topology::PRODUCTION);
+    want.sort_unstable();
+    assert_eq!(ids, want);
+    for m in &d.modules {
+        let component = ws.join("modules").join(format!("{}.component.wasm", m.id));
+        let bytes = std::fs::read(&component).expect("the bundle carries every hashed component");
+        assert_eq!(workspace_config::hex_bytes(&sha2::Sha256::digest(&bytes)), m.code_hash);
+    }
+}
+
+/// a bundle missing a component is named by the file the operator has to go
+/// look for — not by a hash mismatch three boots later.
+#[test]
+fn init_names_the_missing_component() {
+    let tmp = tempfile::tempdir().unwrap();
+    let empty = tmp.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .args(["node", "init", "--name", "x", "--primary-coordinator", "none", "--dir"])
+        .arg(tmp.path().join("ws"))
+        .args(["--listen", "127.0.0.1:0", "--advertised", "127.0.0.1:1", "--modules"])
+        .arg(&empty)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("acl.component.wasm"));
 }

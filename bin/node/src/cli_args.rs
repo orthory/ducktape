@@ -495,6 +495,10 @@ pub struct InitArgs {
     /// found the network here instead of the registry default
     #[arg(long, value_name = "DIR")]
     pub dir: Option<PathBuf>,
+    /// directory of `<id>.component.wasm` files to found the network's genesis
+    /// wasm set from (default: $DUCKTAPE_MODULES_DIR, else ~/.ducktape/modules)
+    #[arg(long, value_name = "DIR")]
+    pub modules: Option<PathBuf>,
     #[command(flatten)]
     pub plumbing: PlumbingArgs,
 }

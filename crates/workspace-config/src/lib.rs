@@ -74,6 +74,15 @@ pub fn executor_dir() -> Result<PathBuf, String> {
     Ok(ducktape_home()?.join("executors"))
 }
 
+/// where `make install-node` / `ops/dev.sh` put the module components a founder
+/// seeds its network from: `$DUCKTAPE_MODULES_DIR`, else `<ducktape_home>/modules`.
+pub fn modules_dir() -> Result<PathBuf, String> {
+    if let Some(dir) = std::env::var_os("DUCKTAPE_MODULES_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    Ok(ducktape_home()?.join("modules"))
+}
+
 /// default recovery checkpoint cadence: small enough that boot replay stays
 /// cheap, large enough that snapshotting the in-memory cohort is amortized.
 pub const DEFAULT_CHECKPOINT_BLOCKS: u64 = 32;

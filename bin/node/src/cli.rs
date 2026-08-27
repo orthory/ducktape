@@ -416,11 +416,13 @@ fn detect_platform_sandbox() -> Option<config::SandboxToml> {
     Some(table)
 }
 
-/// `init --name <human name> [--dir <dir>] [--listen a] [--advertised a] [--http a]
-/// [--rpc a] [--primary-coordinator host:port|none]
+/// `init --name <human name> [--dir <dir>] [--modules <dir>] [--listen a]
+/// [--advertised a] [--http a] [--rpc a] [--primary-coordinator host:port|none]
 /// [--wireguard-listen a] [--wireguard-advertised host:port] [--invite-listen a]`
 /// — found a network: mint the chain-id, write the descriptor + node config,
-/// seed the genesis validator set with this identity. Every flag is optional:
+/// seed the genesis validator set with this identity, and PIN the genesis wasm
+/// set — every component in `--modules` is hashed into the descriptor and
+/// copied into `<workspace>/modules`. Every flag is optional:
 /// the generated config defaults to a WORKING node (mesh `[::]:52200`,
 /// overlay advertise, HTTP 8844, RPC 8845, gateway, WireGuard 51820) and
 /// prints every key, so the file itself documents what to change. without
@@ -493,6 +495,40 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         plumbing.sandbox = detect_platform_sandbox();
     }
 
+    // the genesis wasm set. founding PINS it: every component is hashed into
+    // the descriptor (those hashes are IN the genesis fingerprint, so a node
+    // built against other bytes is a different network) and the SAME bytes are
+    // copied into `<workspace>/modules` — the bundle every boot seeds its code
+    // registry from and re-verifies against the descriptor.
+    let modules_src = match args.modules {
+        Some(dir) => dir,
+        None => config::modules_dir()?,
+    };
+    // by id, so a bundle missing several components always names the same one
+    // first — the operator fixes a stable list, not a topology-order lottery.
+    let mut wasm_ids = topology::TOPOLOGY.wasm_ids(topology::PRODUCTION);
+    wasm_ids.sort_unstable();
+    let hashes = config::hash_bundle(&modules_src, &wasm_ids)
+        .map_err(|e| format!("{e} — pass --modules <dir> holding every <id>.component.wasm"))?;
+    let bundle = dir.join("modules");
+    std::fs::create_dir_all(&bundle)?;
+    for id in &wasm_ids {
+        std::fs::copy(
+            config::component_path(&modules_src, id),
+            config::component_path(&bundle, id),
+        )?;
+    }
+    let mut modules = Vec::with_capacity(hashes.len());
+    for (id, hash) in &hashes {
+        // ids come from the topology today, but the descriptor codec's
+        // delimiter rule is enforced at every entry point — this is one.
+        config::validate_module_id(id)?;
+        modules.push(config::ModuleCode {
+            id: id.clone(),
+            code_hash: hex_bytes(hash),
+        });
+    }
+
     let me = key.public_key();
     let mut descriptor = config::NetworkDescriptor {
         chain_id: chain_id.clone(),
@@ -500,7 +536,7 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         bootstrap: Vec::new(),
         reach: Vec::new(),
         coordination: None,
-        modules: Vec::new(),
+        modules,
     };
     if let Some(addr) = config::dialable(Some(&plumbing.advertised), &plumbing.listen)? {
         descriptor.add_bootstrap(&me, &addr);
@@ -516,6 +552,11 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         hex_bytes(me.as_ref())
     );
     eprintln!("network {chain_id} initialized in {}", dir.display());
+    eprintln!(
+        "modules: {} components bundled from {}",
+        descriptor.modules.len(),
+        modules_src.display()
+    );
     // a registry-default workspace is addressable by chain id; an explicit
     // --dir may live outside the registry, so its hints stay path-based.
     let selector = match explicit_dir {
