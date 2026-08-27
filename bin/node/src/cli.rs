@@ -470,26 +470,8 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         plumbing.sandbox = detect_platform_sandbox();
     }
 
-    // seed the bundle the node boots from: the SAME bytes just hashed, under
-    // the names the boot path reads (`<workspace>/modules/<id>.component.wasm`).
-    //
-    // `--modules <ws>/modules` — the flow the "delete the file to re-found"
-    // refusal above invites — makes source and destination the same file, and
-    // `std::fs::copy(p, p)` returns `Ok(0)` after TRUNCATING it. Those bytes
-    // are already where they belong, so the copy has nothing to do. Both paths
-    // exist by here (one was just created, the other was just read from), so
-    // neither `canonicalize` can fail into a false match.
-    let bundle = dir.join("modules");
-    std::fs::create_dir_all(&bundle)?;
-    let bundle_is_the_source = modules_src.canonicalize().ok() == bundle.canonicalize().ok();
-    if !bundle_is_the_source {
-        for id in hashes.keys() {
-            std::fs::copy(
-                config::component_path(&modules_src, id),
-                config::component_path(&bundle, id),
-            )?;
-        }
-    }
+    // seed the bundle the node boots from: the SAME bytes just hashed.
+    seed_bundle(&dir, &modules_src, hashes.keys())?;
     let mut modules = Vec::with_capacity(hashes.len());
     for (id, hash) in &hashes {
         // ids come from the topology today, but the descriptor codec's
@@ -538,6 +520,72 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("start:  ducktape node run {selector}");
     eprintln!("invite: ducktape node invite {selector}");
     println!("{chain_id}");
+    Ok(())
+}
+
+/// copy every component in `ids` from `src` into `<dir>/modules`, under the
+/// names the boot path reads (`<workspace>/modules/<id>.component.wasm`).
+///
+/// `src == <dir>/modules` — the flow init's "delete the file to re-found"
+/// refusal invites — makes source and destination the same file, and
+/// `std::fs::copy(p, p)` returns `Ok(0)` after TRUNCATING it. Those bytes are
+/// already where they belong, so the copy has nothing to do. Both paths exist
+/// by here (the bundle dir was just created, the source was just hashed), so
+/// neither `canonicalize` can fail into a false match.
+fn seed_bundle<'a>(
+    dir: &std::path::Path,
+    src: &std::path::Path,
+    ids: impl IntoIterator<Item = &'a String>,
+) -> std::io::Result<()> {
+    let bundle = dir.join("modules");
+    std::fs::create_dir_all(&bundle)?;
+    let bundle_is_the_source = src.canonicalize().ok() == bundle.canonicalize().ok();
+    if bundle_is_the_source {
+        return Ok(());
+    }
+    for id in ids {
+        std::fs::copy(
+            config::component_path(src, id),
+            config::component_path(&bundle, id),
+        )?;
+    }
+    Ok(())
+}
+
+/// a MEMBER boots straight into genesis, where `genesis_host` refuses a
+/// missing component and there is no peer to fetch one from — so a `join`
+/// that lands this identity in the validator set seeds `<dir>/modules` from
+/// the managed modules dir, every component verified against the descriptor's
+/// hash first. A non-member joiner keeps no bundle: its statesync fetches the
+/// genesis components off the mesh.
+fn bundle_member_genesis(dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let descriptor = config::NetworkDescriptor::load(&dir.join("network.toml"))?;
+    let want = descriptor.module_hashes()?;
+    let src = config::modules_dir()?;
+    let remedy = format!(
+        "a member boots from its own genesis bundle: fill {} with `make install-node`, or \
+         point $DUCKTAPE_MODULES_DIR at a directory holding this network's components, \
+         then re-run `join`",
+        src.display()
+    );
+    let ids: Vec<&str> = want.keys().map(String::as_str).collect();
+    let have = config::hash_bundle(&src, &ids).map_err(|e| format!("{e} — {remedy}"))?;
+    for (id, hash) in &want {
+        let is_the_genesis_component = have.get(id) == Some(hash);
+        if !is_the_genesis_component {
+            return Err(format!(
+                "module {id} in {} is not this network's genesis component — {remedy}",
+                src.display()
+            )
+            .into());
+        }
+    }
+    seed_bundle(dir, &src, want.keys())?;
+    eprintln!(
+        "modules: {} components bundled from {}",
+        want.len(),
+        src.display()
+    );
     Ok(())
 }
 
@@ -1662,6 +1710,9 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
         invite_listen: net.invite_listen.clone(),
     };
     let joined = config::join_workspace(&blob, args.dir.clone(), &overrides)?;
+    if joined.is_member {
+        bundle_member_genesis(&joined.dir)?;
+    }
 
     if let Some(runtime) = &joined.compute_runtime {
         eprintln!(

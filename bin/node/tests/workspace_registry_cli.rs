@@ -288,6 +288,142 @@ fn re_founding_from_its_own_bundle_keeps_the_components() {
     }
 }
 
+fn assert_ok(out: &std::process::Output, what: &str) {
+    assert!(
+        out.status.success(),
+        "{what} failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// the pre-genesis co-validator ceremony up to the paste: found under
+/// `<tmp>/founder`, mint `<tmp>/joiner`'s identity, `admit` it, mint the
+/// refreshed invite. Returns the joiner dir and the blob the member joins with.
+fn found_and_admit(tmp: &Path) -> (std::path::PathBuf, String) {
+    let founder = tmp.join("founder");
+    let joiner = tmp.join("joiner");
+    let founder_config = founder.join("node.toml");
+    let out = ducktape(
+        tmp,
+        &[
+            "init",
+            "--name",
+            "covalidators",
+            "--primary-coordinator",
+            "none",
+            "--dir",
+            founder.to_str().unwrap(),
+            "--listen",
+            "127.0.0.1:0",
+            "--advertised",
+            "127.0.0.1:1",
+        ],
+    );
+    assert_ok(&out, "init");
+    let out = ducktape(tmp, &["key", "--dir", joiner.to_str().unwrap()]);
+    assert_ok(&out, "key");
+    let joiner_key = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let out = ducktape(
+        tmp,
+        &[
+            "admit",
+            &joiner_key,
+            "--config",
+            founder_config.to_str().unwrap(),
+        ],
+    );
+    assert_ok(&out, "admit");
+    let out = ducktape(
+        tmp,
+        &["invite", "--config", founder_config.to_str().unwrap()],
+    );
+    assert_ok(&out, "invite");
+    let blob = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (joiner, blob)
+}
+
+/// a pre-genesis co-validator: `admit`ted by the founder, it `join`s as a
+/// MEMBER and boots straight into genesis — where a missing component is a
+/// refusal and there is no peer to fetch one from. So a member join seeds
+/// `<joiner>/modules` from the managed dir (`DUCKTAPE_MODULES_DIR` here), the
+/// same bytes the descriptor hashes; a non-member join writes no bundle.
+#[test]
+fn a_member_join_bundles_the_genesis_components() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (joiner, blob) = found_and_admit(tmp.path());
+    let out = ducktape(
+        tmp.path(),
+        &["join", &blob, "--dir", joiner.to_str().unwrap()],
+    );
+    assert_ok(&out, "join");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is a member"),
+        "the admitted key joins as a member:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let d = workspace_config::NetworkDescriptor::load(&joiner.join("network.toml")).unwrap();
+    assert!(!d.modules.is_empty());
+    for m in &d.modules {
+        let name = format!("{}.component.wasm", m.id);
+        assert_eq!(
+            std::fs::read(joiner.join("modules").join(&name)).expect("the member's bundle"),
+            std::fs::read(Path::new(common::FIXTURES).join(&name)).expect("the fixture"),
+            "{name} in the member's bundle is not the founder's component"
+        );
+    }
+}
+
+/// a managed dir whose component is NOT the one the founder hashed is refused
+/// by module name at `join` — not by a genesis root mismatch at first boot.
+#[test]
+fn a_member_join_refuses_a_component_that_is_not_the_genesis_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (joiner, blob) = found_and_admit(tmp.path());
+    let tampered = tmp.path().join("tampered");
+    std::fs::create_dir_all(&tampered).unwrap();
+    let d =
+        workspace_config::NetworkDescriptor::load(&tmp.path().join("founder").join("network.toml"))
+            .unwrap();
+    for m in &d.modules {
+        let name = format!("{}.component.wasm", m.id);
+        std::fs::copy(
+            Path::new(common::FIXTURES).join(&name),
+            tampered.join(&name),
+        )
+        .unwrap();
+    }
+    let victim = &d.modules[0].id;
+    let victim_file = tampered.join(format!("{victim}.component.wasm"));
+    let mut bytes = std::fs::read(&victim_file).unwrap();
+    bytes.push(0);
+    std::fs::write(&victim_file, bytes).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .args(["node", "join", &blob, "--dir", joiner.to_str().unwrap()])
+        .env("DUCKTAPE_HOME", tmp.path())
+        .env("DUCKTAPE_MODULES_DIR", &tampered)
+        .output()
+        .expect("run ducktape");
+    assert!(
+        !out.status.success(),
+        "a tampered component must refuse the join"
+    );
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        err.contains(&format!("module {victim}")),
+        "the refusal names the module: {err}"
+    );
+    assert!(
+        err.contains("install-node"),
+        "the refusal names the remedy: {err}"
+    );
+    assert!(
+        !joiner.join("modules").exists(),
+        "a refused join seeds no bundle"
+    );
+}
+
 /// a bundle missing a component is named by the file the operator has to go
 /// look for — not by a hash mismatch three boots later.
 #[test]
