@@ -35,6 +35,9 @@ pub mod guest_proto;
 // the microVM backend's storage: shells out to e2fsprogs and walks unix modes.
 #[cfg(unix)]
 pub mod workspace_image;
+// the agent CLIs a run may exec, derived from the operator's executors dir.
+#[cfg(unix)]
+pub mod executor_image;
 
 #[cfg(unix)]
 pub use egress::tap_egress_nftables;

@@ -7,8 +7,9 @@
 //! vendor's installer produces a Mach-O binary the guest cannot exec at all.
 //!
 //! So the binary is acquired deliberately, into `~/.ducktape/executors`, and
-//! `ops/build-guest-rootfs.sh` bakes in whatever is there. This verb owns that
-//! directory, the pinned versions, and the one approved way to fill it.
+//! the node derives the guest's copy from whatever is there
+//! (`sandbox_host::executor_image`). This verb owns that directory, the pinned
+//! versions, and the one approved way to fill it.
 //!
 //! TWO RULES IT EXISTS TO KEEP:
 //!
@@ -166,18 +167,17 @@ impl ProviderArg {
     }
 }
 
-/// Where the installed executors live. `ops/build-guest-rootfs.sh` reads the
-/// same two env vars in the same order, so overriding one moves both.
-fn executor_dir() -> Result<PathBuf, String> {
-    if let Some(dir) = std::env::var_os("DUCKTAPE_EXECUTOR_DIR") {
-        return Ok(PathBuf::from(dir));
-    }
-    Ok(workspace_config::ducktape_home()?.join("executors"))
+/// Staging for a download in flight, BESIDE the executors directory rather than
+/// inside it: the guest's copy is an image built from that directory's whole
+/// contents, so a half-written 200 MB `.part` left there by an interrupted
+/// install would be baked into it.
+fn download_dir(executors: &Path) -> PathBuf {
+    executors.with_extension("download")
 }
 
 pub(crate) fn run(args: InstallArgs) -> InstallResult {
     let arch = GuestArch::host()?;
-    let dir = executor_dir()?;
+    let dir = workspace_config::executor_dir()?;
     print_status(&dir, arch);
 
     // Named providers are the operator's explicit ask — already the approval a
@@ -282,11 +282,9 @@ fn install_all(providers: &[ProviderArg], dir: &Path, arch: GuestArch) -> Instal
     for provider in providers {
         install_one(*provider, dir, arch)?;
     }
-    // The image bakes these in at BUILD time, so an install alone changes
-    // nothing a run can see. Say so here rather than let it be discovered as a
-    // run that produces nothing.
-    println!("\nrebuild the guest image so runs can use them:");
-    println!("  ops/build-guest-rootfs.sh");
+    // Nothing else to do: the node derives the guest's copy from this directory
+    // and rebuilds it whenever the directory has moved on, so the next run
+    // picks this up on its own.
     Ok(())
 }
 
@@ -299,7 +297,7 @@ fn install_one(provider: ProviderArg, dir: &Path, arch: GuestArch) -> InstallRes
         download.url
     );
 
-    let work = dir.join(".download");
+    let work = download_dir(dir);
     std::fs::create_dir_all(&work).map_err(|e| format!("create {}: {e}", work.display()))?;
     let artifact = work.join(base_name(&download.url));
     fetch(&download.url, &artifact, download.sha256)?;
@@ -374,7 +372,7 @@ fn sha256_file(path: &Path) -> Result<String, String> {
 /// flavours extract named members the same way, and a tar reader is a parser
 /// this verb does not need to own.
 fn unpack_into(archive: &Path, members: &[&str], dir: &Path) -> Result<(), String> {
-    let unpack = dir.join(".download/unpack");
+    let unpack = download_dir(dir).join("unpack");
     let _ = std::fs::remove_dir_all(&unpack);
     std::fs::create_dir_all(&unpack).map_err(|e| format!("create {}: {e}", unpack.display()))?;
     let status = std::process::Command::new("tar")

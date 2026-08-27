@@ -10,18 +10,21 @@
 # points at it. Under the operator's home because this build is rootless.
 #
 # ROOTLESS on purpose, start to finish. `unsquashfs -no-xattrs` extracts the
-# base without needing privileges, the agent CLIs are copied in as ordinary
-# files, and `mke2fs -d` builds the image without ever mounting it. A node that
-# needs root to build its guest is a node that runs as root.
+# base without needing privileges and `mke2fs -d` builds the image without ever
+# mounting it. A node that needs root to build its guest is a node that runs as
+# root.
 #
-# THIS SCRIPT FETCHES NO EXECUTABLE. The kernel and the base rootfs come from
-# their upstreams; the agent CLIs come from the executors directory, which only
-# `ducktape agent install` (an operator's explicit act) writes to.
+# NO AGENT CLI GOES IN, and that is the point: this image is a base, not an
+# install target. The CLIs a node lends live in `~/.ducktape/executors`
+# (`ducktape agent install`) and the node derives its own read-only image from
+# that directory, mounted at /opt/duck/bin per run. Baking them in here instead
+# made this 500 MB build the unit of installation and gave "which CLIs does
+# this node have" a third answer that could disagree with the other two.
 #
 # What goes in:
 #   /duck-guest-init      the static PID 1 (bin/duck-guest-init, musl)
-#   /opt/duck/bin/*       the agent CLIs this node lends, from ~/.ducktape/executors
-#   /duck /agent          empty mountpoints for the per-run block devices
+#   /duck /agent /opt/duck/bin
+#                         empty mountpoints for the per-run block devices
 #
 # What does NOT go in: any credential. The broker holds those on the host and
 # the guest reaches it over vsock, so the image is safe to share across runs
@@ -62,32 +65,7 @@ KERNEL_URL="${KERNEL_URL:-}"
 KATA_VERSION="${KATA_VERSION:-4.1.0}"
 BASE_URL="${BASE_URL:-https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/$ARCH/ubuntu-24.04.squashfs}"
 
-# the agent CLIs lent to runs, taken from the executors directory — NOT from
-# the host's PATH.
-#
-# A run executes inside a Linux microVM on every host, so this binary must be a
-# Linux build for the GUEST's architecture. The host's own CLI is that only on
-# Linux, by coincidence; on macOS it is Mach-O and the guest cannot exec it at
-# all. Reading the host PATH therefore meant "works on Linux, silently produces
-# an unusable image on a Mac" — and pointed the operator at an instruction they
-# could not carry out ("put a linux/$ARCH build of it on PATH", on a machine
-# where such a binary is not a host tool and does not belong there).
-#
-# `ducktape agent install` owns that directory and the one approved way to fill
-# it. This script never fetches anything: a missing executor prints the command
-# and is skipped.
-#
-# Set as a space-separated list: EXECUTORS="codex" ops/build-guest-rootfs.sh
-read -r -a EXECUTORS <<< "${EXECUTORS:-claude codex}"
-EXEC_DIR="${DUCKTAPE_EXECUTOR_DIR:-${DUCKTAPE_HOME:-$HOME/.ducktape}/executors}"
-
 say() { printf '  %s\n' "$*"; }
-
-# macOS ships `shasum`; most Linux images ship `sha256sum` and not always both.
-sha256_of() {
-  if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'
-  else shasum -a 256 "$1" | awk '{print $1}'; fi
-}
 
 command -v mke2fs >/dev/null || { echo "mke2fs not found; install e2fsprogs" >&2; exit 1; }
 command -v unsquashfs >/dev/null || { echo "unsquashfs not found; install squashfs-tools" >&2; exit 1; }
@@ -175,64 +153,12 @@ CROSS_FLAGS=""
 install -m 0755 "$INIT" "$TREE/duck-guest-init"
 say "init: $(du -h "$TREE/duck-guest-init" | cut -f1) static"
 
-# ---- 4. the agent CLIs -----------------------------------------------------
-mkdir -p "$TREE/opt/duck/bin"
-for name in "${EXECUTORS[@]}"; do
-  real="$EXEC_DIR/$name"
-  if [[ ! -x "$real" ]]; then
-    say "skipping $name (not installed)"
-    say "  install it: ducktape agent install $name"
-    continue
-  fi
-
-  # Still checked, because the operator may have put this file here by hand:
-  # a non-ELF binary fails inside the guest at exec, silently, as a run that
-  # produces nothing. Refuse it here, where the fix can be named.
-  magic="$(head -c 4 "$real" | od -An -tx1 | tr -d ' \n')"
-  if [[ "$magic" != "7f454c46" ]]; then
-    say "skipping $name: $real is not a Linux ELF binary"
-    say "  replace it: ducktape agent install $name"
-    continue
-  fi
-  install -m 0755 "$real" "$TREE/opt/duck/bin/$name"
-  # The sha256 of what actually went in, so the image's contents are
-  # attributable without unpacking it.
-  say "$name: $(du -h "$TREE/opt/duck/bin/$name" | cut -f1) sha256:$(sha256_of "$real" | cut -c1-16)…"
-
-  # codex needs its Code Mode sibling beside it in the guest; the executors
-  # directory carries them together (one release artifact).
-  if [[ "$name" == "codex" && -x "$EXEC_DIR/codex-code-mode-host" ]]; then
-    install -m 0755 "$EXEC_DIR/codex-code-mode-host" "$TREE/opt/duck/bin/codex-code-mode-host"
-    say "codex-code-mode-host: $(du -h "$TREE/opt/duck/bin/codex-code-mode-host" | cut -f1)"
-  fi
-
-  # A dynamically linked CLI needs its libraries present in the guest. The
-  # base is a full Ubuntu userland, so glibc is already there; this reports
-  # anything it is NOT, rather than shipping an image that fails at exec with
-  # a message no one sees (the run just produces nothing). `ldd` only exists
-  # on a Linux host; a cross-built image skips the check rather than failing.
-  if command -v ldd >/dev/null; then
-    if ldd "$real" 2>/dev/null | grep -q 'not found'; then
-      echo "WARNING: $name has unresolved libraries on this host" >&2
-    fi
-    missing=0
-    while read -r lib; do
-      [[ -e "$TREE$lib" ]] || { echo "  MISSING in guest: $lib" >&2; missing=1; }
-    done < <(ldd "$real" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^\//) print $i}' | sort -u)
-    [[ $missing -eq 0 ]] || echo "WARNING: $name will not exec inside the guest" >&2
-  fi
-done
-
-# a couple of ordinary tools a run's own shell-outs expect
-for name in sh cat env; do
-  [[ -e "$TREE/opt/duck/bin/$name" ]] || ln -sf "/bin/$name" "$TREE/opt/duck/bin/$name"
-done
-
 # ---- 5. mountpoints --------------------------------------------------------
 # The per-run devices land here, and so do the tmpfs mounts the init makes for
 # a read-only rootfs. They must EXIST in the image: mounting onto a missing
 # directory fails, and creating one at boot fails too — the rootfs is read-only.
-mkdir -p "$TREE/duck/workspace" "$TREE/agent" "$TREE/proc" "$TREE/sys" "$TREE/dev" \
+mkdir -p "$TREE/duck/workspace" "$TREE/agent" "$TREE/opt/duck/bin" \
+         "$TREE/proc" "$TREE/sys" "$TREE/dev" \
          "$TREE/tmp" "$TREE/run" "$TREE/var/tmp" "$TREE/root"
 chmod 1777 "$TREE/tmp" "$TREE/var/tmp"
 

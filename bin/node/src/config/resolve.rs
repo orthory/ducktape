@@ -351,11 +351,15 @@ fn resolve_sandbox(
     // back".
     let kernel = absolute_runtime_path(&sandbox.kernel)?;
     let rootfs = absolute_runtime_path(&sandbox.rootfs)?;
+    // The agent CLIs are NOT a table key: they are per-machine, installed by
+    // `ducktape agent install`, and every node on this host lends the same set.
+    let executors = workspace_config::executor_dir()?;
     Ok((
         Some(SandboxBackend::MicroVm {
             vmm,
             kernel,
             rootfs,
+            executors,
         }),
         probed()?,
     ))
@@ -1260,9 +1264,12 @@ mod tests {
         assert!(
             matches!(
                 &resolved.service.sandbox,
-                Some(SandboxBackend::MicroVm { vmm: Vmm::Firecracker, kernel, rootfs })
+                Some(SandboxBackend::MicroVm { vmm: Vmm::Firecracker, kernel, rootfs, executors })
                     if kernel == Path::new("/srv/guest/vmlinux")
                         && rootfs == Path::new("/srv/guest/rootfs.ext4")
+                        // the agent CLIs are per-machine, so the table never
+                        // names them and this is the operator's own directory.
+                        && executors == &workspace_config::executor_dir().expect("executor dir")
             ),
             "firecracker backend with the configured images: {:?}",
             resolved.service.sandbox

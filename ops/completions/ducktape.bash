@@ -32,7 +32,7 @@ _ducktape() {
     local service_flags="--config --workspace -n --network --json --yes -y --enable --no-enable"
     # every service verb takes a KIND now, `list`/`status` included.
     local service_kinds="compute agent airlock"
-    local agent_verbs="pty sched help"
+    local agent_verbs="pty sched install help"
     local agent_flags="-n --network --node --host-node --cred --cpu --mem"
 
     if [ "$COMP_CWORD" -eq 1 ]; then

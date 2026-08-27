@@ -57,6 +57,14 @@ pub struct VmConfig {
     /// any declared host PATH directories. Mounted at [`crate::guest_paths::GUEST_ASSETS`]
     /// and never read back.
     pub assets: PathBuf,
+    /// the agent CLIs image, built from the operator's executors directory by
+    /// [`crate::executor_image`] and SHARED read-only across every run — the
+    /// same relationship the rootfs has, and for the same reason.
+    ///
+    /// `None` for a VM that execs something the rootfs already ships (the vm
+    /// smoke example runs `/bin/sh`), which is the only shape with no agent CLI
+    /// to lend.
+    pub executors: Option<PathBuf>,
     /// this run's workspace image, built by [`crate::workspace_image`] and read
     /// back after the guest exits.
     pub workspace: PathBuf,
@@ -94,9 +102,13 @@ pub const WORKSPACE_MOUNTPOINT: &str = crate::guest_paths::GUEST_WORKSPACE;
 pub const ASSETS_MOUNTPOINT: &str = crate::guest_paths::GUEST_ASSETS;
 /// where the guest sees the persistent cache volume.
 pub const AGENT_VOLUME_MOUNTPOINT: &str = crate::guest_paths::GUEST_AGENT_VOLUME;
+/// where the guest sees the agent CLIs image.
+pub const EXECUTORS_MOUNTPOINT: &str = crate::guest_paths::GUEST_BIN_DIR;
 
 /// the guest device names, in the order Firecracker enumerates them.
-const DEVICE_ORDER: [&str; 5] = ["/dev/vda", "/dev/vdb", "/dev/vdc", "/dev/vdd", "/dev/vde"];
+const DEVICE_ORDER: [&str; 6] = [
+    "/dev/vda", "/dev/vdb", "/dev/vdc", "/dev/vdd", "/dev/vde", "/dev/vdf",
+];
 
 /// the drives for `cfg`, in attach order.
 ///
@@ -161,6 +173,19 @@ pub fn guest_drives(cfg: &VmConfig) -> Vec<GuestDrive> {
         read_only: false,
         is_root: false,
     });
+    if let Some(executors) = &cfg.executors {
+        drives.push(GuestDrive {
+            drive_id: "executors",
+            host_path: executors.clone(),
+            device: DEVICE_ORDER[drives.len()],
+            mountpoint: Some(EXECUTORS_MOUNTPOINT),
+            // SHARED across every concurrent run, exactly like the rootfs: a
+            // writable copy would let one buyer's run edit the CLI another
+            // buyer's run is about to exec.
+            read_only: true,
+            is_root: false,
+        });
+    }
     drives
 }
 
@@ -299,6 +324,7 @@ mod tests {
             agent_volume: Some("/srv/agents/a1/cache.ext4".into()),
             assets: "/run/ducktape/run7/assets.ext4".into(),
             workspace: "/run/ducktape/run7/ws.ext4".into(),
+            executors: Some("/srv/executors.img".into()),
             vcpus: 4,
             mem_mib: 8192,
             vsock_uds: "/run/ducktape/run7/v.sock".into(),
@@ -418,6 +444,7 @@ mod tests {
                 ("/dev/vdc".to_string(), AGENT_VOLUME_MOUNTPOINT.to_string()),
                 ("/dev/vdd".to_string(), ASSETS_MOUNTPOINT.to_string()),
                 ("/dev/vde".to_string(), WORKSPACE_MOUNTPOINT.to_string()),
+                ("/dev/vdf".to_string(), EXECUTORS_MOUNTPOINT.to_string()),
             ]
         );
 
@@ -430,6 +457,22 @@ mod tests {
             vec![
                 ("/dev/vdc".to_string(), ASSETS_MOUNTPOINT.to_string()),
                 ("/dev/vdd".to_string(), WORKSPACE_MOUNTPOINT.to_string()),
+                ("/dev/vde".to_string(), EXECUTORS_MOUNTPOINT.to_string()),
+            ]
+        );
+
+        // a VM that execs something the rootfs ships gets no executors device
+        // at all, and the drives behind it do not shift to fill the gap.
+        let without_executors = VmConfig {
+            executors: None,
+            ..cfg()
+        };
+        assert_eq!(
+            at(&manifest_mounts(&without_executors)),
+            vec![
+                ("/dev/vdc".to_string(), AGENT_VOLUME_MOUNTPOINT.to_string()),
+                ("/dev/vdd".to_string(), ASSETS_MOUNTPOINT.to_string()),
+                ("/dev/vde".to_string(), WORKSPACE_MOUNTPOINT.to_string()),
             ]
         );
     }

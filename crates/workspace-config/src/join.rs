@@ -206,6 +206,7 @@ pub fn platform_sandbox() -> Result<(SandboxToml, sandbox_host::SandboxBackend),
         vmm,
         kernel: kernel.clone(),
         rootfs: rootfs.clone(),
+        executors: crate::executor_dir()?,
     };
     let table = SandboxToml {
         runtime: vmm.config_token().into(),
@@ -259,7 +260,9 @@ mod tests {
             vmm,
             kernel,
             rootfs,
+            executors,
         } = &backend;
+        assert_eq!(executors, &crate::executor_dir().expect("executor dir"));
         assert_eq!(table.runtime, vmm.config_token());
         assert_eq!((&table.kernel, &table.rootfs), (kernel, rootfs));
 
