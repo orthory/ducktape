@@ -428,8 +428,6 @@ fn cmd_add(
     name: Option<String>,
     stdin: &mut impl BufRead,
 ) -> CredResult {
-    preflight_binary(provider)?;
-
     let base = ctx.http_base()?;
     let resolved = ctx.workspace()?;
     let user = load_user_signer(&ctx.key_path()?, stdin)?;
@@ -463,12 +461,19 @@ fn cmd_add(
     // for headless hosts and re-registration without another auth round-trip.
     // Everything downstream (artifact check, kind, seal, record, sign, submit)
     // is identical to the browser path; the browser flow remains the default.
-    match std::env::var("DUCKTAPE_CRED_REUSE_ARTIFACT") {
-        Ok(src) if !src.is_empty() => {
+    let reuse = std::env::var("DUCKTAPE_CRED_REUSE_ARTIFACT")
+        .ok()
+        .filter(|src| !src.is_empty());
+    match reuse {
+        Some(src) => {
             std::fs::copy(&src, dir.join(provider.artifact()))
                 .map_err(|e| format!("reuse artifact {src}: {e}"))?;
         }
-        _ => {
+        None => {
+            // The vendor binary is a requirement of THIS arm only: the reuse
+            // path never execs it, and demanding it there refuses the headless
+            // host the reuse path exists for.
+            preflight_binary(provider)?;
             // Start clean so the login-completion watch (the artifact appearing)
             // is unambiguous — a stale file from a prior attempt would otherwise
             // read as instant success.
