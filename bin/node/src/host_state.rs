@@ -1451,15 +1451,16 @@ mod tests {
     };
 
     /// Compose the production genesis host in a throwaway storage root and
-    /// return `(module ids sorted, root hash hex)` — everything both pins below
-    /// need, so neither has to keep its own copy of the construction.
+    /// return `(module ids sorted, root hash hex, native module ids sorted)` —
+    /// everything all three pins below need, so none has to keep its own copy
+    /// of the construction.
     ///
     /// Production runs this root future on macOS's ~8 MiB process stack. Run
     /// the test twin on the same budget: libtest's 2 MiB worker stack is just
     /// below this full 20-module composition's debug-build requirement.
     const GENESIS_TEST_STACK_BYTES: usize = 8 * 1024 * 1024;
 
-    fn genesis_facts() -> (Vec<String>, String) {
+    fn genesis_facts() -> (Vec<String>, String, Vec<String>) {
         std::thread::Builder::new()
             .name("production-genesis-test".into())
             .stack_size(GENESIS_TEST_STACK_BYTES)
@@ -1471,7 +1472,7 @@ mod tests {
             .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
     }
 
-    fn compose_genesis_facts() -> (Vec<String>, String) {
+    fn compose_genesis_facts() -> (Vec<String>, String, Vec<String>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let forge_repo = dir.path().join("forge");
         let duckfs_dir = dir.path().join("duckfs");
@@ -1489,43 +1490,16 @@ mod tests {
             )
             .await;
             // module_roots iterates the host's BTreeMap — sorted by id.
-            let ids = host.module_roots().into_iter().map(|(id, _)| id).collect();
-            (ids, hex(&host.root_hash()))
+            let ids: Vec<String> = host.module_roots().into_iter().map(|(id, _)| id).collect();
+            // a module with no code hash is one the binary compiled in rather
+            // than one lifecycle can swap; `ids` is already sorted, so this is.
+            let native = ids
+                .iter()
+                .filter(|id| host.module_code_hash(id).is_none())
+                .cloned()
+                .collect();
+            (ids, hex(&host.root_hash()), native)
         })
-    }
-
-    /// The composed host's NATIVE module ids, sorted — a module with no code
-    /// hash is one the binary compiled in rather than one lifecycle can swap.
-    /// Same thread/stack shape as [`genesis_facts`], for the same reason.
-    fn genesis_native_ids() -> Vec<String> {
-        std::thread::Builder::new()
-            .name("production-genesis-native-ids".into())
-            .stack_size(GENESIS_TEST_STACK_BYTES)
-            .spawn(|| {
-                let dir = tempfile::tempdir().expect("tempdir");
-                let cfg = commonware_runtime::tokio::Config::default()
-                    .with_storage_directory(dir.path().join("storage"));
-                let executor = commonware_runtime::tokio::Runner::new(cfg);
-                executor.start(|context| async move {
-                    let host = genesis_host(
-                        &context,
-                        &dir.path().join("forge"),
-                        &dir.path().join("duckfs"),
-                        &[],
-                        PIN_BINDINGS,
-                        blobstore::BlobHandle::default(),
-                    )
-                    .await;
-                    host.module_roots()
-                        .into_iter()
-                        .map(|(id, _)| id)
-                        .filter(|id| host.module_code_hash(id).is_none())
-                        .collect()
-                })
-            })
-            .expect("spawn production genesis native ids")
-            .join()
-            .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
     }
 
     /// the registry ↔ topology parity pin. [`ProductionModules`] already forces
@@ -1536,7 +1510,7 @@ mod tests {
     /// misreporting.
     #[test]
     fn genesis_registry_matches_module_ids() {
-        let (got, _root) = genesis_facts();
+        let (got, _root, _native) = genesis_facts();
         let mut want: Vec<String> = MODULE_IDS.iter().map(|s| s.to_string()).collect();
         want.sort_unstable();
         assert_eq!(got, want);
@@ -1547,16 +1521,21 @@ mod tests {
     /// sent to the wasm loader (or a wasm tenant is never reconciled).
     #[test]
     fn topology_code_column_matches_the_composed_host() {
-        let native_by_topology: Vec<String> = topology::TOPOLOGY
+        let in_production_and_native = |m: &topology::ModuleSpec| {
+            MODULE_IDS.contains(&m.id) && m.code == topology::Code::Native
+        };
+        let mut native_by_topology: Vec<String> = topology::TOPOLOGY
             .modules
             .iter()
-            .filter(|m| MODULE_IDS.contains(&m.id) && m.code == topology::Code::Native)
+            .filter(|m| in_production_and_native(m))
             .map(|m| m.id.to_string())
             .collect();
-        let native_by_host = genesis_native_ids();
-        let mut want = native_by_topology;
-        want.sort_unstable();
-        assert_eq!(native_by_host, want);
+        native_by_topology.sort_unstable();
+        let (_ids, _root, native_by_host) = genesis_facts();
+        assert_eq!(native_by_host, native_by_topology);
+        // both sides go empty together if the last native module ever leaves
+        // PRODUCTION, so anchor the pin on the ids themselves as well.
+        assert_eq!(native_by_host, ["lifecycle", "valset"]);
     }
 
     /// THE consensus pin: the production genesis root hash is a constant.
@@ -1594,7 +1573,7 @@ mod tests {
     ///   usual cause is a rebuilt `component.wasm` riding along in the diff.
     #[test]
     fn production_genesis_root_hash_is_pinned() {
-        let (_ids, root) = genesis_facts();
+        let (_ids, root, _native) = genesis_facts();
         assert_eq!(
             root, GENESIS_ROOT_HASH,
             "the production genesis root hash MOVED.\n\
