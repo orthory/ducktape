@@ -124,8 +124,16 @@ install-app:
 	@exit 2
 endif
 
+## the binary embeds no wasm: `node init` founds a network from a directory of
+## <id>.component.wasm, so installing the node also installs that set.
 install-node:
 	$(CARGO) install --path bin/node --locked
+	mkdir -p "$${DUCKTAPE_MODULES_DIR:-$$HOME/.ducktape/modules}"
+	@for m in $(BUILDER_MODULES); do \
+	  id=$$(basename $$m) && \
+	  cp $$m/component.wasm "$${DUCKTAPE_MODULES_DIR:-$$HOME/.ducktape/modules}/$$id.component.wasm" || exit 1; \
+	done
+	@echo "installed module components into $${DUCKTAPE_MODULES_DIR:-$$HOME/.ducktape/modules}"
 
 ## coordinator -> ~/.cargo/bin/ducktape-coordinator
 install-coordinator:

@@ -35,6 +35,9 @@ IP1=172.30.0.11
 SCRATCH="$(cd "$(dirname "$0")" && pwd)"
 LOG="$SCRATCH/smoke.log"
 BIN="${BIN:-$(cd "$SCRATCH/../.." && pwd)/target/debug/ducktape}"
+# the genesis wasm set is on DISK, not in the binary — mounted read-only at
+# /modules in both containers, which is what each node.toml names.
+MODULES="$(cd "$SCRATCH/../.." && pwd)/crates/kernel/host/tests/fixtures"
 # arch + openresolv + iptables — the same base the interop smoke bakes (a
 # host-built binary needs the host's glibc; the debian rust image's is too
 # old). baked here if absent.
@@ -72,6 +75,7 @@ cat > "$SCRATCH/node0/node.toml" <<TOML
 id = 0
 namespace = "wgsmoke"
 peer_seeds = [0, 1]
+modules = "/modules"
 listen = "[::]:41000"
 advertised = "overlay"
 wireguard_listen = "$IP0:51820"
@@ -83,6 +87,7 @@ cat > "$SCRATCH/node1/node.toml" <<TOML
 id = 1
 namespace = "wgsmoke"
 peer_seeds = [0, 1]
+modules = "/modules"
 bootstrapper_addr = "$IP0:41000"
 listen = "[::]:41000"
 advertised = "overlay"
@@ -108,10 +113,12 @@ ENTRY='
 podman run -d --name dtwg-node0 --network $NET --ip "$IP0" \
   --cap-add NET_ADMIN \
   -v "$BIN":/usr/local/bin/ducktape:ro -v "$SCRATCH/node0":/data \
+  -v "$MODULES":/modules:ro \
   $IMG bash -c "$ENTRY" >/dev/null || fail "start node0"
 podman run -d --name dtwg-node1 --network $NET --ip "$IP1" \
   --cap-add NET_ADMIN \
   -v "$BIN":/usr/local/bin/ducktape:ro -v "$SCRATCH/node1":/data \
+  -v "$MODULES":/modules:ro \
   $IMG bash -c "$ENTRY" >/dev/null || fail "start node1"
 
 wait_marker() { # container marker timeout

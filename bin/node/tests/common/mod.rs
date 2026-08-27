@@ -28,6 +28,14 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+/// the checked-in `<id>.component.wasm` set every founding e2e names: a network
+/// has no embedded wasm, so `node init` hashes THIS directory into the
+/// descriptor and the dev shape derives its genesis code set from it.
+pub const FIXTURES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../crates/kernel/host/tests/fixtures"
+);
+
 /// A cluster's storage root, named so an ABANDONED one can be found and swept.
 ///
 /// `tempfile::TempDir` removes itself on Drop, which covers a normal finish AND
@@ -284,6 +292,11 @@ impl NetworkShapeCluster {
                 // shape has its own e2e (coordinated_invite_cli).
                 "--primary-coordinator",
                 "none",
+                // the genesis wasm set lives on disk, not in the binary: found
+                // from the checked-in components rather than the operator's
+                // ~/.ducktape/modules, which a test box need not have.
+                "--modules",
+                FIXTURES,
                 "--dir",
                 self.founder_dir.to_str().expect("utf-8 founder dir"),
                 "--listen",
@@ -804,6 +817,7 @@ impl Cluster {
         cfg.push_str(&format!("namespace = {:?}\n", self.namespace));
         cfg.push_str(&format!("peer_seeds = {:?}\n", self.peer_ids));
         cfg.push_str(&format!("validator_seeds = {:?}\n", self.validator_ids));
+        cfg.push_str(&format!("modules = {FIXTURES:?}\n"));
         cfg.push_str(&self.peer_addrs_toml());
         cfg.push_str(&format!(
             "storage_dir = {:?}\n",
@@ -1151,6 +1165,7 @@ impl Cluster {
         cfg.push_str(&format!("namespace = {:?}\n", self.namespace));
         cfg.push_str(&format!("peer_seeds = {:?}\n", self.peer_ids));
         cfg.push_str(&format!("validator_seeds = {:?}\n", self.validator_ids));
+        cfg.push_str(&format!("modules = {FIXTURES:?}\n"));
         cfg.push_str(&self.peer_addrs_toml());
         cfg.push_str(&format!(
             "storage_dir = {:?}\n",
