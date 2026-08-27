@@ -3,21 +3,20 @@
 //! `-n/--network <chain-id>` selector find it. pure-CLI: no node is booted,
 //! no socket is bound — `DUCKTAPE_HOME` points every run at a temp registry.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+// `node init` hashes a directory of `<id>.component.wasm` into the descriptor,
+// so a CLI test that founds a network needs one: the harness owns THE path to
+// the checked-in set (`common::FIXTURES`).
+mod common;
 
-/// the checked-in `<id>.component.wasm` set — `node init` hashes a directory of
-/// these into the descriptor, so a CLI test that founds a network needs one.
-fn fixtures() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../crates/kernel/host/tests/fixtures")
-}
+use std::path::Path;
+use std::process::Command;
 
 fn ducktape(home: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .arg("node")
         .args(args)
         .env("DUCKTAPE_HOME", home)
-        .env("DUCKTAPE_MODULES_DIR", fixtures())
+        .env("DUCKTAPE_MODULES_DIR", common::FIXTURES)
         .output()
         .expect("run ducktape")
 }
@@ -83,7 +82,7 @@ fn init_with_path(home: &Path, name: &str, path_dir: &Path) -> (String, std::pat
     let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .args(["node", "init", "--name", name, "--primary-coordinator", "none"])
         .env("DUCKTAPE_HOME", home)
-        .env("DUCKTAPE_MODULES_DIR", fixtures())
+        .env("DUCKTAPE_MODULES_DIR", common::FIXTURES)
         .env("PATH", path_dir)
         .output()
         .expect("run ducktape");
@@ -154,7 +153,7 @@ fn ducktape_raw(home: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .args(args)
         .env("DUCKTAPE_HOME", home)
-        .env("DUCKTAPE_MODULES_DIR", fixtures())
+        .env("DUCKTAPE_MODULES_DIR", common::FIXTURES)
         .output()
         .expect("run ducktape")
 }
@@ -233,7 +232,7 @@ fn init_writes_module_hashes_and_the_bundle() {
         .args(["node", "init", "--name", "bundled", "--primary-coordinator", "none", "--dir"])
         .arg(&ws)
         .args(["--listen", "127.0.0.1:0", "--advertised", "127.0.0.1:1", "--modules"])
-        .arg(fixtures())
+        .arg(common::FIXTURES)
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -268,7 +267,7 @@ fn re_founding_from_its_own_bundle_keeps_the_components() {
             .output()
             .expect("run ducktape")
     };
-    let out = found(&fixtures());
+    let out = found(Path::new(common::FIXTURES));
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 
     let bundle = ws.join("modules");
@@ -282,7 +281,8 @@ fn re_founding_from_its_own_bundle_keeps_the_components() {
         let name = format!("{}.component.wasm", m.id);
         assert_eq!(
             std::fs::read(bundle.join(&name)).expect("read the re-founded component"),
-            std::fs::read(fixtures().join(&name)).expect("read the fixture component"),
+            std::fs::read(Path::new(common::FIXTURES).join(&name))
+                .expect("read the fixture component"),
             "{name} did not survive a re-found from its own bundle"
         );
     }
