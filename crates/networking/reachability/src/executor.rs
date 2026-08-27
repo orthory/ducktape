@@ -1,0 +1,615 @@
+//! The host executor: drives the netstack machine over the node's
+//! command/event channels and PERFORMS what it decides — mesh sends,
+//! interface pushes (through a [`WireGuardEffect`]), resolver operations
+//! (through an [`EndpointResolver`]), command replies, and persisted-mesh
+//! writes. Everything the machine is not allowed to touch lives here: the
+//! clock stamp, the filesystem, the sockets, the WireGuard private key.
+//!
+//! Runtime contract: the node runs [`run`] as the ROOT future of a dedicated
+//! plain-tokio runtime on its own OS thread (the same split as the node's
+//! app-surface thread), talking to the commonware runner over the two mpsc
+//! channels. The future is not required to be `Send` — nothing here may
+//! assume `tokio::spawn` onto a shared runtime, so the resolver runs as an
+//! in-future PUMP joined with the command loop: resolver operations queue to
+//! it and their completions feed back as machine events. That split is what
+//! keeps a slow resolve from stalling the plane — commands keep draining
+//! while an operation is in flight — while resolver operations themselves
+//! stay serialized in start order, and it needs neither `Send` nor
+//! `'static` from the resolver.
+//!
+//! One machine obligation is honored HERE: an interface push
+//! ([`Effect::WgApply`]) is performed synchronously and its outcome stepped
+//! back into the machine before anything else drains, so a push round-trips
+//! inside the step cascade that requested it.
+
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use commonware_cryptography::{Signer as _, ed25519};
+use netstack_machine::{
+    CmdToken, Effect, Event, Machine, MachineConfig, MeshEpochEvent, ReachabilityEvent, ReqId,
+    binding,
+};
+use nat_traversal::NodeKey;
+use tokio::sync::mpsc;
+use wireguard::effect::{
+    PeerTunnelConfig, WireGuardEffect, apply_peer_tunnels, update_peer_tunnels,
+};
+use wireguard::{AllowedIp, Endpoint, OverlayPolicy, PortPolicy, UpgradeError};
+
+use crate::keys::{KeyError, WireGuardKeypair};
+use crate::rendezvous::{EndpointResolver, Resolution};
+use crate::store::{self, StoreError};
+
+/// Everything the node resolves ONCE at boot and hands the plane.
+pub struct ReachabilityConfig {
+    /// The chain id — doubles as the advertisement namespace and the ULA
+    /// derivation input, exactly as it does for the commonware mesh.
+    pub chain_id: String,
+    /// The node's ed25519 identity: signs records, advertisements, and
+    /// handshake messages. Its public key IS the member identity.
+    pub signer: ed25519::PrivateKey,
+    /// Where the X25519 keypair lives (beside `identity.key`);
+    /// `keys::WireGuardKeypair::load_or_generate` runs against this path.
+    pub wireguard_key_file: PathBuf,
+    /// The local WireGuard UDP bind port — always needed to bring the
+    /// interface up, independent of whether an endpoint is advertised.
+    pub wireguard_port: u16,
+    /// The node's own advertised WireGuard UDP endpoint — `None` for an
+    /// endpoint-less (NAT'd) node: it advertises no address, installs every
+    /// peer FROM the records, and initiates; peers install it without an
+    /// endpoint and WireGuard roams to its authenticated initiation.
+    pub wireguard_advertised: Option<Endpoint>,
+    /// The node's own advertised control-mesh endpoint.
+    pub control_endpoint: Endpoint,
+    /// Rendezvous coordinators (from `Resolved.coordinated`), possibly none:
+    /// with an empty list every peer resolves to its advertised endpoint.
+    pub coordinators: Vec<SocketAddr>,
+    /// The endpoint policy advertisements and handshakes validate against.
+    pub port_policy: PortPolicy,
+    /// Where the last applied epoch's verified mesh is persisted (and read
+    /// back for the cold-restart re-apply). `None` disables persistence —
+    /// the plane then only ever assembles from live gossip.
+    pub persist_file: Option<PathBuf>,
+    /// A transport identity whose DELIVERIES are admitted even though it is
+    /// no plane participant: the mesh's derived lobby key, which a parked
+    /// standby connects under while its own key is still untracked. Purely
+    /// an ingress allowance — every message still authenticates by its
+    /// owner's content signature, and standby-directed replies route back
+    /// over whichever transport identity delivered the standby's record.
+    pub gossip_ingress: Option<ed25519::PublicKey>,
+}
+
+/// The apply outcome an [`ReachabilityCommand::InstallInvitePeer`] caller
+/// awaits — wrapped so the command enum keeps its `Debug`.
+pub struct InstallReply(pub tokio::sync::oneshot::Sender<Result<(), String>>);
+#[derive(Debug)]
+pub struct CoordinatedInviteReply(pub tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>);
+
+impl std::fmt::Debug for InstallReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InstallReply")
+    }
+}
+
+/// Node -> plane.
+#[derive(Debug)]
+pub enum ReachabilityCommand {
+    /// Boot or epoch cutover: (re)build the mesh for this member set. A
+    /// retarget SUPERSEDES any epoch still assembling — tear down in-flight
+    /// state and start over.
+    Retarget(MeshEpochEvent),
+    /// Install a JOIN-WINDOW tunnel peer, live and epoch-independent: the
+    /// invite layer. The node has already authenticated the request (the
+    /// invite blob's envelope on the joiner side; the token-verified intro
+    /// datagram on the inviter side) — the plane only merges the peer
+    /// onto the interface. Invite peers are the WEAKEST layer: an epoch's
+    /// validated plan or a standby's signed record for the same identity
+    /// supersedes them, and the entry dissolves once one exists.
+    InstallInvitePeer {
+        /// The counterparty's ed25519 identity (its overlay ULA derives from
+        /// this).
+        peer: ed25519::PublicKey,
+        /// The counterparty's X25519 WireGuard key.
+        wireguard_public_key: wireguard::X25519PublicKey,
+        /// Where to dial it: the blob's advertised endpoint on the joiner
+        /// side; the intro datagram's observed source on the inviter side
+        /// (WireGuard roams to the authenticated initiation either way).
+        endpoint: SocketAddr,
+        /// Resolved with the apply outcome (the inviter acks the intro only
+        /// after the peer is really on the interface).
+        reply: InstallReply,
+    },
+    /// Resolve a coordinated invite's inviter through the rendezvous plane,
+    /// install the inviter as a join-window tunnel peer, then send the
+    /// authenticated intro datagram over the same punched underlay socket.
+    BootstrapCoordinatedInvitePeer {
+        peer: ed25519::PublicKey,
+        wireguard_public_key: wireguard::X25519PublicKey,
+        intro: Vec<u8>,
+        reply: CoordinatedInviteReply,
+    },
+    /// Send one datagram over the resolver socket. Used for invite intro ACKs
+    /// after the receiving side has installed the join-window peer.
+    SendResolverDatagram {
+        endpoint: SocketAddr,
+        bytes: Vec<u8>,
+    },
+    /// A reachability-channel message arrived from a mesh peer.
+    Deliver {
+        from: ed25519::PublicKey,
+        bytes: Vec<u8>,
+    },
+    /// The consensus view advanced (drives expiry checks between cutovers).
+    ViewTick(u64),
+    /// Periodic controller kick: re-offer whatever this node is still
+    /// waiting on (see [`Event::Nudge`] for the full contract).
+    Nudge,
+    /// Drain and exit; the interface is torn down on the way out.
+    Shutdown,
+}
+
+/// Why the plane stopped. Everything recoverable is an observed event, not
+/// an error: a refused push, an unreadable state file, a failed resolve all
+/// surface as [`ReachabilityEvent`]s and the plane keeps running.
+#[derive(Debug, thiserror::Error)]
+pub enum ReachabilityError {
+    #[error("wireguard keystore: {0}")]
+    Key(#[from] KeyError),
+    #[error("protocol: {0:?}")]
+    Upgrade(UpgradeError),
+    #[error("the node dropped a reachability channel")]
+    ChannelClosed,
+}
+
+impl From<UpgradeError> for ReachabilityError {
+    fn from(err: UpgradeError) -> Self {
+        Self::Upgrade(err)
+    }
+}
+
+/// unix time in milliseconds — the machine's step clock: record-nonce seeds
+/// and the rendezvous budget both count in it.
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// One queued resolver operation, performed by the pump in start order.
+enum ResolverOp {
+    Resolve {
+        req: ReqId,
+        peer: NodeKey,
+        advertised: SocketAddr,
+    },
+    Rendezvous {
+        req: ReqId,
+        peer: NodeKey,
+    },
+    Send {
+        endpoint: SocketAddr,
+        bytes: Vec<u8>,
+    },
+    SendAwait {
+        req: ReqId,
+        endpoint: SocketAddr,
+        bytes: Vec<u8>,
+        timeout: Duration,
+    },
+}
+
+/// A finished resolver operation, fed back into the machine as its event.
+enum Completion {
+    Resolved {
+        req: ReqId,
+        outcome: Result<Resolution, String>,
+    },
+    Rendezvous {
+        req: ReqId,
+        outcome: Result<SocketAddr, String>,
+    },
+    Datagram {
+        req: ReqId,
+        outcome: Result<Vec<u8>, String>,
+    },
+}
+
+/// The reply half of a command still awaiting its machine-decided outcome,
+/// keyed by the [`CmdToken`] minted when the command was translated.
+enum PendingReply {
+    Install(InstallReply),
+    Intro(CoordinatedInviteReply),
+}
+
+/// The host-owned constants of every interface push: the machine decides
+/// WHICH peers exist; the interface name, listen port, local overlay
+/// addresses, and the private key never leave the host.
+struct WgPlan {
+    interface: String,
+    private_key: [u8; 32],
+    listen_port: u16,
+    local_ips: Vec<AllowedIp>,
+}
+
+/// Drive the reachability plane until `Shutdown` (clean exit) or a channel
+/// closes (error). One call outlives every epoch; `Retarget` events move it
+/// between epochs. The per-epoch protocol is the netstack machine's
+/// ([`Machine`]); this future translates commands to machine events, stamps
+/// the clock, performs the machine's effects in order, and pumps the
+/// resolver.
+pub async fn run<E, R>(
+    config: ReachabilityConfig,
+    effect: E,
+    resolver: R,
+    commands: mpsc::Receiver<ReachabilityCommand>,
+    events: mpsc::Sender<ReachabilityEvent>,
+) -> Result<(), ReachabilityError>
+where
+    E: WireGuardEffect,
+    R: EndpointResolver,
+{
+    let (keypair, _generated) = WireGuardKeypair::load_or_generate(&config.wireguard_key_file)?;
+    let me = binding::identity_of(&config.signer.public_key());
+    let overlay = OverlayPolicy::ula_v6(config.chain_id.clone());
+    let plan = WgPlan {
+        interface: binding::interface_name(&config.chain_id),
+        private_key: keypair.private_key_bytes(),
+        listen_port: config.wireguard_port,
+        // the plane's overlay is ula_v6: the local side is the same
+        // identity-derived /128 every validated plan carries.
+        local_ips: overlay.identity_allowed_ips(me),
+    };
+    let machine = Machine::new(MachineConfig {
+        chain_id: config.chain_id,
+        signer: config.signer,
+        wireguard_public: keypair.public_key(),
+        wireguard_advertised: config.wireguard_advertised,
+        control_endpoint: config.control_endpoint,
+        coordinators: config.coordinators,
+        port_policy: config.port_policy,
+        persist: config.persist_file.is_some(),
+        gossip_ingress: config.gossip_ingress,
+    });
+    let (op_tx, op_rx) = mpsc::unbounded_channel::<ResolverOp>();
+    let (done_tx, done_rx) = mpsc::unbounded_channel::<Completion>();
+    let host = Host {
+        effect,
+        events,
+        op_tx,
+        replies: BTreeMap::new(),
+        next_token: 0,
+        restore_file: config.persist_file.clone(),
+        persist_file: config.persist_file,
+        plan,
+    };
+    // the two halves are joined, not spawned: the loop ending (shutdown or
+    // a closed channel) drops the op queue, which ends the pump.
+    let (outcome, ()) = tokio::join!(
+        host_loop(machine, host, commands, done_rx),
+        resolver_pump(resolver, op_rx, done_tx),
+    );
+    outcome
+}
+
+/// The command loop: completions drain before commands (an outcome the
+/// machine is waiting on should never queue behind fresh work), every event
+/// is stamped, and every effect list is performed before the next drain.
+async fn host_loop<E: WireGuardEffect>(
+    mut machine: Machine,
+    mut host: Host<E>,
+    mut commands: mpsc::Receiver<ReachabilityCommand>,
+    mut done_rx: mpsc::UnboundedReceiver<Completion>,
+) -> Result<(), ReachabilityError> {
+    loop {
+        let (event, exit) = tokio::select! {
+            biased;
+            Some(done) = done_rx.recv() => (completion_event(done), false),
+            cmd = commands.recv() => match cmd {
+                Some(cmd) => host.command_event(cmd).await?,
+                None => return Err(ReachabilityError::ChannelClosed),
+            },
+        };
+        let effects = machine.step(event, unix_now_ms())?;
+        host.perform(&mut machine, effects).await?;
+        if exit {
+            return Ok(());
+        }
+    }
+}
+
+fn completion_event(done: Completion) -> Event {
+    match done {
+        Completion::Resolved { req, outcome } => Event::Resolved { req, outcome },
+        Completion::Rendezvous { req, outcome } => Event::RendezvousResolved { req, outcome },
+        Completion::Datagram { req, outcome } => Event::DatagramReplied { req, outcome },
+    }
+}
+
+/// The resolver's half: operations arrive in start order and run one at a
+/// time — exactly the serialization one `&mut` resolver implies — while the
+/// command loop keeps draining beside it.
+async fn resolver_pump<R: EndpointResolver>(
+    mut resolver: R,
+    mut ops: mpsc::UnboundedReceiver<ResolverOp>,
+    done: mpsc::UnboundedSender<Completion>,
+) {
+    while let Some(op) = ops.recv().await {
+        match op {
+            ResolverOp::Resolve {
+                req,
+                peer,
+                advertised,
+            } => {
+                let outcome = resolver.resolve(peer, advertised).await;
+                let _ = done.send(Completion::Resolved { req, outcome });
+            }
+            ResolverOp::Rendezvous { req, peer } => {
+                let outcome = resolver.resolve_rendezvous_endpoint(peer).await;
+                let _ = done.send(Completion::Rendezvous { req, outcome });
+            }
+            ResolverOp::Send { endpoint, bytes } => {
+                let _ = resolver.send_datagram(endpoint, bytes).await;
+            }
+            ResolverOp::SendAwait {
+                req,
+                endpoint,
+                bytes,
+                timeout,
+            } => {
+                let outcome = resolver.send_datagram_and_recv(endpoint, bytes, timeout).await;
+                let _ = done.send(Completion::Datagram { req, outcome });
+            }
+        }
+    }
+}
+
+/// Everything the loop performs effects WITH.
+struct Host<E> {
+    effect: E,
+    events: mpsc::Sender<ReachabilityEvent>,
+    op_tx: mpsc::UnboundedSender<ResolverOp>,
+    replies: BTreeMap<CmdToken, PendingReply>,
+    next_token: u64,
+    /// The state file still to be offered as the boot restore — taken by
+    /// the first retarget, so the restore is structurally once per life.
+    restore_file: Option<PathBuf>,
+    /// Where applied-mesh snapshots are written, for the whole life.
+    persist_file: Option<PathBuf>,
+    plan: WgPlan,
+}
+
+impl<E: WireGuardEffect> Host<E> {
+    /// Translate one node command into its machine event, minting reply
+    /// tokens for the commands that answer later and reading the persisted
+    /// mesh once for the boot retarget.
+    async fn command_event(
+        &mut self,
+        cmd: ReachabilityCommand,
+    ) -> Result<(Event, bool), ReachabilityError> {
+        match cmd {
+            ReachabilityCommand::Retarget(event) => {
+                let persisted = self.read_restore_file().await?;
+                Ok((Event::Retarget { event, persisted }, false))
+            }
+            ReachabilityCommand::InstallInvitePeer {
+                peer,
+                wireguard_public_key,
+                endpoint,
+                reply,
+            } => {
+                let token = self.mint_token(PendingReply::Install(reply));
+                Ok((
+                    Event::InstallInvitePeer {
+                        token,
+                        peer,
+                        wireguard_public_key,
+                        endpoint,
+                    },
+                    false,
+                ))
+            }
+            ReachabilityCommand::BootstrapCoordinatedInvitePeer {
+                peer,
+                wireguard_public_key,
+                intro,
+                reply,
+            } => {
+                let token = self.mint_token(PendingReply::Intro(reply));
+                Ok((
+                    Event::BootstrapCoordinatedInvitePeer {
+                        token,
+                        peer,
+                        wireguard_public_key,
+                        intro,
+                    },
+                    false,
+                ))
+            }
+            ReachabilityCommand::SendResolverDatagram { endpoint, bytes } => {
+                Ok((Event::SendResolverDatagram { endpoint, bytes }, false))
+            }
+            ReachabilityCommand::Deliver { from, bytes } => {
+                Ok((Event::Deliver { from, bytes }, false))
+            }
+            ReachabilityCommand::ViewTick(view) => Ok((Event::ViewTick(view), false)),
+            ReachabilityCommand::Nudge => Ok((Event::Nudge, false)),
+            ReachabilityCommand::Shutdown => Ok((Event::Shutdown, true)),
+        }
+    }
+
+    fn mint_token(&mut self, reply: PendingReply) -> CmdToken {
+        self.next_token += 1;
+        let token = CmdToken(self.next_token);
+        self.replies.insert(token, reply);
+        token
+    }
+
+    /// The persisted-mesh bytes ride the FIRST retarget of this host life
+    /// only — later retargets are live cutovers with a working transport,
+    /// and restoring over them would tear down good tunnels. The machine
+    /// decodes and verifies; an unreadable FILE is the host's own refusal.
+    async fn read_restore_file(&mut self) -> Result<Option<Vec<u8>>, ReachabilityError> {
+        let Some(path) = self.restore_file.take() else {
+            return Ok(None);
+        };
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => {
+                let reason = StoreError::Io {
+                    path: path.display().to_string(),
+                    source,
+                }
+                .to_string();
+                self.observe(ReachabilityEvent::RestoreFailed { reason })
+                    .await?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Perform one step's effects IN ORDER. An interface push is performed
+    /// here and its outcome stepped straight back in; the new effects run
+    /// to completion before the remainder of the outer list — exactly the
+    /// inline order the machine's step cascade expresses.
+    async fn perform(
+        &mut self,
+        machine: &mut Machine,
+        effects: Vec<Effect>,
+    ) -> Result<(), ReachabilityError> {
+        let mut stack: Vec<std::vec::IntoIter<Effect>> = vec![effects.into_iter()];
+        while let Some(top) = stack.last_mut() {
+            let Some(effect) = top.next() else {
+                stack.pop();
+                continue;
+            };
+            match effect {
+                Effect::MeshSend { to, bytes } => {
+                    self.observe(ReachabilityEvent::Send { to, bytes }).await?
+                }
+                Effect::Observe(event) => self.observe(event).await?,
+                Effect::WgApply {
+                    req,
+                    bring_up,
+                    peers,
+                } => {
+                    let outcome = self.push_interface(bring_up, &peers);
+                    let more = machine.step(Event::WgApplied { req, outcome }, unix_now_ms())?;
+                    stack.push(more.into_iter());
+                }
+                Effect::WgRemove => {
+                    // best-effort by contract: the requester is leaving the
+                    // mesh or the process either way.
+                    let _ = self.effect.remove_interface();
+                }
+                Effect::ResolveStart {
+                    req,
+                    peer,
+                    advertised,
+                } => self.start_op(ResolverOp::Resolve {
+                    req,
+                    peer,
+                    advertised,
+                }),
+                Effect::RendezvousStart { req, peer } => {
+                    self.start_op(ResolverOp::Rendezvous { req, peer })
+                }
+                Effect::UdpSend { endpoint, bytes } => {
+                    self.start_op(ResolverOp::Send { endpoint, bytes })
+                }
+                Effect::UdpSendAwait {
+                    req,
+                    endpoint,
+                    bytes,
+                    timeout_ms,
+                } => self.start_op(ResolverOp::SendAwait {
+                    req,
+                    endpoint,
+                    bytes,
+                    timeout: Duration::from_millis(timeout_ms),
+                }),
+                Effect::ReplyInstall { token, outcome } => self.reply_install(token, outcome),
+                Effect::ReplyIntro { token, outcome } => self.reply_intro(token, outcome),
+                Effect::Persist { bytes } => self.persist(bytes).await?,
+            }
+        }
+        Ok(())
+    }
+
+    async fn observe(&mut self, event: ReachabilityEvent) -> Result<(), ReachabilityError> {
+        self.events
+            .send(event)
+            .await
+            .map_err(|_| ReachabilityError::ChannelClosed)
+    }
+
+    fn start_op(&mut self, op: ResolverOp) {
+        // the pump outlives the loop by construction; a send can only fail
+        // during teardown, where the outcome no longer matters.
+        let _ = self.op_tx.send(op);
+    }
+
+    fn push_interface(&mut self, bring_up: bool, peers: &[PeerTunnelConfig]) -> Result<(), String> {
+        let plan = &self.plan;
+        let pushed = match bring_up {
+            true => apply_peer_tunnels(
+                &mut self.effect,
+                plan.interface.clone(),
+                plan.private_key,
+                plan.listen_port,
+                &plan.local_ips,
+                peers,
+            ),
+            false => update_peer_tunnels(
+                &mut self.effect,
+                plan.interface.clone(),
+                plan.private_key,
+                plan.listen_port,
+                &plan.local_ips,
+                peers,
+            ),
+        };
+        pushed.map_err(|err| format!("{err:?}"))
+    }
+
+    fn reply_install(&mut self, token: CmdToken, outcome: Result<(), String>) {
+        match self.replies.remove(&token) {
+            Some(PendingReply::Install(reply)) => {
+                let _ = reply.0.send(outcome);
+            }
+            Some(PendingReply::Intro(_)) => {
+                debug_assert!(false, "an install reply answered an intro command");
+            }
+            None => {}
+        }
+    }
+
+    fn reply_intro(&mut self, token: CmdToken, outcome: Result<Vec<u8>, String>) {
+        match self.replies.remove(&token) {
+            Some(PendingReply::Intro(reply)) => {
+                let _ = reply.0.send(outcome);
+            }
+            Some(PendingReply::Install(_)) => {
+                debug_assert!(false, "an intro reply answered an install command");
+            }
+            None => {}
+        }
+    }
+
+    async fn persist(&mut self, bytes: Vec<u8>) -> Result<(), ReachabilityError> {
+        let Some(path) = self.persist_file.clone() else {
+            return Ok(());
+        };
+        let Err(err) = store::write_atomic(&path, &bytes) else {
+            return Ok(());
+        };
+        self.observe(ReachabilityEvent::PersistFailed {
+            reason: err.to_string(),
+        })
+        .await
+    }
+}

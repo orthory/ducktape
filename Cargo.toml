@@ -13,8 +13,10 @@
 #                      indexer, never in any root), wasm-host (runs a
 #                      ducktape:module component as a native sdk::Module),
 #                      module-guest (that world's WIT definition)
-#   crates/networking/ — the netstack: host-side transport infra ONLY
-#                      (wireguard, nat-traversal, reachability, data-plane,
+#   crates/networking/ — the netstack: transport infra ONLY (wireguard,
+#                      nat-traversal, netstack-machine [the sans-I/O
+#                      reachability decision core], reachability [its host
+#                      executor + rendezvous runtime], data-plane,
 #                      overlay-net) — owns no consensus module
 #   crates/modules/   — CONSENSUS MODULES AND NOTHING ELSE. every crate under
 #                      system/ or apps/ implements `sdk::Module`; anything that
@@ -95,6 +97,7 @@ members = [
     # networking — the netstack (host-side infra + the modules that govern it)
     "crates/networking/wireguard",
     "crates/networking/nat-traversal",
+    "crates/networking/netstack-machine",
     "crates/networking/reachability",
     "crates/networking/data-plane",
     "crates/networking/overlay-net",
@@ -361,6 +364,7 @@ greeter = { path = "crates/examples/greeter" }
 # internal — types-only interface crates (the legal cross-module surface)
 wireguard = { path = "crates/networking/wireguard" }
 nat-traversal = { path = "crates/networking/nat-traversal" }
+netstack-machine = { path = "crates/networking/netstack-machine" }
 reachability = { path = "crates/networking/reachability" }
 data-plane = { path = "crates/networking/data-plane" }
 overlay-net = { path = "crates/networking/overlay-net" }

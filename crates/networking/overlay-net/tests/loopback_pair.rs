@@ -310,7 +310,7 @@ async fn forced_rekey_keeps_traffic_flowing() {
 }
 
 /// re-applying an IDENTICAL configuration preserves live sessions — the
-/// property the orchestrator's mid-epoch `update_peer_tunnels` re-apply
+/// property the executor's mid-epoch `update_peer_tunnels` re-apply
 /// depends on (an apply that re-tunneled every peer would drop traffic on
 /// every standby record arrival).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -564,7 +564,7 @@ impl WgDevice {
     }
 
     /// a cheap, cloneable handle for HANDSHAKE PROBES that must outlive the move
-    /// of this device into the effect (and thence into the orchestrator).
+    /// of this device into the effect (and thence into the executor).
     ///
     /// the device's state already lives behind an `Arc`, so this is a refcount
     /// bump — it exists because applying a tunnel CONFIG and completing a

@@ -1046,7 +1046,7 @@ async fn reachability_plane(
 /// own age: WireGuard rejects a session older than REJECT_AFTER_TIME (180s) and
 /// boringtun then reports no handshake AT ALL rather than an old one, so an
 /// idle tunnel loses its age and its session together. Every mesh peer carries
-/// a persistent keepalive (`reachability::KEEPALIVE_SECONDS`, 25s), which
+/// a persistent keepalive (`netstack_machine::KEEPALIVE_SECONDS`, 25s), which
 /// re-establishes a session within a keepalive plus a handshake round trip of
 /// the lapse — a peer with none for this long is one whose handshake is
 /// FAILING, not one that idled.

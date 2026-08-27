@@ -14,7 +14,7 @@
 //!   [`sockets`].
 //! - [`effect`] — the orchestration boundary: `WireGuardEffect`
 //!   (`create_interface` / `apply` / `remove_interface`), so the
-//!   reachability orchestrator, epoch cutover, standby pre-warm, and cold
+//!   reachability executor, epoch cutover, standby pre-warm, and cold
 //!   restart drive this backend exactly as they drive the TUN one.
 //!
 //! and two consumer-facing faces over the stack (ADR phase 2), both fed by

@@ -1,0 +1,22 @@
+[package]
+name = "netstack-machine"
+edition.workspace = true
+version.workspace = true
+
+# The netstack's sans-I/O decision core: the reachability protocol as a pure
+# event-in/effects-out state machine, plus the pure protocol modules it owns
+# (epoch state, wire messages, derived bindings, the persisted-mesh codec).
+# Deliberately NO tokio, NO filesystem, NO sockets, NO clock — the host side
+# (the `reachability` crate's executor and resolver runtime) performs every
+# effect and stamps every step. This boundary is what phases 2-4 of the
+# netstack arc freeze, trace, and compile to wasm.
+[dependencies]
+commonware-cryptography = { workspace = true }
+# NodeKey only — the rendezvous RUNTIME stays host-side in `reachability`.
+nat-traversal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+wireguard = { workspace = true }

@@ -4,7 +4,7 @@
 //! pair instead of a TUN.
 //!
 //! the ADR's rule is that the orchestration boundary does not move: the
-//! reachability orchestrator, epoch cutover, standby pre-warm, and cold
+//! reachability executor, epoch cutover, standby pre-warm, and cold
 //! restart keep driving tunnels through `create_interface` / `apply` /
 //! `remove_interface` with the same `InterfaceConfig`. this adapter
 //! maps that contract onto the userspace core:
@@ -189,7 +189,7 @@ impl UserspaceWireGuardEffect {
     }
 
     /// the handshake-probe handle. take it BEFORE moving this effect into the
-    /// orchestrator; it stays valid across backend rebuilds for the effect's life.
+    /// executor; it stays valid across backend rebuilds for the effect's life.
     pub fn probe_slot(&self) -> ProbeSlot {
         self.probes.clone()
     }

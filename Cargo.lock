@@ -6081,6 +6081,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "netstack-machine"
+version = "0.1.0"
+dependencies = [
+ "commonware-cryptography",
+ "nat-traversal",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tracing",
+ "wireguard",
+]
+
+[[package]]
 name = "nettest"
 version = "0.1.0"
 dependencies = [
@@ -7980,8 +7994,8 @@ dependencies = [
  "chacha20poly1305",
  "commonware-cryptography",
  "nat-traversal",
+ "netstack-machine",
  "rand 0.8.6",
- "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
