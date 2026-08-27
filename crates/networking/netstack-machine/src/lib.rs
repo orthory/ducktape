@@ -34,3 +34,4 @@ pub use contract::{
 };
 pub use machine::{HANDSHAKE_TTL_VIEWS, KEEPALIVE_SECONDS, Machine, initiates};
 pub use store::PersistedMesh;
+pub use wire::SnapshotError;

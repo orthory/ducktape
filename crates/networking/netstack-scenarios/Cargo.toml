@@ -14,4 +14,5 @@ version.workspace = true
 commonware-cryptography = { workspace = true }
 nat-traversal = { workspace = true }
 netstack-machine = { workspace = true }
+sha2 = { workspace = true }
 wireguard = { workspace = true }

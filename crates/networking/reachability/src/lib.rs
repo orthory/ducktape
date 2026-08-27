@@ -33,7 +33,7 @@ pub use netstack_machine::{binding, msg};
 // else stays addressable through its module (`binding::`, `msg::`, …).
 pub use executor::{
     CoordinatedInviteReply, InstallReply, NetstackBackend, ReachabilityCommand, ReachabilityConfig,
-    ReachabilityError, run,
+    ReachabilityError, SwapReply, run,
 };
 pub use keys::WireGuardKeypair;
 pub use netstack_machine::binding::{active_set, identity_of, node_key, open_port_policy};

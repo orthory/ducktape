@@ -34,6 +34,13 @@ fn assert_converged(net: &Net, nodes: &[usize], epoch: u64, peers: usize) {
     }
 }
 
+/// How many times the node applied an epoch's tunnels.
+fn applies(net: &Net, node: usize) -> usize {
+    net.count(node, |e| {
+        matches!(e, ReachabilityEvent::TunnelsApplied { .. })
+    })
+}
+
 fn assert_no_peer_failure(net: &Net, nodes: &[usize]) {
     for &node in nodes {
         assert!(
@@ -542,5 +549,63 @@ pub fn join_coordinated_invite(backend: Backend) {
         Some(&Reply::Intro(Ok(b"ack".to_vec())))
     );
     assert!(matches!(net.reply(timed_out), Some(Reply::Intro(Err(_)))));
+    net.finish();
+}
+
+// ----------------------------------------------- 12. backend swap mid-epoch
+
+/// The machine behind a node is swapped for one restored from its
+/// snapshot at three points of an epoch's life — while records and adverts
+/// are still crossing, with handshake requests on the wire, and after the
+/// apply — and the epoch neither restarts nor re-applies: one apply per
+/// node, exactly as with no swap at all, and the next cutover runs on the
+/// swapped machines like any other. The trace pins every snapshot's
+/// digest, so every backend, and every native/guest crossing, must take
+/// the same bytes from the same state.
+pub fn backend_swap_mid_epoch(backend: Backend) {
+    let mut net = Net::new(
+        "backend_swap_mid_epoch",
+        "net#swap",
+        &public_nodes(3),
+        backend,
+    );
+    net.retarget_all(1, &members(3), &[], 1);
+    // records and adverts are still crossing: nothing verified yet.
+    net.run_until(T0_MS + 2 * LINK_DELAY_MS + 5);
+    net.swap(0);
+    // the view verified and the handshake requests are on the wire.
+    net.run_until(T0_MS + 3 * LINK_DELAY_MS + 5);
+    for node in members(3) {
+        assert_eq!(applies(&net, node), 0, "n{}: nothing applied yet", node + 1);
+    }
+    net.swap(1);
+    net.run();
+    assert_converged(&net, &members(3), 1, 2);
+    assert_no_peer_failure(&net, &members(3));
+    for node in members(3) {
+        assert_eq!(
+            applies(&net, node),
+            1,
+            "n{}: one apply for the epoch",
+            node + 1
+        );
+    }
+
+    // a swap of a settled node changes nothing the nudges can see.
+    net.swap(2);
+    net.nudges(3);
+    net.run();
+    for node in members(3) {
+        assert_eq!(applies(&net, node), 1, "n{}: still one apply", node + 1);
+    }
+
+    // the swapped machines carry the next cutover like any other.
+    net.shutdown(2);
+    net.retarget_all(2, &members(2), &[], 100);
+    net.run();
+    assert_converged(&net, &members(2), 2, 1);
+    for node in members(2) {
+        assert_eq!(applies(&net, node), 2, "n{}: one apply per epoch", node + 1);
+    }
     net.finish();
 }

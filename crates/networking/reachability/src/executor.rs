@@ -24,10 +24,13 @@
 //!
 //! The machine is driven through [`NetstackMachine`], so the loop never
 //! learns whether it holds the native [`Machine`] or the wasm guest
-//! ([`NetstackBackend`]). The one difference it handles: a backend can
-//! FAULT (a trap, an exhausted budget), after which its state is unknown —
-//! the loop says so, hands the plane to the native machine, and replays
-//! the last retarget so the epoch re-assembles live.
+//! ([`NetstackBackend`]). Two things it handles beyond stepping: a backend
+//! can FAULT (a trap, an exhausted budget), after which its state is
+//! unknown — the loop says so, hands the plane to the native machine, and
+//! replays the last retarget so the epoch re-assembles live; and the node
+//! can SWAP the backend mid-life ([`ReachabilityCommand::SwapBackend`]) —
+//! the machine's snapshot restores into the new backend and the epoch
+//! continues exactly where it was, no retarget and no interface push.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -38,9 +41,9 @@ use commonware_cryptography::{Signer as _, ed25519};
 use nat_traversal::NodeKey;
 use netstack_machine::{
     CmdToken, Effect, Event, Machine, MachineConfig, MeshEpochEvent, NetstackMachine,
-    ReachabilityEvent, ReqId, StepError, binding,
+    ReachabilityEvent, ReqId, SnapshotError, StepError, binding,
 };
-use netstack_wasm::NetstackGuest;
+use netstack_wasm::{GuestError, NetstackGuest};
 use tokio::sync::mpsc;
 use wireguard::effect::{
     PeerTunnelConfig, WireGuardEffect, apply_peer_tunnels, update_peer_tunnels,
@@ -106,6 +109,16 @@ pub enum NetstackBackend {
     Guest { component: Vec<u8>, step_fuel: u64 },
 }
 
+impl NetstackBackend {
+    /// The backend's name as the logs carry it.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Guest { .. } => "guest",
+        }
+    }
+}
+
 impl std::fmt::Debug for NetstackBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -127,6 +140,18 @@ pub struct CoordinatedInviteReply(pub tokio::sync::oneshot::Sender<Result<Vec<u8
 impl std::fmt::Debug for InstallReply {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("InstallReply")
+    }
+}
+
+/// The outcome a [`ReachabilityCommand::SwapBackend`] caller awaits: `Ok`
+/// once the new backend runs the plane, `Err` naming why the swap was
+/// refused (the current machine continues) or why the old backend faulted
+/// on the way out (the native machine took over).
+pub struct SwapReply(pub tokio::sync::oneshot::Sender<Result<(), String>>);
+
+impl std::fmt::Debug for SwapReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SwapReply")
     }
 }
 
@@ -183,6 +208,16 @@ pub enum ReachabilityCommand {
     /// Periodic controller kick: re-offer whatever this node is still
     /// waiting on (see [`Event::Nudge`] for the full contract).
     Nudge,
+    /// Swap the machine behind the plane for `backend`, mid-life: the
+    /// current machine's snapshot restores into the new one and the epoch
+    /// continues where it was — no retarget, no interface push. A backend
+    /// that cannot restore the snapshot is refused and the current machine
+    /// continues; a machine that cannot even take one has faulted, and the
+    /// native machine takes over as after any fault. The reply says which.
+    SwapBackend {
+        backend: NetstackBackend,
+        reply: SwapReply,
+    },
     /// Drain and exit; the interface is torn down on the way out.
     Shutdown,
 }
@@ -342,7 +377,9 @@ where
 /// The command loop: completions drain before commands (an outcome the
 /// machine is waiting on should never queue behind fresh work), every event
 /// is stamped, and every effect list is performed before the next drain. A
-/// backend fault swaps the native machine in before the next event.
+/// backend fault swaps the native machine in before the next event; a swap
+/// command swaps the machine between two events, which is the only place
+/// its state is at rest.
 async fn host_loop<E: WireGuardEffect>(
     factory: MachineFactory,
     mut host: Host<E>,
@@ -351,22 +388,38 @@ async fn host_loop<E: WireGuardEffect>(
 ) -> Result<(), ReachabilityError> {
     let mut machine = factory.boot();
     loop {
-        let (event, exit) = tokio::select! {
+        let input = tokio::select! {
             biased;
-            Some(done) = done_rx.recv() => (completion_event(done), false),
+            Some(done) = done_rx.recv() => Input::Step { event: completion_event(done), exit: false },
             cmd = commands.recv() => match cmd {
-                Some(cmd) => host.command_event(cmd).await?,
+                Some(cmd) => host.input(cmd).await?,
                 None => return Err(ReachabilityError::ChannelClosed),
             },
         };
-        match host.drive(&mut *machine, event).await? {
-            Drive::Done => {}
-            Drive::Faulted(reason) => machine = host.fail_over(&factory, reason).await?,
-        }
-        if exit {
-            return Ok(());
+        match input {
+            Input::Step { event, exit } => {
+                machine = host.step(&factory, machine, event).await?;
+                if exit {
+                    return Ok(());
+                }
+            }
+            Input::Swap { backend, reply } => {
+                machine = host.swap(&factory, machine, backend, reply).await?;
+            }
         }
     }
+}
+
+/// What one turn of the loop does: step the machine, or swap it.
+enum Input {
+    Step {
+        event: Event,
+        exit: bool,
+    },
+    Swap {
+        backend: NetstackBackend,
+        reply: SwapReply,
+    },
 }
 
 /// Builds the plane's machine: the configured backend at boot, the native
@@ -402,7 +455,7 @@ impl MachineFactory {
                 tracing::info!(
                     target: "ducktape::reachability",
                     event = "netstack_backend",
-                    backend = "guest",
+                    backend = self.backend.name(),
                     step_fuel,
                     "netstack machine runs as the wasm guest"
                 );
@@ -419,6 +472,42 @@ impl MachineFactory {
             }
         }
     }
+
+    /// `backend` continuing from `snapshot`.
+    fn restore(
+        &self,
+        backend: &NetstackBackend,
+        snapshot: &[u8],
+    ) -> Result<Box<dyn NetstackMachine>, RestoreError> {
+        match backend {
+            NetstackBackend::Native => {
+                let machine = Machine::restore(self.signer(), self.config.clone(), snapshot)?;
+                Ok(Box::new(machine))
+            }
+            NetstackBackend::Guest {
+                component,
+                step_fuel,
+            } => {
+                let guest = NetstackGuest::restore(
+                    component,
+                    self.signer(),
+                    self.config.clone(),
+                    snapshot,
+                    *step_fuel,
+                )?;
+                Ok(Box::new(guest))
+            }
+        }
+    }
+}
+
+/// Why a backend could not continue from a snapshot.
+#[derive(Debug, thiserror::Error)]
+enum RestoreError {
+    #[error("native machine: {0}")]
+    Native(#[from] SnapshotError),
+    #[error(transparent)]
+    Guest(#[from] GuestError),
 }
 
 /// What driving one event through the machine came to.
@@ -513,17 +602,16 @@ struct Host<E> {
 }
 
 impl<E: WireGuardEffect> Host<E> {
-    /// Translate one node command into its machine event, minting reply
-    /// tokens for the commands that answer later and reading the persisted
-    /// mesh once for the boot retarget.
-    async fn command_event(
-        &mut self,
-        cmd: ReachabilityCommand,
-    ) -> Result<(Event, bool), ReachabilityError> {
+    /// Sort one node command into the loop's input: the machine event it
+    /// translates to (minting reply tokens for the commands that answer
+    /// later, reading the persisted mesh once for the boot retarget), or
+    /// the one command that swaps the machine instead of stepping it.
+    async fn input(&mut self, cmd: ReachabilityCommand) -> Result<Input, ReachabilityError> {
+        let step = |event: Event, exit: bool| Ok(Input::Step { event, exit });
         match cmd {
             ReachabilityCommand::Retarget(event) => {
                 let persisted = self.read_restore_file().await?;
-                Ok((Event::Retarget { event, persisted }, false))
+                step(Event::Retarget { event, persisted }, false)
             }
             ReachabilityCommand::InstallInvitePeer {
                 peer,
@@ -532,7 +620,7 @@ impl<E: WireGuardEffect> Host<E> {
                 reply,
             } => {
                 let token = self.mint_token(PendingReply::Install(reply));
-                Ok((
+                step(
                     Event::InstallInvitePeer {
                         token,
                         peer,
@@ -540,7 +628,7 @@ impl<E: WireGuardEffect> Host<E> {
                         endpoint,
                     },
                     false,
-                ))
+                )
             }
             ReachabilityCommand::BootstrapCoordinatedInvitePeer {
                 peer,
@@ -549,7 +637,7 @@ impl<E: WireGuardEffect> Host<E> {
                 reply,
             } => {
                 let token = self.mint_token(PendingReply::Intro(reply));
-                Ok((
+                step(
                     Event::BootstrapCoordinatedInvitePeer {
                         token,
                         peer,
@@ -557,17 +645,20 @@ impl<E: WireGuardEffect> Host<E> {
                         intro,
                     },
                     false,
-                ))
+                )
             }
             ReachabilityCommand::SendResolverDatagram { endpoint, bytes } => {
-                Ok((Event::SendResolverDatagram { endpoint, bytes }, false))
+                step(Event::SendResolverDatagram { endpoint, bytes }, false)
             }
             ReachabilityCommand::Deliver { from, bytes } => {
-                Ok((Event::Deliver { from, bytes }, false))
+                step(Event::Deliver { from, bytes }, false)
             }
-            ReachabilityCommand::ViewTick(view) => Ok((Event::ViewTick(view), false)),
-            ReachabilityCommand::Nudge => Ok((Event::Nudge, false)),
-            ReachabilityCommand::Shutdown => Ok((Event::Shutdown, true)),
+            ReachabilityCommand::ViewTick(view) => step(Event::ViewTick(view), false),
+            ReachabilityCommand::Nudge => step(Event::Nudge, false),
+            ReachabilityCommand::SwapBackend { backend, reply } => {
+                Ok(Input::Swap { backend, reply })
+            }
+            ReachabilityCommand::Shutdown => step(Event::Shutdown, true),
         }
     }
 
@@ -598,6 +689,67 @@ impl<E: WireGuardEffect> Host<E> {
                 self.observe(ReachabilityEvent::RestoreFailed { reason })
                     .await?;
                 Ok(None)
+            }
+        }
+    }
+
+    /// Drive one event through the machine; returns the machine that
+    /// continues afterwards — the same one, or the native machine after a
+    /// fault.
+    async fn step(
+        &mut self,
+        factory: &MachineFactory,
+        mut machine: Box<dyn NetstackMachine>,
+        event: Event,
+    ) -> Result<Box<dyn NetstackMachine>, ReachabilityError> {
+        match self.drive(&mut *machine, event).await? {
+            Drive::Done => Ok(machine),
+            Drive::Faulted(reason) => self.fail_over(factory, reason).await,
+        }
+    }
+
+    /// Swap the machine for one `backend` restores from its snapshot; the
+    /// epoch continues where it was. A backend that refuses the snapshot
+    /// leaves the current machine in place; a machine that faults on the
+    /// snapshot itself hands the plane to the native machine as after any
+    /// fault.
+    async fn swap(
+        &mut self,
+        factory: &MachineFactory,
+        mut machine: Box<dyn NetstackMachine>,
+        backend: NetstackBackend,
+        reply: SwapReply,
+    ) -> Result<Box<dyn NetstackMachine>, ReachabilityError> {
+        let snapshot = match machine.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(StepError::Fault(reason)) => {
+                let _ = reply.0.send(Err(format!("snapshot: {reason}")));
+                return self.fail_over(factory, reason).await;
+            }
+            Err(StepError::Protocol(err)) => return Err(err.into()),
+        };
+        match factory.restore(&backend, &snapshot) {
+            Ok(swapped) => {
+                tracing::info!(
+                    target: "ducktape::reachability",
+                    event = "netstack_backend_swapped",
+                    backend = backend.name(),
+                    snapshot_bytes = snapshot.len(),
+                    "netstack machine swapped mid-life; the epoch continues"
+                );
+                let _ = reply.0.send(Ok(()));
+                Ok(swapped)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "ducktape::reachability",
+                    event = "netstack_backend_swap_refused",
+                    backend = backend.name(),
+                    error = %err,
+                    "netstack backend refused the snapshot; the current machine continues"
+                );
+                let _ = reply.0.send(Err(err.to_string()));
+                Ok(machine)
             }
         }
     }

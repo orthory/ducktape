@@ -106,10 +106,38 @@ impl<T: IdentitySigner + ?Sized> IdentitySigner for &T {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 pub struct Root(pub [u8; 32]);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 pub struct AdmissionRoot(pub [u8; 32]);
 
 #[derive(
@@ -129,7 +157,21 @@ pub struct AdmissionRoot(pub [u8; 32]);
 )]
 pub struct MeshVersion(pub [u8; 32]);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 pub struct PolicyHash(pub [u8; 32]);
 
 #[derive(
@@ -182,7 +224,20 @@ impl TryFrom<&[u8]> for ValidatorIdentity {
 )]
 pub struct X25519PublicKey(pub [u8; 32]);
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 pub struct SignatureBytes(pub Vec<u8>);
 
 #[derive(
@@ -322,7 +377,7 @@ impl PortPolicy {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub struct ActiveValidatorSet {
     pub namespace: String,
     pub epoch: u64,
@@ -370,7 +425,17 @@ impl ActiveValidatorSet {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 pub struct EndpointRecord {
     pub namespace: String,
     pub epoch: u64,
@@ -422,7 +487,17 @@ impl EndpointRecord {
 /// so the record itself must carry the owner's signature. Distinct signing
 /// domain from [`EndpointAdvertisement`] (which additionally commits to a
 /// mesh version): the two blobs can never cross-verify.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 pub struct SignedEndpointRecord {
     pub record: EndpointRecord,
     pub signature: SignatureBytes,
@@ -453,7 +528,17 @@ impl SignedEndpointRecord {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 pub struct EndpointAdvertisement {
     pub record: EndpointRecord,
     pub mesh_version: MeshVersion,
@@ -488,7 +573,7 @@ impl EndpointAdvertisement {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub struct MeshView {
     pub active_set: ActiveValidatorSet,
     pub mesh_version: MeshVersion,
@@ -757,7 +842,17 @@ impl OverlayPolicy {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 pub struct TunnelUpgradeRequestFields {
     pub namespace: String,
     pub epoch: u64,
@@ -777,7 +872,17 @@ pub struct TunnelUpgradeRequestFields {
     pub nonce: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 pub struct TunnelUpgradeRequest {
     pub fields: TunnelUpgradeRequestFields,
     pub signature: SignatureBytes,
@@ -813,7 +918,17 @@ impl TunnelUpgradeRequest {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 pub struct TunnelUpgradeResponseFields {
     pub request_hash: [u8; 32],
     pub namespace: String,
@@ -834,7 +949,17 @@ pub struct TunnelUpgradeResponseFields {
     pub nonce: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 pub struct TunnelUpgradeResponse {
     pub fields: TunnelUpgradeResponseFields,
     pub signature: SignatureBytes,
@@ -870,7 +995,17 @@ impl TunnelUpgradeResponse {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 pub struct TunnelUpgradeAckFields {
     pub request_hash: [u8; 32],
     pub response_hash: [u8; 32],
@@ -886,7 +1021,17 @@ pub struct TunnelUpgradeAckFields {
     pub nonce: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 pub struct TunnelUpgradeAck {
     pub fields: TunnelUpgradeAckFields,
     pub signature: SignatureBytes,
@@ -915,7 +1060,7 @@ impl TunnelUpgradeAck {
     }
 }
 
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub struct ReplayCache {
     seen: BTreeSet<(ValidatorIdentity, u64, u64)>,
 }
@@ -953,7 +1098,7 @@ impl ReplayCache {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub struct TunnelInstallContext {
     pub namespace: String,
     pub epoch: u64,
@@ -962,7 +1107,7 @@ pub struct TunnelInstallContext {
     pub mesh_version: MeshVersion,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub struct TunnelInstallPlan {
     context: TunnelInstallContext,
     local_identity: ValidatorIdentity,
