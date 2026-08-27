@@ -730,16 +730,6 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
     // the dev shape's per-process state dir stands in as its workspace, so its
     // grant file sits beside its storage — one rule for both shapes.
     let compute_backend = gate_on_compute_grant(service.sandbox.as_ref(), &service.workspace)?;
-    // the dev shape has no descriptor, so the FILES are its genesis code set:
-    // whatever `<dir>/<id>.component.wasm` hashes to is what this node seeds.
-    let bundle_dir = PathBuf::from(&raw.modules);
-    let genesis = GenesisModules {
-        hashes: hash_bundle(
-            &bundle_dir,
-            &topology::TOPOLOGY.wasm_ids(topology::PRODUCTION),
-        )?,
-        bundle_dir,
-    };
     let wireguard_listen = parse_wireguard_listen(raw.wireguard_listen.as_deref())?;
     let invite_listen = resolved_intro_listener(
         raw.advertised.as_deref(),
@@ -822,6 +812,18 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
         .gateway_listen
         .clone()
         .or_else(|| raw.http_listen.as_ref().map(|_| "127.0.0.1:0".to_string()));
+    // the dev shape has no descriptor, so the FILES are its genesis code set:
+    // whatever `<dir>/<id>.component.wasm` hashes to is what this node seeds.
+    // LAST, because it is the only check that touches the disk — a config with
+    // a typo'd `listen` must be told about the typo, not about the bundle.
+    let bundle_dir = PathBuf::from(&raw.modules);
+    let genesis = GenesisModules {
+        hashes: hash_bundle(
+            &bundle_dir,
+            &topology::TOPOLOGY.wasm_ids(topology::PRODUCTION),
+        )?,
+        bundle_dir,
+    };
     Ok(Resolved {
         signer: ed25519::PrivateKey::from_seed(id),
         label: format!("#{id}"),
@@ -897,6 +899,12 @@ mod tests {
         }
         format!("modules = {:?}\n", modules.to_str().expect("utf8 path"))
     }
+
+    /// the `modules` line for a dev-seed config whose resolve must fail BEFORE
+    /// the bundle is ever read: the key is required by the parse, the directory
+    /// is deliberately absent. A test using this and still passing is the proof
+    /// that hashing runs after the cheap checks.
+    const UNREAD_BUNDLE: &str = "modules = \"/no/such/bundle\"\n";
 
     #[test]
     fn a_hostname_advertised_boots_without_dns_and_stays_a_hostname() {
@@ -1045,6 +1053,12 @@ mod tests {
         // the workspace base is the config directory — where a joiner would
         // persist a `coord.cap` delivered over its Admitted gate reply.
         assert_eq!(r.service.workspace, dir);
+        // the genesis code set comes STRAIGHT off the descriptor (its hashes
+        // are already in the namespace fingerprint), and its bytes are read
+        // from the bundle beside the config.
+        assert_eq!(r.genesis.bundle_dir, dir.join("modules"));
+        assert_eq!(r.genesis.hashes["pages"], [0x11u8; 32]);
+        assert_eq!(r.genesis.hashes.len(), fake_modules().len());
     }
 
     #[test]
@@ -1333,8 +1347,7 @@ mod tests {
             dir.join("node.toml"),
             format!(
                 "id = 0\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\n\
-                 peer_seeds = [0, 1, 1]\n{}",
-                fake_bundle(&dir)
+                 peer_seeds = [0, 1, 1]\n{UNREAD_BUNDLE}"
             ),
         )
         .expect("write");
@@ -1839,8 +1852,8 @@ mod tests {
             dir.join("node.toml"),
             format!(
                 "id = 0\nlisten = \"127.0.0.1:52280\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
-                 wireguard_listen = \"0.0.0.0:51820\"\nwireguard_advertised = \"0.0.0.0:0\"\n{}",
-                fake_bundle(&dir)
+                 wireguard_listen = \"0.0.0.0:51820\"\n\
+                 wireguard_advertised = \"0.0.0.0:0\"\n{UNREAD_BUNDLE}"
             ),
         )
         .expect("write");
@@ -1993,8 +2006,8 @@ peer_addrs = ["127.0.0.1:52200", "127.0.0.1:52210", "127.0.0.1:52202"]
     fn retired_wireguard_effect_key_is_refused() {
         let dir = tmp("wgeffect");
         let base = format!(
-            "id = 0\nlisten = \"127.0.0.1:52230\"\nnamespace = \"demo\"\npeer_seeds = [0]\n{}",
-            fake_bundle(&dir)
+            "id = 0\nlisten = \"127.0.0.1:52230\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
+             {UNREAD_BUNDLE}"
         );
         for spelled in ["socket", "fake", "tun"] {
             std::fs::write(
@@ -2010,6 +2023,8 @@ peer_addrs = ["127.0.0.1:52200", "127.0.0.1:52210", "127.0.0.1:52202"]
     #[test]
     fn overlay_advertised_derives_the_ula_and_requires_v6_listen() {
         let dir = tmp("overlay-advertised");
+        // a REAL bundle: this test's first half resolves successfully, so it
+        // reaches the hashing the refusal half never gets to.
         let base = format!(
             "id = 1\nnamespace = \"demo\"\npeer_seeds = [0, 1]\n\
              peer_addrs = [\"127.0.0.1:52240\", \"127.0.0.1:52241\"]\n{}",
