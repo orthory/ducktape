@@ -3,15 +3,17 @@
 
 on account_loaded(next)
   return if next.generation != account_generation
-  account_bound = next.bound
-  account_id = next.account_id
-  account_name = next.display_name
+  account_exists = next.exists
+  account_number = next.number
+  // The account NUMBER is chat's `me` for DM derivation (both ends of one DM
+  // hash the same pair of numbers), so the rooms mirror moves with it.
+  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
+  account_name = next.name
   // The label's fallback chain ends at the account name — refresh the mirror
   // now that it arrived (the workspace/chain_id cases win and are unchanged).
   network_name = network_label(account_name, connected_rpc)
   account_bio = next.bio
-  account_members = next.members
-  account_nodes = next.nodes
+  account_keys = next.keys
 
 on account_failed(cause)
   return if cause.generation != account_generation
@@ -20,7 +22,7 @@ on account_name_draft_changed(next)
   account_name_draft = next
 
 on account_rename_submit
-  return if !connected || !account_bound || account_renaming || empty(trim(account_name_draft))
+  return if !connected || !account_exists || account_renaming || empty(trim(account_name_draft))
   account_renaming = true
   error = ""
   run every set_account_name(connected_rpc, password, trim(account_name_draft)) -> account_renamed _ | account_rename_failed _
@@ -94,7 +96,7 @@ on dm_peers_loaded(next)
   dm_peers = next.peers
   // The directory decides which channels are DMs and who the header names, so
   // both mirrors move with it — see state/chat.ice's `rooms` note.
-  rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
 

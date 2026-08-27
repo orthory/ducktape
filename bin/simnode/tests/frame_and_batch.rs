@@ -11,8 +11,7 @@
 mod harness;
 
 use commonware_cryptography::Signer as _;
-use harness::{Sim, create_channel, ed_bind_auth};
-use identity::bind_preimage;
+use harness::{Sim, create, create_channel};
 use sdk::Msg;
 
 type Ed = commonware_cryptography::ed25519::PrivateKey;
@@ -105,19 +104,19 @@ fn a_tampered_frame_is_refused_with_no_block() {
         1,
         &chat_frame_op(create_channel("general", "General")),
     );
-    // flip one PAYLOAD byte: the trailing bytes are cont_flag (1) + signature
-    // (64), so the payload's last byte sits at len - 66. the signature binds
-    // (origin, seq, target, payload, cont), so it no longer verifies — and the
-    // tamper stays INSIDE the payload, so it is the signature check that
-    // refuses, not the frame parser.
-    let last = frame.len() - 66;
+    // flip one PAYLOAD byte: the trailing bytes are the ed25519 proof (64), so
+    // the payload's last byte sits at len - 65. the proof binds the whole
+    // preimage (scheme, origin, seq, target, payload), so it no longer
+    // verifies — and the tamper stays INSIDE the payload, so it is the proof
+    // check that refuses, not the frame parser.
+    let last = frame.len() - 65;
     frame[last] ^= 0x01;
 
     let (code, body) = sim.submit_frame(&frame);
     assert_eq!(code, 400, "a tampered frame is refused: {body}");
     let err = body["error"].as_str().expect("a verbatim refusal");
     assert!(
-        err.contains("signature"),
+        err.contains("frame proof does not bind this op to its origin"),
         "the refusal names the cause: {err}"
     );
     // no block: the gate stopped it before the actor.
@@ -514,25 +513,19 @@ fn a_multi_module_script_converges_logically_while_qmdb_roots_split_on_block_str
     let sim_a = Sim::spawn(dir_a.path(), &["--with-valset", &valset]);
     let sim_b = Sim::spawn(dir_b.path(), &["--with-valset", &valset]);
 
-    // the gateway handle account: identity bind seats the node, and set_handle
-    // then reads it (across members in the batch, across blocks in the singles).
-    // both runs bind the identical account deterministically.
-    let key = Ed::from_seed(9);
-    let node = "n".repeat(32);
-    let preimage = bind_preimage("", node.as_bytes(), 0);
+    // the gateway handle account: identity's Create founds account 1 for the
+    // 32-byte origin, and set_handle then reads it (across members in the
+    // batch, across blocks in the singles). both runs found it deterministically.
+    let key = "n".repeat(32);
 
     // the shared script — identical ops AND origins, so the ONLY difference between
     // the two runs is block structure. (target, payload, origin)
     let script: Vec<(&str, serde_json::Value, String)> = vec![
-        (
-            "identity",
-            serde_json::json!({ "bind_node": { "authorizer": ed_bind_auth(&key, &preimage) } }),
-            node.clone(),
-        ),
+        ("identity", create("bob"), key.clone()),
         (
             "gateway",
             serde_json::json!({ "set_handle": { "handle": "bob" } }),
-            node.clone(),
+            key.clone(),
         ),
         ("kv", kv_set(b"k1", b"v1"), "peer".into()),
         ("kv", kv_set(b"k2", b"v2"), "peer".into()),

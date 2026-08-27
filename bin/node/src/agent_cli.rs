@@ -2,15 +2,17 @@
 //!
 //! Two verbs, one credential+targeting story:
 //!
-//! - `agent pty [<provider>] [--host-node <name>] [--cred <name>] [--cpu <n>] [--mem <gb>]`
+//! - `agent pty [<provider>] [--host-node <hex>] [--cred <name>] [--cpu <n>] [--mem <gb>]`
 //!   attaches THIS terminal to a provider running in a microVM on a host
 //!   node (default: this node). The CLI talks ONLY to its own node's ws surface
 //!   (`/v1/ws`); the node does the cross-node mesh. Raw terminal mode + resize
 //!   forwarding make it feel like ssh.
-//! - `agent sched [<provider>] --cred <name> [--host-node <name>] [--cpu] [--mem] -- "<prompt>"`
+//! - `agent sched [<provider>] --cred <name> [--host-node <hex>] [--cpu] [--mem] -- "<prompt>"`
 //!   submits a durable, node-pinned headless run (a `saga::SagaMsg::Trigger`)
-//!   and prints its run id. The target may be offline now and execute on
-//!   reconnect — that durability is the point.
+//!   as a frame the USER key signs, and prints its run id. The saga's origin is
+//!   the user key, so the lender attributes the run to the user's account
+//!   (`OfKey`) when the pinned node asks to draw on `--cred`. The target may be
+//!   offline now and execute on reconnect — that durability is the point.
 //!
 //! `<provider>` is optional when `--cred` names a credential: the registry
 //! record's kind decides what to launch; an explicit provider contradicting the
@@ -18,22 +20,24 @@
 //!
 //! TWO addressing inputs, deliberately two names. `--node`/`-n`/`DUCKTAPE_NODE`
 //! (the shared [`NodeAddr`] group) say which node this CLI DIALS — an http base.
-//! `--host-node` says which PEER runs the work: a display name → account → node
-//! key, or a raw 64-hex node key, erroring with candidates when an account
-//! operates several nodes. They are different types; spelling both `--node`
-//! is what made the flag mean two things.
+//! `--host-node` says which PEER runs the work: its raw 64-hex node key. They
+//! are different types; spelling both `--node` is what made the flag mean two
+//! things.
 //!
 //! Program output stays `println!` (a CLI's stdout is not logging); the pty
 //! passthrough writes raw provider bytes straight to stdout.
 
 use std::collections::BTreeMap;
+use std::io::BufRead;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use commonware_cryptography::Signer as _;
 
 use crate::cli_args::NodeAddr;
 use crate::config::{self, hex_bytes};
-use crate::cred_cli::{ProviderArg, query_node};
+use crate::cred_cli::{ProviderArg, VerbCtx, query_node};
+use crate::userkey_cli::{load_user_signer, user_frame};
 
 type AgentResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -46,6 +50,10 @@ pub(crate) struct AgentArgs {
     cmd: AgentCmd,
     #[command(flatten)]
     addr: NodeAddr,
+    /// path to the user key file that signs a `sched` run (defaults to the
+    /// keystore's active wallet)
+    #[arg(long, value_name = "PATH", global = true)]
+    key: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -62,9 +70,9 @@ pub(crate) enum AgentCmd {
 pub(crate) struct PtyArgs {
     /// provider to launch (`claude`|`codex`); optional when `--cred` names one
     provider: Option<ProviderArg>,
-    /// host node to RUN on: a display name or a raw 64-hex node key
-    /// (omitted = this node). NOT `--node`, which is the http base this CLI dials.
-    #[arg(long = "host-node", value_name = "NAME")]
+    /// host node to RUN on: its raw 64-hex node key (omitted = this node).
+    /// NOT `--node`, which is the http base this CLI dials.
+    #[arg(long = "host-node", value_name = "HEX")]
     host_node: Option<String>,
     /// credential name to serve the session (required for a cross-node host)
     #[arg(long, value_name = "NAME")]
@@ -87,11 +95,11 @@ pub(crate) struct SchedArgs {
     /// this run only, until the run reaches a terminal status.
     #[arg(long, value_name = "NAME")]
     cred: String,
-    /// node to PIN the run to: a display name or a raw 64-hex node key
-    /// (omitted = this node). NOT `--node`, which is the http base this CLI dials.
-    /// The pin is what scopes the `--cred` draw — it is the only node that may
-    /// present this run as its reason for opening a session.
-    #[arg(long = "host-node", value_name = "NAME")]
+    /// node to PIN the run to: its raw 64-hex node key (omitted = this node).
+    /// NOT `--node`, which is the http base this CLI dials. The pin is what
+    /// scopes the `--cred` draw — it is the only node that may present this run
+    /// as its reason for opening a session.
+    #[arg(long = "host-node", value_name = "HEX")]
     host_node: Option<String>,
     /// cpu-cores demand (minimum 2)
     #[arg(long, value_name = "CORES", value_parser = at_least_the_sandbox_floor)]
@@ -124,7 +132,9 @@ fn at_least_the_sandbox_floor(value: &str) -> Result<u64, String> {
 }
 
 pub(crate) fn run(args: AgentArgs) -> AgentResult {
-    let AgentArgs { cmd, addr } = args;
+    let AgentArgs { cmd, addr, key } = args;
+    let ctx = VerbCtx { addr, key };
+    let mut stdin = std::io::BufReader::new(std::io::stdin());
     // `install` fills a directory on THIS host and talks to no node, so the
     // address ladder is resolved per-verb rather than up front — a machine
     // with no workspace yet must still be able to install its executors.
@@ -133,8 +143,8 @@ pub(crate) fn run(args: AgentArgs) -> AgentResult {
         // the node's WORKSPACE too (its 0600 service-link token admits the
         // session's ws topic), and only the ladder knows which workspace the
         // address it just resolved belongs to.
-        AgentCmd::Pty(pty) => cmd_pty(pty, &addr.resolve()?, &addr),
-        AgentCmd::Sched(sched) => cmd_sched(sched, &addr.resolve()?),
+        AgentCmd::Pty(pty) => cmd_pty(pty, &ctx.http_base()?, &ctx.addr),
+        AgentCmd::Sched(sched) => cmd_sched(sched, &ctx, &mut stdin),
         AgentCmd::Install(install) => crate::executors::run(install),
     }
 }
@@ -150,7 +160,7 @@ fn cmd_pty(args: PtyArgs, base: &str, addr: &NodeAddr) -> AgentResult {
     let secret = workspace_secret(addr)?;
     let provider = resolve_provider(base, args.provider, args.cred.as_deref())?;
     let host_hex = match args.host_node.as_deref() {
-        Some(name) => Some(hex_bytes(&resolve_host_node(base, name)?)),
+        Some(hex) => Some(hex_bytes(&host_node_key(hex)?)),
         None => None,
     };
 
@@ -373,24 +383,28 @@ fn window_size(fd: i32) -> (u16, u16) {
 // sched — a node-pinned durable saga trigger
 // ============================================================================
 
-fn cmd_sched(args: SchedArgs, base: &str) -> AgentResult {
+fn cmd_sched(args: SchedArgs, ctx: &VerbCtx, stdin: &mut impl BufRead) -> AgentResult {
+    let base = &ctx.http_base()?;
     let provider = resolve_provider(base, args.provider, Some(&args.cred))?;
     let tag = provider.token();
 
     let target = match args.host_node.as_deref() {
-        Some(name) => resolve_host_node(base, name)?.to_vec(),
+        Some(hex) => host_node_key(hex)?.to_vec(),
         None => own_node_key(base)?,
     };
     preflight_provider(base, &target, tag)?;
 
+    // the USER key signs the trigger: the saga's origin is what the lender
+    // resolves to an account (`OfKey`) when the pinned node draws on `--cred`,
+    // and a node key is on no account. Unlocked before the id is composed —
+    // the id lives under the SIGNER's namespace.
+    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let origin = sdk::Origin::External(user.public_key().as_ref().to_vec());
     let dispatch_id = fresh_dispatch_id();
-    // saga's id space is namespaced per trigger origin, and `/v1/submit`
-    // re-signs with THIS node's key — so the run's id lives under this node's
-    // own actor namespace and no other member can create or squat it.
-    let saga_id = saga::namespaced_id(
-        &sdk::Origin::External(own_node_key(base)?),
-        &format!("sched\u{1f}{dispatch_id}"),
-    );
+    // saga's id space is namespaced per trigger origin, so the run's id lives
+    // under this user key's own actor namespace and no other member can
+    // create or squat it.
+    let saga_id = saga::namespaced_id(&origin, &format!("sched\u{1f}{dispatch_id}"));
     let payload =
         compute_service::envelope::compose_headless(&saga_id, &args.prompt, Some(&args.cred))
             .into_bytes();
@@ -424,7 +438,7 @@ fn cmd_sched(args: SchedArgs, base: &str) -> AgentResult {
         pinned_assignee: Some(target),
     };
 
-    submit(base, "saga", serde_json::to_value(&trigger)?)?;
+    crate::node_http::submit_frame(base, &user_frame(&user, "saga", saga::encode_msg(&trigger)))?;
     println!("{saga_id}");
     Ok(())
 }
@@ -450,22 +464,6 @@ fn preflight_provider(base: &str, target: &[u8], tag: &str) -> AgentResult {
             announced.join(", ")
         )
         .into());
-    }
-    Ok(())
-}
-
-/// One `POST /v1/submit` `{target, payload}` — the module reply/receipt on
-/// success, the node's rejection string on failure.
-fn submit(base: &str, target: &str, payload: serde_json::Value) -> AgentResult {
-    let resp = reqwest::blocking::Client::new()
-        .post(format!("{base}/v1/submit"))
-        .json(&serde_json::json!({ "target": target, "payload": payload }))
-        .send()
-        .map_err(|e| format!("POST {base}/v1/submit: {e}"))?;
-    let status = resp.status();
-    let text = resp.text().unwrap_or_default();
-    if !status.is_success() {
-        return Err(error_field(&text).into());
     }
     Ok(())
 }
@@ -590,55 +588,12 @@ fn credential_hint(base: &str) -> String {
     }
 }
 
-/// Resolve a `--node` target to a 32-byte node key: a raw 64-hex key is used
-/// directly; a display name resolves through identity to its account's node,
-/// erroring with candidates when the account operates several.
-fn resolve_host_node(base: &str, name: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-    if let Some(key) = decode_node_key(name) {
-        return Ok(key);
-    }
-    let query = identity::IdentityQuery::All {
-        from: 0,
-        limit: u64::MAX,
-    };
-    let value = query_node(base, "identity", serde_json::to_value(&query)?)?;
-    let accounts = match serde_json::from_value::<identity::IdentityReply>(value)? {
-        identity::IdentityReply::Accounts(accounts) => accounts,
-        other => return Err(format!("unexpected identity reply: {other:?}").into()),
-    };
-    let matches: Vec<&identity::AccountView> = accounts
-        .iter()
-        .filter(|account| account.display_name.as_deref() == Some(name))
-        .collect();
-    let account = match matches.as_slice() {
-        [only] => only,
-        [] => {
-            return Err(format!("no account named {name:?} (nor a valid 64-hex node key)").into());
-        }
-        many => {
-            return Err(format!(
-                "account name {name:?} is ambiguous across {} accounts",
-                many.len()
-            )
-            .into());
-        }
-    };
-    match account.nodes.as_slice() {
-        [only] => decode_node_key_bytes(&only.node_key),
-        [] => Err(format!("account {name:?} has no bound node").into()),
-        many => {
-            let candidates = many
-                .iter()
-                .map(|node| format!("  {}", hex_bytes(&node.node_key)))
-                .collect::<Vec<_>>()
-                .join("\n");
-            Err(format!(
-                "account {name:?} operates {} nodes — pass one by hex node key:\n{candidates}",
-                many.len()
-            )
-            .into())
-        }
-    }
+/// The `--host-node` target as a 32-byte node key. Hex only: no node is bound
+/// to an account, so a name cannot resolve to one — `ducktape node peers`
+/// lists the keys.
+fn host_node_key(text: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    decode_node_key(text)
+        .ok_or_else(|| format!("--host-node must be a 64-hex node key, not {text:?}").into())
 }
 
 /// Decode a 64-hex string to 32 bytes, or `None` when it is not one.
@@ -648,11 +603,6 @@ fn decode_node_key(text: &str) -> Option<[u8; 32]> {
     }
     let bytes = config::unhex(text).ok()?;
     <[u8; 32]>::try_from(bytes).ok()
-}
-
-fn decode_node_key_bytes(bytes: &[u8]) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-    <[u8; 32]>::try_from(bytes)
-        .map_err(|_| format!("bound node key is not 32 bytes ({} bytes)", bytes.len()).into())
 }
 
 /// `http(s)://host:port` → `ws(s)://host:port/v1/ws`, the node's own ws surface.
@@ -755,19 +705,29 @@ mod tests {
         assert_ne!(id, fresh_dispatch_id(), "a fresh id is fresh");
     }
 
-    /// `sched` composes the run's saga id under the SUBMITTING node's own actor
-    /// namespace, because `/v1/submit` re-signs with that key and saga refuses a
-    /// trigger for anybody else's namespace. Composing a bare `sched\x1f<id>`
-    /// here (what this used to do) would make every scheduled run reject.
+    /// `sched` composes the run's saga id under the SIGNING user key's own
+    /// actor namespace, because the frame's verified signer is the trigger's
+    /// origin and saga refuses a trigger for anybody else's namespace.
+    /// Composing a bare `sched\x1f<id>` here would make every scheduled run
+    /// reject; composing it under the NODE key (what this used to do) would
+    /// too, now that the node no longer re-signs the submit.
     #[test]
-    fn a_sched_saga_id_is_owned_by_the_submitting_node() {
-        let node = sdk::Origin::External(vec![0xAB; 32]);
-        let id = saga::namespaced_id(&node, &format!("sched\u{1f}{}", fresh_dispatch_id()));
-        assert!(saga::owns_id(&node, &id), "saga would refuse {id:?}");
+    fn a_sched_saga_id_is_owned_by_the_signing_user_key() {
+        let user = sdk::Origin::External(vec![0xAB; 32]);
+        let id = saga::namespaced_id(&user, &format!("sched\u{1f}{}", fresh_dispatch_id()));
+        assert!(saga::owns_id(&user, &id), "saga would refuse {id:?}");
         assert!(
             !saga::owns_id(&sdk::Origin::Module("dispatch".into()), &id),
             "and it belongs to nobody else"
         );
+    }
+
+    #[test]
+    fn host_node_is_hex_only() {
+        let hex = "ab".repeat(32);
+        assert_eq!(host_node_key(&hex).unwrap(), [0xab; 32]);
+        let err = host_node_key("alice").unwrap_err().to_string();
+        assert!(err.contains("64-hex node key"), "{err}");
     }
 
     #[test]

@@ -262,9 +262,9 @@ extern crate::backend
   ModuleRow(id:str, category:str, root:str, code_hash:str, pending_hash:str, activation_height:i64, readiness:i64, ready:bool)
   ModulesData(rows:[ModuleRow])
   load_modules(rpc:str) -> ModulesData ! AppError
-  AccountData(generation:i64, bound:bool, account_id:str, display_name:str, bio:str, members:i64, nodes:i64)
+  AccountData(generation:i64, exists:bool, number:str, name:str, bio:str, keys:i64)
   load_account(rpc:str, generation:i64) -> AccountData ! HydrationError
-  set_account_name(rpc:str, password:str, display_name:str) -> bool ! AppError
+  set_account_name(rpc:str, password:str, name:str) -> bool ! AppError
   SettingsFacts(generation:i64, key_path:str, key_state:str, data_dir:str, open_tabs:i64, user_key:str)
   load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
   clear_doc_tabs(rpc:str) -> bool

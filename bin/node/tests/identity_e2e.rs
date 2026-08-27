@@ -1,22 +1,23 @@
-//! live 2-validator e2e for the `identity` module: one USER key binds two
-//! DIFFERENT node identities across a real cluster, and the registry
-//! converges identically on both.
+//! live 2-validator e2e for the `identity` module: one USER founds an account
+//! through node A, a second device key JOINS it through node B on the founder's
+//! consent, and the association converges identically on both validators; then
+//! the joiner evicts the founder (any member removes any key but the last) and
+//! the registry converges again.
 //!
-//! `bin/node` has no lib target (only a `[[bin]]`), so the cert-minting
-//! helpers (`config::mint_bind_cert`/`mint_unbind_cert`) are not reachable
-//! from an integration test — they are replicated inline from the identity
-//! crate's public `bind_preimage`/`unbind_preimage` + a commonware ed25519
-//! sign, exactly as `config.rs` itself does it.
+//! every op is a USER-signed frame over `/v1/submit/frame`: the module
+//! attributes each op to its frame origin, and no node key is involved — a
+//! node is never bound to an account.
 
 mod common;
 
 use std::time::Duration;
 
+use common::{
+    Cluster, account_of_key, add_key, create_account, key_gen, poll_until, serial, submit_frame,
+};
 use commonware_cryptography::{Signer as _, ed25519};
-use common::{Cluster, poll_until, serial};
 use identity::{
-    AccountView, IdentityMsg, IdentityQuery, IdentityReply, MemberAuth, decode_reply, encode_msg,
-    encode_query,
+    AccountView, IdentityMsg, IdentityQuery, IdentityReply, decode_reply, encode_query,
 };
 
 /// convergence budget: mesh formation + leader rotation are real-time on a
@@ -40,164 +41,136 @@ fn boot(cluster: &mut Cluster) {
     }
 }
 
-/// build the `MemberAuth` a bind op carries, exactly like
-/// `config::ed25519_member_auth` over the bind preimage: the user (ed25519)
-/// key's signature in the bind NS domain, wrapped as an ed25519 member.
-fn bind_auth(user: &ed25519::PrivateKey, chain_id: &str, node_pub: &[u8], nonce: u64) -> MemberAuth {
-    identity::testkit::ed_bind_auth(user, &identity::bind_preimage(chain_id, node_pub, nonce))
-}
-
-/// the `MemberAuth` an unbind op carries (same shape, unbind NS domain).
-fn unbind_auth(
-    user: &ed25519::PrivateKey,
-    chain_id: &str,
-    node_pub: &[u8],
-    nonce: u64,
-) -> MemberAuth {
-    identity::testkit::ed_auth(
-        user,
-        identity::IDENTITY_UNBIND_NS,
-        &identity::unbind_preimage(chain_id, node_pub, nonce),
-    )
-}
-
-/// `UserOf(node_key)` on node `idx`. `None` covers both a rejected query and
-/// a query that resolved successfully to "not bound" — the caller only ever
-/// needs to distinguish "resolved as user X" from "not (yet) that", and
-/// `poll_until` already treats both as "not yet" while a bind is landing.
-fn account_of_node(cluster: &Cluster, idx: usize, node_key: &[u8]) -> Option<AccountView> {
+/// `Get { number }` on node `idx`.
+fn account(cluster: &Cluster, idx: usize, number: u64) -> Option<AccountView> {
     let reply = cluster.query(
         idx,
         "identity",
-        &encode_query(&IdentityQuery::OfNode {
-            node_key: node_key.to_vec(),
-        }),
+        &encode_query(&IdentityQuery::Get { number }),
     )?;
     match decode_reply(&reply).ok()? {
         IdentityReply::Account(a) => a,
-        IdentityReply::Accounts(_) => None,
+        IdentityReply::Accounts(_) | IdentityReply::Gen(_) => None,
     }
+}
+
+/// the association's public keys, ascending (the order the module exposes).
+fn pubkeys(view: &AccountView) -> Vec<Vec<u8>> {
+    view.keys.iter().map(|k| k.pubkey.clone()).collect()
 }
 
 /// both validators' committed `identity` module root (hex, from `status`).
 fn identity_roots(cluster: &Cluster) -> [serde_json::Value; 2] {
-    [cluster.status(0)["modules"]["identity"].clone(), cluster.status(1)["modules"]["identity"].clone()]
+    [
+        cluster.status(0)["modules"]["identity"].clone(),
+        cluster.status(1)["modules"]["identity"].clone(),
+    ]
+}
+
+fn assert_roots_converge(cluster: &Cluster, what: &str) {
+    poll_until(what, FINALIZE, || {
+        let roots = identity_roots(cluster);
+        (!roots[0].is_null() && roots[0] == roots[1]).then_some(())
+    });
 }
 
 #[test]
-fn identity_two_nodes_one_user() {
+fn identity_two_nodes_one_account() {
     let _serial = serial();
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
     boot(&mut cluster);
 
-    // the harness's dev-shape chain id IS `Cluster::namespace` (config.rs:
-    // `chain_id: namespace.clone()` for the dev shape) — the exact string
-    // `Identity::new` was constructed with on both nodes.
-    let chain_id = cluster.namespace.clone();
-    let user = ed25519::PrivateKey::from_seed(42);
-    let user_pub = user.public_key().as_ref().to_vec();
-    let a_pub = Cluster::identity(0);
-    let b_pub = Cluster::identity(1);
+    let founder = ed25519::PrivateKey::from_seed(42);
+    let joiner = ed25519::PrivateKey::from_seed(43);
+    let founder_pub = founder.public_key().as_ref().to_vec();
+    let joiner_pub = joiner.public_key().as_ref().to_vec();
+    let mut both = vec![founder_pub.clone(), joiner_pub.clone()];
+    both.sort();
 
-    // node A binds ITSELF (the verified submit origin) to the user. fresh
-    // user record -> nonce 0.
-    cluster.submit(
-        0,
-        "identity",
-        &encode_msg(&IdentityMsg::BindNode {
-            authorizer: bind_auth(&user, &chain_id, &a_pub, 0),
-        }),
-    );
-    poll_until("node A's bind to finalize", FINALIZE, || {
-        account_of_node(&cluster, 0, &a_pub).filter(|v| v.account_id == user_pub)
-    });
-
-    // node B binds itself to the SAME user. A's bind already bumped the
-    // user's nonce to 1 — the cert must sign over that current nonce.
-    cluster.submit(
-        1,
-        "identity",
-        &encode_msg(&IdentityMsg::BindNode {
-            authorizer: bind_auth(&user, &chain_id, &b_pub, 1),
-        }),
-    );
-    poll_until("node B's bind to finalize", FINALIZE, || {
-        account_of_node(&cluster, 1, &b_pub).filter(|v| v.account_id == user_pub)
-    });
-
-    // both binds must be visible from EITHER node's rpc: UserOf(A) and
-    // UserOf(B) resolve to the same user, with both nodes in its set.
-    let node_keys = |view: &AccountView| -> Vec<Vec<u8>> {
-        view.nodes.iter().map(|n| n.node_key.clone()).collect()
-    };
-    let sees_both = |view: &AccountView| {
-        view.account_id == user_pub
-            && view.nodes.len() == 2
-            && node_keys(view).contains(&a_pub)
-            && node_keys(view).contains(&b_pub)
-    };
+    // the founder's Create lands through node A: the first account is 1, and
+    // `Get { 1 }` reads it on EITHER node with the founder as its sole key.
+    let number = create_account(&cluster, 0, &founder, "alice");
+    assert_eq!(number, 1, "the first account a chain founds is 1");
     for reader in [0usize, 1] {
-        let a_view = poll_until(
-            &format!("OfNode(A) to show both bindings on node {reader}"),
-            FINALIZE,
-            || account_of_node(&cluster, reader, &a_pub).filter(&sees_both),
-        );
-        let b_view = poll_until(
-            &format!("OfNode(B) to show both bindings on node {reader}"),
-            FINALIZE,
-            || account_of_node(&cluster, reader, &b_pub).filter(&sees_both),
-        );
-        assert_eq!(a_view.account_id, user_pub, "node {reader}: OfNode(A) wrong account");
-        assert_eq!(b_view.account_id, user_pub, "node {reader}: OfNode(B) wrong account");
-        assert_eq!(a_view.nodes.len(), 2, "node {reader}: expected both nodes bound (via A)");
-        assert_eq!(b_view.nodes.len(), 2, "node {reader}: expected both nodes bound (via B)");
-        let mut nodes = node_keys(&a_view);
-        nodes.sort();
-        let mut expected = vec![a_pub.clone(), b_pub.clone()];
-        expected.sort();
-        assert_eq!(nodes, expected, "node {reader}: wrong bound node set");
-    }
-
-    // both validators agree on the identity module's committed root.
-    poll_until("identity module root to converge across nodes", FINALIZE, || {
-        let roots = identity_roots(&cluster);
-        (!roots[0].is_null() && roots[0] == roots[1]).then_some(())
-    });
-
-    // node B unbinds node A — the recovery path: a surviving device evicts a
-    // lost one, with NO member/origin gate beyond "external". two prior
-    // binds each bumped the nonce once, so the cert signs over nonce 2.
-    cluster.submit(
-        1,
-        "identity",
-        &encode_msg(&IdentityMsg::UnbindNode {
-            node_key: a_pub.clone(),
-            authorizer: unbind_auth(&user, &chain_id, &a_pub, 2),
-        }),
-    );
-    for reader in [0usize, 1] {
-        poll_until(&format!("UnbindNode(A) to finalize on node {reader}"), FINALIZE, || {
-            account_of_node(&cluster, reader, &a_pub).is_none().then_some(())
+        let view = poll_until(&format!("Get(1) on node {reader}"), FINALIZE, || {
+            account(&cluster, reader, 1)
         });
-    }
-
-    // node B remains bound, alone, on both nodes' views.
-    for reader in [0usize, 1] {
-        let b_view = poll_until(&format!("OfNode(B) after unbind on node {reader}"), FINALIZE, || {
-            account_of_node(&cluster, reader, &b_pub)
-        });
-        assert_eq!(b_view.account_id, user_pub, "node {reader}: B should remain bound");
+        assert_eq!(view.name, "alice", "node {reader}: name");
         assert_eq!(
-            node_keys(&b_view),
-            vec![b_pub.clone()],
-            "node {reader}: only B should remain bound"
+            pubkeys(&view),
+            vec![founder_pub.clone()],
+            "node {reader}: the founder is the sole key"
         );
     }
 
-    // final convergence: both validators still agree on the identity root
-    // after the unbind commits.
-    poll_until("identity module root to converge post-unbind", FINALIZE, || {
-        let roots = identity_roots(&cluster);
-        (!roots[0].is_null() && roots[0] == roots[1]).then_some(())
-    });
+    // the joiner is admitted through node B on the founder's consent at the
+    // joiner's current generation (0). the frame is signed by the JOINER: the
+    // origin is the key being admitted, the consent names it.
+    let view = add_key(&cluster, 1, &founder, &joiner);
+    assert_eq!(view.number, 1, "the joiner landed in the founder's account");
+
+    // both keys resolve to account 1 from EITHER node, with both keys listed.
+    let sees_both = |view: &AccountView| view.number == 1 && pubkeys(view) == both;
+    for reader in [0usize, 1] {
+        for (who, key) in [("founder", &founder_pub), ("joiner", &joiner_pub)] {
+            poll_until(
+                &format!("OfKey({who}) to show both keys on node {reader}"),
+                FINALIZE,
+                || account_of_key(&cluster, reader, key).filter(&sees_both),
+            );
+        }
+    }
+    assert_roots_converge(&cluster, "identity module root to converge after the join");
+
+    // the joiner removes the founder — the recovery path: a surviving device
+    // evicts a lost one, with nothing but its own membership.
+    submit_frame(
+        &cluster,
+        1,
+        &joiner,
+        "identity",
+        &identity::encode_msg(&IdentityMsg::RemoveKey {
+            key: founder_pub.clone(),
+        }),
+    );
+    for reader in [0usize, 1] {
+        poll_until(
+            &format!("OfKey(founder) to clear on node {reader}"),
+            FINALIZE,
+            || {
+                account_of_key(&cluster, reader, &founder_pub)
+                    .is_none()
+                    .then_some(())
+            },
+        );
+        let view = poll_until(&format!("OfKey(joiner) on node {reader}"), FINALIZE, || {
+            account_of_key(&cluster, reader, &joiner_pub)
+        });
+        assert_eq!(view.number, 1, "node {reader}: the joiner keeps account 1");
+        assert_eq!(
+            pubkeys(&view),
+            vec![joiner_pub.clone()],
+            "node {reader}: only the joiner remains"
+        );
+    }
+
+    // generations: the joiner was admitted by consent once (its next consent
+    // signs at 1); the founder never was — Create counts no generation and
+    // removal touches none — so a re-admission of the founder signs at 0.
+    for reader in [0usize, 1] {
+        assert_eq!(
+            key_gen(&cluster, reader, &joiner_pub),
+            Some(1),
+            "node {reader}: the joiner's generation"
+        );
+        assert_eq!(
+            key_gen(&cluster, reader, &founder_pub),
+            Some(0),
+            "node {reader}: the founder's generation"
+        );
+    }
+    assert_roots_converge(
+        &cluster,
+        "identity module root to converge after the removal",
+    );
 }

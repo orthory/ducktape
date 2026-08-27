@@ -87,13 +87,14 @@ pub enum CredentialPayload {
 /// is this session's ephemeral X25519 public key: the enclave ECDHs it against
 /// its static seal key to derive the shared session key (see `handshake`).
 ///
-/// There is deliberately NO account field. The grant subject is the account the
-/// node's gateway proxy vouched for on the hop
-/// ([`crate::server::CALLER_ACCOUNT_HEADER`]), which is minted from the
-/// mesh-verified peer identity and refused if a caller supplies one. A request
-/// cannot name a subject: the computation layer does not get to say who it acts
-/// for, and the token it ends up holding carries no identity either — only
-/// `sub`, which credential.
+/// There is deliberately NO account field. The only identity on the hop is the
+/// NODE the node's gateway proxy vouched for
+/// ([`crate::server::CALLER_NODE_HEADER`]), which is minted from the
+/// mesh-verified peer identity and refused if a caller supplies one; the grant
+/// subject is reached from `work`, never from the request. A request cannot
+/// name a subject: the computation layer does not get to say who it acts for,
+/// and the token it ends up holding carries no identity either — only `sub`,
+/// which credential.
 ///
 /// `work` is a POINTER, and the distinction from an account field is the whole
 /// design — see [`WorkRef`].

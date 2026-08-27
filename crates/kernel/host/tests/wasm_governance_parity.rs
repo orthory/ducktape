@@ -33,7 +33,7 @@ use governance::{
     GovAction, GovMsg, GovQuery, Governance, ShareAllocation, encode_msg, encode_query,
 };
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
-use identity::{IDENTITY_BIND_NS, Identity, IdentityMsg, KeyScheme, MemberAuth, bind_preimage};
+use identity::{Identity, IdentityMsg, KeyScheme, account_principal};
 use lifecycle::{
     Lifecycle, LifecycleQuery, LifecycleReply, decode_reply as lifecycle_decode_reply,
     encode_query as lifecycle_encode_query,
@@ -54,9 +54,13 @@ const GOVERNANCE_WASM: &[u8] = include_bytes!("fixtures/governance.component.was
 /// it (natively via `with_invite_binding`, on the wasm side as genesis config).
 const INVITE: &[u8] = b"parity-net#feedface";
 
-/// the chain id the identity SIBLING binds under (identity is native on both
+/// the chain id the identity SIBLING runs under (identity is native on both
 /// hosts here; governance itself carries no chain id).
 const CHAIN_ID: &str = "test-chain";
+
+/// the account numbers the two founders receive, in founding order.
+const ACCOUNT_A: u64 = 1;
+const ACCOUNT_B: u64 = 2;
 
 /// a fresh qmdb store carrying the seeded `__config` invite-binding record —
 /// exactly the production genesis seam (`bin/node/src/host_state.rs`
@@ -106,7 +110,6 @@ fn native_identity() -> Identity {
     Identity::new(
         "identity",
         Box::new(sdk_testkit::MemStore::new()),
-        Some("valset".into()),
         CHAIN_ID.to_string(),
     )
 }
@@ -223,20 +226,15 @@ fn redeem(issuer: &Ed, nonce: [u8; INVITE_NONCE_LEN], binding: &[u8], joiner: &E
     })
 }
 
-/// an identity BindNode founding `founder`'s account — seeds the identity
-/// sibling for the account-share flow.
-fn bind(founder: &Ed, node: &[u8]) -> Msg {
-    let auth = MemberAuth {
-        key: ed_pub(founder),
-        scheme: KeyScheme::Ed25519,
-        proof: founder
-            .sign(IDENTITY_BIND_NS, &bind_preimage(CHAIN_ID, node, 0))
-            .as_ref()
-            .to_vec(),
-    };
+/// an identity Create founding an account for the submitting (founder) key —
+/// seeds the identity sibling for the account-share flow.
+fn create(name: &str) -> Msg {
     Msg {
         target: "identity".into(),
-        payload: identity::encode_msg(&IdentityMsg::BindNode { authorizer: auth }),
+        payload: identity::encode_msg(&IdentityMsg::Create {
+            name: name.into(),
+            scheme: KeyScheme::Ed25519,
+        }),
     }
 }
 
@@ -759,13 +757,13 @@ async fn rejections_inner(context: &deterministic::Context) {
             propose("p", GovAction::Signal { text: "dup".into() }, 5),
             "proposal already exists",
         ),
-        // the standing gate — the submitter is neither a member node nor an
-        // account member key bound to one (A1). decided by the valset + identity
-        // sibling reads.
+        // the standing gate — in validator mode the submitter must ITSELF be
+        // a member node (no identity read; a key never fans out to nodes).
+        // decided by the valset sibling read.
         (
             Origin::External(outsider_pub.clone()),
             propose("p2", GovAction::Signal { text: "x".into() }, 5),
-            "no validator-set standing",
+            "not a validator-set member node",
         ),
         (
             Origin::Module("saga".into()),
@@ -780,7 +778,7 @@ async fn rejections_inner(context: &deterministic::Context) {
         (
             Origin::External(outsider_pub.clone()),
             vote("p", true),
-            "not a member of this proposal's frozen electorate",
+            "voter is not in the frozen electorate",
         ),
         (
             Origin::External(a_pub.clone()),
@@ -981,27 +979,29 @@ async fn share_mode_inner(context: &deterministic::Context) {
     let mut native = native_host(context, &validators).await;
     let mut wasm = wasm_host_(context, &validators).await;
 
-    // seed the identity SIBLING: both validator nodes bind to accounts. these
-    // blocks leave governance alone on both runtimes.
+    // seed the identity SIBLING: two USER keys (no validator standing) found
+    // accounts 1 and 2 from their own origins. these blocks leave governance
+    // alone on both runtimes.
     let (n0, w0) = (root_of(&native), root_of(&wasm));
     for host in [&mut native, &mut wasm] {
         host.submit_at(
-            block(1, Origin::External(a_pub.clone())),
-            bind(&founder_a, &a_pub),
+            block(1, Origin::External(ed_pub(&founder_a))),
+            create("alice"),
         )
         .await
-        .expect("bind A");
+        .expect("found A");
         host.submit_at(
-            block(2, Origin::External(b_pub.clone())),
-            bind(&founder_b, &b_pub),
+            block(2, Origin::External(ed_pub(&founder_b))),
+            create("bob"),
         )
         .await
-        .expect("bind B");
+        .expect("found B");
     }
     assert_eq!(root_of(&native), n0);
     assert_eq!(root_of(&wasm), w0);
 
-    // AdoptShares: the door check resolves EVERY named account against the
+    // AdoptShares (still validator mode: proposed and carried by the member
+    // nodes): the door check resolves EVERY named account NUMBER against the
     // identity sibling — inside the guest those are host-routed query-module
     // reads through the memoized replay.
     roundtrip(
@@ -1015,11 +1015,11 @@ async fn share_mode_inner(context: &deterministic::Context) {
             GovAction::AdoptShares {
                 allocations: vec![
                     ShareAllocation {
-                        account_id: ed_pub(&founder_a),
+                        account_id: ACCOUNT_A,
                         shares: 2,
                     },
                     ShareAllocation {
-                        account_id: ed_pub(&founder_b),
+                        account_id: ACCOUNT_B,
                         shares: 1,
                     },
                 ],
@@ -1065,14 +1065,15 @@ async fn share_mode_inner(context: &deterministic::Context) {
     .await;
 
     // share mode now governs NEW proposals: the proposer and every ballot
-    // resolve node → account through the identity sibling (in-guest reads),
-    // and the frozen electorate is the share registry.
+    // resolve key → account through the identity sibling's `OfKey` (in-guest
+    // reads), and the frozen electorate is the share registry. the USER keys
+    // act — no validator standing anywhere.
     roundtrip(
         &mut native,
         &mut wasm,
         &ids,
         7,
-        Origin::External(a_pub.clone()),
+        Origin::External(ed_pub(&founder_a)),
         propose(
             "sig2",
             GovAction::Signal {
@@ -1089,7 +1090,7 @@ async fn share_mode_inner(context: &deterministic::Context) {
         &mut wasm,
         &ids,
         8,
-        Origin::External(a_pub.clone()),
+        Origin::External(ed_pub(&founder_a)),
         vote("sig2", true),
         true,
         &[],
@@ -1100,7 +1101,7 @@ async fn share_mode_inner(context: &deterministic::Context) {
         &mut wasm,
         &ids,
         9,
-        Origin::External(b_pub.clone()),
+        Origin::External(ed_pub(&founder_b)),
         vote("sig2", false),
         true,
         &[],
@@ -1113,10 +1114,24 @@ async fn share_mode_inner(context: &deterministic::Context) {
         &mut wasm,
         &ids,
         10,
-        Origin::External(b_pub.clone()),
+        Origin::External(ed_pub(&founder_b)),
         execute("sig2"),
         true,
         &[],
+    )
+    .await;
+
+    // a NODE key never resolves to an account: in share mode the validator
+    // that carried the adoption has no standing to propose — decided by the
+    // identity sibling read inside the guest.
+    reject_roundtrip(
+        &mut native,
+        &mut wasm,
+        &ids,
+        11,
+        Origin::External(a_pub.clone()),
+        propose("sig3", GovAction::Signal { text: "x".into() }, 5),
+        "belongs to no Identity account",
     )
     .await;
 
@@ -1140,15 +1155,22 @@ async fn share_mode_inner(context: &deterministic::Context) {
     assert_eq!(view.voter_kind, governance::VoterKind::Account);
     assert_eq!(
         view.proposer,
-        ed_pub(&founder_a),
-        "proposer resolved to the ACCOUNT"
+        account_principal(ACCOUNT_A),
+        "proposer resolved to the ACCOUNT principal"
     );
-    // ballots and the frozen electorate are keyed by ACCOUNT id, served in
-    // ascending key order (the module's BTreeMap projection).
-    let mut expected_votes = vec![(ed_pub(&founder_a), true), (ed_pub(&founder_b), false)];
+    // ballots and the frozen electorate are keyed by ACCOUNT principal (8
+    // bytes LE), served in ascending key order (the module's BTreeMap
+    // projection).
+    let mut expected_votes = vec![
+        (account_principal(ACCOUNT_A), true),
+        (account_principal(ACCOUNT_B), false),
+    ];
     expected_votes.sort();
     assert_eq!(view.votes, expected_votes);
-    let mut expected_powers = vec![(ed_pub(&founder_a), 2), (ed_pub(&founder_b), 1)];
+    let mut expected_powers = vec![
+        (account_principal(ACCOUNT_A), 2),
+        (account_principal(ACCOUNT_B), 1),
+    ];
     expected_powers.sort();
     assert_eq!(view.electorate, expected_powers);
 }

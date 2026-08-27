@@ -22,13 +22,12 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::{Cluster, poll_until, serial};
+use common::{Cluster, create_account, poll_until, serial, submit_frame};
 use commonware_cryptography::{Signer as _, ed25519};
 use gateway::{
     DuckDnsName, GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization, RouteAudience,
     RouteDefinition, RouteMethod, RouteName, RoutePolicy, RouteStatement, RouteTarget,
 };
-use identity::{AccountView, IdentityMsg, IdentityQuery, IdentityReply, MemberAuth};
 
 use airlock::attest::{self, Measurement};
 use airlock::client::Gateway as AirlockClient;
@@ -60,27 +59,9 @@ fn test_enclave() -> &'static Arc<airlock::testkit::SnpTestEnclave> {
     })
 }
 
-// ----- identity + duckdns helpers (mirrors gateway_e2e) ---------------------
+// ----- duckdns + route helpers (mirrors gateway_e2e) ------------------------
 
-fn bind_auth(member: &ed25519::PrivateKey, chain: &str, node: &[u8]) -> MemberAuth {
-    identity::testkit::ed_bind_auth(member, &identity::bind_preimage(chain, node, 0))
-}
-
-fn account_of_node(cluster: &Cluster, reader: usize, node: &[u8]) -> Option<AccountView> {
-    let bytes = cluster.query(
-        reader,
-        "identity",
-        &identity::encode_query(&IdentityQuery::OfNode {
-            node_key: node.to_vec(),
-        }),
-    )?;
-    match identity::decode_reply(&bytes).ok()? {
-        IdentityReply::Account(account) => account,
-        IdentityReply::Accounts(_) => None,
-    }
-}
-
-fn resolve_handle(cluster: &Cluster, reader: usize, handle: &str) -> Option<Vec<u8>> {
+fn resolve_handle(cluster: &Cluster, reader: usize, handle: &str) -> Option<u64> {
     let bytes = cluster.query(
         reader,
         "gateway",
@@ -109,12 +90,14 @@ fn resolve_handle(cluster: &Cluster, reader: usize, handle: &str) -> Option<Vec<
 fn signed_airlock_route(
     member: &ed25519::PrivateKey,
     chain: &str,
+    account: u64,
     publisher: &[u8],
     revision: u64,
 ) -> GatewayMsg {
     signed_loopback_route(
         member,
         chain,
+        account,
         publisher,
         "airlock",
         revision,
@@ -125,9 +108,11 @@ fn signed_airlock_route(
 
 /// A member-signed LoopbackHttp route. `max_response_bytes == 0` = unbounded
 /// streaming (SSE).
+#[allow(clippy::too_many_arguments)]
 fn signed_loopback_route(
     member: &ed25519::PrivateKey,
     chain: &str,
+    account: u64,
     publisher: &[u8],
     name: &str,
     revision: u64,
@@ -136,7 +121,7 @@ fn signed_loopback_route(
 ) -> GatewayMsg {
     let statement = RouteStatement {
         chain_id: chain.into(),
-        account_id: member.public_key().as_ref().to_vec(),
+        account_id: account,
         name: RouteName::named(name),
         publisher_node: publisher.to_vec(),
         revision,
@@ -168,16 +153,16 @@ fn signed_loopback_route(
     }
 }
 
-fn airlock_route_revision(cluster: &Cluster, reader: usize, account: &[u8]) -> Option<u64> {
+fn airlock_route_revision(cluster: &Cluster, reader: usize, account: u64) -> Option<u64> {
     route_revision(cluster, reader, account, "airlock")
 }
 
-fn route_revision(cluster: &Cluster, reader: usize, account: &[u8], name: &str) -> Option<u64> {
+fn route_revision(cluster: &Cluster, reader: usize, account: u64, name: &str) -> Option<u64> {
     let bytes = cluster.query(
         reader,
         "gateway",
         &gateway::encode_query(&GatewayQuery::Get {
-            account_id: account.to_vec(),
+            account_id: account,
             name: RouteName::named(name),
         }),
     )?;
@@ -328,30 +313,17 @@ fn airlock_over_gateway_two_wireguard_nodes() {
         cluster.wait_marker(index, "gateway plane: overlay stream bound", READY);
     }
 
+    // Alice founds her account through her node (a user-signed Create); Bob's
+    // node is only ever a caller, and a node is never an account.
     let alice = ed25519::PrivateKey::from_seed(42);
-    let bob = ed25519::PrivateKey::from_seed(43);
     let alice_node = Cluster::identity(0);
-    let bob_node = Cluster::identity(1);
-    for (index, member, node) in [
-        (0usize, &alice, alice_node.as_slice()),
-        (1usize, &bob, bob_node.as_slice()),
-    ] {
-        cluster.submit(
-            index,
-            "identity",
-            &identity::encode_msg(&IdentityMsg::BindNode {
-                authorizer: bind_auth(member, &cluster.namespace, node),
-            }),
-        );
-        poll_until("identity binding", FINALIZE, || {
-            account_of_node(&cluster, index, node)
-                .filter(|account| account.account_id == member.public_key().as_ref())
-        });
-    }
+    let alice_account = create_account(&cluster, 0, &alice, "alice");
 
     // Alice maps `alice.duck`, so `airlock.alice.duck` resolves to her account.
-    cluster.submit(
+    submit_frame(
+        &cluster,
         0,
+        &alice,
         "gateway",
         &gateway::encode_msg(&GatewayMsg::SetHandle {
             handle: Some("alice".into()),
@@ -361,7 +333,7 @@ fn airlock_over_gateway_two_wireguard_nodes() {
         let resolved = poll_until("alice.duck resolution", FINALIZE, || {
             resolve_handle(&cluster, reader, "alice")
         });
-        assert_eq!(resolved, alice.public_key().as_ref());
+        assert_eq!(resolved, alice_account);
     }
 
     // Register the gateway's loopback port node-locally, then publish the signed
@@ -379,18 +351,21 @@ fn airlock_over_gateway_two_wireguard_nodes() {
     ]);
     assert!(ok, "airlock gateway port bind failed: {output}");
 
-    cluster.submit(
+    submit_frame(
+        &cluster,
         0,
+        &alice,
         "gateway",
         &gateway::encode_msg(&signed_airlock_route(
             &alice,
             &cluster.namespace,
+            alice_account,
             &alice_node,
             1,
         )),
     );
     poll_until("airlock route revision 1", FINALIZE, || {
-        (airlock_route_revision(&cluster, 1, alice.public_key().as_ref()) == Some(1)).then_some(())
+        (airlock_route_revision(&cluster, 1, alice_account) == Some(1)).then_some(())
     });
 
     // Bob's browser-gateway origin base — the `via` a compute-side host process
@@ -494,20 +469,12 @@ fn airlock_single_node_self_serves_its_own_route() {
 
     let alice = ed25519::PrivateKey::from_seed(42);
     let alice_node = Cluster::identity(0);
-    cluster.submit(
-        0,
-        "identity",
-        &identity::encode_msg(&IdentityMsg::BindNode {
-            authorizer: bind_auth(&alice, &cluster.namespace, &alice_node),
-        }),
-    );
-    poll_until("identity binding", FINALIZE, || {
-        account_of_node(&cluster, 0, &alice_node)
-            .filter(|account| account.account_id == alice.public_key().as_ref())
-    });
+    let alice_account = create_account(&cluster, 0, &alice, "alice");
 
-    cluster.submit(
+    submit_frame(
+        &cluster,
         0,
+        &alice,
         "gateway",
         &gateway::encode_msg(&GatewayMsg::SetHandle {
             handle: Some("alice".into()),
@@ -530,18 +497,21 @@ fn airlock_single_node_self_serves_its_own_route() {
     ]);
     assert!(ok, "airlock gateway port bind failed: {output}");
 
-    cluster.submit(
+    submit_frame(
+        &cluster,
         0,
+        &alice,
         "gateway",
         &gateway::encode_msg(&signed_airlock_route(
             &alice,
             &cluster.namespace,
+            alice_account,
             &alice_node,
             1,
         )),
     );
     poll_until("airlock route revision 1", FINALIZE, || {
-        (airlock_route_revision(&cluster, 0, alice.public_key().as_ref()) == Some(1)).then_some(())
+        (airlock_route_revision(&cluster, 0, alice_account) == Some(1)).then_some(())
     });
 
     let (status, browser) = cluster.http(0, "GET", "/v1/gateway/browser", None);
@@ -697,19 +667,11 @@ fn gateway_streams_and_caps_over_the_frame_wire() {
 
     let alice = ed25519::PrivateKey::from_seed(42);
     let alice_node = Cluster::identity(0);
-    cluster.submit(
+    let alice_account = create_account(&cluster, 0, &alice, "alice");
+    submit_frame(
+        &cluster,
         0,
-        "identity",
-        &identity::encode_msg(&IdentityMsg::BindNode {
-            authorizer: bind_auth(&alice, &cluster.namespace, &alice_node),
-        }),
-    );
-    poll_until("identity binding", FINALIZE, || {
-        account_of_node(&cluster, 0, &alice_node)
-            .filter(|account| account.account_id == alice.public_key().as_ref())
-    });
-    cluster.submit(
-        0,
+        &alice,
         "gateway",
         &gateway::encode_msg(&GatewayMsg::SetHandle {
             handle: Some("alice".into()),
@@ -734,12 +696,15 @@ fn gateway_streams_and_caps_over_the_frame_wire() {
         assert!(ok, "{label} port bind failed: {output}");
     }
     // "sse": max_response_bytes 0 = unbounded stream; "capped": 64 KiB cap.
-    cluster.submit(
+    submit_frame(
+        &cluster,
         0,
+        &alice,
         "gateway",
         &gateway::encode_msg(&signed_loopback_route(
             &alice,
             &cluster.namespace,
+            alice_account,
             &alice_node,
             "sse",
             1,
@@ -747,12 +712,15 @@ fn gateway_streams_and_caps_over_the_frame_wire() {
             false,
         )),
     );
-    cluster.submit(
+    submit_frame(
+        &cluster,
         0,
+        &alice,
         "gateway",
         &gateway::encode_msg(&signed_loopback_route(
             &alice,
             &cluster.namespace,
+            alice_account,
             &alice_node,
             "capped",
             1,
@@ -761,8 +729,8 @@ fn gateway_streams_and_caps_over_the_frame_wire() {
         )),
     );
     poll_until("both routes live", FINALIZE, || {
-        (route_revision(&cluster, 0, alice.public_key().as_ref(), "sse") == Some(1)
-            && route_revision(&cluster, 0, alice.public_key().as_ref(), "capped") == Some(1))
+        (route_revision(&cluster, 0, alice_account, "sse") == Some(1)
+            && route_revision(&cluster, 0, alice_account, "capped") == Some(1))
         .then_some(())
     });
 

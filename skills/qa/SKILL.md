@@ -217,18 +217,21 @@ curl -XPOST localhost:$PORT/v1/admin/shutdown \
 
 **`public` — only when the operator set `DUCKTAPE_ADMIN=public`.** The surface
 is reachable off-box, so the OWNER proof-of-possession is the gate for every
-peer, loopback included. The operator token is NOT accepted and NOT a fallback
-there; mint a per-request PoP with the account key instead:
+peer, loopback included. The owner is the Identity ACCOUNT the node's wallet
+key is on (resolved through `OfKey`; no node is ever bound to an account), and
+any member key of that account may sign. The operator token is NOT accepted
+and NOT a fallback there; mint a per-request PoP with a member key instead:
 
 ```
-ducktape user sign-admin --key "$WORKSPACE/user.key" \
+ducktape user sign-admin --key "$DUCK/keys/<wallet>.key" \
   --method POST --path /v1/admin/shutdown --node-key "$NODE_KEY"
 # one json line {"key","ts","sig"} -> x-ducktape-admin-key / -ts / -sig
 ```
 
-A `public` node with no committed owner yet (before its first `BindNode`) falls
-back to the operator token until one commits — so on a fresh network both
-recipes work, and after `user account-init` only the PoP does.
+A `public` node whose wallet key is on no account yet falls back to the
+operator token until that account exists — so on a fresh network both recipes
+work, and after `ducktape account create --name <you>` (a user-signed frame
+from that wallet) only the PoP does.
 
 The refusals tell the two apart: a token presented to an owned `public` node is
 `401 owner_signature_invalid` (wrong credential TYPE), never `403

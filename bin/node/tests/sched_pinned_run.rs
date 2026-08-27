@@ -25,21 +25,26 @@
 //!
 //!   | # | shape | state | outcome |
 //!   |---|---|---|---|
-//!   | 0 | 0 submits, pinned to 1 | 1 admits nobody | `work_not_admitted` |
-//!   | 1 | 1 submits, pinned to itself | nobody granted | `credential_not_granted` |
-//!   | 2 | 0 submits, pinned to 1 | 1 admitted, **still ungranted** | `Done` + `PONG` |
+//!   | 0 | owner submits, pinned to 1 | 1 admits nobody | `work_not_admitted` |
+//!   | 1 | 1's user submits, pinned to 1 | nobody granted | `credential_not_granted` |
+//!   | 2 | owner submits, pinned to 1 | admitted, **still ungranted** | `Done` + `PONG` |
 //!   | 2b | direction 2's pointer, replayed once its saga is terminal | unchanged | **refused** |
-//!   | 3 | 1 submits, pinned to itself | 1 granted | `Done` + `PONG` |
+//!   | 3 | 1's user submits, pinned to 1 | 1's user granted | `Done` + `PONG` |
+//!
+//!   Every submit is a USER-signed frame (what `agent sched` sends): the saga's
+//!   committed origin is the user's key, which identity's `OfKey` resolves to
+//!   an account — the executor's admission and the lender's grant gate both
+//!   read that. A node key resolves to nothing; a node is never an account.
 //!
 //!   Direction 2 is the whole campaign: A submits, B executes, and the draw is
 //!   on A's grant. B supplies only a POINTER — the run's committed saga id — and
 //!   the lender resolves out of its own state that A submitted it and that B
-//!   holds its lease. Direction 3 is the non-regression: an executor granted in
+//!   holds its lease. Direction 3 is the non-regression: a submitter granted in
 //!   its own right still draws in its own right.
 //!
 //!   Directions 0 and 1 are two consents in OPPOSITE directions and both must
-//!   hold: node 1 decides whose work it runs, node 0 decides whose account may
-//!   draw on its credential. Neither substitutes for the other.
+//!   hold: node 1 decides whose work it runs, node 0's user decides whose
+//!   account may draw on its credential. Neither substitutes for the other.
 //!
 //! ## what a sandboxed run costs this suite in evidence
 //!
@@ -60,7 +65,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use common::{Cluster, poll_until, sandbox_toml, serial, skip_unless_sandboxed};
+use common::{
+    Cluster, create_account, poll_until, sandbox_toml, serial, skip_unless_sandboxed, submit_frame,
+};
 use commonware_cryptography::{Signer as _, ed25519};
 
 use airlock::attest::{self, Measurement};
@@ -74,7 +81,6 @@ use gateway::{
     RouteMethod, RouteName, RoutePolicy, RouteStatement, RouteTarget, SetCredentialStatement,
     set_credential_preimage,
 };
-use identity::{AccountView, IdentityMsg, IdentityQuery, IdentityReply, MemberAuth};
 use saga::{SagaMsg, SagaQuery, SagaReply, SagaStatus, SagaView};
 
 use axum::extract::State;
@@ -239,41 +245,7 @@ async fn seal_credential(gw_base: &str, name: &str) -> [u8; 32] {
 // it a trade is gone, since one read-only image serves every node instead of each compute
 // daemon filling its own graph root at boot.
 
-fn bind_auth(member: &ed25519::PrivateKey, chain: &str, node: &[u8]) -> MemberAuth {
-    identity::testkit::ed_bind_auth(member, &identity::bind_preimage(chain, node, 0))
-}
-
-fn account_of_node(cluster: &Cluster, reader: usize, node: &[u8]) -> Option<AccountView> {
-    let bytes = cluster.query(
-        reader,
-        "identity",
-        &identity::encode_query(&IdentityQuery::OfNode {
-            node_key: node.to_vec(),
-        }),
-    )?;
-    match identity::decode_reply(&bytes).ok()? {
-        IdentityReply::Account(account) => account,
-        IdentityReply::Accounts(_) => None,
-    }
-}
-
-/// Bind node `idx` (key `node`) to member `member`'s account and wait for it to
-/// commit — the account the credential grant is checked against.
-fn bind_node(cluster: &Cluster, idx: usize, member: &ed25519::PrivateKey, node: &[u8]) {
-    cluster.submit(
-        idx,
-        "identity",
-        &identity::encode_msg(&IdentityMsg::BindNode {
-            authorizer: bind_auth(member, &cluster.namespace, node),
-        }),
-    );
-    poll_until("identity binding", FINALIZE, || {
-        account_of_node(cluster, idx, node)
-            .filter(|account| account.account_id == member.public_key().as_ref())
-    });
-}
-
-fn resolve_handle(cluster: &Cluster, reader: usize, handle: &str) -> Option<Vec<u8>> {
+fn resolve_handle(cluster: &Cluster, reader: usize, handle: &str) -> Option<u64> {
     let bytes = cluster.query(
         reader,
         "gateway",
@@ -294,12 +266,13 @@ fn resolve_handle(cluster: &Cluster, reader: usize, handle: &str) -> Option<Vec<
 fn signed_airlock_route(
     member: &ed25519::PrivateKey,
     chain: &str,
+    account: u64,
     publisher: &[u8],
     revision: u64,
 ) -> GatewayMsg {
     let statement = RouteStatement {
         chain_id: chain.into(),
-        account_id: member.public_key().as_ref().to_vec(),
+        account_id: account,
         name: RouteName::named("airlock"),
         publisher_node: publisher.to_vec(),
         revision,
@@ -331,12 +304,12 @@ fn signed_airlock_route(
     }
 }
 
-fn airlock_route_revision(cluster: &Cluster, reader: usize, account: &[u8]) -> Option<u64> {
+fn airlock_route_revision(cluster: &Cluster, reader: usize, account: u64) -> Option<u64> {
     let bytes = cluster.query(
         reader,
         "gateway",
         &gateway::encode_query(&GatewayQuery::Get {
-            account_id: account.to_vec(),
+            account_id: account,
             name: RouteName::named("airlock"),
         }),
     )?;
@@ -365,36 +338,49 @@ fn seed_claude_store(storage: &Path, name: &str, refresh: &str) {
     .unwrap();
 }
 
-/// The seal PUBLIC key the lender minted when it opened its store — the on-chain
-/// anchor the executing node pins. Self-host has no quote.
-/// Give a node's workspace a work-admission policy admitting `account`.
+/// Give a node's workspace a work-admission policy admitting `accounts` (by
+/// number). A user-signed run is an ACCOUNT caller even on the user's own node
+/// — only the node key itself is `ThisNode` — so a node that runs its own
+/// user's scheduled work lists that user's account too.
 ///
 /// Written as the FILE, not through the writer: an integration test should pin
 /// the on-disk contract the operator (and `ducktape node work admit`) produces,
 /// not a second copy of the producer. The daemon re-reads it on every decision,
 /// so this lands with no restart — which is itself part of what the test proves.
-fn admit_work_from(workspace: &Path, account: &[u8]) {
+fn admit_work_from(workspace: &Path, accounts: &[u64]) {
+    let listed = accounts
+        .iter()
+        .map(|account| format!("\"{account}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     std::fs::write(
         workspace.join("work-admit.toml"),
-        format!("admit = [\"{}\"]\n", common::hex(account)),
+        format!("admit = [{listed}]\n"),
     )
     .expect("write work-admit.toml");
 }
 
+/// The seal PUBLIC key the lender minted when it opened its store — the on-chain
+/// anchor the executing node pins. Self-host has no quote.
 fn seal_pk_from_store(storage: &Path) -> [u8; 32] {
     let bytes = std::fs::read(storage.join("airlock-creds").join("seal.key")).expect("seal.key");
     let secret: [u8; 32] = bytes.as_slice().try_into().expect("32-byte seal secret");
     airlock::seal::SealKeypair::from_secret_bytes(secret).public_bytes()
 }
 
-/// Owner-signed grant of `CRED_NAME` to `grantee` — which, under this flow, is
-/// the account of the node that will RUN the workload.
-fn signed_grant(owner: &ed25519::PrivateKey, chain: &str, grantee: &[u8]) -> GatewayMsg {
+/// Owner-signed grant of `CRED_NAME` to account `grantee` — which, under this
+/// flow, is the account of the user whose node will RUN the workload.
+fn signed_grant(
+    owner: &ed25519::PrivateKey,
+    chain: &str,
+    owner_account: u64,
+    grantee: u64,
+) -> GatewayMsg {
     let statement = gateway::CredentialGrantStatement {
         chain_id: chain.into(),
-        owner_account: owner.public_key().as_ref().to_vec(),
+        owner_account,
         name: CRED_NAME.into(),
-        account: grantee.to_vec(),
+        account: grantee,
     };
     let signature = owner
         .sign(
@@ -417,6 +403,7 @@ fn signed_grant(owner: &ed25519::PrivateKey, chain: &str, grantee: &[u8]) -> Gat
 fn set_credential(
     owner: &ed25519::PrivateKey,
     chain: &str,
+    owner_account: u64,
     publisher_node: &[u8],
     seal_pk: [u8; 32],
 ) -> GatewayMsg {
@@ -424,7 +411,7 @@ fn set_credential(
         chain_id: chain.into(),
         record: CredentialRecord {
             name: CRED_NAME.into(),
-            owner_account: owner.public_key().as_ref().to_vec(),
+            owner_account,
             publisher_node: publisher_node.to_vec(),
             kind: CredentialKind::Claude,
             seal_pk,
@@ -465,19 +452,27 @@ fn credential_record(cluster: &Cluster, reader: usize) -> Option<CredentialRecor
 // the sched trigger + its committed result
 // ===========================================================================
 
-/// saga's id space is namespaced per trigger origin, and `/v1/submit` re-signs
-/// with the RECEIVING node's own key — so an id node `idx` can trigger lives
-/// under that node's actor namespace, and no other member can create it.
-fn node_sid(cluster: &Cluster, idx: usize, id: &str) -> String {
-    let key = Cluster::identity(cluster.peer_ids[idx]);
+/// saga's id space is namespaced per trigger origin — the frame's USER key —
+/// so an id `user` triggers lives under that key's actor namespace, and no
+/// other signer can create it.
+fn user_sid(user: &ed25519::PrivateKey, id: &str) -> String {
+    let key = user.public_key().as_ref().to_vec();
     saga::namespaced_id(&sdk::Origin::External(key), id)
 }
 
-/// Submit a bare `SagaMsg::Trigger` from node `idx` (its key stamps the origin),
+/// Submit a bare `SagaMsg::Trigger` through node `idx` as a frame `submitter`
+/// signed (its USER key stamps the origin — the shape `agent sched` sends),
 /// pinned to `target`, whose v3 envelope carries `CRED_NAME`. No demands — the
 /// smallest reliable execution shape (the cpu/mem → VM size dimension is not
 /// exercised here).
-fn submit_sched(cluster: &Cluster, idx: usize, saga_id: &str, target: &[u8], max_attempts: u32) {
+fn submit_sched(
+    cluster: &Cluster,
+    idx: usize,
+    submitter: &ed25519::PrivateKey,
+    saga_id: &str,
+    target: &[u8],
+    max_attempts: u32,
+) {
     let spec = dispatch::encode_work_spec(&dispatch::WorkSpec {
         kind: dispatch::WORK_SPEC_KIND.into(),
         dispatch_id: saga_id.rsplit('\u{1f}').next().unwrap().into(),
@@ -499,7 +494,7 @@ fn submit_sched(cluster: &Cluster, idx: usize, saga_id: &str, target: &[u8], max
         demands: BTreeMap::new(),
         pinned_assignee: Some(target.to_vec()),
     };
-    cluster.submit(idx, "saga", &saga::encode_msg(&trigger));
+    submit_frame(cluster, idx, submitter, "saga", &saga::encode_msg(&trigger));
 }
 
 fn saga_view(cluster: &Cluster, reader: usize, saga_id: &str) -> Option<SagaView> {
@@ -752,21 +747,24 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
     // sandbox is a failure.
     cluster.wait_compute_marker(0, "compute daemon serving", CONVERGE);
 
-    // the node owns the credential: bind its key to an account, map its handle,
-    // register the gateway port, publish the airlock route, register the record.
+    // the node's USER owns the credential: found its account, map its handle,
+    // register the gateway port, publish the airlock route, register the
+    // record — every one a user-signed frame.
     let owner = ed25519::PrivateKey::from_seed(42);
     let node_key = Cluster::identity(0);
-    bind_node(&cluster, 0, &owner, &node_key);
+    let owner_account = create_account(&cluster, 0, &owner, "owner");
 
-    cluster.submit(
+    submit_frame(
+        &cluster,
         0,
+        &owner,
         "gateway",
         &gateway::encode_msg(&GatewayMsg::SetHandle {
             handle: Some("owner".into()),
         }),
     );
     poll_until("owner.duck resolution", FINALIZE, || {
-        resolve_handle(&cluster, 0, "owner").filter(|id| id == owner.public_key().as_ref())
+        resolve_handle(&cluster, 0, "owner").filter(|id| *id == owner_account)
     });
 
     let workspace = cluster.workspace(0);
@@ -782,26 +780,32 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
     ]);
     assert!(ok, "airlock gateway port bind failed: {output}");
 
-    cluster.submit(
+    submit_frame(
+        &cluster,
         0,
+        &owner,
         "gateway",
         &gateway::encode_msg(&signed_airlock_route(
             &owner,
             &cluster.namespace,
+            owner_account,
             &node_key,
             1,
         )),
     );
     poll_until("airlock route revision 1", FINALIZE, || {
-        (airlock_route_revision(&cluster, 0, owner.public_key().as_ref()) == Some(1)).then_some(())
+        (airlock_route_revision(&cluster, 0, owner_account) == Some(1)).then_some(())
     });
 
-    cluster.submit(
+    submit_frame(
+        &cluster,
         0,
+        &owner,
         "gateway",
         &gateway::encode_msg(&set_credential(
             &owner,
             &cluster.namespace,
+            owner_account,
             &node_key,
             seal_pk,
         )),
@@ -810,16 +814,21 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
         credential_record(&cluster, 0).filter(|r| r.seal_pk == seal_pk)
     });
 
-    // the pinned run: bound to this node, drawing on its OWN credential (the
-    // owner is always granted). the origin is this node's key.
+    // the node runs its own user's work: a user-signed run is an ACCOUNT
+    // caller even here (only the node key itself is `ThisNode`), so the
+    // owner's account has to be admitted.
+    admit_work_from(&workspace, &[owner_account]);
+
+    // the pinned run: bound to this node, drawing on its user's OWN credential
+    // (the owner is always granted). the origin is the owner's user key.
     // 64 ascii-hex, because that is what the product mints
     // (`agent_cli::fresh_dispatch_id`) and what the node's ws `run_output` gate
     // admits. A short hand-made id — which this fixture used to carry — is
     // dropped at the node as `malformed_run_id`, so the ring assertion below
     // could only ever have failed on a real run.
     let dispatch_id = "5c4ed0e2be5f0ab8f8dc5d0f4c2b1a9e7d3f60518c2a4b6d8e0f1a3c5e7b9d02";
-    let saga_id = node_sid(&cluster, 0, &format!("sched\u{1f}{dispatch_id}"));
-    submit_sched(&cluster, 0, &saga_id, &node_key, 3);
+    let saga_id = user_sid(&owner, &format!("sched\u{1f}{dispatch_id}"));
+    submit_sched(&cluster, 0, &owner, &saga_id, &node_key, 3);
 
     let view = wait_terminal(&cluster, 0, &saga_id, ROUND_TRIP);
     assert_eq!(
@@ -921,15 +930,19 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
     cluster.spawn_service(0, "airlock");
     cluster.wait_service_marker(0, "airlock", "airlock daemon serving", CONVERGE);
 
+    // two USERS: the owner founds account 1 through node 0, the executor's
+    // user account 2 through node 1. The nodes themselves are on no account.
     let owner = ed25519::PrivateKey::from_seed(42);
     let executor = ed25519::PrivateKey::from_seed(43);
     let owner_node = Cluster::identity(0);
     let executor_node = Cluster::identity(1);
-    bind_node(&cluster, 0, &owner, &owner_node);
-    bind_node(&cluster, 1, &executor, &executor_node);
+    let owner_account = create_account(&cluster, 0, &owner, "owner");
+    let executor_account = create_account(&cluster, 1, &executor, "executor");
 
-    cluster.submit(
+    submit_frame(
+        &cluster,
         0,
+        &owner,
         "gateway",
         &gateway::encode_msg(&GatewayMsg::SetHandle {
             handle: Some("owner".into()),
@@ -937,33 +950,39 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
     );
     for reader in 0..2 {
         poll_until("owner.duck resolution", FINALIZE, || {
-            resolve_handle(&cluster, reader, "owner").filter(|id| id == owner.public_key().as_ref())
+            resolve_handle(&cluster, reader, "owner").filter(|id| *id == owner_account)
         });
     }
 
-    cluster.submit(
+    submit_frame(
+        &cluster,
         0,
+        &owner,
         "gateway",
         &gateway::encode_msg(&signed_airlock_route(
             &owner,
             &cluster.namespace,
+            owner_account,
             &owner_node,
             1,
         )),
     );
     poll_until("airlock route revision 1", FINALIZE, || {
-        (airlock_route_revision(&cluster, 1, owner.public_key().as_ref()) == Some(1)).then_some(())
+        (airlock_route_revision(&cluster, 1, owner_account) == Some(1)).then_some(())
     });
 
     // the record carries the STORE's seal_pk (self-host has no quote) and an
     // empty grant set — nobody may draw on it yet.
     let seal_pk = seal_pk_from_store(&owner_storage);
-    cluster.submit(
+    submit_frame(
+        &cluster,
         0,
+        &owner,
         "gateway",
         &gateway::encode_msg(&set_credential(
             &owner,
             &cluster.namespace,
+            owner_account,
             &owner_node,
             seal_pk,
         )),
@@ -975,18 +994,18 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
     // ---- DIRECTION 0: the executor does not run this submitter's work ------
     //
     // TWO consents in opposite directions, and this is the first: before the
-    // lender is ever dialled, node 1 decides whether it runs node 0's work at
-    // all. Its default is owner-only and these are two accounts, so the run is
-    // refused HERE — no microVM, no gateway hop, no session. Without this
-    // step the credential lane below is not even reachable.
+    // lender is ever dialled, node 1 decides whether it runs the owner's work
+    // at all. Its default admits no account, so the run is refused HERE — no
+    // microVM, no gateway hop, no session. Without this step the credential
+    // lane below is not even reachable.
     //
     // They COMPOSE, and this direction is where that is visible: the CREDENTIAL
     // consent is already satisfied for this exact run shape — the owner submits
     // it and the saga module leases it to node 1, which is precisely what
     // direction 2 delegates on — and it makes no difference. One consent
     // satisfied is not the other consent granted.
-    let unadmitted_id = &node_sid(&cluster, 0, "sched\u{1f}sched-delegated-unadmitted");
-    submit_sched(&cluster, 0, unadmitted_id, &executor_node, 1);
+    let unadmitted_id = &user_sid(&owner, "sched\u{1f}sched-delegated-unadmitted");
+    submit_sched(&cluster, 0, &owner, unadmitted_id, &executor_node, 1);
     let view = wait_terminal(&cluster, 0, unadmitted_id, ROUND_TRIP);
     assert_eq!(
         view.status,
@@ -1003,22 +1022,25 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
         view.error,
     );
 
-    // ---- the admission, on the EXECUTOR, for the SUBMITTER's account -------
+    // ---- the admission, on the EXECUTOR ------------------------------------
     //
     // The opposite direction from the grant below: this is node 1 saying whose
-    // work it will run, not node 0 saying who may draw on its credential. No
-    // restart — the policy is re-read on every decision.
-    admit_work_from(&cluster.workspace(1), owner.public_key().as_ref());
+    // work it will run, not the owner saying who may draw on its credential.
+    // It lists the SUBMITTER's account — and its own user's, because a
+    // user-signed run is an account caller on any node (only the node key
+    // itself is `ThisNode`). No restart — the policy is re-read on every
+    // decision.
+    admit_work_from(&cluster.workspace(1), &[owner_account, executor_account]);
 
     // ---- DIRECTION 1: nobody is granted ------------------------------------
     //
-    // Node 1 submits this one and pins it to ITSELF, so there is no delegation
-    // to be had: the committed origin, the assignee and the account the lender's
-    // node stamps on the hop are all node 1, and node 1 is on no grant list. It
-    // also takes the admission's `ThisNode` path, which isolates the CREDENTIAL
-    // gate from the work gate direction 0 just proved.
-    let refused_id = &node_sid(&cluster, 1, "sched\u{1f}sched-delegated-ungranted");
-    submit_sched(&cluster, 1, refused_id, &executor_node, 1);
+    // Node 1's user submits this one and pins it to node 1, so there is no
+    // delegation to be had: the committed origin is the executor's user key
+    // (account 2), the assignee is node 1, and account 2 is on no grant list.
+    // Admission passes (the account was just listed), which isolates the
+    // CREDENTIAL gate from the work gate direction 0 just proved.
+    let refused_id = &user_sid(&executor, "sched\u{1f}sched-delegated-ungranted");
+    submit_sched(&cluster, 1, &executor, refused_id, &executor_node, 1);
     let view = wait_terminal(&cluster, 1, refused_id, ROUND_TRIP);
     assert_eq!(
         view.status,
@@ -1037,19 +1059,19 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
 
     // ---- DIRECTION 2: DELEGATION, and the grant list is untouched -----------
     //
-    // THE POINT OF THE CAMPAIGN. Node 1 is still granted nothing — direction 1
-    // just proved it, and no grant op is submitted until below. What changes is
-    // WHO SUBMITS: the owner does, so the run's committed origin is the owner's
-    // node key (proven by the signature `/v1/submit` re-stamped on the op), and
-    // the saga module leased the attempt to node 1.
+    // THE POINT OF THE CAMPAIGN. Account 2 is still granted nothing — direction
+    // 1 just proved it, and no grant op is submitted until below. What changes
+    // is WHO SUBMITS: the owner does, so the run's committed origin is the
+    // owner's USER key (proven by the frame signature), which resolves to the
+    // owner's account, and the saga module leased the attempt to node 1.
     //
     // Node 1's broker sends the saga id and nothing else. The lender reads both
     // facts out of its own committed state — the owner submitted it, node 1
     // holds its lease — and authorizes the draw on the OWNER's grant. A run
     // submitted by A and executed on B, drawing as A: the thing that has never
     // worked before this PR.
-    let delegated_id = &node_sid(&cluster, 0, "sched\u{1f}sched-delegated-pointer");
-    submit_sched(&cluster, 0, delegated_id, &executor_node, 1);
+    let delegated_id = &user_sid(&owner, "sched\u{1f}sched-delegated-pointer");
+    submit_sched(&cluster, 0, &owner, delegated_id, &executor_node, 1);
     let view = wait_terminal(&cluster, 0, delegated_id, ROUND_TRIP);
     assert_eq!(
         view.status,
@@ -1065,10 +1087,10 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
     assert!(
         !gateway::credential_use_allowed(
             &credential_record(&cluster, 1).expect("the record is still committed"),
-            executor.public_key().as_ref(),
+            executor_account,
         ),
-        "and it did so with the executor on NO grant list — otherwise this \
-         direction proves nothing the next one does not",
+        "and it did so with the executor's account on NO grant list — otherwise \
+         this direction proves nothing the next one does not",
     );
 
     // ---- DIRECTION 2b: and the pointer DIES with the run -------------------
@@ -1104,26 +1126,32 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
     );
 
     // ---- the grant, and the ONLY thing that changes -------------------------
-    let executor_account = executor.public_key().as_ref().to_vec();
-    cluster.submit(
+    submit_frame(
+        &cluster,
         0,
+        &owner,
         "gateway",
-        &gateway::encode_msg(&signed_grant(&owner, &cluster.namespace, &executor_account)),
+        &gateway::encode_msg(&signed_grant(
+            &owner,
+            &cluster.namespace,
+            owner_account,
+            executor_account,
+        )),
     );
     poll_until("the grant to commit", FINALIZE, || {
         credential_record(&cluster, 1)
-            .filter(|record| gateway::credential_use_allowed(record, &executor_account))
+            .filter(|record| gateway::credential_use_allowed(record, executor_account))
             .map(|_| ())
     });
 
     // ---- DIRECTION 3: direction 1's exact shape, now granted ----------------
     //
-    // The non-regression half: an executor granted in its OWN right still draws
-    // in its own right, with no pointer doing any work — origin, assignee and
-    // caller are all node 1 again. The grant is the only thing that changed
-    // since direction 1.
-    let granted_id = &node_sid(&cluster, 1, "sched\u{1f}sched-delegated-granted");
-    submit_sched(&cluster, 1, granted_id, &executor_node, 1);
+    // The non-regression half: a submitter granted in its OWN right still draws
+    // in its own right — the pointer resolves to account 2, which is now on the
+    // grant list; origin, assignee and caller are node 1's user and node 1
+    // again. The grant is the only thing that changed since direction 1.
+    let granted_id = &user_sid(&executor, "sched\u{1f}sched-delegated-granted");
+    submit_sched(&cluster, 1, &executor, granted_id, &executor_node, 1);
     let view = wait_terminal(&cluster, 1, granted_id, ROUND_TRIP);
     assert_eq!(
         view.status,

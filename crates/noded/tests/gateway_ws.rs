@@ -15,7 +15,7 @@ fn route_record(publisher: [u8; 32]) -> gateway::RouteRecord {
     gateway::RouteRecord {
         statement: gateway::RouteStatement {
             chain_id: "test".into(),
-            account_id: vec![1; 32],
+            account_id: 1,
             name: gateway::RouteName::named("api"),
             publisher_node: publisher.to_vec(),
             revision: 3,
@@ -51,7 +51,7 @@ async fn ws_side_door_mints_consumes_and_bridges_to_the_lane() {
                 let bytes = match gateway::decode_query(&req).unwrap() {
                     gateway::GatewayQuery::Resolve { .. } => gateway::encode_reply(
                         &gateway::GatewayReply::Resolved(Some(gateway::ResolvedAccount {
-                            account_id: vec![1; 32],
+                            account_id: 1,
                         })),
                     ),
                     gateway::GatewayQuery::Get { .. } => gateway::encode_reply(

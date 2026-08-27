@@ -1234,9 +1234,11 @@ async fn open_airlock_session(cfg: AirlockConfig) -> Result<(AirlockSession, Str
         AirlockTrust::PinnedSealPk(pk) => *pk,
     };
     // The session names the CREDENTIAL and the WORK it draws for, and nothing
-    // else. On a lending gateway the grant subject is the account the owner's
-    // node vouched for when this request made the hop — this side does not get to
-    // name one, and the token that comes back carries no identity either.
+    // else. On a lending gateway the only identity on the hop is the NODE the
+    // owner's proxy vouched for; the grant subject is the account whose
+    // user-signed frame submitted the work, resolved lender-side from that
+    // pointer — this side does not get to name one, and the token that comes
+    // back carries no identity either.
     //
     // A handshake failure is named for WHAT failed, before any credentialed
     // request. Every distinguishable cause has its own reason: the lender's
@@ -1382,7 +1384,7 @@ impl SessionRefusal {
     /// body falls back to what the STATUS means — never to a guess.
     fn of_gateway_refusal(refusal: &SessionRefusedBy) -> Self {
         match refusal.reason.as_str() {
-            "caller_account_unverified" => Self::CallerUnverified,
+            "caller_node_unverified" => Self::CallerUnverified,
             _unnamed => Self::of_status(refusal.status),
         }
     }
@@ -1416,7 +1418,7 @@ impl SessionRefusal {
             Self::Unreachable => "airlock_gateway_unreachable",
             Self::Absent => "airlock_route_or_credential_absent",
             Self::NotGranted => "credential_not_granted",
-            Self::CallerUnverified => "airlock_caller_account_unverified",
+            Self::CallerUnverified => "airlock_caller_node_unverified",
             Self::AuthorityUnavailable => "airlock_grant_authority_unavailable",
             Self::Refused => "airlock_gateway_refused",
             Self::Malformed => "airlock_gateway_malformed_response",
@@ -3266,17 +3268,17 @@ mod tests {
     }
 
     /// Like [`boot_self_host_gateway`] but with the co-hosted-lending grant gate
-    /// wired: a session opens only when the account equals `granted`. This is the
-    /// production self-host mode (`user cred add` builds an always-gated
-    /// gateway), so a broker that fails to send the account 403s here before any
-    /// credentialed request. The reserved account `wedged` stands in for a lender
-    /// whose node did not answer the grant query at all.
+    /// wired: a session opens only when the vouched caller node equals
+    /// `granted_node`. This is the production self-host mode (`user cred add`
+    /// builds an always-gated gateway), so a session the gate cannot place 403s
+    /// here before any credentialed request. The reserved node `wedged` stands
+    /// in for a lender whose node did not answer the grant query at all.
     ///
     /// Served BEHIND a stand-in for the node's gateway proxy, because that is
     /// the only way production reaches a lending gateway — and the gate keys on
-    /// the account that proxy VOUCHED for, not on the one the request claims.
-    /// `verified_caller` is what the proxy saw; passing it separately from the
-    /// broker's own `rc.account` is what lets a test drive the two apart.
+    /// the node that proxy VOUCHED for, never on anything the request claims.
+    /// `vouched_node` is what the proxy saw; passing it separately from
+    /// `granted_node` is what lets a test drive the two apart.
     async fn boot_grant_gated_gateway(
         upstream: &str,
         seal_kp: airlock::seal::SealKeypair,
@@ -3285,18 +3287,18 @@ mod tests {
             airlock::wire::CredentialKind,
             airlock::wire::CredentialPayload,
         )>,
-        granted: Vec<u8>,
-        verified_caller: Vec<u8>,
+        granted_node: Vec<u8>,
+        vouched_node: Vec<u8>,
         max_requests: u32,
     ) -> String {
         let check: airlock::server::GrantCheck = std::sync::Arc::new(move |question| {
-            let granted = granted.clone();
+            let granted_node = granted_node.clone();
             Box::pin(async move {
-                let account = question.caller;
-                if account == b"wedged" {
+                let caller_node = question.caller_node;
+                if caller_node == b"wedged" {
                     return airlock::server::GrantAnswer::Undetermined;
                 }
-                if account == granted {
+                if caller_node == granted_node {
                     return airlock::server::GrantAnswer::Granted;
                 }
                 airlock::server::GrantAnswer::Refused
@@ -3318,7 +3320,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(vendor, "self-host");
-        let app = airlock::testkit::behind_gateway_proxy(app, &verified_caller);
+        let app = airlock::testkit::behind_gateway_proxy(app, &vouched_node);
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -3333,8 +3335,9 @@ mod tests {
     /// self-host gateway (what `user cred add` always builds): the sealed session
     /// opens, the credential is swapped in, and the reply comes back.
     ///
-    /// It admits because the gateway's proxy vouched for an account the grant
-    /// names — nothing the broker sent. The broker names no account at all; it
+    /// It admits because the lender's own authority found a grant for the
+    /// caller the gateway's proxy vouched for — nothing the broker sent. The
+    /// broker names no account at all; it
     /// cannot, since `SessionRequest` carries none. This test formerly asserted
     /// the opposite ("only because the broker names the granted account in
     /// `account_b64`"), and that field was the credential-theft defect.
@@ -3599,13 +3602,13 @@ mod tests {
         let named = |status, reason: &str| {
             R::of_gateway_refusal(&SessionRefusedBy { status, reason: reason.into() })
         };
-        assert_eq!(named(403, "caller_account_unverified"), R::CallerUnverified);
+        assert_eq!(named(403, "caller_node_unverified"), R::CallerUnverified);
         assert_eq!(named(403, "credential_not_granted"), R::NotGranted);
         // a node's proxy in the path answers with prose, not a token.
         assert_eq!(named(502, "loopback upstream refused the connection"), R::Unreachable);
         // and the tag is what the chain actually carries.
         let unvouched: anyhow::Error =
-            SessionRefusedBy { status: 403, reason: "caller_account_unverified".into() }.into();
+            SessionRefusedBy { status: 403, reason: "caller_node_unverified".into() }.into();
         assert_eq!(R::of(&unvouched), R::CallerUnverified);
 
         // past the response boundary there is no status to read, so the client

@@ -8,12 +8,12 @@ state
   settings_open_tabs:i64 = 0
   settings_generation:i64 = 0
 
-  account_bound = false
-  account_id = ""
+  account_exists = false
+  // The decimal account number; "" when the local key belongs to no account.
+  account_number = ""
   account_name = ""
   account_bio = ""
-  account_members:i64 = 0
-  account_nodes:i64 = 0
+  account_keys:i64 = 0
   account_generation:i64 = 0
   account_name_draft = ""
   account_renaming = false

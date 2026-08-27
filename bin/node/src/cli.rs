@@ -55,9 +55,9 @@ fn work_workspace(selector: &Selector) -> Result<PathBuf, Box<dyn std::error::Er
         .to_path_buf())
 }
 
-/// `anyone` is the literal, everything else is an account (hex id or display
-/// name — the same resolution `user cred grant` takes). A hex id resolves
-/// offline; a display name needs the node to answer.
+/// `anyone` is the literal, everything else is an account (a number or a
+/// display name — the same resolution `user cred grant` takes). A number
+/// resolves offline; a display name needs the node to answer.
 fn resolve_work_target(
     workspace: &std::path::Path,
     input: &str,
@@ -66,7 +66,7 @@ fn resolve_work_target(
         return Ok(AdmitTarget::Anyone);
     }
     let base = config::http_base_in(workspace)?;
-    Ok(AdmitTarget::Account(crate::cred_cli::resolve_account(
+    Ok(AdmitTarget::Account(crate::account_cli::resolve_account(
         &base, input,
     )?))
 }
@@ -74,16 +74,16 @@ fn resolve_work_target(
 fn cmd_work_list(args: SelectorArgs) -> CommandResult {
     let workspace = work_workspace(&args.selector)?;
     match work_admission::load(&workspace)? {
-        WorkAdmission::Owner => {
-            println!("owner only — this node runs its owner's work and its own submissions")
-        }
         WorkAdmission::Anyone => {
             println!("anyone — every network member may run a workload on this node")
         }
         WorkAdmission::Accounts(accounts) => {
-            println!("owner, plus {} admitted account(s):", accounts.len());
+            println!(
+                "this node's own submissions, plus {} admitted account(s):",
+                accounts.len()
+            );
             for account in &accounts {
-                println!("  {}", hex_bytes(account));
+                println!("  {account}");
             }
         }
     }
@@ -111,7 +111,7 @@ fn cmd_work_admit(args: WorkTargetArgs) -> CommandResult {
             );
             println!("admitted: anyone");
         }
-        AdmitTarget::Account(account) => println!("admitted: {}", hex_bytes(&account)),
+        AdmitTarget::Account(account) => println!("admitted: {account}"),
     }
     Ok(())
 }
@@ -134,7 +134,7 @@ fn cmd_work_revoke(args: WorkTargetArgs) -> CommandResult {
     work_admission::save(&workspace, &current.without(target.clone()))?;
     match target {
         AdmitTarget::Anyone => println!("revoked: anyone"),
-        AdmitTarget::Account(account) => println!("revoked: {}", hex_bytes(&account)),
+        AdmitTarget::Account(account) => println!("revoked: {account}"),
     }
     Ok(())
 }
@@ -216,48 +216,7 @@ fn cmd_node_status(args: StatusArgs) -> CommandResult {
     };
     let root_hash = status["root_hash"].as_str().unwrap_or("");
     println!("height={height} root_hash={root_hash}");
-    // WHOSE node this is — the fact `user cred grant <account>`, `node work
-    // admit <account>` and `agent sched --host-node` all stand on, and the one
-    // an operator otherwise had to hand-write a `/v1/query` `OfNode` for.
-    // Prose only: `--json` is the rpc's status document verbatim and stays a
-    // byte-for-byte contract.
-    println!(
-        "{}",
-        account_line(&rpc_addr, resolved.signer.public_key().as_ref())
-    );
     Ok(())
-}
-
-/// The `account=` line under `node status`: this node's own account, named.
-///
-/// Best-effort, and quiet about its own failures on purpose: the node's tip is
-/// the answer `status` promises, and a chain that cannot serve an identity read
-/// must not turn a working status into an error. An UNBOUND node is not a
-/// failure at all — it is the ordinary state between `node run` and
-/// `user account-init`, and the only state with a next step worth printing.
-///
-/// `node_key` comes from the workspace this verb already resolved, NOT from the
-/// rpc status document — which carries height, root hash and module roots and
-/// has never named the node. Asking the running process would be the stricter
-/// source, but this verb opened `identity.key` two lines up to find the rpc
-/// address at all, so there is no new exposure to buy with the round trip.
-fn account_line(rpc_addr: &str, node_key: &[u8]) -> String {
-    let query = identity::encode_query(&identity::IdentityQuery::OfNode {
-        node_key: node_key.to_vec(),
-    });
-    let Ok(view) = rpc_query(rpc_addr, "identity", &query)
-        .and_then(|bytes| identity::decode_reply(&bytes).map_err(|e| e.to_string()))
-    else {
-        return "account=unknown (the identity module did not answer)".into();
-    };
-    let identity::IdentityReply::Account(Some(account)) = view else {
-        return "account=none — claim one with: ducktape user account-init --name <you>".into();
-    };
-    let id = hex_bytes(&account.account_id);
-    match account.display_name {
-        Some(name) => format!("account={name} ({})", id.get(..16).unwrap_or(&id)),
-        None => format!("account={id}"),
-    }
 }
 
 /// `peers [--config <path> | -n <chain-id>] [--json]` — the RUNNING node's
@@ -853,31 +812,128 @@ fn read_residents(addr: &str) -> Result<Vec<Vec<u8>>, String> {
     }
 }
 
-fn account_of_node(addr: &str, node_key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+/// the account number `key` belongs to, if any — through `OfKey`, the one
+/// resolver (a node key is never on an account).
+fn account_of_key(addr: &str, key: &[u8]) -> Result<Option<u64>, String> {
     use identity::{IdentityQuery, IdentityReply, decode_reply, encode_query};
     let raw = rpc_query(
         addr,
         "identity",
-        &encode_query(&IdentityQuery::OfNode {
-            node_key: node_key.to_vec(),
-        }),
+        &encode_query(&IdentityQuery::OfKey { key: key.to_vec() }),
     )?;
     match decode_reply(&raw)? {
-        IdentityReply::Account(account) => Ok(account.map(|account| account.account_id)),
-        other => Err(format!("expected Account, got {other:?}")),
+        IdentityReply::Account(account) => Ok(account.map(|account| account.number)),
+        IdentityReply::Accounts(_) | IdentityReply::Gen(_) => {
+            Err("expected an Account reply from identity".into())
+        }
     }
 }
 
-fn proposal_principal(
-    addr: &str,
-    proposal: &governance::ProposalView,
-    node_key: &[u8],
-) -> Result<Vec<u8>, String> {
-    match proposal.voter_kind {
-        governance::VoterKind::ValidatorNode => Ok(node_key.to_vec()),
-        governance::VoterKind::Account => account_of_node(addr, node_key)?
-            .ok_or_else(|| "this node is not bound to an Identity account".into()),
+fn read_shares(addr: &str) -> Result<governance::SharesView, String> {
+    use governance::{GovQuery, GovReply, decode_reply, encode_query};
+    let raw = rpc_query(addr, "governance", &encode_query(&GovQuery::Shares))?;
+    match decode_reply(&raw)? {
+        GovReply::Shares(view) => Ok(view),
+        other => Err(format!("expected Shares, got {other:?}")),
     }
+}
+
+/// WHO signs this node's governance ops, decided ONCE per ceremony from the
+/// mode the module is in. A validator-mode ballot is the node key's, over the
+/// local rpc (the node re-signs). A share-mode ballot is the active user key's
+/// ACCOUNT, and only a user-signed frame can carry that origin — so the key is
+/// unlocked here (password on stdin) and its ops go over the node's http lane
+/// as frames.
+// one per ceremony, on the stack — variant size is noise.
+#[allow(clippy::large_enum_variant)]
+enum GovSigner {
+    Node {
+        key: Vec<u8>,
+    },
+    User {
+        key: commonware_cryptography::ed25519::PrivateKey,
+        principal: Vec<u8>,
+        http_base: String,
+    },
+}
+
+impl GovSigner {
+    /// the electorate kind this signer's ballots count under.
+    fn kind(&self) -> governance::VoterKind {
+        match self {
+            GovSigner::Node { .. } => governance::VoterKind::ValidatorNode,
+            GovSigner::User { .. } => governance::VoterKind::Account,
+        }
+    }
+
+    /// the principal a proposal records this signer's ballot under.
+    fn principal(&self) -> &[u8] {
+        match self {
+            GovSigner::Node { key } => key,
+            GovSigner::User { principal, .. } => principal,
+        }
+    }
+
+    /// submit one governance op through this signer's lane (accepted !=
+    /// finalized on the rpc lane — callers poll afterwards).
+    fn submit(&self, rpc_addr: &str, msg: &governance::GovMsg) -> Result<(), String> {
+        let payload = governance::encode_msg(msg);
+        match self {
+            GovSigner::Node { .. } => rpc_submit(rpc_addr, "governance", &payload),
+            GovSigner::User { key, http_base, .. } => crate::node_http::submit_frame(
+                http_base,
+                &crate::userkey_cli::user_frame(key, "governance", payload),
+            )
+            .map(|_height| ())
+            .map_err(|e| e.to_string()),
+        }
+    }
+}
+
+/// resolve the signer for a ceremony on the node at `cfg_path`.
+fn gov_signer(
+    rpc_addr: &str,
+    cfg_path: &std::path::Path,
+    resolved: &config::Resolved,
+) -> Result<GovSigner, Box<dyn std::error::Error>> {
+    let shares_govern = read_shares(rpc_addr)?.active;
+    if !shares_govern {
+        return Ok(GovSigner::Node {
+            key: resolved.signer.public_key().as_ref().to_vec(),
+        });
+    }
+    let workspace = cfg_path.parent().unwrap_or(std::path::Path::new("."));
+    let http_base = config::http_base_in(workspace)?;
+    let mut stdin = std::io::BufReader::new(std::io::stdin());
+    let key =
+        crate::userkey_cli::load_user_signer(&keystore::wallet::active_user_key()?, &mut stdin)?;
+    let number = account_of_key(rpc_addr, key.public_key().as_ref())?.ok_or(
+        "shares govern this network and the active user key belongs to no Identity account — \
+         `ducktape account create` first",
+    )?;
+    Ok(GovSigner::User {
+        key,
+        principal: identity::account_principal(number),
+        http_base,
+    })
+}
+
+/// a proposal is decided by the mode frozen when it was opened; a ballot from
+/// the other mode's signer would be refused by the module, so say so here.
+fn require_frozen_kind(
+    proposal: &governance::ProposalView,
+    signer: &GovSigner,
+) -> Result<(), String> {
+    let frozen_kind_matches = proposal.voter_kind == signer.kind();
+    if frozen_kind_matches {
+        return Ok(());
+    }
+    Err(format!(
+        "proposal {} was frozen for {:?} ballots, but this node now governs by {:?} — it cannot vote on it",
+        proposal.proposal_id,
+        proposal.voter_kind,
+        signer.kind()
+    ))
 }
 
 fn proposal_progress(proposal: &governance::ProposalView, members: &[Vec<u8>]) -> (u64, u64, bool) {
@@ -1007,13 +1063,15 @@ fn cast_yes_once(
     addr: &str,
     proposal_id: &str,
     opened: governance::ProposalView,
-    principal: &[u8],
+    signer: &GovSigner,
 ) -> Result<governance::ProposalView, String> {
-    use governance::{GovMsg, ProposalStatus, encode_msg};
+    use governance::{GovMsg, ProposalStatus};
 
     if opened.status != ProposalStatus::Open {
         return Ok(opened);
     }
+    require_frozen_kind(&opened, signer)?;
+    let principal = signer.principal();
     if opened
         .votes
         .iter()
@@ -1022,13 +1080,12 @@ fn cast_yes_once(
         eprintln!("ballot already cast as {}", hex_bytes(principal));
         return Ok(opened);
     }
-    rpc_submit(
+    signer.submit(
         addr,
-        "governance",
-        &encode_msg(&GovMsg::Vote {
+        &GovMsg::Vote {
             proposal_id: proposal_id.into(),
             approve: true,
-        }),
+        },
     )?;
     let proposal = poll_proposal(addr, proposal_id, "this ballot to finalize", |p| {
         p.as_ref().is_some_and(|proposal| {
@@ -1061,13 +1118,13 @@ enum CeremonyOutcome {
 /// (AddValidator), and `resident remove` (RemoveResident).
 fn drive_membership_ceremony(
     rpc_addr: &str,
-    me_bytes: &[u8],
+    signer: &GovSigner,
     pubkey_hex: &str,
     verb: &str,
     id_prefix: &str,
     wanted: governance::GovAction,
 ) -> Result<CeremonyOutcome, Box<dyn std::error::Error>> {
-    use governance::{GovMsg, ProposalStatus, encode_msg};
+    use governance::{GovMsg, ProposalStatus};
     use governance::{GovQuery, GovReply, decode_reply, encode_query};
     let proposals = match decode_reply(&rpc_query(
         rpc_addr,
@@ -1091,17 +1148,16 @@ fn drive_membership_ceremony(
                 .map(|n| format!("{id_prefix}{prefix}:{n}"))
                 .find(|id| !proposals.iter().any(|p| &p.proposal_id == id))
                 .expect("the id space is unbounded");
-            rpc_submit(
+            signer.submit(
                 rpc_addr,
-                "governance",
-                &encode_msg(&GovMsg::Propose {
+                &GovMsg::Propose {
                     proposal_id: id.clone(),
                     action: wanted,
                     // a far horizon in consensus-time units (heights advance
                     // about one per finalized op): admission must not expire
                     // under a slow second ballot.
                     voting_period: 1_000_000,
-                }),
+                },
             )?;
             poll_proposal(rpc_addr, &id, "the proposal to finalize", |p| p.is_some())?;
             eprintln!("proposed {id}");
@@ -1111,8 +1167,7 @@ fn drive_membership_ceremony(
 
     let opened = read_proposal(rpc_addr, &proposal_id)?
         .ok_or_else(|| format!("proposal {proposal_id} disappeared"))?;
-    let principal = proposal_principal(rpc_addr, &opened, me_bytes)?;
-    let after_vote = cast_yes_once(rpc_addr, &proposal_id, opened, &principal)?;
+    let after_vote = cast_yes_once(rpc_addr, &proposal_id, opened, signer)?;
 
     // Execute only when the proposal's frozen rule says the yes power is
     // irreversible. A shortfall is the normal intermediate state, not an error.
@@ -1128,12 +1183,11 @@ fn drive_membership_ceremony(
         return Ok(CeremonyOutcome::AwaitingBallots);
     }
     if after_vote.status == ProposalStatus::Open {
-        rpc_submit(
+        signer.submit(
             rpc_addr,
-            "governance",
-            &encode_msg(&GovMsg::Execute {
+            &GovMsg::Execute {
                 proposal_id: proposal_id.clone(),
-            }),
+            },
         )?;
     }
     let settled = poll_proposal(rpc_addr, &proposal_id, "the tally to settle", |p| {
@@ -1167,7 +1221,7 @@ fn cmd_invite_accept(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
         .rpc_listen
         .clone()
         .ok_or("resident accept drives the node's local rpc — set `rpc_listen` in node.toml")?;
-    let me_bytes = resolved.signer.public_key().as_ref().to_vec();
+    let signer = gov_signer(&rpc_addr, &cfg_path, &resolved)?;
 
     let members = read_members(&rpc_addr)?;
     if members.contains(&key_bytes) {
@@ -1183,7 +1237,7 @@ fn cmd_invite_accept(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
     }
     match drive_membership_ceremony(
         &rpc_addr,
-        &me_bytes,
+        &signer,
         pubkey_hex,
         "node resident accept",
         "resident:",
@@ -1220,7 +1274,7 @@ fn cmd_promote(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
         .rpc_listen
         .clone()
         .ok_or("promote drives the node's local rpc — set `rpc_listen` in node.toml")?;
-    let me_bytes = resolved.signer.public_key().as_ref().to_vec();
+    let signer = gov_signer(&rpc_addr, &cfg_path, &resolved)?;
 
     let members = read_members(&rpc_addr)?;
     if members.contains(&key_bytes) {
@@ -1229,7 +1283,7 @@ fn cmd_promote(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     match drive_membership_ceremony(
         &rpc_addr,
-        &me_bytes,
+        &signer,
         pubkey_hex,
         "node member promote",
         "admit:",
@@ -1272,7 +1326,7 @@ fn cmd_resident_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error
         .rpc_listen
         .clone()
         .ok_or("resident remove drives the node's local rpc — set `rpc_listen` in node.toml")?;
-    let me_bytes = resolved.signer.public_key().as_ref().to_vec();
+    let signer = gov_signer(&rpc_addr, &cfg_path, &resolved)?;
 
     let members = read_members(&rpc_addr)?;
     if members.contains(&key_bytes) {
@@ -1288,7 +1342,7 @@ fn cmd_resident_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error
     }
     match drive_membership_ceremony(
         &rpc_addr,
-        &me_bytes,
+        &signer,
         pubkey_hex,
         "node resident remove",
         "revoke:",
@@ -1317,7 +1371,7 @@ fn cmd_resident_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error
 /// run that lands the deciding ballot executes. the passing proposal's valset
 /// Leave schedules the epoch cutover that drops the key from the tracked set.
 fn cmd_member_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
-    use governance::{GovAction, GovMsg, ProposalStatus, encode_msg};
+    use governance::{GovAction, GovMsg, ProposalStatus};
 
     let pubkey_hex = &args.pubkey;
     let key = config::decode_key(pubkey_hex)?;
@@ -1330,7 +1384,7 @@ fn cmd_member_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
         .rpc_listen
         .clone()
         .ok_or("member remove drives the node's local rpc — set `rpc_listen` in node.toml")?;
-    let me_bytes = resolved.signer.public_key().as_ref().to_vec();
+    let signer = gov_signer(&rpc_addr, &cfg_path, &resolved)?;
 
     let members = read_members(&rpc_addr)?;
     // Inverted admission guard: nothing to remove if the key is not a member.
@@ -1367,16 +1421,15 @@ fn cmd_member_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
                 .map(|n| format!("remove:{prefix}:{n}"))
                 .find(|id| !proposals.iter().any(|p| &p.proposal_id == id))
                 .expect("the id space is unbounded");
-            rpc_submit(
+            signer.submit(
                 &rpc_addr,
-                "governance",
-                &encode_msg(&GovMsg::Propose {
+                &GovMsg::Propose {
                     proposal_id: id.clone(),
                     action: wanted,
                     // a far horizon in consensus-time units: removal must not
                     // expire under a slow second ballot.
                     voting_period: 1_000_000,
-                }),
+                },
             )?;
             poll_proposal(&rpc_addr, &id, "the proposal to finalize", |p| p.is_some())?;
             eprintln!("proposed {id}");
@@ -1386,8 +1439,7 @@ fn cmd_member_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
 
     let opened = read_proposal(&rpc_addr, &proposal_id)?
         .ok_or_else(|| format!("proposal {proposal_id} disappeared"))?;
-    let principal = proposal_principal(&rpc_addr, &opened, &me_bytes)?;
-    let after_vote = cast_yes_once(&rpc_addr, &proposal_id, opened, &principal)?;
+    let after_vote = cast_yes_once(&rpc_addr, &proposal_id, opened, &signer)?;
 
     // Execute only once the proposal's own frozen voting rule is satisfied.
     let members = read_members(&rpc_addr)?;
@@ -1400,12 +1452,11 @@ fn cmd_member_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
         return Ok(());
     }
     if after_vote.status == ProposalStatus::Open {
-        rpc_submit(
+        signer.submit(
             &rpc_addr,
-            "governance",
-            &encode_msg(&GovMsg::Execute {
+            &GovMsg::Execute {
                 proposal_id: proposal_id.clone(),
-            }),
+            },
         )?;
     }
     let settled = poll_proposal(&rpc_addr, &proposal_id, "the tally to settle", |p| {

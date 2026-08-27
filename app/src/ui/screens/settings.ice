@@ -4,7 +4,7 @@
 // `screens/roster.ice` for the screen contract: no app state is reachable from
 // here, so every reading is a prop and every act leaves as a named event that
 // `view.ice` routes back to the handler of the same name.
-component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_answered:bool, account_id:str, bind account_name_draft:str, account_renaming:bool, account_bound:bool, account_members:i64, account_nodes:i64, appearance:Appearance, password:str, status:str, loading:bool, connected:bool, mutation_phase:MutationPhase)
+component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_answered:bool, account_number:str, bind account_name_draft:str, account_renaming:bool, account_exists:bool, account_keys:i64, appearance:Appearance, password:str, status:str, loading:bool, connected:bool, mutation_phase:MutationPhase)
   emits
     select_shell_tab(ShellTab)
     reconnect()
@@ -262,27 +262,29 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                     Badge.Outline label=member_tier(members_rows)
                   if empty(member_tier(members_rows)) && members_answered
                     Badge.Outline label="standing unknown"
-                // The key line says WHICH keypair this is and that it lives
-                // on this device — the custody clause the artifact carries.
+                // The number line says WHICH account this key belongs to and
+                // that the key lives on this device — the custody clause the
+                // artifact carries.
                 row
                   with
                     w=fill
                     gap=5.0
                     align=center
-                  text account_id
+                  text account_number
                     with
                       size=10.5
                       wrap=none
                       font=code_medium
                       @text-hint
-                  // The separator belongs to the KEY, which an unbound account
-                  // does not have: `load_account` answers "" for every field
-                  // until one is bound, and drawn unconditionally the dot led
-                  // the line — `· validator keypair on this device`. Every
-                  // other separator in the console is gated by the run it
-                  // introduces (forge.ice's repo-count dot says so in its own
-                  // comment); this one was the exception.
-                  if !empty(account_id)
+                  // The separator belongs to the NUMBER, which a key outside
+                  // every account does not have: `load_account` answers "" for
+                  // every field until the key belongs to one, and drawn
+                  // unconditionally the dot led the line — `· validator
+                  // keypair on this device`. Every other separator in the
+                  // console is gated by the run it introduces (forge.ice's
+                  // repo-count dot says so in its own comment); this one was
+                  // the exception.
+                  if !empty(account_number)
                     text "·"
                       with
                         size=10.5
@@ -331,16 +333,17 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                       h=28.0
                       p=5.0
                       @secondary_action
-                // ACCOUNT FACTS, ONLY WHEN THERE IS AN ACCOUNT. Unbound,
-                // `load_account` returns zeros for every field, and the card
-                // printed `0 keys 0 nodes` one line under "· validator keypair
-                // on this device" — a count of the account's keys read as a
-                // count of this device's, and the two contradicted each other
-                // in the same card. `account_bound` is the fact that tells
-                // them apart, and it was already in state gating Rename.
-                if account_bound
+                // ACCOUNT FACTS, ONLY WHEN THERE IS AN ACCOUNT. With the key
+                // in no account, `load_account` returns zeros for every field,
+                // and the card printed `0 keys` one line under "· validator
+                // keypair on this device" — a count of the account's keys
+                // read as a count of this device's, and the two contradicted
+                // each other in the same card. `account_exists` is the fact
+                // that tells them apart, and it was already in state gating
+                // Rename.
+                if account_exists
                   row gap=8.0 align=center
-                    text account_members
+                    text account_keys
                       with
                         size=12.0
                         wrap=none
@@ -351,21 +354,10 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                         size=12.5
                         wrap=none
                         @text-meta
-                    text account_nodes
-                      with
-                        size=12.0
-                        wrap=none
-                        font=code
-                        @text-meta
-                    text "nodes"
-                      with
-                        size=12.5
-                        wrap=none
-                        @text-meta
                     space w=fill
-                    button "Copy key" -> emit(copy_to_clipboard, account_id, "Key copied")
+                    button "Copy number" -> emit(copy_to_clipboard, account_number, "Number copied")
                       with
-                        disabled=empty(account_id)
+                        disabled=empty(account_number)
                         h=28.0
                         p=7.0
                         @secondary_action

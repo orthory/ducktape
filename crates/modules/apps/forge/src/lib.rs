@@ -79,10 +79,10 @@
 //! consensus CANNOT check ref descendancy: a validator may not hold the
 //! objects, and reading them would break the determinism invariant above. so
 //! AUTHORIZATION is the whole of protected-branch safety. the push that BIRTHS
-//! a repo pins its owner — the Identity ACCOUNT id the origin resolves to (see
-//! [`state::ForgeState::principal_of_origin`]; `git push` signs with the NODE
-//! key, the app's merge with the USER key, and both collapse onto one account)
-//! — and only that owner may move `main`/`dev` afterwards, whether by
+//! a repo pins its owner — the Identity ACCOUNT principal the origin resolves
+//! to (see [`state::ForgeState::principal_of_origin`]; every key of one
+//! association, laptop or phone, collapses onto one account) — and only that
+//! owner may move `main`/`dev` afterwards, whether by
 //! [`ForgeMsg::PushRefs`] or by [`ForgeMsg::MergePr`] onto a protected target.
 //! FEATURE branches stay open to every member.
 //!
