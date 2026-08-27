@@ -1,6 +1,10 @@
-// node ops/auth-page/test.mjs
+// node ops/auth-page/test.mjs — runs the page's pure helper block under node.
 import assert from "node:assert/strict";
-import { b64u, parseRequest, accountNumberLE, spkiToSec1, derToRawSig } from "./public/auth.js";
+import { readFileSync } from "node:fs";
+
+const html = readFileSync(new URL("./index.html", import.meta.url), "utf8");
+const src = html.match(/<script id="pure">([\s\S]*?)<\/script>/)[1];
+const { b64u, parseRequest, spkiToSec1, derToRawSig } = new Function(`${src}; return pure;`)();
 
 // base64url round-trip, including the no-padding + url-safe alphabet cases
 const bytes = Uint8Array.from([0xfb, 0xff, 0xbf, 0x00, 0x01]);
@@ -8,26 +12,25 @@ assert.equal(b64u.enc(bytes), "-_-_AAE");
 assert.deepEqual(b64u.dec("-_-_AAE"), bytes);
 
 // fragment contract
-const req = parseRequest("#op=create&challenge=AQID&user=42&name=demo&cb=http://127.0.0.1:9/");
+const user42 = "KgAAAAAAAAA"; // 42u64 LE
+const req = parseRequest(`#op=create&challenge=AQID&user=${user42}&name=de%20mo&cb=http://127.0.0.1:9/`);
 assert.equal(req.op, "create");
 assert.deepEqual(req.challenge, Uint8Array.from([1, 2, 3]));
-assert.equal(req.user, 42n);
-assert.equal(req.name, "demo");
+assert.deepEqual(req.user, Uint8Array.from([42, 0, 0, 0, 0, 0, 0, 0]));
+assert.equal(req.name, "de mo");
 assert.equal(req.cb, "http://127.0.0.1:9/");
 assert.equal(parseRequest("#op=get&challenge=AQID").cb, null);
 assert.throws(() => parseRequest("#op=get"), /missing challenge/);
-assert.throws(() => parseRequest("#op=create&challenge=AQID&user=1"), /missing name/);
+assert.throws(() => parseRequest(`#op=create&challenge=AQID&user=${user42}`), /missing name/);
+assert.throws(() => parseRequest("#op=create&challenge=AQID&user=AQ&name=x"), /8-byte/);
 assert.throws(() => parseRequest("#op=nope&challenge=AQID"), /unknown op/);
+
 // the callback is loopback-only: a crafted link cannot relay the signature elsewhere
 assert.equal(parseRequest("#op=get&challenge=AQID&cb=http://localhost:9/x").cb, "http://localhost:9/x");
 assert.equal(parseRequest("#op=get&challenge=AQID&cb=http://[::1]:9/").cb, "http://[::1]:9/");
 assert.throws(() => parseRequest("#op=get&challenge=AQID&cb=https://evil.example/"), /cb must be/);
 assert.throws(() => parseRequest("#op=get&challenge=AQID&cb=http://127.0.0.1.evil.example/"), /cb must be/);
 assert.throws(() => parseRequest("#op=get&challenge=AQID&cb=javascript:alert(1)"), /cb must be/);
-
-// u64 LE
-assert.deepEqual(accountNumberLE(1n), Uint8Array.from([1, 0, 0, 0, 0, 0, 0, 0]));
-assert.deepEqual(accountNumberLE(0x0102n), Uint8Array.from([2, 1, 0, 0, 0, 0, 0, 0]));
 
 // SPKI → compressed SEC1: P-256 generator point G (odd y → 0x03 prefix)
 const gx = "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296";

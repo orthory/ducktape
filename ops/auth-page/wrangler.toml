@@ -4,5 +4,5 @@
 # certificate for the hostname in the same account's zone.
 name = "ducktape-auth"
 compatibility_date = "2026-08-01"
-assets = { directory = "./public" }
+assets = { directory = "." }   # index.html only; .assetsignore drops the rest
 routes = [{ pattern = "auth.ducktape.byeongsu.dev", custom_domain = true }]
