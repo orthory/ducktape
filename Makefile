@@ -10,7 +10,7 @@ APP_DEST ?= $(HOME)/Applications
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all app dev demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-repro-check labs-gate
+.PHONY: all app dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-repro-check labs-gate
 
 ## build every workspace crate (the default target)
 all:
@@ -21,10 +21,17 @@ all:
 ## serving, start the local compute/agent/airlock services, sync ducktape's own
 ## repo into that node's forge (dogfood-forge — non-fatal when origin is
 ## unreachable), then run the desktop app against it in the foreground. Ctrl-C
-## quits the app and leaves the node and services running; `make demo-clear`
-## tears down.
+## quits the app and leaves the node and services running; `make dev-clear`
+## stops that background runtime without deleting its state, while
+## `make demo-clear` removes the workspace entirely.
 dev:
 	@bash ops/dev.sh
+
+## stop the demo node and compute/agent/airlock services left by `make dev`.
+## Preserves the workspace, registry entry, module state, wallets, and
+## credentials. The foreground app and `make demo-app` are not killed.
+dev-clear:
+	@bash ops/dev-clear.sh
 
 ## seed a local "demo" network preloaded with sample data — chat channels +
 ## messages, a tasks board, pages, a registered agent (with a live @mention run),
