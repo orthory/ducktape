@@ -386,7 +386,8 @@ const PACK_SWEEP_TICK: std::time::Duration = std::time::Duration::from_secs(30);
 /// keeps that to one legitimate pack's worth of disk.
 pub const MAX_FORGE_PACK_BYTES: u64 = 512 * 1024 * 1024;
 
-/// pull the packs forge is waiting on, forever.
+/// keep this node's forge substrate healthy, forever: pull the packs forge is
+/// waiting on, then collapse the packs it has piled up.
 ///
 /// forge's submit-time fanout reaches only the CURRENT validators, so a
 /// resident — or a validator that was down during the push — holds a committed
@@ -400,6 +401,12 @@ pub const MAX_FORGE_PACK_BYTES: u64 = 512 * 1024 * 1024;
 /// module code uses, and stop. forge picks them up from its blob store on its
 /// next `commit_block` — nothing here touches the repo, the module, or the
 /// host, so it can never influence a root.
+///
+/// compaction rides the same tick because it needs the same two things (the
+/// workspace path and a moment when nothing is mid-block) and has the same
+/// standing — node-local, ref-reading, root-blind. it is a `read_dir` on a
+/// caught-up workspace until a repo passes [`forge::COMPACT_PACK_LIMIT`], and
+/// the repack itself blocks, so it runs off the runtime's blocking pool.
 pub async fn sweep_forge_packs<C: SyncClient + SourceRotate>(
     client: C,
     blobs: blobstore::BlobHandle,
@@ -409,7 +416,31 @@ pub async fn sweep_forge_packs<C: SyncClient + SourceRotate>(
     loop {
         tokio::time::sleep(PACK_SWEEP_TICK).await;
         sweep_packs_once(&client, &blobs, &forge_repo, &label).await;
+        compact_forge_packs_once(forge_repo.clone(), &label).await;
     }
+}
+
+/// one compaction tick, off-thread. a failure is this node's own housekeeping
+/// falling behind — the repo still serves every committed head it holds — and
+/// every tick retries, so like the pull above this is per-attempt noise rather
+/// than a warning that would evict the ring 120 times an hour.
+async fn compact_forge_packs_once(forge_repo: std::path::PathBuf, label: &str) {
+    let compacted = tokio::task::spawn_blocking(move || {
+        forge::compact_repos(&forge_repo, forge::COMPACT_PACK_LIMIT)
+    })
+    .await;
+    let failure = match compacted {
+        Ok(Ok(_)) => return,
+        Ok(Err(e)) => e.to_string(),
+        Err(e) => e.to_string(),
+    };
+    tracing::debug!(
+        target: "ducktape::forge",
+        node = %label,
+        reason = "compaction_failed",
+        error = %failure,
+        "could not collapse this node's forge packfiles"
+    );
 }
 
 /// one sweep tick — the whole body, so it is reachable without a clock.
