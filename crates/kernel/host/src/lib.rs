@@ -672,8 +672,9 @@ impl Host {
     /// module is absent / its reply is unreadable — the shared out-of-block
     /// committed read behind [`Host::pending_lifecycle_advance`] and
     /// [`Host::realize_module_swaps`] (a missing registry is never an error,
-    /// just nothing to do).
-    async fn lifecycle_module_status(&self) -> Option<Vec<lifecycle::ModuleCode>> {
+    /// just nothing to do). `pub` for the node's restore/sync composers, which
+    /// adopt the modules the registry admitted after genesis.
+    pub async fn lifecycle_module_status(&self) -> Option<Vec<lifecycle::ModuleCode>> {
         let req = lifecycle::encode_query(&lifecycle::LifecycleQuery::ModuleStatus);
         let bytes = self.query(LIFECYCLE_MODULE_ID, &req).await.ok()?;
         match lifecycle::decode_reply(&bytes).ok()? {
