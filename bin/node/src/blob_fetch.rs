@@ -320,8 +320,10 @@ impl<C: SyncClient + SourceRotate> host::CodeSource for FetchingCodeSource<C> {
             fetch_blob(&self.client, &self.local, &digest, self.cap, self.attempts).await
         {
             // an honest report, not a panic: the caller (realize) fails
-            // closed on the None and says which hash it needed.
-            tracing::warn!(
+            // closed on the None and says which hash it needed. `debug`: this
+            // fires once per hash per park attempt (the replica park's failure
+            // arm `warn!`s once per attempt with the reason).
+            tracing::debug!(
                 target: "ducktape::modules",
                 digest = %crate::config::hex_bytes(&digest),
                 error = %e,
