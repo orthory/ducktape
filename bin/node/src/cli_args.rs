@@ -47,6 +47,26 @@ pub enum OpCmd {
     /// whose work this node will execute
     #[command(subcommand)]
     Work(WorkCmd),
+    /// whether this node isolates provider runs, and turn it on
+    Sandbox(SandboxArgs),
+}
+
+/// `ducktape node sandbox` — reconcile "can this HOST isolate a run" with
+/// "does this WORKSPACE say to".
+///
+/// They are decided at different moments and can disagree for a long time
+/// without saying so: the `[sandbox]` table is written once, when `node
+/// init`/`join` probed the host, and nothing revisits it. A machine that gained
+/// its hypervisor afterwards keeps a node.toml that refuses every provider run,
+/// and the only symptom is the compute daemon's boot FATAL — after the setup
+/// steps have all reported ready.
+#[derive(Debug, clap::Args)]
+pub struct SandboxArgs {
+    /// write the table without asking (for scripts and non-interactive hosts)
+    #[arg(long)]
+    pub yes: bool,
+    #[command(flatten)]
+    pub selector: Selector,
 }
 
 /// `ducktape node work` — this node's own answer to "whose workload do I run?".

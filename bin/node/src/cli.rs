@@ -33,6 +33,7 @@ pub(super) fn run(op: OpCmd) -> CommandResult {
         OpCmd::Resident(cmd) => dispatch_resident(cmd),
         OpCmd::Member(cmd) => dispatch_member(cmd),
         OpCmd::Work(cmd) => dispatch_work(cmd),
+        OpCmd::Sandbox(args) => crate::sandbox_cli::run(args),
     }
 }
 

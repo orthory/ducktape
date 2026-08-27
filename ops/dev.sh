@@ -53,6 +53,15 @@ if [ ! -f "$WSDIR/node.toml" ] || [ ! -f "$WSDIR/network.toml" ] || [ -n "${DEV_
   bash "$SCRIPT_DIR/demo-seed.sh" || die "seeding the '$ID' localnet failed"
 fi
 
+# A workspace seeded before this host could sandbox — or before the guest images
+# moved — carries a [sandbox] table that says the opposite of what the machine
+# can now do, and says it silently: every step above reports ready and the
+# compute daemon dies at boot. Reconcile the two here, where the workspace has
+# just appeared. --yes because the operator asked for a dev node, and a dev
+# node's own compute plane is not a separate decision.
+"$NODE_BIN" node sandbox --config "$WSDIR/node.toml" --yes \
+  || log "this workspace will refuse provider runs — see above"
+
 # The workspace's app endpoint — the same `http_listen` key the app reads.
 LISTEN="$(sed -n 's/^[[:space:]]*http_listen[[:space:]]*=[[:space:]]*"\{0,1\}\([^"#]*\)"\{0,1\}.*/\1/p' \
   "$WSDIR/node.toml" | head -1 | tr -d '[:space:]')"

@@ -91,6 +91,7 @@ mod relay_runtime;
 mod replica;
 mod resource_limits;
 mod rpc;
+mod sandbox_cli;
 mod services;
 mod sync;
 mod term_plane;

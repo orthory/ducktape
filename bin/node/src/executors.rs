@@ -350,14 +350,106 @@ fn download_to(url: &str, dest: &Path) -> Result<(), String> {
         .map_err(|e| format!("fetch {url}: {e}"))?
         .error_for_status()
         .map_err(|e| format!("fetch {url}: {e}"))?;
+    let response_length = response.content_length();
+    // The meter draws nothing off a terminal, so say the size once instead: it
+    // is the part that tells a long download from a wedged one, and it is the
+    // only part a log wants.
+    if !std::io::stdout().is_terminal() {
+        match response_length {
+            Some(total) => println!("  downloading {} MiB", mib(total)),
+            None => println!("  downloading"),
+        }
+    }
     let mut file =
         std::fs::File::create(&part).map_err(|e| format!("create {}: {e}", part.display()))?;
-    let copied = std::io::copy(&mut response, &mut file);
+    let mut metered = Metered::new(&mut response, response_length);
+    let copied = std::io::copy(&mut metered, &mut file);
+    metered.finish();
     if let Err(e) = copied {
         let _ = std::fs::remove_file(&part);
         return Err(format!("download {url}: {e}"));
     }
     std::fs::rename(&part, dest).map_err(|e| format!("rename into {}: {e}", dest.display()))
+}
+
+const METER_CELLS: u64 = 24;
+
+/// A `Read` that draws a one-line meter as the bytes go past, so a
+/// quarter-gigabyte download does not look like a hung terminal.
+///
+/// Wrapping the response keeps `io::copy` doing the copying — the alternative
+/// was hand-rolling the read/write loop to count in the middle of it.
+struct Metered<R> {
+    inner: R,
+    total: Option<u64>,
+    done: u64,
+    /// When the line was last rewritten. A redraw per 8 KiB chunk would spend
+    /// more time on the terminal than on the socket.
+    drawn: std::time::Instant,
+    /// Redirected output COLLECTS a line per redraw instead of rewriting one,
+    /// and `make dev`'s log is what would collect them.
+    live: bool,
+}
+
+impl<R: std::io::Read> Metered<R> {
+    fn new(inner: R, total: Option<u64>) -> Self {
+        Self {
+            inner,
+            total,
+            done: 0,
+            drawn: std::time::Instant::now(),
+            live: std::io::stdout().is_terminal(),
+        }
+    }
+
+    /// A server that sends no `Content-Length` gets a byte count and no bar —
+    /// a bar with a guessed denominator is a worse answer than none.
+    fn line(&self) -> String {
+        let Some(total) = self.total.filter(|total| *total > 0) else {
+            return format!("  {} MiB", mib(self.done));
+        };
+        let filled = (self.done * METER_CELLS / total).min(METER_CELLS) as usize;
+        format!(
+            "  [{}{}] {} / {} MiB",
+            "#".repeat(filled),
+            "·".repeat(METER_CELLS as usize - filled),
+            mib(self.done),
+            mib(total)
+        )
+    }
+
+    fn draw(&self) {
+        if !self.live {
+            return;
+        }
+        print!("\r{}", self.line());
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+
+    /// Close the line so the next print does not land on top of it.
+    fn finish(&self) {
+        if !self.live {
+            return;
+        }
+        self.draw();
+        println!();
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for Metered<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.done += read as u64;
+        if self.drawn.elapsed() >= std::time::Duration::from_millis(100) {
+            self.drawn = std::time::Instant::now();
+            self.draw();
+        }
+        Ok(read)
+    }
+}
+
+fn mib(bytes: u64) -> String {
+    format!("{:.1}", bytes as f64 / (1024.0 * 1024.0))
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
@@ -403,6 +495,40 @@ fn install_file(src: &Path, dest: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The meter's only real arithmetic is the fill, and it has to hold at both
+    /// ends and on a server that sends no `Content-Length` — the bar is drawn
+    /// against a quarter-gigabyte download nobody can otherwise tell from a
+    /// hung terminal.
+    #[test]
+    fn the_meter_fills_end_to_end_and_degrades_without_a_length() {
+        let meter = |done: u64, total: Option<u64>| {
+            let mut meter = Metered::new(std::io::empty(), total);
+            meter.done = done;
+            meter.line()
+        };
+        let mib = 1024 * 1024;
+        assert_eq!(
+            meter(0, Some(100 * mib)),
+            "  [························] 0.0 / 100.0 MiB"
+        );
+        assert_eq!(
+            meter(50 * mib, Some(100 * mib)),
+            "  [############············] 50.0 / 100.0 MiB"
+        );
+        assert_eq!(
+            meter(100 * mib, Some(100 * mib)),
+            "  [########################] 100.0 / 100.0 MiB"
+        );
+        // a length that undercounts must not run the bar off its own end.
+        assert_eq!(
+            meter(200 * mib, Some(100 * mib)),
+            "  [########################] 200.0 / 100.0 MiB"
+        );
+        // no length, and a zero length (which would divide by it).
+        assert_eq!(meter(7 * mib, None), "  7.0 MiB");
+        assert_eq!(meter(7 * mib, Some(0)), "  7.0 MiB");
+    }
 
     /// Every pin is a full sha256 and every url is the vendor's, on both
     /// arches — the two things a bump can get wrong without failing to compile.
