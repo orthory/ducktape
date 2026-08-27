@@ -116,6 +116,9 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         coordinator_relay,
         wireguard_advertised,
         compute_backend,
+        // not an env fact: the genesis wasm set is read off `Resolved` where
+        // the module set is composed, never copied into the boot environment.
+        genesis: _,
     } = resolved;
     // A key outside the GENESIS validator set is not an error: post-genesis
     // standing is admitted via governance and resolved from the latest
