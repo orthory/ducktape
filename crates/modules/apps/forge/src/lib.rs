@@ -145,7 +145,7 @@ mod module;
 pub mod refs;
 pub mod state;
 #[cfg(feature = "native")]
-pub use module::{Forge, pending_digests};
+pub use module::{COMPACT_PACK_LIMIT, Forge, compact_repos, pending_digests};
 #[cfg(feature = "native")]
 mod backing;
 #[cfg(feature = "native")]

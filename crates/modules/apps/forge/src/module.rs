@@ -88,6 +88,73 @@ fn decode_pending(bytes: &[u8]) -> Result<BTreeMap<String, refs::PendingMap>, Er
     Ok(out)
 }
 
+/// the per-repo catch-up map on disk, decoded WITHOUT opening the module — an
+/// absent file is an empty map. [`pending_digests`], [`compact_repos`], and
+/// [`Forge::init`]'s re-adopt all read the file through here.
+fn read_pending(base: &std::path::Path) -> Result<BTreeMap<String, refs::PendingMap>, Error> {
+    let bytes = match std::fs::read(base.join(PENDING_FILE)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(Error::Module(format!("forge: read pending file: {e}"))),
+    };
+    decode_pending(&bytes)
+}
+
+/// packs one repo may accumulate before [`compact_repos`] collapses them —
+/// git's own `gc.autoPackLimit` default. the ceiling is load-bearing on THIS
+/// substrate: libgit2 ships no gc, so nothing collapses packs on its own (see
+/// [`git::compact`] for the measured cost of letting them pile up).
+pub const COMPACT_PACK_LIMIT: usize = 50;
+
+/// collapse the packfiles every repo under `base` has accumulated, and return
+/// how many packs that reclaimed. the node's maintenance handle, with the same
+/// out-of-band standing as [`pending_digests`]: it never opens the module,
+/// never moves a ref, and can never reach a root.
+///
+/// a repo whose branches are still WAITING on their objects is skipped — its
+/// on-disk refs run behind the committed heads, so the closure kept here is
+/// not the closure the repo is about to need. it compacts on a later tick,
+/// once the node's blob sweep has caught it up.
+pub fn compact_repos(base: &std::path::Path, min_packs: usize) -> Result<usize, Error> {
+    let pending = read_pending(base)?;
+    let entries = match std::fs::read_dir(base) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(Error::Module(format!("forge: read repo base: {e}"))),
+    };
+    let mut reclaimed = 0;
+    for entry in entries {
+        let dir = entry
+            .map_err(|e| Error::Module(format!("forge: read repo base: {e}")))?
+            .path();
+        let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let is_repo = dir.join(".git").exists();
+        let waiting = pending
+            .get(name)
+            .is_some_and(|branches| !branches.is_empty());
+        if !is_repo || waiting {
+            continue;
+        }
+        let repo = git::open(&dir)
+            .map_err(|e| Error::Module(format!("forge: open repo {name:?}: {e}")))?;
+        let packs = git::compact(&repo, min_packs)
+            .map_err(|e| Error::Module(format!("forge: compact repo {name:?}: {e}")))?;
+        if packs == 0 {
+            continue;
+        }
+        tracing::info!(
+            target: "ducktape::forge",
+            repo = %name,
+            packs,
+            "compacted a repo's packfiles into one"
+        );
+        reclaimed += packs;
+    }
+    Ok(reclaimed)
+}
+
 /// every pack digest a forge workspace is still waiting on, read from
 /// [`PENDING_FILE`] WITHOUT opening the module.
 ///
@@ -99,13 +166,7 @@ fn decode_pending(bytes: &[u8]) -> Result<BTreeMap<String, refs::PendingMap>, Er
 ///
 /// a workspace with nothing outstanding has no file, which is `Ok(vec![])`.
 pub fn pending_digests(base: &std::path::Path) -> Result<Vec<[u8; 32]>, Error> {
-    let path = base.join(PENDING_FILE);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(Error::Module(format!("forge: read pending file: {e}"))),
-    };
-    let mut digests: Vec<[u8; 32]> = decode_pending(&bytes)?
+    let mut digests: Vec<[u8; 32]> = read_pending(base)?
         .into_values()
         .flat_map(|pending| pending.into_values().map(|(_, digest)| digest))
         .collect();
@@ -232,13 +293,8 @@ impl Forge {
         // read, so it is the authority wherever the two disagree. a corrupt
         // file is FAIL-STOP for the same reason the tracker is — booting on a
         // rewound branch map composes a wrong root.
-        let pending_path = base.join(PENDING_FILE);
-        if pending_path.exists() {
-            let bytes = std::fs::read(&pending_path)
-                .map_err(|e| Error::Module(format!("forge: read pending file: {e}")))?;
-            for (name, pending) in decode_pending(&bytes)? {
-                repos.entry(name).or_default().adopt_pending(pending);
-            }
+        for (name, pending) in read_pending(&base)? {
+            repos.entry(name).or_default().adopt_pending(pending);
         }
 
         // re-adopt the persisted tracker. a corrupt file is FAIL-STOP (like a
@@ -2793,6 +2849,132 @@ mod tests {
             "the owner is re-adopted from the persisted tracker"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// installed packs under a repo — what compaction collapses.
+    fn pack_count(repo_dir: &std::path::Path) -> usize {
+        std::fs::read_dir(repo_dir.join(".git").join("objects").join("pack"))
+            .expect("a repo that received a pack has a pack dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "pack"))
+            .count()
+    }
+
+    /// seed `base/demo` the way `materialize` does — one installed pack per
+    /// push, objects that exist ONLY inside those packs (the history is built
+    /// in a separate repo, so nothing lands loose) — and return its head.
+    fn seed_pushed_packs(base: &std::path::Path, source_base: &std::path::Path) -> Oid {
+        let source = git::init(source_base).expect("source repo");
+        let dest = refs::open_or_init_repo(base, "demo").expect("dest repo");
+        let mut head = None;
+        for (t, content) in ["one", "two", "three"].iter().enumerate() {
+            let blob = source.blob(content.as_bytes()).unwrap();
+            let parent = head.map(|oid: Oid| source.find_commit(oid.into()).unwrap());
+            let base_tree = parent.as_ref().map(|commit| commit.tree().unwrap());
+            let tree_oid = git::build_tree(&source, base_tree.as_ref(), "a.txt", blob).unwrap();
+            let tree = source.find_tree(tree_oid).unwrap();
+            let oid = git::commit(&source, &tree, parent.as_ref(), content, t as u64).unwrap();
+            // what a real push carries: the closure the client's common base
+            // leaves out, and the WHOLE closure only when it has no base.
+            let pack = match head {
+                Some(prev) => git::pack_delta(&source, &[oid], &[prev.into()]).unwrap(),
+                None => git::pack_closure_many(&source, &[oid]).unwrap(),
+            };
+            git::install_pack(&dest, &pack).unwrap();
+            head = Some(oid.into());
+        }
+        let head = head.expect("three commits");
+        git::update_ref(&dest, &refs::full_ref(MAIN_BRANCH), head.into()).unwrap();
+        head
+    }
+
+    /// libgit2 implements no gc, so nothing but this collapses the pack a
+    /// push installs. compaction must leave ONE pack that still closes the
+    /// branch head, with the ref untouched.
+    #[test]
+    fn compaction_folds_the_packs_and_keeps_every_head_whole() {
+        let base = tmp_base("compact");
+        let source_base = tmp_base("compact-source");
+        let head = seed_pushed_packs(&base, &source_base);
+        assert_eq!(pack_count(&base.join("demo")), 3, "one pack per push");
+
+        let reclaimed = compact_repos(&base, 2).expect("compaction runs");
+
+        assert_eq!(reclaimed, 3, "every pack that predated the compacted one");
+        assert_eq!(pack_count(&base.join("demo")), 1, "collapsed into one pack");
+        let repo = refs::open_or_init_repo(&base, "demo").unwrap();
+        git::verify_closure(&repo, head.into())
+            .expect("the compacted pack still closes the branch head");
+        assert_eq!(git_head_oid(&base, "demo"), head, "the ref never moved");
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&source_base);
+    }
+
+    /// a packfile is named for its contents, so when one installed pack
+    /// ALREADY holds the whole closure, compaction re-installs that same file
+    /// and has nothing new to keep. it must then leave every pack alone rather
+    /// than unlink the one holding everything.
+    #[test]
+    fn compaction_keeps_the_pack_that_already_holds_the_whole_closure() {
+        let base = tmp_base("compact-collide");
+        let source_base = tmp_base("compact-collide-source");
+        let head = seed_pushed_packs(&base, &source_base);
+        // a client with no common base pushes the FULL closure — the same pack
+        // compaction would write.
+        let source = git::open(&source_base).unwrap();
+        let dest = refs::open_or_init_repo(&base, "demo").unwrap();
+        let whole = git::pack_closure_many(&source, &[head.into()]).unwrap();
+        git::install_pack(&dest, &whole).unwrap();
+        assert_eq!(pack_count(&base.join("demo")), 4);
+
+        assert_eq!(compact_repos(&base, 2).expect("compaction runs"), 0);
+
+        assert_eq!(pack_count(&base.join("demo")), 4, "nothing unlinked");
+        git::verify_closure(&dest, head.into()).expect("the closure survives");
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&source_base);
+    }
+
+    /// a repo below the ceiling is left alone — the point of the ceiling is
+    /// that repacking a healthy repo every tick is pure waste.
+    #[test]
+    fn compaction_leaves_a_repo_under_the_pack_ceiling_alone() {
+        let base = tmp_base("compact-under");
+        let source_base = tmp_base("compact-under-source");
+        seed_pushed_packs(&base, &source_base);
+
+        assert_eq!(compact_repos(&base, 3).expect("compaction runs"), 0);
+
+        assert_eq!(pack_count(&base.join("demo")), 3, "packs untouched");
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&source_base);
+    }
+
+    /// a repo still waiting on objects keeps its packs: its on-disk refs run
+    /// behind the committed heads, so the closure compaction would keep is not
+    /// the closure the repo is about to need.
+    #[test]
+    fn compaction_skips_a_repo_still_waiting_on_its_objects() {
+        let base = tmp_base("compact-pending");
+        let source_base = tmp_base("compact-pending-source");
+        let head = seed_pushed_packs(&base, &source_base);
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+        forge
+            .state
+            .repos
+            .get_mut("demo")
+            .expect("the on-disk repo is adopted")
+            .adopt_pending(refs::PendingMap::from([(
+                MAIN_BRANCH.to_string(),
+                (head, [7u8; 32]),
+            )]));
+        forge.persist_pending().unwrap();
+
+        assert_eq!(compact_repos(&base, 2).expect("compaction runs"), 0);
+
+        assert_eq!(pack_count(&base.join("demo")), 3, "packs untouched");
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&source_base);
     }
 
     #[test]
