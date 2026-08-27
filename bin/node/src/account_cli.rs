@@ -120,17 +120,21 @@ pub(crate) enum KeyCmd {
     /// `key join`; `--passkey`/`--eth` run the browser ceremony and submit
     Add {
         /// the key (hex) being admitted
-        #[arg(long, value_name = "HEX", required_unless_present_any = ["passkey", "eth"])]
+        #[arg(long, value_name = "HEX", required_unless_present_any = ["passkey", "eth", "ssh"])]
         pubkey: Option<String>,
         /// the key's scheme (with --pubkey)
         #[arg(long, value_enum, default_value_t = SchemeArg::Ed25519)]
         scheme: SchemeArg,
         /// register a NEW passkey in the browser and admit it
-        #[arg(long, conflicts_with_all = ["pubkey", "eth"])]
+        #[arg(long, conflicts_with_all = ["pubkey", "eth", "ssh"])]
         passkey: bool,
         /// link an Ethereum wallet from the browser and admit it
-        #[arg(long, conflicts_with = "pubkey")]
+        #[arg(long, conflicts_with_all = ["pubkey", "ssh"])]
         eth: bool,
+        /// admit an SSH ed25519 key (its `.pub` file; the private key or
+        /// ssh-agent signs via `ssh-keygen -Y sign`) — for `git push --signed`
+        #[arg(long, value_name = "PATH", conflicts_with = "pubkey")]
+        ssh: Option<PathBuf>,
         /// a human label for the key (e.g. "phone")
         #[arg(long, value_name = "TEXT")]
         label: Option<String>,
@@ -185,17 +189,27 @@ enum NewKey {
     Passkey,
     /// a wallet linked in the browser, submitted by its own signature
     Wallet,
+    /// an SSH ed25519 key (`.pub` path), submitted by its own `ssh-keygen`
+    /// signature
+    Ssh(PathBuf),
 }
 
-/// the three flags, resolved once (clap already refused a mix).
-fn new_key(pubkey: Option<String>, scheme: SchemeArg, passkey: bool, eth: bool) -> NewKey {
-    match (pubkey, passkey, eth) {
-        (Some(pubkey), _, _) => NewKey::Hex {
+/// the four flags, resolved once (clap already refused a mix).
+fn new_key(
+    pubkey: Option<String>,
+    scheme: SchemeArg,
+    passkey: bool,
+    eth: bool,
+    ssh: Option<PathBuf>,
+) -> NewKey {
+    match (pubkey, passkey, eth, ssh) {
+        (_, _, _, Some(path)) => NewKey::Ssh(path),
+        (Some(pubkey), _, _, None) => NewKey::Hex {
             pubkey,
             scheme: scheme.into(),
         },
-        (None, true, _) => NewKey::Passkey,
-        (None, false, _) => NewKey::Wallet,
+        (None, true, _, None) => NewKey::Passkey,
+        (None, false, _, None) => NewKey::Wallet,
     }
 }
 
@@ -227,11 +241,12 @@ pub(crate) fn run(args: AccountArgs) -> AccountResult {
             scheme,
             passkey,
             eth,
+            ssh,
             label,
         }) => cmd_key_add(
             &ctx,
             &auth,
-            new_key(pubkey, scheme, passkey, eth),
+            new_key(pubkey, scheme, passkey, eth, ssh),
             label,
             &mut stdin,
         ),
@@ -304,7 +319,84 @@ fn cmd_key_add(
         NewKey::Hex { pubkey, scheme } => cmd_key_add_hex(ctx, pubkey, scheme, label, stdin),
         NewKey::Passkey => cmd_key_add_passkey(ctx, auth, label, stdin),
         NewKey::Wallet => cmd_key_add_wallet(ctx, auth, label, stdin),
+        NewKey::Ssh(path) => cmd_key_add_ssh(ctx, &path, label, stdin),
     }
+}
+
+/// `key add --ssh <id_ed25519.pub>`: this device consents, and the SSH key
+/// signs its own `AddKey` frame AS ITS ORIGIN through `ssh-keygen -Y sign -n
+/// ducktape` (the private key file beside the `.pub`, or ssh-agent) — the
+/// OpenSSH envelope the `Ed25519` scheme accepts. Once a member, the key's
+/// `git push --signed` speaks for this account.
+fn cmd_key_add_ssh(
+    ctx: &VerbCtx,
+    pub_path: &std::path::Path,
+    label: Option<String>,
+    stdin: &mut impl BufRead,
+) -> AccountResult {
+    let line = std::fs::read_to_string(pub_path)
+        .map_err(|e| format!("reading {}: {e}", pub_path.display()))?;
+    let pubkey = keyscheme::sshsig::authorized_key(&line)?;
+    let base = ctx.http_base()?;
+    let chain_id = ctx.workspace()?.service.chain_id;
+    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    own_account(&base, user.public_key().as_ref())?;
+    let msg = consented_add_key(&base, &user, &chain_id, KeyScheme::Ed25519, &pubkey, label)?;
+    let preimage = node::frame_preimage(
+        KeyScheme::Ed25519,
+        &pubkey,
+        frame_seq(),
+        &identity_msg(&msg),
+    );
+    let armored = ssh_keygen_sign(
+        pub_path,
+        &keyscheme::sshsig::ssh_message(node::FRAME_NS, &preimage),
+    )?;
+    let height = node_http::submit_frame(&base, &ssh_frame(preimage, &armored)?)?;
+    println!("ssh key {} added at height {height}", hex_bytes(&pubkey));
+    print_keys(&own_account(&base, user.public_key().as_ref())?);
+    eprintln!(
+        "signed pushes now speak for this account:\n    git config gpg.format ssh\n    \
+         git config user.signingkey {}\n    git config push.gpgSign true",
+        pub_path.display()
+    );
+    Ok(())
+}
+
+/// `ssh-keygen -Y sign -n ducktape -f <pub>` over `message` on stdin; the
+/// armored signature it prints. `-f` takes the `.pub` when the private key
+/// sits beside it or in ssh-agent — ssh-keygen resolves that itself.
+fn ssh_keygen_sign(pub_path: &std::path::Path, message: &[u8]) -> Result<String, String> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("ssh-keygen")
+        .args(["-Y", "sign", "-n", keyscheme::sshsig::DUCKTAPE_SSH_NS, "-f"])
+        .arg(pub_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("running ssh-keygen: {e}"))?;
+    child
+        .stdin
+        .take()
+        .expect("piped")
+        .write_all(message)
+        .map_err(|e| format!("feeding ssh-keygen: {e}"))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("waiting for ssh-keygen: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("ssh-keygen -Y sign failed ({})", out.status));
+    }
+    String::from_utf8(out.stdout).map_err(|_| "ssh-keygen printed non-utf-8".to_string())
+}
+
+/// the SSH key's frame: preimage ‖ the dearmored SSHSIG — what
+/// `/v1/submit/frame` verifies under `Ed25519`'s OpenSSH envelope.
+fn ssh_frame(mut preimage: Vec<u8>, armored: &str) -> Result<Vec<u8>, String> {
+    preimage.extend_from_slice(&keyscheme::sshsig::dearmor(armored)?);
+    Ok(preimage)
 }
 
 fn cmd_key_add_hex(
@@ -831,6 +923,14 @@ mod tests {
                 ..
             })
         ));
+        assert!(matches!(
+            parse("t key add --ssh /home/me/.ssh/id_ed25519.pub").unwrap(),
+            AccountCmd::Key(KeyCmd::Add { ssh: Some(_), .. })
+        ));
+        assert!(
+            parse("t key add --ssh a.pub --passkey").is_err(),
+            "two sources"
+        );
         assert!(parse("t key add").is_err(), "no source");
         assert!(parse("t key add --passkey --eth").is_err(), "two sources");
         assert!(parse(&format!("t key add --pubkey {hex} --eth")).is_err());
@@ -842,10 +942,36 @@ mod tests {
             parse("t login --label laptop").unwrap(),
             AccountCmd::Login { label: Some(_) }
         ));
-        match new_key(None, SchemeArg::Ed25519, false, true) {
+        match new_key(None, SchemeArg::Ed25519, false, true, None) {
             NewKey::Wallet => {}
-            NewKey::Hex { .. } | NewKey::Passkey => panic!("--eth is the wallet"),
+            NewKey::Hex { .. } | NewKey::Passkey | NewKey::Ssh(_) => panic!("--eth is the wallet"),
         }
+    }
+
+    /// an SSH key's admission: the frame the CLI submits carries the key's
+    /// own `ssh-keygen -Y sign -n ducktape` (faked by the testkit, armored as
+    /// ssh-keygen prints it) and decodes at the node with the SSH key as its
+    /// verified origin.
+    #[test]
+    fn an_ssh_key_signs_its_own_admission() {
+        use keyscheme::sshsig::{armor, ssh_message};
+        use keyscheme::testkit::{ssh_key, ssh_proof, ssh_pubkey};
+        let member = signer(5);
+        let sk = ssh_key(3);
+        let pubkey = ssh_pubkey(&sk);
+        let msg = add_key_msg(&member, "chain-a", KeyScheme::Ed25519, &pubkey, None, 0);
+        let preimage = node::frame_preimage(KeyScheme::Ed25519, &pubkey, 9, &identity_msg(&msg));
+        // what ssh-keygen prints for the bytes the CLI pipes into it.
+        let armored = armor(&ssh_proof(&sk, node::FRAME_NS, &preimage));
+        assert_eq!(
+            ssh_message(node::FRAME_NS, &preimage),
+            keyscheme::sshsig::ssh_message(node::FRAME_NS, &preimage)
+        );
+        let frame = ssh_frame(preimage, &armored).unwrap();
+        let (origin, submitted) = node::decode_frame(&frame).expect("the node verifies it");
+        assert_eq!(origin, sdk::Origin::External(pubkey));
+        assert_eq!(identity::decode_msg(&submitted.payload).unwrap(), msg);
+        assert!(ssh_frame(Vec::new(), "not armored").is_err());
     }
 
     /// a login's frame: the page's assertion (faked exactly as an

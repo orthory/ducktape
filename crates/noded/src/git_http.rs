@@ -288,6 +288,120 @@ async fn forge_refs(handle: &NodeHandle, repo: &str) -> Result<Vec<forge::RefHea
     }
 }
 
+/// a receive-pack command list, decoded.
+#[derive(Debug)]
+struct PushCommands {
+    /// `(old hex, new hex, full refname)` per update — the report-status
+    /// keys, in the order the pusher named them.
+    cmds: Vec<(String, String, String)>,
+    /// `git push --signed`'s certificate, when one rode along.
+    cert: Option<forge::PushCert>,
+}
+
+const PUSH_CERT_LINE: &str = "push-cert";
+const PUSH_CERT_END: &str = "push-cert-end";
+const SSHSIG_ARMOR_BEGIN: &str = "-----BEGIN SSH SIGNATURE-----";
+
+/// decode the command list. a stock push sends `<old> <new> <refname>` lines
+/// (capabilities after a NUL on the first). a signed push (send-pack.c
+/// `generate_push_cert`) sends `push-cert\0<caps>` instead, then every line
+/// of the certificate — its text, then the armored signature — one pkt-line
+/// each WITH its newline, then `push-cert-end`; the ref updates are inside
+/// the certificate, and the plain lines are not sent. `expected_nonce` is
+/// what this node advertised: a certificate must echo it (the chain half of
+/// the nonce is checked here, the repo half by consensus).
+fn parse_push_commands(
+    commands: &[Vec<u8>],
+    expected_nonce: Option<&str>,
+) -> Result<PushCommands, String> {
+    let Some((first, rest)) = commands.split_first() else {
+        return Err("empty command list".into());
+    };
+    let signed = command_text(first) == PUSH_CERT_LINE;
+    if !signed {
+        let cmds = commands
+            .iter()
+            .map(|raw| command_triple(command_text(raw)))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(PushCommands { cmds, cert: None });
+    }
+    let Some(expected_nonce) = expected_nonce else {
+        return Err("this node offered no push-cert (its chain is not named yet)".into());
+    };
+    let (text, armor) = certificate_lines(rest)?;
+    let sshsig = keyscheme::sshsig::dearmor(&armor)?;
+    let certificate = forge::pushcert::parse(text.as_bytes())?;
+    if certificate.nonce != expected_nonce {
+        return Err(format!(
+            "push certificate nonce {:?} is not this node's {expected_nonce:?}",
+            certificate.nonce
+        ));
+    }
+    let cmds = certificate
+        .updates
+        .iter()
+        .map(|u| {
+            (
+                oid_hex(u.prev_oid.as_deref()),
+                oid_hex(u.new_oid.as_deref()),
+                format!("{GIT_HEADS_PREFIX}{}", u.ref_name),
+            )
+        })
+        .collect();
+    Ok(PushCommands {
+        cmds,
+        cert: Some(forge::PushCert {
+            cert: text.into_bytes(),
+            sshsig,
+        }),
+    })
+}
+
+/// the certificate's text and its armored signature, reassembled from the
+/// pkt-lines between `push-cert` and `push-cert-end` — verbatim, newline for
+/// newline, because the signature is over exactly those bytes.
+fn certificate_lines(lines: &[Vec<u8>]) -> Result<(String, String), String> {
+    let mut text = String::new();
+    let mut armor = String::new();
+    for raw in lines {
+        let line = std::str::from_utf8(raw).map_err(|_| "push certificate is not utf-8")?;
+        if line.trim_end() == PUSH_CERT_END {
+            return Ok((text, armor));
+        }
+        let in_armor = !armor.is_empty() || line.starts_with(SSHSIG_ARMOR_BEGIN);
+        if in_armor {
+            armor.push_str(line);
+        } else {
+            text.push_str(line);
+        }
+    }
+    Err("push certificate is not terminated by push-cert-end".into())
+}
+
+/// a command pkt-line's text: up to the NUL that starts the capability list
+/// (first line only), trailing newline dropped.
+fn command_text(raw: &[u8]) -> &str {
+    let nul = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    std::str::from_utf8(&raw[..nul])
+        .map(str::trim_end)
+        .unwrap_or("")
+}
+
+fn command_triple(line: &str) -> Result<(String, String, String), String> {
+    let mut parts = line.split(' ');
+    let (Some(old), Some(new), Some(refname)) = (parts.next(), parts.next(), parts.next()) else {
+        return Err("malformed ref-update command".into());
+    };
+    Ok((old.to_string(), new.to_string(), refname.to_string()))
+}
+
+fn oid_hex(oid: Option<&[u8]>) -> String {
+    match oid {
+        Some(bytes) => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+        None => GIT_ZERO_OID.to_string(),
+    }
+}
+
 /// build a receive-pack `report-status` body: `unpack ok`, one status line per
 /// ref, then a flush. each entry is `(full refname, None == ok | Some(reason)
 /// == ng)`. forge's PushRefs is ATOMIC, so callers report one shared fate for
@@ -354,6 +468,30 @@ impl GitService {
     }
 }
 
+/// the capability line for `service` on `repo`. receive-pack additionally
+/// offers `push-cert=<nonce>` — the invitation `git push --signed` needs
+/// (git refuses to sign a push the server did not offer a nonce for) — once
+/// this node knows its chain: the nonce is `<chain id>/<repo>`.
+fn advertised_caps(handle: &NodeHandle, repo: &str, service: GitService) -> String {
+    let base = service.caps();
+    let nonce = match service {
+        GitService::Receive => push_cert_nonce(handle, repo),
+        GitService::Upload => None,
+    };
+    match nonce {
+        Some(nonce) => format!("{base} push-cert={nonce}"),
+        None => base.to_string(),
+    }
+}
+
+/// the push-cert nonce this node offers for `repo`; `None` until the status
+/// cell names the chain (a node still booting offers no signed pushes).
+fn push_cert_nonce(handle: &NodeHandle, repo: &str) -> Option<String> {
+    let chain_id = handle.status.current().chain_id;
+    let named = !chain_id.is_empty();
+    named.then(|| forge::pushcert::nonce(&chain_id, repo))
+}
+
 /// GET /forge/{repo}/info/refs?service=… — the smart-HTTP ref advertisement a
 /// `git push`/`git clone` fetches FIRST to learn the remote's current head.
 /// which heads those are differs per service (see [`advertised_refs`]). both
@@ -393,7 +531,7 @@ async fn git_advertise_refs(handle: &NodeHandle, repo: &str, service: GitService
         Ok(refs) => refs,
         Err(resp) => return resp,
     };
-    let caps = service.caps();
+    let caps = advertised_caps(handle, repo, service);
 
     let mut body = Vec::new();
     body.extend_from_slice(&pkt_line(
@@ -508,22 +646,14 @@ pub(crate) async fn git_receive_pack(
             .into_response();
     }
 
-    // each command line is `<old> <new> <refname>`, with capabilities after a
-    // NUL on the FIRST line. parse every command — one push may update several
+    // the command list: plain `<old> <new> <refname>` lines, or — a signed
+    // push — the certificate they live in. one push may update several
     // branches, and forge applies them ATOMICALLY.
-    let mut cmds: Vec<(String, String, String)> = Vec::new();
-    for raw in &commands {
-        let nul = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
-        let line = std::str::from_utf8(&raw[..nul])
-            .map(str::trim_end)
-            .unwrap_or("");
-        let mut parts = line.split(' ');
-        let (Some(old), Some(new), Some(refname)) = (parts.next(), parts.next(), parts.next())
-        else {
-            return error_response(StatusCode::BAD_REQUEST, "malformed ref-update command");
-        };
-        cmds.push((old.to_string(), new.to_string(), refname.to_string()));
-    }
+    let nonce = push_cert_nonce(&handle, &repo);
+    let PushCommands { cmds, cert } = match parse_push_commands(&commands, nonce.as_deref()) {
+        Ok(parsed) => parsed,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    };
 
     // only branches are pushable (no tags/notes). consume-and-refuse: the pack
     // was fully received; reporting `ng` (not an http error) lets git print a
@@ -566,6 +696,19 @@ pub(crate) async fn git_receive_pack(
         });
     }
 
+    // a signed push is refused HERE with the reason consensus would give — a
+    // clean per-ref `ng` instead of a rejected block. every validator
+    // re-verifies; this node is not trusted for it.
+    if let Some(cert) = &cert
+        && let Err(reason) = forge::pushcert::signer(cert, &repo, &updates)
+    {
+        let results: Vec<(String, Option<String>)> = cmds
+            .into_iter()
+            .map(|(_, _, r)| (r, Some(reason.clone())))
+            .collect();
+        return git_report_status(&results);
+    }
+
     // stash the WHOLE packfile as one node-local blob, keyed by its sha256;
     // forge materializes it by this digest (the bytes never cross consensus).
     // a delete-only push carries no objects, so nothing is stashed.
@@ -580,6 +723,7 @@ pub(crate) async fn git_receive_pack(
         repo,
         updates,
         pack_digest,
+        cert,
     });
     let (reply, rx) = oneshot::channel();
     if let Err(resp) = handle
@@ -773,6 +917,81 @@ fn build_upload_pack(
     forge::pack_delta(&repo, &oids, &common)
         .map(|pack| (pack, Some(ack)))
         .map_err(|e| format!("build delta pack: {e}"))
+}
+
+#[cfg(test)]
+mod receive_pack_tests {
+    use super::*;
+
+    /// the real `ssh-keygen -Y sign -n git` fixture keyscheme and forge pin,
+    /// framed exactly as `git push --signed` frames it.
+    const CERT: &str = "certificate version 0.1\npusher key::ssh-ed25519 AAAA 1756332000 +0000\npushee http://127.0.0.1:8844/forge/lab\nnonce chain-a/lab\n\n0000000000000000000000000000000000000000 ab5b1f3d5b7e3e0e0d33e2c6d1f6c2a7d3a7f1e2 refs/heads/main\n";
+    const ARMORED: &str = "-----BEGIN SSH SIGNATURE-----\n\
+U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgJjhQt02r3vG8+pxaBdryKnexRC\n\
+cULQqMrrcadzt/2iEAAAADZ2l0AAAAAAAAAAZzaGE1MTIAAABTAAAAC3NzaC1lZDI1NTE5\n\
+AAAAQAkqyuC4rshUkBgUVsgAqGxBltLKRLcwdq5LAQn+2lCUmiUJWTsYTykmuaNO+cntB2\n\
+ZYBzkWoVNWmNV5YTCuZwE=\n\
+-----END SSH SIGNATURE-----\n";
+
+    fn signed_commands() -> Vec<Vec<u8>> {
+        let mut lines = vec![b"push-cert\0report-status agent=git/2.43.0\n".to_vec()];
+        for line in CERT.split_inclusive('\n') {
+            lines.push(line.as_bytes().to_vec());
+        }
+        for line in ARMORED.split_inclusive('\n') {
+            lines.push(line.as_bytes().to_vec());
+        }
+        lines.push(b"push-cert-end\n".to_vec());
+        lines
+    }
+
+    #[test]
+    fn a_signed_push_yields_its_certificate_and_the_moves_inside_it() {
+        let parsed = parse_push_commands(&signed_commands(), Some("chain-a/lab")).unwrap();
+        assert_eq!(
+            parsed.cmds,
+            vec![(
+                GIT_ZERO_OID.to_string(),
+                "ab5b1f3d5b7e3e0e0d33e2c6d1f6c2a7d3a7f1e2".to_string(),
+                "refs/heads/main".to_string()
+            )]
+        );
+        let cert = parsed.cert.expect("a certificate");
+        assert_eq!(cert.cert, CERT.as_bytes(), "the signed bytes, verbatim");
+        assert_eq!(cert.sshsig, keyscheme::sshsig::dearmor(ARMORED).unwrap());
+        // and it is what consensus will accept.
+        let updates = vec![forge::RefUpdate {
+            ref_name: "main".into(),
+            prev_oid: None,
+            new_oid: Some(hex_to_bytes("ab5b1f3d5b7e3e0e0d33e2c6d1f6c2a7d3a7f1e2").unwrap()),
+        }];
+        forge::pushcert::signer(&cert, "lab", &updates).expect("verifies");
+    }
+
+    #[test]
+    fn a_certificate_must_echo_this_nodes_nonce_and_be_terminated() {
+        let wrong = parse_push_commands(&signed_commands(), Some("chain-b/lab")).unwrap_err();
+        assert!(wrong.contains("nonce"), "{wrong}");
+        let unoffered = parse_push_commands(&signed_commands(), None).unwrap_err();
+        assert!(unoffered.contains("offered no push-cert"), "{unoffered}");
+        let mut cut = signed_commands();
+        cut.pop();
+        let cut = parse_push_commands(&cut, Some("chain-a/lab")).unwrap_err();
+        assert!(cut.contains("push-cert-end"), "{cut}");
+    }
+
+    #[test]
+    fn a_stock_push_still_parses_line_by_line() {
+        let commands = vec![
+            b"0000000000000000000000000000000000000000 ab5b1f3d5b7e3e0e0d33e2c6d1f6c2a7d3a7f1e2 refs/heads/main\0report-status\n".to_vec(),
+            b"ab5b1f3d5b7e3e0e0d33e2c6d1f6c2a7d3a7f1e2 0000000000000000000000000000000000000000 refs/heads/old\n".to_vec(),
+        ];
+        let parsed = parse_push_commands(&commands, None).unwrap();
+        assert!(parsed.cert.is_none());
+        assert_eq!(parsed.cmds.len(), 2);
+        assert_eq!(parsed.cmds[1].2, "refs/heads/old");
+        assert!(parse_push_commands(&[b"junk\n".to_vec()], None).is_err());
+    }
 }
 
 #[cfg(test)]

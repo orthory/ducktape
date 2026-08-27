@@ -32,6 +32,17 @@ use crate::tracker_iface::{RefUpdate, ReviewComment, ReviewVerdict};
 ///
 /// every variant names its target repo via `repo` (required on the wire). an
 /// empty `repo` slug maps to the `"default"` repo (see the module docstring).
+/// a git push certificate as `git push --signed` sends it: the signed text
+/// (`certificate version 0.1` … one `<old> <new> <refname>` line per update)
+/// and the OpenSSH `SSHSIG` blob over it (namespace `git`). See
+/// [`crate::pushcert`] for what consensus checks.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PushCert {
+    pub cert: Vec<u8>,
+    pub sshsig: Vec<u8>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ForgeMsg {
@@ -45,6 +56,12 @@ pub enum ForgeMsg {
         repo: String,
         updates: Vec<RefUpdate>,
         pack_digest: Option<Vec<u8>>,
+        /// `git push --signed`'s push certificate, when the pusher sent one:
+        /// the PRINCIPAL becomes the certificate's SSH signer (its account),
+        /// verified by every validator. Absent, the principal is the frame
+        /// origin — the node's own key for a stock push through its bridge.
+        #[serde(default)]
+        cert: Option<PushCert>,
     },
     /// open an issue. assigns the repo's next shared number, stores title/body
     /// on the record (authorship is origin-derived), and emits a follow-up
@@ -350,6 +367,7 @@ mod tests {
                 repo: String::new(),
                 updates: Vec::new(),
                 pack_digest: None,
+                cert: None,
             }
         );
     }

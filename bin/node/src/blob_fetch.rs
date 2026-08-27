@@ -930,6 +930,7 @@ mod tests {
                     new_oid: Some(vec![7u8; 20]),
                 }],
                 pack_digest: Some(digest.to_vec()),
+                cert: None,
             }),
         };
         let mut ctx = sdk_testkit::TestCtx::with_env(sdk::Env {

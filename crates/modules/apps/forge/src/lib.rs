@@ -140,6 +140,7 @@ mod git;
 pub use git::{list_branches, pack_closure_many, pack_delta};
 pub mod oid;
 pub use oid::Oid;
+pub mod pushcert;
 #[cfg(feature = "native")]
 mod module;
 pub mod refs;

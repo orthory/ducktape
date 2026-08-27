@@ -640,6 +640,7 @@ mod tests {
                     new_oid: Some(vec![0xab; 20]),
                 }],
                 pack_digest: Some(vec![7u8; 32]),
+                cert: None,
             });
             exec(&mut forge, t, member.clone(), push).expect("push");
         }

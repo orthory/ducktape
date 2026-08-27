@@ -181,6 +181,7 @@ fn push(updates: Vec<RefUpdate>, pack: Option<[u8; 32]>) -> Msg {
         repo: REPO.into(),
         updates,
         pack_digest: pack.map(|d| d.to_vec()),
+        cert: None,
     })
 }
 

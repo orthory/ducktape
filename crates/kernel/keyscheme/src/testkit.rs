@@ -42,6 +42,39 @@ pub fn eth_sign_message(sk: &k256::ecdsa::SigningKey, message: &[u8]) -> Vec<u8>
     proof
 }
 
+/// a deterministic ed25519 SSH key (the raw-signing kind `ssh-keygen` holds)
+/// from a non-zero seed byte.
+pub fn ssh_key(seed: u8) -> ed25519_dalek::SigningKey {
+    assert_ne!(seed, 0, "seed 0 is the zero scalar");
+    ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+}
+
+/// the 32 raw key bytes — what an `id_ed25519.pub` line carries.
+pub fn ssh_pubkey(sk: &ed25519_dalek::SigningKey) -> Vec<u8> {
+    sk.verifying_key().to_bytes().to_vec()
+}
+
+/// exactly what `ssh-keygen -Y sign -n <namespace>` writes (dearmored): an
+/// SSHSIG blob over `message` with sha512.
+pub fn sshsig(sk: &ed25519_dalek::SigningKey, namespace: &str, message: &[u8]) -> Vec<u8> {
+    use ed25519_dalek::Signer as _;
+    let hash = crate::sshsig::SshHash::Sha512;
+    let signed = crate::sshsig::signed_data(namespace, hash, message);
+    crate::sshsig::encode(&crate::sshsig::SshSig {
+        pubkey: sk.verifying_key().to_bytes(),
+        namespace: namespace.to_string(),
+        hash,
+        signature: sk.sign(&signed).to_bytes(),
+    })
+}
+
+/// an SSH key's proof for `(ns, preimage)`: the SSHSIG the `Ed25519` arm
+/// accepts — namespace `ducktape` over commonware's namespaced preimage.
+pub fn ssh_proof(sk: &ed25519_dalek::SigningKey, ns: &[u8], preimage: &[u8]) -> Vec<u8> {
+    let message = crate::sshsig::ssh_message(ns, preimage);
+    sshsig(sk, crate::sshsig::DUCKTAPE_SSH_NS, &message)
+}
+
 /// a deterministic P-256 signing key from a non-zero seed byte.
 pub fn passkey(seed: u8) -> p256::ecdsa::SigningKey {
     assert_ne!(seed, 0, "seed 0 is not a valid scalar");

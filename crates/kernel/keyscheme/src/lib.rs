@@ -9,7 +9,9 @@
 //! verdict.
 //!
 //! `proof` is SCHEME-OWNED bytes; each arm parses its own envelope:
-//! - `Ed25519`: 64-byte commonware signature over `union_unique(ns, preimage)`.
+//! - `Ed25519`: 64-byte commonware signature over `union_unique(ns, preimage)`,
+//!   or an OpenSSH `SSHSIG` blob (magic-prefixed) over the same bytes under
+//!   namespace `ducktape` — an SSH key's `ssh-keygen -Y sign` (see [`sshsig`]).
 //! - `Secp256k1`: 65-byte `r‖s‖v` from a wallet's `personal_sign` over the
 //!   same `union_unique(ns, preimage)` bytes (see [`eth`]).
 //! - `Secp256r1`: a WebAuthn assertion envelope whose challenge is
@@ -19,6 +21,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
 mod eth;
+pub mod sshsig;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 mod webauthn;
@@ -97,8 +100,17 @@ impl KeyScheme {
     }
 }
 
-/// commonware namespaced EdDSA over the raw preimage: exactly 64 proof bytes.
+/// two envelopes, told apart by magic: an OpenSSH `SSHSIG` blob (an SSH key's
+/// `ssh-keygen -Y sign -n ducktape` over the SAME namespaced preimage
+/// commonware would sign) or commonware's namespaced EdDSA — exactly 64 proof
+/// bytes, which can never start with `SSHSIG`… and a blob never is 64 bytes
+/// of bare signature.
 fn verify_ed25519(pubkey: &[u8], ns: &[u8], preimage: &[u8], proof: &[u8]) -> bool {
+    let is_sshsig = proof.starts_with(sshsig::SSHSIG_MAGIC);
+    if is_sshsig {
+        let message = sshsig::ssh_message(ns, preimage);
+        return sshsig::verify_ed25519(pubkey, sshsig::DUCKTAPE_SSH_NS, &message, proof);
+    }
     use commonware_codec::DecodeExt as _;
     use commonware_cryptography::{
         Verifier as _,
@@ -117,6 +129,31 @@ mod tests {
 
     const NS: &[u8] = b"ducktape-test-ns-v1";
     const OTHER_NS: &[u8] = b"ducktape-other-ns-v1";
+
+    /// an SSH key is an `Ed25519` member like any other: its `ssh-keygen -Y
+    /// sign -n ducktape` over the namespaced preimage is a proof the arm
+    /// accepts, bound to (ns, preimage) exactly as a commonware signature is
+    /// — and a commonware signature by the same key bytes still verifies.
+    #[test]
+    fn an_sshsig_proof_is_an_ed25519_proof() {
+        use crate::testkit::{ssh_key, ssh_proof, ssh_pubkey, sshsig};
+        let sk = ssh_key(3);
+        let pk = ssh_pubkey(&sk);
+        let preimage = b"chain|scheme|newkey|gen";
+        let proof = ssh_proof(&sk, NS, preimage);
+        assert!(proof.starts_with(sshsig::SSHSIG_MAGIC));
+        assert!(KeyScheme::Ed25519.verify(&pk, NS, preimage, &proof));
+        assert!(!KeyScheme::Ed25519.verify(&pk, OTHER_NS, preimage, &proof));
+        assert!(!KeyScheme::Ed25519.verify(&pk, NS, b"other", &proof));
+        assert!(!KeyScheme::Ed25519.verify(&ssh_pubkey(&ssh_key(4)), NS, preimage, &proof));
+        // a push-certificate signature (namespace `git`) is NOT a frame proof.
+        let git_signed = sshsig(
+            &sk,
+            sshsig::GIT_SSH_NS,
+            &commonware_utils::union_unique(NS, preimage),
+        );
+        assert!(!KeyScheme::Ed25519.verify(&pk, NS, preimage, &git_signed));
+    }
 
     #[test]
     fn tags_are_stable_and_round_trip() {
