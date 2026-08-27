@@ -9,13 +9,15 @@
 # the workspace's http endpoint, initializes its forge with ducktape's own
 # repository (ops/dogfood-forge.sh), starts the three local agent services, then
 # runs the desktop app in the foreground. Ctrl-C quits the app and LEAVES the
-# node and services running for the next iteration — `make demo-clear` is the
-# teardown.
+# node and services running for the next iteration. `make dev-clear` stops that
+# background runtime without deleting state; `make demo-clear` removes the
+# workspace entirely.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ID="${DEMO_WORKSPACE_ID:-demo}"
-WSDIR="$HOME/.ducktape/workspaces/$ID"
+DUCK="${DUCKTAPE_HOME:-$HOME/.ducktape}"
+WSDIR="$DUCK/workspaces/$ID"
 
 log(){ printf '\033[36m[dev]\033[0m %s\n' "$*"; }
 die(){ printf '\033[31m[dev] %s\033[0m\n' "$*" >&2; exit 1; }
@@ -71,15 +73,16 @@ else
   curl -sf "$URL/v1/status" >/dev/null 2>&1 || die "node http never came up — see $WSDIR/dev-node.log"
   # The node outlives this script on purpose: the dev loop is edit → Ctrl-C →
   # `make dev` again, and rebooting a warm node every lap would cost more than
-  # it protects against. `make demo-clear` sweeps it by cmdline + /v1/shutdown.
+  # it protects against. `make dev-clear` and `make demo-clear` sweep it by
+  # cmdline + /v1/shutdown.
   disown "$NODE_PID"
   log "node up (pid $NODE_PID, log $WSDIR/dev-node.log)"
 fi
 
 # Shell needs all three local planes: compute owns durable runs, agent owns raw
 # PTYs, and airlock lends the credential selected in the app. A warm dev loop
-# keeps them beside the node; demo-clear's workspace-verified pid sweep stops
-# the whole set. The service catalog is the readiness event, so do not guess
+# keeps them beside the node; the clear targets' workspace-verified pid sweep
+# stops the whole set. The service catalog is the readiness event, so do not guess
 # from stale pidfiles or fixed startup time.
 service_state(){
   "$NODE_BIN" service list "$1" --workspace "$WSDIR" --json 2>/dev/null |

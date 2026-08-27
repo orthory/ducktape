@@ -12,6 +12,7 @@ runnable surfaces are the node daemon (`node-bin`/`noded`), the deterministic
 ```bash
 make demo-seed   # ops/demo-seed.sh  — seed a solo "demo" workspace with sample data
 make demo-app    # ops/demo-app.sh   — serve the user-hosted app behind its gateway route
+make dev-clear   # ops/dev-clear.sh  — stop make dev's background runtime; preserve state
 make demo-clear  # ops/demo-clear.sh — stop and delete the demo workspace
 ```
 
