@@ -316,7 +316,6 @@ fn cmd_user_account_init(
         keystore::wallet::AccountInitKey::Mint { path, name } => (path, Some(name)),
     };
     let (user, origin) = load_or_mint_user_signer(&key_path, stdin)?;
-    let user_pub = user.public_key();
     // the mnemonic BEFORE the submits: they take a block each, and a person
     // who ^Cs on a slow chain must still have the only copy of their seed.
     if let KeyOrigin::Minted(words) = origin {
@@ -329,9 +328,20 @@ fn cmd_user_account_init(
         println!("{words}");
     }
 
-    // Already bound? then the bind is a no-op — just (re)assert name + handle.
-    let query = IdentityQuery::OfMember {
-        member_key: user_pub.as_ref().to_vec(),
+    // Is THIS NODE already bound? then the bind is a no-op — just (re)assert
+    // name + handle.
+    //
+    // The question is about the node, not the key: `BindNode` binds the
+    // SUBMITTING NODE, and one person's account legitimately spans several of
+    // them (a laptop that talks to a Mac mini hosting compute). Asking
+    // `OfMember` instead — "does this key belong to some account" — answers
+    // yes on the operator's SECOND node and skips the bind it came for, and
+    // every later submit from there is refused with "origin node is not bound
+    // to an account", pointing at the `account-init` that just declined to do
+    // it.
+    let node_pub = resolved.signer.public_key();
+    let query = IdentityQuery::OfNode {
+        node_key: node_pub.as_ref().to_vec(),
     };
     let reply: IdentityReply = serde_json::from_value(crate::cred_cli::query_node(
         &base,
@@ -341,7 +351,6 @@ fn cmd_user_account_init(
     let already_bound = matches!(reply, IdentityReply::Account(Some(_)));
 
     if !already_bound {
-        let node_pub = resolved.signer.public_key();
         let authorizer = config::ed25519_member_auth(
             &user,
             identity::IDENTITY_BIND_NS,
