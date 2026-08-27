@@ -141,7 +141,12 @@ kill "$SVC_PID" 2>/dev/null; wait "$SVC_PID" 2>/dev/null
 if [ -f "$WSDIR/services.toml" ]; then
   log "compute granted — agent runs available"
 else
-  log "compute NOT granted (no usable container runtime?) — see $WSDIR/service.log;"
+  # The reason is in service.log and nowhere else; guessing at it ("no usable
+  # container runtime?") sends the reader hunting for the wrong thing — the
+  # usual cause is a node.toml with no live [sandbox] table, not a missing VMM.
+  log "compute NOT granted:"
+  tail -n 3 "$WSDIR/service.log" 2>/dev/null | sed 's/^/    /'
+  log "  full log: $WSDIR/service.log"
   log "  the demo still runs, just without agent runs. Grant it later with:"
   log "  ducktape service run compute --workspace $WSDIR"
 fi

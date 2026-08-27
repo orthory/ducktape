@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize as _;
 
 use super::DEFAULT_PRIMARY_COORDINATOR;
-use super::{DEFAULT_CHECKPOINT_BLOCKS, DEFAULT_GUEST_DIR};
+use super::DEFAULT_CHECKPOINT_BLOCKS;
 
 /// the generated defaults: a fresh init/join with no flags yields a node
 /// with every surface up. Loopback for the operator surfaces (HTTP app
@@ -485,9 +485,11 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
             );
         }
         None => {
-            // the commented-out template names THIS OS's adapter, so
-            // uncommenting it on the machine `node init` ran on is enough.
+            // the commented-out template names THIS OS's adapter AND this
+            // operator's guest dir, so uncommenting it on the machine `node
+            // init` ran on is enough.
             let runtime = sandbox_host::Vmm::platform_default().config_token();
+            let guest = super::default_guest_dir()?.display().to_string();
             let _ = writeln!(
                 s,
                 "\n# compute plane (off): uncomment [sandbox] to run providers on this node.\n\
@@ -495,8 +497,8 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
                  # bare on the host. Build the two images with ops/build-guest-rootfs.sh.\n\
                  #[sandbox]\n\
                  #runtime = \"{runtime}\"\n\
-                 #kernel = \"{DEFAULT_GUEST_DIR}/vmlinux\"\n\
-                 #rootfs = \"{DEFAULT_GUEST_DIR}/rootfs.ext4\"\n\
+                 #kernel = \"{guest}/vmlinux\"\n\
+                 #rootfs = \"{guest}/rootfs.ext4\"\n\
                  #cores = 0\n\
                  #mem_gb = 0"
             );

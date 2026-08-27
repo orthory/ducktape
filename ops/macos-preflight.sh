@@ -16,7 +16,7 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-GUEST_DIR="${GUEST_DIR:-$HOME/.ducktape/guest}"
+GUEST_DIR="${GUEST_DIR:-${DUCKTAPE_HOME:-$HOME/.ducktape}/guest}"
 
 # brew lives outside a non-login shell's PATH (ssh commands, make, cron), so
 # look for it at the standard prefixes rather than reporting a Homebrew that

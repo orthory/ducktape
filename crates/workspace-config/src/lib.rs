@@ -47,8 +47,17 @@ pub use node_toml::*;
 
 /// where `ops/build-guest-rootfs.sh` writes the kernel and rootfs by default —
 /// the paths `[sandbox]` generation puts in a fresh table and in the commented
-/// example.
-pub const DEFAULT_GUEST_DIR: &str = "/var/lib/ducktape/guest";
+/// example: `$DUCKTAPE_HOME/guest`, else `~/.ducktape/guest`.
+///
+/// Under the operator's home, beside `workspaces/`, because that is the only
+/// place BOTH platforms can write without root: the guest build is rootless
+/// start to finish ("a node that needs root to build its guest is a node that
+/// runs as root"), and macOS has no `/var/lib` an operator would ever use.
+/// One value, so the builder, the preflight and the written table cannot
+/// disagree about where the images are.
+pub fn default_guest_dir() -> Result<PathBuf, String> {
+    Ok(ducktape_home()?.join("guest"))
+}
 
 /// default recovery checkpoint cadence: small enough that boot replay stays
 /// cheap, large enough that snapshotting the in-memory cohort is amortized.
@@ -745,15 +754,20 @@ pub fn sync_source_candidates<A>(
 // address a node by the name humans actually know.
 // ============================================================================
 
-/// the registry root: `$DUCKTAPE_HOME/workspaces` when the override is set
-/// (tests, portable setups), else `~/.ducktape/workspaces`.
-pub fn workspaces_root() -> Result<PathBuf, String> {
+/// everything this operator's node keeps on disk: `$DUCKTAPE_HOME` when the
+/// override is set (tests, portable setups), else `~/.ducktape`.
+pub fn ducktape_home() -> Result<PathBuf, String> {
     if let Some(home) = std::env::var_os("DUCKTAPE_HOME") {
-        return Ok(PathBuf::from(home).join("workspaces"));
+        return Ok(PathBuf::from(home));
     }
     let home = std::env::var_os("HOME")
         .ok_or("cannot resolve $HOME — pass --config <node.toml> instead of --network")?;
-    Ok(PathBuf::from(home).join(".ducktape").join("workspaces"))
+    Ok(PathBuf::from(home).join(".ducktape"))
+}
+
+/// the registry root: `<ducktape_home>/workspaces`.
+pub fn workspaces_root() -> Result<PathBuf, String> {
+    Ok(ducktape_home()?.join("workspaces"))
 }
 
 /// the registry directory a chain-id's workspace materializes into:
