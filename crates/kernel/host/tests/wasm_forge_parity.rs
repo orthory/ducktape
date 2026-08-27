@@ -339,9 +339,12 @@ fn probe_op(q: &ForgeQuery) -> Msg {
 fn full_matrix_roots_identical_block_by_block() {
     let dir_n = tempfile::tempdir().unwrap();
     let dir_w = tempfile::tempdir().unwrap();
-    // one blob store on both sides: the packs are node-local possession, and
-    // both substrates must materialize the same objects.
-    let blobs = blobstore::BlobHandle::default();
+    // the SAME packs on both sides, in a store EACH: possession is node-local,
+    // and materialize RELEASES a pack once its objects are in the odb — one
+    // shared handle would let whichever substrate ran first take the bytes away
+    // from the other. both must materialize the same objects.
+    let blobs_n = blobstore::BlobHandle::default();
+    let blobs_w = blobstore::BlobHandle::default();
     let commits = history(
         "parity",
         &[
@@ -353,12 +356,16 @@ fn full_matrix_roots_identical_block_by_block() {
     );
     let packs: Vec<[u8; 32]> = commits
         .iter()
-        .map(|c| blobs.put_chunk(c.pack.clone()))
+        .map(|c| {
+            let digest = blobs_n.put_chunk(c.pack.clone());
+            assert_eq!(digest, blobs_w.put_chunk(c.pack.clone()));
+            digest
+        })
         .collect();
     let (c1, c2, c3, c4) = (&commits[0], &commits[1], &commits[2], &commits[3]);
 
-    let mut native = native_host(&dir_n, blobs.clone());
-    let mut wasm = wasm_host(&dir_w, blobs);
+    let mut native = native_host(&dir_n, blobs_n);
+    let mut wasm = wasm_host(&dir_w, blobs_w);
 
     // ROOT CONTINUITY from block zero: both sides commit to the SAME empty
     // namespace, so the roots are EQUAL (and ZERO).
@@ -685,12 +692,17 @@ fn a_wasm_tenant_without_the_pack_reaches_the_same_root_then_catches_up() {
     assert_ne!(forge_root(&without), StateRoot::ZERO);
 
     // the catch-up map is the node's pull handle — readable without the module.
+    // it names the pack to pull AND the head that pack explains.
+    let outstanding = forge::pending_branches(&dir_bare.path().join(FORGE)).unwrap();
     assert_eq!(
-        forge::pending_digests(&dir_bare.path().join(FORGE)).unwrap(),
-        vec![pack]
+        outstanding
+            .iter()
+            .map(|p| (p.digest, p.head.as_bytes().to_vec()))
+            .collect::<Vec<_>>(),
+        vec![(pack, c1.head.clone())]
     );
     assert!(
-        forge::pending_digests(&dir_full.path().join(FORGE))
+        forge::pending_branches(&dir_full.path().join(FORGE))
             .unwrap()
             .is_empty()
     );
@@ -716,7 +728,7 @@ fn a_wasm_tenant_without_the_pack_reaches_the_same_root_then_catches_up() {
     });
     block_on(without.submit_at(block(2, owner()), touch)).expect("nudge");
     assert!(
-        forge::pending_digests(&dir_bare.path().join(FORGE))
+        forge::pending_branches(&dir_bare.path().join(FORGE))
             .unwrap()
             .is_empty()
     );
