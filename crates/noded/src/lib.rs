@@ -294,6 +294,12 @@ pub struct NodeStatus {
     /// into ops that route peer traffic to it (chat's `JoinHuddle.node`).
     /// empty on daemons with no mesh identity (the embedded local daemon).
     pub public_key: String,
+    /// the chain id every chain-scoped USER proof is minted for — an identity
+    /// `AddKey` consent, a gateway route statement. Wired once at boot into
+    /// the [`StatusCell`] (`wire_chain_id`) and overlaid on every read, so a
+    /// boundary publish never has to carry it; empty on a daemon that serves
+    /// no chain (simnode, the embedded local daemon).
+    pub chain_id: String,
     /// Node-owned operational state. This is the stable, role-aware facade for
     /// operators; dependency-specific consensus and transport metrics remain
     /// available on `/metrics` for deeper diagnosis.

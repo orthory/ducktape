@@ -288,6 +288,7 @@ fn publish_status(
         height,
         modules,
         public_key: String::new(),
+        chain_id: String::new(),
         operations: Default::default(),
     });
     // no mesh: height only, no roles or epoch — same as the embedded daemon.

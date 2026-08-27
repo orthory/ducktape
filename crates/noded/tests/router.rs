@@ -360,6 +360,7 @@ async fn status_reports_root_hash_height_and_module_roots() {
             category: ModuleCategory::of("chat"),
         }],
         public_key: "ab".repeat(32),
+        chain_id: String::new(),
         operations: noded::OperationalStatus {
             role: noded::NodeRole::Validator,
             phase: noded::NodePhase::Validating,

@@ -568,6 +568,9 @@ fn run_node(
             public_key: status_public_key.clone(),
             ..Default::default()
         });
+        // the chain every chain-scoped user proof names; a boot fact, wired
+        // once so no role loop's boundary publish has to carry it.
+        status.wire_chain_id(identity_chain_id.clone());
         // The one moment `/v1/status` starts carrying a mesh identity, and the
         // only wait seam a supervisor has for it. The HTTP listener binds well
         // upstream of here, so "app surface listening" says nothing about

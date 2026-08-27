@@ -14,6 +14,7 @@ on account_loaded(next)
   network_name = network_label(account_name, connected_rpc)
   account_bio = next.bio
   account_keys = next.keys
+  account_key_rows = next.key_rows
 
 on account_failed(cause)
   return if cause.generation != account_generation
@@ -35,6 +36,72 @@ on account_renamed(_result)
 
 on account_rename_failed(cause)
   account_renaming = false
+  error = cause.message
+
+// THE FOUR IDENTITY OPS — found, mint a ticket, join with one, remove a key.
+// Each is one user-signed frame (the CLI's `ducktape account` verbs, in the
+// app), and every committed one lands in `account_changed`: the account
+// picture moved, so it is re-read under a fresh generation.
+on account_create_draft_changed(next)
+  account_create_draft = next
+
+on account_create_submit
+  return if !connected || account_exists || account_busy || empty(password) || empty(trim(account_create_draft))
+  account_busy = true
+  error = ""
+  run every create_account(connected_rpc, password, trim(account_create_draft)) -> account_changed _ | account_op_failed _
+
+on account_key_draft_changed(next)
+  account_key_draft = next
+
+on account_key_label_draft_changed(next)
+  account_key_label_draft = next
+
+// A ticket is chain-scoped, so it carries the chain id the status stream
+// named (`network_chain_id`); the backend refuses to mint before one landed.
+on account_key_add_submit
+  return if !connected || !account_exists || account_busy || empty(password) || empty(trim(account_key_draft))
+  account_busy = true
+  error = ""
+  account_ticket = ""
+  run every mint_key_ticket(connected_rpc, password, network_chain_id, trim(account_key_draft), trim(account_key_label_draft)) -> account_ticket_minted _ | account_op_failed _
+
+// Minting commits nothing: the ticket is shown to copy, the drafts it
+// consumed clear, and the account is re-read only when the OTHER device joins.
+on account_ticket_minted(ticket)
+  account_busy = false
+  account_ticket = ticket
+  account_key_draft = ""
+  account_key_label_draft = ""
+
+on account_join_draft_changed(next)
+  account_join_draft = next
+
+// Joining is the one op a key OUTSIDE every account performs, so it is not
+// gated on `account_exists`; a key already on an account is refused by the
+// module ("key already belongs to an account").
+on account_key_join_submit
+  return if !connected || account_busy || empty(password) || empty(trim(account_join_draft))
+  account_busy = true
+  error = ""
+  run every join_with_ticket(connected_rpc, password, trim(account_join_draft)) -> account_changed _ | account_op_failed _
+
+on account_key_remove(pubkey)
+  return if !connected || !account_exists || account_busy || empty(password) || account_keys <= 1
+  account_busy = true
+  error = ""
+  run every remove_account_key(connected_rpc, password, pubkey) -> account_changed _ | account_op_failed _
+
+on account_changed(_result)
+  account_busy = false
+  account_create_draft = ""
+  account_join_draft = ""
+  account_ticket = ""
+  account_generation = account_generation + 1
+  run replace lane=account_load load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
+
+on account_op_failed(cause)
+  account_busy = false
   error = cause.message
 
 on agents_loaded(next)

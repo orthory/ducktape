@@ -17,8 +17,8 @@ _ducktape() {
 
     local user_key=(init restore unlock reveal status)
     local user_cred=(add list remove grant revoke inspect seal)
-    local user_verbs=(key sign-gateway-route sign-frame sign-admin cred help)
-    local user_flags=(--path --method --statement --out --key --node -n --network --node-key --name --json --host --remote --attest --pccs-url --snp-product --snp-vcek --vendor --measurement --credentials --cred-kind --access-token --refresh-token)
+    local user_verbs=(key sign-gateway-route sign-frame sign-admin sign-caller cred help)
+    local user_flags=(--path --method --statement --out --key --node -n --network --node-key --publisher-node --account --route --name --json --host --remote --attest --pccs-url --snp-product --snp-vcek --vendor --measurement --credentials --cred-kind --access-token --refresh-token)
     local account_verbs=(create show key set-name set-profile help)
     local account_key=(list approve add join remove)
     local account_flags=(--node -n --network --key --name --number --pubkey --scheme --label --ticket --avatar --bio)

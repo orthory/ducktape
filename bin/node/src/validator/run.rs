@@ -81,6 +81,8 @@ pub(super) fn publish_boundary_status(
         height: node.finalized().map(|f| f.height).unwrap_or(0),
         modules,
         public_key: status_public_key.into(),
+        // the cell overlays the boot-wired chain id on every read.
+        chain_id: String::new(),
         operations: metrics.operational_status(),
     });
 }

@@ -30,6 +30,7 @@ on node_facts_loaded(next)
   node_key = next.public_key
   node_version = next.version
   node_root_hash = next.root_hash
+  network_chain_id = next.chain_id
   node_last_finalized = next.last_finalized_at
   node_checkpoint = next.checkpoint_height
   node_height = next.height
@@ -52,6 +53,7 @@ on node_status_pushed(next)
   node_key = next.public_key
   node_version = next.version
   node_root_hash = next.root_hash
+  network_chain_id = next.chain_id
   node_last_finalized = next.last_finalized_at
   node_checkpoint = next.checkpoint_height
   node_height = next.height

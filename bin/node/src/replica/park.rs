@@ -193,6 +193,7 @@ async fn publish_replica_status(
         height,
         modules,
         public_key: status_public_key.into(),
+        chain_id: String::new(),
         operations: metrics.operational_status(),
     });
     // the same standing the retired per-request sample attested; the epoch
