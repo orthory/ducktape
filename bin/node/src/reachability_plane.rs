@@ -404,6 +404,37 @@ where
                             node = %pump_label, epoch, %interface, peers,
                             "standby pre-warm tunnels applied"
                         ),
+                        reachability::ReachabilityEvent::MeshAdopted {
+                            epoch,
+                            version: _,
+                            peers,
+                        } => tracing::info!(
+                            target: "ducktape::reachability",
+                            node = %pump_label, epoch, peers,
+                            "peers' locked mesh adopted — this node re-assembled mid-epoch; \
+                             re-offering its fresh record until every peer re-tunnels it"
+                        ),
+                        reachability::ReachabilityEvent::PeerReadvertised { peer, interface } => {
+                            tracing::info!(
+                                target: "ducktape::reachability",
+                                node = %pump_label,
+                                peer = %hex_bytes(&peer.as_ref()[..4]),
+                                %interface,
+                                "peer re-advertised mid-epoch — its tunnel re-pointed in place"
+                            )
+                        }
+                        reachability::ReachabilityEvent::PeerEndpointResolved {
+                            peer,
+                            endpoint,
+                        } => {
+                            tracing::info!(
+                                target: "ducktape::reachability",
+                                node = %pump_label,
+                                peer = %hex_bytes(&peer.as_ref()[..4]),
+                                %endpoint,
+                                "endpoint resolved post-apply — live interface reconfigured"
+                            )
+                        }
                         reachability::ReachabilityEvent::InvitePeerInstalled {
                             peer,
                             interface,
