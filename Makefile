@@ -77,22 +77,24 @@ ifeq ($(UNAME_S),Darwin)
 # Build cargo-ice from the same ducktape-ui rev as the app. A global cargo-ice
 # can parse a different language than the compiler in app/Cargo.toml.
 #
-# The install source is the orthory fork's `ice-install/<rev>` branch: that
-# rev with the example members dropped from the workspace, cargo-ice sources
-# untouched. `cargo install --git` resolves the package's whole workspace and
-# clones every member's git dependency before building anything, so installing
-# from the upstream workspace fetches libraries only the examples use. Keying
-# the branch on ICE_REV makes the pairing self-enforcing: bumping the rev in
-# app/Cargo.toml fails this recipe until the matching branch is pushed
-# (rebase the prune commit onto the new rev as `ice-install/<new-rev>`).
+# Both the URL and the rev come from app/Cargo.toml, so the install source
+# cannot drift from the pin the app compiles against.
+#
+# This installs straight from the pinned rev. `cargo install --git` resolves the
+# package's whole workspace, so it also clones the one git dependency no part of
+# cargo-ice uses (pornin/ecgfp5, which the trading example wants). That clone is
+# the deliberate price: the alternative was a hand-maintained `ice-install/<rev>`
+# branch holding the same rev minus the example members, which had to be rebased
+# and pushed on every pin bump and broke `make app` with a bare git exit 128
+# every time someone forgot.
+ICE_GIT = $(shell sed -n 's|.*git = "\([^"]*ducktape-ui.git\)", rev = .*|\1|p' app/Cargo.toml | head -n1)
 ICE_REV = $(shell sed -n 's/.*ducktape-ui.git", rev = "\([^"]*\)".*/\1/p' app/Cargo.toml | head -n1)
 ICE_ROOT = $(CURDIR)/target/cargo-ice/$(ICE_REV)
 ICE_BIN = $(ICE_ROOT)/bin/cargo-ice
 
 $(ICE_BIN):
 	CARGO_TARGET_DIR="$(CURDIR)/target/cargo-ice-build" $(CARGO) install cargo-ice \
-		--git https://github.com/orthory/ducktape-ui.git \
-		--branch "ice-install/$(ICE_REV)" --locked --root "$(ICE_ROOT)"
+		--git "$(ICE_GIT)" --rev "$(ICE_REV)" --locked --root "$(ICE_ROOT)"
 
 ## build the signed-ad-hoc Ducktape.app and DMG under target/ice-bundle
 app: $(ICE_BIN)
