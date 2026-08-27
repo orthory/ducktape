@@ -273,6 +273,13 @@ extern crate::backend
   mint_key_ticket(rpc:str, password:str, chain_id:str, pubkey:str, label:str) -> str ! AppError
   join_with_ticket(rpc:str, password:str, ticket:str) -> bool ! AppError
   remove_account_key(rpc:str, password:str, pubkey:str) -> bool ! AppError
+  // the browser ceremonies (`authpage`): a passkey or a wallet becomes a
+  // member key by signing its own AddKey frame in the browser; a login is a
+  // passkey's consent to admit THIS device. Each blocks on the page's answer
+  // (a 5-minute ceiling, then it fails).
+  register_passkey(rpc:str, password:str, chain_id:str, label:str) -> bool ! AppError
+  link_wallet(rpc:str, password:str, chain_id:str, label:str) -> bool ! AppError
+  login_with_passkey(rpc:str, password:str, chain_id:str, label:str) -> bool ! AppError
   SettingsFacts(generation:i64, key_path:str, key_state:str, data_dir:str, open_tabs:i64, user_key:str)
   load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
   clear_doc_tabs(rpc:str) -> bool

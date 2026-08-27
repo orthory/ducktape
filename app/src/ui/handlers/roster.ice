@@ -86,6 +86,29 @@ on account_key_join_submit
   error = ""
   run every join_with_ticket(connected_rpc, password, trim(account_join_draft)) -> account_changed _ | account_op_failed _
 
+// BROWSER CEREMONIES. Each opens the auth page and blocks on its answer;
+// `account_busy` holds the card until the page answers or the backend gives
+// up. The label draft names the new key, exactly as it names a pasted one.
+on account_passkey_submit
+  return if !connected || !account_exists || account_busy || empty(password)
+  account_busy = true
+  error = ""
+  run every register_passkey(connected_rpc, password, network_chain_id, trim(account_key_label_draft)) -> account_changed _ | account_op_failed _
+
+on account_wallet_submit
+  return if !connected || !account_exists || account_busy || empty(password)
+  account_busy = true
+  error = ""
+  run every link_wallet(connected_rpc, password, network_chain_id, trim(account_key_label_draft)) -> account_changed _ | account_op_failed _
+
+// Logging in is the other op a key OUTSIDE every account performs: a passkey
+// registered on a member device consents, in the browser, to admitting this one.
+on account_login_submit
+  return if !connected || account_exists || account_busy || empty(password)
+  account_busy = true
+  error = ""
+  run every login_with_passkey(connected_rpc, password, network_chain_id, "") -> account_changed _ | account_op_failed _
+
 on account_key_remove(pubkey)
   return if !connected || !account_exists || account_busy || empty(password) || account_keys <= 1
   account_busy = true
@@ -96,6 +119,8 @@ on account_changed(_result)
   account_busy = false
   account_create_draft = ""
   account_join_draft = ""
+  account_key_draft = ""
+  account_key_label_draft = ""
   account_ticket = ""
   account_generation = account_generation + 1
   run replace lane=account_load load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _

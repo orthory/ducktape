@@ -1346,42 +1346,24 @@ pub async fn mint_key_ticket(
     label: String,
 ) -> Result<String, AppError> {
     async {
-        if chain_id.is_empty() {
-            return Err(
-                "the connected node has not named its chain yet — a ticket is chain-scoped"
-                    .to_string(),
-            );
-        }
+        let chain_id = named_chain(chain_id)?;
         let new_key = hex_decode(pubkey.trim())?;
         let wellformed = identity::KeyScheme::Ed25519.pubkey_wellformed(&new_key);
         if !wellformed {
             return Err("that is not a well-formed ed25519 public key".to_string());
         }
-        let label = match label.trim() {
-            "" => None,
-            text => Some(bounded_text(
-                text.to_string(),
-                "key label",
-                identity::MAX_LABEL_LEN,
-            )?),
-        };
+        let label = optional_label(label)?;
         let client = rpc_client(&rpc)?;
-        let reply: identity::IdentityReply = client
-            .query(
-                "identity",
-                &identity::IdentityQuery::KeyGen {
-                    key: new_key.clone(),
-                },
-            )
-            .await?;
-        let generation = match reply {
-            identity::IdentityReply::Gen(generation) => generation,
-            identity::IdentityReply::Account(_) | identity::IdentityReply::Accounts(_) => {
-                return Err("the identity module returned the wrong reply".to_string());
-            }
-        };
-        let authorizer = sign_add_key_consent(password, &chain_id, &new_key, generation).await?;
-        Ok(add_key_ticket(label, authorizer))
+        let msg = consented_add_key(
+            &client,
+            password,
+            &chain_id,
+            identity::KeyScheme::Ed25519,
+            &new_key,
+            label,
+        )
+        .await?;
+        Ok(add_key_ticket(&msg))
     }
     .await
     .map_err(app_error)
@@ -1389,13 +1371,253 @@ pub async fn mint_key_ticket(
 
 /// The ticket text: ONE json line, exactly the `AddKey` payload the joining
 /// key signs into its frame.
-fn add_key_ticket(label: Option<String>, authorizer: identity::Authorizer) -> String {
-    let msg = identity::IdentityMsg::AddKey {
-        scheme: identity::KeyScheme::Ed25519,
+fn add_key_ticket(msg: &identity::IdentityMsg) -> String {
+    String::from_utf8(identity::encode_msg(msg)).expect("json is utf-8")
+}
+
+/// An `AddKey` is chain-scoped; a node that has not named its chain yet
+/// cannot be consented on.
+fn named_chain(chain_id: String) -> Result<String, String> {
+    if chain_id.is_empty() {
+        return Err(
+            "the connected node has not named its chain yet — a key consent is chain-scoped"
+                .to_string(),
+        );
+    }
+    Ok(chain_id)
+}
+
+fn optional_label(label: String) -> Result<Option<String>, String> {
+    match label.trim() {
+        "" => Ok(None),
+        text => Ok(Some(bounded_text(
+            text.to_string(),
+            "key label",
+            identity::MAX_LABEL_LEN,
+        )?)),
+    }
+}
+
+/// A key's current generation — what a consent signs, so it is single-use.
+async fn key_generation(client: &RpcClient, key: &[u8]) -> Result<u64, String> {
+    let reply: identity::IdentityReply = client
+        .query(
+            "identity",
+            &identity::IdentityQuery::KeyGen { key: key.to_vec() },
+        )
+        .await?;
+    match reply {
+        identity::IdentityReply::Gen(generation) => Ok(generation),
+        identity::IdentityReply::Account(_) | identity::IdentityReply::Accounts(_) => {
+            Err("the identity module returned the wrong reply".to_string())
+        }
+    }
+}
+
+/// The `AddKey` this device consents to for `new_key` (of `scheme`) at its
+/// current generation.
+async fn consented_add_key(
+    client: &RpcClient,
+    password: String,
+    chain_id: &str,
+    scheme: identity::KeyScheme,
+    new_key: &[u8],
+    label: Option<String>,
+) -> Result<identity::IdentityMsg, String> {
+    let generation = key_generation(client, new_key).await?;
+    let authorizer = sign_add_key_consent(password, chain_id, scheme, new_key, generation).await?;
+    Ok(identity::IdentityMsg::AddKey {
+        scheme,
         label,
         authorizer,
+    })
+}
+
+/// The account this device's key belongs to, by the canonical resolver.
+async fn own_account(client: &RpcClient) -> Result<identity::AccountView, String> {
+    let Some(key) = local_user_key().await else {
+        return Err("this device has no user key".to_string());
     };
-    String::from_utf8(identity::encode_msg(&msg)).expect("json is utf-8")
+    account_reply(
+        client
+            .query("identity", &identity::IdentityQuery::OfKey { key })
+            .await?,
+    )?
+    .ok_or_else(|| "this device's key belongs to no account yet".to_string())
+}
+
+fn account_reply(reply: identity::IdentityReply) -> Result<Option<identity::AccountView>, String> {
+    match reply {
+        identity::IdentityReply::Account(account) => Ok(account),
+        identity::IdentityReply::Accounts(_) | identity::IdentityReply::Gen(_) => {
+            Err("the identity module returned the wrong reply".to_string())
+        }
+    }
+}
+
+fn identity_msg(msg: &identity::IdentityMsg) -> sdk::Msg {
+    sdk::Msg {
+        target: "identity".into(),
+        payload: identity::encode_msg(msg),
+    }
+}
+
+// ============================================================================
+// browser ceremonies (`authpage`)
+// ============================================================================
+
+/// How long a browser touch may take before the app gives up on it.
+const CEREMONY_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// One browser round trip, off the async runtime (the callback listener is a
+/// blocking accept): open the page, block for its result. On timeout the
+/// listener is poked with an abandon result so its thread ends too.
+async fn browser_ceremony(request: authpage::Request) -> Result<authpage::Outcome, String> {
+    let listener = authpage::Listener::bind().map_err(|e| format!("auth callback: {e}"))?;
+    let callback = listener.callback_url();
+    let url = authpage::request_url(authpage::AUTH_PAGE, &request, &callback);
+    let opened = authpage::open_browser(&url);
+    if !opened {
+        return Err("no browser opener on this machine (xdg-open / open)".to_string());
+    }
+    let waiting = tokio::task::spawn_blocking(move || listener.wait());
+    let answered = tokio::time::timeout(CEREMONY_TIMEOUT, waiting).await;
+    match answered {
+        Ok(joined) => joined.map_err(|_| "the browser ceremony did not finish".to_string())?,
+        Err(_elapsed) => {
+            authpage::abandon(&callback, "no answer from the browser");
+            Err("the browser did not answer in time".to_string())
+        }
+    }
+}
+
+/// Register a NEW passkey on this device's account: ceremony 1 creates it
+/// (the page hands back its key), this device consents, ceremony 2 has the
+/// passkey sign its own `AddKey` frame — possession proven by the assertion.
+pub async fn register_passkey(
+    rpc: String,
+    password: String,
+    chain_id: String,
+    label: String,
+) -> Result<bool, AppError> {
+    async {
+        let chain_id = named_chain(chain_id)?;
+        let label = optional_label(label)?;
+        require_password(&password)?;
+        let client = rpc_client(&rpc)?;
+        let account = own_account(&client).await?;
+        let registered = browser_ceremony(authpage::Request::Create {
+            challenge: authpage::create_challenge(),
+            user: account.number,
+            name: account.name,
+        })
+        .await?;
+        let authpage::Outcome::Create { public_key, .. } = registered else {
+            return Err("expected a passkey registration".to_string());
+        };
+        let msg = consented_add_key(
+            &client,
+            password,
+            &chain_id,
+            identity::KeyScheme::Secp256r1,
+            &public_key,
+            label,
+        )
+        .await?;
+        let (request, preimage) =
+            authpage::passkey_frame_request(&public_key, next_sequence(), &identity_msg(&msg));
+        let signed = browser_ceremony(request).await?;
+        submit_raw_frame(
+            &client,
+            "identity",
+            authpage::passkey_frame(preimage, &signed)?,
+        )
+        .await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+/// Link an Ethereum wallet to this device's account: touch 1 reveals its
+/// key, this device consents, touch 2 has the wallet sign its own `AddKey`
+/// frame.
+pub async fn link_wallet(
+    rpc: String,
+    password: String,
+    chain_id: String,
+    label: String,
+) -> Result<bool, AppError> {
+    async {
+        let chain_id = named_chain(chain_id)?;
+        let label = optional_label(label)?;
+        require_password(&password)?;
+        let client = rpc_client(&rpc)?;
+        own_account(&client).await?;
+        let reveal = authpage::reveal_message();
+        let touch = browser_ceremony(authpage::Request::Eth {
+            message: reveal.clone(),
+        })
+        .await?;
+        let pubkey = authpage::wallet_pubkey(&reveal, &touch)?;
+        let msg = consented_add_key(
+            &client,
+            password,
+            &chain_id,
+            identity::KeyScheme::Secp256k1,
+            &pubkey,
+            label,
+        )
+        .await?;
+        let (request, preimage) =
+            authpage::wallet_frame_request(&pubkey, next_sequence(), &identity_msg(&msg));
+        let touch = browser_ceremony(request).await?;
+        submit_raw_frame(
+            &client,
+            "identity",
+            authpage::wallet_frame(preimage, &touch)?,
+        )
+        .await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+/// Admit THIS device into an account by a passkey's consent: the assertion
+/// over this key's `AddKey` preimage IS the consent, its `userHandle` names
+/// the account, and this device signs the frame (the key being admitted).
+pub async fn login_with_passkey(
+    rpc: String,
+    password: String,
+    chain_id: String,
+    label: String,
+) -> Result<bool, AppError> {
+    async {
+        let chain_id = named_chain(chain_id)?;
+        let label = optional_label(label)?;
+        require_password(&password)?;
+        let Some(device_key) = local_user_key().await else {
+            return Err("this device has no user key".to_string());
+        };
+        let client = rpc_client(&rpc)?;
+        let generation = key_generation(&client, &device_key).await?;
+        let consent =
+            browser_ceremony(authpage::login_request(&chain_id, &device_key, generation)).await?;
+        let (number, proof) = authpage::login_consent(&consent)?;
+        let account = account_reply(
+            client
+                .query("identity", &identity::IdentityQuery::Get { number })
+                .await?,
+        )?
+        .ok_or_else(|| format!("the passkey names account {number}, unknown to this node"))?;
+        let msg =
+            authpage::login_add_key(&chain_id, &device_key, generation, &account, label, proof)?;
+        signed_write(&client, "identity", identity::encode_msg(&msg), password).await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
 }
 
 /// A pasted ticket is an `AddKey` or it is refused HERE, before any signature
@@ -1481,7 +1703,11 @@ mod account_ticket_tests {
             &new_key,
             3,
         );
-        let ticket = add_key_ticket(Some("phone".into()), authorizer);
+        let ticket = add_key_ticket(&identity::IdentityMsg::AddKey {
+            scheme: identity::KeyScheme::Ed25519,
+            label: Some("phone".into()),
+            authorizer,
+        });
         assert_eq!(ticket.lines().count(), 1, "one json line, pasteable");
         let identity::IdentityMsg::AddKey {
             scheme,

@@ -836,6 +836,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "authpage"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "identity",
+ "keyscheme",
+ "node",
+ "rand 0.8.6",
+ "sdk",
+ "serde_json",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3238,6 +3251,7 @@ dependencies = [
 name = "ducktape-app"
 version = "0.1.0"
 dependencies = [
+ "authpage",
  "capability",
  "chat",
  "commonware-cryptography",
@@ -6175,6 +6189,7 @@ dependencies = [
  "anyhow",
  "argon2",
  "async-trait",
+ "authpage",
  "axum",
  "base64 0.22.1",
  "bip39",

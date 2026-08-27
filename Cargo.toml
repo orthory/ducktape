@@ -131,6 +131,7 @@ members = [
     # node/noded/simnode parse and validate `.duck` names host-side. Under
     # crates/modules/system/ it made "modules = onchain" literally false.
     "crates/duckdns",
+    "crates/authpage",
     # keystore — the device keystore (`keys/<name>.key` + the active pointer)
     # and the argon2id/AEAD seal under it. Same standing, same reason: its two
     # consumers are the CLI and the desktop app, which share nothing else. It
@@ -358,6 +359,9 @@ sandbox-host = { path = "crates/services/sandbox" }
 duckdns = { path = "crates/duckdns" }
 # the device keystore, linked by both the CLI and the desktop app.
 keystore = { path = "crates/keystore" }
+# the WebAuthn RP page client (ops/auth-page): request URL, loopback callback,
+# passkey/wallet frames — shared by the CLI and the app.
+authpage = { path = "crates/authpage" }
 # the run envelope's magic + headless composer, linked by the CLI, the compute
 # service and the desktop app.
 run-envelope = { path = "crates/run-envelope" }

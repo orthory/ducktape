@@ -21,6 +21,17 @@ pub(crate) async fn signed_write(
         ));
     }
     let frame = sign_frame(target, &payload, password).await?;
+    submit_raw_frame(rpc, target, frame).await
+}
+
+/// Submit a frame signed ELSEWHERE — by a passkey or a wallet in the browser
+/// (`authpage`), never this device's key — through the same funnel, so the
+/// block it lands in is noted for the reads that follow.
+pub(crate) async fn submit_raw_frame(
+    rpc: &RpcClient,
+    target: &str,
+    frame: Vec<u8>,
+) -> Result<u64, String> {
     let height = rpc.submit_frame(frame).await?;
     note_module_block(rpc, target, height);
     Ok(height)
@@ -236,6 +247,7 @@ async fn sign_frame(target: &str, payload: &[u8], password: String) -> Result<Ve
 pub(crate) async fn sign_add_key_consent(
     password: String,
     chain_id: &str,
+    scheme: identity::KeyScheme,
     new_key: &[u8],
     generation: u64,
 ) -> Result<identity::Authorizer, String> {
@@ -244,7 +256,7 @@ pub(crate) async fn sign_add_key_consent(
     Ok(workspace_config::ed25519_authorizer(
         &signer.key,
         chain_id,
-        identity::KeyScheme::Ed25519,
+        scheme,
         new_key,
         generation,
     ))

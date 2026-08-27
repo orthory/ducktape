@@ -23,7 +23,7 @@ mod eth;
 pub mod testkit;
 mod webauthn;
 
-pub use eth::{eip191_digest, personal_message};
+pub use eth::{eip191_digest, personal_message, recover_personal_sign};
 pub use webauthn::{webauthn_challenge, webauthn_proof};
 
 /// the closed scheme set. borsh rides along for stored records (identity's

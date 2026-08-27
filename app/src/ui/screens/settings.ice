@@ -21,6 +21,9 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
     account_join_draft_changed(str)
     account_key_join_submit()
     account_key_remove(str)
+    account_passkey_submit()
+    account_wallet_submit()
+    account_login_submit()
     copy_to_clipboard(str, str)
     settings_clear_tabs()
     forget_workspace_submit()
@@ -397,6 +400,25 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                         h=28.0
                         p=5.0
                         @secondary_action
+                  // …or a passkey registered on a member device consents in
+                  // the browser — no ticket to carry across.
+                  row
+                    with
+                      w=fill
+                      h=28.0
+                      gap=5.0
+                      align=center
+                    text "…or let a passkey from another device admit this one."
+                      with
+                        w=fill
+                        size=12.0
+                        @text-meta
+                    button "Log in with a passkey" -> emit(account_login_submit)
+                      with
+                        disabled=(account_busy || empty(password))
+                        h=28.0
+                        p=5.0
+                        @secondary_action
                 // ACCOUNT FACTS, ONLY WHEN THERE IS AN ACCOUNT. With the key
                 // in no account, `load_account` returns zeros for every field,
                 // and the card printed `0 keys` one line under "· validator
@@ -524,6 +546,31 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                       button "Mint ticket" -> emit(account_key_add_submit)
                         with
                           disabled=(account_busy || empty(password) || empty(trim(account_key_draft)))
+                          h=28.0
+                          p=5.0
+                          @secondary_action
+                    // …or from a browser: a passkey registered here, or an
+                    // Ethereum wallet, signs its own admission (the label
+                    // above names it).
+                    row
+                      with
+                        w=fill
+                        gap=7.0
+                        align=center
+                      text "…or from a browser:"
+                        with
+                          w=fill
+                          size=12.0
+                          @text-meta
+                      button "Register a passkey" -> emit(account_passkey_submit)
+                        with
+                          disabled=(account_busy || empty(password))
+                          h=28.0
+                          p=5.0
+                          @secondary_action
+                      button "Link a wallet" -> emit(account_wallet_submit)
+                        with
+                          disabled=(account_busy || empty(password))
                           h=28.0
                           p=5.0
                           @secondary_action
