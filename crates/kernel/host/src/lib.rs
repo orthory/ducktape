@@ -815,6 +815,13 @@ impl Host {
         self.registry.get(id).map(|m| m.root())
     }
 
+    /// the sha256 of the component a registered module currently RUNS, or
+    /// `None` for a native module (no swappable code) and for an unknown id.
+    /// per-node realization state, never part of `root()`.
+    pub fn module_code_hash(&self, id: &str) -> Option<Vec<u8>> {
+        self.registry.get(id).and_then(|m| m.code_hash())
+    }
+
     /// every registered module's `(id, root)`, in registry (sorted-id) order —
     /// the exact input [`Host::root_hash`] composes over. a recovery journal
     /// seals each applied block with these so a restarted node can locate every

@@ -1494,6 +1494,40 @@ mod tests {
         })
     }
 
+    /// The composed host's NATIVE module ids, sorted — a module with no code
+    /// hash is one the binary compiled in rather than one lifecycle can swap.
+    /// Same thread/stack shape as [`genesis_facts`], for the same reason.
+    fn genesis_native_ids() -> Vec<String> {
+        std::thread::Builder::new()
+            .name("production-genesis-native-ids".into())
+            .stack_size(GENESIS_TEST_STACK_BYTES)
+            .spawn(|| {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let cfg = commonware_runtime::tokio::Config::default()
+                    .with_storage_directory(dir.path().join("storage"));
+                let executor = commonware_runtime::tokio::Runner::new(cfg);
+                executor.start(|context| async move {
+                    let host = genesis_host(
+                        &context,
+                        &dir.path().join("forge"),
+                        &dir.path().join("duckfs"),
+                        &[],
+                        PIN_BINDINGS,
+                        blobstore::BlobHandle::default(),
+                    )
+                    .await;
+                    host.module_roots()
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .filter(|id| host.module_code_hash(id).is_none())
+                        .collect()
+                })
+            })
+            .expect("spawn production genesis native ids")
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+    }
+
     /// the registry ↔ topology parity pin. [`ProductionModules`] already forces
     /// genesis, restore, and state sync onto one module set at compile time;
     /// this test pins that set to `MODULE_IDS` — the `production` selection of
@@ -1506,6 +1540,23 @@ mod tests {
         let mut want: Vec<String> = MODULE_IDS.iter().map(|s| s.to_string()).collect();
         want.sort_unstable();
         assert_eq!(got, want);
+    }
+
+    /// the topology's `code` column is what the loader branches on; if it
+    /// disagrees with what the composed host actually runs, a native module is
+    /// sent to the wasm loader (or a wasm tenant is never reconciled).
+    #[test]
+    fn topology_code_column_matches_the_composed_host() {
+        let native_by_topology: Vec<String> = topology::TOPOLOGY
+            .modules
+            .iter()
+            .filter(|m| MODULE_IDS.contains(&m.id) && m.code == topology::Code::Native)
+            .map(|m| m.id.to_string())
+            .collect();
+        let native_by_host = genesis_native_ids();
+        let mut want = native_by_topology;
+        want.sort_unstable();
+        assert_eq!(native_by_host, want);
     }
 
     /// THE consensus pin: the production genesis root hash is a constant.
