@@ -82,6 +82,29 @@ pub mod option_socket_addr {
     }
 }
 
+/// `Vec<std::net::SocketAddr>`, laid out as borsh lays out every
+/// sequence: a `u32` count, then the elements.
+pub mod vec_socket_addr {
+    use super::*;
+
+    pub fn declaration() -> Declaration {
+        format!("Vec<{}>", socket_addr::declaration())
+    }
+
+    pub fn definitions(definitions: &mut BTreeMap<Declaration, Definition>) {
+        borsh::schema::add_definition(
+            declaration(),
+            Definition::Sequence {
+                length_width: Definition::DEFAULT_LENGTH_WIDTH,
+                length_range: Definition::DEFAULT_LENGTH_RANGE,
+                elements: socket_addr::declaration(),
+            },
+            definitions,
+        );
+        socket_addr::definitions(definitions);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +128,7 @@ mod tests {
         assert!(definitions.contains_key("Option<SocketAddr>"));
         assert!(definitions.contains_key("SocketAddr"));
         assert!(definitions.contains_key("SocketAddrV6"));
+        vec_socket_addr::definitions(&mut definitions);
+        assert!(definitions.contains_key("Vec<SocketAddr>"));
     }
 }

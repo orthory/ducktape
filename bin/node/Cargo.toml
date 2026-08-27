@@ -97,7 +97,7 @@ reachability = { workspace = true }
 # the coordinator-auth credential types: `coord.cap` is the private-mode
 # admission token a node persists beside its descriptor (minted by a genesis
 # validator via `mint_coord_cap`, presented on each rendezvous request).
-nat-traversal = { workspace = true }
+nat-traversal = { workspace = true, features = ["runtime"] }
 wireguard = { workspace = true }
 # the voice hub's transport seam: huddle media rides data-plane datagrams over
 # the per-service overlay sockets (src/voice_plane.rs binds them); the mesh arm

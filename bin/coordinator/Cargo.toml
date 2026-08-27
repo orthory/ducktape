@@ -12,7 +12,7 @@ name = "coordinator"
 path = "src/main.rs"
 
 [dependencies]
-nat-traversal = { workspace = true }
+nat-traversal = { workspace = true, features = ["runtime"] }
 tokio = { workspace = true, features = ["net", "rt", "macros", "time"] }
 # reading the PUBLIC genesis valset out of network.toml (--genesis-set). No
 # secret, no node-crate dependency: a local GenesisPin struct + hex decode.

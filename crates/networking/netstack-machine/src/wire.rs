@@ -6,10 +6,11 @@
 //! and [`schema_text`] is what says so.
 //!
 //! Foreign types the contract carries and borsh does not describe get a
-//! helper module each (`key`, `keys`, `result_socket_addr`; the socket
-//! address itself lives in `wireguard::wire_schema`). A helper's serialized
-//! form is the plain borsh encoding of its underlying bytes, and its schema
-//! declares exactly that, so the description never drifts from the bytes.
+//! helper module each (`key`, `keys`, `option_key`, `result_socket_addr`;
+//! the socket address itself lives in `wireguard::wire_schema`). A helper's
+//! serialized form is the plain borsh encoding of its underlying bytes, and
+//! its schema declares exactly that, so the description never drifts from
+//! the bytes.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -19,16 +20,17 @@ use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
 use sha2::{Digest, Sha256};
+use wireguard::UpgradeError;
 use wireguard::wire_schema::socket_addr;
 
-use crate::contract::{Effect, Event, ReachabilityEvent};
+use crate::contract::{Effect, Event, MachineConfig, ReachabilityEvent};
 
 /// The pinned hash of [`schema_text`]: the contract's version. A change
 /// here is a wire change — the schema test refuses drift until the fixture
 /// (`tests/fixtures/contract.schema`) and this constant are regenerated in
 /// the same PR (`UPDATE_TRACES=1 cargo test -p netstack-machine`).
 pub const CONTRACT_SCHEMA_HASH: &str =
-    "e7c399754832777546900cefbee47ce07dd0157ff0bd503b5ae518167bfa3512";
+    "3cdc0594e21ce0a61e734ee38510cada50712eb20475e190a8324421c53084f9";
 
 #[derive(Debug, thiserror::Error)]
 #[error("contract wire: {0}")]
@@ -42,30 +44,45 @@ pub fn decode_event(bytes: &[u8]) -> Result<Event, WireError> {
     Ok(borsh::from_slice(bytes)?)
 }
 
-pub fn encode_effects(effects: &[Effect]) -> Vec<u8> {
-    borsh::to_vec(effects).expect("contract types always serialize")
+/// One step's outcome as it crosses the boundary: the effects to perform,
+/// or the protocol error that stops the plane.
+pub type StepOutcome = Result<Vec<Effect>, UpgradeError>;
+
+pub fn encode_step(outcome: &StepOutcome) -> Vec<u8> {
+    borsh::to_vec(outcome).expect("contract types always serialize")
 }
 
-pub fn decode_effects(bytes: &[u8]) -> Result<Vec<Effect>, WireError> {
+pub fn decode_step(bytes: &[u8]) -> Result<StepOutcome, WireError> {
     Ok(borsh::from_slice(bytes)?)
 }
 
-/// The wire's three roots — the event in, the effect list out, the
-/// observation the host surfaces — with every definition they reach, as
-/// one canonical text. Definitions are a sorted map, so the text is stable
-/// across runs and its hash identifies the contract.
+pub fn encode_config(config: &MachineConfig) -> Vec<u8> {
+    borsh::to_vec(config).expect("contract types always serialize")
+}
+
+pub fn decode_config(bytes: &[u8]) -> Result<MachineConfig, WireError> {
+    Ok(borsh::from_slice(bytes)?)
+}
+
+/// The wire's four roots — the config the machine is built from, the event
+/// in, the step outcome out, the observation the host surfaces — with every
+/// definition they reach, as one canonical text. Definitions are a sorted
+/// map, so the text is stable across runs and its hash identifies the
+/// contract.
 pub fn schema_text() -> String {
     let mut out = String::new();
+    let _ = writeln!(out, "root config = {}", MachineConfig::declaration());
     let _ = writeln!(out, "root event = {}", Event::declaration());
-    let _ = writeln!(out, "root effects = {}", <Vec<Effect>>::declaration());
+    let _ = writeln!(out, "root step = {}", StepOutcome::declaration());
     let _ = writeln!(
         out,
         "root observation = {}",
         ReachabilityEvent::declaration()
     );
     let mut definitions = BTreeMap::new();
+    MachineConfig::add_definitions_recursively(&mut definitions);
     Event::add_definitions_recursively(&mut definitions);
-    <Vec<Effect>>::add_definitions_recursively(&mut definitions);
+    StepOutcome::add_definitions_recursively(&mut definitions);
     ReachabilityEvent::add_definitions_recursively(&mut definitions);
     for (declaration, definition) in &definitions {
         let _ = writeln!(out, "{declaration} = {definition:?}");
@@ -161,6 +178,58 @@ pub(crate) mod keys {
     }
 }
 
+/// An optional ed25519 public key, laid out as borsh lays out every
+/// `Option`: a one-byte tag, `None` = 0, `Some` = 1.
+pub(crate) mod option_key {
+    use super::*;
+
+    pub fn serialize<W: borsh::io::Write>(
+        key: &Option<ed25519::PublicKey>,
+        writer: &mut W,
+    ) -> Result<(), borsh::io::Error> {
+        match key {
+            None => 0u8.serialize(writer),
+            Some(key) => {
+                1u8.serialize(writer)?;
+                key::serialize(key, writer)
+            }
+        }
+    }
+
+    pub fn deserialize<R: borsh::io::Read>(
+        reader: &mut R,
+    ) -> Result<Option<ed25519::PublicKey>, borsh::io::Error> {
+        match u8::deserialize_reader(reader)? {
+            0 => Ok(None),
+            1 => key::deserialize(reader).map(Some),
+            tag => Err(borsh::io::Error::new(
+                borsh::io::ErrorKind::InvalidData,
+                format!("option tag {tag}"),
+            )),
+        }
+    }
+
+    pub fn declaration() -> Declaration {
+        format!("Option<{}>", key::declaration())
+    }
+
+    pub fn definitions(definitions: &mut BTreeMap<Declaration, Definition>) {
+        borsh::schema::add_definition(
+            declaration(),
+            Definition::Enum {
+                tag_width: 1,
+                variants: vec![
+                    (0, "None".into(), <() as BorshSchema>::declaration()),
+                    (1, "Some".into(), key::declaration()),
+                ],
+            },
+            definitions,
+        );
+        <() as BorshSchema>::add_definitions_recursively(definitions);
+        key::definitions(definitions);
+    }
+}
+
 /// `Result<SocketAddr, String>` — schema only (borsh serializes it natively),
 /// laid out as borsh lays out every `Result`: tag 1 = `Ok`, tag 0 = `Err`.
 pub(crate) mod result_socket_addr {
@@ -199,7 +268,9 @@ mod tests {
     use std::net::SocketAddr;
     use std::path::Path;
     use wireguard::effect::PeerTunnelConfig;
-    use wireguard::{AllowedIp, MeshVersion, ValidatorIdentity, X25519PublicKey};
+    use wireguard::{
+        AllowedIp, Endpoint, MeshVersion, PortPolicy, Transport, ValidatorIdentity, X25519PublicKey,
+    };
 
     fn key(seed: u64) -> ed25519::PublicKey {
         PrivateKey::from_seed(seed).public_key()
@@ -392,8 +463,21 @@ mod tests {
         for event in events() {
             assert_eq!(decode_event(&encode_event(&event)).unwrap(), event);
         }
-        let effects = effects();
-        assert_eq!(decode_effects(&encode_effects(&effects)).unwrap(), effects);
+        let outcomes: [StepOutcome; 4] = [
+            Ok(effects()),
+            Err(UpgradeError::MeshVersionMismatch),
+            Err(UpgradeError::InvalidKeyLength {
+                expected: 32,
+                actual: 31,
+            }),
+            Err(UpgradeError::InvalidEndpoint("refused".into())),
+        ];
+        for outcome in outcomes {
+            assert_eq!(decode_step(&encode_step(&outcome)).unwrap(), outcome);
+        }
+        for config in configs() {
+            assert_eq!(decode_config(&encode_config(&config)).unwrap(), config);
+        }
         for observation in observations() {
             let bytes = borsh::to_vec(&observation).unwrap();
             assert_eq!(
@@ -401,6 +485,43 @@ mod tests {
                 observation
             );
         }
+    }
+
+    /// A public and an endpoint-less node, with and without the lobby
+    /// ingress: every optional field in both states.
+    fn configs() -> Vec<MachineConfig> {
+        let policy = PortPolicy::production();
+        let endpoint = |octet, port, transport| {
+            Endpoint::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, octet)),
+                port,
+                transport,
+                &policy,
+            )
+            .unwrap()
+        };
+        vec![
+            MachineConfig {
+                chain_id: "net#wire".into(),
+                wireguard_public: X25519PublicKey([1; 32]),
+                wireguard_advertised: Some(endpoint(1, 51820, Transport::Udp)),
+                control_endpoint: endpoint(1, 443, Transport::Tcp),
+                coordinators: vec![addr(9, 3478)],
+                port_policy: policy.clone(),
+                persist: true,
+                gossip_ingress: Some(key(7)),
+            },
+            MachineConfig {
+                chain_id: "net#wire".into(),
+                wireguard_public: X25519PublicKey([2; 32]),
+                wireguard_advertised: None,
+                control_endpoint: endpoint(2, 443, Transport::Tcp),
+                coordinators: Vec::new(),
+                port_policy: policy.clone(),
+                persist: false,
+                gossip_ingress: None,
+            },
+        ]
     }
 
     #[test]

@@ -1,5 +1,6 @@
+root config = MachineConfig
 root event = Event
-root effects = Vec<Effect>
+root step = Result<Vec<Effect>, UpgradeError>
 root observation = ReachabilityEvent
 () = Primitive(0)
 AllowedIp = Struct { fields: NamedFields([("addr", "IpAddr"), ("cidr", "u8")]) }
@@ -17,6 +18,7 @@ Effect__UdpSend = Struct { fields: NamedFields([("endpoint", "SocketAddr"), ("by
 Effect__UdpSendAwait = Struct { fields: NamedFields([("req", "ReqId"), ("endpoint", "SocketAddr"), ("bytes", "Vec<u8>"), ("timeout_ms", "u64")]) }
 Effect__WgApply = Struct { fields: NamedFields([("req", "ReqId"), ("bring_up", "bool"), ("peers", "Vec<PeerTunnelConfig>")]) }
 Effect__WgRemove = Struct { fields: Empty }
+Endpoint = Struct { fields: NamedFields([("addr", "IpAddr"), ("port", "u16"), ("transport", "Transport")]) }
 Event = Enum { tag_width: 1, variants: [(0, "Retarget", "Event__Retarget"), (1, "Deliver", "Event__Deliver"), (2, "ViewTick", "Event__ViewTick"), (3, "Nudge", "Event__Nudge"), (4, "InstallInvitePeer", "Event__InstallInvitePeer"), (5, "BootstrapCoordinatedInvitePeer", "Event__BootstrapCoordinatedInvitePeer"), (6, "SendResolverDatagram", "Event__SendResolverDatagram"), (7, "Resolved", "Event__Resolved"), (8, "RendezvousResolved", "Event__RendezvousResolved"), (9, "DatagramReplied", "Event__DatagramReplied"), (10, "WgApplied", "Event__WgApplied"), (11, "Shutdown", "Event__Shutdown")] }
 Event__BootstrapCoordinatedInvitePeer = Struct { fields: NamedFields([("token", "CmdToken"), ("peer", "Ed25519PublicKey"), ("wireguard_public_key", "X25519PublicKey"), ("intro", "Vec<u8>")]) }
 Event__DatagramReplied = Struct { fields: NamedFields([("req", "ReqId"), ("outcome", "Result<Vec<u8>, String>")]) }
@@ -35,13 +37,17 @@ IpAddr__V4 = Struct { fields: UnnamedFields(["Ipv4Addr"]) }
 IpAddr__V6 = Struct { fields: UnnamedFields(["Ipv6Addr"]) }
 Ipv4Addr = Struct { fields: NamedFields([("octets", "[u8; 4]")]) }
 Ipv6Addr = Struct { fields: NamedFields([("octets", "[u8; 16]")]) }
+MachineConfig = Struct { fields: NamedFields([("chain_id", "String"), ("wireguard_public", "X25519PublicKey"), ("wireguard_advertised", "Option<Endpoint>"), ("control_endpoint", "Endpoint"), ("coordinators", "Vec<SocketAddr>"), ("port_policy", "PortPolicy"), ("persist", "bool"), ("gossip_ingress", "Option<Ed25519PublicKey>")]) }
 MeshEpochEvent = Struct { fields: NamedFields([("epoch", "u64"), ("members", "Vec<Ed25519PublicKey>"), ("standbys", "Vec<Ed25519PublicKey>"), ("current_view", "u64")]) }
 MeshVersion = Struct { fields: UnnamedFields(["[u8; 32]"]) }
 NodeKey = Struct { fields: UnnamedFields(["[u8; 32]"]) }
+Option<Ed25519PublicKey> = Enum { tag_width: 1, variants: [(0, "None", "()"), (1, "Some", "Ed25519PublicKey")] }
+Option<Endpoint> = Enum { tag_width: 1, variants: [(0, "None", "()"), (1, "Some", "Endpoint")] }
 Option<SocketAddr> = Enum { tag_width: 1, variants: [(0, "None", "()"), (1, "Some", "SocketAddr")] }
 Option<Vec<u8>> = Enum { tag_width: 1, variants: [(0, "None", "()"), (1, "Some", "Vec<u8>")] }
 Option<u16> = Enum { tag_width: 1, variants: [(0, "None", "()"), (1, "Some", "u16")] }
 PeerTunnelConfig = Struct { fields: NamedFields([("wireguard_public_key", "X25519PublicKey"), ("endpoint", "Option<SocketAddr>"), ("allowed_ips", "Vec<AllowedIp>"), ("keepalive_seconds", "Option<u16>")]) }
+PortPolicy = Struct { fields: NamedFields([("name", "String"), ("allowed_control_tcp_ports", "Vec<u16>"), ("allowed_wireguard_udp_ports", "Vec<u16>"), ("allow_loopback", "bool"), ("allow_private_ip", "bool")]) }
 ReachabilityEvent = Enum { tag_width: 1, variants: [(0, "Send", "ReachabilityEvent__Send"), (1, "MeshReady", "ReachabilityEvent__MeshReady"), (2, "TunnelsApplied", "ReachabilityEvent__TunnelsApplied"), (3, "PeerFailed", "ReachabilityEvent__PeerFailed"), (4, "EpochFailed", "ReachabilityEvent__EpochFailed"), (5, "MeshRestored", "ReachabilityEvent__MeshRestored"), (6, "RestoreFailed", "ReachabilityEvent__RestoreFailed"), (7, "PersistFailed", "ReachabilityEvent__PersistFailed"), (8, "StandbyTunnelsApplied", "ReachabilityEvent__StandbyTunnelsApplied"), (9, "MeshAdopted", "ReachabilityEvent__MeshAdopted"), (10, "PeerReadvertised", "ReachabilityEvent__PeerReadvertised"), (11, "PeerEndpointResolved", "ReachabilityEvent__PeerEndpointResolved"), (12, "InvitePeerInstalled", "ReachabilityEvent__InvitePeerInstalled"), (13, "ControlEndpointObserved", "ReachabilityEvent__ControlEndpointObserved")] }
 ReachabilityEvent__ControlEndpointObserved = Struct { fields: NamedFields([("peer", "ValidatorIdentity"), ("control_endpoint", "SocketAddr")]) }
 ReachabilityEvent__EpochFailed = Struct { fields: NamedFields([("epoch", "u64"), ("reason", "String")]) }
@@ -64,16 +70,41 @@ Resolution__Punched = Struct { fields: UnnamedFields(["SocketAddr"]) }
 Result<(), String> = Enum { tag_width: 1, variants: [(1, "Ok", "()"), (0, "Err", "String")] }
 Result<Resolution, String> = Enum { tag_width: 1, variants: [(1, "Ok", "Resolution"), (0, "Err", "String")] }
 Result<SocketAddr, String> = Enum { tag_width: 1, variants: [(1, "Ok", "SocketAddr"), (0, "Err", "String")] }
+Result<Vec<Effect>, UpgradeError> = Enum { tag_width: 1, variants: [(1, "Ok", "Vec<Effect>"), (0, "Err", "UpgradeError")] }
 Result<Vec<u8>, String> = Enum { tag_width: 1, variants: [(1, "Ok", "Vec<u8>"), (0, "Err", "String")] }
 SocketAddr = Enum { tag_width: 1, variants: [(0, "V4", "SocketAddrV4"), (1, "V6", "SocketAddrV6")] }
 SocketAddrV4 = Struct { fields: NamedFields([("ip", "Ipv4Addr"), ("port", "u16")]) }
 SocketAddrV6 = Struct { fields: NamedFields([("ip", "Ipv6Addr"), ("port", "u16")]) }
 String = Sequence { length_width: 4, length_range: 0..=4294967295, elements: "u8" }
+Transport = Enum { tag_width: 1, variants: [(0, "Tcp", "Transport__Tcp"), (1, "Udp", "Transport__Udp")] }
+Transport__Tcp = Struct { fields: Empty }
+Transport__Udp = Struct { fields: Empty }
+UpgradeError = Enum { tag_width: 1, variants: [(0, "InvalidKeyLength", "UpgradeError__InvalidKeyLength"), (1, "EmptyValidatorSet", "UpgradeError__EmptyValidatorSet"), (2, "MissingAdmissionRoot", "UpgradeError__MissingAdmissionRoot"), (3, "DuplicateValidator", "UpgradeError__DuplicateValidator"), (4, "UnknownValidator", "UpgradeError__UnknownValidator"), (5, "MissingAdvertisement", "UpgradeError__MissingAdvertisement"), (6, "StaleDuplicateAdvertisement", "UpgradeError__StaleDuplicateAdvertisement"), (7, "Expired", "UpgradeError__Expired"), (8, "InvalidEndpoint", "UpgradeError__InvalidEndpoint"), (9, "PortPolicyMismatch", "UpgradeError__PortPolicyMismatch"), (10, "MeshVersionMismatch", "UpgradeError__MeshVersionMismatch"), (11, "BadSignature", "UpgradeError__BadSignature"), (12, "HashMismatch", "UpgradeError__HashMismatch"), (13, "HandshakeMismatch", "UpgradeError__HandshakeMismatch"), (14, "BadAckView", "UpgradeError__BadAckView"), (15, "Replay", "UpgradeError__Replay"), (16, "InvalidAllowedIp", "UpgradeError__InvalidAllowedIp"), (17, "InvalidWireGuardKey", "UpgradeError__InvalidWireGuardKey")] }
+UpgradeError__BadAckView = Struct { fields: Empty }
+UpgradeError__BadSignature = Struct { fields: Empty }
+UpgradeError__DuplicateValidator = Struct { fields: Empty }
+UpgradeError__EmptyValidatorSet = Struct { fields: Empty }
+UpgradeError__Expired = Struct { fields: Empty }
+UpgradeError__HandshakeMismatch = Struct { fields: Empty }
+UpgradeError__HashMismatch = Struct { fields: Empty }
+UpgradeError__InvalidAllowedIp = Struct { fields: Empty }
+UpgradeError__InvalidEndpoint = Struct { fields: UnnamedFields(["String"]) }
+UpgradeError__InvalidKeyLength = Struct { fields: NamedFields([("expected", "u32"), ("actual", "u32")]) }
+UpgradeError__InvalidWireGuardKey = Struct { fields: Empty }
+UpgradeError__MeshVersionMismatch = Struct { fields: Empty }
+UpgradeError__MissingAdmissionRoot = Struct { fields: Empty }
+UpgradeError__MissingAdvertisement = Struct { fields: Empty }
+UpgradeError__PortPolicyMismatch = Struct { fields: Empty }
+UpgradeError__Replay = Struct { fields: Empty }
+UpgradeError__StaleDuplicateAdvertisement = Struct { fields: Empty }
+UpgradeError__UnknownValidator = Struct { fields: Empty }
 ValidatorIdentity = Struct { fields: UnnamedFields(["[u8; 32]"]) }
 Vec<AllowedIp> = Sequence { length_width: 4, length_range: 0..=4294967295, elements: "AllowedIp" }
 Vec<Ed25519PublicKey> = Sequence { length_width: 4, length_range: 0..=4294967295, elements: "Ed25519PublicKey" }
 Vec<Effect> = Sequence { length_width: 4, length_range: 0..=4294967295, elements: "Effect" }
 Vec<PeerTunnelConfig> = Sequence { length_width: 4, length_range: 0..=4294967295, elements: "PeerTunnelConfig" }
+Vec<SocketAddr> = Sequence { length_width: 4, length_range: 0..=4294967295, elements: "SocketAddr" }
+Vec<u16> = Sequence { length_width: 4, length_range: 0..=4294967295, elements: "u16" }
 Vec<u8> = Sequence { length_width: 4, length_range: 0..=4294967295, elements: "u8" }
 X25519PublicKey = Struct { fields: UnnamedFields(["[u8; 32]"]) }
 [u8; 16] = Sequence { length_width: 0, length_range: 16..=16, elements: "u8" }
@@ -81,5 +112,6 @@ X25519PublicKey = Struct { fields: UnnamedFields(["[u8; 32]"]) }
 [u8; 4] = Sequence { length_width: 0, length_range: 4..=4, elements: "u8" }
 bool = Primitive(1)
 u16 = Primitive(2)
+u32 = Primitive(4)
 u64 = Primitive(8)
 u8 = Primitive(1)

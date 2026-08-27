@@ -167,7 +167,7 @@ impl Driver {
                 expires_at_view: self.view + HANDSHAKE_TTL_VIEWS,
                 nonce,
             };
-            let request = TunnelUpgradeRequest::sign(fields, &self.config.signer);
+            let request = TunnelUpgradeRequest::sign(fields, &*self.signer);
             state.handshakes.insert(
                 peer,
                 PeerHandshake::AwaitingResponse {
@@ -346,7 +346,7 @@ impl Driver {
             expires_at_view: self.view + HANDSHAKE_TTL_VIEWS,
             nonce,
         };
-        let response = TunnelUpgradeResponse::sign(fields, &self.config.signer);
+        let response = TunnelUpgradeResponse::sign(fields, &*self.signer);
         state.handshakes.insert(
             sender,
             PeerHandshake::AwaitingAck {
@@ -437,7 +437,7 @@ impl Driver {
             expires_at_view: self.view + HANDSHAKE_TTL_VIEWS,
             nonce: state.next_nonce(),
         };
-        let ack = TunnelUpgradeAck::sign(fields, &self.config.signer);
+        let ack = TunnelUpgradeAck::sign(fields, &*self.signer);
         let plan = wireguard::validate_upgrade_as(
             Perspective::Initiator,
             &view,

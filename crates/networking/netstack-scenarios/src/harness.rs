@@ -10,6 +10,9 @@
 //! is answered from the scenario's model after its latency; `Persist`
 //! bytes are kept per node and offered back on the first retarget after a
 //! restart, the way the executor offers the state file.
+//!
+//! The machine behind each node is whatever the scenario's [`Backend`]
+//! builds — the trace never says which, which is the point.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
@@ -22,9 +25,11 @@ use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use nat_traversal::NodeKey;
 use netstack_machine::msg::ReachabilityMsg;
 use netstack_machine::{
-    CmdToken, Effect, Event, Machine, MachineConfig, MeshEpochEvent, ReachabilityEvent, ReqId,
-    Resolution, binding,
+    CmdToken, Effect, Event, MachineConfig, MeshEpochEvent, NetstackMachine, ReachabilityEvent,
+    ReqId, Resolution, binding,
 };
+
+use crate::Backend;
 use wireguard::effect::PeerTunnelConfig;
 use wireguard::{Endpoint, MeshVersion, PortPolicy, Transport, ValidatorIdentity, X25519PublicKey};
 
@@ -158,7 +163,7 @@ struct Node {
     advertised: Option<Endpoint>,
     control: Endpoint,
     /// `None` while the node is down.
-    machine: Option<Machine>,
+    machine: Option<Box<dyn NetstackMachine>>,
     /// The state file this life will offer on its first retarget.
     restore: Option<Vec<u8>>,
     /// The last persisted snapshot (what a restart reads back).
@@ -231,6 +236,7 @@ impl Ord for Scheduled {
 /// The whole simulated world.
 pub struct Net {
     scenario: String,
+    backend: Backend,
     chain_id: String,
     coordinators: Vec<SocketAddr>,
     persist: bool,
@@ -252,8 +258,9 @@ pub struct Net {
 }
 
 impl Net {
-    /// `scenario` names the fixture (`tests/fixtures/<scenario>.trace`).
-    pub fn new(scenario: &str, chain_id: &str, specs: &[NodeSpec]) -> Self {
+    /// `scenario` names the fixture (`fixtures/<scenario>.trace`); `backend`
+    /// builds every node's machine.
+    pub fn new(scenario: &str, chain_id: &str, specs: &[NodeSpec], backend: Backend) -> Self {
         let policy = PortPolicy::production();
         let nodes = specs
             .iter()
@@ -285,6 +292,7 @@ impl Net {
             .collect();
         let mut net = Self {
             scenario: scenario.into(),
+            backend,
             chain_id: chain_id.into(),
             coordinators: Vec::new(),
             persist: false,
@@ -408,7 +416,6 @@ impl Net {
         let node = &self.nodes[node];
         MachineConfig {
             chain_id: self.chain_id.clone(),
-            signer: node.signer.clone(),
             wireguard_public: node.wg,
             wireguard_advertised: node.advertised,
             control_endpoint: node.control,
@@ -424,7 +431,7 @@ impl Net {
     /// its old life — the transport links died with the process.
     pub fn start(&mut self, node: usize) {
         self.purge(node);
-        let machine = Machine::new(self.config(node));
+        let machine = (self.backend)(Box::new(self.nodes[node].signer.clone()), self.config(node));
         let entry = &mut self.nodes[node];
         entry.machine = Some(machine);
         entry.restore = entry.persisted.clone();
@@ -705,7 +712,12 @@ impl Net {
         self.nodes[node].machine = Some(machine);
     }
 
-    fn step(&mut self, machine: &mut Machine, node: usize, event: Event) -> Vec<Effect> {
+    fn step(
+        &mut self,
+        machine: &mut dyn NetstackMachine,
+        node: usize,
+        event: Event,
+    ) -> Vec<Effect> {
         let _ = writeln!(
             self.trace,
             "@{:<6} {} <- {}",
@@ -715,7 +727,7 @@ impl Net {
         );
         machine
             .step(event, self.now_ms)
-            .expect("a scenario step never breaches a protocol invariant")
+            .expect("a scenario step never breaches a protocol invariant or faults")
     }
 
     /// Route one mesh send through the scripted link, recording a drop
@@ -1174,7 +1186,7 @@ fn updating_traces() -> bool {
 }
 
 fn fixture_path(scenario: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/{scenario}.trace"))
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("fixtures/{scenario}.trace"))
 }
 
 fn short(identity: ValidatorIdentity) -> String {

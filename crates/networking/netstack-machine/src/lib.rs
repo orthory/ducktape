@@ -25,9 +25,12 @@ pub mod msg;
 pub mod store;
 pub mod wire;
 
+#[cfg(feature = "guest")]
+pub mod guest;
+
 pub use contract::{
-    COORD_STEP_TIMEOUT, CmdToken, Effect, Event, MachineConfig, MeshEpochEvent, PUNCH_STEP_TIMEOUT,
-    PUNCH_TRIES, ReachabilityEvent, ReqId, Resolution,
+    COORD_STEP_TIMEOUT, CmdToken, Effect, Event, MachineConfig, MeshEpochEvent, NetstackMachine,
+    PUNCH_STEP_TIMEOUT, PUNCH_TRIES, ReachabilityEvent, ReqId, Resolution, StepError,
 };
 pub use machine::{HANDSHAKE_TTL_VIEWS, KEEPALIVE_SECONDS, Machine, initiates};
 pub use store::PersistedMesh;

@@ -222,6 +222,13 @@ INDEX_MODULES := \
   crates/modules/apps/inbox crates/modules/system/saga \
   crates/kernel/index-guest/testmap
 
+# The netstack guest: the reachability machine as a `ducktape:netstack`
+# component (crates/networking/netstack-machine/src/guest.rs behind the same
+# `guest` feature convention). Not a consensus module, so no kernel fixture
+# copy: bin/node embeds the artifact from the crate directory and the
+# netstack-wasm scenario lane reads it from there.
+NETSTACK_GUEST := crates/networking/netstack-machine
+
 wasm-modules:
 	@for m in $(BUILDER_MODULES); do \
 	  id=$$(basename $$m) && \
@@ -232,6 +239,7 @@ wasm-modules:
 	@for m in $(INDEX_MODULES); do \
 	  $(CARGO) run -q -p guest-builder -- --index $$m || exit 1; \
 	done
+	$(CARGO) run -q -p guest-builder -- $(NETSTACK_GUEST)
 	# hello mirrors its component into BOTH fixture homes; sibling/object write
 	# straight to the wasm-host fixture with no guest copy; hello-replacement
 	# builds the replacement crate directly into the host fixture. Each shape is
@@ -274,6 +282,8 @@ wasm-modules-check:
 	@for m in $(INDEX_MODULES); do \
 	  test -f $$m/index.wasm || { echo "missing $$m/index.wasm (make wasm-modules)"; exit 1; }; \
 	done
+	@test -f $(NETSTACK_GUEST)/component.wasm \
+	  || { echo "missing $(NETSTACK_GUEST)/component.wasm (make wasm-modules)"; exit 1; }
 # and no committed artifact may carry a builder-local absolute path. guest-builder
 # remaps the checkout, CARGO_HOME and RUSTUP_HOME prefixes to stable tokens (see
 # `remap_flags`), so a `/home/...` or `/Users/...` in the bytes means an artifact

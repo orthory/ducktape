@@ -33,10 +33,10 @@ const UPGRADE_RESPONSE_NS: &[u8] = b"ducktape:wireguard-upgrade-response:v1";
 const UPGRADE_ACK_NS: &[u8] = b"ducktape:wireguard-upgrade-ack:v1";
 const MAX_ACK_INSTALL_LAG: u64 = 8;
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub enum UpgradeError {
     #[error("invalid key length: expected {expected}, got {actual}")]
-    InvalidKeyLength { expected: usize, actual: usize },
+    InvalidKeyLength { expected: u32, actual: u32 },
     #[error("empty active validator set")]
     EmptyValidatorSet,
     #[error("missing admission root")]
@@ -71,6 +71,39 @@ pub enum UpgradeError {
     InvalidAllowedIp,
     #[error("invalid WireGuard key")]
     InvalidWireGuardKey,
+}
+
+/// The node's identity as a signer: what records, advertisements, and
+/// handshake messages are signed WITH. Natively the identity is an
+/// [`ed25519::PrivateKey`]; a wasm guest implements this over a host import,
+/// so the private key never enters guest memory. ed25519 signing is
+/// deterministic, so a message signs to the same bytes either way.
+pub trait IdentitySigner {
+    /// The identity's public key — the member identity derives from it.
+    fn identity(&self) -> ed25519::PublicKey;
+    /// Sign `message` under `namespace` (the domain-separation prefix every
+    /// signed netstack message carries).
+    fn sign_message(&self, namespace: &[u8], message: &[u8]) -> ed25519::Signature;
+}
+
+impl IdentitySigner for ed25519::PrivateKey {
+    fn identity(&self) -> ed25519::PublicKey {
+        self.public_key()
+    }
+
+    fn sign_message(&self, namespace: &[u8], message: &[u8]) -> ed25519::Signature {
+        self.sign(namespace, message)
+    }
+}
+
+impl<T: IdentitySigner + ?Sized> IdentitySigner for &T {
+    fn identity(&self) -> ed25519::PublicKey {
+        (**self).identity()
+    }
+
+    fn sign_message(&self, namespace: &[u8], message: &[u8]) -> ed25519::Signature {
+        (**self).sign_message(namespace, message)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -123,7 +156,7 @@ impl TryFrom<&[u8]> for ValidatorIdentity {
         if value.len() != 32 {
             return Err(UpgradeError::InvalidKeyLength {
                 expected: 32,
-                actual: value.len(),
+                actual: u32::try_from(value.len()).unwrap_or(u32::MAX),
             });
         }
         let mut out = [0u8; 32];
@@ -152,14 +185,42 @@ pub struct X25519PublicKey(pub [u8; 32]);
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SignatureBytes(pub Vec<u8>);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Transport {
     Tcp,
     Udp,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 pub struct Endpoint {
     pub addr: IpAddr,
     pub port: u16,
@@ -200,7 +261,17 @@ impl Endpoint {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 pub struct PortPolicy {
     pub name: String,
     pub allowed_control_tcp_ports: Vec<u16>,
@@ -358,10 +429,10 @@ pub struct SignedEndpointRecord {
 }
 
 impl SignedEndpointRecord {
-    pub fn sign(record: EndpointRecord, signer: &ed25519::PrivateKey) -> Self {
+    pub fn sign(record: EndpointRecord, signer: &dyn IdentitySigner) -> Self {
         let mut msg = Vec::new();
         put_endpoint_record(&mut msg, &record);
-        let signature = signer.sign(ENDPOINT_RECORD_NS, &msg);
+        let signature = signer.sign_message(ENDPOINT_RECORD_NS, &msg);
         Self {
             record,
             signature: signature_bytes(&signature),
@@ -393,11 +464,11 @@ impl EndpointAdvertisement {
     pub fn sign(
         record: EndpointRecord,
         mesh_version: MeshVersion,
-        signer: &ed25519::PrivateKey,
+        signer: &dyn IdentitySigner,
     ) -> Self {
         let mut msg = Vec::new();
         put_endpoint_ad_without_signature(&mut msg, &record, mesh_version);
-        let signature = signer.sign(ENDPOINT_NS, &msg);
+        let signature = signer.sign_message(ENDPOINT_NS, &msg);
         Self {
             record,
             mesh_version,
@@ -713,10 +784,10 @@ pub struct TunnelUpgradeRequest {
 }
 
 impl TunnelUpgradeRequest {
-    pub fn sign(fields: TunnelUpgradeRequestFields, signer: &ed25519::PrivateKey) -> Self {
+    pub fn sign(fields: TunnelUpgradeRequestFields, signer: &dyn IdentitySigner) -> Self {
         let mut msg = Vec::new();
         put_request_fields(&mut msg, &fields);
-        let signature = signer.sign(UPGRADE_REQUEST_NS, &msg);
+        let signature = signer.sign_message(UPGRADE_REQUEST_NS, &msg);
         Self {
             fields,
             signature: signature_bytes(&signature),
@@ -770,10 +841,10 @@ pub struct TunnelUpgradeResponse {
 }
 
 impl TunnelUpgradeResponse {
-    pub fn sign(fields: TunnelUpgradeResponseFields, signer: &ed25519::PrivateKey) -> Self {
+    pub fn sign(fields: TunnelUpgradeResponseFields, signer: &dyn IdentitySigner) -> Self {
         let mut msg = Vec::new();
         put_response_fields(&mut msg, &fields);
-        let signature = signer.sign(UPGRADE_RESPONSE_NS, &msg);
+        let signature = signer.sign_message(UPGRADE_RESPONSE_NS, &msg);
         Self {
             fields,
             signature: signature_bytes(&signature),
@@ -822,10 +893,10 @@ pub struct TunnelUpgradeAck {
 }
 
 impl TunnelUpgradeAck {
-    pub fn sign(fields: TunnelUpgradeAckFields, signer: &ed25519::PrivateKey) -> Self {
+    pub fn sign(fields: TunnelUpgradeAckFields, signer: &dyn IdentitySigner) -> Self {
         let mut msg = Vec::new();
         put_ack_fields(&mut msg, &fields);
-        let signature = signer.sign(UPGRADE_ACK_NS, &msg);
+        let signature = signer.sign_message(UPGRADE_ACK_NS, &msg);
         Self {
             fields,
             signature: signature_bytes(&signature),

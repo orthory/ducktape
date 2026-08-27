@@ -14,7 +14,8 @@ version.workspace = true
 borsh = { workspace = true, features = ["unstable__schema"] }
 commonware-codec = { workspace = true }
 commonware-cryptography = { workspace = true }
-# NodeKey only — the rendezvous RUNTIME stays host-side in `reachability`.
+# NodeKey only — the rendezvous RUNTIME stays host-side in `reachability`,
+# and off the wasm32 build entirely.
 nat-traversal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -22,3 +23,10 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 wireguard = { workspace = true }
+wit-bindgen = { workspace = true, optional = true }
+
+[features]
+# the `ducktape:netstack` component port (src/guest.rs): the machine behind
+# the wasm boundary. NEVER enabled by a host-side dependent — only
+# guest-builder's synthesized wasm32 workspace turns it on.
+guest = ["dep:wit-bindgen"]

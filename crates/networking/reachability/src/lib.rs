@@ -32,13 +32,14 @@ pub use netstack_machine::{binding, msg};
 // the crate-root surface is exactly what consumers reach for; everything
 // else stays addressable through its module (`binding::`, `msg::`, …).
 pub use executor::{
-    CoordinatedInviteReply, InstallReply, ReachabilityCommand, ReachabilityConfig,
+    CoordinatedInviteReply, InstallReply, NetstackBackend, ReachabilityCommand, ReachabilityConfig,
     ReachabilityError, run,
 };
 pub use keys::WireGuardKeypair;
 pub use netstack_machine::binding::{active_set, identity_of, node_key, open_port_policy};
 pub use netstack_machine::msg::ReachabilityMsg;
 pub use netstack_machine::{MeshEpochEvent, ReachabilityEvent};
+pub use netstack_wasm::STEP_FUEL as NETSTACK_STEP_FUEL;
 pub use rendezvous::{
     EndpointResolver, NatResolver, RENDEZVOUS_KEEPALIVE, RendezvousStatus, Resolution,
     StaticResolver,
