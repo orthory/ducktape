@@ -1,0 +1,8 @@
+# The WebAuthn relying-party origin. Static files only, no Worker code.
+#   CLOUDFLARE_API_TOKEN=… CLOUDFLARE_ACCOUNT_ID=… npx wrangler@4 deploy
+# `custom_domain = true` makes wrangler create the DNS record and the
+# certificate for the hostname in the same account's zone.
+name = "ducktape-auth"
+compatibility_date = "2026-08-01"
+assets = { directory = "./public" }
+routes = [{ pattern = "auth.ducktape.byeongsu.dev", custom_domain = true }]

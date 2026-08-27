@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ducktape auth</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 40rem; margin: 4rem auto; padding: 0 1rem; color: #222; }
+  button { font: inherit; padding: .6rem 1.2rem; }
+  pre { white-space: pre-wrap; word-break: break-all; background: #f4f4f4; padding: 1rem; }
+  .err { color: #b00020; }
+</style>
+</head>
+<body>
+<h1>ducktape</h1>
+<p id="what"></p>
+<button id="go" hidden></button>
+<pre id="out" hidden></pre>
+<form id="cb" method="post" hidden><input type="hidden" name="result"></form>
+<script type="module">
+import { b64u, hex, parseRequest, accountNumberLE, spkiToSec1, derToRawSig } from "./auth.js";
+
+const $ = (id) => document.getElementById(id);
+const rpId = location.hostname;
+
+const OPS = {
+  async create(req) {
+    const cred = await navigator.credentials.create({ publicKey: {
+      rp: { id: rpId, name: "ducktape" },
+      user: { id: accountNumberLE(req.user), name: req.name, displayName: req.name },
+      challenge: req.challenge,
+      pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+      authenticatorSelection: { residentKey: "required", userVerification: "preferred" },
+      attestation: "none",
+    } });
+    const r = cred.response;
+    return {
+      op: "create",
+      credential_id: b64u.enc(new Uint8Array(cred.rawId)),
+      pubkey: b64u.enc(spkiToSec1(new Uint8Array(r.getPublicKey()))),
+      client_data_json: b64u.enc(new Uint8Array(r.clientDataJSON)),
+    };
+  },
+  async get(req) {
+    const cred = await navigator.credentials.get({ publicKey: {
+      rpId,
+      challenge: req.challenge,
+      allowCredentials: [],
+      userVerification: "preferred",
+    } });
+    const r = cred.response;
+    return {
+      op: "get",
+      credential_id: b64u.enc(new Uint8Array(cred.rawId)),
+      authenticator_data: b64u.enc(new Uint8Array(r.authenticatorData)),
+      client_data_json: b64u.enc(new Uint8Array(r.clientDataJSON)),
+      signature: b64u.enc(derToRawSig(new Uint8Array(r.signature))),
+      user_handle: r.userHandle ? b64u.enc(new Uint8Array(r.userHandle)) : null,
+    };
+  },
+  async eth(req) {
+    if (!window.ethereum) throw new Error("no wallet found (window.ethereum)");
+    const [address] = await window.ethereum.request({ method: "eth_requestAccounts" });
+    const signature = await window.ethereum.request({
+      method: "personal_sign",
+      params: ["0x" + hex(req.challenge), address],
+    });
+    return { op: "eth", address, signature };
+  },
+};
+
+const LABEL = {
+  create: "Register a passkey for this ducktape account",
+  get: "Sign in with a passkey (use your phone if it lives there)",
+  eth: "Sign with your Ethereum wallet",
+};
+
+function deliver(req, result) {
+  const json = JSON.stringify(result);
+  if (!req.cb) {
+    $("out").textContent = json;
+    $("out").hidden = false;
+    return;
+  }
+  // A top-level form POST to the loopback listener: no CORS, no preflight,
+  // no local-network-access gate — the `gh auth login` shape.
+  const form = $("cb");
+  form.action = req.cb;
+  form.result.value = json;
+  form.submit();
+}
+
+function fail(e) {
+  $("what").textContent = e.message || String(e);
+  $("what").className = "err";
+  $("go").hidden = true;
+}
+
+try {
+  const req = parseRequest(location.hash);
+  $("what").textContent = LABEL[req.op];
+  const go = $("go");
+  go.textContent = "Continue";
+  go.hidden = false;
+  go.onclick = () => OPS[req.op](req).then((r) => deliver(req, r)).catch(fail);
+} catch (e) {
+  fail(e);
+}
+</script>
+</body>
+</html>
