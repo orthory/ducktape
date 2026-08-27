@@ -12,7 +12,6 @@
 //! blob store LACKS the pack reaches the SAME root as one that has it. that is
 //! the fork-safety invariant — pack possession is per-node, root is not.
 
-
 use std::path::{Path, PathBuf};
 
 use forge::Forge;
@@ -628,6 +627,36 @@ fn the_catch_up_map_clears_on_arrival_and_a_corrupt_one_is_fail_stop() {
 }
 
 #[test]
+fn materialize_releases_the_pack_once_the_objects_land() {
+    // the pack is a courier. once its objects are in the odb every reader —
+    // the git fetch lane, a PR diff, a peer's catch-up — takes them from
+    // THERE, so a second copy in the blob store is pure duplication that
+    // nothing ever released.
+    let (src_dir, _src, cap) = source_one("release-src");
+    let dir = tmp_repo("release");
+    let blobs = blobstore::BlobHandle::default();
+    let digest = cap.stash(&blobs);
+    let staged: [u8; 32] = digest.clone().try_into().unwrap();
+    assert!(blobs.has_chunk(&staged), "staged for the push");
+
+    let mut node = Forge::with_blobs("forge", dir.clone(), blobs.clone()).unwrap();
+    push(&mut node, None, &cap.head, &digest);
+    node.materialize().unwrap();
+
+    assert!(
+        forge::pending_branches(&dir).unwrap().is_empty(),
+        "the branch materialized",
+    );
+    assert!(
+        !blobs.has_chunk(&staged),
+        "and the pack it no longer needs is released",
+    );
+
+    let _ = std::fs::remove_dir_all(&src_dir);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn pending_branches_is_the_node_side_pull_handle() {
     // the node's blob plane reads this WITHOUT opening the module: node-local
     // possession must never ride the deterministic `Module` surface, because a
@@ -649,7 +678,10 @@ fn pending_branches_is_the_node_side_pull_handle() {
     let outstanding = forge::pending_branches(&dir).unwrap();
     assert_eq!(outstanding.len(), 1, "one branch is waiting");
     assert_eq!(
-        (outstanding[0].digest, outstanding[0].head.as_bytes().as_slice()),
+        (
+            outstanding[0].digest,
+            outstanding[0].head.as_bytes().as_slice()
+        ),
         (want, cap.head.as_slice()),
         "the outstanding pack AND the head it explains are both visible from \
          outside the module",

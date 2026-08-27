@@ -332,7 +332,7 @@ impl RepoState {
                 .map_err(|e| Error::Module(e.to_string()))?
                 .map(Oid::from);
             if prior == Some(*head) {
-                done.push(branch.clone());
+                done.push((branch.clone(), *digest));
                 continue;
             }
             // the pack named by the push is the fast route to the objects, not
@@ -382,11 +382,26 @@ impl RepoState {
                 }
                 continue;
             }
-            done.push(branch.clone());
+            done.push((branch.clone(), *digest));
         }
-        for branch in done {
-            self.pending.remove(&branch);
-            self.warned.remove(&branch);
+        for (branch, _) in &done {
+            self.pending.remove(branch);
+            self.warned.remove(branch);
+        }
+        // the pack has done its whole job: the objects are in the odb, which
+        // is where every reader — the git fetch lane, a PR diff, a peer's
+        // catch-up — takes them from. holding the bytes a second time bought
+        // nothing but the ability to re-serve that exact file, and a peer
+        // that needs them asks for the OBJECTS now (see `build_objects`), so
+        // it costs nothing to let them go.
+        for (_, digest) in &done {
+            let still_wanted = self
+                .pending
+                .values()
+                .any(|(_, outstanding)| outstanding == digest);
+            if !still_wanted {
+                blobs.forget(digest);
+            }
         }
         Ok(())
     }
