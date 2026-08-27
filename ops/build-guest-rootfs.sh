@@ -2,8 +2,12 @@
 # Build the shared guest artifacts every run's microVM boots from: the kernel
 # and one read-only ext4 rootfs.
 #
-#   ops/build-guest-rootfs.sh                 # -> /var/lib/ducktape/guest
+#   ops/build-guest-rootfs.sh                 # -> ~/.ducktape/guest
 #   OUT=~/guest ops/build-guest-rootfs.sh     # anywhere writable
+#
+# The default is where `node init` writes a fresh [sandbox] table
+# (workspace-config's `default_guest_dir`) — build here and the node already
+# points at it. Under the operator's home because this build is rootless.
 #
 # ROOTLESS on purpose, start to finish. `unsquashfs -no-xattrs` extracts the
 # base without needing privileges, the agent CLIs are copied in as ordinary
@@ -21,7 +25,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-OUT="${OUT:-/var/lib/ducktape/guest}"
+OUT="${OUT:-${DUCKTAPE_HOME:-$HOME/.ducktape}/guest}"
 # Beside the output, never under /tmp: the extracted base is ~1 GB and /tmp on
 # this class of host is both memory-backed and periodically reaped — a reaped
 # cache silently turns every rebuild into a fresh 250 MB download.

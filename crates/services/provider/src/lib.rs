@@ -3146,8 +3146,11 @@ mod tests {
     /// hardware test additionally runs [`SandboxBackend::probe`] and skips when
     /// the images or `/dev/kvm` are absent.
     fn firecracker_backend() -> SandboxBackend {
-        let dir = std::env::var("DUCKTAPE_GUEST_DIR")
-            .unwrap_or_else(|_| "/var/lib/ducktape/guest".into());
+        let dir = std::env::var("DUCKTAPE_GUEST_DIR").unwrap_or_else(|_| {
+            let home = std::env::var("DUCKTAPE_HOME")
+                .unwrap_or_else(|_| format!("{}/.ducktape", std::env::var("HOME").unwrap()));
+            format!("{home}/guest")
+        });
         SandboxBackend::MicroVm {
             vmm: sandbox_host::Vmm::Firecracker,
             kernel: PathBuf::from(&dir).join("vmlinux"),

@@ -197,10 +197,10 @@ fn fold_overlay_reach_hints(
 /// The images need not exist yet — `init`/`join` run
 /// before `ops/build-guest-rootfs.sh` on a fresh box, and the loud error
 /// belongs to the boot probe, where an operator who uncommented the table is
-/// standing.
-pub fn platform_sandbox() -> (SandboxToml, sandbox_host::SandboxBackend) {
+/// standing. [`detect_platform_sandbox`] therefore probes the ADAPTER only.
+pub fn platform_sandbox() -> Result<(SandboxToml, sandbox_host::SandboxBackend), String> {
     let vmm = sandbox_host::Vmm::platform_default();
-    let guest = Path::new(crate::DEFAULT_GUEST_DIR);
+    let guest = crate::default_guest_dir()?;
     let (kernel, rootfs) = (guest.join("vmlinux"), guest.join("rootfs.ext4"));
     let backend = sandbox_host::SandboxBackend::MicroVm {
         vmm,
@@ -216,18 +216,25 @@ pub fn platform_sandbox() -> (SandboxToml, sandbox_host::SandboxBackend) {
         cores: 0,
         mem_gb: 0,
     };
-    (table, backend)
+    Ok((table, backend))
 }
 
 /// Fresh-workspace compute detection: the platform adapter's runtime binary on
 /// PATH ⇒ a live `[sandbox]` table and the binary the probe actually found;
 /// absent ⇒ `None` (the commented example).
 ///
+/// [`sandbox_host::SandboxBackend::probe_adapter`], NOT the full boot probe:
+/// the question here is whether this HOST can isolate a run, and the images
+/// are built after `init` on a fresh box. Asking the full probe made a machine
+/// that can run providers write the commented table, and the operator then met
+/// `no [sandbox] table in node.toml` instead of `build it with
+/// ops/build-guest-rootfs.sh`.
+///
 /// The path comes back because WHICH `firecracker` answered is the fact an
 /// operator with several on `PATH` needs, and only the probe knows it.
 pub fn detect_platform_sandbox() -> Option<(SandboxToml, PathBuf)> {
-    let (table, backend) = platform_sandbox();
-    backend.probe().ok().map(|found| (table, found))
+    let (table, backend) = platform_sandbox().ok()?;
+    backend.probe_adapter().ok().map(|found| (table, found))
 }
 
 /// The plumbing a caller with no overrides gets — exposed because both callers
@@ -245,7 +252,7 @@ mod tests {
     /// a boot error on a machine whose images are exactly where init said.
     #[test]
     fn the_written_table_and_the_probed_backend_name_one_runtime() {
-        let (table, backend) = platform_sandbox();
+        let (table, backend) = platform_sandbox().expect("platform sandbox");
         // an irrefutable destructure ON PURPOSE: a second `SandboxBackend`
         // variant must fail this build, not silently skip the comparison.
         let sandbox_host::SandboxBackend::MicroVm {
@@ -256,7 +263,7 @@ mod tests {
         assert_eq!(table.runtime, vmm.config_token());
         assert_eq!((&table.kernel, &table.rootfs), (kernel, rootfs));
 
-        let guest = Path::new(crate::DEFAULT_GUEST_DIR);
+        let guest = crate::default_guest_dir().expect("guest dir");
         assert_eq!(table.kernel, guest.join("vmlinux"));
         assert_eq!(table.rootfs, guest.join("rootfs.ext4"));
         assert_eq!((table.cores, table.mem_gb), (0, 0));

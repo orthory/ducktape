@@ -147,6 +147,32 @@ impl SandboxBackend {
     /// All of it is a hard dependency, so a missing one fails at boot, never as
     /// a silently unsandboxed / unfirewalled run.
     pub fn probe(&self) -> Result<PathBuf, String> {
+        let found = self.probe_adapter()?;
+        self.probe_images()?;
+        // Once per DAEMON BOOT — the crate's whole `info` budget, and the only
+        // line that separates "this daemon probed green" from "this daemon
+        // never reached the probe". The FAILURE arms stay as the returned Err:
+        // the compute daemon dies on it and the operator reads it from main, so
+        // an `error!` here would double-report.
+        tracing::info!(
+            target: "ducktape::sandbox",
+            event = "sandbox_backend_ready",
+            backend = self.runtime_bin(),
+            "the sandbox backend probed green"
+        );
+        Ok(found)
+    }
+
+    /// Everything about the HOST: the runtime binary, the tools it shells out
+    /// to, and the adapter-specific capability a tool check cannot express
+    /// (`/dev/kvm` opens; the vz shim carries its entitlement). Returns the
+    /// resolved VMM binary.
+    ///
+    /// Split out of [`Self::probe`] because "can this host isolate a run" and
+    /// "are this node's images built" are asked at different times: `node
+    /// init`/`join` decide whether to write a live `[sandbox]` table BEFORE
+    /// `ops/build-guest-rootfs.sh` has ever run.
+    pub fn probe_adapter(&self) -> Result<PathBuf, String> {
         let bin = self.runtime_bin();
         let found = crate::host_tools::find_executable(bin).ok_or_else(|| {
             format!(
@@ -163,34 +189,14 @@ impl SandboxBackend {
             }
         }
         self.probe_host_capabilities(&found)?;
-        // Once per DAEMON BOOT — the crate's whole `info` budget, and the only
-        // line that separates "this daemon probed green" from "this daemon
-        // never reached the probe". The FAILURE arms stay as the returned Err:
-        // the compute daemon dies on it and the operator reads it from main, so
-        // an `error!` here would double-report.
-        tracing::info!(
-            target: "ducktape::sandbox",
-            event = "sandbox_backend_ready",
-            backend = self.runtime_bin(),
-            "the sandbox backend probed green"
-        );
         Ok(found)
     }
 
-    /// the adapter-specific host state a tool check cannot express. `runtime`
-    /// is the resolved VMM binary, which the vz probe inspects for its
-    /// entitlement.
-    fn probe_host_capabilities(&self, runtime: &Path) -> Result<(), String> {
+    /// the guest artifacts this node's `[sandbox]` table points at. A boot
+    /// concern only: the operator standing here already chose the table.
+    fn probe_images(&self) -> Result<(), String> {
         match self {
-            SandboxBackend::MicroVm {
-                vmm,
-                kernel,
-                rootfs,
-            } => {
-                match vmm {
-                    Vmm::Firecracker => probe_kvm()?,
-                    Vmm::Vz => probe_vz(runtime)?,
-                }
+            SandboxBackend::MicroVm { kernel, rootfs, .. } => {
                 for (label, image) in [("kernel", kernel), ("rootfs", rootfs)] {
                     if !image.is_file() {
                         return Err(format!(
@@ -201,6 +207,20 @@ impl SandboxBackend {
                 }
                 Ok(())
             }
+            #[cfg(any(test, feature = "testkit"))]
+            SandboxBackend::Bare => Ok(()),
+        }
+    }
+
+    /// the adapter-specific host state a tool check cannot express. `runtime`
+    /// is the resolved VMM binary, which the vz probe inspects for its
+    /// entitlement.
+    fn probe_host_capabilities(&self, runtime: &Path) -> Result<(), String> {
+        match self {
+            SandboxBackend::MicroVm { vmm, .. } => match vmm {
+                Vmm::Firecracker => probe_kvm(),
+                Vmm::Vz => probe_vz(runtime),
+            },
             #[cfg(any(test, feature = "testkit"))]
             SandboxBackend::Bare => Ok(()),
         }
@@ -284,4 +304,34 @@ fn probe_vz(_shim: &Path) -> Result<(), String> {
     Err("the vz sandbox runs only on macOS (it drives Virtualization.framework); \
          on Linux use runtime = \"firecracker\""
         .into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The image check is the BOOT probe's, not the adapter's: `node
+    /// init`/`join` decide whether to write a live `[sandbox]` table before
+    /// `ops/build-guest-rootfs.sh` has ever run, so folding this back into
+    /// [`SandboxBackend::probe_adapter`] makes a machine that can isolate runs
+    /// write the commented-out table instead.
+    #[test]
+    fn missing_images_fail_the_boot_probe_and_name_the_builder() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = SandboxBackend::MicroVm {
+            vmm: Vmm::platform_default(),
+            kernel: dir.path().join("vmlinux"),
+            rootfs: dir.path().join("rootfs.ext4"),
+        };
+        let error = backend.probe_images().expect_err("absent images must refuse");
+        assert!(error.contains("kernel"), "names which image: {error}");
+        assert!(
+            error.contains("ops/build-guest-rootfs.sh"),
+            "names the builder: {error}"
+        );
+
+        std::fs::write(dir.path().join("vmlinux"), b"k").expect("kernel");
+        std::fs::write(dir.path().join("rootfs.ext4"), b"r").expect("rootfs");
+        backend.probe_images().expect("present images pass");
+    }
 }

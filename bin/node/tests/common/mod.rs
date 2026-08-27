@@ -1603,7 +1603,8 @@ pub fn http_text_request(port: u16, path: &str) -> (u16, String) {
 /// [`guest_backend`] probes with — so the daemon this table boots is the one
 /// the capability gate just proved can run.
 pub fn sandbox_toml() -> Vec<String> {
-    let dir = std::env::var("DUCKTAPE_GUEST_DIR").unwrap_or_else(|_| GUEST_DIR.into());
+    let dir = std::env::var("DUCKTAPE_GUEST_DIR")
+        .unwrap_or_else(|_| guest_dir().display().to_string());
     let runtime = provider_host::Vmm::platform_default().config_token();
     vec![
         "[sandbox]".into(),
@@ -1635,8 +1636,8 @@ pub fn unsandboxable_host() -> Option<String> {
 /// somewhere else.
 pub fn guest_backend() -> provider_host::SandboxBackend {
     let vmm = provider_host::Vmm::platform_default();
-    let dir =
-        PathBuf::from(std::env::var("DUCKTAPE_GUEST_DIR").unwrap_or_else(|_| GUEST_DIR.into()));
+    let dir = std::env::var("DUCKTAPE_GUEST_DIR")
+        .map_or_else(|_| guest_dir(), PathBuf::from);
     provider_host::SandboxBackend::MicroVm {
         vmm,
         kernel: dir.join("vmlinux"),
@@ -1644,8 +1645,11 @@ pub fn guest_backend() -> provider_host::SandboxBackend {
     }
 }
 
-/// where the guest artifacts live by default.
-pub const GUEST_DIR: &str = "/var/lib/ducktape/guest";
+/// where the guest artifacts live by default — the same answer
+/// `workspace-config::default_guest_dir` gives `node init`.
+pub fn guest_dir() -> std::path::PathBuf {
+    workspace_config::default_guest_dir().expect("guest dir")
+}
 
 /// `Some(())` = this test cannot run here and the caller must return; `None` =
 /// run it.
