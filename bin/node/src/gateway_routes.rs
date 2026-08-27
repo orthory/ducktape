@@ -100,15 +100,26 @@ pub fn load(workspace: &Path) -> Result<LocalRoutes, String> {
         }
         Err(error) => return Err(format!("read {path:?}: {error}")),
     };
-    let routes: LocalRoutes =
-        serde_json::from_slice(&bytes).map_err(|error| format!("decode {path:?}: {error}"))?;
+    let routes: LocalRoutes = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("decode {path:?}: {error}\n  {REMEDY}"))?;
     routes.validate()?;
     let canonical = serde_json::to_vec_pretty(&routes).expect("routes serialize");
     if canonical != bytes {
-        return Err(format!("{path:?} is not canonical; re-bind its routes"));
+        return Err(format!("{path:?} is not canonical\n  {REMEDY}"));
     }
     Ok(routes)
 }
+
+/// Every way this file is refused has ONE remedy, and it is cheap: the file is
+/// a cache of ports the daemons themselves chose, so deleting it loses nothing
+/// a heartbeat does not put straight back.
+///
+/// Worth spelling out because the refusal reads like data loss when it is not.
+/// A stale field name in here took down a whole `make dev` — the message named
+/// the offending field, and nothing else — and the remedy people reached for
+/// was hand-editing JSON under `~/.ducktape`.
+const REMEDY: &str = "this file only caches which local port each daemon chose: \
+                      delete it and restart the node, and each re-registers its own route";
 
 fn temporary_path(workspace: &Path) -> PathBuf {
     workspace.join(format!(".{FILE_NAME}.{}.tmp", std::process::id()))
@@ -555,6 +566,31 @@ mod tests {
             "the sweep must never touch the route file itself"
         );
         std::fs::remove_file(&ours).unwrap();
+    }
+
+    /// A file this build does not understand is refused — and the refusal has
+    /// to carry its own remedy, because it reads like data loss and is not. A
+    /// stale `version` field written by an old tool took a whole `make dev`
+    /// down with `unknown field 'version'` and nothing else, and the reflex it
+    /// produced was hand-editing JSON under `~/.ducktape`.
+    #[test]
+    fn a_file_this_build_cannot_read_is_refused_with_its_remedy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+
+        for bytes in [
+            // a field this schema does not have (deny_unknown_fields)
+            br#"{"version": 1, "routes": []}"#.as_slice(),
+            // valid, decodable, but not the bytes `save` would have written
+            br#"{"routes":[]}"#.as_slice(),
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            let refusal = load(dir.path()).unwrap_err();
+            assert!(
+                refusal.contains(REMEDY),
+                "every refusal names the remedy: {refusal}"
+            );
+        }
     }
 
     #[test]
