@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     CoordRef, Coordination, ModuleCode, NetworkDescriptor, Reach, ReachHint, decode_key, hex_bytes,
-    unhex,
+    unhex, validate_module_id,
 };
 
 /// the invite blob prefix. UNVERSIONED on purpose (bootstrapping posture): the
@@ -475,10 +475,10 @@ pub fn decode_invite_at(blob: &str, now_unix_secs: u64) -> Result<Invite, String
 
 /// pack the signed portion of the invite. validator hex and module code hashes
 /// are decoded to raw bytes (rejecting a malformed descriptor here rather than
-/// shipping it); the typed
-/// reach hints come from [`NetworkDescriptor::reach_hints`] (the union of
-/// `reach` and `bootstrap`-synthesised Direct hints), so a founder that only
-/// ever ran `add_bootstrap` still ships a well-formed invite.
+/// shipping it); the typed reach hints come from
+/// [`NetworkDescriptor::reach_hints`] (the union of `reach` and
+/// `bootstrap`-synthesised Direct hints), so a founder that only ever ran
+/// `add_bootstrap` still ships a well-formed invite.
 fn pack_invite(
     d: &NetworkDescriptor,
     token: &InviteToken,
@@ -629,6 +629,10 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
     let mut modules = Vec::with_capacity(mcount);
     for _ in 0..mcount {
         let id = r.take_str_u8()?;
+        // a blob is untrusted input: an id carrying `=` or a newline could
+        // otherwise smuggle two module lines into one, folding a foreign set
+        // onto this network's fingerprint.
+        validate_module_id(&id)?;
         modules.push(ModuleCode {
             id,
             code_hash: hex_bytes(r.take(32)?),
@@ -929,6 +933,34 @@ mod tests {
         let err = encode_invite(&d, &token, &coordinated_test_wg(), &[], &issuer)
             .expect_err("a short hash never ships");
         assert!(err.contains("pages"), "{err}");
+    }
+
+    #[test]
+    fn a_module_id_carrying_a_fingerprint_delimiter_is_refused_at_decode() {
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let d = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            validators: vec![hex_bytes(issuer.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            modules: vec![ModuleCode {
+                id: "pages".into(),
+                code_hash: "11".repeat(32),
+            }],
+        };
+        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes(), u64::MAX);
+        let mut bytes = pack_invite(&d, &token, &coordinated_test_wg(), &[]).unwrap();
+        // rewrite the packed id "pages" -> "p=ges" in place: same length, so
+        // the framing stays intact and only the id turns hostile. a blob is
+        // untrusted input — the encoder's guard is not the decoder's.
+        let at = bytes
+            .windows(5)
+            .position(|w| w == b"pages")
+            .expect("the module id rides the packed blob");
+        bytes[at + 1] = b'=';
+        let err = unpack_invite(&bytes, 0).expect_err("a delimiter in an id never decodes");
+        assert!(err.contains("p=ges"), "{err}");
     }
 
     #[test]

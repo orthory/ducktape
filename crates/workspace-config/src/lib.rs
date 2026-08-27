@@ -92,8 +92,25 @@ pub use duckfs_core::{to_hex as hex_bytes, unhex};
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleCode {
+    /// the consensus-visible module id, the host registry key.
     pub id: String,
+    /// sha256 of the component bytes, 64 hex chars; IN the genesis fingerprint.
     pub code_hash: String,
+}
+
+/// a module id is a bare identifier: non-empty, no `=`, no newline — the two
+/// bytes the genesis fingerprint uses as delimiters, so no two module sets can
+/// fold to one namespace. checked at every boundary a descriptor enters
+/// through (`from_toml`, the invite decoder, `module_hashes`).
+pub fn validate_module_id(id: &str) -> Result<(), String> {
+    let is_empty = id.is_empty();
+    let has_delimiter = id.contains('=') || id.contains('\n');
+    if is_empty || has_delimiter {
+        return Err(format!(
+            "module id {id:?} is not a bare identifier (empty, or contains '=' / newline)"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -125,6 +142,10 @@ pub struct NetworkDescriptor {
     /// IN the genesis fingerprint — a node built against different components
     /// is a different network, never a block-0 fork. the bytes travel
     /// out-of-band (the workspace bundle, the blob plane).
+    ///
+    /// KEEP THIS LAST: toml serializes an array-of-tables after every scalar,
+    /// so a scalar declared below it would be written INSIDE the final
+    /// `[[modules]]` table and read back as one of its keys.
     pub modules: Vec<ModuleCode>,
 }
 
@@ -141,6 +162,7 @@ impl NetworkDescriptor {
         }
         d.validators.sort();
         for m in &mut d.modules {
+            validate_module_id(&m.id)?;
             m.code_hash = m.code_hash.trim().to_ascii_lowercase();
         }
         d.modules.sort_by(|a, b| a.id.cmp(&b.id));
@@ -228,6 +250,7 @@ impl NetworkDescriptor {
     pub fn module_hashes(&self) -> Result<std::collections::BTreeMap<String, [u8; 32]>, String> {
         let mut out = std::collections::BTreeMap::new();
         for m in &self.modules {
+            validate_module_id(&m.id)?;
             let bytes =
                 unhex(&m.code_hash).map_err(|e| format!("module {} code_hash: {e}", m.id))?;
             let digest: [u8; 32] = bytes
@@ -1493,9 +1516,10 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
-            modules: Vec::new(),
+            modules: modules_fixture_sorted(),
         };
-        // a hand-edited twin: uppercase, whitespace, different order.
+        // a hand-edited twin: uppercase, whitespace, different order — in the
+        // module list as much as in the validator list.
         let messy = NetworkDescriptor {
             chain_id: "canon#00000000".into(),
             validators: vec![
@@ -1505,7 +1529,16 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
-            modules: Vec::new(),
+            modules: vec![
+                ModuleCode {
+                    id: "pages".into(),
+                    code_hash: format!("  {}  ", "11".repeat(32).to_ascii_uppercase()),
+                },
+                ModuleCode {
+                    id: "chat".into(),
+                    code_hash: "22".repeat(32),
+                },
+            ],
         };
         // identical decoded sets MUST run under the identical namespace.
         assert_eq!(messy.genesis_namespace(), canonical.genesis_namespace());
@@ -1520,6 +1553,56 @@ mod tests {
             v.sort();
             v
         });
+        // the module list is canonicalized the same way: hashes trimmed and
+        // lowercased, entries id-sorted.
+        assert_eq!(reloaded.modules, modules_fixture_sorted());
+        assert_eq!(reloaded.genesis_namespace(), canonical.genesis_namespace());
+    }
+
+    /// the `modules_fixture()` pair in canonical form: id-sorted, lowercase.
+    fn modules_fixture_sorted() -> Vec<ModuleCode> {
+        vec![
+            ModuleCode {
+                id: "chat".into(),
+                code_hash: "22".repeat(32),
+            },
+            ModuleCode {
+                id: "pages".into(),
+                code_hash: "11".repeat(32),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_module_id_carrying_a_fingerprint_delimiter_is_refused() {
+        // `\n{id}={hash}` is the fingerprint's framing, so an id holding `=`
+        // or a newline could make two distinct module sets fold to one
+        // namespace. every entry point refuses it, naming the id.
+        let toml = format!(
+            "chain_id = \"canon#00000000\"\nvalidators = []\n\n\
+             [[modules]]\nid = \"a=b\"\ncode_hash = \"{}\"\n",
+            "11".repeat(32)
+        );
+        let err = NetworkDescriptor::from_toml(&toml).unwrap_err();
+        assert!(err.contains("a=b"), "{err}");
+
+        let mut d = NetworkDescriptor {
+            chain_id: "canon#00000000".into(),
+            validators: vec![],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            modules: vec![ModuleCode {
+                id: "x\ny".into(),
+                code_hash: "11".repeat(32),
+            }],
+        };
+        let err = d.module_hashes().unwrap_err();
+        assert!(err.contains("x\\ny"), "{err}");
+
+        // and an empty id is no identifier at all.
+        d.modules[0].id = String::new();
+        assert!(d.module_hashes().is_err());
     }
 
     #[test]
