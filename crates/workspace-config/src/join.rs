@@ -254,14 +254,22 @@ mod tests {
     #[test]
     fn the_written_table_and_the_probed_backend_name_one_runtime() {
         let (table, backend) = platform_sandbox().expect("platform sandbox");
-        // an irrefutable destructure ON PURPOSE: a second `SandboxBackend`
-        // variant must fail this build, not silently skip the comparison.
+        // whether `SandboxBackend::Bare` exists here is decided by feature
+        // unification — a workspace build turns sandbox-host's `testkit` on
+        // through some other crate's dev-dependency, `-p workspace-config`
+        // does not. so this destructure is refutable in one build and
+        // irrefutable in the other: keep the guard, which names what the
+        // comparison needs and FAILS loudly rather than silently skipping it.
+        #[allow(irrefutable_let_patterns)]
         let sandbox_host::SandboxBackend::MicroVm {
             vmm,
             kernel,
             rootfs,
             executors,
-        } = &backend;
+        } = &backend
+        else {
+            panic!("test expects the MicroVm backend, got {backend:?}")
+        };
         assert_eq!(executors, &crate::executor_dir().expect("executor dir"));
         assert_eq!(table.runtime, vmm.config_token());
         assert_eq!((&table.kernel, &table.rootfs), (kernel, rootfs));

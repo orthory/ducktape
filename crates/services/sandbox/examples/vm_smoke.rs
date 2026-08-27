@@ -78,6 +78,8 @@ async fn smoke() -> Result<(), String> {
         manifest: run_dir.join("manifest.bin"),
         agent_volume: None,
         assets: run_dir.join("assets.ext4"),
+        // this run execs `/bin/sh` from the rootfs — there is no agent CLI to lend.
+        executors: None,
         workspace: run_dir.join("workspace.ext4"),
         vcpus: 1,
         mem_mib: 512,
