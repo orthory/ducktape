@@ -12,9 +12,10 @@
 # the "$ID" workspace) for app.<id>.duck to resolve to this server.
 set -uo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ID="${DEMO_WORKSPACE_ID:-demo}"
-WSDIR="$HOME/.ducktape/workspaces/$ID"
-RJSON="$WSDIR/gateway-routes.json"
+DUCK="${DUCKTAPE_HOME:-$HOME/.ducktape}"
+WSDIR="$DUCK/workspaces/$ID"
 
 log(){ printf '\033[36m[demo-app]\033[0m %s\n' "$*"; }
 die(){ printf '\033[31m[demo-app] %s\033[0m\n' "$*" >&2; exit 1; }
@@ -22,26 +23,42 @@ die(){ printf '\033[31m[demo-app] %s\033[0m\n' "$*" >&2; exit 1; }
 command -v bun >/dev/null || die "bun is required"
 [ -d "$WSDIR" ] || die "no '$ID' workspace — run 'make demo-seed' first"
 
-# reuse the port already mapped for route "app", else allocate a fresh one
-PORT="$(bun - "$RJSON" <<'JS'
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-const path = process.argv[2];
-let port;
-if (existsSync(path)) {
-  try {
-    port = Number(JSON.parse(readFileSync(path, "utf8")).routes
-      ?.find((route) => route.name?.label === "app")?.port);
-  } catch {}
-}
+# Resolve the same freshly-built binary demo-seed uses. Route files have one
+# canonical writer; duplicating its JSON shape here is how the retired
+# top-level `version` field survived the schema purge.
+NODE_BIN="${DUCKTAPE_NODE_BIN:-}"
+if [ -z "$NODE_BIN" ]; then
+  log "building ducktape (cargo build -p node-bin)…"
+  BUILD_LOG="$(mktemp)"
+  if ! cargo build --manifest-path "$SCRIPT_DIR/../Cargo.toml" -p node-bin >"$BUILD_LOG" 2>&1; then
+    die "node-bin build failed — see $BUILD_LOG"
+  fi
+  rm -f "$BUILD_LOG"
+  NODE_BIN="$(cargo metadata --manifest-path "$SCRIPT_DIR/../Cargo.toml" \
+    --no-deps --format-version 1 \
+    | bun -e 'console.log((await Bun.stdin.json()).target_directory)')/debug/ducktape"
+fi
+[ -x "$NODE_BIN" ] || die "node binary not executable: $NODE_BIN"
+
+# Reuse the port already mapped for route "app", else allocate a fresh one.
+# `gateway list` strictly reads the latest schema; `gateway bind` preserves the
+# airlock and every other local route, validates the result, and writes it
+# atomically.
+ROUTES="$("$NODE_BIN" gateway list --workspace "$WSDIR")" \
+  || die "could not read local gateway routes — re-bind them with '$NODE_BIN gateway bind'"
+PORT="$(bun - "$ROUTES" <<'JS'
+const routes = JSON.parse(process.argv[2]);
+let port = Number(routes.find((route) => route.name?.label === "app")?.port);
 if (!Number.isInteger(port) || port < 1 || port > 65535) {
   const listener = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
   port = listener.port;
   listener.stop();
 }
-writeFileSync(path, JSON.stringify({ version: 1, routes: [{ name: { label: "app" }, port }] }, null, 2));
 console.log(port);
 JS
 )"
+"$NODE_BIN" gateway bind --workspace "$WSDIR" --label app --port "$PORT" >/dev/null \
+  || die "could not bind the app gateway route"
 
 log "route app.$ID.duck -> 127.0.0.1:$PORT"
 log "KEEP THIS RUNNING: app.$ID.duck is Unavailable whenever this process is not up."
