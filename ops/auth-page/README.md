@@ -1,6 +1,8 @@
 # `auth.ducktape.byeongsu.dev` — the WebAuthn relying-party page
 
-One static file, no backend (`index.html`). The app/CLI opens the system
+One static file, no backend (`index.html`). Gate: `node ops/auth-page/test.mjs`
+— plain `node`, no dependencies, no install; it lifts the page's pure helper
+block and checks the fragment parser, DER→raw and SPKI→compressed-SEC1. The app/CLI opens the system
 browser to it with the request in the URL fragment, the page runs the
 ceremony, and the result goes to a one-shot loopback listener in the app/CLI
 (the `gh auth login` shape). Design: `docs/superpowers/specs/2026-08-27-identity-rework-design.md`
