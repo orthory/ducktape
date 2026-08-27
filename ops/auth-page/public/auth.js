@@ -28,7 +28,7 @@ export function parseRequest(fragment) {
     return v;
   };
   const op = get("op");
-  const req = { op, challenge: b64u.dec(get("challenge")), cb: p.get("cb") };
+  const req = { op, challenge: b64u.dec(get("challenge")), cb: loopbackOnly(p.get("cb")) };
   if (op === "create") {
     req.user = BigInt(get("user"));
     req.name = get("name");
@@ -36,6 +36,17 @@ export function parseRequest(fragment) {
     throw new Error(`unknown op ${op}`);
   }
   return req;
+}
+
+/// The result (a signature the chain will accept) only ever goes to the
+/// app/CLI listener on this machine — a crafted link cannot relay it elsewhere.
+const LOOPBACK = new Set(["127.0.0.1", "[::1]", "localhost"]);
+function loopbackOnly(cb) {
+  if (cb === null) return null;
+  const url = new URL(cb);
+  const isLoopback = url.protocol === "http:" && LOOPBACK.has(url.hostname);
+  if (!isLoopback) throw new Error("cb must be http://127.0.0.1, [::1] or localhost");
+  return url.href;
 }
 
 /// Account number as the WebAuthn `user.id`: u64 little-endian.

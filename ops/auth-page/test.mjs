@@ -18,6 +18,12 @@ assert.equal(parseRequest("#op=get&challenge=AQID").cb, null);
 assert.throws(() => parseRequest("#op=get"), /missing challenge/);
 assert.throws(() => parseRequest("#op=create&challenge=AQID&user=1"), /missing name/);
 assert.throws(() => parseRequest("#op=nope&challenge=AQID"), /unknown op/);
+// the callback is loopback-only: a crafted link cannot relay the signature elsewhere
+assert.equal(parseRequest("#op=get&challenge=AQID&cb=http://localhost:9/x").cb, "http://localhost:9/x");
+assert.equal(parseRequest("#op=get&challenge=AQID&cb=http://[::1]:9/").cb, "http://[::1]:9/");
+assert.throws(() => parseRequest("#op=get&challenge=AQID&cb=https://evil.example/"), /cb must be/);
+assert.throws(() => parseRequest("#op=get&challenge=AQID&cb=http://127.0.0.1.evil.example/"), /cb must be/);
+assert.throws(() => parseRequest("#op=get&challenge=AQID&cb=javascript:alert(1)"), /cb must be/);
 
 // u64 LE
 assert.deepEqual(accountNumberLE(1n), Uint8Array.from([1, 0, 0, 0, 0, 0, 0, 0]));
