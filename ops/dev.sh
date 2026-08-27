@@ -100,14 +100,24 @@ ensure_service(){
   if [ "$state" = "enabled" ]; then
     disown "$pid"
     log "$kind service up (pid $pid, log $WSDIR/dev-$kind.log)"
-  else
-    if kill -0 "$pid" 2>/dev/null; then
-      disown "$pid"
-    else
-      wait "$pid" 2>/dev/null
-    fi
-    log "$kind service did not become ready — Shell may be unavailable; see $WSDIR/dev-$kind.log"
+    return
   fi
+
+  # It never reached `enabled`, and the two ways that happens want different
+  # words: a live-but-slow service may still arrive, a dead one never will.
+  # Either way the reason is in its log and NOWHERE else — pointing at a path
+  # the reader has to go open loses hard failures (a workspace this build
+  # refuses to decode, a port already held) behind a line that reads like a
+  # timing hiccup, and `make dev` runs on to launch the app regardless.
+  if kill -0 "$pid" 2>/dev/null; then
+    disown "$pid"
+    log "$kind service is still not ready after 20s — Shell may be unavailable:"
+  else
+    wait "$pid" 2>/dev/null
+    log "$kind service exited before it was ready — Shell will be unavailable:"
+  fi
+  tail -n 3 "$WSDIR/dev-$kind.log" 2>/dev/null | sed 's/^/    /'
+  log "full log: $WSDIR/dev-$kind.log"
 }
 
 ensure_service compute
