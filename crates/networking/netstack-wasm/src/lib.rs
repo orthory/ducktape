@@ -10,6 +10,11 @@
 //! exhausted budget, or an undecodable wire value is a [`StepError::Fault`]:
 //! the guest's state is unknown from then on and the executor fails over
 //! to the native machine.
+//!
+//! A guest can also start from a snapshot ([`NetstackGuest::restore`]) and
+//! hand one out ([`NetstackMachine::snapshot`]): the same wire value the
+//! native machine takes and gives, which is what lets a plane swap
+//! backends mid-epoch without touching a tunnel.
 
 use netstack_machine::wire;
 use netstack_machine::{Effect, Event, MachineConfig, NetstackMachine, StepError};
@@ -80,6 +85,10 @@ pub enum GuestError {
     /// The guest refused the config it was handed.
     #[error("netstack guest refused the config: {0}")]
     Configure(String),
+    /// The guest refused the snapshot it was handed: another contract,
+    /// another identity, or bytes that are not a snapshot.
+    #[error("netstack guest refused the snapshot: {0}")]
+    Restore(String),
 }
 
 /// One configured machine inside one component instance, alive for the
@@ -109,6 +118,40 @@ impl NetstackGuest {
         config: MachineConfig,
         step_fuel: u64,
     ) -> Result<Self, GuestError> {
+        let mut guest = Self::instantiate(component, signer, step_fuel)?;
+        guest
+            .world
+            .call_configure(&mut guest.store, &wire::encode_config(&config))
+            .map_err(component_err)?
+            .map_err(GuestError::Configure)?;
+        Ok(guest)
+    }
+
+    /// A guest continuing from `snapshot` — the wire snapshot any machine
+    /// of this contract took under the same identity — under `step_fuel`
+    /// per step; the restore call runs under the default budget.
+    pub fn restore(
+        component: &[u8],
+        signer: Box<dyn IdentitySigner>,
+        config: MachineConfig,
+        snapshot: &[u8],
+        step_fuel: u64,
+    ) -> Result<Self, GuestError> {
+        let mut guest = Self::instantiate(component, signer, step_fuel)?;
+        guest
+            .world
+            .call_restore(&mut guest.store, &wire::encode_config(&config), snapshot)
+            .map_err(component_err)?
+            .map_err(GuestError::Restore)?;
+        Ok(guest)
+    }
+
+    /// Load, link, and instantiate the component — no machine inside yet.
+    fn instantiate(
+        component: &[u8],
+        signer: Box<dyn IdentitySigner>,
+        step_fuel: u64,
+    ) -> Result<Self, GuestError> {
         let engine = Engine::new(&engine_config()).map_err(component_err)?;
         let component = Component::from_binary(&engine, component).map_err(component_err)?;
         let mut linker = Linker::new(&engine);
@@ -118,10 +161,6 @@ impl NetstackGuest {
         store.set_fuel(STEP_FUEL).map_err(component_err)?;
         let world =
             Netstack::instantiate(&mut store, &component, &linker).map_err(component_err)?;
-        world
-            .call_configure(&mut store, &wire::encode_config(&config))
-            .map_err(component_err)?
-            .map_err(GuestError::Configure)?;
         Ok(Self {
             store,
             world,
@@ -140,6 +179,14 @@ impl NetstackMachine for NetstackGuest {
             .map_err(StepError::Fault)?;
         let outcome = wire::decode_step(&bytes).map_err(fault)?;
         outcome.map_err(StepError::Protocol)
+    }
+
+    fn snapshot(&mut self) -> Result<Vec<u8>, StepError> {
+        self.store.set_fuel(self.step_fuel).map_err(fault)?;
+        self.world
+            .call_snapshot(&mut self.store)
+            .map_err(fault)?
+            .map_err(StepError::Fault)
     }
 }
 

@@ -6067,6 +6067,7 @@ dependencies = [
  "commonware-cryptography",
  "nat-traversal",
  "netstack-machine",
+ "sha2 0.10.9",
  "wireguard",
 ]
 

@@ -1,7 +1,7 @@
 //! The native machine over the frozen suite: every scenario, against the
 //! shared fixture set.
 
-netstack_scenarios::suite!(netstack_scenarios::native);
+netstack_scenarios::suite!(netstack_scenarios::NATIVE);
 
 /// Every scenario the crate defines is one the `suite!` macro runs — a
 /// scenario left out of the macro would be a fixture nobody checks.

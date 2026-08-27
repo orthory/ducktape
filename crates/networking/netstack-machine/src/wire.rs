@@ -6,11 +6,17 @@
 //! and [`schema_text`] is what says so.
 //!
 //! Foreign types the contract carries and borsh does not describe get a
-//! helper module each (`key`, `keys`, `option_key`, `result_socket_addr`;
-//! the socket address itself lives in `wireguard::wire_schema`). A helper's
-//! serialized form is the plain borsh encoding of its underlying bytes, and
-//! its schema declares exactly that, so the description never drifts from
-//! the bytes.
+//! helper module each (`key`, `keys`, `option_key`, `identity_keys`,
+//! `result_socket_addr`, `identity_socket_addrs`,
+//! `identity_optional_socket_addrs`; the socket address itself lives in
+//! `wireguard::wire_schema`). A helper's serialized form is the plain borsh
+//! encoding of its underlying bytes, and its schema declares exactly that,
+//! so the description never drifts from the bytes.
+//!
+//! The fifth root, `snapshot`, is the machine's whole state behind a
+//! [`Snapshot`] envelope whose first field is this contract's hash: a
+//! backend swap restores only a state taken under the same contract, and a
+//! layout change anywhere in the state moves the hash.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -20,17 +26,18 @@ use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
 use sha2::{Digest, Sha256};
-use wireguard::UpgradeError;
-use wireguard::wire_schema::socket_addr;
+use wireguard::wire_schema::{option_socket_addr, socket_addr};
+use wireguard::{UpgradeError, ValidatorIdentity};
 
 use crate::contract::{Effect, Event, MachineConfig, ReachabilityEvent};
+use crate::machine::MachineState;
 
 /// The pinned hash of [`schema_text`]: the contract's version. A change
 /// here is a wire change — the schema test refuses drift until the fixture
 /// (`tests/fixtures/contract.schema`) and this constant are regenerated in
 /// the same PR (`UPDATE_TRACES=1 cargo test -p netstack-machine`).
 pub const CONTRACT_SCHEMA_HASH: &str =
-    "3cdc0594e21ce0a61e734ee38510cada50712eb20475e190a8324421c53084f9";
+    "1c2bb1329756f3d5462a35d881d79457ca987795cfa1917654e7a87cd553da14";
 
 #[derive(Debug, thiserror::Error)]
 #[error("contract wire: {0}")]
@@ -64,11 +71,64 @@ pub fn decode_config(bytes: &[u8]) -> Result<MachineConfig, WireError> {
     Ok(borsh::from_slice(bytes)?)
 }
 
-/// The wire's four roots — the config the machine is built from, the event
-/// in, the step outcome out, the observation the host surfaces — with every
-/// definition they reach, as one canonical text. Definitions are a sorted
-/// map, so the text is stable across runs and its hash identifies the
-/// contract.
+/// The machine's state as it crosses a backend swap: the contract it was
+/// taken under, then the state. The contract comes first so a restore can
+/// refuse a foreign snapshot by name before decoding a byte of state.
+#[derive(BorshSerialize, BorshDeserialize, BorshSchema)]
+pub(crate) struct Snapshot {
+    pub(crate) contract: String,
+    pub(crate) state: MachineState,
+}
+
+/// Why a snapshot could not be taken or restored.
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotError {
+    /// An interface push is in flight: the caller broke the step contract
+    /// (a push round-trips before anything else), so the state is not at
+    /// rest.
+    #[error("an interface push is in flight")]
+    PushInFlight,
+    /// The snapshot was taken under another contract; this machine cannot
+    /// read it.
+    #[error("snapshot contract {found} is not this machine's {CONTRACT_SCHEMA_HASH}")]
+    Contract { found: String },
+    /// The snapshot was taken by another identity.
+    #[error("snapshot belongs to another identity")]
+    Identity,
+    /// Bytes past the end of the state.
+    #[error("snapshot carries trailing bytes")]
+    Trailing,
+    #[error(transparent)]
+    Wire(#[from] WireError),
+}
+
+pub(crate) fn encode_snapshot(state: MachineState) -> Vec<u8> {
+    let snapshot = Snapshot {
+        contract: CONTRACT_SCHEMA_HASH.into(),
+        state,
+    };
+    borsh::to_vec(&snapshot).expect("contract types always serialize")
+}
+
+pub(crate) fn decode_snapshot(bytes: &[u8]) -> Result<MachineState, SnapshotError> {
+    let mut cursor = bytes;
+    let contract = String::deserialize(&mut cursor).map_err(WireError)?;
+    let same_contract = contract == CONTRACT_SCHEMA_HASH;
+    if !same_contract {
+        return Err(SnapshotError::Contract { found: contract });
+    }
+    let state = MachineState::deserialize(&mut cursor).map_err(WireError)?;
+    if !cursor.is_empty() {
+        return Err(SnapshotError::Trailing);
+    }
+    Ok(state)
+}
+
+/// The wire's five roots — the config the machine is built from, the event
+/// in, the step outcome out, the observation the host surfaces, the
+/// snapshot a swap carries — with every definition they reach, as one
+/// canonical text. Definitions are a sorted map, so the text is stable
+/// across runs and its hash identifies the contract.
 pub fn schema_text() -> String {
     let mut out = String::new();
     let _ = writeln!(out, "root config = {}", MachineConfig::declaration());
@@ -79,11 +139,13 @@ pub fn schema_text() -> String {
         "root observation = {}",
         ReachabilityEvent::declaration()
     );
+    let _ = writeln!(out, "root snapshot = {}", Snapshot::declaration());
     let mut definitions = BTreeMap::new();
     MachineConfig::add_definitions_recursively(&mut definitions);
     Event::add_definitions_recursively(&mut definitions);
     StepOutcome::add_definitions_recursively(&mut definitions);
     ReachabilityEvent::add_definitions_recursively(&mut definitions);
+    Snapshot::add_definitions_recursively(&mut definitions);
     for (declaration, definition) in &definitions {
         let _ = writeln!(out, "{declaration} = {definition:?}");
     }
@@ -228,6 +290,136 @@ pub(crate) mod option_key {
         <() as BorshSchema>::add_definitions_recursively(definitions);
         key::definitions(definitions);
     }
+}
+
+/// A map from validator identity to ed25519 public key, laid out as borsh
+/// lays out every map: a `u32` count, then `(key, value)` pairs in key
+/// order.
+pub(crate) mod identity_keys {
+    use super::*;
+
+    pub fn serialize<W: borsh::io::Write>(
+        map: &BTreeMap<ValidatorIdentity, ed25519::PublicKey>,
+        writer: &mut W,
+    ) -> Result<(), borsh::io::Error> {
+        let count = u32::try_from(map.len()).map_err(|_| {
+            borsh::io::Error::new(borsh::io::ErrorKind::InvalidData, "too many keys")
+        })?;
+        count.serialize(writer)?;
+        map.iter().try_for_each(|(identity, key)| {
+            identity.serialize(writer)?;
+            key::serialize(key, writer)
+        })
+    }
+
+    pub fn deserialize<R: borsh::io::Read>(
+        reader: &mut R,
+    ) -> Result<BTreeMap<ValidatorIdentity, ed25519::PublicKey>, borsh::io::Error> {
+        let count = u32::deserialize_reader(reader)?;
+        (0..count)
+            .map(|_| {
+                let identity = ValidatorIdentity::deserialize_reader(reader)?;
+                let key = key::deserialize(reader)?;
+                Ok((identity, key))
+            })
+            .collect()
+    }
+
+    pub fn declaration() -> Declaration {
+        format!(
+            "BTreeMap<{}, {}>",
+            ValidatorIdentity::declaration(),
+            key::declaration()
+        )
+    }
+
+    pub fn definitions(definitions: &mut BTreeMap<Declaration, Definition>) {
+        map_definitions(
+            declaration(),
+            ValidatorIdentity::declaration(),
+            key::declaration(),
+            definitions,
+        );
+        ValidatorIdentity::add_definitions_recursively(definitions);
+        key::definitions(definitions);
+    }
+}
+
+/// `BTreeMap<ValidatorIdentity, SocketAddr>` — schema only (borsh
+/// serializes it natively).
+pub(crate) mod identity_socket_addrs {
+    use super::*;
+
+    pub fn declaration() -> Declaration {
+        format!(
+            "BTreeMap<{}, {}>",
+            ValidatorIdentity::declaration(),
+            socket_addr::declaration()
+        )
+    }
+
+    pub fn definitions(definitions: &mut BTreeMap<Declaration, Definition>) {
+        map_definitions(
+            declaration(),
+            ValidatorIdentity::declaration(),
+            socket_addr::declaration(),
+            definitions,
+        );
+        ValidatorIdentity::add_definitions_recursively(definitions);
+        socket_addr::definitions(definitions);
+    }
+}
+
+/// `BTreeMap<ValidatorIdentity, Option<SocketAddr>>` — schema only (borsh
+/// serializes it natively).
+pub(crate) mod identity_optional_socket_addrs {
+    use super::*;
+
+    pub fn declaration() -> Declaration {
+        format!(
+            "BTreeMap<{}, {}>",
+            ValidatorIdentity::declaration(),
+            option_socket_addr::declaration()
+        )
+    }
+
+    pub fn definitions(definitions: &mut BTreeMap<Declaration, Definition>) {
+        map_definitions(
+            declaration(),
+            ValidatorIdentity::declaration(),
+            option_socket_addr::declaration(),
+            definitions,
+        );
+        ValidatorIdentity::add_definitions_recursively(definitions);
+        option_socket_addr::definitions(definitions);
+    }
+}
+
+/// A map's schema as borsh lays every map out: a sequence of `(key, value)`
+/// tuples.
+fn map_definitions(
+    map: Declaration,
+    key: Declaration,
+    value: Declaration,
+    definitions: &mut BTreeMap<Declaration, Definition>,
+) {
+    let pair = format!("({key}, {value})");
+    borsh::schema::add_definition(
+        map,
+        Definition::Sequence {
+            length_width: Definition::DEFAULT_LENGTH_WIDTH,
+            length_range: Definition::DEFAULT_LENGTH_RANGE,
+            elements: pair.clone(),
+        },
+        definitions,
+    );
+    borsh::schema::add_definition(
+        pair,
+        Definition::Tuple {
+            elements: vec![key, value],
+        },
+        definitions,
+    );
 }
 
 /// `Result<SocketAddr, String>` — schema only (borsh serializes it natively),

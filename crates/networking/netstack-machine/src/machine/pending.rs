@@ -1,7 +1,7 @@
 //! The machine's parked work: every operation whose outcome arrives as a
 //! later [`Event`](crate::Event), as DATA — never a closure — so the
-//! machine's whole state stays inspectable, replayable, and (in the arc's
-//! later phases) snapshot-able.
+//! machine's whole state stays inspectable, replayable, and snapshot-able
+//! (`super::snapshot`).
 //!
 //! Two lifetimes coexist here. [`PendingOp`] entries wait on the HOST'S
 //! runtime (a resolver op, the intro-ack datagram): commands interleave with
@@ -14,31 +14,43 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
+use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
 use commonware_cryptography::ed25519;
 use wireguard::effect::PeerTunnelConfig;
+use wireguard::wire_schema::socket_addr;
 use wireguard::{
     EndpointRecord, MeshVersion, MeshView, SignedEndpointRecord, ValidatorIdentity, X25519PublicKey,
 };
 
 use crate::contract::{CmdToken, MeshEpochEvent, ReqId};
 use crate::epoch::Role;
+use crate::wire::{identity_keys, identity_optional_socket_addrs, key};
 
 /// One started host operation, keyed by its [`ReqId`], carrying exactly the
 /// checkpoint its resumption needs. The variant families mirror the effect
 /// that started them: `*Endpoint` waits on an advertised-endpoint resolve,
 /// `*Rendezvous` on a by-identity rendezvous lookup, [`Self::IntroAck`] on
 /// the invite bootstrap's awaited datagram.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub(crate) enum PendingOp {
     /// The cold-restart restore resolving one remembered record's endpoint;
     /// joins into [`PendingRestore`].
     RestoreEndpoint {
         owner: ValidatorIdentity,
+        #[borsh(schema(with_funcs(
+            declaration = "socket_addr::declaration",
+            definitions = "socket_addr::definitions"
+        )))]
         advertised: SocketAddr,
     },
     /// The peers-locked-mesh adoption resolving one peer record's endpoint;
     /// joins into [`PendingAdopt`].
     AdoptEndpoint {
         peer: ValidatorIdentity,
+        #[borsh(schema(with_funcs(
+            declaration = "socket_addr::declaration",
+            definitions = "socket_addr::definitions"
+        )))]
         advertised: SocketAddr,
         wireguard_public_key: X25519PublicKey,
     },
@@ -48,6 +60,10 @@ pub(crate) enum PendingOp {
         owner: ValidatorIdentity,
         signed: SignedEndpointRecord,
         via: ValidatorIdentity,
+        #[borsh(schema(with_funcs(
+            declaration = "socket_addr::declaration",
+            definitions = "socket_addr::definitions"
+        )))]
         advertised: SocketAddr,
     },
     /// A standby's accepted record (member side) resolving its advertised
@@ -57,6 +73,10 @@ pub(crate) enum PendingOp {
     /// before the pre-warm merge.
     MemberPrewarmEndpoint {
         record: EndpointRecord,
+        #[borsh(schema(with_funcs(
+            declaration = "socket_addr::declaration",
+            definitions = "socket_addr::definitions"
+        )))]
         advertised: SocketAddr,
     },
     /// A handshake-time resolve for a peer with an advertised endpoint: a
@@ -77,6 +97,14 @@ pub(crate) enum PendingOp {
     /// The coordinated-invite bootstrap rendezvousing its inviter.
     InviteRendezvous {
         token: CmdToken,
+        #[borsh(
+            serialize_with = "key::serialize",
+            deserialize_with = "key::deserialize",
+            schema(with_funcs(
+                declaration = "key::declaration",
+                definitions = "key::definitions"
+            ))
+        )]
         peer: ed25519::PublicKey,
         wireguard_public_key: X25519PublicKey,
         intro: Vec<u8>,
@@ -87,11 +115,16 @@ pub(crate) enum PendingOp {
 
 /// The standby-record pre-warm continuation: everything the merge needs
 /// once the record's advertised endpoint resolves.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub(crate) struct StandbyPrewarm {
     pub(crate) owner: ValidatorIdentity,
     pub(crate) signed: SignedEndpointRecord,
     pub(crate) via: ValidatorIdentity,
     pub(crate) first_contact: bool,
+    #[borsh(schema(with_funcs(
+        declaration = "socket_addr::declaration",
+        definitions = "socket_addr::definitions"
+    )))]
     pub(crate) advertised: SocketAddr,
 }
 
@@ -155,13 +188,26 @@ pub(crate) enum LayersFollowUp {
 /// while the remembered records' endpoints resolve, then joins into one
 /// interface push. The epoch itself does not exist yet — it is built by the
 /// retarget tail once the push settles.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub(crate) struct PendingRestore {
     pub event: MeshEpochEvent,
     pub role: Role,
     pub mesh_epoch: u64,
     pub records: Vec<EndpointRecord>,
     pub standby_records: Vec<SignedEndpointRecord>,
+    #[borsh(
+        serialize_with = "identity_keys::serialize",
+        deserialize_with = "identity_keys::deserialize",
+        schema(with_funcs(
+            declaration = "identity_keys::declaration",
+            definitions = "identity_keys::definitions"
+        ))
+    )]
     pub member_pk_of: BTreeMap<ValidatorIdentity, ed25519::PublicKey>,
+    #[borsh(schema(with_funcs(
+        declaration = "identity_optional_socket_addrs::declaration",
+        definitions = "identity_optional_socket_addrs::definitions"
+    )))]
     pub endpoints: BTreeMap<ValidatorIdentity, Option<SocketAddr>>,
     pub outstanding: BTreeSet<ReqId>,
 }
@@ -179,6 +225,7 @@ pub(crate) struct RestoreApply {
 /// The peers-locked-mesh adoption mid-resolution: endpoint resolves for the
 /// peers' records join here into one apply. While this exists the epoch's
 /// `advance` holds off — the adoption's own completion re-advances.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub(crate) struct PendingAdopt {
     pub version: MeshVersion,
     pub records: Vec<EndpointRecord>,

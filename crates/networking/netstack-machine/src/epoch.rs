@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
+use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
 use commonware_cryptography::ed25519;
 use wireguard::effect::PeerTunnelConfig;
 use wireguard::{
@@ -19,6 +20,7 @@ use wireguard::{
 
 use crate::contract::{COORD_STEP_TIMEOUT, PUNCH_STEP_TIMEOUT, PUNCH_TRIES};
 use crate::msg::ReachabilityMsg;
+use crate::wire::{identity_keys, identity_socket_addrs};
 
 /// Nudge ticks between two heals of the SAME peer.
 ///
@@ -79,7 +81,7 @@ pub(crate) fn should_attempt_rendezvous_fallback(previous: Option<(u64, u32)>) -
 }
 
 /// Which side of the plane this node runs for the epoch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub(crate) enum Role {
     /// In the epoch's `ActiveValidatorSet`: full phase-A assembly, plus the
     /// pre-warm layer toward the epoch's standbys.
@@ -93,7 +95,7 @@ pub(crate) enum Role {
 /// previous one gathered: the record set once the advert is signed over it,
 /// the advert set once the view verified. A standby never leaves
 /// [`Phase::Records`] — its pre-warm layer has no version lock.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub(crate) enum Phase {
     /// Collecting every member's endpoint record; this node's advert is not
     /// signed yet, so the record set is still open to higher nonces.
@@ -176,7 +178,7 @@ pub(crate) enum MemberRecordVerdict {
 
 /// Whether this node's own record is the one its peers locked into the
 /// epoch's mesh version, or a fresh life signed after that lock.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub(crate) enum OwnRecordStanding {
     /// The peers' locked set carries this record (or the epoch is still
     /// assembling toward that): the settled phases re-offer nothing.
@@ -211,7 +213,18 @@ fn admit<V>(
 /// A handshake message's stage in the request -> response -> ack triple.
 /// Ordered: a later stage proves the earlier one arrived, so it supersedes
 /// a relay slot holding the earlier one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 pub(crate) enum HandshakeStage {
     Request,
     Response,
@@ -226,6 +239,7 @@ pub(crate) enum HandshakeStage {
     clippy::large_enum_variant,
     reason = "each epoch holds only a handful of handshakes; boxing would complicate the retry state"
 )]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub(crate) enum PeerHandshake {
     /// We initiated and sent the request; the peer's response is due.
     AwaitingResponse { request: TunnelUpgradeRequest },
@@ -270,6 +284,7 @@ impl PeerHandshake {
 /// `(initiator, responder)` pair, re-offered on nudge until superseded or
 /// expired. Signature-verified before acceptance, so a malicious member
 /// cannot evict a real in-flight message by poisoning the slot.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub(crate) struct RelaySlot {
     pub(crate) stage: HandshakeStage,
     /// The member whose signature the slot's message carries — the one peer
@@ -350,6 +365,7 @@ pub(crate) enum RelayVerdict {
 }
 
 /// Everything one epoch accumulates on the way to its apply.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub(crate) struct EpochState {
     pub(crate) epoch: u64,
     pub(crate) role: Role,
@@ -359,6 +375,14 @@ pub(crate) struct EpochState {
     pub(crate) peers: Vec<ValidatorIdentity>,
     /// The epoch's standby identities (never in `set`).
     pub(crate) standbys: Vec<ValidatorIdentity>,
+    #[borsh(
+        serialize_with = "identity_keys::serialize",
+        deserialize_with = "identity_keys::deserialize",
+        schema(with_funcs(
+            declaration = "identity_keys::declaration",
+            definitions = "identity_keys::definitions"
+        ))
+    )]
     pub(crate) pk_of: BTreeMap<ValidatorIdentity, ed25519::PublicKey>,
     /// The accepted nonce per pre-warm counterparty (standby records on a
     /// member, member records on a standby). Higher nonce wins — the live
@@ -387,6 +411,14 @@ pub(crate) struct EpochState {
     /// the standby's record when that identity is not a member (the lobby
     /// ingress a parked joiner connects under, or the standby's own key) —
     /// a standby is not necessarily dialable under its record identity.
+    #[borsh(
+        serialize_with = "identity_keys::serialize",
+        deserialize_with = "identity_keys::deserialize",
+        schema(with_funcs(
+            declaration = "identity_keys::declaration",
+            definitions = "identity_keys::definitions"
+        ))
+    )]
     routes: BTreeMap<ValidatorIdentity, ed25519::PublicKey>,
     /// One strictly-monotonic counter for EVERYTHING this identity signs in
     /// the epoch — replay keys are `(identity, epoch, nonce)`, and the
@@ -427,6 +459,10 @@ pub(crate) struct EpochState {
     /// two OTHER members.
     relayed: BTreeMap<(ValidatorIdentity, ValidatorIdentity), RelaySlot>,
     pub(crate) plans: BTreeMap<ValidatorIdentity, TunnelInstallPlan>,
+    #[borsh(schema(with_funcs(
+        declaration = "identity_socket_addrs::declaration",
+        definitions = "identity_socket_addrs::definitions"
+    )))]
     pub(crate) overrides: BTreeMap<ValidatorIdentity, SocketAddr>,
     /// By-identity rendezvous-fallback bookkeeping per endpoint-less peer:
     /// `(last attempt unix ms, attempts so far)` — the backoff + per-epoch

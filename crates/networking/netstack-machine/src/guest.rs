@@ -126,14 +126,18 @@ fn level_of(level: tracing::Level) -> host::Level {
 
 struct Component;
 
+/// Make `machine` the instance's machine. The subscriber outlives every
+/// machine this instance builds; a second install finds it in place and
+/// keeps it.
+fn install(machine: Machine) {
+    let _ = tracing::subscriber::set_global_default(HostLog);
+    MACHINE.with(|slot| *slot.borrow_mut() = Some(machine));
+}
+
 impl Guest for Component {
     fn configure(config: Vec<u8>) -> Result<(), String> {
         let config = wire::decode_config(&config).map_err(|err| err.to_string())?;
-        // the subscriber outlives every machine this instance builds; a
-        // second configure finds it installed and keeps it.
-        let _ = tracing::subscriber::set_global_default(HostLog);
-        let machine = Machine::new(Box::new(HostSigner), config);
-        MACHINE.with(|slot| *slot.borrow_mut() = Some(machine));
+        install(Machine::new(Box::new(HostSigner), config));
         Ok(())
     }
 
@@ -144,6 +148,22 @@ impl Guest for Component {
             let machine = slot.as_mut().ok_or("step before configure")?;
             Ok(wire::encode_step(&machine.step(event, now_ms)))
         })
+    }
+
+    fn snapshot() -> Result<Vec<u8>, String> {
+        MACHINE.with(|slot| {
+            let slot = slot.borrow();
+            let machine = slot.as_ref().ok_or("snapshot before configure")?;
+            machine.snapshot().map_err(|err| err.to_string())
+        })
+    }
+
+    fn restore(config: Vec<u8>, snapshot: Vec<u8>) -> Result<(), String> {
+        let config = wire::decode_config(&config).map_err(|err| err.to_string())?;
+        let machine = Machine::restore(Box::new(HostSigner), config, &snapshot)
+            .map_err(|err| err.to_string())?;
+        install(machine);
+        Ok(())
     }
 }
 

@@ -7,8 +7,9 @@
 //!
 //! The suite is generic over the [`Backend`] that builds each node's
 //! machine, so ONE fixture set binds every backend: the native machine (this
-//! crate's tests) and the wasm guest (`netstack-wasm`'s). A backend whose
-//! trace differs by a byte fails exactly the way a behavior change does.
+//! crate's tests), the wasm guest (`netstack-wasm`'s), and every crossing
+//! between them a mid-life swap makes. A backend whose trace differs by a
+//! byte fails exactly the way a behavior change does.
 
 pub mod harness;
 pub mod scenarios;
@@ -16,12 +17,39 @@ pub mod scenarios;
 use netstack_machine::{Machine, MachineConfig, NetstackMachine};
 use wireguard::IdentitySigner;
 
-/// Builds one node's machine from its identity and config.
-pub type Backend = fn(Box<dyn IdentitySigner>, MachineConfig) -> Box<dyn NetstackMachine>;
+/// How a lane builds a node's machine: fresh from its identity and config,
+/// or continuing from a snapshot another machine took. Two functions
+/// because a swap crosses backends — the machine that steps down and the
+/// one that takes over need not be the same kind, and the trace must not
+/// be able to tell.
+#[derive(Clone, Copy)]
+pub struct Backend {
+    pub build: fn(Box<dyn IdentitySigner>, MachineConfig) -> Box<dyn NetstackMachine>,
+    pub restore: fn(Box<dyn IdentitySigner>, MachineConfig, &[u8]) -> Box<dyn NetstackMachine>,
+}
 
-/// The native machine as a backend.
-pub fn native(signer: Box<dyn IdentitySigner>, config: MachineConfig) -> Box<dyn NetstackMachine> {
+/// The native machine, building and restoring.
+pub const NATIVE: Backend = Backend {
+    build: native_build,
+    restore: native_restore,
+};
+
+pub fn native_build(
+    signer: Box<dyn IdentitySigner>,
+    config: MachineConfig,
+) -> Box<dyn NetstackMachine> {
     Box::new(Machine::new(signer, config))
+}
+
+pub fn native_restore(
+    signer: Box<dyn IdentitySigner>,
+    config: MachineConfig,
+    snapshot: &[u8],
+) -> Box<dyn NetstackMachine> {
+    Box::new(
+        Machine::restore(signer, config, snapshot)
+            .expect("a scenario restores the snapshot it just took"),
+    )
 }
 
 /// One `#[test]` per scenario, each run on `$backend` against the shared
@@ -49,6 +77,7 @@ macro_rules! suite {
             slow_resolver_does_not_stall,
             join_direct_invite,
             join_coordinated_invite,
+            backend_swap_mid_epoch,
         );
     };
     (@each $backend:expr; $($name:ident),* $(,)?) => {

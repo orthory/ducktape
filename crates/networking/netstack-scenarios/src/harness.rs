@@ -28,10 +28,11 @@ use netstack_machine::{
     CmdToken, Effect, Event, MachineConfig, MeshEpochEvent, NetstackMachine, ReachabilityEvent,
     ReqId, Resolution, binding,
 };
-
-use crate::Backend;
+use sha2::{Digest, Sha256};
 use wireguard::effect::PeerTunnelConfig;
 use wireguard::{Endpoint, MeshVersion, PortPolicy, Transport, ValidatorIdentity, X25519PublicKey};
+
+use crate::Backend;
 
 /// One hop on the scripted network.
 pub const LINK_DELAY_MS: u64 = 10;
@@ -407,6 +408,11 @@ impl Net {
         self.nodes[node].observed.iter().any(pred)
     }
 
+    /// How many of the node's observations satisfy `pred`.
+    pub fn count(&self, node: usize, pred: impl Fn(&ReachabilityEvent) -> bool) -> usize {
+        self.nodes[node].observed.iter().filter(|e| pred(e)).count()
+    }
+
     /// The machine's reply to the command `token` names, once it has one.
     pub fn reply(&self, token: CmdToken) -> Option<&Reply> {
         self.replies.get(&token)
@@ -431,7 +437,8 @@ impl Net {
     /// its old life — the transport links died with the process.
     pub fn start(&mut self, node: usize) {
         self.purge(node);
-        let machine = (self.backend)(Box::new(self.nodes[node].signer.clone()), self.config(node));
+        let machine =
+            (self.backend.build)(Box::new(self.nodes[node].signer.clone()), self.config(node));
         let entry = &mut self.nodes[node];
         entry.machine = Some(machine);
         entry.restore = entry.persisted.clone();
@@ -451,6 +458,35 @@ impl Net {
     pub fn restart(&mut self, node: usize) {
         self.stop(node);
         self.start(node);
+    }
+
+    /// Swap the node's machine for one the backend restores from its
+    /// snapshot — the mid-life backend swap. Nothing in flight is touched:
+    /// the links, the queue, and the persisted state all outlive the
+    /// machine. The trace pins the snapshot's digest, so every backend
+    /// must take the SAME bytes from the same state.
+    pub fn swap(&mut self, node: usize) {
+        let mut machine = self.nodes[node]
+            .machine
+            .take()
+            .expect("a swap needs a running node");
+        let snapshot = machine
+            .snapshot()
+            .expect("a scenario snapshot never faults");
+        let _ = writeln!(
+            self.trace,
+            "@{:<6} {} ** swap snapshot={} ({} bytes)",
+            self.now_ms,
+            self.nodes[node].name,
+            short_hash(Sha256::digest(&snapshot).into()),
+            snapshot.len()
+        );
+        let restored = (self.backend.restore)(
+            Box::new(self.nodes[node].signer.clone()),
+            self.config(node),
+            &snapshot,
+        );
+        self.nodes[node].machine = Some(restored);
     }
 
     fn purge(&mut self, node: usize) {

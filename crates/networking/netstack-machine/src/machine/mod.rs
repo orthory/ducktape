@@ -24,6 +24,7 @@ mod nudge;
 mod pending;
 mod prewarm;
 mod restore;
+mod snapshot;
 mod steps;
 
 use std::collections::BTreeMap;
@@ -42,6 +43,7 @@ use crate::epoch::{EpochState, Phase, Role};
 use crate::msg::ReachabilityMsg;
 use crate::store::{self, PersistedMesh};
 use pending::{LayersFollowUp, PendingAdopt, PendingOp, PendingRestore, WgCont};
+pub(crate) use snapshot::MachineState;
 
 /// Views a handshake message stays valid for. Tight on purpose: a handshake
 /// is a live conversation, not a standing record. (Endpoint RECORDS carry no
@@ -466,6 +468,10 @@ impl Machine {
 impl NetstackMachine for Machine {
     fn step(&mut self, event: Event, now_ms: u64) -> Result<Vec<Effect>, StepError> {
         Machine::step(self, event, now_ms).map_err(StepError::Protocol)
+    }
+
+    fn snapshot(&mut self) -> Result<Vec<u8>, StepError> {
+        Machine::snapshot(self).map_err(|err| StepError::Fault(err.to_string()))
     }
 }
 

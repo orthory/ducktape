@@ -16,7 +16,7 @@ use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use nat_traversal::NodeKey;
 use reachability::{
     EndpointResolver as _, InstallReply, MeshEpochEvent, NetstackBackend, ReachabilityCommand,
-    ReachabilityConfig, ReachabilityEvent, ReachabilityMsg, Resolution, StaticResolver,
+    ReachabilityConfig, ReachabilityEvent, ReachabilityMsg, Resolution, StaticResolver, SwapReply,
     WireGuardKeypair, binding,
 };
 use tokio::sync::mpsc;
@@ -3180,6 +3180,98 @@ async fn a_faulting_guest_fails_over_to_the_native_machine() {
             );
             assert_eq!(fake.applied.len(), 1);
             assert_eq!(fake.applied[0].peers.len(), 2);
+        })
+        .await;
+}
+
+/// Ask the node's plane to swap its backend and await the plane's answer.
+async fn swap_backend(node: &TestNode, backend: NetstackBackend) -> Result<(), String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    node.cmd
+        .send(ReachabilityCommand::SwapBackend {
+            backend,
+            reply: SwapReply(tx),
+        })
+        .await
+        .unwrap();
+    rx.await.expect("plane alive")
+}
+
+/// A backend swap mid-epoch — native to guest with the retarget just
+/// stepped, guest back to native once applied — continues the epoch on the
+/// swapped machine: one interface, one apply, and the next cutover runs on
+/// it like any other.
+#[tokio::test]
+async fn a_backend_swap_mid_epoch_keeps_the_tunnels() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            let (nodes, mut collected) = spawn_mesh(&local, dir.path(), &[1, 2, 3], vec![]);
+            retarget_all(&nodes, &[0, 1, 2], &[], 1, 10).await;
+            // queued right behind the retarget: the epoch is assembling.
+            swap_backend(&nodes[0], guest_backend(reachability::NETSTACK_STEP_FUEL))
+                .await
+                .expect("the guest continues the epoch");
+            let versions = await_applied(&mut collected, &[0, 1, 2], 1).await;
+            assert_eq!(versions[&0], versions[&1]);
+            assert_eq!(versions[&0], versions[&2]);
+            for (i, node) in nodes.iter().enumerate() {
+                let fake = node.effect.0.lock().unwrap();
+                assert_eq!(fake.create_calls, 1, "node {i}: one interface");
+                assert_eq!(fake.applied.len(), 1, "node {i}: one apply");
+            }
+
+            // and back, on the settled epoch: nothing moves on the interface.
+            swap_backend(&nodes[0], NetstackBackend::Native)
+                .await
+                .expect("the native machine continues the epoch");
+            for _ in 0..3 {
+                nodes[0].cmd.send(ReachabilityCommand::Nudge).await.unwrap();
+            }
+
+            // the next cutover runs on the swapped machine like any other.
+            retarget_all(&nodes, &[0, 1, 2], &[], 2, 20).await;
+            await_applied(&mut collected, &[0, 1, 2], 2).await;
+            let fake = nodes[0].effect.0.lock().unwrap();
+            assert_eq!(fake.create_calls, 1, "the interface never flapped");
+            assert_eq!(
+                fake.applied.len(),
+                2,
+                "one apply per epoch, none for the swaps"
+            );
+        })
+        .await;
+}
+
+/// A backend that cannot restore the snapshot is refused, and the current
+/// machine continues untouched.
+#[tokio::test]
+async fn a_refused_swap_leaves_the_current_machine_in_place() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            let (nodes, mut collected) = spawn_mesh(&local, dir.path(), &[1, 2, 3], vec![]);
+            retarget_all(&nodes, &[0, 1, 2], &[], 1, 10).await;
+            await_applied(&mut collected, &[0, 1, 2], 1).await;
+
+            let not_a_component = NetstackBackend::Guest {
+                component: b"not a component".to_vec(),
+                step_fuel: reachability::NETSTACK_STEP_FUEL,
+            };
+            let refusal = swap_backend(&nodes[0], not_a_component)
+                .await
+                .expect_err("bytes that are not a component cannot take the plane");
+            assert!(refusal.contains("component"), "{refusal}");
+
+            // the plane is unchanged: the next epoch converges on the same
+            // machine and the same interface.
+            retarget_all(&nodes, &[0, 1, 2], &[], 2, 20).await;
+            await_applied(&mut collected, &[0, 1, 2], 2).await;
+            let fake = nodes[0].effect.0.lock().unwrap();
+            assert_eq!(fake.create_calls, 1);
+            assert_eq!(fake.applied.len(), 2);
         })
         .await;
 }

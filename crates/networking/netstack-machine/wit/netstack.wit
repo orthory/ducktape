@@ -34,4 +34,12 @@ world netstack {
   /// plane. The error string is a boundary failure: an undecodable event,
   /// or a step before `configure`.
   export step: func(event: list<u8>, now-ms: u64) -> result<list<u8>, string>;
+  /// The machine's whole state as the wire `Snapshot` (the contract hash,
+  /// then the state): what a backend swap carries. Between steps only.
+  export snapshot: func() -> result<list<u8>, string>;
+  /// Build the machine from a wire `MachineConfig` and continue it from a
+  /// wire `Snapshot` any machine of this contract took under the same
+  /// identity. Replaces the machine the way `configure` does; a snapshot
+  /// from another contract or identity is refused by name.
+  export restore: func(config: list<u8>, snapshot: list<u8>) -> result<_, string>;
 }

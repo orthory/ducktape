@@ -141,11 +141,21 @@ pub trait NetstackMachine {
     /// Step one event, stamped with the caller's unix-millisecond clock, and
     /// return the effects to perform IN ORDER.
     fn step(&mut self, event: Event, now_ms: u64) -> Result<Vec<Effect>, StepError>;
+
+    /// The machine's whole state as one wire value ([`crate::wire`]'s
+    /// `snapshot` root): what a backend swap carries to the machine that
+    /// takes over. Taken between steps only. `&mut` because a guest's call
+    /// runs inside its store, under its step budget.
+    fn snapshot(&mut self) -> Result<Vec<u8>, StepError>;
 }
 
 impl<M: NetstackMachine + ?Sized> NetstackMachine for Box<M> {
     fn step(&mut self, event: Event, now_ms: u64) -> Result<Vec<Effect>, StepError> {
         (**self).step(event, now_ms)
+    }
+
+    fn snapshot(&mut self) -> Result<Vec<u8>, StepError> {
+        (**self).snapshot()
     }
 }
 
