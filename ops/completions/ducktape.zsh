@@ -8,12 +8,12 @@
 _ducktape() {
     local families=(node user wallet gateway fs service agent mcp help --help -h --version -V)
 
-    local node_verbs=(run key init invite admit join list status peers resident member work help)
+    local node_verbs=(run key init invite admit join list status peers resident member work sandbox help)
     local node_resident=(accept remove)
     local node_member=(promote remove leave status)
     local node_work=(list admit revoke)
     local node_join=(requests state)
-    local node_flags=(--config -n --network --sync-only --json --out --dir --name --listen --advertised --http --rpc --gateway --primary-coordinator --wireguard-listen --wireguard-advertised --invite-listen --ttl-days)
+    local node_flags=(--config -n --network --sync-only --json --yes --out --dir --name --listen --advertised --http --rpc --gateway --primary-coordinator --wireguard-listen --wireguard-advertised --invite-listen --ttl-days)
 
     local user_key=(init restore unlock reveal status)
     local user_cred=(add list remove grant revoke inspect seal)
@@ -44,7 +44,7 @@ _ducktape() {
                 member)   compadd -- $node_member $node_flags ;;
                 work)     compadd -- $node_work $node_flags ;;
                 join)     compadd -- $node_join $node_flags ;;
-                run|key|init|invite|admit|list|status|peers) compadd -- $node_flags ;;
+                run|key|init|invite|admit|list|status|peers|sandbox) compadd -- $node_flags ;;
                 *)        compadd -- $node_verbs ;;
             esac
             ;;
