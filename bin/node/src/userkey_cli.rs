@@ -48,8 +48,6 @@ pub(crate) enum UserCmd {
     SignAdmin(AdminArgs),
     /// print the base64url WebAuthn challenge a passkey must sign to join
     WebauthnChallenge(EnrollArgs),
-    /// print the hex bytes a software P256 key must ECDSA-sign to join
-    P256Payload(EnrollArgs),
     /// named, grantable API credentials co-hosted through this node's gateway
     Cred(crate::cred_cli::CredArgs),
     /// bind this user key to an account on the local node and name it — one
@@ -168,17 +166,17 @@ pub(crate) struct AddMemberArgs {
     /// the new key (hex) being admitted
     #[arg(long = "new-key", value_name = "HEX")]
     new_key: String,
-    /// the new key's kind: ed25519 | p256 | webauthn_p256
-    #[arg(long = "new-kind", value_name = "KIND")]
-    new_kind: String,
+    /// the new key's scheme: ed25519 | secp256k1 (wallet) | secp256r1 (passkey)
+    #[arg(long = "new-scheme", value_name = "SCHEME")]
+    new_scheme: String,
     /// monotonic per-account nonce
     #[arg(long, value_name = "N")]
     nonce: u64,
     /// optional human label for the new key
     #[arg(long, value_name = "S")]
     label: Option<String>,
-    /// the new key's possession proof (`MemberProof` json)
-    #[arg(long, value_name = "JSON")]
+    /// the new key's possession proof (hex proof bytes, in its scheme's encoding)
+    #[arg(long, value_name = "HEX")]
     possession: String,
 }
 
@@ -277,7 +275,6 @@ pub(super) fn run(cmd: UserCmd) -> CommandResult {
         UserCmd::SignFrame(args) => cmd_user_sign_frame(args, &mut stdin),
         UserCmd::SignAdmin(args) => cmd_user_sign_admin(args, &mut stdin),
         UserCmd::WebauthnChallenge(args) => cmd_user_webauthn_challenge(args),
-        UserCmd::P256Payload(args) => cmd_user_p256_payload(args),
         UserCmd::Cred(args) => crate::cred_cli::run(args, &mut stdin),
         UserCmd::AccountInit(args) => cmd_user_account_init(args, &mut stdin),
     }
@@ -324,7 +321,10 @@ fn cmd_user_account_init(
         if let Some(name) = &minted_wallet {
             keystore::wallet::set_active(&keystore::wallet::duck_root()?, name)?;
         }
-        println!("a new wallet {wallet_name:?} was minted at {}", key_path.display());
+        println!(
+            "a new wallet {wallet_name:?} was minted at {}",
+            key_path.display()
+        );
         println!("write these 24 words down — they are the only way to restore it:");
         println!("{words}");
     }
@@ -850,18 +850,19 @@ fn cmd_user_sign_admin(args: AdminArgs, stdin: &mut impl std::io::BufRead) -> Co
     Ok(())
 }
 
-/// parse a `--new-kind` flag value into a [`identity::KeyKind`]. the CLI's own
-/// key is always ed25519; `p256`/`webauthn_p256` name the kind of a DIFFERENT
-/// key being admitted (whose possession proof comes from that key's holder --
-/// a native signer, or the FIDO2 transport for a passkey).
-fn parse_kind(s: &str) -> Result<identity::KeyKind, Box<dyn std::error::Error>> {
+/// parse a `--new-scheme` flag value into a [`identity::KeyScheme`]. the CLI's
+/// own key is always ed25519; `secp256k1`/`secp256r1` name the scheme of a
+/// DIFFERENT key being admitted (whose possession proof comes from that key's
+/// holder -- a wallet's `personal_sign`, or the FIDO2 transport for a passkey).
+fn parse_scheme(s: &str) -> Result<identity::KeyScheme, Box<dyn std::error::Error>> {
     match s {
-        "ed25519" => Ok(identity::KeyKind::Ed25519),
-        "p256" => Ok(identity::KeyKind::P256),
-        "webauthn_p256" | "webauthn-p256" | "passkey" => Ok(identity::KeyKind::WebauthnP256),
-        other => {
-            Err(format!("unknown key kind {other:?} (want ed25519|p256|webauthn_p256)").into())
-        }
+        "ed25519" => Ok(identity::KeyScheme::Ed25519),
+        "secp256k1" | "wallet" => Ok(identity::KeyScheme::Secp256k1),
+        "secp256r1" | "passkey" => Ok(identity::KeyScheme::Secp256r1),
+        other => Err(format!(
+            "unknown key scheme {other:?} (want ed25519|secp256k1|wallet|secp256r1|passkey)"
+        )
+        .into()),
     }
 }
 
@@ -880,18 +881,18 @@ fn user_sign_possession(
         &args.chain_id,
         &account_id,
         &new_key,
-        identity::KeyKind::Ed25519,
+        identity::KeyScheme::Ed25519,
         args.nonce,
     );
     let proof = config::ed25519_possession(&user, identity::IDENTITY_ADD_MEMBER_NS, &preimage);
-    Ok(serde_json::to_string(&proof).expect("json is utf-8"))
+    Ok(proof.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// `user-sign-possession --key <path> --chain-id <id> --account-id <hex> --nonce <n>`
-/// — for a NEW ed25519 device joining an existing account: print the
-/// possession-proof `MemberProof` JSON this device signs over the add-member
-/// preimage (pair its `user-key status` pubkey with it). the existing member
-/// then feeds both to `user-sign-add-member`.
+/// — for a NEW ed25519 device joining an existing account: print the hex
+/// possession proof this device signs over the add-member preimage (pair its
+/// `user-key status` pubkey with it). the existing member then feeds both to
+/// `user-sign-add-member`.
 fn cmd_user_sign_possession(
     args: PossessionArgs,
     stdin: &mut impl std::io::BufRead,
@@ -909,21 +910,26 @@ fn user_sign_add_member(
 
     let account_id = config::unhex(&args.account_id)?;
     let new_key = config::unhex(&args.new_key)?;
-    let new_kind = parse_kind(&args.new_kind)?;
+    let new_scheme = parse_scheme(&args.new_scheme)?;
     let new_label = args.label;
-    let possession: identity::MemberProof = serde_json::from_str(&args.possession)
-        .map_err(|e| format!("--possession is not a MemberProof: {e}"))?;
+    let possession = config::unhex(&args.possession)
+        .map_err(|e| format!("--possession is not hex proof bytes: {e}"))?;
 
     // the local user key is an existing member; it consents to admitting the
     // new key over the same preimage the new key proved possession of.
     let user = load_user_signer(&args.key, stdin)?;
-    let preimage =
-        identity::add_member_preimage(&args.chain_id, &account_id, &new_key, new_kind, args.nonce);
+    let preimage = identity::add_member_preimage(
+        &args.chain_id,
+        &account_id,
+        &new_key,
+        new_scheme,
+        args.nonce,
+    );
     let authorizer =
         config::ed25519_member_auth(&user, identity::IDENTITY_ADD_MEMBER_NS, &preimage);
     let msg = IdentityMsg::AddMemberKey {
         new_key,
-        new_kind,
+        new_scheme,
         new_label,
         possession,
         authorizer,
@@ -932,11 +938,12 @@ fn user_sign_add_member(
 }
 
 /// `user-sign-add-member --key <path> --chain-id <id> --account-id <hex>
-/// --new-key <hex> --new-kind <ed25519|p256|webauthn_p256> --nonce <n>
-/// --possession <json> [--label <s>]` — the LOCAL user key (an existing
+/// --new-key <hex> --new-scheme <ed25519|secp256k1|secp256r1> --nonce <n>
+/// --possession <hex> [--label <s>]` — the LOCAL user key (an existing
 /// member) consents to admitting `new-key`; `--possession` is that key's own
-/// proof (from `user-sign-possession`, or the FIDO2 transport for a passkey).
-/// prints the ready-to-submit `IdentityMsg::AddMemberKey` JSON.
+/// proof bytes (from `user-sign-possession`, a wallet's `personal_sign`, or
+/// the FIDO2 transport's assertion envelope for a passkey). prints the
+/// ready-to-submit `IdentityMsg::AddMemberKey` JSON.
 fn cmd_user_sign_add_member(
     args: AddMemberArgs,
     stdin: &mut impl std::io::BufRead,
@@ -989,15 +996,15 @@ fn user_webauthn_challenge(args: EnrollArgs) -> Result<String, Box<dyn std::erro
 
     // the exact bytes the on-chain verifier will demand the passkey signed:
     // SHA256(ADD_MEMBER_NS ‖ add_member_preimage(...)). one source of truth
-    // with `identity::verify_authority` — no drift between enroll and verify.
+    // with `KeyScheme::Secp256r1.verify` — no drift between enroll and verify.
     let preimage = identity::add_member_preimage(
         &args.chain_id,
         &account_id,
         &new_key,
-        identity::KeyKind::WebauthnP256,
+        identity::KeyScheme::Secp256r1,
         args.nonce,
     );
-    let challenge = identity::webauthn_challenge(identity::IDENTITY_ADD_MEMBER_NS, &preimage);
+    let challenge = keyscheme::webauthn_challenge(identity::IDENTITY_ADD_MEMBER_NS, &preimage);
     // base64url (no pad) — WebAuthn's native challenge encoding, so the phone
     // page passes it straight into `navigator.credentials.get({ challenge })`.
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(challenge))
@@ -1011,34 +1018,6 @@ fn user_webauthn_challenge(args: EnrollArgs) -> Result<String, Box<dyn std::erro
 /// (not the web page) is why "core in node" — the page never reconstructs it.
 fn cmd_user_webauthn_challenge(args: EnrollArgs) -> CommandResult {
     println!("{}", user_webauthn_challenge(args)?);
-    Ok(())
-}
-
-/// `user-p256-payload` core — see [`cmd_user_p256_payload`].
-fn user_p256_payload(args: EnrollArgs) -> Result<String, Box<dyn std::error::Error>> {
-    let account_id = config::unhex(&args.account_id)?;
-    let new_key = config::unhex(&args.new_key)?;
-
-    // the exact bytes a P256 joiner must ECDSA-sign — union_unique(ADD_MEMBER_NS,
-    // add_member_preimage(...)), what the on-chain verifier reconstructs. Hex so
-    // the phone hex-decodes and signs them raw; no preimage math on the page.
-    let payload = identity::add_member_signing_payload(
-        &args.chain_id,
-        &account_id,
-        &new_key,
-        identity::KeyKind::P256,
-        args.nonce,
-    );
-    Ok(payload.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-/// `user-p256-payload --chain-id <id> --account-id <hex> --new-key <hex>
-/// --nonce <n>` — print the hex bytes a software P256 key (a phone's pure-JS
-/// signer, in the in-app LAN enrollment) must ECDSA-P256-SHA256-sign to join
-/// `account-id` as `new-key` at `nonce`. Its raw R‖S signature feeds
-/// `user-sign-add-member --new-kind p256 --possession`. Pure computation.
-fn cmd_user_p256_payload(args: EnrollArgs) -> CommandResult {
-    println!("{}", user_p256_payload(args)?);
     Ok(())
 }
 
@@ -1070,13 +1049,13 @@ mod webauthn_challenge_tests {
         // verifier uses. if the verb and the verifier ever diverge, an enrolled
         // passkey would sign a challenge the chain then rejects.
         let expected =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(identity::webauthn_challenge(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(keyscheme::webauthn_challenge(
                 identity::IDENTITY_ADD_MEMBER_NS,
                 &identity::add_member_preimage(
                     "team#abcd",
                     &account_id,
                     &new_key,
-                    identity::KeyKind::WebauthnP256,
+                    identity::KeyScheme::Secp256r1,
                     5,
                 ),
             ));
@@ -1090,36 +1069,6 @@ mod webauthn_challenge_tests {
         assert_ne!(base, challenge("c", "cc", "bb", 0), "account must move it");
         assert_ne!(base, challenge("c", "aa", "cc", 0), "new key must move it");
         assert_ne!(base, challenge("c", "aa", "bb", 1), "nonce must move it");
-    }
-
-    #[test]
-    fn p256_payload_matches_identity_signing_payload() {
-        let account_id = [0xabu8; 33];
-        let new_key = [0xcdu8; 33];
-        let account_hex: String = account_id.iter().map(|b| format!("{b:02x}")).collect();
-        let new_hex: String = new_key.iter().map(|b| format!("{b:02x}")).collect();
-
-        let got = user_p256_payload(EnrollArgs {
-            chain_id: "team#abcd".to_string(),
-            account_id: account_hex,
-            new_key: new_hex,
-            nonce: 5,
-        })
-        .unwrap();
-
-        // the verb's hex must be exactly identity's signing payload — the bytes
-        // the on-chain P256 verifier reconstructs.
-        let expected: String = identity::add_member_signing_payload(
-            "team#abcd",
-            &account_id,
-            &new_key,
-            identity::KeyKind::P256,
-            5,
-        )
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-        assert_eq!(got, expected);
     }
 }
 
@@ -1187,7 +1136,6 @@ mod userkey_verb_tests {
             "sign-frame",
             "sign-admin",
             "webauthn-challenge",
-            "p256-payload",
         ] {
             assert!(cmd.find_subcommand(name).is_some(), "verb {name} missing");
         }
@@ -1381,7 +1329,7 @@ mod userkey_verb_tests {
         match identity::decode_msg(json.as_bytes()).unwrap() {
             identity::IdentityMsg::BindNode { authorizer } => {
                 assert_eq!(authorizer.key, pubkey_bytes(&seed));
-                assert_eq!(authorizer.kind, identity::KeyKind::Ed25519);
+                assert_eq!(authorizer.scheme, identity::KeyScheme::Ed25519);
             }
             other => panic!("expected BindNode, got {other:?}"),
         }
@@ -1444,15 +1392,11 @@ mod userkey_verb_tests {
         };
         assert_eq!(decoded, statement);
         assert_eq!(authorization.signer, signer.public_key().as_ref());
-        assert!(identity::verify_authority(
-            identity::KeyKind::Ed25519,
+        assert!(identity::KeyScheme::Ed25519.verify(
             &authorization.signer,
-            None,
             gateway::GATEWAY_ROUTE_NS,
             &gateway::route_signing_preimage(&decoded).unwrap(),
-            &identity::MemberProof::Signature {
-                sig: authorization.signature,
-            },
+            &authorization.signature,
         ));
 
         let mut unsafe_statement = statement;

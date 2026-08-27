@@ -14,7 +14,7 @@ use commonware_cryptography::Signer as _;
 use harness::{Sim, create_channel, post_message};
 use identity::{
     IDENTITY_ADD_MEMBER_NS, IDENTITY_BIND_NS, IDENTITY_REMOVE_MEMBER_NS, IDENTITY_UNBIND_NS,
-    KeyKind, add_member_preimage, bind_preimage, remove_member_preimage, unbind_preimage,
+    KeyScheme, add_member_preimage, bind_preimage, remove_member_preimage, unbind_preimage,
 };
 
 type Ed = commonware_cryptography::ed25519::PrivateKey;
@@ -75,16 +75,16 @@ fn a_member_add_bumps_the_nonce_and_invalidates_a_pre_bump_cert() {
         "",
         &acct_a,
         key_c.public_key().as_ref(),
-        KeyKind::Ed25519,
+        KeyScheme::Ed25519,
         1,
     );
     sim.submit_ok(
         "identity",
         serde_json::json!({ "add_member_key": {
             "new_key": key_c.public_key().as_ref().to_vec(),
-            "new_kind": "ed25519",
+            "new_scheme": "ed25519",
             "new_label": null,
-            "possession": { "signature": { "sig": key_c.sign(IDENTITY_ADD_MEMBER_NS, &add_at_1).as_ref().to_vec() } },
+            "possession": key_c.sign(IDENTITY_ADD_MEMBER_NS, &add_at_1).as_ref().to_vec(),
             "authorizer": ed_auth(&key_a, IDENTITY_ADD_MEMBER_NS, &add_at_1),
         }}),
         Some(&node_a),
@@ -472,7 +472,10 @@ fn an_expired_reclaim_fails_the_job_exactly_at_the_attempt_ceiling() {
         }
         sim.submit_ok("tasks", reclaim.clone(), Some("scavenger"));
 
-        let reply = sim.query("tasks", job(serde_json::json!({ "get": { "job_id": "j1" } })));
+        let reply = sim.query(
+            "tasks",
+            job(serde_json::json!({ "get": { "job_id": "j1" } })),
+        );
         let job_view = &reply["job"];
         assert_eq!(
             job_view["job"]["attempt"].as_u64(),

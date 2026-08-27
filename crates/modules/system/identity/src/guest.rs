@@ -19,8 +19,8 @@
 //! `WitStore::get`, and each successful `execute` flushes the inner staging
 //! with the inner `commit_block`. the `BindNode` member gate (valset
 //! validators ∪ residents) resolves through the runtime's memoized replay,
-//! and the WebAuthn / P-256 member verifies run IN the guest — pure-Rust p256,
-//! deterministic on wasm32.
+//! and every member proof verifies IN the guest through `keyscheme` —
+//! pure-Rust p256/k256 and commonware ed25519, deterministic on wasm32.
 //!
 //! ## the genesis-config chain id
 //!

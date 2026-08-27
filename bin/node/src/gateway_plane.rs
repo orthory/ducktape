@@ -569,28 +569,24 @@ async fn revalidate_route_authority(
     };
     let authorization = &record.authorization;
     let signer_is_current = account.member_keys.iter().any(|member| {
-        member.kind == identity::KeyKind::Ed25519 && member.pubkey == authorization.signer
+        member.scheme == identity::KeyScheme::Ed25519 && member.pubkey == authorization.signer
     });
     let node_is_current = account
         .nodes
         .iter()
         .any(|node| node.node_key == statement.publisher_node);
-    let proof = identity::MemberProof::Signature {
-        sig: authorization.signature.clone(),
-    };
     let preimage =
         gateway::route_signing_preimage(statement).map_err(GatewayFailure::Unavailable)?;
+    let signature_verifies = identity::KeyScheme::Ed25519.verify(
+        &authorization.signer,
+        gateway::GATEWAY_ROUTE_NS,
+        &preimage,
+        &authorization.signature,
+    );
     if account.account_id != statement.account_id
         || !signer_is_current
         || !node_is_current
-        || !identity::verify_authority(
-            identity::KeyKind::Ed25519,
-            &authorization.signer,
-            None,
-            gateway::GATEWAY_ROUTE_NS,
-            &preimage,
-            &proof,
-        )
+        || !signature_verifies
     {
         return Err(GatewayFailure::Forbidden(
             "gateway route authority is no longer current".into(),
@@ -1987,7 +1983,7 @@ mod tests {
             nonce: 0,
             member_keys: vec![identity::MemberKeyView {
                 pubkey: member.public_key().as_ref().to_vec(),
-                kind: identity::KeyKind::Ed25519,
+                scheme: identity::KeyScheme::Ed25519,
                 label: None,
                 added_at: 0,
             }],

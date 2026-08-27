@@ -84,6 +84,9 @@ members = [
     "crates/kernel/node", "crates/kernel/consensus",
     "crates/kernel/statesync", "crates/kernel/recovery", "crates/kernel/indexer",
     "crates/kernel/index-guest",
+    # the closed signature-scheme set + ONE verifier: shared by the kernel
+    # frame codec (below modules) and the identity module (a module).
+    "crates/kernel/keyscheme",
     # the node-local receipt-lane byte store. platform, not a module: it holds
     # no consensus state and lands in no root — the same standing `indexer` has
     # two lines up, and the reason it left crates/modules/system/.
@@ -242,6 +245,11 @@ smoltcp = { version = "0.13", default-features = false, features = [
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 base64 = "0.22"
 p256 = "0.13"
+# secp256k1 with public-key RECOVERY: an Ethereum wallet's `personal_sign`
+# proof carries r‖s‖v and no pubkey, so verify = recover + compare.
+k256 = { version = "0.13", features = ["ecdsa"] }
+# keccak-256 for the EIP-191 personal-message digest.
+sha3 = "0.10"
 # duckfs path normalization: NFC so visually-identical names collide instead
 # of coexisting (a consensus-determinism requirement, not cosmetics).
 unicode-normalization = "0.1"
@@ -280,6 +288,7 @@ wasmtime = "=46.0.1"
 
 # internal — kernel crates (the platform)
 sdk = { path = "crates/kernel/sdk" }
+keyscheme = { path = "crates/kernel/keyscheme" }
 # dev-only shared test doubles for the sdk boundary traits (TestCtx +
 # in-memory MerkleStore). MAY ONLY appear in `[dev-dependencies]` of consumers —
 # the Module Rule (modules link only sdk + wire surfaces) is untouched.

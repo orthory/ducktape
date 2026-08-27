@@ -79,21 +79,20 @@ impl From<host::SubmitError> for Error {
 // stream. that is why `submit` is async here even though the deterministic body
 // never suspends.
 
-use commonware_codec::DecodeExt as _;
-use commonware_cryptography::{
-    Signer as _, Verifier as _,
-    ed25519::{PrivateKey, PublicKey, Signature},
-};
+use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
+use keyscheme::KeyScheme;
 use sdk::Origin;
 
 /// the signing domain for op frames. domain-separated so an op signature can
 /// never double as a consensus vote, an endpoint advertisement, or any other
-/// signed artifact in the system. the ONE codec: length-prefixed
-/// `(origin, seq, target, payload)` and nothing else. a frame carries EXACTLY
-/// ONE op — there is no envelope continuation section, so a frame cannot
-/// append a second op that dispatches under a caller-chosen `Origin::Module`
-/// (see `no_continuation_lane.rs`).
-const FRAME_NS: &[u8] = b"ducktape:op-frame:v1";
+/// signed artifact in the system. the ONE codec: a scheme tag, then
+/// length-prefixed `(origin, seq, target, payload)` and nothing else. a frame
+/// carries EXACTLY ONE op — there is no envelope continuation section, so a
+/// frame cannot append a second op that dispatches under a caller-chosen
+/// `Origin::Module` (see `no_continuation_lane.rs`). PUBLIC so an external
+/// signer (a wallet, a passkey page) signs the exact namespace the decoder
+/// verifies against.
+pub const FRAME_NS: &[u8] = b"ducktape:op-frame:v1";
 
 /// the content address of an encoded frame — sha256 over the exact bytes the
 /// orderer carries. computed identically at submit and at drain, so a caller
@@ -115,10 +114,12 @@ pub fn frame_id(bytes: &[u8]) -> FrameId {
     id
 }
 
-// a wire frame: the ordered unit. carries the submitter's ed25519 public key
-// (`origin`), a per-origin monotonic `seq` (so two intentionally identical
-// msgs are still DISTINCT frames — the order key must be tie-free), and a
-// SIGNATURE binding (origin, seq, target, payload) to the origin key: after
+// a wire frame: the ordered unit. carries the submitter's public key
+// (`origin`) under a declared SCHEME (the first byte — ed25519 for nodes and
+// device keys, secp256k1 for a wallet, secp256r1 for a passkey), a per-origin
+// monotonic `seq` (so two intentionally identical msgs are still DISTINCT
+// frames — the order key must be tie-free), and a PROOF binding (scheme,
+// origin, seq, target, payload) to the origin key: after
 // [`decode_frame`] verifies it, `Origin::External(pubkey)` is AUTHENTICATED
 // AUTHORSHIP a module (e.g. governance voting) may rely on — no validator can
 // forge another identity's op. the agreed order is the byte-lexicographic
@@ -129,8 +130,9 @@ pub fn frame_id(bytes: &[u8]) -> FrameId {
 // nonce enforcement IN STATE is the planned successor.
 //
 // the encoding is BINARY, not json: the frame is exactly the signed preimage
-// (length-prefixed fields, see [`frame_preimage`]) with the 64-byte signature
-// appended. json rendered the `Vec<u8>` payload as a decimal array (~3.57x
+// (length-prefixed fields, see [`frame_preimage`]) with the scheme's proof
+// bytes appended (64 for ed25519, 65 for a wallet, an assertion envelope for
+// a passkey). json rendered the `Vec<u8>` payload as a decimal array (~3.57x
 // expansion), which pushed any op past ~290 KiB of content over the p2p
 // message cap — and commonware's `Sender::send` ASSERTS on that cap, so a
 // full-CHUNK_SIZE duckfs putblob panicked the proposer's gossip task instead
@@ -166,14 +168,16 @@ fn take_slice<'a>(buf: &mut &'a [u8]) -> Option<&'a [u8]> {
     Some(head)
 }
 
-/// the signed preimage AND the frame's wire prefix: length-prefixed fields so
-/// no two (seq, target, payload) triples can collide across a moving
-/// boundary. a frame is exactly these bytes with the signature appended, so
-/// [`decode_frame`] verifies against the received prefix without rebuilding
-/// anything.
-fn frame_preimage(origin: &[u8], seq: u64, msg: &Msg) -> Vec<u8> {
+/// the signed preimage AND the frame's wire prefix: the scheme tag, then
+/// length-prefixed fields so no two (seq, target, payload) triples can
+/// collide across a moving boundary. a frame is exactly these bytes with the
+/// scheme's proof appended, so [`decode_frame`] verifies against the received
+/// prefix without rebuilding anything. PUBLIC so a wallet or passkey client
+/// signs the exact bytes the decoder verifies — never a reconstruction.
+pub fn frame_preimage(scheme: KeyScheme, origin: &[u8], seq: u64, msg: &Msg) -> Vec<u8> {
     let target = msg.target.as_bytes();
-    let mut out = Vec::with_capacity(8 * 3 + origin.len() + target.len() + msg.payload.len());
+    let mut out = Vec::with_capacity(1 + 8 * 3 + origin.len() + target.len() + msg.payload.len());
+    out.push(scheme.tag());
     out.extend_from_slice(&(origin.len() as u64).to_le_bytes());
     out.extend_from_slice(origin);
     out.extend_from_slice(&seq.to_le_bytes());
@@ -184,30 +188,42 @@ fn frame_preimage(origin: &[u8], seq: u64, msg: &Msg) -> Vec<u8> {
     out
 }
 
-/// frame and SIGN a locally-originated msg for the ordered lane. the signer's
-/// public key becomes the frame's origin; the frame bytes are the signed
-/// preimage with the signature appended.
+/// frame and SIGN a locally-originated msg for the ordered lane with an
+/// ed25519 key (a node's or a device's). the signer's public key becomes the
+/// frame's origin under tag 0; the frame bytes are the signed preimage with
+/// the 64-byte signature appended. other schemes sign [`frame_preimage`]
+/// externally and append their own proof.
 pub fn encode_frame(signer: &PrivateKey, seq: u64, msg: &Msg) -> Vec<u8> {
     let origin = signer.public_key();
-    let mut frame = frame_preimage(origin.as_ref(), seq, msg);
+    let mut frame = frame_preimage(KeyScheme::Ed25519, origin.as_ref(), seq, msg);
     let sig = signer.sign(FRAME_NS, &frame);
     frame.extend_from_slice(sig.as_ref());
     frame
 }
 
-/// decode a delivered frame back to `(Origin, Msg)`, VERIFYING the signature
-/// first. rejects deterministically on: a parse failure, TRAILING BYTES
-/// between the payload and the signature (exactly one valid encoding per
-/// frame — this is what makes an appended continuation section
-/// unrepresentable), an origin that is not a valid ed25519 key, or a
-/// signature that does not bind the whole preimage. the ordered drain treats
-/// any rejection as a deterministic no-op: every honest validator rejects the
-/// identical forged frame identically. the verified `origin` becomes the
-/// block's `Origin::External(pubkey)` — authorship a module can trust; the
-/// `seq` is ordering/replay metadata, not surfaced.
+/// decode a delivered frame back to `(Origin, Msg)`, VERIFYING the proof
+/// first under the frame's declared scheme. rejects deterministically on: an
+/// unknown scheme tag, a parse failure, TRAILING BYTES between the payload
+/// and the proof (exactly one valid encoding per frame — this is what makes
+/// an appended continuation section unrepresentable; every scheme's proof is
+/// self-delimiting so the boundary is the preimage's own end), an origin
+/// malformed for its scheme, or a proof that does not bind the whole
+/// preimage. the ordered drain treats any rejection as a deterministic no-op:
+/// every honest validator rejects the identical forged frame identically.
+/// the verified `origin` becomes the block's `Origin::External(pubkey)` — raw
+/// key bytes, scheme not surfaced (a key's bytes cannot collide across
+/// schemes without a discrete log on the other curve); the `seq` is
+/// ordering/replay metadata, not surfaced.
 pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg), Error> {
     let parse_err = || Error::Host(sdk::Error::Module("frame does not parse".into()));
     let mut buf = bytes;
+    let (tag, rest) = buf.split_first().ok_or_else(parse_err)?;
+    buf = rest;
+    let scheme = KeyScheme::from_tag(*tag).ok_or_else(|| {
+        Error::Host(sdk::Error::Module(format!(
+            "frame scheme tag {tag} is unknown"
+        )))
+    })?;
     let origin = take_slice(&mut buf).ok_or_else(parse_err)?;
     // seq is ordering/replay metadata, consumed but not surfaced.
     let Some(_seq) = take_u64(&mut buf) else {
@@ -217,13 +233,14 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg), Error> {
         .map_err(|_| parse_err())?;
     let payload = take_slice(&mut buf).ok_or_else(parse_err)?;
     let preimage_len = bytes.len() - buf.len();
-    let pubkey = PublicKey::decode(origin)
-        .map_err(|e| Error::Host(sdk::Error::Module(format!("frame origin: {e}"))))?;
-    let sig = Signature::decode(buf)
-        .map_err(|e| Error::Host(sdk::Error::Module(format!("frame signature: {e}"))))?;
-    if !pubkey.verify(FRAME_NS, &bytes[..preimage_len], &sig) {
+    if !scheme.pubkey_wellformed(origin) {
         return Err(Error::Host(sdk::Error::Module(
-            "frame signature does not bind this op to its origin".into(),
+            "frame origin is malformed for its scheme".into(),
+        )));
+    }
+    if !scheme.verify(origin, FRAME_NS, &bytes[..preimage_len], buf) {
+        return Err(Error::Host(sdk::Error::Module(
+            "frame proof does not bind this op to its origin".into(),
         )));
     }
     Ok((
@@ -240,7 +257,8 @@ pub fn decode_frame(bytes: &[u8]) -> Result<(Origin, Msg), Error> {
 /// frames to advance its local sequence past everything it may have framed).
 /// `None` for bytes that are not a frame.
 pub fn frame_origin_seq(bytes: &[u8]) -> Option<(Vec<u8>, u64)> {
-    let mut buf = bytes;
+    let (tag, mut buf) = bytes.split_first()?;
+    KeyScheme::from_tag(*tag)?;
     let origin = take_slice(&mut buf)?;
     let seq = take_u64(&mut buf)?;
     Some((origin.to_vec(), seq))

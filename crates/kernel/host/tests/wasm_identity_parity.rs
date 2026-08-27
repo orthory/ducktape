@@ -22,19 +22,17 @@
 //! verifies run IN the guest — deterministic pure-Rust p256 on wasm32 — and
 //! must answer byte-identically to the native module.
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PrivateKey;
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use identity::{
     IDENTITY_ADD_MEMBER_NS, IDENTITY_BIND_NS, IDENTITY_REMOVE_MEMBER_NS, IDENTITY_UNBIND_NS,
-    Identity, IdentityMsg, IdentityQuery, KeyKind, MAX_QUERY_LIMIT, MemberAuth, MemberProof,
+    Identity, IdentityMsg, IdentityQuery, KeyScheme, MAX_QUERY_LIMIT, MemberAuth,
     add_member_preimage, bind_preimage, encode_msg, encode_query, remove_member_preimage,
     unbind_preimage,
 };
 use sdk::{Error, MerkleStore as _, Msg, Origin, StateRoot};
-use sha2::{Digest as _, Sha256};
 use statesync::qmdb::QmdbStore;
 use valset::{Valset, ValsetMsg, encode_msg as valset_encode_msg};
 use wasm_host::WasmModule;
@@ -126,57 +124,33 @@ fn ed(seed: u64) -> Ed {
 fn ed_pub(k: &Ed) -> Vec<u8> {
     k.public_key().as_ref().to_vec()
 }
-fn ed_proof(k: &Ed, ns: &[u8], preimage: &[u8]) -> MemberProof {
-    MemberProof::Signature {
-        sig: k.sign(ns, preimage).as_ref().to_vec(),
-    }
+fn ed_proof(k: &Ed, ns: &[u8], preimage: &[u8]) -> Vec<u8> {
+    keyscheme::testkit::ed25519_proof(k, ns, preimage)
 }
 fn ed_auth(k: &Ed, ns: &[u8], preimage: &[u8]) -> MemberAuth {
     MemberAuth {
         key: ed_pub(k),
-        kind: KeyKind::Ed25519,
+        scheme: KeyScheme::Ed25519,
         proof: ed_proof(k, ns, preimage),
     }
 }
 
 // a WebAuthn passkey, synthesized exactly as an authenticator would produce
-// it (identity's own test recipe). p256 signing is RFC-6979 deterministic, so
+// it (keyscheme's testkit recipe). p256 signing is RFC-6979 deterministic, so
 // the proof bytes are identical on every run — no OS randomness in this proof.
 fn wa_key(seed: u8) -> p256::ecdsa::SigningKey {
-    p256::ecdsa::SigningKey::from_slice(&[seed; 32]).expect("valid scalar")
+    keyscheme::testkit::passkey(seed)
 }
 fn wa_pub(k: &p256::ecdsa::SigningKey) -> Vec<u8> {
-    k.verifying_key().to_sec1_bytes().to_vec()
+    keyscheme::testkit::passkey_pubkey(k)
 }
-fn wa_proof(k: &p256::ecdsa::SigningKey, rp_id: &str, ns: &[u8], preimage: &[u8]) -> MemberProof {
-    use p256::ecdsa::{Signature, signature::Signer as _};
-    // challenge = SHA256(namespace ‖ preimage), mirroring identity's scheme.
-    let mut chal = Sha256::new();
-    chal.update(ns);
-    chal.update(preimage);
-    let challenge = chal.finalize();
-    let client_data_json = format!(
-        r#"{{"type":"webauthn.get","challenge":"{}","origin":"https://ducktape.local"}}"#,
-        URL_SAFE_NO_PAD.encode(challenge)
-    )
-    .into_bytes();
-    let mut authenticator_data = Vec::new();
-    authenticator_data.extend_from_slice(&Sha256::digest(rp_id.as_bytes()));
-    authenticator_data.push(0x01); // User Present
-    authenticator_data.extend_from_slice(&0u32.to_be_bytes());
-    let mut signed = authenticator_data.clone();
-    signed.extend_from_slice(&Sha256::digest(&client_data_json));
-    let sig: Signature = k.sign(&signed);
-    MemberProof::Webauthn {
-        authenticator_data,
-        client_data_json,
-        signature: sig.to_bytes().to_vec(),
-    }
+fn wa_proof(k: &p256::ecdsa::SigningKey, rp_id: &str, ns: &[u8], preimage: &[u8]) -> Vec<u8> {
+    keyscheme::testkit::passkey_proof(k, rp_id, ns, preimage, true)
 }
 fn wa_auth(k: &p256::ecdsa::SigningKey, rp_id: &str, ns: &[u8], preimage: &[u8]) -> MemberAuth {
     MemberAuth {
         key: wa_pub(k),
-        kind: KeyKind::WebauthnP256,
+        scheme: KeyScheme::Secp256r1,
         proof: wa_proof(k, rp_id, ns, preimage),
     }
 }
@@ -450,7 +424,7 @@ async fn same_ops_inner(context: &deterministic::Context) {
 
     // h6: founder A admits a second ed25519 key (consent + possession over one
     // preimage, both verified in the guest). A's nonce: 1.
-    let preimage = add_member_preimage(CHAIN_ID, &a_id, &ed_pub(&w.joiner), KeyKind::Ed25519, 1);
+    let preimage = add_member_preimage(CHAIN_ID, &a_id, &ed_pub(&w.joiner), KeyScheme::Ed25519, 1);
     roundtrip(
         &mut native,
         &mut wasm,
@@ -459,7 +433,7 @@ async fn same_ops_inner(context: &deterministic::Context) {
         Origin::External(w.node_a.clone()),
         msg(&IdentityMsg::AddMemberKey {
             new_key: ed_pub(&w.joiner),
-            new_kind: KeyKind::Ed25519,
+            new_scheme: KeyScheme::Ed25519,
             new_label: Some("laptop".into()),
             possession: ed_proof(&w.joiner, IDENTITY_ADD_MEMBER_NS, &preimage),
             authorizer: ed_auth(&w.founder_a, IDENTITY_ADD_MEMBER_NS, &preimage),
@@ -475,7 +449,7 @@ async fn same_ops_inner(context: &deterministic::Context) {
         CHAIN_ID,
         &a_id,
         &wa_pub(&w.passkey),
-        KeyKind::WebauthnP256,
+        KeyScheme::Secp256r1,
         2,
     );
     roundtrip(
@@ -486,7 +460,7 @@ async fn same_ops_inner(context: &deterministic::Context) {
         Origin::External(w.node_a.clone()),
         msg(&IdentityMsg::AddMemberKey {
             new_key: wa_pub(&w.passkey),
-            new_kind: KeyKind::WebauthnP256,
+            new_scheme: KeyScheme::Secp256r1,
             new_label: Some("phone".into()),
             possession: wa_proof(&w.passkey, rp, IDENTITY_ADD_MEMBER_NS, &preimage),
             authorizer: ed_auth(&w.founder_a, IDENTITY_ADD_MEMBER_NS, &preimage),
@@ -651,18 +625,23 @@ async fn rejections_inner(context: &deterministic::Context) {
 
     // the rejection matrix: every distinct refusal family — the valset gate
     // (decided by sibling reads inside the wasm runtime), certificate
-    // verification (stale nonce), the registered-kind pin, single-ownership,
+    // verification (stale nonce), the registered-scheme pin, single-ownership,
     // membership invariants, origin shapes, and the decode seam. each
     // rejected block must leave BOTH roots byte-identical (abort: no trace).
     let stale_bind = bind(&w.founder_a, &w.node_b.clone(), 0); // A's nonce is 1 now
-    let mut forged_kind = ed_auth(
+    let mut forged_scheme = ed_auth(
         &w.founder_a,
         IDENTITY_BIND_NS,
         &bind_preimage(CHAIN_ID, &w.node_b, 1),
     );
-    forged_kind.kind = KeyKind::P256;
-    let already_preimage =
-        add_member_preimage(CHAIN_ID, &a_id, &ed_pub(&w.founder_a), KeyKind::Ed25519, 1);
+    forged_scheme.scheme = KeyScheme::Secp256k1;
+    let already_preimage = add_member_preimage(
+        CHAIN_ID,
+        &a_id,
+        &ed_pub(&w.founder_a),
+        KeyScheme::Ed25519,
+        1,
+    );
     let remove_last_preimage = remove_member_preimage(CHAIN_ID, &a_id, &ed_pub(&w.founder_a), 1);
 
     let rejects: Vec<(Origin, Msg, &str)> = vec![
@@ -679,23 +658,23 @@ async fn rejections_inner(context: &deterministic::Context) {
             stale_bind,
             "does not verify",
         ),
-        // the registered-kind pin: the founder's real signature presented
-        // under a forged kind.
+        // the registered-scheme pin: the founder's real signature presented
+        // under a forged scheme.
         (
             Origin::External(w.node_b.clone()),
             msg(&IdentityMsg::BindNode {
-                authorizer: forged_kind,
+                authorizer: forged_scheme,
             }),
-            "does not match its registered kind",
+            "does not match its registered scheme",
         ),
-        // a malformed founding key for its kind (from a standing origin).
+        // a malformed founding key for its scheme (from a standing origin).
         (
             Origin::External(w.node_b.clone()),
             msg(&IdentityMsg::BindNode {
                 authorizer: MemberAuth {
                     key: vec![7; 5],
-                    kind: KeyKind::Ed25519,
-                    proof: MemberProof::Signature { sig: vec![0; 64] },
+                    scheme: KeyScheme::Ed25519,
+                    proof: vec![0; 64],
                 },
             }),
             "founding key is malformed",
@@ -712,9 +691,9 @@ async fn rejections_inner(context: &deterministic::Context) {
             Origin::External(w.node_a.clone()),
             msg(&IdentityMsg::AddMemberKey {
                 new_key: ed_pub(&w.founder_a),
-                new_kind: KeyKind::Ed25519,
+                new_scheme: KeyScheme::Ed25519,
                 new_label: None,
-                possession: MemberProof::Signature { sig: vec![0; 64] },
+                possession: vec![0; 64],
                 authorizer: ed_auth(&w.founder_a, IDENTITY_ADD_MEMBER_NS, &already_preimage),
             }),
             "already a member",

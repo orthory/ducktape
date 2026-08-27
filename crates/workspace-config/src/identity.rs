@@ -84,24 +84,21 @@ pub fn ed25519_member_auth(
 ) -> identity::MemberAuth {
     identity::MemberAuth {
         key: user.public_key().as_ref().to_vec(),
-        kind: identity::KeyKind::Ed25519,
-        proof: identity::MemberProof::Signature {
-            sig: user.sign(namespace, preimage).as_ref().to_vec(),
-        },
+        scheme: identity::KeyScheme::Ed25519,
+        proof: ed25519_possession(user, namespace, preimage),
     }
 }
 
 /// the possession proof an ed25519 key produces over `preimage` -- what a NEW
 /// device signs to prove it holds the key it is asking to enroll (the other
 /// half of an `AddMemberKey`, alongside an existing member's [`ed25519_member_auth`]).
+/// the 64 signature bytes ARE the `KeyScheme::Ed25519` proof encoding.
 pub fn ed25519_possession(
     user: &ed25519::PrivateKey,
     namespace: &[u8],
     preimage: &[u8],
-) -> identity::MemberProof {
-    identity::MemberProof::Signature {
-        sig: user.sign(namespace, preimage).as_ref().to_vec(),
-    }
+) -> Vec<u8> {
+    user.sign(namespace, preimage).as_ref().to_vec()
 }
 
 /// mint a chain-id: the human-readable name plus a short salt, so two

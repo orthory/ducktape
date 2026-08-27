@@ -24,7 +24,7 @@ use gateway::{
     set_credential_preimage,
 };
 use identity::{
-    AccountView, IdentityQuery, IdentityReply, KeyKind, MemberKeyView, NodeView,
+    AccountView, IdentityQuery, IdentityReply, KeyScheme, MemberKeyView, NodeView,
     decode_query as identity_decode_query, encode_reply as identity_encode_reply,
 };
 use sdk::{Env, Error, MerkleStore as _, Module, Msg, Origin, StateRoot};
@@ -54,7 +54,7 @@ fn account_view(founder: &Ed, node: &[u8]) -> AccountView {
         nonce: 1,
         member_keys: vec![MemberKeyView {
             pubkey: ed_pub(founder),
-            kind: KeyKind::Ed25519,
+            scheme: KeyScheme::Ed25519,
             label: None,
             added_at: 0,
         }],

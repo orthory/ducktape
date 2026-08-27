@@ -4,11 +4,9 @@
 //! qmdb continuity proof lives in `tests/sync_round_trip.rs`).
 
 use super::*;
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use commonware_cryptography::Signer as _;
 use futures::executor::block_on;
 use sdk_testkit::MemStore;
-use sha2::{Digest, Sha256};
 
 const CHAIN: &str = "test-chain";
 
@@ -64,7 +62,6 @@ fn ctx_gated(key: &[u8], validators: Vec<Vec<u8>>, residents: Vec<Vec<u8>>) -> T
 // ---- member builders (one per scheme) -----------------------------------
 
 type Ed = commonware_cryptography::ed25519::PrivateKey;
-type P256Native = commonware_cryptography::secp256r1::standard::PrivateKey;
 
 fn ed(seed: u64) -> Ed {
     Ed::from_seed(seed)
@@ -72,71 +69,46 @@ fn ed(seed: u64) -> Ed {
 fn ed_pub(k: &Ed) -> Vec<u8> {
     k.public_key().as_ref().to_vec()
 }
-fn ed_proof(k: &Ed, ns: &[u8], preimage: &[u8]) -> MemberProof {
-    MemberProof::Signature {
-        sig: k.sign(ns, preimage).as_ref().to_vec(),
-    }
+fn ed_proof(k: &Ed, ns: &[u8], preimage: &[u8]) -> Vec<u8> {
+    keyscheme::testkit::ed25519_proof(k, ns, preimage)
 }
 fn ed_auth(k: &Ed, ns: &[u8], preimage: &[u8]) -> MemberAuth {
     MemberAuth {
         key: ed_pub(k),
-        kind: KeyKind::Ed25519,
+        scheme: KeyScheme::Ed25519,
         proof: ed_proof(k, ns, preimage),
     }
 }
 
-fn p256(seed: u64) -> P256Native {
-    P256Native::from_seed(seed)
+// an Ethereum wallet: secp256k1, `personal_sign` over the namespaced preimage.
+fn wallet(seed: u8) -> k256::ecdsa::SigningKey {
+    keyscheme::testkit::eth_key(seed)
 }
-fn p256_pub(k: &P256Native) -> Vec<u8> {
-    k.public_key().as_ref().to_vec()
+fn wallet_pub(k: &k256::ecdsa::SigningKey) -> Vec<u8> {
+    keyscheme::testkit::eth_pubkey(k)
 }
-fn p256_auth(k: &P256Native, ns: &[u8], preimage: &[u8]) -> MemberAuth {
+fn wallet_auth(k: &k256::ecdsa::SigningKey, ns: &[u8], preimage: &[u8]) -> MemberAuth {
     MemberAuth {
-        key: p256_pub(k),
-        kind: KeyKind::P256,
-        proof: MemberProof::Signature {
-            sig: k.sign(ns, preimage).as_ref().to_vec(),
-        },
+        key: wallet_pub(k),
+        scheme: KeyScheme::Secp256k1,
+        proof: keyscheme::testkit::eth_proof(k, ns, preimage),
     }
 }
 
 // a WebAuthn passkey, synthesized exactly as an authenticator would produce it.
 fn wa_key(seed: u8) -> p256::ecdsa::SigningKey {
-    p256::ecdsa::SigningKey::from_slice(&[seed; 32]).expect("valid scalar")
+    keyscheme::testkit::passkey(seed)
 }
 fn wa_pub(k: &p256::ecdsa::SigningKey) -> Vec<u8> {
-    k.verifying_key().to_sec1_bytes().to_vec()
+    keyscheme::testkit::passkey_pubkey(k)
 }
-fn wa_proof(k: &p256::ecdsa::SigningKey, rp_id: &str, ns: &[u8], preimage: &[u8]) -> MemberProof {
-    use p256::ecdsa::{Signature, signature::Signer as _};
-    // challenge = SHA256(namespace ‖ preimage), mirroring scheme::webauthn_challenge.
-    let mut chal = Sha256::new();
-    chal.update(ns);
-    chal.update(preimage);
-    let challenge = chal.finalize();
-    let client_data_json = format!(
-        r#"{{"type":"webauthn.get","challenge":"{}","origin":"https://ducktape.local"}}"#,
-        URL_SAFE_NO_PAD.encode(challenge)
-    )
-    .into_bytes();
-    let mut authenticator_data = Vec::new();
-    authenticator_data.extend_from_slice(&Sha256::digest(rp_id.as_bytes()));
-    authenticator_data.push(0x01); // User Present
-    authenticator_data.extend_from_slice(&0u32.to_be_bytes());
-    let mut signed = authenticator_data.clone();
-    signed.extend_from_slice(&Sha256::digest(&client_data_json));
-    let sig: Signature = k.sign(&signed);
-    MemberProof::Webauthn {
-        authenticator_data,
-        client_data_json,
-        signature: sig.to_bytes().to_vec(),
-    }
+fn wa_proof(k: &p256::ecdsa::SigningKey, rp_id: &str, ns: &[u8], preimage: &[u8]) -> Vec<u8> {
+    keyscheme::testkit::passkey_proof(k, rp_id, ns, preimage, true)
 }
 fn wa_auth(k: &p256::ecdsa::SigningKey, rp_id: &str, ns: &[u8], preimage: &[u8]) -> MemberAuth {
     MemberAuth {
         key: wa_pub(k),
-        kind: KeyKind::WebauthnP256,
+        scheme: KeyScheme::Secp256r1,
         proof: wa_proof(k, rp_id, ns, preimage),
     }
 }
@@ -144,7 +116,12 @@ fn wa_auth(k: &p256::ecdsa::SigningKey, rp_id: &str, ns: &[u8], preimage: &[u8])
 // ---- harness ------------------------------------------------------------
 
 fn new_identity() -> Identity {
-    Identity::new("identity", Box::new(MemStore::new()), None, CHAIN.to_string())
+    Identity::new(
+        "identity",
+        Box::new(MemStore::new()),
+        None,
+        CHAIN.to_string(),
+    )
 }
 fn new_gated_identity() -> Identity {
     Identity::new(
@@ -205,7 +182,7 @@ fn bind_creates_a_single_member_account() {
     assert_eq!(acc.nonce, 1, "a founding bind bumps the nonce to 1");
     assert_eq!(acc.member_keys.len(), 1);
     assert_eq!(acc.member_keys[0].pubkey, ed_pub(&founder));
-    assert_eq!(acc.member_keys[0].kind, KeyKind::Ed25519);
+    assert_eq!(acc.member_keys[0].scheme, KeyScheme::Ed25519);
     assert_eq!(
         acc.nodes,
         vec![NodeView {
@@ -238,7 +215,7 @@ fn a_second_ed25519_key_joins_and_can_bind_its_own_node() {
         CHAIN,
         &account_id,
         &ed_pub(&joiner),
-        KeyKind::Ed25519,
+        KeyScheme::Ed25519,
         nonce,
     );
     apply(
@@ -246,7 +223,7 @@ fn a_second_ed25519_key_joins_and_can_bind_its_own_node() {
         node1,
         IdentityMsg::AddMemberKey {
             new_key: ed_pub(&joiner),
-            new_kind: KeyKind::Ed25519,
+            new_scheme: KeyScheme::Ed25519,
             new_label: Some("laptop".into()),
             possession: ed_proof(&joiner, IDENTITY_ADD_MEMBER_NS, &preimage),
             authorizer: ed_auth(&founder, IDENTITY_ADD_MEMBER_NS, &preimage),
@@ -293,7 +270,7 @@ fn any_surviving_member_can_evict_a_lost_key_but_not_the_last() {
         CHAIN,
         &account_id,
         &ed_pub(&joiner),
-        KeyKind::Ed25519,
+        KeyScheme::Ed25519,
         nonce,
     );
     apply(
@@ -301,7 +278,7 @@ fn any_surviving_member_can_evict_a_lost_key_but_not_the_last() {
         node,
         IdentityMsg::AddMemberKey {
             new_key: ed_pub(&joiner),
-            new_kind: KeyKind::Ed25519,
+            new_scheme: KeyScheme::Ed25519,
             new_label: None,
             possession: ed_proof(&joiner, IDENTITY_ADD_MEMBER_NS, &preimage),
             authorizer: ed_auth(&founder, IDENTITY_ADD_MEMBER_NS, &preimage),
@@ -361,7 +338,7 @@ fn a_passkey_joins_and_then_authorizes_an_unbind() {
         CHAIN,
         &account_id,
         &wa_pub(&passkey),
-        KeyKind::WebauthnP256,
+        KeyScheme::Secp256r1,
         nonce,
     );
     apply(
@@ -369,7 +346,7 @@ fn a_passkey_joins_and_then_authorizes_an_unbind() {
         node,
         IdentityMsg::AddMemberKey {
             new_key: wa_pub(&passkey),
-            new_kind: KeyKind::WebauthnP256,
+            new_scheme: KeyScheme::Secp256r1,
             new_label: Some("phone".into()),
             possession: wa_proof(&passkey, "ducktape", IDENTITY_ADD_MEMBER_NS, &preimage),
             authorizer: ed_auth(&founder, IDENTITY_ADD_MEMBER_NS, &preimage),
@@ -384,7 +361,7 @@ fn a_passkey_joins_and_then_authorizes_an_unbind() {
         .iter()
         .find(|m| m.pubkey == wa_pub(&passkey))
         .unwrap();
-    assert_eq!(pk_view.kind, KeyKind::WebauthnP256);
+    assert_eq!(pk_view.scheme, KeyScheme::Secp256r1);
     assert_eq!(pk_view.label.as_deref(), Some("phone"));
 
     // the passkey -- a first-class member -- now authorizes evicting the node
@@ -412,23 +389,23 @@ fn a_passkey_joins_and_then_authorizes_an_unbind() {
 }
 
 #[test]
-fn a_native_p256_key_can_found_and_authorize() {
-    // proves the abstraction is genuinely multi-curve, not ed25519-shaped: a
-    // native P-256 key founds an account and binds a node.
+fn a_wallet_key_can_found_and_authorize() {
+    // proves the abstraction is genuinely multi-curve, not ed25519-shaped: an
+    // Ethereum wallet founds an account and binds a node.
     let mut id = new_identity();
-    let founder = p256(3);
+    let founder = wallet(3);
     let node = b"node-1";
-    let account_id = p256_pub(&founder);
+    let account_id = wallet_pub(&founder);
     apply(
         &mut id,
         node,
         IdentityMsg::BindNode {
-            authorizer: p256_auth(&founder, IDENTITY_BIND_NS, &bind_preimage(CHAIN, node, 0)),
+            authorizer: wallet_auth(&founder, IDENTITY_BIND_NS, &bind_preimage(CHAIN, node, 0)),
         },
     )
-    .expect("p256 founds account");
+    .expect("wallet founds account");
     let acc = get_account(&id, &account_id).unwrap();
-    assert_eq!(acc.member_keys[0].kind, KeyKind::P256);
+    assert_eq!(acc.member_keys[0].scheme, KeyScheme::Secp256k1);
 }
 
 #[test]
@@ -470,21 +447,21 @@ fn a_stale_certificate_is_rejected_after_the_nonce_advances() {
 }
 
 #[test]
-fn a_forged_authorizer_kind_is_rejected() {
+fn a_forged_authorizer_scheme_is_rejected() {
     let mut id = new_identity();
     let founder = ed(1);
     let node = b"node-1";
     let account_id = found_account(&mut id, &founder, node);
     let nonce = get_account(&id, &account_id).unwrap().nonce;
 
-    // claim the founder is a P256 member while presenting its real ed25519 sig:
-    // the registered kind (Ed25519) does not match the asserted kind (P256).
+    // claim the founder is a wallet member while presenting its real ed25519
+    // sig: the registered scheme (Ed25519) does not match the asserted one.
     let mut auth = ed_auth(
         &founder,
         IDENTITY_BIND_NS,
         &bind_preimage(CHAIN, b"node-2", nonce),
     );
-    auth.kind = KeyKind::P256;
+    auth.scheme = KeyScheme::Secp256k1;
     let err = apply(
         &mut id,
         b"node-2",
@@ -492,7 +469,7 @@ fn a_forged_authorizer_kind_is_rejected() {
     )
     .unwrap_err();
     assert!(
-        format!("{err:?}").contains("kind does not match"),
+        format!("{err:?}").contains("scheme does not match"),
         "got {err:?}"
     );
 }
@@ -544,14 +521,19 @@ fn set_node_label_is_origin_gated_to_the_accounts_own_nodes() {
     // a second key joins and binds node2, so the account owns two nodes.
     let joiner = ed(2);
     let nonce = get_account(&id, &account_id).unwrap().nonce;
-    let preimage =
-        add_member_preimage(CHAIN, &account_id, &ed_pub(&joiner), KeyKind::Ed25519, nonce);
+    let preimage = add_member_preimage(
+        CHAIN,
+        &account_id,
+        &ed_pub(&joiner),
+        KeyScheme::Ed25519,
+        nonce,
+    );
     apply(
         &mut id,
         node1,
         IdentityMsg::AddMemberKey {
             new_key: ed_pub(&joiner),
-            new_kind: KeyKind::Ed25519,
+            new_scheme: KeyScheme::Ed25519,
             new_label: None,
             possession: ed_proof(&joiner, IDENTITY_ADD_MEMBER_NS, &preimage),
             authorizer: ed_auth(&founder, IDENTITY_ADD_MEMBER_NS, &preimage),
@@ -564,7 +546,11 @@ fn set_node_label_is_origin_gated_to_the_accounts_own_nodes() {
         &mut id,
         node2,
         IdentityMsg::BindNode {
-            authorizer: ed_auth(&joiner, IDENTITY_BIND_NS, &bind_preimage(CHAIN, node2, nonce)),
+            authorizer: ed_auth(
+                &joiner,
+                IDENTITY_BIND_NS,
+                &bind_preimage(CHAIN, node2, nonce),
+            ),
         },
     )
     .unwrap();
@@ -652,7 +638,10 @@ fn set_profile_is_origin_gated_trims_caps_and_clears() {
     )
     .expect("bound node sets its profile");
     let acc = get_account(&id, &account_id).unwrap();
-    assert_eq!(acc.avatar.as_deref(), Some("/shared/attachments/avatars/abc.png"));
+    assert_eq!(
+        acc.avatar.as_deref(),
+        Some("/shared/attachments/avatars/abc.png")
+    );
     assert_eq!(acc.bio.as_deref(), Some("hi there"));
     // no signature is consumed: the nonce stays put (still 1 from the bind).
     assert_eq!(acc.nonce, 1);
@@ -712,7 +701,10 @@ fn node_label_sets_and_drops_with_its_node_on_unbind() {
         },
     )
     .unwrap();
-    assert_eq!(node_label(&id, &account_id, node).as_deref(), Some("my box"));
+    assert_eq!(
+        node_label(&id, &account_id, node).as_deref(),
+        Some("my box")
+    );
 
     // unbinding the node drops it -- and its label -- from the account, and
     // clears the node-ownership index.
@@ -774,7 +766,7 @@ fn mixed_scheme_membership_round_trips_the_store_records() {
         CHAIN,
         &account_id,
         &wa_pub(&passkey),
-        KeyKind::WebauthnP256,
+        KeyScheme::Secp256r1,
         nonce,
     );
     apply(
@@ -782,7 +774,7 @@ fn mixed_scheme_membership_round_trips_the_store_records() {
         node,
         IdentityMsg::AddMemberKey {
             new_key: wa_pub(&passkey),
-            new_kind: KeyKind::WebauthnP256,
+            new_scheme: KeyScheme::Secp256r1,
             new_label: Some("phone".into()),
             possession: wa_proof(&passkey, "ducktape", IDENTITY_ADD_MEMBER_NS, &preimage),
             authorizer: ed_auth(&founder, IDENTITY_ADD_MEMBER_NS, &preimage),
@@ -814,8 +806,8 @@ fn mixed_scheme_membership_round_trips_the_store_records() {
             .account_id,
         account_id
     );
-    let reply = block_on(id.query(&encode_query(&IdentityQuery::All { from: 0, limit: 10 })))
-        .unwrap();
+    let reply =
+        block_on(id.query(&encode_query(&IdentityQuery::All { from: 0, limit: 10 }))).unwrap();
     let IdentityReply::Accounts(listed) = decode_reply(&reply).unwrap() else {
         panic!("expected Accounts");
     };

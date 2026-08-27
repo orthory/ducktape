@@ -11,7 +11,7 @@ use gateway::{
     grant_credential_preimage, remove_credential_preimage, revoke_credential_preimage,
     route_signing_preimage, set_credential_preimage, validate_credential_name,
 };
-use identity::{AccountView, IdentityQuery, IdentityReply, KeyKind, MemberKeyView, NodeView};
+use identity::{AccountView, IdentityQuery, IdentityReply, KeyScheme, MemberKeyView, NodeView};
 use sdk::{Ctx, Env, Error, Event, Module, Msg, Origin, StateRoot};
 use valset::{ValsetQuery, ValsetReply};
 
@@ -68,7 +68,7 @@ fn account(node: &[u8], signer: &ed25519::PrivateKey) -> AccountView {
         nonce: 0,
         member_keys: vec![MemberKeyView {
             pubkey: signer.public_key().as_ref().to_vec(),
-            kind: KeyKind::Ed25519,
+            scheme: KeyScheme::Ed25519,
             label: None,
             added_at: 0,
         }],

@@ -2,22 +2,24 @@
 //!
 //! an ACCOUNT is the umbrella a person owns: it is keyed by its FOUNDING key
 //! (`account_id` = the first member key), collects many MEMBER KEYS of
-//! different schemes (an ed25519 seed key, a WebAuthn passkey, ...), shares one
-//! display name across all of them, and owns many NODES (each a workspace's
-//! mesh/valset identity). binding a node resolves to the ACCOUNT, so any
-//! verified submit origin (a node key) maps to the human who owns it.
+//! different [`KeyScheme`]s (an ed25519 device key, an Ethereum wallet, a
+//! WebAuthn passkey), shares one display name across all of them, and owns
+//! many NODES (each a workspace's mesh/valset identity). binding a node
+//! resolves to the ACCOUNT, so any verified submit origin (a node key) maps
+//! to the human who owns it.
 //!
 //! writes go via [`IdentityMsg`]; reads via [`IdentityQuery`] ->
 //! [`IdentityReply`]. every state-changing op is authorized by a MEMBER KEY --
-//! captured as a [`MemberAuth`] (which key, which scheme, and the proof over
-//! the op's chain-and-nonce-scoped preimage) -- so a certificate can never
-//! replay across networks or after the account nonce advances. adding/removing
-//! a member key needs TWO consents: an existing member authorizes, and (for an
+//! captured as a [`MemberAuth`] (which key, its scheme, and the scheme-owned
+//! proof BYTES over the op's chain-and-nonce-scoped preimage --
+//! `KeyScheme::verify` parses them) -- so a certificate can never replay
+//! across networks or after the account nonce advances. adding/removing a
+//! member key needs TWO consents: an existing member authorizes, and (for an
 //! add) the new key proves possession, both over the same preimage.
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::scheme::{KeyKind, MemberProof};
+pub use keyscheme::KeyScheme;
 
 /// signing domain for node-bind certificates -- namespace-separated from every
 /// other signed artifact (frames, invites, coord caps, endpoint records).
@@ -48,7 +50,7 @@ pub const MAX_QUERY_LIMIT: u64 = 256;
 #[serde(deny_unknown_fields)]
 pub struct MemberKeyView {
     pub pubkey: Vec<u8>,
-    pub kind: KeyKind,
+    pub scheme: KeyScheme,
     pub label: Option<String>,
     pub added_at: u64,
 }
@@ -90,15 +92,16 @@ pub struct AccountView {
     pub updated_at: u64,
 }
 
-/// an authorization by one member key: which key, its scheme, and its proof
-/// over the operation's preimage. the account it speaks for is resolved from
-/// this key's membership -- never carried as a spoofable payload field.
+/// an authorization by one member key: which key, its scheme, and its
+/// scheme-owned proof bytes over the operation's preimage. the account it
+/// speaks for is resolved from this key's membership -- never carried as a
+/// spoofable payload field.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MemberAuth {
     pub key: Vec<u8>,
-    pub kind: KeyKind,
-    pub proof: MemberProof,
+    pub scheme: KeyScheme,
+    pub proof: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -118,15 +121,15 @@ pub enum IdentityMsg {
         node_key: Vec<u8>,
         authorizer: MemberAuth,
     },
-    /// add `new_key` (of `new_kind`, optional `new_label`) to the account
+    /// add `new_key` (of `new_scheme`, optional `new_label`) to the account
     /// `authorizer` belongs to. TWO consents over [`add_member_preimage`]: the
-    /// existing member `authorizer` admits it, and `possession` proves the new
-    /// key holds itself. bumps the nonce.
+    /// existing member `authorizer` admits it, and `possession` (the new key's
+    /// own proof bytes) proves the new key holds itself. bumps the nonce.
     AddMemberKey {
         new_key: Vec<u8>,
-        new_kind: KeyKind,
+        new_scheme: KeyScheme,
         new_label: Option<String>,
-        possession: MemberProof,
+        possession: Vec<u8>,
         authorizer: MemberAuth,
     },
     /// remove `target_key` from the account `authorizer` belongs to, over
@@ -209,21 +212,21 @@ pub fn unbind_preimage(chain_id: &str, node_key: &[u8], nonce: u64) -> Vec<u8> {
 }
 
 /// the signed preimage of an add-member-key certificate, over (in order) the
-/// chain id, account id, new key, its one-byte kind tag, and the nonce. the
-/// kind tag binds the consent to the exact scheme being admitted, so it can't
-/// be swapped after the fact.
+/// chain id, account id, new key, its one-byte scheme tag, and the nonce. the
+/// scheme tag binds the consent to the exact scheme being admitted, so it
+/// can't be swapped after the fact.
 pub fn add_member_preimage(
     chain_id: &str,
     account_id: &[u8],
     new_key: &[u8],
-    new_kind: KeyKind,
+    new_scheme: KeyScheme,
     nonce: u64,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     sdk::codec::push_bytes(&mut out, chain_id.as_bytes());
     sdk::codec::push_bytes(&mut out, account_id);
     sdk::codec::push_bytes(&mut out, new_key);
-    out.push(new_kind.tag());
+    out.push(new_scheme.tag());
     out.extend_from_slice(&nonce.to_le_bytes());
     out
 }
@@ -242,29 +245,6 @@ pub fn remove_member_preimage(
     sdk::codec::push_bytes(&mut out, target_key);
     out.extend_from_slice(&nonce.to_le_bytes());
     out
-}
-
-/// the exact bytes a NATIVE key (`Ed25519`/`P256`) signs to prove possession
-/// when joining an account: commonware's namespaced signing preimage
-/// `union_unique(IDENTITY_ADD_MEMBER_NS, add_member_preimage(...))`, which is
-/// what `commonware_cryptography`'s `verify` reconstructs internally.
-///
-/// exposed for the ENROLLMENT side: the node hands a joining device these exact
-/// bytes to ECDSA/EdDSA-sign, so the phone page never reconstructs the preimage
-/// or the namespace framing -- one source of truth with the on-chain verifier.
-/// (a WebAuthn passkey does NOT use this; its challenge is the hashed form --
-/// see [`crate::webauthn_challenge`].)
-pub fn add_member_signing_payload(
-    chain_id: &str,
-    account_id: &[u8],
-    new_key: &[u8],
-    new_kind: KeyKind,
-    nonce: u64,
-) -> Vec<u8> {
-    commonware_utils::union_unique(
-        IDENTITY_ADD_MEMBER_NS,
-        &add_member_preimage(chain_id, account_id, new_key, new_kind, nonce),
-    )
 }
 
 pub fn encode_msg(m: &IdentityMsg) -> Vec<u8> {
@@ -292,19 +272,19 @@ mod tests {
 
     #[test]
     fn preimages_are_length_prefixed_and_deterministic() {
-        let a = add_member_preimage("net-a", &[1u8; 32], &[2u8; 33], KeyKind::WebauthnP256, 0);
-        let b = add_member_preimage("net-a", &[1u8; 32], &[2u8; 33], KeyKind::WebauthnP256, 0);
+        let a = add_member_preimage("net-a", &[1u8; 32], &[2u8; 33], KeyScheme::Secp256r1, 0);
+        let b = add_member_preimage("net-a", &[1u8; 32], &[2u8; 33], KeyScheme::Secp256r1, 0);
         assert_eq!(a, b);
         // account id and new key cannot bleed into each other.
         assert_ne!(
-            add_member_preimage("n", &[1, 2, 3], &[4], KeyKind::Ed25519, 0),
-            add_member_preimage("n", &[1], &[2, 3, 4], KeyKind::Ed25519, 0),
+            add_member_preimage("n", &[1, 2, 3], &[4], KeyScheme::Ed25519, 0),
+            add_member_preimage("n", &[1], &[2, 3, 4], KeyScheme::Ed25519, 0),
         );
-        // the kind tag moves the preimage: same key admitted as a different
+        // the scheme tag moves the preimage: same key admitted as a different
         // scheme is a different consent.
         assert_ne!(
-            add_member_preimage("n", &[1u8; 32], &[2u8; 33], KeyKind::P256, 0),
-            add_member_preimage("n", &[1u8; 32], &[2u8; 33], KeyKind::WebauthnP256, 0),
+            add_member_preimage("n", &[1u8; 32], &[2u8; 33], KeyScheme::Secp256k1, 0),
+            add_member_preimage("n", &[1u8; 32], &[2u8; 33], KeyScheme::Secp256r1, 0),
         );
         // nonce moves the preimage.
         assert_ne!(
@@ -317,8 +297,8 @@ mod tests {
     fn msg_codec_roundtrips() {
         let auth = MemberAuth {
             key: vec![7; 32],
-            kind: KeyKind::Ed25519,
-            proof: MemberProof::Signature { sig: vec![9; 64] },
+            scheme: KeyScheme::Ed25519,
+            proof: vec![9; 64],
         };
         for m in [
             IdentityMsg::BindNode {
@@ -330,13 +310,9 @@ mod tests {
             },
             IdentityMsg::AddMemberKey {
                 new_key: vec![2; 33],
-                new_kind: KeyKind::WebauthnP256,
+                new_scheme: KeyScheme::Secp256r1,
                 new_label: Some("phone".into()),
-                possession: MemberProof::Webauthn {
-                    authenticator_data: vec![0; 37],
-                    client_data_json: b"{}".to_vec(),
-                    signature: vec![3; 64],
-                },
+                possession: vec![3; 120],
                 authorizer: auth.clone(),
             },
             IdentityMsg::RemoveMemberKey {
