@@ -3193,13 +3193,27 @@ mod tests {
     /// the live backend with an explicit executors directory — the one whose
     /// contents the guest finds at `/opt/duck/bin`.
     fn firecracker_backend_with(executors: PathBuf) -> SandboxBackend {
+        live_backend(sandbox_host::Vmm::Firecracker, executors)
+    }
+
+    /// the live backend for THIS host's hypervisor: Firecracker on Linux, the
+    /// vz shim on macOS. What a real node resolves, and the only shape that
+    /// exercises a Mac's device model.
+    fn platform_backend() -> SandboxBackend {
+        live_backend(
+            sandbox_host::Vmm::platform_default(),
+            installed_executor_dir(),
+        )
+    }
+
+    fn live_backend(vmm: sandbox_host::Vmm, executors: PathBuf) -> SandboxBackend {
         let dir = std::env::var("DUCKTAPE_GUEST_DIR").unwrap_or_else(|_| {
             let home = std::env::var("DUCKTAPE_HOME")
                 .unwrap_or_else(|_| format!("{}/.ducktape", std::env::var("HOME").unwrap()));
             format!("{home}/guest")
         });
         SandboxBackend::MicroVm {
-            vmm: sandbox_host::Vmm::Firecracker,
+            vmm,
             kernel: PathBuf::from(&dir).join("vmlinux"),
             rootfs: PathBuf::from(&dir).join("rootfs.ext4"),
             executors,
@@ -5125,10 +5139,14 @@ printf '%s\n' "$PATH"
     /// attached to a rootfs that carries no CLI at all. `--version` because it
     /// needs no credential and no network: the question here is whether the
     /// bytes exec, not what they do.
+    ///
+    /// On THIS host's hypervisor, not Firecracker's: a Mac attaching the
+    /// executors device makes six block devices on a VZ machine, and whether
+    /// Virtualization.framework takes six is a question only a Mac can answer.
     #[tokio::test]
-    #[ignore = "live: needs /dev/kvm, a built guest rootfs, and `ducktape agent install codex`"]
+    #[ignore = "live: needs a hypervisor, a built guest rootfs, and `ducktape agent install codex`"]
     async fn the_installed_cli_execs_from_its_derived_image() {
-        let backend = firecracker_backend();
+        let backend = platform_backend();
         if let Err(why) = backend.probe() {
             eprintln!("skipping: {why}");
             return;
