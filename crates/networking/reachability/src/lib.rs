@@ -1,9 +1,11 @@
-//! The node-driven WireGuard reachability plane: the orchestrator that turns
-//! valset cutover events into a live validator↔validator WireGuard mesh on a
-//! DEDICATED interface, composing proven crates the live node did not call
-//! until now — `wireguard` (the signed advertisement + tunnel handshake
-//! protocol plus the interface effect boundary) and `nat-traversal`
-//! (STUN/rendezvous/hole-punch).
+//! The node-driven WireGuard reachability plane, HOST half: the executor
+//! that drives the netstack machine into a live validator↔validator
+//! WireGuard mesh on a DEDICATED interface, the rendezvous runtime
+//! (STUN/rendezvous/hole-punch), the WireGuard keystore, sealed envelopes,
+//! and the persisted-mesh file store. The DECISION core — the protocol
+//! state machine, per-epoch state, wire messages, derived bindings, the
+//! persisted-mesh codec — lives in the `netstack-machine` crate; this crate
+//! re-exports the shared surface so consumers keep one import root.
 //!
 //! Design anchors (docs/deploy/private-cutover-integration-gap.md §2/§3):
 //! - The control mesh (commonware TCP) is UNTOUCHED — this plane composes
@@ -17,24 +19,26 @@
 //!   `(chain_id, identity)`, epoch bindings from `(chain_id, epoch,
 //!   members)` — no allocator, no coordination, no consensus-state change.
 
-pub mod binding;
-mod epoch;
+pub mod executor;
 pub mod keys;
-pub mod msg;
-pub mod orchestrator;
 pub mod rendezvous;
 pub mod seal;
 pub mod store;
 
+// the pure protocol modules live in the machine crate; re-exported so
+// `reachability::binding` / `reachability::msg` stay the paths they were.
+pub use netstack_machine::{binding, msg};
+
 // the crate-root surface is exactly what consumers reach for; everything
 // else stays addressable through its module (`binding::`, `msg::`, …).
-pub use binding::{active_set, identity_of, node_key, open_port_policy};
-pub use keys::WireGuardKeypair;
-pub use msg::ReachabilityMsg;
-pub use orchestrator::{
-    CoordinatedInviteReply, InstallReply, MeshEpochEvent, ReachabilityCommand, ReachabilityConfig,
-    ReachabilityError, ReachabilityEvent, run,
+pub use executor::{
+    CoordinatedInviteReply, InstallReply, ReachabilityCommand, ReachabilityConfig,
+    ReachabilityError, run,
 };
+pub use keys::WireGuardKeypair;
+pub use netstack_machine::binding::{active_set, identity_of, node_key, open_port_policy};
+pub use netstack_machine::msg::ReachabilityMsg;
+pub use netstack_machine::{MeshEpochEvent, ReachabilityEvent};
 pub use rendezvous::{
     EndpointResolver, NatResolver, RENDEZVOUS_KEEPALIVE, RendezvousStatus, Resolution,
     StaticResolver,

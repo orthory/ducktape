@@ -84,7 +84,7 @@ fn endpoint(policy: &PortPolicy, octet: u8, port: u16, transport: Transport) -> 
     .unwrap()
 }
 
-/// Spin up `seeds.len()` orchestrators on the local set, wired through an
+/// Spin up `seeds.len()` planes on the local set, wired through an
 /// in-memory router; returns the node handles and the collected non-Send
 /// event stream as `(node index, event)`.
 fn spawn_mesh(
@@ -262,7 +262,7 @@ fn spawn_router(
                         continue;
                     };
                     let msg =
-                        ReachabilityMsg::decode(&bytes).expect("orchestrators send valid frames");
+                        ReachabilityMsg::decode(&bytes).expect("planes send valid frames");
                     let copies = (wiring.filter)(i, j, &msg);
                     let target = wiring.cmd_slots.borrow()[j].clone();
                     let from = wiring.transports[i].clone();
@@ -283,7 +283,7 @@ fn spawn_router(
     });
 }
 
-/// Relaunch node `node.index` as a fresh orchestrator life: the same
+/// Relaunch node `node.index` as a fresh plane life: the same
 /// identity, keystore, and persist file (the crash-restart shape), a fresh
 /// effect and command channel, and the advertised address moved to `octet`.
 /// Re-points the router's inbox slot so mesh deliveries reach the new life
@@ -370,7 +370,7 @@ async fn retarget_all(
 /// How long a whole-mesh convergence may take before the test calls it hung.
 ///
 /// A BACKSTOP, not a synchronizer: every wait below is driven by the
-/// orchestrator's own events and exits the moment they arrive, so this bound
+/// plane's own events and exits the moment they arrive, so this bound
 /// only turns a hang into a failure. Kept generous because the cost of a
 /// generous backstop on a healthy run is zero and the cost of a tight one is a
 /// red CI on a busy machine.
@@ -1246,7 +1246,7 @@ async fn await_restored(
 }
 
 /// THE cold-restart brick, healed from disk alone: converge a mesh in one
-/// process life, then respawn every orchestrator from the same directory
+/// process life, then respawn every plane from the same directory
 /// with the router gate DOWN — the exact restart topology where no TCP link
 /// exists, so no gossip can flow and (before persistence) nothing could ever
 /// apply. Every node must re-apply the persisted mesh purely locally, with
@@ -2074,7 +2074,7 @@ async fn standby_readvertisement_updates_the_endpoint_live() {
 
 /// Issue #1102 — the REBOOT form of the re-advertisement above: a standby
 /// that restarts mid-epoch re-signs its record for the SAME epoch tuple in a
-/// fresh orchestrator life, so whatever nonce `retarget` REALLY signs is
+/// fresh plane life, so whatever nonce `retarget` REALLY signs is
 /// what the members judge (no hand-minted nonce here). The previous life's
 /// nonce is already burnt into every member's pre-warm gate; a fixed nonce
 /// seed replay-drops the reboot's re-introduction for the rest of the epoch
@@ -2606,7 +2606,7 @@ async fn standby_persists_the_member_mesh_for_its_promotion_reboot() {
 /// datagram: `resolve` returns the punched underlay endpoint from the fixed
 /// map (so `resolve_rendezvous_endpoint` succeeds), and `send_datagram_and_recv`
 /// hands back a canned ack — the inviter's `IntroAck` riding home over the same
-/// punched socket. Lets an orchestrator test drive
+/// punched socket. Lets a plane test drive
 /// [`ReachabilityCommand::BootstrapCoordinatedInvitePeer`] end to end
 /// (resolve -> install -> ack) with no real UDP.
 /// what the resolver's `send_datagram_and_recv` observed — `(dest, intro
@@ -2640,13 +2640,13 @@ impl reachability::EndpointResolver for CoordinatedAckResolver {
 }
 
 /// `BootstrapCoordinatedInvitePeer` over a [`StaticResolver`]: the inviter's
-/// node-key resolves to a punched underlay endpoint, the orchestrator installs
+/// node-key resolves to a punched underlay endpoint, the plane installs
 /// it as a join-window tunnel peer, sends the intro over that same socket, and
 /// the reply carries the inviter's ack back. Proves the whole
 /// resolve -> install -> ack path #260 built, with no real WireGuard or UDP.
 #[tokio::test(flavor = "current_thread")]
 async fn bootstrap_coordinated_invite_resolves_installs_and_acks() {
-    let dir = tempfile::tempdir().expect("orchestrator tempdir");
+    let dir = tempfile::tempdir().expect("plane tempdir");
     let local = LocalSet::new();
     local
         .run_until(async {

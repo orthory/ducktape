@@ -8,7 +8,6 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
 
 use commonware_cryptography::ed25519;
 use wireguard::effect::PeerTunnelConfig;
@@ -19,7 +18,7 @@ use wireguard::{
 };
 
 use crate::msg::ReachabilityMsg;
-use crate::rendezvous::{COORD_STEP_TIMEOUT, PUNCH_STEP_TIMEOUT, PUNCH_TRIES};
+use crate::contract::{COORD_STEP_TIMEOUT, PUNCH_STEP_TIMEOUT, PUNCH_TRIES};
 
 /// Nudge ticks between two heals of the SAME peer.
 ///
@@ -32,14 +31,14 @@ use crate::rendezvous::{COORD_STEP_TIMEOUT, PUNCH_STEP_TIMEOUT, PUNCH_TRIES};
 const HEAL_COOLDOWN_NUDGES: u64 = 4;
 
 /// Minimum spacing between by-identity rendezvous-fallback attempts for the
-/// same endpoint-less peer. The nudge fires every couple of seconds and
-/// would otherwise re-attempt a stalled resolve before the resolver's own
-/// worst-case attempt (`COORD_STEP_TIMEOUT` + `PUNCH_TRIES` punch windows)
-/// could even finish, storming the coordinator — so the spacing IS the
-/// resolver's timeout envelope.
-pub(crate) const RENDEZVOUS_FALLBACK_BACKOFF: Duration = Duration::from_secs(
-    COORD_STEP_TIMEOUT.as_secs() + PUNCH_STEP_TIMEOUT.as_secs() * PUNCH_TRIES as u64,
-);
+/// same endpoint-less peer, in the milliseconds every step is stamped with.
+/// The nudge fires every couple of seconds and would otherwise re-attempt a
+/// stalled resolve before the resolver's own worst-case attempt
+/// (`COORD_STEP_TIMEOUT` + `PUNCH_TRIES` punch windows) could even finish,
+/// storming the coordinator — so the spacing IS the resolver's timeout
+/// envelope.
+pub(crate) const RENDEZVOUS_FALLBACK_BACKOFF_MS: u64 =
+    (COORD_STEP_TIMEOUT.as_secs() + PUNCH_STEP_TIMEOUT.as_secs() * PUNCH_TRIES as u64) * 1000;
 
 /// Cap on rendezvous-fallback attempts per peer PER EPOCH. Each attempt
 /// blocks the single-threaded driver loop for up to the resolver's full
@@ -51,32 +50,30 @@ pub(crate) const RENDEZVOUS_FALLBACK_BACKOFF: Duration = Duration::from_secs(
 /// grants a new budget.
 pub(crate) const RENDEZVOUS_FALLBACK_MAX_ATTEMPTS: u32 = 3;
 
-/// The epoch's record-nonce seed: unix time in MILLISECONDS. Wall-clock for
-/// the same reason the rendezvous readvertise nonce is: a REBOOTED node
-/// re-signs the SAME epoch tuple, and its previous life's nonces are already
-/// burnt into every peer's dedup gates (`prewarm_nonces`, the phase-A record
-/// map) — a fixed seed would replay-drop the reboot's re-introduction for
-/// the rest of the epoch. Milliseconds so even a sub-second orchestrator
-/// relaunch still climbs. A broken clock degrades to 0 exactly like
-/// `nat_traversal::now_secs`: the node then re-advertises as a stale life
-/// and heals at the next cutover.
-pub(crate) fn epoch_nonce_seed() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
+/// The epoch's record-nonce seed: the step's unix-millisecond stamp,
+/// verbatim. Wall-clock for the same reason the rendezvous readvertise nonce
+/// is: a REBOOTED node re-signs the SAME epoch tuple, and its previous
+/// life's nonces are already burnt into every peer's dedup gates
+/// (`prewarm_nonces`, the phase-A record map) — a fixed seed would
+/// replay-drop the reboot's re-introduction for the rest of the epoch.
+/// Milliseconds so even a sub-second relaunch still climbs. A broken clock
+/// degrades to 0 exactly like `nat_traversal::now_secs`: the node then
+/// re-advertises as a stale life and heals at the next cutover.
+pub(crate) fn epoch_nonce_seed(now_ms: u64) -> u64 {
+    now_ms
 }
 
 /// Pure backoff/budget decision: attempt iff never attempted this epoch, or
 /// the backoff window has elapsed AND the per-epoch attempt budget remains.
-/// `previous` = `(elapsed since the last attempt, attempts made so far)`;
+/// `previous` = `(ms elapsed since the last attempt, attempts made so far)`;
 /// `None` = never attempted — also the shape a fresh epoch's reset map
 /// produces, which is how "a new epoch resets the budget" happens.
-pub(crate) fn should_attempt_rendezvous_fallback(previous: Option<(Duration, u32)>) -> bool {
+pub(crate) fn should_attempt_rendezvous_fallback(previous: Option<(u64, u32)>) -> bool {
     match previous {
         None => true,
-        Some((elapsed, attempts)) => {
-            attempts < RENDEZVOUS_FALLBACK_MAX_ATTEMPTS && elapsed >= RENDEZVOUS_FALLBACK_BACKOFF
+        Some((elapsed_ms, attempts)) => {
+            attempts < RENDEZVOUS_FALLBACK_MAX_ATTEMPTS
+                && elapsed_ms >= RENDEZVOUS_FALLBACK_BACKOFF_MS
         }
     }
 }
@@ -394,7 +391,8 @@ pub(crate) struct EpochState {
     /// One strictly-monotonic counter for EVERYTHING this identity signs in
     /// the epoch — replay keys are `(identity, epoch, nonce)`, and the
     /// advert duplicate rule wants strictly-increasing nonces too. Seeded
-    /// from wall clock (`epoch_nonce_seed`), never a constant, so a reboot's
+    /// from the step's wall-clock stamp (`epoch_nonce_seed`), never a
+    /// constant, so a reboot's
     /// fresh counter still supersedes everything the previous life signed
     /// for this same epoch tuple.
     nonce: u64,
@@ -431,10 +429,10 @@ pub(crate) struct EpochState {
     pub(crate) plans: BTreeMap<ValidatorIdentity, TunnelInstallPlan>,
     pub(crate) overrides: BTreeMap<ValidatorIdentity, SocketAddr>,
     /// By-identity rendezvous-fallback bookkeeping per endpoint-less peer:
-    /// `(last attempt instant, attempts so far)` — the backoff + per-epoch
+    /// `(last attempt unix ms, attempts so far)` — the backoff + per-epoch
     /// budget behind [`Self::claim_rendezvous_attempt`]. Fresh per epoch: a
     /// `Retarget` resets the budget.
-    rendezvous_attempted: BTreeMap<ValidatorIdentity, (Instant, u32)>,
+    rendezvous_attempted: BTreeMap<ValidatorIdentity, (u64, u32)>,
     pub(crate) failed: HashSet<ValidatorIdentity>,
 }
 
@@ -725,6 +723,18 @@ impl EpochState {
         self.rendezvous_attempted.remove(&peer);
     }
 
+    /// The nonce of `owner`'s held post-lock re-advertisement, if any — the
+    /// staleness guard a parked re-advertisement resumption checks against.
+    pub(crate) fn readvertised_nonce(&self, owner: ValidatorIdentity) -> Option<u64> {
+        self.readvertised.get(&owner).map(|signed| signed.record.nonce)
+    }
+
+    /// The freshest accepted pre-warm nonce for `owner`, if any — the
+    /// staleness guard a parked pre-warm resumption checks against.
+    pub(crate) fn prewarm_nonce(&self, owner: ValidatorIdentity) -> Option<u64> {
+        self.prewarm_nonces.get(&owner).copied()
+    }
+
     /// The single mesh version EVERY peer's advert commits to, when they
     /// all agree. When it also differs from the version this node computes,
     /// the peers locked this epoch's mesh over a record this node no longer
@@ -799,17 +809,17 @@ impl EpochState {
     pub(crate) fn claim_rendezvous_attempt(
         &mut self,
         peer: ValidatorIdentity,
-        now: Instant,
+        now_ms: u64,
     ) -> bool {
         let previous = self
             .rendezvous_attempted
             .get(&peer)
-            .map(|(last, attempts)| (now.saturating_duration_since(*last), *attempts));
+            .map(|(last, attempts)| (now_ms.saturating_sub(*last), *attempts));
         if !should_attempt_rendezvous_fallback(previous) {
             return false;
         }
-        let entry = self.rendezvous_attempted.entry(peer).or_insert((now, 0));
-        *entry = (now, entry.1 + 1);
+        let entry = self.rendezvous_attempted.entry(peer).or_insert((now_ms, 0));
+        *entry = (now_ms, entry.1 + 1);
         true
     }
 
@@ -954,30 +964,27 @@ mod tests {
             "never attempted before (or a fresh epoch reset the map) — must fire"
         );
         assert!(
-            !should_attempt_rendezvous_fallback(Some((Duration::from_millis(1), 1))),
+            !should_attempt_rendezvous_fallback(Some((1, 1))),
             "1ms after the last attempt — must NOT storm the coordinator"
         );
         assert!(
-            !should_attempt_rendezvous_fallback(Some((
-                RENDEZVOUS_FALLBACK_BACKOFF - Duration::from_millis(1),
-                1
-            ))),
+            !should_attempt_rendezvous_fallback(Some((RENDEZVOUS_FALLBACK_BACKOFF_MS - 1, 1))),
             "just under the backoff window — still suppressed"
         );
         assert!(
-            should_attempt_rendezvous_fallback(Some((RENDEZVOUS_FALLBACK_BACKOFF, 1))),
+            should_attempt_rendezvous_fallback(Some((RENDEZVOUS_FALLBACK_BACKOFF_MS, 1))),
             "exactly the backoff window, budget remaining — allowed"
         );
         assert!(
             should_attempt_rendezvous_fallback(Some((
-                RENDEZVOUS_FALLBACK_BACKOFF + Duration::from_secs(60),
+                RENDEZVOUS_FALLBACK_BACKOFF_MS + 60_000,
                 RENDEZVOUS_FALLBACK_MAX_ATTEMPTS - 1
             ))),
             "well past the backoff window on the last budgeted attempt — allowed"
         );
         assert!(
             !should_attempt_rendezvous_fallback(Some((
-                RENDEZVOUS_FALLBACK_BACKOFF + Duration::from_secs(3600),
+                RENDEZVOUS_FALLBACK_BACKOFF_MS + 3_600_000,
                 RENDEZVOUS_FALLBACK_MAX_ATTEMPTS
             ))),
             "budget spent — suppressed no matter how much time has passed; only the next \
@@ -985,7 +992,7 @@ mod tests {
         );
         assert!(
             !should_attempt_rendezvous_fallback(Some((
-                Duration::from_secs(3600),
+                3_600_000,
                 RENDEZVOUS_FALLBACK_MAX_ATTEMPTS + 1
             ))),
             "past the cap stays suppressed (defensive: the counter never exceeds the cap in \
@@ -1468,7 +1475,7 @@ mod tests {
         let (me, peer) = (signer(1), signer(2));
         let mut state = epoch(&me, Role::Member, &[&me, &peer], &[]);
         let p = identity(&peer);
-        let t0 = Instant::now();
+        let t0: u64 = 1_000_000;
         assert!(
             state.claim_rendezvous_attempt(p, t0),
             "first attempt is free"
@@ -1477,14 +1484,14 @@ mod tests {
             !state.claim_rendezvous_attempt(p, t0),
             "inside the backoff window"
         );
-        let t1 = t0 + RENDEZVOUS_FALLBACK_BACKOFF;
+        let t1 = t0 + RENDEZVOUS_FALLBACK_BACKOFF_MS;
         assert!(state.claim_rendezvous_attempt(p, t1));
-        let t2 = t1 + RENDEZVOUS_FALLBACK_BACKOFF;
+        let t2 = t1 + RENDEZVOUS_FALLBACK_BACKOFF_MS;
         assert!(
             state.claim_rendezvous_attempt(p, t2),
             "the last budgeted attempt"
         );
-        let t3 = t2 + RENDEZVOUS_FALLBACK_BACKOFF * 10;
+        let t3 = t2 + RENDEZVOUS_FALLBACK_BACKOFF_MS * 10;
         assert!(
             !state.claim_rendezvous_attempt(p, t3),
             "budget spent for the epoch"
@@ -1560,7 +1567,7 @@ mod tests {
         let (me, peer) = (signer(1), signer(2));
         let mut state = epoch(&me, Role::Member, &[&me, &peer], &[]);
         let p = identity(&peer);
-        let t0 = Instant::now();
+        let t0: u64 = 1_000_000;
         assert!(state.claim_rendezvous_attempt(p, t0));
         assert!(
             !state.claim_rendezvous_attempt(p, t0),
