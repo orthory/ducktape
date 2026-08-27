@@ -650,9 +650,9 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
             &mut stores,
             &disk_substrates(forge_repo, duckfs_dir, blobs.clone()),
             &bindings,
-            // `Genesis` here means "install nothing": an odb tenant seeds no
-            // config, and the promoted dir already holds the certified refs.
-            &mut Boot::Genesis,
+            &mut Boot::Reopen {
+                snapshots: &mut snapshots,
+            },
         )
         .await
         .map_err(|e| format!("duckfs reopen: {e}"))?,

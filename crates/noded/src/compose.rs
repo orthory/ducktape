@@ -61,7 +61,7 @@ pub struct Bindings<'a> {
 }
 
 /// how the composed modules come up.
-pub enum Boot<'a> {
+pub enum Boot<'a, 'b> {
     /// fresh stores: the native registries seed from [`Bindings`], the
     /// store-backed network-bound tenants commit their `__config` record, and
     /// the Map tenants start empty.
@@ -71,7 +71,10 @@ pub enum Boot<'a> {
     /// sync path, odb) tenants' state; `None` means "nothing to install".
     Reopen {
         /// the snapshot source consulted for every non-store-backed wasm tenant.
-        snapshots: &'a mut SnapshotSource<'a>,
+        /// two lifetimes, like `StoreSource`'s `&mut StoreSource<'_>`: the
+        /// borrow ends with the compose, the futures' lifetime is the closure's,
+        /// so one source serves a compose AND a later `compose_module`.
+        snapshots: &'a mut SnapshotSource<'b>,
     },
 }
 
@@ -83,7 +86,7 @@ pub async fn compose(
     stores: &mut StoreSource<'_>,
     substrates: &Substrates,
     bindings: &Bindings<'_>,
-    mut boot: Boot<'_>,
+    mut boot: Boot<'_, '_>,
 ) -> Result<Vec<Box<dyn Module>>, String> {
     let specs = selection
         .iter()
@@ -128,7 +131,7 @@ pub async fn compose_module(
     stores: &mut StoreSource<'_>,
     substrates: &Substrates,
     bindings: &Bindings<'_>,
-    boot: &mut Boot<'_>,
+    boot: &mut Boot<'_, '_>,
 ) -> Result<Box<dyn Module>, String> {
     match spec.code {
         Code::Native => native(spec, stores, bindings, boot).await,
@@ -142,7 +145,7 @@ async fn native(
     spec: &ModuleSpec,
     stores: &mut StoreSource<'_>,
     bindings: &Bindings<'_>,
-    boot: &mut Boot<'_>,
+    boot: &mut Boot<'_, '_>,
 ) -> Result<Box<dyn Module>, String> {
     let is_genesis = matches!(boot, Boot::Genesis);
     let store = stores(spec.id).await?;
@@ -194,7 +197,7 @@ async fn wasm(
     stores: &mut StoreSource<'_>,
     substrates: &Substrates,
     bindings: &Bindings<'_>,
-    boot: &mut Boot<'_>,
+    boot: &mut Boot<'_, '_>,
 ) -> Result<Box<dyn Module>, String> {
     let hash = bindings
         .code_hashes
