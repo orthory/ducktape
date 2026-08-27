@@ -256,11 +256,26 @@ pub(super) async fn restore_host(
     .await?;
     let mut host = finish(modules).map_err(|e| format!("restore host: {e}"))?;
     adopt_admitted_modules(&mut host, &code, &mut |id| {
-        let got = manifest_snapshot(manifest, id).map(Some);
+        let got = admitted_restore_snapshot(manifest, id);
         Box::pin(async move { got })
     })
     .await?;
     Ok(host)
+}
+
+/// an admitted module's checkpoint state. checkpoints are periodic while the
+/// lifecycle store is per-block durable and reopens AHEAD of the checkpoint,
+/// so a registry id the checkpoint never captured is an admission that
+/// activated after it: register the module EMPTY (its whole history is
+/// post-checkpoint and replay rebuilds it — exactly what
+/// `realize_module_swaps`' factory arm did). an entry the checkpoint HAS but
+/// cannot complete stays an error.
+fn admitted_restore_snapshot(manifest: &Manifest, id: &str) -> Result<Snapshot, String> {
+    let admitted_after_checkpoint = manifest.snapshot(id).is_none();
+    if admitted_after_checkpoint {
+        return Ok(None);
+    }
+    manifest_snapshot(manifest, id).map(Some)
 }
 
 /// what a checkpoint restore installs for a tenant: a Map tenant's snapshot
@@ -580,6 +595,8 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
             &mut stores,
             &disk_substrates(forge_repo, duckfs_dir, blobs.clone()),
             &bindings,
+            // `Genesis` here means "install nothing": an odb tenant seeds no
+            // config, and the promoted dir already holds the certified refs.
             &mut Boot::Genesis,
         )
         .await
@@ -686,6 +703,49 @@ mod tests {
                 .collect();
             (ids, hex(&host.root_hash()), native)
         })
+    }
+
+    /// a module the lifecycle registry admitted AFTER the last checkpoint has
+    /// no snapshot there: restore registers it empty for replay to rebuild
+    /// (an `Err` here would refuse every restart between an activation and
+    /// the next checkpoint). a captured module still restores its bytes.
+    #[test]
+    fn an_admission_after_the_checkpoint_restores_empty() {
+        std::thread::Builder::new()
+            .name("admission-after-checkpoint-test".into())
+            .stack_size(GENESIS_TEST_STACK_BYTES)
+            .spawn(|| {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let cfg = commonware_runtime::tokio::Config::default()
+                    .with_storage_directory(dir.path().join("storage"));
+                let executor = commonware_runtime::tokio::Runner::new(cfg);
+                executor.start(|context| async move {
+                    let host = genesis_host(
+                        &context,
+                        &dir.path().join("forge"),
+                        &dir.path().join("duckfs"),
+                        &[],
+                        PIN_BINDINGS,
+                        blobstore::BlobHandle::default(),
+                        &fixture_genesis(),
+                    )
+                    .await;
+                    let manifest =
+                        Manifest::capture(&host, None, 0, 0, Vec::new(), Vec::new(), None, 0, 1)
+                            .expect("capture");
+                    let captured = admitted_restore_snapshot(&manifest, "hello").expect("hello");
+                    assert!(
+                        captured.is_some(),
+                        "a captured Map tenant restores its bytes"
+                    );
+                    let later = admitted_restore_snapshot(&manifest, "admitted-later")
+                        .expect("an uncaptured admission is not an error");
+                    assert!(later.is_none(), "it registers empty for replay");
+                })
+            })
+            .expect("spawn")
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
     }
 
     /// the registry ↔ topology parity pin. the composer already builds
