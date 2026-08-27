@@ -54,18 +54,31 @@ pub(crate) fn verify_personal_sign(
     preimage: &[u8],
     proof: &[u8],
 ) -> bool {
-    if proof.len() != PROOF_LEN {
-        return false;
-    }
     let Ok(expected) = VerifyingKey::from_sec1_bytes(pubkey) else {
         return false;
     };
-    let Ok(sig) = Signature::from_slice(&proof[..64]) else {
-        return false;
-    };
-    let Some(recid) = recovery_id(proof[64]) else {
-        return false;
-    };
+    match recover(&personal_message(ns, preimage), proof) {
+        Some(recovered) => recovered == expected,
+        None => false,
+    }
+}
+
+/// the key that `personal_sign`ed `message` (the EXACT bytes the wallet was
+/// handed — the EIP-191 envelope is applied here), as the 33-byte compressed
+/// SEC1 point a member key is registered under. `None` for a malformed proof.
+/// A wallet reveals no public key on its own, so the enrollment side learns
+/// it by asking for one signature and recovering — this is that step.
+pub fn recover_personal_sign(message: &[u8], proof: &[u8]) -> Option<Vec<u8>> {
+    let recovered = recover(message, proof)?;
+    Some(recovered.to_encoded_point(true).as_bytes().to_vec())
+}
+
+fn recover(message: &[u8], proof: &[u8]) -> Option<VerifyingKey> {
+    if proof.len() != PROOF_LEN {
+        return None;
+    }
+    let sig = Signature::from_slice(&proof[..64]).ok()?;
+    let recid = recovery_id(proof[64])?;
     // a high-S signature recovers to the wrong point unless S is normalized
     // and the parity bit flipped with it.
     let (sig, recid) = match sig.normalize_s() {
@@ -75,11 +88,7 @@ pub(crate) fn verify_personal_sign(
         ),
         None => (sig, recid),
     };
-    let digest = eip191_digest(&personal_message(ns, preimage));
-    match VerifyingKey::recover_from_prehash(&digest, &sig, recid) {
-        Ok(recovered) => recovered == expected,
-        Err(_) => false,
-    }
+    VerifyingKey::recover_from_prehash(&eip191_digest(message), &sig, recid).ok()
 }
 
 #[cfg(test)]
@@ -98,6 +107,34 @@ mod tests {
         assert_eq!(
             hex,
             "d9eba16ed0ecae432b71fe008c98cc872bb4cc214d3220a36f365326cf807d68"
+        );
+    }
+
+    /// the enrollment side learns a wallet's key from one signature: the
+    /// recovered point IS the registered form (33-byte compressed SEC1), and a
+    /// tampered signature recovers to some OTHER key or nothing — never the
+    /// signer's.
+    #[test]
+    fn recover_personal_sign_answers_the_signing_key() {
+        use crate::recover_personal_sign;
+        use crate::testkit::eth_sign_message;
+        let sk = eth_key(9);
+        let message = b"ducktape:reveal-key:v1\x01\x02\x03";
+        let proof = eth_sign_message(&sk, message);
+        assert_eq!(
+            recover_personal_sign(message, &proof),
+            Some(eth_pubkey(&sk))
+        );
+        let mut tampered = proof.clone();
+        tampered[10] ^= 0x40;
+        assert_ne!(
+            recover_personal_sign(message, &tampered),
+            Some(eth_pubkey(&sk))
+        );
+        assert_eq!(
+            recover_personal_sign(message, &proof[..64]),
+            None,
+            "no v byte"
         );
     }
 

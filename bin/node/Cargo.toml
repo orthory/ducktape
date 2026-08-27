@@ -61,6 +61,7 @@ tasks = { workspace = true }
 identity = { workspace = true }
 # the passkey enrollment challenge — the same bytes `KeyScheme::Secp256r1` verifies.
 keyscheme = { workspace = true }
+authpage = { workspace = true }
 gateway = { workspace = true }
 # the airlock contract: `server` supplies the GrantCheck type the lender daemon
 # injects (src/airlock.rs), `client` + `verify` the enclave-facing credential
@@ -187,6 +188,9 @@ noded = { path = "../../crates/noded", features = ["testkit"] }
 # the ed25519 bind-auth builder, shared from identity (was: a per-suite copy).
 # dev-only feature keeps it out of the production binary build.
 identity = { workspace = true, features = ["testkit"] }
+# the passkey/wallet signers the `account login` and auth-page tests fake a
+# browser ceremony with.
+keyscheme = { workspace = true, features = ["testkit"] }
 # the git-history/packfile builder. the forge e2e needs REAL objects in the
 # node's store for a PR diff to be computable, and consensus has no
 # commit-building op — this is how production gets them too (a stock git push).

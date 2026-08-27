@@ -56,6 +56,30 @@ app"), then it closes.
 {"op":"…","error":"<DOMException name>","message":"…"}
 ```
 
+## Ceremonies — how the clients sequence the ops
+
+The client half is `crates/authpage` (the fragment URL, the loopback
+listener, the result JSON, and the frame/consent builders); the CLI verbs
+are `ducktape account key add --passkey|--eth`, `create --eth` and
+`login` (`--no-browser` prints the URL for a headless box, `--auth-page`
+points at another deployment); the app's Settings › Account card has the
+same three buttons.
+
+- **A passkey is registered in two ceremonies.** `create` yields the public
+  key but a `webauthn.create` attestation is not a possession proof
+  `keyscheme` accepts, so the client then asks for a `get` over the `AddKey`
+  frame preimage — the passkey signs its own admission as the frame's
+  origin.
+- **A wallet is two touches.** A wallet never shows its public key, so touch
+  1 signs `ducktape:reveal-key:v1` ‖ 16 random bytes and the client
+  RECOVERS the key from the signature (`keyscheme::recover_personal_sign`);
+  touch 2 signs the real preimage. Nothing on chain verifies the reveal
+  signature — it authorizes nothing.
+- **A login is one `get` with `allowCredentials: []`**: the discoverable
+  passkey answers with its `userHandle` (the account number written at
+  registration), and its assertion over the NEW device's `AddKey` preimage
+  is the member consent that frame carries; the device signs the frame.
+
 ## Deploy
 
 Cloudflare Workers static assets; the `custom_domain` route makes wrangler

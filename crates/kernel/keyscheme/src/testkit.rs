@@ -26,7 +26,14 @@ pub fn eth_pubkey(sk: &k256::ecdsa::SigningKey) -> Vec<u8> {
 /// exactly what a wallet's `personal_sign` returns for
 /// [`crate::personal_message`]`(ns, preimage)`: `r‖s‖v` with `v ∈ {27, 28}`.
 pub fn eth_proof(sk: &k256::ecdsa::SigningKey, ns: &[u8], preimage: &[u8]) -> Vec<u8> {
-    let digest = crate::eip191_digest(&crate::personal_message(ns, preimage));
+    eth_sign_message(sk, &crate::personal_message(ns, preimage))
+}
+
+/// a wallet's `personal_sign` over ARBITRARY message bytes (the EIP-191
+/// envelope applied here): `r‖s‖v` with `v ∈ {27, 28}`. What a client's
+/// key-reveal touch gets back.
+pub fn eth_sign_message(sk: &k256::ecdsa::SigningKey, message: &[u8]) -> Vec<u8> {
+    let digest = crate::eip191_digest(message);
     let (sig, recid) = sk
         .sign_prehash_recoverable(&digest)
         .expect("signing a 32-byte digest");
@@ -79,6 +86,31 @@ fn assertion(
     user_present: bool,
     client_type: &str,
 ) -> Vec<u8> {
+    let (authenticator_data, client_data_json, signature) =
+        assertion_parts(sk, rp_id, ns, preimage, user_present, client_type);
+    crate::webauthn_proof(&authenticator_data, &client_data_json, &signature)
+}
+
+/// the three parts of a `webauthn.get` assertion as the auth page delivers
+/// them (`authenticatorData`, `clientDataJSON`, raw `R‖S`) — for a client
+/// test that fakes the page's result before framing it.
+pub fn passkey_assertion_parts(
+    sk: &p256::ecdsa::SigningKey,
+    rp_id: &str,
+    ns: &[u8],
+    preimage: &[u8],
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    assertion_parts(sk, rp_id, ns, preimage, true, "webauthn.get")
+}
+
+fn assertion_parts(
+    sk: &p256::ecdsa::SigningKey,
+    rp_id: &str,
+    ns: &[u8],
+    preimage: &[u8],
+    user_present: bool,
+    client_type: &str,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use p256::ecdsa::{Signature, signature::Signer as _};
     use sha2::{Digest as _, Sha256};
@@ -96,5 +128,9 @@ fn assertion(
     signed.extend_from_slice(&Sha256::digest(&client_data_json));
     // RustCrypto signs deterministically (RFC6979), low-S; `.to_bytes()` is raw R‖S.
     let sig: Signature = sk.sign(&signed);
-    crate::webauthn_proof(&authenticator_data, &client_data_json, &sig.to_bytes())
+    (
+        authenticator_data,
+        client_data_json,
+        sig.to_bytes().to_vec(),
+    )
 }

@@ -1958,7 +1958,80 @@ fn a_committed_identity_op_rereads_the_account_and_clears_its_drafts() {
     assert_eq!(app.account_generation, before + 1, "the account is re-read");
     assert!(app.account_create_draft.is_empty());
     assert!(app.account_join_draft.is_empty());
+    assert!(app.account_key_draft.is_empty());
+    assert!(app.account_key_label_draft.is_empty());
     assert!(app.account_ticket.is_empty());
+}
+
+/// THE BROWSER CEREMONIES ARE WIRED LIKE THE PASTED OPS: each button emits
+/// its own signal, each handler runs its backend fn on the connected chain
+/// under the signing seat, and every one lands in `account_changed` /
+/// `account_op_failed` — the one pair that re-reads the account and frees
+/// the card. And each is offered only where consensus would accept it:
+/// registering/linking with an account, logging in without one.
+#[test]
+fn the_browser_ceremonies_land_where_the_pasted_ops_do() {
+    let settings = include_str!("../ui/screens/settings.ice");
+    let roster = include_str!("../ui/handlers/roster.ice");
+    for (button, signal, backend) in [
+        (
+            "Register a passkey",
+            "account_passkey_submit",
+            "register_passkey",
+        ),
+        ("Link a wallet", "account_wallet_submit", "link_wallet"),
+        (
+            "Log in with a passkey",
+            "account_login_submit",
+            "login_with_passkey",
+        ),
+    ] {
+        assert!(
+            settings.contains(&format!(r#"button "{button}" -> emit({signal})"#)),
+            "{button} emits {signal}"
+        );
+        let handler = roster
+            .split(&format!("\non {signal}\n"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("a handler for {signal}"))
+            .split("\non ")
+            .next()
+            .unwrap();
+        assert!(
+            handler.contains(&format!(
+                "run every {backend}(connected_rpc, password, network_chain_id"
+            )),
+            "{signal} runs {backend} on the connected chain"
+        );
+        assert!(
+            handler.contains("-> account_changed _ | account_op_failed _"),
+            "{signal} lands where the pasted ops do"
+        );
+        assert!(
+            handler.contains("empty(password)"),
+            "{signal} needs the signing seat"
+        );
+    }
+    let login = settings
+        .find(r#"button "Log in with a passkey""#)
+        .expect("the login button");
+    let last_gate = |upto: usize| {
+        let with = settings[..upto].rfind("if account_exists");
+        let without = settings[..upto].rfind("if !account_exists");
+        (with, without)
+    };
+    let (with, without) = last_gate(login);
+    assert!(
+        without > with,
+        "login is offered only while there is no account"
+    );
+    for button in ["Register a passkey", "Link a wallet"] {
+        let at = settings
+            .find(&format!(r#"button "{button}""#))
+            .expect(button);
+        let (with, without) = last_gate(at);
+        assert!(with > without, "{button} is offered only with an account");
+    }
 }
 
 /// A MINTED TICKET COMMITS NOTHING: it is shown to copy, the inputs that

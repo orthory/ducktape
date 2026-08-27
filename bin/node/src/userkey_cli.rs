@@ -506,11 +506,16 @@ fn user_sign_frame(
 /// tie-breaker: a fresh one per call, so resubmitting the same payload never
 /// trips the consensus lane's content-digest replay guard.
 pub(crate) fn user_frame(user: &ed25519::PrivateKey, target: &str, payload: Vec<u8>) -> Vec<u8> {
-    let seq = std::time::SystemTime::now()
+    user_frame_at(user, frame_seq(), target, payload)
+}
+
+/// the `seq` a one-shot CLI frame carries: wall-clock nanoseconds, so two
+/// frames from one key never collide as a byte-identical replay.
+pub(crate) fn frame_seq() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    user_frame_at(user, seq, target, payload)
+        .unwrap_or(0)
 }
 
 /// [`user_frame`] at an explicit `seq` — the `sign-frame` verb takes the seq

@@ -13,6 +13,12 @@
 //!   under ITS OWN signature (`join`) — the frame origin is the key being
 //!   admitted, so no possession proof rides the payload.
 //! - `set-name`, `set-profile` — display text on the origin's account.
+//! - `key add --passkey|--eth`, `create --eth`, `login` — the browser
+//!   ceremonies ([`authpage`]): a passkey or an Ethereum wallet becomes a
+//!   member key by signing its own `AddKey` frame AS ORIGIN (registration is
+//!   two touches: the page yields the key, then the key proves possession);
+//!   `login` is the reverse — a passkey's assertion over THIS key's `AddKey`
+//!   preimage is the consent that admits this device.
 //!
 //! Program output stays `println!` (a CLI's stdout is not logging); the
 //! password crosses on stdin, never a flag.
@@ -20,6 +26,7 @@
 use std::io::BufRead;
 use std::path::PathBuf;
 
+use authpage::{Outcome, Request};
 use commonware_cryptography::{Signer as _, ed25519};
 use identity::{AccountView, IdentityMsg, IdentityQuery, IdentityReply, KeyScheme};
 
@@ -27,7 +34,7 @@ use crate::cli_args::NodeAddr;
 use crate::config::{self, hex_bytes};
 use crate::cred_cli::VerbCtx;
 use crate::node_http;
-use crate::userkey_cli::{load_user_signer, user_frame};
+use crate::userkey_cli::{frame_seq, load_user_signer, user_frame};
 
 type AccountResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -42,6 +49,18 @@ pub(crate) struct AccountArgs {
     /// path to the user key file (defaults to the keystore's active wallet)
     #[arg(long, value_name = "PATH", global = true)]
     key: Option<PathBuf>,
+    /// the relying-party page the passkey/wallet ceremonies open
+    #[arg(long, value_name = "URL", default_value = authpage::AUTH_PAGE, global = true)]
+    auth_page: String,
+    /// print the ceremony URL instead of opening a browser (a headless box)
+    #[arg(long, global = true)]
+    no_browser: bool,
+}
+
+/// how a verb reaches the browser: which page, and whether to open it.
+struct AuthCtx {
+    page: String,
+    browser: bool,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -51,6 +70,17 @@ pub(crate) enum AccountCmd {
         /// the account's display name (not unique — the number is the id)
         #[arg(long, value_name = "NAME")]
         name: String,
+        /// found it for an Ethereum wallet instead (two wallet touches; no
+        /// user key or password involved)
+        #[arg(long)]
+        eth: bool,
+    },
+    /// admit THIS device into an account by a passkey's consent (a browser
+    /// touch); the account is the one the passkey was registered for
+    Login {
+        /// a human label for this device's key (e.g. "laptop")
+        #[arg(long, value_name = "TEXT")]
+        label: Option<String>,
     },
     /// print one account: this key's by default, else by number or member key
     Show {
@@ -86,14 +116,21 @@ pub(crate) enum KeyCmd {
     List,
     /// print THIS device's public key, for an existing member to `key add`
     Approve,
-    /// (an existing member) consent to admitting a key: prints the ticket for `key join`
+    /// (an existing member) admit a key: `--pubkey` prints the ticket for
+    /// `key join`; `--passkey`/`--eth` run the browser ceremony and submit
     Add {
         /// the key (hex) being admitted
-        #[arg(long, value_name = "HEX")]
-        pubkey: String,
-        /// the key's scheme
+        #[arg(long, value_name = "HEX", required_unless_present_any = ["passkey", "eth"])]
+        pubkey: Option<String>,
+        /// the key's scheme (with --pubkey)
         #[arg(long, value_enum, default_value_t = SchemeArg::Ed25519)]
         scheme: SchemeArg,
+        /// register a NEW passkey in the browser and admit it
+        #[arg(long, conflicts_with_all = ["pubkey", "eth"])]
+        passkey: bool,
+        /// link an Ethereum wallet from the browser and admit it
+        #[arg(long, conflicts_with = "pubkey")]
+        eth: bool,
         /// a human label for the key (e.g. "phone")
         #[arg(long, value_name = "TEXT")]
         label: Option<String>,
@@ -139,22 +176,65 @@ fn scheme_token(scheme: KeyScheme) -> &'static str {
     }
 }
 
+/// where `key add` gets the key it admits — the one discriminant the verb
+/// branches on.
+enum NewKey {
+    /// pasted: the ticket path (`key join` on the other device submits)
+    Hex { pubkey: String, scheme: KeyScheme },
+    /// a passkey registered in the browser, submitted by its own assertion
+    Passkey,
+    /// a wallet linked in the browser, submitted by its own signature
+    Wallet,
+}
+
+/// the three flags, resolved once (clap already refused a mix).
+fn new_key(pubkey: Option<String>, scheme: SchemeArg, passkey: bool, eth: bool) -> NewKey {
+    match (pubkey, passkey, eth) {
+        (Some(pubkey), _, _) => NewKey::Hex {
+            pubkey,
+            scheme: scheme.into(),
+        },
+        (None, true, _) => NewKey::Passkey,
+        (None, false, _) => NewKey::Wallet,
+    }
+}
+
 /// Dispatch one `account` verb. ONE visible dispatch, nothing in the arms but
 /// delegation; the password is read off stdin by the verbs that sign.
 pub(crate) fn run(args: AccountArgs) -> AccountResult {
     let mut stdin = std::io::BufReader::new(std::io::stdin());
-    let AccountArgs { cmd, addr, key } = args;
+    let AccountArgs {
+        cmd,
+        addr,
+        key,
+        auth_page,
+        no_browser,
+    } = args;
     let ctx = VerbCtx { addr, key };
+    let auth = AuthCtx {
+        page: auth_page,
+        browser: !no_browser,
+    };
     match cmd {
-        AccountCmd::Create { name } => cmd_create(&ctx, name, &mut stdin),
+        AccountCmd::Create { name, eth: false } => cmd_create(&ctx, name, &mut stdin),
+        AccountCmd::Create { name, eth: true } => cmd_create_eth(&ctx, &auth, name),
+        AccountCmd::Login { label } => cmd_login(&ctx, &auth, label, &mut stdin),
         AccountCmd::Show { number, pubkey } => cmd_show(&ctx, number, pubkey),
         AccountCmd::Key(KeyCmd::List) => cmd_key_list(&ctx),
         AccountCmd::Key(KeyCmd::Approve) => cmd_key_approve(&ctx),
         AccountCmd::Key(KeyCmd::Add {
             pubkey,
             scheme,
+            passkey,
+            eth,
             label,
-        }) => cmd_key_add(&ctx, pubkey, scheme.into(), label, &mut stdin),
+        }) => cmd_key_add(
+            &ctx,
+            &auth,
+            new_key(pubkey, scheme, passkey, eth),
+            label,
+            &mut stdin,
+        ),
         AccountCmd::Key(KeyCmd::Join { ticket }) => cmd_key_join(&ctx, ticket, &mut stdin),
         AccountCmd::Key(KeyCmd::Remove { pubkey }) => cmd_key_remove(&ctx, pubkey, &mut stdin),
         AccountCmd::SetName { name } => cmd_set_name(&ctx, name, &mut stdin),
@@ -215,6 +295,20 @@ fn cmd_key_approve(ctx: &VerbCtx) -> AccountResult {
 
 fn cmd_key_add(
     ctx: &VerbCtx,
+    auth: &AuthCtx,
+    new_key: NewKey,
+    label: Option<String>,
+    stdin: &mut impl BufRead,
+) -> AccountResult {
+    match new_key {
+        NewKey::Hex { pubkey, scheme } => cmd_key_add_hex(ctx, pubkey, scheme, label, stdin),
+        NewKey::Passkey => cmd_key_add_passkey(ctx, auth, label, stdin),
+        NewKey::Wallet => cmd_key_add_wallet(ctx, auth, label, stdin),
+    }
+}
+
+fn cmd_key_add_hex(
+    ctx: &VerbCtx,
     pubkey: String,
     scheme: KeyScheme,
     label: Option<String>,
@@ -228,18 +322,204 @@ fn cmd_key_add(
     let base = ctx.http_base()?;
     let chain_id = ctx.workspace()?.service.chain_id;
     let user = load_user_signer(&ctx.key_path()?, stdin)?;
-    // the consent signs the new key's CURRENT generation, so it is single-use:
-    // the module advances the generation on admission.
-    let generation = gen_reply(query_identity(
-        &base,
-        &IdentityQuery::KeyGen {
-            key: new_key.clone(),
-        },
-    )?)?;
-    let ticket = add_key_ticket(&user, &chain_id, scheme, &new_key, label, generation);
+    let msg = consented_add_key(&base, &user, &chain_id, scheme, &new_key, label)?;
+    let ticket = String::from_utf8(identity::encode_msg(&msg)).expect("json is utf-8");
     println!("{ticket}");
     eprintln!("on the new device, run:\n    ducktape account key join --ticket '{ticket}'");
     Ok(())
+}
+
+/// `key add --passkey`: ceremony 1 registers the passkey (the page returns its
+/// key), this device consents, ceremony 2 has the passkey sign the `AddKey`
+/// frame AS ITS ORIGIN — the possession proof a create attestation lacks.
+fn cmd_key_add_passkey(
+    ctx: &VerbCtx,
+    auth: &AuthCtx,
+    label: Option<String>,
+    stdin: &mut impl BufRead,
+) -> AccountResult {
+    let base = ctx.http_base()?;
+    let chain_id = ctx.workspace()?.service.chain_id;
+    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let account = own_account(&base, user.public_key().as_ref())?;
+    let registered = ceremony(
+        auth,
+        &Request::Create {
+            challenge: authpage::create_challenge(),
+            user: account.number,
+            name: account.name.clone(),
+        },
+    )?;
+    let Outcome::Create { public_key, .. } = registered else {
+        return Err("expected a passkey registration (op=create)".into());
+    };
+    let msg = consented_add_key(
+        &base,
+        &user,
+        &chain_id,
+        KeyScheme::Secp256r1,
+        &public_key,
+        label,
+    )?;
+    let (request, preimage) =
+        authpage::passkey_frame_request(&public_key, frame_seq(), &identity_msg(&msg));
+    let signed = ceremony(auth, &request)?;
+    let height = node_http::submit_frame(&base, &authpage::passkey_frame(preimage, &signed)?)?;
+    println!(
+        "passkey {} added at height {height}",
+        hex_bytes(&public_key)
+    );
+    print_keys(&own_account(&base, user.public_key().as_ref())?);
+    Ok(())
+}
+
+/// `key add --eth`: touch 1 reveals the wallet's key, this device consents,
+/// touch 2 has the wallet sign the `AddKey` frame AS ITS ORIGIN.
+fn cmd_key_add_wallet(
+    ctx: &VerbCtx,
+    auth: &AuthCtx,
+    label: Option<String>,
+    stdin: &mut impl BufRead,
+) -> AccountResult {
+    let base = ctx.http_base()?;
+    let chain_id = ctx.workspace()?.service.chain_id;
+    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    own_account(&base, user.public_key().as_ref())?;
+    let pubkey = reveal_wallet(auth)?;
+    let msg = consented_add_key(
+        &base,
+        &user,
+        &chain_id,
+        KeyScheme::Secp256k1,
+        &pubkey,
+        label,
+    )?;
+    let height = submit_as_wallet(&base, auth, &pubkey, &msg)?;
+    println!("wallet {} added at height {height}", hex_bytes(&pubkey));
+    print_keys(&own_account(&base, user.public_key().as_ref())?);
+    Ok(())
+}
+
+/// `create --eth`: the wallet founds the account itself — no user key, no
+/// password; touch 1 reveals its key, touch 2 signs the `Create` frame.
+fn cmd_create_eth(ctx: &VerbCtx, auth: &AuthCtx, name: String) -> AccountResult {
+    let base = ctx.http_base()?;
+    let pubkey = reveal_wallet(auth)?;
+    let msg = IdentityMsg::Create {
+        name,
+        scheme: KeyScheme::Secp256k1,
+    };
+    let height = submit_as_wallet(&base, auth, &pubkey, &msg)?;
+    let account = account_of_key(&base, &pubkey)?.ok_or_else(|| {
+        format!("committed at height {height}, but the wallet resolves to no account")
+    })?;
+    println!("account {} created at height {height}", account.number);
+    print_account(&account);
+    Ok(())
+}
+
+/// `login`: this device asks a passkey to admit it. The assertion over THIS
+/// key's `AddKey` preimage is the consent; its `userHandle` names the account;
+/// the frame is signed by this device — the key being admitted, as `key join`.
+fn cmd_login(
+    ctx: &VerbCtx,
+    auth: &AuthCtx,
+    label: Option<String>,
+    stdin: &mut impl BufRead,
+) -> AccountResult {
+    let base = ctx.http_base()?;
+    let chain_id = ctx.workspace()?.service.chain_id;
+    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let device_key = user.public_key().as_ref().to_vec();
+    let generation = gen_reply(query_identity(
+        &base,
+        &IdentityQuery::KeyGen {
+            key: device_key.clone(),
+        },
+    )?)?;
+    let consent = ceremony(
+        auth,
+        &authpage::login_request(&chain_id, &device_key, generation),
+    )?;
+    let (number, proof) = authpage::login_consent(&consent)?;
+    let account = account_reply(query_identity(&base, &IdentityQuery::Get { number })?)?
+        .ok_or_else(|| format!("the passkey names account {number}, unknown to this node"))?;
+    let msg = authpage::login_add_key(&chain_id, &device_key, generation, &account, label, proof)?;
+    let height = submit_identity(&base, &user, &msg)?;
+    println!("joined account {number} at height {height}");
+    print_keys(&own_account(&base, &device_key)?);
+    Ok(())
+}
+
+// ============================================================================
+// browser ceremonies
+// ============================================================================
+
+/// one browser round trip: bind the loopback callback, open (or print) the
+/// page URL, block until the page POSTs its result.
+fn ceremony(auth: &AuthCtx, request: &Request) -> Result<Outcome, Box<dyn std::error::Error>> {
+    let listener = authpage::Listener::bind()?;
+    let url = authpage::request_url(&auth.page, request, &listener.callback_url());
+    let opened = auth.browser && authpage::open_browser(&url);
+    if !opened {
+        eprintln!("open this in a browser:\n    {url}");
+    }
+    eprintln!("waiting for the browser…");
+    Ok(listener.wait()?)
+}
+
+/// touch 1 of a wallet: it signs a nonce'd reveal message and its key is
+/// recovered from the signature (a wallet never shows its public key).
+fn reveal_wallet(auth: &AuthCtx) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let reveal = authpage::reveal_message();
+    let touch = ceremony(
+        auth,
+        &Request::Eth {
+            message: reveal.clone(),
+        },
+    )?;
+    Ok(authpage::wallet_pubkey(&reveal, &touch)?)
+}
+
+/// touch 2 of a wallet: it signs the op frame as its origin; the commit height.
+fn submit_as_wallet(
+    base: &str,
+    auth: &AuthCtx,
+    pubkey: &[u8],
+    msg: &IdentityMsg,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let (request, preimage) =
+        authpage::wallet_frame_request(pubkey, frame_seq(), &identity_msg(msg));
+    let touch = ceremony(auth, &request)?;
+    node_http::submit_frame(base, &authpage::wallet_frame(preimage, &touch)?)
+}
+
+/// the `AddKey` this device consents to for `new_key`, at the key's CURRENT
+/// generation (single-use: the module advances the generation on admission).
+fn consented_add_key(
+    base: &str,
+    user: &ed25519::PrivateKey,
+    chain_id: &str,
+    scheme: KeyScheme,
+    new_key: &[u8],
+    label: Option<String>,
+) -> Result<IdentityMsg, Box<dyn std::error::Error>> {
+    let generation = gen_reply(query_identity(
+        base,
+        &IdentityQuery::KeyGen {
+            key: new_key.to_vec(),
+        },
+    )?)?;
+    Ok(add_key_msg(
+        user, chain_id, scheme, new_key, label, generation,
+    ))
+}
+
+fn identity_msg(msg: &IdentityMsg) -> sdk::Msg {
+    sdk::Msg {
+        target: "identity".into(),
+        payload: identity::encode_msg(msg),
+    }
 }
 
 fn cmd_key_join(ctx: &VerbCtx, ticket: String, stdin: &mut impl BufRead) -> AccountResult {
@@ -295,23 +575,22 @@ fn create_msg(name: String) -> IdentityMsg {
     }
 }
 
-/// the `AddKey` ticket an existing member mints for `new_key` (of `scheme`) at
-/// its current `generation` on `chain_id`: ONE json line, exactly the payload
-/// the new device submits.
-fn add_key_ticket(
+/// the `AddKey` an existing member consents to for `new_key` (of `scheme`) at
+/// its current `generation` on `chain_id`. Encoded, it is the ticket `key add
+/// --pubkey` prints — ONE json line, exactly the payload the new device submits.
+fn add_key_msg(
     user: &ed25519::PrivateKey,
     chain_id: &str,
     scheme: KeyScheme,
     new_key: &[u8],
     label: Option<String>,
     generation: u64,
-) -> String {
-    let msg = IdentityMsg::AddKey {
+) -> IdentityMsg {
+    IdentityMsg::AddKey {
         scheme,
         label,
         authorizer: config::ed25519_authorizer(user, chain_id, scheme, new_key, generation),
-    };
-    String::from_utf8(identity::encode_msg(&msg)).expect("json is utf-8")
+    }
 }
 
 /// the joining device's frame: the ticket bytes VERBATIM (the member's proof
@@ -494,11 +773,23 @@ mod tests {
         ed25519::PrivateKey::decode([seed; 32].as_slice()).unwrap()
     }
 
+    fn add_key_ticket(
+        user: &ed25519::PrivateKey,
+        chain_id: &str,
+        scheme: KeyScheme,
+        new_key: &[u8],
+        label: Option<String>,
+        generation: u64,
+    ) -> String {
+        let msg = add_key_msg(user, chain_id, scheme, new_key, label, generation);
+        String::from_utf8(identity::encode_msg(&msg)).unwrap()
+    }
+
     #[test]
-    fn the_verb_tree_is_create_show_key_set_name_set_profile() {
+    fn the_verb_tree_is_create_show_key_login_set_name_set_profile() {
         use clap::CommandFactory as _;
         let cmd = TestCli::command();
-        for name in ["create", "show", "key", "set-name", "set-profile"] {
+        for name in ["create", "show", "key", "login", "set-name", "set-profile"] {
             assert!(cmd.find_subcommand(name).is_some(), "verb {name} missing");
         }
         let key = cmd.find_subcommand("key").unwrap();
@@ -508,6 +799,98 @@ mod tests {
                 "key verb {name} missing"
             );
         }
+    }
+
+    /// `key add` names its key ONE way: a pasted hex, a browser passkey, or a
+    /// browser wallet — never none, never two.
+    #[test]
+    fn key_add_takes_exactly_one_key_source() {
+        use clap::Parser as _;
+        let parse = |line: &str| TestCli::try_parse_from(line.split(' ')).map(|cli| cli.cmd);
+        let hex = "0011";
+        let AccountCmd::Key(KeyCmd::Add { pubkey, scheme, .. }) =
+            parse(&format!("t key add --pubkey {hex} --scheme secp256k1")).unwrap()
+        else {
+            panic!("an add");
+        };
+        assert_eq!(pubkey.as_deref(), Some(hex));
+        assert_eq!(scheme, SchemeArg::Secp256k1);
+        assert!(matches!(
+            parse("t key add --passkey --label phone").unwrap(),
+            AccountCmd::Key(KeyCmd::Add {
+                passkey: true,
+                eth: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse("t key add --eth").unwrap(),
+            AccountCmd::Key(KeyCmd::Add {
+                passkey: false,
+                eth: true,
+                ..
+            })
+        ));
+        assert!(parse("t key add").is_err(), "no source");
+        assert!(parse("t key add --passkey --eth").is_err(), "two sources");
+        assert!(parse(&format!("t key add --pubkey {hex} --eth")).is_err());
+        assert!(matches!(
+            parse("t create --name x --eth").unwrap(),
+            AccountCmd::Create { eth: true, .. }
+        ));
+        assert!(matches!(
+            parse("t login --label laptop").unwrap(),
+            AccountCmd::Login { label: Some(_) }
+        ));
+        match new_key(None, SchemeArg::Ed25519, false, true) {
+            NewKey::Wallet => {}
+            NewKey::Hex { .. } | NewKey::Passkey => panic!("--eth is the wallet"),
+        }
+    }
+
+    /// a login's frame: the page's assertion (faked exactly as an
+    /// authenticator signs it) becomes the `AddKey` this device submits AS
+    /// ITS OWN ORIGIN — `key join`'s shape with a passkey's consent inside.
+    #[test]
+    fn login_submits_the_consented_add_key_under_the_device_key() {
+        use keyscheme::testkit::{passkey, passkey_assertion_parts, passkey_pubkey};
+        let device = signer(6);
+        let device_key = device.public_key().as_ref().to_vec();
+        let mine = passkey(3);
+        let account = AccountView {
+            number: 11,
+            name: "alice".into(),
+            keys: vec![identity::KeyView {
+                scheme: KeyScheme::Secp256r1,
+                pubkey: passkey_pubkey(&mine),
+                label: Some("phone".into()),
+                added_at: 0,
+            }],
+            avatar: None,
+            bio: None,
+            updated_at: 0,
+        };
+        let preimage = identity::add_key_preimage("chain-a", KeyScheme::Ed25519, &device_key, 4);
+        let (authenticator_data, client_data_json, signature) = passkey_assertion_parts(
+            &mine,
+            "auth.ducktape.byeongsu.dev",
+            identity::IDENTITY_ADD_KEY_NS,
+            &preimage,
+        );
+        let outcome = Outcome::Get {
+            authenticator_data,
+            client_data_json,
+            signature,
+            user_handle: Some(11),
+        };
+        let (number, proof) = authpage::login_consent(&outcome).unwrap();
+        assert_eq!(number, 11);
+        let msg =
+            authpage::login_add_key("chain-a", &device_key, 4, &account, None, proof).unwrap();
+        let frame = user_frame(&device, "identity", identity::encode_msg(&msg));
+        let (origin, submitted) = node::decode_frame(&frame).unwrap();
+        assert_eq!(origin, sdk::Origin::External(device_key));
+        assert_eq!(identity::decode_msg(&submitted.payload).unwrap(), msg);
     }
 
     #[test]

@@ -561,6 +561,9 @@ view
               account_join_draft_changed -> account_join_draft_changed _
               account_key_join_submit -> account_key_join_submit
               account_key_remove -> account_key_remove _
+              account_passkey_submit -> account_passkey_submit
+              account_wallet_submit -> account_wallet_submit
+              account_login_submit -> account_login_submit
               copy_to_clipboard -> copy_to_clipboard _ _
               settings_clear_tabs -> settings_clear_tabs
               switch_network -> switch_network
