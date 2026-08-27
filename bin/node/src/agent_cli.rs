@@ -54,6 +54,8 @@ pub(crate) enum AgentCmd {
     Pty(PtyArgs),
     /// submit a durable headless run pinned to a node; prints its run id
     Sched(SchedArgs),
+    /// install the agent CLIs this host's guest image lends to runs
+    Install(crate::executors::InstallArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -123,14 +125,17 @@ fn at_least_the_sandbox_floor(value: &str) -> Result<u64, String> {
 
 pub(crate) fn run(args: AgentArgs) -> AgentResult {
     let AgentArgs { cmd, addr } = args;
-    let base = addr.resolve()?;
+    // `install` fills a directory on THIS host and talks to no node, so the
+    // address ladder is resolved per-verb rather than up front — a machine
+    // with no workspace yet must still be able to install its executors.
     match cmd {
         // pty takes the whole group, not just the resolved base: attaching needs
         // the node's WORKSPACE too (its 0600 service-link token admits the
         // session's ws topic), and only the ladder knows which workspace the
         // address it just resolved belongs to.
-        AgentCmd::Pty(pty) => cmd_pty(pty, &base, &addr),
-        AgentCmd::Sched(sched) => cmd_sched(sched, &base),
+        AgentCmd::Pty(pty) => cmd_pty(pty, &addr.resolve()?, &addr),
+        AgentCmd::Sched(sched) => cmd_sched(sched, &addr.resolve()?),
+        AgentCmd::Install(install) => crate::executors::run(install),
     }
 }
 

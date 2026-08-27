@@ -65,6 +65,7 @@ mod constants;
 mod cred_cli;
 mod cred_seal;
 mod drain_actions;
+mod executors;
 mod explorer;
 mod first_contact_join;
 mod fs_cli;

@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # make dev — the desktop-app dev loop against the seeded "demo" localnet.
 #
-# Ensures the "demo" workspace exists (first run seeds it via ops/demo-seed.sh;
-# DEV_RESEED=1 forces a fresh seed), starts its node when nothing is serving
+# Offers this host's setup as two prompts up front (which agent CLIs the guest
+# image should carry, and on macOS the sandbox prerequisites), rebuilds that
+# image when a CLI is newer than it, then ensures the "demo" workspace exists
+# (first run seeds it via ops/demo-seed.sh; DEV_RESEED=1 forces a fresh seed),
+# starts its node when nothing is serving
 # the workspace's http endpoint, initializes its forge with ducktape's own
 # repository (ops/dogfood-forge.sh), starts the three local agent services, then
 # runs the desktop app in the foreground. Ctrl-C quits the app and LEAVES the
@@ -17,20 +20,9 @@ WSDIR="$HOME/.ducktape/workspaces/$ID"
 log(){ printf '\033[36m[dev]\033[0m %s\n' "$*"; }
 die(){ printf '\033[31m[dev] %s\033[0m\n' "$*" >&2; exit 1; }
 
-# macOS: offer the sandbox prerequisites as an install prompt, once, up front —
-# instead of the node's boot probe refusing them one at a time later. Declining
-# (or an unfixable machine) is not fatal: the dev loop still runs, provider
-# runs are what gets refused.
-if [ "$(uname -s)" = "Darwin" ]; then
-  bash "$SCRIPT_DIR/macos-preflight.sh" --prompt \
-    || log "sandbox prerequisites incomplete — the node will refuse provider runs until they are installed"
-fi
-
-if [ ! -f "$WSDIR/node.toml" ] || [ ! -f "$WSDIR/network.toml" ] || [ -n "${DEV_RESEED:-}" ]; then
-  bash "$SCRIPT_DIR/demo-seed.sh" || die "seeding the '$ID' localnet failed"
-fi
-
-# The node binary, resolved the way demo-seed resolves it.
+# The node binary, resolved the way demo-seed resolves it. Built FIRST: the
+# setup steps below are its own verbs, and the guest image they feed is built
+# further down.
 NODE_BIN="${DUCKTAPE_NODE_BIN:-}"
 if [ -z "$NODE_BIN" ]; then
   log "building ducktape (cargo build -p node-bin)…"
@@ -40,6 +32,39 @@ if [ -z "$NODE_BIN" ]; then
     | bun -e 'console.log((await Bun.stdin.json()).target_directory)')/debug/ducktape"
 fi
 [ -x "$NODE_BIN" ] || die "node binary not executable: $NODE_BIN"
+
+# What this host's guest image can lend to runs. A checklist, because it is the
+# operator's call: each entry is a vendor download this machine does not have,
+# shown with its url and expected hash, and checking none is a complete answer.
+"$NODE_BIN" agent install || log "agent CLI setup skipped — runs will refuse the providers that are missing"
+
+# macOS: offer the sandbox prerequisites as an install prompt, once, up front —
+# instead of the node's boot probe refusing them one at a time later. Declining
+# (or an unfixable machine) is not fatal: the dev loop still runs, provider
+# runs are what gets refused.
+if [ "$(uname -s)" = "Darwin" ]; then
+  bash "$SCRIPT_DIR/macos-preflight.sh" --prompt \
+    || log "sandbox prerequisites incomplete — the node will refuse provider runs until they are installed"
+fi
+
+# The image bakes the agent CLIs in at BUILD time, so one installed after the
+# image was built reaches no run until the image is rebuilt. Anything in the
+# executors directory newer than the image is, by definition, not in it — and
+# finding that out as "the run produced nothing" is the whole failure this
+# checks for. (A machine with no image yet is not stale: on macOS the preflight
+# above just built one, and on Linux there is nothing to refresh.)
+GUEST_DIR="${GUEST_DIR:-$HOME/.ducktape/guest}"
+EXEC_DIR="${DUCKTAPE_EXECUTOR_DIR:-$HOME/.ducktape/executors}"
+if [ -f "$GUEST_DIR/rootfs.ext4" ] &&
+   [ -n "$(find "$EXEC_DIR" -type f -newer "$GUEST_DIR/rootfs.ext4" 2>/dev/null | head -1)" ]; then
+  log "an agent CLI is newer than the guest image — rebuilding it"
+  OUT="$GUEST_DIR" bash "$SCRIPT_DIR/build-guest-rootfs.sh" ||
+    log "guest image rebuild failed — runs keep using the previous image"
+fi
+
+if [ ! -f "$WSDIR/node.toml" ] || [ ! -f "$WSDIR/network.toml" ] || [ -n "${DEV_RESEED:-}" ]; then
+  bash "$SCRIPT_DIR/demo-seed.sh" || die "seeding the '$ID' localnet failed"
+fi
 
 # The workspace's app endpoint — the same `http_listen` key the app reads.
 LISTEN="$(sed -n 's/^[[:space:]]*http_listen[[:space:]]*=[[:space:]]*"\{0,1\}\([^"#]*\)"\{0,1\}.*/\1/p' \
