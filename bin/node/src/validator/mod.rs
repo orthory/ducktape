@@ -68,6 +68,7 @@ pub(crate) async fn run_validator(
     manifest: Option<Manifest>,
     forge_repo: std::path::PathBuf,
     duckfs_dir: std::path::PathBuf,
+    genesis: &crate::config::GenesisModules,
 ) {
     metrics.set_role_phase(noded::NodeRole::Validator, noded::NodePhase::Recovering);
     tracing::info!(
@@ -97,6 +98,7 @@ pub(crate) async fn run_validator(
         &signer,
         &label,
         &mut boot_fold,
+        genesis,
     )
     .await;
 

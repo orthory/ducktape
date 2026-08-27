@@ -114,8 +114,8 @@ pub(crate) const EPOCH_CHANNEL_BANK: u64 = 16;
 pub(crate) const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order — the
 /// `production` selection of the single-source [`topology`]. pinned to the
-/// `host_state::ProductionModules` registry by the parity test in `host_state`;
-/// the topology's own tests pin the selection to today's 20.
+/// composed host's registry by the parity test in `host_state`; the
+/// topology's own tests pin the selection to today's 20.
 ///
 /// A module here is in the root-hash: every node must run it, agree on its root
 /// at every height, and keep doing so forever. Experiments therefore live

@@ -33,6 +33,7 @@ pub(super) async fn restore(
     signer: &ed25519::PrivateKey,
     label: &str,
     boot_fold: &mut IndexFold<'_>,
+    genesis: &crate::config::GenesisModules,
 ) -> BootState {
     match manifest {
         None => {
@@ -56,6 +57,7 @@ pub(super) async fn restore(
                     identity_chain_id,
                 },
                 blobs.clone(),
+                genesis,
             )
             .await;
             let pos = recovery.oplog_pos().await;
@@ -84,8 +86,15 @@ pub(super) async fn restore(
             (host, None, 1, (None, pos), None)
         }
         Some(manifest) => {
-            let restored =
-                restore_host(context, forge_repo, duckfs_dir, &manifest, blobs.clone()).await;
+            let restored = restore_host(
+                context,
+                forge_repo,
+                duckfs_dir,
+                &manifest,
+                blobs.clone(),
+                genesis,
+            )
+            .await;
             let mut host = match restored {
                 Ok(h) => h,
                 Err(e) => {

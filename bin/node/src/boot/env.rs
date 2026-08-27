@@ -69,6 +69,10 @@ pub(crate) struct BootEnv {
     /// for its pool's ledger, so the scheduler can never be promised what this
     /// host cannot seat. EMPTY for a consensus-only node.
     pub(crate) sandbox_capacity: BTreeMap<String, u64>,
+    /// the genesis wasm set (descriptor hashes + the bundle dir its bytes are
+    /// read from), carried whole to the three host composers — genesis,
+    /// checkpoint restore, and state sync all seed from it.
+    pub(crate) genesis: config::GenesisModules,
 }
 
 pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
@@ -116,9 +120,7 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         coordinator_relay,
         wireguard_advertised,
         compute_backend,
-        // not an env fact: the genesis wasm set is read off `Resolved` where
-        // the module set is composed, never copied into the boot environment.
-        genesis: _,
+        genesis,
     } = resolved;
     // A key outside the GENESIS validator set is not an error: post-genesis
     // standing is admitted via governance and resolved from the latest
@@ -351,5 +353,6 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         sandbox,
         compute_backend,
         sandbox_capacity,
+        genesis,
     }
 }
