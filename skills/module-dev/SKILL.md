@@ -74,11 +74,11 @@ observably (`/v1/index/status` `fold.{module}`), never atomically.
 
 | Bin | Runs | What to touch |
 |---|---|---|
-| `bin/node` | production set: native + wasm tenants | `crates/topology/src/lib.rs`: a `ModuleSpec` row in `MODULES` (`code`/`backing`/wiring) and the id in `PRODUCTION`; `host_state` composes genesis/restore/sync from that selection — nothing to mirror there. A native tenant also needs the `Cargo.toml` dep. The component is NOT embedded: it lives in the kernel fixtures dir (the pins' bundle) and the founder's `modules/` dir, hashed into the descriptor at `node init`. |
+| `bin/node` | production set: native + wasm tenants | `crates/topology/src/lib.rs`: a `ModuleSpec` row in `MODULES` (`code`/`backing`/wiring) and the id in `PRODUCTION`; `host_state` composes genesis/restore/sync from that selection — nothing to mirror there. A native tenant also needs the `Cargo.toml` dep. The component is NOT embedded: `node init` hashes `<id>.component.wasm` out of `--modules <dir>` (default `$DUCKTAPE_MODULES_DIR`, else `~/.ducktape/modules`, filled by `make install-node`) into the descriptor, then copies those bytes into `<workspace>/modules/`. The kernel fixtures dir pins the same bytes. |
 | `bin/noded` | daemon, composes native instances | grep `"tasks"`: id list, `use`, construct, register |
 | `bin/simnode` | deterministic /v1 twin | same shape as noded |
 
-noded/simnode run a SUBSET — a wasm-only tenant (e.g. `vaults`) appears
+noded/simnode run a SUBSET — a wasm-only tenant (e.g. `capability`) appears
 in `bin/node` alone. Decide whether the module belongs in the daemon/sim lanes;
 if it should be testable in sim-lane or visible in the app, it does.
 

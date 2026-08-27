@@ -44,10 +44,9 @@ pub struct ModuleSpec {
     /// The NATIVE sibling wiring the native composers (noded/simnode) pass
     /// as constructor args — the concrete duplication this topology absorbs.
     /// A backend realizes an edge only when it also composes the target module.
-    /// The wasm
-    /// production guests compile in their OWN wiring, which can be richer than
-    /// the native args (e.g. saga reads valset/capability inside the guest);
-    /// that guest-internal wiring is not represented here.
+    /// The wasm production guests compile in their OWN wiring, which can be
+    /// richer than the native args (e.g. saga reads valset/capability inside
+    /// the guest); that guest-internal wiring is not represented here.
     pub wiring: &'static [&'static str],
     /// The per-network genesis-config keys this module needs (empty = none).
     /// The VALUES are runtime (a `NetworkBindings`: the invite namespace + the

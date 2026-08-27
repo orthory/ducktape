@@ -10,8 +10,10 @@ fixtures, in no genesis set. The first wasm port of a native module is
 `crates/examples/directory` (`src/guest.rs`), bytes-compatible with the native
 implementation it replaced (same root, same snapshot encoding); it stays in
 `topology::PRODUCTION` as the e2e lane's write tenant. The node binary embeds
-no component: the founder bundles every wasm tenant's `component.wasm` into
-the workspace `modules/` dir, and the network descriptor commits its sha256.
+no component: `node init` hashes every wasm tenant's `<id>.component.wasm` out
+of `--modules <dir>` (default `$DUCKTAPE_MODULES_DIR`, else `~/.ducktape/modules`,
+filled by `make install-node`) into the network descriptor, then copies those
+same bytes into the workspace's `modules/` dir.
 
 ## The model (design-B: host-owned state, guest as pure logic)
 

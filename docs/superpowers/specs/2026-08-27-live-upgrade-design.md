@@ -189,6 +189,13 @@ their fixtures stay — they are the kernel tests' and the e2e's swap subject.
 The native `directory` crate stays for the kernel tests that construct it
 directly. `GENESIS_ROOT_HASH` moves; the commit says so.
 
+> **Amendment (2026-08-27, Ruling 10):** `directory` STAYS in `PRODUCTION` for
+> now — the "unused" premise above was wrong. It is the write tenant of all 8
+> process e2e suites and of `--dev-demo`
+> (`bin/node/src/validator/engine.rs`, `bin/node/src/validator/run/drain.rs`).
+> Porting that lane to another indexed tenant is a follow-up; `directory` leaves
+> (and the root moves once more) with it. Part 1 ships 21 → 20, not 21 → 19.
+
 ## §2 The topology says the shape
 
 ```rust

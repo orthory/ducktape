@@ -266,9 +266,10 @@ wasm-modules:
 	  -o crates/kernel/wasm-host/tests/fixtures/object.component.wasm
 
 ## the drift gate for the committed component artifacts: every copy of the SAME
-## module must be byte-identical (bin/node embeds the canonical artifact; the
-## kernel test fixtures pin the same bytes). toolchain-independent, so it rides
-## the pre-push `test` gate; run `make wasm-modules` to refresh the set.
+## module must be byte-identical (`node init` hashes the bundle into the
+## descriptor; the kernel test fixtures pin the same bytes).
+## toolchain-independent, so it rides the pre-push `test` gate; run
+## `make wasm-modules` to refresh the set.
 wasm-modules-check:
 	cmp crates/guests/hello-wasm/component.wasm \
 	  crates/kernel/wasm-host/tests/fixtures/hello.component.wasm

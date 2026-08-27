@@ -14,6 +14,14 @@ three `bin/node/src/host_state.rs` builders become thin callers. `hello`,
 `directory`, `greeter` and the dead `DEMO` selection leave the topology; the
 production set goes 21 → 19 (PR 2, the flag day: `GENESIS_ROOT_HASH` moves).
 
+> **Amendment (2026-08-27, Ruling 10):** `directory` STAYS. It is the write
+> tenant of all 8 process e2e suites and of `--dev-demo`
+> (`bin/node/src/validator/engine.rs`, `bin/node/src/validator/run/drain.rs`),
+> so the plan's "unused" premise was wrong. Porting that lane to another indexed
+> tenant is a follow-up; `directory` leaves (and the root moves once more) with
+> it. Everywhere below that says `directory` leaves or `PRODUCTION` is 19, read
+> `directory` stays and 20 (21 → 20).
+
 **Tech Stack:** Rust workspace; `wasm-host` (wasmtime), `sdk::MerkleStore` /
 `statesync::qmdb::QmdbStore`, `blobstore::BlobHandle`, serde/toml descriptors,
 clap CLI. Gates: `cargo clippy -p <crate> --tests --no-deps`,
@@ -1430,6 +1438,13 @@ git commit -m "chore: every founder and dev-shape site names its module componen
 ```
 
 ### Task 10: the flag day — hello/directory/greeter/DEMO out
+
+> **Amendment (2026-08-27, Ruling 10):** as shipped, `directory` STAYS in
+> `PRODUCTION` (21 → 20, not 19) — it is the write tenant of all 8 process e2e
+> suites and of `--dev-demo` (`bin/node/src/validator/engine.rs`,
+> `bin/node/src/validator/run/drain.rs`). Only `hello`, `greeter` and `DEMO`
+> leave here. Porting that lane to another indexed tenant, then dropping
+> `directory` (20 → 19, one more root move), is a follow-up.
 
 **Files:**
 - Modify: `crates/topology/src/lib.rs` — remove `directory`, `greeter`, `hello` from `MODULES`; remove `"hello"` and `"directory"` from `PRODUCTION`; delete `DEMO` and the `demo` field on `ModuleTopology` + `TOPOLOGY`; update the pins (`PRODUCTION.len() == 19`, the sorted lists, the shape test's expected native/map lists → native `["kv","lifecycle","valset"]`, map `["runs"]`).
