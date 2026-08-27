@@ -19,9 +19,9 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
 mod eth;
-mod webauthn;
 #[cfg(feature = "testkit")]
 pub mod testkit;
+mod webauthn;
 
 pub use eth::{eip191_digest, personal_message};
 pub use webauthn::{webauthn_challenge, webauthn_proof};
@@ -123,7 +123,11 @@ mod tests {
         assert_eq!(KeyScheme::Ed25519.tag(), 0);
         assert_eq!(KeyScheme::Secp256k1.tag(), 1);
         assert_eq!(KeyScheme::Secp256r1.tag(), 2);
-        for s in [KeyScheme::Ed25519, KeyScheme::Secp256k1, KeyScheme::Secp256r1] {
+        for s in [
+            KeyScheme::Ed25519,
+            KeyScheme::Secp256k1,
+            KeyScheme::Secp256r1,
+        ] {
             assert_eq!(KeyScheme::from_tag(s.tag()), Some(s));
         }
         assert_eq!(KeyScheme::from_tag(3), None);
@@ -134,7 +138,11 @@ mod tests {
     fn borsh_tag_matches_wire_tag() {
         // the stored record codec numbers variants by declaration order; the
         // declaration order must equal `tag()` or a stored scheme lies.
-        for s in [KeyScheme::Ed25519, KeyScheme::Secp256k1, KeyScheme::Secp256r1] {
+        for s in [
+            KeyScheme::Ed25519,
+            KeyScheme::Secp256k1,
+            KeyScheme::Secp256r1,
+        ] {
             assert_eq!(borsh::to_vec(&s).unwrap(), vec![s.tag()]);
         }
     }

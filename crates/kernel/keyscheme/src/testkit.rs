@@ -17,7 +17,10 @@ pub fn eth_key(seed: u8) -> k256::ecdsa::SigningKey {
 
 /// the 33-byte compressed SEC1 point — the form a wallet registers.
 pub fn eth_pubkey(sk: &k256::ecdsa::SigningKey) -> Vec<u8> {
-    sk.verifying_key().to_encoded_point(true).as_bytes().to_vec()
+    sk.verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .to_vec()
 }
 
 /// exactly what a wallet's `personal_sign` returns for
@@ -30,4 +33,68 @@ pub fn eth_proof(sk: &k256::ecdsa::SigningKey, ns: &[u8], preimage: &[u8]) -> Ve
     let mut proof = sig.to_bytes().to_vec();
     proof.push(recid.to_byte() + 27);
     proof
+}
+
+/// a deterministic P-256 signing key from a non-zero seed byte.
+pub fn passkey(seed: u8) -> p256::ecdsa::SigningKey {
+    assert_ne!(seed, 0, "seed 0 is not a valid scalar");
+    p256::ecdsa::SigningKey::from_slice(&[seed; 32]).expect("valid scalar")
+}
+
+/// the 33-byte compressed SEC1 point the transport lifts out of the COSE key.
+pub fn passkey_pubkey(sk: &p256::ecdsa::SigningKey) -> Vec<u8> {
+    sk.verifying_key().to_sec1_bytes().to_vec()
+}
+
+/// a self-consistent `webauthn.get` assertion for `(ns, preimage)` under
+/// `rp_id` — exactly what an authenticator produces, so a passing verify
+/// proves the envelope reconstruction matches real signing.
+pub fn passkey_proof(
+    sk: &p256::ecdsa::SigningKey,
+    rp_id: &str,
+    ns: &[u8],
+    preimage: &[u8],
+    user_present: bool,
+) -> Vec<u8> {
+    assertion(sk, rp_id, ns, preimage, user_present, "webauthn.get")
+}
+
+/// the same envelope with a caller-chosen clientData `type` (a
+/// `webauthn.create` must NOT verify as a possession proof).
+pub fn passkey_proof_typed(
+    sk: &p256::ecdsa::SigningKey,
+    rp_id: &str,
+    ns: &[u8],
+    preimage: &[u8],
+    client_type: &str,
+) -> Vec<u8> {
+    assertion(sk, rp_id, ns, preimage, true, client_type)
+}
+
+fn assertion(
+    sk: &p256::ecdsa::SigningKey,
+    rp_id: &str,
+    ns: &[u8],
+    preimage: &[u8],
+    user_present: bool,
+    client_type: &str,
+) -> Vec<u8> {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use p256::ecdsa::{Signature, signature::Signer as _};
+    use sha2::{Digest as _, Sha256};
+    let challenge = crate::webauthn_challenge(ns, preimage);
+    let client_data_json = format!(
+        r#"{{"type":"{client_type}","challenge":"{}","origin":"https://{rp_id}"}}"#,
+        URL_SAFE_NO_PAD.encode(challenge)
+    )
+    .into_bytes();
+    let mut authenticator_data = Vec::new();
+    authenticator_data.extend_from_slice(&Sha256::digest(rp_id.as_bytes()));
+    authenticator_data.push(if user_present { 0x01 } else { 0 });
+    authenticator_data.extend_from_slice(&0u32.to_be_bytes()); // signCount
+    let mut signed = authenticator_data.clone();
+    signed.extend_from_slice(&Sha256::digest(&client_data_json));
+    // RustCrypto signs deterministically (RFC6979), low-S; `.to_bytes()` is raw R‖S.
+    let sig: Signature = sk.sign(&signed);
+    crate::webauthn_proof(&authenticator_data, &client_data_json, &sig.to_bytes())
 }
