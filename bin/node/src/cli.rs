@@ -431,6 +431,22 @@ fn detect_platform_sandbox() -> Option<config::SandboxToml> {
 fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let name = &args.name;
     let explicit_dir = args.dir.is_some();
+    // the genesis wasm set. founding PINS it: every component is hashed into
+    // the descriptor (those hashes are IN the genesis fingerprint, so a node
+    // built against other bytes is a different network) and the same bytes are
+    // seeded into `<workspace>/modules` below.
+    //
+    // FIRST, before any directory is created: an absent or incomplete bundle is
+    // the one refusal that has nothing to do with the flags, and a founding
+    // that dies after `create_dir_all` leaves an orphan workspace holding a
+    // freshly minted `identity.key` behind on every attempt.
+    let modules_src = match args.modules {
+        Some(src) => src,
+        None => config::modules_dir()?,
+    };
+    let wasm_ids = topology::TOPOLOGY.wasm_ids(topology::PRODUCTION);
+    let hashes = config::hash_bundle(&modules_src, &wasm_ids)
+        .map_err(|e| format!("{e} — pass --modules <dir> holding every <id>.component.wasm"))?;
     // the workspace dir: `--dir` is the explicit escape hatch; the default is
     // the registry — `~/.ducktape/workspaces/<chain-id>/` — so the network is
     // addressable by `-n <chain-id>` (run/invite/list) from the moment it is
@@ -495,28 +511,25 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         plumbing.sandbox = detect_platform_sandbox();
     }
 
-    // the genesis wasm set. founding PINS it: every component is hashed into
-    // the descriptor (those hashes are IN the genesis fingerprint, so a node
-    // built against other bytes is a different network) and the SAME bytes are
-    // copied into `<workspace>/modules` — the bundle every boot seeds its code
-    // registry from and re-verifies against the descriptor.
-    let modules_src = match args.modules {
-        Some(dir) => dir,
-        None => config::modules_dir()?,
-    };
-    // by id, so a bundle missing several components always names the same one
-    // first — the operator fixes a stable list, not a topology-order lottery.
-    let mut wasm_ids = topology::TOPOLOGY.wasm_ids(topology::PRODUCTION);
-    wasm_ids.sort_unstable();
-    let hashes = config::hash_bundle(&modules_src, &wasm_ids)
-        .map_err(|e| format!("{e} — pass --modules <dir> holding every <id>.component.wasm"))?;
+    // seed the bundle the node boots from: the SAME bytes just hashed, under
+    // the names the boot path reads (`<workspace>/modules/<id>.component.wasm`).
+    //
+    // `--modules <ws>/modules` — the flow the "delete the file to re-found"
+    // refusal above invites — makes source and destination the same file, and
+    // `std::fs::copy(p, p)` returns `Ok(0)` after TRUNCATING it. Those bytes
+    // are already where they belong, so the copy has nothing to do. Both paths
+    // exist by here (one was just created, the other was just read from), so
+    // neither `canonicalize` can fail into a false match.
     let bundle = dir.join("modules");
     std::fs::create_dir_all(&bundle)?;
-    for id in &wasm_ids {
-        std::fs::copy(
-            config::component_path(&modules_src, id),
-            config::component_path(&bundle, id),
-        )?;
+    let bundle_is_the_source = modules_src.canonicalize().ok() == bundle.canonicalize().ok();
+    if !bundle_is_the_source {
+        for id in hashes.keys() {
+            std::fs::copy(
+                config::component_path(&modules_src, id),
+                config::component_path(&bundle, id),
+            )?;
+        }
     }
     let mut modules = Vec::with_capacity(hashes.len());
     for (id, hash) in &hashes {

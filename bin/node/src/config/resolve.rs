@@ -167,10 +167,16 @@ pub fn component_path(dir: &Path, id: &str) -> PathBuf {
 
 /// sha256 every `<id>.component.wasm` in `dir` for `ids`; a missing file names
 /// its path, because the operator's next move is to look at that directory.
+///
+/// The walk is BY ID, not in the caller's selection order, so a bundle missing
+/// several components always names the same one first — the operator fixes a
+/// stable list instead of chasing a topology-order lottery one file at a time.
 pub fn hash_bundle(dir: &Path, ids: &[&str]) -> Result<BTreeMap<String, [u8; 32]>, String> {
     use sha2::Digest as _;
+    let mut ids = ids.to_vec();
+    ids.sort_unstable();
     let mut out = BTreeMap::new();
-    for id in ids {
+    for id in &ids {
         let path = component_path(dir, id);
         let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
         out.insert((*id).to_string(), sha2::Sha256::digest(&bytes).into());
@@ -1312,9 +1318,11 @@ mod tests {
         let err = resolve(&cfg).expect_err("an empty bundle dir is refused");
         // the refusal names the FULL path of the first component it could not
         // read — an operator pointed at the wrong directory needs the path,
-        // not a bare module id.
-        let first = topology::TOPOLOGY.wasm_ids(topology::PRODUCTION)[0];
-        let missing = component_path(&modules, first);
+        // not a bare module id. `hash_bundle` walks BY ID, so "first" is the
+        // alphabetically first wasm module, not the first in topology order.
+        let mut ids = topology::TOPOLOGY.wasm_ids(topology::PRODUCTION);
+        ids.sort_unstable();
+        let missing = component_path(&modules, ids[0]);
         assert!(err.contains(&missing.display().to_string()), "{err}");
     }
 

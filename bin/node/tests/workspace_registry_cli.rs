@@ -249,6 +249,45 @@ fn init_writes_module_hashes_and_the_bundle() {
     }
 }
 
+/// re-founding a workspace from ITS OWN bundle — the flow the "delete the file
+/// to re-found from scratch" refusal invites — points `--modules` at the very
+/// directory `init` seeds. `std::fs::copy(p, p)` returns `Ok(0)` and TRUNCATES
+/// on Linux, so a blind copy would zero every component AFTER hashing it: init
+/// reports success and the node refuses its first boot against bytes that no
+/// longer exist. Bytes, not existence, is what this asserts.
+#[test]
+fn re_founding_from_its_own_bundle_keeps_the_components() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    let found = |modules: &Path| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_ducktape"))
+            .args(["node", "init", "--name", "refound", "--primary-coordinator", "none", "--dir"])
+            .arg(&ws)
+            .args(["--listen", "127.0.0.1:0", "--advertised", "127.0.0.1:1", "--modules"])
+            .arg(modules)
+            .output()
+            .expect("run ducktape")
+    };
+    let out = found(&fixtures());
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let bundle = ws.join("modules");
+    std::fs::remove_file(ws.join("network.toml")).expect("un-found the network");
+    let out = found(&bundle);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let d = workspace_config::NetworkDescriptor::load(&ws.join("network.toml")).unwrap();
+    assert!(!d.modules.is_empty());
+    for m in &d.modules {
+        let name = format!("{}.component.wasm", m.id);
+        assert_eq!(
+            std::fs::read(bundle.join(&name)).expect("read the re-founded component"),
+            std::fs::read(fixtures().join(&name)).expect("read the fixture component"),
+            "{name} did not survive a re-found from its own bundle"
+        );
+    }
+}
+
 /// a bundle missing a component is named by the file the operator has to go
 /// look for — not by a hash mismatch three boots later.
 #[test]
