@@ -154,6 +154,11 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Raise the node's inherited open-file soft limit before opening module stores.
 libc = "0.2"
+# the `agent install` checklist (src/executors.rs). default-features off: the
+# editor/password/history extras are prompts this binary does not have, and
+# each carries its own dependency. What is left is 4 crates, `console` being
+# the terminal one clap's own graph already pulls.
+dialoguer = { version = "0.12.0", default-features = false }
 
 # App Nap opt-out (see main.rs `hold_macos_activity`): a desktop-spawned node
 # lives in the GUI app's coalition and would otherwise be timer-coalesced the
