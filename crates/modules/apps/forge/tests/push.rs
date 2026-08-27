@@ -170,6 +170,7 @@ fn push_branch_msg(branch: &str, prev: Option<&[u8]>, new: &[u8], digest: &[u8])
                 new_oid: Some(new.to_vec()),
             }],
             pack_digest: Some(digest.to_vec()),
+            cert: None,
         }),
     }
 }

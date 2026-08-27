@@ -41,6 +41,9 @@ chat = { workspace = true }
 # it belongs to, so the SAME human's node-key `git push` and user-key app merge
 # land on one owner principal (see `ForgeState::principal_of_origin`).
 identity = { workspace = true }
+# `git push --signed`: the push certificate's OpenSSH signature is verified
+# in consensus (`pushcert::signer`), by every validator.
+keyscheme = { workspace = true }
 async-trait = { workspace = true }
 # the node's log plane — `materialize`'s pack-missing / refused-advance warnings
 # must reach the app's Logs tab and `RUST_LOG`, which a `println!` never does.
@@ -61,6 +64,8 @@ guest-adapter = { path = "../../../guests/guest-adapter", optional = true }
 # enable its own features for its test targets. This self dev-dependency is how
 # cargo lets them opt in, and it never reaches the production build.
 forge = { path = ".", features = ["testkit"] }
+# the SSH signer the signed-push tests mint certificates with.
+keyscheme = { workspace = true, features = ["testkit"] }
 # dev-only: prove forge's root composes into the global root-hash. not a
 # production dep — a module still depends on sdk + its interface only.
 host = { workspace = true }

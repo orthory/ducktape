@@ -53,6 +53,9 @@ saga = { workspace = true }
 # ForgeMsg::PushRefs / ForgeQuery::HeadOf onto the actor lane (the ONE forge-specific
 # route pair; every other route stays module-agnostic opaque json).
 forge = { workspace = true }
+# `git push --signed`: the bridge dearmors the push certificate's OpenSSH
+# signature and refuses a bad one early (consensus re-verifies regardless).
+keyscheme = { workspace = true }
 # duckfs wire/path/object helpers used by the daemon's HTTP and workspace
 # adapter surfaces without depending on the module adapter re-export.
 duckfs-core = { workspace = true }

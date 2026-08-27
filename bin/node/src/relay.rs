@@ -357,6 +357,7 @@ mod tests {
                 repo: "ducktape".into(),
                 updates: Vec::new(),
                 pack_digest: Some(digest.to_vec()),
+                cert: None,
             }),
         };
         let frame = node::encode_frame(&author, 1, &msg);
@@ -376,6 +377,7 @@ mod tests {
                 repo: "ducktape".into(),
                 updates: Vec::new(),
                 pack_digest: Some(digest.to_vec()),
+                cert: None,
             }),
         };
         assert_eq!(
