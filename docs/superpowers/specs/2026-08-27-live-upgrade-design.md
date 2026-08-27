@@ -117,8 +117,8 @@ One naming convention, already in use by the kernel fixtures:
 - `crates/kernel/host/tests/fixtures/` — the repo copy, refreshed by `make
   wasm-modules` (already the case). Tests and the e2e harness point here.
 - `~/.ducktape/modules/` — the operator's managed dir, populated by `make
-  install-node` and `ops/dev.sh` with one `cp` loop over `BUILDER_MODULES`
-  (the same shape as `~/.ducktape/executors`).
+  install-node` with one `cp` loop over `BUILDER_MODULES` (the same shape as
+  `~/.ducktape/executors`; `ops/dev.sh` does not fill it).
 - `<workspace>/modules/` — the network's own bundle, written by `ducktape
   node init` (below), same id-named files. The loader verifies
   `sha256(bytes) == descriptor hash` on every read, so no content-addressed

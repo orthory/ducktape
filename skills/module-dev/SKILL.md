@@ -17,11 +17,12 @@ External/third-party authoring rides `ducktape-quack`, not this path.
 
 A module in `topology::PRODUCTION` (`bin/node`'s `MODULE_IDS` IS that
 selection) joins the genesis set: every existing workspace fails closed, dev
-networks re-genesis, and `GENESIS_ROOT_HASH` moves. Post-genesis admission (lifecycle
-`ScheduleRegister`) exists, but the recovery/state-sync composers still
-enumerate a fixed module set, so restore past an admitted module's first
-checkpoint fails closed. A new module today ⇒ a new genesis — get that agreed
-before wiring.
+networks re-genesis, and `GENESIS_ROOT_HASH` moves. Post-genesis admission
+(lifecycle `ScheduleRegister`) is the path that does NOT move the root:
+`adopt_admitted_modules` composes every registry id on restore and sync, and
+a module admitted after the last checkpoint restores empty and is rebuilt by
+replay — no test drives that path yet (live-upgrade part 4). A genesis module
+⇒ a new genesis — get that agreed before wiring.
 Experiments that shouldn't pay this cost live unwired in `crates/labs`.
 
 ## 1. Native crate — `crates/modules/{apps|system}/<id>`
