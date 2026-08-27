@@ -8,10 +8,14 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
 use commonware_cryptography::ed25519;
 use nat_traversal::NodeKey;
 use wireguard::effect::PeerTunnelConfig;
+use wireguard::wire_schema::socket_addr;
 use wireguard::{Endpoint, MeshVersion, PortPolicy, ValidatorIdentity, X25519PublicKey};
+
+use crate::wire::{key, keys, result_socket_addr};
 
 /// How long each coordinator interaction (reflexive discovery, lookup) may
 /// take before the host resolver moves on. Declared HERE because the
@@ -25,26 +29,54 @@ pub const PUNCH_STEP_TIMEOUT: Duration = Duration::from_secs(1);
 pub const PUNCH_TRIES: usize = 3;
 
 /// How a peer's WireGuard endpoint was resolved.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub enum Resolution {
     /// Dial the advertised endpoint as-is (public or already-reachable
     /// address; also the no-coordinator dev path).
     Advertised,
     /// Hole-punch succeeded: dial the peer's punched reflexive.
-    Punched(SocketAddr),
+    Punched(
+        #[borsh(schema(with_funcs(
+            declaration = "socket_addr::declaration",
+            definitions = "socket_addr::definitions"
+        )))]
+        SocketAddr,
+    ),
 }
 
 /// Correlates a started operation (an [`Effect`] that will produce an
 /// outcome) with the [`Event`] that carries the outcome back. Minted by the
 /// machine, monotonic within its life.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 pub struct ReqId(pub u64);
 
 /// Correlates a host command that awaits a reply (an invite install, the
 /// coordinated-invite bootstrap) with the [`Effect::ReplyInstall`] /
 /// [`Effect::ReplyIntro`] that answers it. Minted by the HOST — the machine
 /// only threads it through, never interprets it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 pub struct CmdToken(pub u64);
 
 /// Everything the machine decides over, resolved ONCE by the host and handed
@@ -88,16 +120,26 @@ pub struct MachineConfig {
 }
 
 /// A valset cutover (or boot) the machine must retarget to.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub struct MeshEpochEvent {
     pub epoch: u64,
     /// The epoch's consensus members' ed25519 public keys, this node
     /// included. Order is irrelevant — every derived commitment sorts.
+    #[borsh(
+        serialize_with = "keys::serialize",
+        deserialize_with = "keys::deserialize",
+        schema(with_funcs(declaration = "keys::declaration", definitions = "keys::definitions"))
+    )]
     pub members: Vec<ed25519::PublicKey>,
     /// The epoch's STANDBY identities (the valset resident tier): registered
     /// keys the pre-warm layer tunnels toward ahead of their activation.
     /// Never part of the epoch's `ActiveValidatorSet` — a standby that never
     /// shows up costs the epoch nothing.
+    #[borsh(
+        serialize_with = "keys::serialize",
+        deserialize_with = "keys::deserialize",
+        schema(with_funcs(declaration = "keys::declaration", definitions = "keys::definitions"))
+    )]
     pub standbys: Vec<ed25519::PublicKey>,
     /// The consensus view at the cutover; the freshness clock for expiries.
     pub current_view: u64,
@@ -106,10 +148,18 @@ pub struct MeshEpochEvent {
 /// Machine -> node observability and mesh-send surface. (The host executor
 /// wraps [`Effect::MeshSend`] into [`ReachabilityEvent::Send`] so the node's
 /// event pump keeps its single channel.)
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub enum ReachabilityEvent {
     /// Send `bytes` to `to` on the reachability channel.
     Send {
+        #[borsh(
+            serialize_with = "key::serialize",
+            deserialize_with = "key::deserialize",
+            schema(with_funcs(
+                declaration = "key::declaration",
+                definitions = "key::definitions"
+            ))
+        )]
         to: ed25519::PublicKey,
         bytes: Vec<u8>,
     },
@@ -126,6 +176,14 @@ pub enum ReachabilityEvent {
     /// failed) or sent traffic it had no business sending. The mesh keeps
     /// going without it; the node surfaces the warning.
     PeerFailed {
+        #[borsh(
+            serialize_with = "key::serialize",
+            deserialize_with = "key::deserialize",
+            schema(with_funcs(
+                declaration = "key::declaration",
+                definitions = "key::definitions"
+            ))
+        )]
         peer: ed25519::PublicKey,
         reason: String,
     },
@@ -170,6 +228,14 @@ pub enum ReachabilityEvent {
     /// restart, an address rebind): its tunnel was re-pointed in place as a
     /// layer over the applied base, leaving the rest of the mesh untouched.
     PeerReadvertised {
+        #[borsh(
+            serialize_with = "key::serialize",
+            deserialize_with = "key::deserialize",
+            schema(with_funcs(
+                declaration = "key::declaration",
+                definitions = "key::definitions"
+            ))
+        )]
         peer: ed25519::PublicKey,
         interface: String,
     },
@@ -178,12 +244,32 @@ pub enum ReachabilityEvent {
     /// produced a dialable address for a peer, and the live interface was
     /// reconfigured with it in place.
     PeerEndpointResolved {
+        #[borsh(
+            serialize_with = "key::serialize",
+            deserialize_with = "key::deserialize",
+            schema(with_funcs(
+                declaration = "key::declaration",
+                definitions = "key::definitions"
+            ))
+        )]
         peer: ed25519::PublicKey,
+        #[borsh(schema(with_funcs(
+            declaration = "socket_addr::declaration",
+            definitions = "socket_addr::definitions"
+        )))]
         endpoint: SocketAddr,
     },
     /// A join-window invite peer merged onto the interface (see
     /// [`Event::InstallInvitePeer`]).
     InvitePeerInstalled {
+        #[borsh(
+            serialize_with = "key::serialize",
+            deserialize_with = "key::deserialize",
+            schema(with_funcs(
+                declaration = "key::declaration",
+                definitions = "key::definitions"
+            ))
+        )]
         peer: ed25519::PublicKey,
         interface: String,
     },
@@ -194,6 +280,10 @@ pub enum ReachabilityEvent {
     /// restore; `peer` is the owner's raw ed25519 identity bytes.
     ControlEndpointObserved {
         peer: ValidatorIdentity,
+        #[borsh(schema(with_funcs(
+            declaration = "socket_addr::declaration",
+            definitions = "socket_addr::definitions"
+        )))]
         control_endpoint: SocketAddr,
     },
 }
@@ -201,7 +291,7 @@ pub enum ReachabilityEvent {
 /// Everything that can happen TO the machine: the node's commands, delivered
 /// gossip, the clock's ticks, and the outcomes of operations the machine
 /// itself started.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub enum Event {
     /// Boot or epoch cutover: (re)build the mesh for this member set. A
     /// retarget SUPERSEDES any epoch still assembling — in-flight state and
@@ -215,6 +305,14 @@ pub enum Event {
     },
     /// A reachability-channel message arrived from a mesh peer.
     Deliver {
+        #[borsh(
+            serialize_with = "key::serialize",
+            deserialize_with = "key::deserialize",
+            schema(with_funcs(
+                declaration = "key::declaration",
+                definitions = "key::definitions"
+            ))
+        )]
         from: ed25519::PublicKey,
         bytes: Vec<u8>,
     },
@@ -246,12 +344,24 @@ pub enum Event {
         token: CmdToken,
         /// The counterparty's ed25519 identity (its overlay ULA derives from
         /// this).
+        #[borsh(
+            serialize_with = "key::serialize",
+            deserialize_with = "key::deserialize",
+            schema(with_funcs(
+                declaration = "key::declaration",
+                definitions = "key::definitions"
+            ))
+        )]
         peer: ed25519::PublicKey,
         /// The counterparty's X25519 WireGuard key.
         wireguard_public_key: X25519PublicKey,
         /// Where to dial it: the blob's advertised endpoint on the joiner
         /// side; the intro datagram's observed source on the inviter side
         /// (WireGuard roams to the authenticated initiation either way).
+        #[borsh(schema(with_funcs(
+            declaration = "socket_addr::declaration",
+            definitions = "socket_addr::definitions"
+        )))]
         endpoint: SocketAddr,
     },
     /// Resolve a coordinated invite's inviter through the rendezvous plane,
@@ -260,6 +370,14 @@ pub enum Event {
     /// The final outcome answers through [`Effect::ReplyIntro`].
     BootstrapCoordinatedInvitePeer {
         token: CmdToken,
+        #[borsh(
+            serialize_with = "key::serialize",
+            deserialize_with = "key::deserialize",
+            schema(with_funcs(
+                declaration = "key::declaration",
+                definitions = "key::definitions"
+            ))
+        )]
         peer: ed25519::PublicKey,
         wireguard_public_key: X25519PublicKey,
         intro: Vec<u8>,
@@ -267,6 +385,10 @@ pub enum Event {
     /// Send one datagram over the resolver socket. Used for invite intro ACKs
     /// after the receiving side has installed the join-window peer.
     SendResolverDatagram {
+        #[borsh(schema(with_funcs(
+            declaration = "socket_addr::declaration",
+            definitions = "socket_addr::definitions"
+        )))]
         endpoint: SocketAddr,
         bytes: Vec<u8>,
     },
@@ -278,6 +400,10 @@ pub enum Event {
     /// Outcome of an [`Effect::RendezvousStart`].
     RendezvousResolved {
         req: ReqId,
+        #[borsh(schema(with_funcs(
+            declaration = "result_socket_addr::declaration",
+            definitions = "result_socket_addr::definitions"
+        )))]
         outcome: Result<SocketAddr, String>,
     },
     /// Outcome of an [`Effect::UdpSendAwait`]: the first non-rendezvous
@@ -300,10 +426,18 @@ pub enum Event {
 
 /// Everything the machine asks the host to DO. Performed in order; the
 /// variants that produce outcomes name the event that carries them back.
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub enum Effect {
     /// Send `bytes` to `to` on the reachability mesh channel.
     MeshSend {
+        #[borsh(
+            serialize_with = "key::serialize",
+            deserialize_with = "key::deserialize",
+            schema(with_funcs(
+                declaration = "key::declaration",
+                definitions = "key::definitions"
+            ))
+        )]
         to: ed25519::PublicKey,
         bytes: Vec<u8>,
     },
@@ -328,6 +462,10 @@ pub enum Effect {
     ResolveStart {
         req: ReqId,
         peer: NodeKey,
+        #[borsh(schema(with_funcs(
+            declaration = "socket_addr::declaration",
+            definitions = "socket_addr::definitions"
+        )))]
         advertised: SocketAddr,
     },
     /// Resolve `peer` strictly through rendezvous (no trusted advertised
@@ -336,6 +474,10 @@ pub enum Effect {
     /// Send one datagram from the resolver's underlay socket, fire and
     /// forget.
     UdpSend {
+        #[borsh(schema(with_funcs(
+            declaration = "socket_addr::declaration",
+            definitions = "socket_addr::definitions"
+        )))]
         endpoint: SocketAddr,
         bytes: Vec<u8>,
     },
@@ -344,6 +486,10 @@ pub enum Effect {
     /// [`Event::DatagramReplied`].
     UdpSendAwait {
         req: ReqId,
+        #[borsh(schema(with_funcs(
+            declaration = "socket_addr::declaration",
+            definitions = "socket_addr::definitions"
+        )))]
         endpoint: SocketAddr,
         bytes: Vec<u8>,
         timeout_ms: u64,

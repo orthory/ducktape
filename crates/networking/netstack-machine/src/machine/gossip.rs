@@ -9,10 +9,10 @@ use commonware_cryptography::ed25519;
 use wireguard::effect::PeerTunnelConfig;
 use wireguard::{EndpointAdvertisement, SignedEndpointRecord, UpgradeError, ValidatorIdentity};
 
+use crate::binding;
 use crate::contract::{Effect, Resolution};
 use crate::epoch::{Admission, EpochState, MemberRecordVerdict, Phase};
 use crate::msg::ReachabilityMsg;
-use crate::binding;
 
 use super::pending::{LayersFollowUp, PendingOp};
 use super::{Driver, KEEPALIVE_SECONDS, short};
@@ -142,7 +142,11 @@ impl Driver {
         // steady re-offers cannot heal-bomb us.
         state.request_heal(owner, self.nudges);
         if let Err(err) = signed.record.check(&self.config.port_policy) {
-            self.fail_peer(state, via, &format!("re-advertised record refused: {err:?}"));
+            self.fail_peer(
+                state,
+                via,
+                &format!("re-advertised record refused: {err:?}"),
+            );
             return;
         }
         let admission = state.admit_readvertisement(owner, signed.clone());
@@ -210,8 +214,10 @@ impl Driver {
                     req,
                     peer: binding::node_key(owner),
                 });
-                self.pending
-                    .insert(req, PendingOp::ReadvertisedRendezvous { owner, signed, via });
+                self.pending.insert(
+                    req,
+                    PendingOp::ReadvertisedRendezvous { owner, signed, via },
+                );
             }
         }
     }

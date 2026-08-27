@@ -1,8 +1,11 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use arrayvec::ArrayVec;
+use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize, BorshSchema,
+)]
 pub struct NodeKey(pub [u8; 32]);
 
 #[derive(Clone, Debug, PartialEq, Eq)]

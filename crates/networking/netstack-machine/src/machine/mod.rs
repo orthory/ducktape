@@ -212,15 +212,20 @@ impl Machine {
                 peer,
                 wireguard_public_key,
                 intro,
-            } => self
-                .driver
-                .bootstrap_coordinated_invite_peer(token, peer, wireguard_public_key, intro),
+            } => self.driver.bootstrap_coordinated_invite_peer(
+                token,
+                peer,
+                wireguard_public_key,
+                intro,
+            ),
             Event::SendResolverDatagram { endpoint, bytes } => {
                 self.driver.send_resolver_datagram(endpoint, bytes)
             }
             Event::Resolved { req, outcome } => self.on_resolved(req, outcome),
             Event::RendezvousResolved { req, outcome } => self.on_rendezvous_resolved(req, outcome),
-            Event::DatagramReplied { req, outcome } => self.driver.on_datagram_replied(req, outcome),
+            Event::DatagramReplied { req, outcome } => {
+                self.driver.on_datagram_replied(req, outcome)
+            }
             Event::WgApplied { req, outcome } => self.on_wg_applied(req, outcome)?,
             Event::Shutdown => self.driver.shutdown(),
         }
@@ -289,7 +294,8 @@ impl Machine {
                 let Some(state) = self.epoch.as_mut() else {
                     return;
                 };
-                self.driver.standby_prewarm_endpoint_resolved(state, op, outcome)
+                self.driver
+                    .standby_prewarm_endpoint_resolved(state, op, outcome)
             }
             PendingOp::MemberPrewarmEndpoint { record, advertised } => {
                 let Some(state) = self.epoch.as_mut() else {
@@ -309,7 +315,10 @@ impl Machine {
             | PendingOp::PeerRendezvous { .. }
             | PendingOp::InviteRendezvous { .. }
             | PendingOp::IntroAck { .. } => {
-                debug_assert!(false, "an endpoint resolution answered a non-resolve operation");
+                debug_assert!(
+                    false,
+                    "an endpoint resolution answered a non-resolve operation"
+                );
             }
         }
     }
@@ -365,7 +374,10 @@ impl Machine {
             | PendingOp::MemberPrewarmEndpoint { .. }
             | PendingOp::PeerEndpoint { .. }
             | PendingOp::IntroAck { .. } => {
-                debug_assert!(false, "a rendezvous resolution answered a non-rendezvous operation");
+                debug_assert!(
+                    false,
+                    "a rendezvous resolution answered a non-rendezvous operation"
+                );
             }
         }
     }
@@ -373,7 +385,11 @@ impl Machine {
     /// The in-flight interface push settled: mirror what a landed push
     /// means for the interface (live, with at least an empty base), then
     /// settle whatever the push was FOR.
-    fn on_wg_applied(&mut self, req: ReqId, outcome: Result<(), String>) -> Result<(), UpgradeError> {
+    fn on_wg_applied(
+        &mut self,
+        req: ReqId,
+        outcome: Result<(), String>,
+    ) -> Result<(), UpgradeError> {
         let Some((expected, cont)) = self.driver.wg.take() else {
             tracing::debug!(
                 target: "ducktape::reachability",
@@ -450,7 +466,12 @@ impl Driver {
         self.effects.push(Effect::Observe(event));
     }
 
-    pub(crate) fn send_msg(&mut self, state: &EpochState, to: ValidatorIdentity, msg: &ReachabilityMsg) {
+    pub(crate) fn send_msg(
+        &mut self,
+        state: &EpochState,
+        to: ValidatorIdentity,
+        msg: &ReachabilityMsg,
+    ) {
         let Some(pk) = state.route_to(to) else {
             return;
         };
@@ -487,7 +508,11 @@ impl Driver {
     /// boot restore), so the mesh address book upstream is never churned by
     /// re-gossip of an unchanged address. own endpoint is skipped — the node
     /// does not dial itself.
-    pub(crate) fn observe_control_endpoint(&mut self, owner: ValidatorIdentity, endpoint: Endpoint) {
+    pub(crate) fn observe_control_endpoint(
+        &mut self,
+        owner: ValidatorIdentity,
+        endpoint: Endpoint,
+    ) {
         if owner == self.me {
             return;
         }
@@ -512,7 +537,10 @@ impl Driver {
     /// which) and park what its outcome settles. At most one push is ever
     /// in flight: the host answers it within this very step cascade.
     pub(crate) fn start_wg_push(&mut self, peers: Vec<PeerTunnelConfig>, cont: WgCont) {
-        debug_assert!(self.wg.is_none(), "a second interface push cannot start mid-flight");
+        debug_assert!(
+            self.wg.is_none(),
+            "a second interface push cannot start mid-flight"
+        );
         let req = self.mint_req();
         let bring_up = !self.interface_live;
         self.wg = Some((req, cont));
@@ -680,7 +708,10 @@ impl Driver {
         if !applied {
             return;
         }
-        self.request_epoch_layers_push(state, LayersFollowUp::EndpointWriteThrough { peer, endpoint });
+        self.request_epoch_layers_push(
+            state,
+            LayersFollowUp::EndpointWriteThrough { peer, endpoint },
+        );
     }
 
     /// The shared settlement for a live-accepted record's endpoint resolve

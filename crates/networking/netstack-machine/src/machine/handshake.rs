@@ -215,7 +215,11 @@ impl Driver {
     /// failed resolve stays terminal for THIS attempt — no relay — but a
     /// per-peer backoff lets a later `Nudge` retry once the peer has had
     /// time to register, up to a bounded per-epoch budget.
-    fn request_peer_rendezvous_fallback(&mut self, state: &mut EpochState, peer: ValidatorIdentity) {
+    fn request_peer_rendezvous_fallback(
+        &mut self,
+        state: &mut EpochState,
+        peer: ValidatorIdentity,
+    ) {
         if self.config.coordinators.is_empty() {
             return;
         }

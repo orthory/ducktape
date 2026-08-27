@@ -35,7 +35,8 @@ impl Driver {
             token,
             peer: peer.clone(),
         };
-        if let Err(reason) = self.begin_invite_tunnel(&peer, wireguard_public_key, endpoint, epoch, cont)
+        if let Err(reason) =
+            self.begin_invite_tunnel(&peer, wireguard_public_key, endpoint, epoch, cont)
         {
             // on failure the interface keeps whatever configuration it had;
             // the caller decides whether to retry.
@@ -166,7 +167,8 @@ impl Driver {
             endpoint,
             intro,
         };
-        if let Err(reason) = self.begin_invite_tunnel(&peer, wireguard_public_key, endpoint, epoch, cont)
+        if let Err(reason) =
+            self.begin_invite_tunnel(&peer, wireguard_public_key, endpoint, epoch, cont)
         {
             self.effects.push(Effect::ReplyIntro {
                 token,

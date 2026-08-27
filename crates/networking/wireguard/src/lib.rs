@@ -10,12 +10,14 @@
 //! userspace backend in production).
 
 pub mod effect;
+pub mod wire_schema;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryFrom;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 
+use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer, Verifier, ed25519};
 use serde::{Deserialize, Serialize};
@@ -77,13 +79,41 @@ pub struct Root(pub [u8; 32]);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct AdmissionRoot(pub [u8; 32]);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 pub struct MeshVersion(pub [u8; 32]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PolicyHash(pub [u8; 32]);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 pub struct ValidatorIdentity(pub [u8; 32]);
 
 impl TryFrom<&[u8]> for ValidatorIdentity {
@@ -102,7 +132,21 @@ impl TryFrom<&[u8]> for ValidatorIdentity {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 pub struct X25519PublicKey(pub [u8; 32]);
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -501,7 +545,21 @@ pub fn compute_mesh_version(records: &[EndpointRecord]) -> Result<MeshVersion, U
     Ok(MeshVersion(hash32(&out)))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 pub struct AllowedIp {
     pub addr: IpAddr,
     pub cidr: u8,

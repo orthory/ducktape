@@ -6,7 +6,7 @@
 //! executes the steps and sends the messages this module decides, which is
 //! what keeps the transitions testable without a transport or a clock.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
 use commonware_cryptography::ed25519;
@@ -17,8 +17,8 @@ use wireguard::{
     TunnelUpgradeResponse, ValidatorIdentity,
 };
 
-use crate::msg::ReachabilityMsg;
 use crate::contract::{COORD_STEP_TIMEOUT, PUNCH_STEP_TIMEOUT, PUNCH_TRIES};
+use crate::msg::ReachabilityMsg;
 
 /// Nudge ticks between two heals of the SAME peer.
 ///
@@ -359,7 +359,7 @@ pub(crate) struct EpochState {
     pub(crate) peers: Vec<ValidatorIdentity>,
     /// The epoch's standby identities (never in `set`).
     pub(crate) standbys: Vec<ValidatorIdentity>,
-    pub(crate) pk_of: HashMap<ValidatorIdentity, ed25519::PublicKey>,
+    pub(crate) pk_of: BTreeMap<ValidatorIdentity, ed25519::PublicKey>,
     /// The accepted nonce per pre-warm counterparty (standby records on a
     /// member, member records on a standby). Higher nonce wins — the live
     /// re-advertisement rule the phase-A member set deliberately does not
@@ -387,7 +387,7 @@ pub(crate) struct EpochState {
     /// the standby's record when that identity is not a member (the lobby
     /// ingress a parked joiner connects under, or the standby's own key) —
     /// a standby is not necessarily dialable under its record identity.
-    routes: HashMap<ValidatorIdentity, ed25519::PublicKey>,
+    routes: BTreeMap<ValidatorIdentity, ed25519::PublicKey>,
     /// One strictly-monotonic counter for EVERYTHING this identity signs in
     /// the epoch — replay keys are `(identity, epoch, nonce)`, and the
     /// advert duplicate rule wants strictly-increasing nonces too. Seeded
@@ -413,16 +413,16 @@ pub(crate) struct EpochState {
     /// (a record once our advert signed, an advert once the view verified) —
     /// i.e. peers still missing our half of the exchange. The next nudge
     /// answers them ([`Self::heal_sends`]) and clears this.
-    heal_requests: HashSet<ValidatorIdentity>,
+    heal_requests: BTreeSet<ValidatorIdentity>,
     /// The nudge tick each peer was last healed at — the cooldown clock that
     /// keeps two settled nodes from healing each other every tick forever.
-    heal_backoff: HashMap<ValidatorIdentity, u64>,
+    heal_backoff: BTreeMap<ValidatorIdentity, u64>,
     pub(crate) replay: ReplayCache,
     /// Requests that arrived before our own `MeshView` completed (the peer
     /// verified faster); drained the moment it does. Keyed by initiator so
     /// nudged re-offers of the same request collapse to one entry.
     pub(crate) pending_requests: BTreeMap<ValidatorIdentity, TunnelUpgradeRequest>,
-    pub(crate) handshakes: HashMap<ValidatorIdentity, PeerHandshake>,
+    pub(crate) handshakes: BTreeMap<ValidatorIdentity, PeerHandshake>,
     /// Relay slots keyed by `(initiator, responder)` for handshakes between
     /// two OTHER members.
     relayed: BTreeMap<(ValidatorIdentity, ValidatorIdentity), RelaySlot>,
@@ -433,7 +433,7 @@ pub(crate) struct EpochState {
     /// budget behind [`Self::claim_rendezvous_attempt`]. Fresh per epoch: a
     /// `Retarget` resets the budget.
     rendezvous_attempted: BTreeMap<ValidatorIdentity, (u64, u32)>,
-    pub(crate) failed: HashSet<ValidatorIdentity>,
+    pub(crate) failed: BTreeSet<ValidatorIdentity>,
 }
 
 impl EpochState {
@@ -446,7 +446,7 @@ impl EpochState {
         set: ActiveValidatorSet,
         peers: Vec<ValidatorIdentity>,
         standbys: Vec<ValidatorIdentity>,
-        pk_of: HashMap<ValidatorIdentity, ed25519::PublicKey>,
+        pk_of: BTreeMap<ValidatorIdentity, ed25519::PublicKey>,
         own_record: SignedEndpointRecord,
     ) -> Self {
         let mut records = BTreeMap::new();
@@ -465,23 +465,23 @@ impl EpochState {
             prewarm_peers: BTreeMap::new(),
             readvertised: BTreeMap::new(),
             readvertised_peers: BTreeMap::new(),
-            routes: HashMap::new(),
+            routes: BTreeMap::new(),
             nonce: own_record.record.nonce,
             own_record,
             own_standing: OwnRecordStanding::Locked,
             records,
             adverts: BTreeMap::new(),
             phase: Phase::Records,
-            heal_requests: HashSet::new(),
-            heal_backoff: HashMap::new(),
+            heal_requests: BTreeSet::new(),
+            heal_backoff: BTreeMap::new(),
             replay: ReplayCache::default(),
             pending_requests: BTreeMap::new(),
-            handshakes: HashMap::new(),
+            handshakes: BTreeMap::new(),
             relayed: BTreeMap::new(),
             plans: BTreeMap::new(),
             overrides: BTreeMap::new(),
             rendezvous_attempted: BTreeMap::new(),
-            failed: HashSet::new(),
+            failed: BTreeSet::new(),
         }
     }
 
@@ -726,7 +726,9 @@ impl EpochState {
     /// The nonce of `owner`'s held post-lock re-advertisement, if any — the
     /// staleness guard a parked re-advertisement resumption checks against.
     pub(crate) fn readvertised_nonce(&self, owner: ValidatorIdentity) -> Option<u64> {
-        self.readvertised.get(&owner).map(|signed| signed.record.nonce)
+        self.readvertised
+            .get(&owner)
+            .map(|signed| signed.record.nonce)
     }
 
     /// The freshest accepted pre-warm nonce for `owner`, if any — the
@@ -1515,7 +1517,10 @@ mod tests {
             "the record set is still open — plain phase-A admission decides"
         );
         state.phase = Phase::Adverts;
-        assert_eq!(state.judge_member_record(a, 99), MemberRecordVerdict::Behind);
+        assert_eq!(
+            state.judge_member_record(a, 99),
+            MemberRecordVerdict::Behind
+        );
         assert_eq!(
             state.judge_member_record(a, 100),
             MemberRecordVerdict::Behind,
@@ -1556,8 +1561,7 @@ mod tests {
             "an even fresher life supersedes in place"
         );
         assert_eq!(
-            state.records[&p].record.nonce,
-            100,
+            state.records[&p].record.nonce, 100,
             "the locked set never moves — the mesh version stands"
         );
     }

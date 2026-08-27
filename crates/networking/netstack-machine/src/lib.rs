@@ -23,6 +23,7 @@ mod epoch;
 pub mod machine;
 pub mod msg;
 pub mod store;
+pub mod wire;
 
 pub use contract::{
     COORD_STEP_TIMEOUT, CmdToken, Effect, Event, MachineConfig, MeshEpochEvent, PUNCH_STEP_TIMEOUT,

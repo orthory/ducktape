@@ -11,6 +11,8 @@ version.workspace = true
 # effect and stamps every step. This boundary is what phases 2-4 of the
 # netstack arc freeze, trace, and compile to wasm.
 [dependencies]
+borsh = { workspace = true, features = ["unstable__schema"] }
+commonware-codec = { workspace = true }
 commonware-cryptography = { workspace = true }
 # NodeKey only — the rendezvous RUNTIME stays host-side in `reachability`.
 nat-traversal = { workspace = true }

@@ -11,14 +11,13 @@
 //! anything else drains, so it is a singleton that never survives across
 //! foreign events.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
 use commonware_cryptography::ed25519;
 use wireguard::effect::PeerTunnelConfig;
 use wireguard::{
-    EndpointRecord, MeshVersion, MeshView, SignedEndpointRecord, ValidatorIdentity,
-    X25519PublicKey,
+    EndpointRecord, MeshVersion, MeshView, SignedEndpointRecord, ValidatorIdentity, X25519PublicKey,
 };
 
 use crate::contract::{CmdToken, MeshEpochEvent, ReqId};
@@ -162,7 +161,7 @@ pub(crate) struct PendingRestore {
     pub mesh_epoch: u64,
     pub records: Vec<EndpointRecord>,
     pub standby_records: Vec<SignedEndpointRecord>,
-    pub member_pk_of: HashMap<ValidatorIdentity, ed25519::PublicKey>,
+    pub member_pk_of: BTreeMap<ValidatorIdentity, ed25519::PublicKey>,
     pub endpoints: BTreeMap<ValidatorIdentity, Option<SocketAddr>>,
     pub outstanding: BTreeSet<ReqId>,
 }
