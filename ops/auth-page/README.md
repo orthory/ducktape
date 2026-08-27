@@ -86,7 +86,7 @@ Cloudflare Workers static assets; the `custom_domain` route makes wrangler
 create the DNS record and certificate in the zone.
 
 ```
-set -a; . ~/.config/cloudflare/ducktape-auth.env; set +a   # CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID
+npx wrangler@4 login                                       # once per machine (OAuth; headless: --browser=false, then curl the callback URL within 120 s)
 npx wrangler@4 deploy --config ops/auth-page/wrangler.toml
 node ops/auth-page/test.mjs                                # the pure helpers (fragment, DER→raw, SPKI→SEC1)
 ```

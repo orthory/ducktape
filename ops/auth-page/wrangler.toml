@@ -1,5 +1,5 @@
 # The WebAuthn relying-party origin. Static files only, no Worker code.
-#   CLOUDFLARE_API_TOKEN=… CLOUDFLARE_ACCOUNT_ID=… npx wrangler@4 deploy
+#   npx wrangler@4 login && npx wrangler@4 deploy --config ops/auth-page/wrangler.toml
 # `custom_domain = true` makes wrangler create the DNS record and the
 # certificate for the hostname in the same account's zone.
 name = "ducktape-auth"
