@@ -604,11 +604,11 @@ async fn codex_credential_proxies_to_the_openai_upstream() {
 /// stub stands for here is only that the pointer ARRIVES.
 const DELEGABLE: &str = "sched\u{1f}delegable";
 
-/// The injected gate: only the account `granted` may draw on the credential —
-/// the node's committed-record lookup, stubbed here. `wedged` stands in for a
-/// node that did not answer at all. A caller presenting [`DELEGABLE`] is
-/// admitted whoever it is, standing in for a real lender resolving that saga and
-/// finding a granted submitter.
+/// The injected gate: only the node `granted` may draw on the credential —
+/// the node's committed-state resolution, stubbed here. `wedged` stands in for
+/// a node that did not answer at all. A caller presenting [`DELEGABLE`] is
+/// admitted whoever it is, standing in for a real lender resolving that saga
+/// and finding a granted submitter.
 fn stub_grant_check() -> airlock::server::GrantCheck {
     std::sync::Arc::new(|question: airlock::server::GrantQuestion| {
         Box::pin(async move {
@@ -619,7 +619,7 @@ fn stub_grant_check() -> airlock::server::GrantCheck {
             if delegated {
                 return airlock::server::GrantAnswer::Granted;
             }
-            match question.caller.as_slice() {
+            match question.caller_node.as_slice() {
                 b"granted" => airlock::server::GrantAnswer::Granted,
                 b"wedged" => airlock::server::GrantAnswer::Undetermined,
                 _other => airlock::server::GrantAnswer::Refused,
@@ -664,9 +664,9 @@ async fn the_work_pointer_a_session_presents_reaches_the_grant_gate() {
 }
 
 /// A grant-gated self-host lender, reached the ONLY way production reaches one:
-/// through the node's gateway proxy, which stamps the account it verified for
-/// the caller. `verified_caller` is what that proxy vouched for — the test
-/// chooses it because a real caller cannot.
+/// through the node's gateway proxy, which stamps the node it verified for the
+/// caller. `verified_caller` is what that proxy vouched for — the test chooses
+/// it because a real caller cannot.
 ///
 /// `seal_secret` is passed in rather than generated so several differently-
 /// vouched gateways share one seal_pk, exactly as one lender serving several
@@ -694,12 +694,12 @@ async fn boot_lender_behind_proxy(
 }
 
 #[tokio::test]
-async fn grant_gate_admits_a_granted_account_and_refuses_the_rest() {
+async fn grant_gate_admits_what_the_authority_grants_and_refuses_the_rest() {
     let upstream = boot_echo_upstream().await;
     let secret = SealKeypair::generate().secret_bytes();
     let seal_pk = SealKeypair::from_secret_bytes(secret).public_bytes();
 
-    // Granted account: the session opens and the round-trip carries the real token.
+    // Granted caller: the session opens and the round-trip carries the real token.
     let url = boot_lender_behind_proxy(&upstream, secret, b"granted").await;
     let gw = Gateway::local(url.clone());
     let token =
@@ -716,13 +716,13 @@ async fn grant_gate_admits_a_granted_account_and_refuses_the_rest() {
         .unwrap();
     assert_eq!(seen, "Bearer tok-a");
 
-    // Ungranted account: refused at session open with 403. The caller really IS
+    // Ungranted caller: refused at session open with 403. The caller really IS
     // `stranger` here — the proxy said so — so this is the grant refusal and not
     // an identity one.
     let url = boot_lender_behind_proxy(&upstream, secret, b"stranger").await;
     let gw = Gateway::local(url);
     let err = gw.open_session(&seal_pk, "a", &WorkRef::Direct).await.unwrap_err();
-    assert!(err.to_string().contains("403"), "an ungranted account must 403: {err}");
+    assert!(err.to_string().contains("403"), "an ungranted caller must 403: {err}");
 
     // The gate could not ASK its authority. That is NOT a refusal: a 403 sends
     // the borrower's operator to add a grant that already exists, so the one
@@ -773,8 +773,8 @@ async fn a_session_request_cannot_name_an_account_at_all() {
         "an account on a session request is an unknown field, not an authorization input"
     );
 
-    // and the well-formed request from the same caller is refused on the account
-    // the transport vouched for, which is the only one that counts.
+    // and the well-formed request from the same caller is refused on the node
+    // the transport vouched for, which is the only identity that counts.
     let gw = Gateway::local(url);
     let err = gw
         .open_session(
@@ -823,7 +823,7 @@ async fn a_session_no_proxy_vouched_for_is_refused() {
         reqwest::StatusCode::FORBIDDEN,
         "an unvouched caller must never open a lending session"
     );
-    assert_eq!(refusal.text().await.unwrap(), "caller_account_unverified");
+    assert_eq!(refusal.text().await.unwrap(), "caller_node_unverified");
 }
 
 /// A client that omits or misspells a field gets a DECODE error, never a grant

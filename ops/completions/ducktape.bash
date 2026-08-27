@@ -9,7 +9,7 @@ _ducktape() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local families="node user wallet gateway fs service agent mcp help --help -h --version -V"
+    local families="node user account wallet gateway fs service agent mcp help --help -h --version -V"
 
     local node_verbs="run key init invite admit join list status peers resident member work sandbox help"
     local node_resident="accept remove"
@@ -20,8 +20,11 @@ _ducktape() {
 
     local user_key="init restore unlock reveal status"
     local user_cred="add list remove grant revoke inspect seal"
-    local user_verbs="key sign-bind sign-unbind sign-possession sign-add-member sign-remove-member sign-gateway-route sign-frame sign-admin webauthn-challenge p256-payload cred account-init help"
-    local user_flags="--path --method --statement --possession --out --key --node -n --network --account-id --chain-id --new-key --new-kind --node-key --node-pub --target-key --nonce --name --json --label --host --remote --attest --pccs-url --snp-product --snp-vcek --vendor --measurement --credentials --cred-kind --access-token --refresh-token"
+    local user_verbs="key sign-gateway-route sign-frame sign-admin cred help"
+    local user_flags="--path --method --statement --out --key --node -n --network --node-key --name --json --host --remote --attest --pccs-url --snp-product --snp-vcek --vendor --measurement --credentials --cred-kind --access-token --refresh-token"
+    local account_verbs="create show key set-name set-profile help"
+    local account_key="list approve add join remove"
+    local account_flags="--node -n --network --key --name --number --pubkey --scheme --label --ticket --avatar --bio"
     local wallet_verbs="new import list use help"
     local wallet_flags="--json"
     local gateway_verbs="bind unbind list help"
@@ -33,7 +36,7 @@ _ducktape() {
     # every service verb takes a KIND now, `list`/`status` included.
     local service_kinds="compute agent airlock"
     local agent_verbs="pty sched install help"
-    local agent_flags="-n --network --node --host-node --cred --cpu --mem"
+    local agent_flags="-n --network --node --key --host-node --cred --cpu --mem"
 
     if [ "$COMP_CWORD" -eq 1 ]; then
         COMPREPLY=( $(compgen -W "$families" -- "$cur") )
@@ -57,6 +60,12 @@ _ducktape() {
                 key)  COMPREPLY=( $(compgen -W "$user_key $user_flags" -- "$cur") ) ;;
                 cred) COMPREPLY=( $(compgen -W "$user_cred $user_flags" -- "$cur") ) ;;
                 *)    COMPREPLY=( $(compgen -W "$user_verbs $user_flags" -- "$cur") ) ;;
+            esac
+            ;;
+        account)
+            case "${COMP_WORDS[2]}" in
+                key) COMPREPLY=( $(compgen -W "$account_key $account_flags" -- "$cur") ) ;;
+                *)   COMPREPLY=( $(compgen -W "$account_verbs $account_flags" -- "$cur") ) ;;
             esac
             ;;
         wallet)  COMPREPLY=( $(compgen -W "$wallet_verbs $wallet_flags" -- "$cur") ) ;;

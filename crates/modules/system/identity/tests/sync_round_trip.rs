@@ -2,29 +2,26 @@
 //! pulling a source store's operation range through commonware's qmdb sync,
 //! then wraps a fresh `Identity` around the injected store — the same
 //! discriminating property chat, pages, agent, automations, and governance
-//! prove, over the account + ownership-index + roster layout.
+//! prove, over the account + key-index + generation-counter layout.
 //!
 //! the source SEEDS the `__config` chain-id record exactly the way the
 //! production genesis path does (`bin/node/src/host_state.rs`
 //! `seed_store_config`), then founds an account, admits a WebAuthn passkey
-//! member (the rp-pinned meta must survive the trip), binds and UNBINDS a
-//! second node (the op log carries an index DELETE, not just inserts), and
+//! (the consent verifies in-module), REMOVES it again (the op log carries an
+//! index DELETE, not just inserts, and the generation counter survives), and
 //! sets the profile (record overwrites). only a real sync that ships the
-//! ACTUAL proven op range lands on the same root — and the config record arrives with it,
-//! which is what lets a joiner's wasm guest read its chain id from the
-//! synced store.
+//! ACTUAL proven op range lands on the same root — and the config record
+//! arrives with it, which is what lets a joiner's wasm guest read its chain id
+//! from the synced store.
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use identity::{
-    IDENTITY_ADD_MEMBER_NS, IDENTITY_BIND_NS, IDENTITY_UNBIND_NS, Identity, IdentityMsg,
-    IdentityQuery, IdentityReply, KeyKind, MemberAuth, MemberProof, add_member_preimage,
-    bind_preimage, decode_reply, encode_msg, encode_query, unbind_preimage,
+    IDENTITY_ADD_KEY_NS, Authorizer, Identity, IdentityMsg, IdentityQuery, IdentityReply,
+    KeyScheme, add_key_preimage, decode_reply, encode_msg, encode_query,
 };
 use sdk::{Env, MerkleStore as _, Module, Msg, Origin, StateRoot};
 use sdk_testkit::TestCtx;
-use sha2::{Digest as _, Sha256};
 use statesync::qmdb::QmdbStore;
 
 const CHAIN: &str = "sync-chain";
@@ -39,46 +36,12 @@ fn ed_pub(k: &Ed) -> Vec<u8> {
     k.public_key().as_ref().to_vec()
 }
 
-fn ed_auth(k: &Ed, ns: &[u8], preimage: &[u8]) -> MemberAuth {
-    MemberAuth {
-        key: ed_pub(k),
-        kind: KeyKind::Ed25519,
-        proof: MemberProof::Signature {
-            sig: k.sign(ns, preimage).as_ref().to_vec(),
-        },
-    }
-}
-
-// a WebAuthn passkey, synthesized exactly as an authenticator would produce
-// it (identity's own test recipe; RFC-6979 p256 signing is deterministic).
-fn wa_key(seed: u8) -> p256::ecdsa::SigningKey {
-    p256::ecdsa::SigningKey::from_slice(&[seed; 32]).expect("valid scalar")
-}
-fn wa_pub(k: &p256::ecdsa::SigningKey) -> Vec<u8> {
-    k.verifying_key().to_sec1_bytes().to_vec()
-}
-fn wa_proof(k: &p256::ecdsa::SigningKey, rp_id: &str, ns: &[u8], preimage: &[u8]) -> MemberProof {
-    use p256::ecdsa::{Signature, signature::Signer as _};
-    let mut chal = Sha256::new();
-    chal.update(ns);
-    chal.update(preimage);
-    let challenge = chal.finalize();
-    let client_data_json = format!(
-        r#"{{"type":"webauthn.get","challenge":"{}","origin":"https://ducktape.local"}}"#,
-        URL_SAFE_NO_PAD.encode(challenge)
-    )
-    .into_bytes();
-    let mut authenticator_data = Vec::new();
-    authenticator_data.extend_from_slice(&Sha256::digest(rp_id.as_bytes()));
-    authenticator_data.push(0x01); // User Present
-    authenticator_data.extend_from_slice(&0u32.to_be_bytes());
-    let mut signed = authenticator_data.clone();
-    signed.extend_from_slice(&Sha256::digest(&client_data_json));
-    let sig: Signature = k.sign(&signed);
-    MemberProof::Webauthn {
-        authenticator_data,
-        client_data_json,
-        signature: sig.to_bytes().to_vec(),
+/// the founder's consent to admit `new_key` (of `scheme`) at `generation`.
+fn ed_consent(member: &Ed, scheme: KeyScheme, new_key: &[u8], generation: u64) -> Authorizer {
+    let preimage = add_key_preimage(CHAIN, scheme, new_key, generation);
+    Authorizer {
+        key: ed_pub(member),
+        proof: keyscheme::testkit::ed25519_proof(member, IDENTITY_ADD_KEY_NS, &preimage),
     }
 }
 
@@ -106,35 +69,23 @@ async fn apply_commit(m: &mut Identity, height: u64, origin: Origin, op: Msg) {
     m.commit_block().await.unwrap();
 }
 
-/// the read matrix compared source-vs-joiner: the roster-served listing, the
-/// account point read, both ownership-index resolvers (a live node, the
-/// unbound node, the passkey member).
-const QUERIES: [&str; 6] = [
-    "all",
-    "get",
-    "of-node-live",
-    "of-node-unbound",
-    "of-member-founder",
-    "of-member-passkey",
-];
+/// the read matrix compared source-vs-joiner: the listing, the account point
+/// read, the key resolver for a live key and a removed one, and the removed
+/// key's surviving generation counter.
+const QUERIES: [&str; 5] = ["all", "get", "of-key-founder", "of-key-removed", "gen-removed"];
 
-async fn replies(m: &Identity, account_id: &[u8], nodes: [&[u8]; 2], passkey: &[u8]) -> Vec<IdentityReply> {
+async fn replies(m: &Identity, founder: &[u8], removed: &[u8]) -> Vec<IdentityReply> {
     let queries = [
         encode_query(&IdentityQuery::All { from: 0, limit: 16 }),
-        encode_query(&IdentityQuery::Get {
-            account_id: account_id.to_vec(),
+        encode_query(&IdentityQuery::Get { number: 1 }),
+        encode_query(&IdentityQuery::OfKey {
+            key: founder.to_vec(),
         }),
-        encode_query(&IdentityQuery::OfNode {
-            node_key: nodes[0].to_vec(),
+        encode_query(&IdentityQuery::OfKey {
+            key: removed.to_vec(),
         }),
-        encode_query(&IdentityQuery::OfNode {
-            node_key: nodes[1].to_vec(),
-        }),
-        encode_query(&IdentityQuery::OfMember {
-            member_key: account_id.to_vec(),
-        }),
-        encode_query(&IdentityQuery::OfMember {
-            member_key: passkey.to_vec(),
+        encode_query(&IdentityQuery::KeyGen {
+            key: removed.to_vec(),
         }),
     ];
     let mut out = Vec::new();
@@ -144,20 +95,17 @@ async fn replies(m: &Identity, account_id: &[u8], nodes: [&[u8]; 2], passkey: &[
     out
 }
 
-/// the production wiring shape, ungated (no valset — the round trip proves
-/// the record layout, not the member gate, which the parity proof pins).
+/// the production wiring shape.
 fn identity_over(store: Box<dyn sdk::MerkleStore>) -> Identity {
-    Identity::new("identity", store, None, CHAIN.to_string())
+    Identity::new("identity", store, CHAIN.to_string())
 }
 
 #[test]
 fn synced_store_reconstructs_source_root_accounts_and_indexes() {
     deterministic::Runner::default().start(|context| async move {
         let founder = ed(1);
-        let account_id = ed_pub(&founder);
-        let passkey = wa_key(0x42);
-        let node_a = b"node-a".as_slice();
-        let node_b = b"node-b".as_slice();
+        let passkey = keyscheme::testkit::passkey(0x42);
+        let passkey_pub = keyscheme::testkit::passkey_pubkey(&passkey);
 
         // SOURCE: seed the genesis-config record the way the production
         // genesis path does, THEN wrap the module — the config is committed
@@ -176,62 +124,45 @@ fn synced_store_reconstructs_source_root_accounts_and_indexes() {
         assert_ne!(config_root, StateRoot::ZERO, "config alone moves the root");
         let mut src = identity_over(Box::new(src_store));
 
-        // found the account: bind node A under the founding ed25519 key.
+        // found account 1 from the founder key.
         apply_commit(
             &mut src,
             1,
-            Origin::External(node_a.to_vec()),
-            identity_msg(&IdentityMsg::BindNode {
-                authorizer: ed_auth(&founder, IDENTITY_BIND_NS, &bind_preimage(CHAIN, node_a, 0)),
+            Origin::External(ed_pub(&founder)),
+            identity_msg(&IdentityMsg::Create {
+                name: "alice".into(),
+                scheme: KeyScheme::Ed25519,
             }),
         )
         .await;
-        // admit the WebAuthn passkey (rp-pinned member meta rides the record).
-        let preimage =
-            add_member_preimage(CHAIN, &account_id, &wa_pub(&passkey), KeyKind::WebauthnP256, 1);
+        // admit the passkey: origin = the passkey, consent = the founder.
         apply_commit(
             &mut src,
             2,
-            Origin::External(node_a.to_vec()),
-            identity_msg(&IdentityMsg::AddMemberKey {
-                new_key: wa_pub(&passkey),
-                new_kind: KeyKind::WebauthnP256,
-                new_label: Some("phone".into()),
-                possession: wa_proof(&passkey, "ducktape", IDENTITY_ADD_MEMBER_NS, &preimage),
-                authorizer: ed_auth(&founder, IDENTITY_ADD_MEMBER_NS, &preimage),
+            Origin::External(passkey_pub.clone()),
+            identity_msg(&IdentityMsg::AddKey {
+                scheme: KeyScheme::Secp256r1,
+                label: Some("phone".into()),
+                authorizer: ed_consent(&founder, KeyScheme::Secp256r1, &passkey_pub, 0),
             }),
         )
         .await;
-        // bind a second node, then UNBIND it: the op log carries an
-        // ownership-index DELETE, not just inserts.
+        // remove it again: the op log carries a key-index DELETE, and the
+        // generation counter stays at 1.
         apply_commit(
             &mut src,
             3,
-            Origin::External(node_b.to_vec()),
-            identity_msg(&IdentityMsg::BindNode {
-                authorizer: ed_auth(&founder, IDENTITY_BIND_NS, &bind_preimage(CHAIN, node_b, 2)),
-            }),
-        )
-        .await;
-        apply_commit(
-            &mut src,
-            4,
-            Origin::External(node_a.to_vec()),
-            identity_msg(&IdentityMsg::UnbindNode {
-                node_key: node_b.to_vec(),
-                authorizer: ed_auth(
-                    &founder,
-                    IDENTITY_UNBIND_NS,
-                    &unbind_preimage(CHAIN, node_b, 3),
-                ),
+            Origin::External(ed_pub(&founder)),
+            identity_msg(&IdentityMsg::RemoveKey {
+                key: passkey_pub.clone(),
             }),
         )
         .await;
         // profile writes: record overwrites.
         apply_commit(
             &mut src,
-            5,
-            Origin::External(node_a.to_vec()),
+            4,
+            Origin::External(ed_pub(&founder)),
             identity_msg(&IdentityMsg::SetProfile {
                 avatar: Some("/shared/attachments/avatars/cafe.png".into()),
                 bio: Some("syncing ducks".into()),
@@ -240,11 +171,12 @@ fn synced_store_reconstructs_source_root_accounts_and_indexes() {
         .await;
         let src_root: StateRoot = src.root();
         assert_ne!(src_root, config_root, "the ops moved the root");
-        let src_replies = replies(&src, &account_id, [node_a, node_b], &wa_pub(&passkey)).await;
+        let src_replies = replies(&src, &ed_pub(&founder), &passkey_pub).await;
         let IdentityReply::Accounts(listed) = &src_replies[0] else {
             panic!("expected the listing");
         };
-        assert_eq!(listed.len(), 1, "the account is rostered");
+        assert_eq!(listed.len(), 1, "one account is numbered");
+        assert_eq!(src_replies[4], IdentityReply::Gen(1), "removal keeps the counter");
 
         // the module consumed its store, so REOPEN the committed partitions
         // as a bare store for the handoff (drop first — one owner at a time).
@@ -289,20 +221,19 @@ fn synced_store_reconstructs_source_root_accounts_and_indexes() {
             "synced store root must equal the source root"
         );
 
-        // account record, roster, and both ownership indexes synced together:
+        // account record, key index and generation counter synced together:
         // the joiner answers every read exactly like the source (including
-        // the ABSENT index entry for the unbound node).
-        let synced_replies =
-            replies(&synced, &account_id, [node_a, node_b], &wa_pub(&passkey)).await;
+        // the ABSENT index entry for the removed key).
+        let synced_replies = replies(&synced, &ed_pub(&founder), &passkey_pub).await;
         for (name, (a, b)) in QUERIES.iter().zip(src_replies.iter().zip(&synced_replies)) {
             assert_eq!(a, b, "the {name} reply diverged");
         }
         let IdentityReply::Account(Some(account)) = &synced_replies[1] else {
             panic!("the account record must be present on the joiner");
         };
-        assert_eq!(account.member_keys.len(), 2, "founder + passkey survive");
+        assert_eq!(account.keys.len(), 1, "only the founder survives");
         let IdentityReply::Account(None) = &synced_replies[3] else {
-            panic!("the unbound node must stay unbound on the joiner");
+            panic!("the removed key must stay unlinked on the joiner");
         };
     });
 }

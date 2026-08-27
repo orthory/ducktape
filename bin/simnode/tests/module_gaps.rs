@@ -1,177 +1,147 @@
 //! module-gap scenarios against the sim: the second wave of module semantics
-//! the app never surfaces — identity's shared replay nonce, automations'
-//! cross-module abort atomicity (P2), the jobs authorization matrix and its
-//! attempt ceiling, forge's per-branch compare-and-swap, and tagging's
-//! module-origin gate. like `core_scenarios`, every rejection asserted here is
-//! the REAL module refusing over noded's exact wire; the sim only decides WHEN
-//! a block commits. these paths have no console action (no identity key
-//! ceremony, no jobs board, no raw forge push, no tagging surface), so neither
-//! the TS scenario lane nor fleet live-QA can reach them.
+//! the app never surfaces — identity's single-use add-key consents and per-key
+//! generations, automations' cross-module abort atomicity (P2), the jobs
+//! authorization matrix and its attempt ceiling, forge's per-branch
+//! compare-and-swap, and tagging's module-origin gate. like `core_scenarios`,
+//! every rejection asserted here is the REAL module refusing over noded's exact
+//! wire; the sim only decides WHEN a block commits. these paths have no console
+//! action (no identity key ceremony, no jobs board, no raw forge push, no
+//! tagging surface), so neither the TS scenario lane nor fleet live-QA can
+//! reach them.
 
 mod harness;
 
 use commonware_cryptography::Signer as _;
-use harness::{Sim, create_channel, post_message};
-use identity::{
-    IDENTITY_ADD_MEMBER_NS, IDENTITY_BIND_NS, IDENTITY_REMOVE_MEMBER_NS, IDENTITY_UNBIND_NS,
-    KeyKind, add_member_preimage, bind_preimage, remove_member_preimage, unbind_preimage,
-};
+use harness::{Sim, add_ed25519_key, create, create_channel, key_origin, post_message};
 
 type Ed = commonware_cryptography::ed25519::PrivateKey;
 
-/// a MemberAuth whose ed25519 `key` consents to `preimage` under `ns` — the
-/// identity module's own member-consent shape (the shared `identity::testkit`
-/// builder, wrapped back to the untyped JSON the sim's `/v1/submit` takes), over
-/// ANY signing namespace — the general ns variant this suite needs (bind, unbind,
-/// add/remove-member).
-fn ed_auth(key: &Ed, ns: &[u8], preimage: &[u8]) -> serde_json::Value {
-    serde_json::to_value(identity::testkit::ed_auth(key, ns, preimage))
-        .expect("MemberAuth serializes")
+// ── C2 — identity: single-use consents, per-key generations ──
+
+/// the account `key` belongs to (`OfKey`), or `Null`.
+fn of_key(sim: &Sim, key: &[u8]) -> serde_json::Value {
+    sim.query(
+        "identity",
+        serde_json::json!({ "of_key": { "key": key.to_vec() } }),
+    )["account"]
+        .clone()
 }
 
-// ── C2 — identity: the shared replay nonce ──────────────
+/// how many times `key` has been admitted anywhere — the generation the next
+/// add-key consent for it must sign.
+fn key_gen(sim: &Sim, key: &[u8]) -> serde_json::Value {
+    sim.query(
+        "identity",
+        serde_json::json!({ "key_gen": { "key": key.to_vec() } }),
+    )["gen"]
+        .clone()
+}
 
-/// AddMemberKey advances the account's shared nonce, so a certificate minted at
-/// the old nonce can never replay; the account always keeps one live key.
+/// an add-key consent names the joining key at its CURRENT generation and is
+/// spent by acceptance: once the key is removed, the same consent no longer
+/// verifies, while a fresh consent at the next generation re-admits the key —
+/// here to ANOTHER account, since a removed key belongs to nobody.
 #[test]
-fn a_member_add_bumps_the_nonce_and_invalidates_a_pre_bump_cert() {
+fn an_add_key_consent_is_single_use_and_a_removed_key_relinks_at_its_next_gen() {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &["--auto"]);
 
-    // found account A: key_a's consent binds node_a at nonce 0, and acceptance
-    // advances the account's shared nonce to 1. (the sim's chain_id is empty.)
-    let node_a = "a".repeat(32);
+    // key_a founds account 1. the origin is the REAL key (the `hex:` escape),
+    // so key_a is a member that can later sign a consent.
     let key_a = Ed::from_seed(1);
-    let acct_a = key_a.public_key().as_ref().to_vec();
-    sim.submit_ok(
-        "identity",
-        serde_json::json!({ "bind_node": {
-            "authorizer": ed_auth(&key_a, IDENTITY_BIND_NS, &bind_preimage("", node_a.as_bytes(), 0)),
-        }}),
-        Some(&node_a),
-    );
-    let acct = sim.query(
-        "identity",
-        serde_json::json!({ "get": { "account_id": acct_a } }),
-    );
+    let origin_a = key_origin(&key_a);
+    sim.submit_ok("identity", create("a"), Some(&origin_a));
+    let acct = of_key(&sim, key_a.public_key().as_ref());
     assert_eq!(
-        acct["account"]["nonce"], 1,
-        "founding bind advances the nonce: {acct}"
+        acct["number"], 1,
+        "the first Create founds account 1: {acct}"
     );
 
-    // pre-build (but do NOT yet submit) an unbind cert for node_a at the CURRENT
-    // nonce, 1. an AddMemberKey is about to move the nonce out from under it.
-    let stale_unbind = ed_auth(
-        &key_a,
-        IDENTITY_UNBIND_NS,
-        &unbind_preimage("", node_a.as_bytes(), 1),
-    );
-
-    // admit a second member key_c: an existing member (key_a) consents AND the
-    // new key proves possession, both over the add-preimage at nonce 1. this
-    // advances the nonce to 2.
+    // key_c has never been admitted anywhere: generation 0, no account.
     let key_c = Ed::from_seed(3);
-    let add_at_1 = add_member_preimage(
-        "",
-        &acct_a,
-        key_c.public_key().as_ref(),
-        KeyKind::Ed25519,
-        1,
-    );
-    sim.submit_ok(
-        "identity",
-        serde_json::json!({ "add_member_key": {
-            "new_key": key_c.public_key().as_ref().to_vec(),
-            "new_kind": "ed25519",
-            "new_label": null,
-            "possession": { "signature": { "sig": key_c.sign(IDENTITY_ADD_MEMBER_NS, &add_at_1).as_ref().to_vec() } },
-            "authorizer": ed_auth(&key_a, IDENTITY_ADD_MEMBER_NS, &add_at_1),
-        }}),
-        Some(&node_a),
-    );
-    let acct = sim.query(
-        "identity",
-        serde_json::json!({ "get": { "account_id": acct_a } }),
+    let pub_c = key_c.public_key().as_ref().to_vec();
+    let origin_c = key_origin(&key_c);
+    assert_eq!(key_gen(&sim, &pub_c), 0, "a fresh key is at generation 0");
+    assert!(of_key(&sim, &pub_c).is_null(), "a fresh key has no account");
+
+    // key_a consents at gen 0; key_c submits the AddKey as ITS OWN origin.
+    let consent_at_0 = add_ed25519_key(&key_a, &pub_c, 0);
+    sim.submit_ok("identity", consent_at_0.clone(), Some(&origin_c));
+    let acct = of_key(&sim, &pub_c);
+    assert_eq!(acct["number"], 1, "key_c joined account 1: {acct}");
+    assert_eq!(
+        acct["keys"].as_array().map(Vec::len),
+        Some(2),
+        "the association holds both keys: {acct}"
     );
     assert_eq!(
-        acct["account"]["nonce"], 2,
-        "the add advances the nonce: {acct}"
+        key_gen(&sim, &pub_c),
+        1,
+        "acceptance advances the joining key's generation"
     );
 
-    // THE REPLAY: the stale unbind cert (signed at nonce 1) no longer verifies
-    // against the account's advanced nonce (2) — the module recomputes the
-    // preimage at the current nonce, so a one-nonce-behind cert is a forgery.
-    let error = sim.submit_rejected(
+    // key_a removes key_c; the generation counter stays where it is.
+    sim.submit_ok(
         "identity",
-        serde_json::json!({ "unbind_node": {
-            "node_key": node_a.as_bytes().to_vec(),
-            "authorizer": stale_unbind,
-        }}),
-        Some(&node_a),
+        serde_json::json!({ "remove_key": { "key": pub_c } }),
+        Some(&origin_a),
     );
     assert!(
-        error.contains("authorizer certificate does not verify"),
-        "the pre-bump cert must not replay: {error}"
+        of_key(&sim, &pub_c).is_null(),
+        "a removed key has no account"
+    );
+    assert_eq!(key_gen(&sim, &pub_c), 1, "removal leaves the generation");
+
+    // THE REPLAY: the spent gen-0 consent no longer verifies — the module
+    // recomputes the preimage at the CURRENT generation (1).
+    let error = sim.submit_rejected("identity", consent_at_0, Some(&origin_c));
+    assert!(
+        error.contains("authorizer consent does not verify"),
+        "a spent consent must not replay: {error}"
     );
 
-    // a FRESH-nonce unbind cert (at nonce 2) evicts node_a — nonce → 3 — and
-    // node_a re-binds cleanly with another fresh cert (at nonce 3).
+    // key_b founds account 2 and re-admits key_c THERE: a gen-0 consent is
+    // stale, a gen-1 consent relinks — and the generation advances again.
+    let key_b = Ed::from_seed(2);
+    sim.submit_ok("identity", create("b"), Some(&key_origin(&key_b)));
+    let stale = sim.submit_rejected(
+        "identity",
+        add_ed25519_key(&key_b, &pub_c, 0),
+        Some(&origin_c),
+    );
+    assert!(
+        stale.contains("authorizer consent does not verify"),
+        "a consent at a past generation is a forgery: {stale}"
+    );
     sim.submit_ok(
         "identity",
-        serde_json::json!({ "unbind_node": {
-            "node_key": node_a.as_bytes().to_vec(),
-            "authorizer": ed_auth(&key_a, IDENTITY_UNBIND_NS, &unbind_preimage("", node_a.as_bytes(), 2)),
-        }}),
-        Some(&node_a),
+        add_ed25519_key(&key_b, &pub_c, 1),
+        Some(&origin_c),
     );
-    sim.submit_ok(
-        "identity",
-        serde_json::json!({ "bind_node": {
-            "authorizer": ed_auth(&key_a, IDENTITY_BIND_NS, &bind_preimage("", node_a.as_bytes(), 3)),
-        }}),
-        Some(&node_a),
-    );
-    let acct = sim.query(
-        "identity",
-        serde_json::json!({ "get": { "account_id": acct_a } }),
-    );
-    assert_eq!(
-        acct["account"]["nonce"], 4,
-        "unbind then re-bind each advance the nonce: {acct}"
-    );
+    let acct = of_key(&sim, &pub_c);
+    assert_eq!(acct["number"], 2, "key_c relinked to account 2: {acct}");
+    assert_eq!(key_gen(&sim, &pub_c), 2, "re-admission advances it again");
 }
 
-/// an account never gives up its last key: RemoveMemberKey of the sole member
-/// is refused before any signature is even considered.
+/// an account never gives up its last key: RemoveKey of the sole member is
+/// refused by the keep-one-key guard, even from that member itself.
 #[test]
 fn removing_the_last_member_key_is_refused() {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &["--auto"]);
 
-    // found account B with a single member, key_b (binding node_b).
-    let node_b = "b".repeat(32);
-    let key_b = Ed::from_seed(2);
-    let acct_b = key_b.public_key().as_ref().to_vec();
-    sim.submit_ok(
-        "identity",
-        serde_json::json!({ "bind_node": {
-            "authorizer": ed_auth(&key_b, IDENTITY_BIND_NS, &bind_preimage("", node_b.as_bytes(), 0)),
-        }}),
-        Some(&node_b),
-    );
+    // a 32-byte ASCII origin is a well-formed ed25519 key as far as founding
+    // goes — no consent is needed for Create or RemoveKey, only membership.
+    let origin_b = "b".repeat(32);
+    sim.submit_ok("identity", create("b"), Some(&origin_b));
 
-    // removing the only member is refused by the keep-one-key guard, which fires
-    // before the authorizer cert is verified (a valid cert would still fail).
     let error = sim.submit_rejected(
         "identity",
-        serde_json::json!({ "remove_member_key": {
-            "target_key": acct_b,
-            "authorizer": ed_auth(&key_b, IDENTITY_REMOVE_MEMBER_NS, &remove_member_preimage("", &acct_b, &acct_b, 1)),
-        }}),
-        Some(&node_b),
+        serde_json::json!({ "remove_key": { "key": origin_b.as_bytes().to_vec() } }),
+        Some(&origin_b),
     );
     assert!(
-        error.contains("cannot remove the last member of an account"),
+        error.contains("cannot remove the last key of an account"),
         "the last key must survive: {error}"
     );
 }
@@ -472,7 +442,10 @@ fn an_expired_reclaim_fails_the_job_exactly_at_the_attempt_ceiling() {
         }
         sim.submit_ok("tasks", reclaim.clone(), Some("scavenger"));
 
-        let reply = sim.query("tasks", job(serde_json::json!({ "get": { "job_id": "j1" } })));
+        let reply = sim.query(
+            "tasks",
+            job(serde_json::json!({ "get": { "job_id": "j1" } })),
+        );
         let job_view = &reply["job"];
         assert_eq!(
             job_view["job"]["attempt"].as_u64(),

@@ -13,7 +13,7 @@
 //! announced identity is the verified external submit origin, never payload
 //! data, so a node can only speak for itself. an empty set removes the node.
 //! when constructed with a valset id, announcements are additionally gated to
-//! current validators UNION residents (mirroring identity's `BindNode` gate):
+//! current validators UNION residents:
 //! a joined-but-not-promoted node provides real executors too, and its
 //! announce is what lets dispatch route work to it. without a valset (the
 //! single-node daemon) any external key may self-announce.
@@ -293,9 +293,9 @@ impl CapabilityRegistry {
             }
         };
         if let Some(valset_id) = self.valset_id.clone() {
-            // member-gated like identity's BindNode: validators UNION
-            // residents populate the registry, so lookups resolve to known
-            // peers — including a joined node that has not been promoted yet.
+            // member-gated: validators UNION residents populate the registry,
+            // so lookups resolve to known peers — including a joined node
+            // that has not been promoted yet.
             if !valset::members_and_residents(ctx, &valset_id)
                 .await?
                 .contains(&node)

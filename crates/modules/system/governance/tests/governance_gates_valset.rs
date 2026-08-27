@@ -713,7 +713,9 @@ fn non_members_cannot_propose_or_vote_and_minority_rejects() {
         )
         .await
         .expect_err("outsider vote must be refused");
-        assert!(matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("member")));
+        assert!(
+            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("frozen electorate"))
+        );
 
         // ...one yes of two members is NOT a strict majority: not decidable
         // early, and after the deadline it rejects.

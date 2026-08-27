@@ -21,7 +21,7 @@ use acl::{Acl, AclMsg, Standing};
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use futures::executor::block_on;
 use host::{BlockContext, Host, SubmitError};
-use identity::{Identity, IdentityMsg, KeyKind, MemberAuth, MemberProof};
+use identity::{Identity, IdentityMsg, KeyScheme};
 use sdk::{Error, Msg, Origin};
 use sdk_testkit::MemStore;
 use valset::{Valset, ValsetMsg};
@@ -40,7 +40,10 @@ fn key_bytes(k: &PrivateKey) -> Vec<u8> {
 /// identity plane — the production system-module shape in miniature.
 async fn gate_host() -> Host {
     let mut valset = Valset::new("valset", Box::new(MemStore::new()));
-    valset.seed(key_bytes(&keypair(1))).await.expect("seed valset");
+    valset
+        .seed(key_bytes(&keypair(1)))
+        .await
+        .expect("seed valset");
     valset.finish_seed().await.expect("seed valset");
     Host::genesis(vec![
         Box::new(valset),
@@ -48,7 +51,6 @@ async fn gate_host() -> Host {
         Box::new(Identity::new(
             "identity",
             Box::new(MemStore::new()),
-            None,
             CHAIN.into(),
         )),
     ])
@@ -253,52 +255,61 @@ fn user_standing_resolves_through_the_identity_account_plane() {
     block_on(async {
         let mut host = gate_host().await;
         let (founder, nobody) = (keypair(10), keypair(9));
-        let node_key = key_bytes(&keypair(1)); // a valset member — bindable
+        let node_key = key_bytes(&keypair(1)); // a valset member — still no account
 
-        // found an account: the founder's ed25519 member auth binds the node.
-        let preimage = identity::bind_preimage(CHAIN, &node_key, 0);
-        let auth = MemberAuth {
-            key: key_bytes(&founder),
-            kind: KeyKind::Ed25519,
-            proof: MemberProof::Signature {
-                sig: founder
-                    .sign(identity::IDENTITY_BIND_NS, &preimage)
-                    .as_ref()
-                    .to_vec(),
-            },
-        };
+        // found an account for the founder's key.
         submit(
             &mut host,
-            Origin::External(node_key.clone()),
+            Origin::External(key_bytes(&founder)),
             1,
             "identity",
-            identity::encode_msg(&IdentityMsg::BindNode { authorizer: auth }),
+            identity::encode_msg(&IdentityMsg::Create {
+                name: "founder".into(),
+                scheme: KeyScheme::Ed25519,
+            }),
         )
         .await
         .expect("account founded");
 
         set_policy(&mut host, 2, "identity", Some(Standing::User)).await;
 
-        // the founder's MEMBER key and the BOUND NODE key both resolve to the
-        // account — the op passes dispatch (identity then answers itself).
-        let probe = identity::encode_msg(&IdentityMsg::SetAccountName {
-            display_name: "gate".into(),
+        // the founder's key resolves to the account — the op passes dispatch
+        // (identity then answers itself).
+        let probe = identity::encode_msg(&IdentityMsg::SetName {
+            name: "gate".into(),
         });
         submit(
             &mut host,
-            Origin::External(node_key.clone()),
+            Origin::External(key_bytes(&founder)),
             3,
             "identity",
             probe.clone(),
         )
         .await
-        .expect("a bound node passes user standing");
+        .expect("an account key passes user standing");
 
-        // an unbound key is refused at dispatch.
+        // a NODE key holds node standing, never user standing: no account
+        // is ever keyed by a node.
+        let err = submit(
+            &mut host,
+            Origin::External(node_key),
+            4,
+            "identity",
+            probe.clone(),
+        )
+        .await
+        .expect_err("a node key is not a user");
+        assert!(
+            matches!(err, SubmitError::Rejected(Error::Module(ref m))
+                if m.contains("requires user standing")),
+            "got {err:?}"
+        );
+
+        // an account-less key is refused at dispatch.
         let err = submit(
             &mut host,
             Origin::External(key_bytes(&nobody)),
-            4,
+            5,
             "identity",
             probe,
         )

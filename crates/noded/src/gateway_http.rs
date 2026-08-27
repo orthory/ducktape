@@ -160,10 +160,10 @@ fn gateway_api_origin_guard(headers: &HeaderMap) -> Option<Response> {
 
 async fn current_route(
     handle: &NodeHandle,
-    account_id: &[u8],
+    account_id: u64,
     name: &gateway::RouteName,
 ) -> Result<gateway::RouteRecord, GatewayFailure> {
-    gateway::validate_account_id(account_id).map_err(GatewayFailure::Invalid)?;
+    gateway::validate_account_number(account_id).map_err(GatewayFailure::Invalid)?;
     name.validate().map_err(GatewayFailure::Invalid)?;
     let (reply, rx) = oneshot::channel();
     let mut commands = handle.cmds.clone();
@@ -171,7 +171,7 @@ async fn current_route(
         .send(NodeCommand::Query {
             target: "gateway".into(),
             req: gateway::encode_query(&gateway::GatewayQuery::Get {
-                account_id: account_id.to_vec(),
+                account_id,
                 name: name.clone(),
             }),
             reply,
@@ -214,7 +214,7 @@ async fn proxy_current(
             "gateway body length does not match its request head".into(),
         ));
     }
-    let record = current_route(handle, &head.account_id, &head.name).await?;
+    let record = current_route(handle, head.account_id, &head.name).await?;
     if record.statement.revision != head.revision {
         return Err(GatewayFailure::Conflict(
             "gateway route changed; resolve the name again".into(),
@@ -326,7 +326,7 @@ pub(crate) async fn gateway_browser_base(
 async fn resolve_duck_authority(
     handle: &NodeHandle,
     authority: &str,
-) -> Result<(Vec<u8>, gateway::RouteName), GatewayFailure> {
+) -> Result<(u64, gateway::RouteName), GatewayFailure> {
     let trimmed = authority
         .trim()
         .strip_prefix("duck://")
@@ -409,6 +409,43 @@ fn gateway_method(method: &Method) -> Option<gateway::RouteMethod> {
         Method::PATCH => Some(gateway::RouteMethod::Patch),
         Method::DELETE => Some(gateway::RouteMethod::Delete),
         _ => None,
+    }
+}
+
+/// The three headers the app stamps to act AS an account on a `.duck` request
+/// (`x-duck-user-key`/`-ts`/`-sig`, hex/decimal/hex). They ride the proxy head
+/// as [`gateway::UserPop`] — never as forwarded headers, which the `x-duck-*`
+/// denylist strips — and the PUBLISHER verifies them against the route. All
+/// three or none: a partial set is a malformed request, not an anonymous one.
+fn user_pop_headers(headers: &HeaderMap) -> Result<Option<gateway::UserPop>, String> {
+    let field = |name: &str| -> Result<Option<String>, String> {
+        headers
+            .get(name)
+            .map(|value| {
+                value
+                    .to_str()
+                    .map(str::to_string)
+                    .map_err(|_| format!("gateway browser received non-ASCII {name}"))
+            })
+            .transpose()
+    };
+    let (key, ts, sig) = (
+        field("x-duck-user-key")?,
+        field("x-duck-user-ts")?,
+        field("x-duck-user-sig")?,
+    );
+    match (key, ts, sig) {
+        (None, None, None) => Ok(None),
+        (Some(key), Some(ts), Some(sig)) => Ok(Some(gateway::UserPop {
+            key: crate::admin::from_hex(&key)
+                .ok_or_else(|| "x-duck-user-key is not hex".to_string())?,
+            ts: ts
+                .parse()
+                .map_err(|_| "x-duck-user-ts is not a unix timestamp".to_string())?,
+            sig: crate::admin::from_hex(&sig)
+                .ok_or_else(|| "x-duck-user-sig is not hex".to_string())?,
+        })),
+        _partial => Err("x-duck-user-key, -ts and -sig travel together".into()),
     }
 }
 
@@ -550,12 +587,16 @@ async fn gateway_browser_proxy(
         Ok(resolved) => resolved,
         Err(failure) => return gateway_failure_response(failure),
     };
-    let record = match current_route(&handle, &account_id, &name).await {
+    let record = match current_route(&handle, account_id, &name).await {
         Ok(record) => record,
         Err(failure) => return gateway_failure_response(failure),
     };
     let forwarded = match gateway_request_headers(&headers) {
         Ok(headers) => headers,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, &error),
+    };
+    let user_pop = match user_pop_headers(&headers) {
+        Ok(pop) => pop,
         Err(error) => return error_response(StatusCode::BAD_REQUEST, &error),
     };
     let head = gateway::ProxyRequestHead {
@@ -571,6 +612,7 @@ async fn gateway_browser_proxy(
         headers: forwarded,
         body_len: body.len() as u64,
         upgrade: false,
+        user_pop,
     };
     let response = match proxy_current(&handle, head, body.to_vec()).await {
         Ok(response) => response,
@@ -717,7 +759,7 @@ async fn gateway_ws_door(
     let Some(grant) = browser_gateway.ws_tokens.consume(&token, &origin) else {
         return error_response(StatusCode::FORBIDDEN, "invalid or expired websocket token");
     };
-    let record = match current_route(&handle, &grant.account_id, &grant.name).await {
+    let record = match current_route(&handle, grant.account_id, &grant.name).await {
         Ok(record) => record,
         Err(_) => return error_response(StatusCode::BAD_GATEWAY, "route no longer resolves"),
     };
@@ -733,6 +775,7 @@ async fn gateway_ws_door(
         headers: vec![],
         body_len: 0,
         upgrade: true,
+        user_pop: None,
     };
     upgrade.on_upgrade(move |socket| bridge_axum_ws(socket, lane, publisher, head))
 }

@@ -24,7 +24,7 @@ use gateway::{
     set_credential_preimage,
 };
 use identity::{
-    AccountView, IdentityQuery, IdentityReply, KeyKind, MemberKeyView, NodeView,
+    AccountView, IdentityQuery, IdentityReply, KeyScheme, KeyView,
     decode_query as identity_decode_query, encode_reply as identity_encode_reply,
 };
 use sdk::{Env, Error, MerkleStore as _, Module, Msg, Origin, StateRoot};
@@ -32,6 +32,8 @@ use sdk_testkit::TestCtx;
 use statesync::qmdb::QmdbStore;
 
 const CHAIN: &str = "sync-chain";
+/// the founder's account number.
+const ACCOUNT: u64 = 1;
 
 type Ed = PrivateKey;
 
@@ -42,41 +44,37 @@ fn ed_pub(k: &Ed) -> Vec<u8> {
     k.public_key().as_ref().to_vec()
 }
 
-/// the one identity read gateway makes (`OfNode`), answered with a fixed
-/// account owned by `founder` and binding `node` — the TestCtx double for the
+/// the one identity read gateway makes (`OfKey`), answered with a fixed
+/// account whose sole member is `founder` — the TestCtx double for the
 /// sibling the parity proof exercises for real.
-fn account_view(founder: &Ed, node: &[u8]) -> AccountView {
+fn account_view(founder: &Ed) -> AccountView {
     AccountView {
-        account_id: ed_pub(founder),
-        display_name: None,
-        avatar: None,
-        bio: None,
-        nonce: 1,
-        member_keys: vec![MemberKeyView {
+        number: ACCOUNT,
+        name: "founder".into(),
+        keys: vec![KeyView {
+            scheme: KeyScheme::Ed25519,
             pubkey: ed_pub(founder),
-            kind: KeyKind::Ed25519,
             label: None,
             added_at: 0,
         }],
-        nodes: vec![NodeView {
-            node_key: node.to_vec(),
-            label: None,
-        }],
+        avatar: None,
+        bio: None,
         updated_at: 0,
     }
 }
 
-fn ctx(height: u64, node: Vec<u8>, founder: &Ed) -> TestCtx {
-    let view = account_view(founder, &node);
+/// the founder's key is the frame origin of every op.
+fn ctx(height: u64, founder: &Ed) -> TestCtx {
+    let view = account_view(founder);
     TestCtx::with_env(Env {
         height,
         consensus_time: height,
-        origin: Origin::External(node),
+        origin: Origin::External(ed_pub(founder)),
         me: "gateway".into(),
     })
     .on_query("identity", move |req| {
         match identity_decode_query(req).map_err(Error::Module)? {
-            IdentityQuery::OfNode { .. } => Ok(identity_encode_reply(&IdentityReply::Account(
+            IdentityQuery::OfKey { .. } => Ok(identity_encode_reply(&IdentityReply::Account(
                 Some(view.clone()),
             ))),
             _ => Err(Error::QueryUnsupported),
@@ -110,7 +108,7 @@ fn content_route(seed: u8) -> RouteDefinition {
 fn set_route(founder: &Ed, node: &[u8], revision: u64, route: Option<RouteDefinition>) -> Msg {
     let statement = RouteStatement {
         chain_id: CHAIN.into(),
-        account_id: ed_pub(founder),
+        account_id: ACCOUNT,
         name: RouteName::apex(),
         publisher_node: node.to_vec(),
         revision,
@@ -132,7 +130,7 @@ fn set_credential(founder: &Ed, node: &[u8], name: &str) -> Msg {
         chain_id: CHAIN.into(),
         record: CredentialRecord {
             name: name.into(),
-            owner_account: ed_pub(founder),
+            owner_account: ACCOUNT,
             publisher_node: node.to_vec(),
             kind: CredentialKind::Claude,
             seal_pk: [7u8; 32],
@@ -153,10 +151,10 @@ fn set_credential(founder: &Ed, node: &[u8], name: &str) -> Msg {
     })
 }
 
-fn grant_credential(founder: &Ed, name: &str, account: Vec<u8>) -> Msg {
+fn grant_credential(founder: &Ed, name: &str, account: u64) -> Msg {
     let statement = CredentialGrantStatement {
         chain_id: CHAIN.into(),
-        owner_account: ed_pub(founder),
+        owner_account: ACCOUNT,
         name: name.into(),
         account,
     };
@@ -177,7 +175,7 @@ fn grant_credential(founder: &Ed, name: &str, account: Vec<u8>) -> Msg {
 fn remove_credential(founder: &Ed, name: &str) -> Msg {
     let statement = RemoveCredentialStatement {
         chain_id: CHAIN.into(),
-        owner_account: ed_pub(founder),
+        owner_account: ACCOUNT,
         name: name.into(),
     };
     let preimage = remove_credential_preimage(&statement).expect("statement validates");
@@ -202,8 +200,8 @@ fn set_handle(handle: Option<&str>) -> Msg {
 
 // drive one op through the REAL module path: execute + commit_block (one op
 // per block-height), so the committed op log is what a validator produces.
-async fn apply_commit(m: &mut Gateway, height: u64, node: Vec<u8>, founder: &Ed, op: Msg) {
-    let mut c = ctx(height, node, founder);
+async fn apply_commit(m: &mut Gateway, height: u64, founder: &Ed, op: Msg) {
+    let mut c = ctx(height, founder);
     m.execute(&mut c, &op).await.unwrap();
     m.commit_block().await.unwrap();
 }
@@ -221,7 +219,7 @@ const QUERIES: [&str; 7] = [
     "credentials",
 ];
 
-async fn replies(m: &Gateway, founder: &Ed) -> Vec<GatewayReply> {
+async fn replies(m: &Gateway) -> Vec<GatewayReply> {
     let queries = [
         encode_query(&GatewayQuery::Resolve {
             name: DuckDnsName {
@@ -235,11 +233,11 @@ async fn replies(m: &Gateway, founder: &Ed) -> Vec<GatewayReply> {
         }),
         encode_query(&GatewayQuery::Registrations { from: 0, limit: 16 }),
         encode_query(&GatewayQuery::Get {
-            account_id: ed_pub(founder),
+            account_id: ACCOUNT,
             name: RouteName::apex(),
         }),
         encode_query(&GatewayQuery::List {
-            account_id: ed_pub(founder),
+            account_id: ACCOUNT,
         }),
         encode_query(&GatewayQuery::Credential {
             name: "anthropic".into(),
@@ -253,10 +251,10 @@ async fn replies(m: &Gateway, founder: &Ed) -> Vec<GatewayReply> {
     out
 }
 
-/// the production wiring shape, ungated (no valset — the round trip proves
-/// the record layout, not the member gate, which the parity proof pins).
+/// the production wiring shape (the round trip proves the record layout; the
+/// member gate is pinned by the parity proof).
 fn gateway_over(store: Box<dyn sdk::MerkleStore>) -> Gateway {
-    Gateway::new("gateway", store, "identity", None, CHAIN)
+    Gateway::new("gateway", store, "identity", CHAIN)
 }
 
 #[test]
@@ -264,7 +262,7 @@ fn synced_store_reconstructs_source_root_handles_routes_and_credentials() {
     deterministic::Runner::default().start(|context| async move {
         let founder = ed(1);
         let node = ed_pub(&ed(2));
-        let grantee = ed_pub(&ed(3));
+        let grantee: u64 = 3;
 
         // SOURCE: seed the genesis-config record the way the production
         // genesis path does, THEN wrap the module — the config is committed
@@ -285,27 +283,12 @@ fn synced_store_reconstructs_source_root_handles_routes_and_credentials() {
 
         // handle: register, then RENAME (the op log carries the old name's
         // index delete, not just inserts).
-        apply_commit(
-            &mut src,
-            1,
-            node.clone(),
-            &founder,
-            set_handle(Some("orthory")),
-        )
-        .await;
-        apply_commit(
-            &mut src,
-            2,
-            node.clone(),
-            &founder,
-            set_handle(Some("quack")),
-        )
-        .await;
+        apply_commit(&mut src, 1, &founder, set_handle(Some("orthory"))).await;
+        apply_commit(&mut src, 2, &founder, set_handle(Some("quack"))).await;
         // route: publish at revision 1, replace at revision 2 (overwrite).
         apply_commit(
             &mut src,
             3,
-            node.clone(),
             &founder,
             set_route(&founder, &node, 1, Some(content_route(0x11))),
         )
@@ -313,7 +296,6 @@ fn synced_store_reconstructs_source_root_handles_routes_and_credentials() {
         apply_commit(
             &mut src,
             4,
-            node.clone(),
             &founder,
             set_route(&founder, &node, 2, Some(content_route(0x22))),
         )
@@ -323,7 +305,6 @@ fn synced_store_reconstructs_source_root_handles_routes_and_credentials() {
         apply_commit(
             &mut src,
             5,
-            node.clone(),
             &founder,
             set_credential(&founder, &node, "anthropic"),
         )
@@ -331,31 +312,22 @@ fn synced_store_reconstructs_source_root_handles_routes_and_credentials() {
         apply_commit(
             &mut src,
             6,
-            node.clone(),
             &founder,
-            grant_credential(&founder, "anthropic", grantee.clone()),
+            grant_credential(&founder, "anthropic", grantee),
         )
         .await;
         apply_commit(
             &mut src,
             7,
-            node.clone(),
             &founder,
             set_credential(&founder, &node, "extra"),
         )
         .await;
-        apply_commit(
-            &mut src,
-            8,
-            node.clone(),
-            &founder,
-            remove_credential(&founder, "extra"),
-        )
-        .await;
+        apply_commit(&mut src, 8, &founder, remove_credential(&founder, "extra")).await;
 
         let src_root: StateRoot = src.root();
         assert_ne!(src_root, config_root, "the ops moved the root");
-        let src_replies = replies(&src, &founder).await;
+        let src_replies = replies(&src).await;
 
         // the module consumed its store, so REOPEN the committed partitions
         // as a bare store for the handoff (drop first — one owner at a time).
@@ -402,14 +374,14 @@ fn synced_store_reconstructs_source_root_handles_routes_and_credentials() {
         // handles (with the rename's delete), the route at revision 2, and
         // the surviving credential (with its grant) synced together: the
         // joiner answers every read exactly like the source.
-        let synced_replies = replies(&synced, &founder).await;
+        let synced_replies = replies(&synced).await;
         for (name, (a, b)) in QUERIES.iter().zip(src_replies.iter().zip(&synced_replies)) {
             assert_eq!(a, b, "the {name} reply diverged");
         }
         let GatewayReply::Resolved(Some(resolved)) = &synced_replies[0] else {
             panic!("the live handle must resolve on the joiner");
         };
-        assert_eq!(resolved.account_id, ed_pub(&founder));
+        assert_eq!(resolved.account_id, ACCOUNT);
         let GatewayReply::Resolved(None) = &synced_replies[1] else {
             panic!("the renamed-away handle must stay free on the joiner");
         };

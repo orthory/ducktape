@@ -1495,27 +1495,21 @@ impl Host {
                 .any(|k| k.as_slice() == submitter)
     }
 
-    /// does `submitter` belong to an identity account — as a member key or a
-    /// bound node key? an unreadable reply is "no" — fail-closed for a policy
-    /// that names user standing.
+    /// does `submitter` belong to an identity account? an unreadable reply is
+    /// "no" — fail-closed for a policy that names user standing. a node key
+    /// is never an account member by itself: only a user-signed origin holds
+    /// user standing.
     async fn identity_account_holds(&self, submitter: &[u8]) -> bool {
-        let owner = |q: identity::IdentityQuery| async move {
-            let bytes = self
-                .query(IDENTITY_MODULE_ID, &identity::encode_query(&q))
-                .await;
-            matches!(
-                bytes.map(|b| identity::decode_reply(&b)),
-                Ok(Ok(identity::IdentityReply::Account(Some(_))))
-            )
+        let query = identity::IdentityQuery::OfKey {
+            key: submitter.to_vec(),
         };
-        owner(identity::IdentityQuery::OfMember {
-            member_key: submitter.to_vec(),
-        })
-        .await
-            || owner(identity::IdentityQuery::OfNode {
-                node_key: submitter.to_vec(),
-            })
-            .await
+        let bytes = self
+            .query(IDENTITY_MODULE_ID, &identity::encode_query(&query))
+            .await;
+        matches!(
+            bytes.map(|b| identity::decode_reply(&b)),
+            Ok(Ok(identity::IdentityReply::Account(Some(_))))
+        )
     }
 
     async fn drain_queue(

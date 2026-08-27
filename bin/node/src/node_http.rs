@@ -1,11 +1,15 @@
 //! The operator CLI's thin HTTP client for a node's `/v1` surface: one
-//! `submit` and one `query` primitive, shared by every `user`/`agent` verb so
-//! the `{target, payload}` / `{target, query}` shapes and the receipt/error
-//! handling live in exactly one place instead of being re-inlined per verb.
+//! `submit`, one `submit_frame` and one `query` primitive, shared by every
+//! `user`/`account`/`agent` verb so the `{target, payload}` / `{target, query}`
+//! shapes and the receipt/error handling live in exactly one place instead of
+//! being re-inlined per verb.
 //!
-//! Both hit the frameless lanes: `/v1/submit` stamps the NODE's key as the op
-//! origin (valid when the node is bound to the account the op mutates), and
-//! `/v1/query` reads committed module state.
+//! `/v1/submit` is the frameless lane: it stamps the NODE's key as the op
+//! origin, so only node-authored ops (announces, node-level governance) go
+//! there. Every USER-authored op — an identity, gateway or saga op that must be
+//! attributed to an account — is a frame the user key signed, POSTed verbatim
+//! to `/v1/submit/frame`; its verified signer is the op's origin. `/v1/query`
+//! reads committed module state.
 
 /// Submit one module op over `/v1/submit` `{target, payload}` and return the
 /// commit height from the receipt. A non-2xx status carries the node's
@@ -20,7 +24,32 @@ pub(crate) fn submit(
         "/v1/submit",
         &serde_json::json!({ "target": target, "payload": payload }),
     )?;
-    serde_json::from_str::<serde_json::Value>(&body)
+    receipt_height(&body)
+}
+
+/// Submit one ALREADY-SIGNED op frame (the exact bytes `node::encode_frame`
+/// produced — see `userkey_cli::user_frame`) over `/v1/submit/frame` and
+/// return the commit height. The frame's verified signer becomes the op's
+/// `Origin::External`, which is what lets an account's key act for itself.
+pub(crate) fn submit_frame(base: &str, frame: &[u8]) -> Result<u64, Box<dyn std::error::Error>> {
+    const PATH: &str = "/v1/submit/frame";
+    let resp = reqwest::blocking::Client::new()
+        .post(format!("{base}{PATH}"))
+        .header("content-type", "application/octet-stream")
+        .body(frame.to_vec())
+        .send()
+        .map_err(|error| transport_failure(PATH, &error).to_string())?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("{PATH} rejected ({status}): {text}").into());
+    }
+    receipt_height(&text)
+}
+
+/// the `height` of a `SubmitReceipt` body — both submit lanes answer with one.
+fn receipt_height(body: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|v| v["height"].as_u64())
         .ok_or_else(|| format!("unexpected submit receipt: {body}").into())

@@ -57,7 +57,7 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   // the "did my click land?" void #1059 removed from the pickers, still live on
   // the one navigation whose entire purpose is to jump somewhere else.
   active_channel = channel_id
-  active_dm_peer = dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel)
+  active_dm_peer = dm_peer_of_channel(active_dm_peer, account_number, active_channel)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = next_channel.name
   active_channel_archived = next_channel.archived
@@ -215,7 +215,7 @@ on choose_dm(peer_key)
   // `active_channel` on the room she left is how the peer's face came up beside
   // that room's "Archived" badge, its "· 7 added" count and its composer
   // refusal for the several blocks a DM open takes.
-  let dm_room = dm_channel_id(settings_user_key, active_dm_peer)
+  let dm_room = dm_channel_id(account_number, active_dm_peer)
   // WITH NO USER KEY BOUND, `dm_room` IS A PHANTOM — `dm_channel_id` hashes ""
   // against the peer and answers an id no channel in the list carries, while
   // the node resolves the real one from its OWN key. That degrades to exactly
@@ -528,13 +528,13 @@ on chat_updated(next)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(channels, next.active_channel))
-  rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   active_channel = next.active_channel
   // A LANDING ANSWERS FOR THE PEER TOO. The DM header suppresses the `#` and
   // the channel name, so a peer that outlives the room it named leaves the room
   // on screen unnamed under someone else's face — see `dm_peer_of_channel`.
-  active_dm_peer = dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel)
+  active_dm_peer = dm_peer_of_channel(active_dm_peer, account_number, active_channel)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
@@ -602,12 +602,12 @@ on chat_hit_loaded(next)
   // through `choose_channel` -> `chat_updated`, which marks the room read when
   // she actually reaches the tail. The sidebar mirrors still refresh: the
   // `channels` fold above moved, even though the cursor did not.
-  rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   active_channel = next.active_channel
   // Same landing answer as `chat_updated`: a hit in another room retires the
   // peer, a hit inside the DM keeps him.
-  active_dm_peer = dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel)
+  active_dm_peer = dm_peer_of_channel(active_dm_peer, account_number, active_channel)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
@@ -694,14 +694,14 @@ on channel_created(next)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(channels, next.active_channel))
-  rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   // A CREATE IS A ROOM SWITCH — the line below lands her IN the new channel,
   // and the composer she was typing into stays keyed to the room she left
   // (ducktape-ui#697).
   active_channel = next.active_channel
   // Creating lands you in the new room, which is nobody's DM.
-  active_dm_peer = dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel)
+  active_dm_peer = dm_peer_of_channel(active_dm_peer, account_number, active_channel)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived

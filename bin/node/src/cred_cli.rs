@@ -16,16 +16,18 @@
 //!
 //! Every other verb runs CO-HOSTED with the node whose credential it manages: it reads
 //! the node's own workspace (chain id, consensus key, storage) to build the
-//! owner-signed statement, then submits it over the node's frameless
-//! `/v1/submit` (which stamps the node as the op origin — the record's
-//! `publisher_node`). Program output stays `println!` (a CLI's stdout is not
-//! logging).
+//! owner-signed statement, then submits it as a USER-signed frame over
+//! `/v1/submit/frame` — the frame's signer is the op origin, which the gateway
+//! resolves to the owner account through `OfKey`; the record's
+//! `publisher_node` is a statement field the account vouches for. Program
+//! output stays `println!` (a CLI's stdout is not logging).
 
 use std::io::BufRead;
 use std::path::Path;
 
 use commonware_cryptography::Signer as _;
 
+use crate::account_cli::resolve_account;
 use crate::cli_args::NodeAddr;
 use crate::config;
 use crate::userkey_cli::load_user_signer;
@@ -41,7 +43,7 @@ pub(crate) struct CredArgs {
     cmd: CredCmd,
     #[command(flatten)]
     addr: NodeAddr,
-    /// path to the user key file (defaults to the network workspace's `user.key`)
+    /// path to the user key file (defaults to the keystore's active wallet)
     #[arg(long, value_name = "PATH", global = true)]
     key: Option<std::path::PathBuf>,
 }
@@ -66,17 +68,15 @@ pub(crate) enum CredCmd {
         /// the credential name
         name: String,
     },
-    /// lend a credential to an account: its nodes may draw on it, and so may a
-    /// node it delegates a run to (owner-signed)
+    /// lend a credential to an account: work that account SUBMITS may draw on
+    /// it while it executes on the node the account pinned it to (owner-signed)
     Grant {
         /// the credential name
         name: String,
-        /// a hex account id or a display name. It is granted TWO ways, and both
-        /// are deliberate: any workload on a node bound to this account may draw
-        /// on the credential, AND a run this account SUBMITS may draw on it while
-        /// it executes on the node the account pinned it to (`agent sched
-        /// --host-node`, which names this credential in the committed work). The
-        /// second ends when that run ends. Nobody else's work, on either path.
+        /// an account number or a display name. The grant reaches exactly the
+        /// runs this account's keys sign (`agent sched --host-node`, which names
+        /// this credential in the committed work), on the node each run is
+        /// pinned to, until that run ends. Nobody else's work.
         account: String,
     },
     /// rescind a lend (owner-signed). In flight sessions keep working until their
@@ -84,8 +84,7 @@ pub(crate) enum CredCmd {
     Revoke {
         /// the credential name
         name: String,
-        /// the account to stop lending to — the same executing-node account
-        /// `grant` named
+        /// the account to stop lending to — the same account `grant` named
         account: String,
     },
     /// read a TEE gateway's enclave measurement out of its quote, so it can be
@@ -207,31 +206,31 @@ pub(crate) fn run(args: CredArgs, stdin: &mut impl BufRead) -> CredResult {
     }
 }
 
-/// The shared node/key context every verb resolves against.
-struct VerbCtx {
-    addr: NodeAddr,
-    key: Option<std::path::PathBuf>,
+/// The shared node/key context every `cred` and `account` verb resolves against.
+pub(crate) struct VerbCtx {
+    pub(crate) addr: NodeAddr,
+    pub(crate) key: Option<std::path::PathBuf>,
 }
 
 impl VerbCtx {
     /// the node's http base, through the one shared addressing ladder.
-    fn http_base(&self) -> Result<String, Box<dyn std::error::Error>> {
+    pub(crate) fn http_base(&self) -> Result<String, Box<dyn std::error::Error>> {
         Ok(self.addr.resolve()?)
     }
 
     /// the user key path for the signing verbs: explicit `--key` wins, else
     /// THE shared wallet resolver ($DUCKTAPE_USER_KEY, else the keystore's
     /// active wallet). A MISSING key is a loud error, never a cue to mint:
-    /// cred always signs as an already-bound account.
-    fn key_path(&self) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    /// these verbs sign AS a key, and a silently minted stranger would be a
+    /// fresh, accountless identity wearing the right path.
+    pub(crate) fn key_path(&self) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
         let path = match &self.key {
             Some(explicit) => explicit.clone(),
             None => keystore::wallet::active_user_key()?,
         };
         if !path.exists() {
             return Err(format!(
-                "no user key at {} — run `ducktape user account-init --name <you>` first \
-                 (it mints one), or pass --key",
+                "no user key at {} — run `ducktape wallet new <name>` first, or pass --key",
                 path.display()
             )
             .into());
@@ -246,7 +245,7 @@ impl VerbCtx {
     /// [`NodeAddr::workspace`] is the ONE ladder that answers this, `--node`
     /// included: a bare url names no directory, so it is resolved backwards
     /// through the registry to the workspace that serves it.
-    fn workspace(&self) -> Result<config::Resolved, Box<dyn std::error::Error>> {
+    pub(crate) fn workspace(&self) -> Result<config::Resolved, Box<dyn std::error::Error>> {
         let dir = self.addr.workspace()?;
         Ok(config::resolve(&dir.join("node.toml"))?)
     }
@@ -267,19 +266,17 @@ fn cmd_list(ctx: &VerbCtx, json: bool) -> CredResult {
         println!("no credentials registered");
         return Ok(());
     }
-    println!("{:<24} {:<8} {:<20} grants", "name", "kind", "owner");
+    println!("{:<24} {:<8} {:<8} grants", "name", "kind", "owner");
     for record in &records {
-        let owner = config::hex_bytes(&record.owner_account);
-        let owner_short = owner.get(..16).unwrap_or(&owner);
         let kind = match record.kind {
             gateway::CredentialKind::Claude => "claude",
             gateway::CredentialKind::Codex => "codex",
         };
         println!(
-            "{:<24} {:<8} {:<20} {}",
+            "{:<24} {:<8} {:<8} {}",
             record.name,
             kind,
-            owner_short,
+            record.owner_account,
             record.grants.len()
         );
     }
@@ -287,7 +284,7 @@ fn cmd_list(ctx: &VerbCtx, json: bool) -> CredResult {
 }
 
 // ============================================================================
-// grant / revoke / remove — owner-signed statement, frameless submit
+// grant / revoke / remove — owner-signed statement, user-signed frame
 // ============================================================================
 
 fn cmd_grant(ctx: &VerbCtx, name: String, account: String, stdin: &mut impl BufRead) -> CredResult {
@@ -307,11 +304,11 @@ fn cmd_grant(ctx: &VerbCtx, name: String, account: String, stdin: &mut impl BufR
         statement,
         authorization: authorize(&user, &preimage),
     };
-    let height = submit_gateway(&base, &message)?;
+    let height = submit_gateway(&base, &user, &message)?;
     println!("granted at height {height}");
     println!(
-        "note: this lends to that account's NODES. Any workload running on one of \
-         them can draw on {name:?} — including work submitted by someone else."
+        "note: this lends to the work account {grantee} SUBMITS. A run one of its keys \
+         signs can draw on {name:?} on the node it is pinned to, until that run ends."
     );
     Ok(())
 }
@@ -338,7 +335,7 @@ fn cmd_revoke(
         statement,
         authorization: authorize(&user, &preimage),
     };
-    let height = submit_gateway(&base, &message)?;
+    let height = submit_gateway(&base, &user, &message)?;
     println!("revoked at height {height}");
     Ok(())
 }
@@ -374,7 +371,7 @@ fn cmd_remove(ctx: &VerbCtx, name: String, stdin: &mut impl BufRead) -> CredResu
         statement,
         authorization: authorize(&user, &preimage),
     };
-    let height = submit_gateway(&base, &message)?;
+    let height = submit_gateway(&base, &user, &message)?;
     let removed_local = remove_local_credential(&resolved.service.storage_dir, &name)
         .map_err(|error| format!("removed on-chain at height {height}, but {error}"))?;
     if removed_local {
@@ -433,21 +430,14 @@ fn cmd_add(
     let user = load_user_signer(&ctx.key_path()?, stdin)?;
     let user_pub = user.public_key().as_ref().to_vec();
 
-    // owner account (bind check) + existing names (for the default's counter)
-    // — one identity query, one gateway query. The display name is needed only
-    // to DERIVE a default name; an explicit name never requires one.
+    // owner account (membership check) + existing names (for the default's
+    // counter) — one identity query, one gateway query.
     let account = query_owner_account_view(&base, &user_pub)?;
     let existing = query_credentials(&base)?;
     let existing_names: Vec<&str> = existing.iter().map(|r| r.name.as_str()).collect();
     let name = match name {
         Some(name) => name,
-        None => {
-            let display = account
-                .display_name
-                .clone()
-                .ok_or("this account has no display name — pass an explicit credential name")?;
-            derive_default_name(&display, provider, &existing_names)
-        }
+        None => derive_default_name(&account.name, provider, &existing_names),
     };
     gateway::validate_credential_name(&name)?;
 
@@ -499,7 +489,7 @@ fn cmd_add(
     let seal = airlock_service::load_or_create_seal_keypair(&store)?;
     let record = gateway::CredentialRecord {
         name: name.clone(),
-        owner_account: account.account_id.clone(),
+        owner_account: account.number,
         publisher_node: resolved.signer.public_key().as_ref().to_vec(),
         kind: provider.kind(),
         seal_pk: seal.public_bytes(),
@@ -514,13 +504,13 @@ fn cmd_add(
         statement,
         authorization: authorize(&user, &preimage),
     };
-    let height = submit_gateway(&base, &message)?;
+    let height = submit_gateway(&base, &user, &message)?;
     println!("registered {name} at height {height}");
     // A lent credential is only reachable once the co-hosted airlock gateway has
     // a signed on-chain route. That route is per-ACCOUNT (one `airlock` route
     // serves every credential this account co-hosts), so publish it once and
     // skip on later `cred add`s — the operator never hand-signs a RouteStatement.
-    ensure_airlock_route(&base, &user, &resolved, &account.account_id)?;
+    ensure_airlock_route(&base, &user, &resolved, account.number)?;
     // The record and the route are committed, but neither LENDS anything: the
     // credential is only reachable while the daemon that serves the store runs,
     // and nothing else in this flow — nor `cred list`, nor `gateway list` —
@@ -543,13 +533,13 @@ fn ensure_airlock_route(
     base: &str,
     user: &commonware_cryptography::ed25519::PrivateKey,
     resolved: &config::Resolved,
-    account_id: &[u8],
+    account_id: u64,
 ) -> CredResult {
     let name = gateway::RouteName::named(crate::airlock::AIRLOCK_ROUTE);
     let existing = query_gateway(
         base,
         &gateway::GatewayQuery::Get {
-            account_id: account_id.to_vec(),
+            account_id,
             name: name.clone(),
         },
     )?;
@@ -563,7 +553,7 @@ fn ensure_airlock_route(
     // bearer (`allow_authorization`). Request cap is the module ceiling.
     let statement = gateway::RouteStatement {
         chain_id: resolved.service.chain_id.clone(),
-        account_id: account_id.to_vec(),
+        account_id,
         name,
         publisher_node: resolved.signer.public_key().as_ref().to_vec(),
         revision: 1,
@@ -590,7 +580,7 @@ fn ensure_airlock_route(
                 .to_vec(),
         },
     };
-    let height = submit_gateway(base, &message)?;
+    let height = submit_gateway(base, user, &message)?;
     println!("published airlock route at height {height}");
     Ok(())
 }
@@ -787,13 +777,16 @@ fn authorize(
     }
 }
 
-/// Submit one gateway op over the node's frameless `/v1/submit` (the node stamps
-/// itself as origin) and return the committed height.
+/// Submit one gateway op as a frame `user` signed over `/v1/submit/frame` (the
+/// user key is the origin the gateway resolves to the owner account) and
+/// return the committed height.
 fn submit_gateway(
     base: &str,
+    user: &commonware_cryptography::ed25519::PrivateKey,
     message: &gateway::GatewayMsg,
 ) -> Result<u64, Box<dyn std::error::Error>> {
-    crate::node_http::submit(base, "gateway", &serde_json::to_value(message)?)
+    let frame = crate::userkey_cli::user_frame(user, "gateway", gateway::encode_msg(message));
+    crate::node_http::submit_frame(base, &frame)
 }
 
 /// Read every registered credential record from committed gateway state.
@@ -824,69 +817,17 @@ fn query_gateway(
     Ok(serde_json::from_value(value)?)
 }
 
-/// The account id the local user key belongs to (owner of any record it signs).
-fn query_owner_account(
-    base: &str,
-    member_key: &[u8],
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    Ok(query_owner_account_view(base, member_key)?.account_id)
+/// The account number the local user key belongs to (owner of any record it
+/// signs), resolved through `OfKey` — the one resolver.
+fn query_owner_account(base: &str, member_key: &[u8]) -> Result<u64, Box<dyn std::error::Error>> {
+    Ok(query_owner_account_view(base, member_key)?.number)
 }
 
 fn query_owner_account_view(
     base: &str,
     member_key: &[u8],
 ) -> Result<identity::AccountView, Box<dyn std::error::Error>> {
-    let query = identity::IdentityQuery::OfMember {
-        member_key: member_key.to_vec(),
-    };
-    let value = query_node(base, "identity", serde_json::to_value(&query)?)?;
-    match serde_json::from_value::<identity::IdentityReply>(value)? {
-        identity::IdentityReply::Account(Some(account)) => Ok(account),
-        identity::IdentityReply::Account(None) => {
-            Err("this user key belongs to no account on this node — bind it first".into())
-        }
-        other => Err(format!("unexpected identity reply: {other:?}").into()),
-    }
-}
-
-/// Resolve a grant target: a hex account id used directly, else a display name
-/// matched against the account set (ambiguity and absence are loud errors).
-pub(crate) fn resolve_account(
-    base: &str,
-    input: &str,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    if let Ok(bytes) = config::unhex(input) {
-        return Ok(bytes);
-    }
-    let query = identity::IdentityQuery::All {
-        from: 0,
-        limit: u64::MAX,
-    };
-    let value = query_node(base, "identity", serde_json::to_value(&query)?)?;
-    let accounts = match serde_json::from_value::<identity::IdentityReply>(value)? {
-        identity::IdentityReply::Accounts(accounts) => accounts,
-        other => return Err(format!("unexpected identity reply: {other:?}").into()),
-    };
-    let matches: Vec<&identity::AccountView> = accounts
-        .iter()
-        .filter(|a| a.display_name.as_deref() == Some(input))
-        .collect();
-    match matches.as_slice() {
-        [only] => Ok(only.account_id.clone()),
-        [] => Err(format!("no account named {input:?} (nor a valid hex account id)").into()),
-        many => {
-            let ids: Vec<String> = many
-                .iter()
-                .map(|a| config::hex_bytes(&a.account_id))
-                .collect();
-            Err(format!(
-                "account name {input:?} is ambiguous across {} accounts: {}",
-                many.len(),
-                ids.join(", ")
-            )
-            .into())
-        }
-    }
+    crate::account_cli::own_account(base, member_key)
 }
 
 /// One `/v1/query` round-trip: `{target, query}` in, the module reply JSON out.

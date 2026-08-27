@@ -9,8 +9,8 @@
 //!
 //! authorship is trusted because the ordered lane VERIFIES frame signatures:
 //! `Origin::External(pubkey)` reaching a module is authenticated. validator
-//! mode keys a ballot by that node; share mode resolves it to one Identity
-//! account, so no validator can forge another principal's ballot.
+//! mode keys a ballot by that node key; share mode resolves the key to its one
+//! Identity account (`OfKey`), so no key can forge another principal's ballot.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
@@ -32,14 +32,14 @@ pub enum GovAction {
     /// execution.
     RemoveResident { key: Vec<u8> },
     /// initialize non-transferable account shares and enable share mode. the
-    /// allocation must be non-empty, unique by account id, and name existing
-    /// Identity accounts. initialization is one-time; the registry is retained
-    /// when governance later switches back to validator ballots.
+    /// allocation must be non-empty, unique by account number, and name
+    /// existing Identity accounts. initialization is one-time; the registry is
+    /// retained when governance later switches back to validator ballots.
     AdoptShares { allocations: Vec<ShareAllocation> },
     /// set one Identity account's shares. zero removes the account from the
     /// registry. only available after shares were configured; the current mode
     /// freezes the electorate and structural threshold that decides it.
-    SetShares { account_id: Vec<u8>, shares: u64 },
+    SetShares { account_id: u64, shares: u64 },
     /// choose the electorate for future proposals. `true` uses the configured
     /// account shares; `false` restores one ballot per validator node. this
     /// proposal itself is always decided by the mode frozen when it was opened.
@@ -86,11 +86,12 @@ pub enum GovAction {
     },
 }
 
-/// one non-transferable governance-share allocation.
+/// one non-transferable governance-share allocation, keyed by the Identity
+/// account NUMBER.
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ShareAllocation {
-    pub account_id: Vec<u8>,
+    pub account_id: u64,
     pub shares: u64,
 }
 
@@ -168,21 +169,25 @@ pub enum ProposalStatus {
     Rejected,
 }
 
-/// the readable projection of one proposal.
+/// the readable projection of one proposal. every principal (`proposer`,
+/// `votes`, `electorate`) is a node key in validator mode and
+/// `identity::account_principal(n)` (8 bytes LE) in share mode, per
+/// `voter_kind`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProposalView {
     pub proposal_id: String,
     pub action: GovAction,
+    /// the submitter's principal: its node key, or its account principal.
     pub proposer: Vec<u8>,
     pub created_at: u64,
     pub deadline: u64,
     pub status: ProposalStatus,
-    /// ballots by validator-node key or account id, per `voter_kind`.
+    /// ballots by validator-node key or account principal, per `voter_kind`.
     pub votes: Vec<(Vec<u8>, bool)>,
     pub voter_kind: VoterKind,
     /// the proposal-time power snapshot — every proposal freezes its electorate
-    /// when it is opened.
+    /// when it is opened. keyed like `votes`.
     pub electorate: Vec<(Vec<u8>, u64)>,
     pub voting_rule: VotingRule,
 }

@@ -100,10 +100,12 @@ dropped from the race (an all-coordinated invite on a TUN node then hits the
 honest terminal immediately rather than hanging).
 
 The two-node real-WireGuard container smoke that proved mesh-over-tunnels
-(and its cold-restart leg) lives at `ops/wg-smoke/run-smoke.sh`; extending
-it to drive this join recipe end-to-end on real tunnels is the standing
-verification gate for the tunnel-first flow (the TCP-carrier halves are
-proven by `bin/node/tests/join_request_e2e.rs`).
+(and its cold-restart leg) was `ops/wg-smoke/run-smoke.sh`; it hand-wrote a
+pre-2026-07-23 node.toml (`bootstrapper_addr`, no `http_listen`/`[sandbox]`)
+that today's node refuses, so it was removed rather than left as a gate
+nobody could run. A tunnel-first end-to-end gate on real tunnels is still
+owed; it should generate its configs with `ducktape node init`, not by hand
+(the TCP-carrier halves are proven by `bin/node/tests/join_request_e2e.rs`).
 
 ## Cold restart (shipped)
 

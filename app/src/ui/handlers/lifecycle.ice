@@ -159,7 +159,7 @@ on workspace_connected(next)
   block_height = next.height
   channels = next.channels
   channel_reads = initial_channel_reads(next.channels, channel_reads)
-  rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   unread_boundary = 0
   // A connect answers with the LATEST page of whatever room it landed on, so
@@ -176,7 +176,7 @@ on workspace_connected(next)
   // (ducktape-ui#697).
   // A reconnect lands on `channels.first()`, which is nobody's DM unless the
   // derivation says so — see `dm_peer_of_channel`.
-  active_dm_peer = dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel)
+  active_dm_peer = dm_peer_of_channel(active_dm_peer, account_number, active_channel)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
@@ -442,7 +442,7 @@ on live_resynced(next)
   // today's `active_channel`), so `chat_loaded` alone still blanks him.
   // `loading` is true for precisely the `choose_dm` -> `chat_updated`/`failed`
   // window, and the landing it names re-derives the peer itself.
-  active_dm_peer = keep_str(next.chat_loaded && !loading, dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel), active_dm_peer)
+  active_dm_peer = keep_str(next.chat_loaded && !loading, dm_peer_of_channel(active_dm_peer, account_number, active_channel), active_dm_peer)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = keep_str(next.chat_loaded, next.active_channel_name, active_channel_name)
   active_channel_archived = keep_bool(next.chat_loaded, next.active_channel_archived, active_channel_archived)
@@ -477,7 +477,7 @@ on live_resynced(next)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, resync_tail_channel, channel_head_seq(channels, resync_tail_channel))
-  rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   // A resync carries whatever page was active WHEN IT WAS ISSUED and takes
   // several queries to answer, so a mutation landing in between leaves it
@@ -671,7 +671,7 @@ on select_shell_tab(next)
   unread_boundary = keep_i64(chat_tab_arrivals, channel_last_read(channel_reads, chat_tab_channel), unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, chat_tab_channel, channel_head_seq(channels, chat_tab_channel))
-  rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   // MENU-ONLY STATE BELONGS TO THE SCREEN THAT MOUNTED IT, and every one of
   // these surfaces is mounted under an arm of `match tab`. Left set, an armed
@@ -722,12 +722,12 @@ on select_shell_tab(next)
   // THE SETTINGS BUMP IS GATED TOO, AND IT IS THE ONE THAT HAS TO BE. Every
   // other loader here draws only its own tab, so a bump that discards a
   // still-flying CONNECT load is re-earned the moment that tab is opened. The
-  // settings facts are not: chat mounts `settings_user_key` as `me`, and chat
-  // returns above this block, so nothing chat does ever re-issues them. Bump
-  // unconditionally and a move into Members while the connect load is in
-  // flight orphans it, and `me` stays "" for the session, which
-  // `chat_sidebar_rooms` reads as "show every DM under CHANNELS"
-  // and `post_gate` as "not seated", refusing the composer on every DM.
+  // settings facts are not: chat mounts `settings_user_key` as the seating
+  // key, and chat returns above this block, so nothing chat does ever
+  // re-issues them. Bump unconditionally and a move into Members while the
+  // connect load is in flight orphans it, and the key stays "" for the
+  // session, which `post_gate` reads as "not seated", refusing the composer
+  // on every members-only room.
   settings_generation = keep_i64(shell_tab == ShellTab.settings, settings_generation + 1, settings_generation)
   node_peers_generation = node_peers_generation + 1
   explorer_loading = shell_tab == ShellTab.explorer

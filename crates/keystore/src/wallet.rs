@@ -205,31 +205,6 @@ pub fn active_user_key() -> Result<PathBuf, String> {
     active_key_path(&duck_root()?)
 }
 
-/// Where `user account-init` signs from when no `--key` is given: the
-/// active wallet when the keystore has any; a NAMED mint only into an
-/// empty keystore. Minting beside existing wallets is exactly the
-/// silently-minted-stranger footgun this module exists to kill.
-pub enum AccountInitKey {
-    Active(PathBuf),
-    Mint { path: PathBuf, name: String },
-}
-
-pub fn account_init_target(display_name: &str) -> Result<AccountInitKey, String> {
-    account_init_target_in(&duck_root()?, display_name)
-}
-
-fn account_init_target_in(duck: &Path, display_name: &str) -> Result<AccountInitKey, String> {
-    adopt_legacy(duck)?;
-    if list(duck)?.is_empty() {
-        let name = sanitize_name(display_name);
-        return Ok(AccountInitKey::Mint {
-            path: key_file(duck, &name),
-            name,
-        });
-    }
-    Ok(AccountInitKey::Active(active_key_path(duck)?))
-}
-
 // ============================================================================
 // the wallet ceremonies — mint, import, activate
 // ============================================================================
@@ -410,27 +385,6 @@ mod tests {
         assert!(dangling.contains("wallet use"), "{dangling}");
         set_active(duck, "alpha").unwrap();
         assert_eq!(active_key_path(duck).unwrap(), key_file(duck, "alpha"));
-    }
-
-    #[test]
-    fn account_init_target_prefers_active_and_mints_only_into_emptiness() {
-        let dir = tempfile::tempdir().unwrap();
-        let duck = dir.path();
-        // empty keystore: mint target named after --name, sanitized.
-        match account_init_target_in(duck, "Byeongsu Hong").unwrap() {
-            AccountInitKey::Mint { path, name } => {
-                assert_eq!(name, "byeongsu-hong");
-                assert_eq!(path, key_file(duck, "byeongsu-hong"));
-            }
-            AccountInitKey::Active(_) => panic!("empty keystore must mint"),
-        }
-        // populated keystore: the active wallet, never a new mint.
-        seed_wallet(duck, "alice");
-        set_active(duck, "alice").unwrap();
-        match account_init_target_in(duck, "whoever").unwrap() {
-            AccountInitKey::Active(path) => assert_eq!(path, key_file(duck, "alice")),
-            AccountInitKey::Mint { .. } => panic!("populated keystore must not mint"),
-        }
     }
 
     #[test]

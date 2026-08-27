@@ -446,15 +446,13 @@ impl ForgeState {
         Ok(())
     }
 
-    /// the Identity ACCOUNT id a key belongs to, or `None`.
+    /// the Identity ACCOUNT number a key belongs to, or `None`.
     ///
     /// a host with no identity module at all (the minimal test hosts) has no
     /// accounts, so nothing resolves — the only tolerated query failures are
     /// exactly "that module is not here".
-    async fn identity_account(
-        ctx: &dyn Ctx,
-        query: IdentityQuery,
-    ) -> Result<Option<Vec<u8>>, Error> {
+    async fn identity_account(ctx: &dyn Ctx, key: &[u8]) -> Result<Option<u64>, Error> {
+        let query = IdentityQuery::OfKey { key: key.to_vec() };
         let reply = match ctx
             .query(IDENTITY_MODULE, &identity::encode_query(&query))
             .await
@@ -464,7 +462,7 @@ impl ForgeState {
             Err(other) => return Err(other),
         };
         match identity::decode_reply(&reply).map_err(Error::Module)? {
-            IdentityReply::Account(account) => Ok(account.map(|a| a.account_id)),
+            IdentityReply::Account(account) => Ok(account.map(|a| a.number)),
             other => Err(Error::Module(format!(
                 "forge: identity answered an account query with {other:?}"
             ))),
@@ -473,17 +471,17 @@ impl ForgeState {
 
     /// the PRINCIPAL a ref-moving op speaks for.
     ///
-    /// the two ref-move doors sign under DIFFERENT key domains: `git push`
-    /// rides the NODE key (bin/noded's smart-HTTP lane submits, and the
-    /// validator ingress discards the claimed origin and re-signs with the node
-    /// key), while the app's merge is signed by the USER key. collapsing both
-    /// through Identity onto ONE account id is what lets the same human push
-    /// from the CLI and merge the PR from the app — a raw-key owner would
-    /// refuse the second.
+    /// every ref-move door signs with a USER key (`git push` through the
+    /// node's smart-HTTP lane carries the user's signed frame, the app's merge
+    /// is user-signed too), and Identity collapses every key of one
+    /// association onto ONE account principal
+    /// ([`identity::account_principal`]) — so the same human pushes from a
+    /// laptop key and merges the PR from a phone key.
     ///
     /// a key Identity knows nothing about is its OWN principal. that keeps a
     /// single-operator or identity-less network self-consistent and does not
-    /// widen the gate: an unbound key still only ever matches itself.
+    /// widen the gate: an account-less key still only ever matches itself,
+    /// and an account principal (8 bytes) never collides with a key.
     async fn principal_of_origin(ctx: &dyn Ctx) -> Result<Vec<u8>, Error> {
         let Origin::External(key) = &ctx.env().origin else {
             return Err(Error::Module(
@@ -495,24 +493,8 @@ impl ForgeState {
                 "forge: a ref-moving op requires an authenticated external origin".into(),
             ));
         }
-        let as_member = Self::identity_account(
-            ctx,
-            IdentityQuery::OfMember {
-                member_key: key.clone(),
-            },
-        )
-        .await?;
-        if let Some(account) = as_member {
-            return Ok(account);
-        }
-        let as_node = Self::identity_account(
-            ctx,
-            IdentityQuery::OfNode {
-                node_key: key.clone(),
-            },
-        )
-        .await?;
-        Ok(as_node.unwrap_or_else(|| key.clone()))
+        let account = Self::identity_account(ctx, key).await?;
+        Ok(account.map_or_else(|| key.clone(), identity::account_principal))
     }
 
     /// stage an atomic multi-branch push: validate the update list, settle

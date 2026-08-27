@@ -17,9 +17,7 @@
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use futures::executor::block_on;
-use governance::invite::{
-    INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteToken, sign_join_proof,
-};
+use governance::invite::{INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteToken, sign_join_proof};
 use governance::{
     GovMsg, GovQuery, GovReply, Governance, decode_reply as gov_decode, encode_msg as gov_encode,
     encode_query as gov_query,
@@ -86,20 +84,30 @@ fn redeem_msg(token: &InviteToken, joiner: &PrivateKey) -> Vec<u8> {
 /// 1 and 2.
 async fn gov_host() -> Host {
     let mut valset = Valset::new("valset", Box::new(MemStore::new()));
-    valset.seed(key_bytes(&keypair(1))).await.expect("seed valset");
-    valset.seed(key_bytes(&keypair(2))).await.expect("seed valset");
+    valset
+        .seed(key_bytes(&keypair(1)))
+        .await
+        .expect("seed valset");
+    valset
+        .seed(key_bytes(&keypair(2)))
+        .await
+        .expect("seed valset");
     valset.finish_seed().await.expect("seed valset");
     Host::genesis(vec![
         Box::new(valset),
         Box::new(Identity::new(
             "identity",
             Box::new(MemStore::new()),
-            None,
             "testnet".into(),
         )),
         Box::new(
-            Governance::new("governance", Box::new(MemStore::new()), "valset", "identity")
-                .with_invite_binding(BINDING),
+            Governance::new(
+                "governance",
+                Box::new(MemStore::new()),
+                "valset",
+                "identity",
+            )
+            .with_invite_binding(BINDING),
         ),
     ])
     .expect("genesis")
@@ -275,7 +283,10 @@ fn forged_or_unauthorized_redemptions_are_refused() {
 fn a_network_without_a_binding_refuses_redemption() {
     block_on(async {
         let mut valset = Valset::new("valset", Box::new(MemStore::new()));
-        valset.seed(key_bytes(&keypair(1))).await.expect("seed valset");
+        valset
+            .seed(key_bytes(&keypair(1)))
+            .await
+            .expect("seed valset");
         valset.finish_seed().await.expect("seed valset");
         let mut host = Host::genesis(vec![
             Box::new(valset),

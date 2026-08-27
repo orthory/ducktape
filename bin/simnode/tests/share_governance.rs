@@ -3,37 +3,37 @@
 //! exact /v1 wire (no live roll). three things pinned here:
 //!
 //! - **account-share governance** (the last governance surface unexercised):
-//!   validators adopt shares over two bound Identity accounts, which ALSO flips
-//!   the electorate to account mode; a share-mode Signal is then decided by
-//!   ParticipatingMajority over ACCOUNT-keyed ballots, honours its deadline, and
-//!   — the load-bearing invariant — every proposal FREEZES its electorate, so
-//!   one opened in share mode stays account-decided even after the mode flips
-//!   back to validator ballots.
+//!   validators adopt shares over two Identity accounts (numbers 1 and 2),
+//!   which ALSO flips the electorate to account mode; a share-mode Signal is
+//!   then decided by ParticipatingMajority over ACCOUNT-keyed ballots, honours
+//!   its deadline, and — the load-bearing invariant — every proposal FREEZES
+//!   its electorate, so one opened in share mode stays account-decided even
+//!   after the mode flips back to validator ballots.
 //! - **kv under the preset**: kv registers only with `--with-valset`; a
 //!   set/get/overwrite round-trip, the no-delete reality, and a cheap
 //!   same-script-same-hash determinism pass.
 //!
 //! every ballot is authored as a real principal: validators through the `hex:`
 //! origin escape (governance keys their ballots on `Origin::External`), account
-//! voters through the 32-byte node key bound to the account — governance
-//! resolves that node to its Identity account (`account_of_node`), so the
-//! account, never the node, is the frozen ballot principal.
+//! voters through a member key of the account — governance resolves that key
+//! to its Identity account (`OfKey`), so the ballot principal is
+//! `identity::account_principal(number)`, never the key.
 
 mod harness;
 
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PrivateKey;
-use harness::{Sim, ed_bind_auth};
-use identity::bind_preimage;
+use harness::{Sim, create};
 use serde_json::{Value, json};
 use std::path::Path;
 
 type Ed = PrivateKey;
 
-// the two account nodes: 32-byte ASCII node keys (bind origins AND account-mode
-// ballot origins — printable, so no `hex:` escape is needed for them).
-const NODE_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const NODE_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+// the two account keys: 32-byte ASCII origins (well-formed ed25519 keys as far
+// as founding goes — printable, so no `hex:` escape is needed for them). each
+// founds its own account and casts that account's ballots.
+const KEY_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const KEY_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 // ── ceremony helpers (mirrors governance_scenarios.rs) ──
 
@@ -63,15 +63,10 @@ fn governed(storage: &Path) -> (Sim, Vec<Ed>) {
     (sim, validators)
 }
 
-/// found an Identity account: `key` consents to binding `node` at nonce 0 (the
-/// sim's identity has empty chain_id). the account_id IS `key`'s pubkey.
-fn bind_account(sim: &Sim, key: &Ed, node: &str) {
-    let preimage = bind_preimage("", node.as_bytes(), 0);
-    sim.submit_ok(
-        "identity",
-        json!({ "bind_node": { "authorizer": ed_bind_auth(key, &preimage) } }),
-        Some(node),
-    );
+/// found an Identity account for the origin `key`: numbers are handed out in
+/// commit order, so the first Create founds 1, the second 2.
+fn found_account(sim: &Sim, key: &str) {
+    sim.submit_ok("identity", create(key), Some(key));
 }
 
 fn propose(sim: &Sim, origin: &str, id: &str, action: Value, period: u64) {
@@ -142,14 +137,12 @@ fn walk_to(sim: &Sim, target: u64) {
     }
 }
 
-/// a governed sim with two share-holding Identity accounts adopted (A:2, B:1)
-/// — which ALSO enables account-share mode. returns the account founding keys.
-fn share_governed(storage: &Path) -> (Sim, Ed, Ed) {
+/// a governed sim with two share-holding Identity accounts adopted (1:2, 2:1)
+/// — which ALSO enables account-share mode.
+fn share_governed(storage: &Path) -> Sim {
     let (sim, validators) = governed(storage);
-    let key_a = Ed::from_seed(10);
-    let key_b = Ed::from_seed(11);
-    bind_account(&sim, &key_a, NODE_A);
-    bind_account(&sim, &key_b, NODE_B);
+    found_account(&sim, KEY_A);
+    found_account(&sim, KEY_B);
     let v0 = origin(&validators[0]);
     let v1 = origin(&validators[1]);
     pass(
@@ -157,12 +150,17 @@ fn share_governed(storage: &Path) -> (Sim, Ed, Ed) {
         &[&v0, &v1],
         "adopt",
         json!({ "adopt_shares": { "allocations": [
-            { "account_id": key_a.public_key().as_ref().to_vec(), "shares": 2 },
-            { "account_id": key_b.public_key().as_ref().to_vec(), "shares": 1 },
+            { "account_id": 1, "shares": 2 },
+            { "account_id": 2, "shares": 1 },
         ]}}),
         1_000_000,
     );
-    (sim, key_a, key_b)
+    sim
+}
+
+/// the ballot principal of account `number`: 8 bytes LE, never a key.
+fn principal(number: u64) -> Value {
+    json!(identity::account_principal(number))
 }
 
 // ── account-share governance: adopt, decide, honour the deadline ─
@@ -174,8 +172,7 @@ fn share_governed(storage: &Path) -> (Sim, Ed, Ed) {
 #[test]
 fn account_shares_adopt_enable_and_decide_by_participating_majority() {
     let storage = tempfile::tempdir().expect("storage dir");
-    let (sim, key_a, _key_b) = share_governed(storage.path());
-    let acct_a = key_a.public_key().as_ref().to_vec();
+    let sim = share_governed(storage.path());
 
     // adoption already switched the electorate on — the registry is active with
     // total power 3.
@@ -196,18 +193,18 @@ fn account_shares_adopt_enable_and_decide_by_participating_majority() {
         json!({ "propose": { "proposal_id": "redundant", "voting_period": 1000, "action": {
             "set_share_mode": { "enabled": true }
         }}}),
-        Some(NODE_A),
+        Some(KEY_A),
     );
     assert!(
         error.contains("governance is already using the requested voting mode"),
         "adopt already enabled share mode: {error}"
     );
 
-    // a share-mode Signal, proposed by account A's node. the proposal FREEZES an
+    // a share-mode Signal, proposed by account 1's key. the proposal FREEZES an
     // account electorate under the ParticipatingMajority rule (quorum ceil(3/2)=2).
     propose(
         &sim,
-        NODE_A,
+        KEY_A,
         "ship",
         json!({ "signal": { "text": "ship it" } }),
         1_000_000,
@@ -222,17 +219,17 @@ fn account_shares_adopt_enable_and_decide_by_participating_majority() {
         "share-mode Signal uses ParticipatingMajority quorum ceil(n/2): {view}"
     );
 
-    // account A holds 2 of 3 shares: its lone yes is an irreversible majority, so
+    // account 1 holds 2 of 3 shares: its lone yes is an irreversible majority, so
     // execute settles EARLY, well before the deadline — and the ballot is keyed
-    // by the ACCOUNT id, not A's node key (the node→account resolution).
-    vote(&sim, NODE_A, "ship", true);
+    // by the ACCOUNT principal, not the member key (the key→account resolution).
+    vote(&sim, KEY_A, "ship", true);
     let view = proposal(&sim, "ship");
     assert_eq!(
         view["votes"][0][0],
-        json!(acct_a),
-        "the ballot principal is the account, not the node: {view}"
+        principal(1),
+        "the ballot principal is the account, not the key: {view}"
     );
-    execute_ok(&sim, NODE_A, "ship");
+    execute_ok(&sim, KEY_A, "ship");
     assert_eq!(
         proposal(&sim, "ship")["status"],
         "passed",
@@ -244,13 +241,13 @@ fn account_shares_adopt_enable_and_decide_by_participating_majority() {
     let base = height(&sim);
     propose(
         &sim,
-        NODE_A,
+        KEY_A,
         "minority",
         json!({ "signal": { "text": "nope" } }),
         5000,
     );
-    vote(&sim, NODE_B, "minority", true);
-    let error = execute_rejected(&sim, NODE_A, "minority");
+    vote(&sim, KEY_B, "minority", true);
+    let error = execute_rejected(&sim, KEY_A, "minority");
     assert!(
         error.contains("not decidable yet"),
         "a lone minority ballot cannot settle early: {error}"
@@ -258,7 +255,7 @@ fn account_shares_adopt_enable_and_decide_by_participating_majority() {
     // …and once the clock passes the deadline it settles rejected (participation
     // never reached the quorum).
     walk_to(&sim, base + 10);
-    execute_ok(&sim, NODE_A, "minority");
+    execute_ok(&sim, KEY_A, "minority");
     assert_eq!(
         proposal(&sim, "minority")["status"],
         "rejected",
@@ -266,14 +263,14 @@ fn account_shares_adopt_enable_and_decide_by_participating_majority() {
     );
 }
 
-/// account voting is gated at the node→account resolution: a node bound to no
+/// account voting is gated at the key→account resolution: a key on no
 /// Identity account cannot open or carry a share-mode ballot.
 #[test]
-fn a_node_bound_to_no_account_cannot_vote_in_share_mode() {
+fn a_key_on_no_account_cannot_vote_in_share_mode() {
     let storage = tempfile::tempdir().expect("storage dir");
-    let (sim, _a, _b) = share_governed(storage.path());
+    let sim = share_governed(storage.path());
 
-    // an unbound 32-byte node proposing in share mode is refused when governance
+    // a stranger key proposing in share mode is refused when governance
     // resolves it to an account and finds none.
     let stranger = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
     let error = sim.submit_rejected(
@@ -284,7 +281,7 @@ fn a_node_bound_to_no_account_cannot_vote_in_share_mode() {
         Some(stranger),
     );
     assert!(
-        error.contains("submitter node is not bound to an Identity account"),
+        error.contains("submitter key belongs to no Identity account"),
         "share-mode authorship resolves through Identity: {error}"
     );
 }
@@ -298,13 +295,12 @@ fn a_node_bound_to_no_account_cannot_vote_in_share_mode() {
 #[test]
 fn a_share_mode_proposal_stays_account_decided_after_the_flip_back() {
     let storage = tempfile::tempdir().expect("storage dir");
-    let (sim, key_a, _key_b) = share_governed(storage.path());
-    let acct_a = key_a.public_key().as_ref().to_vec();
+    let sim = share_governed(storage.path());
 
     // open a Signal in share mode (frozen account electorate), do NOT settle it.
     propose(
         &sim,
-        NODE_A,
+        KEY_A,
         "frozen",
         json!({ "signal": { "text": "pre-flip" } }),
         1_000_000,
@@ -316,7 +312,7 @@ fn a_share_mode_proposal_stays_account_decided_after_the_flip_back() {
     // action, so ceil(2n/3)=2, which account A's 2 shares meet alone.
     propose(
         &sim,
-        NODE_A,
+        KEY_A,
         "flip",
         json!({ "set_share_mode": { "enabled": false } }),
         1_000_000,
@@ -330,8 +326,8 @@ fn a_share_mode_proposal_stays_account_decided_after_the_flip_back() {
         flip["voting_rule"]["threshold"]["required_yes"], 2,
         "ceil(2n/3): {flip}"
     );
-    vote(&sim, NODE_A, "flip", true);
-    execute_ok(&sim, NODE_A, "flip");
+    vote(&sim, KEY_A, "flip", true);
+    execute_ok(&sim, KEY_A, "flip");
     assert_eq!(
         shares_view(&sim)["active"],
         false,
@@ -354,7 +350,7 @@ fn a_share_mode_proposal_stays_account_decided_after_the_flip_back() {
     );
 
     // THE FREEZING INVARIANT: the "frozen" proposal STILL resolves its ballots by
-    // account — a validator's vote is refused at the node→account resolution,
+    // account — a validator's vote is refused at the key→account resolution,
     // exactly as in share mode…
     let error = sim.submit_rejected(
         "governance",
@@ -362,15 +358,15 @@ fn a_share_mode_proposal_stays_account_decided_after_the_flip_back() {
         Some(v0.as_str()),
     );
     assert!(
-        error.contains("submitter node is not bound to an Identity account"),
+        error.contains("submitter key belongs to no Identity account"),
         "the frozen proposal keeps its account resolution: {error}"
     );
 
-    // …and it tallies by the FROZEN account electorate: account A's 2 of 3 shares
+    // …and it tallies by the FROZEN account electorate: account 1's 2 of 3 shares
     // pass it under ParticipatingMajority, though the network is now in validator
-    // mode. the winning ballot is keyed by the account.
-    vote(&sim, NODE_A, "frozen", true);
-    execute_ok(&sim, NODE_A, "frozen");
+    // mode. the winning ballot is keyed by the account principal.
+    vote(&sim, KEY_A, "frozen", true);
+    execute_ok(&sim, KEY_A, "frozen");
     let settled = proposal(&sim, "frozen");
     assert_eq!(
         settled["status"], "passed",
@@ -382,8 +378,8 @@ fn a_share_mode_proposal_stays_account_decided_after_the_flip_back() {
     );
     assert_eq!(
         settled["votes"][0][0],
-        json!(acct_a),
-        "keyed by the account id: {settled}"
+        principal(1),
+        "keyed by the account principal: {settled}"
     );
 }
 

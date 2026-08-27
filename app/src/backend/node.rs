@@ -11,11 +11,11 @@ pub struct SettingsFacts {
     pub data_dir: String,
     pub open_tabs: i64,
     /// THE VIEWER'S OWN KEY, full hex — the `me` every membership test needs.
-    /// `ChatMember.key` is `member_id(..)` at full width, and `account_id` is a
-    /// `short_label` of the identity module's ACCOUNT id, so neither the account
-    /// card nor the node key can answer "is this row me". Empty on a device with
-    /// no user key, which `post_gate` reads as "not seated" — the honest answer
-    /// when there is no identity to seat.
+    /// `ChatMember.key` is `member_id(..)` at full width, and the account card
+    /// carries an account NUMBER, not a key, so neither the account card nor
+    /// the node key can answer "is this row me". Empty on a device with no user
+    /// key, which `post_gate` reads as "not seated" — the honest answer when
+    /// there is no identity to seat.
     pub user_key: String,
 }
 
@@ -1190,66 +1190,59 @@ pub async fn set_agent_status(
     Ok(true)
 }
 
-/// The local account picture: whether THIS NODE is bound, and the account's
-/// public face.
+/// The local account picture: whether the local user key belongs to an
+/// account, and that account's public face. `number` is the decimal account
+/// number — "" when there is none.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct AccountData {
     pub generation: i64,
-    pub bound: bool,
-    pub account_id: String,
-    pub display_name: String,
+    pub exists: bool,
+    pub number: String,
+    pub name: String,
     pub bio: String,
-    pub members: i64,
-    pub nodes: i64,
+    pub keys: i64,
 }
 
-/// Load the account this node is bound to (via the canonical resolver).
+impl AccountData {
+    fn none(generation: i64) -> Self {
+        Self {
+            generation,
+            exists: false,
+            number: String::new(),
+            name: String::new(),
+            bio: String::new(),
+            keys: 0,
+        }
+    }
+}
+
+/// Load the account the local user key belongs to (via the canonical
+/// resolver, `OfKey`). A device with no user key has no account to load.
 pub async fn load_account(rpc: String, generation: i64) -> Result<AccountData, HydrationError> {
     async {
+        let Some(key) = local_user_key().await else {
+            return Ok(AccountData::none(generation));
+        };
         let client = rpc_client(&rpc)?;
-        let node_key_hex = client.status().await?.public_key;
-        let node_key: Vec<u8> = (0..node_key_hex.len())
-            .step_by(2)
-            .filter_map(|i| u8::from_str_radix(&node_key_hex[i..i + 2], 16).ok())
-            .collect();
-        let reply: serde_json::Value = client
-            .query(
-                "identity",
-                &serde_json::json!({ "of_node": { "node_key": node_key } }),
-            )
+        let reply: identity::IdentityReply = client
+            .query("identity", &identity::IdentityQuery::OfKey { key })
             .await?;
-        let account = &reply["account"];
-        if account.is_null() {
-            return Ok(AccountData {
-                generation,
-                bound: false,
-                account_id: String::new(),
-                display_name: String::new(),
-                bio: String::new(),
-                members: 0,
-                nodes: 0,
-            });
-        }
-        let id_bytes: Vec<u8> = account["account_id"]
-            .as_array()
-            .map(|bytes| {
-                bytes
-                    .iter()
-                    .filter_map(|byte| byte.as_u64().map(|byte| byte as u8))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let account = match reply {
+            identity::IdentityReply::Account(account) => account,
+            identity::IdentityReply::Accounts(_) | identity::IdentityReply::Gen(_) => {
+                return Err("the identity module returned the wrong reply".to_string());
+            }
+        };
+        let Some(account) = account else {
+            return Ok(AccountData::none(generation));
+        };
         Ok(AccountData {
             generation,
-            bound: true,
-            account_id: short_label(&hex_encode(&id_bytes)),
-            display_name: account["display_name"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
-            bio: account["bio"].as_str().unwrap_or_default().to_string(),
-            members: count_i64(account["members"].as_array().map_or(0, |m| m.len())),
-            nodes: count_i64(account["nodes"].as_array().map_or(0, |n| n.len())),
+            exists: true,
+            number: account.number.to_string(),
+            name: account.name,
+            bio: account.bio.unwrap_or_default(),
+            keys: count_i64(account.keys.len()),
         })
     }
     .await
@@ -1259,20 +1252,20 @@ pub async fn load_account(rpc: String, generation: i64) -> Result<AccountData, H
     })
 }
 
-/// Rename the account this node is bound to (origin-gated: the bound node
-/// itself is the authority).
+/// Rename the account the local user key belongs to (origin-gated: any member
+/// key is the authority).
 pub async fn set_account_name(
     rpc: String,
     password: String,
-    display_name: String,
+    name: String,
 ) -> Result<bool, AppError> {
     async {
-        let display_name = bounded_text(display_name, "display name", 128)?;
+        let name = bounded_text(name, "account name", identity::MAX_NAME_LEN)?;
         let client = rpc_client(&rpc)?;
         signed_write(
             &client,
             "identity",
-            identity::encode_msg(&identity::IdentityMsg::SetAccountName { display_name }),
+            identity::encode_msg(&identity::IdentityMsg::SetName { name }),
             password,
         )
         .await

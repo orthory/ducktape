@@ -89,7 +89,7 @@ pub enum WorkCmd {
 /// one account, or the literal `anyone`.
 #[derive(Debug, clap::Args)]
 pub struct WorkTargetArgs {
-    /// a hex account id, a display name, or the literal `anyone`. `anyone`
+    /// an account number, a display name, or the literal `anyone`. `anyone`
     /// admits every network member — and lets a stranger's workload draw on
     /// every credential this node has been granted.
     pub target: String,
@@ -179,8 +179,8 @@ impl Selector {
 /// workspace's node.toml PATH for the daemon that IS the node.
 ///
 /// `--node` is an http base here and means nothing else anywhere: the `agent`
-/// family's host targeting — which PEER runs the work, a display name or a raw
-/// node key — is `--host-node`, because it is a different type of input.
+/// family's host targeting — which PEER runs the work, a raw 64-hex node key —
+/// is `--host-node`, because it is a different type of input.
 #[derive(Debug, Default, clap::Args)]
 pub struct NodeAddr {
     /// the node's http base url (wins over -n/--network and DUCKTAPE_NODE)
@@ -194,7 +194,7 @@ pub struct NodeAddr {
 /// one rung of the node-addressing ladder — ONE tagged value, so the precedence
 /// is a single ordered expression instead of a hand-written `if` chain per
 /// family. Four of those existed and disagreed about `DUCKTAPE_NODE`, so
-/// `ducktape fs`, `ducktape agent` and `ducktape user account-init` could each
+/// `ducktape fs`, `ducktape agent` and `ducktape account create` could each
 /// dial a DIFFERENT node in one shell.
 #[derive(Debug)]
 enum Rung {
@@ -756,7 +756,7 @@ mod tests {
 
     /// the fifth-caller guard. `DUCKTAPE_NODE` was read by three families with
     /// three different precedences, so `ducktape fs`, `ducktape agent` and
-    /// `ducktape user account-init` could each dial a different node in one
+    /// `ducktape account create` could each dial a different node in one
     /// shell. There is now exactly ONE read; a family that hand-writes its own
     /// ladder fails here instead of shipping a fourth answer.
     ///

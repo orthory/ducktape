@@ -5,9 +5,7 @@ use iced::advanced::widget::{Operation, Tree, tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, renderer};
 use iced::futures::SinkExt as _;
 use iced::{Element, Length, Rectangle, Size, Subscription, Theme, mouse};
-use identity::{AccountView, IdentityQuery, IdentityReply};
 use saga::{SagaQuery, SagaReply, SagaStatus, SagaView};
-use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use tokio_tungstenite::tungstenite::Message;
@@ -328,23 +326,9 @@ pub async fn load_agent_host_nodes(
         let CapabilityReply::All(registry) = reply else {
             return Err("the capability registry returned the wrong reply".into());
         };
-        let reply: IdentityReply = client
-            .query(
-                "identity",
-                &IdentityQuery::All {
-                    from: 0,
-                    limit: u64::MAX,
-                },
-            )
-            .await
-            .map_err(String::from)?;
-        let IdentityReply::Accounts(accounts) = reply else {
-            return Err("the identity module returned the wrong reply".into());
-        };
-        let names = node_account_names(&accounts);
         let mut rows = registry
             .into_iter()
-            .filter_map(|(node, tags)| host_node_row(&names, &node, tags))
+            .filter_map(|(node, tags)| host_node_row(&node, tags))
             .collect::<Vec<_>>();
         rows.sort_by(|left, right| left.label.cmp(&right.label));
         Ok(AgentHostNodesData { generation, rows })
@@ -449,29 +433,11 @@ fn host_node_option(row: &AgentHostNode) -> String {
     row.label.clone()
 }
 
-/// node key -> the display name of the account that bound it. Accounts without
-/// a name contribute nothing, so their nodes fall back to a short key.
-fn node_account_names(accounts: &[AccountView]) -> HashMap<Vec<u8>, String> {
-    accounts
-        .iter()
-        .filter_map(|account| Some((account, account.display_name.clone()?)))
-        .flat_map(|(account, name)| {
-            account
-                .nodes
-                .iter()
-                .map(move |node| (node.node_key.clone(), name.clone()))
-        })
-        .collect()
-}
-
 /// A registry row becomes a pick only when it announces a provider this app can
 /// launch — the same provider set the argv builders accept, so the picker can
-/// never offer a host the run would bounce off.
-fn host_node_row(
-    names: &HashMap<Vec<u8>, String>,
-    node: &[u8],
-    tags: Vec<String>,
-) -> Option<AgentHostNode> {
+/// never offer a host the run would bounce off. A node is labelled by its
+/// short key: no account is bound to a node.
+fn host_node_row(node: &[u8], tags: Vec<String>) -> Option<AgentHostNode> {
     let providers = tags
         .into_iter()
         .filter(|tag| agent_provider(tag).is_ok())
@@ -480,10 +446,7 @@ fn host_node_row(
         return None;
     }
     let key = hex_encode(node);
-    let label = names
-        .get(node)
-        .cloned()
-        .unwrap_or_else(|| short_label(&key));
+    let label = short_label(&key);
     Some(AgentHostNode {
         key,
         label,
@@ -1878,18 +1841,15 @@ mod tests {
     }
 
     /// A node that announces nothing this app can launch is not a compute
-    /// choice, and an unnamed account still has to read as something.
+    /// choice, and a node reads as its short key.
     #[test]
     fn only_launchable_announcements_become_host_rows() {
         let key = vec![0xab, 0xcd, 0xef, 0x01, 0x23];
-        let names = HashMap::from([(key.clone(), "alice".to_string())]);
-        assert!(host_node_row(&names, &key, vec!["storage".into()]).is_none());
-        assert!(host_node_row(&names, &key, Vec::new()).is_none());
-        let named = host_node_row(&names, &key, vec!["codex".into(), "storage".into()]).unwrap();
-        assert_eq!((named.label.as_str(), named.providers.len()), ("alice", 1));
-        assert_eq!(named.key, "abcdef0123");
-        let unnamed = host_node_row(&HashMap::new(), &key, vec!["claude".into()]).unwrap();
-        assert_eq!(unnamed.label, "abcdef01…");
+        assert!(host_node_row(&key, vec!["storage".into()]).is_none());
+        assert!(host_node_row(&key, Vec::new()).is_none());
+        let row = host_node_row(&key, vec!["codex".into(), "storage".into()]).unwrap();
+        assert_eq!((row.label.as_str(), row.providers.len()), ("abcdef01…", 1));
+        assert_eq!(row.key, "abcdef0123");
     }
 
     /// The local row is one string in two languages: Rust rebuilds the option

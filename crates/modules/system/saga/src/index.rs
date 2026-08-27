@@ -5,7 +5,7 @@
 //! (one [`SagaMsg::OracleResult`], Ok or Err — retries fan out, failures also
 //! bill) is attributed to its EXECUTOR, the External node key that submitted
 //! the result op (the op row's `origin.id`, lowercase hex). node→account
-//! resolution is app-side via identity's `OfNode` — a mapper can only read
+//! resolution is app-side via identity's `OfKey` — a mapper can only read
 //! its own module's index.
 //! token counters are executor-reported observability, not provider-attested
 //! proof; quotas, rewards, and billing must never trust them.

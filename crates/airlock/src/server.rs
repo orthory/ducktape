@@ -146,16 +146,18 @@ pub enum GrantAnswer {
 }
 
 /// Everything the injected gate is given about one session-open. A struct, not a
-/// positional list: `credential` and `caller` are both opaque identifiers, and a
-/// security gate whose two arguments can be silently transposed is a defect
-/// waiting to happen.
+/// positional list: `credential` and `caller_node` are both opaque identifiers,
+/// and a security gate whose two arguments can be silently transposed is a
+/// defect waiting to happen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantQuestion {
     /// the credential NAME the session names (`SessionRequest::sub`).
     pub credential: String,
-    /// the account the TRANSPORT vouched for — see [`CALLER_ACCOUNT_HEADER`].
-    /// The only identity input, and the request contributes nothing to it.
-    pub caller: Vec<u8>,
+    /// the NODE the TRANSPORT vouched for — see [`CALLER_NODE_HEADER`]. The
+    /// only identity input, and the request contributes nothing to it. A node
+    /// is never an account: the gate reaches an account only through the
+    /// committed work the session points at.
+    pub caller_node: Vec<u8>,
     /// WHICH WORK the session draws for. A pointer into the lender's own
     /// committed state, never a claim — see [`WorkRef`].
     pub work: WorkRef,
@@ -167,8 +169,8 @@ pub struct GrantQuestion {
 /// record, and for a delegated pointer the saga module and the identity module
 /// too).
 ///
-/// The account handed here is ALWAYS the one the node's proxy vouched for in
-/// [`CALLER_ACCOUNT_HEADER`]. There is no other source, and there must not be
+/// The node handed here is ALWAYS the one the node's proxy vouched for in
+/// [`CALLER_NODE_HEADER`]. There is no other source, and there must not be
 /// one: the record's `owner_account` is a public field of the very record a
 /// borrower must read to learn `seal_pk`, so a gate keyed on anything the
 /// request could carry admits everyone who can read the chain. See
@@ -217,12 +219,12 @@ enum CredentialUploads {
 
 /// The unforgeable half of a session request.
 ///
-/// The node's gateway proxy mints `x-duck-caller-account` from the mesh-verified
-/// WireGuard peer identity (`bin/node/src/gateway_plane.rs`), and the proxy's own
-/// decode REFUSES a caller-supplied `x-duck-*`, so a borrower cannot write it.
-/// Everything else on a [`SessionRequest`] is chosen by whoever composed the
-/// JSON.
-pub const CALLER_ACCOUNT_HEADER: &str = "x-duck-caller-account";
+/// The node's gateway proxy mints `x-duck-caller-node` (the hex node key) from
+/// the mesh-verified WireGuard peer identity (`bin/node/src/gateway_plane.rs`),
+/// and the proxy's own decode REFUSES a caller-supplied `x-duck-*`, so a
+/// borrower cannot write it. Everything else on a [`SessionRequest`] is chosen
+/// by whoever composed the JSON.
+pub const CALLER_NODE_HEADER: &str = "x-duck-caller-node";
 
 /// Build the gateway router and report the vendor ("tdx"/"snp"/"self-host").
 pub fn build(cfg: GatewayConfig) -> Result<(Router, String)> {
@@ -548,15 +550,15 @@ async fn credential(
     Ok(StatusCode::OK)
 }
 
-/// The account the TRANSPORT vouched for, or `None` when nothing did.
+/// The node the TRANSPORT vouched for, or `None` when nothing did.
 ///
 /// This is the whole of the identity input, and a session request contributes
-/// nothing to it: the node's gateway proxy mints [`CALLER_ACCOUNT_HEADER`] from
+/// nothing to it: the node's gateway proxy mints [`CALLER_NODE_HEADER`] from
 /// the mesh-verified WireGuard peer and refuses a caller-supplied copy at its own
 /// decode, so it is the one field on the request that its sender cannot choose.
 fn vouched_caller(headers: &HeaderMap) -> Option<Vec<u8>> {
     headers
-        .get(CALLER_ACCOUNT_HEADER)
+        .get(CALLER_NODE_HEADER)
         .and_then(|value| value.to_str().ok())
         .and_then(|encoded| hex::decode(encoded).ok())
 }
@@ -576,20 +578,20 @@ enum SessionGate {
 /// Decide whether one session may open. Pure decision: it reads state and the
 /// injected authority, and writes nothing.
 ///
-/// Co-hosted lending: when a grant gate is wired, the caller must be one the
-/// node's proxy VOUCHED for, and that account must be the owner or a grantee of
-/// the on-chain record. Both before any handshake work — a session for an
-/// ungranted account never opens.
+/// Co-hosted lending: when a grant gate is wired, the caller must be a node
+/// the node's proxy VOUCHED for, and the authority must find a grant for the
+/// session — before any handshake work; a session nobody's grant covers never
+/// opens.
 ///
-/// The caller is the account of the node that made the hop, which is the node
-/// running the sandbox — and the ONE identity this flow can establish, since the
-/// session token the sandbox ends up holding names a credential and nothing
-/// about who is acting.
+/// The caller is the node that made the hop, which is the node running the
+/// sandbox — and the ONE identity this flow can establish, since the session
+/// token the sandbox ends up holding names a credential and nothing about who
+/// is acting. A node is never an account, so it holds no grant of its own.
 ///
-/// The request's [`WorkRef`] rides along so the authority can ALSO admit a
-/// session on the grant held by whoever the committed work says submitted it.
-/// That is not a second identity input: it is an id, and the authority derives
-/// every fact from it out of its own state.
+/// The request's [`WorkRef`] is how a grant is reached: the authority admits a
+/// session on the grant held by the account whose user-signed frame submitted
+/// the committed work. That is not a second identity input: it is an id, and
+/// the authority derives every fact from it out of its own state.
 ///
 /// With no gate wired (owner-local, TEE) this gateway lends to nobody across
 /// accounts, so there is no subject to check.
@@ -601,12 +603,12 @@ async fn session_gate(
     let Some(check) = grant_check else {
         return SessionGate::Open;
     };
-    let Some(caller) = vouched_caller(headers) else {
+    let Some(caller_node) = vouched_caller(headers) else {
         return SessionGate::CallerUnverified;
     };
     let question = GrantQuestion {
         credential: req.sub.clone(),
-        caller,
+        caller_node,
         work: req.work.clone(),
     };
     match check(question).await {
@@ -661,7 +663,7 @@ async fn session(
     match session_gate(&st.grant_check, &headers, &req).await {
         SessionGate::Open => {}
         SessionGate::CallerUnverified => {
-            return Err(AppErr(StatusCode::FORBIDDEN, "caller_account_unverified".into()));
+            return Err(AppErr(StatusCode::FORBIDDEN, "caller_node_unverified".into()));
         }
         SessionGate::NotGranted => {
             return Err(AppErr(StatusCode::FORBIDDEN, "credential_not_granted".into()));

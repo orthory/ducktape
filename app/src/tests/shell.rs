@@ -504,10 +504,10 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
 /// connect load still in flight. Every other generation on that
 /// block may bump freely — their loaders draw one tab, so opening it re-earns
 /// the read. The settings facts are the exception: `settings_user_key` is
-/// chat's `me`, chat returns above the tab block, and nothing chat does ever
-/// re-issues the load. Lose it and `me` stays "" for the session — which
-/// `chat_sidebar_rooms` reads as "show every DM under CHANNELS" and `post_gate` as
-/// "not seated", refusing the composer on every DM.
+/// chat's seating key, chat returns above the tab block, and nothing chat does
+/// ever re-issues the load. Lose it and the key stays "" for the session —
+/// which `post_gate` reads as "not seated", refusing the composer on every
+/// members-only room.
 #[test]
 fn a_move_to_a_pane_that_does_not_draw_the_settings_facts_keeps_the_connect_load() {
     let (mut app, _) = Ducktape::__boot();
@@ -748,30 +748,30 @@ fn approvals_tells_a_first_run_apart_from_a_finished_one() {
     );
 }
 
-/// ACCOUNT FACTS ONLY WHEN THERE IS AN ACCOUNT. With no account bound,
-/// `load_account` returns zeros for every field, and the identity card printed
-/// `0 keys 0 nodes` one line under "· validator keypair on this device" — a
-/// count of the ACCOUNT's keys reading as a count of THIS DEVICE's, and the two
-/// contradicting each other inside one card.
+/// ACCOUNT FACTS ONLY WHEN THERE IS AN ACCOUNT. With the local key in no
+/// account, `load_account` returns zeros for every field, and the identity
+/// card printed `0 keys` one line under "· validator keypair on this device" —
+/// a count of the ACCOUNT's keys reading as a count of THIS DEVICE's, and the
+/// two contradicting each other inside one card.
 ///
-/// `account_bound` is the fact that tells an empty account from no account. It
-/// was already in state, already gating the Rename submit, and simply was not
-/// given to the screen.
+/// `account_exists` is the fact that tells an empty account from no account.
+/// It was already in state, already gating the Rename submit, and simply was
+/// not given to the screen.
 #[test]
-fn the_identity_card_counts_only_a_bound_account() {
+fn the_identity_card_counts_only_an_existing_account() {
     let settings = inlined(include_str!("../ui/screens/settings.ice"));
     assert!(
-        settings.contains("account_bound:bool"),
+        settings.contains("account_exists:bool"),
         "the screen has to be handed the fact before it can use it"
     );
     let card = settings
-        .split("if account_bound")
+        .split("if account_exists")
         .nth(1)
-        .expect("the counts sit under the bound gate")
+        .expect("the counts sit under the exists gate")
         .split("\n        col ")
         .next()
         .expect("card region");
-    for reading in ["account_members", "account_nodes", "Copy key"] {
+    for reading in ["account_keys", "Copy number"] {
         assert!(
             card.contains(reading),
             "{reading} is an account reading and belongs under the gate"
@@ -780,26 +780,29 @@ fn the_identity_card_counts_only_a_bound_account() {
 
     // And view.ice actually passes it, or the screen renders a default.
     let view = inlined(include_str!("../ui/view.ice"));
-    assert!(view.contains("account_bound"), "the mount has to supply it");
+    assert!(
+        view.contains("account_exists"),
+        "the mount has to supply it"
+    );
 
-    // THE SEPARATOR BELONGS TO THE KEY. #998 stopped the card counting an
+    // THE SEPARATOR BELONGS TO THE NUMBER. #998 stopped the card counting an
     // account that does not exist; the dot that had joined those counts stayed
-    // ungated, and an unbound account has no `account_id` either — so the line
-    // led with it: `· validator keypair on this device`. Every other separator
-    // in the console is gated by the run it introduces (forge.ice's repo-count
-    // dot carries the reasoning in its own comment).
-    let key_line = settings
-        .split_once("text account_id")
-        .expect("the key line")
+    // ungated, and a key in no account has no `account_number` either — so the
+    // line led with it: `· validator keypair on this device`. Every other
+    // separator in the console is gated by the run it introduces (forge.ice's
+    // repo-count dot carries the reasoning in its own comment).
+    let number_line = settings
+        .split_once("text account_number")
+        .expect("the number line")
         .1
         .split_once(r#"text "keypair on this device""#)
         .expect("the custody clause closes it")
         .0;
-    let dot = key_line.find(r#"text "·""#).expect("the separator");
-    let guard = key_line
-        .find("if !empty(account_id)")
+    let dot = number_line.find(r#"text "·""#).expect("the separator");
+    let guard = number_line
+        .find("if !empty(account_number)")
         .expect("the separator's guard");
-    assert!(guard < dot, "the dot is gated by the key it introduces");
+    assert!(guard < dot, "the dot is gated by the number it introduces");
 }
 
 /// A ZERO IS A CLAIM, AND THIS APP SAYS IT WITH BLANK. `count_label` returns

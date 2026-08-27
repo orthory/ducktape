@@ -203,7 +203,7 @@ fn a_landing_in_another_room_retires_the_dm_header() {
 
     let (mut app, _) = Ducktape::__boot();
     app.loading = false;
-    app.settings_user_key = me.into();
+    app.account_number = me.into();
     app.active_dm_peer = peer.into();
     app.active_channel = dm.clone();
 
@@ -279,9 +279,9 @@ fn a_landing_in_another_room_retires_the_dm_header() {
     );
     app.loading = false;
 
-    // a device with no user key derives no DM id, so it holds no DM — the same
+    // a key in no account derives no DM id, so it holds no DM — the same
     // answer `chat_sidebar_rooms` gives when `me` is empty
-    app.settings_user_key = String::new();
+    app.account_number = String::new();
     app.active_dm_peer = peer.into();
     let _ = app.__update(__DucktapeMessage::ChatUpdated(chat_data(
         &dm,
@@ -910,7 +910,7 @@ fn a_dm_click_takes_the_room_with_it_instead_of_wearing_the_last_ones_badges() {
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.connected_rpc = "http://node".into();
-    app.settings_user_key = "me".into();
+    app.account_number = "me".into();
     app.active_channel = "locked".into();
     app.active_channel_name = "locked".into();
     app.active_channel_archived = true;

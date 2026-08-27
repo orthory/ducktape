@@ -24,8 +24,6 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
 - `dogfood-forge.sh` (`make dogfood-forge`) — mirror GitHub `origin/dev` into
   the local node's Forge `dev` without moving release-only `main`; needs a
   running node.
-- `mirror-forge-pr.sh` — deliver a merged canonical Forge PR onto GitHub `dev`
-  (`mirror-forge-pr.test.sh` is its test).
 
 ## Node operator CLI
 
@@ -38,7 +36,8 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
 
 - `coordinator/` — systemd unit, env example, and Dockerfile for the UDP
   coordinator (see `coordinator/README.md`).
-- `wg-smoke/` — WireGuard smoke, interop, and bench harnesses.
+- `wg-smoke/` — WireGuard interop and bench harnesses (the `wg_interop`
+  probe binary in rootless podman; no node.toml involved).
 
 ## Wasm guests
 

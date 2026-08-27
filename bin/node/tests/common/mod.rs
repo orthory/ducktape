@@ -1618,8 +1618,8 @@ pub fn http_text_request(port: u16, path: &str) -> (u16, String) {
 /// [`guest_backend`] probes with — so the daemon this table boots is the one
 /// the capability gate just proved can run.
 pub fn sandbox_toml() -> Vec<String> {
-    let dir = std::env::var("DUCKTAPE_GUEST_DIR")
-        .unwrap_or_else(|_| guest_dir().display().to_string());
+    let dir =
+        std::env::var("DUCKTAPE_GUEST_DIR").unwrap_or_else(|_| guest_dir().display().to_string());
     let runtime = provider_host::Vmm::platform_default().config_token();
     vec![
         "[sandbox]".into(),
@@ -1651,8 +1651,7 @@ pub fn unsandboxable_host() -> Option<String> {
 /// somewhere else.
 pub fn guest_backend() -> provider_host::SandboxBackend {
     let vmm = provider_host::Vmm::platform_default();
-    let dir = std::env::var("DUCKTAPE_GUEST_DIR")
-        .map_or_else(|_| guest_dir(), PathBuf::from);
+    let dir = std::env::var("DUCKTAPE_GUEST_DIR").map_or_else(|_| guest_dir(), PathBuf::from);
     provider_host::SandboxBackend::MicroVm {
         vmm,
         kernel: dir.join("vmlinux"),
@@ -1787,4 +1786,154 @@ pub fn unhex(s: &str) -> Vec<u8> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))
         .collect()
+}
+
+// ---- the USER lane: user-signed frames and identity accounts -----------------
+//
+// `Cluster::submit` rides the rpc, which re-signs every op with the NODE's key:
+// its committed origin is the node, and a node key is never on an Identity
+// account. Anything a user does — founding an account, claiming a handle,
+// publishing a route, registering or granting a credential, scheduling a run —
+// is attributed through `OfKey(origin)`, so it has to arrive as a frame the
+// USER signed, over `/v1/submit/frame`. These helpers are that lane.
+
+/// a frame's `seq` is an ordering/dedup tie-breaker (any u64); one process-wide
+/// counter keeps every frame a suite signs distinct from every other.
+static FRAME_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// the budget for one user-lane op to finalize and become readable elsewhere.
+const USER_LANE_FINALIZE: Duration = Duration::from_secs(60);
+
+/// POST one frame `user` signed over `(target, payload)` to node `idx`'s
+/// `/v1/submit/frame` and return (status, body). The frame's verified signer
+/// becomes the op's `Origin::External`; the validator answers once the op's
+/// block commits, so a same-node read right after sees it.
+pub fn try_submit_frame(
+    cluster: &Cluster,
+    idx: usize,
+    user: &ed25519::PrivateKey,
+    target: &str,
+    payload: &[u8],
+) -> (u16, serde_json::Value) {
+    let seq = FRAME_SEQ.fetch_add(1, Ordering::Relaxed);
+    let frame = node::encode_frame(
+        user,
+        seq,
+        &sdk::Msg {
+            target: target.into(),
+            payload: payload.to_vec(),
+        },
+    );
+    let (status, body) = nettest::http_bytes(
+        cluster.http_ports[idx],
+        "POST",
+        "/v1/submit/frame",
+        "application/octet-stream",
+        &frame,
+    );
+    (
+        status,
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+/// [`try_submit_frame`], asserting the lane accepted and committed the op.
+pub fn submit_frame(
+    cluster: &Cluster,
+    idx: usize,
+    user: &ed25519::PrivateKey,
+    target: &str,
+    payload: &[u8],
+) {
+    let (status, body) = try_submit_frame(cluster, idx, user, target, payload);
+    assert_eq!(
+        status, 200,
+        "user-signed {target} frame via node idx {idx} rejected: {body}"
+    );
+}
+
+/// `OfKey(key)` on node `idx`: the account `key` belongs to. `None` covers both
+/// a rejected query and "no account" — all a poll needs to tell apart is
+/// "resolved" from "not (yet)".
+pub fn account_of_key(cluster: &Cluster, idx: usize, key: &[u8]) -> Option<identity::AccountView> {
+    let bytes = cluster.query(
+        idx,
+        "identity",
+        &identity::encode_query(&identity::IdentityQuery::OfKey { key: key.to_vec() }),
+    )?;
+    match identity::decode_reply(&bytes).ok()? {
+        identity::IdentityReply::Account(account) => account,
+        identity::IdentityReply::Accounts(_) | identity::IdentityReply::Gen(_) => None,
+    }
+}
+
+/// `KeyGen(key)` on node `idx`: how many times `key` has been admitted
+/// anywhere — the generation an add-key consent for it must sign.
+pub fn key_gen(cluster: &Cluster, idx: usize, key: &[u8]) -> Option<u64> {
+    let bytes = cluster.query(
+        idx,
+        "identity",
+        &identity::encode_query(&identity::IdentityQuery::KeyGen { key: key.to_vec() }),
+    )?;
+    match identity::decode_reply(&bytes).ok()? {
+        identity::IdentityReply::Gen(generation) => Some(generation),
+        identity::IdentityReply::Account(_) | identity::IdentityReply::Accounts(_) => None,
+    }
+}
+
+/// found an Identity account for `user` through node `idx` — `Create` as a
+/// user-signed frame — and wait until `OfKey(user)` resolves to it there.
+/// Returns the account number (1 for the first account a cluster founds).
+pub fn create_account(
+    cluster: &Cluster,
+    idx: usize,
+    user: &ed25519::PrivateKey,
+    name: &str,
+) -> u64 {
+    submit_frame(
+        cluster,
+        idx,
+        user,
+        "identity",
+        &identity::encode_msg(&identity::testkit::create(name)),
+    );
+    let key = user.public_key().as_ref().to_vec();
+    poll_until(
+        &format!("account {name:?} to found"),
+        USER_LANE_FINALIZE,
+        || account_of_key(cluster, idx, &key),
+    )
+    .number
+}
+
+/// admit `new_key` into `member`'s account through node `idx`: `member`
+/// consents at `new_key`'s CURRENT generation, and the JOINING key signs the
+/// `AddKey` frame (the op's origin is the key being admitted). Waits until
+/// `OfKey(new_key)` resolves there and returns the account as it then reads.
+pub fn add_key(
+    cluster: &Cluster,
+    idx: usize,
+    member: &ed25519::PrivateKey,
+    new_key: &ed25519::PrivateKey,
+) -> identity::AccountView {
+    let joining = new_key.public_key().as_ref().to_vec();
+    let generation = poll_until("the joining key's generation", USER_LANE_FINALIZE, || {
+        key_gen(cluster, idx, &joining)
+    });
+    submit_frame(
+        cluster,
+        idx,
+        new_key,
+        "identity",
+        &identity::encode_msg(&identity::testkit::add_ed25519_key(
+            member,
+            &cluster.namespace,
+            &joining,
+            generation,
+            None,
+        )),
+    );
+    poll_until("the joining key to resolve", USER_LANE_FINALIZE, || {
+        account_of_key(cluster, idx, &joining)
+    })
 }

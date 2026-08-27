@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # make dogfood-forge — host ducktape's OWN source in ducktape's forge module.
 # This flows GitHub origin/dev -> Forge dev without moving release-only main.
-# Use ops/mirror-forge-pr.sh for canonical Forge PR -> GitHub delivery.
 #
 # Registers a static git remote `ducktape-dev` pointing at the local dev node's
 # forge git smart-HTTP endpoint, fetches the canonical development branch, then

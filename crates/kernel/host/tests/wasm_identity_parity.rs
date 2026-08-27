@@ -6,9 +6,9 @@
 //! key, so the native logical-key commit order and the wasm hashed-key drain
 //! order produce the same op log).
 //!
-//! identity's per-network parameter is the CHAIN ID every certificate
-//! preimage folds in, which travels as GENESIS CONFIG — a `__config` RECORD
-//! seeded into the qmdb store under `sdk::store_key` (the production
+//! identity's per-network parameter is the CHAIN ID every add-key consent
+//! folds in, which travels as GENESIS CONFIG — a `__config` RECORD seeded
+//! into the qmdb store under `sdk::store_key` (the production
 //! `seed_store_config` seam), read back by the guest's
 //! `store_genesis_chain_id` per dispatch. BOTH runtimes' stores carry the
 //! identical record here (root-continuity demands it; the native twin reads
@@ -16,27 +16,22 @@
 //! root). the config-in-the-root and config-governs-the-guest pins ride at
 //! the end of this file.
 //!
-//! the wasm host carries a REAL genesis-seeded `valset::Valset` sibling, so
-//! the member gate on `BindNode` resolves through the runtime's memoized
-//! replay under real dispatch. the WebAuthn (passkey) and multi-scheme member
-//! verifies run IN the guest — deterministic pure-Rust p256 on wasm32 — and
+//! identity reads NO sibling: accounts are founded by the frame ORIGIN and
+//! keys are admitted by an existing member's consent, so the hosts carry the
+//! tenant alone. the consent verifies run IN the guest — ed25519 and the
+//! WebAuthn passkey envelope (deterministic pure-Rust p256 on wasm32) — and
 //! must answer byte-identically to the native module.
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PrivateKey;
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use identity::{
-    IDENTITY_ADD_MEMBER_NS, IDENTITY_BIND_NS, IDENTITY_REMOVE_MEMBER_NS, IDENTITY_UNBIND_NS,
-    Identity, IdentityMsg, IdentityQuery, KeyKind, MAX_QUERY_LIMIT, MemberAuth, MemberProof,
-    add_member_preimage, bind_preimage, encode_msg, encode_query, remove_member_preimage,
-    unbind_preimage,
+    Authorizer, IDENTITY_ADD_KEY_NS, Identity, IdentityMsg, IdentityQuery, KeyScheme,
+    MAX_QUERY_LIMIT, add_key_preimage, encode_msg, encode_query,
 };
 use sdk::{Error, MerkleStore as _, Msg, Origin, StateRoot};
-use sha2::{Digest as _, Sha256};
 use statesync::qmdb::QmdbStore;
-use valset::{Valset, ValsetMsg, encode_msg as valset_encode_msg};
 use wasm_host::WasmModule;
 
 /// GENERATED artifact — built from the `identity` module's guest port by
@@ -46,6 +41,9 @@ const IDENTITY_WASM: &[u8] = include_bytes!("fixtures/identity.component.wasm");
 /// the chain id BOTH runtimes are constructed with — natively as a constructor
 /// argument, on the wasm side through the store-seeded genesis config.
 const CHAIN_ID: &str = "test-chain";
+
+/// the WebAuthn relying party the passkey assertions are minted for.
+const RP_ID: &str = "ducktape";
 
 /// a fresh qmdb store carrying the seeded `__config` chain-id record —
 /// exactly the production genesis seam (`bin/node/src/host_state.rs`
@@ -78,45 +76,23 @@ fn wasm_identity(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
     WasmModule::with_store("identity", IDENTITY_WASM, store).expect("load component")
 }
 
-/// the production wiring, verbatim: identity is valset-gated under this
-/// network's chain id (the native builder chain is what the guest compiles in).
+/// the production wiring, verbatim: identity under this network's chain id
+/// (the native builder chain is what the guest compiles in).
 fn native_identity(store: Box<dyn sdk::MerkleStore>) -> Identity {
-    Identity::new(
-        "identity",
-        store,
-        Some("valset".into()),
-        CHAIN_ID.to_string(),
-    )
+    Identity::new("identity", store, CHAIN_ID.to_string())
 }
 
-async fn seeded_valset(validators: &[Vec<u8>]) -> Valset {
-    let mut valset = Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
-    for v in validators {
-        valset.seed(v.clone()).await.expect("seed valset");
-    }
-    valset.finish_seed().await.expect("seed valset");
-    valset
-}
-
-async fn native_host(context: &deterministic::Context, validators: &[Vec<u8>]) -> Host {
+async fn native_host(context: &deterministic::Context) -> Host {
     let store = identity_store(context, "native_id", CHAIN_ID).await;
-    Host::genesis(vec![
-        Box::new(native_identity(Box::new(store))),
-        Box::new(seeded_valset(validators).await),
-    ])
-    .expect("genesis")
+    Host::genesis(vec![Box::new(native_identity(Box::new(store)))]).expect("genesis")
 }
 
-async fn wasm_host_(context: &deterministic::Context, validators: &[Vec<u8>]) -> Host {
+async fn wasm_host_(context: &deterministic::Context) -> Host {
     let store = identity_store(context, "wasm_id", CHAIN_ID).await;
-    Host::genesis(vec![
-        Box::new(wasm_identity(Box::new(store))),
-        Box::new(seeded_valset(validators).await),
-    ])
-    .expect("genesis")
+    Host::genesis(vec![Box::new(wasm_identity(Box::new(store)))]).expect("genesis")
 }
 
-// ---- member builders (the shapes identity's own tests use) -----------------
+// ---- key builders (the shapes identity's own tests use) --------------------
 
 type Ed = PrivateKey;
 
@@ -126,58 +102,42 @@ fn ed(seed: u64) -> Ed {
 fn ed_pub(k: &Ed) -> Vec<u8> {
     k.public_key().as_ref().to_vec()
 }
-fn ed_proof(k: &Ed, ns: &[u8], preimage: &[u8]) -> MemberProof {
-    MemberProof::Signature {
-        sig: k.sign(ns, preimage).as_ref().to_vec(),
-    }
-}
-fn ed_auth(k: &Ed, ns: &[u8], preimage: &[u8]) -> MemberAuth {
-    MemberAuth {
-        key: ed_pub(k),
-        kind: KeyKind::Ed25519,
-        proof: ed_proof(k, ns, preimage),
+/// an ed25519 member's consent to admit `new_key` (of `scheme`) at `gen`.
+fn ed_consent(member: &Ed, scheme: KeyScheme, new_key: &[u8], generation: u64) -> Authorizer {
+    let preimage = add_key_preimage(CHAIN_ID, scheme, new_key, generation);
+    Authorizer {
+        key: ed_pub(member),
+        proof: keyscheme::testkit::ed25519_proof(member, IDENTITY_ADD_KEY_NS, &preimage),
     }
 }
 
 // a WebAuthn passkey, synthesized exactly as an authenticator would produce
-// it (identity's own test recipe). p256 signing is RFC-6979 deterministic, so
+// it (keyscheme's testkit recipe). p256 signing is RFC-6979 deterministic, so
 // the proof bytes are identical on every run — no OS randomness in this proof.
 fn wa_key(seed: u8) -> p256::ecdsa::SigningKey {
-    p256::ecdsa::SigningKey::from_slice(&[seed; 32]).expect("valid scalar")
+    keyscheme::testkit::passkey(seed)
 }
 fn wa_pub(k: &p256::ecdsa::SigningKey) -> Vec<u8> {
-    k.verifying_key().to_sec1_bytes().to_vec()
+    keyscheme::testkit::passkey_pubkey(k)
 }
-fn wa_proof(k: &p256::ecdsa::SigningKey, rp_id: &str, ns: &[u8], preimage: &[u8]) -> MemberProof {
-    use p256::ecdsa::{Signature, signature::Signer as _};
-    // challenge = SHA256(namespace ‖ preimage), mirroring identity's scheme.
-    let mut chal = Sha256::new();
-    chal.update(ns);
-    chal.update(preimage);
-    let challenge = chal.finalize();
-    let client_data_json = format!(
-        r#"{{"type":"webauthn.get","challenge":"{}","origin":"https://ducktape.local"}}"#,
-        URL_SAFE_NO_PAD.encode(challenge)
-    )
-    .into_bytes();
-    let mut authenticator_data = Vec::new();
-    authenticator_data.extend_from_slice(&Sha256::digest(rp_id.as_bytes()));
-    authenticator_data.push(0x01); // User Present
-    authenticator_data.extend_from_slice(&0u32.to_be_bytes());
-    let mut signed = authenticator_data.clone();
-    signed.extend_from_slice(&Sha256::digest(&client_data_json));
-    let sig: Signature = k.sign(&signed);
-    MemberProof::Webauthn {
-        authenticator_data,
-        client_data_json,
-        signature: sig.to_bytes().to_vec(),
-    }
-}
-fn wa_auth(k: &p256::ecdsa::SigningKey, rp_id: &str, ns: &[u8], preimage: &[u8]) -> MemberAuth {
-    MemberAuth {
-        key: wa_pub(k),
-        kind: KeyKind::WebauthnP256,
-        proof: wa_proof(k, rp_id, ns, preimage),
+/// a passkey member's consent (a full WebAuthn assertion envelope) to admit
+/// `new_key` (of `scheme`) at `gen`.
+fn wa_consent(
+    member: &p256::ecdsa::SigningKey,
+    scheme: KeyScheme,
+    new_key: &[u8],
+    generation: u64,
+) -> Authorizer {
+    let preimage = add_key_preimage(CHAIN_ID, scheme, new_key, generation);
+    Authorizer {
+        key: wa_pub(member),
+        proof: keyscheme::testkit::passkey_proof(
+            member,
+            RP_ID,
+            IDENTITY_ADD_KEY_NS,
+            &preimage,
+            true,
+        ),
     }
 }
 
@@ -190,21 +150,29 @@ fn msg(m: &IdentityMsg) -> Msg {
     }
 }
 
-fn bind(founder: &Ed, node: &[u8], nonce: u64) -> Msg {
-    msg(&IdentityMsg::BindNode {
-        authorizer: ed_auth(
-            founder,
-            IDENTITY_BIND_NS,
-            &bind_preimage(CHAIN_ID, node, nonce),
-        ),
+/// found an account for the ORIGIN (an ed25519 key).
+fn create(name: &str) -> Msg {
+    msg(&IdentityMsg::Create {
+        name: name.into(),
+        scheme: KeyScheme::Ed25519,
     })
 }
 
-fn grant(key: &[u8]) -> Msg {
-    Msg {
-        target: "valset".into(),
-        payload: valset_encode_msg(&ValsetMsg::Grant { key: key.to_vec() }),
-    }
+/// admit the ORIGIN (of `scheme`) under `authorizer`'s consent.
+fn add_key(scheme: KeyScheme, label: Option<&str>, authorizer: Authorizer) -> Msg {
+    msg(&IdentityMsg::AddKey {
+        scheme,
+        label: label.map(str::to_string),
+        authorizer,
+    })
+}
+
+fn remove_key(key: &[u8]) -> Msg {
+    msg(&IdentityMsg::RemoveKey { key: key.to_vec() })
+}
+
+fn set_name(name: &str) -> Msg {
+    msg(&IdentityMsg::SetName { name: name.into() })
 }
 
 /// one block's agreed context: both runtimes must see the identical env.
@@ -220,46 +188,32 @@ fn root_of(h: &Host) -> StateRoot {
     h.module_root("identity").expect("identity registered")
 }
 
-/// the read matrix: every query family — the roster-served paginated listing
-/// (full, a window, an empty window), per-account gets (present + absent),
-/// and both ownership-index resolvers over every key the test knows about.
-async fn replies(
-    h: &Host,
-    accounts: &[Vec<u8>],
-    nodes: &[Vec<u8>],
-    members: &[Vec<u8>],
-) -> Vec<Vec<u8>> {
+/// the read matrix: every query family — the numbered listing (full, a
+/// window, an empty window), per-account gets (present + absent), and both
+/// per-key resolvers (the ownership index and the admission counter) over
+/// every key the test knows about plus an absent one.
+async fn replies(h: &Host, numbers: &[u64], keys: &[Vec<u8>]) -> Vec<Vec<u8>> {
     let mut queries = vec![
         encode_query(&IdentityQuery::All {
             from: 0,
             limit: MAX_QUERY_LIMIT,
         }),
-        encode_query(&IdentityQuery::All { from: 1, limit: 1 }),
+        encode_query(&IdentityQuery::All { from: 2, limit: 1 }),
         encode_query(&IdentityQuery::All { from: 0, limit: 0 }),
-        encode_query(&IdentityQuery::Get {
-            account_id: b"absent".to_vec(),
+        encode_query(&IdentityQuery::Get { number: 99 }),
+        encode_query(&IdentityQuery::OfKey {
+            key: b"absent".to_vec(),
         }),
-        encode_query(&IdentityQuery::OfNode {
-            node_key: b"absent".to_vec(),
-        }),
-        encode_query(&IdentityQuery::OfMember {
-            member_key: b"absent".to_vec(),
+        encode_query(&IdentityQuery::KeyGen {
+            key: b"absent".to_vec(),
         }),
     ];
-    for a in accounts {
-        queries.push(encode_query(&IdentityQuery::Get {
-            account_id: a.clone(),
-        }));
+    for n in numbers {
+        queries.push(encode_query(&IdentityQuery::Get { number: *n }));
     }
-    for n in nodes {
-        queries.push(encode_query(&IdentityQuery::OfNode {
-            node_key: n.clone(),
-        }));
-    }
-    for m in members {
-        queries.push(encode_query(&IdentityQuery::OfMember {
-            member_key: m.clone(),
-        }));
+    for k in keys {
+        queries.push(encode_query(&IdentityQuery::OfKey { key: k.clone() }));
+        queries.push(encode_query(&IdentityQuery::KeyGen { key: k.clone() }));
     }
     let mut out = Vec::new();
     for q in &queries {
@@ -268,47 +222,45 @@ async fn replies(
     out
 }
 
-/// the fixed keyset one world uses; shared by the matrix helpers.
+/// the fixed keyset one world uses; shared by the matrix helpers. founder A
+/// and founder B each found an account (numbers 1 and 2); the joiner, the
+/// passkey and the device are admitted into A's.
 struct World {
-    node_a: Vec<u8>,
-    node_b: Vec<u8>,
-    node_c: Vec<u8>,
     founder_a: Ed,
     founder_b: Ed,
     joiner: Ed,
+    device: Ed,
     passkey: p256::ecdsa::SigningKey,
 }
 
 impl World {
     fn new() -> Self {
         Self {
-            node_a: ed_pub(&ed(1)),
-            node_b: ed_pub(&ed(2)),
-            node_c: ed_pub(&ed(3)),
             founder_a: ed(11),
             founder_b: ed(12),
             joiner: ed(21),
+            device: ed(22),
             passkey: wa_key(0x42),
         }
     }
 
-    fn accounts(&self) -> Vec<Vec<u8>> {
-        vec![ed_pub(&self.founder_a), ed_pub(&self.founder_b)]
+    fn numbers(&self) -> Vec<u64> {
+        vec![1, 2]
     }
-    fn nodes(&self) -> Vec<Vec<u8>> {
-        vec![
-            self.node_a.clone(),
-            self.node_b.clone(),
-            self.node_c.clone(),
-        ]
-    }
-    fn members(&self) -> Vec<Vec<u8>> {
+    fn keys(&self) -> Vec<Vec<u8>> {
         vec![
             ed_pub(&self.founder_a),
             ed_pub(&self.founder_b),
             ed_pub(&self.joiner),
+            ed_pub(&self.device),
             wa_pub(&self.passkey),
         ]
+    }
+    fn a(&self) -> Origin {
+        Origin::External(ed_pub(&self.founder_a))
+    }
+    fn b(&self) -> Origin {
+        Origin::External(ed_pub(&self.founder_b))
     }
 }
 
@@ -333,11 +285,10 @@ async fn roundtrip(
         .await
         .expect("wasm submit");
     assert_eq!(
-        replies(native, &w.accounts(), &w.nodes(), &w.members()).await,
-        replies(wasm, &w.accounts(), &w.nodes(), &w.members()).await,
+        replies(native, &w.numbers(), &w.keys()).await,
+        replies(wasm, &w.numbers(), &w.keys()).await,
         "replies diverge after block {height}"
     );
-    assert_eq!(native.module_root("valset"), wasm.module_root("valset"));
     if moves {
         assert_ne!(root_of(native), n_before, "native root stuck at {height}");
         assert_ne!(root_of(wasm), w_before, "wasm root stuck at {height}");
@@ -362,11 +313,9 @@ fn same_ops_same_replies_roots_in_lockstep_and_continuous() {
 
 async fn same_ops_inner(context: &deterministic::Context) {
     let w = World::new();
-    let (a_id, rp) = (ed_pub(&w.founder_a), "ducktape");
-    let validators = vec![w.node_a.clone()];
 
-    let mut native = native_host(context, &validators).await;
-    let mut wasm = wasm_host_(context, &validators).await;
+    let mut native = native_host(context).await;
+    let mut wasm = wasm_host_(context).await;
 
     // ROOT-CONTINUITY from GENESIS: both roots are the store's merkle root,
     // and the store already carries the seeded `__config` record — a real
@@ -382,215 +331,140 @@ async fn same_ops_inner(context: &deterministic::Context) {
         "genesis roots must be continuous across the runtimes"
     );
     assert_eq!(
-        replies(&native, &w.accounts(), &w.nodes(), &w.members()).await,
-        replies(&wasm, &w.accounts(), &w.nodes(), &w.members()).await,
+        replies(&native, &w.numbers(), &w.keys()).await,
+        replies(&wasm, &w.numbers(), &w.keys()).await,
         "empty registries answer identically"
     );
 
-    // sibling-only blocks (valset grants for the resident tier) hold the
-    // identity roots on both runtimes.
-    roundtrip(
-        &mut native,
-        &mut wasm,
-        &w,
-        1,
-        Origin::System,
-        grant(&w.node_b),
-        false,
-    )
-    .await;
-    roundtrip(
-        &mut native,
-        &mut wasm,
-        &w,
-        2,
-        Origin::System,
-        grant(&w.node_c),
-        false,
-    )
-    .await;
+    // h1: founder A founds account 1 from its own key (the frame signature is
+    // the possession proof; no sibling read anywhere).
+    roundtrip(&mut native, &mut wasm, &w, 1, w.a(), create("alice"), true).await;
 
-    // h3: a VALIDATOR founds account A (valset gate resolves through the wasm
-    // runtime's memoized replay; the bind cert verifies IN the guest).
+    // h2: founder B founds account 2 — names trim, numbers are monotonic.
+    roundtrip(&mut native, &mut wasm, &w, 2, w.b(), create("  bob "), true).await;
+
+    // h3: the joiner admits ITSELF into A under founder A's consent at the
+    // joiner's generation 0 (the ed25519 consent verifies IN the guest).
     roundtrip(
         &mut native,
         &mut wasm,
         &w,
         3,
-        Origin::External(w.node_a.clone()),
-        bind(&w.founder_a, &w.node_a.clone(), 0),
+        Origin::External(ed_pub(&w.joiner)),
+        add_key(
+            KeyScheme::Ed25519,
+            Some("laptop"),
+            ed_consent(&w.founder_a, KeyScheme::Ed25519, &ed_pub(&w.joiner), 0),
+        ),
         true,
     )
     .await;
 
-    // h4: the SAME bind again is declaratively idempotent — no nonce bump, no
-    // staged write, the root holds on both runtimes.
+    // h4: a WebAuthn PASSKEY joins A — a Secp256r1 origin under the founder's
+    // ed25519 consent over the passkey's scheme tag.
     roundtrip(
         &mut native,
         &mut wasm,
         &w,
         4,
-        Origin::External(w.node_a.clone()),
-        bind(&w.founder_a, &w.node_a.clone(), 0),
-        false,
+        Origin::External(wa_pub(&w.passkey)),
+        add_key(
+            KeyScheme::Secp256r1,
+            Some("phone"),
+            ed_consent(&w.founder_a, KeyScheme::Secp256r1, &wa_pub(&w.passkey), 0),
+        ),
+        true,
     )
     .await;
 
-    // h5: a RESIDENT founds account B (the union arm admits the second tier).
+    // h5: the PASSKEY authorizes a device key — the raw ECDSA-P256 assertion
+    // envelope (authData ‖ SHA256(clientDataJSON)) verifies inside the wasm
+    // guest, byte-identically to the native module.
     roundtrip(
         &mut native,
         &mut wasm,
         &w,
         5,
-        Origin::External(w.node_b.clone()),
-        bind(&w.founder_b, &w.node_b.clone(), 0),
+        Origin::External(ed_pub(&w.device)),
+        add_key(
+            KeyScheme::Ed25519,
+            None,
+            wa_consent(&w.passkey, KeyScheme::Ed25519, &ed_pub(&w.device), 0),
+        ),
         true,
     )
     .await;
 
-    // h6: founder A admits a second ed25519 key (consent + possession over one
-    // preimage, both verified in the guest). A's nonce: 1.
-    let preimage = add_member_preimage(CHAIN_ID, &a_id, &ed_pub(&w.joiner), KeyKind::Ed25519, 1);
+    // h6: a non-founding member (the device) evicts the joiner — membership,
+    // not founding, is the authority; the joiner's generation stays at 1.
     roundtrip(
         &mut native,
         &mut wasm,
         &w,
         6,
-        Origin::External(w.node_a.clone()),
-        msg(&IdentityMsg::AddMemberKey {
-            new_key: ed_pub(&w.joiner),
-            new_kind: KeyKind::Ed25519,
-            new_label: Some("laptop".into()),
-            possession: ed_proof(&w.joiner, IDENTITY_ADD_MEMBER_NS, &preimage),
-            authorizer: ed_auth(&w.founder_a, IDENTITY_ADD_MEMBER_NS, &preimage),
-        }),
+        Origin::External(ed_pub(&w.device)),
+        remove_key(&ed_pub(&w.joiner)),
         true,
     )
     .await;
 
-    // h7: founder A admits a WebAuthn PASSKEY — the raw ECDSA-P256 assertion
-    // envelope (authData ‖ SHA256(clientDataJSON)) verifies inside the wasm
-    // guest, byte-identically to the native module. A's nonce: 2.
-    let preimage = add_member_preimage(
-        CHAIN_ID,
-        &a_id,
-        &wa_pub(&w.passkey),
-        KeyKind::WebauthnP256,
-        2,
-    );
+    // h7: a member renames the account (origin-gated, no proof — updated_at
+    // moves, so the root moves).
     roundtrip(
         &mut native,
         &mut wasm,
         &w,
         7,
-        Origin::External(w.node_a.clone()),
-        msg(&IdentityMsg::AddMemberKey {
-            new_key: wa_pub(&w.passkey),
-            new_kind: KeyKind::WebauthnP256,
-            new_label: Some("phone".into()),
-            possession: wa_proof(&w.passkey, rp, IDENTITY_ADD_MEMBER_NS, &preimage),
-            authorizer: ed_auth(&w.founder_a, IDENTITY_ADD_MEMBER_NS, &preimage),
-        }),
+        Origin::External(wa_pub(&w.passkey)),
+        set_name("  Kim  "),
         true,
     )
     .await;
 
-    // h8: the SECOND member (not the founder) binds another node to A —
-    // membership, not founding, is the authority. A's nonce: 3.
-    roundtrip(
-        &mut native,
-        &mut wasm,
-        &w,
-        8,
-        Origin::External(w.node_c.clone()),
-        msg(&IdentityMsg::BindNode {
-            authorizer: ed_auth(
-                &w.joiner,
-                IDENTITY_BIND_NS,
-                &bind_preimage(CHAIN_ID, &w.node_c, 3),
-            ),
-        }),
-        true,
-    )
-    .await;
-
-    // h9: the PASSKEY authorizes evicting that node (the recovery path, with a
-    // fresh WebAuthn assertion verified in the guest). A's nonce: 4.
-    roundtrip(
-        &mut native,
-        &mut wasm,
-        &w,
-        9,
-        Origin::External(w.node_a.clone()),
-        msg(&IdentityMsg::UnbindNode {
-            node_key: w.node_c.clone(),
-            authorizer: wa_auth(
-                &w.passkey,
-                rp,
-                IDENTITY_UNBIND_NS,
-                &unbind_preimage(CHAIN_ID, &w.node_c, 4),
-            ),
-        }),
-        true,
-    )
-    .await;
-
-    // h10: the passkey evicts the second ed25519 key. A's nonce: 5.
-    let preimage = remove_member_preimage(CHAIN_ID, &a_id, &ed_pub(&w.joiner), 5);
-    roundtrip(
-        &mut native,
-        &mut wasm,
-        &w,
-        10,
-        Origin::External(w.node_a.clone()),
-        msg(&IdentityMsg::RemoveMemberKey {
-            target_key: ed_pub(&w.joiner),
-            authorizer: wa_auth(&w.passkey, rp, IDENTITY_REMOVE_MEMBER_NS, &preimage),
-        }),
-        true,
-    )
-    .await;
-
-    // h11: a bound node names its account (origin-gated, no signature, no
-    // nonce bump — but updated_at moves, so the root moves).
-    roundtrip(
-        &mut native,
-        &mut wasm,
-        &w,
-        11,
-        Origin::External(w.node_a.clone()),
-        msg(&IdentityMsg::SetAccountName {
-            display_name: "  Kim  ".into(),
-        }),
-        true,
-    )
-    .await;
-
-    // decoded spot check on the wasm side: the surviving membership is the
-    // founder + the passkey, the name trimmed, node C evicted.
+    // decoded spot check on the wasm side: the surviving association is the
+    // founder + the passkey + the device, the name trimmed, the joiner
+    // unlinked at generation 1.
     let reply = wasm
-        .query(
-            "identity",
-            &encode_query(&IdentityQuery::Get {
-                account_id: a_id.clone(),
-            }),
-        )
+        .query("identity", &encode_query(&IdentityQuery::Get { number: 1 }))
         .await
-        .expect("get A");
+        .expect("get 1");
     let identity::IdentityReply::Account(Some(acc)) =
         identity::decode_reply(&reply).expect("decode")
     else {
-        panic!("account A must exist");
+        panic!("account 1 must exist");
     };
-    assert_eq!(acc.display_name.as_deref(), Some("Kim"));
-    assert_eq!(acc.nonce, 6);
-    assert_eq!(acc.member_keys.len(), 2, "founder + passkey survive");
+    assert_eq!(acc.number, 1);
+    assert_eq!(acc.name, "Kim");
+    let mut survivors = vec![ed_pub(&w.founder_a), ed_pub(&w.device), wa_pub(&w.passkey)];
+    survivors.sort();
+    let keys: Vec<Vec<u8>> = acc.keys.iter().map(|k| k.pubkey.clone()).collect();
+    assert_eq!(keys, survivors, "ascending by public key");
+    let reply = wasm
+        .query(
+            "identity",
+            &encode_query(&IdentityQuery::OfKey {
+                key: ed_pub(&w.joiner),
+            }),
+        )
+        .await
+        .expect("of_key joiner");
     assert_eq!(
-        acc.nodes,
-        vec![identity::NodeView {
-            node_key: w.node_a.clone(),
-            label: None,
-        }]
+        identity::decode_reply(&reply).expect("decode"),
+        identity::IdentityReply::Account(None)
+    );
+    let reply = wasm
+        .query(
+            "identity",
+            &encode_query(&IdentityQuery::KeyGen {
+                key: ed_pub(&w.joiner),
+            }),
+        )
+        .await
+        .expect("key_gen joiner");
+    assert_eq!(
+        identity::decode_reply(&reply).expect("decode"),
+        identity::IdentityReply::Gen(1),
+        "removal keeps the admission counter"
     );
 
     // error-shaped queries reject identically too (needle containment — the
@@ -615,7 +489,7 @@ async fn same_ops_inner(context: &deterministic::Context) {
 
     // queries are read-only on the wasm side too.
     let settled = root_of(&wasm);
-    let _ = replies(&wasm, &w.accounts(), &w.nodes(), &w.members()).await;
+    let _ = replies(&wasm, &w.numbers(), &w.keys()).await;
     assert_eq!(root_of(&wasm), settled, "a query moved the wasm root");
 }
 
@@ -628,149 +502,123 @@ fn rejections_match_and_leave_no_trace() {
 
 async fn rejections_inner(context: &deterministic::Context) {
     let w = World::new();
-    let a_id = ed_pub(&w.founder_a);
-    let outsider = ed_pub(&ed(99));
-    let validators = vec![w.node_a.clone()];
+    let stranger = ed(99);
+    let unfounded = ed(31);
 
-    let mut native = native_host(context, &validators).await;
-    let mut wasm = wasm_host_(context, &validators).await;
+    let mut native = native_host(context).await;
+    let mut wasm = wasm_host_(context).await;
 
-    // seed both worlds identically: node B gains resident standing, A is
-    // founded and bound to node A.
+    // seed both worlds identically: A is founded, the joiner admitted at
+    // generation 0 and evicted again — its counter is now 1 and A is back to
+    // its single founding key.
+    let spent = ed_consent(&w.founder_a, KeyScheme::Ed25519, &ed_pub(&w.joiner), 0);
     for host in [&mut native, &mut wasm] {
-        host.submit_at(block(1, Origin::System), grant(&w.node_b))
+        host.submit_at(block(1, w.a()), create("alice"))
             .await
-            .expect("grant resident");
+            .expect("found A");
         host.submit_at(
-            block(2, Origin::External(w.node_a.clone())),
-            bind(&w.founder_a, &w.node_a.clone(), 0),
+            block(2, Origin::External(ed_pub(&w.joiner))),
+            add_key(KeyScheme::Ed25519, None, spent.clone()),
         )
         .await
-        .expect("bind node A");
+        .expect("admit the joiner");
+        host.submit_at(block(3, w.a()), remove_key(&ed_pub(&w.joiner)))
+            .await
+            .expect("evict the joiner");
     }
 
-    // the rejection matrix: every distinct refusal family — the valset gate
-    // (decided by sibling reads inside the wasm runtime), certificate
-    // verification (stale nonce), the registered-kind pin, single-ownership,
-    // membership invariants, origin shapes, and the decode seam. each
-    // rejected block must leave BOTH roots byte-identical (abort: no trace).
-    let stale_bind = bind(&w.founder_a, &w.node_b.clone(), 0); // A's nonce is 1 now
-    let mut forged_kind = ed_auth(
-        &w.founder_a,
-        IDENTITY_BIND_NS,
-        &bind_preimage(CHAIN_ID, &w.node_b, 1),
-    );
-    forged_kind.kind = KeyKind::P256;
-    let already_preimage =
-        add_member_preimage(CHAIN_ID, &a_id, &ed_pub(&w.founder_a), KeyKind::Ed25519, 1);
-    let remove_last_preimage = remove_member_preimage(CHAIN_ID, &a_id, &ed_pub(&w.founder_a), 1);
-
+    // the rejection matrix: every distinct refusal family — the single-use
+    // consent (replayed after eviction), scheme pinning, authorizer standing,
+    // single ownership, membership invariants, member gating, name caps,
+    // origin shapes, and the decode seam. each rejected block must leave BOTH
+    // roots byte-identical (abort: no trace).
     let rejects: Vec<(Origin, Msg, &str)> = vec![
-        // valset-gated: a key with no standing — the STANDING read resolves
-        // through the wasm runtime and rejects.
+        // the spent consent: minted at generation 0, the joiner is at 1.
         (
-            Origin::External(outsider.clone()),
-            bind(&ed(31), &outsider.clone(), 0),
-            "not a network member",
+            Origin::External(ed_pub(&w.joiner)),
+            add_key(KeyScheme::Ed25519, None, spent),
+            "consent does not verify",
         ),
-        // a stale certificate: minted at nonce 0, the account is at 1.
+        // a consent minted for a different scheme of the same bytes is a
+        // forgery.
         (
-            Origin::External(w.node_b.clone()),
-            stale_bind,
-            "does not verify",
+            Origin::External(ed_pub(&unfounded)),
+            add_key(
+                KeyScheme::Ed25519,
+                None,
+                ed_consent(&w.founder_a, KeyScheme::Secp256r1, &ed_pub(&unfounded), 0),
+            ),
+            "consent does not verify",
         ),
-        // the registered-kind pin: the founder's real signature presented
-        // under a forged kind.
+        // an authorizer on no account has nothing to admit into.
         (
-            Origin::External(w.node_b.clone()),
-            msg(&IdentityMsg::BindNode {
-                authorizer: forged_kind,
-            }),
-            "does not match its registered kind",
+            Origin::External(ed_pub(&unfounded)),
+            add_key(
+                KeyScheme::Ed25519,
+                None,
+                ed_consent(&stranger, KeyScheme::Ed25519, &ed_pub(&unfounded), 0),
+            ),
+            "authorizer belongs to no account",
         ),
-        // a malformed founding key for its kind (from a standing origin).
+        // single ownership: a member key cannot be admitted again ...
         (
-            Origin::External(w.node_b.clone()),
-            msg(&IdentityMsg::BindNode {
-                authorizer: MemberAuth {
-                    key: vec![7; 5],
-                    kind: KeyKind::Ed25519,
-                    proof: MemberProof::Signature { sig: vec![0; 64] },
-                },
+            w.a(),
+            add_key(
+                KeyScheme::Ed25519,
+                None,
+                ed_consent(&w.founder_a, KeyScheme::Ed25519, &ed_pub(&w.founder_a), 0),
+            ),
+            "already belongs to an account",
+        ),
+        // ... nor found a second account.
+        (w.a(), create("again"), "already belongs to an account"),
+        // a malformed founding key for its declared scheme: 32 bytes as a
+        // wallet, and 5 bytes as ed25519.
+        (
+            w.b(),
+            msg(&IdentityMsg::Create {
+                name: "x".into(),
+                scheme: KeyScheme::Secp256k1,
             }),
             "founding key is malformed",
         ),
-        // single ownership: node A is already bound to A; founder B cannot
-        // steal it.
         (
-            Origin::External(w.node_a.clone()),
-            bind(&w.founder_b, &w.node_a.clone(), 0),
-            "already bound to another account",
-        ),
-        // membership invariant: the founding key is already a member.
-        (
-            Origin::External(w.node_a.clone()),
-            msg(&IdentityMsg::AddMemberKey {
-                new_key: ed_pub(&w.founder_a),
-                new_kind: KeyKind::Ed25519,
-                new_label: None,
-                possession: MemberProof::Signature { sig: vec![0; 64] },
-                authorizer: ed_auth(&w.founder_a, IDENTITY_ADD_MEMBER_NS, &already_preimage),
-            }),
-            "already a member",
+            Origin::External(vec![7; 5]),
+            create("x"),
+            "founding key is malformed",
         ),
         // membership invariant: the last key can never be removed.
         (
-            Origin::External(w.node_a.clone()),
-            msg(&IdentityMsg::RemoveMemberKey {
-                target_key: ed_pub(&w.founder_a),
-                authorizer: ed_auth(
-                    &w.founder_a,
-                    IDENTITY_REMOVE_MEMBER_NS,
-                    &remove_last_preimage,
-                ),
-            }),
-            "last member",
+            w.a(),
+            remove_key(&ed_pub(&w.founder_a)),
+            "cannot remove the last key",
         ),
-        // unbinding a node nobody bound.
+        // member gating: a stranger renames nothing.
         (
-            Origin::External(w.node_a.clone()),
-            msg(&IdentityMsg::UnbindNode {
-                node_key: b"never-bound".to_vec(),
-                authorizer: ed_auth(&w.founder_a, IDENTITY_UNBIND_NS, b"irrelevant"),
-            }),
-            "not bound",
+            Origin::External(ed_pub(&stranger)),
+            set_name("x"),
+            "origin key belongs to no account",
         ),
-        // naming from an unbound node.
+        // an over-limit name from a member.
         (
-            Origin::External(w.node_b.clone()),
-            msg(&IdentityMsg::SetAccountName {
-                display_name: "x".into(),
-            }),
-            "not bound to an account",
-        ),
-        // an over-limit display name from a bound node.
-        (
-            Origin::External(w.node_a.clone()),
-            msg(&IdentityMsg::SetAccountName {
-                display_name: "x".repeat(65),
-            }),
+            w.a(),
+            set_name(&"x".repeat(65)),
             "exceeds the 64-byte limit",
         ),
         // origin shapes: system and empty-external submitters.
         (
             Origin::System,
-            bind(&w.founder_a, &w.node_b.clone(), 1),
+            create("sys"),
             "origin-gated to external submitters",
         ),
         (
             Origin::External(Vec::new()),
-            bind(&w.founder_a, &w.node_b.clone(), 1),
+            create("nobody"),
             "non-empty submitter",
         ),
-        // the decode seam (from a fully-authorized origin).
+        // the decode seam (from a member origin).
         (
-            Origin::External(w.node_a.clone()),
+            w.a(),
             Msg {
                 target: "identity".into(),
                 payload: b"definitely-not-json".to_vec(),
@@ -780,7 +628,7 @@ async fn rejections_inner(context: &deterministic::Context) {
     ];
 
     for (height, (origin, m, needle)) in rejects.into_iter().enumerate() {
-        let height = height as u64 + 3;
+        let height = height as u64 + 4;
         let (n_before, w_before) = (root_of(&native), root_of(&wasm));
 
         let n_err = native
@@ -808,8 +656,8 @@ async fn rejections_inner(context: &deterministic::Context) {
         assert_eq!(root_of(&wasm), w_before, "wasm root moved on reject");
         assert_eq!(root_of(&native), root_of(&wasm));
         assert_eq!(
-            replies(&native, &w.accounts(), &w.nodes(), &w.members()).await,
-            replies(&wasm, &w.accounts(), &w.nodes(), &w.members()).await
+            replies(&native, &w.numbers(), &w.keys()).await,
+            replies(&wasm, &w.numbers(), &w.keys()).await
         );
     }
 }
@@ -823,35 +671,21 @@ fn multi_dispatch_block_reads_prior_writes_and_isolates_rejections() {
 
 async fn multi_dispatch_inner(context: &deterministic::Context) {
     let w = World::new();
-    let outsider = ed_pub(&ed(99));
-    let validators = vec![w.node_a.clone(), w.node_b.clone()];
 
-    let mut native = native_host(context, &validators).await;
-    let mut wasm = wasm_host_(context, &validators).await;
+    let mut native = native_host(context).await;
+    let mut wasm = wasm_host_(context).await;
 
-    // ONE block, two ops: the bind founds account B, and the SetAccountName
-    // from the SAME node reads that bind STAGED IN THIS BLOCK — on the wasm
-    // side dispatch 2 reads dispatch 1's staged store writes through the
-    // host's outer staged overlay (the read-your-writes seam), while dispatch
-    // 1's member gate resolves through memoized replay.
-    let batch = vec![
-        (
-            Origin::External(w.node_b.clone()),
-            bind(&w.founder_b, &w.node_b.clone(), 0),
-        ),
-        (
-            Origin::External(w.node_b.clone()),
-            msg(&IdentityMsg::SetAccountName {
-                display_name: "quack".into(),
-            }),
-        ),
-    ];
+    // ONE block, two ops: the create founds account 1, and the SetName from
+    // the SAME key reads that founding STAGED IN THIS BLOCK — on the wasm side
+    // dispatch 2 reads dispatch 1's staged store writes through the host's
+    // outer staged overlay (the read-your-writes seam).
+    let batch = vec![(w.a(), create("alice")), (w.a(), set_name("quack"))];
     let n_out = native
-        .submit_block(block(1, Origin::External(w.node_b.clone())), batch.clone())
+        .submit_block(block(1, w.a()), batch.clone())
         .await
         .expect("native block");
     let w_out = wasm
-        .submit_block(block(1, Origin::External(w.node_b.clone())), batch)
+        .submit_block(block(1, w.a()), batch)
         .await
         .expect("wasm block");
     for out in [&n_out, &w_out] {
@@ -865,43 +699,52 @@ async fn multi_dispatch_inner(context: &deterministic::Context) {
     }
     assert_eq!(root_of(&native), root_of(&wasm));
     assert_eq!(
-        replies(&native, &w.accounts(), &w.nodes(), &w.members()).await,
-        replies(&wasm, &w.accounts(), &w.nodes(), &w.members()).await
+        replies(&native, &w.numbers(), &w.keys()).await,
+        replies(&wasm, &w.numbers(), &w.keys()).await
     );
 
-    // ONE block where the SECOND member rejects (the standing gate — the
-    // sibling read itself is what rejects): the runtime aborts the staged
-    // overlay and replays the accepted member — committed state must equal
-    // the accepted subset alone, on both runtimes.
+    // ONE block, three members: B founds account 2, the joiner is admitted
+    // into A, and the SAME admission replays — the replay is DECIDED by
+    // read-your-writes (the staged key index already owns the joiner). the
+    // runtime aborts the rejected member's overlay and replays the accepted
+    // ones — committed state must equal the accepted subset alone, on both
+    // runtimes.
     let (n_before, w_before) = (root_of(&native), root_of(&wasm));
+    let consent = ed_consent(&w.founder_a, KeyScheme::Ed25519, &ed_pub(&w.joiner), 0);
     let batch = vec![
+        (w.b(), create("bob")),
         (
-            Origin::External(w.node_a.clone()),
-            bind(&w.founder_a, &w.node_a.clone(), 0),
+            Origin::External(ed_pub(&w.joiner)),
+            add_key(KeyScheme::Ed25519, None, consent.clone()),
         ),
         (
-            Origin::External(outsider.clone()),
-            bind(&ed(31), &outsider.clone(), 0),
+            Origin::External(ed_pub(&w.joiner)),
+            add_key(KeyScheme::Ed25519, None, consent),
         ),
     ];
     let n_out = native
-        .submit_block(block(2, Origin::External(w.node_a.clone())), batch.clone())
+        .submit_block(block(2, w.b()), batch.clone())
         .await
         .expect("native block");
     let w_out = wasm
-        .submit_block(block(2, Origin::External(w.node_a.clone())), batch)
+        .submit_block(block(2, w.b()), batch)
         .await
         .expect("wasm block");
     for out in [&n_out, &w_out] {
         assert!(matches!(out.members[0], MemberOutcome::Applied { .. }));
-        assert!(matches!(out.members[1], MemberOutcome::Rejected { .. }));
+        assert!(matches!(out.members[1], MemberOutcome::Applied { .. }));
+        assert!(
+            matches!(out.members[2], MemberOutcome::Rejected { .. }),
+            "the replayed admission must reject against the SAME-BLOCK stage: {:?}",
+            out.members
+        );
     }
     assert_ne!(root_of(&native), n_before);
     assert_ne!(root_of(&wasm), w_before);
     assert_eq!(root_of(&native), root_of(&wasm));
     assert_eq!(
-        replies(&native, &w.accounts(), &w.nodes(), &w.members()).await,
-        replies(&wasm, &w.accounts(), &w.nodes(), &w.members()).await
+        replies(&native, &w.numbers(), &w.keys()).await,
+        replies(&wasm, &w.numbers(), &w.keys()).await
     );
 }
 
@@ -926,27 +769,33 @@ async fn genesis_config_inner(context: &deterministic::Context) {
     );
     drop((here, same));
 
-    // and the config GOVERNS the guest: the same bind certificate (minted for
+    // and the config GOVERNS the guest: the same add-key consent (minted for
     // CHAIN_ID) is accepted by the tenant configured with CHAIN_ID and
     // deterministically refused by the tenant configured with another chain —
     // proof the parameter actually reaches the ported logic, not just the root.
     let w = World::new();
-    let validators = vec![w.node_a.clone()];
-    let mut wasm = wasm_host_(context, &validators).await;
-    let mut other_host = Host::genesis(vec![
-        Box::new(wasm_identity(Box::new(other))),
-        Box::new(seeded_valset(&validators).await),
-    ])
-    .expect("genesis");
+    let mut wasm = wasm_host_(context).await;
+    let mut other_host =
+        Host::genesis(vec![Box::new(wasm_identity(Box::new(other)))]).expect("genesis");
+    for host in [&mut wasm, &mut other_host] {
+        host.submit_at(block(1, w.a()), create("alice"))
+            .await
+            .expect("founding reads no chain id");
+    }
 
-    let m = bind(&w.founder_a, &w.node_a.clone(), 0);
-    wasm.submit_at(block(1, Origin::External(w.node_a.clone())), m.clone())
+    let m = add_key(
+        KeyScheme::Ed25519,
+        None,
+        ed_consent(&w.founder_a, KeyScheme::Ed25519, &ed_pub(&w.joiner), 0),
+    );
+    let joiner = Origin::External(ed_pub(&w.joiner));
+    wasm.submit_at(block(2, joiner.clone()), m.clone())
         .await
-        .expect("the configured chain accepts its own certificate");
+        .expect("the configured chain accepts its own consent");
     let err = other_host
-        .submit_at(block(1, Origin::External(w.node_a.clone())), m)
+        .submit_at(block(2, joiner), m)
         .await
-        .expect_err("a foreign chain id must refuse the certificate");
+        .expect_err("a foreign chain id must refuse the consent");
     let SubmitError::Rejected(Error::Module(reason)) = err else {
         panic!("rejection shape: {err:?}");
     };

@@ -737,11 +737,10 @@ test settings_keyboard_scroll_contract
             settings_open_tabs
             members_rows
             members_answered
-            account_id
+            account_number
             account_renaming
-            account_bound
-            account_members
-            account_nodes
+            account_exists
+            account_keys
             appearance
             password
             status

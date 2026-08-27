@@ -17,14 +17,14 @@
 //! stores carry the identical record; the config-in-the-root and
 //! config-governs-the-guest pins ride at the end of this file.
 //!
-//! every gateway execute depends on SIBLING reads: the valset standing gate
-//! (validators ∪ residents) and the identity `OfNode` account derivation plus
-//! the current-member signer check. both hosts therefore carry the REAL native
-//! siblings — a genesis-seeded `valset::Valset` and an `identity::Identity`
-//! wired exactly as production — so on the wasm side every acceptance and
-//! every gating rejection resolves through the runtime's memoized replay. the
-//! WASM host carries NATIVE identity + valset: each parity proof isolates ONE
-//! wasm tenant.
+//! every gateway execute depends on ONE sibling read: the identity `OfKey`
+//! resolution of the origin (a USER key) to its account, plus the
+//! current-member signer check over that account's keys. both hosts therefore
+//! carry the REAL native `identity::Identity` wired exactly as production, so
+//! on the wasm side every acceptance and every gating rejection resolves
+//! through the runtime's memoized replay. the WASM host carries NATIVE
+//! identity: each parity proof isolates ONE wasm tenant. no valset: a node
+//! key never resolves to an account, and standing is not a gateway concern.
 
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PrivateKey;
@@ -36,12 +36,9 @@ use gateway::{
     encode_query, route_signing_preimage,
 };
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
-use identity::{
-    IDENTITY_BIND_NS, Identity, IdentityMsg, KeyKind, MemberAuth, MemberProof, bind_preimage,
-};
+use identity::{Identity, IdentityMsg, KeyScheme};
 use sdk::{Error, MerkleStore as _, Msg, Origin, StateRoot};
 use statesync::qmdb::QmdbStore;
-use valset::{Valset, ValsetMsg, encode_msg as valset_encode_msg};
 use wasm_host::WasmModule;
 
 /// GENERATED artifact — built from the `gateway` module's guest port by
@@ -50,8 +47,14 @@ const GATEWAY_WASM: &[u8] = include_bytes!("fixtures/gateway.component.wasm");
 
 /// the chain id BOTH runtimes are constructed with — natively as a constructor
 /// argument, on the wasm side as the host-installed genesis config. the
-/// identity sibling binds under the same id (one network, one chain id).
+/// identity sibling runs under the same id (one network, one chain id).
 const CHAIN_ID: &str = "test-chain";
+
+/// the account numbers the two founders receive, in founding order.
+const ACCOUNT_A: u64 = 1;
+const ACCOUNT_B: u64 = 2;
+/// a number no founding ever reaches in these worlds.
+const ABSENT_ACCOUNT: u64 = 99;
 
 /// a fresh qmdb store carrying the seeded `__config` chain-id record —
 /// exactly the production genesis seam (`bin/node/src/host_state.rs`
@@ -84,13 +87,7 @@ fn wasm_gateway(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
 
 /// the production wiring, verbatim (`bin/node/src/host_state.rs`).
 fn native_gateway(store: Box<dyn sdk::MerkleStore>) -> Gateway {
-    Gateway::new(
-        "gateway",
-        store,
-        "identity",
-        Some("valset".into()),
-        CHAIN_ID,
-    )
+    Gateway::new("gateway", store, "identity", CHAIN_ID)
 }
 
 /// the native identity SIBLING over a MemStore double — the store backend is
@@ -100,36 +97,24 @@ fn native_identity() -> Identity {
     Identity::new(
         "identity",
         Box::new(sdk_testkit::MemStore::new()),
-        Some("valset".into()),
         CHAIN_ID.to_string(),
     )
 }
 
-async fn seeded_valset(validators: &[Vec<u8>]) -> Valset {
-    let mut valset = Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
-    for v in validators {
-        valset.seed(v.clone()).await.expect("seed valset");
-    }
-    valset.finish_seed().await.expect("seed valset");
-    valset
-}
-
-async fn native_host(context: &deterministic::Context, validators: &[Vec<u8>]) -> Host {
+async fn native_host(context: &deterministic::Context) -> Host {
     let store = gw_store(context, "native_gw", CHAIN_ID).await;
     Host::genesis(vec![
         Box::new(native_gateway(Box::new(store))),
         Box::new(native_identity()),
-        Box::new(seeded_valset(validators).await),
     ])
     .expect("genesis")
 }
 
-async fn wasm_host_(context: &deterministic::Context, validators: &[Vec<u8>]) -> Host {
+async fn wasm_host_(context: &deterministic::Context) -> Host {
     let store = gw_store(context, "wasm_gw", CHAIN_ID).await;
     Host::genesis(vec![
         Box::new(wasm_gateway(Box::new(store))),
         Box::new(native_identity()),
-        Box::new(seeded_valset(validators).await),
     ])
     .expect("genesis")
 }
@@ -143,30 +128,16 @@ fn ed_pub(k: &Ed) -> Vec<u8> {
     k.public_key().as_ref().to_vec()
 }
 
-/// an identity BindNode op founding `founder`'s account from the submitting
-/// node — the certificate flow identity's tests drive, here to seed the REAL
-/// identity sibling both gateways read through.
-fn bind(founder: &Ed, node: &[u8]) -> Msg {
-    let auth = MemberAuth {
-        key: ed_pub(founder),
-        kind: KeyKind::Ed25519,
-        proof: MemberProof::Signature {
-            sig: founder
-                .sign(IDENTITY_BIND_NS, &bind_preimage(CHAIN_ID, node, 0))
-                .as_ref()
-                .to_vec(),
-        },
-    };
+/// an identity Create op founding an account for the submitting (founder)
+/// key — the flow identity's tests drive, here to seed the REAL identity
+/// sibling both gateways read through.
+fn create(name: &str) -> Msg {
     Msg {
         target: "identity".into(),
-        payload: identity::encode_msg(&IdentityMsg::BindNode { authorizer: auth }),
-    }
-}
-
-fn grant(key: &[u8]) -> Msg {
-    Msg {
-        target: "valset".into(),
-        payload: valset_encode_msg(&ValsetMsg::Grant { key: key.to_vec() }),
+        payload: identity::encode_msg(&IdentityMsg::Create {
+            name: name.into(),
+            scheme: KeyScheme::Ed25519,
+        }),
     }
 }
 
@@ -221,7 +192,7 @@ fn loopback_route() -> RouteDefinition {
 }
 
 fn statement(
-    account_id: &[u8],
+    account_id: u64,
     label: Option<&str>,
     publisher: &[u8],
     revision: u64,
@@ -229,7 +200,7 @@ fn statement(
 ) -> RouteStatement {
     RouteStatement {
         chain_id: CHAIN_ID.into(),
-        account_id: account_id.to_vec(),
+        account_id,
         name: match label {
             Some(l) => RouteName::named(l),
             None => RouteName::apex(),
@@ -276,28 +247,26 @@ fn root_of(h: &Host) -> StateRoot {
 
 /// the read matrix: exact-name gets (present, tombstoned, absent) and the
 /// management listings for both accounts plus an absent one.
-async fn replies(h: &Host, accounts: &[Vec<u8>]) -> Vec<Vec<u8>> {
+async fn replies(h: &Host, accounts: &[u64]) -> Vec<Vec<u8>> {
     let mut queries = Vec::new();
     for a in accounts {
         for label in [None, Some("api"), Some("web"), Some("multi"), Some("iso")] {
             queries.push(encode_query(&GatewayQuery::Get {
-                account_id: a.clone(),
+                account_id: *a,
                 name: match label {
                     Some(l) => RouteName::named(l),
                     None => RouteName::apex(),
                 },
             }));
         }
-        queries.push(encode_query(&GatewayQuery::List {
-            account_id: a.clone(),
-        }));
+        queries.push(encode_query(&GatewayQuery::List { account_id: *a }));
     }
     queries.push(encode_query(&GatewayQuery::Get {
-        account_id: b"absent".to_vec(),
+        account_id: ABSENT_ACCOUNT,
         name: RouteName::apex(),
     }));
     queries.push(encode_query(&GatewayQuery::List {
-        account_id: b"absent".to_vec(),
+        account_id: ABSENT_ACCOUNT,
     }));
     let mut out = Vec::new();
     for q in &queries {
@@ -306,13 +275,13 @@ async fn replies(h: &Host, accounts: &[Vec<u8>]) -> Vec<Vec<u8>> {
     out
 }
 
-/// the world both tests stand up: node A a validator bound to account A, node
-/// B a resident bound to account B, node C a resident bound to NO account
-/// (the seam between the two sibling gates).
+/// the world both tests stand up: founder A founds account 1 and founder B
+/// account 2 (every gateway op's ORIGIN is one of these USER keys); node A and
+/// node B are the 32-byte node keys the statements name as publishers — an
+/// account vouches for whichever node it names, no node is bound to anything.
 struct World {
     node_a: Vec<u8>,
     node_b: Vec<u8>,
-    node_c: Vec<u8>,
     founder_a: Ed,
     founder_b: Ed,
 }
@@ -322,42 +291,35 @@ impl World {
         Self {
             node_a: ed_pub(&ed(1)),
             node_b: ed_pub(&ed(2)),
-            node_c: ed_pub(&ed(3)),
             founder_a: ed(11),
             founder_b: ed(12),
         }
     }
-    fn a_id(&self) -> Vec<u8> {
-        ed_pub(&self.founder_a)
+    fn a_id(&self) -> u64 {
+        ACCOUNT_A
     }
-    fn b_id(&self) -> Vec<u8> {
-        ed_pub(&self.founder_b)
+    fn b_id(&self) -> u64 {
+        ACCOUNT_B
     }
-    fn accounts(&self) -> Vec<Vec<u8>> {
+    fn a(&self) -> Origin {
+        Origin::External(ed_pub(&self.founder_a))
+    }
+    fn b(&self) -> Origin {
+        Origin::External(ed_pub(&self.founder_b))
+    }
+    fn accounts(&self) -> Vec<u64> {
         vec![self.a_id(), self.b_id()]
     }
 
-    /// stand up the shared siblings on one host. these blocks touch only the
-    /// NATIVE siblings — the gateway root must hold through all of them.
+    /// stand up the shared sibling on one host. these blocks touch only the
+    /// NATIVE identity — the gateway root must hold through all of them.
     async fn seed(&self, host: &mut Host) {
-        host.submit_at(block(1, Origin::System), grant(&self.node_b))
+        host.submit_at(block(1, self.a()), create("alice"))
             .await
-            .expect("grant resident B");
-        host.submit_at(block(2, Origin::System), grant(&self.node_c))
+            .expect("found account A");
+        host.submit_at(block(2, self.b()), create("bob"))
             .await
-            .expect("grant resident C");
-        host.submit_at(
-            block(3, Origin::External(self.node_a.clone())),
-            bind(&self.founder_a, &self.node_a),
-        )
-        .await
-        .expect("bind node A");
-        host.submit_at(
-            block(4, Origin::External(self.node_b.clone())),
-            bind(&self.founder_b, &self.node_b),
-        )
-        .await
-        .expect("bind node B");
+            .expect("found account B");
     }
 }
 
@@ -384,13 +346,11 @@ async fn roundtrip(
         replies(wasm, &w.accounts()).await,
         "replies diverge after block {height}"
     );
-    for sibling in ["identity", "valset"] {
-        assert_eq!(
-            native.module_root(sibling),
-            wasm.module_root(sibling),
-            "the native {sibling} sibling diverged"
-        );
-    }
+    assert_eq!(
+        native.module_root("identity"),
+        wasm.module_root("identity"),
+        "the native identity sibling diverged"
+    );
     if moves {
         assert_ne!(root_of(native), n_before, "native root stuck at {height}");
         assert_ne!(root_of(wasm), w_before, "wasm root stuck at {height}");
@@ -415,9 +375,8 @@ fn same_ops_same_replies_roots_in_lockstep_and_continuous() {
 
 async fn same_ops_inner(context: &deterministic::Context) {
     let w = World::new();
-    let validators = vec![w.node_a.clone()];
-    let mut native = native_host(context, &validators).await;
-    let mut wasm = wasm_host_(context, &validators).await;
+    let mut native = native_host(context).await;
+    let mut wasm = wasm_host_(context).await;
 
     // ROOT-CONTINUITY from GENESIS: both roots are the store's merkle root,
     // and the store already carries the seeded `__config` record — a real
@@ -433,40 +392,39 @@ async fn same_ops_inner(context: &deterministic::Context) {
         "genesis roots must be continuous across the runtimes"
     );
 
-    // sibling-only seeding (grants + binds) holds the gateway roots.
+    // sibling-only seeding (the two foundings) holds the gateway roots.
     let (n0, w0) = (root_of(&native), root_of(&wasm));
     w.seed(&mut native).await;
     w.seed(&mut wasm).await;
     assert_eq!(root_of(&native), n0, "sibling blocks hold the native root");
     assert_eq!(root_of(&wasm), w0, "sibling blocks hold the wasm root");
 
-    // h5: a VALIDATOR publishes its apex content route (both sibling gates —
-    // valset standing, identity OfNode + signer membership — resolve through
-    // the wasm runtime's memoized replay; the route signature verifies IN the
-    // guest).
+    // h5: founder A publishes its apex content route naming node A (the
+    // identity OfKey + signer-membership gate resolves through the wasm
+    // runtime's memoized replay; the route signature verifies IN the guest).
     roundtrip(
         &mut native,
         &mut wasm,
         &w,
         5,
-        Origin::External(w.node_a.clone()),
+        w.a(),
         set_route(
-            statement(&w.a_id(), None, &w.node_a, 1, Some(content_route(0x11))),
+            statement(w.a_id(), None, &w.node_a, 1, Some(content_route(0x11))),
             &w.founder_a,
         ),
         true,
     )
     .await;
 
-    // h6: a RESIDENT publishes a labeled loopback route (the union arm).
+    // h6: founder B publishes a labeled loopback route on node B.
     roundtrip(
         &mut native,
         &mut wasm,
         &w,
         6,
-        Origin::External(w.node_b.clone()),
+        w.b(),
         set_route(
-            statement(&w.b_id(), Some("api"), &w.node_b, 1, Some(loopback_route())),
+            statement(w.b_id(), Some("api"), &w.node_b, 1, Some(loopback_route())),
             &w.founder_b,
         ),
         true,
@@ -479,9 +437,9 @@ async fn same_ops_inner(context: &deterministic::Context) {
         &mut wasm,
         &w,
         7,
-        Origin::External(w.node_a.clone()),
+        w.a(),
         set_route(
-            statement(&w.a_id(), None, &w.node_a, 2, Some(content_route(0x22))),
+            statement(w.a_id(), None, &w.node_a, 2, Some(content_route(0x22))),
             &w.founder_a,
         ),
         true,
@@ -495,8 +453,8 @@ async fn same_ops_inner(context: &deterministic::Context) {
         &mut wasm,
         &w,
         8,
-        Origin::External(w.node_a.clone()),
-        set_route(statement(&w.a_id(), None, &w.node_a, 3, None), &w.founder_a),
+        w.a(),
+        set_route(statement(w.a_id(), None, &w.node_a, 3, None), &w.founder_a),
         true,
     )
     .await;
@@ -507,27 +465,29 @@ async fn same_ops_inner(context: &deterministic::Context) {
         &mut wasm,
         &w,
         9,
-        Origin::External(w.node_a.clone()),
+        w.a(),
         set_route(
-            statement(&w.a_id(), None, &w.node_a, 4, Some(loopback_route())),
+            statement(w.a_id(), None, &w.node_a, 4, Some(loopback_route())),
             &w.founder_a,
         ),
         true,
     )
     .await;
 
-    // h10: a second label under A lands beside the apex.
+    // h10: a second label under A lands beside the apex — served by node B:
+    // the account vouches for whichever node it names, the origin is never
+    // compared to the publisher.
     roundtrip(
         &mut native,
         &mut wasm,
         &w,
         10,
-        Origin::External(w.node_a.clone()),
+        w.a(),
         set_route(
             statement(
-                &w.a_id(),
+                w.a_id(),
                 Some("web"),
-                &w.node_a,
+                &w.node_b,
                 1,
                 Some(content_route(0x33)),
             ),
@@ -561,10 +521,8 @@ async fn same_ops_inner(context: &deterministic::Context) {
     // error-shaped queries reject identically (needle containment).
     for (q, needle) in [
         (
-            encode_query(&GatewayQuery::List {
-                account_id: Vec::new(),
-            }),
-            "account id must be",
+            encode_query(&GatewayQuery::List { account_id: 0 }),
+            "account number must be non-zero",
         ),
         (b"definitely-not-json".to_vec(), "expected value"),
     ] {
@@ -603,16 +561,15 @@ async fn rejections_inner(context: &deterministic::Context) {
     let w = World::new();
     let outsider = ed_pub(&ed(99));
     let outsider_signer = ed(99);
-    let validators = vec![w.node_a.clone()];
-    let mut native = native_host(context, &validators).await;
-    let mut wasm = wasm_host_(context, &validators).await;
+    let mut native = native_host(context).await;
+    let mut wasm = wasm_host_(context).await;
     for host in [&mut native, &mut wasm] {
         w.seed(host).await;
         // one committed route so the revision matrix has a stream to violate.
         host.submit_at(
-            block(5, Origin::External(w.node_a.clone())),
+            block(5, w.a()),
             set_route(
-                statement(&w.a_id(), None, &w.node_a, 1, Some(content_route(0x11))),
+                statement(w.a_id(), None, &w.node_a, 1, Some(content_route(0x11))),
                 &w.founder_a,
             ),
         )
@@ -623,87 +580,79 @@ async fn rejections_inner(context: &deterministic::Context) {
     // a statement whose label the canonical grammar refuses (module-side
     // validation is under test, so the authorization is explicit junk).
     let bad_label = statement(
-        &w.a_id(),
+        w.a_id(),
         Some("Bad_Label"),
         &w.node_a,
         1,
         Some(loopback_route()),
     );
-    let zero_revision = statement(&w.a_id(), Some("api"), &w.node_a, 0, Some(loopback_route()));
+    let zero_revision = statement(w.a_id(), Some("api"), &w.node_a, 0, Some(loopback_route()));
     // a content route violating the signed content-policy shape (POST).
     let mut bad_content = content_route(0x44);
     bad_content.policy.methods = vec![RouteMethod::Get, RouteMethod::Post];
     bad_content.policy.max_request_bytes = 64;
-    let bad_content_st = statement(&w.a_id(), Some("api"), &w.node_a, 1, Some(bad_content));
+    let bad_content_st = statement(w.a_id(), Some("api"), &w.node_a, 1, Some(bad_content));
 
-    // the rejection matrix: both sibling gates (valset standing, identity
-    // account), chain scoping, publisher/account/signer authority, signature
-    // verification, the monotonic revision stream, statement grammar, origin
-    // shapes, and the decode seam. each rejected block leaves BOTH roots
-    // byte-identical.
+    // the rejection matrix: the identity gate (an origin on no account — a
+    // stranger's key AND a node key, which never resolves), chain scoping,
+    // account/signer authority, signature verification, the monotonic
+    // revision stream, statement grammar, origin shapes, and the decode
+    // seam. each rejected block leaves BOTH roots byte-identical.
     let rejects: Vec<(Origin, Msg, &str)> = vec![
-        // valset-gated: no standing anywhere — decided by the sibling reads.
+        // identity-gated: a key on no account — decided by the sibling read.
         (
             Origin::External(outsider.clone()),
             set_route(
-                statement(&outsider, None, &outsider, 1, Some(loopback_route())),
+                statement(ABSENT_ACCOUNT, None, &outsider, 1, Some(loopback_route())),
                 &outsider_signer,
             ),
-            "not a validator or admitted resident",
+            "belongs to no Identity account",
         ),
-        // identity-gated: resident standing but NO bound account.
-        (
-            Origin::External(w.node_c.clone()),
-            set_route(
-                statement(&w.a_id(), None, &w.node_c, 2, Some(loopback_route())),
-                &w.founder_a,
-            ),
-            "not bound to an Identity account",
-        ),
-        // chain scoping: a statement for another network.
+        // identity-gated: a NODE key as origin never resolves to an account,
+        // even the node A's routes name as publisher.
         (
             Origin::External(w.node_a.clone()),
             set_route(
+                statement(w.a_id(), None, &w.node_a, 2, Some(loopback_route())),
+                &w.founder_a,
+            ),
+            "belongs to no Identity account",
+        ),
+        // chain scoping: a statement for another network.
+        (
+            w.a(),
+            set_route(
                 RouteStatement {
                     chain_id: "other-chain".into(),
-                    ..statement(&w.a_id(), None, &w.node_a, 2, Some(loopback_route()))
+                    ..statement(w.a_id(), None, &w.node_a, 2, Some(loopback_route()))
                 },
                 &w.founder_a,
             ),
             "belongs to another chain",
         ),
-        // publisher authority: the signed publisher is not the origin.
+        // account authority: the origin key belongs to A, the statement is B's.
         (
-            Origin::External(w.node_a.clone()),
+            w.a(),
             set_route(
-                statement(&w.a_id(), None, &w.node_b, 2, Some(loopback_route())),
-                &w.founder_a,
-            ),
-            "publisher does not match",
-        ),
-        // account authority: the origin node belongs to A, not B.
-        (
-            Origin::External(w.node_a.clone()),
-            set_route(
-                statement(&w.b_id(), None, &w.node_a, 1, Some(loopback_route())),
+                statement(w.b_id(), None, &w.node_a, 1, Some(loopback_route())),
                 &w.founder_b,
             ),
-            "does not own the publisher node",
+            "route account is not the origin's account",
         ),
-        // signer authority: a key outside the account's member set.
+        // signer authority: a key outside the account's association.
         (
-            Origin::External(w.node_a.clone()),
+            w.a(),
             set_route(
-                statement(&w.a_id(), None, &w.node_a, 2, Some(loopback_route())),
+                statement(w.a_id(), None, &w.node_a, 2, Some(loopback_route())),
                 &outsider_signer,
             ),
-            "not a current Ed25519 account member",
+            "signer is not a current account member",
         ),
         // signature verification: a member signer, a junk signature.
         (
-            Origin::External(w.node_a.clone()),
+            w.a(),
             set_route_raw(
-                statement(&w.a_id(), None, &w.node_a, 2, Some(loopback_route())),
+                statement(w.a_id(), None, &w.node_a, 2, Some(loopback_route())),
                 ed_pub(&w.founder_a),
                 vec![9; 64],
             ),
@@ -711,58 +660,59 @@ async fn rejections_inner(context: &deterministic::Context) {
         ),
         // the monotonic stream: a replayed revision...
         (
-            Origin::External(w.node_a.clone()),
+            w.a(),
             set_route(
-                statement(&w.a_id(), None, &w.node_a, 1, Some(content_route(0x55))),
+                statement(w.a_id(), None, &w.node_a, 1, Some(content_route(0x55))),
                 &w.founder_a,
             ),
             "route revision must be",
         ),
         // ...and a skipped one.
         (
-            Origin::External(w.node_a.clone()),
+            w.a(),
             set_route(
-                statement(&w.a_id(), None, &w.node_a, 7, Some(content_route(0x55))),
+                statement(w.a_id(), None, &w.node_a, 7, Some(content_route(0x55))),
                 &w.founder_a,
             ),
             "route revision must be",
         ),
         // statement grammar: label, zero revision, content-policy shape.
         (
-            Origin::External(w.node_a.clone()),
+            w.a(),
             set_route_raw(bad_label, ed_pub(&w.founder_a), vec![9; 64]),
             "invalid route label",
         ),
         (
-            Origin::External(w.node_a.clone()),
+            w.a(),
             set_route_raw(zero_revision, ed_pub(&w.founder_a), vec![9; 64]),
             "revision starts at 1",
         ),
         (
-            Origin::External(w.node_a.clone()),
+            w.a(),
             set_route_raw(bad_content_st, ed_pub(&w.founder_a), vec![9; 64]),
             "content routes require",
         ),
-        // origin shapes.
+        // origin shapes: a system origin, and a non-key blob (no length rule
+        // any more — it simply belongs to no account).
         (
             Origin::System,
             set_route(
-                statement(&w.a_id(), None, &w.node_a, 2, Some(loopback_route())),
+                statement(w.a_id(), None, &w.node_a, 2, Some(loopback_route())),
                 &w.founder_a,
             ),
-            "requires an external node origin",
+            "origin must be an external key",
         ),
         (
             Origin::External(vec![7; 16]),
             set_route(
-                statement(&w.a_id(), None, &w.node_a, 2, Some(loopback_route())),
+                statement(w.a_id(), None, &w.node_a, 2, Some(loopback_route())),
                 &w.founder_a,
             ),
-            "32-byte node key",
+            "belongs to no Identity account",
         ),
         // the decode seam (from a fully-authorized origin).
         (
-            Origin::External(w.node_a.clone()),
+            w.a(),
             Msg {
                 target: "gateway".into(),
                 payload: b"definitely-not-json".to_vec(),
@@ -816,23 +766,22 @@ async fn multi_dispatch_inner(context: &deterministic::Context) {
     let w = World::new();
     let outsider = ed_pub(&ed(99));
     let outsider_signer = ed(99);
-    let validators = vec![w.node_a.clone()];
-    let mut native = native_host(context, &validators).await;
-    let mut wasm = wasm_host_(context, &validators).await;
+    let mut native = native_host(context).await;
+    let mut wasm = wasm_host_(context).await;
     w.seed(&mut native).await;
     w.seed(&mut wasm).await;
 
     // ONE block, two revisions of the SAME route: the second dispatch's
     // monotonic check reads the first dispatch's STAGED revision — on the wasm
     // side that is the outer staged `__state` reloaded by dispatch 2 (the
-    // read-your-writes seam), with both sibling gates resolving through
+    // read-your-writes seam), with the identity gate resolving through
     // memoized replay on each dispatch.
     let batch = vec![
         (
-            Origin::External(w.node_a.clone()),
+            w.a(),
             set_route(
                 statement(
-                    &w.a_id(),
+                    w.a_id(),
                     Some("multi"),
                     &w.node_a,
                     1,
@@ -842,10 +791,10 @@ async fn multi_dispatch_inner(context: &deterministic::Context) {
             ),
         ),
         (
-            Origin::External(w.node_a.clone()),
+            w.a(),
             set_route(
                 statement(
-                    &w.a_id(),
+                    w.a_id(),
                     Some("multi"),
                     &w.node_a,
                     2,
@@ -856,11 +805,11 @@ async fn multi_dispatch_inner(context: &deterministic::Context) {
         ),
     ];
     let n_out = native
-        .submit_block(block(5, Origin::External(w.node_a.clone())), batch.clone())
+        .submit_block(block(5, w.a()), batch.clone())
         .await
         .expect("native block");
     let w_out = wasm
-        .submit_block(block(5, Origin::External(w.node_a.clone())), batch)
+        .submit_block(block(5, w.a()), batch)
         .await
         .expect("wasm block");
     for out in [&n_out, &w_out] {
@@ -884,10 +833,10 @@ async fn multi_dispatch_inner(context: &deterministic::Context) {
     let (n_before, w_before) = (root_of(&native), root_of(&wasm));
     let batch = vec![
         (
-            Origin::External(w.node_a.clone()),
+            w.a(),
             set_route(
                 statement(
-                    &w.a_id(),
+                    w.a_id(),
                     Some("iso"),
                     &w.node_a,
                     1,
@@ -897,10 +846,10 @@ async fn multi_dispatch_inner(context: &deterministic::Context) {
             ),
         ),
         (
-            Origin::External(w.node_a.clone()),
+            w.a(),
             set_route(
                 statement(
-                    &w.a_id(),
+                    w.a_id(),
                     Some("iso"),
                     &w.node_a,
                     1,
@@ -910,19 +859,19 @@ async fn multi_dispatch_inner(context: &deterministic::Context) {
             ),
         ),
         (
-            Origin::External(w.node_b.clone()),
+            w.b(),
             set_route(
-                statement(&w.b_id(), None, &w.node_b, 1, Some(loopback_route())),
+                statement(w.b_id(), None, &w.node_b, 1, Some(loopback_route())),
                 &w.founder_b,
             ),
         ),
     ];
     let n_out = native
-        .submit_block(block(6, Origin::External(w.node_a.clone())), batch.clone())
+        .submit_block(block(6, w.a()), batch.clone())
         .await
         .expect("native block");
     let w_out = wasm
-        .submit_block(block(6, Origin::External(w.node_a.clone())), batch)
+        .submit_block(block(6, w.a()), batch)
         .await
         .expect("wasm block");
     for out in [&n_out, &w_out] {
@@ -942,32 +891,32 @@ async fn multi_dispatch_inner(context: &deterministic::Context) {
         replies(&wasm, &w.accounts()).await
     );
 
-    // one block where a member from an account WITHOUT authority rejects
-    // between two acceptances — the outsider's member is gate-rejected by the
-    // sibling reads, leaving the accepted subset only.
+    // one block where a key on NO account rejects after an acceptance — the
+    // outsider's member is gate-rejected by the sibling read, leaving the
+    // accepted subset only.
     let (n_before, w_before) = (root_of(&native), root_of(&wasm));
     let batch = vec![
         (
-            Origin::External(w.node_a.clone()),
+            w.a(),
             set_route(
-                statement(&w.a_id(), Some("api"), &w.node_a, 1, Some(loopback_route())),
+                statement(w.a_id(), Some("api"), &w.node_a, 1, Some(loopback_route())),
                 &w.founder_a,
             ),
         ),
         (
             Origin::External(outsider.clone()),
             set_route(
-                statement(&outsider, None, &outsider, 1, Some(loopback_route())),
+                statement(ABSENT_ACCOUNT, None, &outsider, 1, Some(loopback_route())),
                 &outsider_signer,
             ),
         ),
     ];
     let n_out = native
-        .submit_block(block(7, Origin::External(w.node_a.clone())), batch.clone())
+        .submit_block(block(7, w.a()), batch.clone())
         .await
         .expect("native block");
     let w_out = wasm
-        .submit_block(block(7, Origin::External(w.node_a.clone())), batch)
+        .submit_block(block(7, w.a()), batch)
         .await
         .expect("wasm block");
     for out in [&n_out, &w_out] {
@@ -1009,26 +958,24 @@ async fn genesis_config_inner(context: &deterministic::Context) {
     // and deterministically refused as another chain's by the tenant
     // configured differently.
     let w = World::new();
-    let validators = vec![w.node_a.clone()];
-    let mut wasm = wasm_host_(context, &validators).await;
+    let mut wasm = wasm_host_(context).await;
     let mut other_host = Host::genesis(vec![
         Box::new(wasm_gateway(Box::new(other))),
         Box::new(native_identity()),
-        Box::new(seeded_valset(&validators).await),
     ])
     .expect("genesis");
     w.seed(&mut wasm).await;
     w.seed(&mut other_host).await;
 
     let m = set_route(
-        statement(&w.a_id(), None, &w.node_a, 1, Some(content_route(0x11))),
+        statement(w.a_id(), None, &w.node_a, 1, Some(content_route(0x11))),
         &w.founder_a,
     );
-    wasm.submit_at(block(5, Origin::External(w.node_a.clone())), m.clone())
+    wasm.submit_at(block(5, w.a()), m.clone())
         .await
         .expect("the configured chain accepts its own statement");
     let err = other_host
-        .submit_at(block(5, Origin::External(w.node_a.clone())), m)
+        .submit_at(block(5, w.a()), m)
         .await
         .expect_err("a foreign chain id must refuse the statement");
     let SubmitError::Rejected(Error::Module(reason)) = err else {
@@ -1101,9 +1048,8 @@ fn handle_plane_ops_stay_in_lockstep_on_the_merged_tenant() {
 
 async fn handle_plane_inner(context: &deterministic::Context) {
     let w = World::new();
-    let validators = vec![w.node_a.clone()];
-    let mut native = native_host(context, &validators).await;
-    let mut wasm = wasm_host_(context, &validators).await;
+    let mut native = native_host(context).await;
+    let mut wasm = wasm_host_(context).await;
 
     // root-continuity from genesis: both roots carry the seeded `__config`.
     let genesis = root_of(&native);
@@ -1116,27 +1062,24 @@ async fn handle_plane_inner(context: &deterministic::Context) {
 
     // every handle op family in one deterministic sequence; `moves` says
     // whether committed state changes — root movement must agree on both sides.
-    // node A is a validator bound to account A; node B a resident bound to B.
-    let ops: Vec<(Vec<u8>, Option<&str>, bool)> = vec![
-        (w.node_a.clone(), Some("orthory"), true), // validator registers
-        (w.node_b.clone(), Some("quack-2"), true), // resident registers
-        (w.node_a.clone(), Some("orthory"), false), // idempotent no-op
-        (w.node_a.clone(), Some("renamed"), true), // atomic rename frees "orthory"
-        (w.node_b.clone(), None, true),            // unregister "quack-2"
-        (w.node_b.clone(), Some("orthory"), true), // claim the freed name
+    // founder A's key acts for account A; founder B's for account B.
+    let ops: Vec<(Origin, Option<&str>, bool)> = vec![
+        (w.a(), Some("orthory"), true),  // A registers
+        (w.b(), Some("quack-2"), true),  // B registers
+        (w.a(), Some("orthory"), false), // idempotent no-op
+        (w.a(), Some("renamed"), true),  // atomic rename frees "orthory"
+        (w.b(), None, true),             // unregister "quack-2"
+        (w.b(), Some("orthory"), true),  // claim the freed name
     ];
 
     for (i, (who, handle, moves)) in ops.into_iter().enumerate() {
         let height = i as u64 + 5;
         let (n_before, w_before) = (root_of(&native), root_of(&wasm));
         native
-            .submit_at(
-                block(height, Origin::External(who.clone())),
-                set_handle(handle),
-            )
+            .submit_at(block(height, who.clone()), set_handle(handle))
             .await
             .expect("native submit");
-        wasm.submit_at(block(height, Origin::External(who)), set_handle(handle))
+        wasm.submit_at(block(height, who), set_handle(handle))
             .await
             .expect("wasm submit");
 
@@ -1155,13 +1098,13 @@ async fn handle_plane_inner(context: &deterministic::Context) {
         assert_eq!(root_of(&native), root_of(&wasm), "continuity per block");
     }
 
-    // resolution stops at the stable AccountId (the founding key), never a node.
+    // resolution stops at the stable account NUMBER, never a key or a node.
     assert_eq!(
         resolved(&wasm, "renamed").await,
         Some(ResolvedAccount {
             account_id: w.a_id()
         }),
-        "A's rename resolves to A's account id"
+        "A's rename resolves to A's account number"
     );
     assert_eq!(
         resolved(&wasm, "orthory").await,
@@ -1180,17 +1123,11 @@ async fn handle_plane_inner(context: &deterministic::Context) {
     // reject leaves BOTH roots byte-identical to pre-block (abort, no trace).
     let (n_before, w_before) = (root_of(&native), root_of(&wasm));
     let n_err = native
-        .submit_at(
-            block(20, Origin::External(w.node_a.clone())),
-            set_handle(Some("net")),
-        )
+        .submit_at(block(20, w.a()), set_handle(Some("net")))
         .await
         .expect_err("native rejects reserved");
     let w_err = wasm
-        .submit_at(
-            block(20, Origin::External(w.node_a.clone())),
-            set_handle(Some("net")),
-        )
+        .submit_at(block(20, w.a()), set_handle(Some("net")))
         .await
         .expect_err("wasm rejects reserved");
     for err in [n_err, w_err] {

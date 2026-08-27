@@ -49,6 +49,7 @@
 use commonware_cryptography::Signer;
 use commonware_runtime::{Metrics as _, Runner, Supervisor};
 
+mod account_cli;
 mod agent;
 mod agent_cli;
 mod agent_plane;
@@ -178,8 +179,9 @@ Getting started:
   ducktape node init --name mynet     found your own network here
   ducktape node join <invite>         ...or join someone else's
   ducktape node run                   start it (^C checkpoints and exits)
-  ducktape user account-init --name <you>
-                                      claim an account on it (mints your key)
+  ducktape wallet new <you>           mint your user key
+  ducktape account create --name <you>
+                                      found your account on it (signed by that key)
   ducktape node status                height + root hash of the running node
 
 Then, to run agents on it:
@@ -220,9 +222,11 @@ enum Family {
     /// run a workspace node, plus operator verbs (init, invite, join, ...)
     #[command(subcommand)]
     Node(cli_args::NodeCmd),
-    /// user-identity keys and signing (init/restore, sign-*, account-init, ...)
+    /// user keys and signing (init/restore, sign-*, cred)
     #[command(subcommand)]
     User(userkey_cli::UserCmd),
+    /// the account this user key belongs to: create, keys, name, profile
+    Account(account_cli::AccountArgs),
     /// named user-key wallets: mint, import, list, switch the active one
     #[command(subcommand)]
     Wallet(wallet_cli::WalletCmd),
@@ -263,6 +267,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // all, and reaches this host only through a vsock tunnel the host owns
         // both ends of — so there is no hook and nothing for one to install.
         Family::User(cmd) => userkey_cli::run(cmd),
+        Family::Account(args) => account_cli::run(args),
         Family::Wallet(cmd) => wallet_cli::run(cmd),
         Family::Agent(args) => agent_cli::run(args),
         Family::Gateway(cmd) => gateway_routes::run(cmd),

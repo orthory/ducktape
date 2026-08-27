@@ -44,8 +44,8 @@ pub(crate) struct BindConfig<'a> {
     pub(crate) gateway_listen: Option<String>,
     pub(crate) gateway_enabled: bool,
     pub(crate) log_ring: noded::LogRing,
-    /// this node's consensus public key — the `BindNode` subject the owner-gated
-    /// admin namespace resolves ownership against (ADR A5).
+    /// this node's consensus public key — the salt every owner PoP on the
+    /// admin namespace is bound to (ADR A5).
     pub(crate) node_key: Vec<u8>,
     /// how the owner-gated admin namespace is exposed (ADR A2/A4).
     pub(crate) admin_exposure: noded::AdminExposure,
@@ -74,6 +74,18 @@ pub(crate) fn bind_listener(
         ),
         _ => format!("cannot bind the {surface} on {addr}: {error} (`{key}` in node.toml)"),
     })
+}
+
+/// the operator's active wallet PUBLIC key, if this host has a keystore — the
+/// key whose account owns the admin namespace. Read without a password (the
+/// key file carries its pubkey in the clear); a host with no wallet, or one
+/// whose keystore cannot be read, boots operator-gated instead of refusing to
+/// boot. Not the user's node: the wallet is per operator, shared by the CLI
+/// and the app.
+fn operator_wallet_key() -> Option<Vec<u8>> {
+    let path = keystore::wallet::active_user_key().ok()?;
+    let key = keystore::userkey::read_user_key_file(&path).ok()?;
+    Some(key.pubkey)
 }
 
 pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::error::Error>> {
@@ -177,12 +189,15 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         // the duckfs workspace RPC's managed-checkout root (disk state, separate
         // from the module's own `<storage>/duckfs` dir).
         .with_duckfs_workspaces(storage.join("duckfs-workspaces"))
-        // the owner-gated control namespace (ADR A2/A5): this node's own key is
-        // the `BindNode` subject ownership resolves against; the exposure is the
-        // operator's choice (default loopback). shutdown + module-code staging
-        // live here, off the unauthenticated public surface.
+        // the owner-gated control namespace (ADR A2/A5): this node's own key
+        // salts the owner PoP, and the operator's active wallet key names the
+        // account that may present one (identity binds no node to anyone);
+        // the exposure is the operator's choice (default loopback). shutdown +
+        // module-code staging live here, off the unauthenticated public
+        // surface.
         .with_admin(noded::AdminConfig {
             node_key: Some(node_key.clone()),
+            owner_key: operator_wallet_key(),
             ..admin
         });
     let http_handle = if gateway_enabled {

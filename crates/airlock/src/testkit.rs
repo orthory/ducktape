@@ -106,28 +106,27 @@ impl SnpTestEnclave {
 /// Put an airlock router behind a stand-in for the node's gateway proxy.
 ///
 /// In production nothing reaches a lending gateway's loopback listener except
-/// through `bin/node`'s gateway plane, which authenticates the WireGuard peer,
-/// resolves it to an Identity account, and stamps
-/// [`crate::server::CALLER_ACCOUNT_HEADER`] — refusing any caller-supplied copy
-/// at decode. `account` is therefore what the proxy VERIFIED, not what anyone
-/// asked for.
+/// through `bin/node`'s gateway plane, which authenticates the WireGuard peer
+/// and stamps its node key as [`crate::server::CALLER_NODE_HEADER`] — refusing
+/// any caller-supplied copy at decode. `node` is therefore what the proxy
+/// VERIFIED, not what anyone asked for.
 ///
-/// This is the ONLY way a test supplies an account, because it is the only way
-/// production does. A session request carries none — the field a caller could
-/// once name itself with is deleted — so an ungranted member is driven by
-/// wrapping with the account the proxy would really have stamped for them, and
-/// asserting the lender refuses it.
+/// This is the ONLY way a test supplies a caller, because it is the only way
+/// production does. A session request carries no identity — the field a
+/// caller could once name itself with is deleted — so an ungranted member is
+/// driven by wrapping with the node the proxy would really have stamped for
+/// them, and asserting the lender refuses it.
 #[cfg(feature = "server")]
-pub fn behind_gateway_proxy(app: axum::Router, account: &[u8]) -> axum::Router {
+pub fn behind_gateway_proxy(app: axum::Router, node: &[u8]) -> axum::Router {
     let stamped: axum::http::HeaderValue =
-        hex::encode(account).parse().expect("hex is a valid header value");
+        hex::encode(node).parse().expect("hex is a valid header value");
     app.layer(axum::middleware::from_fn(
         move |mut request: axum::extract::Request, next: axum::middleware::Next| {
             let stamped = stamped.clone();
             async move {
                 request
                     .headers_mut()
-                    .insert(crate::server::CALLER_ACCOUNT_HEADER, stamped);
+                    .insert(crate::server::CALLER_NODE_HEADER, stamped);
                 next.run(request).await
             }
         },

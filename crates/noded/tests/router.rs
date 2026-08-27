@@ -204,8 +204,9 @@ async fn a_tampered_frame_is_refused_before_it_reaches_the_actor() {
     let signer = commonware_cryptography::ed25519::PrivateKey::from_seed(42);
     let op = chat_op();
     let mut frame = node::encode_frame(&signer, 1, &op);
-    // flip one byte of the PAYLOAD: the signature binds (origin, seq, target,
-    // payload), so the frame no longer verifies — and the actor never sees it.
+    // flip one byte of the PAYLOAD: the proof binds (scheme, origin, seq,
+    // target, payload), so the frame no longer verifies — and the actor never
+    // sees it.
     // located by SEARCHING for the payload rather than counting back from the
     // tail: an offset measured against the frame's trailer silently slides onto
     // a structural byte when the layout gains a field, and the refusal becomes
@@ -225,7 +226,7 @@ async fn a_tampered_frame_is_refused_before_it_reaches_the_actor() {
     let body = body_json(response).await;
     let err = body["error"].as_str().expect("a verbatim refusal");
     assert!(
-        err.contains("signature"),
+        err.contains("proof does not bind"),
         "the refusal names the cause: {err}"
     );
 }
@@ -749,30 +750,32 @@ async fn a_node_with_no_minted_credential_refuses_every_admin_request() {
     );
 }
 
-/// an actor that answers exactly one thing: `identity` `OfNode` → the account
-/// that owns `node_key`, whose sole member is `owner_key`. everything else is a
-/// module error (the admin owner path only ever asks this one question).
-fn spawn_owner_actor(mut cmds: mpsc::Receiver<NodeCommand>, node_key: Vec<u8>, owner_key: Vec<u8>) {
+/// an actor that answers exactly one thing: `identity` `OfKey` for the
+/// operator's `owner_key` → the account it is on, whose sole member it is.
+/// everything else is a module error (the admin owner path only ever asks this
+/// one question).
+fn spawn_owner_actor(mut cmds: mpsc::Receiver<NodeCommand>, owner_key: Vec<u8>) {
     tokio::spawn(async move {
         while let Some(cmd) = cmds.next().await {
-            if let NodeCommand::Query { target, reply, .. } = cmd {
+            if let NodeCommand::Query { target, req, reply } = cmd {
                 assert_eq!(target, "identity");
+                let identity::IdentityQuery::OfKey { key } =
+                    identity::decode_query(&req).expect("an identity query")
+                else {
+                    panic!("the admin owner path asks only OfKey");
+                };
+                assert_eq!(key, owner_key, "the owner path resolves the operator's own key");
                 let view = identity::AccountView {
-                    account_id: owner_key.clone(),
-                    display_name: None,
-                    avatar: None,
-                    bio: None,
-                    nonce: 0,
-                    member_keys: vec![identity::MemberKeyView {
+                    number: 1,
+                    name: "owner".into(),
+                    keys: vec![identity::KeyView {
+                        scheme: identity::KeyScheme::Ed25519,
                         pubkey: owner_key.clone(),
-                        kind: identity::KeyKind::Ed25519,
                         label: None,
                         added_at: 0,
                     }],
-                    nodes: vec![identity::NodeView {
-                        node_key: node_key.clone(),
-                        label: None,
-                    }],
+                    avatar: None,
+                    bio: None,
                     updated_at: 0,
                 };
                 let bytes = identity::encode_reply(&identity::IdentityReply::Account(Some(view)));
@@ -823,10 +826,11 @@ async fn public_admin_enforces_the_committed_owner_pop() {
     // every assertion below is made against a node that HAS the other secret.
     let mk_handle = || {
         let (handle, cmd_rx, _e) = NodeHandle::channel();
-        spawn_owner_actor(cmd_rx, node_key.clone(), owner_key.clone());
+        spawn_owner_actor(cmd_rx, owner_key.clone());
         handle.with_admin(AdminConfig {
             exposure: AdminExposure::Public,
             node_key: Some(node_key.clone()),
+            owner_key: Some(owner_key.clone()),
             operator_token: Some(OPERATOR.to_string()),
             ..Default::default()
         })
@@ -965,7 +969,7 @@ fn gateway_route() -> gateway::RouteRecord {
     gateway::RouteRecord {
         statement: gateway::RouteStatement {
             chain_id: "test".into(),
-            account_id: vec![1],
+            account_id: 1,
             name: gateway::RouteName::named("app"),
             publisher_node: vec![2; 32],
             revision: 7,
@@ -1000,11 +1004,11 @@ fn spawn_duck_actor(mut cmds: mpsc::Receiver<NodeCommand>, queries: usize) {
             };
             assert_eq!(target, "gateway");
             let bytes = match gateway::decode_query(&req).unwrap() {
-                gateway::GatewayQuery::Resolve { .. } => gateway::encode_reply(
-                    &gateway::GatewayReply::Resolved(Some(gateway::ResolvedAccount {
-                        account_id: vec![1],
-                    })),
-                ),
+                gateway::GatewayQuery::Resolve { .. } => {
+                    gateway::encode_reply(&gateway::GatewayReply::Resolved(Some(
+                        gateway::ResolvedAccount { account_id: 1 },
+                    )))
+                }
                 gateway::GatewayQuery::Get { .. } => gateway::encode_reply(
                     &gateway::GatewayReply::Route(Box::new(Some(gateway_route()))),
                 ),
@@ -1025,7 +1029,7 @@ fn spawn_gateway_actor(mut cmds: mpsc::Receiver<NodeCommand>, replies: usize) {
             assert_eq!(
                 gateway::decode_query(&req).unwrap(),
                 gateway::GatewayQuery::Get {
-                    account_id: vec![1],
+                    account_id: 1,
                     name: gateway::RouteName::named("app"),
                 }
             );
@@ -1081,7 +1085,7 @@ async fn gateway_proxy_resolves_the_signed_route_and_forwards_post_body() {
         "/v1/gateway/proxy",
         serde_json::json!({
             "head": {
-                "account_id": [1],
+                "account_id": 1,
                 "name": { "label": "app" },
                 "revision": 7,
                 "method": "post",
