@@ -29,13 +29,14 @@ mod steps;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
-use commonware_cryptography::{Signer as _, ed25519};
+use commonware_cryptography::ed25519;
 use wireguard::effect::PeerTunnelConfig;
-use wireguard::{Endpoint, OverlayPolicy, UpgradeError, ValidatorIdentity};
+use wireguard::{Endpoint, IdentitySigner, OverlayPolicy, UpgradeError, ValidatorIdentity};
 
 use crate::binding;
 use crate::contract::{
-    Effect, Event, MachineConfig, MeshEpochEvent, ReachabilityEvent, ReqId, Resolution,
+    Effect, Event, MachineConfig, MeshEpochEvent, NetstackMachine, ReachabilityEvent, ReqId,
+    Resolution, StepError,
 };
 use crate::epoch::{EpochState, Phase, Role};
 use crate::msg::ReachabilityMsg;
@@ -97,6 +98,8 @@ pub struct Machine {
 /// handler, so no handler has to re-borrow an optional epoch mid-flight.
 pub(crate) struct Driver {
     pub(crate) config: MachineConfig,
+    /// The node's identity: everything this machine signs goes through it.
+    pub(crate) signer: Box<dyn IdentitySigner>,
     pub(crate) me: ValidatorIdentity,
     pub(crate) overlay: OverlayPolicy,
     pub(crate) interface: String,
@@ -149,13 +152,14 @@ pub(crate) struct Driver {
 }
 
 impl Machine {
-    pub fn new(config: MachineConfig) -> Self {
-        let me = binding::identity_of(&config.signer.public_key());
+    pub fn new(signer: Box<dyn IdentitySigner>, config: MachineConfig) -> Self {
+        let me = binding::identity_of(&signer.identity());
         let overlay = OverlayPolicy::ula_v6(config.chain_id.clone());
         let interface = binding::interface_name(&config.chain_id);
         Self {
             driver: Driver {
                 config,
+                signer,
                 me,
                 overlay,
                 interface,
@@ -456,6 +460,12 @@ impl Machine {
                 Ok(())
             }
         }
+    }
+}
+
+impl NetstackMachine for Machine {
+    fn step(&mut self, event: Event, now_ms: u64) -> Result<Vec<Effect>, StepError> {
+        Machine::step(self, event, now_ms).map_err(StepError::Protocol)
     }
 }
 

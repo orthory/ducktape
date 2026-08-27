@@ -15,9 +15,14 @@
 #                      module-guest (that world's WIT definition)
 #   crates/networking/ — the netstack: transport infra ONLY (wireguard,
 #                      nat-traversal, netstack-machine [the sans-I/O
-#                      reachability decision core], reachability [its host
-#                      executor + rendezvous runtime], data-plane,
-#                      overlay-net) — owns no consensus module
+#                      reachability decision core, its ducktape:netstack
+#                      WIT world and the guest build of it],
+#                      netstack-scenarios [the frozen scenario suite and
+#                      golden traces every backend is held to],
+#                      netstack-wasm [the wasmtime embedding of that
+#                      world], reachability [the host executor + rendezvous
+#                      runtime], data-plane, overlay-net) — owns no
+#                      consensus module
 #   crates/modules/   — CONSENSUS MODULES AND NOTHING ELSE. every crate under
 #                      system/ or apps/ implements `sdk::Module`; anything that
 #                      does not belongs somewhere else in this list. (module =
@@ -95,6 +100,8 @@ members = [
     "crates/networking/wireguard",
     "crates/networking/nat-traversal",
     "crates/networking/netstack-machine",
+    "crates/networking/netstack-scenarios",
+    "crates/networking/netstack-wasm",
     "crates/networking/reachability",
     "crates/networking/data-plane",
     "crates/networking/overlay-net",
@@ -280,6 +287,10 @@ borsh = { version = "1", default-features = false, features = ["derive", "std"] 
 # semantics, so it is consensus-affecting and every validator must run the
 # identical build; changing it is a binary upgrade, never a live module swap.
 wasmtime = "=46.0.1"
+# wit-bindgen — the guest-side binding generator for a crate's own component
+# port (the netstack machine's `guest` feature). Only ever compiled inside
+# guest-builder's synthesized wasm32 workspace.
+wit-bindgen = "0.57"
 
 # internal — kernel crates (the platform)
 sdk = { path = "crates/kernel/sdk" }
@@ -354,8 +365,13 @@ directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }
 # internal — types-only interface crates (the legal cross-module surface)
 wireguard = { path = "crates/networking/wireguard" }
-nat-traversal = { path = "crates/networking/nat-traversal" }
+# default-features off at the workspace level: the `runtime` feature (sockets,
+# clocks) is opted into by the host-side consumers below; the netstack
+# machine takes the pure wire surface only, natively and on wasm32.
+nat-traversal = { path = "crates/networking/nat-traversal", default-features = false }
 netstack-machine = { path = "crates/networking/netstack-machine" }
+netstack-scenarios = { path = "crates/networking/netstack-scenarios" }
+netstack-wasm = { path = "crates/networking/netstack-wasm" }
 reachability = { path = "crates/networking/reachability" }
 data-plane = { path = "crates/networking/data-plane" }
 overlay-net = { path = "crates/networking/overlay-net" }

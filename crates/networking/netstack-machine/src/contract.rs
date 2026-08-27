@@ -12,10 +12,12 @@ use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
 use commonware_cryptography::ed25519;
 use nat_traversal::NodeKey;
 use wireguard::effect::PeerTunnelConfig;
-use wireguard::wire_schema::socket_addr;
-use wireguard::{Endpoint, MeshVersion, PortPolicy, ValidatorIdentity, X25519PublicKey};
+use wireguard::wire_schema::{socket_addr, vec_socket_addr};
+use wireguard::{
+    Endpoint, MeshVersion, PortPolicy, UpgradeError, ValidatorIdentity, X25519PublicKey,
+};
 
-use crate::wire::{key, keys, result_socket_addr};
+use crate::wire::{key, keys, option_key, result_socket_addr};
 
 /// How long each coordinator interaction (reflexive discovery, lookup) may
 /// take before the host resolver moves on. Declared HERE because the
@@ -80,17 +82,18 @@ pub struct ReqId(pub u64);
 pub struct CmdToken(pub u64);
 
 /// Everything the machine decides over, resolved ONCE by the host and handed
-/// in whole: identity, key material, policy, and the advertised endpoints.
-/// No paths and no private tunnel keys — the filesystem is the host's
-/// domain, and the WireGuard PRIVATE key never enters the machine (interface
-/// pushes carry peer sets; the host assembles the full interface config).
+/// in whole: public key material, policy, and the advertised endpoints. No
+/// paths and no private keys of any kind — the filesystem is the host's
+/// domain, the WireGuard PRIVATE key never enters the machine (interface
+/// pushes carry peer sets; the host assembles the full interface config),
+/// and the identity signs through an [`wireguard::IdentitySigner`] handed
+/// to [`crate::Machine::new`] beside this config. Plain data, so it crosses
+/// the guest boundary as one wire value.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub struct MachineConfig {
     /// The chain id — doubles as the advertisement namespace and the ULA
     /// derivation input, exactly as it does for the commonware mesh.
     pub chain_id: String,
-    /// The node's ed25519 identity: signs records, advertisements, and
-    /// handshake messages. Its public key IS the member identity.
-    pub signer: ed25519::PrivateKey,
     /// The node's X25519 WireGuard PUBLIC key (the host owns the private
     /// half): what records, handshake messages, and peers' installs carry.
     pub wireguard_public: X25519PublicKey,
@@ -103,6 +106,10 @@ pub struct MachineConfig {
     pub control_endpoint: Endpoint,
     /// Rendezvous coordinators (from `Resolved.coordinated`), possibly none:
     /// with an empty list every peer resolves to its advertised endpoint.
+    #[borsh(schema(with_funcs(
+        declaration = "vec_socket_addr::declaration",
+        definitions = "vec_socket_addr::definitions"
+    )))]
     pub coordinators: Vec<SocketAddr>,
     /// The endpoint policy advertisements and handshakes validate against.
     pub port_policy: PortPolicy,
@@ -116,7 +123,45 @@ pub struct MachineConfig {
     /// an ingress allowance — every message still authenticates by its
     /// owner's content signature, and standby-directed replies route back
     /// over whichever transport identity delivered the standby's record.
+    #[borsh(
+        serialize_with = "option_key::serialize",
+        deserialize_with = "option_key::deserialize",
+        schema(with_funcs(
+            declaration = "option_key::declaration",
+            definitions = "option_key::definitions"
+        ))
+    )]
     pub gossip_ingress: Option<ed25519::PublicKey>,
+}
+
+/// The step boundary every backend implements: the native [`crate::Machine`]
+/// and a wasm guest behind a host embedding. The executor drives one through
+/// this trait and never learns which it holds.
+pub trait NetstackMachine {
+    /// Step one event, stamped with the caller's unix-millisecond clock, and
+    /// return the effects to perform IN ORDER.
+    fn step(&mut self, event: Event, now_ms: u64) -> Result<Vec<Effect>, StepError>;
+}
+
+impl<M: NetstackMachine + ?Sized> NetstackMachine for Box<M> {
+    fn step(&mut self, event: Event, now_ms: u64) -> Result<Vec<Effect>, StepError> {
+        (**self).step(event, now_ms)
+    }
+}
+
+/// Why a step produced no effects.
+#[derive(Debug, thiserror::Error)]
+pub enum StepError {
+    /// A protocol invariant breach (a commitment that failed to compute):
+    /// the plane cannot continue past it, whichever backend raised it.
+    #[error("protocol: {0:?}")]
+    Protocol(#[from] UpgradeError),
+    /// The backend itself failed to run the step — a guest trap, an
+    /// exhausted fuel budget, an undecodable wire value. The machine's state
+    /// is unknown from here on; the executor fails over to the native
+    /// backend.
+    #[error("backend fault: {0}")]
+    Fault(String),
 }
 
 /// A valset cutover (or boot) the machine must retarget to.

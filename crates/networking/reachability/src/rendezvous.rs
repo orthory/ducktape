@@ -20,8 +20,8 @@ use nat_traversal::{ClientEvent, NatClient, NodeKey, SocketEvent};
 // the machine's contract (an `Event::Resolved` carries a `Resolution` back
 // in; the machine budgets its rendezvous backoff from the step timeouts),
 // so the resolver implements one shared definition rather than its own.
-use netstack_machine::{COORD_STEP_TIMEOUT, PUNCH_STEP_TIMEOUT, PUNCH_TRIES};
 pub use netstack_machine::Resolution;
+use netstack_machine::{COORD_STEP_TIMEOUT, PUNCH_STEP_TIMEOUT, PUNCH_TRIES};
 
 /// Per-peer endpoint resolution, pluggable so the machine's protocol logic
 /// tests deterministically without UDP. The real implementation is

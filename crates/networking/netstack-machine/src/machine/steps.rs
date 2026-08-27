@@ -51,11 +51,8 @@ impl Driver {
     fn sign_advert(&mut self, state: &mut EpochState) -> Result<(), UpgradeError> {
         let records: Vec<EndpointRecord> = state.known_records().into_values().collect();
         let version = compute_mesh_version(&records)?;
-        let advert = EndpointAdvertisement::sign(
-            state.own_record.record.clone(),
-            version,
-            &self.config.signer,
-        );
+        let advert =
+            EndpointAdvertisement::sign(state.own_record.record.clone(), version, &*self.signer);
         state.adverts.insert(self.me, advert.clone());
         state.phase = Phase::Adverts;
         tracing::debug!(

@@ -15,8 +15,9 @@ use std::time::Duration;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use nat_traversal::NodeKey;
 use reachability::{
-    EndpointResolver as _, InstallReply, MeshEpochEvent, ReachabilityCommand, ReachabilityConfig,
-    ReachabilityEvent, ReachabilityMsg, Resolution, StaticResolver, WireGuardKeypair, binding,
+    EndpointResolver as _, InstallReply, MeshEpochEvent, NetstackBackend, ReachabilityCommand,
+    ReachabilityConfig, ReachabilityEvent, ReachabilityMsg, Resolution, StaticResolver,
+    WireGuardKeypair, binding,
 };
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
@@ -47,6 +48,16 @@ impl WireGuardEffect for SharedFake {
 }
 
 const CHAIN: &str = "net#e2e";
+
+/// The canonical `ducktape:netstack` component — the bytes `bin/node` embeds.
+const NETSTACK_COMPONENT: &[u8] = include_bytes!("../../netstack-machine/component.wasm");
+
+fn guest_backend(step_fuel: u64) -> NetstackBackend {
+    NetstackBackend::Guest {
+        component: NETSTACK_COMPONENT.to_vec(),
+        step_fuel,
+    }
+}
 
 #[derive(Clone)]
 struct TestNode {
@@ -127,7 +138,18 @@ fn spawn_mesh_filtered(
     resolvers: Vec<StaticResolver>,
     filter: DeliveryFilter,
 ) -> (Vec<TestNode>, mpsc::Receiver<(usize, ReachabilityEvent)>) {
-    spawn_mesh_transported(local, dir, seeds, resolvers, filter, vec![], None, &[], &[])
+    spawn_mesh_transported(
+        local,
+        dir,
+        seeds,
+        resolvers,
+        filter,
+        vec![],
+        None,
+        &[],
+        &[],
+        vec![],
+    )
 }
 
 /// The full-parameter core: `transport_pks[i]`, when set, is the identity
@@ -138,7 +160,8 @@ fn spawn_mesh_filtered(
 /// (change 2 / issue #331's endpoint-less shape); `coordinators_configured[i]`
 /// gives node i a non-empty `ReachabilityConfig.coordinators` (the gate the
 /// rendezvous fallback checks) — independent knobs so a test can cover
-/// "endpoint-less WITHOUT a coordinator" too.
+/// "endpoint-less WITHOUT a coordinator" too. `backends[i]` is node i's
+/// netstack backend, the native machine when absent.
 #[allow(clippy::too_many_arguments)]
 fn spawn_mesh_transported(
     local: &LocalSet,
@@ -150,6 +173,7 @@ fn spawn_mesh_transported(
     gossip_ingress: Option<commonware_cryptography::ed25519::PublicKey>,
     endpointless: &[usize],
     coordinators_configured: &[usize],
+    backends: Vec<NetstackBackend>,
 ) -> (Vec<TestNode>, mpsc::Receiver<(usize, ReachabilityEvent)>) {
     let policy = PortPolicy::production();
     let signers: Vec<PrivateKey> = seeds.iter().map(|s| PrivateKey::from_seed(*s)).collect();
@@ -208,6 +232,7 @@ fn spawn_mesh_transported(
             // from the same dir IS the cold-restart scenario.
             persist_file: Some(dir.join(format!("mesh-{i}.json"))),
             gossip_ingress: gossip_ingress.clone(),
+            backend: backends.get(i).cloned().unwrap_or(NetstackBackend::Native),
         };
         let resolver = resolvers
             .get(i)
@@ -261,8 +286,7 @@ fn spawn_router(
                     else {
                         continue;
                     };
-                    let msg =
-                        ReachabilityMsg::decode(&bytes).expect("planes send valid frames");
+                    let msg = ReachabilityMsg::decode(&bytes).expect("planes send valid frames");
                     let copies = (wiring.filter)(i, j, &msg);
                     let target = wiring.cmd_slots.borrow()[j].clone();
                     let from = wiring.transports[i].clone();
@@ -317,6 +341,7 @@ fn respawn_node(
         port_policy: policy,
         persist_file: Some(dir.join(format!("mesh-{i}.json"))),
         gossip_ingress: None,
+        backend: NetstackBackend::Native,
     };
     local.spawn_local(reachability::run(
         config,
@@ -376,16 +401,24 @@ async fn retarget_all(
 /// red CI on a busy machine.
 const CONVERGE_BUDGET: Duration = Duration::from_secs(30);
 
+/// What a convergence drain saw: the `MeshReady` version per node and every
+/// `EpochFailed` on the way, in order.
+struct Converged {
+    versions: HashMap<usize, Vec<u8>>,
+    epoch_failures: Vec<(usize, String)>,
+}
+
 /// Drain collected events until every node in `want` has emitted
-/// `TunnelsApplied` for `epoch`; returns the `MeshReady` versions seen.
-/// A healthy convergence emits NO failure events — `PeerFailed` here means
-/// a retry replayed or a duplicate was mistaken for a violation.
-async fn await_applied(
+/// `TunnelsApplied` for `epoch`. `EpochFailed` is recorded for the caller to
+/// judge; `PeerFailed` is never legitimate on the way to convergence — it
+/// means a retry replayed or a duplicate was mistaken for a violation.
+async fn drain_until_applied(
     collected: &mut mpsc::Receiver<(usize, ReachabilityEvent)>,
     want: &[usize],
     epoch: u64,
-) -> HashMap<usize, Vec<u8>> {
+) -> Converged {
     let mut versions = HashMap::new();
+    let mut epoch_failures = Vec::new();
     let mut applied: Vec<usize> = Vec::new();
     tokio::time::timeout(CONVERGE_BUDGET, async {
         while applied.len() < want.len() {
@@ -400,7 +433,7 @@ async fn await_applied(
                     applied.push(i);
                 }
                 ReachabilityEvent::EpochFailed { reason, .. } => {
-                    panic!("epoch failed on node {i}: {reason}");
+                    epoch_failures.push((i, reason));
                 }
                 ReachabilityEvent::PeerFailed { reason, .. } => {
                     panic!("peer failed on node {i}: {reason}");
@@ -411,7 +444,26 @@ async fn await_applied(
     })
     .await
     .expect("mesh converged in time");
-    versions
+    Converged {
+        versions,
+        epoch_failures,
+    }
+}
+
+/// [`drain_until_applied`] for a HEALTHY convergence, which emits no
+/// failure event at all; returns the `MeshReady` versions seen.
+async fn await_applied(
+    collected: &mut mpsc::Receiver<(usize, ReachabilityEvent)>,
+    want: &[usize],
+    epoch: u64,
+) -> HashMap<usize, Vec<u8>> {
+    let converged = drain_until_applied(collected, want, epoch).await;
+    assert!(
+        converged.epoch_failures.is_empty(),
+        "epoch failed: {:?}",
+        converged.epoch_failures
+    );
+    converged.versions
 }
 
 /// bin/node's nudge ticker, at test cadence, for every node.
@@ -1831,6 +1883,7 @@ async fn prewarm_merge_keeps_the_invite_tunnels_observed_endpoints() {
                 None,
                 &[0, 1],
                 &[],
+                vec![],
             );
             // pre-create both keystores so each side can install the OTHER
             // as its invite peer; the nodes load these same files at start.
@@ -2256,7 +2309,11 @@ async fn member_reboot_readvertises_and_adopts_the_locked_mesh_in_place() {
                     .iter()
                     .find(|p| p.allowed_ips == vec![ula(nodes[2].identity)])
                     .unwrap_or_else(|| panic!("member {i}: no entry for the reborn member"));
-                assert_eq!(entry.endpoint, Some(life2), "member {i}: the reboot's address");
+                assert_eq!(
+                    entry.endpoint,
+                    Some(life2),
+                    "member {i}: the reboot's address"
+                );
                 assert_eq!(entry.wireguard_public_key, reborn_keys.public_key());
                 let fake = nodes[i].effect.0.lock().unwrap();
                 assert_eq!(fake.remove_calls, 0, "member {i}: never a teardown");
@@ -2323,6 +2380,7 @@ async fn member_reboot_without_its_mesh_file_adopts_the_peers_lock() {
                 None,
                 &[1],
                 &[],
+                vec![],
             );
             retarget_all(&nodes, &[0, 1, 2], &[], 1, 10).await;
             spawn_nudgers(&local, &nodes);
@@ -2497,6 +2555,7 @@ async fn standby_gossip_rides_the_lobby_ingress_identity() {
                 Some(lobby),
                 &[],
                 &[],
+                vec![],
             );
             retarget_all(&nodes, &[0, 1], &[2], 1, 10).await;
             spawn_nudgers(&local, &nodes);
@@ -2683,6 +2742,7 @@ async fn bootstrap_coordinated_invite_resolves_installs_and_acks() {
                 port_policy: policy.clone(),
                 persist_file: None,
                 gossip_ingress: None,
+                backend: NetstackBackend::Native,
             };
             let (cmd_tx, cmd_rx) = mpsc::channel(8);
             let (ev_tx, mut ev_rx) = mpsc::channel(64);
@@ -2819,6 +2879,7 @@ async fn endpoint_less_members_resolve_via_coordinator_rendezvous_fallback() {
                 &[0, 1],
                 // ...and both have a coordinator configured.
                 &[0, 1],
+                vec![],
             );
 
             retarget_all(&nodes, &[0, 1], &[], 1, 10).await;
@@ -2866,6 +2927,7 @@ async fn endpoint_less_members_without_a_coordinator_stay_endpoint_less() {
                 None,
                 &[0, 1], // endpoint-less...
                 &[],     // ...but no coordinator configured for either.
+                vec![],
             );
 
             retarget_all(&nodes, &[0, 1], &[], 1, 10).await;
@@ -2913,6 +2975,7 @@ async fn standby_reboot_rendezvouses_its_endpointless_members() {
                 None,
                 &[0],
                 &[],
+                vec![],
             );
             retarget_all(&nodes, &[0, 1], &[2], 1, 10).await;
             spawn_nudgers(&local, &nodes);
@@ -2965,6 +3028,7 @@ async fn standby_reboot_rendezvouses_its_endpointless_members() {
                 port_policy: policy.clone(),
                 persist_file: Some(persist),
                 gossip_ingress: None,
+                backend: NetstackBackend::Native,
             };
             local.spawn_local(reachability::run(
                 config,
@@ -3035,6 +3099,87 @@ async fn standby_reboot_rendezvouses_its_endpointless_members() {
                 .find(|p| p.allowed_ips == vec![ula(nodes[1].identity)])
                 .expect("member 1 restored");
             assert_eq!(member1.endpoint, Some(advertised));
+        })
+        .await;
+}
+
+/// A node whose machine is the wasm guest converges with native peers onto
+/// the same mesh: past the executor the backend is invisible.
+#[tokio::test]
+async fn a_guest_backed_node_converges_with_native_peers() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            let (nodes, mut collected) = spawn_mesh_transported(
+                &local,
+                dir.path(),
+                &[1, 2, 3],
+                vec![],
+                Rc::new(|_, _, _| 1),
+                vec![],
+                None,
+                &[],
+                &[],
+                vec![guest_backend(reachability::NETSTACK_STEP_FUEL)],
+            );
+            retarget_all(&nodes, &[0, 1, 2], &[], 1, 10).await;
+            let versions = await_applied(&mut collected, &[0, 1, 2], 1).await;
+
+            assert_eq!(versions.len(), 3);
+            assert_eq!(versions[&0], versions[&1]);
+            assert_eq!(versions[&0], versions[&2]);
+            for (i, node) in nodes.iter().enumerate() {
+                let fake = node.effect.0.lock().unwrap();
+                assert_eq!(fake.create_calls, 1, "node {i}: one interface");
+                assert_eq!(fake.applied.len(), 1, "node {i}: one apply");
+                assert_eq!(fake.applied[0].peers.len(), 2, "node {i}: both peers");
+            }
+        })
+        .await;
+}
+
+/// A guest that faults mid-epoch fails over LOUDLY: the epoch it was
+/// assembling is reported failed with the backend's reason, the native
+/// machine replays the retarget, and the mesh converges all the same.
+#[tokio::test]
+async fn a_faulting_guest_fails_over_to_the_native_machine() {
+    let local = LocalSet::new();
+    let dir = tempfile::tempdir().unwrap();
+    local
+        .run_until(async {
+            // one unit of fuel per step: node 0's guest traps on its first
+            // event, the epoch-1 retarget.
+            let (nodes, mut collected) = spawn_mesh_transported(
+                &local,
+                dir.path(),
+                &[1, 2, 3],
+                vec![],
+                Rc::new(|_, _, _| 1),
+                vec![],
+                None,
+                &[],
+                &[],
+                vec![guest_backend(1)],
+            );
+            retarget_all(&nodes, &[0, 1, 2], &[], 1, 10).await;
+            let converged = drain_until_applied(&mut collected, &[0, 1, 2], 1).await;
+
+            assert_eq!(
+                converged.epoch_failures,
+                vec![(0, "netstack_backend_fault".to_string())],
+                "exactly the faulted node reports its epoch failed, once"
+            );
+            assert_eq!(converged.versions.len(), 3);
+            assert_eq!(converged.versions[&0], converged.versions[&1]);
+            assert_eq!(converged.versions[&0], converged.versions[&2]);
+            let fake = nodes[0].effect.0.lock().unwrap();
+            assert_eq!(
+                fake.create_calls, 1,
+                "the native replay brought the interface up once"
+            );
+            assert_eq!(fake.applied.len(), 1);
+            assert_eq!(fake.applied[0].peers.len(), 2);
         })
         .await;
 }

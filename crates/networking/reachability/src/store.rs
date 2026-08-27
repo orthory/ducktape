@@ -13,8 +13,8 @@
 
 use std::path::Path;
 
-use netstack_machine::store::{MeshDecodeError, decode_verified, encode};
 pub use netstack_machine::store::PersistedMesh;
+use netstack_machine::store::{MeshDecodeError, decode_verified, encode};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {

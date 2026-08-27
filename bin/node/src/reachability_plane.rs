@@ -868,6 +868,7 @@ async fn reachability_plane(
         // joiner's gossip arrives under its REAL key — the mesh re-track at
         // its Redeem grant is what admits it.
         gossip_ingress: None,
+        backend: netstack_backend(),
     };
     // the invite intro listener: a fresh joiner's first contact. one
     // datagram carries the token, the joiner's identity + proof, and its
@@ -1037,6 +1038,35 @@ async fn reachability_plane(
             "reachability plane EXITED — this node has no overlay for the rest of \
              this boot"
         );
+    }
+}
+
+/// The netstack guest: the reachability machine as a `ducktape:netstack`
+/// component, built by guest-builder from the machine crate and committed
+/// beside it (`make wasm-modules`).
+const NETSTACK_COMPONENT: &[u8] =
+    include_bytes!("../../../crates/networking/netstack-machine/component.wasm");
+
+/// Which machine drives the reachability plane. `DUCKTAPE_NETSTACK=guest`
+/// runs the wasm component; unset or `native` runs the machine compiled
+/// into this binary. Any other value is refused loudly and runs native —
+/// a typo must never pick a backend by accident.
+fn netstack_backend() -> reachability::NetstackBackend {
+    let requested = std::env::var("DUCKTAPE_NETSTACK").ok();
+    match requested.as_deref() {
+        Some("guest") => reachability::NetstackBackend::Guest {
+            component: NETSTACK_COMPONENT.to_vec(),
+            step_fuel: reachability::NETSTACK_STEP_FUEL,
+        },
+        Some("native") | None => reachability::NetstackBackend::Native,
+        Some(_) => {
+            tracing::warn!(
+                target: "ducktape::reachability",
+                reason = "netstack_backend_unknown",
+                "DUCKTAPE_NETSTACK names no backend; running native"
+            );
+            reachability::NetstackBackend::Native
+        }
     }
 }
 

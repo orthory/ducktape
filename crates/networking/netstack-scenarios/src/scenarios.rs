@@ -1,16 +1,17 @@
-//! The frozen scenario suite: every lifecycle the reachability machine is
+//! The frozen scenarios: every lifecycle the reachability machine is
 //! expected to survive, run on the pure harness and pinned as a golden
-//! event→effect trace under `tests/fixtures/<scenario>.trace`. The trace
-//! IS the specification — a behavior change is a PR that regenerates it
-//! (`UPDATE_TRACES=1 cargo test -p netstack-machine --test lifecycle`),
-//! and the review reads the fixture diff. The assertions here are the
-//! coarse invariants a reader should not have to find in the trace.
+//! event→effect trace under `fixtures/<scenario>.trace`. The trace IS the
+//! specification — a behavior change is a PR that regenerates it
+//! (`UPDATE_TRACES=1 cargo test -p netstack-scenarios`), and the review
+//! reads the fixture diff. The assertions here are the coarse invariants a
+//! reader should not have to find in the trace.
+//!
+//! Each scenario is a plain function over the [`Backend`] that builds its
+//! nodes' machines; the `suite!` macro in the crate root turns the set into
+//! one `#[test]` per scenario for each backend's test crate.
 
-mod lifecycle {
-    pub mod harness;
-}
-
-use lifecycle::harness::*;
+use crate::Backend;
+use crate::harness::*;
 use netstack_machine::{ReachabilityEvent, Resolution};
 
 fn public_nodes(count: usize) -> Vec<NodeSpec> {
@@ -53,9 +54,8 @@ fn readvertised(net: &Net, node: usize, peer: usize) -> bool {
 
 // ---------------------------------------------------------------- 1. boot
 
-#[test]
-fn boot_two_members() {
-    let mut net = Net::new("boot_two_members", "net#boot", &public_nodes(2));
+pub fn boot_two_members(backend: Backend) {
+    let mut net = Net::new("boot_two_members", "net#boot", &public_nodes(2), backend);
     net.retarget_all(1, &members(2), &[], 1);
     net.run();
     assert_converged(&net, &members(2), 1, 1);
@@ -63,9 +63,8 @@ fn boot_two_members() {
     net.finish();
 }
 
-#[test]
-fn boot_three_members() {
-    let mut net = Net::new("boot_three_members", "net#boot", &public_nodes(3));
+pub fn boot_three_members(backend: Backend) {
+    let mut net = Net::new("boot_three_members", "net#boot", &public_nodes(3), backend);
     net.retarget_all(1, &members(3), &[], 1);
     net.run();
     assert_converged(&net, &members(3), 1, 2);
@@ -73,9 +72,8 @@ fn boot_three_members() {
     net.finish();
 }
 
-#[test]
-fn boot_five_members() {
-    let mut net = Net::new("boot_five_members", "net#boot", &public_nodes(5));
+pub fn boot_five_members(backend: Backend) {
+    let mut net = Net::new("boot_five_members", "net#boot", &public_nodes(5), backend);
     net.retarget_all(1, &members(5), &[], 1);
     net.run();
     assert_converged(&net, &members(5), 1, 4);
@@ -85,9 +83,14 @@ fn boot_five_members() {
 
 /// n2 and n3 share no link: everything between them — records, adverts,
 /// the handshake triple — relays through the hub n1.
-#[test]
-fn boot_relay_through_hub() {
-    let mut net = Net::new("boot_relay_through_hub", "net#boot", &public_nodes(3)).isolated();
+pub fn boot_relay_through_hub(backend: Backend) {
+    let mut net = Net::new(
+        "boot_relay_through_hub",
+        "net#boot",
+        &public_nodes(3),
+        backend,
+    )
+    .isolated();
     net.connect(0, 1);
     net.connect(0, 2);
     net.retarget_all(1, &members(3), &[], 1);
@@ -101,13 +104,13 @@ fn boot_relay_through_hub() {
 
 // ------------------------------------------------------- 2/3. member restart
 
-fn nated_mesh(scenario: &str) -> Net {
+fn nated_mesh(scenario: &str, backend: Backend) -> Net {
     let specs = [
         NodeSpec::public(10),
         NodeSpec::endpoint_less(20),
         NodeSpec::public(30),
     ];
-    let mut net = Net::new(scenario, "net#restart", &specs)
+    let mut net = Net::new(scenario, "net#restart", &specs, backend)
         .with_coordinators()
         .with_persistence();
     for resolver in [0, 2] {
@@ -124,9 +127,8 @@ fn nated_mesh(scenario: &str) -> Net {
 /// The NAT'd member restarts and its underlay mapping survived: the restored
 /// base carries the boot gossip, the peers re-tunnel its fresh record in
 /// place, and it adopts the mesh the peers had already locked — no cutover.
-#[test]
-fn member_restart_mapping_kept() {
-    let mut net = nated_mesh("member_restart_mapping_kept");
+pub fn member_restart_mapping_kept(backend: Backend) {
+    let mut net = nated_mesh("member_restart_mapping_kept", backend);
     net.retarget_all(1, &members(3), &[], 1);
     net.run();
     net.nudges(2);
@@ -157,9 +159,8 @@ fn member_restart_mapping_kept() {
 /// punched address is dead. Its fresh record makes every peer rendezvous
 /// it by identity again, and the re-tunnel carries the fresh mapping (the
 /// trace's `WgApply` shows it); the reborn member adopts the locked mesh.
-#[test]
-fn member_restart_mapping_lost() {
-    let mut net = nated_mesh("member_restart_mapping_lost");
+pub fn member_restart_mapping_lost(backend: Backend) {
+    let mut net = nated_mesh("member_restart_mapping_lost", backend);
     net.retarget_all(1, &members(3), &[], 1);
     net.run();
     net.nudges(2);
@@ -197,9 +198,13 @@ fn member_restart_mapping_lost() {
 /// A member's advertised endpoint moves mid-epoch (a rebind is a new life
 /// with a new address): its fresh record re-advertises, and every peer
 /// re-points the tunnel in place without a cutover.
-#[test]
-fn nat_rebind_readvertises() {
-    let mut net = Net::new("nat_rebind_readvertises", "net#rebind", &public_nodes(3));
+pub fn nat_rebind_readvertises(backend: Backend) {
+    let mut net = Net::new(
+        "nat_rebind_readvertises",
+        "net#rebind",
+        &public_nodes(3),
+        backend,
+    );
     net.retarget_all(1, &members(3), &[], 1);
     net.run();
     assert_converged(&net, &members(3), 1, 2);
@@ -224,12 +229,12 @@ fn nat_rebind_readvertises() {
 /// A cutover over the SAME member set reconfigures the live interface in
 /// place (an update, never a fresh bring-up), so unchanged peers keep
 /// their sessions.
-#[test]
-fn cutover_keeps_unchanged_peers() {
+pub fn cutover_keeps_unchanged_peers(backend: Backend) {
     let mut net = Net::new(
         "cutover_keeps_unchanged_peers",
         "net#cutover",
         &public_nodes(3),
+        backend,
     );
     net.retarget_all(1, &members(3), &[], 1);
     net.run();
@@ -246,9 +251,13 @@ fn cutover_keeps_unchanged_peers() {
 /// A cutover that drops a member: the departed node tears its interface
 /// down on the way out, the survivors re-verify a reduced mesh, and
 /// traffic toward the departed node is simply gone.
-#[test]
-fn cutover_to_reduced_mesh() {
-    let mut net = Net::new("cutover_to_reduced_mesh", "net#cutover", &public_nodes(3));
+pub fn cutover_to_reduced_mesh(backend: Backend) {
+    let mut net = Net::new(
+        "cutover_to_reduced_mesh",
+        "net#cutover",
+        &public_nodes(3),
+        backend,
+    );
     net.retarget_all(1, &members(3), &[], 1);
     net.run();
     assert_converged(&net, &members(3), 1, 2);
@@ -265,14 +274,13 @@ fn cutover_to_reduced_mesh() {
 /// Coordinators are configured but answer nothing: every resolve fails
 /// honestly, assembly proceeds on advertised endpoints, and the by-identity
 /// rendezvous sweep for the endpoint-less member backs off and caps.
-#[test]
-fn coordinator_dark() {
+pub fn coordinator_dark(backend: Backend) {
     let specs = [
         NodeSpec::public(10),
         NodeSpec::endpoint_less(20),
         NodeSpec::public(30),
     ];
-    let mut net = Net::new("coordinator_dark", "net#dark", &specs).with_coordinators();
+    let mut net = Net::new("coordinator_dark", "net#dark", &specs, backend).with_coordinators();
     for node in 0..3 {
         for peer in 0..3 {
             net.resolve_answer(node, peer, Some(Answer::err("coordinator unreachable")));
@@ -292,9 +300,13 @@ fn coordinator_dark() {
 /// Both members lose the other's FIRST record: nothing in the record path
 /// can heal (neither side ever hears the other), so the nudge re-offer is
 /// the only cure — and it is enough.
-#[test]
-fn first_fanout_lost_both_sides() {
-    let mut net = Net::new("first_fanout_lost_both_sides", "net#loss", &public_nodes(2));
+pub fn first_fanout_lost_both_sides(backend: Backend) {
+    let mut net = Net::new(
+        "first_fanout_lost_both_sides",
+        "net#loss",
+        &public_nodes(2),
+        backend,
+    );
     net.link(0, 1, Link::dropping(vec![Loss::Next(1)]));
     net.link(1, 0, Link::dropping(vec![Loss::Next(1)]));
     net.retarget_all(1, &members(2), &[], 1);
@@ -314,12 +326,12 @@ fn first_fanout_lost_both_sides() {
 /// nothing converges for as long as the partition holds, and the first
 /// nudge after the link returns carries the records across and assembles
 /// the new epoch — no cutover replay needed.
-#[test]
-fn partition_across_cutover_heals_on_reconnect() {
+pub fn partition_across_cutover_heals_on_reconnect(backend: Backend) {
     let mut net = Net::new(
         "partition_across_cutover_heals_on_reconnect",
         "net#loss",
         &public_nodes(2),
+        backend,
     );
     net.retarget_all(1, &members(2), &[], 1);
     net.run();
@@ -350,8 +362,7 @@ fn partition_across_cutover_heals_on_reconnect() {
 /// directions: the nudge re-offers the STORED message verbatim — the trace
 /// shows the same nonce each time — and the replay cache never sees a
 /// nonce twice.
-#[test]
-fn handshake_lost_at_each_stage() {
+pub fn handshake_lost_at_each_stage(backend: Backend) {
     let lossy = || {
         Link::dropping(vec![
             Loss::Kind(MsgKind::Request, 1),
@@ -359,7 +370,12 @@ fn handshake_lost_at_each_stage() {
             Loss::Kind(MsgKind::Ack, 1),
         ])
     };
-    let mut net = Net::new("handshake_lost_at_each_stage", "net#loss", &public_nodes(2));
+    let mut net = Net::new(
+        "handshake_lost_at_each_stage",
+        "net#loss",
+        &public_nodes(2),
+        backend,
+    );
     net.link(0, 1, lossy());
     net.link(1, 0, lossy());
     net.retarget_all(1, &members(2), &[], 1);
@@ -373,12 +389,12 @@ fn handshake_lost_at_each_stage() {
 
 /// Every message arrives twice: gossip dedups by nonce, handshakes by hash,
 /// and the mesh converges exactly as it does over a clean link.
-#[test]
-fn duplicated_delivery_is_tolerated() {
+pub fn duplicated_delivery_is_tolerated(backend: Backend) {
     let mut net = Net::new(
         "duplicated_delivery_is_tolerated",
         "net#loss",
         &public_nodes(2),
+        backend,
     );
     net.link(0, 1, Link::duplicating());
     net.link(1, 0, Link::duplicating());
@@ -394,12 +410,12 @@ fn duplicated_delivery_is_tolerated() {
 /// A standby's tunnels exist on both sides BEFORE its activation; the
 /// promotion cutover then folds it into the verified mesh without tearing
 /// anything down.
-#[test]
-fn standby_prewarm_then_promotion() {
+pub fn standby_prewarm_then_promotion(backend: Backend) {
     let mut net = Net::new(
         "standby_prewarm_then_promotion",
         "net#standby",
         &public_nodes(3),
+        backend,
     );
     net.retarget_all(1, &[0, 1], &[2], 1);
     net.run();
@@ -433,12 +449,12 @@ fn standby_prewarm_then_promotion() {
 
 /// One resolve never answers: the rest of the mesh assembles regardless,
 /// and a join-window install issued mid-stall is answered at once.
-#[test]
-fn slow_resolver_does_not_stall() {
+pub fn slow_resolver_does_not_stall(backend: Backend) {
     let mut net = Net::new(
         "slow_resolver_does_not_stall",
         "net#stall",
         &public_nodes(4),
+        backend,
     );
     net.resolve_answer(0, 1, None);
     net.retarget_all(1, &members(3), &[], 1);
@@ -461,9 +477,8 @@ fn slow_resolver_does_not_stall() {
 /// The direct invite: the inviter merges the joiner as a join-window peer
 /// onto its live mesh interface; the joiner, with no epoch at all, brings
 /// its interface up with the inviter alone.
-#[test]
-fn join_direct_invite() {
-    let mut net = Net::new("join_direct_invite", "net#join", &public_nodes(3));
+pub fn join_direct_invite(backend: Backend) {
+    let mut net = Net::new("join_direct_invite", "net#join", &public_nodes(3), backend);
     net.retarget_all(1, &members(2), &[], 1);
     net.run();
     assert_converged(&net, &members(2), 1, 1);
@@ -490,10 +505,14 @@ fn join_direct_invite() {
 /// The coordinated invite: the joiner rendezvouses its inviter by identity,
 /// installs it, sends the intro over the punched socket and awaits the ack
 /// — once answered, once timing out.
-#[test]
-fn join_coordinated_invite() {
-    let mut net =
-        Net::new("join_coordinated_invite", "net#join", &public_nodes(3)).with_coordinators();
+pub fn join_coordinated_invite(backend: Backend) {
+    let mut net = Net::new(
+        "join_coordinated_invite",
+        "net#join",
+        &public_nodes(3),
+        backend,
+    )
+    .with_coordinators();
     net.retarget_all(1, &members(2), &[], 1);
     net.run();
 

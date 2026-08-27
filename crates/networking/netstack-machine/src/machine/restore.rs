@@ -381,7 +381,7 @@ impl Driver {
                 wireguard_endpoint: self.config.wireguard_advertised,
                 nonce: epoch_nonce_seed(self.now_ms),
             },
-            &self.config.signer,
+            &*self.signer,
         );
         let mut state = EpochState::new(
             event.epoch,

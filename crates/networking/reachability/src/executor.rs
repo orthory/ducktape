@@ -21,6 +21,13 @@
 //! ([`Effect::WgApply`]) is performed synchronously and its outcome stepped
 //! back into the machine before anything else drains, so a push round-trips
 //! inside the step cascade that requested it.
+//!
+//! The machine is driven through [`NetstackMachine`], so the loop never
+//! learns whether it holds the native [`Machine`] or the wasm guest
+//! ([`NetstackBackend`]). The one difference it handles: a backend can
+//! FAULT (a trap, an exhausted budget), after which its state is unknown —
+//! the loop says so, hands the plane to the native machine, and replays
+//! the last retarget so the epoch re-assembles live.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -28,16 +35,17 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use commonware_cryptography::{Signer as _, ed25519};
-use netstack_machine::{
-    CmdToken, Effect, Event, Machine, MachineConfig, MeshEpochEvent, ReachabilityEvent, ReqId,
-    binding,
-};
 use nat_traversal::NodeKey;
+use netstack_machine::{
+    CmdToken, Effect, Event, Machine, MachineConfig, MeshEpochEvent, NetstackMachine,
+    ReachabilityEvent, ReqId, StepError, binding,
+};
+use netstack_wasm::NetstackGuest;
 use tokio::sync::mpsc;
 use wireguard::effect::{
     PeerTunnelConfig, WireGuardEffect, apply_peer_tunnels, update_peer_tunnels,
 };
-use wireguard::{AllowedIp, Endpoint, OverlayPolicy, PortPolicy, UpgradeError};
+use wireguard::{AllowedIp, Endpoint, IdentitySigner, OverlayPolicy, PortPolicy, UpgradeError};
 
 use crate::keys::{KeyError, WireGuardKeypair};
 use crate::rendezvous::{EndpointResolver, Resolution};
@@ -80,6 +88,34 @@ pub struct ReachabilityConfig {
     /// owner's content signature, and standby-directed replies route back
     /// over whichever transport identity delivered the standby's record.
     pub gossip_ingress: Option<ed25519::PublicKey>,
+    /// Which machine drives the plane.
+    pub backend: NetstackBackend,
+}
+
+/// Which implementation of the netstack machine the plane runs. The guest
+/// is the arc's upgradeable form: the same contract behind the wasm
+/// boundary, swappable without a binary release. A guest that fails to
+/// come up, or faults mid-life, hands the plane to the native machine —
+/// loudly, never silently.
+#[derive(Clone)]
+pub enum NetstackBackend {
+    /// The machine compiled into this binary.
+    Native,
+    /// The `ducktape:netstack` component these bytes carry, stepped under
+    /// `step_fuel` units of wasm fuel per event — exhaustion is a fault.
+    Guest { component: Vec<u8>, step_fuel: u64 },
+}
+
+impl std::fmt::Debug for NetstackBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Native => f.write_str("Native"),
+            Self::Guest {
+                component,
+                step_fuel,
+            } => write!(f, "Guest({} bytes, {step_fuel} fuel/step)", component.len()),
+        }
+    }
 }
 
 /// The apply outcome an [`ReachabilityCommand::InstallInvitePeer`] caller
@@ -162,6 +198,10 @@ pub enum ReachabilityError {
     Upgrade(UpgradeError),
     #[error("the node dropped a reachability channel")]
     ChannelClosed,
+    /// The native machine — the fallback with no fallback of its own —
+    /// reported a backend fault.
+    #[error("netstack backend fault with no fallback left: {0}")]
+    Backend(String),
 }
 
 impl From<UpgradeError> for ReachabilityError {
@@ -263,17 +303,20 @@ where
         // identity-derived /128 every validated plan carries.
         local_ips: overlay.identity_allowed_ips(me),
     };
-    let machine = Machine::new(MachineConfig {
-        chain_id: config.chain_id,
+    let factory = MachineFactory {
         signer: config.signer,
-        wireguard_public: keypair.public_key(),
-        wireguard_advertised: config.wireguard_advertised,
-        control_endpoint: config.control_endpoint,
-        coordinators: config.coordinators,
-        port_policy: config.port_policy,
-        persist: config.persist_file.is_some(),
-        gossip_ingress: config.gossip_ingress,
-    });
+        config: MachineConfig {
+            chain_id: config.chain_id,
+            wireguard_public: keypair.public_key(),
+            wireguard_advertised: config.wireguard_advertised,
+            control_endpoint: config.control_endpoint,
+            coordinators: config.coordinators,
+            port_policy: config.port_policy,
+            persist: config.persist_file.is_some(),
+            gossip_ingress: config.gossip_ingress,
+        },
+        backend: config.backend,
+    };
     let (op_tx, op_rx) = mpsc::unbounded_channel::<ResolverOp>();
     let (done_tx, done_rx) = mpsc::unbounded_channel::<Completion>();
     let host = Host {
@@ -285,11 +328,12 @@ where
         restore_file: config.persist_file.clone(),
         persist_file: config.persist_file,
         plan,
+        last_retarget: None,
     };
     // the two halves are joined, not spawned: the loop ending (shutdown or
     // a closed channel) drops the op queue, which ends the pump.
     let (outcome, ()) = tokio::join!(
-        host_loop(machine, host, commands, done_rx),
+        host_loop(factory, host, commands, done_rx),
         resolver_pump(resolver, op_rx, done_tx),
     );
     outcome
@@ -297,13 +341,15 @@ where
 
 /// The command loop: completions drain before commands (an outcome the
 /// machine is waiting on should never queue behind fresh work), every event
-/// is stamped, and every effect list is performed before the next drain.
+/// is stamped, and every effect list is performed before the next drain. A
+/// backend fault swaps the native machine in before the next event.
 async fn host_loop<E: WireGuardEffect>(
-    mut machine: Machine,
+    factory: MachineFactory,
     mut host: Host<E>,
     mut commands: mpsc::Receiver<ReachabilityCommand>,
     mut done_rx: mpsc::UnboundedReceiver<Completion>,
 ) -> Result<(), ReachabilityError> {
+    let mut machine = factory.boot();
     loop {
         let (event, exit) = tokio::select! {
             biased;
@@ -313,11 +359,90 @@ async fn host_loop<E: WireGuardEffect>(
                 None => return Err(ReachabilityError::ChannelClosed),
             },
         };
-        let effects = machine.step(event, unix_now_ms())?;
-        host.perform(&mut machine, effects).await?;
+        match host.drive(&mut *machine, event).await? {
+            Drive::Done => {}
+            Drive::Faulted(reason) => machine = host.fail_over(&factory, reason).await?,
+        }
         if exit {
             return Ok(());
         }
+    }
+}
+
+/// Builds the plane's machine: the configured backend at boot, the native
+/// machine as the fallback after a fault.
+struct MachineFactory {
+    signer: ed25519::PrivateKey,
+    config: MachineConfig,
+    backend: NetstackBackend,
+}
+
+impl MachineFactory {
+    fn signer(&self) -> Box<dyn IdentitySigner> {
+        Box::new(self.signer.clone())
+    }
+
+    fn native(&self) -> Box<dyn NetstackMachine> {
+        Box::new(Machine::new(self.signer(), self.config.clone()))
+    }
+
+    /// The configured backend — or the native machine when the guest cannot
+    /// come up. That is a build that shipped a component this binary cannot
+    /// run: an error, never a quiet downgrade.
+    fn boot(&self) -> Box<dyn NetstackMachine> {
+        let (component, step_fuel) = match &self.backend {
+            NetstackBackend::Native => return self.native(),
+            NetstackBackend::Guest {
+                component,
+                step_fuel,
+            } => (component, *step_fuel),
+        };
+        match NetstackGuest::with_fuel(component, self.signer(), self.config.clone(), step_fuel) {
+            Ok(guest) => {
+                tracing::info!(
+                    target: "ducktape::reachability",
+                    event = "netstack_backend",
+                    backend = "guest",
+                    step_fuel,
+                    "netstack machine runs as the wasm guest"
+                );
+                Box::new(guest)
+            }
+            Err(err) => {
+                tracing::error!(
+                    target: "ducktape::reachability",
+                    event = "netstack_guest_boot_failed",
+                    error = %err,
+                    "netstack guest did not come up; the native machine takes over"
+                );
+                self.native()
+            }
+        }
+    }
+}
+
+/// What driving one event through the machine came to.
+enum Drive {
+    /// Every effect performed.
+    Done,
+    /// The backend faulted mid-drive: its state is unknown, and whatever
+    /// effects the step had not yet produced are lost with it.
+    Faulted(String),
+}
+
+/// One step's outcomes, sorted for the loop: effects to perform, a backend
+/// fault to fail over from, or a protocol breach — which is terminal
+/// whichever backend raised it.
+enum Stepped {
+    Effects(Vec<Effect>),
+    Faulted(String),
+}
+
+fn stepped(result: Result<Vec<Effect>, StepError>) -> Result<Stepped, ReachabilityError> {
+    match result {
+        Ok(effects) => Ok(Stepped::Effects(effects)),
+        Err(StepError::Fault(reason)) => Ok(Stepped::Faulted(reason)),
+        Err(StepError::Protocol(err)) => Err(err.into()),
     }
 }
 
@@ -360,7 +485,9 @@ async fn resolver_pump<R: EndpointResolver>(
                 bytes,
                 timeout,
             } => {
-                let outcome = resolver.send_datagram_and_recv(endpoint, bytes, timeout).await;
+                let outcome = resolver
+                    .send_datagram_and_recv(endpoint, bytes, timeout)
+                    .await;
                 let _ = done.send(Completion::Datagram { req, outcome });
             }
         }
@@ -380,6 +507,9 @@ struct Host<E> {
     /// Where applied-mesh snapshots are written, for the whole life.
     persist_file: Option<PathBuf>,
     plan: WgPlan,
+    /// The epoch the plane was last pointed at — what a machine brought up
+    /// after a fault is retargeted to.
+    last_retarget: Option<MeshEpochEvent>,
 }
 
 impl<E: WireGuardEffect> Host<E> {
@@ -472,15 +602,66 @@ impl<E: WireGuardEffect> Host<E> {
         }
     }
 
+    /// Step one event and perform what it decides.
+    async fn drive(
+        &mut self,
+        machine: &mut dyn NetstackMachine,
+        event: Event,
+    ) -> Result<Drive, ReachabilityError> {
+        if let Event::Retarget { event, .. } = &event {
+            self.last_retarget = Some(event.clone());
+        }
+        let effects = match stepped(machine.step(event, unix_now_ms()))? {
+            Stepped::Effects(effects) => effects,
+            Stepped::Faulted(reason) => return Ok(Drive::Faulted(reason)),
+        };
+        self.perform(machine, effects).await
+    }
+
+    /// The backend faulted: its machine's state is unknown. Say so, hand
+    /// the plane to the native machine, and replay the last retarget so it
+    /// re-assembles the epoch from live gossip (the persisted mesh was
+    /// already offered to the faulted machine; the gossip is the source of
+    /// truth from here).
+    async fn fail_over(
+        &mut self,
+        factory: &MachineFactory,
+        reason: String,
+    ) -> Result<Box<dyn NetstackMachine>, ReachabilityError> {
+        tracing::error!(
+            target: "ducktape::reachability",
+            event = "netstack_backend_fault",
+            error = %reason,
+            "netstack backend faulted; the native machine takes over"
+        );
+        let mut machine = factory.native();
+        let Some(event) = self.last_retarget.clone() else {
+            return Ok(machine);
+        };
+        self.observe(ReachabilityEvent::EpochFailed {
+            epoch: event.epoch,
+            reason: "netstack_backend_fault".into(),
+        })
+        .await?;
+        let retarget = Event::Retarget {
+            event,
+            persisted: None,
+        };
+        match self.drive(&mut *machine, retarget).await? {
+            Drive::Done => Ok(machine),
+            Drive::Faulted(reason) => Err(ReachabilityError::Backend(reason)),
+        }
+    }
+
     /// Perform one step's effects IN ORDER. An interface push is performed
     /// here and its outcome stepped straight back in; the new effects run
     /// to completion before the remainder of the outer list — exactly the
     /// inline order the machine's step cascade expresses.
     async fn perform(
         &mut self,
-        machine: &mut Machine,
+        machine: &mut dyn NetstackMachine,
         effects: Vec<Effect>,
-    ) -> Result<(), ReachabilityError> {
+    ) -> Result<Drive, ReachabilityError> {
         let mut stack: Vec<std::vec::IntoIter<Effect>> = vec![effects.into_iter()];
         while let Some(top) = stack.last_mut() {
             let Some(effect) = top.next() else {
@@ -498,7 +679,11 @@ impl<E: WireGuardEffect> Host<E> {
                     peers,
                 } => {
                     let outcome = self.push_interface(bring_up, &peers);
-                    let more = machine.step(Event::WgApplied { req, outcome }, unix_now_ms())?;
+                    let applied = Event::WgApplied { req, outcome };
+                    let more = match stepped(machine.step(applied, unix_now_ms()))? {
+                        Stepped::Effects(more) => more,
+                        Stepped::Faulted(reason) => return Ok(Drive::Faulted(reason)),
+                    };
                     stack.push(more.into_iter());
                 }
                 Effect::WgRemove => {
@@ -537,7 +722,7 @@ impl<E: WireGuardEffect> Host<E> {
                 Effect::Persist { bytes } => self.persist(bytes).await?,
             }
         }
-        Ok(())
+        Ok(Drive::Done)
     }
 
     async fn observe(&mut self, event: ReachabilityEvent) -> Result<(), ReachabilityError> {

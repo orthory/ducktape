@@ -6057,6 +6057,30 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "wireguard",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "netstack-scenarios"
+version = "0.1.0"
+dependencies = [
+ "commonware-cryptography",
+ "nat-traversal",
+ "netstack-machine",
+ "wireguard",
+]
+
+[[package]]
+name = "netstack-wasm"
+version = "0.1.0"
+dependencies = [
+ "commonware-cryptography",
+ "netstack-machine",
+ "netstack-scenarios",
+ "thiserror 2.0.18",
+ "tracing",
+ "wasmtime",
+ "wireguard",
 ]
 
 [[package]]
@@ -7959,6 +7983,7 @@ dependencies = [
  "commonware-cryptography",
  "nat-traversal",
  "netstack-machine",
+ "netstack-wasm",
  "rand 0.8.6",
  "serde_json",
  "sha2 0.10.9",
