@@ -1141,12 +1141,19 @@ fn read_proposal(addr: &str, id: &str) -> Result<Option<governance::ProposalView
     }
 }
 
+/// the ceremony's failure when an executed proposal never leaves `Open`: the
+/// target module refused the action inside governance's `Execute` op, so the
+/// op was rejected whole. named so a verb can recognise it and say what the
+/// target's rules are.
+pub(super) const TALLY_SETTLE_TIMEOUT: &str = "timed out waiting for the tally to settle";
+
 /// poll a proposal until `pred` accepts its view, ~30s budget (ops finalize
 /// within a few pump ticks; the budget covers a mesh still forming quorum).
+/// `timed_out` is the whole failure sentence.
 fn poll_proposal(
     addr: &str,
     id: &str,
-    what: &str,
+    timed_out: &str,
     mut pred: impl FnMut(&Option<governance::ProposalView>) -> bool,
 ) -> Result<Option<governance::ProposalView>, String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -1156,7 +1163,7 @@ fn poll_proposal(
             return Ok(view);
         }
         if std::time::Instant::now() >= deadline {
-            return Err(format!("timed out waiting for {what}"));
+            return Err(timed_out.to_string());
         }
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
@@ -1190,7 +1197,7 @@ fn cast_yes_once(
             approve: true,
         },
     )?;
-    let proposal = poll_proposal(addr, proposal_id, "this ballot to finalize", |p| {
+    let proposal = poll_proposal(addr, proposal_id, "timed out waiting for this ballot to finalize", |p| {
         p.as_ref().is_some_and(|proposal| {
             proposal.status != ProposalStatus::Open
                 || proposal
@@ -1277,7 +1284,7 @@ pub(super) fn drive_proposal_ceremony(
                     voting_period: 1_000_000,
                 },
             )?;
-            poll_proposal(rpc_addr, &id, "the proposal to finalize", |p| p.is_some())?;
+            poll_proposal(rpc_addr, &id, "timed out waiting for the proposal to finalize", |p| p.is_some())?;
             eprintln!("proposed {id}");
             id
         }
@@ -1308,7 +1315,7 @@ pub(super) fn drive_proposal_ceremony(
             },
         )?;
     }
-    let settled = poll_proposal(rpc_addr, &proposal_id, "the tally to settle", |p| {
+    let settled = poll_proposal(rpc_addr, &proposal_id, TALLY_SETTLE_TIMEOUT, |p| {
         p.as_ref().is_some_and(|v| v.status != ProposalStatus::Open)
     })?
     .expect("the poll only accepts a present proposal");
@@ -1567,7 +1574,7 @@ fn cmd_member_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
                     voting_period: 1_000_000,
                 },
             )?;
-            poll_proposal(&rpc_addr, &id, "the proposal to finalize", |p| p.is_some())?;
+            poll_proposal(&rpc_addr, &id, "timed out waiting for the proposal to finalize", |p| p.is_some())?;
             eprintln!("proposed {id}");
             id
         }
@@ -1595,7 +1602,7 @@ fn cmd_member_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
             },
         )?;
     }
-    let settled = poll_proposal(&rpc_addr, &proposal_id, "the tally to settle", |p| {
+    let settled = poll_proposal(&rpc_addr, &proposal_id, TALLY_SETTLE_TIMEOUT, |p| {
         p.as_ref().is_some_and(|v| v.status != ProposalStatus::Open)
     })?
     .expect("the poll only accepts a present proposal");

@@ -54,7 +54,7 @@ pub fn run(cmd: ModuleCmd) -> CommandResult {
 /// which staging verb is running — the only difference between the two is
 /// the governance action they propose.
 #[derive(Clone, Copy, Debug)]
-pub(super) enum Verb {
+enum Verb {
     Update,
     Register,
 }
@@ -113,7 +113,7 @@ fn cmd_register(args: StageArgs) -> CommandResult {
 /// would land one more ballot on a doomed proposal and leave the operator
 /// unable to schedule those bytes until it expires. such a proposal is
 /// skipped and a fresh one minted.
-pub(super) fn matches_module_action<'a>(
+fn matches_module_action<'a>(
     verb: Verb,
     module_id: &'a str,
     code_hash: &'a [u8],
@@ -179,12 +179,34 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
         verb.name()
     ))?;
     let http_base = config::http_base_of(http_listen);
+    let code_hash: [u8; 32] = {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(&bytes).into()
+    };
 
-    // 1. stage + fan-out; 2. every member holds the bytes or nothing is proposed
+    // 1. the registry's static rules, before anything is staged or proposed:
+    //    each would reject governance's execute in-kernel and leave a
+    //    proposal open for its whole voting period.
+    let precheck = registry_precheck(verb, &read_module_status(&rpc_addr)?, &args.id, &code_hash)?;
+    match precheck {
+        Precheck::Proceed => {}
+        // a member running the verb after the deciding ballot: the registry
+        // already holds the swap, so there is no proposal to join or mint.
+        Precheck::AlreadyScheduled => {
+            eprintln!(
+                "{} → {} is already scheduled — nothing to do; track with: ducktape module status",
+                args.id,
+                hex_bytes(&code_hash)
+            );
+            return Ok(());
+        }
+    }
+
+    // 2. stage + fan-out; 3. every member holds the bytes or nothing is proposed
     // the token lives in the node's workspace — its `storage_dir` in the dev
     // shape, which is NOT the config file's directory.
     let reply = stage_component(&http_base, &resolved.service.workspace, &bytes)?;
-    let code_hash = digest_matches(&reply, &bytes)?;
+    digest_matches(&reply, &bytes)?;
     eprintln!(
         "staged {} ({} bytes), {} peer receipt(s)",
         hex_bytes(&code_hash),
@@ -192,29 +214,21 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
         reply.receipts.len()
     );
     refuse_on_bad_receipts(&reply)?;
+    // the fan-out never pushes to the staging node itself, so the one valset
+    // member allowed no receipt is THIS NODE's key — not the governance
+    // signer's, which under share governance is an account key.
+    let me_hex = hex_bytes(resolved.signer.public_key().as_ref());
+    let members = crate::cli::read_members(&rpc_addr)?;
+    refuse_on_missing_receipts(&reply, &members, &me_hex)?;
     let signer = crate::cli::gov_signer(&rpc_addr, &cfg_path, &resolved)?;
     let pubkey_hex = signer_pubkey_hex(&signer);
-    let members = crate::cli::read_members(&rpc_addr)?;
-    refuse_on_missing_receipts(&reply, &members, &pubkey_hex)?;
 
-    // a member running the verb after the deciding ballot: the registry
-    // already holds the swap, so there is no proposal to join or mint.
-    let already_scheduled = registry_holds(&read_module_status(&rpc_addr)?, &args.id, &code_hash);
-    if already_scheduled {
-        eprintln!(
-            "{} → {} is already scheduled — nothing to do; track with: ducktape module status",
-            args.id,
-            hex_bytes(&code_hash)
-        );
-        return Ok(());
-    }
-
-    // 3. activation = this node's height + N (each member computes its own)
+    // 4. activation = this node's height + N (each member computes its own)
     let height = current_height(&rpc_addr)?;
     let activation_height = height + args.after;
     let floor = height + lifecycle::MIN_SWAP_LEAD;
 
-    // 4. the ceremony: join an open proposal for the same (verb, id, hash)
+    // 5. the ceremony: join an open proposal for the same (verb, id, hash)
     //    that can still be scheduled, or propose; cast yes; execute when
     //    decidable
     let matches = matches_module_action(verb, &args.id, &code_hash, floor);
@@ -266,14 +280,19 @@ fn confirm_scheduled(
 /// the ceremony failed. the one failure the registry causes: governance's
 /// `Execute` emits the schedule to lifecycle in the SAME op, so a registry
 /// refusal rejects the whole op — the proposal never settles and the ceremony
-/// times out waiting for the tally. the proposal carries no reason, so when
-/// the registry holds nothing for these bytes the rules are named here.
+/// times out waiting for the tally. the proposal carries no reason, so on
+/// exactly that failure, with the registry holding nothing for these bytes,
+/// the rules are named here. every other ceremony error passes through.
 fn ceremony_failed(
     rpc_addr: &str,
     id: &str,
     code_hash: &[u8; 32],
     error: Box<dyn std::error::Error>,
 ) -> Box<dyn std::error::Error> {
+    let tally_never_settled = error.to_string() == crate::cli::TALLY_SETTLE_TIMEOUT;
+    if !tally_never_settled {
+        return error;
+    }
     let Ok(modules) = read_module_status(rpc_addr) else {
         return error;
     };
@@ -282,12 +301,53 @@ fn ceremony_failed(
         return error;
     }
     format!(
-        "{error}. the lifecycle registry holds no swap for {id} → {} — if governance's execute was \
-         refused, the registry refused it. {}",
+        "{error}: governance's execute was refused by the lifecycle registry, which holds no swap \
+         for {id} → {}. {}",
         hex_bytes(code_hash),
         registry_rules()
     )
     .into()
+}
+
+/// what the committed registry lets this verb do with these bytes.
+#[derive(Debug)]
+enum Precheck {
+    /// nothing in the registry stands in the way — stage and propose.
+    Proceed,
+    /// the registry already carries these bytes for the module (pending or
+    /// active): a member running after the deciding ballot. nothing to do.
+    AlreadyScheduled,
+}
+
+/// the registry's STATIC rules (`lifecycle` `handle_schedule_swap` /
+/// `handle_schedule_register`), decided from the committed registry before
+/// anything is staged or proposed. each refusal here would otherwise reject
+/// governance's execute in-kernel and leave a proposal open for its whole
+/// voting period; the wording mirrors the registry's own. pure.
+fn registry_precheck(
+    verb: Verb,
+    modules: &[lifecycle::ModuleCode],
+    id: &str,
+    code_hash: &[u8; 32],
+) -> Result<Precheck, String> {
+    let holds_ours = registry_holds(modules, id, code_hash);
+    if holds_ours {
+        return Ok(Precheck::AlreadyScheduled);
+    }
+    let entry = modules.iter().find(|m| m.module_id == id);
+    let other_swap_pending = entry.map(|m| m.pending.is_some());
+    match (verb, other_swap_pending) {
+        (Verb::Register, None) | (Verb::Update, Some(false)) => Ok(Precheck::Proceed),
+        (Verb::Register, Some(true)) | (Verb::Register, Some(false)) => Err(format!(
+            "module {id} is already registered (code changes go through `module update`)"
+        )),
+        (Verb::Update, None) => Err(format!(
+            "cannot schedule a swap for unregistered module {id} (`module register` admits a new id)"
+        )),
+        (Verb::Update, Some(true)) => Err(format!(
+            "module {id} already has a pending swap (cancel it first)"
+        )),
+    }
 }
 
 /// the registry's schedule rules, for a refusal it does not narrate itself.
@@ -325,7 +385,7 @@ fn current_height(rpc_addr: &str) -> Result<u64, String> {
 }
 
 /// the signer's public key as hex: the proposal-id seed the ceremony mints
-/// from, and — as `me` — the one member whose receipt is its own store.
+/// from (and nothing else — the receipt gate is keyed by the NODE's key).
 fn signer_pubkey_hex(signer: &GovSigner) -> String {
     match signer {
         GovSigner::Node { key } => hex_bytes(key),
@@ -609,9 +669,59 @@ mod tests {
         // me + every other member answered: nothing missing
         let present = vec![me.clone(), answered];
         assert!(refuse_on_missing_receipts(&reply, &present, &hex_bytes(&me)).is_ok());
-        // a signer that is not a validator (a user key): every member needs a row
+        // a staging node outside the valset needs every member's receipt
         let err = refuse_on_missing_receipts(&reply, &present, "ff").unwrap_err();
         assert!(err.contains(&hex_bytes(&me)), "{err}");
+    }
+
+    #[test]
+    fn the_registry_precheck_refuses_each_static_rule_before_staging() {
+        let ours = [0xabu8; 32];
+        let theirs = [0xcdu8; 32];
+        let swap = |hash: [u8; 32]| ScheduledSwap {
+            name: "x".into(),
+            activation_height: 9,
+            code_hash: hash.to_vec(),
+            readiness: Vec::new(),
+            ready: false,
+        };
+        let entry = |active: &[u8], pending: Option<ScheduledSwap>| ModuleCode {
+            module_id: "hello".into(),
+            active_code_hash: active.to_vec(),
+            pending,
+        };
+        let precheck =
+            |verb, modules: &[ModuleCode]| registry_precheck(verb, modules, "hello", &ours);
+
+        // register: a free id proceeds; any existing entry refuses
+        assert!(matches!(
+            precheck(Verb::Register, &[]),
+            Ok(Precheck::Proceed)
+        ));
+        let err = precheck(Verb::Register, &[entry(&theirs, None)]).unwrap_err();
+        assert!(err.contains("already registered"), "{err}");
+        // update: a missing entry refuses; a registered, quiet one proceeds
+        let err = precheck(Verb::Update, &[]).unwrap_err();
+        assert!(err.contains("unregistered module hello"), "{err}");
+        assert!(matches!(
+            precheck(Verb::Update, &[entry(&theirs, None)]),
+            Ok(Precheck::Proceed)
+        ));
+        // a pending swap for OTHER bytes refuses either verb
+        let busy = [entry(&theirs, Some(swap([0xefu8; 32])))];
+        let err = precheck(Verb::Update, &busy).unwrap_err();
+        assert!(err.contains("already has a pending swap"), "{err}");
+        assert!(precheck(Verb::Register, &busy).is_err());
+        // our own bytes, pending or active: nothing to do, whichever verb
+        let pending_ours = [entry(&[], Some(swap(ours)))];
+        assert!(matches!(
+            precheck(Verb::Register, &pending_ours),
+            Ok(Precheck::AlreadyScheduled)
+        ));
+        assert!(matches!(
+            precheck(Verb::Update, &[entry(&ours, None)]),
+            Ok(Precheck::AlreadyScheduled)
+        ));
     }
 
     #[test]

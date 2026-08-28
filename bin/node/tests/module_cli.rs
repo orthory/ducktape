@@ -216,12 +216,6 @@ fn register_then_update_activate_across_three_validators() {
     }
 }
 
-/// BLOCKED on the node: the custodian's push to a DEAD peer dials over the
-/// virtual stack with no SYN timeout (`overlay-net` `stack.rs`, no
-/// `set_timeout`) and is only reaped by the code plane's 600 s
-/// `PUSH_TIMEOUT`, so the stage route cannot answer with a receipt table
-/// inside the CLI's 60 s — every run ends in
-/// `/v1/admin/module-code/stage timed out — the node is up but not answering`.
 /// a dead peer refuses BEFORE the proposal (spec decision 2-B): the
 /// custodian's push dials it over the userspace stack, which has no SYN
 /// timeout, so only the code plane's `OPEN_TIMEOUT` (15 s) turns that peer
@@ -248,9 +242,24 @@ fn a_dead_peer_refuses_the_proposal_before_it_is_made() {
     let dead = common::hex(&Cluster::identity(3));
     assert!(out.contains(&format!("{dead}  open timed out")), "{out}");
     assert!(out.contains("not proposed"), "{out}");
-    // nothing reached governance: no pending swap, no open proposal
+    // nothing reached governance: no pending swap, no proposal at all
     let (_, status) = cluster.run_verb(&["module", "status", "--config", cfg]);
     assert!(!status.contains("hello"), "{status}");
+    assert_no_proposals(&cluster, 0);
+}
+
+/// "before any governance" is only proven by the proposal list itself: the
+/// registry writes nothing until execute, so an empty `module status` row
+/// would still pass with a minted proposal sitting open.
+fn assert_no_proposals(cluster: &Cluster, idx: usize) {
+    use governance::{GovQuery, GovReply, decode_reply, encode_query};
+    let raw = cluster
+        .query(idx, "governance", &encode_query(&GovQuery::Proposals))
+        .expect("governance answers");
+    let GovReply::Proposals(views) = decode_reply(&raw).expect("a proposals reply") else {
+        panic!("expected Proposals");
+    };
+    assert!(views.is_empty(), "a proposal was minted: {views:?}");
 }
 
 #[test]
@@ -277,7 +286,9 @@ fn an_activation_inside_the_min_lead_is_refused_with_the_registry_reason() {
     for (ok, out) in &runs {
         assert!(!ok, "{}", outputs(&runs));
         assert!(
-            out.contains("MIN_SWAP_LEAD") || out.contains("must exceed"),
+            out.contains(
+                "--after 2 cannot schedule anything: activation must exceed height+MIN_SWAP_LEAD (3)"
+            ),
             "{out}"
         );
         assert!(!out.contains("staged"), "nothing is staged first: {out}");
@@ -289,4 +300,5 @@ fn an_activation_inside_the_min_lead_is_refused_with_the_registry_reason() {
         cluster.config_file(0).to_str().unwrap(),
     ]);
     assert!(!status.contains("hello"), "{status}");
+    assert_no_proposals(&cluster, 0);
 }
