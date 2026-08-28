@@ -222,15 +222,18 @@ fn register_then_update_activate_across_three_validators() {
 /// `PUSH_TIMEOUT`, so the stage route cannot answer with a receipt table
 /// inside the CLI's 60 s — every run ends in
 /// `/v1/admin/module-code/stage timed out — the node is up but not answering`.
-/// un-ignore once `code_plane::push_peer` bounds `service.open`.
+/// a dead peer refuses BEFORE the proposal (spec decision 2-B): the
+/// custodian's push dials it over the userspace stack, which has no SYN
+/// timeout, so only the code plane's `OPEN_TIMEOUT` (15 s) turns that peer
+/// into a receipt the operator can read — well inside the CLI's 60 s.
 #[test]
-#[ignore = "BLOCKED: a push to a dead peer is unbounded below PUSH_TIMEOUT (600s); needs a node-side open bound"]
 fn a_dead_peer_refuses_the_proposal_before_it_is_made() {
     let _guard = common::serial();
     let mut cluster = three_validators();
     cluster.kill(2);
     let cfg = cluster.config_file(0);
     let cfg = cfg.to_str().unwrap();
+    let started = std::time::Instant::now();
     let (ok, out) = cluster.run_verb(&[
         "module",
         "register",
@@ -239,8 +242,11 @@ fn a_dead_peer_refuses_the_proposal_before_it_is_made() {
         "--config",
         cfg,
     ]);
+    println!("dead-peer run took {:?}:\n{out}", started.elapsed());
     assert!(!ok, "{out}");
     assert!(out.contains("peer  status"), "{out}");
+    let dead = common::hex(&Cluster::identity(3));
+    assert!(out.contains(&format!("{dead}  open timed out")), "{out}");
     assert!(out.contains("not proposed"), "{out}");
     // nothing reached governance: no pending swap, no open proposal
     let (_, status) = cluster.run_verb(&["module", "status", "--config", cfg]);
