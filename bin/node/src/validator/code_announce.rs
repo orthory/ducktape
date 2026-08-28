@@ -64,7 +64,8 @@ impl CodeReadinessSignaller {
         for m in modules {
             let Some(pending) = &m.pending else { continue };
             // coverage complete: nothing left for anyone to say.
-            if pending.ready {
+            let coverage_complete = pending.ready_at.is_some();
+            if coverage_complete {
                 continue;
             }
             // the module already recorded our (committed) signal.
@@ -124,7 +125,7 @@ mod tests {
                 activation_height: 10,
                 code_hash: vec![hash; 32],
                 readiness: signed.to_vec(),
-                ready,
+                ready_at: ready.then_some(5),
             }),
             history: Vec::new(),
         }

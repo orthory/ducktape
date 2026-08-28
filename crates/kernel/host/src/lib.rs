@@ -615,17 +615,16 @@ impl Host {
     /// pending-swap clear reconstruct byte-for-byte on every node (never a
     /// respawn side-effect, invisible to replay). keyed purely on committed
     /// lifecycle state + `height`: injected iff the committed module holds an
-    /// armed swap (ready + height reached). idempotent — the first block
+    /// armed swap ([`lifecycle::ScheduledSwap::armed_at`] — readiness latched
+    /// before `height`, floor reached). idempotent — the first block
     /// at/after `H` clears it, so later blocks inject nothing. ABSENT until
     /// the module is registered (the query errors → `None`), so the drain is
     /// byte-identical on a net without the module.
     async fn pending_lifecycle_advance(&self, height: u64) -> Option<Msg> {
         let swap_armed = self.lifecycle_module_status().await.is_some_and(|modules| {
-            modules.iter().any(|m| {
-                m.pending
-                    .as_ref()
-                    .is_some_and(|p| p.ready && height >= p.activation_height)
-            })
+            modules
+                .iter()
+                .any(|m| m.pending.as_ref().is_some_and(|p| p.armed_at(height)))
         });
         swap_armed.then(|| Msg {
             target: LIFECYCLE_MODULE_ID.into(),

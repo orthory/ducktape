@@ -334,14 +334,41 @@ fn swap_readiness_gate() {
     let mut m1 = ctx(Origin::External(member(1)), 0).with_members(two.clone());
     run(&mut lc, &mut m1, &swap_ready("hello", "replacement")).unwrap();
     commit(&mut lc);
-    assert!(!module_status(&lc)[0].pending.clone().unwrap().ready);
+    assert!(
+        module_status(&lc)[0]
+            .pending
+            .clone()
+            .unwrap()
+            .ready_at
+            .is_none()
+    );
     assert!(armed_at(&lc, 10).is_empty());
 
-    let mut m2 = ctx(Origin::External(member(2)), 0).with_members(two);
+    // the covering signal, in block 6: the latch records THAT height.
+    let mut m2 = ctx(Origin::External(member(2)), 6).with_members(two);
     run(&mut lc, &mut m2, &swap_ready("hello", "replacement")).unwrap();
     commit(&mut lc);
-    assert!(module_status(&lc)[0].pending.clone().unwrap().ready);
+    let latched = module_status(&lc)[0].pending.clone().unwrap();
+    assert_eq!(latched.ready_at, Some(6));
     assert_eq!(armed_at(&lc, 10).len(), 1);
+    // the arm predicate: latched STRICTLY before the height, floor reached.
+    assert!(!latched.armed_at(6), "the latch block itself is not armed");
+    assert!(!latched.armed_at(9), "below the activation floor");
+    assert!(latched.armed_at(10));
+    let early = ScheduledSwap {
+        activation_height: 3,
+        ..latched.clone()
+    };
+    assert!(
+        !early.armed_at(6),
+        "latched at 6: block 6 still runs old code"
+    );
+    assert!(early.armed_at(7));
+    let unlatched = ScheduledSwap {
+        ready_at: None,
+        ..latched
+    };
+    assert!(!unlatched.armed_at(u64::MAX));
 }
 
 #[test]
@@ -473,18 +500,30 @@ fn code_at_reads_the_armed_pending_then_the_history() {
         activation_height: 50,
         code_hash: hash(2),
         readiness: vec![member(1)],
-        ready: true,
+        ready_at: Some(20),
     };
     let e = entry(&[(10, 1)], Some(armed.clone()));
     assert_eq!(code_at(&e, 50), Some(hash(2).as_slice()));
     assert_eq!(code_at(&e, 49), Some(hash(1).as_slice()));
     // an unready pending never arms, however high the height.
     let unready = ScheduledSwap {
-        ready: false,
-        ..armed
+        ready_at: None,
+        ..armed.clone()
     };
     let e = entry(&[(10, 1)], Some(unready));
     assert_eq!(code_at(&e, 99), Some(hash(1).as_slice()));
+    // LATE readiness: latched at 45, past the activation floor of 40. blocks
+    // 40..=45 ran on the old code live (the drain saw the latch only from
+    // 46), so a replay whose tip is 45 must say so.
+    let late = ScheduledSwap {
+        activation_height: 40,
+        ready_at: Some(45),
+        ..armed
+    };
+    let e = entry(&[(10, 1)], Some(late));
+    assert_eq!(code_at(&e, 42), Some(hash(1).as_slice()));
+    assert_eq!(code_at(&e, 45), Some(hash(1).as_slice()));
+    assert_eq!(code_at(&e, 46), Some(hash(2).as_slice()));
 
     // registered, never activated: no code at all.
     assert_eq!(code_at(&entry(&[], None), 99), None);

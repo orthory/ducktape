@@ -638,7 +638,7 @@ fn render_status(modules: &[lifecycle::ModuleCode]) -> String {
 /// how far a pending swap's readiness has come: the count of validators that
 /// signalled, or `✓` once the latch covered the whole set.
 fn readiness_word(swap: &lifecycle::ScheduledSwap) -> String {
-    if swap.ready {
+    if swap.ready_at.is_some() {
         return "✓".into();
     }
     swap.readiness.len().to_string()
@@ -729,7 +729,7 @@ mod tests {
             activation_height: 9,
             code_hash: hash.to_vec(),
             readiness: Vec::new(),
-            ready: false,
+            ready_at: None,
         };
         let entry = |active: &[u8], pending: Option<ScheduledSwap>| ModuleCode {
             module_id: "hello".into(),
@@ -846,7 +846,7 @@ mod tests {
                     activation_height: 120,
                     code_hash: next.clone(),
                     readiness: vec![vec![1], vec![2]],
-                    ready: false,
+                    ready_at: None,
                 }),
                 history: Vec::new(),
             },
@@ -859,7 +859,7 @@ mod tests {
                     activation_height: 120,
                     code_hash: next.clone(),
                     readiness: Vec::new(),
-                    ready: false,
+                    ready_at: None,
                 }),
                 history: Vec::new(),
             },
