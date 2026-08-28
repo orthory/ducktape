@@ -1287,6 +1287,41 @@ pub async fn load_account(rpc: String, generation: i64) -> Result<AccountData, H
     })
 }
 
+/// The chain a network names, read once off `/v1/status` — the welcome step
+/// runs before the console's status stream exists, and every key consent is
+/// chain-scoped.
+pub async fn chain_id_of(rpc: String) -> Result<String, AppError> {
+    async {
+        let client = rpc_client(&rpc)?;
+        let status = client.status_json().await?;
+        named_chain(node_facts(&status).chain_id)
+    }
+    .await
+    .map_err(app_error)
+}
+
+/// Test seam: Ice reads extern structs but cannot construct one.
+pub fn account_data_none(generation: i64) -> AccountData {
+    AccountData::none(generation)
+}
+
+/// A network pick's gate: no password means a read-only session with no key
+/// to probe an account for — the console opens outright.
+pub fn pick_gate(password: &str) -> crate::PickGate {
+    match password.is_empty() {
+        true => crate::PickGate::ReadOnly,
+        false => crate::PickGate::Probe,
+    }
+}
+
+/// The probe's answer as the discriminant the launch window branches on.
+pub fn account_probe(found: bool) -> crate::AccountProbe {
+    match found {
+        true => crate::AccountProbe::Found,
+        false => crate::AccountProbe::Missing,
+    }
+}
+
 /// Rename the account the local user key belongs to (origin-gated: any member
 /// key is the authority).
 pub async fn set_account_name(

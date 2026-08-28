@@ -58,6 +58,17 @@ enum HubStep
   live
   account
 
+// A network pick's gate: a read-only session (no password, no key) opens the
+// console outright; a signing session probes the account first.
+enum PickGate
+  read_only
+  probe
+
+// The account probe's answer for the picked network's chain.
+enum AccountProbe
+  found
+  missing
+
 enum NodeTab
   overview
   permissions

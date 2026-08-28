@@ -264,6 +264,13 @@ extern crate::backend
   AccountKeyRow(scheme:str, pubkey:str, label:str, added_at:i64)
   AccountData(generation:i64, exists:bool, number:str, name:str, bio:str, keys:i64, key_rows:[AccountKeyRow])
   load_account(rpc:str, generation:i64) -> AccountData ! HydrationError
+  // the welcome step's two probes, before any console exists: the chain a
+  // picked network names (every key consent is chain-scoped), and a test
+  // seam for the "no account" reading Ice cannot construct itself.
+  chain_id_of(rpc:str) -> str ! AppError
+  pure account_data_none(generation:i64) -> AccountData
+  pure pick_gate(password:&str) -> PickGate
+  pure account_probe(found:bool) -> AccountProbe
   set_account_name(rpc:str, password:str, name:str) -> bool ! AppError
   create_account(rpc:str, password:str, name:str) -> bool ! AppError
   // An `AddKey` ticket this device (a member) mints for another device's

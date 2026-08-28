@@ -445,8 +445,12 @@ test launch_wallets_contract
   preset ui_launch
   viewport 480 680
   mount
-    HubColumn #hub
+    HubColumn name_draft<->welcome_name_draft #hub
       with
+        network=""
+        phase=""
+        qr=""
+        detail=""
         step=HubStep.wallets
         wallets=hub_wallets
         wallet_selected=hub_wallet_selected
@@ -468,6 +472,11 @@ test launch_wallets_contract
         unlock_submit -> unlock_submit _
         login_skip -> login_skip
         password_submit -> password_submit _
+        welcome_create_submit -> welcome_create_submit _
+        welcome_login_submit -> welcome_login_submit
+        welcome_desktop -> welcome_desktop
+        welcome_cancel -> welcome_cancel
+        welcome_skip -> welcome_skip
         go_restore -> go_restore
         go_login -> go_login
         restore_submit -> restore_submit _ _
@@ -563,8 +572,12 @@ test launch_networks_empty_contract
   preset ui_launch
   viewport 480 680
   mount
-    HubColumn #hub
+    HubColumn name_draft<->welcome_name_draft #hub
       with
+        network=""
+        phase=""
+        qr=""
+        detail=""
         step=HubStep.networks
         wallets=hub_wallets
         wallet_selected=hub_wallet_selected
@@ -586,6 +599,11 @@ test launch_networks_empty_contract
         unlock_submit -> unlock_submit _
         login_skip -> login_skip
         password_submit -> password_submit _
+        welcome_create_submit -> welcome_create_submit _
+        welcome_login_submit -> welcome_login_submit
+        welcome_desktop -> welcome_desktop
+        welcome_cancel -> welcome_cancel
+        welcome_skip -> welcome_skip
         go_restore -> go_restore
         go_login -> go_login
         restore_submit -> restore_submit _ _
@@ -604,6 +622,71 @@ test launch_networks_empty_contract
   expect exists cta
   click cta
   expect hub_step == HubStep.join
+
+// The welcome step mid-ceremony: the QR the stream handed back is on screen.
+preset ui_welcome_qr
+  state
+    mutation_phase = MutationPhase.onboarding
+    onboarding_error = ""
+    hub_step = HubStep.account
+    ceremony_phase = "show_qr"
+    ceremony_qr = "https://auth.ducktape.byeongsu.dev/#op=get&challenge=AQID"
+    ceremony_detail = "Your phone will confirm with the passkey."
+
+// A signing session that just picked a network — the probe is in flight.
+preset ui_pick_probe
+  state
+    password = "hunter2-hunter2"
+    rpc = "http://127.0.0.1:1"
+    mutation_phase = MutationPhase.onboarding
+    hub_step = HubStep.networks
+
+// THE WELCOME SCREEN is where a device key with no account on the picked
+// network lands. Skipping opens the console (a window task — not asserted
+// here); a QR in state renders as a real qr node; cancel clears it.
+test welcome_screen_contract
+  preset ui_welcome_qr
+  viewport 480 680
+  mount
+    WelcomeScreen name_draft<->welcome_name_draft #welcome
+      with
+        network="demo"
+        phase=ceremony_phase
+        qr=ceremony_qr
+        detail=ceremony_detail
+        busy=false
+        error=""
+      events
+        welcome_create_submit -> welcome_create_submit _
+        welcome_login_submit -> welcome_login_submit
+        welcome_desktop -> welcome_desktop
+        welcome_cancel -> welcome_cancel
+        welcome_skip -> welcome_skip
+  target screen = #welcome/root
+  target qr = #welcome/root/welcome-qr
+  target cancel = #welcome/root/welcome-cancel
+  target create = #welcome/root/welcome-create
+  expect exists qr
+  expect missing create
+  expect text "demo" within screen
+  click cancel
+  expect ceremony_qr == ""
+  expect ceremony_phase == ""
+  expect hub_step == HubStep.account
+  // with no ceremony in flight the doors are back, and the QR is gone.
+  expect exists create
+  expect missing qr
+
+// A network pick probes the account BEFORE the console opens: no account →
+// the welcome step; an account → straight through (window task, not
+// asserted). The probe answer is dispatched directly — the pick itself
+// launches a real `load_account`.
+test network_pick_lands_on_the_welcome_step_without_an_account
+  preset ui_pick_probe
+  dispatch account_probed(account_data_none(7))
+  expect hub_step == HubStep.account
+  expect mutation_phase == MutationPhase.idle
+  expect ceremony_phase == ""
 
 preset ui_palette_overlay
   state

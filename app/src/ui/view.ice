@@ -6,9 +6,13 @@ view
   // between open and register.
   col w=fill h=fill
     if (console_win != some(window)) && (huddle_win != some(window))
-      HubColumn
+      HubColumn name_draft<->welcome_name_draft
         with
           step=hub_step
+          network=network_name
+          phase=ceremony_phase
+          qr=ceremony_qr
+          detail=ceremony_detail
           wallets=hub_wallets
           wallet_selected=hub_wallet_selected
           networks=hub_networks
@@ -29,6 +33,11 @@ view
           unlock_submit -> unlock_submit _
           login_skip -> login_skip
           password_submit -> password_submit _
+          welcome_create_submit -> welcome_create_submit _
+          welcome_login_submit -> welcome_login_submit
+          welcome_desktop -> welcome_desktop
+          welcome_cancel -> welcome_cancel
+          welcome_skip -> welcome_skip
           go_restore -> go_restore
           go_login -> go_login
           restore_submit -> restore_submit _ _

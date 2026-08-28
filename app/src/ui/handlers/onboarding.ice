@@ -135,11 +135,23 @@ on login_failed(cause)
 on pick_network(id)
   hub_selected = id
 
+// A NETWORK PICK PROBES THE ACCOUNT FIRST. The console opens only for a
+// device key that has one on that chain (or a read-only session, which has
+// no key to ask about); a key with none lands on the welcome step. The probe
+// block is inlined in the three pickers — a handler cannot call a handler.
 on open_network_submit
   return if mutation_phase != MutationPhase.idle || empty(selected_network_endpoint(hub_networks, hub_selected))
   rpc = selected_network_endpoint(hub_networks, hub_selected)
   onboarding_error = ""
-  task window open console -> console_opened _
+  let gate = pick_gate(password)
+  match gate
+    PickGate.read_only
+      task window open console -> console_opened _
+    PickGate.probe
+      mutation_phase = MutationPhase.onboarding
+      parallel
+        run replace lane=account_probe load_account(rpc, account_generation) -> account_probed _ | account_probe_failed _
+        run replace lane=chain_probe chain_id_of(rpc) -> chain_named _ | chain_probe_failed _
 
 // A remote endpoint this device holds no workspace for. On a successful
 // connect `remember_network` saves it, which is how a `saved_remotes` row is
@@ -148,7 +160,67 @@ on connect_remote_submit(endpoint)
   return if mutation_phase != MutationPhase.idle || empty(trim(endpoint))
   rpc = canonical_endpoint(endpoint)
   onboarding_error = ""
+  let gate = pick_gate(password)
+  match gate
+    PickGate.read_only
+      task window open console -> console_opened _
+    PickGate.probe
+      mutation_phase = MutationPhase.onboarding
+      parallel
+        run replace lane=account_probe load_account(rpc, account_generation) -> account_probed _ | account_probe_failed _
+        run replace lane=chain_probe chain_id_of(rpc) -> chain_named _ | chain_probe_failed _
+
+on chain_named(id)
+  hub_chain_id = id
+
+// A node that serves no chain yet cannot take a key consent; the welcome
+// still shows, and the ceremonies refuse on the empty chain id.
+on chain_probe_failed(_cause)
+  hub_chain_id = ""
+
+on account_probed(next)
+  mutation_phase = MutationPhase.idle
+  let probe = account_probe(next.exists)
+  match probe
+    AccountProbe.found
+      task window open console -> console_opened _
+    AccountProbe.missing
+      network_name = network_label(account_name, rpc)
+      ceremony_phase = ""
+      ceremony_qr = ""
+      ceremony_detail = ""
+      hub_step = HubStep.account
+
+// A node that cannot answer the probe is a node the console cannot use
+// either: say so where the user is, keep the pick.
+on account_probe_failed(cause)
+  mutation_phase = MutationPhase.idle
+  onboarding_error = cause.message
+
+// THE WELCOME'S DOORS. Skipping opens the console without an account (the
+// banner there is the way back); cancel drops a ceremony mid-flight — the
+// lane invalidation drops the stream's receiver, and the backend task ends
+// on its next step.
+on welcome_skip
+  return if mutation_phase != MutationPhase.idle
+  onboarding_error = ""
   task window open console -> console_opened _
+
+on welcome_cancel
+  mutation_phase = MutationPhase.idle
+  ceremony_phase = ""
+  ceremony_qr = ""
+  ceremony_detail = ""
+
+// wired in the ceremonies change
+on welcome_create_submit(_name)
+  onboarding_error = ""
+
+on welcome_login_submit
+  onboarding_error = ""
+
+on welcome_desktop
+  onboarding_error = ""
 
 // The console window exists: point it at the picked endpoint, remember the
 // pick, close the launch window BY ID, and run the same connect boot the
@@ -467,7 +539,15 @@ on copy_onboarding_invite
 on enter_console
   return if mutation_phase != MutationPhase.idle
   onboarding_error = ""
-  task window open console -> console_opened _
+  let gate = pick_gate(password)
+  match gate
+    PickGate.read_only
+      task window open console -> console_opened _
+    PickGate.probe
+      mutation_phase = MutationPhase.onboarding
+      parallel
+        run replace lane=account_probe load_account(rpc, account_generation) -> account_probed _ | account_probe_failed _
+        run replace lane=chain_probe chain_id_of(rpc) -> chain_named _ | chain_probe_failed _
 
 // A refusal here is recoverable — the workspace is already on disk — so the
 // screen keeps its controls and says what happened.

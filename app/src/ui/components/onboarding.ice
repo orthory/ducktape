@@ -13,12 +13,17 @@
 // only resolve local handlers and declared emissions, so an app handler is
 // never named inside this file.
 
-component HubColumn(step:HubStep, wallets:[WalletInfo], wallet_selected:str, networks:[HubNetwork], selected:str, hidden:i64, name:str, invite:str, steps:[ProvisionStep], step_index:i64, height:i64, tier:str, error:str, busy:bool, restore_empty:bool, join_empty:bool)
+component HubColumn(step:HubStep, wallets:[WalletInfo], wallet_selected:str, networks:[HubNetwork], selected:str, hidden:i64, name:str, invite:str, steps:[ProvisionStep], step_index:i64, height:i64, tier:str, error:str, busy:bool, restore_empty:bool, join_empty:bool, network:str, bind name_draft:str, phase:str, qr:str, detail:str)
   emits
     pick_wallet(str)
     unlock_submit(str)
     login_skip
     password_submit(str)
+    welcome_create_submit(str)
+    welcome_login_submit
+    welcome_desktop
+    welcome_cancel
+    welcome_skip
     go_restore
     go_login
     restore_submit(str, str)
@@ -129,15 +134,21 @@ component HubColumn(step:HubStep, wallets:[WalletInfo], wallet_selected:str, net
                 size=13.5
                 wrap=none
                 @text-hint
-        // the welcome step lands in the next change; until then it renders
-        // the quiet loading arm.
         HubStep.account
-          col gap=0.0 align=center
-            text "…"
-              with
-                size=13.5
-                wrap=none
-                @text-hint
+          WelcomeScreen name_draft<->name_draft #welcome
+            with
+              network
+              phase
+              qr
+              detail
+              busy
+              error
+            forward
+              welcome_create_submit
+              welcome_login_submit
+              welcome_desktop
+              welcome_cancel
+              welcome_skip
 
 // The brand plate every sign-in screen opens with.
 component HubBrand(title:str, caption:str)
@@ -535,6 +546,165 @@ component PasswordScreen(busy:bool, error:str)
             wrap=none
             font=code_medium
             @text-icon_idle
+    OnboardingError message=error
+
+// WELCOME. A picked network on which this device's key has no account. The
+// two doors both go through the phone: create the account and enrol a
+// passkey (two QR scans), or sign in with a passkey that already names an
+// account (one scan). `phase` is the ceremony stream's reading — "" shows
+// the doors, `show_qr` the code, `working` the line between touches. The
+// desktop browser path stays one link under the QR.
+component WelcomeScreen(network:str, bind name_draft:str, phase:str, qr:str, detail:str, busy:bool, error:str)
+  emits
+    welcome_create_submit(str)
+    welcome_login_submit
+    welcome_desktop
+    welcome_cancel
+    welcome_skip
+  col #root w=428.0 gap=0.0
+    HubBrand
+      with
+        title="No account on this network yet"
+        caption=network
+    if phase == "show_qr"
+      box w=fill pt=22.0
+        col
+          with
+            w=fill
+            gap=12.0
+            align=center
+          box
+            with
+              p=12.0
+              bg=surface
+              border=border
+              border-w=1.0
+              r=12.0
+            qr qr #welcome-qr cell-size=4.0 correction=medium
+          text "Scan with your phone"
+            with
+              size=13.5
+              wrap=none
+              font=display
+              @text-primary
+          text detail
+            with
+              w=fill
+              size=12.0
+              line-h=1.5
+              align-x=center
+              @text-caption
+          button "Use this computer's passkey instead" #welcome-desktop -> emit(welcome_desktop)
+            with
+              disabled=busy
+              h=26.0
+              p=5.0
+              @ghost_action
+            active bg=transparent text=muted r=7.0
+            hovered bg=fg/9 text=fg
+            pressed bg=fg/14
+          button "Cancel" #welcome-cancel -> emit(welcome_cancel)
+            with
+              h=26.0
+              p=5.0
+              @ghost_action
+            active bg=transparent text=muted r=7.0
+            hovered bg=fg/9 text=fg
+            pressed bg=fg/14
+    if phase == "working"
+      box w=fill pt=22.0
+        col
+          with
+            w=fill
+            gap=12.0
+            align=center
+          text detail
+            with
+              w=fill
+              size=13.0
+              line-h=1.5
+              align-x=center
+              @text-caption
+          button "Cancel" #welcome-cancel-working -> emit(welcome_cancel)
+            with
+              h=26.0
+              p=5.0
+              @ghost_action
+            active bg=transparent text=muted r=7.0
+            hovered bg=fg/9 text=fg
+            pressed bg=fg/14
+    if empty(phase)
+      box w=fill pt=26.0
+        text "ACCOUNT NAME"
+          with
+            size=10.0
+            wrap=none
+            font=code_semibold
+            @text-label
+      box w=fill pt=8.0
+        box
+          with
+            w=fill
+            px=14.0
+            py=12.0
+            bg=surface
+            border=primary
+            border-w=1.5
+            r=10.0
+          input "" #welcome-name <-> name_draft
+            with
+              label="Account name"
+              hint="shown to others; not unique"
+              disabled=busy
+              submit=emit(welcome_create_submit, trim(name_draft))
+              w=fill
+              p=0.0
+              text-size=13.0
+              line-h=1.2
+              font=code
+              @control
+            active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
+            disabled value=hint
+      box w=fill pt=16.0
+        button #welcome-create -> emit(welcome_create_submit, trim(name_draft))
+          with
+            label="Create account with a passkey"
+            disabled=(busy || empty(trim(name_draft)))
+            w=fill
+            @primary_action
+            @px-0px
+            @py-13px
+            @rounded-10px
+          text "Create account with a passkey →"
+            with
+              w=fill
+              size=13.5
+              wrap=none
+              align-x=center
+              font=display
+              @text-primary_fg
+      box w=fill pt=10.0
+        button "Sign in with a passkey" #welcome-login -> emit(welcome_login_submit)
+          with
+            disabled=busy
+            w=fill
+            h=40.0
+            @secondary_action
+      box w=fill pt=18.0
+        col
+          with
+            w=fill
+            gap=8.0
+            align=center
+          button "Continue without an account" #welcome-skip -> emit(welcome_skip)
+            with
+              disabled=busy
+              h=26.0
+              p=5.0
+              @ghost_action
+            active bg=transparent text=muted r=7.0
+            hovered bg=fg/9 text=fg
+            pressed bg=fg/14
     OnboardingError message=error
 
 // RESTORE. 24 words in, a new password around them, the same pubkey out.
