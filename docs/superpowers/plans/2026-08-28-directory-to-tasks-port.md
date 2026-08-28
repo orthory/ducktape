@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - **The `directory` CRATE stays.** Only its membership in the genesis set is retired. `crates/examples/greeter/src/lib.rs:22` hard-binds `directory: "directory"`, `crates/kernel/host/tests/{cross_module.rs:18,wasm_cutover_parity.rs:18}` `include_bytes!` its fixture wasm, and ~15 kernel/consensus/recovery files plus `bin/node/src/main_tests.rs` construct `Directory::new`. Keep it in `Makefile:216` `BUILDER_MODULES` and keep the committed component (`vaults` is the standing precedent for a component-shipping crate outside the universe). **Zero edits** to `crates/kernel/**`, `crates/examples/**`, `bin/node/src/main_tests.rs`, `bin/node/tests/network_joiner_full.rs`.
-- **`TaskMsg::CreateTask` is not an upsert.** It validates and REFUSES a duplicate (`crates/modules/apps/tasks/src/task_board.rs:77-80`), and a `Module` Err fails the whole block. Every ported op must use a unique id. It also rejects: an empty id, an id over `MAX_TASK_ID` (256 bytes), an id containing `\x1f`, an empty title (`sdk::validate_id` + `require_non_empty`), and a record over 1 MiB − 4 KiB.
+- **`TaskMsg::CreateTask` is not an upsert.** It validates and REFUSES a duplicate (`crates/modules/apps/tasks/src/task_board.rs:77-80`). That rejection is ISOLATED, not fatal: the op's stage rolls back and it is recorded `Rejected` while the block still seals (`crates/kernel/host/src/lib.rs:237`, `:283`) — so a duplicate silently never applies, and the confirm loop that waits for it spins to its timeout or passes VACUOUSLY on the surviving row. Every ported op must use a unique id. It also rejects: an empty id, an id over `MAX_TASK_ID` (256 bytes), an id containing `\x1f`, an empty title (`sdk::validate_id` + `require_non_empty`), and a record over 1 MiB − 4 KiB.
 - **`TaskQuery` has exactly one variant, `List`** (`interface.rs:50-53`), returning the whole board. Every `dir_value` point read becomes list-then-find. The `Option`-shaped point lookup exists only on the derived index tier (`index.rs:118-120`) and is unreachable from an execute-path `ctx.query`.
 - **Every payload gains the `WorkMsg::Task` envelope** (`interface.rs:245-247`). On the wire: `{"task":{"create_task":{"task_id":…,"title":…}}}`; a query is `{"task":"list"}`.
 - **`GENESIS_ROOT_HASH` (`bin/node/src/host_state.rs:665-666`) moves exactly once, in PR B's flag-day commit**, together with every count pin. It must not move in PR A. `bin/simnode/tests/topology_set.rs:23` `DEFAULT_GENESIS_ROOT_HASH` and `bin/noded/tests/daemon_e2e.rs:462` do NOT move — `SIM_BASE` (`topology:180-196`) and `SIM_VALSET` (:205) never contained `directory`.
@@ -69,7 +69,9 @@ fn dir_value(cluster: &Cluster, idx: usize, key: &str) -> Option<String> {
 use tasks::{TaskMsg, TaskQuery, TaskReply, decode_task_reply, encode_task_msg, encode_task_query};
 
 /// a create for `task_id`; NOT an upsert — `tasks` refuses a duplicate id
-/// (`task_board.rs:77-80`) and a module Err fails the whole block.
+/// (`task_board.rs:77-80`). The rejection is ISOLATED — stage rolled back, op
+/// recorded `Rejected`, block still seals — so a duplicate silently never
+/// applies. Every call site carries a fresh id.
 fn task_create(task_id: &str, title: &str) -> Vec<u8> {
     encode_task_msg(&TaskMsg::CreateTask { task_id: task_id.into(), title: title.into() })
 }

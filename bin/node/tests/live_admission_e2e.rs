@@ -26,8 +26,12 @@ use tasks::{TaskMsg, TaskQuery, TaskReply, decode_task_reply, encode_task_msg, e
 const CONVERGE: Duration = Duration::from_secs(180);
 
 /// a create for `task_id`; NOT an upsert — `tasks` refuses a duplicate id
-/// (`task_board.rs:77-80`) and a module Err fails the whole block, so every
-/// call site here has to carry a fresh id.
+/// (`task_board.rs:77-80`). That rejection is ISOLATED, not fatal: the op's
+/// stage rolls back and it is recorded `Rejected` while the block still seals
+/// (`host/src/lib.rs:237`, `:283`). So a duplicate never applies and never
+/// announces itself — `write_and_confirm` spins to its timeout, or passes
+/// VACUOUSLY when the re-created title happens to match the surviving one.
+/// Every call site here has to carry a fresh id.
 fn task_create(task_id: &str, title: &str) -> Vec<u8> {
     encode_task_msg(&TaskMsg::CreateTask {
         task_id: task_id.into(),
