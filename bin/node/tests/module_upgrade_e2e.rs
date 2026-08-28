@@ -17,9 +17,10 @@ const FINALIZE: Duration = Duration::from_secs(60);
 const ACTIVATE: Duration = Duration::from_secs(180);
 
 /// three founders (3-of-3) plus a DECLARED fourth peer (idx 3 = id 4) that
-/// is not spawned: statesync is fail-closed for a peer with no committed
-/// standing, and the harness's joiner helpers key on the index, so the
-/// joiner must exist in the cluster layout from the start.
+/// is started later with `cluster.spawn(3)`: statesync is fail-closed for a
+/// peer with no committed standing, so the joiner must exist in the cluster
+/// layout from the start — and `Cluster::spawn_joiner` keys on the ID and
+/// appends it to `peer_ids`, so it would declare id 4 twice.
 fn founders_and_declared_joiner() -> Cluster {
     let mut cluster = Cluster::new(&[1, 2, 3, 4], &[1, 2, 3]);
     // every sealed block stays in the journal-replay window: the restart
@@ -47,8 +48,9 @@ fn root_hashes_agree(cluster: &Cluster, idxs: &[usize]) -> Option<String> {
                 .map(str::to_string)
         })
         .collect::<Option<_>>()?;
-    let all_same = hashes.iter().all(|h| *h == hashes[0]);
-    all_same.then(|| hashes[0].clone())
+    let first = hashes.first()?;
+    let all_same = hashes.iter().all(|h| h == first);
+    all_same.then(|| first.clone())
 }
 
 /// `inc` on one node, the new count readable on every founder.
@@ -129,6 +131,37 @@ fn a_registered_module_survives_a_live_swap_a_restart_and_statesync() {
         || root_hashes_agree(&cluster, &[0, 1, 2]),
     );
 
-    // Task 3 continues here (step 6), then Task 4 (step 7)
-    let _ = (&mut cluster, root_after_swap);
+    // 6. crash node 2 (SIGKILL) and respawn it over the same storage. with
+    // 3-of-3 the chain halts while it is down and resumes when it is back.
+    // the boot must RECOVER — replaying hello's register, swap and both
+    // incs from the journal — not re-run genesis.
+    cluster.kill(2);
+    cluster.spawn(2);
+    let recovered = cluster.wait_marker(2, "recovered root_hash=", Duration::from_secs(120));
+    println!("node 2 recovered root_hash={recovered}");
+    let recovered_hash = recovered.split_whitespace().next().expect("recovered hash");
+    assert_eq!(
+        recovered_hash, root_after_swap,
+        "node 2 recovered a different root than the founders' post-swap boundary"
+    );
+    assert!(
+        cluster.marker(2, "genesis root_hash=").is_none(),
+        "a restart must not re-run genesis"
+    );
+    let seen = cluster.await_committed(2, "hello count == 101 after restart", FINALIZE, || {
+        count(&cluster, 2).filter(|c| *c == 101)
+    });
+    assert_eq!(seen, 101);
+    let root_after_restart = cluster.await_committed(
+        0,
+        "founders' root-hashes to agree after the restart",
+        FINALIZE,
+        || root_hashes_agree(&cluster, &[0, 1, 2]),
+    );
+    assert_eq!(
+        root_after_restart, root_after_swap,
+        "a restart moved the state root"
+    );
+
+    // Task 4 continues here (step 7)
 }

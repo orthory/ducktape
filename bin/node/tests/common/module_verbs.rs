@@ -6,8 +6,9 @@ use super::{Cluster, FIXTURES};
 
 /// blocks a ceremony's activation is placed out: three sequential runs plus
 /// the readiness signals must all land under the lifecycle floor
-/// (`height + MIN_SWAP_LEAD`) at execute time, and the chain ticks one block
-/// per second while idle. it also bounds the MATCHER: run 1 joins run 0's
+/// (`height + MIN_SWAP_LEAD`) at execute time, and each validator beats one
+/// nop per `BLOCK_TIME`, so a 3-founder chain ticks ~3 blocks/s while idle.
+/// it also bounds the MATCHER: run 1 joins run 0's
 /// proposal only while that activation still clears run 1's own floor, so a
 /// lead this far above the runs' wall-clock spacing is what keeps
 /// `deciding == 1` exact on a loaded box.
