@@ -301,9 +301,27 @@ fn cluster_lifecycle() {
         .iter()
         .find(|b| b["height"] == block["height"])
         .unwrap_or_else(|| panic!("held submit's block missing from the explorer: {body}"));
-    // the held submit is its block's member op; a block carries its ops under
-    // `ops[]` now.
-    let op = &submitted["ops"][0];
+    // the held submit's op, picked by IDENTITY and not by position. a block is
+    // a BATCH and the row lists every member op, so `ops[0]` is whichever op
+    // the batch ordered first — and the cutover filler loop above submits
+    // `cutover-filler-*` creates against this SAME `tasks` target, fire and
+    // forget (their fate is explicitly not the test's business: "tolerate
+    // rejection"), which a peeking automaton can carry across views into this
+    // block. positional access would pass the target assert on such a filler
+    // and then fail 8d's blob comparison with a baffling diff. `task_id` is
+    // unique to this submit and the row carries the payload verbatim
+    // (`noded::payload_preview` truncates only past 1024 chars).
+    let is_the_held_submit = |op: &&serde_json::Value| {
+        op["payload"]
+            .as_str()
+            .is_some_and(|payload| payload.contains("via-app-surface"))
+    };
+    let op = submitted["ops"]
+        .as_array()
+        .expect("a block row lists its ops")
+        .iter()
+        .find(is_the_held_submit)
+        .unwrap_or_else(|| panic!("held submit's op missing from its block row: {submitted}"));
     assert_eq!(op["target"], "tasks");
     assert_eq!(op["disposition"], "applied");
     assert_eq!(
@@ -390,7 +408,7 @@ fn cluster_lifecycle() {
     // 8d. the record's op hash is a real content address: staging at the
     // drain keys the committed payload bytes by sha256, so the blob lane
     // must serve the exact submitted payload back under that digest.
-    let op_hash = submitted["ops"][0]["op_hash"].as_str().unwrap_or_default();
+    let op_hash = op["op_hash"].as_str().unwrap_or_default();
     assert_eq!(
         op_hash.len(),
         64,
