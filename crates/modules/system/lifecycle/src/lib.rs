@@ -2,8 +2,11 @@
 //! hot-swappable module runs.
 //!
 //! it holds, folded into a single `root()`: per hot-swappable module, the
-//! ACTIVE 32-byte code hash plus at most one pending `ScheduledSwap` with its
-//! byte-receipt readiness latch (the height-gated wasm code swap).
+//! ACTIVE 32-byte code hash, at most one pending `ScheduledSwap` with its
+//! byte-receipt readiness latch (the height-gated wasm code swap), and the
+//! activation HISTORY — every `(height, code_hash)` that ever went live, so a
+//! crash-restart replay against this disk-durable, already-AHEAD registry can
+//! still run each block on the code that sealed it ([`code_at`]).
 //!
 //! governance authorizes a schedule/cancel/register by emitting a host-drained
 //! follow-up (origin `Module("governance")`); validators self-submit the
@@ -81,6 +84,19 @@ const MODULE_ROSTER_KEY: &[u8] = b"modules";
 struct ModuleEntry {
     active_code_hash: Vec<u8>,
     pending: Option<ScheduledSwap>,
+    /// every activation in block order — appended by a register/seed and by
+    /// each `Advance` flip, never rewritten. 40 bytes per swap for the
+    /// module's whole life, each one a governance vote away; the qmdb record
+    /// decode cap is the ceiling, thousands of swaps out.
+    history: Vec<Activation>,
+}
+
+/// the activation `code_hash` makes for block `height`.
+fn activation(height: u64, code_hash: &[u8]) -> Activation {
+    Activation {
+        height,
+        code_hash: code_hash.to_vec(),
+    }
 }
 
 pub struct Lifecycle {
@@ -135,9 +151,11 @@ impl Lifecycle {
                 "module roster",
             )?;
         }
+        // genesis is block zero: the seed is the activation at 0.
         self.store(
             mod_key(&module_id),
             &ModuleEntry {
+                history: vec![activation(0, &code_hash)],
                 active_code_hash: code_hash,
                 pending: None,
             },
@@ -326,6 +344,7 @@ impl Lifecycle {
             roster,
             module_id,
             &ModuleEntry {
+                history: vec![activation(ctx.env().height, &code_hash)],
                 active_code_hash: code_hash,
                 pending: None,
             },
@@ -431,6 +450,7 @@ impl Lifecycle {
                     readiness: Vec::new(),
                     ready: false,
                 }),
+                history: Vec::new(),
             },
         )
     }
@@ -569,12 +589,15 @@ impl Lifecycle {
         }
 
         // flip every armed swap's active hash into the root, applied over the
-        // staged view like every other write.
+        // staged view like every other write. the flip IS the activation for
+        // this block: the history records it so a later replay of `height`
+        // finds this code, not whatever replaced it since.
         for id in armed_swaps {
             let mut entry = self.rostered_entry(&id).await?;
             let Some(swap) = entry.pending.take() else {
                 continue;
             };
+            entry.history.push(activation(height, &swap.code_hash));
             entry.active_code_hash = swap.code_hash;
             self.store(mod_key(&id), &entry);
         }
@@ -591,6 +614,7 @@ impl Lifecycle {
                 module_id: id,
                 active_code_hash: e.active_code_hash,
                 pending: e.pending,
+                history: e.history,
             });
         }
         Ok(LifecycleReply::ModuleStatus { modules })

@@ -735,6 +735,7 @@ mod tests {
             module_id: "hello".into(),
             active_code_hash: active.to_vec(),
             pending,
+            history: Vec::new(),
         };
         let precheck =
             |verb, modules: &[ModuleCode]| registry_precheck(verb, modules, "hello", &ours);
@@ -835,6 +836,7 @@ mod tests {
                 module_id: "acl".into(),
                 active_code_hash: active.clone(),
                 pending: None,
+                history: Vec::new(),
             },
             ModuleCode {
                 module_id: "hello".into(),
@@ -846,6 +848,7 @@ mod tests {
                     readiness: vec![vec![1], vec![2]],
                     ready: false,
                 }),
+                history: Vec::new(),
             },
             // `module register`: no active code at all until the swap lands.
             ModuleCode {
@@ -858,6 +861,7 @@ mod tests {
                     readiness: Vec::new(),
                     ready: false,
                 }),
+                history: Vec::new(),
             },
         ];
         let out = render_status(&modules);

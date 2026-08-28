@@ -126,6 +126,7 @@ mod tests {
                 readiness: signed.to_vec(),
                 ready,
             }),
+            history: Vec::new(),
         }
     }
 
@@ -169,6 +170,7 @@ mod tests {
             module_id: "c".into(),
             active_code_hash: vec![0; 32],
             pending: None,
+            history: Vec::new(),
         }];
         let acts = s.decide(&idle, |_| true);
         assert!(acts.signals.is_empty() && acts.fetches.is_empty());

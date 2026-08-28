@@ -704,20 +704,30 @@ impl Host {
     /// to `root()`, so a swap keeps the module's state and the root-hash is
     /// byte-continuous across it.
     ///
-    /// keyed PURELY on committed registry state + `height`, so it reconstructs
-    /// identically on every path that advances a node to a committed state — live
-    /// drain, recovery replay, state-sync catch-up — and is idempotent: it
-    /// compares [`Module::code_hash`] and re-instantiates a component only on an
-    /// actual change. run it BEFORE applying block `height`, so that block's
-    /// dispatches execute on the code the registry designates for `height`.
+    /// keyed PURELY on committed registry state + `height` — the code the
+    /// registry designates FOR `height` ([`lifecycle::code_at`]) — so it
+    /// reconstructs identically on every path that advances a node to a
+    /// committed state: live drain, recovery replay, state-sync catch-up. it
+    /// is idempotent: it compares [`Module::code_hash`] and re-instantiates a
+    /// component only on an actual change. run it BEFORE applying block
+    /// `height`, so that block's dispatches execute on the code the registry
+    /// designates for `height`.
     ///
-    /// the target hash for a module at `height` is a pending hash that has reached
-    /// activation (`activation_height <= height`), else its committed ACTIVE hash
-    /// — the SAME predicate lifecycle's `Advance` arm-check applies, so this
-    /// out-of-block realization and the in-block commit never disagree on the arm
-    /// set. reading ACTIVE (not only the armed pending) is what lets a state-sync
-    /// joiner — which installs post-activation state with no pending left to arm —
-    /// reconcile to the live code instead of forking on stale genesis code.
+    /// the target hash for a module at `height` is a pending hash that has
+    /// armed (`ready && activation_height <= height` — the SAME predicate
+    /// lifecycle's `Advance` applies, so this out-of-block realization and the
+    /// in-block flip never disagree on the arm set; on the live drain the
+    /// registry sits at `height - 1` and this is the read that precedes the
+    /// flip), else the latest ACTIVATION at or before `height`. the registry is
+    /// disk-durable and reopens AHEAD of a crash-restart replay — active =
+    /// whatever landed last, pending gone — so the tip cannot say which code
+    /// sealed a replayed block; the activation history can, and a replay that
+    /// spans a swap moves the module back to the pre-swap code and forward
+    /// again at the swap block. a state-sync joiner (post-activation state,
+    /// nothing pending) reads the same last activation and reconciles its
+    /// genesis code to the live one instead of forking. a module whose first
+    /// activation is past `height` seats its first code; one registered but
+    /// never activated is nothing to realize.
     ///
     /// FAIL-CLOSED: a designated hash whose bytes this node lacks, or bytes whose
     /// sha256 does not match the committed hash, is a hard error (the node cannot
@@ -732,48 +742,36 @@ impl Host {
             return Ok(());
         };
         for m in modules {
-            // the SAME arm predicate as lifecycle::handle_advance (height >=
-            // activation_height): pending-if-armed, else the committed active hash.
-            let target = match m.pending {
-                // the SAME arm predicate as lifecycle: ready (full byte receipt,
-                // latched in committed state) AND the height floor reached.
-                Some(p) if p.ready && height >= p.activation_height => p.code_hash,
-                _ => m.active_code_hash,
+            let Some(target) = lifecycle::code_at(&m, height) else {
+                continue; // registered, never activated — nothing to realize.
             };
             // only reconcile a module this node actually runs AS a hot-swappable
             // component: a native module (no `code_hash`) is nothing to realize —
             // its registry entry is a genesis concern. an id absent from the
-            // registry whose committed target is NON-empty is a post-genesis
-            // ADMISSION this boundary must realize by instantiating the module
-            // from its verified bytes; an empty target is an admission not yet
-            // armed.
+            // registry is a post-genesis ADMISSION this boundary must realize by
+            // instantiating the module from its verified bytes.
             let current = match self.registry.get(&m.module_id) {
                 Some(module) => match module.code_hash() {
                     Some(current) => Some(current),
                     None => continue, // native module — genesis concern.
                 },
-                None => {
-                    if target.is_empty() {
-                        continue;
-                    }
-                    None // admission to realize below.
-                }
+                None => None, // admission to realize below.
             };
-            if current.as_ref() == Some(&target) {
+            if current.as_deref() == Some(target) {
                 continue; // already on the designated code — idempotent no-op.
             }
-            let bytes = src.fetch(&target).await.ok_or_else(|| {
+            let bytes = src.fetch(target).await.ok_or_else(|| {
                 Error::Module(format!(
                     "code bytes absent for module {} (hash {}) — fail-closed",
                     m.module_id,
-                    hex32(&target),
+                    hex32(target),
                 ))
             })?;
             if sha256(&bytes) != target {
                 return Err(Error::Module(format!(
                     "code bytes for module {} do not match committed hash {} — fail-closed",
                     m.module_id,
-                    hex32(&target),
+                    hex32(target),
                 )));
             }
             match current {

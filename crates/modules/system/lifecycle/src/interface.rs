@@ -46,6 +46,20 @@ pub struct ScheduledSwap {
     pub ready: bool,
 }
 
+/// one activation: `code_hash` became the module's running code FOR block
+/// `height` — the block whose boundary `Advance` flipped it (a `RegisterModule`
+/// records its own block; a genesis seed records 0). appended, never
+/// rewritten: the registry is disk-durable and reopens AHEAD of a crash-restart
+/// replay, so only a history can answer "which code sealed block h" once the
+/// swap that replaced it has landed. committed state, in the root.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Activation {
+    pub height: u64,
+    /// the 32-byte sha256 of the component bytes.
+    pub code_hash: Vec<u8>,
+}
+
 /// the readable per-module projection.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -53,6 +67,30 @@ pub struct ModuleCode {
     pub module_id: String,
     pub active_code_hash: Vec<u8>,
     pub pending: Option<ScheduledSwap>,
+    /// every activation in block order; `active_code_hash` is its last entry
+    /// (empty only for an admission that has not reached its boundary).
+    pub history: Vec<Activation>,
+}
+
+/// the code designated for block `height` — what a node must RUN to apply it.
+/// a pending swap armed at `height` (ready, activation reached) wins: that is
+/// the live pre-flip read, the boundary of the very block that flips it, and
+/// the flip then records the same `(height, code_hash)`. otherwise the latest
+/// activation at or before `height` — the replay read against a registry that
+/// is already AHEAD. a module whose first activation is later than `height`
+/// seats its first code (it has no ops before it). `None` is a module
+/// registered but never activated.
+pub fn code_at(entry: &ModuleCode, height: u64) -> Option<&[u8]> {
+    let armed = entry
+        .pending
+        .as_ref()
+        .filter(|p| p.ready && height >= p.activation_height);
+    if let Some(p) = armed {
+        return Some(&p.code_hash);
+    }
+    let sealed_at_or_before = entry.history.iter().rev().find(|a| a.height <= height);
+    let seat = sealed_at_or_before.or_else(|| entry.history.first());
+    seat.map(|a| a.code_hash.as_slice())
 }
 
 /// one armed swap the host must realize: swap `module_id`'s registry code to
@@ -197,6 +235,10 @@ mod tests {
                 module_id: "hello".into(),
                 active_code_hash: vec![1u8; CODE_HASH_LEN],
                 pending: None,
+                history: vec![Activation {
+                    height: 0,
+                    code_hash: vec![1u8; CODE_HASH_LEN],
+                }],
             }],
         };
         assert_eq!(decode_reply(&encode_reply(&r)).unwrap(), r);

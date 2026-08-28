@@ -366,6 +366,34 @@ fn statesync_joiner_reconciles_to_committed_active_hash() {
     );
 }
 
+/// crash-restart replay: the registry is disk-durable and reopens AHEAD of the
+/// blocks being replayed (active = replacement, no pending left), so the
+/// tip's active hash says nothing about which code sealed a pre-swap block.
+/// realization keys on the activation HISTORY — a block below `H` re-executes
+/// on v1, one at/after `H` on the replacement — never on the tip.
+#[test]
+fn replay_behind_an_ahead_registry_realizes_the_code_that_sealed_each_block() {
+    let (mut host, _) = run_swap_scenario();
+    let src = MapSource::with(&[HELLO_V1, HELLO_REPLACEMENT]);
+    assert_eq!(
+        host.module_code_hash("hello"),
+        Some(sha(HELLO_REPLACEMENT)),
+        "the live node runs the replacement at the tip"
+    );
+
+    // a pre-swap block: back to v1, over the kept state (203 + 1).
+    realize(&mut host, H - 1, &src).expect("pre-swap block realizes v1");
+    assert_eq!(host.module_code_hash("hello"), Some(sha(HELLO_V1)));
+    submit(&mut host, H - 1, Origin::External(vec![7; 32]), inc_msg());
+    assert_eq!(count(&host), 204, "v1 steps by 1 on the replayed block");
+
+    // the swap block itself and everything after: the replacement.
+    realize(&mut host, H, &src).expect("the swap block realizes the replacement");
+    assert_eq!(host.module_code_hash("hello"), Some(sha(HELLO_REPLACEMENT)));
+    realize(&mut host, H + 5, &src).expect("post-swap is a no-op");
+    assert_eq!(host.module_code_hash("hello"), Some(sha(HELLO_REPLACEMENT)));
+}
+
 /// the receipt gate at the host seam: a scheduled swap whose readiness never
 /// covered the member set does NOT arm past its height — realization is a
 /// clean no-op (never a fail-closed error, never a swap) and the drain

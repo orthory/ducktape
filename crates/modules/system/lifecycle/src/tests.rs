@@ -439,6 +439,115 @@ fn cancelled_admission_removes_entry() {
     assert!(module_status(&lc).is_empty());
 }
 
+// ---- the activation history (code-at-height) --------------------------------
+
+fn activation(height: u64, code: u8) -> Activation {
+    Activation {
+        height,
+        code_hash: hash(code),
+    }
+}
+
+/// a hand-built entry over `history` (`(height, code)` pairs, ascending).
+fn entry(history: &[(u64, u8)], pending: Option<ScheduledSwap>) -> ModuleCode {
+    ModuleCode {
+        module_id: "hello".into(),
+        active_code_hash: history.last().map(|(_, c)| hash(*c)).unwrap_or_default(),
+        pending,
+        history: history.iter().map(|(h, c)| activation(*h, *c)).collect(),
+    }
+}
+
+#[test]
+fn code_at_reads_the_armed_pending_then_the_history() {
+    let e = entry(&[(10, 1), (50, 2)], None);
+    assert_eq!(code_at(&e, 20), Some(hash(1).as_slice()));
+    assert_eq!(code_at(&e, 50), Some(hash(2).as_slice()));
+    assert_eq!(code_at(&e, 70), Some(hash(2).as_slice()));
+    // before the first activation: the first code is the natural seat.
+    assert_eq!(code_at(&e, 5), Some(hash(1).as_slice()));
+
+    // a pending swap armed at `height` wins — the live pre-flip read.
+    let armed = ScheduledSwap {
+        name: "replacement".into(),
+        activation_height: 50,
+        code_hash: hash(2),
+        readiness: vec![member(1)],
+        ready: true,
+    };
+    let e = entry(&[(10, 1)], Some(armed.clone()));
+    assert_eq!(code_at(&e, 50), Some(hash(2).as_slice()));
+    assert_eq!(code_at(&e, 49), Some(hash(1).as_slice()));
+    // an unready pending never arms, however high the height.
+    let unready = ScheduledSwap {
+        ready: false,
+        ..armed
+    };
+    let e = entry(&[(10, 1)], Some(unready));
+    assert_eq!(code_at(&e, 99), Some(hash(1).as_slice()));
+
+    // registered, never activated: no code at all.
+    assert_eq!(code_at(&entry(&[], None), 99), None);
+}
+
+#[test]
+fn every_activation_is_appended_in_block_order() {
+    let mut lc = fresh();
+    let mut at7 = ctx(Origin::System, 7);
+    run(
+        &mut lc,
+        &mut at7,
+        &msg(LifecycleMsg::RegisterModule {
+            module_id: "hello".into(),
+            code_hash: hash(1),
+        }),
+    )
+    .unwrap();
+    commit(&mut lc);
+    assert_eq!(module_status(&lc)[0].history, [activation(7, 1)]);
+
+    run(
+        &mut lc,
+        &mut at7,
+        &schedule_swap("hello", "replacement", 30, 2),
+    )
+    .unwrap();
+    commit(&mut lc);
+    make_swap_ready(&mut lc, "hello", "replacement");
+    assert_eq!(
+        module_status(&lc)[0].history,
+        [activation(7, 1)],
+        "scheduling records nothing: only a flip is an activation"
+    );
+    let mut at30 = ctx(Origin::System, 30);
+    run(&mut lc, &mut at30, &advance()).unwrap();
+    commit(&mut lc);
+    assert_eq!(
+        module_status(&lc)[0].history,
+        [activation(7, 1), activation(30, 2)]
+    );
+
+    // an admission has no history until its boundary flips it.
+    let mut lc = fresh();
+    let mut sys = ctx(Origin::System, 0);
+    run(&mut lc, &mut sys, &schedule_register("kanban", "v1", 10, 5)).unwrap();
+    commit(&mut lc);
+    assert!(module_status(&lc)[0].history.is_empty());
+    make_swap_ready(&mut lc, "kanban", "v1");
+    let mut at10 = ctx(Origin::System, 10);
+    run(&mut lc, &mut at10, &advance()).unwrap();
+    commit(&mut lc);
+    assert_eq!(module_status(&lc)[0].history, [activation(10, 5)]);
+
+    // a genesis seed is the activation at block zero.
+    let mut lc = fresh();
+    futures::executor::block_on(async {
+        lc.seed("hello", hash(1)).await.unwrap();
+        lc.finish_seed().await.unwrap();
+    });
+    assert_eq!(module_status(&lc)[0].history, [activation(0, 1)]);
+}
+
 // ============================================================================
 // root + snapshot
 // ============================================================================
