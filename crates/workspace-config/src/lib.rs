@@ -487,7 +487,7 @@ pub enum Coordination {
 
 /// Shared public rendezvous coordinator used when a network is created without
 /// an explicit direct-only override.
-pub const DEFAULT_PRIMARY_COORDINATOR: &str = "p2p.ducktape.byeongsu.dev:3478";
+pub const DEFAULT_PRIMARY_COORDINATOR: &str = "relay.ducktape.industries:3478";
 
 /// The typed invite format still carries a coordinator key, but the deployed
 /// coordinator is intentionally keyless. Keep one stable valid key in the
@@ -1081,7 +1081,7 @@ mod tests {
     #[test]
     fn primary_coordinator_defaults_to_deployed_public_rendezvous() {
         let coord = primary_coordinator_or_default(None).expect("default coordinator");
-        assert_eq!(coord.as_deref(), Some("p2p.ducktape.byeongsu.dev:3478"));
+        assert_eq!(coord.as_deref(), Some("relay.ducktape.industries:3478"));
 
         let disabled = primary_coordinator_or_default(Some("none")).expect("disabled");
         assert_eq!(disabled, None);
@@ -1121,7 +1121,7 @@ mod tests {
             modules: Vec::new(),
         };
 
-        d.apply_primary_coordinator(&me, "p2p.ducktape.byeongsu.dev:3478")
+        d.apply_primary_coordinator(&me, "relay.ducktape.industries:3478")
             .expect("coordinator hint");
 
         assert_eq!(d.coordination(), Coordination::Public);
@@ -1130,7 +1130,7 @@ mod tests {
         assert_eq!(hints[0].expected_key, me);
         match &hints[0].reach {
             Reach::Coordinated(coord) => {
-                assert_eq!(coord.coord_addr, "p2p.ducktape.byeongsu.dev:3478");
+                assert_eq!(coord.coord_addr, "relay.ducktape.industries:3478");
                 assert_eq!(coord.coord_key, keyless_coordinator_placeholder_key());
             }
             other => panic!("expected coordinated reach hint, got {other:?}"),

@@ -151,7 +151,7 @@ mod tests {
         let sk = passkey(0x21);
         let pk = passkey_pubkey(&sk);
         let preimage = b"chain|scheme|newkey|gen-0";
-        let proof = passkey_proof(&sk, "auth.ducktape.byeongsu.dev", NS, preimage, true);
+        let proof = passkey_proof(&sk, "auth.ducktape.industries", NS, preimage, true);
         assert!(KeyScheme::Secp256r1.verify(&pk, NS, preimage, &proof));
         assert!(!KeyScheme::Secp256r1.verify(&pk, OTHER_NS, preimage, &proof));
         assert!(!KeyScheme::Secp256r1.verify(&pk, NS, b"chain|scheme|newkey|gen-1", &proof));

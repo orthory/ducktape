@@ -52,7 +52,7 @@ fn a_passkey_signed_frame_decodes_to_the_passkey() {
     let mut frame = node::frame_preimage(KeyScheme::Secp256r1, &pk, 1, &msg());
     let proof = passkey_proof(
         &sk,
-        "auth.ducktape.byeongsu.dev",
+        "auth.ducktape.industries",
         node::FRAME_NS,
         &frame,
         true,

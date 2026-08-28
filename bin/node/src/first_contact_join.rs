@@ -1052,7 +1052,7 @@ mod tests {
             "93.184.216.34:51820",
             "[2606:2800:220:1:248:1893:25c8:1946]:51820",
             // a name resolves per-attempt; the joiner cannot judge it here.
-            "p2p.ducktape.byeongsu.dev:51820",
+            "relay.ducktape.industries:51820",
         ] {
             assert!(
                 !endpoint_is_unroutable_offnet(endpoint),

@@ -26,7 +26,7 @@ direct endpoint transparently falls through to the coordinated path/fronts.
 Coordinator info does **not** belong in the invitation. The coordinator is network
 rendezvous infrastructure — the invite carries *who* to reach (keys), and the joiner
 uses **its own configured coordinator** (`config::primary_coordinator_or_default`,
-defaulting to the deployed public `p2p.ducktape.byeongsu.dev:3478`) to look any key up.
+defaulting to the deployed public `relay.ducktape.industries:3478`) to look any key up.
 
 - The invite carries **no** `coord_addr`/`coord_key`. A candidate is "coordinated" iff it
   has no direct endpoint → the joiner rendezvous-looks-it-up by key.

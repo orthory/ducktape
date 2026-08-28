@@ -309,8 +309,8 @@ and the browser hands the assertion back. That works only from a real
 browser page at a stable origin, because a passkey is scoped to its RP ID
 and every device must use the same one.
 
-So: one static page at **`https://auth.ducktape.byeongsu.dev/`** (RP ID
-`auth.ducktape.byeongsu.dev`), no backend. The app/CLI opens the system
+So: one static page at **`https://auth.ducktape.industries/`** (RP ID
+`auth.ducktape.industries`), no backend. The app/CLI opens the system
 browser to it with the request in the URL fragment
 (`#op=create|get|eth&challenge=…&user=…&cb=http://127.0.0.1:<port>/`), the
 page runs the ceremony, and POSTs the result to the loopback callback (the
@@ -408,7 +408,7 @@ git config push.gpgSign true                            # every push carries a p
 2. Account creation is open; `MAX_ACCOUNTS` raised to 65 536.
 3. Key storage unchanged: one device key shared by app and CLI, the
    2026-08-26 keystore as is.
-4. RP ID / auth page: `auth.ducktape.byeongsu.dev`.
+4. RP ID / auth page: `auth.ducktape.industries`.
 5. Peer attribution: the app's request proof-of-possession, in phase 3
    (with phase 4's stamping); airlock lanes re-keyed on the node key and
    the saga origin; `WorkAdmission::Owner` deleted.

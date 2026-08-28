@@ -1056,7 +1056,7 @@ mod tests {
         let preimage = identity::add_key_preimage("chain-a", KeyScheme::Ed25519, &device_key, 4);
         let (authenticator_data, client_data_json, signature) = passkey_assertion_parts(
             &mine,
-            "auth.ducktape.byeongsu.dev",
+            "auth.ducktape.industries",
             identity::IDENTITY_ADD_KEY_NS,
             &preimage,
         );

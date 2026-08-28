@@ -632,7 +632,7 @@ preset ui_welcome_qr
     onboarding_error = ""
     hub_step = HubStep.account
     ceremony_phase = "show_qr"
-    ceremony_qr = "https://auth.ducktape.byeongsu.dev/#op=get&challenge=AQID"
+    ceremony_qr = "https://auth.ducktape.industries/#op=get&challenge=AQID"
     ceremony_detail = "Your phone will confirm with the passkey."
     ceremony_left = "4:58"
 
@@ -666,7 +666,7 @@ preset ui_settings_qr
     account_exists = true
     account_busy = true
     account_ceremony_phase = "show_qr"
-    account_ceremony_qr = "https://auth.ducktape.byeongsu.dev/#op=create&challenge=AQID"
+    account_ceremony_qr = "https://auth.ducktape.industries/#op=create&challenge=AQID"
     account_ceremony_detail = "Your phone will create the passkey."
     account_ceremony_left = "4:58"
     shell_tab = ShellTab.settings

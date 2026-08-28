@@ -36,7 +36,7 @@ use keyscheme::KeyScheme;
 
 /// the live page. Its host IS the RP ID every passkey is scoped to — changing
 /// it invalidates every registered passkey (acceptable at zero live networks).
-pub const AUTH_PAGE: &str = "https://auth.ducktape.byeongsu.dev/";
+pub const AUTH_PAGE: &str = "https://auth.ducktape.industries/";
 
 /// the domain tag of a wallet's key-reveal touch: the wallet signs this ‖ 16
 /// random bytes, and the client recovers its public key from the signature.
@@ -738,7 +738,7 @@ mod tests {
         passkey_pubkey,
     };
 
-    const RP: &str = "auth.ducktape.byeongsu.dev";
+    const RP: &str = "auth.ducktape.industries";
 
     fn msg() -> sdk::Msg {
         sdk::Msg {

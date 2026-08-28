@@ -1,4 +1,4 @@
-# `auth.ducktape.byeongsu.dev` — the WebAuthn relying-party page
+# `auth.ducktape.industries` — the WebAuthn relying-party page
 
 One static file (`index.html`) plus one Worker route (`worker.js`, the
 result relay — §Relay). Gate: `node ops/auth-page/test.mjs` — plain `node`,
