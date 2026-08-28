@@ -2213,7 +2213,7 @@ mod qr_ceremony_tests {
         assert!(
             shown
                 .qr
-                .starts_with("https://auth.ducktape.byeongsu.dev/#op=get&challenge="),
+                .starts_with("https://auth.ducktape.industries/#op=get&challenge="),
             "{}",
             shown.qr
         );

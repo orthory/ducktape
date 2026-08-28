@@ -1,6 +1,6 @@
-# Coordinator Deployment Recipe (`p2p.ducktape.byeongsu.dev`)
+# Coordinator Deployment Recipe (`relay.ducktape.industries`)
 
-How to run `bin/coordinator` as `p2p.ducktape.byeongsu.dev`: an **untrusted,
+How to run `bin/coordinator` as `relay.ducktape.industries`: an **untrusted,
 non-validator reachability helper** that lets two NAT'd validators find each
 other and hole-punch a direct path. Its optional TCP lane carries only sealed
 first-contact admission datagrams when UDP setup is exhausted; it never carries
@@ -291,7 +291,7 @@ the standard port without granting the container a privileged bind.
 
 ## DNS + firewall
 
-- Point an `A` record `p2p.ducktape.byeongsu.dev` → the VPS IP.
+- Point an `A` record `relay.ducktape.industries` → the VPS IP.
 - Open **inbound UDP 3478**. When the sealed-intro fallback is enabled, also
   open its externally mapped TCP port (normally 443).
 

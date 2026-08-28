@@ -6,8 +6,9 @@
 # certificate for the hostname in the same account's zone.
 name = "ducktape-auth"
 main = "worker.js"
+account_id = "21eabf11ff9bd15da76d1c9fa9fc3cc4"   # ops@ducktape.industries — owns the ducktape.industries zone
 compatibility_date = "2026-08-01"
-routes = [{ pattern = "auth.ducktape.byeongsu.dev", custom_domain = true }]
+routes = [{ pattern = "auth.ducktape.industries", custom_domain = true }]
 
 [assets]
 directory = "."               # index.html only; .assetsignore drops the rest

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** A passkey or an Ethereum wallet becomes a member key of an account from the CLI and the app, and a new device joins an account by scanning a QR — all through the live RP page `https://auth.ducktape.byeongsu.dev/` (contract: `ops/auth-page/README.md`).
+**Goal:** A passkey or an Ethereum wallet becomes a member key of an account from the CLI and the app, and a new device joins an account by scanning a QR — all through the live RP page `https://auth.ducktape.industries/` (contract: `ops/auth-page/README.md`).
 
 **Architecture:** One new pure library, `crates/authpage`, owns the page contract from the client side: the fragment URL, the one-shot loopback listener that receives the page's form POST, the result JSON, and the three ceremony builders (passkey-origin frame, wallet-origin frame, QR-login `AddKey`). It does no node I/O — `node` queries (`KeyGen`, `Get`) stay in the CLI/app, which sequence the ceremonies. `keyscheme` gains the one primitive the wallet flow needs (`recover_personal_sign`, the eth two-touch's first touch) and a testkit helper that yields an assertion's three parts.
 
@@ -33,7 +33,7 @@
 **Files:** Create `crates/authpage/Cargo.toml`, `crates/authpage/src/lib.rs`; modify workspace `Cargo.toml` (member + dependency).
 
 **Interfaces (produces):**
-- `pub const AUTH_PAGE: &str = "https://auth.ducktape.byeongsu.dev/"`.
+- `pub const AUTH_PAGE: &str = "https://auth.ducktape.industries/"`.
 - `pub enum Request { Create { challenge: [u8; 32], user: u64, name: String }, Get { challenge: [u8; 32] }, Eth { message: Vec<u8> } }`; `pub fn request_url(page: &str, request: &Request, callback: &str) -> String`.
 - `pub enum Outcome { Create { credential_id: Vec<u8>, public_key: Vec<u8> }, Get { authenticator_data: Vec<u8>, client_data_json: Vec<u8>, signature: Vec<u8>, user_handle: Option<u64> }, Eth { address: String, signature: Vec<u8>, message: Vec<u8> } }`; `pub fn parse_result(json: &str) -> Result<Outcome, String>` (an `error` result is `Err("<name>: <message>")`).
 - `pub struct Listener` — `Listener::bind() -> io::Result<Listener>`, `callback_url(&self) -> String` (`http://127.0.0.1:<port>/`), `wait(self) -> Result<Outcome, String>` (accept ONE connection, read the request, take `result=` out of the form body, answer `200 text/html`, return); `pub fn open_browser(url: &str) -> bool` (xdg-open / open / cmd start; false = print the URL instead).

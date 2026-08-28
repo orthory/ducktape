@@ -53,18 +53,18 @@
 - Test: `ops/auth-page/test.mjs`
 
 **Interfaces:**
-- Produces: `POST https://auth.ducktape.byeongsu.dev/r/<id>` (form field `result`) → 200 html; `GET /r/<id>` → 200 `application/json` once, 204 while absent, 404 for a malformed id. `worker.js` exports `default { fetch }` and a named `handle(request, env)` for tests.
+- Produces: `POST https://auth.ducktape.industries/r/<id>` (form field `result`) → 200 html; `GET /r/<id>` → 200 `application/json` once, 204 while absent, 404 for a malformed id. `worker.js` exports `default { fetch }` and a named `handle(request, env)` for tests.
 
 - [x] **Step 1: Write the failing page test** — append to `ops/auth-page/test.mjs` before `console.log("auth-page: ok")`:
 
 ```js
 // the callback is loopback OR this origin's relay path — a crafted link still cannot relay elsewhere
 assert.equal(
-  parseRequest("#op=get&challenge=AQID&cb=https://auth.ducktape.byeongsu.dev/r/abc", "https://auth.ducktape.byeongsu.dev").cb,
-  "https://auth.ducktape.byeongsu.dev/r/abc",
+  parseRequest("#op=get&challenge=AQID&cb=https://auth.ducktape.industries/r/abc", "https://auth.ducktape.industries").cb,
+  "https://auth.ducktape.industries/r/abc",
 );
-assert.throws(() => parseRequest("#op=get&challenge=AQID&cb=https://auth.ducktape.byeongsu.dev/x", "https://auth.ducktape.byeongsu.dev"), /cb must be/);
-assert.throws(() => parseRequest("#op=get&challenge=AQID&cb=https://evil.example/r/abc", "https://auth.ducktape.byeongsu.dev"), /cb must be/);
+assert.throws(() => parseRequest("#op=get&challenge=AQID&cb=https://auth.ducktape.industries/x", "https://auth.ducktape.industries"), /cb must be/);
+assert.throws(() => parseRequest("#op=get&challenge=AQID&cb=https://evil.example/r/abc", "https://auth.ducktape.industries"), /cb must be/);
 
 // the relay worker, with a Map standing in for KV
 const workerSrc = readFileSync(new URL("./worker.js", import.meta.url), "utf8");
@@ -177,7 +177,7 @@ export default { fetch: handle };
 name = "ducktape-auth"
 main = "worker.js"
 compatibility_date = "2026-08-01"
-routes = [{ pattern = "auth.ducktape.byeongsu.dev", custom_domain = true }]
+routes = [{ pattern = "auth.ducktape.industries", custom_domain = true }]
 
 [assets]
 directory = "."             # index.html only; .assetsignore drops the rest
@@ -653,7 +653,7 @@ test welcome_screen_contract
   state
     hub_step = HubStep.account
     ceremony_phase = "show_qr"
-    ceremony_qr = "https://auth.ducktape.byeongsu.dev/#op=get&challenge=AQID"
+    ceremony_qr = "https://auth.ducktape.industries/#op=get&challenge=AQID"
   mount
     WelcomeScreen name_draft<->welcome_name_draft #welcome
       with
@@ -989,7 +989,7 @@ git commit -m "feat(app): a network pick probes the account; no account lands on
         assert!(matches!(outcome, authpage::Outcome::Get { user_handle: Some(42), .. }));
         let shown = rx.next().await.unwrap();
         assert_eq!(shown.phase, "show_qr");
-        assert!(shown.qr.starts_with("https://auth.ducktape.byeongsu.dev/#op=get&challenge="), "{}", shown.qr);
+        assert!(shown.qr.starts_with("https://auth.ducktape.industries/#op=get&challenge="), "{}", shown.qr);
         assert!(shown.qr.contains(&format!("cb={}", urlencoding_free_check(&base))), "{}", shown.qr);
     }
 ```
@@ -1257,9 +1257,9 @@ test ceremony_steps_drive_the_welcome
   state
     hub_step = HubStep.account
     mutation_phase = MutationPhase.onboarding
-  dispatch ceremony_stepped(ceremony_step("show_qr", "https://auth.ducktape.byeongsu.dev/#op=get", "Your phone will confirm."))
+  dispatch ceremony_stepped(ceremony_step("show_qr", "https://auth.ducktape.industries/#op=get", "Your phone will confirm."))
   expect ceremony_phase == "show_qr"
-  expect ceremony_qr == "https://auth.ducktape.byeongsu.dev/#op=get"
+  expect ceremony_qr == "https://auth.ducktape.industries/#op=get"
   dispatch ceremony_stepped(ceremony_step("failed", "", "the phone did not answer in time"))
   expect ceremony_qr == ""
   expect onboarding_error == "the phone did not answer in time"
@@ -1313,7 +1313,7 @@ test settings_card_shows_the_passkey_qr
     connected = true
     account_exists = true
     account_ceremony_phase = "show_qr"
-    account_ceremony_qr = "https://auth.ducktape.byeongsu.dev/#op=create"
+    account_ceremony_qr = "https://auth.ducktape.industries/#op=create"
   target qr = #settings/settings-body/account-ceremony-qr
   expect exists qr
   dispatch account_ceremony_cancel
@@ -1500,10 +1500,10 @@ npx wrangler@4 deploy --config ops/auth-page/wrangler.toml
 
 ```bash
 ID=$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n')
-curl -s -o /dev/null -w '%{http_code}\n' https://auth.ducktape.byeongsu.dev/r/$ID           # 204
-curl -s -o /dev/null -w '%{http_code}\n' -d 'result={"op":"get"}' https://auth.ducktape.byeongsu.dev/r/$ID   # 200
-curl -s https://auth.ducktape.byeongsu.dev/r/$ID; echo                                     # {"op":"get"}
-curl -s -o /dev/null -w '%{http_code}\n' https://auth.ducktape.byeongsu.dev/r/$ID           # 204
+curl -s -o /dev/null -w '%{http_code}\n' https://auth.ducktape.industries/r/$ID           # 204
+curl -s -o /dev/null -w '%{http_code}\n' -d 'result={"op":"get"}' https://auth.ducktape.industries/r/$ID   # 200
+curl -s https://auth.ducktape.industries/r/$ID; echo                                     # {"op":"get"}
+curl -s -o /dev/null -w '%{http_code}\n' https://auth.ducktape.industries/r/$ID           # 204
 ```
 
 - [x] **Step 3: Gates**

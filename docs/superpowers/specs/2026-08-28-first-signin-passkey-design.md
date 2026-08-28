@@ -23,7 +23,7 @@ app shows.
 1. **Placement: a launch-window step after the network pick, plus a console
    banner.** `HubStep.account` gates the console; the banner is the way back
    for a session that continued without an account.
-2. **QR callback: a relay on the auth host.** `auth.ducktape.byeongsu.dev`
+2. **QR callback: a relay on the auth host.** `auth.ducktape.industries`
    gains a Worker route `/r/<id>` that holds the ceremony result until the
    app polls it. The node is never involved (a dev node listens on loopback;
    a private node is unreachable from a phone).
