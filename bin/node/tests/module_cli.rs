@@ -154,8 +154,11 @@ fn outputs(runs: &[(bool, String)]) -> String {
 /// blocks a ceremony's activation is placed out: three sequential runs plus
 /// the readiness signals must all land under the lifecycle floor
 /// (`height + MIN_SWAP_LEAD`) at execute time, and the chain ticks one block
-/// per second while idle.
-const AFTER: &str = "30";
+/// per second while idle. it also bounds the MATCHER: run 1 joins run 0's
+/// proposal only while that activation still clears run 1's own floor, so a
+/// lead this far above the runs' wall-clock spacing is what keeps
+/// `deciding == 1` exact on a loaded box.
+const AFTER: &str = "60";
 
 #[test]
 fn register_then_update_activate_across_three_validators() {
@@ -179,7 +182,7 @@ fn register_then_update_activate_across_three_validators() {
     let seen = cluster.await_committed(
         0,
         "hello registered and active",
-        Duration::from_secs(120),
+        Duration::from_secs(180),
         || active_hash(&cluster, 0, "hello").filter(|h| *h == first),
     );
     assert_eq!(seen, first);
@@ -198,7 +201,7 @@ fn register_then_update_activate_across_three_validators() {
     );
     assert_ceremony_scheduled(&runs, "hello");
     let second = sha256_hex(&fixture("hello-replacement"));
-    let seen = cluster.await_committed(0, "hello swapped", Duration::from_secs(120), || {
+    let seen = cluster.await_committed(0, "hello swapped", Duration::from_secs(180), || {
         active_hash(&cluster, 0, "hello").filter(|h| *h == second)
     });
     assert_eq!(seen, second);

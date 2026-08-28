@@ -1216,9 +1216,11 @@ fn cast_yes_once(
     Ok(proposal)
 }
 
-/// how a driven membership ceremony left the proposal.
+/// how a driven ceremony left the proposal.
 pub(super) enum CeremonyOutcome {
-    /// passed and executed — the set changes at the next epoch cutover.
+    /// passed and executed. what that execution CHANGED is the caller's to
+    /// confirm: a membership set turns over at the next epoch cutover, a
+    /// module swap lands in the lifecycle registry.
     Passed,
     /// this ballot landed but the proposal's frozen threshold is outstanding.
     AwaitingBallots,
@@ -1242,8 +1244,10 @@ pub(super) fn open_proposal_matching<'a>(
 /// (else mint an unused `<id_prefix><key>:<n>` id and propose), cast a yes
 /// ballot, and execute once decidable. idempotent across
 /// members — each runs the same verb; the run landing the deciding ballot
-/// executes. shared by `resident accept` (AddResident), `member promote`
-/// (AddValidator), and `resident remove` (RemoveResident).
+/// executes. shared by the membership verbs — `resident accept`
+/// (AddResident), `member promote` (AddValidator), `resident remove`
+/// (RemoveResident) — and the module verbs `module update`/`module register`
+/// (UpdateModule/RegisterModule).
 pub(super) fn drive_proposal_ceremony(
     rpc_addr: &str,
     signer: &GovSigner,

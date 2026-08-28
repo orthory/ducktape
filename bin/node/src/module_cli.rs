@@ -191,13 +191,15 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
     let precheck = registry_precheck(verb, &read_module_status(&rpc_addr)?, &args.id, &code_hash)?;
     match precheck {
         Precheck::Proceed => {}
-        // a member running the verb after the deciding ballot: the registry
-        // already holds the swap, so there is no proposal to join or mint.
-        Precheck::AlreadyScheduled => {
+        // a member running the verb after the deciding ballot (or after the
+        // activation): the registry already holds these bytes, so there is no
+        // proposal to join or mint.
+        Precheck::AlreadyHeld(held) => {
             eprintln!(
-                "{} → {} is already scheduled — nothing to do; track with: ducktape module status",
+                "{} → {} is already {} — nothing to do; track with: ducktape module status",
                 args.id,
-                hex_bytes(&code_hash)
+                hex_bytes(&code_hash),
+                held.word()
             );
             return Ok(());
         }
@@ -224,9 +226,14 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
     let signer = crate::cli::gov_signer(&rpc_addr, &cfg_path, &resolved)?;
     let pubkey_hex = signer_pubkey_hex(&signer);
 
-    // 4. activation = this node's height + N (each member computes its own)
+    // 4. activation = this node's height + N (each member computes its own).
+    //    an `--after` that wraps would land UNDER the floor in release, where
+    //    the matcher's debug assert is compiled out: the verb would mint a
+    //    proposal the registry refuses at execute.
     let height = current_height(&rpc_addr)?;
-    let activation_height = height + args.after;
+    let activation_height = height
+        .checked_add(args.after)
+        .ok_or("--after overflows the chain height")?;
     let floor = height + lifecycle::MIN_SWAP_LEAD;
 
     // 5. the ceremony: join an open proposal for the same (verb, id, hash)
@@ -262,7 +269,7 @@ fn confirm_scheduled(
     code_hash: &[u8; 32],
     activation_height: u64,
 ) -> CommandResult {
-    let scheduled = registry_holds(&read_module_status(rpc_addr)?, id, code_hash);
+    let scheduled = registry_holds(&read_module_status(rpc_addr)?, id, code_hash).is_some();
     if !scheduled {
         return Err(format!(
             "proposal passed but the lifecycle registry holds no swap for {id} → {}. {}",
@@ -297,7 +304,7 @@ fn ceremony_failed(
     let Ok(modules) = read_module_status(rpc_addr) else {
         return error;
     };
-    let scheduled = registry_holds(&modules, id, code_hash);
+    let scheduled = registry_holds(&modules, id, code_hash).is_some();
     if scheduled {
         return error;
     }
@@ -315,9 +322,29 @@ fn ceremony_failed(
 enum Precheck {
     /// nothing in the registry stands in the way — stage and propose.
     Proceed,
-    /// the registry already carries these bytes for the module (pending or
-    /// active): a member running after the deciding ballot. nothing to do.
-    AlreadyScheduled,
+    /// the registry already carries these bytes for the module: a member
+    /// running after the deciding ballot, or after the activation. nothing to
+    /// do — and the two are different facts, so the line names which.
+    AlreadyHeld(Held),
+}
+
+/// how the registry carries a code hash for a module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    /// the module is RUNNING this code.
+    Active,
+    /// a scheduled swap will activate this code at its height.
+    Pending,
+}
+
+impl Held {
+    /// the word the operator's "nothing to do" line uses.
+    fn word(self) -> &'static str {
+        match self {
+            Held::Active => "active",
+            Held::Pending => "scheduled",
+        }
+    }
 }
 
 /// the registry's STATIC rules (`lifecycle` `handle_schedule_swap` /
@@ -342,9 +369,8 @@ fn registry_precheck(
             "{id} is a genesis module — its code changes with `module update`, not `register`"
         ));
     }
-    let holds_ours = registry_holds(modules, id, code_hash);
-    if holds_ours {
-        return Ok(Precheck::AlreadyScheduled);
+    if let Some(held) = registry_holds(modules, id, code_hash) {
+        return Ok(Precheck::AlreadyHeld(held));
     }
     let entry = modules.iter().find(|m| m.module_id == id);
     let other_swap_pending = entry.map(|m| m.pending.is_some());
@@ -373,16 +399,24 @@ fn registry_rules() -> String {
     )
 }
 
-/// whether the registry carries `code_hash` for `id` — pending or already
-/// active. pure: the one predicate behind both "nothing to do" and the
-/// post-`Passed` confirmation.
-fn registry_holds(modules: &[lifecycle::ModuleCode], id: &str, code_hash: &[u8; 32]) -> bool {
-    modules.iter().any(|m| {
-        let same_id = m.module_id == id;
-        let pending_is_ours = m.pending.as_ref().is_some_and(|p| p.code_hash == code_hash);
-        let already_active = m.active_code_hash == code_hash;
-        same_id && (pending_is_ours || already_active)
-    })
+/// how the registry carries `code_hash` for `id`, if it carries it at all.
+/// pure: the one read behind both "nothing to do" and the post-`Passed`
+/// confirmation.
+fn registry_holds(
+    modules: &[lifecycle::ModuleCode],
+    id: &str,
+    code_hash: &[u8; 32],
+) -> Option<Held> {
+    let entry = modules.iter().find(|m| m.module_id == id)?;
+    let pending_is_ours = entry
+        .pending
+        .as_ref()
+        .is_some_and(|p| p.code_hash == code_hash);
+    if pending_is_ours {
+        return Some(Held::Pending);
+    }
+    let already_active = entry.active_code_hash == code_hash;
+    already_active.then_some(Held::Active)
 }
 
 /// this node's committed height, from the rpc status snapshot.
@@ -424,7 +458,7 @@ fn cmd_status(args: StatusArgs) -> CommandResult {
 
 /// the lifecycle registry over the generic query lane — the same shape
 /// `read_members` uses for governance.
-pub(super) fn read_module_status(rpc_addr: &str) -> Result<Vec<lifecycle::ModuleCode>, String> {
+fn read_module_status(rpc_addr: &str) -> Result<Vec<lifecycle::ModuleCode>, String> {
     use lifecycle::{LifecycleQuery, LifecycleReply, decode_reply, encode_query};
     let raw = rpc_query(
         rpc_addr,
@@ -440,7 +474,7 @@ pub(super) fn read_module_status(rpc_addr: &str) -> Result<Vec<lifecycle::Module
 /// what the node's stage route answers with: the digest it ingested, its
 /// length, and one receipt per peer the code plane fanned the bytes out to.
 #[derive(Debug, Clone, serde::Deserialize)]
-pub(super) struct StageReply {
+struct StageReply {
     /// hex sha256 of the artifact as the node stored it.
     pub digest: String,
     /// the artifact's length in bytes, as the node counted it.
@@ -451,7 +485,7 @@ pub(super) struct StageReply {
 
 /// one peer's answer to the fan-out (`noded::module_code::CodePeerReceipt`).
 #[derive(Debug, Clone, serde::Deserialize)]
-pub(super) struct PeerReceipt {
+struct PeerReceipt {
     /// hex of the peer's public key.
     pub peer: String,
     /// "stored" | "already-have" | the peer's refusal reason.
@@ -464,7 +498,7 @@ pub(super) struct PeerReceipt {
 /// node stores them, pushes them to every validator, and answers with the
 /// digest and one receipt per peer. Loopback exposure wants the operator token
 /// minted beside `node.toml` at boot.
-pub(super) fn stage_component(
+fn stage_component(
     http_base: &str,
     workspace: &std::path::Path,
     bytes: &[u8],
@@ -495,7 +529,7 @@ pub(super) fn stage_component(
 /// One non-ok receipt and nothing is proposed: the swap only makes sense once
 /// every validator can run the code. The refusal names each holdout peer with
 /// the status token its node reported.
-pub(super) fn refuse_on_bad_receipts(reply: &StageReply) -> Result<(), String> {
+fn refuse_on_bad_receipts(reply: &StageReply) -> Result<(), String> {
     let failing: Vec<&PeerReceipt> = reply.receipts.iter().filter(|r| !r.ok).collect();
     let every_peer_holds_it = failing.is_empty();
     if every_peer_holds_it {
@@ -518,7 +552,7 @@ const NOT_PROPOSED: &str = "not proposed: every validator must hold the bytes be
 /// has no row at all and `refuse_on_bad_receipts` cannot see it. Every member
 /// of the valset must be `me_hex` (the staging node holds the bytes itself) or
 /// a receipt peer; a member with neither is listed as unreachable and refuses.
-pub(super) fn refuse_on_missing_receipts(
+fn refuse_on_missing_receipts(
     reply: &StageReply,
     members: &[Vec<u8>],
     me_hex: &str,
@@ -546,7 +580,7 @@ pub(super) fn refuse_on_missing_receipts(
 
 /// The digest the proposal will carry is the sha256 of the bytes WE read; the
 /// node's answer must agree or something between us rewrote the file.
-pub(super) fn digest_matches(reply: &StageReply, bytes: &[u8]) -> Result<[u8; 32], String> {
+fn digest_matches(reply: &StageReply, bytes: &[u8]) -> Result<[u8; 32], String> {
     use sha2::Digest as _;
     let ours: [u8; 32] = sha2::Sha256::digest(bytes).into();
     let theirs = config::unhex(&reply.digest).map_err(|e| format!("stage digest: {e}"))?;
@@ -567,7 +601,7 @@ const SHORT_HASH: usize = 12;
 
 /// one row per module: `id  active  pending`. Either column is `—` when there
 /// is nothing to show; pending is otherwise `<hash> ready <k|✓> activation <h>`.
-pub(super) fn render_status(modules: &[lifecycle::ModuleCode]) -> String {
+fn render_status(modules: &[lifecycle::ModuleCode]) -> String {
     let id_width = modules
         .iter()
         .map(|m| m.module_id.len())
@@ -724,16 +758,20 @@ mod tests {
         let err = precheck(Verb::Update, &busy).unwrap_err();
         assert!(err.contains("already has a pending swap"), "{err}");
         assert!(precheck(Verb::Register, &busy).is_err());
-        // our own bytes, pending or active: nothing to do, whichever verb
+        // our own bytes: nothing to do, whichever verb — but a swap that has
+        // not activated is "scheduled" and code the module already RUNS is
+        // "active", and the operator's line says which.
         let pending_ours = [entry(&[], Some(swap(ours)))];
         assert!(matches!(
             precheck(Verb::Register, &pending_ours),
-            Ok(Precheck::AlreadyScheduled)
+            Ok(Precheck::AlreadyHeld(Held::Pending))
         ));
         assert!(matches!(
             precheck(Verb::Update, &[entry(&ours, None)]),
-            Ok(Precheck::AlreadyScheduled)
+            Ok(Precheck::AlreadyHeld(Held::Active))
         ));
+        assert_eq!(Held::Pending.word(), "scheduled");
+        assert_eq!(Held::Active.word(), "active");
         // a genesis id carries no registry entry when it is native, so only the
         // topology set catches it — lifecycle would refuse it in-kernel
         let err = registry_precheck(Verb::Register, &[], "identity", &ours).unwrap_err();
