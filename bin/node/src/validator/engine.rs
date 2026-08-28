@@ -259,12 +259,14 @@ pub(super) async fn resume(
     // and this process's store-only drain cached them. the seed stays order-
     // INDEPENDENT: each create writes its OWN `t/{id}` record plus one entry in
     // the `t#` index, a `BTreeSet` that serializes ascending — so both nodes
-    // commit the same records under any interleaving, and `created_at` /
-    // `updated_at` are the block's `consensus_time`, the same number on every
-    // validator applying it. that isolates the property under test (did the
-    // peer's payload cross the wire?) from op ordering. ONE submit — the
-    // automaton PEEKS (never pops), so the digest rides out every nullified
-    // early view until the mesh forms and this node leads and proposes it.
+    // commit the same records under any ordering WITHIN a block, and
+    // `created_at` / `updated_at` are that block's `consensus_time`, the same
+    // number on every validator applying it. (across blocks the timestamps
+    // differ, so this is not a cross-run hash pin — nothing asks it to be.)
+    // that isolates the property under test (did the peer's payload cross the
+    // wire?) from op ordering. ONE submit — the automaton PEEKS (never pops),
+    // so the digest rides out every nullified early view until the mesh forms
+    // and this node leads and proposes it.
     // dev shape only — a REAL network's genesis carries no demo scaffolding
     // (and a restored boot must not re-seed: seq 0 was already spent, and a
     // create is not an upsert — a second "kN" is REFUSED, not overwritten).

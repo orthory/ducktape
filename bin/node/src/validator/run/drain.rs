@@ -888,26 +888,42 @@ impl ValidatorRuntime<'_> {
         }
         notes.finish();
         if dev_demo && !*converged && *applied >= expected {
-            let h = node.root_hash();
-            tracing::info!(
-                target: "ducktape::consensus",
-                "node={label} converged root_hash={}", hex(&h)
-            );
-            // dump the whole task board so the demo can eyeball the ops (each
-            // node ends holding the task it originated AND the peer's). ONE
-            // query: `List` is the board's only read, and it returns them all.
+            // the board is read BEFORE the marker so the marker can carry it.
+            // `applied` counts a finalized frame however it was dispositioned
+            // (`kernel/node/src/lib.rs:1393-1399`), so a REJECTED seed latches
+            // this just as an applied one does — `seeds=<landed>/<expected>` on
+            // the one line everything already greps is what makes a seed that
+            // never landed visible at all. ONE query: `List` is the board's
+            // only read, and it returns them all.
             let reply = node
                 .host()
                 .query("tasks", &encode_task_query(&TaskQuery::List))
                 .await
                 .expect("tasks query");
             let TaskReply::Tasks(board) = decode_task_reply(&reply).expect("task reply");
+            // the count goes BEFORE the marker, and that is load-bearing: the
+            // harness reads a marker as the REST OF ITS LINE
+            // (`tests/common/mod.rs:1783-1788`) and `cluster_e2e.rs:154-155`
+            // compares that whole remainder against the genesis marker's to
+            // prove ops applied. anything appended after the hash — a tracing
+            // field included — would make that `assert_ne!` vacuously true.
+            let seeds_landed = board.iter().filter(|t| is_a_dev_seed(&t.id)).count();
+            let h = node.root_hash();
+            tracing::info!(
+                target: "ducktape::consensus",
+                "node={label} seeds={seeds_landed}/{expected} converged root_hash={}",
+                hex(&h)
+            );
+            // then one line per task so the demo can eyeball the ops (each node
+            // ends holding the task it originated AND the peer's). a title is
+            // arbitrary user text on a shared board — render it Debug so an
+            // embedded newline or quote cannot split the log event.
             for task in board {
                 tracing::debug!(
                     target: "ducktape::modules",
                     node = %label,
                     task_id = %task.id,
-                    title = %task.title,
+                    title = ?task.title,
                     "demo task"
                 );
             }
@@ -1356,6 +1372,17 @@ fn heartbeat_action(
 /// aggregate under load instead of reviving the 1-tx-1-block regime.
 fn eager_flush_due(disabled: bool, ops_pending: bool, orderer_idle: bool) -> bool {
     !disabled && ops_pending && orderer_idle
+}
+
+/// is this task id one the dev-demo boot seed minted? the seed writes exactly
+/// `k{node-label}` (`validator/engine.rs:271-280`), and nothing else that
+/// reaches a demo board is shaped like that. counting the WHOLE board instead
+/// would let any unrelated write mask a seed that never landed — restart_e2e's
+/// own writes land before the converge latch and do exactly that.
+fn is_a_dev_seed(task_id: &str) -> bool {
+    task_id
+        .strip_prefix('k')
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// the round-robin leader for `view`, MIRRORING the engine's elector

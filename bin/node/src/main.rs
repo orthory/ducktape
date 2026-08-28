@@ -15,7 +15,7 @@
 //! per-process `ContentStore`.
 //!
 //! payload dissemination is REAL: each process submits a DISTINCT op (node N
-//! writes directory key `kN`), so a peer that finalizes another node's op-digest
+//! creates task `kN`), so a peer that finalizes another node's op-digest
 //! has NO local bytes for it. `SimplexOrderer::spawn_with_resolver` wires a
 //! `ConsensusRelay` that, at propose time, gossips the proposed frame's bytes to
 //! all peers on the payload channel; every peer's STORE-ONLY drain caches them, so
