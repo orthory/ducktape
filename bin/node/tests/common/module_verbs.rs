@@ -53,8 +53,9 @@ pub fn sha256_hex(path: &str) -> String {
     format!("{:x}", sha2::Sha256::digest(&bytes))
 }
 
-/// the house shape: three founders, all validators (3-of-3), each serving
-/// with its module-code plane bound and at least one tunnel carrying traffic.
+/// spawn the founders — idx 0–2 of whatever cluster it is given — and wait
+/// until each serves with its module-code plane bound and at least one tunnel
+/// carrying traffic. any further declared peer is the caller's to spawn.
 ///
 /// the code bytes travel over the OVERLAY and nothing else: without
 /// `wireguard_listen` the plane binds an OS socket on a `/128` no host owns,
