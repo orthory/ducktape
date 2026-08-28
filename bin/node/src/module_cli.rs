@@ -101,6 +101,93 @@ pub(super) fn read_module_status(rpc_addr: &str) -> Result<Vec<lifecycle::Module
     }
 }
 
+/// what the node's stage route answers with: the digest it ingested, its
+/// length, and one receipt per peer the code plane fanned the bytes out to.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(super) struct StageReply {
+    /// hex sha256 of the artifact as the node stored it.
+    pub digest: String,
+    /// the artifact's length in bytes, as the node counted it.
+    pub len: u64,
+    /// one row per member — empty when the node fanned nothing out.
+    pub receipts: Vec<PeerReceipt>,
+}
+
+/// one peer's answer to the fan-out (`noded::module_code::CodePeerReceipt`).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(super) struct PeerReceipt {
+    /// hex of the peer's public key.
+    pub peer: String,
+    /// "stored" | "already-have" | the peer's refusal reason.
+    pub status: String,
+    /// whether that peer now holds the bytes.
+    pub ok: bool,
+}
+
+/// Stage the bytes at this node's owner-gated admin route with fan-out on: the
+/// node stores them, pushes them to every validator, and answers with the
+/// digest and one receipt per peer. Loopback exposure wants the operator token
+/// minted beside `node.toml` at boot.
+pub(super) fn stage_component(
+    http_base: &str,
+    workspace: &std::path::Path,
+    bytes: &[u8],
+) -> Result<StageReply, String> {
+    let token = noded::admin::read_operator_token(workspace)?;
+    let resp = reqwest::blocking::Client::new()
+        .post(format!(
+            "{http_base}/v1/admin/module-code/stage?fanout=true"
+        ))
+        .header(noded::admin::ADMIN_TOKEN_HEADER, token)
+        .body(bytes.to_vec())
+        .send()
+        .map_err(|e| format!("stage: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    let refused = !status.is_success();
+    if refused {
+        return Err(format!("stage rejected ({status}): {text}"));
+    }
+    serde_json::from_str(&text).map_err(|e| format!("stage reply: {e}: {text}"))
+}
+
+/// One non-ok receipt and nothing is proposed: the swap only makes sense once
+/// every validator can run the code. The refusal names each holdout peer with
+/// the status token its node reported.
+pub(super) fn refuse_on_bad_receipts(reply: &StageReply) -> Result<(), String> {
+    let failing: Vec<&PeerReceipt> = reply.receipts.iter().filter(|r| !r.ok).collect();
+    let every_peer_holds_it = failing.is_empty();
+    if every_peer_holds_it {
+        return Ok(());
+    }
+    let mut table = String::from("peer  status\n");
+    for r in failing {
+        table.push_str(&format!("{}  {}\n", r.peer, r.status));
+    }
+    table.push_str(
+        "not proposed: every validator must hold the bytes before a swap is scheduled \
+         — re-run once they are reachable (staging is idempotent)",
+    );
+    Err(table)
+}
+
+/// The digest the proposal will carry is the sha256 of the bytes WE read; the
+/// node's answer must agree or something between us rewrote the file.
+pub(super) fn digest_matches(reply: &StageReply, bytes: &[u8]) -> Result<[u8; 32], String> {
+    use sha2::Digest as _;
+    let ours: [u8; 32] = sha2::Sha256::digest(bytes).into();
+    let theirs = config::unhex(&reply.digest).map_err(|e| format!("stage digest: {e}"))?;
+    let agree = theirs[..] == ours[..];
+    if !agree {
+        return Err(format!(
+            "stage digest {} is not the sha256 of the file we read ({})",
+            reply.digest,
+            hex_bytes(&ours)
+        ));
+    }
+    Ok(ours)
+}
+
 /// how much of a code hash a row shows — enough to tell two builds apart at a
 /// glance, short enough that the table stays one line per module.
 const SHORT_HASH: usize = 12;
@@ -158,6 +245,59 @@ fn short(hash: &[u8]) -> String {
 mod tests {
     use super::*;
     use lifecycle::{ModuleCode, ScheduledSwap};
+
+    #[test]
+    fn a_single_bad_receipt_refuses_and_names_the_peer() {
+        let reply = StageReply {
+            digest: "00".repeat(32),
+            len: 3,
+            receipts: vec![
+                PeerReceipt {
+                    peer: "aa11".into(),
+                    status: "stored".into(),
+                    ok: true,
+                },
+                PeerReceipt {
+                    peer: "bb22".into(),
+                    status: "already-have".into(),
+                    ok: true,
+                },
+                PeerReceipt {
+                    peer: "cc33".into(),
+                    status: "module_artifact_too_large".into(),
+                    ok: false,
+                },
+            ],
+        };
+        let err = refuse_on_bad_receipts(&reply).unwrap_err();
+        assert!(err.contains("cc33  module_artifact_too_large"), "{err}");
+        assert!(!err.contains("aa11"), "ok peers are not listed: {err}");
+        let all_ok = StageReply {
+            receipts: reply.receipts[..2].to_vec(),
+            ..reply
+        };
+        assert!(refuse_on_bad_receipts(&all_ok).is_ok());
+    }
+
+    #[test]
+    fn the_node_digest_must_be_the_bytes_we_read() {
+        use sha2::Digest as _;
+        let bytes = b"component";
+        let want = sha2::Sha256::digest(bytes);
+        let good = StageReply {
+            digest: hex_bytes(&want),
+            len: 9,
+            receipts: vec![],
+        };
+        assert_eq!(digest_matches(&good, bytes).unwrap()[..], want[..]);
+        let lying = StageReply {
+            digest: "ff".repeat(32),
+            len: 9,
+            receipts: vec![],
+        };
+        let err = digest_matches(&lying, bytes).unwrap_err();
+        assert!(err.contains("digest"), "{err}");
+    }
 
     #[test]
     fn status_rows_show_active_pending_and_readiness() {
