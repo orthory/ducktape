@@ -276,6 +276,10 @@ The noded and simnode golden hashes (`bin/simnode/tests/topology_set.rs`,
 the daemon parity lane) move; each commit names the flag day. The app's
 tests boot simnode and will pay the wasmtime load (19 components) — accepted.
 
+*(This paragraph is SUPERSEDED — only the sim golden moved, there is no daemon
+parity lane, and the count is 14. See "As built" below; do not quote the
+sentence above.)*
+
 ### As built (2026-08-28, `feat/composer-callers`)
 
 All three callers compose through `noded::compose::compose` now. What the
@@ -287,7 +291,8 @@ sketch above got wrong, and what it cost:
 | the composer's helpers live in `compose.rs` | `crates/noded/src/bundle.rs` | `DirCodeSource`, `hash_bundle`, `qmdb_stores`, `WasmModuleFactory` and `host_from` are what a CALLER needs around the composer, not the composer. `bin/node`'s copies of the last three are deleted. |
 | "the daemon parity lane" pins noded's set | there is no parity lane | `bin/noded/tests/daemon_e2e.rs` asserts `/v1/status` modules == `topology::SIM_BASE`. That is the pin; nothing else ever existed. |
 | both golden hashes move | only the sim's moves: `af1078f7… → 49f49b10…` | noded publishes no golden root. `bin/node`'s `GENESIS_ROOT_HASH` does NOT move — Part 1 already put the production set on the composer, and this branch changes no bytes it composes. |
-| (unstated) | `chain_id = "local"` in BOTH daemons, one const each (`SIM_CHAIN_ID`, `CHAIN_ID`) | the identity and gateway guests scope their records to it, so the composer must bind SOMETHING; noded's `/v1/status` now reports it. It reported `""` before, and the app's `named_chain` refused that — an add-key consent against noded was impossible to sign. |
+| (unstated) | `chain_id = "local"` in BOTH daemons, from ONE shared `noded::LOCAL_CHAIN_ID` | the identity and gateway guests scope their records to it, so the composer must bind SOMETHING; noded's `/v1/status` now reports it. It reported `""` before, and the app's `named_chain` refused that — an add-key consent against noded was impossible to sign. Two per-daemon consts would let the daemons' roots drift apart on a typo, so there is one. |
+| (unstated) | each daemon's CALLER opens the code source; no actor-thread `expect` decides bundle completeness | `main` (noded) and `boot` (simnode) call `DirCodeSource::open` and return `Err`; the `DirCodeSource` + hash map then ride into the actor thread. Two deciders — an `is_file` precheck plus the composer's own read — would disagree on a component that exists but cannot be read, and the second one panics where its remedy reaches nobody. |
 | (unstated) | both echo oracles bid before answering | the saga guest runs `LeasePolicy::Strict`: a result from a worker that never claimed the attempt is refused. Each oracle now sends `SagaMsg::Accept` first, mirroring `crates/services/compute/src/lib.rs:131-154`. |
 
 **Cost, and the follow-up it makes REQUIRED.** Genesis cranelift-compiles 14

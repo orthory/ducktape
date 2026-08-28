@@ -99,8 +99,12 @@ log "source commit: $SOURCE_OID ($SRC_REF)"
 # a healthy node is required (git-receive-pack is served off the node's http
 # surface). fail fast with an actionable message rather than a git transport error.
 if ! curl -fsS -m 5 "$BASE_URL/v1/status" >/dev/null 2>&1; then
-  die "no node responding at $BASE_URL — start a node first (\
-`cargo run -p noded`), or set DUCKTAPE_DEV_FORGE_URL to a running node."
+  # NOTE: no backticks in this string — it is double-quoted, so they would be
+  # command substitution, and the die message would RUN whatever it names.
+  die "no node responding at $BASE_URL — start a node first \
+(make install-node, once, to fill ~/.ducktape/modules with the components its \
+genesis composes from; then cargo run -p noded-bin), or set \
+DUCKTAPE_DEV_FORGE_URL to a running node."
 fi
 
 # idempotent remote wiring: add, or re-point if it already exists.
