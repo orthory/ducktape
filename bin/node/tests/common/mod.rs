@@ -28,6 +28,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+/// the `ducktape module …` verbs as an e2e drives them, shared by the suites
+/// that exercise a live code swap.
+pub mod module_verbs;
+
 /// the checked-in `<id>.component.wasm` set every founding e2e names: a network
 /// has no embedded wasm, so `node init` hashes THIS directory into the
 /// descriptor and the dev shape derives its genesis code set from it.
