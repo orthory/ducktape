@@ -153,6 +153,12 @@ use topology::TOPOLOGY;
 const ORACLE_ORIGIN: &[u8] = b"oracle";
 const PEER_ORIGIN: &[u8] = b"peer";
 
+/// the sim's network name: the composer binds it into the identity and gateway
+/// guests' genesis `__config`, and `/v1/status` serves it back. ONE value — a
+/// client that signs an identity consent reads the chain id from status, so a
+/// status that disagreed with the bindings would mint signatures nothing accepts.
+const SIM_CHAIN_ID: &str = "local";
+
 /// the logical clock: `consensus_time = SIM_EPOCH_MS + height * SIM_BLOCK_MS`.
 /// a fixed epoch keeps module timestamps (message sent_at, task created_at)
 /// plausible in the ui while staying identical across runs.
@@ -304,7 +310,7 @@ pub struct SimOpts {
     /// register the deterministic echo oracle (`--echo-oracle`).
     pub echo_oracle: bool,
     /// opt-in governance genesis: raw 32-byte ed25519 validator pubkeys. empty
-    /// => the default 14-module set, byte-identical.
+    /// => the default 14-module set (`topology::SIM_BASE`) alone.
     pub valset_keys: Vec<Vec<u8>>,
     /// the invite namespace governance verifies tokens against — meaningful only
     /// with `valset_keys`. defaults to `b"sim"`.
@@ -786,7 +792,7 @@ fn run_sim(
         };
         let bindings = Bindings {
             invite: &invite_binding,
-            chain_id: "local",
+            chain_id: SIM_CHAIN_ID,
             validators: &valset_keys,
             code_hashes: &code_hashes,
         };
@@ -1321,9 +1327,7 @@ impl Sim {
             // seeded key names an identity for consensus-op scenarios; no mesh
             // routes behind it.
             public_key: self.public_key.clone(),
-            // the simulator serves no chain (its identity module runs with an
-            // empty chain id), so there is nothing to name here.
-            chain_id: String::new(),
+            chain_id: SIM_CHAIN_ID.into(),
             operations: noded::OperationalStatus {
                 role: noded::NodeRole::Local,
                 phase: noded::NodePhase::Serving,

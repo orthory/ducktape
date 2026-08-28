@@ -112,4 +112,19 @@ fn with_valset_genesis_appends_topology_sim_valset_and_wires_the_code_registry()
         code, 200,
         "an UpdateModule proposal must open a ballot in the sim: {reply}"
     );
+
+    // and the ballot is really THERE: governance took the action into committed
+    // state, so the registry is wired all the way through, not just past the door.
+    let proposal = sim.query(
+        "governance",
+        serde_json::json!({ "proposal": { "proposal_id": "u" } }),
+    );
+    assert_eq!(
+        proposal["proposal"]["status"], "open",
+        "the UpdateModule proposal is open for votes: {proposal}"
+    );
+    assert_eq!(
+        proposal["proposal"]["action"]["update_module"]["module_id"], "chat",
+        "the open ballot carries the proposed swap: {proposal}"
+    );
 }
