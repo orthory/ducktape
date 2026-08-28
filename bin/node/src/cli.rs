@@ -846,7 +846,7 @@ fn cmd_admit(args: AdmitArgs) -> Result<(), Box<dyn std::error::Error>> {
 // ---- resident accept: post-genesis admission over the local rpc -----------
 
 /// one blocking json-lines rpc round-trip against the LOCAL node.
-fn rpc_call(addr: &str, req: &serde_json::Value) -> Result<serde_json::Value, String> {
+pub(super) fn rpc_call(addr: &str, req: &serde_json::Value) -> Result<serde_json::Value, String> {
     use std::io::{BufRead as _, BufReader, Write as _};
     // the same calm sentence the http lane gives, for the same condition: an
     // `os error 111` with a port in it is a diagnosis nobody asked for.
@@ -870,7 +870,7 @@ fn rpc_call(addr: &str, req: &serde_json::Value) -> Result<serde_json::Value, St
 }
 
 /// query a module through the rpc; the reply's hex payload, decoded.
-fn rpc_query(addr: &str, target: &str, req: &[u8]) -> Result<Vec<u8>, String> {
+pub(super) fn rpc_query(addr: &str, target: &str, req: &[u8]) -> Result<Vec<u8>, String> {
     let reply = rpc_call(
         addr,
         &serde_json::json!({ "cmd": "query", "target": target, "req_hex": hex_bytes(req) }),
@@ -897,7 +897,7 @@ fn rpc_submit(addr: &str, target: &str, payload: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn read_members(addr: &str) -> Result<Vec<Vec<u8>>, String> {
+pub(super) fn read_members(addr: &str) -> Result<Vec<Vec<u8>>, String> {
     use valset::{ValsetQuery, ValsetReply, decode_reply, encode_query};
     let raw = rpc_query(addr, "valset", &encode_query(&ValsetQuery::Validators))?;
     match decode_reply(&raw)? {
@@ -949,7 +949,7 @@ fn read_shares(addr: &str) -> Result<governance::SharesView, String> {
 /// as frames.
 // one per ceremony, on the stack — variant size is noise.
 #[allow(clippy::large_enum_variant)]
-enum GovSigner {
+pub(super) enum GovSigner {
     Node {
         key: Vec<u8>,
     },
@@ -994,7 +994,7 @@ impl GovSigner {
 }
 
 /// resolve the signer for a ceremony on the node at `cfg_path`.
-fn gov_signer(
+pub(super) fn gov_signer(
     rpc_addr: &str,
     cfg_path: &std::path::Path,
     resolved: &config::Resolved,
@@ -1205,27 +1205,41 @@ fn cast_yes_once(
 }
 
 /// how a driven membership ceremony left the proposal.
-enum CeremonyOutcome {
+pub(super) enum CeremonyOutcome {
     /// passed and executed — the set changes at the next epoch cutover.
     Passed,
     /// this ballot landed but the proposal's frozen threshold is outstanding.
     AwaitingBallots,
 }
 
-/// drive a governance membership ceremony for `wanted` through this eligible
-/// account's running node: adopt an existing OPEN proposal
-/// for exactly this action (else mint an unused `<id_prefix><key>:<n>` id and
-/// propose), cast a yes ballot, and execute once decidable. idempotent across
+/// the open proposal a member should JOIN rather than duplicate. the matcher
+/// decides which fields identify "the same proposal": membership verbs match
+/// the whole action, module verbs match (variant, module_id, code_hash) and
+/// ignore the activation height each member computed for itself.
+pub(super) fn open_proposal_matching<'a>(
+    views: &'a [governance::ProposalView],
+    matches: &dyn Fn(&governance::GovAction) -> bool,
+) -> Option<&'a governance::ProposalView> {
+    views
+        .iter()
+        .find(|p| p.status == governance::ProposalStatus::Open && matches(&p.action))
+}
+
+/// drive a governance proposal ceremony for `wanted` through this eligible
+/// account's running node: adopt an existing OPEN proposal `matches` accepts
+/// (else mint an unused `<id_prefix><key>:<n>` id and propose), cast a yes
+/// ballot, and execute once decidable. idempotent across
 /// members — each runs the same verb; the run landing the deciding ballot
 /// executes. shared by `resident accept` (AddResident), `member promote`
 /// (AddValidator), and `resident remove` (RemoveResident).
-fn drive_membership_ceremony(
+pub(super) fn drive_proposal_ceremony(
     rpc_addr: &str,
     signer: &GovSigner,
     pubkey_hex: &str,
     verb: &str,
     id_prefix: &str,
     wanted: governance::GovAction,
+    matches: &dyn Fn(&governance::GovAction) -> bool,
 ) -> Result<CeremonyOutcome, Box<dyn std::error::Error>> {
     use governance::{GovMsg, ProposalStatus};
     use governance::{GovQuery, GovReply, decode_reply, encode_query};
@@ -1237,10 +1251,7 @@ fn drive_membership_ceremony(
         GovReply::Proposals(views) => views,
         other => return Err(format!("unexpected governance reply: {other:?}").into()),
     };
-    let proposal_id = match proposals
-        .iter()
-        .find(|p| p.status == ProposalStatus::Open && p.action == wanted)
-    {
+    let proposal_id = match open_proposal_matching(&proposals, matches) {
         Some(p) => {
             eprintln!("joining open proposal {}", p.proposal_id);
             p.proposal_id.clone()
@@ -1338,13 +1349,19 @@ fn cmd_invite_accept(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
         );
         return Ok(());
     }
-    match drive_membership_ceremony(
+    let wanted = GovAction::AddResident { key: key_bytes };
+    let same_action = {
+        let wanted = wanted.clone();
+        move |a: &GovAction| *a == wanted
+    };
+    match drive_proposal_ceremony(
         &rpc_addr,
         &signer,
         pubkey_hex,
         "node resident accept",
         "resident:",
-        GovAction::AddResident { key: key_bytes },
+        wanted,
+        &same_action,
     )? {
         CeremonyOutcome::Passed => {
             eprintln!(
@@ -1384,13 +1401,19 @@ fn cmd_promote(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("{pubkey_hex} is already a validator — nothing to do");
         return Ok(());
     }
-    match drive_membership_ceremony(
+    let wanted = GovAction::AddValidator { key: key_bytes };
+    let same_action = {
+        let wanted = wanted.clone();
+        move |a: &GovAction| *a == wanted
+    };
+    match drive_proposal_ceremony(
         &rpc_addr,
         &signer,
         pubkey_hex,
         "node member promote",
         "admit:",
-        GovAction::AddValidator { key: key_bytes },
+        wanted,
+        &same_action,
     )? {
         CeremonyOutcome::Passed => {
             eprintln!(
@@ -1443,13 +1466,19 @@ fn cmd_resident_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error
         eprintln!("{pubkey_hex} holds no resident standing — nothing to do");
         return Ok(());
     }
-    match drive_membership_ceremony(
+    let wanted = GovAction::RemoveResident { key: key_bytes };
+    let same_action = {
+        let wanted = wanted.clone();
+        move |a: &GovAction| *a == wanted
+    };
+    match drive_proposal_ceremony(
         &rpc_addr,
         &signer,
         pubkey_hex,
         "node resident remove",
         "revoke:",
-        GovAction::RemoveResident { key: key_bytes },
+        wanted,
+        &same_action,
     )? {
         CeremonyOutcome::Passed => {
             eprintln!(
@@ -1919,6 +1948,71 @@ mod tests {
             declaration_tokens(&bash, "gateway").contains("bind"),
             "a family scope still finds its own verbs"
         );
+    }
+
+    /// a module verb must JOIN the founder's open proposal even though every
+    /// member computed its own activation height, so the matcher — not action
+    /// equality — decides which fields identify "the same proposal".
+    #[test]
+    fn open_proposal_matching_ignores_fields_the_matcher_ignores() {
+        use super::open_proposal_matching;
+        use governance::{GovAction, ProposalStatus, ProposalView, VoterKind, VotingRule};
+        let view = |id: &str, status: ProposalStatus, action: GovAction| ProposalView {
+            proposal_id: id.into(),
+            action,
+            proposer: vec![1],
+            created_at: 0,
+            deadline: 10,
+            status,
+            votes: vec![],
+            voter_kind: VoterKind::ValidatorNode,
+            electorate: vec![],
+            voting_rule: VotingRule::Threshold { required_yes: 1 },
+        };
+        let hash = vec![7u8; 32];
+        let founders = view(
+            "module:aa:0",
+            ProposalStatus::Open,
+            GovAction::UpdateModule {
+                name: "x".into(),
+                module_id: "hello".into(),
+                activation_height: 60,
+                code_hash: hash.clone(),
+            },
+        );
+        let settled = view(
+            "module:bb:0",
+            ProposalStatus::Passed,
+            GovAction::UpdateModule {
+                name: "x".into(),
+                module_id: "hello".into(),
+                activation_height: 60,
+                code_hash: hash.clone(),
+            },
+        );
+        let other = view(
+            "module:cc:0",
+            ProposalStatus::Open,
+            GovAction::RegisterModule {
+                name: "x".into(),
+                module_id: "hello".into(),
+                activation_height: 60,
+                code_hash: hash.clone(),
+            },
+        );
+        let views = vec![settled, other, founders];
+        // the second member computed height 61, not 60 — equality on the whole
+        // action would never join the founder's proposal.
+        let matches = |a: &GovAction| {
+            matches!(a, GovAction::UpdateModule { module_id, code_hash, .. }
+                if module_id == "hello" && *code_hash == hash)
+        };
+        let found = open_proposal_matching(&views, &matches).expect("the open update proposal");
+        assert_eq!(found.proposal_id, "module:aa:0");
+        let none = open_proposal_matching(&views, &|a| {
+            matches!(a, GovAction::CancelModuleUpdate { .. })
+        });
+        assert!(none.is_none());
     }
 
     /// the grammar's own consistency check (conflicting ids, broken flatten,
