@@ -58,6 +58,13 @@ async fn get_on(host: &Host, target: &str, key: &str) -> Option<String> {
 /// the composer adopts it EMPTY (`adopt_admitted_modules`). the first block
 /// that touches it must replay from that empty pre-root — not be classed torn
 /// because the manifest holds no root for it.
+///
+/// the module's op must be the FIRST thing sealed after the checkpoint: every
+/// seal records every host root, so an earlier replayed block would carry
+/// `later: empty` in its seal, be classed `at_post` for it, and recovery's
+/// own post-block bookkeeping would seed the very root under test before the
+/// op block arrived — green with or without the seed. with the op in the first
+/// block, `changed == {later}` and only the seed makes it `at_pre`.
 #[test]
 fn an_adopted_empty_module_replays_its_first_op_from_the_empty_pre_root() {
     let executor = deterministic::Runner::default();
@@ -83,13 +90,13 @@ fn an_adopted_empty_module_replays_its_first_op_from_the_empty_pre_root() {
             .expect("write manifest");
 
         let signer = sk(1);
-        node.submit(&signer, 0, set("k0", "v0"))
+        // `later`'s first op, in the first block after the checkpoint: the
+        // block a live admission would have activated it in.
+        node.submit(&signer, 0, set_on("later", "k1", "v1"))
             .await
             .expect("submit");
         node.flush_batch().await.expect("flush");
-        // `later`'s first op, in its own block: the block a live admission
-        // would have activated it in.
-        node.submit(&signer, 1, set_on("later", "k1", "v1"))
+        node.submit(&signer, 1, set("k0", "v0"))
             .await
             .expect("submit");
         node.flush_batch().await.expect("flush");
