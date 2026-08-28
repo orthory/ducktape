@@ -135,7 +135,7 @@ fn why_unanswered(error: &reqwest::Error) -> Unanswered {
 }
 
 /// Turn a failed `send()` into what to tell the operator. The one `match`.
-fn transport_failure(path: &str, error: &reqwest::Error) -> ReadFailure {
+pub(crate) fn transport_failure(path: &str, error: &reqwest::Error) -> ReadFailure {
     match why_unanswered(error) {
         Unanswered::NoAnswer => ReadFailure::Unreachable,
         // the url is deliberately not echoed: it adds nothing a reader can act

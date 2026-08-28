@@ -9,7 +9,7 @@ _ducktape() {
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local families="node user account wallet gateway fs service agent mcp help --help -h --version -V"
+    local families="node user account wallet gateway fs service agent module mcp help --help -h --version -V"
 
     local node_verbs="run key init invite admit join list status peers resident member work sandbox help"
     local node_resident="accept remove"
@@ -37,6 +37,8 @@ _ducktape() {
     local service_kinds="compute agent airlock"
     local agent_verbs="pty sched install help"
     local agent_flags="-n --network --node --key --host-node --cred --cpu --mem"
+    local module_verbs="update register status help"
+    local module_flags="--after --config -n --network --json"
 
     if [ "$COMP_CWORD" -eq 1 ]; then
         COMPREPLY=( $(compgen -W "$families" -- "$cur") )
@@ -79,6 +81,7 @@ _ducktape() {
             esac
             ;;
         agent)   COMPREPLY=( $(compgen -W "$agent_verbs $agent_flags" -- "$cur") ) ;;
+        module)  COMPREPLY=( $(compgen -W "$module_verbs $module_flags" -- "$cur") ) ;;
     esac
 }
 

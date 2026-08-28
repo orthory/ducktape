@@ -51,6 +51,13 @@ const STAGING_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
 /// its own; this only reaps a peer that accepts and then goes silent.
 const PUSH_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// one fan-out OPEN: a dial over the userspace stack has no SYN timeout
+/// (`overlay-net/src/userspace/stack.rs`, `new_tcp_socket` sets none), so a
+/// DEAD peer would otherwise hold the whole push until `PUSH_TIMEOUT` reaps
+/// it. this bound is what turns that peer into a receipt the operator can
+/// read before proposing (spec decision 2-B) instead of a ten-minute stall.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(15);
+
 fn code_flow() -> FlowId {
     FlowId::derive(b"ducktape:module-code:v1")
 }
@@ -355,15 +362,21 @@ async fn push_peer<T: DataPlaneTransport>(
     let len = blobs
         .chunk_len(&digest)
         .ok_or_else(|| "artifact not resident locally".to_string())?;
-    let mut stream = service
-        .open(
+    let opened = tokio::time::timeout(
+        OPEN_TIMEOUT,
+        service.open(
             peer,
             code_flow(),
             INTENT_PUSH,
             encode_push_meta(kind, &digest, len),
-        )
-        .await
-        .map_err(|e| format!("open failed: {e}"))?;
+        ),
+    )
+    .await;
+    let mut stream = match opened {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => return Err(format!("open failed: {e}")),
+        Err(_elapsed) => return Err("open timed out".into()),
+    };
     let mut ack = [0u8; 9];
     stream
         .read_exact(&mut ack)
