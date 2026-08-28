@@ -20,7 +20,7 @@
 //! make every new block look already-indexed and be silently skipped).
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -82,12 +82,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(dir) => dir,
         None => workspace_config::modules_dir()?,
     };
-    let bundle_is_installed = modules_dir.is_dir();
-    if !bundle_is_installed {
+    if let Some(missing) = missing_from_bundle(&modules_dir) {
         return Err(format!(
-            "no genesis components at {} — fill `~/.ducktape/modules` (`make install-node`), \
-             or pass --modules <dir> holding every <id>.component.wasm",
-            modules_dir.display()
+            "no genesis components at {missing} — fill `~/.ducktape/modules` \
+             (`make install-node`), or pass --modules <dir> holding every \
+             <id>.component.wasm"
         )
         .into());
     }
@@ -201,6 +200,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
 }
 
+/// what the genesis bundle is missing, named for the operator: the modules dir
+/// itself, else the first `<id>.component.wasm` a [`MODULE_IDS`] wasm tenant
+/// needs. `None` = a bundle the composer can read.
+///
+/// half-filled dirs are the common case (an interrupted `make install-node`, a
+/// hand-assembled `--modules`), and the composer's own failure surfaces from
+/// the actor thread AFTER a storage root exists. probes only — no read, no
+/// hash: the composer opens and hashes the bytes itself a moment later.
+fn missing_from_bundle(dir: &Path) -> Option<String> {
+    if !dir.is_dir() {
+        return Some(dir.display().to_string());
+    }
+    TOPOLOGY
+        .wasm_ids(MODULE_IDS)
+        .into_iter()
+        .map(|id| noded::bundle::component_path(dir, id))
+        .find(|component| !component.is_file())
+        .map(|component| component.display().to_string())
+}
+
 /// own the host for the process lifetime: genesis the module set, then apply
 /// commands in arrival order — every submit is its own block.
 // the actor thread's entry point threads every daemon-owned root/lane in by
@@ -227,8 +246,7 @@ fn run_node(
         // genesis: the topology's `sim_base` selection composed the way bin/node
         // composes — every wasm tenant is the REAL guest component read from the
         // modules dir, over qmdb stores in this runtime's storage root.
-        let selection: &[&'static str] = MODULE_IDS;
-        let wasm_ids = TOPOLOGY.wasm_ids(selection);
+        let wasm_ids = TOPOLOGY.wasm_ids(MODULE_IDS);
         let (code, code_hashes) =
             DirCodeSource::open(&modules_dir, &wasm_ids).expect("noded modules dir");
         // the block loop's own handle: each block's root payload is staged as
@@ -251,7 +269,7 @@ fn run_node(
         };
         let mut stores = qmdb_stores(&context);
         let modules = compose(
-            selection,
+            MODULE_IDS,
             &code,
             &mut stores,
             &substrates,

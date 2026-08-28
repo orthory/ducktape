@@ -381,6 +381,47 @@ fn post_mention(channel: &str, message_id: &str, agent_id: &str) -> serde_json::
     })
 }
 
+/// an INCOMPLETE modules dir is refused at argv time, naming the first
+/// component it could not find, with the same remedy a missing dir gets. the
+/// composer refuses it too — but from the actor thread, as a panic, after a
+/// storage root exists; that is a stack trace, not a remedy.
+#[test]
+fn an_incomplete_modules_dir_is_refused_before_boot() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    // a directory that EXISTS and holds no components: the half-installed
+    // bundle (`make install-node` interrupted, a hand-assembled --modules).
+    let modules = tempfile::TempDir::new().expect("modules dir");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ducktape-noded"))
+        .arg("--storage")
+        .arg(storage.path())
+        .arg("--modules")
+        .arg(modules.path())
+        .output()
+        .expect("spawn ducktape-noded");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "an empty modules dir composes no genesis: {stderr}"
+    );
+    // the path named is INSIDE the dir — a missing-component refusal, not the
+    // missing-directory one (which names the dir and stops there).
+    let names_a_component = format!(
+        "no genesis components at {}{}",
+        modules.path().display(),
+        std::path::MAIN_SEPARATOR
+    );
+    assert!(
+        stderr.contains(&names_a_component),
+        "refusal names the first missing component: {stderr}"
+    );
+    assert!(
+        stderr.contains("make install-node"),
+        "refusal carries the remedy: {stderr}"
+    );
+}
+
 /// the embedded daemon runs no mesh, so it never wires a call hub — which
 /// makes the real binary exactly the no-hub case /v1/call/ws must refuse
 /// LOUDLY: 503 at upgrade with a body that says why (the #178 posture — every
