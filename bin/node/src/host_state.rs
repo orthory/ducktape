@@ -157,8 +157,14 @@ fn seed_complete_bundle(
     if bundle_is_complete {
         return Ok(());
     }
+    // a founder or a pre-genesis co-validator boots from its own bundle; the
+    // remedy names the two ways that bundle gets there, because the most
+    // common way to land here is a member workspace written by something other
+    // than `ducktape node join` (which bundles for a member itself).
     Err(format!(
-        "genesis bundle {} has no component for {missing:?} (expected <id>.component.wasm) — fail-closed",
+        "genesis bundle {} has no component for {missing:?} (expected <id>.component.wasm) — fail-closed. \
+         a genesis member boots from its own bundle: re-join with `ducktape node join <invite>`, \
+         or fill `~/.ducktape/modules` (`make install-node`) and re-found with `node init --modules`",
         genesis.bundle_dir.display()
     ))
 }
