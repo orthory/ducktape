@@ -35,15 +35,15 @@ use std::path::Path;
 
 type Ed = commonware_cryptography::ed25519::PrivateKey;
 
-/// the sim's gateway chain id (`Gateway::new(.., "local")`).
+/// the sim's gateway chain id (the composer's `Bindings { chain_id: "local" }`).
 const CHAIN: &str = "local";
 /// the account the first Create founds.
 const ACCOUNT: u64 = 1;
 
 // ── the founding ceremony ───────────────────────────────
 
-/// spawn an `--auto` sim and found one Identity account for `key` (account 1;
-/// empty chain_id), seating it as the sole current Ed25519 member. returns the
+/// spawn an `--auto` sim and found one Identity account for `key` (account 1 on
+/// the `local` chain), seating it as the sole current Ed25519 member. returns the
 /// sim, the account key, and the key's submit origin (its `hex:` escape).
 fn published(storage: &Path) -> (Sim, Ed, String) {
     let sim = Sim::spawn(storage, &["--auto"]);

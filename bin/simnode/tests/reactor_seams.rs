@@ -156,18 +156,23 @@ fn a_rule_posting_into_its_own_hooked_channel_fires_once_not_forever() {
 // ── A3: oracle-drain discipline ─────────────────────────
 
 /// with the echo worker installed in HOLD mode, each committed saga trigger's
-/// `WorkerRequest` effect is claimed by the worker, whose `OracleResult`
-/// follow-up parks in the oracle queue. two follow-ups queue without coalescing;
-/// each `/sim/step` commits EXACTLY ONE as its own `oracle`-kind block; and a
-/// peer block wedged between two drains commits fine without disturbing queue
-/// order (`oracle_queued` tracks the count throughout).
+/// `WorkerRequest` effect is claimed by the worker, whose follow-up parks in the
+/// oracle queue. follow-ups queue without coalescing; each `/sim/step` commits
+/// EXACTLY ONE as its own `oracle`-kind block; and a peer block wedged between
+/// two drains commits fine without disturbing queue order (`oracle_queued`
+/// tracks the count throughout).
+///
+/// two follow-ups per saga: the guest runs the STRICT lease policy, so the
+/// worker bids for the unassigned announcement (`Accept`) and answers only the
+/// re-emitted order that names it — the bid-then-work lane a real compute node
+/// walks, one queued follow-up at a time.
 #[test]
 fn each_step_drains_exactly_one_queued_oracle_follow_up_in_order() {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &["--echo-oracle"]); // hold mode + echo worker
     let spec = echo_work_spec();
 
-    // two peer blocks commit two triggers; each enqueues one worker follow-up.
+    // two peer blocks commit two triggers; each enqueues the worker's bid.
     let b1 = sim.peer_block("saga", saga_trigger(&sid("peer", "s1"), &spec), "peer");
     assert_eq!(b1["height"], 1, "first trigger committed: {b1}");
     assert_eq!(sim.sim_state()["oracle_queued"], 1, "one follow-up queued");
@@ -179,7 +184,8 @@ fn each_step_drains_exactly_one_queued_oracle_follow_up_in_order() {
         "follow-ups queue behind each other — they never coalesce"
     );
 
-    // a step drains EXACTLY ONE follow-up as its own oracle block.
+    // a step drains EXACTLY ONE follow-up as its own oracle block: s1's bid,
+    // whose won order queues s1's result BEHIND s2's still-parked bid.
     let r = sim.step();
     assert_eq!(
         r["committed"]["kind"], "oracle",
@@ -188,8 +194,8 @@ fn each_step_drains_exactly_one_queued_oracle_follow_up_in_order() {
     assert_eq!(r["committed"]["height"], 3);
     assert_eq!(
         sim.sim_state()["oracle_queued"],
-        1,
-        "one drained, one still queued"
+        2,
+        "one bid drained, its result and the other bid still queued"
     );
 
     // a peer block wedged between two drains commits fine and leaves the queue
@@ -201,15 +207,18 @@ fn each_step_drains_exactly_one_queued_oracle_follow_up_in_order() {
     );
     assert_eq!(
         sim.sim_state()["oracle_queued"],
-        1,
-        "the peer wedge did not disturb the parked follow-up"
+        2,
+        "the peer wedge did not disturb the parked follow-ups"
     );
 
-    // the second follow-up drains next, still one-per-step, still its own block.
-    let r = sim.step();
-    assert_eq!(r["committed"]["kind"], "oracle");
-    assert_eq!(r["committed"]["height"], 5);
-    assert_eq!(sim.sim_state()["oracle_queued"], 0, "queue drained");
+    // the rest drain one-per-step, each its own block, in queue order: s2's bid
+    // (queuing s2's result), then s1's result, then s2's.
+    for (height, left) in [(5, 2), (6, 1), (7, 0)] {
+        let r = sim.step();
+        assert_eq!(r["committed"]["kind"], "oracle");
+        assert_eq!(r["committed"]["height"], height, "drained in order: {r}");
+        assert_eq!(sim.sim_state()["oracle_queued"], left);
+    }
 
     // nothing left: a further step commits nothing (both queues empty).
     let r = sim.step();
@@ -411,8 +420,9 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
             Some(origin.clone()),
         ),
         // gateway — the account's founding key signs a route naming `node` as
-        // its publisher. the sim wires `Gateway::new(.., None, "local")` (no
-        // valset), so the only ceremony is: the origin is a member of the
+        // its publisher. the composer binds the gateway guest's genesis
+        // `__config` to chain id "local" and the default sim genesis has no
+        // valset, so the only ceremony is: the origin is a member of the
         // route's account, and a current Ed25519 member signs.
         (
             "gateway",

@@ -160,30 +160,10 @@ pub struct GenesisModules {
     pub bundle_dir: PathBuf,
 }
 
-/// `<dir>/<id>.component.wasm` — the one component file naming convention
-/// (kernel fixtures, `~/.ducktape/modules`, and every workspace bundle).
-pub fn component_path(dir: &Path, id: &str) -> PathBuf {
-    dir.join(format!("{id}.component.wasm"))
-}
-
-/// sha256 every `<id>.component.wasm` in `dir` for `ids`; a missing file names
-/// its path, because the operator's next move is to look at that directory.
-///
-/// The walk is BY ID, not in the caller's selection order, so a bundle missing
-/// several components always names the same one first — the operator fixes a
-/// stable list instead of chasing a topology-order lottery one file at a time.
-pub fn hash_bundle(dir: &Path, ids: &[&str]) -> Result<BTreeMap<String, [u8; 32]>, String> {
-    use sha2::Digest as _;
-    let mut ids = ids.to_vec();
-    ids.sort_unstable();
-    let mut out = BTreeMap::new();
-    for id in &ids {
-        let path = component_path(dir, id);
-        let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        out.insert((*id).to_string(), sha2::Sha256::digest(&bytes).into());
-    }
-    Ok(out)
-}
+// the component bundle's naming and hashing live beside the composer, where
+// the daemons that also read a bundle dir can reach them; `config::*` keeps
+// re-exporting both for `bin/node`'s own call sites.
+pub use noded::bundle::{component_path, hash_bundle};
 
 /// Everything a SERVICE DAEMON legitimately needs from its node's workspace —
 /// and, being a member of [`Resolved`], everything the NODE knows about the

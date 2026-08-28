@@ -2,45 +2,19 @@
 //! stores on a temp runtime, an empty blob plane — genesis, then a reopen of
 //! the same stores with a Map snapshot re-installed.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use commonware_runtime::{Runner as _, Supervisor as _};
+use noded::bundle::DirCodeSource;
 use noded::compose::{Bindings, Boot, BoxFut, Substrates, compose};
 use sdk::{MerkleStore, StateRoot, StateSyncHandle};
-
-/// a code source over the fixtures dir, keyed by the sha256 of each component.
-struct DirSource(PathBuf, BTreeMap<[u8; 32], &'static str>);
-
-#[async_trait::async_trait(?Send)]
-impl host::CodeSource for DirSource {
-    async fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>> {
-        let digest: [u8; 32] = code_hash.try_into().ok()?;
-        let id = self.1.get(&digest)?;
-        std::fs::read(self.0.join(format!("{id}.component.wasm"))).ok()
-    }
-}
 
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../kernel/host/tests/fixtures")
 }
 
-type ByHash = BTreeMap<[u8; 32], &'static str>;
 /// one `SnapshotSource` call's future.
 type SnapshotFut<'a> = BoxFut<'a, Result<Option<(Vec<u8>, StateRoot)>, String>>;
-
-fn hashes(ids: &[&'static str]) -> (BTreeMap<String, [u8; 32]>, ByHash) {
-    use sha2::Digest as _;
-    let mut by_id = BTreeMap::new();
-    let mut by_hash = BTreeMap::new();
-    for id in ids {
-        let bytes = std::fs::read(fixtures().join(format!("{id}.component.wasm"))).unwrap();
-        let h: [u8; 32] = sha2::Sha256::digest(&bytes).into();
-        by_id.insert(id.to_string(), h);
-        by_hash.insert(h, *id);
-    }
-    (by_id, by_hash)
-}
 
 const SELECTION: &[&str] = &["kv", "valset", "acl", "governance", "lifecycle", "runs"];
 
@@ -56,8 +30,8 @@ fn run(body: impl FnOnce(commonware_runtime::tokio::Context, PathBuf) -> BoxFut<
 fn composes_wasm_store_map_and_native_over_injected_stores() {
     run(|context, dir| {
         Box::pin(async move {
-            let (by_id, by_hash) = hashes(&["acl", "governance", "runs"]);
-            let code = DirSource(fixtures(), by_hash);
+            let (code, by_id) =
+                DirCodeSource::open(&fixtures(), &["acl", "governance", "runs"]).unwrap();
             let validators = vec![vec![7u8; 32]];
             let bindings = Bindings {
                 invite: b"t",
@@ -157,9 +131,8 @@ fn composes_wasm_store_map_and_native_over_injected_stores() {
 fn code_hash_drift_and_unknown_ids_are_refused_by_name() {
     run(|context, dir| {
         Box::pin(async move {
-            let (by_id, by_hash) = hashes(&["acl"]);
-            let (with_extra, _) = hashes(&["acl", "governance"]);
-            let code = DirSource(fixtures(), by_hash);
+            let (code, by_id) = DirCodeSource::open(&fixtures(), &["acl"]).unwrap();
+            let (_, with_extra) = DirCodeSource::open(&fixtures(), &["acl", "governance"]).unwrap();
             let bindings = Bindings {
                 invite: b"t",
                 chain_id: "t",
@@ -239,6 +212,18 @@ fn code_hash_drift_and_unknown_ids_are_refused_by_name() {
     });
 }
 
+/// a code source that answers EVERY hash with one fixed component's bytes.
+/// a `DirCodeSource` keys itself by what it hashed, so it cannot lie by
+/// construction — the composer's re-hash needs a source that can.
+struct LiarSource(PathBuf);
+
+#[async_trait::async_trait(?Send)]
+impl host::CodeSource for LiarSource {
+    async fn fetch(&self, _code_hash: &[u8]) -> Option<Vec<u8>> {
+        std::fs::read(&self.0).ok()
+    }
+}
+
 /// a code source is a lookup, not a guarantee: bytes that do not hash to the
 /// genesis entry never seat, or the running code and the lifecycle registry
 /// would silently disagree.
@@ -246,10 +231,9 @@ fn code_hash_drift_and_unknown_ids_are_refused_by_name() {
 fn a_code_source_whose_bytes_miss_the_hash_is_refused() {
     run(|context, dir| {
         Box::pin(async move {
-            let (by_id, mut by_hash) = hashes(&["acl"]);
+            let (_, by_id) = DirCodeSource::open(&fixtures(), &["acl"]).unwrap();
             // the liar answers acl's hash with governance's component.
-            by_hash.insert(by_id["acl"], "governance");
-            let liar = DirSource(fixtures(), by_hash);
+            let liar = LiarSource(fixtures().join("governance.component.wasm"));
             let bindings = Bindings {
                 invite: b"t",
                 chain_id: "t",

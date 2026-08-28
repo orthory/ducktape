@@ -57,6 +57,14 @@ impl Daemon {
             .arg(format!("127.0.0.1:{port}"))
             .arg("--storage")
             .arg(storage)
+            // the daemon composes its wasm tenants from a modules dir; this
+            // suite points at the repo's kernel fixtures so it needs no
+            // `make install-node` bundle in `~/.ducktape/modules`.
+            .arg("--modules")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../crates/kernel/host/tests/fixtures"
+            ))
             .stdout(Stdio::null())
             // startup failures (port stolen in the free_port window, bad
             // storage) land on stderr — keep it visible or they read as an
@@ -95,7 +103,12 @@ impl Daemon {
     }
 
     fn await_status(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        // generous because genesis COMPILES: every tenant is a wasm component
+        // the daemon cranelift-compiles at boot, and `cargo test` runs this
+        // suite's daemons in parallel — one per test, each compiling the whole
+        // set at once. The bound is only a hang-catcher; the loop below exits
+        // on the daemon's own readiness answer, never on the clock.
+        let deadline = Instant::now() + Duration::from_secs(180);
         loop {
             // liveness BEFORE the probe, never after. If our child lost a race
             // for the port and exited, something else is listening on it — and
@@ -368,6 +381,44 @@ fn post_mention(channel: &str, message_id: &str, agent_id: &str) -> serde_json::
     })
 }
 
+/// an INCOMPLETE modules dir is refused at argv time, naming the component it
+/// could not read plus the remedy. `main` opens the code source itself, so this
+/// is the ONE completeness decision — before a storage root exists, and never a
+/// stack trace from the actor thread.
+#[test]
+fn an_incomplete_modules_dir_is_refused_before_boot() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    // a directory that EXISTS and holds no components: the half-installed
+    // bundle (`make install-node` interrupted, a hand-assembled --modules).
+    let modules = tempfile::TempDir::new().expect("modules dir");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ducktape-noded"))
+        .arg("--storage")
+        .arg(storage.path())
+        .arg("--modules")
+        .arg(modules.path())
+        .output()
+        .expect("spawn ducktape-noded");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "an empty modules dir composes no genesis: {stderr}"
+    );
+    // a path INSIDE the dir, i.e. the component it could not read — never just
+    // the directory. WHICH id comes first is `hash_bundle`'s sorted-by-id walk
+    // and not this test's business.
+    let names_a_component = format!("{}{}", modules.path().display(), std::path::MAIN_SEPARATOR);
+    assert!(
+        stderr.contains(&names_a_component),
+        "refusal names the component it could not read: {stderr}"
+    );
+    assert!(
+        stderr.contains("make install-node"),
+        "refusal carries the remedy: {stderr}"
+    );
+}
+
 /// the embedded daemon runs no mesh, so it never wires a call hub — which
 /// makes the real binary exactly the no-hub case /v1/call/ws must refuse
 /// LOUDLY: 503 at upgrade with a body that says why (the #178 posture — every
@@ -408,25 +459,7 @@ fn full_surface_blocks_authorship_and_ws() {
         .iter()
         .map(|m| m["id"].as_str().expect("module id"))
         .collect();
-    assert_eq!(
-        modules,
-        [
-            "chat",
-            "saga",
-            "dispatch",
-            "tagging",
-            "tasks",
-            "inbox",
-            "automations",
-            "agent",
-            "runs",
-            "pages",
-            "forge",
-            "files",
-            "identity",
-            "gateway"
-        ]
-    );
+    assert_eq!(modules, topology::SIM_BASE);
     let genesis_hash = status["root_hash"].as_str().expect("root_hash").to_string();
 
     // connect before submitting: the stream heartbeats without a subscription,
@@ -638,14 +671,16 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
         block["height"], 4,
         "the receipt should carry the post's inclusion block"
     );
-    // …while the drain tail runs behind it: the oracle follow-up block (5)
-    // commits the result into the dispatch mailbox, and the nudge block (6)
-    // carries the DeliverPending injection that posts the reply — the
-    // never-pop-stack rule made visible in the block arithmetic.
+    // …while the drain tail runs behind it: the saga guest runs the STRICT
+    // lease policy, so the echo worker BIDS for the unassigned announcement
+    // (block 5), answers the re-emitted order that names it (block 6, the
+    // result into the dispatch mailbox), and the nudge block (7) carries the
+    // DeliverPending injection that posts the reply — the never-pop-stack rule
+    // made visible in the block arithmetic.
     assert_eq!(
         daemon.status()["height"],
-        6,
-        "post + oracle follow-up + delivery nudge should all drain"
+        7,
+        "post + oracle bid + oracle result + delivery nudge should all drain"
     );
 
     let run_id = "chat\u{1f}general\u{1f}1\u{1f}quackbot";

@@ -72,15 +72,20 @@
 //! peer traffic; it is a value for state ops to reference. a key that is not
 //! 32 bytes of hex fails loud at startup.
 //!
+//! genesis composition: the sim runs the SAME composer bin/node does
+//! (`noded::compose::compose` over a `topology` selection), so every wasm tenant
+//! is the REAL guest component — read from `--modules <dir>`, defaulting to the
+//! repo's kernel fixtures so a bare checkout boots with nothing installed.
+//!
 //! opt-in governance genesis: `--with-valset <hex-pubkey>[,<hex>...]` (comma-
-//! separated, and repeatable) appends the kv/valset/governance/lifecycle system
-//! modules AFTER the default 14, seeding the validator set with the given
+//! separated, and repeatable) appends the kv/valset/acl/governance/lifecycle
+//! system modules AFTER the default 14, seeding the validator set with the given
 //! genesis ed25519 keys exactly like bin/node. `--invite-binding <string>`
 //! (default `"sim"`, meaningful only with `--with-valset`) sets the network
 //! binding governance verifies invite tokens against. registering the upgrade
 //! module makes the host's once-per-block boundary `Advance` ride every sim
-//! block automatically. the DEFAULT genesis is byte-identical to before —
-//! these modules exist only under the flag.
+//! block automatically, and it is also the code registry governance is wired
+//! to — so `UpdateModule` proposals are live here, not gated off.
 //!
 //! origin hex escape (sim lanes only): a `/v1/submit` or `/sim/peer-block`
 //! origin string prefixed `hex:` (e.g. `hex:ab12…`, any even-length hex)
@@ -100,7 +105,7 @@
 //! run: `cargo run -p simnode -- [--listen 127.0.0.1:8845] [--storage <dir>]
 //!       [--auto] [--persona local|networked] [--echo-oracle]
 //!       [--with-valset <hex>[,<hex>...]] [--invite-binding <string>]
-//!       [--node-key <64-hex>]`
+//!       [--node-key <64-hex>] [--modules <dir>]`
 //!
 //! block-on-reject (validator parity): a rejected SINGLE op JOURNALS a block
 //! here, exactly like the ordered validator — the op rides the drain, seals its
@@ -110,13 +115,11 @@
 //! batch is folded into that batch's one block with its own `rejected` verdict,
 //! as before.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use agent::AgentModule;
-use automations::Automations;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
@@ -124,47 +127,29 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chat::Chat;
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
-use dispatch::DispatchModule;
-use files::Files;
-use forge::Forge;
-use gateway::Gateway;
-use runs::RunsModule;
-use tagging::TaggingModule;
-// the opt-in `--with-valset` governance genesis modules (registered only under
-// the flag; the default genesis stays byte-identical without them).
-use acl::Acl;
 use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
 use futures::select;
-use governance::Governance;
+use host::BlockOp;
 use host::worker;
-use host::{BlockOp, Host};
-use identity::Identity;
-use inbox::Inbox;
 use indexer::IndexStore;
-use kv::Kv;
-use lifecycle::Lifecycle;
 use node::{ConsensusTimePolicy, DrainedFrame, NullSink, OrderedNode, StepHandle, StepOrderer};
+use noded::bundle::{DirCodeSource, host_from, qmdb_stores};
+use noded::compose::{Bindings, Boot, Substrates, compose};
 use noded::{
-    BlockDisposition, BlockSummary, ModuleCategory, ModuleStatus, NodeCommand, NodeHandle,
-    NodeStatus, StreamHub, hex_bytes, hex_root,
+    BlockDisposition, BlockSummary, LOCAL_CHAIN_ID, ModuleCategory, ModuleStatus, NodeCommand,
+    NodeHandle, NodeStatus, ORACLE_ORIGIN, StreamHub, hex_bytes, hex_root,
 };
-use pages::Pages;
-use saga::SagaModule;
-use sdk::{Event, Module, Msg, Origin};
+use sdk::{Event, Msg, Origin};
 use serde::{Deserialize, Serialize};
-use statesync::qmdb::QmdbStore;
-use tasks::Tasks;
-use valset::Valset;
+use topology::TOPOLOGY;
 
 // the sim's genesis sets are the `sim_base` (+ `sim_valset`) selections of the
 // single-source `topology` — noded's exact 14-module default plus the
-// opt-in 4 system modules. changing the daemon set changes the topology, which
-// re-pins here and at node/demo. the native genesis vec below composes these
-// same ids over native module structs (the wasm/native root split is by design).
-const ORACLE_ORIGIN: &[u8] = b"oracle";
+// opt-in 5 system modules. changing the daemon set changes the topology, which
+// re-pins here and at node/demo. the composer below builds exactly those ids,
+// the same way bin/node does.
 const PEER_ORIGIN: &[u8] = b"peer";
 
 /// the logical clock: `consensus_time = SIM_EPOCH_MS + height * SIM_BLOCK_MS`.
@@ -318,7 +303,7 @@ pub struct SimOpts {
     /// register the deterministic echo oracle (`--echo-oracle`).
     pub echo_oracle: bool,
     /// opt-in governance genesis: raw 32-byte ed25519 validator pubkeys. empty
-    /// => the default 14-module set, byte-identical.
+    /// => the default 14-module set (`topology::SIM_BASE`) alone.
     pub valset_keys: Vec<Vec<u8>>,
     /// the invite namespace governance verifies tokens against — meaningful only
     /// with `valset_keys`. defaults to `b"sim"`.
@@ -329,6 +314,10 @@ pub struct SimOpts {
     pub node_key: Option<String>,
     /// the receipt/ring persona — local daemon vs networked validator shapes.
     pub persona: Persona,
+    /// the directory of `<id>.component.wasm` the sim composes its wasm tenants
+    /// from; `None` = the repo's kernel fixtures, so an embedder in this
+    /// checkout needs no install.
+    pub modules_dir: Option<PathBuf>,
     /// install noded's PROCESS-GLOBAL tracing subscriber + panic hook (feeding
     /// the log ring). the binary sets this; an embedder leaves it `false` so
     /// `boot` has no global side effects and repeated boots don't stack hooks.
@@ -344,6 +333,7 @@ impl Default for SimOpts {
             invite_binding: b"sim".to_vec(),
             node_key: None,
             persona: Persona::Local,
+            modules_dir: None,
             install_log: false,
         }
     }
@@ -363,11 +353,19 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
         invite_binding,
         node_key,
         persona,
+        modules_dir,
         install_log,
     } = opts;
+    // the component bytes every wasm tenant composes from. the default is the
+    // repo's kernel fixtures — the sim is a dev tool that must boot from a bare
+    // checkout, with no bundle install and no managed modules dir.
+    let modules_dir = modules_dir.unwrap_or_else(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../crates/kernel/host/tests/fixtures")
+    });
 
     // the status module list and the index tier both extend only under valset
-    // keys; the default path stays the exact 14-module set the parity lane pins.
+    // keys; the default path stays the exact 14-module set `daemon_e2e` pins
+    // against noded.
     let module_ids: Vec<&'static str> = if valset_keys.is_empty() {
         topology::SIM_BASE.to_vec()
     } else {
@@ -377,6 +375,13 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
             .copied()
             .collect()
     };
+    // read and hash the bundle HERE, in the caller: ONE decision about whether
+    // the components are usable, surfaced as `boot`'s own Err instead of a
+    // panic on the actor thread that reaches an embedder as "sim actor died
+    // during genesis". the source (a path and a hash table) then rides in.
+    let wasm_ids = TOPOLOGY.wasm_ids(&module_ids);
+    let (code, code_hashes) = DirCodeSource::open(&modules_dir, &wasm_ids)?;
+
     let storage = storage.to_path_buf();
     let forge_repo = storage.join("forge-git");
 
@@ -444,6 +449,8 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
             run_sim(
                 actor_storage,
                 forge_repo,
+                code,
+                code_hashes,
                 index,
                 blobs,
                 actor_persona,
@@ -748,6 +755,8 @@ struct Sim {
 fn run_sim(
     storage: PathBuf,
     forge_repo: PathBuf,
+    code: DirCodeSource,
+    code_hashes: BTreeMap<String, [u8; 32]>,
     index: Arc<IndexStore>,
     blobs: blobstore::BlobHandle,
     persona: Arc<Mutex<Persona>>,
@@ -771,144 +780,35 @@ fn run_sim(
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
     executor.start(|context| async move {
-        // genesis: noded's exact module set (topology `sim_base`), composed here
-        // over native module structs so app queries and status roots behave like
-        // a real daemon's.
-        let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("chat"), "chat").await))
-            .with_tagging("tagging");
-        let saga = SagaModule::new(
-            "saga",
-            Box::new(QmdbStore::init(context.child("saga"), "saga").await),
-        );
-        let dispatch = DispatchModule::new(
-            "dispatch",
-            "saga",
-            Box::new(QmdbStore::init(context.child("dispatch"), "dispatch").await),
-        );
-        let tagging = TaggingModule::new(
-            "tagging",
-            Box::new(QmdbStore::init(context.child("tagging"), "tagging").await),
+        // genesis: the topology selection composed the way bin/node composes —
+        // wasm tenants fetched by hash from the source `boot` opened, the native
+        // registries seeded from the sim's bindings. governance composes as
+        // wasm, so its code registry is wired and UpdateModule proposals are
+        // live in the sim.
+        let selection: &[&'static str] = &module_ids;
+        let substrates = Substrates {
+            forge_repo,
+            duckfs_dir,
+            blobs: blobs.clone(),
+        };
+        let bindings = Bindings {
+            invite: &invite_binding,
+            chain_id: LOCAL_CHAIN_ID,
+            validators: &valset_keys,
+            code_hashes: &code_hashes,
+        };
+        let mut stores = qmdb_stores(&context);
+        let modules = compose(
+            selection,
+            &code,
+            &mut stores,
+            &substrates,
+            &bindings,
+            Boot::Genesis,
         )
-        .with_direct_owner("runs");
-        let tasks = Tasks::new(
-            "tasks",
-            Box::new(QmdbStore::init(context.child("tasks"), "tasks").await),
-        );
-        let inbox = Inbox::new(
-            "inbox",
-            Box::new(QmdbStore::init(context.child("inbox"), "inbox").await),
-        );
-        let automations = Automations::new(
-            "automations",
-            Box::new(QmdbStore::init(context.child("automations"), "automations").await),
-            "chat",
-            "tasks",
-            "inbox",
-        );
-        let agent = AgentModule::new(
-            "agent",
-            Box::new(QmdbStore::init(context.child("agent"), "agent").await),
-            "saga",
-            Some("runs".into()),
-        );
-        let runs = RunsModule::new(
-            "runs",
-            "chat",
-            "saga",
-            "tagging",
-            "dispatch",
-            "agent",
-            Some("tasks".into()),
-            Some("tasks".into()),
-        )
-        // The portable composer pins its source head from duckfs/files.
-        .with_files_module("files")
-        // the pages module the composer renders [[page:<id>]] refs from and
-        // the pages effects lane writes to; unwired, both degrade.
-        .with_pages_module("pages");
-        let pages = Pages::new("pages", Box::new(QmdbStore::init(context.child("pages"), "pages").await))
-            .with_tagging("tagging");
-        let forge = Forge::with_blobs("forge", forge_repo, blobs.clone())
-            .expect("forge init")
-            .with_chat("chat");
-        let files = Files::open("files", duckfs_dir).expect("duckfs open");
-        // the account registry (numbered principals over key associations) —
-        // no chain id (the simulator has none), matching noded's daemon
-        // wiring. store-backed like chat/pages.
-        let identity = Identity::new(
-            "identity",
-            Box::new(QmdbStore::init(context.child("identity"), "identity").await),
-            String::new(),
-        );
-        let gateway = Gateway::new(
-            "gateway",
-            Box::new(QmdbStore::init(context.child("gateway"), "gateway").await),
-            "identity",
-            "local",
-        );
-        let mut modules: Vec<Box<dyn Module>> = vec![
-            Box::new(chat),
-            Box::new(saga),
-            Box::new(dispatch),
-            Box::new(tagging),
-            Box::new(tasks),
-            Box::new(inbox),
-            Box::new(automations),
-            Box::new(agent),
-            Box::new(runs),
-            Box::new(pages),
-            Box::new(forge),
-            Box::new(files),
-            Box::new(identity),
-            Box::new(gateway),
-        ];
-        // opt-in governance genesis, AFTER the default 14 in registry order:
-        // kv, valset (seeded with the given genesis validators exactly like
-        // bin/node), acl (the submit-policy table, EMPTY = allow-all),
-        // governance (the sole authorized author of valset and acl change,
-        // bound to the invite namespace), and the lifecycle coordinator — whose
-        // registration alone makes the host's once-per-block boundary `Advance`
-        // ride every sim block. governance's code-registry path stays unwired
-        // (no `with_code_registry`, so UpdateModule proposals are gated off) and
-        // capability is left out; saga's construction is untouched. empty
-        // valset_keys => the default set, byte-identical.
-        if !valset_keys.is_empty() {
-            let kv = Kv::new("kv", Box::new(QmdbStore::init(context.child("kv"), "kv").await));
-            let mut valset = Valset::new(
-                "valset",
-                Box::new(QmdbStore::init(context.child("valset"), "valset").await),
-            );
-            for key in &valset_keys {
-                valset.seed(key.clone()).await.expect("seed sim valset");
-            }
-            valset.finish_seed().await.expect("seed sim valset");
-            let acl_table = Acl::new(
-                "acl",
-                Box::new(QmdbStore::init(context.child("acl"), "acl").await),
-            );
-            // identity is already in the default module set above. store-backed
-            // like bin/node; the sim wires the binding through the native
-            // builder (no wasm guest here, so no `__config` seeding).
-            let governance = Governance::new(
-                "governance",
-                Box::new(QmdbStore::init(context.child("governance"), "governance").await),
-                "valset",
-                "identity",
-            )
-            .with_invite_binding(invite_binding)
-            .with_acl("acl");
-            let lifecycle = Lifecycle::new(
-                "lifecycle",
-                Box::new(QmdbStore::init(context.child("lifecycle"), "lifecycle").await),
-                "valset",
-            );
-            modules.push(Box::new(kv));
-            modules.push(Box::new(valset));
-            modules.push(Box::new(acl_table));
-            modules.push(Box::new(governance));
-            modules.push(Box::new(lifecycle));
-        }
-        let host = Host::genesis(modules).expect("genesis");
+        .await
+        .expect("sim genesis composes");
+        let host = host_from(modules).expect("genesis");
 
         // a lib must not write to stdout — this is a once-per-boot lifecycle
         // fact, so it rides tracing (visible on the binary's stderr + ring under
@@ -1428,9 +1328,7 @@ impl Sim {
             // seeded key names an identity for consensus-op scenarios; no mesh
             // routes behind it.
             public_key: self.public_key.clone(),
-            // the simulator serves no chain (its identity module runs with an
-            // empty chain id), so there is nothing to name here.
-            chain_id: String::new(),
+            chain_id: LOCAL_CHAIN_ID.into(),
             operations: noded::OperationalStatus {
                 role: noded::NodeRole::Local,
                 phase: noded::NodePhase::Serving,
@@ -1546,23 +1444,40 @@ struct EchoWorker;
 #[async_trait::async_trait(?Send)]
 impl worker::Worker for EchoWorker {
     async fn run(&self, event: &Event) -> Result<worker::WorkOutcome, worker::Error> {
-        let request = match saga::decode_worker_request(&event.payload) {
-            Ok(request) => request,
-            Err(_) => return Ok(worker::WorkOutcome::NotMine),
+        let Ok(request) = saga::decode_worker_request(&event.payload) else {
+            return Ok(worker::WorkOutcome::NotMine);
         };
         // a dispatch-plane WorkSpec echoes its raw-text lane (the dispatch
         // module judged a Text contract; the agent module normalizes).
         let Ok(work) = dispatch::decode_work_spec(&request.spec) else {
             return Ok(worker::WorkOutcome::NotMine);
         };
-        Ok(worker::WorkOutcome::Handled(Some(Msg {
-            target: "saga".into(),
-            payload: saga::encode_msg(&saga::SagaMsg::OracleResult {
-                saga_id: request.saga_id,
-                attempt: request.attempt,
+        let saga::WorkerRequest {
+            saga_id,
+            attempt,
+            assignee,
+            ..
+        } = request;
+        // the saga guest runs the STRICT lease policy, so this walks the same
+        // bid-then-work lane a real compute node does: an UNASSIGNED request is
+        // an announcement, claimed with `Accept` (the module then re-emits the
+        // work order naming the winner), and only the assignee's own result
+        // lands. the sim commits every follow-up under `ORACLE_ORIGIN`, so that
+        // is the key this worker holds its leases under.
+        let follow = match assignee.as_deref() {
+            None => saga::SagaMsg::Accept { saga_id, attempt },
+            Some(ORACLE_ORIGIN) => saga::SagaMsg::OracleResult {
+                saga_id,
+                attempt,
                 outcome: Ok(format!("echo: handling dispatch {}", work.dispatch_id).into_bytes()),
                 usage: None,
-            }),
+            },
+            // an order another node won is not this worker's to answer.
+            Some(_) => return Ok(worker::WorkOutcome::NotMine),
+        };
+        Ok(worker::WorkOutcome::Handled(Some(Msg {
+            target: "saga".into(),
+            payload: saga::encode_msg(&follow),
         })))
     }
 }

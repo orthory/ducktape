@@ -276,6 +276,38 @@ The noded and simnode golden hashes (`bin/simnode/tests/topology_set.rs`,
 the daemon parity lane) move; each commit names the flag day. The app's
 tests boot simnode and will pay the wasmtime load (19 components) — accepted.
 
+*(This paragraph is SUPERSEDED — only the sim golden moved, there is no daemon
+parity lane, and the count is 14. See "As built" below; do not quote the
+sentence above.)*
+
+### As built (2026-08-28, `feat/composer-callers`)
+
+All three callers compose through `noded::compose::compose` now. What the
+sketch above got wrong, and what it cost:
+
+| Spec said | As built | Why |
+|---|---|---|
+| `trait CodeBytes { fn bytes(&self, id) }` | `host::CodeSource`, keyed BY HASH | the kernel already had the seam, and the ONE that a post-genesis swap uses. `DirCodeSource::open(dir, ids)` hashes the bundle first and answers by digest; the id→hash map it returns IS `Bindings::code_hashes`. An id-keyed source would have been a second, weaker lookup beside it. |
+| the composer's helpers live in `compose.rs` | `crates/noded/src/bundle.rs` | `DirCodeSource`, `hash_bundle`, `qmdb_stores`, `WasmModuleFactory` and `host_from` are what a CALLER needs around the composer, not the composer. `bin/node`'s copies of the last three are deleted. |
+| "the daemon parity lane" pins noded's set | there is no parity lane | `bin/noded/tests/daemon_e2e.rs` asserts `/v1/status` modules == `topology::SIM_BASE`. That is the pin; nothing else ever existed. |
+| both golden hashes move | only the sim's moves: `af1078f7… → 49f49b10…` | noded publishes no golden root. `bin/node`'s `GENESIS_ROOT_HASH` does NOT move — Part 1 already put the production set on the composer, and this branch changes no bytes it composes. |
+| (unstated) | `chain_id = "local"` in BOTH daemons, from ONE shared `noded::LOCAL_CHAIN_ID` | the identity and gateway guests scope their records to it, so the composer must bind SOMETHING; noded's `/v1/status` now reports it. It reported `""` before, and the app's `named_chain` refused that — an add-key consent against noded was impossible to sign. Two per-daemon consts would let the daemons' roots drift apart on a typo, so there is one. |
+| (unstated) | each daemon's CALLER opens the code source; no actor-thread `expect` decides bundle completeness | `main` (noded) and `boot` (simnode) call `DirCodeSource::open` and return `Err`; the `DirCodeSource` + hash map then ride into the actor thread. Two deciders — an `is_file` precheck plus the composer's own read — would disagree on a component that exists but cannot be read, and the second one panics where its remedy reaches nobody. |
+| (unstated) | both echo oracles bid before answering | the saga guest runs `LeasePolicy::Strict`: a result from a worker that never claimed the attempt is refused. Each oracle now sends `SagaMsg::Accept` first, mirroring `crates/services/compute/src/lib.rs:131-154`. |
+
+**Cost, and the follow-up it makes REQUIRED.** Genesis cranelift-compiles 14
+components per daemon, per boot, with nothing shared between them:
+
+- `bin/noded/tests/daemon_e2e.rs` readiness went 30 s → 180 s. 22 daemons
+  compile in parallel under one `cargo test`; at 30 s the whole suite failed.
+- the app lane (`cargo test -p ducktape-app`, which embeds simnode) went
+  13.2 s → 19.1 s.
+
+A shared compiled-component cache — one `wasmtime::Module` per (engine,
+digest), reused across hosts in a process and across boots on disk — is NOT in
+this branch and is the next thing to build. Both numbers above are what it has
+to recover.
+
 ## §4 CLI — `bin/node/src/module_cli.rs`
 
 ```
@@ -460,7 +492,7 @@ boundary.
    removal (**flag day**: `GENESIS_ROOT_HASH` moves, named in the commit).
 3. §4 CLI verbs + status.
 4. §5 e2e (fixes anything it exposes in 2).
-5. §3's noded/simnode callers (golden hashes move, named).
+5. §3's noded/simnode callers (the SIM golden moves, named; noded has none).
 
 Gates per PR: `cargo clippy -p <crate> --tests --no-deps` for touched crates,
 `cargo check --workspace --all-targets`, `make wasm-modules-check`, and the

@@ -20,6 +20,37 @@ fn boot_auto(storage: &std::path::Path) -> simnode::SimHandle {
     .expect("boot embedded sim")
 }
 
+/// the noded counterpart of `an_incomplete_modules_dir_is_refused_before_boot`:
+/// `boot` reads and hashes the bundle ITSELF, so an unusable one comes back as
+/// `boot`'s own Err naming the component it could not read. An embedder must
+/// never have to read "sim actor died during genesis" off a panicking thread
+/// for a dir it handed in.
+#[test]
+fn boot_refuses_a_modules_dir_with_no_components() {
+    let storage = tempfile::tempdir().expect("storage");
+    let modules = tempfile::tempdir().expect("modules");
+
+    let booted = simnode::boot(
+        storage.path(),
+        loopback0(),
+        simnode::SimOpts {
+            modules_dir: Some(modules.path().to_path_buf()),
+            ..Default::default()
+        },
+    );
+    let Err(err) = booted else {
+        panic!("an empty modules dir composes no genesis, so boot must refuse");
+    };
+
+    // a path INSIDE the dir — the component, not the directory. WHICH id is
+    // named first belongs to `hash_bundle`'s sorted walk, not to this test.
+    let names_a_component = format!("{}{}", modules.path().display(), std::path::MAIN_SEPARATOR);
+    assert!(
+        err.contains(&names_a_component),
+        "boot names the component it could not read: {err}"
+    );
+}
+
 #[test]
 fn embedded_boot_serves_and_commits() {
     let storage = tempfile::tempdir().expect("storage");

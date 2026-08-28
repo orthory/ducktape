@@ -10,7 +10,8 @@
 //! same way. POST /v1/admin/shutdown is how a client retires it: no pid handshake,
 //! the port IS the daemon's identity.
 //!
-//! run: `cargo run -p noded-bin -- [--listen 127.0.0.1:8844] [--storage <dir>]`
+//! run: `cargo run -p noded-bin -- [--listen 127.0.0.1:8844] [--storage <dir>]
+//! [--modules <dir>]`
 //!
 //! without `--storage` state lives in a fresh temp dir (clean run each boot).
 //! with it, qmdb modules, the forge repo, and the per-module index persist;
@@ -18,41 +19,31 @@
 //! heights stay monotonic across restarts (a counter restarting at 0 would
 //! make every new block look already-indexed and be silently skipped).
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use agent::AgentModule;
-use automations::Automations;
-use chat::Chat;
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
-use dispatch::DispatchModule;
-use files::Files;
-use forge::Forge;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use gateway::Gateway;
 use host::{BlockContext, Host, SubmitError};
-use identity::Identity;
-use inbox::Inbox;
 use indexer::IndexStore;
+use noded::bundle::{DirCodeSource, host_from, qmdb_stores};
+use noded::compose::{Bindings, Boot, Substrates, compose};
 use noded::{
-    BlockDisposition, BlockRecord, BlockSummary, ModuleCategory, ModuleStatus, NodeCommand,
-    NodeHandle, NodeMetrics, NodeStatus, ORACLE_ORIGIN, StreamHub, block_row, hex_root,
+    BlockDisposition, BlockRecord, BlockSummary, LOCAL_CHAIN_ID, ModuleCategory, ModuleStatus,
+    NodeCommand, NodeHandle, NodeMetrics, NodeStatus, ORACLE_ORIGIN, StreamHub, block_row,
+    hex_root,
 };
-use pages::Pages;
-use runs::RunsModule;
-use saga::SagaModule;
 use sdk::{Event, Msg, Origin};
-use statesync::qmdb::QmdbStore;
-use tagging::TaggingModule;
-use tasks::Tasks;
+use topology::TOPOLOGY;
 
 /// every module registered at genesis, in registry order — the `sim_base`
 /// selection of the single-source [`topology`] (identical to simnode's
-/// default set). status reports use this list; the genesis vec in `run_node`
-/// composes the same ids over native module structs.
+/// default set). status reports use this list, and `run_node` composes exactly
+/// these ids through the topology composer.
 const MODULE_IDS: &[&str] = topology::SIM_BASE;
 
 mod echo_oracle;
@@ -60,16 +51,40 @@ mod echo_oracle;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut listen: SocketAddr = "127.0.0.1:8844".parse()?;
     let mut storage: Option<PathBuf> = None;
+    let mut modules: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--listen" => listen = args.next().ok_or("--listen needs an addr")?.parse()?,
             "--storage" => storage = args.next().map(PathBuf::from),
+            "--modules" => {
+                modules = Some(PathBuf::from(args.next().ok_or("--modules needs a dir")?))
+            }
             other => {
-                return Err(format!("unexpected arg {other:?} (want --listen/--storage)").into());
+                return Err(format!(
+                    "unexpected arg {other:?} (want --listen/--storage/--modules)"
+                )
+                .into());
             }
         }
     }
+    // where the wasm tenants' `<id>.component.wasm` bytes come from: `--modules`,
+    // else the managed dir `make install-node` fills. Read and hashed HERE,
+    // before a storage root is created or a listener binds — ONE decision about
+    // whether the bundle is usable, made where its remedy is the operator's
+    // rather than a stack trace from the actor thread. the source (a path and a
+    // hash table) then rides into the actor.
+    let modules_dir = match modules {
+        Some(dir) => dir,
+        None => workspace_config::modules_dir()?,
+    };
+    let wasm_ids = TOPOLOGY.wasm_ids(MODULE_IDS);
+    let (code, code_hashes) = DirCodeSource::open(&modules_dir, &wasm_ids).map_err(|err| {
+        format!(
+            "{err} — fill `~/.ducktape/modules` (`make install-node`), or pass \
+             --modules <dir> holding every <id>.component.wasm"
+        )
+    })?;
     let storage = storage.unwrap_or_else(|| {
         std::env::temp_dir().join(format!("ducktape-noded-{}", std::process::id()))
     });
@@ -145,6 +160,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_node(
                 actor_storage,
                 actor_forge_repo,
+                code,
+                code_hashes,
                 actor_index,
                 blobs,
                 actor_handle,
@@ -188,6 +205,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn run_node(
     storage: PathBuf,
     forge_repo: PathBuf,
+    code: DirCodeSource,
+    code_hashes: BTreeMap<String, [u8; 32]>,
     index: Arc<IndexStore>,
     blobs: noded::blobs::BlobHandle,
     node_handle: noded::NodeHandle,
@@ -201,125 +220,40 @@ fn run_node(
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
     executor.start(|context| async move {
-        // genesis: the full product surface. chat/tasks/inbox as the core loop,
-        // automations bridging chat events into chat/tasks/inbox follow-ups,
-        // jobs for deferred work, pages + forge for the substrate-backed
-        // stores, and files (duckfs) for the content plane.
-        let chat = Chat::new(
-            "chat",
-            Box::new(QmdbStore::init(context.child("chat"), "chat").await),
-        )
-            .with_tagging("tagging");
-        let saga = SagaModule::new(
-            "saga",
-            Box::new(QmdbStore::init(context.child("saga"), "saga").await),
-        );
-        // the task plane: recipe manifests + capability dispatch with
-        // next-block result delivery.
-        let dispatch = DispatchModule::new(
-            "dispatch",
-            "saga",
-            Box::new(QmdbStore::init(context.child("dispatch"), "dispatch").await),
-        );
-        // the engagement plane: tag reports in, engagement events out.
-        let tagging = TaggingModule::new(
-            "tagging",
-            Box::new(QmdbStore::init(context.child("tagging"), "tagging").await),
-        )
-        .with_direct_owner("runs");
-        let tasks = Tasks::new(
-            "tasks",
-            Box::new(QmdbStore::init(context.child("tasks"), "tasks").await),
-        );
-        let inbox = Inbox::new(
-            "inbox",
-            Box::new(QmdbStore::init(context.child("inbox"), "inbox").await),
-        );
-        let automations = Automations::new(
-            "automations",
-            Box::new(QmdbStore::init(context.child("automations"), "automations").await),
-            "chat",
-            "tasks",
-            "inbox",
-        );
-        let agent = AgentModule::new(
-            "agent",
-            Box::new(QmdbStore::init(context.child("agent"), "agent").await),
-            "saga",
-            Some("runs".into()),
-        );
-        let runs = RunsModule::new(
-            "runs",
-            "chat",
-            "saga",
-            "tagging",
-            "dispatch",
-            "agent",
-            Some("tasks".into()),
-            Some("tasks".into()),
-        )
-        // The portable composer pins its source head from duckfs/files.
-        .with_files_module("files")
-        // the forge module the composer resolves forge:<repo>:<n> channels
-        // against and the PR sink queries; unwired, forge-channel mentions
-        // skip at compose.
-        .with_sink_forge("forge")
-        // the pages module the composer renders [[page:<id>]] refs from and
-        // the pages effects lane (pages.comment / pages.set_checked) writes
-        // to; unwired, both degrade to breadcrumbs.
-        .with_pages_module("pages");
-        let pages = Pages::new(
-            "pages",
-            Box::new(QmdbStore::init(context.child("pages"), "pages").await),
-        )
-            .with_tagging("tagging");
-        // forge shares the files body plane so a Push's packfile — uploaded to
-        // the blob lane before the op is submitted — materializes locally; the
-        // pack bytes never enter consensus (root stays sha256(head oid)).
-        let forge = Forge::with_blobs("forge", forge_repo, blobs.clone())
-            .expect("forge init")
-            .with_chat("chat");
+        // genesis: the topology's `sim_base` selection composed the way bin/node
+        // composes — every wasm tenant is the REAL guest component, fetched by
+        // hash from the source `main` opened, over qmdb stores in this runtime's
+        // storage root.
         // the block loop's own handle: each block's root payload is staged as
         // its explorer row is built, so op hashes stay dereferencable via the
         // blob lane (worker follow-ups included — the http submit handler only
         // stages what clients POST).
         let op_blobs = blobs.clone();
-        let files = Files::open("files", duckfs_dir).expect("duckfs open");
-        // the account registry (numbered principals over key associations).
-        // the single-node daemon carries no chain id (dev-only: chain-unscoped
-        // add-key consents are an acceptable surface here). store-backed like
-        // chat/pages.
-        let identity = Identity::new(
-            "identity",
-            Box::new(QmdbStore::init(context.child("identity"), "identity").await),
-            String::new(),
-        );
-        // the MERGED gateway owns both the `.duck` handle plane and the route
-        // plane; the single-node daemon carries no valset (ungated) and a
-        // dev-only chain id.
-        let gateway = Gateway::new(
-            "gateway",
-            Box::new(QmdbStore::init(context.child("gateway"), "gateway").await),
-            "identity",
-            "local",
-        );
-        let mut host = Host::genesis(vec![
-            Box::new(chat),
-            Box::new(saga),
-            Box::new(dispatch),
-            Box::new(tagging),
-            Box::new(tasks),
-            Box::new(inbox),
-            Box::new(automations),
-            Box::new(agent),
-            Box::new(runs),
-            Box::new(pages),
-            Box::new(forge),
-            Box::new(files),
-            Box::new(identity),
-            Box::new(gateway),
-        ])
-        .expect("genesis");
+        let substrates = Substrates {
+            forge_repo,
+            duckfs_dir,
+            blobs,
+        };
+        let bindings = Bindings {
+            // no governance in this set, so nothing reads an invite namespace.
+            invite: b"",
+            chain_id: LOCAL_CHAIN_ID,
+            // and no valset: the single-writer daemon has no validators.
+            validators: &[],
+            code_hashes: &code_hashes,
+        };
+        let mut stores = qmdb_stores(&context);
+        let modules = compose(
+            MODULE_IDS,
+            &code,
+            &mut stores,
+            &substrates,
+            &bindings,
+            Boot::Genesis,
+        )
+        .await
+        .expect("noded genesis composes");
+        let mut host = host_from(modules).expect("genesis");
 
         tracing::info!(
             target: "ducktape::consensus",
@@ -617,9 +551,9 @@ fn publish_status(
         // the embedded daemon has no mesh identity — clients treat an empty
         // key as "no peer-routed features here".
         public_key: String::new(),
-        // the embedded daemon serves no chain (its identity module runs with
-        // an empty chain id), so there is nothing to name here.
-        chain_id: String::new(),
+        // the chain the composer bound into the identity and gateway guests —
+        // the value a client's add-key consent must sign over.
+        chain_id: LOCAL_CHAIN_ID.into(),
         operations: metrics.operational_status(),
     });
     // no mesh, no consensus: the standing carries only the height — the
