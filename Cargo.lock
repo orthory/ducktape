@@ -6292,6 +6292,7 @@ dependencies = [
  "dispatch 0.1.0",
  "duckfs-client",
  "duckfs-core",
+ "files",
  "flate2",
  "forge",
  "futures",
@@ -6302,6 +6303,8 @@ dependencies = [
  "identity",
  "indexer",
  "keyscheme",
+ "kv",
+ "lifecycle",
  "media-service",
  "nettest",
  "node",
@@ -6321,10 +6324,13 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.24.0",
+ "topology",
  "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber 0.3.23",
+ "valset",
+ "wasm-host",
 ]
 
 [[package]]

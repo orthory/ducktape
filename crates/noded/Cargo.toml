@@ -29,6 +29,16 @@ bytes = "1"
 statesync = { workspace = true }
 host = { workspace = true }
 sdk = { workspace = true }
+# the ONE module composer (`src/compose.rs`): the topology names each module's
+# shape, wasm-host wraps the component over its backing, and the three native
+# system modules (valset/lifecycle/kv) plus the two odb substrates (files/forge)
+# are the only constructors it calls by name.
+topology = { workspace = true }
+wasm-host = { workspace = true }
+valset = { workspace = true }
+lifecycle = { workspace = true }
+kv = { workspace = true }
+files = { workspace = true }
 chat = { workspace = true }
 # the `/v1/call/ws` framing (the webview leg of a huddle) and the voice frame size.
 media-service = { workspace = true }

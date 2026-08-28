@@ -672,8 +672,9 @@ impl Host {
     /// module is absent / its reply is unreadable — the shared out-of-block
     /// committed read behind [`Host::pending_lifecycle_advance`] and
     /// [`Host::realize_module_swaps`] (a missing registry is never an error,
-    /// just nothing to do).
-    async fn lifecycle_module_status(&self) -> Option<Vec<lifecycle::ModuleCode>> {
+    /// just nothing to do). `pub` for the node's restore/sync composers, which
+    /// adopt the modules the registry admitted after genesis.
+    pub async fn lifecycle_module_status(&self) -> Option<Vec<lifecycle::ModuleCode>> {
         let req = lifecycle::encode_query(&lifecycle::LifecycleQuery::ModuleStatus);
         let bytes = self.query(LIFECYCLE_MODULE_ID, &req).await.ok()?;
         match lifecycle::decode_reply(&bytes).ok()? {
@@ -813,6 +814,13 @@ impl Host {
     /// the live root of a single registered module (test/inspection accessor).
     pub fn module_root(&self, id: &str) -> Option<StateRoot> {
         self.registry.get(id).map(|m| m.root())
+    }
+
+    /// the sha256 of the component a registered module currently RUNS, or
+    /// `None` for a native module (no swappable code) and for an unknown id.
+    /// per-node realization state, never part of `root()`.
+    pub fn module_code_hash(&self, id: &str) -> Option<Vec<u8>> {
+        self.registry.get(id).and_then(|m| m.code_hash())
     }
 
     /// every registered module's `(id, root)`, in registry (sorted-id) order —

@@ -18,6 +18,11 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# no wasm is embedded in the binary: founding hashes THIS directory of
+# <id>.component.wasm into the descriptor. the checkout's committed set, so a
+# demo seed never depends on the operator's ~/.ducktape/modules.
+MODULES="$REPO_ROOT/crates/kernel/host/tests/fixtures"
 ID="${DEMO_WORKSPACE_ID:-demo}"
 # The SAME root the CLI resolves (`wallet::duck_root`) and the app resolves
 # (`duck_home`). Hardcoding `$HOME` split the two under DUCKTAPE_HOME: the
@@ -67,6 +72,7 @@ WGP="$(bun -e 'const s=await Bun.udpSocket({port:0});process.stdout.write(String
 #                        the app reboots from) fully local.
 INIT_ERR="$(mktemp)"
 if ! CHAIN="$("$NODE_BIN" node init --name "$ID" --dir "$WSDIR" \
+  --modules "$MODULES" \
   --listen "127.0.0.1:$P1" --advertised "127.0.0.1:$P1" \
   --http "127.0.0.1:$P2" --rpc "127.0.0.1:$P3" --gateway 127.0.0.1:0 \
   --primary-coordinator none \

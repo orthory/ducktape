@@ -37,6 +37,7 @@ pub(crate) async fn run(
     storage_for_sync: std::path::PathBuf,
     namespace: Vec<u8>,
     blobs: noded::blobs::BlobHandle,
+    genesis: &crate::config::GenesisModules,
     voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
 ) {
     metrics.set_role_phase(noded::NodeRole::SyncOnly, noded::NodePhase::Syncing);
@@ -181,6 +182,7 @@ pub(crate) async fn run(
             blobs: blobs.clone(),
         },
         0,
+        genesis,
     )
     .await
     {

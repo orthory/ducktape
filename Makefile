@@ -124,8 +124,16 @@ install-app:
 	@exit 2
 endif
 
+## the binary embeds no wasm: `node init` founds a network from a directory of
+## <id>.component.wasm, so installing the node also installs that set.
 install-node:
 	$(CARGO) install --path bin/node --locked
+	mkdir -p "$${DUCKTAPE_MODULES_DIR:-$$HOME/.ducktape/modules}"
+	@for m in $(BUILDER_MODULES); do \
+	  id=$$(basename $$m) && \
+	  cp $$m/component.wasm "$${DUCKTAPE_MODULES_DIR:-$$HOME/.ducktape/modules}/$$id.component.wasm" || exit 1; \
+	done
+	@echo "installed module components into $${DUCKTAPE_MODULES_DIR:-$$HOME/.ducktape/modules}"
 
 ## coordinator -> ~/.cargo/bin/ducktape-coordinator
 install-coordinator:
@@ -269,9 +277,10 @@ wasm-modules:
 	  -o crates/kernel/wasm-host/tests/fixtures/object.component.wasm
 
 ## the drift gate for the committed component artifacts: every copy of the SAME
-## module must be byte-identical (bin/node embeds the canonical artifact; the
-## kernel test fixtures pin the same bytes). toolchain-independent, so it rides
-## the pre-push `test` gate; run `make wasm-modules` to refresh the set.
+## module must be byte-identical (`node init` hashes the bundle into the
+## descriptor; the kernel test fixtures pin the same bytes).
+## toolchain-independent, so it rides the pre-push `test` gate; run
+## `make wasm-modules` to refresh the set.
 wasm-modules-check:
 	cmp crates/guests/hello-wasm/component.wasm \
 	  crates/kernel/wasm-host/tests/fixtures/hello.component.wasm

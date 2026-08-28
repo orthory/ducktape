@@ -135,6 +135,53 @@ pub struct Resolved {
     /// whose operator wants pty sessions does not have to grant it a compute
     /// service. Decided once here so no boot site re-derives the predicate.
     pub compute_backend: Option<SandboxBackend>,
+    /// the genesis wasm set and where its bytes are: what this node seeds its
+    /// code registry from at block zero, and the directory it reads those
+    /// components out of. Both shapes carry it — the network shape from its
+    /// descriptor (the hashes are IN the genesis fingerprint), the dev shape
+    /// derived from the files themselves.
+    pub genesis: GenesisModules,
+}
+
+/// the genesis code set of a network, as a booting node needs it: WHICH
+/// components (by id and content hash) and WHERE their bytes live.
+///
+/// The hashes are the consensus fact — a node whose bundle hashes differently
+/// is on a different network — and `bundle_dir` is merely the local directory
+/// those bytes are read from, so the two travel together but only one is
+/// signed for.
+#[derive(Debug)]
+pub struct GenesisModules {
+    /// id -> sha256 of the genesis component, for every wasm tenant.
+    pub hashes: BTreeMap<String, [u8; 32]>,
+    /// where `<id>.component.wasm` files live: `<workspace>/modules` (network
+    /// shape) or the dev shape's `modules` dir.
+    pub bundle_dir: PathBuf,
+}
+
+/// `<dir>/<id>.component.wasm` — the one component file naming convention
+/// (kernel fixtures, `~/.ducktape/modules`, and every workspace bundle).
+pub fn component_path(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!("{id}.component.wasm"))
+}
+
+/// sha256 every `<id>.component.wasm` in `dir` for `ids`; a missing file names
+/// its path, because the operator's next move is to look at that directory.
+///
+/// The walk is BY ID, not in the caller's selection order, so a bundle missing
+/// several components always names the same one first — the operator fixes a
+/// stable list instead of chasing a topology-order lottery one file at a time.
+pub fn hash_bundle(dir: &Path, ids: &[&str]) -> Result<BTreeMap<String, [u8; 32]>, String> {
+    use sha2::Digest as _;
+    let mut ids = ids.to_vec();
+    ids.sort_unstable();
+    let mut out = BTreeMap::new();
+    for id in &ids {
+        let path = component_path(dir, id);
+        let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        out.insert((*id).to_string(), sha2::Sha256::digest(&bytes).into());
+    }
+    Ok(out)
 }
 
 /// Everything a SERVICE DAEMON legitimately needs from its node's workspace —
@@ -231,6 +278,12 @@ fn load_valid_descriptor(path: &Path) -> Result<NetworkDescriptor, String> {
     let descriptor = NetworkDescriptor::load(path)?;
     if descriptor.validator_keys()?.is_empty() {
         return Err(format!("network {} has no validators", descriptor.chain_id));
+    }
+    if descriptor.modules.is_empty() {
+        return Err(format!(
+            "network {} has no modules — re-found it with `node init --modules <dir>`",
+            descriptor.chain_id
+        ));
     }
     Ok(descriptor)
 }
@@ -473,6 +526,12 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     )?;
     let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised_value())?;
     let compute_backend = gate_on_compute_grant(service.sandbox.as_ref(), &service.workspace)?;
+    // the descriptor IS the genesis code set here: its hashes are already in
+    // the namespace fingerprint, so the bundle beside it only has to match.
+    let genesis = GenesisModules {
+        hashes: descriptor.module_hashes()?,
+        bundle_dir: base.join("modules"),
+    };
 
     Ok(Resolved {
         label: hex_bytes(&me.as_ref()[..4]),
@@ -504,6 +563,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         wireguard_advertised,
         service,
         compute_backend,
+        genesis,
     })
 }
 
@@ -758,6 +818,18 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
         .gateway_listen
         .clone()
         .or_else(|| raw.http_listen.as_ref().map(|_| "127.0.0.1:0".to_string()));
+    // the dev shape has no descriptor, so the FILES are its genesis code set:
+    // whatever `<dir>/<id>.component.wasm` hashes to is what this node seeds.
+    // LAST, because it is the only check that touches the disk — a config with
+    // a typo'd `listen` must be told about the typo, not about the bundle.
+    let bundle_dir = PathBuf::from(&raw.modules);
+    let genesis = GenesisModules {
+        hashes: hash_bundle(
+            &bundle_dir,
+            &topology::TOPOLOGY.wasm_ids(topology::PRODUCTION),
+        )?,
+        bundle_dir,
+    };
     Ok(Resolved {
         signer: ed25519::PrivateKey::from_seed(id),
         label: format!("#{id}"),
@@ -790,6 +862,7 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
         wireguard_advertised,
         service,
         compute_backend,
+        genesis,
     })
 }
 
@@ -810,6 +883,35 @@ mod tests {
         dir
     }
 
+    /// a stand-in genesis module set for the network-shape descriptors these
+    /// tests resolve: a descriptor with NO modules is not a runnable network.
+    fn fake_modules() -> Vec<crate::config::ModuleCode> {
+        vec![crate::config::ModuleCode {
+            id: "pages".into(),
+            code_hash: "11".repeat(32),
+        }]
+    }
+
+    /// a dev-shape genesis bundle under `dir`: one stub `<id>.component.wasm`
+    /// per production wasm tenant, returned as the `modules = ...` line a
+    /// dev-seed config must carry (its code set is derived from these files).
+    /// Append it BEFORE any `[sandbox]` table — a scalar after a table header
+    /// belongs to the table.
+    fn fake_bundle(dir: &Path) -> String {
+        let modules = dir.join("modules");
+        std::fs::create_dir_all(&modules).expect("modules dir");
+        for id in topology::TOPOLOGY.wasm_ids(topology::PRODUCTION) {
+            std::fs::write(component_path(&modules, id), id.as_bytes()).expect("write component");
+        }
+        format!("modules = {:?}\n", modules.to_str().expect("utf8 path"))
+    }
+
+    /// the `modules` line for a dev-seed config whose resolve must fail BEFORE
+    /// the bundle is ever read: the key is required by the parse, the directory
+    /// is deliberately absent. A test using this and still passing is the proof
+    /// that hashing runs after the cheap checks.
+    const UNREAD_BUNDLE: &str = "modules = \"/no/such/bundle\"\n";
+
     #[test]
     fn a_hostname_advertised_boots_without_dns_and_stays_a_hostname() {
         // the tunnel case: a stable name whose IP moves (or does not resolve
@@ -826,6 +928,7 @@ mod tests {
             )],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         };
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
@@ -865,6 +968,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         };
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
@@ -899,6 +1003,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         };
         d.add_bootstrap(&founder, "203.0.113.7:41000");
         d.save(&dir.join("network.toml")).expect("save");
@@ -924,6 +1029,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         };
         d.add_bootstrap(&other, "127.0.0.1:52200");
         d.save(&dir.join("network.toml")).expect("save descriptor");
@@ -953,6 +1059,12 @@ mod tests {
         // the workspace base is the config directory — where a joiner would
         // persist a `coord.cap` delivered over its Admitted gate reply.
         assert_eq!(r.service.workspace, dir);
+        // the genesis code set comes STRAIGHT off the descriptor (its hashes
+        // are already in the namespace fingerprint), and its bytes are read
+        // from the bundle beside the config.
+        assert_eq!(r.genesis.bundle_dir, dir.join("modules"));
+        assert_eq!(r.genesis.hashes["pages"], [0x11u8; 32]);
+        assert_eq!(r.genesis.hashes.len(), fake_modules().len());
     }
 
     #[test]
@@ -970,6 +1082,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         }
         .save(&dir.join("network.toml"))
         .expect("save descriptor");
@@ -997,11 +1110,13 @@ mod tests {
     #[test]
     fn dev_shape_relative_storage_is_absolute_from_launch_cwd() {
         let launch_cwd = std::env::current_dir().expect("current directory");
-        let raw: DevSeedToml = toml::from_str(
+        let dir = tmp("devrelative");
+        let bundle = fake_bundle(&dir);
+        let raw: DevSeedToml = toml::from_str(&format!(
             "id = 7\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\n\
              peer_seeds = [7]\n\
-             storage_dir = \"relative/storage\"\n",
-        )
+             storage_dir = \"relative/storage\"\n{bundle}"
+        ))
         .expect("parse dev config");
         let resolved = resolve_dev_shape(raw).expect("resolve relative storage");
         assert_eq!(
@@ -1010,10 +1125,10 @@ mod tests {
         );
         assert!(resolved.service.storage_dir.is_absolute());
 
-        let default_raw: DevSeedToml = toml::from_str(
+        let default_raw: DevSeedToml = toml::from_str(&format!(
             "id = 8\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\n\
-             peer_seeds = [8]\n",
-        )
+             peer_seeds = [8]\n{bundle}"
+        ))
         .expect("parse default dev config");
         let default = resolve_dev_shape(default_raw).expect("resolve default storage");
         assert_eq!(
@@ -1073,6 +1188,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         }
         .save(&network_dir.join("network.toml"))
         .expect("save descriptor");
@@ -1090,7 +1206,10 @@ mod tests {
         let dev_config = dev_dir.join("node.toml");
         std::fs::write(
             &dev_config,
-            "id = 0\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\npeer_seeds = [0]\n",
+            format!(
+                "id = 0\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\npeer_seeds = [0]\n{}",
+                fake_bundle(&dev_dir)
+            ),
         )
         .expect("write dev config");
         let doomed_cwd = tmp("deleted-cwd-launch");
@@ -1131,6 +1250,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         };
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
@@ -1151,11 +1271,92 @@ mod tests {
     }
 
     #[test]
+    fn dev_shape_hashes_its_modules_dir() {
+        use sha2::Digest as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let modules = dir.path().join("modules");
+        std::fs::create_dir_all(&modules).expect("modules dir");
+        for id in topology::TOPOLOGY.wasm_ids(topology::PRODUCTION) {
+            std::fs::write(component_path(&modules, id), id.as_bytes()).expect("write component");
+        }
+        let cfg = dir.path().join("node.toml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "id = 1\nnamespace = \"t\"\npeer_seeds = [1]\nlisten = \"127.0.0.1:0\"\n\
+                 storage_dir = {:?}\nmodules = {:?}\n",
+                dir.path().join("storage").to_str().expect("utf8 path"),
+                modules.to_str().expect("utf8 path")
+            ),
+        )
+        .expect("write node.toml");
+        let r = resolve(&cfg).expect("resolve dev shape");
+        assert_eq!(r.genesis.bundle_dir, modules);
+        assert_eq!(
+            r.genesis.hashes["pages"],
+            <[u8; 32]>::from(sha2::Sha256::digest(b"pages")),
+            "each hash is the sha256 of the component file on disk"
+        );
+    }
+
+    #[test]
+    fn dev_shape_names_a_missing_component() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let modules = dir.path().join("modules");
+        std::fs::create_dir_all(&modules).expect("modules dir");
+        let cfg = dir.path().join("node.toml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "id = 1\nnamespace = \"t\"\npeer_seeds = [1]\nlisten = \"127.0.0.1:0\"\n\
+                 storage_dir = {:?}\nmodules = {:?}\n",
+                dir.path().join("storage").to_str().expect("utf8 path"),
+                modules.to_str().expect("utf8 path")
+            ),
+        )
+        .expect("write node.toml");
+        let err = resolve(&cfg).expect_err("an empty bundle dir is refused");
+        // the refusal names the FULL path of the first component it could not
+        // read — an operator pointed at the wrong directory needs the path,
+        // not a bare module id. `hash_bundle` walks BY ID, so "first" is the
+        // alphabetically first wasm module, not the first in topology order.
+        let mut ids = topology::TOPOLOGY.wasm_ids(topology::PRODUCTION);
+        ids.sort_unstable();
+        let missing = component_path(&modules, ids[0]);
+        assert!(err.contains(&missing.display().to_string()), "{err}");
+    }
+
+    /// a network with no modules is not a runnable network — its nodes would
+    /// seed an empty code registry — so it is refused beside the empty
+    /// validator set, by the loader BOTH paths run.
+    #[test]
+    fn network_shape_refuses_an_empty_module_list() {
+        let dir = tmp("nomodules");
+        let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
+        NetworkDescriptor {
+            chain_id: "nomodules#12345678".into(),
+            validators: vec![hex_bytes(me.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            modules: Vec::new(),
+        }
+        .save(&dir.join("network.toml"))
+        .expect("save descriptor");
+        std::fs::write(dir.join("node.toml"), network_shape_toml(&[])).expect("write node.toml");
+        let err = resolve(&dir.join("node.toml")).expect_err("an empty module list is refused");
+        assert!(err.contains("no modules"), "{err}");
+    }
+
+    #[test]
     fn dev_shape_duplicate_seeds_are_a_config_error() {
         let dir = tmp("devdups");
         std::fs::write(
             dir.join("node.toml"),
-            "id = 0\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\npeer_seeds = [0, 1, 1]\n",
+            format!(
+                "id = 0\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\n\
+                 peer_seeds = [0, 1, 1]\n{UNREAD_BUNDLE}"
+            ),
         )
         .expect("write");
         let err = resolve(&dir.join("node.toml")).expect_err("dup seeds refused");
@@ -1171,8 +1372,9 @@ mod tests {
         // run) that resolves the same id.
         let base = format!(
             "id = 0\nlisten = \"127.0.0.1:52221\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
-             storage_dir = {:?}\n",
-            dir.join("storage").to_str().expect("utf8 path")
+             storage_dir = {:?}\n{}",
+            dir.join("storage").to_str().expect("utf8 path"),
+            fake_bundle(&dir)
         );
         let sandbox = sandbox_table("firecracker", "/var/lib/ducktape/guest", 0, 0);
 
@@ -1234,10 +1436,13 @@ mod tests {
     #[test]
     fn sandbox_table_selects_the_compute_plane() {
         let dir = tmp("sandbox");
-        let base = "id = 0\nlisten = \"127.0.0.1:52222\"\nnamespace = \"demo\"\npeer_seeds = [0]\n";
+        let base = format!(
+            "id = 0\nlisten = \"127.0.0.1:52222\"\nnamespace = \"demo\"\npeer_seeds = [0]\n{}",
+            fake_bundle(&dir)
+        );
 
         // no [sandbox] table ⇒ consensus-only: no backend, no capacity.
-        std::fs::write(dir.join("node.toml"), base).expect("write");
+        std::fs::write(dir.join("node.toml"), &base).expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve default");
         assert_eq!(resolved.service.sandbox, None);
         assert!(
@@ -1352,11 +1557,11 @@ mod tests {
     #[test]
     fn primary_coordinator_key_survives_resolve_default_absent_and_explicit() {
         let dir = tmp("primary-coordinator-key");
-        std::fs::write(
-            dir.join("node.toml"),
-            "id = 0\nlisten = \"127.0.0.1:52260\"\nnamespace = \"demo\"\npeer_seeds = [0]\n",
-        )
-        .expect("write");
+        let base = format!(
+            "id = 0\nlisten = \"127.0.0.1:52260\"\nnamespace = \"demo\"\npeer_seeds = [0]\n{}",
+            fake_bundle(&dir)
+        );
+        std::fs::write(dir.join("node.toml"), &base).expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve absent");
         assert_eq!(
             resolved.primary_coordinator, None,
@@ -1365,8 +1570,7 @@ mod tests {
 
         std::fs::write(
             dir.join("node.toml"),
-            "id = 0\nlisten = \"127.0.0.1:52260\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
-             primary_coordinator = \"none\"\n",
+            format!("{base}primary_coordinator = \"none\"\n"),
         )
         .expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve none");
@@ -1379,8 +1583,7 @@ mod tests {
 
         std::fs::write(
             dir.join("node.toml"),
-            "id = 0\nlisten = \"127.0.0.1:52260\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
-             primary_coordinator = \"203.0.113.9:3478\"\n",
+            format!("{base}primary_coordinator = \"203.0.113.9:3478\"\n"),
         )
         .expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve override");
@@ -1400,8 +1603,11 @@ mod tests {
     #[test]
     fn coordinator_relay_key_survives_resolve_default_absent_and_explicit() {
         let dir = tmp("coordinator-relay-key");
-        let base = "id = 0\nlisten = \"127.0.0.1:52261\"\nnamespace = \"demo\"\npeer_seeds = [0]\n";
-        std::fs::write(dir.join("node.toml"), base).expect("write");
+        let base = format!(
+            "id = 0\nlisten = \"127.0.0.1:52261\"\nnamespace = \"demo\"\npeer_seeds = [0]\n{}",
+            fake_bundle(&dir)
+        );
+        std::fs::write(dir.join("node.toml"), &base).expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve absent");
         assert_eq!(
             resolved.coordinator_relay, None,
@@ -1430,12 +1636,12 @@ mod tests {
     #[test]
     fn wireguard_advertised_key_absent_defaults_and_explicit_value_parses() {
         let dir = tmp("wg-advertised-key");
-        std::fs::write(
-            dir.join("node.toml"),
+        let base = format!(
             "id = 0\nlisten = \"127.0.0.1:52270\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
-             wireguard_listen = \"0.0.0.0:51820\"\n",
-        )
-        .expect("write");
+             wireguard_listen = \"0.0.0.0:51820\"\n{}",
+            fake_bundle(&dir)
+        );
+        std::fs::write(dir.join("node.toml"), &base).expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve absent");
         assert_eq!(
             resolved.wireguard_advertised, None,
@@ -1444,8 +1650,7 @@ mod tests {
 
         std::fs::write(
             dir.join("node.toml"),
-            "id = 0\nlisten = \"127.0.0.1:52270\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
-             wireguard_listen = \"0.0.0.0:51820\"\nwireguard_advertised = \"203.0.113.9:41820\"\n",
+            format!("{base}wireguard_advertised = \"203.0.113.9:41820\"\n"),
         )
         .expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve override");
@@ -1456,9 +1661,10 @@ mod tests {
 
         std::fs::write(
             dir.join("node.toml"),
-            "id = 0\nlisten = \"127.0.0.1:52270\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
-             wireguard_listen = \"0.0.0.0:51820\"\n\
-             wireguard_advertised = \"definitely-not-resolvable.ducktape.invalid:41820\"\n",
+            format!(
+                "{base}wireguard_advertised = \
+                 \"definitely-not-resolvable.ducktape.invalid:41820\"\n"
+            ),
         )
         .expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("hostnames never block boot");
@@ -1525,6 +1731,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         }
         .save(&dir.join("network.toml"))
         .expect("save descriptor");
@@ -1579,6 +1786,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         }
         .save(&dir.join("network.toml"))
         .expect("save descriptor");
@@ -1606,6 +1814,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         };
         d.save(&dir.join("network.toml")).expect("save");
 
@@ -1649,8 +1858,11 @@ mod tests {
         let dir = tmp("wg-advertised-bad");
         std::fs::write(
             dir.join("node.toml"),
-            "id = 0\nlisten = \"127.0.0.1:52280\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
-             wireguard_listen = \"0.0.0.0:51820\"\nwireguard_advertised = \"0.0.0.0:0\"\n",
+            format!(
+                "id = 0\nlisten = \"127.0.0.1:52280\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
+                 wireguard_listen = \"0.0.0.0:51820\"\n\
+                 wireguard_advertised = \"0.0.0.0:0\"\n{UNREAD_BUNDLE}"
+            ),
         )
         .expect("write");
         let err = resolve(&dir.join("node.toml")).expect_err(
@@ -1744,7 +1956,11 @@ mod tests {
         let dir = tmp("devself");
         std::fs::write(
             dir.join("node.toml"),
-            "id = 1\nlisten = \"127.0.0.1:52230\"\nnamespace = \"demo\"\npeer_seeds = [1, 0]\npeer_addrs = [\"127.0.0.1:52230\", \"127.0.0.1:52231\"]\n",
+            format!(
+                "id = 1\nlisten = \"127.0.0.1:52230\"\nnamespace = \"demo\"\npeer_seeds = [1, 0]\n\
+                 peer_addrs = [\"127.0.0.1:52230\", \"127.0.0.1:52231\"]\n{}",
+                fake_bundle(&dir)
+            ),
         )
         .expect("write");
         let r = resolve(&dir.join("node.toml")).expect("resolve");
@@ -1762,15 +1978,18 @@ mod tests {
 
     #[test]
     fn dev_shape_builds_the_full_hint_list() {
-        let toml = r#"
+        let dir = tmp("dev");
+        let toml = format!(
+            r#"
 id = 1
 listen = "127.0.0.1:52210"
 namespace = "demo"
 peer_seeds = [0, 1, 2]
 validator_seeds = [0, 1]
 peer_addrs = ["127.0.0.1:52200", "127.0.0.1:52210", "127.0.0.1:52202"]
-"#;
-        let dir = tmp("dev");
+{}"#,
+            fake_bundle(&dir)
+        );
         std::fs::write(dir.join("node.toml"), toml).expect("write");
         let r = resolve(&dir.join("node.toml")).expect("resolve");
         assert!(r.dev_demo);
@@ -1794,7 +2013,10 @@ peer_addrs = ["127.0.0.1:52200", "127.0.0.1:52210", "127.0.0.1:52202"]
     #[test]
     fn retired_wireguard_effect_key_is_refused() {
         let dir = tmp("wgeffect");
-        let base = "id = 0\nlisten = \"127.0.0.1:52230\"\nnamespace = \"demo\"\npeer_seeds = [0]\n";
+        let base = format!(
+            "id = 0\nlisten = \"127.0.0.1:52230\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
+             {UNREAD_BUNDLE}"
+        );
         for spelled in ["socket", "fake", "tun"] {
             std::fs::write(
                 dir.join("node.toml"),
@@ -1809,8 +2031,13 @@ peer_addrs = ["127.0.0.1:52200", "127.0.0.1:52210", "127.0.0.1:52202"]
     #[test]
     fn overlay_advertised_derives_the_ula_and_requires_v6_listen() {
         let dir = tmp("overlay-advertised");
-        let base = "id = 1\nnamespace = \"demo\"\npeer_seeds = [0, 1]\n\
-                    peer_addrs = [\"127.0.0.1:52240\", \"127.0.0.1:52241\"]\n";
+        // a REAL bundle: this test's first half resolves successfully, so it
+        // reaches the hashing the refusal half never gets to.
+        let base = format!(
+            "id = 1\nnamespace = \"demo\"\npeer_seeds = [0, 1]\n\
+             peer_addrs = [\"127.0.0.1:52240\", \"127.0.0.1:52241\"]\n{}",
+            fake_bundle(&dir)
+        );
         std::fs::write(
             dir.join("node.toml"),
             format!("{base}listen = \"[::]:52241\"\nadvertised = \"overlay\"\n"),

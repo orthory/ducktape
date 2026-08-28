@@ -26,6 +26,9 @@ pub mod admin;
 pub use admin::{AdminConfig, AdminExposure};
 
 pub mod blobs;
+// the ONE module composer every host in the workspace builds its module set
+// through: a topology selection + a code source + a store source.
+pub mod compose;
 pub mod log;
 pub mod stream;
 pub use stream::{

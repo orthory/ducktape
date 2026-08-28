@@ -143,6 +143,10 @@ pub struct DevSeedToml {
     pub namespace: String,
     pub peer_seeds: Vec<u64>,
     pub validator_seeds: Option<Vec<u64>>,
+    /// the directory holding `<id>.component.wasm` for every wasm tenant — the
+    /// dev shape has no descriptor, so its genesis code set is DERIVED from
+    /// these files (every node of a dev cluster must point at identical bytes).
+    pub modules: String,
     /// one dial address per `peer_seeds` entry, same order. optional only
     /// for a SOLO node (nobody to dial); a multi-node cluster without it
     /// is refused at resolve.
@@ -686,7 +690,8 @@ mod tests {
         let dir = tmp("dev-seed");
         std::fs::write(
             dir.join("node.toml"),
-            "id = 0\nnamespace = \"demo\"\npeer_seeds = [0]\nlisten = \"127.0.0.1:0\"\n",
+            "id = 0\nnamespace = \"demo\"\npeer_seeds = [0]\nlisten = \"127.0.0.1:0\"\n\
+             modules = \"/srv/modules\"\n",
         )
         .expect("write");
         let (raw, _) = load_raw_node_toml(&dir.join("node.toml")).expect("parse");

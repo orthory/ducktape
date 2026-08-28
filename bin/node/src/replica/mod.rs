@@ -118,6 +118,7 @@ pub(crate) async fn run(
     manifest: &Option<Manifest>,
     forge_repo: std::path::PathBuf,
     duckfs_dir: std::path::PathBuf,
+    genesis: &crate::config::GenesisModules,
 ) -> crate::validator::PromotionBaton {
     // `wire` and `park` both read `signer`/`label`/`namespace`/`overlay_slot`
     // — cheap plain-data (or, for `overlay_slot`, an Arc-backed handle)
@@ -190,6 +191,7 @@ pub(crate) async fn run(
         duckfs_dir,
         manifest,
         recovery,
+        genesis,
     )
     .await
 }

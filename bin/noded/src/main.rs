@@ -617,6 +617,9 @@ fn publish_status(
         // the embedded daemon has no mesh identity — clients treat an empty
         // key as "no peer-routed features here".
         public_key: String::new(),
+        // the embedded daemon serves no chain (its identity module runs with
+        // an empty chain id), so there is nothing to name here.
+        chain_id: String::new(),
         operations: metrics.operational_status(),
     });
     // no mesh, no consensus: the standing carries only the height — the
