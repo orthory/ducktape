@@ -331,26 +331,110 @@ ducktape module status
 
 ## §5 Real-cluster e2e — `bin/node/tests/module_upgrade_e2e.rs`
 
-`#[ignore]` like every cluster suite (runs under `make test`'s
-`--ignored --test-threads=1` lane). `Cluster::new(&[1,2,3], &[1,2,3])`,
-`modules =` the repo fixtures dir.
+**As built (2026-08-28, `feat/module-upgrade-e2e`).** ONE plain `#[test]`,
+`a_registered_module_survives_a_live_swap_a_restart_and_statesync`, serialized
+by `common::serial()` — NOT `#[ignore]`d: it runs on a plain
+`cargo test -p node-bin --test module_upgrade_e2e -- --test-threads=1` in
+~90 s. `Cluster::new(&[1, 2, 3, 4], &[1, 2, 3])`: the fourth peer is DECLARED
+in the layout from the start and spawned only in step 7 — statesync is
+fail-closed for a peer with no committed standing, and `Cluster::spawn_joiner`
+appends its id to `peer_ids`, so it would declare id 4 twice.
+`spawn_founders` (`tests/common/module_verbs.rs`) sets `wireguard = true` —
+the code bytes travel over the overlay and nothing else — plus
+`primary_coordinator = "none"`; `modules =` the repo fixtures dir; the suite
+pins `checkpoint_blocks = 100000` so the restart REPLAYS rather than restoring
+from a checkpoint that happened to land after the swap; and the verbs use
+`--after 60` (`module_verbs::AFTER` — the lead a three-run ceremony needs to
+keep its activation above the lifecycle floor on a loaded box).
 
-1. Spawn three validators; wait admitted/serving.
-2. Each runs `ducktape module register hello <fixtures>/hello.component.wasm
-   --after 10` (via `run_verb`). Wait until `module status` shows `hello`
-   active (poll `status` through the harness's committed-event wait, no
-   sleeps).
-3. Submit hello `inc` on node 1; query `count == 1` on all three.
+1. `spawn_founders` — three validators up, each waited to `converged
+   root_hash=`, `module-code plane: overlay stream bound` and a tunnel
+   carrying traffic.
+2. Each founder runs `ducktape module register hello
+   <fixtures>/hello.component.wasm --after 60`; wait `module status --json` to
+   show `hello` active at the fixture's sha256 on all three (the harness's
+   committed-event wait, no sleeps).
+3. Submit hello `inc` on node 1; `count == 1` on all three.
 4. Each runs `module update hello <fixtures>/hello-replacement.component.wasm
-   --after 10`; wait active.
+   --after 60`; wait the replacement's hash active on all three.
 5. `inc` → `count == 101` (the replacement steps by 100) on all three;
-   `await_committed` root-hash equal across nodes.
-6. Kill node 2, respawn; wait the `restart replayed the journal` marker;
-   root equal; `count == 101` on node 2.
-7. `spawn_joiner(4)`, sync-only; root equal; `count == 101` on the joiner.
+   `await_committed` the founders' `root_hash` to agree (`root_after_swap`).
+6. `kill(2)` (SIGKILL) then `spawn(2)` over the same storage. Wait the boot
+   marker `recovered root_hash=` (`bin/node/src/validator/boot.rs`) — there is
+   no `restart replayed the journal` line — and assert: it equals
+   `root_after_swap`, no `genesis root_hash=` marker ever appeared,
+   `count == 101` on node 2, and the founders' roots still agree at
+   `root_after_swap`. Observed: `recovered root_hash=… height=137 epoch=0
+   replayed=5 already_on_disk=127` — the five Map-cohort blocks that span the
+   register, the pre-swap `inc`, the swap and the post-swap `inc`.
+7. Seat the declared joiner, then let it statesync as a fresh resident:
+   - `admit_validator(Cluster::identity(4))` — governance `AddValidator`:
+     Propose on 0 → `Open` → Vote on 0 and 1 → both ballots → Execute on 1 →
+     `Passed`, then `cutover complete: epoch 1` on all three founders, crossed
+     on their own idle blocks (no filler traffic needed).
+   - `run_sync_only(3, 180 s)`: its `synced root_hash=` must equal the
+     founders' POST-cutover root — the ceremony moved governance/valset state,
+     so the joiner is held to that root, not step 6's.
+   - `spawn(3)` LIVE. A sync-only run binds no rpc, so the count needs a live
+     boot; and a non-genesis key ALWAYS enters the replica park
+     (`bin/node/src/main.rs:663-672` routes it there regardless of what is on
+     disk, and a sync-only run writes no recovery manifest). So the live boot
+     is a re-sync, not a reopen: it prints `synced root_hash=` again (asserted
+     equal to the sync-only run's — same boundary state), then `promoted:
+     validator at epoch 1 boundary H; seating in-process`. Then `count == 101`
+     read from node 3 — state it never executed, whose bytes it could only
+     pull over the blob plane — and all four roots agree. The count is waited
+     on node 0's block feed: node 3 answers `None` until it serves, and the
+     chain's blocks are the wait seam either way.
 
 Steps 6–7 are the proof for §1's "admitted modules across restart and
 statesync". If either fails, §1 is incomplete — not the test.
+
+### What it found: replay ran pre-swap blocks on post-swap code
+
+Step 6 failed on its first run. The lifecycle registry is disk-durable and
+reopens at the TIP carrying no record of what came before, and
+`realize_module_swaps(h)` read that tip's `active_code_hash` — so every
+replayed block, whatever its height, ran on the POST-swap component. Real on
+any node: a crash within the checkpoint cadence after a swap, with ops on both
+sides of it. §1's "admitted modules across restart" assumed the registry
+replays; it did not.
+
+Fixed (user-ruled) in the registry, not the test:
+
+- `ModuleEntry.history: Vec<Activation { height, code_hash }>` — every
+  activation appended in block order (the genesis seed at 0, `RegisterModule`
+  at its height, the `Advance` flip at its flip height). An admission appends
+  nothing until it flips.
+- `lifecycle::code_at(entry, h)` — the armed pending, else the latest history
+  entry at or before `h`, else the first, else `None`. One rule, three callers:
+  the host's `realize_module_swaps`, restore adoption and statesync adoption.
+- `ScheduledSwap.ready: bool` → `ready_at: Option<u64>`, with
+  `armed_at(h) = ready_at.is_some_and(|latched| latched < h) &&
+  activation_height <= h` replacing all four inline copies of the arm
+  predicate. The STRICT `<` closes a second, pre-existing hole: readiness that
+  latches in block `L` is invisible to the drain until `L+1`, so a replay of
+  `[activation_height, L]` used to read the pending as armed while the live
+  node ran those blocks on the old code.
+- `ModuleEntry.active_code_hash` is no longer a field — it is derived from
+  `history.last()`, so no second copy can disagree with the history. The
+  `ModuleCode` projection is unchanged.
+
+Committed shape, so the root moved twice on this branch: `GENESIS_ROOT_HASH`
+`0f71fe9f… → a7988ac7… → b290fe31…` (flag day; zero live networks). Lifecycle
+is `Code::Native`, so no component, descriptor or bundle hash moved and no
+wasm was rebuilt.
+
+### The gap this suite does NOT close
+
+Restore over a POST-SWAP CHECKPOINT never runs live. Step 6 pins
+`checkpoint_blocks = 100000` on purpose — replay is the hard path — and step
+7's joiner statesyncs rather than restoring. So `adopt_admitted_modules`
+seating `code_at(entry, checkpoint_height)` is covered by a unit test only
+(`bin/node/src/host_state.rs`,
+`adoption_seats_the_code_at_the_checkpoint_height`). Closing it live needs a
+cluster run with the default cadence and a swap placed before a checkpoint
+boundary.
 
 ## Deferred (recorded, not built)
 
