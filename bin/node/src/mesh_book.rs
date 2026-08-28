@@ -9,10 +9,17 @@
 //!    observed by the running plane ([`MeshAddressBook::observe_advert`]).
 //! 2. **operator hint** — a resolved config dial hint (descriptor
 //!    `reach`/`bootstrap` routes, invite-injected ULA routes, dev-shape
-//!    `peer_addrs`). EXCEPTION, the named predicate `dns_hint_pins_address`:
+//!    `peer_addrs`). TWO EXCEPTIONS, the named predicate `hint_pins_address`:
 //!    a DNS hint outranks live adverts — per-dial re-resolution is
 //!    deliberate operator config (the sentry doctrine), and an advert would
-//!    freeze it to one stale resolution.
+//!    freeze it to one stale resolution. an OVERLAY hint (an address inside
+//!    this chain's ULA /48) outranks an UNDERLAY advert — a member's advert
+//!    carries its `advertised` (default: its `listen`, on a LAN literally
+//!    `192.168.0.151:9020`), which says where the member IS, never whether
+//!    THIS node can get there; the overlay route is reachable the moment the
+//!    tunnel is up, from anywhere. an overlay ADVERT (`advertised =
+//!    "overlay"`) is just as reachable and carries the live port, so it
+//!    still wins.
 //! 3. **persisted advert** — a mesh-state.json control endpoint from a
 //!    previous run; never displaces an operator hint (a possibly-dead
 //!    persisted address must not shadow a live operator-provided one).
@@ -52,6 +59,8 @@ struct Sourced {
 pub(crate) struct MeshAddressBook {
     /// the genesis namespace string — the ULA derivation input.
     namespace: String,
+    /// this chain's overlay ULA /48 — the `is_overlay` mask.
+    ula_prefix: [u8; 6],
     /// the port the derived-ULA fallthrough dials (the shipped
     /// `[::]:8846` default; a peer on a custom port is reached through a
     /// hint or an advert instead).
@@ -61,8 +70,13 @@ pub(crate) struct MeshAddressBook {
 
 impl MeshAddressBook {
     pub(crate) fn new(namespace: impl Into<String>, default_mesh_port: u16) -> Self {
+        let namespace = namespace.into();
+        let ula_prefix = wireguard::ula_v6_prefix(&namespace).octets()[..6]
+            .try_into()
+            .expect("a /48 is six octets");
         Self {
-            namespace: namespace.into(),
+            namespace,
+            ula_prefix,
             default_mesh_port,
             entries: RwLock::new(BTreeMap::new()),
         }
@@ -70,8 +84,8 @@ impl MeshAddressBook {
 
     /// seed one operator-config dial hint. replaces persisted entries and
     /// absent ones; a live advert already in place keeps winning UNLESS the
-    /// hint is DNS (`dns_hint_pins_address` — the pin outranks adverts in
-    /// both directions).
+    /// hint pins (`hint_pins_address` — a pin outranks adverts in both
+    /// directions).
     pub(crate) fn seed_hint(&self, peer: ed25519::PublicKey, ingress: Ingress) {
         let addr = address_of(ingress);
         let mut entries = self.entries.write().expect("mesh book lock");
@@ -79,7 +93,7 @@ impl MeshAddressBook {
             None => true,
             Some(existing) => match existing.tier {
                 Tier::OperatorHint | Tier::PersistedAdvert => true,
-                Tier::LiveAdvert => is_dns(&addr),
+                Tier::LiveAdvert => self.hint_pins_address(&addr, &existing.addr),
             },
         };
         if !displaces_existing {
@@ -122,15 +136,15 @@ impl MeshAddressBook {
         socket: SocketAddr,
     ) -> Option<Address> {
         let mut entries = self.entries.write().expect("mesh book lock");
-        let dns_hint_pins_address = matches!(
+        let next = Address::Symmetric(socket);
+        let hint_pins_address = matches!(
             entries.get(peer),
-            Some(Sourced { tier: Tier::OperatorHint, addr }) if is_dns(addr)
+            Some(Sourced { tier: Tier::OperatorHint, addr }) if self.hint_pins_address(addr, &next)
         );
-        if dns_hint_pins_address {
+        if hint_pins_address {
             return None;
         }
         let previous_effective = self.effective_locked(&entries, peer);
-        let next = Address::Symmetric(socket);
         let unchanged = previous_effective == next;
         entries.insert(
             peer.clone(),
@@ -154,6 +168,27 @@ impl MeshAddressBook {
                 .iter()
                 .map(|peer| (peer.clone(), self.effective_locked(&entries, peer))),
         )
+    }
+
+    /// does operator hint `hint` outrank live advert `advert`? DNS always
+    /// (per-dial re-resolution is deliberate); an overlay route against
+    /// anything that is not itself an overlay route (see the module doc).
+    fn hint_pins_address(&self, hint: &Address, advert: &Address) -> bool {
+        let dns_pins = is_dns(hint);
+        let overlay_pins_underlay = self.is_overlay(hint) && !self.is_overlay(advert);
+        dns_pins || overlay_pins_underlay
+    }
+
+    /// an address inside this chain's overlay ULA /48 — dialable over the
+    /// tunnel from anywhere, and only over the tunnel.
+    fn is_overlay(&self, addr: &Address) -> bool {
+        let Address::Symmetric(socket) = addr else {
+            return false;
+        };
+        let IpAddr::V6(v6) = socket.ip() else {
+            return false;
+        };
+        v6.octets()[..6] == self.ula_prefix
     }
 
     /// one peer's effective address under the lock: its entry, or the
@@ -322,6 +357,42 @@ mod tests {
                 .get_value(&peer)
                 .cloned(),
             Some(expected)
+        );
+    }
+
+    #[test]
+    fn overlay_hint_pins_the_address_against_underlay_adverts() {
+        let b = book();
+        let peer = key(1);
+        let overlay = |port| {
+            SocketAddr::new(
+                IpAddr::V6(ula_of("test#chain", peer.as_ref().try_into().unwrap())),
+                port,
+            )
+        };
+        b.seed_hint(peer.clone(), Ingress::Socket(overlay(9020)));
+        assert!(
+            b.observe_advert(&peer, sock(1, 9020)).is_none(),
+            "a LAN advert never displaces the overlay route an off-LAN peer can actually reach"
+        );
+        assert_eq!(
+            b.addressed(&set(std::slice::from_ref(&peer)))
+                .get_value(&peer)
+                .cloned(),
+            Some(Address::Symmetric(overlay(9020)))
+        );
+        assert_eq!(
+            b.observe_advert(&peer, overlay(9030)),
+            Some(Address::Symmetric(overlay(9030))),
+            "an overlay advert (advertised = \"overlay\") is as reachable and carries the live port"
+        );
+        b.seed_hint(peer.clone(), Ingress::Socket(overlay(9020)));
+        assert_eq!(
+            b.addressed(&set(std::slice::from_ref(&peer)))
+                .get_value(&peer)
+                .cloned(),
+            Some(Address::Symmetric(overlay(9030))),
+            "re-seeding the hint never regresses an overlay advert's port"
         );
     }
 
