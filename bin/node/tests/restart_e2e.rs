@@ -61,10 +61,14 @@ fn write_and_confirm(cluster: &Cluster, idx: usize, task_id: &str, title: &str) 
 
 /// the ops in an explorer row that name `target`. a block is a BATCH and a row
 /// lists every member op, so the tenant's op is NOT reliably `ops[0]`: the dev
-/// shape's boot seed submits one `directory` op at seq 0
-/// (`validator/engine.rs:267-275`) and it batches with whatever else is
+/// shape's boot seed submits one `tasks` op at seq 0
+/// (`validator/engine.rs:271-280`) and it batches with whatever else is
 /// pending, which lands it ahead of the first submitted write about half the
 /// time. scanning the row is the only stable read.
+///
+/// the seed rides THIS SAME tenant, so `target` alone never separates it from a
+/// write — anything that must name a specific write matches the op's `payload`
+/// preview instead (`carries_write` below).
 fn ops_targeting<'a>(row: &'a serde_json::Value, target: &str) -> Vec<&'a serde_json::Value> {
     row["ops"]
         .as_array()
@@ -72,6 +76,22 @@ fn ops_targeting<'a>(row: &'a serde_json::Value, target: &str) -> Vec<&'a serde_
         .iter()
         .filter(|op| op["target"] == target)
         .collect()
+}
+
+/// does any row carry the `tasks` write that created `task_id`? picked by
+/// IDENTITY, not by count: the boot seed's own `tasks` op is indistinguishable
+/// from a write by target, so counting tenant-carrying rows would let
+/// [seed, write#1] satisfy a "both writes landed" wait while write#2's row is
+/// still missing. the row carries the op payload verbatim
+/// (`noded::payload_preview` truncates only past 1024 chars), and the quoted id
+/// appears in it as `"task_id":"<id>"`, so it cannot collide with a title.
+fn carries_write(rows: &[(u64, serde_json::Value)], task_id: &str) -> bool {
+    let quoted = format!("\"{task_id}\"");
+    rows.iter().any(|(_, row)| {
+        ops_targeting(row, "tasks")
+            .iter()
+            .any(|op| op["payload"].as_str().is_some_and(|p| p.contains(&quoted)))
+    })
 }
 
 /// the explorer rows /v1/blocks currently serves, keyed by height. only real
@@ -128,11 +148,9 @@ fn solo_validator_survives_crash_and_graceful_restart() {
         Duration::from_secs(30),
         || {
             let rows = block_rows(&cluster, 0);
-            let rows_carrying_a_write = rows
-                .iter()
-                .filter(|(_, r)| !ops_targeting(r, "tasks").is_empty())
-                .count();
-            (rows_carrying_a_write >= 2).then_some(rows)
+            let both_writes_have_rows =
+                carries_write(&rows, "who") && carries_write(&rows, "where");
+            both_writes_have_rows.then_some(rows)
         },
     );
 
