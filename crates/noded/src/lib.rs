@@ -1131,9 +1131,12 @@ mod tests {
             assert_eq!(ModuleCategory::of(id), Developer, "{id}");
         }
         assert_eq!(ModuleCategory::of("automations"), Automation);
-        // infra + internals fall to the System bucket — including ids only the
-        // full `node` binary registers (kv/valset/governance) and anything
-        // unknown, so the view never breaks on a new module.
+        // infra + internals fall to the System bucket — including ids this
+        // daemon never composes at all: `valset`/`governance` are in
+        // `PRODUCTION` but not `SIM_BASE`, so only the full `node` binary
+        // registers them, and `kv` is in NEITHER — it reaches a composer only
+        // through simnode's opt-in `--with-valset` (`SIM_VALSET`). plus
+        // anything unknown, so the view never breaks on a new module.
         for id in [
             "files",
             "saga",

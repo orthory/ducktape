@@ -207,7 +207,8 @@ directly. `GENESIS_ROOT_HASH` moves; the commit says so.
 > `6f89e523fcccdb2f36cd26b4c06817c7a3f6b782788c1f8fb3e821afa0eb4e07`.
 > The `directory` CRATE stays exactly where it was: it is the in-process test
 > tenant for the kernel suites under `crates/kernel/**/tests/`, for
-> `crates/examples/greeter`, and for `bin/node`'s own `#[cfg(test)]` units —
+> `crates/examples/greeter`, for `bin/node/tests/network_joiner_full.rs` (which
+> composes its own host), and for `bin/node`'s own `#[cfg(test)]` units —
 > which is why `bin/node` keeps it as a `[dev-dependencies]` entry and the
 > `Makefile`'s `BUILDER_MODULES` row and committed fixture wasm stay. A
 > descriptor-shaped workspace written before the move fails closed on the extra
@@ -472,7 +473,9 @@ Fixed (user-ruled) in the registry, not the test:
 Committed shape, so the root moved twice on this branch: `GENESIS_ROOT_HASH`
 `0f71fe9f… → a7988ac7… → b290fe31…` (flag day; zero live networks). Lifecycle
 is `Code::Native`, so no component, descriptor or bundle hash moved and no
-wasm was rebuilt.
+wasm was rebuilt. (`b290fe31…` is where THIS branch left it, not the current
+value: the Ruling-10 discharge above moved it once more, to `6f89e523…`, when
+`directory` left `PRODUCTION`.)
 
 ### The gap this suite does NOT close
 

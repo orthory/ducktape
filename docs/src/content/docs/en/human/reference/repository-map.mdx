@@ -75,7 +75,6 @@ shows what is built and tested.
 - `crates/apps/files`: the duckfs module adapter; it owns the consensus
   filesystem surface and absorbed the old memory/workspace role as ordinary
   duckfs snapshots, paths, and `duck://files/...` evidence.
-- `crates/apps/jobs`: consensus-native work board.
 - app wire surfaces: the crate-root types are the legal cross-module payload surface.
 
 ## Examples and Binaries
@@ -83,9 +82,7 @@ shows what is built and tested.
 - `crates/examples/directory`: state-based directory module — the first wasm
   port, now a test tenant in no genesis set.
 - `crates/examples/greeter`: demo module that emits follow-up writes.
-- `crates/examples/evm`: experimental QMDB-backed EVM module, registered in
-  the `noded`/`simnode` genesis.
-- `bin/demo`: in-process walkthrough of the registered module set.
+- `crates/labs`: unwired experiments, registered by no genesis set.
 - `bin/node`: real-socket node and unified `ducktape` CLI, including the `fs`
   working-copy and `mcp` server families.
 - `crates/noded`: the daemon library behind the app HTTP/WebSocket surface (the `/v1` router, actor lane, index/blob/stream lanes, in-process testkit); `bin/noded` is the `ducktape-noded` process that serves it.

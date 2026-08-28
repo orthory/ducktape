@@ -12,9 +12,9 @@ use harness::Sim;
 
 /// The default 14-module sim genesis root-hash.
 ///
-/// This is the SIM's number and only the sim's: `sim_base` excludes
-/// `capability`, `hello`, `governance` and `lifecycle`, so it is NOT what a node
-/// runs and it is NOT the consensus pin. That one is
+/// This is the SIM's number and only the sim's: `sim_base` excludes all five
+/// of `acl`, `capability`, `governance`, `lifecycle` and `valset`, so it is NOT
+/// what a node runs and it is NOT the consensus pin. That one is
 /// `bin/node/src/host_state.rs`'s `GENESIS_ROOT_HASH`, over the production
 /// module set — moving THAT is the flag day that matters. This constant guards
 /// something narrower and still worth guarding: that composing the sim's

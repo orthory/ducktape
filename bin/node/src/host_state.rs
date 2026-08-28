@@ -680,9 +680,11 @@ mod tests {
     /// everything all three pins below need, so none has to keep its own copy
     /// of the construction.
     ///
-    /// Production runs this root future on macOS's ~8 MiB process stack. Run
-    /// the test twin on the same budget: libtest's 2 MiB worker stack is just
-    /// below this full 19-module composition's debug-build requirement.
+    /// Production runs this root future on macOS's ~8 MiB process stack, and
+    /// the reason to run the test twin on the same budget is to MATCH
+    /// production, not to clear a measured bar: libtest's 2 MiB worker stack
+    /// was observed too small for the full composition's debug build back when
+    /// the set was 20 modules, and dropping to 19 was never re-measured.
     const GENESIS_TEST_STACK_BYTES: usize = 8 * 1024 * 1024;
 
     /// the genesis code set the pins compose over: the kernel's fixture
@@ -976,10 +978,13 @@ mod tests {
     ///
     /// It is the only ABSOLUTE one in the tree, and until it existed every claim
     /// that "the root hash did not move" was relative and therefore weak.
-    /// `bin/simnode/tests/topology_set.rs` pins the 14-module NATIVE sim
-    /// composition — which excludes `acl`, `capability`, `governance`,
-    /// `lifecycle` and `valset`, and is not what a node runs. And
-    /// `git diff crates/modules/`
+    /// `bin/simnode/tests/topology_set.rs` pins the 14-module sim composition
+    /// — which excludes `acl`, `capability`, `governance`, `lifecycle` and
+    /// `valset`, and is not what a node runs. (Not a NATIVE composition, as
+    /// this said for a while: simnode opens a `DirCodeSource` over the host
+    /// fixtures and composes through `noded::compose`, so every `SIM_BASE` id
+    /// loads as a wasm component — which is why a rebuilt fixture moves that
+    /// root.) And `git diff crates/modules/`
     /// on a committed tree is EMPTY BY CONSTRUCTION, so quoting it proves
     /// nothing at all. Neither would have noticed a module's bytes changing.
     ///
