@@ -23,6 +23,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the fabricated mesh identity `status().public_key` serves — None by
     // default (no mesh), a canonical 64-hex string under `--node-key`.
     let mut node_key: Option<String> = None;
+    // where the `<id>.component.wasm` tenants come from — None composes from
+    // the repo's kernel fixtures.
+    let mut modules_dir: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -86,10 +89,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 node_key = Some(noded::hex_bytes(&key));
             }
+            "--modules" => {
+                modules_dir = Some(PathBuf::from(args.next().ok_or("--modules needs a dir")?));
+            }
             other => {
                 return Err(format!(
                     "unexpected arg {other:?} (want --listen/--storage/--auto/--persona/\
-                     --echo-oracle/--with-valset/--invite-binding/--node-key)"
+                     --echo-oracle/--with-valset/--invite-binding/--node-key/--modules)"
                 )
                 .into());
             }
@@ -110,6 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         invite_binding,
         node_key,
         persona,
+        modules_dir,
         // the binary installs noded's process-global tracing subscriber (an
         // embedder does not — see SimOpts::install_log).
         install_log: true,

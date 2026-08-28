@@ -1,9 +1,9 @@
 //! Genesis-composition parity: the sim's default (and `--with-valset`) genesis
 //! sets ARE the `sim_base` (+ `sim_valset`) selections of the single-source
-//! `topology`, and the default set's root-hash is byte-identical to the
-//! pre-topology composition. The daemon parity lane pins the same `sim_base`
-//! against noded; this pins the sim composer against the topology it now draws
-//! from, and guards C4's "no construction change" invariant with a golden hash.
+//! `topology`, composed through the SAME `noded::compose::compose` bin/node
+//! runs. The daemon parity lane pins the same `sim_base` against noded; this
+//! pins the sim composer against the topology it draws from with a golden hash,
+//! and pins that composing `sim_valset` gives governance its code registry.
 
 mod harness;
 
@@ -20,7 +20,7 @@ use harness::Sim;
 /// genesis is a pure function of the topology selection, so a change in how the
 /// sim builds its host shows up here instead of silently under a scenario.
 const DEFAULT_GENESIS_ROOT_HASH: &str =
-    "af1078f73fa64675eeb7eec1427bd01cd3e0dbfe88f2cf3aab745281d8e7ab02";
+    "49f49b10f7ee255509a02943c846cfb077d4a1081bf26d9f8e80716a9f4a323e";
 
 fn module_ids(status: &serde_json::Value) -> Vec<String> {
     status["modules"]
@@ -67,12 +67,12 @@ fn default_genesis_composes_topology_sim_base() {
 }
 
 #[test]
-fn with_valset_genesis_appends_topology_sim_valset() {
+fn with_valset_genesis_appends_topology_sim_valset_and_wires_the_code_registry() {
     // any 32-byte value is an accepted genesis validator key (the binary checks
     // length, not curve membership).
     let key = "11".repeat(32);
     let storage = tempfile::tempdir().expect("storage dir");
-    let sim = Sim::spawn(storage.path(), &["--with-valset", &key]);
+    let sim = Sim::spawn(storage.path(), &["--auto", "--with-valset", &key]);
     let status = sim.status();
 
     let want: Vec<String> = topology::SIM_BASE
@@ -84,5 +84,32 @@ fn with_valset_genesis_appends_topology_sim_valset() {
         module_ids(&status),
         want,
         "--with-valset appends topology sim_valset after sim_base, in registry order"
+    );
+
+    // governance composes as a WASM tenant now, so the lifecycle code registry
+    // it is wired to comes with it: an UpdateModule proposal opens a ballot
+    // instead of being refused at the door. the code hash names no component
+    // the network has — lifecycle refuses that at execute, which is a different
+    // (and later) gate; the claim here is only that a registry exists at all.
+    let propose = governance::GovMsg::Propose {
+        proposal_id: "u".into(),
+        action: governance::GovAction::UpdateModule {
+            name: "x".into(),
+            module_id: "chat".into(),
+            activation_height: 10_000,
+            code_hash: vec![0; 32],
+        },
+        voting_period: 600_000,
+    };
+    let (code, reply) = sim.submit(
+        "governance",
+        serde_json::to_value(propose).expect("Propose serializes"),
+        // the genesis validator's own `hex:` origin — the electorate gate wants
+        // a member NODE key, and only the escape can express raw key bytes.
+        Some(&format!("hex:{key}")),
+    );
+    assert_eq!(
+        code, 200,
+        "an UpdateModule proposal must open a ballot in the sim: {reply}"
     );
 }
