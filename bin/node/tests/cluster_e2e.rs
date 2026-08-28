@@ -352,7 +352,11 @@ fn cluster_lifecycle() {
         "the apply-latency histogram observed the block:\n{exposition}"
     );
     assert!(
-        exposition.contains("ducktape_dispatch_total") && exposition.contains("module=\"tasks\""),
+        // the labeled-PREFIX, not the full label set: `DispatchLabels` is
+        // `{ module, origin }` (`crates/noded/src/metrics.rs:32-36`), so the
+        // real sample is `…{module="tasks",origin="external"} N` and a label
+        // appended after `module` must not break this.
+        exposition.contains(r#"ducktape_dispatch_total{module="tasks""#),
         "the dispatch counter carries the submitted module label:\n{exposition}"
     );
     for sample in [
