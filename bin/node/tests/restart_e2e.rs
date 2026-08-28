@@ -62,7 +62,7 @@ fn write_and_confirm(cluster: &Cluster, idx: usize, task_id: &str, title: &str) 
 /// the ops in an explorer row that name `target`. a block is a BATCH and a row
 /// lists every member op, so the tenant's op is NOT reliably `ops[0]`: the dev
 /// shape's boot seed submits one `tasks` op at seq 0
-/// (`validator/engine.rs:271-280`) and it batches with whatever else is
+/// (`validator/engine.rs:273-283`) and it batches with whatever else is
 /// pending, which lands it ahead of the first submitted write about half the
 /// time. scanning the row is the only stable read.
 ///
@@ -86,7 +86,7 @@ fn ops_targeting<'a>(row: &'a serde_json::Value, target: &str) -> Vec<&'a serde_
 /// (`noded::payload_preview` truncates only past 1024 chars), and the quoted id
 /// appears in it as `"task_id":"<id>"`, so it cannot collide with a title.
 fn carries_write(rows: &[(u64, serde_json::Value)], task_id: &str) -> bool {
-    let quoted = format!("\"{task_id}\"");
+    let quoted = format!("\"task_id\":\"{task_id}\"");
     rows.iter().any(|(_, row)| {
         ops_targeting(row, "tasks")
             .iter()

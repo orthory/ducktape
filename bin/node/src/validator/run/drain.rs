@@ -893,7 +893,15 @@ impl ValidatorRuntime<'_> {
             // (`kernel/node/src/lib.rs:1393-1399`), so a REJECTED seed latches
             // this just as an applied one does — `seeds=<landed>/<expected>` on
             // the one line everything already greps is what makes a seed that
-            // never landed visible at all. ONE query: `List` is the board's
+            // never landed visible at all.
+            //
+            // the signal is ONE-WAY, and reading it as two-way would be wrong:
+            // the latch counts BATCHES, heartbeat nops included
+            // (`kernel/node/src/lib.rs:1362-1367`), so on a multi-node demo a
+            // peer's seed can still be unproposed when this node latches — a
+            // healthy `large_file_e2e` run can print `seeds=1/2`. `seeds=N/N`
+            // proves the seeds landed; a short count means "not landed AT THIS
+            // INSTANT", never "never landed". ONE query: `List` is the board's
             // only read, and it returns them all.
             let reply = node
                 .host()
@@ -1375,7 +1383,7 @@ fn eager_flush_due(disabled: bool, ops_pending: bool, orderer_idle: bool) -> boo
 }
 
 /// is this task id one the dev-demo boot seed minted? the seed writes exactly
-/// `k{node-label}` (`validator/engine.rs:271-280`), and nothing else that
+/// `k{node-label}` (`validator/engine.rs:273-283`), and nothing else that
 /// reaches a demo board is shaped like that. counting the WHOLE board instead
 /// would let any unrelated write mask a seed that never landed — restart_e2e's
 /// own writes land before the converge latch and do exactly that.
