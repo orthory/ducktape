@@ -6,9 +6,13 @@ view
   // between open and register.
   col w=fill h=fill
     if (console_win != some(window)) && (huddle_win != some(window))
-      HubColumn
+      HubColumn name_draft<->welcome_name_draft
         with
           step=hub_step
+          network=network_name
+          phase=ceremony_phase
+          qr=ceremony_qr
+          detail=ceremony_detail
           wallets=hub_wallets
           wallet_selected=hub_wallet_selected
           networks=hub_networks
@@ -16,7 +20,6 @@ view
           hidden=hub_hidden
           name=onboarding_name
           invite=invite_link
-          reveal=reveal_words
           steps=provision_steps
           step_index=provision_index
           height=block_height
@@ -29,8 +32,12 @@ view
           pick_wallet -> pick_wallet _
           unlock_submit -> unlock_submit _
           login_skip -> login_skip
-          create_submit -> create_submit _ _
-          reveal_confirm -> reveal_confirm
+          password_submit -> password_submit _
+          welcome_create_submit -> welcome_create_submit _
+          welcome_login_submit -> welcome_login_submit
+          welcome_desktop -> welcome_desktop
+          welcome_cancel -> welcome_cancel
+          welcome_skip -> welcome_skip
           go_restore -> go_restore
           go_login -> go_login
           restore_submit -> restore_submit _ _
@@ -124,6 +131,15 @@ view
           switch_network -> switch_network
         notice:
           col w=fill
+            AccountBanner #account-banner
+              with
+                connected
+                account_exists
+                dismissed=account_banner_dismissed
+                password
+              events
+                open_account_welcome -> open_account_welcome
+                dismiss_account_banner -> dismiss_account_banner
             if has_error
               box
                 with
@@ -530,6 +546,9 @@ view
               account_name
               network_name
               connected_rpc
+              account_ceremony_phase
+              account_ceremony_qr
+              account_ceremony_detail
               settings_key_state
               settings_key_path
               settings_open_tabs
@@ -562,6 +581,8 @@ view
               account_key_join_submit -> account_key_join_submit
               account_key_remove -> account_key_remove _
               account_passkey_submit -> account_passkey_submit
+              account_passkey_desktop -> account_passkey_desktop
+              account_ceremony_cancel -> account_ceremony_cancel
               account_wallet_submit -> account_wallet_submit
               account_login_submit -> account_login_submit
               copy_to_clipboard -> copy_to_clipboard _ _

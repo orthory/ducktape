@@ -445,8 +445,12 @@ test launch_wallets_contract
   preset ui_launch
   viewport 480 680
   mount
-    HubColumn #hub
+    HubColumn name_draft<->welcome_name_draft #hub
       with
+        network=""
+        phase=""
+        qr=""
+        detail=""
         step=HubStep.wallets
         wallets=hub_wallets
         wallet_selected=hub_wallet_selected
@@ -455,7 +459,6 @@ test launch_wallets_contract
         hidden=0
         name=""
         invite=""
-        reveal=""
         steps=provision_steps
         step_index=0
         height=-1
@@ -468,8 +471,12 @@ test launch_wallets_contract
         pick_wallet -> pick_wallet _
         unlock_submit -> unlock_submit _
         login_skip -> login_skip
-        create_submit -> create_submit _ _
-        reveal_confirm -> reveal_confirm
+        password_submit -> password_submit _
+        welcome_create_submit -> welcome_create_submit _
+        welcome_login_submit -> welcome_login_submit
+        welcome_desktop -> welcome_desktop
+        welcome_cancel -> welcome_cancel
+        welcome_skip -> welcome_skip
         go_restore -> go_restore
         go_login -> go_login
         restore_submit -> restore_submit _ _
@@ -533,30 +540,29 @@ test wallet_list_contract
   expect component alice.pw == "hunter2-hunter2"
 
 // A KEYSTORE THAT COULD NOT BE READ LANDS HERE, and read-only is the way out.
-// A failed `wallet list` yields an empty list, which is the create ceremony —
+// A failed `wallet list` yields an empty list, which is the password step —
 // so this screen, not just the wallet list, has to carry `login_skip`, or
 // someone who HAS wallets is trapped on a mint screen by a missing binary.
-test create_screen_read_only_escape_contract
+// The mint itself is NOT dispatched: `password_submit` seals a real key.
+test password_screen_read_only_escape_contract
   preset ui_launch
   viewport 480 680
   mount
-    CreateScreen #create
+    PasswordScreen #pw
       with
         busy=false
         error="the keystore listing is unreadable"
       events
-        create_submit -> create_submit _ _
+        password_submit -> password_submit _
         go_restore -> go_restore
         login_skip -> login_skip
-  target screen = #create/root
-  target skip = #create/root/create-skip
-  target name = #create/root/wallet-name
-  expect exists skip
+  target screen = #pw/root
+  target skip = #pw/root/password-skip
+  target field = #pw/root/device-password
+  target go = #pw/root/password-submit
+  expect exists field
+  expect exists go
   expect text "the keystore listing is unreadable" within screen
-  // the name a mint would use — `create_submit` stashes it so the network
-  // list's "signing as …" line names the wallet the session actually signs
-  // as. NOT dispatched here: `create_submit` shells a real `wallet new`.
-  expect name.value == "default"
   // read-only signs as NOBODY: the label must not keep naming a wallet.
   click skip
   expect hub_wallet_selected == ""
@@ -566,8 +572,12 @@ test launch_networks_empty_contract
   preset ui_launch
   viewport 480 680
   mount
-    HubColumn #hub
+    HubColumn name_draft<->welcome_name_draft #hub
       with
+        network=""
+        phase=""
+        qr=""
+        detail=""
         step=HubStep.networks
         wallets=hub_wallets
         wallet_selected=hub_wallet_selected
@@ -576,7 +586,6 @@ test launch_networks_empty_contract
         hidden=0
         name=""
         invite=""
-        reveal=""
         steps=provision_steps
         step_index=0
         height=-1
@@ -589,8 +598,12 @@ test launch_networks_empty_contract
         pick_wallet -> pick_wallet _
         unlock_submit -> unlock_submit _
         login_skip -> login_skip
-        create_submit -> create_submit _ _
-        reveal_confirm -> reveal_confirm
+        password_submit -> password_submit _
+        welcome_create_submit -> welcome_create_submit _
+        welcome_login_submit -> welcome_login_submit
+        welcome_desktop -> welcome_desktop
+        welcome_cancel -> welcome_cancel
+        welcome_skip -> welcome_skip
         go_restore -> go_restore
         go_login -> go_login
         restore_submit -> restore_submit _ _
@@ -609,6 +622,162 @@ test launch_networks_empty_contract
   expect exists cta
   click cta
   expect hub_step == HubStep.join
+
+// The welcome step mid-ceremony: the QR the stream handed back is on screen.
+preset ui_welcome_qr
+  state
+    mutation_phase = MutationPhase.onboarding
+    onboarding_error = ""
+    hub_step = HubStep.account
+    ceremony_phase = "show_qr"
+    ceremony_qr = "https://auth.ducktape.byeongsu.dev/#op=get&challenge=AQID"
+    ceremony_detail = "Your phone will confirm with the passkey."
+
+// A connected, signing console whose device key has no account here.
+preset ui_console_no_account
+  state
+    rpc = "http://127.0.0.1:1"
+    connected_rpc = "http://127.0.0.1:1"
+    password = "hunter2-hunter2"
+    status = "Connected"
+    connected = true
+    loading = false
+    mutation_phase = MutationPhase.idle
+    error = ""
+    account_exists = false
+    account_banner_dismissed = false
+    shell_tab = ShellTab.settings
+
+// The Settings card mid-ceremony: a passkey is being registered from the
+// phone and the QR is on the card.
+preset ui_settings_qr
+  state
+    rpc = "http://127.0.0.1:1"
+    connected_rpc = "http://127.0.0.1:1"
+    password = "hunter2-hunter2"
+    status = "Connected"
+    connected = true
+    loading = false
+    mutation_phase = MutationPhase.idle
+    error = ""
+    account_exists = true
+    account_busy = true
+    account_ceremony_phase = "show_qr"
+    account_ceremony_qr = "https://auth.ducktape.byeongsu.dev/#op=create&challenge=AQID"
+    account_ceremony_detail = "Your phone will create the passkey."
+    shell_tab = ShellTab.settings
+
+// A signing session that just picked a network — the probe is in flight.
+preset ui_pick_probe
+  state
+    password = "hunter2-hunter2"
+    rpc = "http://127.0.0.1:1"
+    mutation_phase = MutationPhase.onboarding
+    hub_step = HubStep.networks
+
+// THE WELCOME SCREEN is where a device key with no account on the picked
+// network lands. Skipping opens the console (a window task — not asserted
+// here); a QR in state renders as a real qr node; cancel clears it.
+test welcome_screen_contract
+  preset ui_welcome_qr
+  viewport 480 680
+  mount
+    WelcomeScreen name_draft<->welcome_name_draft #welcome
+      with
+        network="demo"
+        phase=ceremony_phase
+        qr=ceremony_qr
+        detail=ceremony_detail
+        busy=false
+        error=""
+      events
+        welcome_create_submit -> welcome_create_submit _
+        welcome_login_submit -> welcome_login_submit
+        welcome_desktop -> welcome_desktop
+        welcome_cancel -> welcome_cancel
+        welcome_skip -> welcome_skip
+  target screen = #welcome/root
+  target qr = #welcome/root/welcome-qr
+  target cancel = #welcome/root/welcome-cancel
+  target create = #welcome/root/welcome-create
+  expect exists qr
+  expect missing create
+  expect text "demo" within screen
+  click cancel
+  expect ceremony_qr == ""
+  expect ceremony_phase == ""
+  expect hub_step == HubStep.account
+  // with no ceremony in flight the doors are back, and the QR is gone.
+  expect exists create
+  expect missing qr
+
+// A network pick probes the account BEFORE the console opens: no account →
+// the welcome step; an account → straight through (window task, not
+// asserted). The probe answer is dispatched directly — the pick itself
+// launches a real `load_account`.
+test network_pick_lands_on_the_welcome_step_without_an_account
+  preset ui_pick_probe
+  dispatch account_probed(account_data_none(7))
+  expect hub_step == HubStep.account
+  expect mutation_phase == MutationPhase.idle
+  expect ceremony_phase == ""
+
+// THE BANNER: a connected console whose device key has no account says so;
+// dismiss hides it for the session. Reopening the launch window at the
+// welcome is a window task (not asserted).
+test console_banner_names_the_missing_account
+  preset ui_console_no_account
+  viewport 900 300
+  mount
+    AccountBanner #account-banner
+      with
+        connected
+        account_exists
+        dismissed=account_banner_dismissed
+        password
+      events
+        open_account_welcome -> open_account_welcome
+        dismiss_account_banner -> dismiss_account_banner
+  target banner = #account-banner/root/banner
+  target dismiss = #account-banner/root/banner/dismiss
+  expect exists banner
+  click dismiss
+  expect account_banner_dismissed == true
+  expect missing banner
+
+// The Settings card renders the ceremony's QR in place, and cancel clears it.
+test settings_card_shows_the_passkey_qr
+  preset ui_settings_qr
+  viewport 600 400
+  mount
+    CeremonyPlate #account-ceremony
+      with
+        phase=account_ceremony_phase
+        qr=account_ceremony_qr
+        detail=account_ceremony_detail
+      events
+        account_ceremony_cancel -> account_ceremony_cancel
+  target qr = #account-ceremony/root/plate-qr
+  target cancel = #account-ceremony/root/plate-cancel
+  expect exists qr
+  click cancel
+  expect account_ceremony_qr == ""
+  expect account_busy == false
+  expect missing qr
+
+// A ceremony's steps drive the welcome: `working` swaps the QR for its line,
+// `failed` lands the message on the screen and frees the machine.
+test ceremony_steps_drive_the_welcome
+  preset ui_welcome_qr
+  dispatch ceremony_stepped(ceremony_step("working", "", "Consenting to the new key…"))
+  expect ceremony_phase == "working"
+  expect ceremony_qr == ""
+  expect ceremony_detail == "Consenting to the new key…"
+  expect mutation_phase == MutationPhase.onboarding
+  dispatch ceremony_stepped(ceremony_step("failed", "", "the phone did not answer in time"))
+  expect ceremony_phase == ""
+  expect onboarding_error == "the phone did not answer in time"
+  expect mutation_phase == MutationPhase.idle
 
 preset ui_palette_overlay
   state
@@ -732,6 +901,9 @@ test settings_keyboard_scroll_contract
             account_name
             network_name
             connected_rpc
+            account_ceremony_phase
+            account_ceremony_qr
+            account_ceremony_detail
             settings_key_state
             settings_key_path
             settings_open_tabs
@@ -764,6 +936,8 @@ test settings_keyboard_scroll_contract
             account_key_join_submit -> account_key_join_submit
             account_key_remove -> account_key_remove _
             account_passkey_submit -> account_passkey_submit
+            account_passkey_desktop -> account_passkey_desktop
+            account_ceremony_cancel -> account_ceremony_cancel
             account_wallet_submit -> account_wallet_submit
             account_login_submit -> account_login_submit
             copy_to_clipboard -> copy_to_clipboard _ _

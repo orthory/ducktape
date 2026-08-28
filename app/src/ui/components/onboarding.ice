@@ -1,7 +1,8 @@
 // THE LAUNCH WINDOW'S COLUMN. `hub_step` is the single discriminant:
-// (create | wallets) -> [reveal | restore] -> networks -> [join ->
-// provisioning -> live]. The console never renders here — it lives in its
-// own window, opened on a network pick.
+// (password | wallets) -> [restore] -> networks -> [join -> provisioning ->
+// live] -> [account]. The console never renders here — it lives in its own
+// window, opened on a network pick (once the device key has an account there,
+// or the user goes on without one).
 //
 // THERE IS NO CREATE-NETWORK ROUTE. Founding a network is an operator act on
 // the node (`ducktape node init`). This app attaches to a node somebody
@@ -12,13 +13,17 @@
 // only resolve local handlers and declared emissions, so an app handler is
 // never named inside this file.
 
-component HubColumn(step:HubStep, wallets:[WalletInfo], wallet_selected:str, networks:[HubNetwork], selected:str, hidden:i64, name:str, invite:str, reveal:str, steps:[ProvisionStep], step_index:i64, height:i64, tier:str, error:str, busy:bool, restore_empty:bool, join_empty:bool)
+component HubColumn(step:HubStep, wallets:[WalletInfo], wallet_selected:str, networks:[HubNetwork], selected:str, hidden:i64, name:str, invite:str, steps:[ProvisionStep], step_index:i64, height:i64, tier:str, error:str, busy:bool, restore_empty:bool, join_empty:bool, network:str, bind name_draft:str, phase:str, qr:str, detail:str)
   emits
     pick_wallet(str)
     unlock_submit(str)
     login_skip
-    create_submit(str, str)
-    reveal_confirm
+    password_submit(str)
+    welcome_create_submit(str)
+    welcome_login_submit
+    welcome_desktop
+    welcome_cancel
+    welcome_skip
     go_restore
     go_login
     restore_submit(str, str)
@@ -55,16 +60,12 @@ component HubColumn(step:HubStep, wallets:[WalletInfo], wallet_selected:str, net
               unlock_submit
               login_skip
               go_restore
-        HubStep.create
-          CreateScreen busy=busy error=error
+        HubStep.password
+          PasswordScreen #password busy=busy error=error
             forward
-              create_submit
+              password_submit
               go_restore
               login_skip
-        HubStep.reveal
-          RevealScreen words=reveal
-            forward
-              reveal_confirm
         HubStep.restore
           RestoreScreen
             with
@@ -133,6 +134,21 @@ component HubColumn(step:HubStep, wallets:[WalletInfo], wallet_selected:str, net
                 size=13.5
                 wrap=none
                 @text-hint
+        HubStep.account
+          WelcomeScreen name_draft<->name_draft #welcome
+            with
+              network
+              phase
+              qr
+              detail
+              busy
+              error
+            forward
+              welcome_create_submit
+              welcome_login_submit
+              welcome_desktop
+              welcome_cancel
+              welcome_skip
 
 // The brand plate every sign-in screen opens with.
 component HubBrand(title:str, caption:str)
@@ -384,54 +400,25 @@ component WalletRow(row:WalletInfo, selected:bool, busy:bool)
         hovered bg=subtle text=fg
         pressed bg=rail_hover text=fg
 
-// CREATE. First run: mint this device's identity under a password. The
+// PASSWORD. First run: one password, and the device key is minted under it —
+// no name to pick, no 24 words to write down. Recovery is a passkey login
+// from another device (the welcome step, once a network is picked). The
 // authoritative floor lives in Rust (`password_problem` mirrors the CLI's
 // 8-char minimum); the button stays dead until the pair is acceptable.
-component CreateScreen(busy:bool, error:str)
+component PasswordScreen(busy:bool, error:str)
   emits
-    create_submit(str, str)
+    password_submit(str)
     go_restore
     login_skip
   state
-    name_draft = "default"
     pw = ""
     pw2 = ""
   col #root w=428.0 gap=0.0
     HubBrand
       with
-        title="Create your identity"
-        caption="One key, generated on this device. A password seals it; 24 recovery words back it up."
+        title="Welcome to ducktape"
+        caption="Set a password for this device. Your account lives on the network you join next — a passkey on your phone is how you get back in."
     box w=fill pt=26.0
-      text "WALLET NAME"
-        with
-          size=10.0
-          wrap=none
-          font=code_semibold
-          @text-label
-    box w=fill pt=8.0
-      box
-        with
-          w=fill
-          px=14.0
-          py=12.0
-          bg=surface
-          border=primary
-          border-w=1.5
-          r=10.0
-        input "" #wallet-name <-> name_draft
-          with
-            label="Wallet name"
-            hint="lowercase letters, digits, . _ -"
-            disabled=busy
-            w=fill
-            p=0.0
-            text-size=13.0
-            line-h=1.2
-            font=code
-            @control
-          active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
-          disabled value=hint
-    box w=fill pt=14.0
       text "PASSWORD"
         with
           size=10.0
@@ -448,7 +435,7 @@ component CreateScreen(busy:bool, error:str)
           border=primary
           border-w=1.5
           r=10.0
-        input "" #create-password <-> pw
+        input "" #device-password <-> pw
           with
             label="New password"
             hint="at least 8 characters"
@@ -472,13 +459,13 @@ component CreateScreen(busy:bool, error:str)
           border=primary
           border-w=1.5
           r=10.0
-        input "" #create-confirm <-> pw2
+        input "" #device-password-confirm <-> pw2
           with
             label="Confirm password"
             hint="again"
             secure=true
             disabled=busy
-            submit=emit(create_submit, name_draft, pw)
+            submit=emit(password_submit, pw)
             w=fill
             p=0.0
             text-size=13.0
@@ -496,16 +483,16 @@ component CreateScreen(busy:bool, error:str)
             line-h=1.4
             @text-danger_fg
     box w=fill pt=16.0
-      button -> emit(create_submit, name_draft, pw)
+      button #password-submit -> emit(password_submit, pw)
         with
-          label="Create identity"
-          disabled=(busy || empty(pw) || empty(name_draft) || password_problem(pw, pw2) != "")
+          label="Continue"
+          disabled=(busy || empty(pw) || password_problem(pw, pw2) != "")
           w=fill
           @primary_action
           @px-0px
           @py-13px
           @rounded-10px
-        text "Create →"
+        text "Continue →"
           with
             w=fill
             size=13.5
@@ -530,9 +517,9 @@ component CreateScreen(busy:bool, error:str)
           pressed bg=fg/14
         // THE WAY OUT OF THIS SCREEN WITHOUT A KEY. This is where a failed
         // `wallet list` lands someone who already HAS wallets, and without
-        // this the create ceremony is the only door — reads never needed a
-        // key, so refusing to show the network list was never honest.
-        button "Continue read-only" #create-skip -> emit(login_skip)
+        // this the mint is the only door — reads never needed a key, so
+        // refusing to show the network list was never honest.
+        button "Continue read-only" #password-skip -> emit(login_skip)
           with
             disabled=busy
             h=26.0
@@ -561,56 +548,164 @@ component CreateScreen(busy:bool, error:str)
             @text-icon_idle
     OnboardingError message=error
 
-// REVEAL. The one time the 24 words exist on screen. No copy button on
-// purpose: a clipboard outlives this screen, paper does not leak.
-component RevealScreen(words:str)
+// WELCOME. A picked network on which this device's key has no account. The
+// two doors both go through the phone: create the account and enrol a
+// passkey (two QR scans), or sign in with a passkey that already names an
+// account (one scan). `phase` is the ceremony stream's reading — "" shows
+// the doors, `show_qr` the code, `working` the line between touches. The
+// desktop browser path stays one link under the QR.
+component WelcomeScreen(network:str, bind name_draft:str, phase:str, qr:str, detail:str, busy:bool, error:str)
   emits
-    reveal_confirm
+    welcome_create_submit(str)
+    welcome_login_submit
+    welcome_desktop
+    welcome_cancel
+    welcome_skip
   col #root w=428.0 gap=0.0
     HubBrand
       with
-        title="Your recovery phrase"
-        caption="Write these 24 words down, in order. They are the ONLY way back into this identity."
-    box w=fill pt=22.0
-      box
-        with
-          w=fill
-          p=14.0
-          bg=muted_bg
-          border=border
-          border-w=1.0
-          r=10.0
-        text words
+        title="No account on this network yet"
+        caption=network
+    if phase == "show_qr"
+      box w=fill pt=22.0
+        col
           with
             w=fill
-            size=13.0
-            line-h=1.7
-            font=code
-            @text-accent_fg
-    box w=fill pt=14.0
-      text "Anyone holding these words IS this identity. They are shown once and never stored."
-        with
-          w=fill
-          size=12.0
-          line-h=1.55
-          @text-caption
-    box w=fill pt=20.0
-      button -> emit(reveal_confirm)
-        with
-          label="I saved them"
-          w=fill
-          @primary_action
-          @px-0px
-          @py-13px
-          @rounded-10px
-        text "I saved them — continue →"
+            gap=12.0
+            align=center
+          box
+            with
+              p=12.0
+              bg=surface
+              border=border
+              border-w=1.0
+              r=12.0
+            qr qr #welcome-qr cell-size=4.0 correction=medium
+          text "Scan with your phone"
+            with
+              size=13.5
+              wrap=none
+              font=display
+              @text-primary
+          text detail
+            with
+              w=fill
+              size=12.0
+              line-h=1.5
+              align-x=center
+              @text-caption
+          button "Use this computer's passkey instead" #welcome-desktop -> emit(welcome_desktop)
+            with
+              disabled=busy
+              h=26.0
+              p=5.0
+              @ghost_action
+            active bg=transparent text=muted r=7.0
+            hovered bg=fg/9 text=fg
+            pressed bg=fg/14
+          button "Cancel" #welcome-cancel -> emit(welcome_cancel)
+            with
+              h=26.0
+              p=5.0
+              @ghost_action
+            active bg=transparent text=muted r=7.0
+            hovered bg=fg/9 text=fg
+            pressed bg=fg/14
+    if phase == "working"
+      box w=fill pt=22.0
+        col
           with
             w=fill
-            size=13.5
+            gap=12.0
+            align=center
+          text detail
+            with
+              w=fill
+              size=13.0
+              line-h=1.5
+              align-x=center
+              @text-caption
+          button "Cancel" #welcome-cancel-working -> emit(welcome_cancel)
+            with
+              h=26.0
+              p=5.0
+              @ghost_action
+            active bg=transparent text=muted r=7.0
+            hovered bg=fg/9 text=fg
+            pressed bg=fg/14
+    if empty(phase)
+      box w=fill pt=26.0
+        text "ACCOUNT NAME"
+          with
+            size=10.0
             wrap=none
-            align-x=center
-            font=display
-            @text-primary_fg
+            font=code_semibold
+            @text-label
+      box w=fill pt=8.0
+        box
+          with
+            w=fill
+            px=14.0
+            py=12.0
+            bg=surface
+            border=primary
+            border-w=1.5
+            r=10.0
+          input "" #welcome-name <-> name_draft
+            with
+              label="Account name"
+              hint="shown to others; not unique"
+              disabled=busy
+              submit=emit(welcome_create_submit, trim(name_draft))
+              w=fill
+              p=0.0
+              text-size=13.0
+              line-h=1.2
+              font=code
+              @control
+            active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
+            disabled value=hint
+      box w=fill pt=16.0
+        button #welcome-create -> emit(welcome_create_submit, trim(name_draft))
+          with
+            label="Create account with a passkey"
+            disabled=(busy || empty(trim(name_draft)))
+            w=fill
+            @primary_action
+            @px-0px
+            @py-13px
+            @rounded-10px
+          text "Create account with a passkey →"
+            with
+              w=fill
+              size=13.5
+              wrap=none
+              align-x=center
+              font=display
+              @text-primary_fg
+      box w=fill pt=10.0
+        button "Sign in with a passkey" #welcome-login -> emit(welcome_login_submit)
+          with
+            disabled=busy
+            w=fill
+            h=40.0
+            @secondary_action
+      box w=fill pt=18.0
+        col
+          with
+            w=fill
+            gap=8.0
+            align=center
+          button "Continue without an account" #welcome-skip -> emit(welcome_skip)
+            with
+              disabled=busy
+              h=26.0
+              p=5.0
+              @ghost_action
+            active bg=transparent text=muted r=7.0
+            hovered bg=fg/9 text=fg
+            pressed bg=fg/14
+    OnboardingError message=error
 
 // RESTORE. 24 words in, a new password around them, the same pubkey out.
 component RestoreScreen(busy:bool, error:str, phrase_empty:bool)
@@ -1750,3 +1845,78 @@ component OnboardingError(message:str)
     if !empty(message)
       box w=fill pt=14.0
         GateNote reason=message next="Nothing was lost. Fix the cause and try again."
+
+// NO ACCOUNT ON THIS NETWORK — the console's line for a signing session that
+// went past the welcome without one. The way back is the welcome itself;
+// dismiss hides it for this console.
+component AccountBanner(connected:bool, account_exists:bool, dismissed:bool, password:str)
+  emits
+    open_account_welcome()
+    dismiss_account_banner()
+  col #root w=fill
+    if connected && !account_exists && !dismissed && !empty(password)
+      box #banner
+        with
+          w=fill
+          pl=12.0
+          pr=12.0
+          pb=8.0
+        box
+          with
+            w=fill
+            px=12.0
+            py=8.0
+            bg=surface
+            border=border
+            border-w=1.0
+            r=8.0
+          row
+            with
+              w=fill
+              gap=10.0
+              align=center
+            text "No account on this network yet."
+              with
+                w=fill
+                size=12.5
+                @text-meta
+            button "Create or sign in" #open -> emit(open_account_welcome)
+              with
+                h=26.0
+                p=5.0
+                @secondary_action
+            button "Dismiss" #dismiss -> emit(dismiss_account_banner)
+              with
+                h=26.0
+                p=5.0
+                @ghost_action
+              active bg=transparent text=muted r=7.0
+              hovered bg=fg/9 text=fg
+              pressed bg=fg/14
+
+// A PHONE CEREMONY ON A CARD: the QR while the phone is asked, the line
+// while the chain is; an empty phase renders nothing. The Settings card's
+// reading of the same stream the welcome shows full-size.
+component CeremonyPlate(phase:str, qr:str, detail:str)
+  emits
+    account_ceremony_cancel()
+  col #root w=fill gap=8.0 align=center
+    if phase == "show_qr"
+      qr qr #plate-qr cell-size=3.0 correction=medium
+      text detail
+        with
+          w=fill
+          size=12.0
+          align-x=center
+          @text-meta
+      button "Cancel" #plate-cancel -> emit(account_ceremony_cancel)
+        with
+          h=26.0
+          p=5.0
+          @secondary_action
+    if phase == "working"
+      text detail
+        with
+          w=fill
+          size=12.0
+          @text-meta

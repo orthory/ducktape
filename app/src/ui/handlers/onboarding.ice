@@ -1,6 +1,6 @@
 // THE LAUNCH WINDOW'S HANDLERS. One `hub_step` machine inside the onboarding
-// window: loading -> (create | wallets) -> [reveal | restore] -> networks ->
-// [join -> provisioning -> live] -> console window.
+// window: loading -> (password | wallets) -> [restore] -> networks ->
+// [join -> provisioning -> live] -> [account] -> console window.
 //
 // The app is a strict CLIENT, and there is no create route: founding a network
 // is `ducktape node init` on the node, where the coordinator and the rest of the
@@ -81,30 +81,23 @@ on login_skip
   onboarding_error = ""
   hub_step = HubStep.networks
 
-// CREATE — mint a named wallet under the new password. The confirm field is
-// checked in the component (`password_problem`); this only fires clean.
-// The NAME is stored the same way and for the same reason as the password:
-// `key_created` carries only the words and the pubkey, and the screens past
-// the reveal — the network list's "signing as …" line — name the wallet this
-// session is about to sign as. A failed mint leaves a name that no row
-// matches, and the next refresh drops it (`refreshed_wallet_selection`).
-on create_submit(name, pw)
-  return if mutation_phase != MutationPhase.idle || empty(pw) || empty(name)
+// PASSWORD — the device key is minted here, silently: no name to pick, no
+// phrase to write down. Recovery is a passkey login from another device, so
+// the words the keystore hands back are dropped before anything can show
+// them. The confirm field is checked in the component (`password_problem`);
+// this only fires clean.
+on password_submit(pw)
+  return if mutation_phase != MutationPhase.idle || empty(pw)
   onboarding_error = ""
   password = pw
-  hub_wallet_selected = name
   mutation_phase = MutationPhase.onboarding
-  run every create_user_key(name, password) -> key_created _ | login_failed _
+  run every create_device_key(password) -> device_key_created _ | login_failed _
 
-on key_created(created)
+// The key exists; the list is refreshed so "signing as …" can name it.
+on device_key_created(_pubkey)
   mutation_phase = MutationPhase.idle
-  reveal_words = created.words
-  hub_step = HubStep.reveal
-
-// The one moment the 24 words exist on screen ends here.
-on reveal_confirm
-  reveal_words = ""
   hub_step = HubStep.networks
+  run replace lane=hub_state hub_state() -> hub_refreshed _
 
 on go_restore
   return if mutation_phase != MutationPhase.idle
@@ -142,11 +135,23 @@ on login_failed(cause)
 on pick_network(id)
   hub_selected = id
 
+// A NETWORK PICK PROBES THE ACCOUNT FIRST. The console opens only for a
+// device key that has one on that chain (or a read-only session, which has
+// no key to ask about); a key with none lands on the welcome step. The probe
+// block is inlined in the three pickers — a handler cannot call a handler.
 on open_network_submit
   return if mutation_phase != MutationPhase.idle || empty(selected_network_endpoint(hub_networks, hub_selected))
   rpc = selected_network_endpoint(hub_networks, hub_selected)
   onboarding_error = ""
-  task window open console -> console_opened _
+  let gate = pick_gate(password)
+  match gate
+    PickGate.read_only
+      task window open console -> console_opened _
+    PickGate.probe
+      mutation_phase = MutationPhase.onboarding
+      parallel
+        run replace lane=account_probe load_account(rpc, account_generation) -> account_probed _ | account_probe_failed _
+        run replace lane=chain_probe chain_id_of(rpc) -> chain_named _ | chain_probe_failed _
 
 // A remote endpoint this device holds no workspace for. On a successful
 // connect `remember_network` saves it, which is how a `saved_remotes` row is
@@ -155,7 +160,128 @@ on connect_remote_submit(endpoint)
   return if mutation_phase != MutationPhase.idle || empty(trim(endpoint))
   rpc = canonical_endpoint(endpoint)
   onboarding_error = ""
+  let gate = pick_gate(password)
+  match gate
+    PickGate.read_only
+      task window open console -> console_opened _
+    PickGate.probe
+      mutation_phase = MutationPhase.onboarding
+      parallel
+        run replace lane=account_probe load_account(rpc, account_generation) -> account_probed _ | account_probe_failed _
+        run replace lane=chain_probe chain_id_of(rpc) -> chain_named _ | chain_probe_failed _
+
+on chain_named(id)
+  hub_chain_id = id
+
+// A node that serves no chain yet cannot take a key consent; the welcome
+// still shows, and the ceremonies refuse on the empty chain id.
+on chain_probe_failed(_cause)
+  hub_chain_id = ""
+
+on account_probed(next)
+  mutation_phase = MutationPhase.idle
+  let probe = account_probe(next.exists)
+  match probe
+    AccountProbe.found
+      task window open console -> console_opened _
+    AccountProbe.missing
+      network_name = network_label(account_name, rpc)
+      ceremony_phase = ""
+      ceremony_qr = ""
+      ceremony_detail = ""
+      hub_step = HubStep.account
+
+// A node that cannot answer the probe is a node the console cannot use
+// either: say so where the user is, keep the pick.
+on account_probe_failed(cause)
+  mutation_phase = MutationPhase.idle
+  onboarding_error = cause.message
+
+// THE WELCOME'S DOORS. Skipping opens the console without an account (the
+// banner there is the way back); cancel drops a ceremony mid-flight — the
+// lane invalidation drops the stream's receiver, and the backend task ends
+// on its next step.
+on welcome_skip
+  return if mutation_phase != MutationPhase.idle
+  onboarding_error = ""
   task window open console -> console_opened _
+
+on welcome_cancel
+  invalidate lane=ceremony
+  invalidate lane=desktop_ceremony
+  mutation_phase = MutationPhase.idle
+  ceremony_phase = ""
+  ceremony_qr = ""
+  ceremony_detail = ""
+
+// THE CEREMONIES. Each is a stream on ONE lane: the first reading is the QR
+// to show, `working` lines fill the gaps between touches, and `done` /
+// `failed` close it. The chain id is the pick's probe answer; a node that
+// named none refuses here, before any phone is involved.
+on welcome_create_submit(name)
+  return if mutation_phase != MutationPhase.idle || empty(name) || empty(hub_chain_id)
+  onboarding_error = ""
+  mutation_phase = MutationPhase.onboarding
+  stream replace lane=ceremony create_account_by_qr(rpc, password, hub_chain_id, name) -> ceremony_stepped _
+
+on welcome_login_submit
+  return if mutation_phase != MutationPhase.idle || empty(hub_chain_id)
+  onboarding_error = ""
+  mutation_phase = MutationPhase.onboarding
+  stream replace lane=ceremony login_by_qr(rpc, password, hub_chain_id) -> ceremony_stepped _
+
+// The desktop path, from under the QR: the browser ceremonies the Settings
+// card runs. A non-empty name draft means the user was creating — the
+// account exists by the time a QR shows, so registering the passkey is the
+// right continuation; otherwise it is a login.
+on welcome_desktop
+  return if ceremony_phase != "show_qr"
+  invalidate lane=ceremony
+  ceremony_phase = "working"
+  ceremony_qr = ""
+  ceremony_detail = "Continue in the browser…"
+  let door = welcome_door(welcome_name_draft)
+  match door
+    WelcomeDoor.create
+      run replace lane=desktop_ceremony register_passkey(rpc, password, hub_chain_id, "") -> welcome_desktop_done _ | welcome_failed _
+    WelcomeDoor.login
+      run replace lane=desktop_ceremony login_with_passkey(rpc, password, hub_chain_id, "") -> welcome_desktop_done _ | welcome_failed _
+
+// Same landing as a `done` step (inlined: a handler cannot call a handler).
+on welcome_desktop_done(_ok)
+  mutation_phase = MutationPhase.idle
+  ceremony_phase = ""
+  ceremony_qr = ""
+  ceremony_detail = ""
+  task window open console -> console_opened _
+
+on ceremony_stepped(next)
+  let phase = ceremony_phase(next)
+  ceremony_phase = next.phase
+  ceremony_qr = next.qr
+  ceremony_detail = next.detail
+  match phase
+    CeremonyPhase.done
+      mutation_phase = MutationPhase.idle
+      ceremony_phase = ""
+      ceremony_qr = ""
+      task window open console -> console_opened _
+    CeremonyPhase.failed
+      mutation_phase = MutationPhase.idle
+      ceremony_phase = ""
+      ceremony_qr = ""
+      onboarding_error = next.detail
+    CeremonyPhase.show_qr
+      onboarding_error = ""
+    CeremonyPhase.working
+      onboarding_error = ""
+
+on welcome_failed(cause)
+  mutation_phase = MutationPhase.idle
+  ceremony_phase = ""
+  ceremony_qr = ""
+  ceremony_detail = ""
+  onboarding_error = cause.message
 
 // The console window exists: point it at the picked endpoint, remember the
 // pick, close the launch window BY ID, and run the same connect boot the
@@ -172,6 +298,10 @@ on connect_remote_submit(endpoint)
 // from the previous network must land dead.
 // (`reconnect` is the same-endpoint sibling that deliberately KEEPS drafts.)
 on console_opened(id)
+  account_banner_dismissed = false
+  account_ceremony_phase = ""
+  account_ceremony_qr = ""
+  account_ceremony_detail = ""
   invalidate lane=chat_search
   invalidate lane=page_search
   invalidate lane=palette_search
@@ -474,7 +604,15 @@ on copy_onboarding_invite
 on enter_console
   return if mutation_phase != MutationPhase.idle
   onboarding_error = ""
-  task window open console -> console_opened _
+  let gate = pick_gate(password)
+  match gate
+    PickGate.read_only
+      task window open console -> console_opened _
+    PickGate.probe
+      mutation_phase = MutationPhase.onboarding
+      parallel
+        run replace lane=account_probe load_account(rpc, account_generation) -> account_probed _ | account_probe_failed _
+        run replace lane=chain_probe chain_id_of(rpc) -> chain_named _ | chain_probe_failed _
 
 // A refusal here is recoverable — the workspace is already on disk — so the
 // screen keeps its controls and says what happened.
@@ -513,3 +651,40 @@ on onboarding_reopened(id)
     task window close target=window_target(console_win)
     task window close target=window_target(huddle_win)
     run replace lane=hub_state hub_state() -> hub_refreshed _
+
+// THE BANNER'S WAY BACK — the launch window at the welcome step for THIS
+// network. Same teardown as `switch_network` (a handler cannot call a
+// handler, so the lines are repeated), different landing.
+on dismiss_account_banner
+  account_banner_dismissed = true
+
+on open_account_welcome
+  return if mutation_phase != MutationPhase.idle
+  invalidate lane=page_autosave
+  invalidate lane=shell_credentials
+  invalidate lane=shell_terminal
+  invalidate lane=shell_chat
+  shell_credentials_generation = shell_credentials_generation + 1
+  shell_credentials_loading = false
+  shell_terminal = idle_agent_terminal()
+  shell_terminal_running = false
+  shell_terminal_busy = false
+  shell_terminal_title = ""
+  shell_chat_busy = false
+  shell_chat_status = ""
+  shell_chat_detail = ""
+  shell_chat_live = ""
+  rpc = connected_rpc
+  hub_chain_id = network_chain_id
+  task window open onboarding -> welcome_reopened _
+
+on welcome_reopened(id)
+  onboarding_win = some(id)
+  ceremony_phase = ""
+  ceremony_qr = ""
+  ceremony_detail = ""
+  onboarding_error = ""
+  hub_step = HubStep.account
+  parallel
+    task window close target=window_target(console_win)
+    task window close target=window_target(huddle_win)

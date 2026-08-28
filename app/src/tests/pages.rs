@@ -220,7 +220,7 @@ fn page_autosave_freshness_is_compiler_owned_without_aborting_writes() {
     let onboarding = inlined(include_str!("../ui/handlers/onboarding.ice"));
     assert_eq!(
         onboarding.matches("invalidate lane=page_autosave").count(),
-        2
+        3
     );
 }
 

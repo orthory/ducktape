@@ -89,11 +89,54 @@ on account_key_join_submit
 // BROWSER CEREMONIES. Each opens the auth page and blocks on its answer;
 // `account_busy` holds the card until the page answers or the backend gives
 // up. The label draft names the new key, exactly as it names a pasted one.
+//
+// A passkey is registered FROM THE PHONE by default: the stream hands back
+// the QR the card shows, and `done`/`failed` close it. The desktop browser
+// path is the button beside it.
 on account_passkey_submit
   return if !connected || !account_exists || account_busy || empty(password)
   account_busy = true
   error = ""
+  stream replace lane=account_ceremony add_passkey_by_qr(connected_rpc, password, network_chain_id, trim(account_key_label_draft)) -> account_ceremony_stepped _
+
+on account_passkey_desktop
+  return if !connected || !account_exists || account_busy || empty(password)
+  account_busy = true
+  error = ""
   run every register_passkey(connected_rpc, password, network_chain_id, trim(account_key_label_draft)) -> account_changed _ | account_op_failed _
+
+// `done` is `account_changed`'s body inlined (a handler cannot call a
+// handler): the account picture moved, so it is re-read under a fresh
+// generation.
+on account_ceremony_stepped(next)
+  let phase = ceremony_phase(next)
+  account_ceremony_phase = next.phase
+  account_ceremony_qr = next.qr
+  account_ceremony_detail = next.detail
+  match phase
+    CeremonyPhase.done
+      account_ceremony_phase = ""
+      account_ceremony_qr = ""
+      account_busy = false
+      account_key_label_draft = ""
+      account_generation = account_generation + 1
+      run replace lane=account_load load_account(connected_rpc, account_generation) -> account_loaded _ | account_failed _
+    CeremonyPhase.failed
+      account_ceremony_phase = ""
+      account_ceremony_qr = ""
+      account_busy = false
+      error = next.detail
+    CeremonyPhase.show_qr
+      error = ""
+    CeremonyPhase.working
+      error = ""
+
+on account_ceremony_cancel
+  invalidate lane=account_ceremony
+  account_busy = false
+  account_ceremony_phase = ""
+  account_ceremony_qr = ""
+  account_ceremony_detail = ""
 
 on account_wallet_submit
   return if !connected || !account_exists || account_busy || empty(password)

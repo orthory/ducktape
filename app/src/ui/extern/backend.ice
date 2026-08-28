@@ -147,7 +147,6 @@ extern crate::backend
   HubProbe(id:str, live:bool, height:i64)
   WalletInfo(name:str, pubkey:str, state:str, active:bool)
   HubState(wallets:[WalletInfo], wallets_error:str, networks:[HubNetwork], preselect:str, hidden:i64)
-  KeyCreated(words:str, pubkey:str)
   hub_state() -> HubState
   stream probe_known_networks() -> HubProbe
   pure apply_network_probe(networks:[HubNetwork], probe:HubProbe) -> [HubNetwork]
@@ -164,7 +163,7 @@ extern crate::backend
   pure without_window(current:window-id?, closed:window-id) -> window-id?
   sync window_target(current:window-id?) -> window-id
   sync window_target_unless(keep:bool, current:window-id?) -> window-id
-  create_user_key(name:str, password:str) -> KeyCreated ! AppError
+  create_device_key(password:str) -> str ! AppError
   restore_user_key(name:str, words:secret, password:str) -> str ! AppError
   unlock_wallet(name:str, password:str) -> str ! AppError
   unlock_user_key(password:str) -> str ! AppError
@@ -265,6 +264,13 @@ extern crate::backend
   AccountKeyRow(scheme:str, pubkey:str, label:str, added_at:i64)
   AccountData(generation:i64, exists:bool, number:str, name:str, bio:str, keys:i64, key_rows:[AccountKeyRow])
   load_account(rpc:str, generation:i64) -> AccountData ! HydrationError
+  // the welcome step's two probes, before any console exists: the chain a
+  // picked network names (every key consent is chain-scoped), and a test
+  // seam for the "no account" reading Ice cannot construct itself.
+  chain_id_of(rpc:str) -> str ! AppError
+  pure account_data_none(generation:i64) -> AccountData
+  pure pick_gate(password:&str) -> PickGate
+  pure account_probe(found:bool) -> AccountProbe
   set_account_name(rpc:str, password:str, name:str) -> bool ! AppError
   create_account(rpc:str, password:str, name:str) -> bool ! AppError
   // An `AddKey` ticket this device (a member) mints for another device's
@@ -280,6 +286,17 @@ extern crate::backend
   register_passkey(rpc:str, password:str, chain_id:str, label:str) -> bool ! AppError
   link_wallet(rpc:str, password:str, chain_id:str, label:str) -> bool ! AppError
   login_with_passkey(rpc:str, password:str, chain_id:str, label:str) -> bool ! AppError
+  // the same ceremonies with the browser on a PHONE: each is a stream whose
+  // first reading is the QR to show and whose last is `done` or `failed`;
+  // `phase` is `working | show_qr | done | failed`. The phone's answer comes
+  // back through the auth host's relay (`authpage::Relay`).
+  CeremonyStep(phase:str, qr:str, detail:str)
+  stream create_account_by_qr(rpc:str, password:str, chain_id:str, name:str) -> CeremonyStep
+  stream login_by_qr(rpc:str, password:str, chain_id:str) -> CeremonyStep
+  stream add_passkey_by_qr(rpc:str, password:str, chain_id:str, label:str) -> CeremonyStep
+  pure ceremony_step(phase:str, qr:str, detail:str) -> CeremonyStep
+  pure ceremony_phase(step:&CeremonyStep) -> CeremonyPhase
+  pure welcome_door(name_draft:&str) -> WelcomeDoor
   SettingsFacts(generation:i64, key_path:str, key_state:str, data_dir:str, open_tabs:i64, user_key:str)
   load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
   clear_doc_tabs(rpc:str) -> bool

@@ -1,12 +1,16 @@
 # `auth.ducktape.byeongsu.dev` — the WebAuthn relying-party page
 
-One static file, no backend (`index.html`). Gate: `node ops/auth-page/test.mjs`
-— plain `node`, no dependencies, no install; it lifts the page's pure helper
-block and checks the fragment parser, DER→raw and SPKI→compressed-SEC1. The app/CLI opens the system
-browser to it with the request in the URL fragment, the page runs the
-ceremony, and the result goes to a one-shot loopback listener in the app/CLI
-(the `gh auth login` shape). Design: `docs/superpowers/specs/2026-08-27-identity-rework-design.md`
-§WebAuthn; the verifier it must satisfy: `crates/kernel/keyscheme`.
+One static file (`index.html`) plus one Worker route (`worker.js`, the
+result relay — §Relay). Gate: `node ops/auth-page/test.mjs` — plain `node`,
+no dependencies, no install; it lifts the page's pure helper block and checks
+the fragment parser, DER→raw and SPKI→compressed-SEC1, and runs the relay
+against a Map. The app/CLI opens the system browser to the page with the
+request in the URL fragment — or shows the same URL as a QR for a phone —
+the page runs the ceremony, and the result goes to a one-shot loopback
+listener in the app/CLI (the `gh auth login` shape) or, from a phone, to the
+relay the app polls. Design: `docs/superpowers/specs/2026-08-27-identity-rework-design.md`
+§WebAuthn and `docs/superpowers/specs/2026-08-28-first-signin-passkey-design.md`;
+the verifier it must satisfy: `crates/kernel/keyscheme`.
 
 The RP ID is the page's own host, never a parameter. The same file served by
 the node at `http://localhost:<port>/.duck/auth` gives RP ID `localhost` —
@@ -25,7 +29,7 @@ All binary fields are base64url, no padding.
 | `challenge` | all | `create`/`get`: the 32 challenge bytes (`SHA-256(ns ‖ preimage)`, hashed by the client; passed straight through). `eth`: the exact `personal_sign` message bytes (`union_unique(ns, preimage)`, NOT hashed; the wallet prepends the EIP-191 prefix itself). |
 | `user` | create | `user.id`: the account number as 8 bytes u64 LE. |
 | `name` | create | `user.name` = `user.displayName`: the account's display name. |
-| `cb` | all, optional | the listener URL. **Loopback only** (`http://127.0.0.1`, `[::1]`, `localhost`) — any other host is refused before the ceremony. Without it the page prints the result JSON (manual testing). |
+| `cb` | all, optional | where the result goes: **loopback** (`http://127.0.0.1`, `[::1]`, `localhost`), or **this origin's `/r/<id>`** (the relay, §Relay) — any other URL is refused before the ceremony. Without it the page prints the result JSON (manual testing). |
 
 Fixed options: `pubKeyCredParams` ES256 (-7) only; `residentKey: required`
 (discoverable → usernameless QR login); `userVerification: preferred`; no
@@ -56,6 +60,25 @@ app"), then it closes.
 {"op":"…","error":"<DOMException name>","message":"…"}
 ```
 
+## Relay — `/r/<id>`
+
+When the app shows the request as a QR instead of opening a browser, the
+ceremony runs on the phone, which cannot reach the app — so `cb` is this
+origin's `/r/<id>` (`id` = 32 random bytes, base64url, 43 chars, minted by
+the app). `worker.js` (`run_worker_first = ["/r/*"]`; everything else is
+the static page):
+
+- `POST /r/<id>` — the page's form (`result=<JSON>`); stored in KV
+  (`CEREMONIES`) for 300 s; answers a "Done — return to ducktape" page. A
+  body over 16 KiB is 413, a malformed id 404.
+- `GET /r/<id>` — 200 `application/json` with the result exactly once
+  (deleted on read); 204 while nothing has arrived.
+
+The relayed body is an assertion or a created credential's public key —
+public data the app verifies against the account's keys; a forged or
+replayed post fails there, and an unguessable id keeps strangers from
+polling a ceremony. The client half is `authpage::Relay`.
+
 ## Ceremonies — how the clients sequence the ops
 
 The client half is `crates/authpage` (the fragment URL, the loopback
@@ -82,11 +105,13 @@ same three buttons.
 
 ## Deploy
 
-Cloudflare Workers static assets; the `custom_domain` route makes wrangler
-create the DNS record and certificate in the zone.
+Cloudflare Workers static assets plus the relay Worker and its KV namespace;
+the `custom_domain` route makes wrangler create the DNS record and
+certificate in the zone.
 
 ```
 npx wrangler@4 login                                       # once per machine (OAuth; headless: --browser=false, then curl the callback URL within 120 s)
+npx wrangler@4 kv namespace create CEREMONIES --config ops/auth-page/wrangler.toml   # once; put the printed id into wrangler.toml
 npx wrangler@4 deploy --config ops/auth-page/wrangler.toml
-node ops/auth-page/test.mjs                                # the pure helpers (fragment, DER→raw, SPKI→SEC1)
+node ops/auth-page/test.mjs                                # the pure helpers (fragment, DER→raw, SPKI→SEC1) + the relay against a Map
 ```

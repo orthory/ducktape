@@ -49,14 +49,37 @@ enum ForgePhase
 
 enum HubStep
   loading
-  create
+  password
   wallets
-  reveal
   restore
   networks
   join
   provisioning
   live
+  account
+
+// A network pick's gate: a read-only session (no password, no key) opens the
+// console outright; a signing session probes the account first.
+enum PickGate
+  read_only
+  probe
+
+// The account probe's answer for the picked network's chain.
+enum AccountProbe
+  found
+  missing
+
+// A QR ceremony stream's reading, as the handlers branch on it.
+enum CeremonyPhase
+  working
+  show_qr
+  done
+  failed
+
+// Which welcome door a ceremony came through — the name draft is the tell.
+enum WelcomeDoor
+  create
+  login
 
 enum NodeTab
   overview

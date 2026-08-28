@@ -8,6 +8,8 @@
 //! 2. binds a one-shot [`Listener`] on loopback; the page's result arrives as
 //!    a top-level form POST (`result=<JSON>`) — a navigation, which Chrome's
 //!    local-network-access rules and CORS both leave alone, unlike a `fetch`;
+//!    or, when the request is shown as a QR for a phone, mints a [`Relay`]
+//!    slot on the auth host and polls it for the same result;
 //! 3. turns the [`Outcome`] into signed bytes the node accepts: a frame whose
 //!    origin is the passkey/wallet ([`passkey_frame`], [`wallet_frame`]) or a
 //!    passkey's consent to admit this device ([`login_consent`]).
@@ -26,6 +28,7 @@
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
@@ -339,9 +342,18 @@ fn respond(stream: &mut TcpStream, status: u16, text: &str) {
         200 => "OK",
         _ => "Bad Request",
     };
+    // the same card the page and the relay's "Done" wear (ops/auth-page).
     let html = format!(
-        "<!doctype html><meta charset=utf-8><title>ducktape</title>\
-         <body style=\"font-family:system-ui;padding:2em\"><p>{text}</p></body>"
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>ducktape</title>\
+         <style>:root{{color-scheme:light dark;--fg:#1b1b1f;--bg:#f3f3f6;--card:#fff;--muted:#6b6b76;--line:#e2e2e8}}\
+         @media (prefers-color-scheme:dark){{:root{{--fg:#ececf1;--bg:#111114;--card:#1b1b20;--muted:#9a9aa6;--line:#2a2a33}}}}\
+         body{{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--fg);\
+         font:16px/1.5 system-ui,-apple-system,\"Segoe UI\",sans-serif}}\
+         main{{width:min(26rem,calc(100vw - 2rem));background:var(--card);border:1px solid var(--line);border-radius:16px;padding:2rem}}\
+         .brand{{font-size:.8rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}}\
+         p{{margin:1rem 0 0}}</style></head>\
+         <body><main><div class=\"brand\">🦆 ducktape</div><p>{text}</p></main></body></html>"
     );
     let response = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\n\
@@ -442,6 +454,78 @@ pub fn open_browser(url: &str) -> bool {
             .spawn()
             .is_ok()
     })
+}
+
+// ============================================================================
+// the relay callback — a ceremony that ran on a phone
+// ============================================================================
+
+/// how often [`Relay::wait`] asks the auth host whether the phone answered.
+pub const RELAY_POLL: Duration = Duration::from_millis(1500);
+
+/// the auth host's `/r/<id>` slot the page POSTs to when the ceremony ran on
+/// a phone that cannot reach this machine (the app showed the request as a
+/// QR); [`Relay::wait`] polls it. Contract: `ops/auth-page/README.md` §Relay.
+pub struct Relay {
+    base: String,
+    /// 32 random bytes, base64url — unguessable, so nobody else can poll it.
+    pub id: String,
+}
+
+impl Default for Relay {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Relay {
+    /// at the live page.
+    pub fn new() -> Self {
+        Self::at(AUTH_PAGE)
+    }
+
+    /// at another deployment (`--auth-page`, tests). `base` ends with `/`.
+    pub fn at(base: &str) -> Self {
+        let raw: [u8; 32] = rand::random();
+        Self {
+            base: base.to_string(),
+            id: B64.encode(raw),
+        }
+    }
+
+    /// the `cb` to put in the request URL — the page accepts its own origin's
+    /// `/r/<id>`.
+    pub fn callback_url(&self) -> String {
+        format!("{}r/{}", self.base, self.id)
+    }
+
+    /// block until the phone's result lands (200) or `deadline` passes; a 204
+    /// is "not yet". Blocking on purpose — callers run it on a blocking
+    /// thread, exactly like [`Listener::wait`].
+    pub fn wait(self, deadline: Duration) -> Result<Outcome, String> {
+        let url = self.callback_url();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| format!("relay client: {e}"))?;
+        let started = std::time::Instant::now();
+        loop {
+            let response = client.get(&url).send().map_err(|e| format!("relay: {e}"))?;
+            match response.status().as_u16() {
+                200 => {
+                    let body = response.text().map_err(|e| format!("relay body: {e}"))?;
+                    return parse_result(&body);
+                }
+                204 => {}
+                other => return Err(format!("relay answered {other}")),
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= deadline {
+                return Err("the phone did not answer in time".into());
+            }
+            std::thread::sleep(RELAY_POLL.min(deadline - elapsed));
+        }
+    }
 }
 
 // ============================================================================
@@ -954,5 +1038,72 @@ mod tests {
             Some("{}")
         );
         assert_eq!(form_field(b"x=1", "result"), None);
+    }
+
+    /// a relay that answers 204 `absent` times, then the JSON once, then 204.
+    fn fake_relay(absent: usize, json: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for (served, stream) in listener.incoming().enumerate() {
+                let mut stream = stream.unwrap();
+                let mut line = String::new();
+                BufReader::new(&stream).read_line(&mut line).unwrap();
+                assert!(line.starts_with("GET /r/"), "{line}");
+                let is_the_answer = served == absent;
+                let response = match is_the_answer {
+                    true => format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                        json.len()
+                    ),
+                    false => "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string(),
+                };
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        base
+    }
+
+    #[test]
+    fn a_relay_id_is_43_url_safe_chars_and_names_the_callback() {
+        let relay = Relay::at("https://auth.example/");
+        assert_eq!(relay.id.len(), 43);
+        assert!(
+            relay
+                .id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        );
+        assert_eq!(
+            relay.callback_url(),
+            format!("https://auth.example/r/{}", relay.id)
+        );
+        assert_ne!(Relay::at("x").id, Relay::at("x").id);
+    }
+
+    #[test]
+    fn a_relay_waits_through_204s_and_takes_the_first_200() {
+        let base = fake_relay(
+            2,
+            r#"{"op":"get","credentialId":"AQ","authenticatorData":"AQ","clientDataJSON":"AQ","signature":"AQ","userHandle":"KgAAAAAAAAA"}"#,
+        );
+        let outcome = Relay::at(&base).wait(Duration::from_secs(20)).unwrap();
+        assert!(matches!(
+            outcome,
+            Outcome::Get {
+                user_handle: Some(42),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_relay_gives_up_at_the_deadline() {
+        let base = fake_relay(usize::MAX, "{}");
+        let err = Relay::at(&base)
+            .wait(Duration::from_millis(10))
+            .unwrap_err();
+        assert!(err.contains("did not answer"), "{err}");
     }
 }

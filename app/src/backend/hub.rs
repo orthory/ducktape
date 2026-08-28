@@ -85,14 +85,6 @@ pub struct HubState {
     pub hidden: i64,
 }
 
-/// What `user key init` hands back: the 24 recovery words (shown exactly
-/// once) and the minted pubkey.
-#[derive(Clone, Debug, Hash, PartialEq)]
-pub struct KeyCreated {
-    pub words: String,
-    pub pubkey: String,
-}
-
 /// `absent` | `encrypted` | `plaintext` | `unlocatable` — the same probe
 /// Settings runs, computed in-process (no subprocess, no password).
 pub(crate) fn user_key_state() -> String {
@@ -189,16 +181,31 @@ fn preselect_id(rows: &[HubNetwork]) -> String {
     rows.first().map(|row| row.id.clone()).unwrap_or_default()
 }
 
-/// Which step the launch window opens on: an empty keystore means the create
-/// ceremony, anything else lands on the wallet list — the unlock surface. An
-/// unreadable key renders its refusal plate on its own row rather than on a
-/// separate screen.
+/// Which step the launch window opens on: an empty keystore means the
+/// password step (the device key is minted under it), anything else lands on
+/// the wallet list — the unlock surface. An unreadable key renders its refusal
+/// plate on its own row rather than on a separate screen.
 pub fn hub_entry_step(wallets: Vec<WalletInfo>) -> crate::HubStep {
     if wallets.is_empty() {
-        crate::HubStep::Create
+        crate::HubStep::Password
     } else {
         crate::HubStep::Wallets
     }
+}
+
+/// The name an auto-minted device key gets: this host's name, in the
+/// keystore's grammar; `device` when the host has none to give.
+pub fn device_key_name() -> String {
+    let host = std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .unwrap_or_default();
+    let name = keystore::wallet::sanitize_name(host.trim());
+    if name.is_empty() {
+        return "device".to_string();
+    }
+    name
 }
 
 /// The row the wallet list preselects: the active wallet, else the first.
@@ -534,20 +541,34 @@ async fn in_the_keystore<T: Send + 'static>(
 /// pubkey; the fresh wallet becomes the active one and the in-process key
 /// cache is refreshed, so the new identity signs without a restart.
 ///
-/// THE WORDS COME BACK FIRST. Once the mint returns, a sealed key exists on
-/// disk whose ONLY backup is the phrase in that first field — an error after
-/// that point destroys the phrase and leaves the key. So the pointer write is
-/// not allowed to fail this call: it degrades to a warning, and the user lands
-/// on a wallet that is minted but not active, which the list can still fix.
-pub async fn create_user_key(name: String, password: String) -> Result<KeyCreated, AppError> {
-    let created = async {
+/// Mint this device's key under `password` with NO phrase shown: the words
+/// the keystore hands back are dropped here, because recovery is a passkey
+/// login from another device, not paper. Named after the host (`-2`… on a
+/// collision); the pubkey seeds the identity cache. Returns pubkey-hex.
+///
+/// The pointer write is not allowed to fail this call: it degrades to a
+/// warning, and the user lands on a wallet that is minted but not active,
+/// which the wallet list can still fix.
+pub async fn create_device_key(password: String) -> Result<String, AppError> {
+    let (name, pubkey) = async {
+        require_password(&password)?;
         let duck = duck_home()?;
+        let base = device_key_name();
+        let candidates =
+            std::iter::once(base.clone()).chain((2..10).map(|n| format!("{base}-{n}")));
+        let name = candidates
+            .into_iter()
+            .find(|name| !keystore::wallet::key_file(&duck, name).exists())
+            .ok_or_else(|| {
+                "this host already holds nine device keys — pick one in the wallet list".to_string()
+            })?;
         let minting = {
             let (name, password) = (name.clone(), Zeroizing::new(password));
             in_the_keystore(move || keystore::wallet::create(&duck, &name, &password))
         };
         let (words, pubkey) = minting.await?;
-        Ok(KeyCreated { words, pubkey })
+        drop(Zeroizing::new(words));
+        Ok((name, pubkey))
     }
     .await
     .map_err(app_error)?;
@@ -558,8 +579,8 @@ pub async fn create_user_key(name: String, password: String) -> Result<KeyCreate
             "the minted wallet is not the active one; pick it in the launch window"
         );
     }
-    set_local_user_key(hex_decode(&created.pubkey).ok()).await;
-    Ok(created)
+    set_local_user_key(hex_decode(&pubkey).ok()).await;
+    Ok(pubkey)
 }
 
 /// Re-seal an identity from its 24 words under a new password. Returns the
@@ -656,12 +677,21 @@ mod tests {
             .collect()
     }
 
+    /// A device key is named after the host, in the keystore's grammar, and
+    /// never comes out empty.
+    #[test]
+    fn a_device_key_is_named_after_the_host_and_never_empty() {
+        let name = device_key_name();
+        assert!(!name.is_empty());
+        assert!(keystore::wallet::valid_name(&name).is_ok(), "{name}");
+    }
+
     /// The keystore decides both the entry step and the preselected row: an
-    /// empty one is the create ceremony, and the active wallet is the row the
+    /// empty one is the password step, and the active wallet is the row the
     /// list opens on.
     #[test]
     fn entry_step_and_preselect_follow_the_keystore() {
-        assert!(matches!(hub_entry_step(vec![]), crate::HubStep::Create));
+        assert!(matches!(hub_entry_step(vec![]), crate::HubStep::Password));
         assert!(matches!(
             hub_entry_step(rows(&[("a", false)])),
             crate::HubStep::Wallets

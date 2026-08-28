@@ -1975,8 +1975,8 @@ fn the_browser_ceremonies_land_where_the_pasted_ops_do() {
     let roster = include_str!("../ui/handlers/roster.ice");
     for (button, signal, backend) in [
         (
-            "Register a passkey",
-            "account_passkey_submit",
+            "In this browser",
+            "account_passkey_desktop",
             "register_passkey",
         ),
         ("Link a wallet", "account_wallet_submit", "link_wallet"),
@@ -2025,7 +2025,7 @@ fn the_browser_ceremonies_land_where_the_pasted_ops_do() {
         without > with,
         "login is offered only while there is no account"
     );
-    for button in ["Register a passkey", "Link a wallet"] {
+    for button in ["On your phone", "In this browser", "Link a wallet"] {
         let at = settings
             .find(&format!(r#"button "{button}""#))
             .expect(button);

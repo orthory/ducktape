@@ -3,20 +3,36 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ducktape auth</title>
+<title>ducktape</title>
 <style>
-  body { font: 16px/1.5 system-ui, sans-serif; max-width: 40rem; margin: 4rem auto; padding: 0 1rem; color: #222; }
-  button { font: inherit; padding: .6rem 1.2rem; }
-  pre { white-space: pre-wrap; word-break: break-all; background: #f4f4f4; padding: 1rem; }
-  .err { color: #b00020; }
+  :root { color-scheme: light dark; --fg: #1b1b1f; --bg: #f3f3f6; --card: #ffffff; --muted: #6b6b76; --line: #e2e2e8; --accent: #2f6df6; --danger: #b00020; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #ececf1; --bg: #111114; --card: #1b1b20; --muted: #9a9aa6; --line: #2a2a33; --accent: #6f9bff; --danger: #ff6b7a; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { width: min(26rem, calc(100vw - 2rem)); background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 2rem; box-shadow: 0 10px 30px rgba(0, 0, 0, .08); }
+  .brand { display: flex; align-items: center; gap: .5rem; font-size: .8rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+  h1 { font-size: 1.35rem; line-height: 1.3; margin: 1rem 0 .4rem; }
+  p { margin: .3rem 0; color: var(--muted); }
+  .who { display: inline-block; margin-top: .8rem; padding: .25rem .7rem; border: 1px solid var(--line); border-radius: 999px; font: .9rem ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--fg); }
+  button { display: block; width: 100%; margin-top: 1.4rem; padding: .85rem 1.2rem; font: inherit; font-weight: 600; color: #fff; background: var(--accent); border: 0; border-radius: 12px; cursor: pointer; }
+  button:disabled { opacity: .55; cursor: default; }
+  .status { min-height: 1.5rem; margin-top: 1rem; }
+  .err { color: var(--danger); }
+  .ok { color: var(--fg); font-weight: 600; }
+  pre { white-space: pre-wrap; word-break: break-all; margin-top: 1rem; padding: 1rem; background: var(--bg); border-radius: 10px; font-size: .8rem; }
 </style>
 </head>
 <body>
-<h1>ducktape</h1>
-<p id="what"></p>
-<button id="go" hidden></button>
-<pre id="out" hidden></pre>
-<form id="cb" method="post" hidden><input type="hidden" name="result"></form>
+<main>
+  <div class="brand">🦆 ducktape</div>
+  <h1 id="title"></h1>
+  <p id="what"></p>
+  <span id="who" class="who" hidden></span>
+  <button id="go" hidden></button>
+  <p id="status" class="status"></p>
+  <pre id="out" hidden></pre>
+  <form id="cb" method="post" hidden><input type="hidden" name="result"></form>
+</main>
 
 <!-- Pure helpers: no DOM, no WebAuthn. `test.mjs` lifts this block out and runs it under node. -->
 <script id="pure">
@@ -39,8 +55,9 @@ const pure = {
   },
 
   // The request rides in the URL fragment so it never reaches a server log.
-  // See README.md for the contract.
-  parseRequest(fragment) {
+  // See README.md for the contract. `origin` is this page's own, for the
+  // relay rule in `allowedCallback`.
+  parseRequest(fragment, origin) {
     const p = new URLSearchParams(fragment.replace(/^#/, ""));
     const get = (k) => {
       const v = p.get(k);
@@ -48,7 +65,7 @@ const pure = {
       return v;
     };
     const op = get("op");
-    const req = { op, challenge: pure.b64u.dec(get("challenge")), cb: pure.loopbackOnly(p.get("cb")) };
+    const req = { op, challenge: pure.b64u.dec(get("challenge")), cb: pure.allowedCallback(p.get("cb"), origin) };
     if (op === "create") {
       req.user = pure.b64u.dec(get("user"));
       if (req.user.length !== 8) throw new Error("user must be the 8-byte LE account number");
@@ -60,12 +77,15 @@ const pure = {
   },
 
   // The result (a signature the chain will accept) only ever goes to the
-  // app/CLI listener on this machine — a crafted link cannot relay it elsewhere.
-  loopbackOnly(cb) {
+  // app/CLI listener on this machine, or to THIS origin's relay (`/r/<id>`,
+  // which the app polls when the ceremony ran on a phone) — a crafted link
+  // cannot relay it elsewhere.
+  allowedCallback(cb, origin) {
     if (cb === null) return null;
     const url = new URL(cb);
     const isLoopback = url.protocol === "http:" && ["127.0.0.1", "[::1]", "localhost"].includes(url.hostname);
-    if (!isLoopback) throw new Error("cb must be http://127.0.0.1, [::1] or localhost");
+    const isRelay = url.origin === origin && /^\/r\/[A-Za-z0-9_-]{43}$/.test(url.pathname);
+    if (!isLoopback && !isRelay) throw new Error("cb must be http://127.0.0.1, [::1], localhost, or this origin's /r/<id>");
     return url.href;
   },
 
@@ -164,11 +184,34 @@ const OPS = {
   },
 };
 
-const LABEL = {
-  create: "Register a passkey for this ducktape account",
-  get: "Sign in with a passkey (use your phone if it lives there)",
-  eth: "Sign with your Ethereum wallet",
+// What the person is being asked to do, per op — the same page serves the
+// desktop browser and a phone that scanned the app's QR.
+const COPY = {
+  create: {
+    title: "Add a passkey",
+    what: "This device will create a passkey for your ducktape account. You'll use it to sign in from any device.",
+    button: "Create passkey",
+    waiting: "Waiting for your device…",
+  },
+  get: {
+    title: "Confirm with your passkey",
+    what: "Choose the passkey that belongs to your ducktape account.",
+    button: "Continue with passkey",
+    waiting: "Waiting for your device…",
+  },
+  eth: {
+    title: "Sign with your wallet",
+    what: "Your Ethereum wallet will sign a message for ducktape. Nothing is sent on-chain.",
+    button: "Sign with wallet",
+    waiting: "Waiting for your wallet…",
+  },
 };
+
+function say(text, cls) {
+  const status = $("status");
+  status.textContent = text;
+  status.className = `status ${cls || ""}`;
+}
 
 function deliver(req, result) {
   const json = JSON.stringify(result);
@@ -177,8 +220,9 @@ function deliver(req, result) {
     $("out").hidden = false;
     return;
   }
-  // A top-level form POST to the loopback listener: no CORS, no preflight,
-  // no Chrome local-network-access prompt — the `gh auth login` shape.
+  // A top-level form POST to the loopback listener (or this origin's relay):
+  // no CORS, no preflight, no Chrome local-network-access prompt — the `gh
+  // auth login` shape.
   const form = $("cb");
   form.action = req.cb;
   form.result.value = json;
@@ -186,24 +230,40 @@ function deliver(req, result) {
 }
 
 function fail(e) {
+  $("title").textContent = "This link isn't valid";
   $("what").textContent = e.message || String(e);
-  $("what").className = "err";
   $("go").hidden = true;
 }
 
 try {
-  const req = parseRequest(location.hash);
-  $("what").textContent = LABEL[req.op];
+  const req = parseRequest(location.hash, location.origin);
+  const copy = COPY[req.op];
+  $("title").textContent = copy.title;
+  $("what").textContent = copy.what;
+  if (req.op === "create") {
+    $("who").textContent = req.name;
+    $("who").hidden = false;
+  }
   const go = $("go");
-  go.textContent = "Continue";
+  go.textContent = copy.button;
   go.hidden = false;
-  go.onclick = () =>
+  go.onclick = () => {
+    go.disabled = true;
+    say(copy.waiting);
     OPS[req.op](req)
-      .then((r) => deliver(req, r))
+      .then((r) => {
+        say(req.cb ? "Done — sending it back to ducktape…" : "Done.", "ok");
+        deliver(req, r);
+      })
       .catch((e) => {
-        fail(e);
+        // A failure is delivered too, so the app stops waiting with the
+        // reason; without a callback the page itself is the retry surface.
+        say(e.message || String(e), "err");
+        go.textContent = req.cb ? copy.button : "Try again";
+        go.disabled = !!req.cb;
         deliver(req, { op: req.op, error: e.name || "Error", message: e.message || String(e) });
       });
+  };
 } catch (e) {
   fail(e);
 }
