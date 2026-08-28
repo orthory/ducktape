@@ -901,19 +901,28 @@ fn a_refused_key_password_reaches_the_screen_as_a_sentence() {
 #[test]
 fn a_signed_write_records_the_block_that_took_it() {
     const RPC: &str = include_str!("../rpc.rs");
-    let signed_write = RPC
-        .split("pub(crate) async fn signed_write(")
-        .nth(1)
-        .expect("signed_write is declared")
-        .split("\n/// ")
-        .next()
-        .expect("signed_write body");
-    let submit = signed_write
+    let body = |name: &str| {
+        RPC.split(&format!("pub(crate) async fn {name}("))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{name} is declared"))
+            .split("\n/// ")
+            .next()
+            .unwrap_or_else(|| panic!("{name} body"))
+    };
+    // a write this device signs and one a passkey/wallet signed in the
+    // browser share ONE submit funnel, so the receipt is recorded once.
+    let signed_write = body("signed_write");
+    assert!(
+        signed_write.contains("submit_raw_frame("),
+        "signed_write submits through the raw-frame funnel"
+    );
+    let funnel = body("submit_raw_frame");
+    let submit = funnel
         .find("submit_frame(")
-        .expect("signed_write submits the frame");
-    let record = signed_write
+        .expect("the funnel submits the frame");
+    let record = funnel
         .find("note_module_block(")
-        .expect("signed_write records the block its write landed in");
+        .expect("the funnel records the block its write landed in");
     assert!(
         submit < record,
         "the height is recorded from the RECEIPT, so there is nothing to \

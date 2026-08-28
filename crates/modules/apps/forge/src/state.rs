@@ -32,7 +32,8 @@ use crate::oid::{OID_RAW_LEN, Oid};
 use crate::refs::{INTEGRATION_BRANCH, RepoState, StagedRef, is_protected_branch, norm_branch};
 use crate::tracker::{self, Tracker, author_from_origin, parse_hex_oid};
 use crate::{
-    ForgeMsg, ItemKind, MAX_REFS_PER_PUSH, RefUpdate, ReviewVerdict, decode_msg, norm_repo,
+    ForgeMsg, ItemKind, MAX_REFS_PER_PUSH, PushCert, RefUpdate, ReviewVerdict, decode_msg,
+    norm_repo,
 };
 
 /// the Identity module's genesis-constant id — the account registry every
@@ -249,9 +250,10 @@ impl ForgeState {
                 repo,
                 updates,
                 pack_digest,
+                cert,
             } => {
                 let name = norm_repo(&repo)?;
-                let principal = Self::principal_of_origin(ctx).await?;
+                let principal = Self::push_principal(ctx, &name, cert.as_ref(), &updates).await?;
                 self.stage_push_refs(&name, principal, updates, pack_digest)
             }
             ForgeMsg::OpenIssue { repo, title, body } => {
@@ -495,6 +497,25 @@ impl ForgeState {
         }
         let account = Self::identity_account(ctx, key).await?;
         Ok(account.map_or_else(|| key.clone(), identity::account_principal))
+    }
+
+    /// the principal a PUSH speaks for: with a push certificate, the SSH key
+    /// that signed it (its account, when it has one) — `git push --signed`
+    /// through any node, verified here by every validator; without one, the
+    /// frame origin ([`Self::principal_of_origin`]).
+    async fn push_principal(
+        ctx: &dyn Ctx,
+        repo: &str,
+        cert: Option<&PushCert>,
+        updates: &[RefUpdate],
+    ) -> Result<Vec<u8>, Error> {
+        let Some(cert) = cert else {
+            return Self::principal_of_origin(ctx).await;
+        };
+        let signer = crate::pushcert::signer(cert, repo, updates)
+            .map_err(|reason| Error::Module(format!("forge: {reason}")))?;
+        let account = Self::identity_account(ctx, &signer).await?;
+        Ok(account.map_or(signer, identity::account_principal))
     }
 
     /// stage an atomic multi-branch push: validate the update list, settle

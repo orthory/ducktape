@@ -525,7 +525,7 @@ view
             activity_log:
               extern node_log_timeline(node_log_timeline, connected_rpc) #node-log-timeline -> node_log_timeline_changed _
         settings:
-          SettingsScreen account_name_draft<->account_name_draft #settings
+          SettingsScreen account_name_draft<->account_name_draft account_create_draft<->account_create_draft account_key_draft<->account_key_draft account_key_label_draft<->account_key_label_draft account_join_draft<->account_join_draft #settings
             with
               account_name
               network_name
@@ -539,6 +539,9 @@ view
               account_renaming
               account_exists
               account_keys
+              account_key_rows
+              account_busy
+              account_ticket
               appearance
               password
               status
@@ -550,6 +553,17 @@ view
               reconnect -> reconnect
               account_name_draft_changed -> account_name_draft_changed _
               account_rename_submit -> account_rename_submit
+              account_create_draft_changed -> account_create_draft_changed _
+              account_create_submit -> account_create_submit
+              account_key_draft_changed -> account_key_draft_changed _
+              account_key_label_draft_changed -> account_key_label_draft_changed _
+              account_key_add_submit -> account_key_add_submit
+              account_join_draft_changed -> account_join_draft_changed _
+              account_key_join_submit -> account_key_join_submit
+              account_key_remove -> account_key_remove _
+              account_passkey_submit -> account_passkey_submit
+              account_wallet_submit -> account_wallet_submit
+              account_login_submit -> account_login_submit
               copy_to_clipboard -> copy_to_clipboard _ _
               settings_clear_tabs -> settings_clear_tabs
               switch_network -> switch_network

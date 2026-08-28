@@ -249,7 +249,7 @@ extern crate::backend
   pure node_log_timeline_filter(state:NodeLogTimelineState, filter:str) -> NodeLogTimelineState
   pure node_log_timeline_apply(state:NodeLogTimelineState, event:NodeLogTimelineEvent) -> NodeLogTimelineState
   component node_log_timeline(state:&NodeLogTimelineState, source:&str) -> NodeLogTimelineEvent
-  NodeFacts(public_key:str, version:str, root_hash:str, view:i64?, quorum:i64?, reachable_validators:i64?, last_finalized_at:i64, checkpoint_height:i64, height:i64, phase:str, phase_since:i64, sync_target:i64, sync_applied:i64, sync_retries:i64, sync_failures:i64, sync_last_error:str)
+  NodeFacts(public_key:str, version:str, root_hash:str, chain_id:str, view:i64?, quorum:i64?, reachable_validators:i64?, last_finalized_at:i64, checkpoint_height:i64, height:i64, phase:str, phase_since:i64, sync_target:i64, sync_applied:i64, sync_retries:i64, sync_failures:i64, sync_last_error:str)
   load_node_facts(rpc:str) -> NodeFacts ! AppError
   pure optional_number(value:i64?) -> str
   PeerRow(key:str, role:str, live:bool)
@@ -262,9 +262,24 @@ extern crate::backend
   ModuleRow(id:str, category:str, root:str, code_hash:str, pending_hash:str, activation_height:i64, readiness:i64, ready:bool)
   ModulesData(rows:[ModuleRow])
   load_modules(rpc:str) -> ModulesData ! AppError
-  AccountData(generation:i64, exists:bool, number:str, name:str, bio:str, keys:i64)
+  AccountKeyRow(scheme:str, pubkey:str, label:str, added_at:i64)
+  AccountData(generation:i64, exists:bool, number:str, name:str, bio:str, keys:i64, key_rows:[AccountKeyRow])
   load_account(rpc:str, generation:i64) -> AccountData ! HydrationError
   set_account_name(rpc:str, password:str, name:str) -> bool ! AppError
+  create_account(rpc:str, password:str, name:str) -> bool ! AppError
+  // An `AddKey` ticket this device (a member) mints for another device's
+  // pasted key — one JSON line, the bytes `ducktape account key join` and
+  // `join_with_ticket` submit verbatim.
+  mint_key_ticket(rpc:str, password:str, chain_id:str, pubkey:str, label:str) -> str ! AppError
+  join_with_ticket(rpc:str, password:str, ticket:str) -> bool ! AppError
+  remove_account_key(rpc:str, password:str, pubkey:str) -> bool ! AppError
+  // the browser ceremonies (`authpage`): a passkey or a wallet becomes a
+  // member key by signing its own AddKey frame in the browser; a login is a
+  // passkey's consent to admit THIS device. Each blocks on the page's answer
+  // (a 5-minute ceiling, then it fails).
+  register_passkey(rpc:str, password:str, chain_id:str, label:str) -> bool ! AppError
+  link_wallet(rpc:str, password:str, chain_id:str, label:str) -> bool ! AppError
+  login_with_passkey(rpc:str, password:str, chain_id:str, label:str) -> bool ! AppError
   SettingsFacts(generation:i64, key_path:str, key_state:str, data_dir:str, open_tabs:i64, user_key:str)
   load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
   clear_doc_tabs(rpc:str) -> bool

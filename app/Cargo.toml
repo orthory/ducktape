@@ -42,6 +42,7 @@ keystore.workspace = true
 # of holding the key in-process; `node::encode_frame` is the ONE encoder, and a
 # second implementation of a machine wire format is not a thing to write.
 node.workspace = true
+authpage.workspace = true
 # the ed25519 signer `keystore` hands back and `node::encode_frame` signs with.
 commonware-cryptography.workspace = true
 # scheduling a durable agent run in-process: the work spec the saga carries and

@@ -290,7 +290,7 @@ fn invite_bundles_reachable_member_fronts_from_seeded_mesh_state() {
     // a foreign file and carries no fronts.
     let namespace = genesis_namespace(&founder);
     let advert = direct_member_advert(&namespace, 7, 20);
-    let mesh = PersistedMesh::new(namespace, 1, vec![advert], vec![]);
+    let mesh = PersistedMesh::new(namespace, 1, vec![advert], vec![], vec![]);
     let storage = founder.join("storage");
     std::fs::create_dir_all(&storage).expect("create founder storage");
     reachability::store::save(&storage.join("mesh-state.json"), &mesh)

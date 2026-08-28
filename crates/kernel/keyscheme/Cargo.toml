@@ -23,6 +23,10 @@ commonware-utils = { workspace = true }
 p256 = { workspace = true }
 # secp256k1 (Ethereum wallet `personal_sign`) — recovery-based verify.
 k256 = { workspace = true }
+# OpenSSH `SSHSIG` (an SSH ed25519 key's `ssh-keygen -Y sign`) — raw ed25519
+# over the SSHSIG signed-data blob, which commonware's namespaced verify cannot
+# express.
+ed25519-dalek = { workspace = true }
 sha2 = { workspace = true }
 sha3 = { workspace = true }
 # base64url-decoding the WebAuthn challenge out of clientDataJSON.

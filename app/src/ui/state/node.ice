@@ -17,6 +17,19 @@ state
   account_generation:i64 = 0
   account_name_draft = ""
   account_renaming = false
+  // The account's key associations, as the settings card lists them.
+  account_key_rows:[AccountKeyRow] = []
+  // One identity op in flight (create / mint / join / remove) — the buttons
+  // wait on it the way Rename waits on `account_renaming`.
+  account_busy = false
+  account_create_draft = ""
+  // "Add a device": the other device's pasted public key + a label, and the
+  // ticket minted for it (shown until the next op clears it).
+  account_key_draft = ""
+  account_key_label_draft = ""
+  account_ticket = ""
+  // "Join with a ticket": a ticket another device minted for THIS key.
+  account_join_draft = ""
 
   node_log_timeline:NodeLogTimelineState = node_log_timeline_state()
   node_log_filter = ""
@@ -24,6 +37,9 @@ state
   node_peers_generation:i64 = 0
   node_version = ""
   node_root_hash = ""
+  // The chain id the connected node serves — what an AddKey consent minted
+  // here is scoped to; "" until the first status lands (or on a chainless node).
+  network_chain_id = ""
   // A negative number means the node has published no measurement.
   node_last_finalized:i64 = -1
   node_checkpoint:i64 = -1

@@ -6,20 +6,21 @@
 //! executes the steps and sends the messages this module decides, which is
 //! what keeps the transitions testable without a transport or a clock.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
 
+use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
 use commonware_cryptography::ed25519;
 use wireguard::effect::PeerTunnelConfig;
 use wireguard::{
-    ActiveValidatorSet, EndpointAdvertisement, EndpointRecord, MeshView, ReplayCache,
+    ActiveValidatorSet, EndpointAdvertisement, EndpointRecord, MeshVersion, MeshView, ReplayCache,
     SignedEndpointRecord, TunnelInstallPlan, TunnelUpgradeAck, TunnelUpgradeRequest,
     TunnelUpgradeResponse, ValidatorIdentity,
 };
 
+use crate::contract::{COORD_STEP_TIMEOUT, PUNCH_STEP_TIMEOUT, PUNCH_TRIES};
 use crate::msg::ReachabilityMsg;
-use crate::rendezvous::{COORD_STEP_TIMEOUT, PUNCH_STEP_TIMEOUT, PUNCH_TRIES};
+use crate::wire::{identity_keys, identity_socket_addrs};
 
 /// Nudge ticks between two heals of the SAME peer.
 ///
@@ -32,14 +33,14 @@ use crate::rendezvous::{COORD_STEP_TIMEOUT, PUNCH_STEP_TIMEOUT, PUNCH_TRIES};
 const HEAL_COOLDOWN_NUDGES: u64 = 4;
 
 /// Minimum spacing between by-identity rendezvous-fallback attempts for the
-/// same endpoint-less peer. The nudge fires every couple of seconds and
-/// would otherwise re-attempt a stalled resolve before the resolver's own
-/// worst-case attempt (`COORD_STEP_TIMEOUT` + `PUNCH_TRIES` punch windows)
-/// could even finish, storming the coordinator — so the spacing IS the
-/// resolver's timeout envelope.
-pub(crate) const RENDEZVOUS_FALLBACK_BACKOFF: Duration = Duration::from_secs(
-    COORD_STEP_TIMEOUT.as_secs() + PUNCH_STEP_TIMEOUT.as_secs() * PUNCH_TRIES as u64,
-);
+/// same endpoint-less peer, in the milliseconds every step is stamped with.
+/// The nudge fires every couple of seconds and would otherwise re-attempt a
+/// stalled resolve before the resolver's own worst-case attempt
+/// (`COORD_STEP_TIMEOUT` + `PUNCH_TRIES` punch windows) could even finish,
+/// storming the coordinator — so the spacing IS the resolver's timeout
+/// envelope.
+pub(crate) const RENDEZVOUS_FALLBACK_BACKOFF_MS: u64 =
+    (COORD_STEP_TIMEOUT.as_secs() + PUNCH_STEP_TIMEOUT.as_secs() * PUNCH_TRIES as u64) * 1000;
 
 /// Cap on rendezvous-fallback attempts per peer PER EPOCH. Each attempt
 /// blocks the single-threaded driver loop for up to the resolver's full
@@ -51,38 +52,36 @@ pub(crate) const RENDEZVOUS_FALLBACK_BACKOFF: Duration = Duration::from_secs(
 /// grants a new budget.
 pub(crate) const RENDEZVOUS_FALLBACK_MAX_ATTEMPTS: u32 = 3;
 
-/// The epoch's record-nonce seed: unix time in MILLISECONDS. Wall-clock for
-/// the same reason the rendezvous readvertise nonce is: a REBOOTED node
-/// re-signs the SAME epoch tuple, and its previous life's nonces are already
-/// burnt into every peer's dedup gates (`prewarm_nonces`, the phase-A record
-/// map) — a fixed seed would replay-drop the reboot's re-introduction for
-/// the rest of the epoch. Milliseconds so even a sub-second orchestrator
-/// relaunch still climbs. A broken clock degrades to 0 exactly like
-/// `nat_traversal::now_secs`: the node then re-advertises as a stale life
-/// and heals at the next cutover.
-pub(crate) fn epoch_nonce_seed() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
+/// The epoch's record-nonce seed: the step's unix-millisecond stamp,
+/// verbatim. Wall-clock for the same reason the rendezvous readvertise nonce
+/// is: a REBOOTED node re-signs the SAME epoch tuple, and its previous
+/// life's nonces are already burnt into every peer's dedup gates
+/// (`prewarm_nonces`, the phase-A record map) — a fixed seed would
+/// replay-drop the reboot's re-introduction for the rest of the epoch.
+/// Milliseconds so even a sub-second relaunch still climbs. A broken clock
+/// degrades to 0 exactly like `nat_traversal::now_secs`: the node then
+/// re-advertises as a stale life and heals at the next cutover.
+pub(crate) fn epoch_nonce_seed(now_ms: u64) -> u64 {
+    now_ms
 }
 
 /// Pure backoff/budget decision: attempt iff never attempted this epoch, or
 /// the backoff window has elapsed AND the per-epoch attempt budget remains.
-/// `previous` = `(elapsed since the last attempt, attempts made so far)`;
+/// `previous` = `(ms elapsed since the last attempt, attempts made so far)`;
 /// `None` = never attempted — also the shape a fresh epoch's reset map
 /// produces, which is how "a new epoch resets the budget" happens.
-pub(crate) fn should_attempt_rendezvous_fallback(previous: Option<(Duration, u32)>) -> bool {
+pub(crate) fn should_attempt_rendezvous_fallback(previous: Option<(u64, u32)>) -> bool {
     match previous {
         None => true,
-        Some((elapsed, attempts)) => {
-            attempts < RENDEZVOUS_FALLBACK_MAX_ATTEMPTS && elapsed >= RENDEZVOUS_FALLBACK_BACKOFF
+        Some((elapsed_ms, attempts)) => {
+            attempts < RENDEZVOUS_FALLBACK_MAX_ATTEMPTS
+                && elapsed_ms >= RENDEZVOUS_FALLBACK_BACKOFF_MS
         }
     }
 }
 
 /// Which side of the plane this node runs for the epoch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub(crate) enum Role {
     /// In the epoch's `ActiveValidatorSet`: full phase-A assembly, plus the
     /// pre-warm layer toward the epoch's standbys.
@@ -96,7 +95,7 @@ pub(crate) enum Role {
 /// previous one gathered: the record set once the advert is signed over it,
 /// the advert set once the view verified. A standby never leaves
 /// [`Phase::Records`] — its pre-warm layer has no version lock.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub(crate) enum Phase {
     /// Collecting every member's endpoint record; this node's advert is not
     /// signed yet, so the record set is still open to higher nonces.
@@ -160,6 +159,38 @@ impl Admission {
     }
 }
 
+/// What a member's record gossip means for an epoch whose record set may
+/// already be locked, decided by [`EpochState::judge_member_record`] and
+/// dispatched by the orchestrator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MemberRecordVerdict {
+    /// The record set is still open: plain phase-A admission by nonce.
+    Assembling,
+    /// At or below the nonce this epoch locked for the owner: the owner is
+    /// still assembling its own phase A and never got our half — heal it.
+    Behind,
+    /// Above the locked nonce: the owner signed a new record within the
+    /// epoch (a restart, an address rebind) — re-tunnel it in place, as a
+    /// layer over the applied base; the next cutover folds it back into a
+    /// verified mesh.
+    Readvertised,
+}
+
+/// Whether this node's own record is the one its peers locked into the
+/// epoch's mesh version, or a fresh life signed after that lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
+pub(crate) enum OwnRecordStanding {
+    /// The peers' locked set carries this record (or the epoch is still
+    /// assembling toward that): the settled phases re-offer nothing.
+    Locked,
+    /// This record post-dates the set the peers locked — this node adopted
+    /// their view after re-assembling mid-epoch. Every settled-phase nudge
+    /// keeps offering the record so every peer eventually re-tunnels this
+    /// node; receivers dedup by nonce, so a peer that holds it already
+    /// drops the re-offer silently.
+    Live,
+}
+
 /// Store `value` under `owner` iff its `nonce` beats the held item's.
 fn admit<V>(
     held: &mut BTreeMap<ValidatorIdentity, V>,
@@ -182,7 +213,18 @@ fn admit<V>(
 /// A handshake message's stage in the request -> response -> ack triple.
 /// Ordered: a later stage proves the earlier one arrived, so it supersedes
 /// a relay slot holding the earlier one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 pub(crate) enum HandshakeStage {
     Request,
     Response,
@@ -197,6 +239,7 @@ pub(crate) enum HandshakeStage {
     clippy::large_enum_variant,
     reason = "each epoch holds only a handful of handshakes; boxing would complicate the retry state"
 )]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub(crate) enum PeerHandshake {
     /// We initiated and sent the request; the peer's response is due.
     AwaitingResponse { request: TunnelUpgradeRequest },
@@ -241,6 +284,7 @@ impl PeerHandshake {
 /// `(initiator, responder)` pair, re-offered on nudge until superseded or
 /// expired. Signature-verified before acceptance, so a malicious member
 /// cannot evict a real in-flight message by poisoning the slot.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub(crate) struct RelaySlot {
     pub(crate) stage: HandshakeStage,
     /// The member whose signature the slot's message carries — the one peer
@@ -321,6 +365,7 @@ pub(crate) enum RelayVerdict {
 }
 
 /// Everything one epoch accumulates on the way to its apply.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub(crate) struct EpochState {
     pub(crate) epoch: u64,
     pub(crate) role: Role,
@@ -330,7 +375,15 @@ pub(crate) struct EpochState {
     pub(crate) peers: Vec<ValidatorIdentity>,
     /// The epoch's standby identities (never in `set`).
     pub(crate) standbys: Vec<ValidatorIdentity>,
-    pub(crate) pk_of: HashMap<ValidatorIdentity, ed25519::PublicKey>,
+    #[borsh(
+        serialize_with = "identity_keys::serialize",
+        deserialize_with = "identity_keys::deserialize",
+        schema(with_funcs(
+            declaration = "identity_keys::declaration",
+            definitions = "identity_keys::definitions"
+        ))
+    )]
+    pub(crate) pk_of: BTreeMap<ValidatorIdentity, ed25519::PublicKey>,
     /// The accepted nonce per pre-warm counterparty (standby records on a
     /// member, member records on a standby). Higher nonce wins — the live
     /// re-advertisement rule the phase-A member set deliberately does not
@@ -343,15 +396,35 @@ pub(crate) struct EpochState {
     /// resolved, overlay route derived) — merged over the interface's base
     /// peers on every change.
     pub(crate) prewarm_peers: BTreeMap<ValidatorIdentity, PeerTunnelConfig>,
+    /// Members' post-lock re-advertisements: an owner-signed record whose
+    /// nonce beats what this epoch locked for the owner (a restart, an
+    /// address rebind), accepted under the live supersession rule and kept
+    /// BESIDE the locked set — the locked mesh version never recomputes
+    /// mid-epoch. Persisted with the mesh so a cold restart restores the
+    /// member's current life, not the one the epoch happened to lock.
+    pub(crate) readvertised: BTreeMap<ValidatorIdentity, SignedEndpointRecord>,
+    /// The tunnel parts derived from accepted re-advertisements — merged
+    /// over the interface's base peers on every push, above the base and
+    /// below nothing (a member is never in the pre-warm layer).
+    pub(crate) readvertised_peers: BTreeMap<ValidatorIdentity, PeerTunnelConfig>,
     /// Standby-directed sends route to the transport identity that DELIVERED
     /// the standby's record when that identity is not a member (the lobby
     /// ingress a parked joiner connects under, or the standby's own key) —
     /// a standby is not necessarily dialable under its record identity.
-    routes: HashMap<ValidatorIdentity, ed25519::PublicKey>,
+    #[borsh(
+        serialize_with = "identity_keys::serialize",
+        deserialize_with = "identity_keys::deserialize",
+        schema(with_funcs(
+            declaration = "identity_keys::declaration",
+            definitions = "identity_keys::definitions"
+        ))
+    )]
+    routes: BTreeMap<ValidatorIdentity, ed25519::PublicKey>,
     /// One strictly-monotonic counter for EVERYTHING this identity signs in
     /// the epoch — replay keys are `(identity, epoch, nonce)`, and the
     /// advert duplicate rule wants strictly-increasing nonces too. Seeded
-    /// from wall clock (`epoch_nonce_seed`), never a constant, so a reboot's
+    /// from the step's wall-clock stamp (`epoch_nonce_seed`), never a
+    /// constant, so a reboot's
     /// fresh counter still supersedes everything the previous life signed
     /// for this same epoch tuple.
     nonce: u64,
@@ -360,6 +433,9 @@ pub(crate) struct EpochState {
     /// standby role this field is its only home (a standby is never part of
     /// the member record set).
     pub(crate) own_record: SignedEndpointRecord,
+    /// Where `own_record` stands against the mesh version the peers locked
+    /// (see [`OwnRecordStanding`]).
+    pub(crate) own_standing: OwnRecordStanding,
     /// Owner-signed records as they arrived (our own included) — the form
     /// that can be re-gossiped to peers the owner has no link to.
     pub(crate) records: BTreeMap<ValidatorIdentity, SignedEndpointRecord>,
@@ -369,27 +445,31 @@ pub(crate) struct EpochState {
     /// (a record once our advert signed, an advert once the view verified) —
     /// i.e. peers still missing our half of the exchange. The next nudge
     /// answers them ([`Self::heal_sends`]) and clears this.
-    heal_requests: HashSet<ValidatorIdentity>,
+    heal_requests: BTreeSet<ValidatorIdentity>,
     /// The nudge tick each peer was last healed at — the cooldown clock that
     /// keeps two settled nodes from healing each other every tick forever.
-    heal_backoff: HashMap<ValidatorIdentity, u64>,
+    heal_backoff: BTreeMap<ValidatorIdentity, u64>,
     pub(crate) replay: ReplayCache,
     /// Requests that arrived before our own `MeshView` completed (the peer
     /// verified faster); drained the moment it does. Keyed by initiator so
     /// nudged re-offers of the same request collapse to one entry.
     pub(crate) pending_requests: BTreeMap<ValidatorIdentity, TunnelUpgradeRequest>,
-    pub(crate) handshakes: HashMap<ValidatorIdentity, PeerHandshake>,
+    pub(crate) handshakes: BTreeMap<ValidatorIdentity, PeerHandshake>,
     /// Relay slots keyed by `(initiator, responder)` for handshakes between
     /// two OTHER members.
     relayed: BTreeMap<(ValidatorIdentity, ValidatorIdentity), RelaySlot>,
     pub(crate) plans: BTreeMap<ValidatorIdentity, TunnelInstallPlan>,
+    #[borsh(schema(with_funcs(
+        declaration = "identity_socket_addrs::declaration",
+        definitions = "identity_socket_addrs::definitions"
+    )))]
     pub(crate) overrides: BTreeMap<ValidatorIdentity, SocketAddr>,
     /// By-identity rendezvous-fallback bookkeeping per endpoint-less peer:
-    /// `(last attempt instant, attempts so far)` — the backoff + per-epoch
+    /// `(last attempt unix ms, attempts so far)` — the backoff + per-epoch
     /// budget behind [`Self::claim_rendezvous_attempt`]. Fresh per epoch: a
     /// `Retarget` resets the budget.
-    rendezvous_attempted: BTreeMap<ValidatorIdentity, (Instant, u32)>,
-    pub(crate) failed: HashSet<ValidatorIdentity>,
+    rendezvous_attempted: BTreeMap<ValidatorIdentity, (u64, u32)>,
+    pub(crate) failed: BTreeSet<ValidatorIdentity>,
 }
 
 impl EpochState {
@@ -402,7 +482,7 @@ impl EpochState {
         set: ActiveValidatorSet,
         peers: Vec<ValidatorIdentity>,
         standbys: Vec<ValidatorIdentity>,
-        pk_of: HashMap<ValidatorIdentity, ed25519::PublicKey>,
+        pk_of: BTreeMap<ValidatorIdentity, ed25519::PublicKey>,
         own_record: SignedEndpointRecord,
     ) -> Self {
         let mut records = BTreeMap::new();
@@ -419,22 +499,25 @@ impl EpochState {
             prewarm_nonces: BTreeMap::new(),
             standby_records: BTreeMap::new(),
             prewarm_peers: BTreeMap::new(),
-            routes: HashMap::new(),
+            readvertised: BTreeMap::new(),
+            readvertised_peers: BTreeMap::new(),
+            routes: BTreeMap::new(),
             nonce: own_record.record.nonce,
             own_record,
+            own_standing: OwnRecordStanding::Locked,
             records,
             adverts: BTreeMap::new(),
             phase: Phase::Records,
-            heal_requests: HashSet::new(),
-            heal_backoff: HashMap::new(),
+            heal_requests: BTreeSet::new(),
+            heal_backoff: BTreeMap::new(),
             replay: ReplayCache::default(),
             pending_requests: BTreeMap::new(),
-            handshakes: HashMap::new(),
+            handshakes: BTreeMap::new(),
             relayed: BTreeMap::new(),
             plans: BTreeMap::new(),
             overrides: BTreeMap::new(),
             rendezvous_attempted: BTreeMap::new(),
-            failed: HashSet::new(),
+            failed: BTreeSet::new(),
         }
     }
 
@@ -622,6 +705,93 @@ impl EpochState {
         admit(&mut self.prewarm_nonces, owner, nonce, |held| *held, nonce)
     }
 
+    /// What a member's record gossip means once the record set may be
+    /// locked. In [`Phase::Records`] the set is still open — plain phase-A
+    /// admission decides. After that, the nonce this epoch locked for the
+    /// owner splits the world: at or below it the owner is behind (still
+    /// assembling, missing our half); above it the owner signed a new life
+    /// within the epoch and gets re-tunneled in place.
+    pub(crate) fn judge_member_record(
+        &self,
+        owner: ValidatorIdentity,
+        nonce: u64,
+    ) -> MemberRecordVerdict {
+        if matches!(self.phase, Phase::Records) {
+            return MemberRecordVerdict::Assembling;
+        }
+        // Post-lock, every member's record is known (that is the lock's own
+        // gate), so a missing entry cannot happen; treat it as phase-A lag
+        // rather than a fresh life over a set that never held the owner.
+        let beats_lock = self
+            .known_records()
+            .get(&owner)
+            .is_some_and(|locked| nonce > locked.nonce);
+        if beats_lock {
+            MemberRecordVerdict::Readvertised
+        } else {
+            MemberRecordVerdict::Behind
+        }
+    }
+
+    /// A member's post-lock re-advertisement: stored beside the locked set
+    /// iff its nonce beats the held re-advertisement — the same live
+    /// supersession rule as the pre-warm layer (re-offers are routine and
+    /// drop silently).
+    pub(crate) fn admit_readvertisement(
+        &mut self,
+        owner: ValidatorIdentity,
+        signed: SignedEndpointRecord,
+    ) -> Admission {
+        let nonce = signed.record.nonce;
+        admit(
+            &mut self.readvertised,
+            owner,
+            nonce,
+            |held| held.record.nonce,
+            signed,
+        )
+    }
+
+    /// A peer signed a new record: its previous life's rendezvous-fallback
+    /// budget does not bind the new one — the fallback may be exactly what
+    /// reaches the new life.
+    pub(crate) fn reset_rendezvous_budget(&mut self, peer: ValidatorIdentity) {
+        self.rendezvous_attempted.remove(&peer);
+    }
+
+    /// The nonce of `owner`'s held post-lock re-advertisement, if any — the
+    /// staleness guard a parked re-advertisement resumption checks against.
+    pub(crate) fn readvertised_nonce(&self, owner: ValidatorIdentity) -> Option<u64> {
+        self.readvertised
+            .get(&owner)
+            .map(|signed| signed.record.nonce)
+    }
+
+    /// The freshest accepted pre-warm nonce for `owner`, if any — the
+    /// staleness guard a parked pre-warm resumption checks against.
+    pub(crate) fn prewarm_nonce(&self, owner: ValidatorIdentity) -> Option<u64> {
+        self.prewarm_nonces.get(&owner).copied()
+    }
+
+    /// The single mesh version EVERY peer's advert commits to, when they
+    /// all agree. When it also differs from the version this node computes,
+    /// the peers locked this epoch's mesh over a record this node no longer
+    /// holds — its own previous life. `None` while any peer's advert is
+    /// missing, when the peers disagree among themselves, or with no peers
+    /// at all.
+    pub(crate) fn peers_locked_version(&self) -> Option<MeshVersion> {
+        let mut agreed: Option<MeshVersion> = None;
+        for peer in &self.peers {
+            let advert = self.adverts.get(peer)?;
+            match agreed {
+                None => agreed = Some(advert.mesh_version),
+                Some(version) if advert.mesh_version == version => {}
+                Some(_) => return None,
+            }
+        }
+        agreed
+    }
+
     /// The identities an accepted gossip item floods onward to: every peer
     /// and standby except the item's owner and the link that delivered it.
     pub(crate) fn flood_targets(
@@ -677,17 +847,17 @@ impl EpochState {
     pub(crate) fn claim_rendezvous_attempt(
         &mut self,
         peer: ValidatorIdentity,
-        now: Instant,
+        now_ms: u64,
     ) -> bool {
         let previous = self
             .rendezvous_attempted
             .get(&peer)
-            .map(|(last, attempts)| (now.saturating_duration_since(*last), *attempts));
+            .map(|(last, attempts)| (now_ms.saturating_sub(*last), *attempts));
         if !should_attempt_rendezvous_fallback(previous) {
             return false;
         }
-        let entry = self.rendezvous_attempted.entry(peer).or_insert((now, 0));
-        *entry = (now, entry.1 + 1);
+        let entry = self.rendezvous_attempted.entry(peer).or_insert((now_ms, 0));
+        *entry = (now_ms, entry.1 + 1);
         true
     }
 
@@ -721,7 +891,21 @@ impl EpochState {
         phase_sends
             .into_iter()
             .chain(self.prewarm_reoffers())
+            .chain(self.live_record_reoffers())
             .collect()
+    }
+
+    /// While this node's own record post-dates the version its peers locked
+    /// ([`OwnRecordStanding::Live`]), every nudge keeps offering it to every
+    /// peer: an adopted view proves the peers settled without this record,
+    /// and only their acceptance of it re-tunnels this node. Receivers dedup
+    /// by nonce, so the steady re-offer costs a silent drop once accepted.
+    fn live_record_reoffers(&self) -> Vec<(ValidatorIdentity, ReachabilityMsg)> {
+        if self.own_standing == OwnRecordStanding::Locked {
+            return Vec::new();
+        }
+        let own = ReachabilityMsg::Record(self.own_record.clone());
+        self.peers.iter().map(|peer| (*peer, own.clone())).collect()
     }
 
     fn standby_reoffers(&self) -> Vec<(ValidatorIdentity, ReachabilityMsg)> {
@@ -818,30 +1002,27 @@ mod tests {
             "never attempted before (or a fresh epoch reset the map) — must fire"
         );
         assert!(
-            !should_attempt_rendezvous_fallback(Some((Duration::from_millis(1), 1))),
+            !should_attempt_rendezvous_fallback(Some((1, 1))),
             "1ms after the last attempt — must NOT storm the coordinator"
         );
         assert!(
-            !should_attempt_rendezvous_fallback(Some((
-                RENDEZVOUS_FALLBACK_BACKOFF - Duration::from_millis(1),
-                1
-            ))),
+            !should_attempt_rendezvous_fallback(Some((RENDEZVOUS_FALLBACK_BACKOFF_MS - 1, 1))),
             "just under the backoff window — still suppressed"
         );
         assert!(
-            should_attempt_rendezvous_fallback(Some((RENDEZVOUS_FALLBACK_BACKOFF, 1))),
+            should_attempt_rendezvous_fallback(Some((RENDEZVOUS_FALLBACK_BACKOFF_MS, 1))),
             "exactly the backoff window, budget remaining — allowed"
         );
         assert!(
             should_attempt_rendezvous_fallback(Some((
-                RENDEZVOUS_FALLBACK_BACKOFF + Duration::from_secs(60),
+                RENDEZVOUS_FALLBACK_BACKOFF_MS + 60_000,
                 RENDEZVOUS_FALLBACK_MAX_ATTEMPTS - 1
             ))),
             "well past the backoff window on the last budgeted attempt — allowed"
         );
         assert!(
             !should_attempt_rendezvous_fallback(Some((
-                RENDEZVOUS_FALLBACK_BACKOFF + Duration::from_secs(3600),
+                RENDEZVOUS_FALLBACK_BACKOFF_MS + 3_600_000,
                 RENDEZVOUS_FALLBACK_MAX_ATTEMPTS
             ))),
             "budget spent — suppressed no matter how much time has passed; only the next \
@@ -849,7 +1030,7 @@ mod tests {
         );
         assert!(
             !should_attempt_rendezvous_fallback(Some((
-                Duration::from_secs(3600),
+                3_600_000,
                 RENDEZVOUS_FALLBACK_MAX_ATTEMPTS + 1
             ))),
             "past the cap stays suppressed (defensive: the counter never exceeds the cap in \
@@ -1332,7 +1513,7 @@ mod tests {
         let (me, peer) = (signer(1), signer(2));
         let mut state = epoch(&me, Role::Member, &[&me, &peer], &[]);
         let p = identity(&peer);
-        let t0 = Instant::now();
+        let t0: u64 = 1_000_000;
         assert!(
             state.claim_rendezvous_attempt(p, t0),
             "first attempt is free"
@@ -1341,14 +1522,14 @@ mod tests {
             !state.claim_rendezvous_attempt(p, t0),
             "inside the backoff window"
         );
-        let t1 = t0 + RENDEZVOUS_FALLBACK_BACKOFF;
+        let t1 = t0 + RENDEZVOUS_FALLBACK_BACKOFF_MS;
         assert!(state.claim_rendezvous_attempt(p, t1));
-        let t2 = t1 + RENDEZVOUS_FALLBACK_BACKOFF;
+        let t2 = t1 + RENDEZVOUS_FALLBACK_BACKOFF_MS;
         assert!(
             state.claim_rendezvous_attempt(p, t2),
             "the last budgeted attempt"
         );
-        let t3 = t2 + RENDEZVOUS_FALLBACK_BACKOFF * 10;
+        let t3 = t2 + RENDEZVOUS_FALLBACK_BACKOFF_MS * 10;
         assert!(
             !state.claim_rendezvous_attempt(p, t3),
             "budget spent for the epoch"
@@ -1356,6 +1537,153 @@ mod tests {
         assert!(
             state.claim_rendezvous_attempt(identity(&me), t3),
             "budgets are per peer"
+        );
+    }
+
+    #[test]
+    fn a_member_record_is_judged_by_phase_then_by_the_locked_nonce() {
+        let (me, peer_a, peer_b) = (signer(1), signer(2), signer(3));
+        let mut state = epoch(&me, Role::Member, &[&me, &peer_a, &peer_b], &[]);
+        let a = identity(&peer_a);
+        let set = state.set.clone();
+        state.admit_record(a, record(&peer_a, &set, 2, 100));
+        assert_eq!(
+            state.judge_member_record(a, 101),
+            MemberRecordVerdict::Assembling,
+            "the record set is still open — plain phase-A admission decides"
+        );
+        state.phase = Phase::Adverts;
+        assert_eq!(
+            state.judge_member_record(a, 99),
+            MemberRecordVerdict::Behind
+        );
+        assert_eq!(
+            state.judge_member_record(a, 100),
+            MemberRecordVerdict::Behind,
+            "the locked nonce itself is a routine re-offer, not a fresh life"
+        );
+        assert_eq!(
+            state.judge_member_record(a, 101),
+            MemberRecordVerdict::Readvertised
+        );
+        assert_eq!(
+            state.judge_member_record(identity(&peer_b), 500),
+            MemberRecordVerdict::Behind,
+            "an owner the locked set never held cannot re-tunnel over it"
+        );
+    }
+
+    #[test]
+    fn a_readvertisement_supersedes_by_nonce_beside_the_locked_set() {
+        let (me, peer) = (signer(1), signer(2));
+        let mut state = epoch(&me, Role::Member, &[&me, &peer], &[]);
+        let p = identity(&peer);
+        let set = state.set.clone();
+        state.admit_record(p, record(&peer, &set, 2, 100));
+        state.phase = Phase::Adverts;
+        assert!(
+            state
+                .admit_readvertisement(p, record(&peer, &set, 2, 101))
+                .accepted()
+        );
+        assert_eq!(
+            state.admit_readvertisement(p, record(&peer, &set, 2, 101)),
+            Admission::Stale,
+            "the fresh life's steady re-offer drops silently"
+        );
+        assert_eq!(
+            state.admit_readvertisement(p, record(&peer, &set, 2, 102)),
+            Admission::Superseded,
+            "an even fresher life supersedes in place"
+        );
+        assert_eq!(
+            state.records[&p].record.nonce, 100,
+            "the locked set never moves — the mesh version stands"
+        );
+    }
+
+    #[test]
+    fn a_new_life_gets_a_fresh_rendezvous_budget() {
+        let (me, peer) = (signer(1), signer(2));
+        let mut state = epoch(&me, Role::Member, &[&me, &peer], &[]);
+        let p = identity(&peer);
+        let t0: u64 = 1_000_000;
+        assert!(state.claim_rendezvous_attempt(p, t0));
+        assert!(
+            !state.claim_rendezvous_attempt(p, t0),
+            "the backoff still binds the SAME life"
+        );
+        state.reset_rendezvous_budget(p);
+        assert!(
+            state.claim_rendezvous_attempt(p, t0),
+            "a re-advertised life is resolved fresh"
+        );
+    }
+
+    #[test]
+    fn peers_locked_version_needs_every_peer_on_one_version() {
+        let (me, peer_a, peer_b) = (signer(1), signer(2), signer(3));
+        let mut state = epoch(&me, Role::Member, &[&me, &peer_a, &peer_b], &[]);
+        let set = state.set.clone();
+        let advert = |s, nonce, version| {
+            EndpointAdvertisement::sign(record(s, &set, 2, nonce).record, version, s)
+        };
+        assert_eq!(state.peers_locked_version(), None, "no adverts at all");
+        state.admit_advert(identity(&peer_a), advert(&peer_a, 100, VERSION));
+        assert_eq!(
+            state.peers_locked_version(),
+            None,
+            "a peer's advert is still missing"
+        );
+        state.admit_advert(identity(&peer_b), advert(&peer_b, 100, VERSION));
+        assert_eq!(state.peers_locked_version(), Some(VERSION), "unanimous");
+        // this node's own advert never weighs in — only the PEERS' lock
+        // counts, since a disagreement with it is the very signal.
+        state
+            .adverts
+            .insert(state.me(), advert(&me, 100, MeshVersion([8; 32])));
+        assert_eq!(state.peers_locked_version(), Some(VERSION));
+        state.admit_advert(
+            identity(&peer_b),
+            advert(&peer_b, 101, MeshVersion([8; 32])),
+        );
+        assert_eq!(
+            state.peers_locked_version(),
+            None,
+            "the peers disagree among themselves"
+        );
+    }
+
+    #[test]
+    fn a_live_own_record_keeps_reoffering_in_the_settled_phase() {
+        let (me, peer) = (signer(1), signer(2));
+        let mut state = epoch(&me, Role::Member, &[&me, &peer], &[]);
+        let set = state.set.clone();
+        state.admit_record(identity(&peer), record(&peer, &set, 2, 100));
+        let records: Vec<EndpointRecord> = state.known_records().into_values().collect();
+        state.phase = Phase::Applied {
+            view: MeshView {
+                active_set: set,
+                mesh_version: VERSION,
+                records,
+            },
+        };
+        assert!(
+            state.reoffers().is_empty(),
+            "a settled epoch with a locked own record re-offers nothing"
+        );
+        state.own_standing = OwnRecordStanding::Live;
+        let offers = state.reoffers();
+        assert_eq!(offers.len(), 1, "the fresh own record, to every peer");
+        let (target, msg) = &offers[0];
+        assert_eq!(*target, identity(&peer));
+        assert!(
+            matches!(
+                msg,
+                ReachabilityMsg::Record(signed)
+                    if signed.record.nonce == state.own_record.record.nonce
+            ),
+            "the adopted node's fresh record rides every nudge until the peers hold it"
         );
     }
 }

@@ -1,23 +1,20 @@
-//! Cold-restart persistence for the verified mesh: the last epoch whose
-//! tunnels APPLIED, remembered as its full advertisement set. A NATed member
-//! restarting with zero TCP links (ingress gone, tunnels torn down at exit)
-//! has no path for plane gossip — and a whole-network cold start is the same
-//! brick — so the node re-applies THIS remembered mesh at boot, with fresh
-//! coordinator-resolved endpoints, purely to carry the next epoch's gossip.
+//! Cold-restart persistence for the verified mesh, HOST half: atomic file
+//! writes and verified reads of the machine's persisted-mesh snapshot. The
+//! snapshot's shape, codec, and signature verification live in
+//! `netstack_machine::store` — the machine decodes and verifies what the
+//! host reads — so this module owns only the filesystem: atomic replace on
+//! write, path-tagged refusals on read.
 //!
-//! Adverts rather than plans deliberately: `TunnelInstallPlan` is mintable
-//! only by `validate_upgrade_as` (an invariant this file must not weaken),
-//! and in ULA-overlay mode everything a tunnel needs re-derives from the
-//! records — peer WireGuard keys and endpoints live inside them, overlay
-//! addresses are pure functions of `(chain_id, identity)`. The signed advert
-//! set is the mesh's own canonical, tamper-evident form: `load` re-verifies
-//! every owner signature, so a corrupted or hand-edited file is refused
-//! rather than applied.
+//! Why persistence exists at all: a NATed member restarting with zero TCP
+//! links (ingress gone, tunnels torn down at exit) has no path for plane
+//! gossip — and a whole-network cold start is the same brick — so the node
+//! re-applies the remembered mesh at boot, with fresh coordinator-resolved
+//! endpoints, purely to carry the next epoch's gossip.
 
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
-use wireguard::{EndpointAdvertisement, SignedEndpointRecord};
+pub use netstack_machine::store::PersistedMesh;
+use netstack_machine::store::{MeshDecodeError, decode_verified, encode};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -41,66 +38,34 @@ pub enum StoreError {
     BadSignature { path: String },
 }
 
-/// The persisted mesh: every member's signed advertisement from the last
-/// epoch this node applied tunnels for (this node's own included), plus the
-/// standby records accepted by then. no format version (flag-day rule):
-/// `deny_unknown_fields` plus the required-field set IS the schema guard —
-/// the restore is best-effort, and a file this build cannot parse just means
-/// one boot without it, then `save` rewrites the current form.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PersistedMesh {
-    pub chain_id: String,
-    pub epoch: u64,
-    pub adverts: Vec<EndpointAdvertisement>,
-    /// The pre-warm layer's accepted standby records (member side). These
-    /// persist because a parked resident cannot re-introduce itself to a
-    /// member that forgot its WireGuard key: its invite token was consumed
-    /// at admission and every transport it has left rides the overlay this
-    /// very file re-establishes.
-    pub standby_records: Vec<SignedEndpointRecord>,
-}
-
-impl PersistedMesh {
-    pub fn new(
-        chain_id: String,
-        epoch: u64,
-        adverts: Vec<EndpointAdvertisement>,
-        standby_records: Vec<SignedEndpointRecord>,
-    ) -> Self {
-        Self {
-            chain_id,
-            epoch,
-            adverts,
-            standby_records,
-        }
-    }
-}
-
-/// Write `mesh` to `path` atomically (temp file + rename in the same
+/// Write `bytes` to `path` atomically (temp file + rename in the same
 /// directory), so a crash mid-write can never leave a half-written file
 /// where the next boot's restore would find it.
-pub fn save(path: &Path, mesh: &PersistedMesh) -> Result<(), StoreError> {
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     let io = |source| StoreError::Io {
         path: path.display().to_string(),
         source,
     };
-    let bytes = serde_json::to_vec_pretty(mesh).map_err(|source| StoreError::Codec {
-        path: path.display().to_string(),
-        source,
-    })?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(io)?;
     }
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &bytes).map_err(io)?;
+    std::fs::write(&tmp, bytes).map_err(io)?;
     std::fs::rename(&tmp, path).map_err(io)
 }
 
+/// Write `mesh` to `path` atomically — `encode` into [`write_atomic`].
+pub fn save(path: &Path, mesh: &PersistedMesh) -> Result<(), StoreError> {
+    let bytes = encode(mesh).map_err(|source| StoreError::Codec {
+        path: path.display().to_string(),
+        source,
+    })?;
+    write_atomic(path, &bytes)
+}
+
 /// Read the mesh persisted at `path`; `Ok(None)` when no file exists (a
-/// first boot). Refuses — rather than degrades on — an unparseable schema, a
-/// chain mismatch, and any advert whose owner signature fails to verify: the
-/// caller treats every refusal as "no restore" and says why.
+/// first boot). The refusal gates are `decode_verified`'s, re-reported
+/// with the file's path.
 pub fn load(path: &Path, chain_id: &str) -> Result<Option<PersistedMesh>, StoreError> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -112,33 +77,21 @@ pub fn load(path: &Path, chain_id: &str) -> Result<Option<PersistedMesh>, StoreE
             });
         }
     };
-    let mesh: PersistedMesh =
-        serde_json::from_slice(&bytes).map_err(|source| StoreError::Codec {
+    match decode_verified(&bytes, chain_id) {
+        Ok(mesh) => Ok(Some(mesh)),
+        Err(MeshDecodeError::Codec(source)) => Err(StoreError::Codec {
             path: path.display().to_string(),
             source,
-        })?;
-    if mesh.chain_id != chain_id {
-        return Err(StoreError::ChainMismatch {
+        }),
+        Err(MeshDecodeError::ChainMismatch { found, expected }) => Err(StoreError::ChainMismatch {
             path: path.display().to_string(),
-            found: mesh.chain_id,
-            expected: chain_id.to_string(),
-        });
+            found,
+            expected,
+        }),
+        Err(MeshDecodeError::BadSignature) => Err(StoreError::BadSignature {
+            path: path.display().to_string(),
+        }),
     }
-    for advert in &mesh.adverts {
-        if advert.verify_signature().is_err() {
-            return Err(StoreError::BadSignature {
-                path: path.display().to_string(),
-            });
-        }
-    }
-    for record in &mesh.standby_records {
-        if record.verify().is_err() {
-            return Err(StoreError::BadSignature {
-                path: path.display().to_string(),
-            });
-        }
-    }
-    Ok(Some(mesh))
 }
 
 #[cfg(test)]
@@ -147,8 +100,8 @@ mod tests {
     use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
     use std::net::{IpAddr, Ipv4Addr};
     use wireguard::{
-        AdmissionRoot, Endpoint, EndpointRecord, MeshVersion, PortPolicy, Root, Transport,
-        ValidatorIdentity, X25519PublicKey,
+        AdmissionRoot, Endpoint, EndpointAdvertisement, EndpointRecord, MeshVersion, PortPolicy,
+        Root, SignedEndpointRecord, Transport, ValidatorIdentity, X25519PublicKey,
     };
 
     fn record_of(seed: u64, octet: u8) -> (EndpointRecord, PrivateKey) {
@@ -182,7 +135,7 @@ mod tests {
         EndpointAdvertisement::sign(record, MeshVersion([7; 32]), &signer)
     }
 
-    fn standby_record(seed: u64, octet: u8) -> SignedEndpointRecord {
+    fn signed_record(seed: u64, octet: u8) -> SignedEndpointRecord {
         let (record, signer) = record_of(seed, octet);
         SignedEndpointRecord::sign(record, &signer)
     }
@@ -192,7 +145,8 @@ mod tests {
             "net#store".into(),
             3,
             vec![advert(1, 10), advert(2, 20)],
-            vec![standby_record(3, 30)],
+            vec![signed_record(4, 40)],
+            vec![signed_record(3, 30)],
         )
     }
 
@@ -218,6 +172,24 @@ mod tests {
         // longer covers what the file claims.
         let text = std::fs::read_to_string(&path).unwrap();
         std::fs::write(&path, text.replace("\"epoch\": 3", "\"epoch\": 4")).unwrap();
+
+        assert!(matches!(
+            load(&path, "net#store"),
+            Err(StoreError::BadSignature { .. })
+        ));
+    }
+
+    #[test]
+    fn refuses_a_tampered_member_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mesh-state.json");
+        save(&path, &sample()).unwrap();
+
+        // redirect the re-advertised member record's endpoint (its address
+        // is unique to it in the file): the owner signature no longer
+        // covers the claim.
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replace("8.8.8.40", "8.8.8.41")).unwrap();
 
         assert!(matches!(
             load(&path, "net#store"),

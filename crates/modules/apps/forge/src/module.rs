@@ -1179,6 +1179,7 @@ mod tests {
                     new_oid: Some(new.as_bytes().to_vec()),
                 }],
                 pack_digest: Some(vec![7u8; 32]),
+                cert: None,
             },
         );
     }
@@ -1665,6 +1666,102 @@ mod tests {
         }
     }
 
+    /// `git push --signed`: the certificate's SSH signer is the principal —
+    /// not the node that bridged the push — so a repo it births belongs to
+    /// the SIGNER, and neither the node's own unsigned push nor another SSH
+    /// key's signed one may move its `main`. A certificate authorizes exactly
+    /// the moves it lists, on the repo its nonce names, by the key it embeds.
+    #[test]
+    fn a_signed_push_speaks_for_its_ssh_signer() {
+        use crate::pushcert;
+        use keyscheme::sshsig::GIT_SSH_NS;
+        use keyscheme::testkit::{ssh_key, sshsig};
+        let base = tmp_base("signed-push");
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+        let signed = |seed: u8, updates: Vec<RefUpdate>| {
+            let cert = pushcert::certificate(&pushcert::nonce("chain-a", "lab"), &updates);
+            ForgeMsg::PushRefs {
+                repo: "lab".into(),
+                pack_digest: Some(vec![9u8; 32]),
+                cert: Some(PushCert {
+                    sshsig: sshsig(&ssh_key(seed), GIT_SSH_NS, &cert),
+                    cert,
+                }),
+                updates,
+            }
+        };
+        let main_to = |prev: Option<char>, new: char| RefUpdate {
+            ref_name: "main".into(),
+            prev_oid: prev.map(|c| oid(c).as_bytes().to_vec()),
+            new_oid: Some(oid(new).as_bytes().to_vec()),
+        };
+        let refused = |forge: &mut Forge, t: u64, msg: &ForgeMsg| -> String {
+            let err = exec(forge, &mut ctx_at(t), msg).unwrap_err();
+            futures::executor::block_on(forge.abort_block()).unwrap();
+            format!("{err:?}")
+        };
+        const ALICE: u8 = 5;
+        const BOB: u8 = 6;
+
+        // the node bridges alice's signed push: the repo is HERS.
+        exec_commit(
+            &mut forge,
+            &mut ctx_at(1),
+            &signed(ALICE, vec![main_to(None, 'a')]),
+        );
+        // the node's own unsigned push (frame origin = its key) cannot move main…
+        let unsigned = ForgeMsg::PushRefs {
+            repo: "lab".into(),
+            updates: vec![main_to(Some('a'), 'b')],
+            pack_digest: Some(vec![9u8; 32]),
+            cert: None,
+        };
+        assert!(refused(&mut forge, 2, &unsigned).contains("only the owner"));
+        // …nor can bob's signed one; alice's does.
+        let by_bob = signed(BOB, vec![main_to(Some('a'), 'b')]);
+        assert!(refused(&mut forge, 3, &by_bob).contains("only the owner"));
+        exec_commit(
+            &mut forge,
+            &mut ctx_at(4),
+            &signed(ALICE, vec![main_to(Some('a'), 'b')]),
+        );
+
+        // a certificate authorizes only the moves it lists…
+        let mut borrowed = signed(ALICE, vec![main_to(Some('b'), 'c')]);
+        let ForgeMsg::PushRefs { updates, .. } = &mut borrowed else {
+            unreachable!()
+        };
+        updates[0].new_oid = Some(oid('d').as_bytes().to_vec());
+        assert!(refused(&mut forge, 5, &borrowed).contains("ref updates"));
+        // …on the repo its nonce names…
+        let mut elsewhere = signed(ALICE, vec![main_to(Some('b'), 'c')]);
+        let ForgeMsg::PushRefs { repo, .. } = &mut elsewhere else {
+            unreachable!()
+        };
+        *repo = "other".into();
+        assert!(refused(&mut forge, 6, &elsewhere).contains("nonce"));
+        // …by the key it embeds (a flipped key byte is someone else's blob).
+        let mut forged = signed(ALICE, vec![main_to(Some('b'), 'c')]);
+        let ForgeMsg::PushRefs {
+            cert: Some(cert), ..
+        } = &mut forged
+        else {
+            unreachable!()
+        };
+        // byte 40 sits inside the embedded 32-byte key (after the 6-byte
+        // magic, u32 version, and the two length-prefixed `ssh-ed25519` tags).
+        cert.sshsig[40] ^= 1;
+        assert!(refused(&mut forge, 7, &forged).contains("does not verify"));
+        // alice's second push is the last accepted move.
+        exec_commit(
+            &mut forge,
+            &mut ctx_at(8),
+            &signed(ALICE, vec![main_to(Some('b'), 'c')]),
+        );
+        let refused_stale = signed(ALICE, vec![main_to(Some('b'), 'd')]);
+        assert!(refused(&mut forge, 9, &refused_stale).contains("non-fast-forward"));
+    }
+
     #[test]
     fn successive_pushes_move_the_root() {
         let base = tmp_base("second");
@@ -1732,6 +1829,7 @@ mod tests {
                     },
                 ],
                 pack_digest: Some(digest.clone()),
+                cert: None,
             },
         );
         let r1 = forge.root();
@@ -1765,6 +1863,7 @@ mod tests {
                         new_oid: Some(oid('c').as_bytes().to_vec()),
                     }],
                     pack_digest: Some(digest.clone()),
+                    cert: None,
                 },
             )
             .is_err()
@@ -1783,6 +1882,7 @@ mod tests {
                     new_oid: Some(oid('c').as_bytes().to_vec()), // force-ish move
                 }],
                 pack_digest: Some(digest.clone()),
+                cert: None,
             },
         );
         assert_ne!(forge.root(), r1, "branch move must move the root");
@@ -1802,6 +1902,7 @@ mod tests {
                         new_oid: None,
                     }],
                     pack_digest: None,
+                    cert: None,
                 },
             )
             .is_err()
@@ -1820,6 +1921,7 @@ mod tests {
                     new_oid: None,
                 }],
                 pack_digest: None,
+                cert: None,
             },
         );
         let reply =
@@ -1873,6 +1975,7 @@ mod tests {
                     },
                 ],
                 pack_digest: Some(digest.clone()),
+                cert: None,
             },
         );
 
@@ -2078,6 +2181,7 @@ mod tests {
                         new_oid: Some(oid('a').as_bytes().to_vec()),
                     }],
                     pack_digest: Some(vec![1u8; 32]),
+                    cert: None,
                 },
             );
             let mut ctx = ctx_with_origin(2, user_origin(9));
@@ -2285,6 +2389,7 @@ mod tests {
                     new_oid: Some(head.as_bytes().to_vec()),
                 }],
                 pack_digest: Some(vec![3u8; 32]),
+                cert: None,
             },
         );
         let mut ctx = ctx_with_origin(3, user_origin(4));
@@ -2349,6 +2454,7 @@ mod tests {
                     new_oid: Some(new.as_bytes().to_vec()),
                 }],
                 pack_digest: Some(vec![7u8; 32]),
+                cert: None,
             },
         );
         match &r {
@@ -2413,7 +2519,8 @@ mod tests {
             .expect("the laptop key births the repo");
 
         // a DIFFERENT key, same account -> same principal -> allowed.
-        let mut member = ctx_with_origin(2, user_origin(5)).on_query("identity", identity_of(account));
+        let mut member =
+            ctx_with_origin(2, user_origin(5)).on_query("identity", identity_of(account));
         push(
             &mut forge,
             &mut member,
@@ -2467,6 +2574,7 @@ mod tests {
                     },
                 ],
                 pack_digest: Some(digest.clone()),
+                cert: None,
             },
         );
         // any member may OPEN a PR onto dev — that is the door.

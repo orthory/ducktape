@@ -492,6 +492,9 @@ pub struct NodeFacts {
     /// the version line carries the version alone.
     pub version: String,
     pub root_hash: String,
+    /// The chain id every chain-scoped user proof (an `AddKey` consent) is
+    /// minted for; "" on a daemon that serves no chain.
+    pub chain_id: String,
     /// The three consensus facts are OPTION on purpose: `operations.consensus`
     /// is absent on a resident, a joiner and the embedded local daemon
     /// "rather than being filled with misleading zeroes", so a plain i64 would
@@ -554,6 +557,7 @@ impl Default for NodeFacts {
             public_key: String::new(),
             version: String::new(),
             root_hash: String::new(),
+            chain_id: String::new(),
             view: None,
             quorum: None,
             reachable_validators: None,
@@ -588,6 +592,7 @@ pub(crate) fn node_facts(status: &serde_json::Value) -> NodeFacts {
             .to_string(),
         version: status["version"].as_str().unwrap_or_default().to_string(),
         root_hash: status["root_hash"].as_str().unwrap_or_default().to_string(),
+        chain_id: status["chain_id"].as_str().unwrap_or_default().to_string(),
         view: consensus["view"].as_i64(),
         quorum: consensus["quorum"].as_i64(),
         reachable_validators: consensus["reachable_validators"].as_i64(),
@@ -1201,6 +1206,7 @@ pub struct AccountData {
     pub name: String,
     pub bio: String,
     pub keys: i64,
+    pub key_rows: Vec<AccountKeyRow>,
 }
 
 impl AccountData {
@@ -1212,7 +1218,35 @@ impl AccountData {
             name: String::new(),
             bio: String::new(),
             keys: 0,
+            key_rows: Vec::new(),
         }
+    }
+}
+
+/// One key association as the settings card lists it: the scheme token the
+/// CLI prints, the hex key, the label ("" when none) and the admission time.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct AccountKeyRow {
+    pub scheme: String,
+    pub pubkey: String,
+    pub label: String,
+    pub added_at: i64,
+}
+
+fn key_row(key: identity::KeyView) -> AccountKeyRow {
+    AccountKeyRow {
+        scheme: scheme_token(key.scheme).to_string(),
+        pubkey: hex_encode(&key.pubkey),
+        label: key.label.unwrap_or_default(),
+        added_at: i64::try_from(key.added_at).unwrap_or(i64::MAX),
+    }
+}
+
+fn scheme_token(scheme: identity::KeyScheme) -> &'static str {
+    match scheme {
+        identity::KeyScheme::Ed25519 => "ed25519",
+        identity::KeyScheme::Secp256k1 => "secp256k1",
+        identity::KeyScheme::Secp256r1 => "secp256r1",
     }
 }
 
@@ -1243,6 +1277,7 @@ pub async fn load_account(rpc: String, generation: i64) -> Result<AccountData, H
             name: account.name,
             bio: account.bio.unwrap_or_default(),
             keys: count_i64(account.keys.len()),
+            key_rows: account.keys.into_iter().map(key_row).collect(),
         })
     }
     .await
@@ -1273,4 +1308,451 @@ pub async fn set_account_name(
     .await
     .map_err(app_error)?;
     Ok(true)
+}
+
+/// Found an account with this device's key as its first member. The frame
+/// signature is the key's possession proof; the name is display-only.
+pub async fn create_account(rpc: String, password: String, name: String) -> Result<bool, AppError> {
+    async {
+        let name = bounded_text(name, "account name", identity::MAX_NAME_LEN)?;
+        let client = rpc_client(&rpc)?;
+        signed_write(
+            &client,
+            "identity",
+            identity::encode_msg(&identity::IdentityMsg::Create {
+                name,
+                scheme: identity::KeyScheme::Ed25519,
+            }),
+            password,
+        )
+        .await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+/// Mint the `AddKey` ticket that admits another device's pasted ed25519 key
+/// to this device's account: this device (a member) consents to the key at
+/// its CURRENT generation on `chain_id`, and the other device submits the
+/// ticket verbatim ([`join_with_ticket`], or `ducktape account key join`).
+/// The consent is single-use — the module advances the generation on
+/// admission.
+pub async fn mint_key_ticket(
+    rpc: String,
+    password: String,
+    chain_id: String,
+    pubkey: String,
+    label: String,
+) -> Result<String, AppError> {
+    async {
+        let chain_id = named_chain(chain_id)?;
+        let new_key = hex_decode(pubkey.trim())?;
+        let wellformed = identity::KeyScheme::Ed25519.pubkey_wellformed(&new_key);
+        if !wellformed {
+            return Err("that is not a well-formed ed25519 public key".to_string());
+        }
+        let label = optional_label(label)?;
+        let client = rpc_client(&rpc)?;
+        let msg = consented_add_key(
+            &client,
+            password,
+            &chain_id,
+            identity::KeyScheme::Ed25519,
+            &new_key,
+            label,
+        )
+        .await?;
+        Ok(add_key_ticket(&msg))
+    }
+    .await
+    .map_err(app_error)
+}
+
+/// The ticket text: ONE json line, exactly the `AddKey` payload the joining
+/// key signs into its frame.
+fn add_key_ticket(msg: &identity::IdentityMsg) -> String {
+    String::from_utf8(identity::encode_msg(msg)).expect("json is utf-8")
+}
+
+/// An `AddKey` is chain-scoped; a node that has not named its chain yet
+/// cannot be consented on.
+fn named_chain(chain_id: String) -> Result<String, String> {
+    if chain_id.is_empty() {
+        return Err(
+            "the connected node has not named its chain yet — a key consent is chain-scoped"
+                .to_string(),
+        );
+    }
+    Ok(chain_id)
+}
+
+fn optional_label(label: String) -> Result<Option<String>, String> {
+    match label.trim() {
+        "" => Ok(None),
+        text => Ok(Some(bounded_text(
+            text.to_string(),
+            "key label",
+            identity::MAX_LABEL_LEN,
+        )?)),
+    }
+}
+
+/// A key's current generation — what a consent signs, so it is single-use.
+async fn key_generation(client: &RpcClient, key: &[u8]) -> Result<u64, String> {
+    let reply: identity::IdentityReply = client
+        .query(
+            "identity",
+            &identity::IdentityQuery::KeyGen { key: key.to_vec() },
+        )
+        .await?;
+    match reply {
+        identity::IdentityReply::Gen(generation) => Ok(generation),
+        identity::IdentityReply::Account(_) | identity::IdentityReply::Accounts(_) => {
+            Err("the identity module returned the wrong reply".to_string())
+        }
+    }
+}
+
+/// The `AddKey` this device consents to for `new_key` (of `scheme`) at its
+/// current generation.
+async fn consented_add_key(
+    client: &RpcClient,
+    password: String,
+    chain_id: &str,
+    scheme: identity::KeyScheme,
+    new_key: &[u8],
+    label: Option<String>,
+) -> Result<identity::IdentityMsg, String> {
+    let generation = key_generation(client, new_key).await?;
+    let authorizer = sign_add_key_consent(password, chain_id, scheme, new_key, generation).await?;
+    Ok(identity::IdentityMsg::AddKey {
+        scheme,
+        label,
+        authorizer,
+    })
+}
+
+/// The account this device's key belongs to, by the canonical resolver.
+async fn own_account(client: &RpcClient) -> Result<identity::AccountView, String> {
+    let Some(key) = local_user_key().await else {
+        return Err("this device has no user key".to_string());
+    };
+    account_reply(
+        client
+            .query("identity", &identity::IdentityQuery::OfKey { key })
+            .await?,
+    )?
+    .ok_or_else(|| "this device's key belongs to no account yet".to_string())
+}
+
+fn account_reply(reply: identity::IdentityReply) -> Result<Option<identity::AccountView>, String> {
+    match reply {
+        identity::IdentityReply::Account(account) => Ok(account),
+        identity::IdentityReply::Accounts(_) | identity::IdentityReply::Gen(_) => {
+            Err("the identity module returned the wrong reply".to_string())
+        }
+    }
+}
+
+fn identity_msg(msg: &identity::IdentityMsg) -> sdk::Msg {
+    sdk::Msg {
+        target: "identity".into(),
+        payload: identity::encode_msg(msg),
+    }
+}
+
+// ============================================================================
+// browser ceremonies (`authpage`)
+// ============================================================================
+
+/// How long a browser touch may take before the app gives up on it.
+const CEREMONY_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// One browser round trip, off the async runtime (the callback listener is a
+/// blocking accept): open the page, block for its result. On timeout the
+/// listener is poked with an abandon result so its thread ends too.
+async fn browser_ceremony(request: authpage::Request) -> Result<authpage::Outcome, String> {
+    let listener = authpage::Listener::bind().map_err(|e| format!("auth callback: {e}"))?;
+    let callback = listener.callback_url();
+    let url = authpage::request_url(authpage::AUTH_PAGE, &request, &callback);
+    let opened = authpage::open_browser(&url);
+    if !opened {
+        return Err("no browser opener on this machine (xdg-open / open)".to_string());
+    }
+    let waiting = tokio::task::spawn_blocking(move || listener.wait());
+    let answered = tokio::time::timeout(CEREMONY_TIMEOUT, waiting).await;
+    match answered {
+        Ok(joined) => joined.map_err(|_| "the browser ceremony did not finish".to_string())?,
+        Err(_elapsed) => {
+            authpage::abandon(&callback, "no answer from the browser");
+            Err("the browser did not answer in time".to_string())
+        }
+    }
+}
+
+/// Register a NEW passkey on this device's account: ceremony 1 creates it
+/// (the page hands back its key), this device consents, ceremony 2 has the
+/// passkey sign its own `AddKey` frame — possession proven by the assertion.
+pub async fn register_passkey(
+    rpc: String,
+    password: String,
+    chain_id: String,
+    label: String,
+) -> Result<bool, AppError> {
+    async {
+        let chain_id = named_chain(chain_id)?;
+        let label = optional_label(label)?;
+        require_password(&password)?;
+        let client = rpc_client(&rpc)?;
+        let account = own_account(&client).await?;
+        let registered = browser_ceremony(authpage::Request::Create {
+            challenge: authpage::create_challenge(),
+            user: account.number,
+            name: account.name,
+        })
+        .await?;
+        let authpage::Outcome::Create { public_key, .. } = registered else {
+            return Err("expected a passkey registration".to_string());
+        };
+        let msg = consented_add_key(
+            &client,
+            password,
+            &chain_id,
+            identity::KeyScheme::Secp256r1,
+            &public_key,
+            label,
+        )
+        .await?;
+        let (request, preimage) =
+            authpage::passkey_frame_request(&public_key, next_sequence(), &identity_msg(&msg));
+        let signed = browser_ceremony(request).await?;
+        submit_raw_frame(
+            &client,
+            "identity",
+            authpage::passkey_frame(preimage, &signed)?,
+        )
+        .await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+/// Link an Ethereum wallet to this device's account: touch 1 reveals its
+/// key, this device consents, touch 2 has the wallet sign its own `AddKey`
+/// frame.
+pub async fn link_wallet(
+    rpc: String,
+    password: String,
+    chain_id: String,
+    label: String,
+) -> Result<bool, AppError> {
+    async {
+        let chain_id = named_chain(chain_id)?;
+        let label = optional_label(label)?;
+        require_password(&password)?;
+        let client = rpc_client(&rpc)?;
+        own_account(&client).await?;
+        let reveal = authpage::reveal_message();
+        let touch = browser_ceremony(authpage::Request::Eth {
+            message: reveal.clone(),
+        })
+        .await?;
+        let pubkey = authpage::wallet_pubkey(&reveal, &touch)?;
+        let msg = consented_add_key(
+            &client,
+            password,
+            &chain_id,
+            identity::KeyScheme::Secp256k1,
+            &pubkey,
+            label,
+        )
+        .await?;
+        let (request, preimage) =
+            authpage::wallet_frame_request(&pubkey, next_sequence(), &identity_msg(&msg));
+        let touch = browser_ceremony(request).await?;
+        submit_raw_frame(
+            &client,
+            "identity",
+            authpage::wallet_frame(preimage, &touch)?,
+        )
+        .await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+/// Admit THIS device into an account by a passkey's consent: the assertion
+/// over this key's `AddKey` preimage IS the consent, its `userHandle` names
+/// the account, and this device signs the frame (the key being admitted).
+pub async fn login_with_passkey(
+    rpc: String,
+    password: String,
+    chain_id: String,
+    label: String,
+) -> Result<bool, AppError> {
+    async {
+        let chain_id = named_chain(chain_id)?;
+        let label = optional_label(label)?;
+        require_password(&password)?;
+        let Some(device_key) = local_user_key().await else {
+            return Err("this device has no user key".to_string());
+        };
+        let client = rpc_client(&rpc)?;
+        let generation = key_generation(&client, &device_key).await?;
+        let consent =
+            browser_ceremony(authpage::login_request(&chain_id, &device_key, generation)).await?;
+        let (number, proof) = authpage::login_consent(&consent)?;
+        let account = account_reply(
+            client
+                .query("identity", &identity::IdentityQuery::Get { number })
+                .await?,
+        )?
+        .ok_or_else(|| format!("the passkey names account {number}, unknown to this node"))?;
+        let msg =
+            authpage::login_add_key(&chain_id, &device_key, generation, &account, label, proof)?;
+        signed_write(&client, "identity", identity::encode_msg(&msg), password).await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+/// A pasted ticket is an `AddKey` or it is refused HERE, before any signature
+/// — the module would refuse a stray `SetName` too, but under a name that
+/// says nothing about tickets.
+fn add_key_ticket_bytes(ticket: &str) -> Result<Vec<u8>, String> {
+    let ticket = ticket.trim();
+    let is_add_key = matches!(
+        identity::decode_msg(ticket.as_bytes())?,
+        identity::IdentityMsg::AddKey { .. }
+    );
+    if !is_add_key {
+        return Err(
+            "that is not an add-key ticket (mint one on a device that is already a member)"
+                .to_string(),
+        );
+    }
+    Ok(ticket.as_bytes().to_vec())
+}
+
+/// Join the account a ticket names with THIS device's key: the ticket bytes
+/// ride verbatim (the member's consent is over them), signed by the key being
+/// admitted.
+pub async fn join_with_ticket(
+    rpc: String,
+    password: String,
+    ticket: String,
+) -> Result<bool, AppError> {
+    async {
+        let payload = add_key_ticket_bytes(&ticket)?;
+        let client = rpc_client(&rpc)?;
+        signed_write(&client, "identity", payload, password).await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+/// Remove one key from this device's account (member-gated; the module
+/// refuses the last key).
+pub async fn remove_account_key(
+    rpc: String,
+    password: String,
+    pubkey: String,
+) -> Result<bool, AppError> {
+    async {
+        let key = hex_decode(pubkey.trim())?;
+        let client = rpc_client(&rpc)?;
+        signed_write(
+            &client,
+            "identity",
+            identity::encode_msg(&identity::IdentityMsg::RemoveKey { key }),
+            password,
+        )
+        .await
+    }
+    .await
+    .map_err(app_error)?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod account_ticket_tests {
+    use super::*;
+
+    fn member() -> ed25519::PrivateKey {
+        ed25519::PrivateKey::from_seed(41)
+    }
+
+    /// The ticket the app mints IS the `AddKey` the CLI's `key join` submits:
+    /// one line, decodes to the message, and the consent verifies under the
+    /// module's own namespace at the minted generation — and at no other.
+    #[test]
+    fn a_ticket_is_the_add_key_the_cli_accepts() {
+        let new_key = ed25519::PrivateKey::from_seed(42)
+            .public_key()
+            .as_ref()
+            .to_vec();
+        let authorizer = workspace_config::ed25519_authorizer(
+            &member(),
+            "chain-a",
+            identity::KeyScheme::Ed25519,
+            &new_key,
+            3,
+        );
+        let ticket = add_key_ticket(&identity::IdentityMsg::AddKey {
+            scheme: identity::KeyScheme::Ed25519,
+            label: Some("phone".into()),
+            authorizer,
+        });
+        assert_eq!(ticket.lines().count(), 1, "one json line, pasteable");
+        let identity::IdentityMsg::AddKey {
+            scheme,
+            label,
+            authorizer,
+        } = identity::decode_msg(ticket.as_bytes()).unwrap()
+        else {
+            panic!("a ticket is an AddKey");
+        };
+        assert_eq!(scheme, identity::KeyScheme::Ed25519);
+        assert_eq!(label.as_deref(), Some("phone"));
+        assert_eq!(authorizer.key, member().public_key().as_ref());
+        let preimage = |generation| {
+            identity::add_key_preimage(
+                "chain-a",
+                identity::KeyScheme::Ed25519,
+                &new_key,
+                generation,
+            )
+        };
+        let verifies = |generation| {
+            identity::KeyScheme::Ed25519.verify(
+                &authorizer.key,
+                identity::IDENTITY_ADD_KEY_NS,
+                &preimage(generation),
+                &authorizer.proof,
+            )
+        };
+        assert!(verifies(3), "the consent is over the minted generation");
+        assert!(!verifies(4), "and is single-use");
+        assert_eq!(
+            add_key_ticket_bytes(&format!("  {ticket}\n")).unwrap(),
+            ticket.as_bytes(),
+            "the joining frame carries the ticket bytes verbatim, whitespace trimmed"
+        );
+    }
+
+    #[test]
+    fn a_non_add_key_ticket_is_refused_before_any_signature() {
+        let stray = String::from_utf8(identity::encode_msg(&identity::IdentityMsg::SetName {
+            name: "x".into(),
+        }))
+        .unwrap();
+        let err = add_key_ticket_bytes(&stray).unwrap_err();
+        assert!(err.contains("not an add-key ticket"), "{err}");
+        assert!(add_key_ticket_bytes("not json").is_err());
+    }
 }

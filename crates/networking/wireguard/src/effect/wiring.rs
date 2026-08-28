@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
+use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
+
 use crate::{AllowedIp, TunnelInstallPlan, ValidatorIdentity, X25519PublicKey};
 
 use crate::effect::WireGuardEffect;
@@ -33,12 +35,16 @@ pub fn plan_peer_configs(
 /// One peer relationship expressed as plain parts rather than a validated
 /// `TunnelInstallPlan` — everything a WireGuard peer entry needs, already
 /// resolved.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub struct PeerTunnelConfig {
     pub wireguard_public_key: X25519PublicKey,
     /// `None` for an endpoint-less peer (it advertises no dialable address):
     /// the entry is installed without an endpoint and WireGuard waits for the
     /// peer's own authenticated initiation, then roams to its source.
+    #[borsh(schema(with_funcs(
+        declaration = "crate::wire_schema::option_socket_addr::declaration",
+        definitions = "crate::wire_schema::option_socket_addr::definitions"
+    )))]
     pub endpoint: Option<SocketAddr>,
     pub allowed_ips: Vec<AllowedIp>,
     pub keepalive_seconds: Option<u16>,

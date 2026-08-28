@@ -10,6 +10,7 @@
 //! epoch), human-debuggable on the wire, and the same codec the node's other
 //! operator surfaces speak.
 
+use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use wireguard::{
     EndpointAdvertisement, SignedEndpointRecord, TunnelUpgradeAck, TunnelUpgradeRequest,
@@ -26,7 +27,17 @@ pub struct MsgError(#[from] serde_json::Error);
 /// record: a member must see all records before it can compute the version
 /// its signed advertisement commits to. So each epoch runs record gossip
 /// first, then signed advertisements over the agreed set.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    BorshSerialize,
+    BorshDeserialize,
+    BorshSchema,
+)]
 #[serde(rename_all = "snake_case")]
 // This enum is the reachability channel's serde protocol surface. Keep direct
 // variant payloads so callers match and construct the signed messages verbatim.

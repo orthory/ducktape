@@ -61,6 +61,7 @@ tasks = { workspace = true }
 identity = { workspace = true }
 # the passkey enrollment challenge — the same bytes `KeyScheme::Secp256r1` verifies.
 keyscheme = { workspace = true }
+authpage = { workspace = true }
 gateway = { workspace = true }
 # the airlock contract: `server` supplies the GrantCheck type the lender daemon
 # injects (src/airlock.rs), `client` + `verify` the enclave-facing credential
@@ -89,7 +90,7 @@ workspace-config = { workspace = true }
 blobstore = { workspace = true }
 agent = { workspace = true }
 runs = { workspace = true }
-# the staged node-driven WireGuard plane: the reachability orchestrator runs
+# the staged node-driven WireGuard plane: the reachability executor runs
 # on its own plain-tokio thread (mirroring the app-surface split) behind the
 # `wireguard_listen` node.toml key; the wireguard crate supplies the
 # endpoint types and the phase-A fake effect it drives.
@@ -97,7 +98,7 @@ reachability = { workspace = true }
 # the coordinator-auth credential types: `coord.cap` is the private-mode
 # admission token a node persists beside its descriptor (minted by a genesis
 # validator via `mint_coord_cap`, presented on each rendezvous request).
-nat-traversal = { workspace = true }
+nat-traversal = { workspace = true, features = ["runtime"] }
 wireguard = { workspace = true }
 # the voice hub's transport seam: huddle media rides data-plane datagrams over
 # the per-service overlay sockets (src/voice_plane.rs binds them); the mesh arm
@@ -187,6 +188,9 @@ noded = { path = "../../crates/noded", features = ["testkit"] }
 # the ed25519 bind-auth builder, shared from identity (was: a per-suite copy).
 # dev-only feature keeps it out of the production binary build.
 identity = { workspace = true, features = ["testkit"] }
+# the passkey/wallet signers the `account login` and auth-page tests fake a
+# browser ceremony with.
+keyscheme = { workspace = true, features = ["testkit"] }
 # the git-history/packfile builder. the forge e2e needs REAL objects in the
 # node's store for a PR diff to be computable, and consensus has no
 # commit-building op — this is how production gets them too (a stock git push).

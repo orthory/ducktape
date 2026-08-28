@@ -10,15 +10,18 @@
 
 pub mod advert;
 pub mod auth;
+#[cfg(feature = "runtime")]
 pub mod client;
+#[cfg(feature = "runtime")]
 pub mod coordinator;
+#[cfg(feature = "runtime")]
 pub mod relay;
 // The simulation arms (`simnat`, `simnet`) are gated: available under test
 // cfg or the `simnat` feature, never pulled into a plain non-test,
-// non-feature build (e.g. `coordinator-bin`).
+// non-feature build (e.g. `coordinator-bin`). `simnet` is a runtime arm.
 #[cfg(any(test, feature = "simnat"))]
 pub mod simnat;
-#[cfg(any(test, feature = "simnat"))]
+#[cfg(all(feature = "runtime", any(test, feature = "simnat")))]
 pub mod simnet;
 pub mod wire;
 
@@ -29,12 +32,15 @@ pub use auth::{
     AuthError, AuthPolicy, Authenticator, COORD_CAP_NS, COORD_CAP_TTL_SECS, COORD_REQ_NS, CoordCap,
     DEFAULT_FRESHNESS_WINDOW_SECS, mint_coord_cap, now_secs, sign_authenticator, verify_request,
 };
+#[cfg(feature = "runtime")]
 pub use client::{
     ClientEvent, CoordinatorMetrics, CoordinatorMetricsSnapshot, NatClient, NatSocket, SocketEvent,
     run_coordinator, run_coordinator_with, run_coordinator_workers_with_metrics,
     run_coordinator_workers_with_metrics_using,
 };
+#[cfg(feature = "runtime")]
 pub use coordinator::{Coordinator, CoordinatorReplies, CoordinatorReply};
+#[cfg(feature = "runtime")]
 pub use relay::{
     FRAME_READ_TIMEOUT, FrameError, MAX_FRAME_LEN, MAX_RELAY_PAYLOAD, MAX_RELAY_SESSIONS,
     MAX_SESSION_FORWARDS, MAX_SESSIONS_PER_IP, MIN_FORWARD_GAP, REASON_MALFORMED,
@@ -44,6 +50,6 @@ pub use relay::{
 };
 #[cfg(any(test, feature = "simnat"))]
 pub use simnat::SimNat;
-#[cfg(any(test, feature = "simnat"))]
+#[cfg(all(feature = "runtime", any(test, feature = "simnat")))]
 pub use simnet::{SimHandle, SimNetwork, SimSocket};
 pub use wire::{AuthRequest, Msg, NodeKey, WireError};

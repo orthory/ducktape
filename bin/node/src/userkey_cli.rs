@@ -39,6 +39,9 @@ pub(crate) enum UserCmd {
     SignFrame(FrameArgs),
     /// sign one owner control-plane request (the `/v1/admin` per-request PoP)
     SignAdmin(AdminArgs),
+    /// sign one gateway request as this key's account (the `x-duck-user-*`
+    /// per-request PoP an `owner`/`accounts` audience route checks)
+    SignCaller(CallerArgs),
     /// named, grantable API credentials co-hosted through this node's gateway
     Cred(crate::cred_cli::CredArgs),
 }
@@ -122,6 +125,31 @@ pub(crate) struct AdminArgs {
     node_key: String,
 }
 
+/// `user sign-caller` — every field the gateway's caller preimage binds, so
+/// the proof can never be replayed against another route, publisher, method
+/// or path.
+#[derive(Debug, clap::Args)]
+pub(crate) struct CallerArgs {
+    /// path to the user key file
+    #[arg(long, value_name = "PATH")]
+    key: PathBuf,
+    /// the route's publisher node (hex consensus key)
+    #[arg(long = "publisher-node", value_name = "HEX")]
+    publisher_node: String,
+    /// the account number the route belongs to
+    #[arg(long, value_name = "N")]
+    account: u64,
+    /// the route label; omit for the account's apex route
+    #[arg(long, value_name = "NAME", default_value = "")]
+    route: String,
+    /// the HTTP method of the request (GET, HEAD, POST, PUT, PATCH, DELETE)
+    #[arg(long, value_name = "M")]
+    method: String,
+    /// the request path and query
+    #[arg(long, value_name = "PATH-AND-QUERY")]
+    path: String,
+}
+
 /// Run one verb of the `ducktape user` family. secrets cross via stdin only
 /// (see the module header), so `run` opens stdin once and every handler reads
 /// its secret fields from it — never from `cmd`.
@@ -132,6 +160,7 @@ pub(super) fn run(cmd: UserCmd) -> CommandResult {
         UserCmd::SignGatewayRoute(args) => cmd_user_sign_gateway_route(args, &mut stdin),
         UserCmd::SignFrame(args) => cmd_user_sign_frame(args, &mut stdin),
         UserCmd::SignAdmin(args) => cmd_user_sign_admin(args, &mut stdin),
+        UserCmd::SignCaller(args) => cmd_user_sign_caller(args, &mut stdin),
         UserCmd::Cred(args) => crate::cred_cli::run(args, &mut stdin),
     }
 }
@@ -477,11 +506,16 @@ fn user_sign_frame(
 /// tie-breaker: a fresh one per call, so resubmitting the same payload never
 /// trips the consensus lane's content-digest replay guard.
 pub(crate) fn user_frame(user: &ed25519::PrivateKey, target: &str, payload: Vec<u8>) -> Vec<u8> {
-    let seq = std::time::SystemTime::now()
+    user_frame_at(user, frame_seq(), target, payload)
+}
+
+/// the `seq` a one-shot CLI frame carries: wall-clock nanoseconds, so two
+/// frames from one key never collide as a byte-identical replay.
+pub(crate) fn frame_seq() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    user_frame_at(user, seq, target, payload)
+        .unwrap_or(0)
 }
 
 /// [`user_frame`] at an explicit `seq` — the `sign-frame` verb takes the seq
@@ -556,6 +590,75 @@ fn cmd_user_sign_admin(args: AdminArgs, stdin: &mut impl std::io::BufRead) -> Co
     Ok(())
 }
 
+/// `user-sign-caller` core — see [`cmd_user_sign_caller`].
+///
+/// signs one gateway request as this key's ACCOUNT: the per-request PoP the
+/// publisher checks before an `owner`/`accounts` audience admits the caller
+/// (`gateway::caller_pop_preimage`, the SAME preimage the verifier rebuilds,
+/// under `GATEWAY_CALLER_NS`). Fresh `ts` per call — the publisher accepts it
+/// for 30 s — returned alongside so the caller stamps the exact `ts` signed.
+fn user_sign_caller(
+    args: CallerArgs,
+    stdin: &mut impl std::io::BufRead,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let publisher_node =
+        config::unhex(&args.publisher_node).map_err(|e| format!("--publisher-node hex: {e}"))?;
+    let method = parse_route_method(&args.method)?;
+    let route = match args.route.as_str() {
+        "" => gateway::RouteName::apex(),
+        label => gateway::RouteName::named(label),
+    };
+    // stdin: password only — there is no payload.
+    let user = load_user_signer(&args.key, stdin)?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let preimage = gateway::caller_pop_preimage(
+        &publisher_node,
+        args.account,
+        &route,
+        method,
+        &args.path,
+        ts,
+    );
+    let sig = user.sign(gateway::GATEWAY_CALLER_NS, &preimage);
+    let out = serde_json::json!({
+        "key": hex_bytes(user.public_key().as_ref()),
+        "ts": ts.to_string(),
+        "sig": hex_bytes(sig.as_ref()),
+    });
+    Ok(out.to_string())
+}
+
+/// the HTTP methods a gateway route statement can name, by their wire
+/// spelling; anything else is refused before the key is unlocked.
+fn parse_route_method(method: &str) -> Result<gateway::RouteMethod, String> {
+    let method = match method.to_ascii_uppercase().as_str() {
+        "GET" => gateway::RouteMethod::Get,
+        "HEAD" => gateway::RouteMethod::Head,
+        "POST" => gateway::RouteMethod::Post,
+        "PUT" => gateway::RouteMethod::Put,
+        "PATCH" => gateway::RouteMethod::Patch,
+        "DELETE" => gateway::RouteMethod::Delete,
+        other => {
+            return Err(format!(
+                "--method {other:?} is not a gateway route method (GET, HEAD, POST, PUT, PATCH, DELETE)"
+            ));
+        }
+    };
+    Ok(method)
+}
+
+/// `user-sign-caller --key <path> --publisher-node <hex> --account <n>
+/// [--route <name>] --method <M> --path <path-and-query>` — stdin: password
+/// line. Prints one JSON line `{"key","ts","sig"}`: the `x-duck-user-key`,
+/// `x-duck-user-ts`, `x-duck-user-sig` headers of a gateway request.
+fn cmd_user_sign_caller(args: CallerArgs, stdin: &mut impl std::io::BufRead) -> CommandResult {
+    println!("{}", user_sign_caller(args, stdin)?);
+    Ok(())
+}
+
 #[cfg(test)]
 mod userkey_verb_tests {
     use super::*;
@@ -607,6 +710,7 @@ mod userkey_verb_tests {
             "sign-gateway-route",
             "sign-frame",
             "sign-admin",
+            "sign-caller",
             "cred",
         ] {
             assert!(cmd.find_subcommand(name).is_some(), "verb {name} missing");
@@ -943,6 +1047,68 @@ mod userkey_verb_tests {
                 "accepted {bad:?}"
             );
         }
+    }
+
+    /// the printed proof is exactly what the publisher's gateway plane
+    /// rebuilds — `caller_pop_preimage` over the same six fields, verified
+    /// under `GATEWAY_CALLER_NS` with the key's scheme — and it is bound to
+    /// every one of them.
+    #[test]
+    fn sign_caller_returns_the_pop_a_publisher_would_accept() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("user.key");
+        write_encrypted(&key_path, &[9u8; 32]);
+        let publisher = [0xabu8; 32];
+
+        let mut stdin = stdin_of(&[TEST_PASSWORD]);
+        let out = user_sign_caller(
+            CallerArgs {
+                key: key_path,
+                publisher_node: hex_bytes(&publisher),
+                account: 7,
+                route: "api".into(),
+                method: "get".into(),
+                path: "/whoami?x=1".into(),
+            },
+            &mut stdin,
+        )
+        .unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("one json line");
+        let signer = ed25519::PrivateKey::decode([9u8; 32].as_slice()).unwrap();
+        assert_eq!(parsed["key"], hex_bytes(signer.public_key().as_ref()));
+        let ts: u64 = parsed["ts"].as_str().unwrap().parse().unwrap();
+        let sig = config::unhex(parsed["sig"].as_str().unwrap()).unwrap();
+        let preimage = |account, path: &str| {
+            gateway::caller_pop_preimage(
+                &publisher,
+                account,
+                &gateway::RouteName::named("api"),
+                gateway::RouteMethod::Get,
+                path,
+                ts,
+            )
+        };
+        let verifies = |account, path: &str| {
+            identity::KeyScheme::Ed25519.verify(
+                signer.public_key().as_ref(),
+                gateway::GATEWAY_CALLER_NS,
+                &preimage(account, path),
+                &sig,
+            )
+        };
+        assert!(verifies(7, "/whoami?x=1"));
+        assert!(!verifies(8, "/whoami?x=1"), "bound to the account");
+        assert!(!verifies(7, "/whoami"), "bound to the path");
+    }
+
+    #[test]
+    fn sign_caller_refuses_a_method_the_gateway_cannot_name() {
+        assert!(parse_route_method("TRACE").is_err());
+        assert_eq!(
+            parse_route_method("delete").unwrap(),
+            gateway::RouteMethod::Delete
+        );
     }
 
     #[test]

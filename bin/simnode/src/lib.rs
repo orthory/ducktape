@@ -1428,6 +1428,9 @@ impl Sim {
             // seeded key names an identity for consensus-op scenarios; no mesh
             // routes behind it.
             public_key: self.public_key.clone(),
+            // the simulator serves no chain (its identity module runs with an
+            // empty chain id), so there is nothing to name here.
+            chain_id: String::new(),
             operations: noded::OperationalStatus {
                 role: noded::NodeRole::Local,
                 phase: noded::NodePhase::Serving,

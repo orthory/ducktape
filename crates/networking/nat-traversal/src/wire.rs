@@ -1,8 +1,11 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use arrayvec::ArrayVec;
+use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize, BorshSchema,
+)]
 pub struct NodeKey(pub [u8; 32]);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,6 +88,7 @@ pub(crate) fn put_key<const CAP: usize>(out: &mut ArrayVec<u8, CAP>, key: &NodeK
     put(out, &key.0);
 }
 
+#[cfg(feature = "runtime")]
 pub(crate) fn put_u16<const CAP: usize>(out: &mut ArrayVec<u8, CAP>, value: u16) {
     put(out, &value.to_be_bytes());
 }
@@ -117,6 +121,7 @@ impl<'a> Reader<'a> {
         Self { buf, pos: 0 }
     }
     /// Bytes not yet consumed — the whole-buffer trailing-garbage check.
+    #[cfg(feature = "runtime")]
     pub(crate) fn remaining(&self) -> usize {
         self.buf.len() - self.pos
     }
@@ -135,6 +140,7 @@ impl<'a> Reader<'a> {
         k.copy_from_slice(s);
         Ok(NodeKey(k))
     }
+    #[cfg(feature = "runtime")]
     pub(crate) fn u16(&mut self) -> Result<u16, WireError> {
         let s = self.take(2)?;
         Ok(u16::from_be_bytes([s[0], s[1]]))

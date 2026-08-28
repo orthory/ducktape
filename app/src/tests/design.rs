@@ -1407,6 +1407,10 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         // The keystore's wallets: how many identities this DEVICE holds, and
         // it only moves when one is minted, imported, or removed by hand.
         ("components/onboarding.ice", "for row in wallets"),
+        // The account's key associations: how many devices, wallets and
+        // passkeys ONE account holds, moved only by an add-key ticket or a
+        // removal — a handful, and never a scroll.
+        ("screens/settings.ice", "for row in account_key_rows"),
         ("components/onboarding.ice", "for step in steps"),
         ("components/forge.ice", "for item in items"),
         // 2. WITHIN ONE ROW — one message's blocks and reactions, one

@@ -404,6 +404,37 @@ where
                             node = %pump_label, epoch, %interface, peers,
                             "standby pre-warm tunnels applied"
                         ),
+                        reachability::ReachabilityEvent::MeshAdopted {
+                            epoch,
+                            version: _,
+                            peers,
+                        } => tracing::info!(
+                            target: "ducktape::reachability",
+                            node = %pump_label, epoch, peers,
+                            "peers' locked mesh adopted — this node re-assembled mid-epoch; \
+                             re-offering its fresh record until every peer re-tunnels it"
+                        ),
+                        reachability::ReachabilityEvent::PeerReadvertised { peer, interface } => {
+                            tracing::info!(
+                                target: "ducktape::reachability",
+                                node = %pump_label,
+                                peer = %hex_bytes(&peer.as_ref()[..4]),
+                                %interface,
+                                "peer re-advertised mid-epoch — its tunnel re-pointed in place"
+                            )
+                        }
+                        reachability::ReachabilityEvent::PeerEndpointResolved {
+                            peer,
+                            endpoint,
+                        } => {
+                            tracing::info!(
+                                target: "ducktape::reachability",
+                                node = %pump_label,
+                                peer = %hex_bytes(&peer.as_ref()[..4]),
+                                %endpoint,
+                                "endpoint resolved post-apply — live interface reconfigured"
+                            )
+                        }
                         reachability::ReachabilityEvent::InvitePeerInstalled {
                             peer,
                             interface,
@@ -837,6 +868,7 @@ async fn reachability_plane(
         // joiner's gossip arrives under its REAL key — the mesh re-track at
         // its Redeem grant is what admits it.
         gossip_ingress: None,
+        backend: netstack_backend(),
     };
     // the invite intro listener: a fresh joiner's first contact. one
     // datagram carries the token, the joiner's identity + proof, and its
@@ -1009,13 +1041,42 @@ async fn reachability_plane(
     }
 }
 
+/// The netstack guest: the reachability machine as a `ducktape:netstack`
+/// component, built by guest-builder from the machine crate and committed
+/// beside it (`make wasm-modules`).
+const NETSTACK_COMPONENT: &[u8] =
+    include_bytes!("../../../crates/networking/netstack-machine/component.wasm");
+
+/// Which machine drives the reachability plane. `DUCKTAPE_NETSTACK=guest`
+/// runs the wasm component; unset or `native` runs the machine compiled
+/// into this binary. Any other value is refused loudly and runs native —
+/// a typo must never pick a backend by accident.
+fn netstack_backend() -> reachability::NetstackBackend {
+    let requested = std::env::var("DUCKTAPE_NETSTACK").ok();
+    match requested.as_deref() {
+        Some("guest") => reachability::NetstackBackend::Guest {
+            component: NETSTACK_COMPONENT.to_vec(),
+            step_fuel: reachability::NETSTACK_STEP_FUEL,
+        },
+        Some("native") | None => reachability::NetstackBackend::Native,
+        Some(_) => {
+            tracing::warn!(
+                target: "ducktape::reachability",
+                reason = "netstack_backend_unknown",
+                "DUCKTAPE_NETSTACK names no backend; running native"
+            );
+            reachability::NetstackBackend::Native
+        }
+    }
+}
+
 /// how long a peer may hold NO live session before it is called DARK.
 ///
 /// Measured from the last sample that SAW a session, never from the session's
 /// own age: WireGuard rejects a session older than REJECT_AFTER_TIME (180s) and
 /// boringtun then reports no handshake AT ALL rather than an old one, so an
 /// idle tunnel loses its age and its session together. Every mesh peer carries
-/// a persistent keepalive (`reachability::KEEPALIVE_SECONDS`, 25s), which
+/// a persistent keepalive (`netstack_machine::KEEPALIVE_SECONDS`, 25s), which
 /// re-establishes a session within a keepalive plus a handshake round trip of
 /// the lapse — a peer with none for this long is one whose handshake is
 /// FAILING, not one that idled.

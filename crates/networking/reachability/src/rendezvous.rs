@@ -2,9 +2,10 @@
 //! the coordinator (reflexive discovery, registration, lookup, hole-punch),
 //! plus the underlay-socket datagram lanes the invite intro rides.
 //!
-//! Two shapes live here. [`EndpointResolver`] is the seam the orchestrator
-//! resolves through — pluggable so the epoch protocol tests deterministically
-//! without UDP ([`StaticResolver`]). [`NatResolver`] is the production
+//! Two shapes live here. [`EndpointResolver`] is the seam the executor
+//! performs the machine's resolve effects through — pluggable so the epoch
+//! protocol tests deterministically without UDP ([`StaticResolver`]).
+//! [`NatResolver`] is the production
 //! implementation: a handle to a spawned pump task that owns the
 //! `NatClient`'s receive side, so every datagram reaches ONE dispatch point
 //! and the passive half of somebody else's punch is answered while this
@@ -15,19 +16,15 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use nat_traversal::{ClientEvent, NatClient, NodeKey, SocketEvent};
+// the resolution vocabulary and the coordinator-step timing envelope are
+// the machine's contract (an `Event::Resolved` carries a `Resolution` back
+// in; the machine budgets its rendezvous backoff from the step timeouts),
+// so the resolver implements one shared definition rather than its own.
+pub use netstack_machine::Resolution;
+use netstack_machine::{COORD_STEP_TIMEOUT, PUNCH_STEP_TIMEOUT, PUNCH_TRIES};
 
-/// How a peer's WireGuard endpoint was resolved.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Resolution {
-    /// Dial the advertised endpoint as-is (public or already-reachable
-    /// address; also the no-coordinator dev path).
-    Advertised,
-    /// Hole-punch succeeded: dial the peer's punched reflexive.
-    Punched(SocketAddr),
-}
-
-/// Per-peer endpoint resolution, pluggable so the orchestrator's protocol
-/// logic tests deterministically without UDP. The real implementation is
+/// Per-peer endpoint resolution, pluggable so the machine's protocol logic
+/// tests deterministically without UDP. The real implementation is
 /// [`NatResolver`]; tests use [`StaticResolver`].
 #[allow(
     async_fn_in_trait,
@@ -91,14 +88,6 @@ impl EndpointResolver for StaticResolver {
         Ok(())
     }
 }
-/// How long each coordinator interaction (reflexive discovery, lookup) may
-/// take before the resolver moves on.
-pub(crate) const COORD_STEP_TIMEOUT: Duration = Duration::from_secs(3);
-/// One punch exchange attempt; retried [`PUNCH_TRIES`] times before the
-/// resolution fails (the peer then rides its advertised endpoint — the
-/// coordinator is rendezvous-only, there is no relay to fall back to).
-pub(crate) const PUNCH_STEP_TIMEOUT: Duration = Duration::from_secs(1);
-pub(crate) const PUNCH_TRIES: usize = 3;
 
 /// How often the rendezvous pump re-advertises this node to its coordinator.
 /// Must sit well under common NAT UDP mapping timeouts (~30 s): the keepalive

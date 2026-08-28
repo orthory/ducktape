@@ -193,6 +193,7 @@ impl AdvertBook {
 pub struct SharedAdverts(Arc<Mutex<AdvertBook>>);
 
 impl SharedAdverts {
+    #[cfg(feature = "runtime")]
     pub(crate) fn wrap(book: AdvertBook) -> Self {
         Self(Arc::new(Mutex::new(book)))
     }

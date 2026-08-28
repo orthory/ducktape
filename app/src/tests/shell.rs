@@ -69,6 +69,7 @@ fn a_pushed_status_moves_the_facts_and_leaves_the_table() {
         public_key: "node-key".into(),
         version: "0.2.0".into(),
         root_hash: "hash-new".into(),
+        chain_id: "mynet#d0cdf950".into(),
         checkpoint_height: 512,
         last_finalized_at: 999,
         height: 888,
@@ -87,7 +88,8 @@ fn a_pushed_status_moves_the_facts_and_leaves_the_table() {
     // ALL SEVENTEEN, because a field the handler forgot stays frozen at its
     // connect-time value for as long as the console is open.
     assert_eq!(app.node_key, "node-key");
-    assert_eq!(app.node_version, "0.2.0");
+    assert_eq!(app.node_root_hash, "hash-new");
+    assert_eq!(app.network_chain_id, "mynet#d0cdf950");
     assert_eq!(app.node_root_hash, "hash-new");
     assert_eq!(app.node_checkpoint, 512);
     assert_eq!(app.node_last_finalized, 999);
@@ -1932,4 +1934,152 @@ fn choosing_an_identity_settles_the_provider_and_re_narrows_the_hosts() {
     assert_eq!(app.shell_host_node_options, ["This node"]);
     assert_eq!(app.shell_host_node, "This node");
     assert_eq!(app.shell_host_node_key, "");
+}
+
+/// THE FOUR IDENTITY OPS LAND IN ONE PLACE. `account_changed` is the only
+/// handler that re-reads the account for them, and it clears every draft an op
+/// consumed — a ticket left on screen after its device joined is a stale blob
+/// that looks like a secret, and a create draft after the account exists is a
+/// second Create waiting to be refused.
+#[test]
+fn a_committed_identity_op_rereads_the_account_and_clears_its_drafts() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.account_busy = true;
+    app.account_create_draft = "me".into();
+    app.account_join_draft = "{}".into();
+    app.account_ticket = "{}".into();
+    let before = app.account_generation;
+
+    let _ = app.__update(__DucktapeMessage::AccountChanged(true));
+
+    assert!(!app.account_busy, "the op is over");
+    assert_eq!(app.account_generation, before + 1, "the account is re-read");
+    assert!(app.account_create_draft.is_empty());
+    assert!(app.account_join_draft.is_empty());
+    assert!(app.account_key_draft.is_empty());
+    assert!(app.account_key_label_draft.is_empty());
+    assert!(app.account_ticket.is_empty());
+}
+
+/// THE BROWSER CEREMONIES ARE WIRED LIKE THE PASTED OPS: each button emits
+/// its own signal, each handler runs its backend fn on the connected chain
+/// under the signing seat, and every one lands in `account_changed` /
+/// `account_op_failed` — the one pair that re-reads the account and frees
+/// the card. And each is offered only where consensus would accept it:
+/// registering/linking with an account, logging in without one.
+#[test]
+fn the_browser_ceremonies_land_where_the_pasted_ops_do() {
+    let settings = include_str!("../ui/screens/settings.ice");
+    let roster = include_str!("../ui/handlers/roster.ice");
+    for (button, signal, backend) in [
+        (
+            "Register a passkey",
+            "account_passkey_submit",
+            "register_passkey",
+        ),
+        ("Link a wallet", "account_wallet_submit", "link_wallet"),
+        (
+            "Log in with a passkey",
+            "account_login_submit",
+            "login_with_passkey",
+        ),
+    ] {
+        assert!(
+            settings.contains(&format!(r#"button "{button}" -> emit({signal})"#)),
+            "{button} emits {signal}"
+        );
+        let handler = roster
+            .split(&format!("\non {signal}\n"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("a handler for {signal}"))
+            .split("\non ")
+            .next()
+            .unwrap();
+        assert!(
+            handler.contains(&format!(
+                "run every {backend}(connected_rpc, password, network_chain_id"
+            )),
+            "{signal} runs {backend} on the connected chain"
+        );
+        assert!(
+            handler.contains("-> account_changed _ | account_op_failed _"),
+            "{signal} lands where the pasted ops do"
+        );
+        assert!(
+            handler.contains("empty(password)"),
+            "{signal} needs the signing seat"
+        );
+    }
+    let login = settings
+        .find(r#"button "Log in with a passkey""#)
+        .expect("the login button");
+    let last_gate = |upto: usize| {
+        let with = settings[..upto].rfind("if account_exists");
+        let without = settings[..upto].rfind("if !account_exists");
+        (with, without)
+    };
+    let (with, without) = last_gate(login);
+    assert!(
+        without > with,
+        "login is offered only while there is no account"
+    );
+    for button in ["Register a passkey", "Link a wallet"] {
+        let at = settings
+            .find(&format!(r#"button "{button}""#))
+            .expect(button);
+        let (with, without) = last_gate(at);
+        assert!(with > without, "{button} is offered only with an account");
+    }
+}
+
+/// A MINTED TICKET COMMITS NOTHING: it is shown to copy, the inputs that
+/// produced it clear, and the account is NOT re-read — the other device's
+/// join is what moves it.
+#[test]
+fn a_minted_ticket_is_shown_and_consumes_its_drafts_without_a_reread() {
+    let (mut app, _) = Ducktape::__boot();
+    app.account_busy = true;
+    app.account_key_draft = "ab".into();
+    app.account_key_label_draft = "phone".into();
+    let before = app.account_generation;
+
+    let _ = app.__update(__DucktapeMessage::AccountTicketMinted(
+        r#"{"add_key":{}}"#.into(),
+    ));
+
+    assert!(!app.account_busy);
+    assert_eq!(app.account_ticket, r#"{"add_key":{}}"#);
+    assert!(app.account_key_draft.is_empty());
+    assert!(app.account_key_label_draft.is_empty());
+    assert_eq!(app.account_generation, before, "minting re-reads nothing");
+}
+
+/// THE CARD OFFERS ONLY WHAT CONSENSUS WOULD ACCEPT: founding only while there
+/// is no account, and never the removal of the last key (the module refuses
+/// it, and a button that always refuses is a lie).
+#[test]
+fn the_account_card_gates_founding_and_the_last_key() {
+    let settings = include_str!("../ui/screens/settings.ice");
+    let create = settings.find("#account-create").expect("the create input");
+    assert!(
+        settings[..create].rfind("if !account_exists").is_some(),
+        "founding is offered only while there is no account"
+    );
+    let remove = settings
+        .split_once(r#"button "Remove" -> emit(account_key_remove, row.pubkey)"#)
+        .expect("the remove button")
+        .1;
+    let gate_line = remove
+        .split_once("disabled=")
+        .expect("its gate")
+        .1
+        .lines()
+        .next()
+        .unwrap_or_default();
+    assert!(
+        gate_line.contains("account_keys <= 1"),
+        "the last key is never offered for removal: {gate_line}"
+    );
 }

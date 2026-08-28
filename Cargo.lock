@@ -836,6 +836,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "authpage"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "identity",
+ "keyscheme",
+ "node",
+ "rand 0.8.6",
+ "sdk",
+ "serde_json",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3238,6 +3251,7 @@ dependencies = [
 name = "ducktape-app"
 version = "0.1.0"
 dependencies = [
+ "authpage",
  "capability",
  "chat",
  "commonware-cryptography",
@@ -3777,6 +3791,7 @@ dependencies = [
  "guest-adapter",
  "host",
  "identity",
+ "keyscheme",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -5395,6 +5410,7 @@ dependencies = [
  "commonware-codec",
  "commonware-cryptography",
  "commonware-utils",
+ "ed25519-dalek",
  "k256",
  "keyscheme",
  "p256",
@@ -6018,6 +6034,7 @@ name = "nat-traversal"
 version = "0.1.0"
 dependencies = [
  "arrayvec",
+ "borsh",
  "commonware-codec",
  "commonware-cryptography",
  "crossbeam-channel",
@@ -6081,6 +6098,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "netstack-machine"
+version = "0.1.0"
+dependencies = [
+ "borsh",
+ "commonware-codec",
+ "commonware-cryptography",
+ "nat-traversal",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tracing",
+ "wireguard",
+ "wit-bindgen",
+]
+
+[[package]]
+name = "netstack-scenarios"
+version = "0.1.0"
+dependencies = [
+ "commonware-cryptography",
+ "nat-traversal",
+ "netstack-machine",
+ "sha2 0.10.9",
+ "wireguard",
+]
+
+[[package]]
+name = "netstack-wasm"
+version = "0.1.0"
+dependencies = [
+ "commonware-cryptography",
+ "netstack-machine",
+ "netstack-scenarios",
+ "thiserror 2.0.18",
+ "tracing",
+ "wasmtime",
+ "wireguard",
+]
+
+[[package]]
 name = "nettest"
 version = "0.1.0"
 dependencies = [
@@ -6133,6 +6191,7 @@ dependencies = [
  "anyhow",
  "argon2",
  "async-trait",
+ "authpage",
  "axum",
  "base64 0.22.1",
  "bip39",
@@ -6242,6 +6301,7 @@ dependencies = [
  "http-body-util",
  "identity",
  "indexer",
+ "keyscheme",
  "kv",
  "lifecycle",
  "media-service",
@@ -7986,8 +8046,9 @@ dependencies = [
  "chacha20poly1305",
  "commonware-cryptography",
  "nat-traversal",
+ "netstack-machine",
+ "netstack-wasm",
  "rand 0.8.6",
- "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
@@ -11870,6 +11931,7 @@ dependencies = [
 name = "wireguard"
 version = "0.1.0"
 dependencies = [
+ "borsh",
  "commonware-codec",
  "commonware-cryptography",
  "serde",
