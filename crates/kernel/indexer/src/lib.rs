@@ -452,13 +452,18 @@ impl IndexStore {
     }
 
     fn apply_inner(&self, block: &BlockOps) -> Result<()> {
-        // group by module, keeping the block-wide dispatch index as seq. an
-        // unknown module refuses BEFORE any batch commits — a block folded
-        // into some databases and refused for the rest would be torn.
+        // group by module, keeping the block-wide dispatch index as seq. a
+        // module this store does not index — one admitted after boot by the
+        // lifecycle registry, whose guest (if any) is not bundled — writes no
+        // rows: the index is a read model over the DECLARED tenants, and
+        // skipping an undeclared op on every block leaves nothing torn.
+        // refusing it poisoned every node on a real network for the rest of
+        // its life the first time a live-registered module received an op.
         let mut per: BTreeMap<&str, Vec<(u32, &AppliedOp)>> = BTreeMap::new();
         for (seq, op) in block.ops.iter().enumerate() {
-            if !self.modules.contains_key(op.module.as_str()) {
-                return Err(Error::UnknownModule(op.module.clone()));
+            let indexed = self.modules.contains_key(op.module.as_str());
+            if !indexed {
+                continue;
             }
             per.entry(op.module.as_str())
                 .or_default()
