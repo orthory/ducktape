@@ -251,7 +251,14 @@ fn endpoint_is_unroutable_offnet(endpoint: &str) -> bool {
     let Ok(address) = endpoint.parse::<SocketAddr>() else {
         return false;
     };
-    match address.ip() {
+    ip_is_unroutable_offnet(address.ip())
+}
+
+/// [`endpoint_is_unroutable_offnet`] over an already-parsed address — the
+/// entry point [`crate::mesh_book`] judges a signed advert's control endpoint
+/// with, so the masks live in ONE place.
+pub(crate) fn ip_is_unroutable_offnet(ip: IpAddr) -> bool {
+    match ip {
         IpAddr::V4(ip) => {
             ip.is_private() || ip.is_loopback() || ip.is_link_local() || is_v4_shared_address(ip)
         }
