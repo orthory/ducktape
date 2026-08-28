@@ -663,7 +663,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "b290fe3120eed0d1b04aefaa5738b9ce91c1093b900b20dcc7c1d5df5abd2884";
+        "6f89e523fcccdb2f36cd26b4c06817c7a3f6b782788c1f8fb3e821afa0eb4e07";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's store as a genesis
@@ -682,7 +682,7 @@ mod tests {
     ///
     /// Production runs this root future on macOS's ~8 MiB process stack. Run
     /// the test twin on the same budget: libtest's 2 MiB worker stack is just
-    /// below this full 20-module composition's debug-build requirement.
+    /// below this full 19-module composition's debug-build requirement.
     const GENESIS_TEST_STACK_BYTES: usize = 8 * 1024 * 1024;
 
     /// the genesis code set the pins compose over: the kernel's fixture
@@ -977,7 +977,7 @@ mod tests {
     /// It is the only ABSOLUTE one in the tree, and until it existed every claim
     /// that "the root hash did not move" was relative and therefore weak.
     /// `bin/simnode/tests/topology_set.rs` pins the 14-module NATIVE sim
-    /// composition — which excludes `capability`, `directory`, `governance` and
+    /// composition — which excludes `capability`, `governance` and
     /// `lifecycle`, and is not what a node runs. And `git diff crates/modules/`
     /// on a committed tree is EMPTY BY CONSTRUCTION, so quoting it proves
     /// nothing at all. Neither would have noticed a module's bytes changing.

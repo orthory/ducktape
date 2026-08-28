@@ -126,7 +126,6 @@ const MODULES: &[ModuleSpec] = &[
     store("automations", &["chat", "tasks", "inbox"], NONE),
     store("capability", NONE, NONE),
     store("chat", &["tagging"], NONE),
-    ModuleSpec { id: "directory", wiring: NONE, config: NONE, code: Code::Wasm, backing: Backing::Map, committed_queries: false },
     ModuleSpec { id: "dispatch", wiring: &["saga"], config: NONE, code: Code::Wasm, backing: Backing::Store, committed_queries: true },
     ModuleSpec { id: "files", wiring: NONE, config: NONE, code: Code::Wasm, backing: Backing::Odb, committed_queries: false },
     ModuleSpec { id: "forge", wiring: &["chat"], config: NONE, code: Code::Wasm, backing: Backing::Odb, committed_queries: false },
@@ -144,7 +143,7 @@ const MODULES: &[ModuleSpec] = &[
     ModuleSpec { id: "valset", wiring: NONE, config: NONE, code: Code::Native, backing: Backing::Store, committed_queries: false },
 ];
 
-/// node's production genesis set (20), in status-report order — every node runs
+/// node's production genesis set (19), in status-report order — every node runs
 /// exactly these, so the set is in the root-hash. A module here is consensus
 /// state forever; experiments live unwired in `crates/labs` and appear in no
 /// selection.
@@ -167,7 +166,6 @@ pub const PRODUCTION: &[&str] = &[
     // `duckdns` module used to own separately.
     "gateway",
     "inbox",
-    "directory",
     "automations",
     "files",
     "agent",
@@ -232,7 +230,7 @@ mod tests {
     /// here. Counts AND membership, so neither a stray add nor a silent drop slips.
     #[test]
     fn selections_pin_to_todays_sets() {
-        assert_eq!(PRODUCTION.len(), 20, "production is the 20-module set");
+        assert_eq!(PRODUCTION.len(), 19, "production is the 19-module set");
         assert_eq!(SIM_BASE.len(), 14, "sim_base is the default 14-module set");
         assert_eq!(SIM_VALSET.len(), 5, "sim_valset appends 5 system modules");
 
@@ -240,7 +238,7 @@ mod tests {
         assert_eq!(
             sorted(PRODUCTION),
             sorted(&[
-                "acl", "agent", "automations", "capability", "chat", "directory", "dispatch",
+                "acl", "agent", "automations", "capability", "chat", "dispatch",
                 "files", "forge", "gateway", "governance", "identity", "inbox",
                 "lifecycle", "pages", "runs", "saga", "tagging", "tasks", "valset",
             ])
@@ -358,7 +356,7 @@ mod tests {
         let odb: Vec<&str> = MODULES.iter().filter(|m| m.backing == Backing::Odb).map(|m| m.id).collect();
         assert_eq!(sorted(&odb), ["files", "forge"]);
         let map: Vec<&str> = MODULES.iter().filter(|m| m.backing == Backing::Map).map(|m| m.id).collect();
-        assert_eq!(sorted(&map), ["directory", "runs"]);
+        assert_eq!(sorted(&map), ["runs"]);
         let committed: Vec<&str> = MODULES.iter().filter(|m| m.committed_queries).map(|m| m.id).collect();
         assert_eq!(committed, ["dispatch"]);
     }
