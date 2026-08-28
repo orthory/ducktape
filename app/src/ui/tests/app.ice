@@ -633,6 +633,40 @@ preset ui_welcome_qr
     ceremony_qr = "https://auth.ducktape.byeongsu.dev/#op=get&challenge=AQID"
     ceremony_detail = "Your phone will confirm with the passkey."
 
+// A connected, signing console whose device key has no account here.
+preset ui_console_no_account
+  state
+    rpc = "http://127.0.0.1:1"
+    connected_rpc = "http://127.0.0.1:1"
+    password = "hunter2-hunter2"
+    status = "Connected"
+    connected = true
+    loading = false
+    mutation_phase = MutationPhase.idle
+    error = ""
+    account_exists = false
+    account_banner_dismissed = false
+    shell_tab = ShellTab.settings
+
+// The Settings card mid-ceremony: a passkey is being registered from the
+// phone and the QR is on the card.
+preset ui_settings_qr
+  state
+    rpc = "http://127.0.0.1:1"
+    connected_rpc = "http://127.0.0.1:1"
+    password = "hunter2-hunter2"
+    status = "Connected"
+    connected = true
+    loading = false
+    mutation_phase = MutationPhase.idle
+    error = ""
+    account_exists = true
+    account_busy = true
+    account_ceremony_phase = "show_qr"
+    account_ceremony_qr = "https://auth.ducktape.byeongsu.dev/#op=create&challenge=AQID"
+    account_ceremony_detail = "Your phone will create the passkey."
+    shell_tab = ShellTab.settings
+
 // A signing session that just picked a network — the probe is in flight.
 preset ui_pick_probe
   state
@@ -687,6 +721,49 @@ test network_pick_lands_on_the_welcome_step_without_an_account
   expect hub_step == HubStep.account
   expect mutation_phase == MutationPhase.idle
   expect ceremony_phase == ""
+
+// THE BANNER: a connected console whose device key has no account says so;
+// dismiss hides it for the session. Reopening the launch window at the
+// welcome is a window task (not asserted).
+test console_banner_names_the_missing_account
+  preset ui_console_no_account
+  viewport 900 300
+  mount
+    AccountBanner #account-banner
+      with
+        connected
+        account_exists
+        dismissed=account_banner_dismissed
+        password
+      events
+        open_account_welcome -> open_account_welcome
+        dismiss_account_banner -> dismiss_account_banner
+  target banner = #account-banner/root/banner
+  target dismiss = #account-banner/root/banner/dismiss
+  expect exists banner
+  click dismiss
+  expect account_banner_dismissed == true
+  expect missing banner
+
+// The Settings card renders the ceremony's QR in place, and cancel clears it.
+test settings_card_shows_the_passkey_qr
+  preset ui_settings_qr
+  viewport 600 400
+  mount
+    CeremonyPlate #account-ceremony
+      with
+        phase=account_ceremony_phase
+        qr=account_ceremony_qr
+        detail=account_ceremony_detail
+      events
+        account_ceremony_cancel -> account_ceremony_cancel
+  target qr = #account-ceremony/root/plate-qr
+  target cancel = #account-ceremony/root/plate-cancel
+  expect exists qr
+  click cancel
+  expect account_ceremony_qr == ""
+  expect account_busy == false
+  expect missing qr
 
 // A ceremony's steps drive the welcome: `working` swaps the QR for its line,
 // `failed` lands the message on the screen and frees the machine.
@@ -824,6 +901,9 @@ test settings_keyboard_scroll_contract
             account_name
             network_name
             connected_rpc
+            account_ceremony_phase
+            account_ceremony_qr
+            account_ceremony_detail
             settings_key_state
             settings_key_path
             settings_open_tabs
@@ -856,6 +936,8 @@ test settings_keyboard_scroll_contract
             account_key_join_submit -> account_key_join_submit
             account_key_remove -> account_key_remove _
             account_passkey_submit -> account_passkey_submit
+            account_passkey_desktop -> account_passkey_desktop
+            account_ceremony_cancel -> account_ceremony_cancel
             account_wallet_submit -> account_wallet_submit
             account_login_submit -> account_login_submit
             copy_to_clipboard -> copy_to_clipboard _ _

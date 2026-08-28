@@ -131,6 +131,15 @@ view
           switch_network -> switch_network
         notice:
           col w=fill
+            AccountBanner #account-banner
+              with
+                connected
+                account_exists
+                dismissed=account_banner_dismissed
+                password
+              events
+                open_account_welcome -> open_account_welcome
+                dismiss_account_banner -> dismiss_account_banner
             if has_error
               box
                 with
@@ -537,6 +546,9 @@ view
               account_name
               network_name
               connected_rpc
+              account_ceremony_phase
+              account_ceremony_qr
+              account_ceremony_detail
               settings_key_state
               settings_key_path
               settings_open_tabs
@@ -569,6 +581,8 @@ view
               account_key_join_submit -> account_key_join_submit
               account_key_remove -> account_key_remove _
               account_passkey_submit -> account_passkey_submit
+              account_passkey_desktop -> account_passkey_desktop
+              account_ceremony_cancel -> account_ceremony_cancel
               account_wallet_submit -> account_wallet_submit
               account_login_submit -> account_login_submit
               copy_to_clipboard -> copy_to_clipboard _ _

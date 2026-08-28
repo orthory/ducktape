@@ -298,6 +298,10 @@ on welcome_failed(cause)
 // from the previous network must land dead.
 // (`reconnect` is the same-endpoint sibling that deliberately KEEPS drafts.)
 on console_opened(id)
+  account_banner_dismissed = false
+  account_ceremony_phase = ""
+  account_ceremony_qr = ""
+  account_ceremony_detail = ""
   invalidate lane=chat_search
   invalidate lane=page_search
   invalidate lane=palette_search
@@ -647,3 +651,40 @@ on onboarding_reopened(id)
     task window close target=window_target(console_win)
     task window close target=window_target(huddle_win)
     run replace lane=hub_state hub_state() -> hub_refreshed _
+
+// THE BANNER'S WAY BACK — the launch window at the welcome step for THIS
+// network. Same teardown as `switch_network` (a handler cannot call a
+// handler, so the lines are repeated), different landing.
+on dismiss_account_banner
+  account_banner_dismissed = true
+
+on open_account_welcome
+  return if mutation_phase != MutationPhase.idle
+  invalidate lane=page_autosave
+  invalidate lane=shell_credentials
+  invalidate lane=shell_terminal
+  invalidate lane=shell_chat
+  shell_credentials_generation = shell_credentials_generation + 1
+  shell_credentials_loading = false
+  shell_terminal = idle_agent_terminal()
+  shell_terminal_running = false
+  shell_terminal_busy = false
+  shell_terminal_title = ""
+  shell_chat_busy = false
+  shell_chat_status = ""
+  shell_chat_detail = ""
+  shell_chat_live = ""
+  rpc = connected_rpc
+  hub_chain_id = network_chain_id
+  task window open onboarding -> welcome_reopened _
+
+on welcome_reopened(id)
+  onboarding_win = some(id)
+  ceremony_phase = ""
+  ceremony_qr = ""
+  ceremony_detail = ""
+  onboarding_error = ""
+  hub_step = HubStep.account
+  parallel
+    task window close target=window_target(console_win)
+    task window close target=window_target(huddle_win)

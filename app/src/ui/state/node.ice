@@ -28,6 +28,13 @@ state
   account_key_draft = ""
   account_key_label_draft = ""
   account_ticket = ""
+  // The console's "no account on this network" banner, dismissable for the
+  // session; and the Settings card's reading of a QR ceremony (phase is
+  // `working | show_qr | done | failed`, "" for none).
+  account_banner_dismissed = false
+  account_ceremony_phase = ""
+  account_ceremony_qr = ""
+  account_ceremony_detail = ""
   // "Join with a ticket": a ticket another device minted for THIS key.
   account_join_draft = ""
 

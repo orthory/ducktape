@@ -1845,3 +1845,78 @@ component OnboardingError(message:str)
     if !empty(message)
       box w=fill pt=14.0
         GateNote reason=message next="Nothing was lost. Fix the cause and try again."
+
+// NO ACCOUNT ON THIS NETWORK — the console's line for a signing session that
+// went past the welcome without one. The way back is the welcome itself;
+// dismiss hides it for this console.
+component AccountBanner(connected:bool, account_exists:bool, dismissed:bool, password:str)
+  emits
+    open_account_welcome()
+    dismiss_account_banner()
+  col #root w=fill
+    if connected && !account_exists && !dismissed && !empty(password)
+      box #banner
+        with
+          w=fill
+          pl=12.0
+          pr=12.0
+          pb=8.0
+        box
+          with
+            w=fill
+            px=12.0
+            py=8.0
+            bg=surface
+            border=border
+            border-w=1.0
+            r=8.0
+          row
+            with
+              w=fill
+              gap=10.0
+              align=center
+            text "No account on this network yet."
+              with
+                w=fill
+                size=12.5
+                @text-meta
+            button "Create or sign in" #open -> emit(open_account_welcome)
+              with
+                h=26.0
+                p=5.0
+                @secondary_action
+            button "Dismiss" #dismiss -> emit(dismiss_account_banner)
+              with
+                h=26.0
+                p=5.0
+                @ghost_action
+              active bg=transparent text=muted r=7.0
+              hovered bg=fg/9 text=fg
+              pressed bg=fg/14
+
+// A PHONE CEREMONY ON A CARD: the QR while the phone is asked, the line
+// while the chain is; an empty phase renders nothing. The Settings card's
+// reading of the same stream the welcome shows full-size.
+component CeremonyPlate(phase:str, qr:str, detail:str)
+  emits
+    account_ceremony_cancel()
+  col #root w=fill gap=8.0 align=center
+    if phase == "show_qr"
+      qr qr #plate-qr cell-size=3.0 correction=medium
+      text detail
+        with
+          w=fill
+          size=12.0
+          align-x=center
+          @text-meta
+      button "Cancel" #plate-cancel -> emit(account_ceremony_cancel)
+        with
+          h=26.0
+          p=5.0
+          @secondary_action
+    if phase == "working"
+      text detail
+        with
+          w=fill
+          size=12.0
+          @text-meta

@@ -4,7 +4,7 @@
 // `screens/roster.ice` for the screen contract: no app state is reachable from
 // here, so every reading is a prop and every act leaves as a named event that
 // `view.ice` routes back to the handler of the same name.
-component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_answered:bool, account_number:str, bind account_name_draft:str, account_renaming:bool, account_exists:bool, account_keys:i64, account_key_rows:[AccountKeyRow], account_busy:bool, bind account_create_draft:str, bind account_key_draft:str, bind account_key_label_draft:str, account_ticket:str, bind account_join_draft:str, appearance:Appearance, password:str, status:str, loading:bool, connected:bool, mutation_phase:MutationPhase)
+component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, account_ceremony_phase:str, account_ceremony_qr:str, account_ceremony_detail:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_answered:bool, account_number:str, bind account_name_draft:str, account_renaming:bool, account_exists:bool, account_keys:i64, account_key_rows:[AccountKeyRow], account_busy:bool, bind account_create_draft:str, bind account_key_draft:str, bind account_key_label_draft:str, account_ticket:str, bind account_join_draft:str, appearance:Appearance, password:str, status:str, loading:bool, connected:bool, mutation_phase:MutationPhase)
   emits
     select_shell_tab(ShellTab)
     reconnect()
@@ -22,6 +22,8 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
     account_key_join_submit()
     account_key_remove(str)
     account_passkey_submit()
+    account_passkey_desktop()
+    account_ceremony_cancel()
     account_wallet_submit()
     account_login_submit()
     copy_to_clipboard(str, str)
@@ -549,20 +551,27 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                           h=28.0
                           p=5.0
                           @secondary_action
-                    // …or from a browser: a passkey registered here, or an
-                    // Ethereum wallet, signs its own admission (the label
-                    // above names it).
+                    // …or a passkey: from the phone (the card shows a QR),
+                    // or in this computer's browser; or an Ethereum wallet
+                    // in the browser. Each signs its own admission (the
+                    // label above names it).
                     row
                       with
                         w=fill
                         gap=7.0
                         align=center
-                      text "…or from a browser:"
+                      text "…or a passkey:"
                         with
                           w=fill
                           size=12.0
                           @text-meta
-                      button "Register a passkey" -> emit(account_passkey_submit)
+                      button "On your phone" #account-passkey-qr -> emit(account_passkey_submit)
+                        with
+                          disabled=(account_busy || empty(password))
+                          h=28.0
+                          p=5.0
+                          @secondary_action
+                      button "In this browser" -> emit(account_passkey_desktop)
                         with
                           disabled=(account_busy || empty(password))
                           h=28.0
@@ -574,6 +583,13 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                           h=28.0
                           p=5.0
                           @secondary_action
+                    CeremonyPlate #account-ceremony
+                      with
+                        phase=account_ceremony_phase
+                        qr=account_ceremony_qr
+                        detail=account_ceremony_detail
+                      forward
+                        account_ceremony_cancel
                     if !empty(account_ticket)
                       row
                         with
