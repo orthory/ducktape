@@ -368,6 +368,7 @@ fn run_node(
         sandbox,
         compute_backend,
         sandbox_capacity,
+        genesis,
     } = boot::env::derive(resolved, sync_only);
 
     // A node whose config says it can isolate runs, booting with no compute
@@ -606,6 +607,7 @@ fn run_node(
                 storage_for_sync,
                 namespace,
                 blobs,
+                &genesis,
                 voice_requests,
             )
             .await;
@@ -712,6 +714,7 @@ fn run_node(
                 &manifest,
                 forge_repo.clone(),
                 duckfs_dir,
+                &genesis,
             )
             .await;
             // THE PROMOTION SEAT: the park loop returned the baton — the
@@ -802,6 +805,7 @@ fn run_node(
             manifest,
             forge_repo,
             duckfs_dir,
+            &genesis,
         )
         .await;
     });

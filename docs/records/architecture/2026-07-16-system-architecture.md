@@ -125,7 +125,8 @@ noded's 16, with `--with-valset` appending the governance tier
 
 > **Review here:** is the noded/node genesis drift (16 vs 26) something we
 > want pinned by a parity test, or is divergence the intended contract? Today
-> only `constants::MODULE_IDS` ↔ `ProductionModules` parity is pinned.
+> only `constants::MODULE_IDS` ↔ the composed host's registry parity is pinned
+(`topology_code_column_matches_the_composed_host`).
 
 ---
 

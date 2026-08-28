@@ -1,3 +1,8 @@
+// this binary founds networks with the real `node init`, which hashes a
+// components directory into the descriptor — the harness owns the one path to
+// the checked-in set (`common::FIXTURES`), so it is not copied here.
+mod common;
+
 use std::io::BufRead as _;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
@@ -6,7 +11,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use commonware_cryptography::{Hasher as _, Sha256, Signer as _, ed25519::PrivateKey};
+use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use reachability::PersistedMesh;
 use wireguard::{
     AdmissionRoot, Endpoint, EndpointAdvertisement, EndpointRecord, MeshVersion, PortPolicy, Root,
@@ -121,30 +126,15 @@ fn keygen(dir: &Path) -> String {
 
 use nettest::alloc_ports;
 
-/// recompute a founder's genesis namespace exactly as `config::genesis_namespace`
-/// does — sha256 over the sorted validator hexes, chain-id prefixed —
-/// so a seeded `mesh-state.json` rides the SAME chain id the running `invite`
-/// verb keys its `reachability::store::load` on. `ducktape:genesis:v1:` is a
-/// pinned domain tag; changing it is a genesis flag day the descriptor tests
-/// guard, not this one.
-fn genesis_namespace(chain_id: &str, validators_hex: &[String]) -> String {
-    let mut sorted: Vec<String> = validators_hex
-        .iter()
-        .map(|v| v.trim().to_ascii_lowercase())
-        .collect();
-    sorted.sort();
-    let mut hasher = Sha256::default();
-    hasher.update(b"ducktape:genesis:v1:");
-    for v in &sorted {
-        hasher.update(b"\n");
-        hasher.update(v.as_bytes());
-    }
-    let digest = hasher.finalize();
-    let suffix: String = digest.as_ref()[..16]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    format!("{chain_id}@{suffix}")
+/// the founder's genesis namespace, read from the descriptor `init` just
+/// wrote, so a seeded `mesh-state.json` rides the SAME chain id the running
+/// `invite` verb keys its `reachability::store::load` on. THE derivation lives
+/// on the descriptor (it fingerprints the module set too, which a hand-rolled
+/// copy here silently drifted from); this only loads it.
+fn genesis_namespace(workspace: &Path) -> String {
+    workspace_config::NetworkDescriptor::load(&workspace.join("network.toml"))
+        .expect("load the founder descriptor")
+        .genesis_namespace()
 }
 
 /// a signed advert for a reachable member with a routable WireGuard underlay
@@ -200,6 +190,8 @@ fn coordinated_invite_persists_tunnel_bootstrap_without_direct_endpoint() {
             "init",
             "--name",
             "coordinated-default",
+            "--modules",
+            common::FIXTURES,
             "--dir",
             founder.to_str().expect("utf-8 founder dir"),
         ])
@@ -280,6 +272,8 @@ fn invite_bundles_reachable_member_fronts_from_seeded_mesh_state() {
             "init",
             "--name",
             "fronts-bundle",
+            "--modules",
+            common::FIXTURES,
             "--dir",
             founder.to_str().expect("utf-8 founder dir"),
         ])
@@ -290,19 +284,11 @@ fn invite_bundles_reachable_member_fronts_from_seeded_mesh_state() {
         "init failed:\n{}",
         command_output(&init)
     );
-    // init prints the chain id on stdout and the founder identity on stderr.
-    let chain_id = String::from_utf8_lossy(&init.stdout).trim().to_string();
-    let founder_hex = String::from_utf8_lossy(&init.stderr)
-        .lines()
-        .find_map(|l| l.rsplit("identity ").next().filter(|h| h.len() == 64))
-        .expect("init stderr names the founder identity")
-        .to_string();
-
     // seed the founder's mesh with ONE reachable member (seed 7) that has a
     // routable underlay endpoint — a direct front. The persisted mesh's chain
     // id must equal the descriptor's genesis namespace or `invite` treats it as
     // a foreign file and carries no fronts.
-    let namespace = genesis_namespace(&chain_id, &[founder_hex]);
+    let namespace = genesis_namespace(&founder);
     let advert = direct_member_advert(&namespace, 7, 20);
     let mesh = PersistedMesh::new(namespace, 1, vec![advert], vec![], vec![]);
     let storage = founder.join("storage");
@@ -393,6 +379,8 @@ fn a_dark_coordinator_at_boot_heals_once_it_comes_up() {
             "init",
             "--name",
             "coordinator-heal",
+            "--modules",
+            common::FIXTURES,
             "--dir",
             founder.to_str().expect("utf-8 founder dir"),
             "--wireguard-listen",
@@ -503,6 +491,8 @@ fn unreachable_coordinator_degrades_the_plane_instead_of_killing_it() {
             "init",
             "--name",
             "coordinator-degrade",
+            "--modules",
+            common::FIXTURES,
             "--dir",
             founder.to_str().expect("utf-8 founder dir"),
             "--primary-coordinator",

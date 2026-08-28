@@ -6,5 +6,9 @@ namespace = "ducktape-demo"
 # mesh = validators + the sync-only joiner (seed 2); consensus stays [0, 1].
 peer_seeds = [0, 1, 2, 3]
 validator_seeds = [0, 1, 2]
+# the genesis wasm set: no code is embedded in the binary, so every node of the
+# cluster must point at the SAME components (path is relative to the cwd the
+# node is run from — the repo root).
+modules = "crates/kernel/host/tests/fixtures"
 storage_dir = "/tmp/ducktape-0"
 rpc_listen = "127.0.0.1:52300"

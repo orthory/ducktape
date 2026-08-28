@@ -245,6 +245,7 @@ pub(super) async fn park(
     duckfs_dir: std::path::PathBuf,
     manifest: &Option<Manifest>,
     recovery: Recovery<commonware_runtime::tokio::Context>,
+    genesis: &crate::config::GenesisModules,
 ) -> crate::validator::PromotionBaton {
     let ReplicaChannels {
         context,
@@ -536,7 +537,15 @@ pub(super) async fn park(
             .any(|key| key.as_slice() == me_bytes.as_slice())
     });
     if let Some(ckpt) = resident_checkpoint {
-        let restored = restore_host(&context, &forge_repo, &duckfs_dir, ckpt, blobs.clone()).await;
+        let restored = restore_host(
+            &context,
+            &forge_repo,
+            &duckfs_dir,
+            ckpt,
+            blobs.clone(),
+            genesis,
+        )
+        .await;
         let mut host = match restored {
             Ok(h) => h,
             Err(e) => {
@@ -1969,6 +1978,7 @@ pub(super) async fn park(
                             blobs: blobs.clone(),
                         },
                         attempt,
+                        genesis,
                     )
                     .await
                     {
@@ -2275,6 +2285,7 @@ pub(super) async fn park(
                 blobs: blobs.clone(),
             },
             attempt,
+            genesis,
         )
         .await
         {

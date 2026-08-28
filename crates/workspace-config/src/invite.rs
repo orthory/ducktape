@@ -8,7 +8,8 @@ use commonware_cryptography::{Signer as _, ed25519};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CoordRef, Coordination, NetworkDescriptor, Reach, ReachHint, decode_key, hex_bytes, unhex,
+    CoordRef, Coordination, ModuleCode, NetworkDescriptor, Reach, ReachHint, decode_key, hex_bytes,
+    unhex, validate_module_id,
 };
 
 /// the invite blob prefix. UNVERSIONED on purpose (bootstrapping posture): the
@@ -472,11 +473,12 @@ pub fn decode_invite_at(blob: &str, now_unix_secs: u64) -> Result<Invite, String
     Ok(invite)
 }
 
-/// pack the signed portion of the invite. validator hex is decoded to raw keys
-/// (rejecting a malformed descriptor here rather than shipping it); the typed
-/// reach hints come from [`NetworkDescriptor::reach_hints`] (the union of
-/// `reach` and `bootstrap`-synthesised Direct hints), so a founder that only
-/// ever ran `add_bootstrap` still ships a well-formed invite.
+/// pack the signed portion of the invite. validator hex and module code hashes
+/// are decoded to raw bytes (rejecting a malformed descriptor here rather than
+/// shipping it); the typed reach hints come from
+/// [`NetworkDescriptor::reach_hints`] (the union of `reach` and
+/// `bootstrap`-synthesised Direct hints), so a founder that only ever ran
+/// `add_bootstrap` still ships a well-formed invite.
 fn pack_invite(
     d: &NetworkDescriptor,
     token: &InviteToken,
@@ -497,6 +499,21 @@ fn pack_invite(
     );
     for k in &vkeys {
         out.extend_from_slice(k.as_ref());
+    }
+
+    // the genesis module set — the OTHER half of `genesis_namespace`, so it
+    // rides the invite for the same reason the validator set does: a joiner
+    // that cannot recompute the founder's namespace cannot even handshake.
+    // the hashes ride, the component bytes do not. `module_hashes` is the
+    // mirror of `validator_keys` above — hex -> raw, id-sorted, deduped, and a
+    // malformed hash is rejected HERE (naming its module) rather than shipped.
+    let mhashes = d.module_hashes()?;
+    out.push(
+        u8::try_from(mhashes.len()).map_err(|_| format!("too many modules ({})", mhashes.len()))?,
+    );
+    for (id, hash) in &mhashes {
+        put_str_u8(&mut out, id)?;
+        out.extend_from_slice(hash);
     }
 
     let hints = d.reach_hints()?;
@@ -592,8 +609,8 @@ fn put_str_u8(out: &mut Vec<u8>, s: &str) -> Result<(), String> {
 /// inverse of [`pack_invite`] (the signed portion — the caller has already
 /// split the envelope signature off); yields a descriptor canonicalized
 /// exactly as [`NetworkDescriptor::from_toml`] would (sorted validators,
-/// sorted canonical reach) so the genesis fingerprint of a decoded invite
-/// matches the founder's. signature verification is the CALLER's
+/// id-sorted modules, sorted canonical reach) so the genesis fingerprint of a
+/// decoded invite matches the founder's. signature verification is the CALLER's
 /// ([`decode_invite_at`]) — this only parses and enforces expiry.
 fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
     let mut r = InviteReader::new(bytes);
@@ -607,6 +624,21 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
         validators.push(hex_bytes(r.take(32)?));
     }
     validators.sort();
+
+    let mcount = r.u8()? as usize;
+    let mut modules = Vec::with_capacity(mcount);
+    for _ in 0..mcount {
+        let id = r.take_str_u8()?;
+        // a blob is untrusted input: an id carrying `=` or a newline could
+        // otherwise smuggle two module lines into one, folding a foreign set
+        // onto this network's fingerprint.
+        validate_module_id(&id)?;
+        modules.push(ModuleCode {
+            id,
+            code_hash: hex_bytes(r.take(32)?),
+        });
+    }
+    modules.sort_by(|a, b| a.id.cmp(&b.id));
 
     let hcount = r.u8()? as usize;
     let mut reach = Vec::with_capacity(hcount);
@@ -719,6 +751,7 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
             bootstrap: Vec::new(),
             reach,
             coordination,
+            modules,
         },
         token,
         wireguard,
@@ -802,6 +835,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         d.apply_primary_coordinator(&issuer.public_key(), "p2p.ducktape.byeongsu.dev:3478")
             .expect("coordinator hint");
@@ -835,6 +869,100 @@ mod tests {
         encode_invite(d, &token, wg, &[], issuer).expect("encode")
     }
 
+    /// a two-module genesis set, deliberately NOT in id order so the codec's
+    /// canonical sort is what makes the two sides agree.
+    fn test_modules() -> Vec<ModuleCode> {
+        vec![
+            ModuleCode {
+                id: "pages".into(),
+                code_hash: "11".repeat(32),
+            },
+            ModuleCode {
+                id: "chat".into(),
+                code_hash: "22".repeat(32),
+            },
+        ]
+    }
+
+    #[test]
+    fn the_invite_carries_the_genesis_module_hashes() {
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let d = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            validators: vec![hex_bytes(issuer.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            modules: test_modules(),
+        };
+        let invite = decode_invite(&encode_test_invite(&d, &issuer, None)).expect("roundtrip");
+        // ids and hashes survive, id-sorted on both sides.
+        assert_eq!(
+            invite.descriptor.modules,
+            vec![
+                ModuleCode {
+                    id: "chat".into(),
+                    code_hash: "22".repeat(32),
+                },
+                ModuleCode {
+                    id: "pages".into(),
+                    code_hash: "11".repeat(32),
+                },
+            ]
+        );
+        // and therefore the joiner computes the founder's namespace — without
+        // the module block it would compute the validators-only one instead.
+        assert_eq!(invite.descriptor.genesis_namespace(), d.genesis_namespace());
+    }
+
+    #[test]
+    fn a_malformed_module_hash_is_refused_at_encode_naming_the_module() {
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let d = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            validators: vec![hex_bytes(issuer.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            modules: vec![ModuleCode {
+                id: "pages".into(),
+                code_hash: "11".repeat(16), // 32 hex chars — half a sha256.
+            }],
+        };
+        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes(), u64::MAX);
+        let err = encode_invite(&d, &token, &coordinated_test_wg(), &[], &issuer)
+            .expect_err("a short hash never ships");
+        assert!(err.contains("pages"), "{err}");
+    }
+
+    #[test]
+    fn a_module_id_carrying_a_fingerprint_delimiter_is_refused_at_decode() {
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let d = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            validators: vec![hex_bytes(issuer.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            modules: vec![ModuleCode {
+                id: "pages".into(),
+                code_hash: "11".repeat(32),
+            }],
+        };
+        let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes(), u64::MAX);
+        let mut bytes = pack_invite(&d, &token, &coordinated_test_wg(), &[]).unwrap();
+        // rewrite the packed id "pages" -> "p=ges" in place: same length, so
+        // the framing stays intact and only the id turns hostile. a blob is
+        // untrusted input — the encoder's guard is not the decoder's.
+        let at = bytes
+            .windows(5)
+            .position(|w| w == b"pages")
+            .expect("the module id rides the packed blob");
+        bytes[at + 1] = b'=';
+        let err = unpack_invite(&bytes, 0).expect_err("a delimiter in an id never decodes");
+        assert!(err.contains("p=ges"), "{err}");
+    }
+
     #[test]
     fn invite_blob_roundtrips_and_verifies() {
         let issuer = ed25519::PrivateKey::from_seed(7);
@@ -845,6 +973,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: test_modules(),
         };
         d.add_bootstrap(&me, "127.0.0.1:52200");
         // decode NORMALISES bootstrap hints into typed Direct reach hints, so
@@ -858,6 +987,12 @@ mod tests {
         );
         assert_eq!(invite.wireguard, coordinated_test_wg());
         let binding = d.genesis_namespace();
+        // the token was minted under the FOUNDER's namespace (`cli.rs` mints
+        // against the on-disk descriptor) and `decode_invite` verifies it
+        // against the namespace it recomputes from the DECODED one — so a
+        // decode that succeeded already proves the two agree. assert it
+        // outright, because that agreement is what the module block buys.
+        assert_eq!(invite.descriptor.genesis_namespace(), binding);
         assert!(verify_invite_token(&invite.token, binding.as_bytes()));
 
         // a HOSTNAME dial hint survives verbatim (stored as a string, resolved
@@ -899,6 +1034,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         d.add_bootstrap(&me, "127.0.0.1:52200");
         let blob = encode_test_invite(&d, &issuer, None);
@@ -928,6 +1064,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         d.add_bootstrap(&me, "127.0.0.1:52200");
         let binding = d.genesis_namespace();
@@ -975,6 +1112,7 @@ mod tests {
             // a `None` source resolves to Private, so it decodes as an EXPLICIT
             // "private" (semantically identical — see `coordination()`).
             coordination: Some("private".into()),
+            modules: Vec::new(),
         };
         let wg = InviteWireGuard {
             public_key: [42u8; 32],
@@ -997,6 +1135,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: Some("private".into()),
+            modules: Vec::new(),
         };
         let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes(), u64::MAX);
         let mut bytes = pack_invite(&d, &token, &coordinated_test_wg(), &[]).unwrap();
@@ -1025,6 +1164,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: Some("private".into()),
+            modules: Vec::new(),
         }
     }
 
@@ -1174,6 +1314,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         // the token carries its OWN expiry now (no separate blob param).
         let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes(), 1_000);
@@ -1217,6 +1358,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         };
         for (mode, expect) in [
             ("public", Coordination::Public),
@@ -1247,6 +1389,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: Vec::new(),
         }
     }
 

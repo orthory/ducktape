@@ -5,11 +5,10 @@
 //! No composer keeps a hand-counted id list of its own: the id universe,
 //! wiring, and config live in one [`ModuleTopology`] value, and each
 //! backend's genesis set is a NAMED SELECTION validated against it —
-//! [`PRODUCTION`] for the node, [`SIM_BASE`] and [`SIM_VALSET`] for simnode,
-//! [`DEMO`] for the demo binary.
+//! [`PRODUCTION`] for the node, [`SIM_BASE`] and [`SIM_VALSET`] for simnode.
 //!
 //! This is a plan, NOT a root-hash. Instantiation stays per-backend on purpose:
-//! node composes the selection over the wasm runtime, simnode/noded/demo compose
+//! node composes the selection over the wasm runtime, simnode/noded compose
 //! the SAME ids over native module structs, and the wasm and native roots differ
 //! by design. One topology never means one root-hash — it means one place the
 //! module SET (and the drift guard on it) lives.
@@ -17,18 +16,37 @@
 //! A leaf crate with no dependencies: the catalog is pure `&'static str`, and
 //! the kernel (`host`) knows nothing of the product modules composed over it.
 
+/// Where a module's CODE comes from: compiled into the binary, or a wasm
+/// component the code registry (lifecycle) can swap at a height boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Code {
+    Native,
+    Wasm,
+}
+
+/// Where a module's COMMITTED state lives — the substrate `root()` is computed
+/// from. One per module by definition (`wasm_host::StateBacking` is an enum).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backing {
+    /// host-KV map; root = sha256(canonical kv); rides the snapshot lane.
+    Map,
+    /// host-constructed authenticated store (qmdb); root = store merkle root.
+    Store,
+    /// host-side disk substrate (duckfs odb / git); root = sha256(refs image).
+    Odb,
+}
+
 /// A single module in the composition universe: its id plus the metadata that
 /// used to be scattered across the composer sites.
 pub struct ModuleSpec {
     /// The consensus-visible module id (the key in the host registry / root-hash).
     pub id: &'static str,
-    /// The NATIVE sibling wiring the native composers (noded/simnode/demo) pass
+    /// The NATIVE sibling wiring the native composers (noded/simnode) pass
     /// as constructor args — the concrete duplication this topology absorbs.
-    /// A backend realizes an edge only when it also composes the target module
-    /// (demo omits `pages`, so it does not realize `runs -> pages`). The wasm
-    /// production guests compile in their OWN wiring, which can be richer than
-    /// the native args (e.g. saga reads valset/capability inside the guest);
-    /// that guest-internal wiring is not represented here.
+    /// A backend realizes an edge only when it also composes the target module.
+    /// The wasm production guests compile in their OWN wiring, which can be
+    /// richer than the native args (e.g. saga reads valset/capability inside
+    /// the guest); that guest-internal wiring is not represented here.
     pub wiring: &'static [&'static str],
     /// The per-network genesis-config keys this module needs (empty = none).
     /// The VALUES are runtime (a `NetworkBindings`: the invite namespace + the
@@ -36,10 +54,17 @@ pub struct ModuleSpec {
     /// the wasm `__config` store) — this is only the schema of WHICH modules are
     /// network-bound and on WHICH keys.
     pub config: &'static [&'static str],
+    /// Where this module's code comes from.
+    pub code: Code,
+    /// Where this module's committed state lives.
+    pub backing: Backing,
+    /// the guest's query lane is COMMITTED-ONLY regardless of caller
+    /// (`WasmModule::with_committed_queries`). dispatch only.
+    pub committed_queries: bool,
 }
 
 /// The module composition topology: the id universe (with per-module wiring +
-/// config) and the four named genesis selections drawn from it.
+/// config) and the three named genesis selections drawn from it.
 pub struct ModuleTopology {
     /// Every module that appears in ANY selection, each with its wiring/config.
     pub modules: &'static [ModuleSpec],
@@ -49,8 +74,6 @@ pub struct ModuleTopology {
     pub sim_base: &'static [&'static str],
     /// the system modules simnode's `--with-valset` appends AFTER `sim_base`.
     pub sim_valset: &'static [&'static str],
-    /// the demo walkthrough's native genesis set.
-    pub demo: &'static [&'static str],
 }
 
 impl ModuleTopology {
@@ -68,6 +91,15 @@ impl ModuleTopology {
     pub fn config(&self, id: &str) -> &'static [&'static str] {
         self.spec(id).map(|m| m.config).unwrap_or(&[])
     }
+
+    /// the `code == Wasm` ids of `selection`, in selection order.
+    pub fn wasm_ids(&self, selection: &[&'static str]) -> Vec<&'static str> {
+        selection
+            .iter()
+            .copied()
+            .filter(|id| self.spec(id).is_some_and(|m| m.code == Code::Wasm))
+            .collect()
+    }
 }
 
 /// genesis-config key: the per-network invite namespace (governance verifies
@@ -81,43 +113,37 @@ const CHAIN_ID: &[&str] = &[CONFIG_CHAIN_ID];
 const INVITE: &[&str] = &[CONFIG_INVITE];
 const NONE: &[&str] = &[];
 
+const fn store(id: &'static str, wiring: &'static [&'static str], config: &'static [&'static str]) -> ModuleSpec {
+    ModuleSpec { id, wiring, config, code: Code::Wasm, backing: Backing::Store, committed_queries: false }
+}
+
 /// The module id universe with per-module wiring + config. Alphabetical by id
 /// (order here is documentation only — selections carry the composer orders).
 const MODULES: &[ModuleSpec] = &[
-    // the submit-policy federation: allow-all at genesis (an empty table),
-    // governance-tightened. the kernel host's dispatch gate reads it and
-    // resolves principals against valset/identity itself, so the native
-    // struct takes no sibling constructor args (wiring stays empty).
-    ModuleSpec { id: "acl", wiring: NONE, config: NONE },
-    ModuleSpec { id: "agent", wiring: &["saga", "runs"], config: NONE },
-    ModuleSpec { id: "automations", wiring: &["chat", "tasks", "inbox"], config: NONE },
-    ModuleSpec { id: "capability", wiring: NONE, config: NONE },
-    ModuleSpec { id: "chat", wiring: &["tagging"], config: NONE },
-    ModuleSpec { id: "directory", wiring: NONE, config: NONE },
-    ModuleSpec { id: "dispatch", wiring: &["saga"], config: NONE },
-    ModuleSpec { id: "files", wiring: NONE, config: NONE },
-    ModuleSpec { id: "forge", wiring: &["chat"], config: NONE },
-    ModuleSpec { id: "gateway", wiring: &["identity"], config: CHAIN_ID },
-    ModuleSpec { id: "governance", wiring: &["valset", "lifecycle", "identity"], config: INVITE },
-    ModuleSpec { id: "greeter", wiring: NONE, config: NONE },
-    ModuleSpec { id: "hello", wiring: NONE, config: NONE },
-    ModuleSpec { id: "identity", wiring: NONE, config: CHAIN_ID },
-    ModuleSpec { id: "inbox", wiring: NONE, config: NONE },
-    ModuleSpec { id: "kv", wiring: NONE, config: NONE },
-    ModuleSpec { id: "lifecycle", wiring: &["valset"], config: NONE },
-    ModuleSpec { id: "pages", wiring: &["tagging"], config: NONE },
-    ModuleSpec {
-        id: "runs",
-        wiring: &["chat", "saga", "tagging", "dispatch", "agent", "tasks", "files", "pages"],
-        config: NONE,
-    },
-    ModuleSpec { id: "saga", wiring: NONE, config: NONE },
-    ModuleSpec { id: "tagging", wiring: &["runs"], config: NONE },
-    ModuleSpec { id: "tasks", wiring: NONE, config: NONE },
-    ModuleSpec { id: "valset", wiring: NONE, config: NONE },
+    store("acl", NONE, NONE),
+    store("agent", &["saga", "runs"], NONE),
+    store("automations", &["chat", "tasks", "inbox"], NONE),
+    store("capability", NONE, NONE),
+    store("chat", &["tagging"], NONE),
+    ModuleSpec { id: "directory", wiring: NONE, config: NONE, code: Code::Wasm, backing: Backing::Map, committed_queries: false },
+    ModuleSpec { id: "dispatch", wiring: &["saga"], config: NONE, code: Code::Wasm, backing: Backing::Store, committed_queries: true },
+    ModuleSpec { id: "files", wiring: NONE, config: NONE, code: Code::Wasm, backing: Backing::Odb, committed_queries: false },
+    ModuleSpec { id: "forge", wiring: &["chat"], config: NONE, code: Code::Wasm, backing: Backing::Odb, committed_queries: false },
+    store("gateway", &["identity"], CHAIN_ID),
+    store("governance", &["valset", "lifecycle", "identity"], INVITE),
+    store("identity", NONE, CHAIN_ID),
+    store("inbox", NONE, NONE),
+    ModuleSpec { id: "kv", wiring: NONE, config: NONE, code: Code::Native, backing: Backing::Store, committed_queries: false },
+    ModuleSpec { id: "lifecycle", wiring: &["valset"], config: NONE, code: Code::Native, backing: Backing::Store, committed_queries: false },
+    store("pages", &["tagging"], NONE),
+    ModuleSpec { id: "runs", wiring: &["chat", "saga", "tagging", "dispatch", "agent", "tasks", "files", "pages"], config: NONE, code: Code::Wasm, backing: Backing::Map, committed_queries: false },
+    store("saga", NONE, NONE),
+    store("tagging", &["runs"], NONE),
+    store("tasks", NONE, NONE),
+    ModuleSpec { id: "valset", wiring: NONE, config: NONE, code: Code::Native, backing: Backing::Store, committed_queries: false },
 ];
 
-/// node's production genesis set (21), in status-report order — every node runs
+/// node's production genesis set (20), in status-report order — every node runs
 /// exactly these, so the set is in the root-hash. A module here is consensus
 /// state forever; experiments live unwired in `crates/labs` and appear in no
 /// selection.
@@ -129,7 +155,6 @@ pub const PRODUCTION: &[&str] = &[
     "acl",
     "governance",
     "lifecycle",
-    "hello",
     "saga",
     "capability",
     "dispatch",
@@ -177,37 +202,12 @@ pub const SIM_BASE: &[&str] = &[
 /// host-injected once-per-block boundary `Advance` ride every block.
 pub const SIM_VALSET: &[&str] = &["kv", "valset", "acl", "governance", "lifecycle"];
 
-/// the demo walkthrough's native genesis set (17): the base collaboration set
-/// plus kv/directory/greeter, minus the production-only wasm tenants
-/// (pages/lifecycle/governance/capability/hello) the scripted demo does not
-/// exercise.
-pub const DEMO: &[&str] = &[
-    "kv",
-    "directory",
-    "greeter",
-    "forge",
-    "chat",
-    "valset",
-    "saga",
-    "dispatch",
-    "tagging",
-    "tasks",
-    "identity",
-    "gateway",
-    "inbox",
-    "files",
-    "agent",
-    "runs",
-    "automations",
-];
-
 /// The one topology value composers read.
 pub const TOPOLOGY: ModuleTopology = ModuleTopology {
     modules: MODULES,
     production: PRODUCTION,
     sim_base: SIM_BASE,
     sim_valset: SIM_VALSET,
-    demo: DEMO,
 };
 
 #[cfg(test)]
@@ -231,17 +231,16 @@ mod tests {
     /// here. Counts AND membership, so neither a stray add nor a silent drop slips.
     #[test]
     fn selections_pin_to_todays_sets() {
-        assert_eq!(PRODUCTION.len(), 21, "production is the 21-module set");
+        assert_eq!(PRODUCTION.len(), 20, "production is the 20-module set");
         assert_eq!(SIM_BASE.len(), 14, "sim_base is the default 14-module set");
         assert_eq!(SIM_VALSET.len(), 5, "sim_valset appends 5 system modules");
-        assert_eq!(DEMO.len(), 17, "demo composes 17 modules");
 
         // exact membership (sorted — registration order is not consensus-relevant)
         assert_eq!(
             sorted(PRODUCTION),
             sorted(&[
                 "acl", "agent", "automations", "capability", "chat", "directory", "dispatch",
-                "files", "forge", "gateway", "governance", "hello", "identity", "inbox",
+                "files", "forge", "gateway", "governance", "identity", "inbox",
                 "lifecycle", "pages", "runs", "saga", "tagging", "tasks", "valset",
             ])
         );
@@ -256,14 +255,6 @@ mod tests {
             sorted(SIM_VALSET),
             sorted(&["acl", "governance", "kv", "lifecycle", "valset"])
         );
-        assert_eq!(
-            sorted(DEMO),
-            sorted(&[
-                "agent", "automations", "chat", "dispatch", "directory", "files", "forge",
-                "gateway", "greeter", "identity", "inbox", "kv", "runs", "saga", "tagging",
-                "tasks", "valset",
-            ])
-        );
     }
 
     #[test]
@@ -272,7 +263,6 @@ mod tests {
             ("production", PRODUCTION),
             ("sim_base", SIM_BASE),
             ("sim_valset", SIM_VALSET),
-            ("demo", DEMO),
         ] {
             assert!(!has_dups(sel), "{name} has a duplicate id");
         }
@@ -300,7 +290,6 @@ mod tests {
             .iter()
             .chain(SIM_BASE)
             .chain(SIM_VALSET)
-            .chain(DEMO)
             .copied()
             .collect();
         assert_eq!(
@@ -357,5 +346,25 @@ mod tests {
         assert!(TOPOLOGY.spec("chat").is_some());
         assert!(TOPOLOGY.spec("not-a-module").is_none());
         assert_eq!(TOPOLOGY.wiring("not-a-module"), NONE);
+    }
+
+    /// The shape table is consensus-adjacent: a wrong `backing` composes the
+    /// wrong root, a wrong `code` sends a native module to the wasm loader.
+    #[test]
+    fn shape_table_pins_native_odb_map_and_committed_queries() {
+        let native: Vec<&str> = MODULES.iter().filter(|m| m.code == Code::Native).map(|m| m.id).collect();
+        assert_eq!(sorted(&native), ["kv", "lifecycle", "valset"]);
+        let odb: Vec<&str> = MODULES.iter().filter(|m| m.backing == Backing::Odb).map(|m| m.id).collect();
+        assert_eq!(sorted(&odb), ["files", "forge"]);
+        let map: Vec<&str> = MODULES.iter().filter(|m| m.backing == Backing::Map).map(|m| m.id).collect();
+        assert_eq!(sorted(&map), ["directory", "runs"]);
+        let committed: Vec<&str> = MODULES.iter().filter(|m| m.committed_queries).map(|m| m.id).collect();
+        assert_eq!(committed, ["dispatch"]);
+    }
+
+    #[test]
+    fn wasm_ids_selects_only_wasm_specs_in_selection_order() {
+        let ids = TOPOLOGY.wasm_ids(SIM_VALSET);
+        assert_eq!(ids, ["acl", "governance"]);
     }
 }
