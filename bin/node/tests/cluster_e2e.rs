@@ -27,8 +27,8 @@ use std::time::Duration;
 
 use chat::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, PostPolicy};
 use common::{Cluster, poll_until, serial};
-use directory::{DirMsg, DirQuery, DirReply};
 use governance::{GovAction, GovMsg, GovQuery, GovReply, ProposalStatus};
+use tasks::{TaskMsg, TaskQuery, TaskReply};
 
 /// convergence budget: mesh formation + leader rotation are real-time on a
 /// possibly-loaded CI core; polls exit early, so generosity is free.
@@ -99,14 +99,12 @@ fn proposal_status(cluster: &Cluster, idx: usize, id: &str) -> Option<(ProposalS
     }
 }
 
-fn dir_value(cluster: &Cluster, idx: usize, key: &str) -> Option<String> {
-    let reply = cluster.query(
-        idx,
-        "directory",
-        &directory::encode_query(&DirQuery::Get { key: key.into() }),
-    )?;
-    match directory::decode_reply(&reply) {
-        Ok(DirReply::Value(v)) => v,
+/// `tasks` has no point read on the consensus tier (`TaskQuery::List` is its
+/// only variant), so a title lookup lists the board and finds the id.
+fn task_title(cluster: &Cluster, idx: usize, task_id: &str) -> Option<String> {
+    let reply = cluster.query(idx, "tasks", &tasks::encode_task_query(&TaskQuery::List))?;
+    match tasks::decode_task_reply(&reply) {
+        Ok(TaskReply::Tasks(board)) => board.into_iter().find(|t| t.id == task_id).map(|t| t.title),
         Err(_) => None,
     }
 }
@@ -229,15 +227,18 @@ fn cluster_lifecycle() {
         if last_filler.elapsed() >= Duration::from_secs(1) {
             last_filler = std::time::Instant::now();
             filler += 1;
-            let payload = directory::encode_msg(&DirMsg::Set {
-                key: format!("cutover-filler-{filler}"),
-                value: "x".into(),
+            // the counter keeps every filler id UNIQUE: `tasks` refuses a
+            // duplicate create outright (`task_board.rs:77-80`), so a repeat
+            // would be a hard refusal, not a harmless no-op.
+            let payload = tasks::encode_task_msg(&TaskMsg::CreateTask {
+                task_id: format!("cutover-filler-{filler}"),
+                title: "x".into(),
             });
             let _ = cluster.rpc(
                 0,
                 serde_json::json!({
                     "cmd": "submit",
-                    "target": "directory",
+                    "target": "tasks",
                     "payload_hex": common::hex(&payload),
                 }),
             );
@@ -267,8 +268,8 @@ fn cluster_lifecycle() {
         "POST",
         "/v1/submit",
         Some(&serde_json::json!({
-            "target": "directory",
-            "payload": { "set": { "key": "via-app-surface", "value": "held" } },
+            "target": "tasks",
+            "payload": { "task": { "create_task": { "task_id": "via-app-surface", "title": "held" } } },
         })),
     );
     assert_eq!(code, 200, "app-surface submit failed: {block}");
@@ -278,7 +279,7 @@ fn cluster_lifecycle() {
     );
     for reader in [1, 2] {
         let value = poll_until("app-surface op readable via rpc", FINALIZE, || {
-            dir_value(&cluster, reader, "via-app-surface")
+            task_title(&cluster, reader, "via-app-surface")
         });
         assert_eq!(value, "held", "node {reader} read a wrong value");
     }
@@ -303,7 +304,7 @@ fn cluster_lifecycle() {
     // the held submit is its block's member op; a block carries its ops under
     // `ops[]` now.
     let op = &submitted["ops"][0];
-    assert_eq!(op["target"], "directory");
+    assert_eq!(op["target"], "tasks");
     assert_eq!(op["disposition"], "applied");
     assert_eq!(
         submitted["commit_hash"], block["root_hash"],
@@ -351,8 +352,7 @@ fn cluster_lifecycle() {
         "the apply-latency histogram observed the block:\n{exposition}"
     );
     assert!(
-        exposition.contains("ducktape_dispatch_total")
-            && exposition.contains("module=\"directory\""),
+        exposition.contains("ducktape_dispatch_total") && exposition.contains("module=\"tasks\""),
         "the dispatch counter carries the submitted module label:\n{exposition}"
     );
     for sample in [
@@ -363,7 +363,7 @@ fn cluster_lifecycle() {
         "ducktape_consensus_pending_ops ",
         "ducktape_last_finalized_timestamp_seconds ",
         r#"ducktape_ops_outcome_total{outcome="applied"}"#,
-        r#"ducktape_index_height{module="directory"}"#,
+        r#"ducktape_index_height{module="tasks"}"#,
     ] {
         assert!(
             exposition.contains(sample),
@@ -396,7 +396,7 @@ fn cluster_lifecycle() {
     assert_eq!(code, 200, "op hash must dereference on the blob lane: {blob}");
     assert_eq!(
         blob,
-        serde_json::json!({ "set": { "key": "via-app-surface", "value": "held" } }),
+        serde_json::json!({ "task": { "create_task": { "task_id": "via-app-surface", "title": "held" } } }),
         "blob lane serves the committed payload bytes back"
     );
 
@@ -442,7 +442,7 @@ fn cluster_lifecycle() {
     assert!(
         http_status["operations"]["storage"]["indexes"]
             .as_array()
-            .is_some_and(|indexes| indexes.iter().any(|index| index["module"] == "directory")),
+            .is_some_and(|indexes| indexes.iter().any(|index| index["module"] == "tasks")),
         "status carries bounded index watermarks: {http_status}"
     );
     let boundary = status0["root_hash"]
@@ -521,15 +521,15 @@ fn quorum_tolerates_one_fault() {
     cluster.kill(3);
     cluster.submit(
         0,
-        "directory",
-        &directory::encode_msg(&DirMsg::Set {
-            key: "after-fault".into(),
-            value: "alive".into(),
+        "tasks",
+        &tasks::encode_task_msg(&TaskMsg::CreateTask {
+            task_id: "after-fault".into(),
+            title: "alive".into(),
         }),
     );
     for reader in [1, 2] {
         let value = poll_until("post-fault op to finalize", CONVERGE, || {
-            dir_value(&cluster, reader, "after-fault")
+            task_title(&cluster, reader, "after-fault")
         });
         assert_eq!(value, "alive", "node {reader} read a wrong value");
     }
