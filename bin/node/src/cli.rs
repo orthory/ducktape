@@ -1197,15 +1197,20 @@ fn cast_yes_once(
             approve: true,
         },
     )?;
-    let proposal = poll_proposal(addr, proposal_id, "timed out waiting for this ballot to finalize", |p| {
-        p.as_ref().is_some_and(|proposal| {
-            proposal.status != ProposalStatus::Open
-                || proposal
-                    .votes
-                    .iter()
-                    .any(|(voter, yes)| voter == principal && *yes)
-        })
-    })?
+    let proposal = poll_proposal(
+        addr,
+        proposal_id,
+        "timed out waiting for this ballot to finalize",
+        |p| {
+            p.as_ref().is_some_and(|proposal| {
+                proposal.status != ProposalStatus::Open
+                    || proposal
+                        .votes
+                        .iter()
+                        .any(|(voter, yes)| voter == principal && *yes)
+            })
+        },
+    )?
     .ok_or_else(|| format!("proposal {proposal_id} disappeared"))?;
     eprintln!("ballot cast as {}", hex_bytes(principal));
     Ok(proposal)
@@ -1251,7 +1256,10 @@ pub(super) fn drive_proposal_ceremony(
     // a matcher that rejects its own action would make every member mint a
     // fresh proposal that no one else joins — the exact failure the matcher
     // exists to prevent.
-    debug_assert!(matches(&wanted), "the matcher must accept the action it proposes");
+    debug_assert!(
+        matches(&wanted),
+        "the matcher must accept the action it proposes"
+    );
     use governance::{GovMsg, ProposalStatus};
     use governance::{GovQuery, GovReply, decode_reply, encode_query};
     let proposals = match decode_reply(&rpc_query(
@@ -1284,7 +1292,12 @@ pub(super) fn drive_proposal_ceremony(
                     voting_period: 1_000_000,
                 },
             )?;
-            poll_proposal(rpc_addr, &id, "timed out waiting for the proposal to finalize", |p| p.is_some())?;
+            poll_proposal(
+                rpc_addr,
+                &id,
+                "timed out waiting for the proposal to finalize",
+                |p| p.is_some(),
+            )?;
             eprintln!("proposed {id}");
             id
         }
@@ -1574,7 +1587,12 @@ fn cmd_member_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
                     voting_period: 1_000_000,
                 },
             )?;
-            poll_proposal(&rpc_addr, &id, "timed out waiting for the proposal to finalize", |p| p.is_some())?;
+            poll_proposal(
+                &rpc_addr,
+                &id,
+                "timed out waiting for the proposal to finalize",
+                |p| p.is_some(),
+            )?;
             eprintln!("proposed {id}");
             id
         }

@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 
 use commonware_cryptography::Signer as _;
+use topology::PRODUCTION;
 
 use crate::cli::{CeremonyOutcome, GovSigner, rpc_call, rpc_query};
 use crate::cli_args::{Selector, StatusArgs};
@@ -330,6 +331,17 @@ fn registry_precheck(
     id: &str,
     code_hash: &[u8; 32],
 ) -> Result<Precheck, String> {
+    // a genesis id is code this host already runs, so lifecycle's
+    // `handle_schedule_register` refuses to re-admit it (`ctx.module_root`) —
+    // and that refusal lands in-kernel, leaving the proposal open for its whole
+    // voting period. the registry read cannot see it: a NATIVE module carries no
+    // registry entry at all.
+    let registering_a_genesis_module = matches!(verb, Verb::Register) && PRODUCTION.contains(&id);
+    if registering_a_genesis_module {
+        return Err(format!(
+            "{id} is a genesis module — its code changes with `module update`, not `register`"
+        ));
+    }
     let holds_ours = registry_holds(modules, id, code_hash);
     if holds_ours {
         return Ok(Precheck::AlreadyScheduled);
@@ -722,6 +734,13 @@ mod tests {
             precheck(Verb::Update, &[entry(&ours, None)]),
             Ok(Precheck::AlreadyScheduled)
         ));
+        // a genesis id carries no registry entry when it is native, so only the
+        // topology set catches it — lifecycle would refuse it in-kernel
+        let err = registry_precheck(Verb::Register, &[], "identity", &ours).unwrap_err();
+        assert!(err.contains("genesis module"), "{err}");
+        // update is how a genesis module's code changes: no genesis refusal
+        let err = registry_precheck(Verb::Update, &[], "identity", &ours).unwrap_err();
+        assert!(err.contains("unregistered module identity"), "{err}");
     }
 
     #[test]
