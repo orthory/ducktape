@@ -68,9 +68,12 @@ origin's `/r/<id>` (`id` = 32 random bytes, base64url, 43 chars, minted by
 the app). `worker.js` (`run_worker_first = ["/r/*"]`; everything else is
 the static page):
 
-- `POST /r/<id>` — the page's form (`result=<JSON>`); stored in KV
-  (`CEREMONIES`) for 300 s; answers a "Done — return to ducktape" page. A
-  body over 16 KiB is 413, a malformed id 404.
+- `POST /r/<id>` — the page's form (`result=<JSON>`); held by the id's
+  Durable Object (`CEREMONIES`, class `Ceremony`) for 300 s; answers a
+  "Done — return to ducktape" page. A body over 16 KiB is 413, a malformed
+  id 404. An object, not KV: the phone and the app reach different colos,
+  and KV's per-colo read cache kept answering "not yet" for up to 60 s
+  after the result had landed.
 - `GET /r/<id>` — 200 `application/json` with the result exactly once
   (deleted on read); 204 while nothing has arrived.
 
@@ -105,13 +108,13 @@ same three buttons.
 
 ## Deploy
 
-Cloudflare Workers static assets plus the relay Worker and its KV namespace;
-the `custom_domain` route makes wrangler create the DNS record and
-certificate in the zone.
+Cloudflare Workers static assets plus the relay Worker and its Durable
+Object class (the `[[migrations]]` block registers it on first deploy); the
+`custom_domain` route makes wrangler create the DNS record and certificate
+in the zone.
 
 ```
 npx wrangler@4 login                                       # once per machine (OAuth; headless: --browser=false, then curl the callback URL within 120 s)
-npx wrangler@4 kv namespace create CEREMONIES --config ops/auth-page/wrangler.toml   # once; put the printed id into wrangler.toml
 npx wrangler@4 deploy --config ops/auth-page/wrangler.toml
 node ops/auth-page/test.mjs                                # the pure helpers (fragment, DER→raw, SPKI→SEC1) + the relay against a Map
 ```

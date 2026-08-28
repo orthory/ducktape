@@ -1,5 +1,6 @@
 # The WebAuthn relying-party origin: the static page plus the result relay
-# (`worker.js`, `/r/<id>`, KV-backed, five-minute TTL — README.md §Relay).
+# (`worker.js`, `/r/<id>`, one Durable Object per id, five-minute TTL —
+# README.md §Relay).
 #   npx wrangler@4 login && npx wrangler@4 deploy --config ops/auth-page/wrangler.toml
 # `custom_domain = true` makes wrangler create the DNS record and the
 # certificate for the hostname in the same account's zone.
@@ -13,6 +14,12 @@ directory = "."               # index.html only; .assetsignore drops the rest
 binding = "ASSETS"
 run_worker_first = ["/r/*"]
 
-[[kv_namespaces]]
-binding = "CEREMONIES"
-id = "d98c8ed4cd7747648e466ed333fbac8e"   # `npx wrangler@4 kv namespace create CEREMONIES` (2026-08-28)
+# SQLite-backed objects are the ones a free-plan account may create; the
+# migration tag registers the class on first deploy.
+[[durable_objects.bindings]]
+name = "CEREMONIES"
+class_name = "Ceremony"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Ceremony"]

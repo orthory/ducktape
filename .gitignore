@@ -29,3 +29,6 @@ package-lock.json
 
 # Session handoff notes — local working state, never committed.
 HANDOFF.md
+
+# wrangler local state (ops/auth-page)
+.wrangler/
