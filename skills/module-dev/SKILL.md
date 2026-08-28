@@ -17,13 +17,33 @@ External/third-party authoring rides `ducktape-quack`, not this path.
 
 A module in `topology::PRODUCTION` (`bin/node`'s `MODULE_IDS` IS that
 selection) joins the genesis set: every existing workspace fails closed, dev
-networks re-genesis, and `GENESIS_ROOT_HASH` moves. Post-genesis admission
-(lifecycle `ScheduleRegister`) is the path that does NOT move the root:
-`adopt_admitted_modules` composes every registry id on restore and sync, and
-a module admitted after the last checkpoint restores empty and is rebuilt by
-replay — no test drives that path yet (live-upgrade part 4). A genesis module
-⇒ a new genesis — get that agreed before wiring.
-Experiments that shouldn't pay this cost live unwired in `crates/labs`.
+networks re-genesis, and `GENESIS_ROOT_HASH` moves. A genesis module ⇒ a new
+genesis — get that agreed before wiring.
+
+A POST-genesis module does NOT move the root and needs no genesis edit, no
+topology row, and no bin change — it is one operator command against a LIVE
+network:
+
+```
+ducktape module register <id> <component.wasm> [--after N]  # admit a new id
+ducktape module update   <id> <component.wasm> [--after N]  # swap live code
+ducktape module status                                      # the registry
+```
+
+`register`/`update` stage the component at this node's owner-gated admin route
+(which fans it out to every validator and returns their receipts), then drive
+the governance proposal that schedules the admission/swap; it activates at
+`height + N` (`N > MIN_SWAP_LEAD`, i.e. `> 3`; default 50 to leave room for the
+ceremony's own blocks). `status` prints one row per module — `id  active
+pending`, a pending swap carrying `ready k` (validators that signalled) or
+`ready ✓`. `adopt_admitted_modules` composes every admitted id on restore and
+state sync, and a module admitted after the last checkpoint restores empty and
+is rebuilt by replay (unit-pinned in `host_state.rs`; no e2e drives the full
+restore lane yet — live-upgrade part 4).
+
+The CLI stages bytes, it never builds them: the component still comes from
+`make wasm-modules` / `guest-builder` (§2).
+Experiments that shouldn't pay the genesis cost live unwired in `crates/labs`.
 
 ## 1. Native crate — `crates/modules/{apps|system}/<id>`
 
@@ -71,7 +91,15 @@ the module to `INDEX_MODULES` in the Makefile and to `index_guest_wasm()` in
 ASYNC behind a fluent31 changes-mode trigger — views trail the op feed
 observably (`/v1/index/status` `fold.{module}`), never atomically.
 
-## 3. Registration — the topology, then three bins
+## 3. Registration — `module register`, or (for genesis) the topology + three bins
+
+Post-genesis is the whole of this section for most modules: `ducktape module
+register <id> <component.wasm>` admits the id on a live network and `ducktape
+module update <id> <component.wasm>` swaps its code later. The registry is
+consensus state, so nothing below needs editing — every node composes the
+admitted module from it.
+
+The table is the GENESIS path: the flag day that moves the root hash.
 
 | Bin | Runs | What to touch |
 |---|---|---|

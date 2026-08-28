@@ -301,6 +301,34 @@ ducktape module status
 `active` (first 12 hex), `pending` (hash, `ready k/n`, `activation`), or
 `—`.
 
+### Implementation notes (2026-08-28, `feat/module-cli`)
+
+- `status` prints `ready k` / `ready ✓`, not `k/n`: the readiness set's size
+  comes with the registry, the DENOMINATOR does not — `n` is the validator
+  set, a second (governance `Members`) query for a number the `✓` already
+  answers. `k` counts signalling validators; `✓` is the latch closed.
+- The ceremony narration's "each runs:" line prints the SIGNER PUBKEY, not the
+  real argv — it is `drive_membership_ceremony`'s wording, correct for the
+  resident verbs it was written for and wrong for the module verbs (a member
+  must re-run `ducktape module update <id> <component.wasm>`). Unfixed:
+  changing it means teaching the shared ceremony its caller's argv.
+- Validator-node governance is a MAJORITY of the voting power, so on a
+  3-validator net the FIRST run reports `1 of 2 required voting power` and
+  waits; the second member's run casts the deciding ballot and executes. The
+  third run finds the registry already holding the bytes and says so.
+- A lifecycle refusal at EXECUTE time rolls governance's whole op back
+  in-kernel: the proposal keeps its `Open` status until its voting deadline,
+  and there is no cancel-proposal action to clear it. So the CLI refuses every
+  statically visible case BEFORE staging anything — `--after` inside the
+  min-lead, `register` on a registered id or on a genesis id
+  (`topology::PRODUCTION`, which a native module's absent registry entry
+  cannot reveal), `update` on an unregistered id, a second pending swap — and
+  when a tally never settles it names the registry's rules in the error.
+- A dead peer no longer costs the 600 s dispatch reap: `service.open` in the
+  code plane's push is wrapped in `OPEN_TIMEOUT` (15 s,
+  `bin/node/src/code_plane.rs`), so an unreachable validator comes back as a
+  failing receipt and the verb refuses in ~15 s, before any proposal exists.
+
 ## §5 Real-cluster e2e — `bin/node/tests/module_upgrade_e2e.rs`
 
 `#[ignore]` like every cluster suite (runs under `make test`'s
