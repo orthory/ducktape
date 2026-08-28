@@ -510,10 +510,7 @@ impl Relay {
             .map_err(|e| format!("relay client: {e}"))?;
         let started = std::time::Instant::now();
         loop {
-            let response = client
-                .get(&url)
-                .send()
-                .map_err(|e| format!("relay: {e}"))?;
+            let response = client.get(&url).send().map_err(|e| format!("relay: {e}"))?;
             match response.status().as_u16() {
                 200 => {
                     let body = response.text().map_err(|e| format!("relay body: {e}"))?;
@@ -1072,10 +1069,12 @@ mod tests {
     fn a_relay_id_is_43_url_safe_chars_and_names_the_callback() {
         let relay = Relay::at("https://auth.example/");
         assert_eq!(relay.id.len(), 43);
-        assert!(relay
-            .id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert!(
+            relay
+                .id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        );
         assert_eq!(
             relay.callback_url(),
             format!("https://auth.example/r/{}", relay.id)
