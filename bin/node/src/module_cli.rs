@@ -105,18 +105,25 @@ pub(super) fn read_module_status(rpc_addr: &str) -> Result<Vec<lifecycle::Module
 /// glance, short enough that the table stays one line per module.
 const SHORT_HASH: usize = 12;
 
-/// one row per module: `id  active  pending` — pending is `—`, or
-/// `<hash> ready <k|✓> activation <h>`.
+/// one row per module: `id  active  pending`. Either column is `—` when there
+/// is nothing to show; pending is otherwise `<hash> ready <k|✓> activation <h>`.
 pub(super) fn render_status(modules: &[lifecycle::ModuleCode]) -> String {
     let id_width = modules
         .iter()
         .map(|m| m.module_id.len())
         .max()
-        .unwrap_or(2)
+        .unwrap_or_default()
         .max(2);
     let mut out = format!("{:<id_width$}  {:<SHORT_HASH$}  pending\n", "id", "active");
     for m in modules {
-        let active = short(&m.active_code_hash);
+        // `module register` writes an EMPTY active hash and leaves it empty
+        // until the swap activates — the first thing an operator looks at.
+        let never_activated = m.active_code_hash.is_empty();
+        let active = if never_activated {
+            "—".to_string()
+        } else {
+            short(&m.active_code_hash)
+        };
         let pending = match &m.pending {
             None => "—".to_string(),
             Some(swap) => format!(
@@ -127,7 +134,7 @@ pub(super) fn render_status(modules: &[lifecycle::ModuleCode]) -> String {
             ),
         };
         out.push_str(&format!(
-            "{:<id_width$}  {active}  {pending}\n",
+            "{:<id_width$}  {active:<SHORT_HASH$}  {pending}\n",
             m.module_id
         ));
     }
@@ -137,8 +144,7 @@ pub(super) fn render_status(modules: &[lifecycle::ModuleCode]) -> String {
 /// how far a pending swap's readiness has come: the count of validators that
 /// signalled, or `✓` once the latch covered the whole set.
 fn readiness_word(swap: &lifecycle::ScheduledSwap) -> String {
-    let latched = swap.ready;
-    if latched {
+    if swap.ready {
         return "✓".into();
     }
     swap.readiness.len().to_string()
@@ -174,6 +180,18 @@ mod tests {
                     ready: false,
                 }),
             },
+            // `module register`: no active code at all until the swap lands.
+            ModuleCode {
+                module_id: "runs".into(),
+                active_code_hash: Vec::new(),
+                pending: Some(ScheduledSwap {
+                    name: "runs-1".into(),
+                    activation_height: 120,
+                    code_hash: next.clone(),
+                    readiness: Vec::new(),
+                    ready: false,
+                }),
+            },
         ];
         let out = render_status(&modules);
         let lines: Vec<&str> = out.lines().collect();
@@ -182,6 +200,12 @@ mod tests {
         assert_eq!(
             lines[2],
             "hello  abababababab  cdcdcdcdcdcd  ready 2  activation 120"
+        );
+        // the active column stays 12 wide even when it is a single dash, so
+        // the pending hashes line up with the row above.
+        assert_eq!(
+            lines[3],
+            "runs   —             cdcdcdcdcdcd  ready 0  activation 120"
         );
     }
 }
