@@ -113,6 +113,7 @@ on account_ceremony_stepped(next)
   account_ceremony_phase = next.phase
   account_ceremony_qr = next.qr
   account_ceremony_detail = next.detail
+  account_ceremony_left = next.left
   match phase
     CeremonyPhase.done
       account_ceremony_phase = ""
@@ -137,6 +138,7 @@ on account_ceremony_cancel
   account_ceremony_phase = ""
   account_ceremony_qr = ""
   account_ceremony_detail = ""
+  account_ceremony_left = ""
 
 on account_wallet_submit
   return if !connected || !account_exists || account_busy || empty(password)

@@ -503,6 +503,16 @@ impl Relay {
     /// is "not yet". Blocking on purpose — callers run it on a blocking
     /// thread, exactly like [`Listener::wait`].
     pub fn wait(self, deadline: Duration) -> Result<Outcome, String> {
+        self.wait_reporting(deadline, |_| {})
+    }
+
+    /// [`Relay::wait`] that tells `progress` how long the code has left
+    /// before every poll — a terminal's countdown line.
+    pub fn wait_reporting(
+        self,
+        deadline: Duration,
+        mut progress: impl FnMut(Duration),
+    ) -> Result<Outcome, String> {
         let url = self.callback_url();
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -512,6 +522,7 @@ impl Relay {
         let mut polls: u32 = 0;
         loop {
             polls += 1;
+            progress(deadline.saturating_sub(started.elapsed()));
             let response = client.get(&url).send().map_err(|e| {
                 tracing::warn!(target: "ducktape::auth", event = "relay_unreachable", relay = %self.id, polls, error = %e);
                 format!("relay: {e}")
@@ -546,6 +557,12 @@ impl Relay {
             std::thread::sleep(RELAY_POLL.min(deadline - elapsed));
         }
     }
+}
+
+/// `m:ss` of a duration, whole seconds — the countdown beside a QR.
+pub fn countdown(left: Duration) -> String {
+    let secs = left.as_secs();
+    format!("{}:{:02}", secs / 60, secs % 60)
 }
 
 /// the ceremony URL as a QR a phone can scan OFF A TERMINAL: half-block
@@ -1140,6 +1157,28 @@ mod tests {
             .wait(Duration::from_millis(10))
             .unwrap_err();
         assert!(err.contains("did not answer"), "{err}");
+    }
+
+    #[test]
+    fn a_countdown_is_minutes_and_two_digit_seconds() {
+        assert_eq!(countdown(Duration::from_secs(300)), "5:00");
+        assert_eq!(countdown(Duration::from_millis(61_900)), "1:01");
+        assert_eq!(countdown(Duration::ZERO), "0:00");
+    }
+
+    /// the poller hears how long is left before each poll, shrinking.
+    #[test]
+    fn a_relay_reports_the_time_left_before_each_poll() {
+        let base = fake_relay(
+            2,
+            r#"{"op":"get","credentialId":"AQ","authenticatorData":"AQ","clientDataJSON":"AQ","signature":"AQ","userHandle":"KgAAAAAAAAA"}"#,
+        );
+        let mut seen = Vec::new();
+        Relay::at(&base)
+            .wait_reporting(Duration::from_secs(60), |left| seen.push(left))
+            .unwrap();
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert!(seen[0] > seen[1] && seen[1] > seen[2], "{seen:?}");
     }
 
     /// a real ceremony URL renders inside an 80-column terminal: half-block

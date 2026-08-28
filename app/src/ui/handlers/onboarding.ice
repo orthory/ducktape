@@ -189,6 +189,7 @@ on account_probed(next)
       ceremony_phase = ""
       ceremony_qr = ""
       ceremony_detail = ""
+      ceremony_left = ""
       hub_step = HubStep.account
 
 // A node that cannot answer the probe is a node the console cannot use
@@ -213,6 +214,7 @@ on welcome_cancel
   ceremony_phase = ""
   ceremony_qr = ""
   ceremony_detail = ""
+  ceremony_left = ""
 
 // THE CEREMONIES. Each is a stream on ONE lane: the first reading is the QR
 // to show, `working` lines fill the gaps between touches, and `done` /
@@ -253,6 +255,7 @@ on welcome_desktop_done(_ok)
   ceremony_phase = ""
   ceremony_qr = ""
   ceremony_detail = ""
+  ceremony_left = ""
   task window open console -> console_opened _
 
 on ceremony_stepped(next)
@@ -260,6 +263,7 @@ on ceremony_stepped(next)
   ceremony_phase = next.phase
   ceremony_qr = next.qr
   ceremony_detail = next.detail
+  ceremony_left = next.left
   match phase
     CeremonyPhase.done
       mutation_phase = MutationPhase.idle
@@ -281,6 +285,7 @@ on welcome_failed(cause)
   ceremony_phase = ""
   ceremony_qr = ""
   ceremony_detail = ""
+  ceremony_left = ""
   onboarding_error = cause.message
 
 // The console window exists: point it at the picked endpoint, remember the
@@ -302,6 +307,7 @@ on console_opened(id)
   account_ceremony_phase = ""
   account_ceremony_qr = ""
   account_ceremony_detail = ""
+  account_ceremony_left = ""
   invalidate lane=chat_search
   invalidate lane=page_search
   invalidate lane=palette_search

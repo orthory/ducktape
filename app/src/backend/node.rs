@@ -1679,6 +1679,9 @@ pub struct CeremonyStep {
     pub phase: String,
     pub qr: String,
     pub detail: String,
+    /// `show_qr` only: how long the code stays good, `m:ss`, re-sent every
+    /// second; empty on every other phase.
+    pub left: String,
 }
 
 impl CeremonyStep {
@@ -1687,14 +1690,16 @@ impl CeremonyStep {
             phase: "working".into(),
             qr: String::new(),
             detail: detail.into(),
+            left: String::new(),
         }
     }
 
-    fn show_qr(url: String, detail: &str) -> Self {
+    fn show_qr(url: String, detail: &str, left: Duration) -> Self {
         Self {
             phase: "show_qr".into(),
             qr: url,
             detail: detail.into(),
+            left: authpage::countdown(left),
         }
     }
 
@@ -1703,6 +1708,7 @@ impl CeremonyStep {
             phase: "done".into(),
             qr: String::new(),
             detail: String::new(),
+            left: String::new(),
         }
     }
 
@@ -1711,13 +1717,19 @@ impl CeremonyStep {
             phase: "failed".into(),
             qr: String::new(),
             detail: message,
+            left: String::new(),
         }
     }
 }
 
 /// Test seam: Ice reads extern structs but cannot construct one.
 pub fn ceremony_step(phase: String, qr: String, detail: String) -> CeremonyStep {
-    CeremonyStep { phase, qr, detail }
+    CeremonyStep {
+        phase,
+        qr,
+        detail,
+        left: String::new(),
+    }
 }
 
 /// Which welcome door a ceremony came through: a name was typed only on the
@@ -1773,11 +1785,30 @@ pub(crate) async fn qr_ceremony(
     let url = authpage::request_url(authpage::AUTH_PAGE, &request, &relay.callback_url());
     let op = request_op(&request);
     tracing::info!(target: "ducktape::auth", event = "ceremony_shown", surface = "phone", op, relay = %relay.id);
-    step(tx, CeremonyStep::show_qr(url, detail)).await?;
+    step(
+        tx,
+        CeremonyStep::show_qr(url.clone(), detail, CEREMONY_TIMEOUT),
+    )
+    .await?;
+    let started = std::time::Instant::now();
     let waiting = tokio::task::spawn_blocking(move || relay.wait(CEREMONY_TIMEOUT));
-    let outcome = waiting
-        .await
-        .map_err(|_| "the ceremony did not finish".to_string())?;
+    tokio::pin!(waiting);
+    // The countdown: the same QR re-sent each second with the time it has
+    // left, so the screen can show it. The first tick is a second away —
+    // the reading above already carries the full ceiling.
+    let second = Duration::from_secs(1);
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + second, second);
+    let outcome = loop {
+        tokio::select! {
+            joined = &mut waiting => {
+                break joined.map_err(|_| "the ceremony did not finish".to_string())?;
+            }
+            _ = ticks.tick() => {
+                let left = CEREMONY_TIMEOUT.saturating_sub(started.elapsed());
+                step(tx, CeremonyStep::show_qr(url.clone(), detail, left)).await?;
+            }
+        }
+    };
     match &outcome {
         Ok(_) => {
             tracing::info!(target: "ducktape::auth", event = "ceremony_answered", surface = "phone", op)

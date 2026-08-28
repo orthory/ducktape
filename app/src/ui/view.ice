@@ -13,6 +13,7 @@ view
           phase=ceremony_phase
           qr=ceremony_qr
           detail=ceremony_detail
+          left=ceremony_left
           wallets=hub_wallets
           wallet_selected=hub_wallet_selected
           networks=hub_networks
@@ -549,6 +550,7 @@ view
               account_ceremony_phase
               account_ceremony_qr
               account_ceremony_detail
+              account_ceremony_left
               settings_key_state
               settings_key_path
               settings_open_tabs

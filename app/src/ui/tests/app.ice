@@ -451,6 +451,7 @@ test launch_wallets_contract
         phase=""
         qr=""
         detail=""
+        left=""
         step=HubStep.wallets
         wallets=hub_wallets
         wallet_selected=hub_wallet_selected
@@ -578,6 +579,7 @@ test launch_networks_empty_contract
         phase=""
         qr=""
         detail=""
+        left=""
         step=HubStep.networks
         wallets=hub_wallets
         wallet_selected=hub_wallet_selected
@@ -632,6 +634,7 @@ preset ui_welcome_qr
     ceremony_phase = "show_qr"
     ceremony_qr = "https://auth.ducktape.byeongsu.dev/#op=get&challenge=AQID"
     ceremony_detail = "Your phone will confirm with the passkey."
+    ceremony_left = "4:58"
 
 // A connected, signing console whose device key has no account here.
 preset ui_console_no_account
@@ -665,6 +668,7 @@ preset ui_settings_qr
     account_ceremony_phase = "show_qr"
     account_ceremony_qr = "https://auth.ducktape.byeongsu.dev/#op=create&challenge=AQID"
     account_ceremony_detail = "Your phone will create the passkey."
+    account_ceremony_left = "4:58"
     shell_tab = ShellTab.settings
 
 // A signing session that just picked a network — the probe is in flight.
@@ -688,6 +692,7 @@ test welcome_screen_contract
         phase=ceremony_phase
         qr=ceremony_qr
         detail=ceremony_detail
+        left=ceremony_left
         busy=false
         error=""
       events
@@ -698,9 +703,11 @@ test welcome_screen_contract
         welcome_skip -> welcome_skip
   target screen = #welcome/root
   target qr = #welcome/root/welcome-qr
+  target left = #welcome/root/welcome-left
   target cancel = #welcome/root/welcome-cancel
   target create = #welcome/root/welcome-create
   expect exists qr
+  expect exists left
   expect missing create
   expect text "demo" within screen
   click cancel
@@ -755,11 +762,14 @@ test settings_card_shows_the_passkey_qr
         phase=account_ceremony_phase
         qr=account_ceremony_qr
         detail=account_ceremony_detail
+        left=account_ceremony_left
       events
         account_ceremony_cancel -> account_ceremony_cancel
   target qr = #account-ceremony/root/plate-qr
+  target left = #account-ceremony/root/plate-left
   target cancel = #account-ceremony/root/plate-cancel
   expect exists qr
+  expect exists left
   click cancel
   expect account_ceremony_qr == ""
   expect account_busy == false
@@ -904,6 +914,7 @@ test settings_keyboard_scroll_contract
             account_ceremony_phase
             account_ceremony_qr
             account_ceremony_detail
+            account_ceremony_left
             settings_key_state
             settings_key_path
             settings_open_tabs
