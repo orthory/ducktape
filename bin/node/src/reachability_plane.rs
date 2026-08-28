@@ -347,6 +347,11 @@ where
         context
             .child("reachability_out")
             .spawn(move |_ctx| async move {
+                // peer → the last advert endpoint we REFUSED for it. adverts
+                // re-gossip forever, so a pinned one is reported once per
+                // distinct endpoint: the refusal is a standing state, not an
+                // event, and a `warn!` per gossip round would evict the ring.
+                let mut pinned: HashMap<Vec<u8>, std::net::SocketAddr> = HashMap::new();
                 while let Some(event) = ev_rx.recv().await {
                     match event {
                         reachability::ReachabilityEvent::Send { to, bytes } => {
@@ -503,9 +508,32 @@ where
                             >>::decode(&peer.0[..]) else {
                                 continue;
                             };
-                            let Some(addr) = book.observe_advert(&peer_pk, control_endpoint) else {
-                                // unchanged, or pinned by a DNS/overlay hint — silent.
-                                continue;
+                            let addr = match book.observe_advert(&peer_pk, control_endpoint) {
+                                // the advert says what we already answer — silent.
+                                crate::mesh_book::AdvertOutcome::Unchanged => continue,
+                                crate::mesh_book::AdvertOutcome::Pinned(reason) => {
+                                    let key = peer_pk.as_ref().to_vec();
+                                    let already_reported =
+                                        pinned.get(&key) == Some(&control_endpoint);
+                                    if !already_reported {
+                                        pinned.insert(key, control_endpoint);
+                                        // NOT a failure: the address we keep is
+                                        // the reachable one. It is worth one
+                                        // line because a member advertising an
+                                        // address no peer can use is a config
+                                        // fact its operator wants to know.
+                                        tracing::warn!(
+                                            target: "ducktape::reachability",
+                                            node = %pump_label,
+                                            peer = %hex_bytes(&peer_pk.as_ref()[..4]),
+                                            reason,
+                                            "signed advert REFUSED — keeping the address this \
+                                             node can reach"
+                                        );
+                                    }
+                                    continue;
+                                }
+                                crate::mesh_book::AdvertOutcome::Moved(addr) => addr,
                             };
                             let overwrite = commonware_utils::ordered::Map::from_iter_dedup([(
                                 peer_pk.clone(),
