@@ -1,8 +1,18 @@
-# The WebAuthn relying-party origin. Static files only, no Worker code.
+# The WebAuthn relying-party origin: the static page plus the result relay
+# (`worker.js`, `/r/<id>`, KV-backed, five-minute TTL — README.md §Relay).
 #   npx wrangler@4 login && npx wrangler@4 deploy --config ops/auth-page/wrangler.toml
 # `custom_domain = true` makes wrangler create the DNS record and the
 # certificate for the hostname in the same account's zone.
 name = "ducktape-auth"
+main = "worker.js"
 compatibility_date = "2026-08-01"
-assets = { directory = "." }   # index.html only; .assetsignore drops the rest
 routes = [{ pattern = "auth.ducktape.byeongsu.dev", custom_domain = true }]
+
+[assets]
+directory = "."               # index.html only; .assetsignore drops the rest
+binding = "ASSETS"
+run_worker_first = ["/r/*"]
+
+[[kv_namespaces]]
+binding = "CEREMONIES"
+id = "REPLACED-AT-DEPLOY"     # `npx wrangler@4 kv namespace create CEREMONIES --config ops/auth-page/wrangler.toml`
