@@ -7,11 +7,12 @@
 //! backend's genesis set is a NAMED SELECTION validated against it —
 //! [`PRODUCTION`] for the node, [`SIM_BASE`] and [`SIM_VALSET`] for simnode.
 //!
-//! This is a plan, NOT a root-hash. Instantiation stays per-backend on purpose:
-//! node composes the selection over the wasm runtime, simnode/noded compose
-//! the SAME ids over native module structs, and the wasm and native roots differ
-//! by design. One topology never means one root-hash — it means one place the
-//! module SET (and the drift guard on it) lives.
+//! This is a plan, NOT a root-hash. Every backend instantiates it through the
+//! ONE composer (`noded::compose`) — each spec's `code` decides wasm component
+//! or native struct, identically for node, noded and simnode — but their roots
+//! still differ, because a root is composed from a SELECTION and its genesis
+//! bindings, not from this catalog. One topology never means one root-hash — it
+//! means one place the module SET (and the drift guard on it) lives.
 //!
 //! A leaf crate with no dependencies: the catalog is pure `&'static str`, and
 //! the kernel (`host`) knows nothing of the product modules composed over it.
@@ -173,9 +174,9 @@ pub const PRODUCTION: &[&str] = &[
     "runs",
 ];
 
-/// the DEFAULT native set (14) simnode and the noded daemon compose at genesis,
-/// in registry order — the daemon parity lane pins this against noded. Changing
-/// it means changing the daemon.
+/// the DEFAULT set (14) simnode and the noded daemon compose at genesis, in
+/// registry order — `bin/noded/tests/daemon_e2e.rs` pins the same `sim_base`
+/// against noded. Changing it means changing the daemon.
 pub const SIM_BASE: &[&str] = &[
     "chat",
     "saga",

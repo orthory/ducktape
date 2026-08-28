@@ -420,8 +420,9 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
             Some(origin.clone()),
         ),
         // gateway — the account's founding key signs a route naming `node` as
-        // its publisher. the sim wires `Gateway::new(.., None, "local")` (no
-        // valset), so the only ceremony is: the origin is a member of the
+        // its publisher. the composer binds the gateway guest's genesis
+        // `__config` to chain id "local" and the default sim genesis has no
+        // valset, so the only ceremony is: the origin is a member of the
         // route's account, and a current Ed25519 member signs.
         (
             "gateway",

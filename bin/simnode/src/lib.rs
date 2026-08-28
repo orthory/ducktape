@@ -371,7 +371,8 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
     });
 
     // the status module list and the index tier both extend only under valset
-    // keys; the default path stays the exact 14-module set the parity lane pins.
+    // keys; the default path stays the exact 14-module set `daemon_e2e` pins
+    // against noded.
     let module_ids: Vec<&'static str> = if valset_keys.is_empty() {
         topology::SIM_BASE.to_vec()
     } else {

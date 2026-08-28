@@ -1,8 +1,9 @@
 //! Genesis-composition parity: the sim's default (and `--with-valset`) genesis
 //! sets ARE the `sim_base` (+ `sim_valset`) selections of the single-source
 //! `topology`, composed through the SAME `noded::compose::compose` bin/node
-//! runs. The daemon parity lane pins the same `sim_base` against noded; this
-//! pins the sim composer against the topology it draws from with a golden hash,
+//! runs. `bin/noded/tests/daemon_e2e.rs` pins the same `sim_base` against
+//! noded; this pins the sim composer against the topology it draws from with a
+//! golden hash,
 //! and pins that composing `sim_valset` gives governance its code registry.
 
 mod harness;
