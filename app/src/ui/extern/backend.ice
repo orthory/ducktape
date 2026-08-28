@@ -290,7 +290,7 @@ extern crate::backend
   // first reading is the QR to show and whose last is `done` or `failed`;
   // `phase` is `working | show_qr | done | failed`. The phone's answer comes
   // back through the auth host's relay (`authpage::Relay`).
-  CeremonyStep(phase:str, qr:str, detail:str)
+  CeremonyStep(phase:str, qr:str, detail:str, left:str)
   stream create_account_by_qr(rpc:str, password:str, chain_id:str, name:str) -> CeremonyStep
   stream login_by_qr(rpc:str, password:str, chain_id:str) -> CeremonyStep
   stream add_passkey_by_qr(rpc:str, password:str, chain_id:str, label:str) -> CeremonyStep

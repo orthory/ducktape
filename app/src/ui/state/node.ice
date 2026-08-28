@@ -35,6 +35,7 @@ state
   account_ceremony_phase = ""
   account_ceremony_qr = ""
   account_ceremony_detail = ""
+  account_ceremony_left = ""
   // "Join with a ticket": a ticket another device minted for THIS key.
   account_join_draft = ""
 

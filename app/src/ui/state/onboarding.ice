@@ -25,6 +25,7 @@ state
   ceremony_phase = ""
   ceremony_qr = ""
   ceremony_detail = ""
+  ceremony_left = ""
 
 // Capability-bearing text is consumed once by Rust and cannot enter presets,
 // snapshots, captures, routes, or accessibility output.

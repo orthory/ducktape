@@ -580,8 +580,14 @@ fn phone_ceremony(
         "scan this with your phone (or open the URL there):\n\n{}\n    {url}\n",
         authpage::terminal_qr(&url)?
     );
-    eprintln!("waiting for the phone…");
-    Ok(relay.wait(PHONE_CEREMONY_TIMEOUT)?)
+    let outcome = relay.wait_reporting(PHONE_CEREMONY_TIMEOUT, |left| {
+        eprint!(
+            "\rwaiting for the phone… {} left ",
+            authpage::countdown(left)
+        );
+    });
+    eprintln!();
+    Ok(outcome?)
 }
 
 /// touch 1 of a wallet: it signs a nonce'd reveal message and its key is

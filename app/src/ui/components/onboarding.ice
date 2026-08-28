@@ -13,7 +13,7 @@
 // only resolve local handlers and declared emissions, so an app handler is
 // never named inside this file.
 
-component HubColumn(step:HubStep, wallets:[WalletInfo], wallet_selected:str, networks:[HubNetwork], selected:str, hidden:i64, name:str, invite:str, steps:[ProvisionStep], step_index:i64, height:i64, tier:str, error:str, busy:bool, restore_empty:bool, join_empty:bool, network:str, bind name_draft:str, phase:str, qr:str, detail:str)
+component HubColumn(step:HubStep, wallets:[WalletInfo], wallet_selected:str, networks:[HubNetwork], selected:str, hidden:i64, name:str, invite:str, steps:[ProvisionStep], step_index:i64, height:i64, tier:str, error:str, busy:bool, restore_empty:bool, join_empty:bool, network:str, bind name_draft:str, phase:str, qr:str, detail:str, left:str)
   emits
     pick_wallet(str)
     unlock_submit(str)
@@ -141,6 +141,7 @@ component HubColumn(step:HubStep, wallets:[WalletInfo], wallet_selected:str, net
               phase
               qr
               detail
+              left
               busy
               error
             forward
@@ -554,7 +555,7 @@ component PasswordScreen(busy:bool, error:str)
 // account (one scan). `phase` is the ceremony stream's reading — "" shows
 // the doors, `show_qr` the code, `working` the line between touches. The
 // desktop browser path stays one link under the QR.
-component WelcomeScreen(network:str, bind name_draft:str, phase:str, qr:str, detail:str, busy:bool, error:str)
+component WelcomeScreen(network:str, bind name_draft:str, phase:str, qr:str, detail:str, left:str, busy:bool, error:str)
   emits
     welcome_create_submit(str)
     welcome_login_submit
@@ -594,6 +595,13 @@ component WelcomeScreen(network:str, bind name_draft:str, phase:str, qr:str, det
               line-h=1.5
               align-x=center
               @text-caption
+          // The code's remaining life — the same reading re-sent each second.
+          text left #welcome-left
+            with
+              size=11.0
+              wrap=none
+              font=code_medium
+              @text-hint
           button "Use this computer's passkey instead" #welcome-desktop -> emit(welcome_desktop)
             with
               disabled=busy
@@ -1897,7 +1905,7 @@ component AccountBanner(connected:bool, account_exists:bool, dismissed:bool, pas
 // A PHONE CEREMONY ON A CARD: the QR while the phone is asked, the line
 // while the chain is; an empty phase renders nothing. The Settings card's
 // reading of the same stream the welcome shows full-size.
-component CeremonyPlate(phase:str, qr:str, detail:str)
+component CeremonyPlate(phase:str, qr:str, detail:str, left:str)
   emits
     account_ceremony_cancel()
   col #root w=fill gap=8.0 align=center
@@ -1909,6 +1917,12 @@ component CeremonyPlate(phase:str, qr:str, detail:str)
           size=12.0
           align-x=center
           @text-meta
+      text left #plate-left
+        with
+          size=11.0
+          wrap=none
+          font=code_medium
+          @text-hint
       button "Cancel" #plate-cancel -> emit(account_ceremony_cancel)
         with
           h=26.0
