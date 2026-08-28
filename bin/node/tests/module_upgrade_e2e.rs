@@ -70,6 +70,8 @@ fn inc_and_confirm(cluster: &Cluster, submit_on: usize, expect: u64) {
     }
 }
 
+/// governance's view of proposal `id` via node `idx`: (status, ballots cast);
+/// `None` until visible.
 fn proposal_status(cluster: &Cluster, idx: usize, id: &str) -> Option<(ProposalStatus, usize)> {
     let reply = cluster.query(
         idx,
@@ -243,7 +245,10 @@ fn a_registered_module_survives_a_live_swap_a_restart_and_statesync() {
         .expect("joiner printed a synced root-hash")
         .trim();
     println!("sync-only joiner synced root_hash={synced}");
-    assert_eq!(synced, root_before_sync, "joiner composed a DIFFERENT root-hash");
+    assert_eq!(
+        synced, root_before_sync,
+        "joiner composed a DIFFERENT root-hash"
+    );
 
     // the joiner boots LIVE over the synced storage (a sync-only run binds
     // no rpc). a non-genesis key always enters the replica park: it syncs
@@ -256,15 +261,18 @@ fn a_registered_module_survives_a_live_swap_a_restart_and_statesync() {
     println!("node 3 promoted: validator at epoch 1 {promoted}");
     let live_synced = cluster.marker(3, "synced root_hash=");
     println!("node 3 live boot synced root_hash={live_synced:?}");
+    assert_eq!(
+        live_synced.as_deref(),
+        Some(synced),
+        "the seated joiner re-synced a different root"
+    );
     let seen = cluster.await_committed(0, "hello count == 101 on the joiner", ACTIVATE, || {
         count(&cluster, 3).filter(|c| *c == 101)
     });
     assert_eq!(seen, 101);
-    let root_with_joiner = cluster.await_committed(
-        0,
-        "all four root-hashes to agree",
-        FINALIZE,
-        || root_hashes_agree(&cluster, &[0, 1, 2, 3]),
-    );
+    let root_with_joiner =
+        cluster.await_committed(0, "all four root-hashes to agree", FINALIZE, || {
+            root_hashes_agree(&cluster, &[0, 1, 2, 3])
+        });
     assert_eq!(root_with_joiner, root_before_sync);
 }
