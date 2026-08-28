@@ -18,6 +18,10 @@ serde_json = { workspace = true }
 rand = { workspace = true }
 # the relay poll (`Relay::wait`) — blocking, like the listener it sits beside.
 reqwest = { workspace = true }
+tracing = { workspace = true }
+# `terminal_qr`: the ceremony URL as half-block cells for a headless box's
+# terminal. Core only — no image/svg renderers.
+qrcode = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 keyscheme = { workspace = true, features = ["testkit"] }

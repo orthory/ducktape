@@ -97,6 +97,9 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt"
 # are emitted anyway because `println!` is not logging and a subscriber is the
 # only missing half; when one is installed they light up without a rewrite.
 tracing.workspace = true
+# the device key's name is the host's (`device_key_name`); a kernel call
+# works on every OS the app runs on.
+gethostname = "1"
 zeroize.workspace = true
 iced = { version = "=0.14.0", default-features = false, features = ["advanced", "highlighter", "image-without-codecs", "lazy", "markdown", "svg", "tokio", "wgpu", "x11"] }
 ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "1334f31274e97dcdc43c5d6ba43a0a645a6eed8a", default-features = false, features = ["log-timeline", "terminal"] }

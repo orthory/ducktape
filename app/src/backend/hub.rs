@@ -194,13 +194,11 @@ pub fn hub_entry_step(wallets: Vec<WalletInfo>) -> crate::HubStep {
 }
 
 /// The name an auto-minted device key gets: this host's name, in the
-/// keystore's grammar; `device` when the host has none to give.
+/// keystore's grammar; `device` when the host has none to give. Asked of
+/// the kernel (`gethostname`), not `/etc/hostname` — macOS has no such file
+/// and a GUI app inherits no `HOSTNAME`.
 pub fn device_key_name() -> String {
-    let host = std::fs::read_to_string("/etc/hostname")
-        .ok()
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .or_else(|| std::env::var("COMPUTERNAME").ok())
-        .unwrap_or_default();
+    let host = gethostname::gethostname().to_string_lossy().into_owned();
     let name = keystore::wallet::sanitize_name(host.trim());
     if name.is_empty() {
         return "device".to_string();

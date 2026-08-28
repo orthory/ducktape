@@ -87,9 +87,10 @@ polling a ceremony. The client half is `authpage::Relay`.
 The client half is `crates/authpage` (the fragment URL, the loopback
 listener, the result JSON, and the frame/consent builders); the CLI verbs
 are `ducktape account key add --passkey|--eth`, `create --eth` and
-`login` (`--no-browser` prints the URL for a headless box, `--auth-page`
-points at another deployment); the app's Settings › Account card has the
-same three buttons.
+`login` (`--no-browser` prints the URL and a terminal QR for a phone to
+scan — the result returns through the relay, §Relay — for a headless box;
+`--auth-page` points at another deployment); the app's Settings › Account
+card has the same three buttons.
 
 - **A passkey is registered in two ceremonies.** `create` yields the public
   key but a `webauthn.create` attestation is not a possession proof
