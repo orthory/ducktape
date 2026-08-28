@@ -219,9 +219,9 @@ pub(crate) fn wire_reachability_plane<S, R>(
     wireguard_listen: std::net::SocketAddr,
     overlay_slot: overlay_net::userspace::StackSlot,
     advertised: Ingress,
-    // an explicit WireGuard advertise override (node.toml
-    // `wireguard_advertised`); `None` keeps today's derivation from
-    // `wireguard_listen` (see `reachability_plane`'s body).
+    // the WireGuard endpoint this node advertises, decided once at config
+    // resolution (`config::resolve`, the invite's own derivation); `None` =
+    // no dialable underlay host, the plane runs endpoint-less.
     wireguard_advertised: Option<Ingress>,
     coordinators: Vec<Ingress>,
     intro_listen: Option<std::net::SocketAddr>,
@@ -612,12 +612,13 @@ async fn reachability_plane(
             return;
         }
     };
-    // an UNSPECIFIED wireguard_listen address (0.0.0.0/[::], cmd_join's
-    // NAT'd-joiner default) means "bind the port, advertise NO endpoint":
-    // the plane runs endpoint-less — peers install this node's tunnel
+    // the bind address only BINDS: what this node advertises was decided at
+    // config resolution (`wireguard_advertised_override`, the invite's own
+    // derivation — explicit override, else the dialable advertised/listen
+    // host at the WireGuard port). `None` there means no dialable underlay
+    // host: the plane runs endpoint-less — peers install this node's tunnel
     // without an endpoint and this node's own initiations complete it
-    // (WireGuard roams to the authenticated source). A concrete address
-    // advertises exactly as before.
+    // (WireGuard roams to the authenticated source).
     if wireguard_listen.port() == 0 {
         tracing::error!(
             target: "ducktape::reachability",
@@ -662,27 +663,8 @@ async fn reachability_plane(
                 return;
             }
         },
-        // no override: derive from the bind address exactly like today —
-        // unspecified means endpoint-less/roaming, concrete advertises itself.
-        None if wireguard_listen.ip().is_unspecified() => None,
-        None => match wireguard::Endpoint::new(
-            wireguard_listen.ip(),
-            wireguard_listen.port(),
-            wireguard::Transport::Udp,
-            &policy,
-        ) {
-            Ok(endpoint) => Some(endpoint),
-            Err(err) => {
-                tracing::error!(
-                    target: "ducktape::reachability",
-                    node = %label,
-                    error = ?err,
-                    reason = "wireguard_listen_rejected",
-                    "reachability plane NOT started"
-                );
-                return;
-            }
-        },
+        // no dialable underlay host: endpoint-less/roaming.
+        None => None,
     };
     let mut coords: Vec<std::net::SocketAddr> = Vec::new();
     for ingress in &coordinators {

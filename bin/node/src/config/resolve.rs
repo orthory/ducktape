@@ -120,9 +120,10 @@ pub struct Resolved {
     /// boot, the `primary_coordinator` discipline. `None` = derive the relay
     /// from the ambient coordinator (its host at TCP/443).
     pub coordinator_relay: Option<String>,
-    /// the WireGuard endpoint this node advertises, resolved once
-    /// (`NodeToml::wireguard_advertised`); `None` = derive it from
-    /// `wireguard_listen` exactly like today (see `reachability_plane.rs`).
+    /// the WireGuard endpoint this node advertises in its signed mesh record,
+    /// decided ONCE here (`resolved_wireguard_advertised`) — the same answer
+    /// the invite blob hands out; `None` = no dialable underlay host, the
+    /// plane runs endpoint-less and roams.
     pub wireguard_advertised: Option<Ingress>,
     /// the COMPUTE SERVICE's backend — `Some` only when both halves agree:
     /// the operator's `[sandbox]` table says HOW runs are isolated on this
@@ -524,7 +525,12 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         raw.wireguard_advertised_value(),
         wireguard_listen,
     )?;
-    let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised_value())?;
+    let wireguard_advertised = resolved_wireguard_advertised(
+        raw.wireguard_advertised_value(),
+        Some(&raw.advertised),
+        &raw.listen,
+        wireguard_listen,
+    )?;
     let compute_backend = gate_on_compute_grant(service.sandbox.as_ref(), &service.workspace)?;
     // the descriptor IS the genesis code set here: its hashes are already in
     // the namespace fingerprint, so the bundle beside it only has to match.
@@ -575,10 +581,9 @@ fn parse_wireguard_listen(raw: Option<&str>) -> Result<Option<SocketAddr>, Strin
     .transpose()
 }
 
-/// resolve `wireguard_advertised` into a dial ingress: absent = "derive from
-/// `wireguard_listen`" (the caller's job — see `reachability_plane.rs`), an
-/// explicit value must be dialable (a hostname is kept VERBATIM, resolved
-/// once at plane start, same discipline as the mesh `advertised`).
+/// parse an EXPLICIT `wireguard_advertised` into a dial ingress: it must be
+/// dialable (a hostname is kept VERBATIM, resolved once at plane start, same
+/// discipline as the mesh `advertised`).
 fn parse_wireguard_advertised(raw: Option<&str>) -> Result<Option<Ingress>, String> {
     match raw {
         None => Ok(None),
@@ -587,6 +592,41 @@ fn parse_wireguard_advertised(raw: Option<&str>) -> Result<Option<Ingress>, Stri
             .map(Some)
             .ok_or_else(|| format!("wireguard_advertised addr {a:?} is not dialable")),
     }
+}
+
+/// the WireGuard endpoint this node ADVERTISES, decided once for both of its
+/// consumers — the reachability plane's signed mesh record and the invite
+/// blob — so a peer never learns one endpoint from the invite and another
+/// (or none) from the mesh. an explicit `wireguard_advertised` wins verbatim;
+/// otherwise the host the invite hands out ([`invite_wireguard_endpoint`]: a
+/// concrete `wireguard_listen` IP, else `advertised`/`listen`) at the
+/// WireGuard port. a node with no dialable underlay host at all (`advertised
+/// = "overlay"`, unspecified binds) advertises NO endpoint: peers install its
+/// tunnel without one and its own initiations complete it (WireGuard roams to
+/// the authenticated source).
+///
+/// the plane used to derive this from `wireguard_listen` ALONE: two joiners
+/// on one LAN, both bound `0.0.0.0` with a dialable `advertised`, both
+/// advertised no endpoint, and neither could ever initiate the other's
+/// tunnel — consensus ran over the underlay, only the code plane was dark.
+fn resolved_wireguard_advertised(
+    explicit: Option<&str>,
+    advertised: Option<&str>,
+    listen: &str,
+    wireguard_listen: Option<SocketAddr>,
+) -> Result<Option<Ingress>, String> {
+    if let Some(explicit) = parse_wireguard_advertised(explicit)? {
+        return Ok(Some(explicit));
+    }
+    let Some(wg) = wireguard_listen else {
+        return Ok(None);
+    };
+    let Ok(derived) = invite_wireguard_endpoint(advertised, listen, wg, None) else {
+        return Ok(None);
+    };
+    // a derived value that is not dialable (a port-0 bind) is endpoint-less,
+    // not a config error — only an EXPLICIT value is held to that.
+    ingress_of(&derived).map_err(|e| format!("wireguard endpoint: {e}"))
 }
 
 /// the DIRECT invite intro listener the plane binds: [`resolved_invite_listen`],
@@ -813,7 +853,12 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
         &ed25519::PrivateKey::from_seed(id).public_key(),
     )?;
 
-    let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised.as_deref())?;
+    let wireguard_advertised = resolved_wireguard_advertised(
+        raw.wireguard_advertised.as_deref(),
+        raw.advertised.as_deref(),
+        &raw.listen,
+        wireguard_listen,
+    )?;
     let gateway_listen = raw
         .gateway_listen
         .clone()
@@ -1628,11 +1673,11 @@ mod tests {
         }
     }
 
-    /// `wireguard_advertised` (change 3, issue #331): the key ABSENT resolves
-    /// to `None` — `reachability_plane.rs` then derives it from
-    /// `wireguard_listen` exactly like today; an explicit concrete override
-    /// parses to a socket ingress, and a hostname stays a hostname (DNS
-    /// deferred to plane start, same discipline as the mesh `advertised`).
+    /// `wireguard_advertised` (change 3, issue #331): the key ABSENT derives
+    /// the endpoint the invite hands out — the dialable listen host at the
+    /// WireGuard port; an explicit concrete override parses to a socket
+    /// ingress, and a hostname stays a hostname (DNS deferred to plane start,
+    /// same discipline as the mesh `advertised`).
     #[test]
     fn wireguard_advertised_key_absent_defaults_and_explicit_value_parses() {
         let dir = tmp("wg-advertised-key");
@@ -1644,8 +1689,9 @@ mod tests {
         std::fs::write(dir.join("node.toml"), &base).expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve absent");
         assert_eq!(
-            resolved.wireguard_advertised, None,
-            "absent key: reachability_plane.rs derives it from wireguard_listen, unchanged"
+            resolved.wireguard_advertised,
+            Some(Ingress::Socket("127.0.0.1:51820".parse().unwrap())),
+            "absent key: the dialable listen host at the wireguard port — what the invite hands out"
         );
 
         std::fs::write(
@@ -1851,6 +1897,44 @@ mod tests {
             Some("0.0.0.0:52324".parse().unwrap()),
             "a dialable advertised keeps the direct intro listener"
         );
+    }
+
+    /// the endpoint a peer learns from this node's signed mesh record is the
+    /// one the invite blob hands out — ONE derivation. the real-network lane
+    /// found the plane deriving from `wireguard_listen` alone: two joiners on
+    /// one LAN, both bound `0.0.0.0`, both advertised no endpoint, and
+    /// neither could ever initiate the other's tunnel.
+    #[test]
+    fn wireguard_endpoint_derives_from_advertised_when_the_bind_is_unspecified() {
+        let dir = tmp("wg-advertised-derived");
+        let bundle = fake_bundle(&dir);
+        std::fs::write(
+            dir.join("node.toml"),
+            format!(
+                "id = 0\nlisten = \"0.0.0.0:52272\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
+                 advertised = \"192.0.2.7:52272\"\nwireguard_listen = \"0.0.0.0:51820\"\n{bundle}"
+            ),
+        )
+        .expect("write");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve advertised");
+        assert_eq!(
+            resolved.wireguard_advertised,
+            Some(Ingress::Socket("192.0.2.7:51820".parse().unwrap())),
+            "the advertised host at the wireguard port"
+        );
+
+        // no dialable underlay host at all (the desktop shape): endpoint-less,
+        // and that is a shape, never an error.
+        std::fs::write(
+            dir.join("node.toml"),
+            format!(
+                "id = 0\nlisten = \"[::]:52272\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
+                 advertised = \"overlay\"\nwireguard_listen = \"[::]:51820\"\n{bundle}"
+            ),
+        )
+        .expect("write");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve overlay");
+        assert_eq!(resolved.wireguard_advertised, None);
     }
 
     #[test]

@@ -185,6 +185,18 @@ pub fn apply_block_to_index(
     record: Option<Vec<u8>>,
     dispatches: &[host::DispatchRecord],
 ) {
+    // a poisoned store refuses every write until an operator rebuilds it, and
+    // the ONE error below named that remedy when it happened. re-logging it
+    // per block is a log bomb (8k lines in an hour on a real network) that
+    // evicts the very line explaining what poisoned the store.
+    if index.is_poisoned() {
+        tracing::debug!(
+            target: "ducktape::consensus",
+            height,
+            "index apply skipped: store poisoned"
+        );
+        return;
+    }
     let ops = indexer::BlockOps {
         record,
         ..index_block_ops(height, consensus_time, dispatches)

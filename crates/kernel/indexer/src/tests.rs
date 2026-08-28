@@ -219,10 +219,13 @@ fn scan_pages_with_cursor() {
 }
 
 #[test]
-fn unknown_module_is_refused_and_poisons() {
+fn an_undeclared_modules_ops_are_skipped_not_poisoned() {
+    // a module admitted after boot (lifecycle register) has no database
+    // here: its ops write nothing, every declared module's watermark still
+    // advances past the block, and the store keeps taking writes.
     let dir = tempfile::tempdir().unwrap();
     let store = bare_store(dir.path());
-    let bad = block(
+    let admitted = block(
         1,
         vec![AppliedOp {
             module: "ghost".into(),
@@ -231,17 +234,22 @@ fn unknown_module_is_refused_and_poisons() {
             assigned: Vec::new(),
         }],
     );
+    store.apply_block(&admitted).unwrap();
+    assert!(!store.is_poisoned());
+    assert_eq!(
+        store.applied_height("chat").unwrap(),
+        1,
+        "quiet declared modules advance past the admitted module's block"
+    );
+    store
+        .apply_block(&block(2, vec![chat_op(b"{}")]))
+        .unwrap();
+    assert_eq!(store.applied_height("chat").unwrap(), 2);
+    // asked for BY NAME the undeclared id is still its own error.
     assert!(matches!(
-        store.apply_block(&bad),
+        store.view("ghost", b"count"),
         Err(Error::UnknownModule(_))
     ));
-    assert!(store.is_poisoned());
-    // writes refuse from now on; reads keep serving.
-    assert!(matches!(
-        store.apply_block(&block(2, vec![chat_op(b"{}")])),
-        Err(Error::Poisoned)
-    ));
-    assert!(store.scan("chat", b"", None, 10).is_ok());
 }
 
 // ----------------------------------------------------------------------------
