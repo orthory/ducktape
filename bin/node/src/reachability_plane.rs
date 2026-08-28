@@ -504,7 +504,7 @@ where
                                 continue;
                             };
                             let Some(addr) = book.observe_advert(&peer_pk, control_endpoint) else {
-                                // unchanged, or pinned by a DNS hint — silent.
+                                // unchanged, or pinned by a DNS/overlay hint — silent.
                                 continue;
                             };
                             let overwrite = commonware_utils::ordered::Map::from_iter_dedup([(
