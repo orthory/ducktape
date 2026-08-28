@@ -1241,6 +1241,10 @@ pub(super) fn drive_proposal_ceremony(
     wanted: governance::GovAction,
     matches: &dyn Fn(&governance::GovAction) -> bool,
 ) -> Result<CeremonyOutcome, Box<dyn std::error::Error>> {
+    // a matcher that rejects its own action would make every member mint a
+    // fresh proposal that no one else joins — the exact failure the matcher
+    // exists to prevent.
+    debug_assert!(matches(&wanted), "the matcher must accept the action it proposes");
     use governance::{GovMsg, ProposalStatus};
     use governance::{GovQuery, GovReply, decode_reply, encode_query};
     let proposals = match decode_reply(&rpc_query(
@@ -1976,7 +1980,9 @@ mod tests {
             GovAction::UpdateModule {
                 name: "x".into(),
                 module_id: "hello".into(),
-                activation_height: 60,
+                // the founder computed 61; this member computes 60 below —
+                // the matcher must join anyway.
+                activation_height: 61,
                 code_hash: hash.clone(),
             },
         );
