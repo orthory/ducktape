@@ -57,29 +57,49 @@ assert.deepEqual(raw.slice(0, 32), r);
 assert.deepEqual(raw.slice(32), Uint8Array.from([0, ...s]));
 assert.throws(() => derToRawSig(Uint8Array.from([0x31])), /not a DER sequence/);
 
-// the relay worker, with a Map standing in for KV: 204 until the POST, the
-// JSON exactly once, 204 again; a malformed id is 404, an oversized body 413,
+// the relay worker, with a Map standing in for each object's storage: 204
+// until the POST, the JSON exactly once, 204 again, and the expiry alarm
+// clears an untaken result; a malformed id is 404, an oversized body 413,
 // and every other path is the static asset.
-const { handle } = await import(new URL("./worker.js", import.meta.url));
-const store = new Map();
-const kv = {
-  async put(k, v, opts) { store.set(k, { v, ttl: opts?.expirationTtl }); },
-  async get(k) { return store.get(k)?.v ?? null; },
-  async delete(k) { store.delete(k); },
+const { handle, Ceremony } = await import(new URL("./worker.js", import.meta.url));
+const objects = new Map();
+const namespace = {
+  idFromName: (name) => name,
+  get(name) {
+    if (!objects.has(name)) {
+      const store = new Map();
+      const storage = {
+        alarm: null,
+        async put(k, v) { store.set(k, v); },
+        async get(k) { return store.get(k); },
+        async deleteAll() { store.clear(); },
+        async setAlarm(at) { this.alarm = at; },
+        async deleteAlarm() { this.alarm = null; },
+      };
+      objects.set(name, { object: new Ceremony({ storage }), storage });
+    }
+    const { object } = objects.get(name);
+    return { fetch: (request) => object.fetch(request) };
+  },
 };
-const env = { CEREMONIES: kv, ASSETS: { fetch: async () => new Response("asset", { status: 200 }) } };
+const env = { CEREMONIES: namespace, ASSETS: { fetch: async () => new Response("asset", { status: 200 }) } };
 const relay = (path, init) => handle(new Request(`${ORIGIN}${path}`, init), env);
 const post = (path, body) => relay(path, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body });
 assert.equal((await relay(`/r/${id}`)).status, 204);
 const posted = await post(`/r/${id}`, `result=${encodeURIComponent('{"op":"get"}')}`);
 assert.equal(posted.status, 200);
 assert.match(await posted.text(), /return to ducktape/);
-assert.equal(store.get(id).ttl, 300);
+const slot = objects.get(id);
+assert.ok(slot.storage.alarm >= Date.now() + 299_000 && slot.storage.alarm <= Date.now() + 301_000, "expiry armed at 300 s");
 const taken = await relay(`/r/${id}`);
 assert.equal(taken.status, 200);
 assert.equal(taken.headers.get("content-type"), "application/json");
 assert.equal(await taken.text(), '{"op":"get"}');
+assert.equal(slot.storage.alarm, null, "a taken result disarms its expiry");
 assert.equal((await relay(`/r/${id}`)).status, 204);
+await post(`/r/${id}`, `result=${encodeURIComponent('{"op":"get","late":1}')}`);
+await slot.object.alarm();
+assert.equal((await relay(`/r/${id}`)).status, 204, "the alarm clears an untaken result");
 assert.equal((await relay("/r/short")).status, 404);
 assert.equal((await post(`/r/${id}`, "nothing=here")).status, 400);
 assert.equal((await post(`/r/${id}`, `result=${"x".repeat(17 * 1024)}`)).status, 413);

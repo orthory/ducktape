@@ -142,19 +142,25 @@ correction `medium`).
 ## Relay — `ops/auth-page`
 
 - `worker.js` with `run_worker_first = ["/r/*"]`; assets keep serving
-  `index.html`. KV binding `CEREMONIES`.
+  `index.html`. Durable Object binding `CEREMONIES` (class `Ceremony`, one
+  object per id, SQLite-backed). NOT KV: the phone and the app reach
+  different colos, and KV's per-colo read cache answered "not yet" for up
+  to 60 s after the result had landed (seen live 2026-08-28 — a Mac
+  polling NRT while the phone posted at HKG).
   - `POST /r/<id>` — body `application/x-www-form-urlencoded`, field
-    `result`; `put(id, result, { expirationTtl: 300 })`; responds 200
-    `text/html` "Done — return to the app" (what the phone shows). Refuses
-    a body over 16 KiB and an `id` that is not 43 chars of base64url.
+    `result`; the object stores it and arms a 300 s expiry alarm; responds
+    200 `text/html` "Done — return to the app" (what the phone shows).
+    Refuses a body over 16 KiB and an `id` that is not 43 chars of
+    base64url.
   - `GET /r/<id>` — 200 `application/json` with the stored result, then
-    `delete`; 204 while absent. No CORS needed (the app is not a browser).
+    the object clears itself; 204 while absent. No CORS needed (the app is
+    not a browser).
 - `index.html`: `loopbackOnly(cb)` → `allowedCallback(cb)`: loopback as
   today, OR same-origin `/r/<id>`. Nothing else in the page changes; the
   form POST is the same delivery.
 - `README.md`: the `cb` row and a "Relay" section (the contract pin).
   `test.mjs`: `allowedCallback` accepts/refuses; `worker.js` exercised with a
-  Map-backed KV (`put`/`get`/`delete`), dependency-free.
+  Map standing in for each object's storage, dependency-free.
 - Threat model: the relayed body is an assertion or a created credential's
   public key — public data. The app verifies every assertion against the
   account's keys (`login_consent`, `passkey_frame`); a forged or replayed
@@ -202,7 +208,7 @@ CLI QR; any identity-module or wire change.
 
 ## Deploy
 
-`npx wrangler kv namespace create CEREMONIES` (id into `wrangler.toml`),
-`npx wrangler deploy` — the same account/OAuth path as the page itself
+`npx wrangler deploy` (the `[[migrations]]` block registers the object
+class on first deploy) — the same account/OAuth path as the page itself
 (`ops/auth-page/README.md`). The relay is live before the app PR merges, so
 `make dev` on `dev` can exercise it.

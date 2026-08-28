@@ -1,11 +1,18 @@
 // The result relay. A phone that scanned the app's QR runs the ceremony on
 // this origin and POSTs the result to /r/<id>; the app, which the phone cannot
-// reach, polls the same path. KV holds a result for five minutes and a GET
-// hands it out exactly once. Every other path is the static page.
+// reach, polls the same path. One Durable Object per id holds the result for
+// five minutes and a GET hands it out exactly once. Every other path is the
+// static page.
 //
-// Contract pin: README.md §Relay. Tests: test.mjs (a Map stands in for KV).
+// A Durable Object, not KV: the phone and the app land on different colos
+// (a Mac in Seoul polled NRT while its phone posted at HKG), and KV serves a
+// per-colo read cache — including "not yet" — for 60 s, so the app kept
+// seeing 204 after the answer had landed. The object is one place.
+//
+// Contract pin: README.md §Relay. Tests: test.mjs (a Map stands in for the
+// object's storage).
 const ID = /^\/r\/([A-Za-z0-9_-]{43})$/;
-const TTL_SECONDS = 300;
+const TTL_MS = 300 * 1000;
 const MAX_BODY = 16 * 1024;
 
 const DONE_PAGE = `<!doctype html>
@@ -21,26 +28,47 @@ const DONE_PAGE = `<!doctype html>
 </style></head>
 <body><main><div class="brand">🦆 ducktape</div><h1>Done</h1><p>You can close this and return to ducktape.</p></main></body></html>`;
 
+// One ceremony's slot: POST stores the result and arms the expiry, GET takes
+// it once. Storage is the object's own — strongly consistent, whichever colo
+// the caller came through.
+export class Ceremony {
+  constructor(ctx) {
+    this.ctx = ctx;
+  }
+
+  async fetch(request) {
+    if (request.method === "POST") {
+      await this.ctx.storage.put("result", await request.text());
+      await this.ctx.storage.setAlarm(Date.now() + TTL_MS);
+      return new Response(null, { status: 204 });
+    }
+    const result = await this.ctx.storage.get("result");
+    if (result === undefined) return new Response(null, { status: 204 });
+    await this.ctx.storage.deleteAll();
+    await this.ctx.storage.deleteAlarm();
+    return new Response(result, { status: 200, headers: { "content-type": "application/json" } });
+  }
+
+  async alarm() {
+    await this.ctx.storage.deleteAll();
+  }
+}
+
 export async function handle(request, env) {
   const url = new URL(request.url);
   const m = url.pathname.match(ID);
   if (url.pathname.startsWith("/r/") && !m) return new Response("no such ceremony", { status: 404 });
   if (!m) return env.ASSETS.fetch(request);
-  const id = m[1];
+  const slot = env.CEREMONIES.get(env.CEREMONIES.idFromName(m[1]));
   if (request.method === "POST") {
     const body = await request.text();
     if (body.length > MAX_BODY) return new Response("too large", { status: 413 });
     const result = new URLSearchParams(body).get("result");
     if (result === null) return new Response("no result", { status: 400 });
-    await env.CEREMONIES.put(id, result, { expirationTtl: TTL_SECONDS });
+    await slot.fetch(new Request("https://ceremony/", { method: "POST", body: result }));
     return new Response(DONE_PAGE, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
   }
-  if (request.method === "GET") {
-    const result = await env.CEREMONIES.get(id);
-    if (result === null) return new Response(null, { status: 204 });
-    await env.CEREMONIES.delete(id);
-    return new Response(result, { status: 200, headers: { "content-type": "application/json" } });
-  }
+  if (request.method === "GET") return slot.fetch(new Request("https://ceremony/"));
   return new Response("method", { status: 405 });
 }
 
