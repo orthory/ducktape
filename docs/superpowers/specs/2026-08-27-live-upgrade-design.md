@@ -199,6 +199,20 @@ directly. `GENESIS_ROOT_HASH` moves; the commit says so.
 > Porting that lane to another indexed tenant is a follow-up; `directory` leaves
 > (and the root moves once more) with it. Part 1 ships 21 → 20, not 21 → 19.
 
+> **Discharged (2026-08-28):** the follow-up landed. The lane moved to `tasks` —
+> already in `PRODUCTION` and in `SIM_BASE`, indexed, and a real app module
+> rather than an example crate. Every process e2e suite and `--dev-demo` write
+> there now, `directory` left `PRODUCTION` (20 → 19), and `GENESIS_ROOT_HASH`
+> moved to
+> `6f89e523fcccdb2f36cd26b4c06817c7a3f6b782788c1f8fb3e821afa0eb4e07`.
+> The `directory` CRATE stays exactly where it was: it is the in-process test
+> tenant for the kernel suites under `crates/kernel/**/tests/`, for
+> `crates/examples/greeter`, and for `bin/node`'s own `#[cfg(test)]` units —
+> which is why `bin/node` keeps it as a `[dev-dependencies]` entry and the
+> `Makefile`'s `BUILDER_MODULES` row and committed fixture wasm stay. A
+> descriptor-shaped workspace written before the move fails closed on the extra
+> `directory` entry (`compose.rs:110-125`) and is re-inited.
+
 ## §2 The topology says the shape
 
 ```rust

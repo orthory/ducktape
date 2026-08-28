@@ -977,8 +977,9 @@ mod tests {
     /// It is the only ABSOLUTE one in the tree, and until it existed every claim
     /// that "the root hash did not move" was relative and therefore weak.
     /// `bin/simnode/tests/topology_set.rs` pins the 14-module NATIVE sim
-    /// composition — which excludes `capability`, `governance` and
-    /// `lifecycle`, and is not what a node runs. And `git diff crates/modules/`
+    /// composition — which excludes `acl`, `capability`, `governance`,
+    /// `lifecycle` and `valset`, and is not what a node runs. And
+    /// `git diff crates/modules/`
     /// on a committed tree is EMPTY BY CONSTRUCTION, so quoting it proves
     /// nothing at all. Neither would have noticed a module's bytes changing.
     ///
@@ -990,7 +991,7 @@ mod tests {
     /// guest's CODE DIGEST is consensus state itself. That means a module's
     /// SOURCE is consensus-relevant the moment its component is rebuilt — even
     /// for a change that alters no behaviour, even a comment — and it means
-    /// `make wasm-modules` can ship a sixteen-module flag day as a side effect
+    /// `make wasm-modules` can ship a seventeen-module flag day as a side effect
     /// of touching one guest. That is correct, and it is exactly the event that
     /// must never happen silently.
     ///
