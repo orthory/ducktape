@@ -764,6 +764,14 @@ impl NetworkShapeCluster {
     }
 }
 
+/// the dev-shape node.toml of a LONE node, rooted at `dir` — the same literal
+/// [`Cluster::config_path`] writes, with a free `rpc_listen` and NOTHING behind
+/// it. What a pure-CLI test points a workspace verb at to exercise the
+/// node-is-not-running path without spawning a node.
+pub fn minimal_dev_shape_toml(dir: &std::path::Path) -> String {
+    Cluster::new(&[1], &[1]).config_toml(0, dir)
+}
+
 impl Cluster {
     /// lay out a cluster: `peer_ids` is the full authorized mesh (index 0 is
     /// the bootstrapper), `validator_ids` the consensus subset.
@@ -808,6 +816,16 @@ impl Cluster {
     pub(crate) fn config_path(&self, idx: usize) -> PathBuf {
         let id = self.peer_ids[idx];
         let path = self.dir.path().join(format!("node{id}.toml"));
+        std::fs::write(&path, self.config_toml(idx, self.dir.path())).expect("write node config");
+        self.write_service_grants(idx);
+        path
+    }
+
+    /// the node.toml body [`Cluster::config_path`] writes, rooted at `root`
+    /// (the cluster's own tempdir for a spawned node). Pure, so a pure-CLI
+    /// test can borrow the same dev shape without a cluster on disk.
+    fn config_toml(&self, idx: usize, root: &std::path::Path) -> String {
+        let id = self.peer_ids[idx];
         let mut cfg = String::new();
         cfg.push_str(&format!("id = {id}\n"));
         cfg.push_str(&format!("listen = \"127.0.0.1:{}\"\n", self.p2p_ports[idx]));
@@ -821,11 +839,7 @@ impl Cluster {
         cfg.push_str(&self.peer_addrs_toml());
         cfg.push_str(&format!(
             "storage_dir = {:?}\n",
-            self.dir
-                .path()
-                .join(format!("storage-{id}"))
-                .to_str()
-                .unwrap()
+            root.join(format!("storage-{id}")).to_str().unwrap()
         ));
         cfg.push_str(&format!(
             "rpc_listen = \"127.0.0.1:{}\"\n",
@@ -849,9 +863,7 @@ impl Cluster {
             cfg.push_str(line);
             cfg.push('\n');
         }
-        std::fs::write(&path, cfg).expect("write node config");
-        self.write_service_grants(idx);
-        path
+        cfg
     }
 
     /// Write (or remove) the workspace `services.toml` the node reads at boot:

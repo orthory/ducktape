@@ -81,6 +81,7 @@ mod main_tests;
 mod mcp;
 mod mesh_book;
 mod mesh_window;
+mod module_cli;
 mod node_http;
 mod overlay_book;
 mod plane_metrics;
@@ -241,6 +242,9 @@ enum Family {
     Service(services::ServiceCmd),
     /// remote/interactive sandboxed provider sessions (pty attach, sched runs)
     Agent(agent_cli::AgentArgs),
+    /// live code swaps: update, register, status
+    #[command(subcommand)]
+    Module(module_cli::ModuleCmd),
     /// the stdio MCP server an agent runner spawns
     Mcp,
 }
@@ -272,6 +276,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Family::Agent(args) => agent_cli::run(args),
         Family::Gateway(cmd) => gateway_routes::run(cmd),
         Family::Service(cmd) => services::run(cmd),
+        Family::Module(cmd) => module_cli::run(cmd),
         Family::Node(cli_args::NodeCmd::Run(args)) => run_node_verb(args),
         Family::Node(cli_args::NodeCmd::Op(op)) => cli::run(op),
     }

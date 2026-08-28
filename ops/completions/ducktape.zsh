@@ -6,7 +6,7 @@
 # install: put this file on your $fpath as `_ducktape`, then `autoload -U _ducktape`.
 
 _ducktape() {
-    local families=(node user account wallet gateway fs service agent mcp help --help -h --version -V)
+    local families=(node user account wallet gateway fs service agent module mcp help --help -h --version -V)
 
     local node_verbs=(run key init invite admit join list status peers resident member work sandbox help)
     local node_resident=(accept remove)
@@ -34,6 +34,8 @@ _ducktape() {
     local service_kinds=(compute agent airlock)
     local agent_verbs=(pty sched install help)
     local agent_flags=(-n --network --node --key --host-node --cred --cpu --mem)
+    local module_verbs=(update register status help)
+    local module_flags=(--after --config -n --network --json)
 
     if (( CURRENT == 2 )); then
         compadd -- $families
@@ -74,6 +76,7 @@ _ducktape() {
             esac
             ;;
         agent)   compadd -- $agent_verbs $agent_flags ;;
+        module)  compadd -- $module_verbs $module_flags ;;
     esac
 }
 
