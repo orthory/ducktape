@@ -49,14 +49,14 @@ enum ForgePhase
 
 enum HubStep
   loading
-  create
+  password
   wallets
-  reveal
   restore
   networks
   join
   provisioning
   live
+  account
 
 enum NodeTab
   overview

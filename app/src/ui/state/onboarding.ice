@@ -11,7 +11,6 @@ state
   hub_hidden:i64 = 0
   hub_wallets:[WalletInfo] = []
   hub_wallet_selected = ""
-  reveal_words = ""
   onboarding_name = ""
   onboarding_error = ""
   invite_link = ""

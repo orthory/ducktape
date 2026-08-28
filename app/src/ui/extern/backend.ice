@@ -147,7 +147,6 @@ extern crate::backend
   HubProbe(id:str, live:bool, height:i64)
   WalletInfo(name:str, pubkey:str, state:str, active:bool)
   HubState(wallets:[WalletInfo], wallets_error:str, networks:[HubNetwork], preselect:str, hidden:i64)
-  KeyCreated(words:str, pubkey:str)
   hub_state() -> HubState
   stream probe_known_networks() -> HubProbe
   pure apply_network_probe(networks:[HubNetwork], probe:HubProbe) -> [HubNetwork]
@@ -164,7 +163,7 @@ extern crate::backend
   pure without_window(current:window-id?, closed:window-id) -> window-id?
   sync window_target(current:window-id?) -> window-id
   sync window_target_unless(keep:bool, current:window-id?) -> window-id
-  create_user_key(name:str, password:str) -> KeyCreated ! AppError
+  create_device_key(password:str) -> str ! AppError
   restore_user_key(name:str, words:secret, password:str) -> str ! AppError
   unlock_wallet(name:str, password:str) -> str ! AppError
   unlock_user_key(password:str) -> str ! AppError

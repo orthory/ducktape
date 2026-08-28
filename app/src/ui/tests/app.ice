@@ -455,7 +455,6 @@ test launch_wallets_contract
         hidden=0
         name=""
         invite=""
-        reveal=""
         steps=provision_steps
         step_index=0
         height=-1
@@ -468,8 +467,7 @@ test launch_wallets_contract
         pick_wallet -> pick_wallet _
         unlock_submit -> unlock_submit _
         login_skip -> login_skip
-        create_submit -> create_submit _ _
-        reveal_confirm -> reveal_confirm
+        password_submit -> password_submit _
         go_restore -> go_restore
         go_login -> go_login
         restore_submit -> restore_submit _ _
@@ -533,30 +531,29 @@ test wallet_list_contract
   expect component alice.pw == "hunter2-hunter2"
 
 // A KEYSTORE THAT COULD NOT BE READ LANDS HERE, and read-only is the way out.
-// A failed `wallet list` yields an empty list, which is the create ceremony —
+// A failed `wallet list` yields an empty list, which is the password step —
 // so this screen, not just the wallet list, has to carry `login_skip`, or
 // someone who HAS wallets is trapped on a mint screen by a missing binary.
-test create_screen_read_only_escape_contract
+// The mint itself is NOT dispatched: `password_submit` seals a real key.
+test password_screen_read_only_escape_contract
   preset ui_launch
   viewport 480 680
   mount
-    CreateScreen #create
+    PasswordScreen #pw
       with
         busy=false
         error="the keystore listing is unreadable"
       events
-        create_submit -> create_submit _ _
+        password_submit -> password_submit _
         go_restore -> go_restore
         login_skip -> login_skip
-  target screen = #create/root
-  target skip = #create/root/create-skip
-  target name = #create/root/wallet-name
-  expect exists skip
+  target screen = #pw/root
+  target skip = #pw/root/password-skip
+  target field = #pw/root/device-password
+  target go = #pw/root/password-submit
+  expect exists field
+  expect exists go
   expect text "the keystore listing is unreadable" within screen
-  // the name a mint would use — `create_submit` stashes it so the network
-  // list's "signing as …" line names the wallet the session actually signs
-  // as. NOT dispatched here: `create_submit` shells a real `wallet new`.
-  expect name.value == "default"
   // read-only signs as NOBODY: the label must not keep naming a wallet.
   click skip
   expect hub_wallet_selected == ""
@@ -576,7 +573,6 @@ test launch_networks_empty_contract
         hidden=0
         name=""
         invite=""
-        reveal=""
         steps=provision_steps
         step_index=0
         height=-1
@@ -589,8 +585,7 @@ test launch_networks_empty_contract
         pick_wallet -> pick_wallet _
         unlock_submit -> unlock_submit _
         login_skip -> login_skip
-        create_submit -> create_submit _ _
-        reveal_confirm -> reveal_confirm
+        password_submit -> password_submit _
         go_restore -> go_restore
         go_login -> go_login
         restore_submit -> restore_submit _ _

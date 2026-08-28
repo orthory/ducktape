@@ -1,6 +1,6 @@
 // THE LAUNCH WINDOW'S HANDLERS. One `hub_step` machine inside the onboarding
-// window: loading -> (create | wallets) -> [reveal | restore] -> networks ->
-// [join -> provisioning -> live] -> console window.
+// window: loading -> (password | wallets) -> [restore] -> networks ->
+// [join -> provisioning -> live] -> [account] -> console window.
 //
 // The app is a strict CLIENT, and there is no create route: founding a network
 // is `ducktape node init` on the node, where the coordinator and the rest of the
@@ -81,30 +81,23 @@ on login_skip
   onboarding_error = ""
   hub_step = HubStep.networks
 
-// CREATE — mint a named wallet under the new password. The confirm field is
-// checked in the component (`password_problem`); this only fires clean.
-// The NAME is stored the same way and for the same reason as the password:
-// `key_created` carries only the words and the pubkey, and the screens past
-// the reveal — the network list's "signing as …" line — name the wallet this
-// session is about to sign as. A failed mint leaves a name that no row
-// matches, and the next refresh drops it (`refreshed_wallet_selection`).
-on create_submit(name, pw)
-  return if mutation_phase != MutationPhase.idle || empty(pw) || empty(name)
+// PASSWORD — the device key is minted here, silently: no name to pick, no
+// phrase to write down. Recovery is a passkey login from another device, so
+// the words the keystore hands back are dropped before anything can show
+// them. The confirm field is checked in the component (`password_problem`);
+// this only fires clean.
+on password_submit(pw)
+  return if mutation_phase != MutationPhase.idle || empty(pw)
   onboarding_error = ""
   password = pw
-  hub_wallet_selected = name
   mutation_phase = MutationPhase.onboarding
-  run every create_user_key(name, password) -> key_created _ | login_failed _
+  run every create_device_key(password) -> device_key_created _ | login_failed _
 
-on key_created(created)
+// The key exists; the list is refreshed so "signing as …" can name it.
+on device_key_created(_pubkey)
   mutation_phase = MutationPhase.idle
-  reveal_words = created.words
-  hub_step = HubStep.reveal
-
-// The one moment the 24 words exist on screen ends here.
-on reveal_confirm
-  reveal_words = ""
   hub_step = HubStep.networks
+  run replace lane=hub_state hub_state() -> hub_refreshed _
 
 on go_restore
   return if mutation_phase != MutationPhase.idle

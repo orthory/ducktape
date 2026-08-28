@@ -16,7 +16,6 @@ view
           hidden=hub_hidden
           name=onboarding_name
           invite=invite_link
-          reveal=reveal_words
           steps=provision_steps
           step_index=provision_index
           height=block_height
@@ -29,8 +28,7 @@ view
           pick_wallet -> pick_wallet _
           unlock_submit -> unlock_submit _
           login_skip -> login_skip
-          create_submit -> create_submit _ _
-          reveal_confirm -> reveal_confirm
+          password_submit -> password_submit _
           go_restore -> go_restore
           go_login -> go_login
           restore_submit -> restore_submit _ _
