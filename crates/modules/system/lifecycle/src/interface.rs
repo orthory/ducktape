@@ -37,13 +37,43 @@ pub struct ScheduledSwap {
     /// (`LifecycleMsg::SwapReady`), strictly increasing. committed state, in
     /// the root like everything else here.
     pub readiness: Vec<Vec<u8>>,
-    /// LATCHED true the moment `readiness` covers the whole boundary member
-    /// set (R = n, evaluated at signal time). the arm predicate is
-    /// `ready && activation_height <= height` — a swap never activates onto
-    /// a validator set that has not demonstrably received the bytes. a
-    /// member admitted AFTER the latch heals through the fetch lane
-    /// (fail-closed backstop) rather than blocking the swap.
-    pub ready: bool,
+    /// the block whose signal made `readiness` cover the whole boundary
+    /// member set (R = n, evaluated at signal time) — LATCHED, never cleared.
+    /// a swap never activates onto a validator set that has not demonstrably
+    /// received the bytes; a member admitted AFTER the latch heals through
+    /// the fetch lane (fail-closed backstop) rather than blocking the swap.
+    /// the HEIGHT, not a flag, because the latch in block `L` is visible to
+    /// the drain only from `L+1` (it reads committed `L`), so a replay of
+    /// block `L` itself must still run the old code — see
+    /// [`ScheduledSwap::armed_at`].
+    pub ready_at: Option<u64>,
+}
+
+impl ScheduledSwap {
+    /// THE arm predicate — the one every reader applies (the drain's
+    /// `Advance` injection, the registry's `Advance` flip, the `ArmedAt`
+    /// query, [`code_at`]): readiness latched STRICTLY before `height` (the
+    /// drain at `height` reads the committed end of `height - 1`, so a latch
+    /// in `height` is not yet its business) and the activation floor reached.
+    pub fn armed_at(&self, height: u64) -> bool {
+        let latched_before = self.ready_at.is_some_and(|latched| latched < height);
+        let floor_reached = self.activation_height <= height;
+        latched_before && floor_reached
+    }
+}
+
+/// one activation: `code_hash` became the module's running code FOR block
+/// `height` — the block whose boundary `Advance` flipped it (a `RegisterModule`
+/// records its own block; a genesis seed records 0). appended, never
+/// rewritten: the registry is disk-durable and reopens AHEAD of a crash-restart
+/// replay, so only a history can answer "which code sealed block h" once the
+/// swap that replaced it has landed. committed state, in the root.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Activation {
+    pub height: u64,
+    /// the 32-byte sha256 of the component bytes.
+    pub code_hash: Vec<u8>,
 }
 
 /// the readable per-module projection.
@@ -51,8 +81,32 @@ pub struct ScheduledSwap {
 #[serde(deny_unknown_fields)]
 pub struct ModuleCode {
     pub module_id: String,
+    /// the last activation's hash — a projection of `history`, empty only for
+    /// an admission that has not reached its boundary.
     pub active_code_hash: Vec<u8>,
     pub pending: Option<ScheduledSwap>,
+    /// every activation in block order.
+    pub history: Vec<Activation>,
+}
+
+/// the code designated for block `height` — what a node must RUN to apply it.
+/// a pending swap armed at `height` ([`ScheduledSwap::armed_at`]) wins: that
+/// is the live pre-flip read, the boundary of the very block that flips it,
+/// and the flip then records the same `(height, code_hash)`. otherwise the
+/// latest activation at or before `height` — the replay read against a
+/// registry that is already AHEAD (a pending whose readiness latched in the
+/// tip block is NOT armed for the tip, so those blocks replay on the old
+/// code exactly as they ran). a module whose first activation is later than
+/// `height` seats its first code (it has no ops before it). `None` is a
+/// module registered but never activated.
+pub fn code_at(entry: &ModuleCode, height: u64) -> Option<&[u8]> {
+    let armed = entry.pending.as_ref().filter(|p| p.armed_at(height));
+    if let Some(p) = armed {
+        return Some(&p.code_hash);
+    }
+    let sealed_at_or_before = entry.history.iter().rev().find(|a| a.height <= height);
+    let seat = sealed_at_or_before.or_else(|| entry.history.first());
+    seat.map(|a| a.code_hash.as_slice())
 }
 
 /// one armed swap the host must realize: swap `module_id`'s registry code to
@@ -117,9 +171,9 @@ pub enum LifecycleMsg {
 pub enum LifecycleQuery {
     /// active + pending code for every registered module.
     ModuleStatus,
-    /// the swaps ARMED at `height` (`activation_height <= height`). the host reads
-    /// this at the boundary to know which registry modules to swap and to which
-    /// code hash.
+    /// the swaps ARMED at `height` (`ScheduledSwap::armed_at`: readiness latched
+    /// before `height` AND the activation floor reached). the host reads this at
+    /// the boundary to know which registry modules to swap and to which code hash.
     ArmedAt { height: u64 },
 }
 
@@ -197,6 +251,10 @@ mod tests {
                 module_id: "hello".into(),
                 active_code_hash: vec![1u8; CODE_HASH_LEN],
                 pending: None,
+                history: vec![Activation {
+                    height: 0,
+                    code_hash: vec![1u8; CODE_HASH_LEN],
+                }],
             }],
         };
         assert_eq!(decode_reply(&encode_reply(&r)).unwrap(), r);

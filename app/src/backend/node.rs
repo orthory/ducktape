@@ -955,7 +955,7 @@ pub async fn load_modules(rpc: String) -> Result<ModulesData, AppError> {
                             .as_array()
                             .map_or(0, |signals| signals.len()),
                     ),
-                    ready: pending["ready"].as_bool().unwrap_or(false),
+                    ready: pending_is_ready(&pending),
                     id,
                 }
             })
@@ -964,6 +964,47 @@ pub async fn load_modules(rpc: String) -> Result<ModulesData, AppError> {
     }
     .await
     .map_err(app_error)
+}
+
+/// whether a `ScheduledSwap`'s readiness latch has closed: `ready_at` is the
+/// block it closed in, `null` until then (and the whole `pending` is `null`
+/// when nothing is scheduled).
+fn pending_is_ready(pending: &serde_json::Value) -> bool {
+    !pending["ready_at"].is_null()
+}
+
+#[cfg(test)]
+mod module_row_tests {
+    use super::pending_is_ready;
+
+    /// the Modules row's readiness flag keys on `ScheduledSwap.ready_at` —
+    /// the block the latch closed in, `null` until then. the literal is the
+    /// real `lifecycle::interface::{ModuleCode, ScheduledSwap}` serde field
+    /// set (both `deny_unknown_fields`); this crate cannot decode the typed
+    /// struct (no `lifecycle` dependency), so the field names are pinned here.
+    #[test]
+    fn a_pending_swap_is_ready_once_ready_at_is_set() {
+        let entry = |ready_at: serde_json::Value| {
+            serde_json::json!({
+                "module_id": "x",
+                "active_code_hash": [],
+                "history": [],
+                "pending": {
+                    "name": "n",
+                    "activation_height": 9,
+                    "code_hash": [],
+                    "readiness": [],
+                    "ready_at": ready_at,
+                }
+            })
+        };
+        assert!(pending_is_ready(&entry(serde_json::json!(6))["pending"]));
+        assert!(!pending_is_ready(
+            &entry(serde_json::Value::Null)["pending"]
+        ));
+        // nothing scheduled: the whole `pending` is null.
+        assert!(!pending_is_ready(&serde_json::Value::Null));
+    }
 }
 
 /// `LifecycleQuery::ModuleStatus` keyed by module id, empty when this network

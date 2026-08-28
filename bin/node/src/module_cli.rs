@@ -638,7 +638,7 @@ fn render_status(modules: &[lifecycle::ModuleCode]) -> String {
 /// how far a pending swap's readiness has come: the count of validators that
 /// signalled, or `✓` once the latch covered the whole set.
 fn readiness_word(swap: &lifecycle::ScheduledSwap) -> String {
-    if swap.ready {
+    if swap.ready_at.is_some() {
         return "✓".into();
     }
     swap.readiness.len().to_string()
@@ -729,12 +729,13 @@ mod tests {
             activation_height: 9,
             code_hash: hash.to_vec(),
             readiness: Vec::new(),
-            ready: false,
+            ready_at: None,
         };
         let entry = |active: &[u8], pending: Option<ScheduledSwap>| ModuleCode {
             module_id: "hello".into(),
             active_code_hash: active.to_vec(),
             pending,
+            history: Vec::new(),
         };
         let precheck =
             |verb, modules: &[ModuleCode]| registry_precheck(verb, modules, "hello", &ours);
@@ -835,6 +836,7 @@ mod tests {
                 module_id: "acl".into(),
                 active_code_hash: active.clone(),
                 pending: None,
+                history: Vec::new(),
             },
             ModuleCode {
                 module_id: "hello".into(),
@@ -844,8 +846,9 @@ mod tests {
                     activation_height: 120,
                     code_hash: next.clone(),
                     readiness: vec![vec![1], vec![2]],
-                    ready: false,
+                    ready_at: None,
                 }),
+                history: Vec::new(),
             },
             // `module register`: no active code at all until the swap lands.
             ModuleCode {
@@ -856,8 +859,9 @@ mod tests {
                     activation_height: 120,
                     code_hash: next.clone(),
                     readiness: Vec::new(),
-                    ready: false,
+                    ready_at: None,
                 }),
+                history: Vec::new(),
             },
         ];
         let out = render_status(&modules);

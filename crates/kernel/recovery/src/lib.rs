@@ -1113,6 +1113,13 @@ where
         // shared past the `&mut self` journal borrows below (see the field doc).
         let code_source = std::sync::Arc::clone(&self.code_source);
         let mut expected: BTreeMap<ModuleId, StateRoot> = manifest.roots.iter().cloned().collect();
+        // a module the composer adopted EMPTY (admitted after the checkpoint,
+        // so the manifest never captured it) has no root above; its pre-root
+        // is what it holds right now, so the block that activates it — and
+        // may carry its first op — is found `at_pre`, never torn.
+        for (id, root) in host.module_roots() {
+            expected.entry(id).or_insert(root);
+        }
         let mut tip_height: Option<u64> = manifest.height;
         let mut tip_hash = manifest.root_hash;
         let mut epoch = manifest.epoch;
@@ -1695,9 +1702,12 @@ async fn replay_batch(
 ) -> Result<(Disposition, Vec<DispatchRecord>), Error> {
     // CODE-SWAP REALIZATION, mirroring the live drain: a block sealed after a
     // code-registry swap executed on the NEW component, so replay must swap
-    // before re-applying or the sealed roots cannot reproduce. keyed purely on
-    // the replayed committed registry state + height — the identical swap
-    // points the live node realized. fail-closed on missing/tampered bytes.
+    // before re-applying or the sealed roots cannot reproduce. the registry
+    // is disk-durable and reopens AHEAD of this window — its tip says nothing
+    // about which code sealed `height` — so realization keys on the registry's
+    // activation HISTORY at `height` (`lifecycle::code_at`): the identical
+    // swap points the live node realized, walked in either direction.
+    // fail-closed on missing/tampered bytes.
     host.realize_module_swaps(height, code_source)
         .await
         .map_err(|e| Error::Verify(format!("code-swap realization at height {height}: {e}")))?;

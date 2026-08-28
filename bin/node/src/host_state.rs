@@ -298,7 +298,10 @@ pub(super) async fn restore_host(
     )
     .await?;
     let mut host = finish(modules).map_err(|e| format!("restore host: {e}"))?;
-    adopt_admitted_modules(&mut host, &code, &mut |id| {
+    // a genesis checkpoint has applied nothing: an admitted module seats its
+    // first code and the replay moves it forward from there.
+    let checkpoint_height = manifest.height.unwrap_or(0);
+    adopt_admitted_modules(&mut host, &code, checkpoint_height, &mut |id| {
         let got = admitted_restore_snapshot(manifest, id);
         Box::pin(async move { got })
     })
@@ -345,13 +348,19 @@ fn manifest_snapshot(manifest: &Manifest, id: &str) -> Result<(Vec<u8>, StateRoo
     Ok((bytes.to_vec(), root))
 }
 
-/// register every module the lifecycle registry admitted post-genesis: an id
-/// with a non-empty ACTIVE hash that the topology selection did not compose.
-/// Map-backed by construction (admission instantiates `from_bytes`), so its
-/// state is `snapshot(id)` — the checkpoint's or the peer's.
+/// register every module the lifecycle registry admitted post-genesis — an id
+/// the topology selection did not compose — on the code the registry
+/// designates for `checkpoint_height` (`lifecycle::code_at`). the registry is
+/// per-block durable and reopens AHEAD of the checkpoint, so its ACTIVE hash
+/// may be a swap the replay has yet to reach; seating the checkpoint's code
+/// lets replay's `realize_module_swaps` move the module forward through the
+/// same swap points the live node took. Map-backed by construction (admission
+/// instantiates `from_bytes`), so its state is `snapshot(id)` — the
+/// checkpoint's or the peer's.
 async fn adopt_admitted_modules(
     host: &mut Host,
     code: &dyn host::CodeSource,
+    checkpoint_height: u64,
     snapshot: &mut AdmittedSnapshotSource<'_>,
 ) -> Result<(), String> {
     let Some(registry) = host.lifecycle_module_status().await else {
@@ -359,15 +368,18 @@ async fn adopt_admitted_modules(
     };
     for m in registry {
         let already_composed = host.module_root(&m.module_id).is_some();
-        let not_yet_admitted = m.active_code_hash.is_empty();
-        if already_composed || not_yet_admitted {
+        if already_composed {
             continue;
         }
-        let bytes = code.fetch(&m.active_code_hash).await.ok_or_else(|| {
+        // an admission that has not reached its boundary has no code yet.
+        let Some(code_hash) = lifecycle::code_at(&m, checkpoint_height) else {
+            continue;
+        };
+        let bytes = code.fetch(code_hash).await.ok_or_else(|| {
             format!(
                 "code bytes absent for admitted module {} (hash {}) — fail-closed",
                 m.module_id,
-                hex_bytes(&m.active_code_hash)
+                hex_bytes(code_hash)
             )
         })?;
         let mut module = WasmModule::from_bytes(m.module_id.as_str(), &bytes)
@@ -626,7 +638,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
     // construction — a missing module composes a different root-hash and the
     // join fails its final check.
     let mut host = finish(modules).map_err(|e| format!("compose synced host: {e}"))?;
-    adopt_admitted_modules(&mut host, &code, &mut |id| {
+    adopt_admitted_modules(&mut host, &code, manifest.height, &mut |id| {
         let fetch = snapshot_of(id);
         Box::pin(async move { fetch.await.map(Some) })
     })
@@ -687,7 +699,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "0f71fe9f18aae4d8b212fd1d8b7ad45a7632bff1cf2cf7e886c3a027d7fe30dc";
+        "b290fe3120eed0d1b04aefaa5738b9ce91c1093b900b20dcc7c1d5df5abd2884";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's store as a genesis
@@ -807,6 +819,117 @@ mod tests {
             .expect("spawn")
             .join()
             .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+    }
+
+    /// a lifecycle registry that activated `hello` on `first` at 10 and on
+    /// `second` at 50 — the shape a restart finds after a live swap.
+    fn registry_ahead(first: [u8; 32], second: [u8; 32]) -> lifecycle::Lifecycle {
+        use lifecycle::{Lifecycle, LifecycleMsg, encode_msg};
+        use sdk::{Module as _, Origin};
+        let member = vec![7u8; 32];
+        let one_member = {
+            let member = member.clone();
+            move |req: &[u8]| -> Result<Vec<u8>, sdk::Error> {
+                match valset::decode_query(req) {
+                    Ok(valset::ValsetQuery::Validators) => Ok(valset::encode_reply(
+                        &valset::ValsetReply::Validators(vec![member.clone()]),
+                    )),
+                    _ => Err(sdk::Error::QueryUnsupported),
+                }
+            }
+        };
+        let ctx = |origin: Origin, height: u64| {
+            sdk_testkit::TestCtx::with_env(sdk::Env {
+                height,
+                consensus_time: 0,
+                origin,
+                me: "lifecycle".into(),
+            })
+            .on_query("valset", one_member.clone())
+        };
+        let msg = |m: LifecycleMsg| sdk::Msg {
+            target: "lifecycle".into(),
+            payload: encode_msg(&m),
+        };
+        let steps = [
+            (
+                Origin::System,
+                10,
+                LifecycleMsg::RegisterModule {
+                    module_id: "hello".into(),
+                    code_hash: first.to_vec(),
+                },
+            ),
+            (
+                Origin::System,
+                11,
+                LifecycleMsg::ScheduleSwap {
+                    name: "next".into(),
+                    module_id: "hello".into(),
+                    activation_height: 50,
+                    code_hash: second.to_vec(),
+                },
+            ),
+            (
+                Origin::External(member),
+                12,
+                LifecycleMsg::SwapReady {
+                    name: "next".into(),
+                    module_id: "hello".into(),
+                },
+            ),
+            (Origin::System, 50, LifecycleMsg::Advance),
+        ];
+        let mut registry = Lifecycle::new(
+            "lifecycle",
+            Box::new(sdk_testkit::MemStore::new()),
+            "valset",
+        );
+        futures::executor::block_on(async {
+            for (origin, height, m) in steps {
+                let mut ctx = ctx(origin, height);
+                registry
+                    .execute(&mut ctx, &msg(m))
+                    .await
+                    .expect("registry op");
+                registry.commit_block().await.expect("commit");
+            }
+        });
+        registry
+    }
+
+    /// the registry reopens AHEAD of the checkpoint: a module it swapped after
+    /// the checkpoint is adopted on the code that sealed the checkpoint's
+    /// block, not the tip's active hash — replay's realization moves it
+    /// forward from there. a checkpoint before the module's first activation
+    /// seats that first code.
+    #[test]
+    fn adoption_seats_the_code_at_the_checkpoint_height() {
+        const HELLO_V1: &[u8] =
+            include_bytes!("../../../crates/kernel/host/tests/fixtures/hello.component.wasm");
+        const HELLO_REPLACEMENT: &[u8] = include_bytes!(
+            "../../../crates/kernel/host/tests/fixtures/hello-replacement.component.wasm"
+        );
+        let blobs = blobstore::BlobHandle::default();
+        let v1 = blobs.put_chunk(HELLO_V1.to_vec());
+        let replacement = blobs.put_chunk(HELLO_REPLACEMENT.to_vec());
+        let code = BlobCodeSource(std::sync::Arc::new(blobs));
+        for (checkpoint_height, want) in [(5, v1), (20, v1), (50, replacement), (70, replacement)] {
+            let mut host = Host::new();
+            host.register(Box::new(registry_ahead(v1, replacement)));
+            futures::executor::block_on(adopt_admitted_modules(
+                &mut host,
+                &code,
+                checkpoint_height,
+                &mut |_| Box::pin(async { Ok(None) }),
+            ))
+            .expect("adopt");
+            assert_eq!(
+                host.module_code_hash("hello"),
+                Some(want.to_vec()),
+                "checkpoint at {checkpoint_height}"
+            );
+        }
     }
 
     /// the registry ↔ topology parity pin. the composer already builds
