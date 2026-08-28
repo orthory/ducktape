@@ -171,9 +171,9 @@ pub enum LifecycleMsg {
 pub enum LifecycleQuery {
     /// active + pending code for every registered module.
     ModuleStatus,
-    /// the swaps ARMED at `height` (`activation_height <= height`). the host reads
-    /// this at the boundary to know which registry modules to swap and to which
-    /// code hash.
+    /// the swaps ARMED at `height` (`ScheduledSwap::armed_at`: readiness latched
+    /// before `height` AND the activation floor reached). the host reads this at
+    /// the boundary to know which registry modules to swap and to which code hash.
     ArmedAt { height: u64 },
 }
 

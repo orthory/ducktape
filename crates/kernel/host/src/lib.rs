@@ -713,7 +713,7 @@ impl Host {
     /// designates for `height`.
     ///
     /// the target hash for a module at `height` is a pending hash that has
-    /// armed (`ready && activation_height <= height` — the SAME predicate
+    /// armed (`ScheduledSwap::armed_at` — the SAME predicate
     /// lifecycle's `Advance` applies, so this out-of-block realization and the
     /// in-block flip never disagree on the arm set; on the live drain the
     /// registry sits at `height - 1` and this is the read that precedes the

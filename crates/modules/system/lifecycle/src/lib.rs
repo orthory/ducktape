@@ -21,8 +21,7 @@
 //! end-of-(H-1) state — never staged-over-committed — the SAME snapshot the
 //! host `realize_module_swaps` boundary read uses, so live, recovery-replay,
 //! and state-sync nodes all reconstruct the activation identically, applying
-//! the `ready && activation_height <= height` gate the host's `ArmedAt` read
-//! realizes.
+//! the one `ScheduledSwap::armed_at` gate the host's `ArmedAt` read realizes.
 //!
 //! ## code bytes are out-of-band
 //!

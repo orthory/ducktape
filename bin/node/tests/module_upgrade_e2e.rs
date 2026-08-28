@@ -9,6 +9,9 @@ use common::Cluster;
 use common::module_verbs::{
     AFTER, active_hash, assert_ceremony_scheduled, fixture, run_on_each, sha256_hex, spawn_founders,
 };
+use governance::{
+    GovAction, GovMsg, GovQuery, GovReply, ProposalStatus, decode_reply, encode_msg, encode_query,
+};
 
 /// a query or status read that should already be true lands within a block
 /// or two; this is the budget for a ws-block-fed wait on it.
@@ -65,6 +68,63 @@ fn inc_and_confirm(cluster: &Cluster, submit_on: usize, expect: u64) {
         );
         assert_eq!(seen, expect);
     }
+}
+
+fn proposal_status(cluster: &Cluster, idx: usize, id: &str) -> Option<(ProposalStatus, usize)> {
+    let reply = cluster.query(
+        idx,
+        "governance",
+        &encode_query(&GovQuery::Proposal {
+            proposal_id: id.into(),
+        }),
+    )?;
+    match decode_reply(&reply) {
+        Ok(GovReply::Proposal(Some(view))) => Some((view.status, view.votes.len())),
+        _ => None,
+    }
+}
+
+/// node 0 proposes seating `key`, nodes 0+1 vote (2 of 3 = majority), node 1
+/// executes; the passing proposal emits the valset Join, and the founders
+/// cross the epoch-1 cutover on their own idle blocks.
+fn admit_validator(cluster: &Cluster, key: Vec<u8>) {
+    const ID: &str = "admit-joiner";
+    cluster.submit(
+        0,
+        "governance",
+        &encode_msg(&GovMsg::Propose {
+            proposal_id: ID.into(),
+            action: GovAction::AddValidator { key },
+            voting_period: 600_000,
+        }),
+    );
+    cluster.await_committed(1, "admission proposal to open", FINALIZE, || {
+        proposal_status(cluster, 1, ID).filter(|(s, _)| *s == ProposalStatus::Open)
+    });
+    let vote = encode_msg(&GovMsg::Vote {
+        proposal_id: ID.into(),
+        approve: true,
+    });
+    cluster.submit(0, "governance", &vote);
+    cluster.submit(1, "governance", &vote);
+    cluster.await_committed(1, "both ballots to land", FINALIZE, || {
+        proposal_status(cluster, 1, ID).filter(|(_, votes)| *votes == 2)
+    });
+    cluster.submit(
+        1,
+        "governance",
+        &encode_msg(&GovMsg::Execute {
+            proposal_id: ID.into(),
+        }),
+    );
+    cluster.await_committed(0, "admission to settle as Passed", FINALIZE, || {
+        proposal_status(cluster, 0, ID).filter(|(s, _)| *s == ProposalStatus::Passed)
+    });
+    cluster.await_committed(0, "the epoch-1 cutover on every founder", ACTIVATE, || {
+        let every_founder_cut_over =
+            (0..3).all(|idx| cluster.marker(idx, "cutover complete: epoch 1").is_some());
+        every_founder_cut_over.then_some(())
+    });
 }
 
 fn register_and_activate(cluster: &Cluster) {
@@ -163,5 +223,48 @@ fn a_registered_module_survives_a_live_swap_a_restart_and_statesync() {
         "a restart moved the state root"
     );
 
-    // Task 4 continues here (step 7)
+    // 7. seat the declared joiner, then let it statesync as a fresh resident:
+    // every module — hello included, whose bytes it can only pull over the
+    // blob plane — must compose the founders' root. the ceremony moved
+    // governance/valset state, so the joiner is held to the POST-admission
+    // root, not `root_after_restart`.
+    admit_validator(&cluster, Cluster::identity(4));
+    let root_before_sync = cluster.await_committed(
+        0,
+        "founders' root-hashes to agree before the sync",
+        FINALIZE,
+        || root_hashes_agree(&cluster, &[0, 1, 2]),
+    );
+    let (ok, log) = cluster.run_sync_only(3, Duration::from_secs(180));
+    assert!(ok, "sync-only joiner failed:\n{log}");
+    let synced = log
+        .lines()
+        .find_map(|l| l.split("synced root_hash=").nth(1))
+        .expect("joiner printed a synced root-hash")
+        .trim();
+    println!("sync-only joiner synced root_hash={synced}");
+    assert_eq!(synced, root_before_sync, "joiner composed a DIFFERENT root-hash");
+
+    // the joiner boots LIVE over the synced storage (a sync-only run binds
+    // no rpc). a non-genesis key always enters the replica park: it syncs
+    // the epoch-1 boundary, finds itself seated, and promotes in-process —
+    // then hello answers 101 from state it never executed. the count is
+    // probed on the founders' block feed: node 3 answers `None` until it
+    // serves, and the chain's own blocks are the wait seam either way.
+    cluster.spawn(3);
+    let promoted = cluster.wait_marker(3, "promoted: validator at epoch 1", ACTIVATE);
+    println!("node 3 promoted: validator at epoch 1 {promoted}");
+    let live_synced = cluster.marker(3, "synced root_hash=");
+    println!("node 3 live boot synced root_hash={live_synced:?}");
+    let seen = cluster.await_committed(0, "hello count == 101 on the joiner", ACTIVATE, || {
+        count(&cluster, 3).filter(|c| *c == 101)
+    });
+    assert_eq!(seen, 101);
+    let root_with_joiner = cluster.await_committed(
+        0,
+        "all four root-hashes to agree",
+        FINALIZE,
+        || root_hashes_agree(&cluster, &[0, 1, 2, 3]),
+    );
+    assert_eq!(root_with_joiner, root_before_sync);
 }
