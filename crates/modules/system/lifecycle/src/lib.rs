@@ -215,8 +215,13 @@ impl Lifecycle {
         }
     }
 
-    /// stage a value whose serialized size is bounded by construction (a
-    /// module entry: fixed-size hashes plus a member-capped readiness list).
+    /// stage a value with no write-time cap. a module entry is fixed-size
+    /// hashes, a member-capped readiness list and the activation `history`,
+    /// which grows 40 bytes per swap for the module's life — only the qmdb
+    /// record decode cap bounds it. the day that matters, the refusal goes
+    /// through `store_bounded` in `handle_schedule_swap` (refuse to schedule
+    /// what could not be recorded), NEVER at the `Advance` flip: refusing
+    /// there would strand an armed pending forever.
     fn store<T>(&mut self, key: Vec<u8>, value: &T)
     where
         T: BorshSerialize,
@@ -405,10 +410,7 @@ impl Lifecycle {
     /// admission of a brand-new module: like `handle_schedule_swap`, but the entry
     /// must NOT exist yet. the created entry carries an EMPTY active hash —
     /// "registered, not yet running" — and the normal readiness/advance machinery
-    /// realizes the initial code at the boundary. KNOWN GAP: the recovery /
-    /// state-sync composers still enumerate a fixed module set, so a node
-    /// restarting past an admitted module's first checkpoint fails closed until
-    /// the admitted-module restore path lands.
+    /// realizes the initial code at the boundary.
     async fn handle_schedule_register(
         &mut self,
         ctx: &mut dyn Ctx,

@@ -955,7 +955,9 @@ pub async fn load_modules(rpc: String) -> Result<ModulesData, AppError> {
                             .as_array()
                             .map_or(0, |signals| signals.len()),
                     ),
-                    ready: pending["ready"].as_bool().unwrap_or(false),
+                    // `ready_at` is the block the readiness latch closed in;
+                    // `null` until then.
+                    ready: !pending["ready_at"].is_null(),
                     id,
                 }
             })

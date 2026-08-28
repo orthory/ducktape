@@ -1113,6 +1113,13 @@ where
         // shared past the `&mut self` journal borrows below (see the field doc).
         let code_source = std::sync::Arc::clone(&self.code_source);
         let mut expected: BTreeMap<ModuleId, StateRoot> = manifest.roots.iter().cloned().collect();
+        // a module the composer adopted EMPTY (admitted after the checkpoint,
+        // so the manifest never captured it) has no root above; its pre-root
+        // is what it holds right now, so the block that activates it — and
+        // may carry its first op — is found `at_pre`, never torn.
+        for (id, root) in host.module_roots() {
+            expected.entry(id).or_insert(root);
+        }
         let mut tip_height: Option<u64> = manifest.height;
         let mut tip_hash = manifest.root_hash;
         let mut epoch = manifest.epoch;

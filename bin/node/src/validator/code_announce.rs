@@ -54,7 +54,7 @@ impl CodeReadinessSignaller {
     /// residency check, decide this tick's signals and fetches. truthful
     /// (signals only verified-resident bytes), idempotent (committed
     /// readiness, the in-flight latch, and the fetch dedupe all short-
-    /// circuit), and quiet once a swap is `ready`.
+    /// circuit), and quiet once a swap's `ready_at` has latched.
     pub(crate) fn decide(
         &mut self,
         modules: &[lifecycle::ModuleCode],
