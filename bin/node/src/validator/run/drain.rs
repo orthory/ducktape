@@ -7,9 +7,9 @@ use commonware_runtime::{Clock as _, IoBuf};
 use commonware_utils::ordered::Set;
 
 use consensus::ContentStore;
-use directory::{DirQuery, DirReply, decode_reply, encode_query};
 use recovery::Manifest;
 use sdk::Msg;
+use tasks::{TaskQuery, TaskReply, decode_task_reply, encode_task_query};
 
 use super::ValidatorRuntime;
 use crate::constants::{DRAIN_TICK, NOP_TARGET};
@@ -893,28 +893,23 @@ impl ValidatorRuntime<'_> {
                 target: "ducktape::consensus",
                 "node={label} converged root_hash={}", hex(&h)
             );
-            // dump every directory key so the demo can eyeball the ops
-            // (each node ends holding the op it originated AND the peer's).
-            for k in 0..expected {
-                let reply = node
-                    .host()
-                    .query(
-                        "directory",
-                        &encode_query(&DirQuery::Get {
-                            key: format!("k{k}"),
-                        }),
-                    )
-                    .await
-                    .expect("directory query");
-                if let Ok(DirReply::Value(v)) = decode_reply(&reply) {
-                    tracing::debug!(
-                        target: "ducktape::modules",
-                        node = %label,
-                        key = %format_args!("k{k}"),
-                        value = ?v,
-                        "demo directory value"
-                    );
-                }
+            // dump the whole task board so the demo can eyeball the ops (each
+            // node ends holding the task it originated AND the peer's). ONE
+            // query: `List` is the board's only read, and it returns them all.
+            let reply = node
+                .host()
+                .query("tasks", &encode_task_query(&TaskQuery::List))
+                .await
+                .expect("tasks query");
+            let TaskReply::Tasks(board) = decode_task_reply(&reply).expect("task reply");
+            for task in board {
+                tracing::debug!(
+                    target: "ducktape::modules",
+                    node = %label,
+                    task_id = %task.id,
+                    title = %task.title,
+                    "demo task"
+                );
             }
             *converged = true;
         }

@@ -11,11 +11,11 @@ use commonware_runtime::Supervisor;
 use commonware_utils::ordered::Set;
 
 use consensus::{ContentStore, SimplexOrderer};
-use directory::{DirMsg, encode_msg};
 use host::Host;
 use node::OrderedNode;
 use recovery::Recovery;
 use sdk::Msg;
+use tasks::{TaskMsg, encode_task_msg};
 
 use crate::constants::{CUTOVER_DELAY, EPOCH_CHANNEL_BANK};
 use crate::host_reads::resume_resident_keys;
@@ -252,25 +252,29 @@ pub(super) async fn resume(
         );
     }
 
-    // introduce a DISTINCT op per process: node N writes directory key "kN" =
-    // "node-N". distinct key + distinct origin -> distinct frame -> distinct
+    // introduce a DISTINCT op per process: node N creates task "kN" titled
+    // "node-N". distinct id + distinct origin -> distinct frame -> distinct
     // sha256 digest, so a peer that finalizes THIS op's digest has NO local
     // bytes for it — unless the leader's relay gossiped them on CHANNEL_PAYLOAD
-    // and this process's store-only drain cached them. directory is order-
-    // INDEPENDENT, so both nodes converge on {k0=node-0, k1=node-1} under any
-    // interleaving, isolating the property under test (did the peer's payload
-    // cross the wire?) from op ordering. ONE submit — the automaton PEEKS
-    // (never pops), so the digest rides out every nullified early view until
-    // the mesh forms and this node leads and proposes it.
+    // and this process's store-only drain cached them. the seed stays order-
+    // INDEPENDENT: each create writes its OWN `t/{id}` record plus one entry in
+    // the `t#` index, a `BTreeSet` that serializes ascending — so both nodes
+    // commit the same records under any interleaving, and `created_at` /
+    // `updated_at` are the block's `consensus_time`, the same number on every
+    // validator applying it. that isolates the property under test (did the
+    // peer's payload cross the wire?) from op ordering. ONE submit — the
+    // automaton PEEKS (never pops), so the digest rides out every nullified
+    // early view until the mesh forms and this node leads and proposes it.
     // dev shape only — a REAL network's genesis carries no demo scaffolding
-    // (and a restored boot must not re-frame it: seq 0 was already spent).
+    // (and a restored boot must not re-seed: seq 0 was already spent, and a
+    // create is not an upsert — a second "kN" is REFUSED, not overwritten).
     if dev_demo && resumed.is_none() {
         let n = label.trim_start_matches('#').to_string();
         let op = Msg {
-            target: "directory".into(),
-            payload: encode_msg(&DirMsg::Set {
-                key: format!("k{n}"),
-                value: format!("node-{n}"),
+            target: "tasks".into(),
+            payload: encode_task_msg(&TaskMsg::CreateTask {
+                task_id: format!("k{n}"),
+                title: format!("node-{n}"),
             }),
         };
         node.submit(signer, 0, op).await.expect("submit op");
