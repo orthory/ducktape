@@ -381,10 +381,10 @@ fn post_mention(channel: &str, message_id: &str, agent_id: &str) -> serde_json::
     })
 }
 
-/// an INCOMPLETE modules dir is refused at argv time, naming the first
-/// component it could not find, with the same remedy a missing dir gets. the
-/// composer refuses it too — but from the actor thread, as a panic, after a
-/// storage root exists; that is a stack trace, not a remedy.
+/// an INCOMPLETE modules dir is refused at argv time, naming the component it
+/// could not read plus the remedy. `main` opens the code source itself, so this
+/// is the ONE completeness decision — before a storage root exists, and never a
+/// stack trace from the actor thread.
 #[test]
 fn an_incomplete_modules_dir_is_refused_before_boot() {
     let storage = tempfile::TempDir::new().expect("storage dir");
@@ -405,16 +405,13 @@ fn an_incomplete_modules_dir_is_refused_before_boot() {
         !out.status.success(),
         "an empty modules dir composes no genesis: {stderr}"
     );
-    // the path named is INSIDE the dir — a missing-component refusal, not the
-    // missing-directory one (which names the dir and stops there).
-    let names_a_component = format!(
-        "no genesis components at {}{}",
-        modules.path().display(),
-        std::path::MAIN_SEPARATOR
-    );
+    // a path INSIDE the dir, i.e. the component it could not read — never just
+    // the directory. WHICH id comes first is `hash_bundle`'s sorted-by-id walk
+    // and not this test's business.
+    let names_a_component = format!("{}{}", modules.path().display(), std::path::MAIN_SEPARATOR);
     assert!(
         stderr.contains(&names_a_component),
-        "refusal names the first missing component: {stderr}"
+        "refusal names the component it could not read: {stderr}"
     );
     assert!(
         stderr.contains("make install-node"),

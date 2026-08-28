@@ -115,7 +115,7 @@
 //! batch is folded into that batch's one block with its own `rejected` verdict,
 //! as before.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -138,8 +138,8 @@ use node::{ConsensusTimePolicy, DrainedFrame, NullSink, OrderedNode, StepHandle,
 use noded::bundle::{DirCodeSource, host_from, qmdb_stores};
 use noded::compose::{Bindings, Boot, Substrates, compose};
 use noded::{
-    BlockDisposition, BlockSummary, ModuleCategory, ModuleStatus, NodeCommand, NodeHandle,
-    NodeStatus, StreamHub, hex_bytes, hex_root,
+    BlockDisposition, BlockSummary, LOCAL_CHAIN_ID, ModuleCategory, ModuleStatus, NodeCommand,
+    NodeHandle, NodeStatus, ORACLE_ORIGIN, StreamHub, hex_bytes, hex_root,
 };
 use sdk::{Event, Msg, Origin};
 use serde::{Deserialize, Serialize};
@@ -150,14 +150,7 @@ use topology::TOPOLOGY;
 // opt-in 5 system modules. changing the daemon set changes the topology, which
 // re-pins here and at node/demo. the composer below builds exactly those ids,
 // the same way bin/node does.
-const ORACLE_ORIGIN: &[u8] = b"oracle";
 const PEER_ORIGIN: &[u8] = b"peer";
-
-/// the sim's network name: the composer binds it into the identity and gateway
-/// guests' genesis `__config`, and `/v1/status` serves it back. ONE value — a
-/// client that signs an identity consent reads the chain id from status, so a
-/// status that disagreed with the bindings would mint signatures nothing accepts.
-const SIM_CHAIN_ID: &str = "local";
 
 /// the logical clock: `consensus_time = SIM_EPOCH_MS + height * SIM_BLOCK_MS`.
 /// a fixed epoch keeps module timestamps (message sent_at, task created_at)
@@ -382,6 +375,13 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
             .copied()
             .collect()
     };
+    // read and hash the bundle HERE, in the caller: ONE decision about whether
+    // the components are usable, surfaced as `boot`'s own Err instead of a
+    // panic on the actor thread that reaches an embedder as "sim actor died
+    // during genesis". the source (a path and a hash table) then rides in.
+    let wasm_ids = TOPOLOGY.wasm_ids(&module_ids);
+    let (code, code_hashes) = DirCodeSource::open(&modules_dir, &wasm_ids)?;
+
     let storage = storage.to_path_buf();
     let forge_repo = storage.join("forge-git");
 
@@ -449,7 +449,8 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
             run_sim(
                 actor_storage,
                 forge_repo,
-                modules_dir,
+                code,
+                code_hashes,
                 index,
                 blobs,
                 actor_persona,
@@ -754,7 +755,8 @@ struct Sim {
 fn run_sim(
     storage: PathBuf,
     forge_repo: PathBuf,
-    modules_dir: PathBuf,
+    code: DirCodeSource,
+    code_hashes: BTreeMap<String, [u8; 32]>,
     index: Arc<IndexStore>,
     blobs: blobstore::BlobHandle,
     persona: Arc<Mutex<Persona>>,
@@ -779,13 +781,11 @@ fn run_sim(
 
     executor.start(|context| async move {
         // genesis: the topology selection composed the way bin/node composes —
-        // wasm tenants from the modules dir, the native registries seeded from
-        // the sim's bindings. governance composes as wasm, so its code registry
-        // is wired and UpdateModule proposals are live in the sim.
+        // wasm tenants fetched by hash from the source `boot` opened, the native
+        // registries seeded from the sim's bindings. governance composes as
+        // wasm, so its code registry is wired and UpdateModule proposals are
+        // live in the sim.
         let selection: &[&'static str] = &module_ids;
-        let wasm_ids = TOPOLOGY.wasm_ids(selection);
-        let (code, code_hashes) =
-            DirCodeSource::open(&modules_dir, &wasm_ids).expect("sim modules dir");
         let substrates = Substrates {
             forge_repo,
             duckfs_dir,
@@ -793,7 +793,7 @@ fn run_sim(
         };
         let bindings = Bindings {
             invite: &invite_binding,
-            chain_id: SIM_CHAIN_ID,
+            chain_id: LOCAL_CHAIN_ID,
             validators: &valset_keys,
             code_hashes: &code_hashes,
         };
@@ -1328,7 +1328,7 @@ impl Sim {
             // seeded key names an identity for consensus-op scenarios; no mesh
             // routes behind it.
             public_key: self.public_key.clone(),
-            chain_id: SIM_CHAIN_ID.into(),
+            chain_id: LOCAL_CHAIN_ID.into(),
             operations: noded::OperationalStatus {
                 role: noded::NodeRole::Local,
                 phase: noded::NodePhase::Serving,

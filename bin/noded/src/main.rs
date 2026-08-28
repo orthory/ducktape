@@ -19,8 +19,9 @@
 //! heights stay monotonic across restarts (a counter restarting at 0 would
 //! make every new block look already-indexed and be silently skipped).
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -32,8 +33,9 @@ use indexer::IndexStore;
 use noded::bundle::{DirCodeSource, host_from, qmdb_stores};
 use noded::compose::{Bindings, Boot, Substrates, compose};
 use noded::{
-    BlockDisposition, BlockRecord, BlockSummary, ModuleCategory, ModuleStatus, NodeCommand,
-    NodeHandle, NodeMetrics, NodeStatus, ORACLE_ORIGIN, StreamHub, block_row, hex_root,
+    BlockDisposition, BlockRecord, BlockSummary, LOCAL_CHAIN_ID, ModuleCategory, ModuleStatus,
+    NodeCommand, NodeHandle, NodeMetrics, NodeStatus, ORACLE_ORIGIN, StreamHub, block_row,
+    hex_root,
 };
 use sdk::{Event, Msg, Origin};
 use topology::TOPOLOGY;
@@ -43,13 +45,6 @@ use topology::TOPOLOGY;
 /// default set). status reports use this list, and `run_node` composes exactly
 /// these ids through the topology composer.
 const MODULE_IDS: &[&str] = topology::SIM_BASE;
-
-/// the daemon's network name: the composer binds it into the identity and
-/// gateway guests' genesis `__config`, and `/v1/status` serves it back. ONE
-/// value — a client that signs an identity consent reads the chain id from
-/// status, so a status that disagreed with the bindings would mint signatures
-/// nothing accepts.
-const CHAIN_ID: &str = "local";
 
 mod echo_oracle;
 
@@ -74,22 +69,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     // where the wasm tenants' `<id>.component.wasm` bytes come from: `--modules`,
-    // else the managed dir `make install-node` fills. Refused HERE, before a
-    // storage root is created or a listener binds — a genesis that cannot read
-    // its components is a dead daemon, and the remedy is the operator's, not a
-    // stack trace from the actor thread.
+    // else the managed dir `make install-node` fills. Read and hashed HERE,
+    // before a storage root is created or a listener binds — ONE decision about
+    // whether the bundle is usable, made where its remedy is the operator's
+    // rather than a stack trace from the actor thread. the source (a path and a
+    // hash table) then rides into the actor.
     let modules_dir = match modules {
         Some(dir) => dir,
         None => workspace_config::modules_dir()?,
     };
-    if let Some(missing) = missing_from_bundle(&modules_dir) {
-        return Err(format!(
-            "no genesis components at {missing} — fill `~/.ducktape/modules` \
-             (`make install-node`), or pass --modules <dir> holding every \
-             <id>.component.wasm"
+    let wasm_ids = TOPOLOGY.wasm_ids(MODULE_IDS);
+    let (code, code_hashes) = DirCodeSource::open(&modules_dir, &wasm_ids).map_err(|err| {
+        format!(
+            "{err} — fill `~/.ducktape/modules` (`make install-node`), or pass \
+             --modules <dir> holding every <id>.component.wasm"
         )
-        .into());
-    }
+    })?;
     let storage = storage.unwrap_or_else(|| {
         std::env::temp_dir().join(format!("ducktape-noded-{}", std::process::id()))
     });
@@ -165,7 +160,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_node(
                 actor_storage,
                 actor_forge_repo,
-                modules_dir,
+                code,
+                code_hashes,
                 actor_index,
                 blobs,
                 actor_handle,
@@ -200,26 +196,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
 }
 
-/// what the genesis bundle is missing, named for the operator: the modules dir
-/// itself, else the first `<id>.component.wasm` a [`MODULE_IDS`] wasm tenant
-/// needs. `None` = a bundle the composer can read.
-///
-/// half-filled dirs are the common case (an interrupted `make install-node`, a
-/// hand-assembled `--modules`), and the composer's own failure surfaces from
-/// the actor thread AFTER a storage root exists. probes only — no read, no
-/// hash: the composer opens and hashes the bytes itself a moment later.
-fn missing_from_bundle(dir: &Path) -> Option<String> {
-    if !dir.is_dir() {
-        return Some(dir.display().to_string());
-    }
-    TOPOLOGY
-        .wasm_ids(MODULE_IDS)
-        .into_iter()
-        .map(|id| noded::bundle::component_path(dir, id))
-        .find(|component| !component.is_file())
-        .map(|component| component.display().to_string())
-}
-
 /// own the host for the process lifetime: genesis the module set, then apply
 /// commands in arrival order — every submit is its own block.
 // the actor thread's entry point threads every daemon-owned root/lane in by
@@ -229,7 +205,8 @@ fn missing_from_bundle(dir: &Path) -> Option<String> {
 fn run_node(
     storage: PathBuf,
     forge_repo: PathBuf,
-    modules_dir: PathBuf,
+    code: DirCodeSource,
+    code_hashes: BTreeMap<String, [u8; 32]>,
     index: Arc<IndexStore>,
     blobs: noded::blobs::BlobHandle,
     node_handle: noded::NodeHandle,
@@ -244,11 +221,9 @@ fn run_node(
 
     executor.start(|context| async move {
         // genesis: the topology's `sim_base` selection composed the way bin/node
-        // composes — every wasm tenant is the REAL guest component read from the
-        // modules dir, over qmdb stores in this runtime's storage root.
-        let wasm_ids = TOPOLOGY.wasm_ids(MODULE_IDS);
-        let (code, code_hashes) =
-            DirCodeSource::open(&modules_dir, &wasm_ids).expect("noded modules dir");
+        // composes — every wasm tenant is the REAL guest component, fetched by
+        // hash from the source `main` opened, over qmdb stores in this runtime's
+        // storage root.
         // the block loop's own handle: each block's root payload is staged as
         // its explorer row is built, so op hashes stay dereferencable via the
         // blob lane (worker follow-ups included — the http submit handler only
@@ -262,7 +237,7 @@ fn run_node(
         let bindings = Bindings {
             // no governance in this set, so nothing reads an invite namespace.
             invite: b"",
-            chain_id: CHAIN_ID,
+            chain_id: LOCAL_CHAIN_ID,
             // and no valset: the single-writer daemon has no validators.
             validators: &[],
             code_hashes: &code_hashes,
@@ -578,7 +553,7 @@ fn publish_status(
         public_key: String::new(),
         // the chain the composer bound into the identity and gateway guests —
         // the value a client's add-key consent must sign over.
-        chain_id: CHAIN_ID.into(),
+        chain_id: LOCAL_CHAIN_ID.into(),
         operations: metrics.operational_status(),
     });
     // no mesh, no consensus: the standing carries only the height — the

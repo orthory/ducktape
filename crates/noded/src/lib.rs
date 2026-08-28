@@ -700,6 +700,14 @@ pub const DEFAULT_ORIGIN: &str = "noded";
 /// here rather than each inventing a spelling.
 pub const ORACLE_ORIGIN: &[u8] = b"oracle";
 
+/// the network name BOTH single-writer daemons compose under: the composer
+/// binds it into the identity and gateway guests' genesis `__config`, and
+/// `/v1/status` serves it back. ONE value across noded and simnode — their
+/// genesis roots are comparable only while they share it, and a client that
+/// signs an identity consent reads the chain id from status, so a status
+/// disagreeing with the bindings would mint signatures nothing accepts.
+pub const LOCAL_CHAIN_ID: &str = "local";
+
 async fn submit(State(handle): State<NodeHandle>, Json(req): Json<SubmitRequest>) -> Response {
     let payload = serde_json::to_vec(&req.payload).expect("a decoded json value re-serializes");
     // empty string falls back too — chat rejects empty external authors
