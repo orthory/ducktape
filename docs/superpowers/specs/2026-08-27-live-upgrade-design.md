@@ -171,8 +171,11 @@ binary or its tests).
 ### Admitted modules across restart and statesync
 
 `restore_host` and `sync_all_modules` compose `topology::PRODUCTION ∪ {ids in
-the lifecycle registry with a non-empty active hash that are not in
-PRODUCTION}`. An admitted module is Map-backed (it was instantiated by
+the lifecycle registry that are not in PRODUCTION}`, each admitted id seated on
+`lifecycle::code_at(entry, checkpoint_height)` — an admission whose first
+activation is past the checkpoint is seated with its first code and empty
+state, and replay/`realize_module_swaps` moves it forward from there. An
+admitted module is Map-backed (it was instantiated by
 `WasmModuleFactory::instantiate`, i.e. `WasmModule::from_bytes`), so its
 state is in the checkpoint/statesync manifest's snapshot lane already
 (`host.module_roots()` iterates the whole registry); the composer installs
@@ -335,7 +338,7 @@ ducktape module status
 `a_registered_module_survives_a_live_swap_a_restart_and_statesync`, serialized
 by `common::serial()` — NOT `#[ignore]`d: it runs on a plain
 `cargo test -p node-bin --test module_upgrade_e2e -- --test-threads=1` in
-~90 s. `Cluster::new(&[1, 2, 3, 4], &[1, 2, 3])`: the fourth peer is DECLARED
+~97 s. `Cluster::new(&[1, 2, 3, 4], &[1, 2, 3])`: the fourth peer is DECLARED
 in the layout from the start and spawned only in step 7 — statesync is
 fail-closed for a peer with no committed standing, and `Cluster::spawn_joiner`
 appends its id to `peer_ids`, so it would declare id 4 twice.
