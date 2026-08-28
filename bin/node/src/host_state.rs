@@ -16,6 +16,7 @@ use commonware_runtime::Supervisor as _;
 use duckfs_disk::SyncScratch;
 use files::Files;
 use host::Host;
+use noded::bundle::{host_from, qmdb_stores};
 use noded::compose::{Bindings, Boot, BoxFut, Substrates, compose, compose_module};
 use recovery::Manifest;
 use sdk::StateRoot;
@@ -65,18 +66,6 @@ impl host::CodeSource for BlobCodeSource {
     async fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>> {
         let digest: [u8; 32] = code_hash.try_into().ok()?;
         self.0.get_chunk(&digest)
-    }
-}
-
-/// the wasm-runtime [`host::ModuleFactory`]: a post-genesis ADMISSION
-/// (governance `RegisterModule` → lifecycle `ScheduleRegister`) instantiates its
-/// module from the verified component bytes at the activation boundary — the
-/// constructor twin of [`BlobCodeSource`].
-pub(super) struct WasmModuleFactory;
-
-impl host::ModuleFactory for WasmModuleFactory {
-    fn instantiate(&self, id: &str, bytes: &[u8]) -> Result<Box<dyn sdk::Module>, sdk::Error> {
-        Ok(Box::new(WasmModule::from_bytes(id, bytes)?))
     }
 }
 
@@ -198,31 +187,6 @@ fn bindings<'a>(
     }
 }
 
-/// compose the module set into a [`Host`]. registration order is NOT
-/// consensus-relevant (the host keys modules in a `BTreeMap`) — only the
-/// module set and each module's constructed state compose the root-hash.
-/// every production host admits post-genesis modules through the wasm
-/// runtime — genesis, restore, and statesync compositions alike.
-fn finish(modules: Vec<Box<dyn sdk::Module>>) -> Result<Host, sdk::Error> {
-    let mut host = Host::genesis(modules)?;
-    host.set_module_factory(Box::new(WasmModuleFactory));
-    Ok(host)
-}
-
-/// the canonical store source: every store-backed module `init`s its qmdb
-/// store under its own id in this process's storage root — fresh at genesis,
-/// reopened at its committed position on restore.
-fn canonical_stores<'a>(
-    context: &'a commonware_runtime::tokio::Context,
-) -> impl FnMut(&'static str) -> BoxFut<'a, Result<Box<dyn sdk::MerkleStore>, String>> + 'a {
-    move |id: &'static str| -> BoxFut<'a, Result<Box<dyn sdk::MerkleStore>, String>> {
-        let child = context.child(id);
-        Box::pin(async move {
-            Ok(Box::new(QmdbStore::init(child, id).await) as Box<dyn sdk::MerkleStore>)
-        })
-    }
-}
-
 /// the PRODUCTION module set at block zero — genesis state, identical on every
 /// node (a different set, or different component bytes, composes a different
 /// root-hash and the network forks at genesis): the topology's production
@@ -244,7 +208,7 @@ pub(super) async fn genesis_host(
         .map(|k| k.as_ref().to_vec())
         .collect();
     let code = BlobCodeSource(std::sync::Arc::new(blobs.clone()));
-    let mut stores = canonical_stores(context);
+    let mut stores = qmdb_stores(context);
     let modules = compose(
         PRODUCTION,
         &code,
@@ -255,7 +219,7 @@ pub(super) async fn genesis_host(
     )
     .await
     .expect("genesis compose");
-    finish(modules).expect("genesis host")
+    host_from(modules).expect("genesis host")
 }
 
 /// the RESTORE twin of [`genesis_host`]: the disk substrates (qmdb stores,
@@ -277,7 +241,7 @@ pub(super) async fn restore_host(
 ) -> Result<Host, String> {
     seed_complete_bundle(&blobs, genesis)?;
     let code = BlobCodeSource(std::sync::Arc::new(blobs.clone()));
-    let mut stores = canonical_stores(context);
+    let mut stores = qmdb_stores(context);
     let mut snapshots = |id: &'static str| -> BoxFut<'_, Result<Snapshot, String>> {
         let got = restore_snapshot(manifest, id);
         Box::pin(async move { got })
@@ -297,7 +261,7 @@ pub(super) async fn restore_host(
         },
     )
     .await?;
-    let mut host = finish(modules).map_err(|e| format!("restore host: {e}"))?;
+    let mut host = host_from(modules).map_err(|e| format!("restore host: {e}"))?;
     // a genesis checkpoint has applied nothing: an admitted module seats its
     // first code and the replay moves it forward from there.
     let checkpoint_height = manifest.height.unwrap_or(0);
@@ -637,7 +601,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
     // the topology keeps this set in lockstep with [`genesis_host`] by
     // construction — a missing module composes a different root-hash and the
     // join fails its final check.
-    let mut host = finish(modules).map_err(|e| format!("compose synced host: {e}"))?;
+    let mut host = host_from(modules).map_err(|e| format!("compose synced host: {e}"))?;
     adopt_admitted_modules(&mut host, &code, manifest.height, &mut |id| {
         let fetch = snapshot_of(id);
         Box::pin(async move { fetch.await.map(Some) })

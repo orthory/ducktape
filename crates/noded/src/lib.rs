@@ -26,6 +26,10 @@ pub mod admin;
 pub use admin::{AdminConfig, AdminExposure};
 
 pub mod blobs;
+// the pieces every process needs AROUND the composer: the on-disk component
+// bundle (naming, hashing, a code source over it), the qmdb store source, and
+// the `Host` finisher.
+pub mod bundle;
 // the ONE module composer every host in the workspace builds its module set
 // through: a topology selection + a code source + a store source.
 pub mod compose;
