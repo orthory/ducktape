@@ -1655,6 +1655,254 @@ pub async fn login_with_passkey(
     Ok(true)
 }
 
+// ============================================================================
+// QR ceremonies — the browser is a phone that scanned the app's screen
+// ============================================================================
+
+/// One reading of a ceremony the launch window (or the Settings card) is
+/// showing: `show_qr` carries the URL to render, `working` a line of what
+/// the app is doing between touches, `done`/`failed` close the stream.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct CeremonyStep {
+    pub phase: String,
+    pub qr: String,
+    pub detail: String,
+}
+
+impl CeremonyStep {
+    fn working(detail: &str) -> Self {
+        Self {
+            phase: "working".into(),
+            qr: String::new(),
+            detail: detail.into(),
+        }
+    }
+
+    fn show_qr(url: String, detail: &str) -> Self {
+        Self {
+            phase: "show_qr".into(),
+            qr: url,
+            detail: detail.into(),
+        }
+    }
+
+    fn done() -> Self {
+        Self {
+            phase: "done".into(),
+            qr: String::new(),
+            detail: String::new(),
+        }
+    }
+
+    fn failed(message: String) -> Self {
+        Self {
+            phase: "failed".into(),
+            qr: String::new(),
+            detail: message,
+        }
+    }
+}
+
+/// Test seam: Ice reads extern structs but cannot construct one.
+pub fn ceremony_step(phase: String, qr: String, detail: String) -> CeremonyStep {
+    CeremonyStep { phase, qr, detail }
+}
+
+/// Which welcome door a ceremony came through: a name was typed only on the
+/// create path.
+pub fn welcome_door(name_draft: &str) -> crate::WelcomeDoor {
+    match name_draft.trim().is_empty() {
+        true => crate::WelcomeDoor::Login,
+        false => crate::WelcomeDoor::Create,
+    }
+}
+
+/// The step's phase as the discriminant the handlers branch on.
+pub fn ceremony_phase(step: &CeremonyStep) -> crate::CeremonyPhase {
+    match step.phase.as_str() {
+        "show_qr" => crate::CeremonyPhase::ShowQr,
+        "working" => crate::CeremonyPhase::Working,
+        "done" => crate::CeremonyPhase::Done,
+        _ => crate::CeremonyPhase::Failed,
+    }
+}
+
+type StepSender = iced::futures::channel::mpsc::Sender<CeremonyStep>;
+
+/// Hand one reading to the UI; a closed receiver means the lane was
+/// invalidated (a cancel), which ends the ceremony as an error nobody reads.
+async fn step(tx: &mut StepSender, step: CeremonyStep) -> Result<(), String> {
+    use iced::futures::SinkExt as _;
+    tx.send(step)
+        .await
+        .map_err(|_| "the ceremony was cancelled".to_string())
+}
+
+/// One browser ceremony run ON A PHONE: mint a relay slot, hand the URL to
+/// the UI as a QR, then wait for the phone's answer under the same ceiling
+/// the desktop path uses. `relay_base` is the auth host (tests point it at a
+/// fake).
+pub(crate) async fn qr_ceremony(
+    relay_base: &str,
+    request: authpage::Request,
+    tx: &mut StepSender,
+) -> Result<authpage::Outcome, String> {
+    let relay = authpage::Relay::at(relay_base);
+    let url = authpage::request_url(authpage::AUTH_PAGE, &request, &relay.callback_url());
+    let detail = match request {
+        authpage::Request::Create { .. } => "Your phone will create the passkey.",
+        authpage::Request::Get { .. } => "Your phone will confirm with the passkey.",
+        authpage::Request::Eth { .. } => "Your phone will sign with the wallet.",
+    };
+    step(tx, CeremonyStep::show_qr(url, detail)).await?;
+    let waiting = tokio::task::spawn_blocking(move || relay.wait(CEREMONY_TIMEOUT));
+    waiting
+        .await
+        .map_err(|_| "the ceremony did not finish".to_string())?
+}
+
+/// Run `body` as a step stream: every `Err` becomes a `failed` step, `Ok` a
+/// `done` one. The body is driven BY the stream's own polls (no spawn, so
+/// no runtime handle is assumed), and every reading — the closing one too —
+/// travels the one channel, so the UI sees them in order. Dropping the
+/// stream (a lane invalidation) drops the body mid-await: the cancel.
+fn ceremony_stream<F, Fut>(body: F) -> iced::futures::stream::BoxStream<'static, CeremonyStep>
+where
+    F: FnOnce(StepSender) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+{
+    use iced::futures::{SinkExt as _, StreamExt as _};
+    let (tx, rx) = iced::futures::channel::mpsc::channel::<CeremonyStep>(8);
+    let mut closing = tx.clone();
+    let driving = async move {
+        let last = match body(tx).await {
+            Ok(()) => CeremonyStep::done(),
+            Err(message) => CeremonyStep::failed(message),
+        };
+        let _ = closing.send(last).await;
+    };
+    let driver = iced::futures::stream::once(driving).filter_map(|()| async { None });
+    iced::futures::stream::select(rx, driver).boxed()
+}
+
+/// Create the account with this device's key (no touch), then register a
+/// passkey from the phone: QR 1 creates it, this device consents, QR 2 has
+/// the passkey sign its own admission.
+pub fn create_account_by_qr(
+    rpc: String,
+    password: String,
+    chain_id: String,
+    name: String,
+) -> iced::futures::stream::BoxStream<'static, CeremonyStep> {
+    ceremony_stream(move |mut tx| async move {
+        let chain_id = named_chain(chain_id)?;
+        require_password(&password)?;
+        step(&mut tx, CeremonyStep::working("Creating the account…")).await?;
+        create_account(rpc.clone(), password.clone(), name)
+            .await
+            .map_err(|e| e.message)?;
+        add_passkey_steps(&mut tx, &rpc, password, &chain_id, None).await
+    })
+}
+
+/// Register a passkey on the account this device's key already belongs to.
+pub fn add_passkey_by_qr(
+    rpc: String,
+    password: String,
+    chain_id: String,
+    label: String,
+) -> iced::futures::stream::BoxStream<'static, CeremonyStep> {
+    ceremony_stream(move |mut tx| async move {
+        let chain_id = named_chain(chain_id)?;
+        let label = optional_label(label)?;
+        require_password(&password)?;
+        add_passkey_steps(&mut tx, &rpc, password, &chain_id, label).await
+    })
+}
+
+/// QR 1 (create) → this device consents → QR 2 (the passkey signs its own
+/// `AddKey`) → submit. The phone half of `register_passkey`.
+async fn add_passkey_steps(
+    tx: &mut StepSender,
+    rpc: &str,
+    password: String,
+    chain_id: &str,
+    label: Option<String>,
+) -> Result<(), String> {
+    let client = rpc_client(rpc)?;
+    let account = own_account(&client).await?;
+    let registered = qr_ceremony(
+        authpage::AUTH_PAGE,
+        authpage::Request::Create {
+            challenge: authpage::create_challenge(),
+            user: account.number,
+            name: account.name,
+        },
+        tx,
+    )
+    .await?;
+    let authpage::Outcome::Create { public_key, .. } = registered else {
+        return Err("expected a passkey registration".to_string());
+    };
+    step(tx, CeremonyStep::working("Consenting to the new key…")).await?;
+    let msg = consented_add_key(
+        &client,
+        password,
+        chain_id,
+        identity::KeyScheme::Secp256r1,
+        &public_key,
+        label,
+    )
+    .await?;
+    let (request, preimage) =
+        authpage::passkey_frame_request(&public_key, next_sequence(), &identity_msg(&msg));
+    let signed = qr_ceremony(authpage::AUTH_PAGE, request, tx).await?;
+    step(tx, CeremonyStep::working("Submitting…")).await?;
+    submit_raw_frame(
+        &client,
+        "identity",
+        authpage::passkey_frame(preimage, &signed)?,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Admit THIS device by a passkey's consent given on the phone: one QR. The
+/// phone half of `login_with_passkey`.
+pub fn login_by_qr(
+    rpc: String,
+    password: String,
+    chain_id: String,
+) -> iced::futures::stream::BoxStream<'static, CeremonyStep> {
+    ceremony_stream(move |mut tx| async move {
+        let chain_id = named_chain(chain_id)?;
+        require_password(&password)?;
+        let Some(device_key) = local_user_key().await else {
+            return Err("this device has no user key".to_string());
+        };
+        let client = rpc_client(&rpc)?;
+        let generation = key_generation(&client, &device_key).await?;
+        let consent = qr_ceremony(
+            authpage::AUTH_PAGE,
+            authpage::login_request(&chain_id, &device_key, generation),
+            &mut tx,
+        )
+        .await?;
+        let (number, proof) = authpage::login_consent(&consent)?;
+        step(&mut tx, CeremonyStep::working("Joining the account…")).await?;
+        let account = account_reply(
+            client
+                .query("identity", &identity::IdentityQuery::Get { number })
+                .await?,
+        )?
+        .ok_or_else(|| format!("the passkey names account {number}, unknown to this node"))?;
+        let msg =
+            authpage::login_add_key(&chain_id, &device_key, generation, &account, None, proof)?;
+        signed_write(&client, "identity", identity::encode_msg(&msg), password).await?;
+        Ok(())
+    })
+}
+
 /// A pasted ticket is an `AddKey` or it is refused HERE, before any signature
 /// — the module would refuse a stray `SetName` too, but under a name that
 /// says nothing about tickets.
@@ -1789,5 +2037,96 @@ mod account_ticket_tests {
         let err = add_key_ticket_bytes(&stray).unwrap_err();
         assert!(err.contains("not an add-key ticket"), "{err}");
         assert!(add_key_ticket_bytes("not json").is_err());
+    }
+}
+
+#[cfg(test)]
+mod qr_ceremony_tests {
+    use super::*;
+    use std::io::{BufRead as _, BufReader, Write as _};
+
+    /// a relay that answers 204 `absent` times, then `json` once, then 204.
+    fn fake_relay(absent: usize, json: &'static str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for (served, stream) in listener.incoming().enumerate() {
+                let mut stream = stream.unwrap();
+                let mut line = String::new();
+                BufReader::new(&stream).read_line(&mut line).unwrap();
+                let is_the_answer = served == absent;
+                let response = match is_the_answer {
+                    true => format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                        json.len()
+                    ),
+                    false => "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string(),
+                };
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        base
+    }
+
+    const ASSERTION: &str = r#"{"op":"get","credentialId":"AQ","authenticatorData":"AQ","clientDataJSON":"AQ","signature":"AQ","userHandle":"KgAAAAAAAAA"}"#;
+
+    /// the first reading is the QR — the auth page URL carrying this relay's
+    /// slot as its callback — and the outcome is the phone's answer.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_qr_ceremony_shows_the_url_then_yields_the_outcome() {
+        let base = fake_relay(1, ASSERTION);
+        let (mut tx, mut rx) = iced::futures::channel::mpsc::channel::<CeremonyStep>(8);
+        let outcome = qr_ceremony(
+            &base,
+            authpage::Request::Get {
+                challenge: [7u8; 32],
+            },
+            &mut tx,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            authpage::Outcome::Get {
+                user_handle: Some(42),
+                ..
+            }
+        ));
+        let shown = rx.next().await.unwrap();
+        assert_eq!(shown.phase, "show_qr");
+        assert!(
+            shown
+                .qr
+                .starts_with("https://auth.ducktape.byeongsu.dev/#op=get&challenge="),
+            "{}",
+            shown.qr
+        );
+        // the callback is percent-encoded into the fragment: `/r/` survives as %2Fr%2F
+        assert!(
+            shown.qr.contains("&cb=http%3A%2F%2F127.0.0.1"),
+            "{}",
+            shown.qr
+        );
+        assert!(shown.qr.contains("%2Fr%2F"), "{}", shown.qr);
+    }
+
+    /// the stream shape: readings in order, and the closing one last.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_ceremony_stream_ends_with_its_closing_step_in_order() {
+        let steps: Vec<CeremonyStep> = ceremony_stream(|mut tx| async move {
+            step(&mut tx, CeremonyStep::working("one")).await?;
+            step(&mut tx, CeremonyStep::working("two")).await?;
+            Err("boom".to_string())
+        })
+        .collect()
+        .await;
+        let phases: Vec<&str> = steps.iter().map(|s| s.phase.as_str()).collect();
+        assert_eq!(phases, ["working", "working", "failed"]);
+        assert_eq!(steps[1].detail, "two");
+        assert_eq!(steps[2].detail, "boom");
+        let done: Vec<CeremonyStep> = ceremony_stream(|_tx| async move { Ok(()) }).collect().await;
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].phase, "done");
     }
 }

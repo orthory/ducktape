@@ -286,6 +286,17 @@ extern crate::backend
   register_passkey(rpc:str, password:str, chain_id:str, label:str) -> bool ! AppError
   link_wallet(rpc:str, password:str, chain_id:str, label:str) -> bool ! AppError
   login_with_passkey(rpc:str, password:str, chain_id:str, label:str) -> bool ! AppError
+  // the same ceremonies with the browser on a PHONE: each is a stream whose
+  // first reading is the QR to show and whose last is `done` or `failed`;
+  // `phase` is `working | show_qr | done | failed`. The phone's answer comes
+  // back through the auth host's relay (`authpage::Relay`).
+  CeremonyStep(phase:str, qr:str, detail:str)
+  stream create_account_by_qr(rpc:str, password:str, chain_id:str, name:str) -> CeremonyStep
+  stream login_by_qr(rpc:str, password:str, chain_id:str) -> CeremonyStep
+  stream add_passkey_by_qr(rpc:str, password:str, chain_id:str, label:str) -> CeremonyStep
+  pure ceremony_step(phase:str, qr:str, detail:str) -> CeremonyStep
+  pure ceremony_phase(step:&CeremonyStep) -> CeremonyPhase
+  pure welcome_door(name_draft:&str) -> WelcomeDoor
   SettingsFacts(generation:i64, key_path:str, key_state:str, data_dir:str, open_tabs:i64, user_key:str)
   load_settings_facts(rpc:str, generation:i64) -> SettingsFacts ! HydrationError
   clear_doc_tabs(rpc:str) -> bool

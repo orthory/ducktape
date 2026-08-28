@@ -207,20 +207,81 @@ on welcome_skip
   task window open console -> console_opened _
 
 on welcome_cancel
+  invalidate lane=ceremony
+  invalidate lane=desktop_ceremony
   mutation_phase = MutationPhase.idle
   ceremony_phase = ""
   ceremony_qr = ""
   ceremony_detail = ""
 
-// wired in the ceremonies change
-on welcome_create_submit(_name)
+// THE CEREMONIES. Each is a stream on ONE lane: the first reading is the QR
+// to show, `working` lines fill the gaps between touches, and `done` /
+// `failed` close it. The chain id is the pick's probe answer; a node that
+// named none refuses here, before any phone is involved.
+on welcome_create_submit(name)
+  return if mutation_phase != MutationPhase.idle || empty(name) || empty(hub_chain_id)
   onboarding_error = ""
+  mutation_phase = MutationPhase.onboarding
+  stream replace lane=ceremony create_account_by_qr(rpc, password, hub_chain_id, name) -> ceremony_stepped _
 
 on welcome_login_submit
+  return if mutation_phase != MutationPhase.idle || empty(hub_chain_id)
   onboarding_error = ""
+  mutation_phase = MutationPhase.onboarding
+  stream replace lane=ceremony login_by_qr(rpc, password, hub_chain_id) -> ceremony_stepped _
 
+// The desktop path, from under the QR: the browser ceremonies the Settings
+// card runs. A non-empty name draft means the user was creating — the
+// account exists by the time a QR shows, so registering the passkey is the
+// right continuation; otherwise it is a login.
 on welcome_desktop
-  onboarding_error = ""
+  return if ceremony_phase != "show_qr"
+  invalidate lane=ceremony
+  ceremony_phase = "working"
+  ceremony_qr = ""
+  ceremony_detail = "Continue in the browser…"
+  let door = welcome_door(welcome_name_draft)
+  match door
+    WelcomeDoor.create
+      run replace lane=desktop_ceremony register_passkey(rpc, password, hub_chain_id, "") -> welcome_desktop_done _ | welcome_failed _
+    WelcomeDoor.login
+      run replace lane=desktop_ceremony login_with_passkey(rpc, password, hub_chain_id, "") -> welcome_desktop_done _ | welcome_failed _
+
+// Same landing as a `done` step (inlined: a handler cannot call a handler).
+on welcome_desktop_done(_ok)
+  mutation_phase = MutationPhase.idle
+  ceremony_phase = ""
+  ceremony_qr = ""
+  ceremony_detail = ""
+  task window open console -> console_opened _
+
+on ceremony_stepped(next)
+  let phase = ceremony_phase(next)
+  ceremony_phase = next.phase
+  ceremony_qr = next.qr
+  ceremony_detail = next.detail
+  match phase
+    CeremonyPhase.done
+      mutation_phase = MutationPhase.idle
+      ceremony_phase = ""
+      ceremony_qr = ""
+      task window open console -> console_opened _
+    CeremonyPhase.failed
+      mutation_phase = MutationPhase.idle
+      ceremony_phase = ""
+      ceremony_qr = ""
+      onboarding_error = next.detail
+    CeremonyPhase.show_qr
+      onboarding_error = ""
+    CeremonyPhase.working
+      onboarding_error = ""
+
+on welcome_failed(cause)
+  mutation_phase = MutationPhase.idle
+  ceremony_phase = ""
+  ceremony_qr = ""
+  ceremony_detail = ""
+  onboarding_error = cause.message
 
 // The console window exists: point it at the picked endpoint, remember the
 // pick, close the launch window BY ID, and run the same connect boot the

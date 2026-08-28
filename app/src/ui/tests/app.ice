@@ -688,6 +688,20 @@ test network_pick_lands_on_the_welcome_step_without_an_account
   expect mutation_phase == MutationPhase.idle
   expect ceremony_phase == ""
 
+// A ceremony's steps drive the welcome: `working` swaps the QR for its line,
+// `failed` lands the message on the screen and frees the machine.
+test ceremony_steps_drive_the_welcome
+  preset ui_welcome_qr
+  dispatch ceremony_stepped(ceremony_step("working", "", "Consenting to the new key…"))
+  expect ceremony_phase == "working"
+  expect ceremony_qr == ""
+  expect ceremony_detail == "Consenting to the new key…"
+  expect mutation_phase == MutationPhase.onboarding
+  dispatch ceremony_stepped(ceremony_step("failed", "", "the phone did not answer in time"))
+  expect ceremony_phase == ""
+  expect onboarding_error == "the phone did not answer in time"
+  expect mutation_phase == MutationPhase.idle
+
 preset ui_palette_overlay
   state
     palette_open = true

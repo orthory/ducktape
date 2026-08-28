@@ -69,6 +69,18 @@ enum AccountProbe
   found
   missing
 
+// A QR ceremony stream's reading, as the handlers branch on it.
+enum CeremonyPhase
+  working
+  show_qr
+  done
+  failed
+
+// Which welcome door a ceremony came through — the name draft is the tell.
+enum WelcomeDoor
+  create
+  login
+
 enum NodeTab
   overview
   permissions
