@@ -509,23 +509,58 @@ impl Relay {
             .build()
             .map_err(|e| format!("relay client: {e}"))?;
         let started = std::time::Instant::now();
+        let mut polls: u32 = 0;
         loop {
-            let response = client.get(&url).send().map_err(|e| format!("relay: {e}"))?;
+            polls += 1;
+            let response = client.get(&url).send().map_err(|e| {
+                tracing::warn!(target: "ducktape::auth", event = "relay_unreachable", relay = %self.id, polls, error = %e);
+                format!("relay: {e}")
+            })?;
             match response.status().as_u16() {
                 200 => {
                     let body = response.text().map_err(|e| format!("relay body: {e}"))?;
-                    return parse_result(&body);
+                    let outcome = parse_result(&body);
+                    tracing::info!(
+                        target: "ducktape::auth",
+                        event = "relay_answered",
+                        relay = %self.id,
+                        polls,
+                        waited_ms = started.elapsed().as_millis() as u64,
+                        ok = outcome.is_ok(),
+                    );
+                    return outcome;
                 }
-                204 => {}
-                other => return Err(format!("relay answered {other}")),
+                204 => {
+                    tracing::trace!(target: "ducktape::auth", event = "relay_poll", relay = %self.id, polls)
+                }
+                other => {
+                    tracing::warn!(target: "ducktape::auth", event = "relay_refused", relay = %self.id, polls, status = other);
+                    return Err(format!("relay answered {other}"));
+                }
             }
             let elapsed = started.elapsed();
             if elapsed >= deadline {
+                tracing::warn!(target: "ducktape::auth", event = "relay_timeout", relay = %self.id, polls);
                 return Err("the phone did not answer in time".into());
             }
             std::thread::sleep(RELAY_POLL.min(deadline - elapsed));
         }
     }
+}
+
+/// the ceremony URL as a QR a phone can scan OFF A TERMINAL: half-block
+/// cells (two module rows per text line), a quiet zone, dark modules drawn in
+/// the terminal's foreground. A ~280-byte URL comes out around 37 lines by
+/// 77 columns — inside an 80-column terminal.
+pub fn terminal_qr(text: &str) -> Result<String, String> {
+    let code = qrcode::QrCode::with_error_correction_level(text, qrcode::EcLevel::L)
+        .map_err(|e| format!("qr: {e}"))?;
+    Ok(code
+        .render::<qrcode::render::unicode::Dense1x2>()
+        .dark_color(qrcode::render::unicode::Dense1x2::Light)
+        .light_color(qrcode::render::unicode::Dense1x2::Dark)
+        .quiet_zone(true)
+        .build())
 }
 
 // ============================================================================
@@ -1105,5 +1140,31 @@ mod tests {
             .wait(Duration::from_millis(10))
             .unwrap_err();
         assert!(err.contains("did not answer"), "{err}");
+    }
+
+    /// a real ceremony URL renders inside an 80-column terminal: half-block
+    /// rows, every line the same width, a quiet zone around the code.
+    #[test]
+    fn a_terminal_qr_of_a_ceremony_url_fits_eighty_columns() {
+        let relay = Relay::new();
+        let url = request_url(
+            AUTH_PAGE,
+            &Request::Create {
+                challenge: [9u8; 32],
+                user: 1234,
+                name: "byeongsu".into(),
+            },
+            &relay.callback_url(),
+        );
+        let qr = terminal_qr(&url).unwrap();
+        let lines: Vec<&str> = qr.lines().collect();
+        let width = lines[0].chars().count();
+        assert!(lines.iter().all(|l| l.chars().count() == width));
+        assert!((30..=48).contains(&lines.len()), "{} lines", lines.len());
+        assert!(width <= 80, "{width} columns");
+        assert!(
+            qr.chars()
+                .all(|c| matches!(c, '█' | '▀' | '▄' | ' ' | '\n'))
+        );
     }
 }

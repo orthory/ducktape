@@ -1511,19 +1511,31 @@ async fn browser_ceremony(request: authpage::Request) -> Result<authpage::Outcom
     let listener = authpage::Listener::bind().map_err(|e| format!("auth callback: {e}"))?;
     let callback = listener.callback_url();
     let url = authpage::request_url(authpage::AUTH_PAGE, &request, &callback);
+    let op = request_op(&request);
     let opened = authpage::open_browser(&url);
     if !opened {
+        tracing::warn!(target: "ducktape::auth", event = "ceremony_failed", surface = "browser", op, reason = "no_browser_opener");
         return Err("no browser opener on this machine (xdg-open / open)".to_string());
     }
+    tracing::info!(target: "ducktape::auth", event = "ceremony_shown", surface = "browser", op);
     let waiting = tokio::task::spawn_blocking(move || listener.wait());
     let answered = tokio::time::timeout(CEREMONY_TIMEOUT, waiting).await;
-    match answered {
+    let outcome = match answered {
         Ok(joined) => joined.map_err(|_| "the browser ceremony did not finish".to_string())?,
         Err(_elapsed) => {
             authpage::abandon(&callback, "no answer from the browser");
             Err("the browser did not answer in time".to_string())
         }
+    };
+    match &outcome {
+        Ok(_) => {
+            tracing::info!(target: "ducktape::auth", event = "ceremony_answered", surface = "browser", op)
+        }
+        Err(reason) => {
+            tracing::warn!(target: "ducktape::auth", event = "ceremony_failed", surface = "browser", op, reason)
+        }
     }
+    outcome
 }
 
 /// Register a NEW passkey on this device's account: ceremony 1 creates it
@@ -1738,27 +1750,43 @@ async fn step(tx: &mut StepSender, step: CeremonyStep) -> Result<(), String> {
         .map_err(|_| "the ceremony was cancelled".to_string())
 }
 
+/// The page op a request asks for — the `op` field of its fragment, for logs.
+fn request_op(request: &authpage::Request) -> &'static str {
+    match request {
+        authpage::Request::Create { .. } => "create",
+        authpage::Request::Get { .. } => "get",
+        authpage::Request::Eth { .. } => "eth",
+    }
+}
+
 /// One browser ceremony run ON A PHONE: mint a relay slot, hand the URL to
-/// the UI as a QR, then wait for the phone's answer under the same ceiling
-/// the desktop path uses. `relay_base` is the auth host (tests point it at a
-/// fake).
+/// the UI as a QR under `detail` (the line the screen shows beside it), then
+/// wait for the phone's answer under the same ceiling the desktop path uses.
+/// `relay_base` is the auth host (tests point it at a fake).
 pub(crate) async fn qr_ceremony(
     relay_base: &str,
     request: authpage::Request,
+    detail: &str,
     tx: &mut StepSender,
 ) -> Result<authpage::Outcome, String> {
     let relay = authpage::Relay::at(relay_base);
     let url = authpage::request_url(authpage::AUTH_PAGE, &request, &relay.callback_url());
-    let detail = match request {
-        authpage::Request::Create { .. } => "Your phone will create the passkey.",
-        authpage::Request::Get { .. } => "Your phone will confirm with the passkey.",
-        authpage::Request::Eth { .. } => "Your phone will sign with the wallet.",
-    };
+    let op = request_op(&request);
+    tracing::info!(target: "ducktape::auth", event = "ceremony_shown", surface = "phone", op, relay = %relay.id);
     step(tx, CeremonyStep::show_qr(url, detail)).await?;
     let waiting = tokio::task::spawn_blocking(move || relay.wait(CEREMONY_TIMEOUT));
-    waiting
+    let outcome = waiting
         .await
-        .map_err(|_| "the ceremony did not finish".to_string())?
+        .map_err(|_| "the ceremony did not finish".to_string())?;
+    match &outcome {
+        Ok(_) => {
+            tracing::info!(target: "ducktape::auth", event = "ceremony_answered", surface = "phone", op)
+        }
+        Err(reason) => {
+            tracing::warn!(target: "ducktape::auth", event = "ceremony_failed", surface = "phone", op, reason)
+        }
+    }
+    outcome
 }
 
 /// Run `body` as a step stream: every `Err` becomes a `failed` step, `Ok` a
@@ -1776,8 +1804,14 @@ where
     let mut closing = tx.clone();
     let driving = async move {
         let last = match body(tx).await {
-            Ok(()) => CeremonyStep::done(),
-            Err(message) => CeremonyStep::failed(message),
+            Ok(()) => {
+                tracing::info!(target: "ducktape::auth", event = "ceremony_stream_done");
+                CeremonyStep::done()
+            }
+            Err(message) => {
+                tracing::warn!(target: "ducktape::auth", event = "ceremony_stream_failed", reason = %message);
+                CeremonyStep::failed(message)
+            }
         };
         let _ = closing.send(last).await;
     };
@@ -1838,6 +1872,7 @@ async fn add_passkey_steps(
             user: account.number,
             name: account.name,
         },
+        "Scan 1 of 2 — your phone creates the passkey.",
         tx,
     )
     .await?;
@@ -1856,7 +1891,13 @@ async fn add_passkey_steps(
     .await?;
     let (request, preimage) =
         authpage::passkey_frame_request(&public_key, next_sequence(), &identity_msg(&msg));
-    let signed = qr_ceremony(authpage::AUTH_PAGE, request, tx).await?;
+    let signed = qr_ceremony(
+        authpage::AUTH_PAGE,
+        request,
+        "Scan 2 of 2 — confirm with the passkey you just made.",
+        tx,
+    )
+    .await?;
     step(tx, CeremonyStep::working("Submitting…")).await?;
     submit_raw_frame(
         &client,
@@ -1885,6 +1926,7 @@ pub fn login_by_qr(
         let consent = qr_ceremony(
             authpage::AUTH_PAGE,
             authpage::login_request(&chain_id, &device_key, generation),
+            "Confirm with the passkey that belongs to your account.",
             &mut tx,
         )
         .await?;
@@ -2082,6 +2124,7 @@ mod qr_ceremony_tests {
             authpage::Request::Get {
                 challenge: [7u8; 32],
             },
+            "Confirm with the passkey.",
             &mut tx,
         )
         .await

@@ -52,7 +52,9 @@ pub(crate) struct AccountArgs {
     /// the relying-party page the passkey/wallet ceremonies open
     #[arg(long, value_name = "URL", default_value = authpage::AUTH_PAGE, global = true)]
     auth_page: String,
-    /// print the ceremony URL instead of opening a browser (a headless box)
+    /// do the ceremony on a phone: print the page URL and a QR to scan
+    /// instead of opening a browser (a headless box); the result comes back
+    /// through the auth host's relay
     #[arg(long, global = true)]
     no_browser: bool,
 }
@@ -547,17 +549,39 @@ fn cmd_login(
 // browser ceremonies
 // ============================================================================
 
-/// one browser round trip: bind the loopback callback, open (or print) the
-/// page URL, block until the page POSTs its result.
+/// How long a ceremony on a phone may take before the CLI gives up.
+const PHONE_CEREMONY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// one ceremony round trip. With a browser: bind the loopback callback, open
+/// the page, block until it POSTs its result. Without one (`--no-browser`):
+/// the ceremony runs on a PHONE — print the page URL and a QR of it, with
+/// the auth host's relay as the callback, and poll the relay. A phone cannot
+/// reach a loopback listener, so a printed loopback URL would never answer.
 fn ceremony(auth: &AuthCtx, request: &Request) -> Result<Outcome, Box<dyn std::error::Error>> {
+    if !auth.browser {
+        return phone_ceremony(auth, request);
+    }
     let listener = authpage::Listener::bind()?;
     let url = authpage::request_url(&auth.page, request, &listener.callback_url());
-    let opened = auth.browser && authpage::open_browser(&url);
-    if !opened {
-        eprintln!("open this in a browser:\n    {url}");
+    if !authpage::open_browser(&url) {
+        eprintln!("no browser opener on this machine — open this yourself:\n    {url}");
     }
     eprintln!("waiting for the browser…");
     Ok(listener.wait()?)
+}
+
+fn phone_ceremony(
+    auth: &AuthCtx,
+    request: &Request,
+) -> Result<Outcome, Box<dyn std::error::Error>> {
+    let relay = authpage::Relay::at(&auth.page);
+    let url = authpage::request_url(&auth.page, request, &relay.callback_url());
+    eprintln!(
+        "scan this with your phone (or open the URL there):\n\n{}\n    {url}\n",
+        authpage::terminal_qr(&url)?
+    );
+    eprintln!("waiting for the phone…");
+    Ok(relay.wait(PHONE_CEREMONY_TIMEOUT)?)
 }
 
 /// touch 1 of a wallet: it signs a nonce'd reveal message and its key is
@@ -863,6 +887,33 @@ mod tests {
 
     fn signer(seed: u8) -> ed25519::PrivateKey {
         ed25519::PrivateKey::decode([seed; 32].as_slice()).unwrap()
+    }
+
+    /// `--no-browser` means a PHONE does the ceremony: its callback is the
+    /// auth host's relay, never a loopback listener a phone cannot reach.
+    #[test]
+    fn a_phone_ceremony_relays_and_never_binds_a_loopback_listener() {
+        let source = include_str!("account_cli.rs");
+        let phone = source
+            .split("\nfn phone_ceremony(")
+            .nth(1)
+            .expect("the phone ceremony")
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(phone.contains("authpage::Relay::at(&auth.page)"));
+        assert!(phone.contains("authpage::terminal_qr(&url)"));
+        assert!(!phone.contains("Listener"));
+        let browser = source
+            .split("\nfn ceremony(")
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(
+            browser.contains("if !auth.browser {\n        return phone_ceremony(auth, request);")
+        );
     }
 
     fn add_key_ticket(
