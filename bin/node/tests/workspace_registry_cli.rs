@@ -75,9 +75,9 @@ fn same_name_founds_two_distinct_registry_workspaces() {
 }
 
 /// init a workspace with the child's PATH pinned to `path_dir`, returning the
-/// generated node.toml and the workspace dir — the seam that makes compute
-/// detection hermetic: the probe only checks executability on PATH, it never
-/// runs the binary.
+/// generated node.toml and the workspace dir — the half of compute detection a
+/// test owns: the probe only checks executability on PATH, it never runs the
+/// binary.
 fn init_with_path(home: &Path, name: &str, path_dir: &Path) -> (String, std::path::PathBuf) {
     let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .args(["node", "init", "--name", name, "--primary-coordinator", "none"])
@@ -99,23 +99,27 @@ fn init_with_path(home: &Path, name: &str, path_dir: &Path) -> (String, std::pat
     (toml, workspace)
 }
 
-/// fresh-workspace compute detection on a host that cannot run a microVM: the
-/// `[sandbox]` table stays the commented example, and no service is granted.
+/// fresh-workspace compute detection: `node init` writes a live `[sandbox]`
+/// table exactly when this HOST can start the platform adapter, and grants no
+/// service either way.
 ///
-/// A fake `firecracker` on PATH is deliberately NOT enough. Detection asks
-/// `SandboxBackend::probe`, which opens `/dev/kvm` and stats the kernel and
-/// rootfs images — a table naming a runtime this host cannot start would just
-/// move the failure to the next boot, where nobody is standing. So the only
-/// hermetic half of detection is this one: no usable microVM, no live table.
-/// The agreement between the table init writes and the backend it probes is
-/// pinned by `cli::sandbox_detection_tests`.
+/// Whether the host can is not a test's to decide. Detection asks
+/// `SandboxBackend::probe_adapter` (workspace-config `detect_platform_sandbox`),
+/// and that opens `/dev/kvm` — an input no child `PATH` takes away, and one no
+/// probe should let a test fake. Asserting that a fake `firecracker` on `PATH`
+/// always refuses therefore pinned the HOST, not the code: red on every
+/// KVM-capable box, green only where the machine happened to be incapable. The
+/// oracle is the node's own `sandbox` verb instead, run over the SAME `PATH` —
+/// the one answer to "can this host isolate a run" that cannot drift from what
+/// detection asked. The agreement between the table init writes and the backend
+/// it probes is pinned by workspace-config's
+/// `the_written_table_and_the_probed_backend_name_one_runtime`.
 #[test]
-fn init_on_a_host_without_a_microvm_keeps_the_commented_sandbox_table() {
+fn init_writes_the_sandbox_table_exactly_when_the_host_can_start_the_adapter() {
     use std::os::unix::fs::PermissionsExt as _;
 
-    // an executable named like the adapter, and its hard deps beside it: the
-    // PATH question alone answers yes here, so a live table would prove
-    // detection stopped at PATH instead of asking the host.
+    // an executable named like the adapter, and its hard deps beside it: PATH
+    // is the only half of the probe a test owns.
     let bins = tempfile::tempdir().expect("fake bin dir");
     for bin in ["firecracker", "mke2fs", "debugfs", "nft"] {
         let fake = bins.path().join(bin);
@@ -123,29 +127,71 @@ fn init_on_a_host_without_a_microvm_keeps_the_commented_sandbox_table() {
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
             .expect("mark fake runtime executable");
     }
+    detection_follows_the_host(bins.path());
 
+    // ...and with nothing on PATH at all: no runtime to resolve, so the answer
+    // is the commented example on any host that does not ship one in a
+    // standard bin dir.
+    let empty = tempfile::tempdir().expect("empty PATH dir");
+    detection_follows_the_host(empty.path());
+}
+
+/// init a fresh workspace with `PATH` pinned to `path_dir`, then ask the same
+/// binary — over that same `PATH` — what this host can do. A live table must
+/// also be the one `platform_sandbox` describes, under this run's own
+/// `DUCKTAPE_HOME`.
+fn detection_follows_the_host(path_dir: &Path) {
     let home = tempfile::tempdir().expect("tempdir");
-    let (toml, workspace) = init_with_path(home.path(), "computed", bins.path());
-    assert!(
-        toml.contains("#[sandbox]") && !toml.contains("\n[sandbox]"),
-        "a fake runtime on PATH must not pass the host probe:\n{toml}"
+    let (toml, workspace) = init_with_path(home.path(), "computed", path_dir);
+    let table_is_live = toml.contains("\n[sandbox]");
+    let host_can_isolate = host_verdict(home.path(), path_dir);
+    assert_eq!(
+        table_is_live, host_can_isolate,
+        "init's table must follow the host probe:\n{toml}"
     );
     // detection never opts the node into publishing capacity either way: the
-    // table would say only HOW a run is isolated. Announcing needs a compute
-    // grant, which init cannot mint (there is no daemon signaling yet), so a
-    // fresh workspace carries no services.toml at all.
+    // table says only HOW a run is isolated. Announcing needs a compute grant,
+    // which init cannot mint (there is no daemon signaling yet), so a fresh
+    // workspace carries no services.toml at all.
     assert!(
         !workspace.join("services.toml").exists(),
         "a fresh workspace grants no service"
     );
 
-    let empty = tempfile::tempdir().expect("empty PATH dir");
-    let home = tempfile::tempdir().expect("tempdir");
-    let (toml, _) = init_with_path(home.path(), "bare", empty.path());
+    if !table_is_live {
+        assert!(
+            toml.contains("#[sandbox]"),
+            "a host that cannot isolate keeps the commented example:\n{toml}"
+        );
+        return;
+    }
+    let kernel = home.path().join("guest").join("vmlinux");
     assert!(
-        toml.contains("#[sandbox]") && !toml.contains("\n[sandbox]"),
-        "no runtime on PATH keeps the commented example:\n{toml}"
+        toml.contains(&format!("kernel = \"{}\"", kernel.display())),
+        "a live table names this run's own guest dir:\n{toml}"
     );
+}
+
+/// `ducktape node sandbox` prints one live line about the machine —
+/// `host ok` / `host NO` — from the very `probe_adapter` detection calls.
+/// Its exit status is about the WORKSPACE (an unbuilt image refuses), so only
+/// the verdict line is read.
+fn host_verdict(home: &Path, path_dir: &Path) -> bool {
+    let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .args(["node", "sandbox"])
+        .env("DUCKTAPE_HOME", home)
+        .env("PATH", path_dir)
+        .output()
+        .expect("run ducktape node sandbox");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let probed_green = stdout.contains("host       ok");
+    let probed_red = stdout.contains("host       NO");
+    assert!(
+        probed_green != probed_red,
+        "one host verdict, or this oracle is a coin flip:\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    probed_green
 }
 
 /// Run any family, not just `node`.
