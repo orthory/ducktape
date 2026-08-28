@@ -55,7 +55,7 @@
 **Interfaces:**
 - Produces: `POST https://auth.ducktape.byeongsu.dev/r/<id>` (form field `result`) → 200 html; `GET /r/<id>` → 200 `application/json` once, 204 while absent, 404 for a malformed id. `worker.js` exports `default { fetch }` and a named `handle(request, env)` for tests.
 
-- [ ] **Step 1: Write the failing page test** — append to `ops/auth-page/test.mjs` before `console.log("auth-page: ok")`:
+- [x] **Step 1: Write the failing page test** — append to `ops/auth-page/test.mjs` before `console.log("auth-page: ok")`:
 
 ```js
 // the callback is loopback OR this origin's relay path — a crafted link still cannot relay elsewhere
@@ -100,12 +100,12 @@ assert.equal((await handle(new Request("https://auth.example/"), env)).status, 2
 
 Also change the existing `parseRequest(...)` calls in the file: `parseRequest` now takes `(fragment, origin)` — pass `"https://auth.example"` as the second argument everywhere (a plain `sed`-free edit: there are eight call sites).
 
-- [ ] **Step 2: Run it to see it fail**
+- [x] **Step 2: Run it to see it fail**
 
 Run: `node ops/auth-page/test.mjs`
 Expected: FAIL — `cb must be` thrown for the relay URL (or `Cannot find module ./worker.js`).
 
-- [ ] **Step 3: Page — `allowedCallback`**. In `index.html`, replace the `loopbackOnly` helper and its call:
+- [x] **Step 3: Page — `allowedCallback`**. In `index.html`, replace the `loopbackOnly` helper and its call:
 
 ```js
     const req = { op, challenge: pure.b64u.dec(get("challenge")), cb: pure.allowedCallback(p.get("cb"), origin) };
@@ -126,7 +126,7 @@ Expected: FAIL — `cb must be` thrown for the relay URL (or `Cannot find module
   },
 ```
 
-- [ ] **Step 4: Worker** — `ops/auth-page/worker.js`:
+- [x] **Step 4: Worker** — `ops/auth-page/worker.js`:
 
 ```js
 // The result relay: a phone that scanned the app's QR runs the ceremony
@@ -166,7 +166,7 @@ export async function handle(request, env) {
 export default { fetch: handle };
 ```
 
-- [ ] **Step 5: Wiring** — `wrangler.toml` becomes:
+- [x] **Step 5: Wiring** — `wrangler.toml` becomes:
 
 ```toml
 # The WebAuthn relying-party origin: the static page plus the result relay
@@ -203,12 +203,12 @@ while nothing has arrived. The body is an assertion or a public key — public
 data the app verifies against the account's keys; a forged post fails there.
 ```
 
-- [ ] **Step 6: Run the tests**
+- [x] **Step 6: Run the tests**
 
 Run: `node ops/auth-page/test.mjs`
 Expected: `auth-page: ok`
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add ops/auth-page
@@ -226,7 +226,7 @@ git commit -m "feat(auth-page): a result relay for ceremonies that ran on a phon
 **Interfaces:**
 - Produces: `pub struct Relay { base: String, id: String }`; `Relay::new() -> Relay` (at `AUTH_PAGE`); `Relay::at(base: &str) -> Relay`; `relay.callback_url() -> String` (`{base}r/{id}`); `relay.wait(deadline: Duration) -> Result<Outcome, String>`; `pub const RELAY_POLL: Duration = 1500 ms`.
 
-- [ ] **Step 1: Failing tests** — in `lib.rs`'s `mod tests`:
+- [x] **Step 1: Failing tests** — in `lib.rs`'s `mod tests`:
 
 ```rust
     /// a relay that answers 204 `absent` times, then the JSON once, then 204.
@@ -279,9 +279,9 @@ git commit -m "feat(auth-page): a result relay for ceremonies that ran on a phon
     }
 ```
 
-- [ ] **Step 2: Run** `cargo test -p authpage -j 4 relay` — Expected: compile error, `Relay` unknown.
+- [x] **Step 2: Run** `cargo test -p authpage -j 4 relay` — Expected: compile error, `Relay` unknown.
 
-- [ ] **Step 3: Implement.** `Cargo.toml` dependencies gain `reqwest = { workspace = true }` (the workspace entry already has `blocking` + `rustls-tls`). In `lib.rs`:
+- [x] **Step 3: Implement.** `Cargo.toml` dependencies gain `reqwest = { workspace = true }` (the workspace entry already has `blocking` + `rustls-tls`). In `lib.rs`:
 
 ```rust
 // ============================================================================
@@ -347,9 +347,9 @@ impl Relay {
 
 (`Duration` is `std::time::Duration`; add the `use` if the file lacks it. The `rand`/`base64` crates are already dependencies — match their existing call style in the file, e.g. `create_challenge`.)
 
-- [ ] **Step 4: Run** `cargo test -p authpage -j 4` — Expected: all pass, including the three new ones.
+- [x] **Step 4: Run** `cargo test -p authpage -j 4` — Expected: all pass, including the three new ones.
 
-- [ ] **Step 5: Lint + commit**
+- [x] **Step 5: Lint + commit**
 
 ```bash
 cargo clippy -p authpage --tests --no-deps -j 4
@@ -368,7 +368,7 @@ git commit -m "feat(authpage): Relay — poll the auth host for a phone's answer
 **Interfaces:**
 - Produces: `HubStep.password`, `HubStep.account` (the latter unused until Task 4); extern `create_device_key(password:str) -> str ! AppError` (returns pubkey hex); Ice events `password_submit(str)`, `device_key_created(str)`; component `PasswordScreen(busy:bool, error:str)` emitting `password_submit(str)`, `go_restore`, `login_skip` with ids `#device-password`, `#device-password-confirm`, `#password-submit`, `#password-skip`.
 
-- [ ] **Step 1: Failing Ice test** — replace `create_screen_read_only_escape_contract` in `app/src/ui/tests/app.ice`:
+- [x] **Step 1: Failing Ice test** — replace `create_screen_read_only_escape_contract` in `app/src/ui/tests/app.ice`:
 
 ```
 test password_screen_read_only_escape_contract
@@ -396,7 +396,7 @@ test password_screen_read_only_escape_contract
 
 In `launch_wallets_contract`'s `events` list replace `create_submit -> create_submit _ _` with `password_submit -> password_submit _` and delete `reveal_confirm -> reveal_confirm`; delete `reveal=""` from its `with`.
 
-- [ ] **Step 2: Failing Rust test** — in `hub.rs` `mod tests` replace the two `hub_entry_step` asserts:
+- [x] **Step 2: Failing Rust test** — in `hub.rs` `mod tests` replace the two `hub_entry_step` asserts:
 
 ```rust
     #[test]
@@ -412,9 +412,9 @@ In `launch_wallets_contract`'s `events` list replace `create_submit -> create_su
     }
 ```
 
-- [ ] **Step 3: Run** `cargo test -p ducktape-app -j 4 hub::tests` — Expected: compile error (`Password` variant, `device_key_name` missing).
+- [x] **Step 3: Run** `cargo test -p ducktape-app -j 4 hub::tests` — Expected: compile error (`Password` variant, `device_key_name` missing).
 
-- [ ] **Step 4: Ice types + state.** `types.ice`:
+- [x] **Step 4: Ice types + state.** `types.ice`:
 
 ```
 enum HubStep
@@ -431,7 +431,7 @@ enum HubStep
 
 `state/onboarding.ice`: delete the `reveal_words = ""` line.
 
-- [ ] **Step 5: Backend.** In `hub.rs`:
+- [x] **Step 5: Backend.** In `hub.rs`:
 
 ```rust
 pub fn hub_entry_step(wallets: Vec<WalletInfo>) -> crate::HubStep {
@@ -492,7 +492,7 @@ pub async fn create_device_key(password: String) -> Result<String, AppError> {
 
 `extern/backend.ice` line 167 area: add `create_device_key(password:str) -> str ! AppError`; keep `create_user_key` (the CLI-shaped mint is still used by restore paths? — if `grep -rn create_user_key app/src/ui` finds no caller after this task, delete the extern AND the Rust fn).
 
-- [ ] **Step 6: Component.** In `components/onboarding.ice`, delete `CreateScreen` (line ~390) and `RevealScreen` (~566) and add, keeping `CreateScreen`'s exact box/input styling for the two fields:
+- [x] **Step 6: Component.** In `components/onboarding.ice`, delete `CreateScreen` (line ~390) and `RevealScreen` (~566) and add, keeping `CreateScreen`'s exact box/input styling for the two fields:
 
 ```
 component PasswordScreen(busy:bool, error:str)
@@ -600,7 +600,7 @@ component PasswordScreen(busy:bool, error:str)
 
 (Copy the style utilities the deleted `CreateScreen` used for its danger text, primary button and links — read them off the deleted block before removing it; the names above are the intent, the deleted block is the truth.) In `HubColumn`: `match step` arms `HubStep.create` and `HubStep.reveal` become one `HubStep.password` arm mounting `PasswordScreen #password with busy error forward password_submit go_restore login_skip`; delete the `reveal` prop from `HubColumn`'s signature and the `reveal_confirm`/`create_submit` emits, add `password_submit(str)`.
 
-- [ ] **Step 7: Handlers.** In `handlers/onboarding.ice` replace `create_submit`, `key_created`, `reveal_confirm` with:
+- [x] **Step 7: Handlers.** In `handlers/onboarding.ice` replace `create_submit`, `key_created`, `reveal_confirm` with:
 
 ```
 // PASSWORD — the device key is minted here, silently: no name, no phrase.
@@ -621,9 +621,9 @@ on device_key_created(_pubkey)
 
 (`hub_refreshed` fills `hub_wallets`/`hub_wallet_selected` so "signing as …" names the new key.) `go_login` keeps `hub_entry_step(hub_wallets)`. In `view.ice`: drop `reveal=reveal_words`, replace `create_submit -> create_submit _ _` with `password_submit -> password_submit _`, delete `reveal_confirm -> reveal_confirm`. Update `app/src/tests/design.rs` only if it names `Create`/`Reveal`.
 
-- [ ] **Step 8: Run** `cargo test -p ducktape-app -j 4` — Expected: PASS (Ice contracts + hub tests). If an Ice error names a style utility, read the deleted `CreateScreen` from `git show HEAD:app/src/ui/components/onboarding.ice` and use its exact names.
+- [x] **Step 8: Run** `cargo test -p ducktape-app -j 4` — Expected: PASS (Ice contracts + hub tests). If an Ice error names a style utility, read the deleted `CreateScreen` from `git show HEAD:app/src/ui/components/onboarding.ice` and use its exact names.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add app
@@ -641,7 +641,7 @@ git commit -m "feat(app): first launch asks for a password — the device key is
 **Interfaces:**
 - Produces: extern `chain_id_of(rpc:str) -> str ! AppError`; state `hub_chain_id = ""`, `welcome_name_draft = ""`, `ceremony_phase = ""`, `ceremony_qr = ""`, `ceremony_detail = ""`; events `account_probed(AccountData)`, `account_probe_failed(HydrationError)`, `chain_named(str)`, `welcome_skip`, `welcome_cancel`; component `WelcomeScreen(network:str, name_draft:str (bind), phase:str, qr:str, detail:str, busy:bool, error:str)` emitting `welcome_create_submit(str)`, `welcome_login_submit`, `welcome_desktop`, `welcome_cancel`, `welcome_skip`, with ids `#welcome-name`, `#welcome-create`, `#welcome-login`, `#welcome-skip`, `#welcome-cancel`, `#welcome-desktop`, `#welcome-qr`. Task 5 wires the create/login/desktop events; this task leaves them as no-op handlers that only set `onboarding_error = ""`.
 
-- [ ] **Step 1: Failing Ice tests** — append to `app.ice`:
+- [x] **Step 1: Failing Ice tests** — append to `app.ice`:
 
 ```
 // THE WELCOME SCREEN is where a device key with no account on the picked
@@ -690,9 +690,9 @@ test network_pick_lands_on_the_welcome_step_without_an_account
 
 (`account_data_none(generation:i64) -> AccountData` is a new `pure` extern for tests — Ice cannot construct extern structs; it wraps `AccountData::none`.)
 
-- [ ] **Step 2: Run** `cargo test -p ducktape-app -j 4 ice` — Expected: FAIL, `WelcomeScreen` unknown.
+- [x] **Step 2: Run** `cargo test -p ducktape-app -j 4 ice` — Expected: FAIL, `WelcomeScreen` unknown.
 
-- [ ] **Step 3: Backend.** In `node.rs` after `load_account`:
+- [x] **Step 3: Backend.** In `node.rs` after `load_account`:
 
 ```rust
 /// The chain a network names, read once off `/v1/status` — the welcome step
@@ -717,7 +717,7 @@ pub fn account_data_none(generation: i64) -> AccountData {
 
 `extern/backend.ice`: `chain_id_of(rpc:str) -> str ! AppError` and `pure account_data_none(generation:i64) -> AccountData`.
 
-- [ ] **Step 4: State** — `state/onboarding.ice` gains:
+- [x] **Step 4: State** — `state/onboarding.ice` gains:
 
 ```
   hub_chain_id = ""
@@ -727,7 +727,7 @@ pub fn account_data_none(generation: i64) -> AccountData {
   ceremony_detail = ""
 ```
 
-- [ ] **Step 5: Component** — `WelcomeScreen` in `components/onboarding.ice` (styles as in `PasswordScreen`):
+- [x] **Step 5: Component** — `WelcomeScreen` in `components/onboarding.ice` (styles as in `PasswordScreen`):
 
 ```
 component WelcomeScreen(network:str, bind name_draft:str, phase:str, qr:str, detail:str, busy:bool, error:str)
@@ -860,7 +860,7 @@ component WelcomeScreen(network:str, bind name_draft:str, phase:str, qr:str, det
 
 and the five emits. `view.ice` passes `network=network_label(account_name, rpc)` (or `rpc` when that helper needs a connected endpoint — check `network_label`'s signature), `name_draft<->welcome_name_draft`, `phase=ceremony_phase`, `qr=ceremony_qr`, `detail=ceremony_detail`, and routes the five events to same-named handlers.
 
-- [ ] **Step 6: Handlers** — in `handlers/onboarding.ice`:
+- [x] **Step 6: Handlers** — in `handlers/onboarding.ice`:
 
 ```
 // A NETWORK PICK PROBES THE ACCOUNT FIRST. The console opens only for a
@@ -955,9 +955,9 @@ on welcome_desktop
 
 Declare `lane=ceremony`, `lane=account_probe`, `lane=chain_probe` wherever the file's other lanes are declared. `account_generation` is roster state — bump it in `account_probed` only if the console's `load_account` later ignores stale generations (read `account_loaded`'s guard: `return if next.generation != account_generation`) — the probe uses the CURRENT generation, so no bump is needed.
 
-- [ ] **Step 7: Run** `cargo test -p ducktape-app -j 4` — Expected: PASS.
+- [x] **Step 7: Run** `cargo test -p ducktape-app -j 4` — Expected: PASS.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add app
@@ -976,7 +976,7 @@ git commit -m "feat(app): a network pick probes the account; no account lands on
 - Consumes: `authpage::Relay` (Task 2), `HubStep.account`/state (Task 4), existing `create_account`, `own_account`, `consented_add_key`, `passkey_frame_request`, `passkey_frame`, `login_request`, `login_consent`, `login_add_key`, `signed_write`, `submit_raw_frame`, `key_generation`, `local_user_key`, `CEREMONY_TIMEOUT`.
 - Produces: extern struct `CeremonyStep(phase:str, qr:str, detail:str)`; externs `stream create_account_by_qr(rpc:str, password:str, chain_id:str, name:str) -> CeremonyStep`, `stream login_by_qr(rpc:str, password:str, chain_id:str) -> CeremonyStep`, `stream add_passkey_by_qr(rpc:str, password:str, chain_id:str, label:str) -> CeremonyStep`; Rust `pub(crate) async fn qr_ceremony(relay_base: &str, request: authpage::Request, tx: &mut Sender<CeremonyStep>) -> Result<authpage::Outcome, String>`.
 
-- [ ] **Step 1: Failing Rust test** — in `node.rs` tests (the fake relay from Task 2 is `authpage`-private; re-declare a minimal one here, serving `GET` 204 once then the `get` JSON):
+- [x] **Step 1: Failing Rust test** — in `node.rs` tests (the fake relay from Task 2 is `authpage`-private; re-declare a minimal one here, serving `GET` 204 once then the `get` JSON):
 
 ```rust
     #[tokio::test]
@@ -996,9 +996,9 @@ git commit -m "feat(app): a network pick probes the account; no account lands on
 
 (`urlencoding_free_check` is not a thing — assert instead that `shown.qr.contains("cb=")` and that decoding the `cb` param with `authpage`'s own percent-decoding, if exposed, yields `{base}r/…`; otherwise assert `shown.qr.contains("%2Fr%2F")`.)
 
-- [ ] **Step 2: Run** `cargo test -p ducktape-app -j 4 a_qr_ceremony` — Expected: compile error.
+- [x] **Step 2: Run** `cargo test -p ducktape-app -j 4 a_qr_ceremony` — Expected: compile error.
 
-- [ ] **Step 3: Implement.** In `node.rs`:
+- [x] **Step 3: Implement.** In `node.rs`:
 
 ```rust
 /// One reading of a ceremony the launch window (or the Settings card) is
@@ -1176,7 +1176,7 @@ pub fn login_by_qr(
   stream add_passkey_by_qr(rpc:str, password:str, chain_id:str, label:str) -> CeremonyStep
 ```
 
-- [ ] **Step 4: Handlers** — replace the three placeholders in `handlers/onboarding.ice`:
+- [x] **Step 4: Handlers** — replace the three placeholders in `handlers/onboarding.ice`:
 
 ```
 // THE CEREMONIES. Each is a stream on ONE lane: the first step is the QR to
@@ -1247,7 +1247,7 @@ on welcome_failed(cause)
 
 `welcome_desktop` picks the desktop ceremony by the one fact the welcome has — a non-empty name draft means the user was creating (the account already exists by the time a QR shows, so `register_passkey` is the right continuation); otherwise it is a login. `welcome_cancel` (Task 4) already invalidates `lane=ceremony`.
 
-- [ ] **Step 5: Ice test** — append:
+- [x] **Step 5: Ice test** — append:
 
 ```
 // A ceremony's steps drive the welcome: show_qr renders, failed lands the
@@ -1268,9 +1268,9 @@ test ceremony_steps_drive_the_welcome
 
 (`pure ceremony_step(phase:str, qr:str, detail:str) -> CeremonyStep` — the test constructor, declared in `extern/backend.ice` and implemented as a one-line `pub fn ceremony_step(phase: String, qr: String, detail: String) -> CeremonyStep` in `node.rs`.)
 
-- [ ] **Step 6: Run** `cargo test -p ducktape-app -j 4` then `cargo clippy -p ducktape-app --tests --no-deps -j 4` — Expected: PASS, clean.
+- [x] **Step 6: Run** `cargo test -p ducktape-app -j 4` then `cargo clippy -p ducktape-app --tests --no-deps -j 4` — Expected: PASS, clean.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add app
@@ -1288,7 +1288,7 @@ git commit -m "feat(app): create the account with a passkey, or sign in with one
 **Interfaces:**
 - Produces: state `account_banner_dismissed = false`, `account_ceremony_phase = ""`, `account_ceremony_qr = ""`, `account_ceremony_detail = ""`; events `dismiss_account_banner`, `open_account_welcome`, `welcome_reopened(window-id)`, `account_ceremony_stepped(CeremonyStep)`, `account_ceremony_cancel`, `account_passkey_desktop`.
 
-- [ ] **Step 1: Failing Ice tests** — append:
+- [x] **Step 1: Failing Ice tests** — append:
 
 ```
 // THE BANNER: a connected console whose device key has no account says so,
@@ -1322,9 +1322,9 @@ test settings_card_shows_the_passkey_qr
 
 (Adjust the two `target` paths to the ids the mounted tree actually has — `preset ui_settings` mounts the console; read the existing `settings_keyboard_scroll_contract` for the path prefix.)
 
-- [ ] **Step 2: Run** `cargo test -p ducktape-app -j 4 ice` — Expected: FAIL, `account_banner_dismissed` unknown.
+- [x] **Step 2: Run** `cargo test -p ducktape-app -j 4 ice` — Expected: FAIL, `account_banner_dismissed` unknown.
 
-- [ ] **Step 3: State** — next to `account_exists`:
+- [x] **Step 3: State** — next to `account_exists`:
 
 ```
   account_banner_dismissed = false
@@ -1335,7 +1335,7 @@ test settings_card_shows_the_passkey_qr
 
 In `console_opened` (handlers/onboarding.ice) add `account_banner_dismissed = false` and the three ceremony resets beside the other per-network resets.
 
-- [ ] **Step 4: Banner** — in `view.ice`'s `notice:` slot, before the `if has_error` box:
+- [x] **Step 4: Banner** — in `view.ice`'s `notice:` slot, before the `if has_error` box:
 
 ```
             if connected && !account_exists && !account_banner_dismissed && !empty(password)
@@ -1400,7 +1400,7 @@ on welcome_reopened(id)
 
 (`switch_network` resets shell state before reopening — mirror the same invalidations here by extracting nothing: copy its `invalidate`/reset lines verbatim above the `task window open`, labelled `// same teardown as switch_network`.)
 
-- [ ] **Step 5: Settings QR** — in `handlers/roster.ice` replace `account_passkey_submit`:
+- [x] **Step 5: Settings QR** — in `handlers/roster.ice` replace `account_passkey_submit`:
 
 ```
 // Register a passkey FROM THE PHONE: the card shows the QR the stream hands
@@ -1472,9 +1472,9 @@ In `screens/settings.ice` at the "Register a passkey" button (~line 565): the bu
 
 Add `account_passkey_desktop()` and `account_ceremony_cancel()` to `SettingsScreen`'s emits and the props `account_ceremony_phase`, `account_ceremony_qr`, `account_ceremony_detail`; route them in `view.ice` where the other `account_*` events are routed.
 
-- [ ] **Step 6: Run** `cargo test -p ducktape-app -j 4` and `cargo clippy -p ducktape-app --tests --no-deps -j 4` — Expected: PASS, clean.
+- [x] **Step 6: Run** `cargo test -p ducktape-app -j 4` and `cargo clippy -p ducktape-app --tests --no-deps -j 4` — Expected: PASS, clean.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add app
@@ -1488,7 +1488,7 @@ git commit -m "feat(app): a console without an account says so; Settings registe
 **Files:**
 - Modify: `ops/auth-page/wrangler.toml` (the KV id)
 
-- [ ] **Step 1: KV namespace + deploy** (the OAuth recipe in `ops/auth-page/README.md`; headless: `--browser=false` and curl the printed callback within 120 s):
+- [x] **Step 1: KV namespace + deploy** (the OAuth recipe in `ops/auth-page/README.md`; headless: `--browser=false` and curl the printed callback within 120 s):
 
 ```bash
 npx wrangler@4 kv namespace create CEREMONIES --config ops/auth-page/wrangler.toml   # prints the id
@@ -1496,7 +1496,7 @@ npx wrangler@4 kv namespace create CEREMONIES --config ops/auth-page/wrangler.to
 npx wrangler@4 deploy --config ops/auth-page/wrangler.toml
 ```
 
-- [ ] **Step 2: Live relay check**
+- [x] **Step 2: Live relay check**
 
 ```bash
 ID=$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n')
@@ -1506,7 +1506,7 @@ curl -s https://auth.ducktape.byeongsu.dev/r/$ID; echo                          
 curl -s -o /dev/null -w '%{http_code}\n' https://auth.ducktape.byeongsu.dev/r/$ID           # 204
 ```
 
-- [ ] **Step 3: Gates**
+- [x] **Step 3: Gates**
 
 ```bash
 node ops/auth-page/test.mjs
@@ -1517,7 +1517,7 @@ cargo clippy -p authpage -p ducktape-app --tests --no-deps -j 4
 
 Expected: all green. Then `make dev` on this branch and, with a phone: create an account from the welcome (two scans), from a second workspace sign in (one scan), from Settings add a passkey. Note any refusal verbatim in the PR.
 
-- [ ] **Step 4: Commit the KV id, push, PR**
+- [x] **Step 4: Commit the KV id, push, PR**
 
 ```bash
 git add ops/auth-page/wrangler.toml
