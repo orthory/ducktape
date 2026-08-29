@@ -103,7 +103,9 @@ fn an_adopted_empty_module_replays_its_first_op_from_the_empty_pre_root() {
         assert_eq!(node.drain_delivered().await.expect("drain"), 2);
         let tip = node.finalized().expect("boundary");
         let tip_hash = node.root_hash();
-        node.sink_mut().sync().await.expect("shutdown sync");
+        // shutdown with NO explicit barrier: `seal` fsyncs where it is written,
+        // so the tip is durable already. deleting this line is the regression
+        // proof — without the seal's own sync the replay below loses the tip.
         drop(node);
 
         // ---- boot: `later` is adopted empty, absent from the manifest -------
@@ -214,8 +216,7 @@ fn state_survives_a_crash_and_replays_to_the_sealed_tip() {
         let tip = node.finalized().expect("boundary");
         let tip_hash = node.root_hash();
 
-        // ---- a graceful shutdown: the journal tail is made durable ---------
-        node.sink_mut().sync().await.expect("shutdown sync");
+        // ---- shutdown, no explicit barrier: the seal fsync'd itself --------
         drop(node);
 
         // ---- boot: reopen the store, restore the checkpoint, replay -------

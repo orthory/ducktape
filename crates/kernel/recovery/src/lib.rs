@@ -28,9 +28,12 @@
 //!   synced, which also makes every earlier append durable). boot ROLLS it
 //!   FORWARD: if the live roots still equal the pre-block vector the frame
 //!   re-applies; if they moved, the apply completed before the crash and the
-//!   block is sealed from the observed roots. a POWER CUT flavor of this
-//!   window — the disk substrate committed the block but the un-fsync'd seal
-//!   was lost — is bound-and-verified through the substrate's per-commit
+//!   block is sealed from the observed roots. a narrower flavor of this
+//!   window survives the seal's own fsync — a crash in the TAIL OF APPLY,
+//!   after a disk substrate committed the block but before the seal syncs,
+//!   and a SIGKILL reaches it (the journal buffers in userspace, so an
+//!   un-fsync'd append dies with the process). it is bound-and-verified
+//!   through the substrate's per-commit
 //!   height cursor (see `trailing.rs`): the cursor must claim exactly the
 //!   trailing WAL height, or the state stays fail-closed as [`Error::Torn`].
 //! - a TORN SEALED block: a block whose commit spans substrates with different
@@ -770,8 +773,11 @@ where
         self.journal.size().await
     }
 
-    /// force every buffered journal append durable — the graceful-shutdown
-    /// barrier (a crash instead simply leaves the tail to roll forward).
+    /// force every buffered journal append durable. NOT part of any live path:
+    /// every record the sink writes fsyncs where it is written, so nothing in
+    /// the node needs a separate barrier. it survives for the power-loss
+    /// harness, which wraps this sink to swallow a seal and then syncs the
+    /// inner journal by hand — the only way to build "durable except the seal".
     pub async fn sync(&mut self) -> Result<(), Error> {
         self.journal.sync().await.map_err(storage_err)
     }
@@ -935,11 +941,16 @@ where
     }
 }
 
-// the live sink: append (and where required, sync) records as the ordered
-// lane drives it. sync policy: `pin` and `pre_apply` are barriers (their
-// records must be durable before the engine/host may act); `seal` is a plain
-// append — the NEXT pre-apply's sync makes it durable before another block
-// can apply, and a lost trailing seal is exactly the roll-forward case.
+// the live sink: append and sync records as the ordered lane drives it. sync
+// policy: every record this sink writes is a BARRIER. `pin` and `pre_apply`
+// must be durable before the engine/host may act; `seal` must be durable
+// because a store-backed tenant has ALREADY durably committed the block to its
+// own disk by the time it is written, and the seal is the only record that
+// vouches for that state. the residual window is the tail of block apply —
+// between the first tenant's commit and this sync — and is not closable by a
+// per-store cursor: `trailing.rs` refuses a block claimed by more than one
+// substrate, because there is no cross-substrate atomicity. the seal IS the
+// cross-substrate barrier.
 impl<E> BlockSink for Recovery<E>
 where
     E: Context + BufferPooler + commonware_runtime::Supervisor,
@@ -986,6 +997,15 @@ where
         .encode();
         async move {
             self.journal.append(&record).await.map_err(storage_err)?;
+            // the seal is a BARRIER, not a plain append. a store-backed tenant
+            // durably commits its own disk during apply (`MerkleStore::commit_batch`
+            // is "apply + durably commit"), so from the moment the first one
+            // returns, this node holds state that only the seal can vouch for.
+            // syncing HERE — rather than deferring to the next block's
+            // `pre_apply`, or to a barrier the drain loop remembers to take —
+            // is what makes that vouching durable at the same instant the
+            // state is. it is also the only place that cannot be forgotten.
+            self.journal.sync().await.map_err(storage_err)?;
             Ok(())
         }
     }
@@ -1186,15 +1206,16 @@ where
                 }
             }
         }
-        // TRAILING bound-and-verify (see `trailing.rs`): a power cut can lose
-        // the tip block's seal (a plain append; only the NEXT pre-apply syncs
-        // it) after a disk module already committed that block — leaving its
-        // live root matching NO recorded post-root, which the exact-match scan
-        // above rightly refuses to floor. a disk module carrying a per-commit
-        // height cursor (persisted atomically with its own commit) is floored
-        // AT the trailing unsealed WAL height iff the cursor claims exactly
-        // that height — binding the live root to the one finalized frame the
-        // WAL still holds durably. everything else stays floorless (Torn).
+        // TRAILING bound-and-verify (see `trailing.rs`). `seal` fsyncs where it
+        // is written, so the window is the TAIL OF BLOCK APPLY — between a disk
+        // module's own durable commit and that sync — and not everything up to
+        // the next pre-apply. a crash there leaves the module's live root
+        // matching NO recorded post-root, which the exact-match scan above
+        // rightly refuses to floor. a disk module carrying a per-commit height
+        // cursor (persisted atomically with its own commit) is floored AT the
+        // trailing unsealed WAL height iff the cursor claims exactly that
+        // height — binding the live root to the one finalized frame the WAL
+        // still holds durably. everything else stays floorless (Torn).
         let trailing_claims = trailing::seed_trailing_claims(
             host,
             &disk_cohort,

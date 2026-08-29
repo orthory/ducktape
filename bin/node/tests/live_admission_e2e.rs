@@ -629,29 +629,20 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     );
 
     // (3) quorum untouched: kill the resident; the founder keeps finalizing.
-    //     the kill is SYNCHRONIZED on a quiesced boundary, in two waits
-    //     (replica_restart_e2e.rs:71-74 needs only the first because it
-    //     writes ONCE). a block's `Record::Seal` is a plain WAL append that
-    //     only the NEXT pre-apply syncs, while a `Backing::Store` tenant has
-    //     already committed that block's batch durably — a SIGKILL inside
-    //     that window leaves the store at a root no retained seal vouches
-    //     for, and Store returns `None` from `durable_commit_height`
-    //     (`wasm-host/src/lib.rs:978-981`) so `trailing::seed_trailing_claims`
-    //     can never floor it, and recovery fail-stops with `Error::Torn`.
-    //     that gap is a node-level issue tracked separately; this suite tests
-    //     ADMISSION, not crash durability. so: fold the last tasks op, THEN
-    //     let the resident apply one more block (which syncs that seal).
+    //     ONE wait, on the op this suite cares about. this used to carry a
+    //     SECOND wait — "let the resident apply one more block, which syncs
+    //     that seal" — because a `Record::Seal` was a plain WAL append while a
+    //     `Backing::Store` tenant (`tasks` is one) had already committed the
+    //     block durably, so a SIGKILL between the two left the store at a root
+    //     no retained seal vouched for and recovery fail-stopped `Error::Torn`.
+    //     the seal now fsyncs where it is written, so the tip is durable the
+    //     moment it is sealed and the second wait is gone. it staying gone is
+    //     the process-level regression proof: restore the window and this kill
+    //     tears again, exactly as it did at heights 43 and 94.
     cluster.submit(0, "tasks", &task_create("pre-kill-quiesce", "folded"));
     poll(
         "the resident to fold the last op before the kill",
         Box::new(|| task_title(&cluster, 1, "pre-kill-quiesce").is_some_and(|t| t == "folded")),
-    );
-    let resident_height =
-        || cluster.rpc(1, serde_json::json!({ "cmd": "status" }))["status"]["height"].as_u64();
-    let folded_at = resident_height().expect("the resident reports its applied height");
-    poll(
-        "the resident to apply past the block that carried it (syncing its seal)",
-        Box::new(|| resident_height().is_some_and(|h| h > folded_at)),
     );
     cluster.kill(1);
     cluster.submit(0, "tasks", &task_create("resident-down-liveness", "alive"));

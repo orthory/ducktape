@@ -611,5 +611,7 @@ async fn graceful_checkpoint(
             let _ = node.sink_mut().write_manifest(&manifest).await;
         }
     }
-    let _ = node.sink_mut().sync().await;
+    // no trailing sync: every record the sink writes — pin, pre_apply, seal,
+    // cutover — fsyncs where it is written, and `write_manifest` syncs the
+    // journal before it puts. there is nothing buffered left to barrier.
 }

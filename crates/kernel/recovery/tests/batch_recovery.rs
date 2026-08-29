@@ -111,8 +111,9 @@ fn a_multi_member_batch_seals_as_one_block_and_replays_byte_identically() {
         assert_eq!(get(node.host(), "k1").await.as_deref(), Some("v1"));
         assert_eq!(get(node.host(), "k2").await.as_deref(), Some("v2"));
 
-        // ---- graceful shutdown: the journal tail is made durable ----
-        node.sink_mut().sync().await.expect("shutdown sync");
+        // ---- shutdown: NO explicit barrier. the tail is already durable
+        // because `seal` fsyncs where it is written; if that ever regresses,
+        // the replay below reads a journal missing its last seal and fails.
         drop(node);
 
         // ---- boot: reopen the store, restore the genesis checkpoint (fresh
@@ -149,9 +150,16 @@ fn a_multi_member_batch_seals_as_one_block_and_replays_byte_identically() {
             recovered.applied, 1,
             "exactly ONE block (the batch) was replayed"
         );
+        // THE SEAL-DURABILITY REGRESSION PAIR (with `applied` just above).
+        // nothing in this test fsync'd the journal by hand; the only thing
+        // that made the tip seal survive the drop is `seal`'s own sync. delete
+        // that one line and the seal record dies in the journal's 1024-byte
+        // USERSPACE write buffer — measured: `applied` drops to 0 and this
+        // flips to `rolled_forward == true`, because boot finds the block
+        // unsealed and rolls it forward instead of replaying it sealed.
         assert!(
             !recovered.rolled_forward,
-            "clean shutdown: the batch was already sealed"
+            "the seal was durable on its own: the batch was already sealed"
         );
 
         // all three keys reproduced from the ONE replayed batch commit.

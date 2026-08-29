@@ -1,8 +1,10 @@
-//! the TRAILING-SEAL POWER-LOSS path (issue #218): a [`node::BlockSink::seal`]
-//! is a PLAIN journal append — only the NEXT block's pre-apply sync makes it
-//! durable. a POWER CUT (not a SIGKILL: the page cache preserves an un-fsync'd
-//! append across a mere process death) after a disk module durably committed
-//! the tip block but before that next sync loses the tip SEAL while keeping
+//! the TRAILING-SEAL path (issue #218). [`node::BlockSink::seal`] now fsyncs
+//! where it is written, so the remaining gap is the TAIL OF BLOCK APPLY —
+//! between a disk module's own durable commit and that sync. a SIGKILL
+//! reaches it: the journal buffers in USERSPACE, so an un-fsync'd append dies
+//! with the process (this header used to claim the page cache preserved one,
+//! which is false and is why the window looked power-loss-only). a crash
+//! there loses the tip SEAL while keeping
 //! the tip's WAL [`Block`] record (pre-apply is fsync'd before any apply).
 //! boot then finds the disk module at a live root matching NO recorded
 //! post-root — the record that would have vouched for it is exactly the one
@@ -300,12 +302,14 @@ impl Module for CursorDisk {
     }
 }
 
-// ---- the power-loss sink: swallow the un-fsync'd tip seal -----------------
+// ---- the lost-seal sink: swallow the tip seal ------------------------------
 
 /// forwards everything to the real [`Recovery`] sink but SWALLOWS seal appends
 /// at or above `drop_seals_from` — the on-disk journal then ends with the tip
-/// block's fsync'd WAL record and NO seal, byte-for-byte the state a power cut
-/// leaves after losing the seal's un-fsync'd page-cache append.
+/// block's fsync'd WAL record and NO seal. that is the ONLY way to build the
+/// counterfactual now that `seal` fsyncs itself: byte-for-byte the state a
+/// crash leaves when it lands in the tail of block apply, after a disk module
+/// committed durably but before the seal reaches disk.
 struct PowerLossSink<S> {
     inner: S,
     drop_seals_from: Option<u64>,

@@ -2,16 +2,22 @@
 //!
 //! ## the gap this closes (the un-fsync'd trailing seal)
 //!
-//! a [`crate::Record::Seal`] is a PLAIN journal append: the NEXT block's
-//! pre-apply sync makes it durable. a POWER CUT (not a SIGKILL — the page
-//! cache preserves an un-fsync'd append across a process death) after a disk
-//! module's per-block commit but before that next sync loses the tip seal.
+//! [`crate::Record::Seal`] is fsync'd where it is written, so the gap is now
+//! the TAIL OF BLOCK APPLY: a disk module durably commits its own store during
+//! apply, and the seal that vouches for it syncs at the end of the same block.
+//! a crash in between loses the tip seal, and
 //! boot then sees the disk module at a live root that matches NO recorded
 //! post-root — the record that would have vouched for it is exactly the one
 //! that was lost — and the forward pre-scan (which seeds durable floors ONLY
 //! from exact live-root == sealed-post-root matches) leaves it floorless, so
 //! the sequential classifier fail-stops the first sealed block that touched
 //! the module: a FALSE [`crate::Error::Torn`] that bricks a solo node.
+//!
+//! a SIGKILL reaches this window — do NOT reason about it as power-loss-only.
+//! the journal buffers in USERSPACE (a 1024-byte `write_buffer`), so an
+//! un-fsync'd append dies with the process; no page cache preserves it. this
+//! header used to claim the opposite, and that one sentence is why the window
+//! was believed unreachable by `kill -9` for as long as it was.
 //!
 //! ## the bound-and-verify
 //!
