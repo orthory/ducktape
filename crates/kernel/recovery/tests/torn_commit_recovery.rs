@@ -333,9 +333,10 @@ fn a_torn_block_recovers_by_committing_only_the_in_memory_cohort() {
         let tip_hash = node.root_hash();
         assert_eq!(cell.borrow().counter, 1, "disk committed once");
 
-        // graceful WAL barrier, then the "crash": drop everything in memory but
-        // KEEP the disk cell (durable at post) and the storage backend (WAL).
-        node.sink_mut().sync().await.expect("sync");
+        // the "crash": drop everything in memory but KEEP the disk cell
+        // (durable at post) and the storage backend (WAL). the seals are
+        // already durable — `seal` fsyncs where it is written — so this suite
+        // needs no explicit barrier to reach a SEALED torn layout.
         drop(node);
 
         // ---- boot: reconstruct the TORN layout ------------------------------
@@ -513,9 +514,8 @@ fn a_disk_substrate_two_blocks_ahead_of_the_checkpoint_recovers_cleanly() {
             "the disk raced >= 2 blocks past the checkpoint"
         );
 
-        // graceful WAL barrier (seals durable), then the "crash": drop memory,
-        // KEEP the disk cell. NO checkpoint was written past height C.
-        node.sink_mut().sync().await.expect("sync");
+        // the "crash": drop memory, KEEP the disk cell (the seals are durable
+        // on their own). NO checkpoint was written past height C.
         drop(node);
 
         // ---- boot: the in-memory cohort rolls back to the checkpoint, the disk
@@ -612,7 +612,6 @@ fn pure_disk_blocks_ahead_of_the_checkpoint_skip_cleanly() {
         let tip_hash = node.root_hash();
         assert_eq!(cell.borrow().counter, 3, "disk committed once per block");
 
-        node.sink_mut().sync().await.expect("sync");
         drop(node);
 
         // ---- boot: only the disk is ahead; every block is a pure-disk block ---
@@ -678,7 +677,6 @@ fn a_disk_root_matching_no_record_still_fail_stops() {
         node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         assert_eq!(cell.borrow().counter, 1);
-        node.sink_mut().sync().await.expect("sync");
         drop(node);
 
         // CORRUPT the durable disk: move the commit counter to a value that
@@ -830,7 +828,6 @@ fn a_multi_disk_torn_block_fail_stops() {
         assert_eq!(cell_a.borrow().counter, 1, "diskA committed once");
         assert_eq!(cell_b.borrow().counter, 1, "diskB committed once");
 
-        node.sink_mut().sync().await.expect("sync");
         drop(node);
 
         // ---- boot: TWO disks at post, the in-memory cohort at pre ----------

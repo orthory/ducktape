@@ -972,9 +972,21 @@ impl Module for WasmModule {
     }
 
     /// only an ODB substrate tracks a durable-commit cursor (the native files
-    /// recovery bookkeeping it inherits); Map/Store tenants self-durably commit
-    /// through their own stores and expose no cursor (the trait default `None`).
-    /// Delegating this lets recovery verify a trailing unsealed files block.
+    /// recovery bookkeeping it inherits); delegating it lets recovery verify a
+    /// trailing unsealed files block.
+    ///
+    /// the two `None` arms are NOT the same fact, and reading them as one hid a
+    /// real crash window for years:
+    /// - Map has no window to verify. it is reinstalled wholesale from the
+    ///   checkpoint snapshot, so after a crash it is at the pre-root BY
+    ///   CONSTRUCTION and never needs a cursor.
+    /// - Store DOES have one. `MerkleStore::commit_batch` is contractually
+    ///   "apply + durably commit", so a store tenant's disk moves during apply
+    ///   while nothing here can say WHICH height it moved to. what covers that
+    ///   is not a cursor but the seal's own fsync (`recovery`'s `BlockSink`):
+    ///   one durable record vouching for every module in the block at once.
+    ///   the cursor cannot express that — it is per-substrate, and
+    ///   `recovery::trailing` refuses two claimants outright.
     fn durable_commit_height(&self) -> Option<u64> {
         match &self.backing {
             StateBacking::Map { .. } | StateBacking::Store { .. } => None,

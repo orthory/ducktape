@@ -90,31 +90,11 @@ impl ValidatorRuntime<'_> {
             }
         };
         *applied += drained_count;
-        // durabilize the tip seal when the chain goes idle. a seal is a
-        // plain journal append made durable only by the NEXT block's
-        // pre-apply sync; on an idle chain the tip block's seal can sit
-        // un-synced for a whole block-time, and a crash there loses it,
-        // turning the tip into a TRAILING block. that is fine for most
-        // ops, but a trailing SELF-READING op — a files CAS commit whose
-        // re-execution reads the claimant's already-durable post-state —
-        // cannot be selective-replayed and would brick a SOLO node (no
-        // peer to re-sync from). syncing on the idle transition closes
-        // the window; a busy chain amortizes durability against the next
-        // pre-apply and needs no extra sync here.
-        if drained_count > 0
-            && node.pending_batch_len() == 0
-            && node.orderer().pending_len() == 0
-            && let Err(e) = node.sink_mut().sync().await
-        {
-            // the idle-transition durability sync: losing it turns the tip into a
-            // TRAILING block, which on a SOLO node can brick a self-reading op.
-            tracing::warn!(
-                target: "ducktape::consensus",
-                node = %label,
-                error = %e,
-                "tip-seal sync failed — the tip block may not be durable"
-            );
-        }
+        // NO tip-seal sync here. the seal fsyncs where it is written
+        // (`recovery`'s `BlockSink::seal`), so the tip is durable the moment
+        // it is sealed — idle chain or busy. an idle-transition sync used to
+        // stand here to close the same window from the far side; keeping both
+        // would be a second path to one guarantee.
         // resolve held app-surface submits against what this
         // drain finished with; every disposition is deterministic,
         // so the reply faithfully reports the op's consensus fate.
