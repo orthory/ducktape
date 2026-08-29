@@ -117,7 +117,12 @@ fn refuse_foreign_binaries(dir: &Path) -> Result<(), String> {
 /// the newest mtime among the directory's top-level entries, or `None` when it
 /// holds none. Top level only, because that is what a PATH directory means and
 /// what the image is built from.
-fn newest_mtime(dir: &Path) -> Result<Option<std::time::SystemTime>, String> {
+///
+/// Public because it is the ONE staleness signal for this directory: the guest
+/// image rebuilds on it ([`ensure`]) and the service daemon re-derives its
+/// hello on it. Two answers keyed off the same clock can never disagree about
+/// whether a newly installed CLI exists.
+pub fn newest_mtime(dir: &Path) -> Result<Option<std::time::SystemTime>, String> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         // an operator who has installed nothing has no directory, which is a
