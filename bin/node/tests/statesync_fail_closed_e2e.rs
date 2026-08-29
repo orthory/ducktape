@@ -25,7 +25,7 @@ mod common;
 use std::time::Duration;
 
 use common::{Cluster, poll_until};
-use directory::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
+use tasks::{TaskMsg, TaskQuery, TaskReply, decode_task_reply, encode_task_msg, encode_task_query};
 
 #[test]
 fn a_non_standing_peer_is_refused_statesync() {
@@ -42,28 +42,27 @@ fn a_non_standing_peer_is_refused_statesync() {
     // not a server that simply has nothing to serve yet.
     cluster.submit(
         0,
-        "directory",
-        &encode_msg(&DirMsg::Set {
-            key: "secret".into(),
-            value: "chain-state".into(),
+        "tasks",
+        &encode_task_msg(&TaskMsg::CreateTask {
+            task_id: "secret".into(),
+            title: "chain-state".into(),
         }),
     );
     poll_until(
         "the founder's write to finalize",
         Duration::from_secs(30),
         || {
+            // `tasks` has no point read on the consensus tier (`TaskQuery::List`
+            // is its only variant), so the write is confirmed by listing the
+            // board and finding the id.
             cluster
-                .query(
-                    0,
-                    "directory",
-                    &encode_query(&DirQuery::Get {
-                        key: "secret".into(),
-                    }),
-                )
-                .and_then(|raw| decode_reply(&raw).ok())
+                .query(0, "tasks", &encode_task_query(&TaskQuery::List))
+                .and_then(|raw| decode_task_reply(&raw).ok())
                 .and_then(|r| match r {
-                    DirReply::Value(Some(v)) if v == "chain-state" => Some(()),
-                    _ => None,
+                    TaskReply::Tasks(board) => board
+                        .iter()
+                        .any(|t| t.id == "secret" && t.title == "chain-state")
+                        .then_some(()),
                 })
         },
     );

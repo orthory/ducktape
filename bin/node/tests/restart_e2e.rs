@@ -15,40 +15,83 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use common::{Cluster, poll_until};
-use directory::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
 use files::{
     Change, Content, EntryInfo, FilesMsg, FilesQuery, FilesReply, Kind, RefsInfo,
     decode_reply as files_decode_reply, encode_msg as files_encode_msg, encode_putblob,
     encode_query as files_encode_query, objects::object_id, to_hex,
 };
+use tasks::{TaskMsg, TaskQuery, TaskReply, decode_task_reply, encode_task_msg, encode_task_query};
 
-fn dir_set(key: &str, value: &str) -> Vec<u8> {
-    encode_msg(&DirMsg::Set {
-        key: key.into(),
-        value: value.into(),
+/// a create for `task_id`; NOT an upsert — `tasks` refuses a duplicate id
+/// (`task_board.rs:77-80`). That rejection is ISOLATED, not fatal: the op's
+/// stage rolls back and it is recorded `Rejected` while the block still seals
+/// (`host/src/lib.rs:237`, `:283`). So a duplicate never applies and never
+/// announces itself — `write_and_confirm` spins to its timeout, or passes
+/// VACUOUSLY when the re-created title happens to match the surviving one.
+/// Every call site here has to carry a fresh id — including across a restart,
+/// where the board comes back from the reopened store with the earlier ids
+/// still on it.
+fn task_create(task_id: &str, title: &str) -> Vec<u8> {
+    encode_task_msg(&TaskMsg::CreateTask {
+        task_id: task_id.into(),
+        title: title.into(),
     })
 }
 
-fn dir_value(cluster: &Cluster, idx: usize, key: &str) -> Option<String> {
-    let reply = cluster.query(
-        idx,
-        "directory",
-        &encode_query(&DirQuery::Get { key: key.into() }),
-    )?;
-    match decode_reply(&reply).ok()? {
-        DirReply::Value(v) => v,
+/// `tasks` has no point read on the consensus tier (`TaskQuery::List` is its
+/// only variant), so a title lookup lists the board and finds the id.
+fn task_title(cluster: &Cluster, idx: usize, task_id: &str) -> Option<String> {
+    let reply = cluster.query(idx, "tasks", &encode_task_query(&TaskQuery::List))?;
+    match decode_task_reply(&reply) {
+        Ok(TaskReply::Tasks(board)) => board.into_iter().find(|t| t.id == task_id).map(|t| t.title),
+        Err(_) => None,
     }
 }
 
-/// submit a directory write via rpc and wait until it is readable back — the
+/// submit a tasks write via rpc and wait until it is readable back — the
 /// end-to-end "the engine is live and finalizing" probe.
-fn write_and_confirm(cluster: &Cluster, idx: usize, key: &str, value: &str) {
-    cluster.submit(idx, "directory", &dir_set(key, value));
+fn write_and_confirm(cluster: &Cluster, idx: usize, task_id: &str, title: &str) {
+    cluster.submit(idx, "tasks", &task_create(task_id, title));
     poll_until(
-        &format!("directory {key}={value} to finalize"),
+        &format!("tasks {task_id}={title} to finalize"),
         Duration::from_secs(30),
-        || (dir_value(cluster, idx, key).as_deref() == Some(value)).then_some(()),
+        || (task_title(cluster, idx, task_id).as_deref() == Some(title)).then_some(()),
     );
+}
+
+/// the ops in an explorer row that name `target`. a block is a BATCH and a row
+/// lists every member op, so the tenant's op is NOT reliably `ops[0]`: the dev
+/// shape's boot seed submits one `tasks` op at seq 0
+/// (`validator/engine.rs:273-283`) and it batches with whatever else is
+/// pending, which lands it ahead of the first submitted write about half the
+/// time. scanning the row is the only stable read.
+///
+/// the seed rides THIS SAME tenant, so `target` alone never separates it from a
+/// write — anything that must name a specific write matches the op's `payload`
+/// preview instead (`carries_write` below).
+fn ops_targeting<'a>(row: &'a serde_json::Value, target: &str) -> Vec<&'a serde_json::Value> {
+    row["ops"]
+        .as_array()
+        .expect("row ops is an array")
+        .iter()
+        .filter(|op| op["target"] == target)
+        .collect()
+}
+
+/// does any row carry the `tasks` write that created `task_id`? picked by
+/// IDENTITY, not by count: the boot seed's own `tasks` op is indistinguishable
+/// from a write by target, so counting tenant-carrying rows would let
+/// [seed, write#1] satisfy a "both writes landed" wait while write#2's row is
+/// still missing. the row carries the op payload verbatim
+/// (`noded::payload_preview` truncates only past 1024 chars), and the quoted id
+/// appears in it as `"task_id":"<id>"`, so it cannot collide with a title.
+fn carries_write(rows: &[(u64, serde_json::Value)], task_id: &str) -> bool {
+    let quoted = format!("\"task_id\":\"{task_id}\"");
+    rows.iter().any(|(_, row)| {
+        ops_targeting(row, "tasks")
+            .iter()
+            .any(|op| op["payload"].as_str().is_some_and(|p| p.contains(&quoted)))
+    })
 }
 
 /// the explorer rows /v1/blocks currently serves, keyed by height. only real
@@ -80,8 +123,13 @@ fn solo_validator_survives_crash_and_graceful_restart() {
     cluster.spawn(0);
     cluster.wait_marker(0, "genesis root_hash=", Duration::from_secs(30));
 
-    // real state across two of the substrates the checkpoint has to cover:
-    // directory is in-memory canonical-bytes (dies without recovery).
+    // real state across the substrates this checkpoint has to cover. `tasks`
+    // is Backing::Store: its state comes back from the REOPENED qmdb store,
+    // not from a checkpoint snapshot (crates/noded/src/compose.rs:244-246),
+    // so what this suite proves is the store lane plus the explorer-row
+    // rebuild and the op-blob re-stage. the Map/snapshot-install limb is
+    // covered at kernel level by
+    // crates/kernel/recovery/tests/restart_replay.rs:231-239.
     write_and_confirm(&cluster, 0, "who", "ducktape");
     write_and_confirm(&cluster, 0, "where", "a-worktree");
     let before = cluster.status(0);
@@ -100,16 +148,36 @@ fn solo_validator_survives_crash_and_graceful_restart() {
         Duration::from_secs(30),
         || {
             let rows = block_rows(&cluster, 0);
-            (rows
-                .iter()
-                .filter(|(_, r)| r["ops"][0]["target"] == "directory")
-                .count()
-                >= 2)
-                .then_some(rows)
+            let both_writes_have_rows =
+                carries_write(&rows, "who") && carries_write(&rows, "where");
+            both_writes_have_rows.then_some(rows)
         },
     );
 
     // ---- crash: SIGKILL, no goodbye ------------------------------------
+    // SYNCHRONIZED on a sealed boundary, and that is load-bearing. `tasks` is
+    // Backing::Store: it commits the block's writes to its OWN disk during
+    // apply (`wasm-host/src/lib.rs:1326`), and the block's `Record::Seal` is
+    // only appended AFTER that. a SIGKILL inside that window leaves the store
+    // at a root no journaled seal vouches for, and Store returns `None` from
+    // `durable_commit_height` (`wasm-host/src/lib.rs:978-981`) so
+    // `trailing::seed_trailing_claims` can never floor it — recovery
+    // fail-stops with `Error::Torn`. `directory` (Backing::Map) could never be
+    // in that state: it is reinstalled from the checkpoint snapshot, so it is
+    // at-pre by construction. the node-level gap is tracked separately; this
+    // suite tests RECOVERY, not that window. so wait for the node to apply
+    // PAST the block that carried the last write — idle views finalize empty
+    // proposals, so a solo validator advances on its own, and that next
+    // pre-apply is what makes the pending seal durable.
+    poll_until(
+        "the node to apply past the block that carried the last write",
+        Duration::from_secs(30),
+        || {
+            let sealed_past_the_writes =
+                cluster.status(0)["height"].as_u64().expect("status height") > height_before;
+            sealed_past_the_writes.then_some(())
+        },
+    );
     cluster.kill(0);
 
     // respawn over the SAME storage dir. the node must RECOVER, not re-run
@@ -136,9 +204,9 @@ fn solo_validator_survives_crash_and_graceful_restart() {
         (s["root_hash"] == before["root_hash"]).then_some(s)
     });
     assert!(after["height"].as_u64().expect("height") >= height_before);
-    assert_eq!(dir_value(&cluster, 0, "who").as_deref(), Some("ducktape"));
+    assert_eq!(task_title(&cluster, 0, "who").as_deref(), Some("ducktape"));
     assert_eq!(
-        dir_value(&cluster, 0, "where").as_deref(),
+        task_title(&cluster, 0, "where").as_deref(),
         Some("a-worktree")
     );
 
@@ -184,11 +252,16 @@ fn solo_validator_survives_crash_and_graceful_restart() {
     }
     // and the rebuilt rows' op payloads are dereferencable again — the blob
     // store is in-memory, so ONLY the fold's re-staging can answer this.
-    for (_, row) in rows_before
+    let filtered = rows_before
         .iter()
-        .filter(|(_, r)| r["ops"][0]["target"] == "directory")
-    {
-        let op_hash = row["ops"][0]["op_hash"].as_str().expect("row op_hash");
+        .flat_map(|(_, r)| ops_targeting(r, "tasks"))
+        .collect::<Vec<_>>();
+    assert!(
+        !filtered.is_empty(),
+        "no explorer rows targeted `tasks` — the poll above and this filter must name the same tenant"
+    );
+    for op in filtered {
+        let op_hash = op["op_hash"].as_str().expect("row op_hash");
         let (code, _) = cluster.http(0, "GET", &format!("/v1/files/blob/{op_hash}"), None);
         assert_eq!(
             code, 200,
@@ -216,9 +289,9 @@ fn solo_validator_survives_crash_and_graceful_restart() {
     poll_until(
         "post-shutdown state to answer",
         Duration::from_secs(30),
-        || (dir_value(&cluster, 0, "after-crash").as_deref() == Some("still-here")).then_some(()),
+        || (task_title(&cluster, 0, "after-crash").as_deref() == Some("still-here")).then_some(()),
     );
-    assert_eq!(dir_value(&cluster, 0, "who").as_deref(), Some("ducktape"));
+    assert_eq!(task_title(&cluster, 0, "who").as_deref(), Some("ducktape"));
     // ...and the network keeps running as scheduled.
     write_and_confirm(&cluster, 0, "after-shutdown", "and-again");
 }
@@ -284,10 +357,10 @@ fn solo_validator_survives_sigterm_restart() {
     assert!(after["height"].as_u64().expect("height") >= height_before);
     // both pre-signal writes survived the graceful checkpoint.
     assert_eq!(
-        dir_value(&cluster, 0, "quit").as_deref(),
+        task_title(&cluster, 0, "quit").as_deref(),
         Some("gracefully")
     );
-    assert_eq!(dir_value(&cluster, 0, "via").as_deref(), Some("sigterm"));
+    assert_eq!(task_title(&cluster, 0, "via").as_deref(), Some("sigterm"));
     // and the engine is LIVE again over its reopened journal.
     write_and_confirm(&cluster, 0, "after-sigterm", "still-here");
 }
@@ -295,9 +368,10 @@ fn solo_validator_survives_sigterm_restart() {
 // ---- duckfs restart proof --------------------------------------------------
 //
 // duckfs (the `files` module) is a DISK-COHORT module: unlike the in-memory
-// canonical-bytes modules above, it commits its content-addressed objects and
-// its refs file to disk PER BLOCK (the task-6 durability ordering: flush objects
-// -> fsync dirs -> save refs -> adopt), and recovers them itself via
+// canonical-bytes cohort (the modules the checkpoint stores bytes for), it
+// commits its content-addressed objects and its refs file to disk PER BLOCK
+// (the task-6 durability ordering: flush objects -> fsync dirs -> save refs ->
+// adopt), and recovers them itself via
 // `Files::open` rather than from the checkpoint snapshot (it is `ResolverBacked`,
 // so the checkpoint stores no bytes for it — exactly like the qmdb modules). the
 // property this proves is the one the OLD cas module failed: committed file
