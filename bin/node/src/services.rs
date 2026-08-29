@@ -685,6 +685,50 @@ fn render_enable_summary(plan: &EnablePlan) -> String {
     for (name, value) in rows {
         out.push_str(&format!("  {} {value}\n", column(name, 13, DIM)));
     }
+    out.push_str(&render_reconsent_diff(plan));
+    out
+}
+
+/// The re-consent half of the consent screen: what this enable would CHANGE
+/// about a grant that already stands. Empty for a first grant.
+///
+/// A diff rather than a list because that is the whole question being asked —
+/// the operator already consented to most of this, and what deserves their
+/// attention is the tag that was not there before. Rendered from the two
+/// records, so it says exactly what the file is about to become.
+fn render_reconsent_diff(plan: &EnablePlan) -> String {
+    let Some(previous) = &plan.previous else {
+        return String::new();
+    };
+    let had: std::collections::BTreeSet<&str> =
+        previous.capabilities.iter().map(String::as_str).collect();
+    let has: std::collections::BTreeSet<&str> =
+        plan.grant.capabilities.iter().map(String::as_str).collect();
+    let mut out = format!(
+        "\n  {} is already enabled as {}\n",
+        paint(BOLD, &plan.kind),
+        previous.display_id()
+    );
+    if had == has {
+        out.push_str(&format!(
+            "  {}\n",
+            paint(
+                DIM,
+                "the offered set is unchanged — re-consenting changes nothing"
+            )
+        ));
+        return out;
+    }
+    out.push_str("  the offered set has CHANGED since you consented:\n\n");
+    for tag in has.union(&had) {
+        let (mark, styled) = match (has.contains(tag), had.contains(tag)) {
+            (true, false) => ("+", paint(GREEN, &format!("{tag}  (new)"))),
+            (false, true) => ("-", paint(RED, &format!("{tag}  (no longer installed)"))),
+            _ => (" ", paint(DIM, tag)),
+        };
+        out.push_str(&format!("    {mark} {styled}\n"));
+    }
+    out.push('\n');
     out
 }
 
@@ -1032,6 +1076,10 @@ pub(crate) struct EnablePlan {
     pub node_id: [u8; 32],
     /// the reviewed hello, when the daemon is currently signaling.
     pub offered: Option<noded::services::Signaling>,
+    /// the grant this kind already holds, when this enable is a RE-CONSENT.
+    /// `None` is a first grant. What makes the consent screen a diff rather
+    /// than a list, and what `commit_enable` replaces in place.
+    pub(crate) previous: Option<ServiceGrant>,
     /// the grant this enable would mint. Decided here — minting is randomness
     /// and a clock read, not a write — so the commit below is purely two
     /// writers in order (announce, then persist) with nothing left to decide.
@@ -1094,14 +1142,16 @@ fn plan_enable_from(
             "{kind:?} is not a service kind (1..32 chars of [a-z0-9-])"
         ));
     }
-    // re-enabling would mint a SECOND id for the same kind while the first is
-    // still recorded as live consent. One grant per kind: disable first.
-    if let Some(existing) = load(workspace)?.grant(kind) {
-        return Err(format!(
-            "{kind} is already enabled as {} — `ducktape service disable {kind}` first",
-            existing.display_id()
-        ));
-    }
+    // an existing grant is RE-CONSENT, not a refusal: the operator installs an
+    // executor and runs `enable` again to offer it. One grant per kind still
+    // holds — the id, its nonce and the standing it carries are kept, and only
+    // the reviewed set is re-minted (`remint_grant`), so re-consenting never
+    // mints a second id for a kind that already has live standing.
+    //
+    // It used to refuse with "disable first", which made widening a grant a
+    // revoke-and-regrant: a window with no consent on chain, a new instance id
+    // for every added CLI, and the announce retracted and re-placed in between.
+    let previous = load(workspace)?.grant(kind).cloned();
     // the grant is minted FROM a reviewed hello, so there must BE one. A
     // grant invented for an absent daemon would record no offered tags and no
     // requested scopes — the consent screen would show nothing and the
@@ -1115,7 +1165,10 @@ fn plan_enable_from(
                  start it first: ducktape service run {kind}"
             )
         })?;
-    let grant = mint_grant(kind, node_id, &offered);
+    let grant = match &previous {
+        Some(standing) => remint_grant(standing, &offered),
+        None => mint_grant(kind, node_id, &offered),
+    };
     // REFUSE here if the registry could not take what these grants imply.
     //
     // Bounded against the WIDEST set the grants could ever produce — every
@@ -1125,7 +1178,11 @@ fn plan_enable_from(
     // pass, and the union would cross the cap later when `agent` started, with
     // no verb running to refuse it and no way for the watcher to do anything
     // but announce a truncated set or nothing at all.
+    // the prospective set REPLACES a re-consented kind rather than pushing a
+    // second grant for it — the file is unique-and-sorted by kind, and a
+    // doubled kind would both fail `validate` and double-count against the cap.
     let mut prospective = load(workspace)?.grants;
+    prospective.retain(|existing| existing.kind != grant.kind);
     prospective.push(grant.clone());
     crate::announce::announced_set(
         &prospective,
@@ -1138,6 +1195,7 @@ fn plan_enable_from(
         chain_id: service.chain_id.clone(),
         node_id,
         offered: Some(offered),
+        previous,
         grant,
         capacity: service.sandbox_capacity.clone(),
     })
@@ -1152,6 +1210,25 @@ fn mint_grant(kind: &str, node_id: [u8; 32], offered: &noded::services::Signalin
         kind: kind.to_string(),
         instance: config::hex_bytes(&mint_instance(&node_id, kind, &nonce)),
         nonce: config::hex_bytes(&nonce),
+        granted_unix: now_unix(),
+        capabilities: offered.capabilities.clone(),
+        scopes: offered.scopes.clone(),
+    }
+}
+
+/// Re-mint a grant this kind ALREADY holds against a freshly reviewed hello.
+///
+/// The identity is kept — same instance id, same nonce — because the standing
+/// is the same standing: work already placed on `compute#3f9a1c02` still names
+/// a grant that exists, and a run in flight is not orphaned by the operator
+/// offering one more CLI. Only the reviewed set moves, and `granted_unix`
+/// moves with it: that field is the consent-epoch marker, and this IS a new
+/// consent.
+fn remint_grant(previous: &ServiceGrant, offered: &noded::services::Signaling) -> ServiceGrant {
+    ServiceGrant {
+        kind: previous.kind.clone(),
+        instance: previous.instance.clone(),
+        nonce: previous.nonce.clone(),
         granted_unix: now_unix(),
         capabilities: offered.capabilities.clone(),
         scopes: offered.scopes.clone(),
@@ -1192,11 +1269,15 @@ pub(crate) fn commit_enable(
     plan: &EnablePlan,
 ) -> Result<u64, String> {
     let mut services = load(workspace)?;
-    let position = services
+    // REPLACE on a re-consent, insert on a first grant — one record per kind
+    // either way, which is what `Services::validate` enforces on the next load.
+    match services
         .grants
         .binary_search_by(|existing| existing.kind.as_str().cmp(&plan.kind))
-        .unwrap_or_else(|position| position);
-    services.grants.insert(position, plan.grant.clone());
+    {
+        Ok(standing) => services.grants[standing] = plan.grant.clone(),
+        Err(position) => services.grants.insert(position, plan.grant.clone()),
+    }
     // derived HERE, from the grants as they stand now — not carried down from
     // the plan. A human may have sat on the consent prompt for a while, and
     // another `enable` on this node could have landed in the meantime;
@@ -1935,7 +2016,10 @@ fn enable(args: EnableArgs) -> Result<(), Box<dyn std::error::Error>> {
     let plan = plan_enable(&workspace, &args.kind, &service, node_id)?;
 
     write_err(&render_enable_summary(&plan))?;
-    let question = format!("Enable {} on this node?", plan.kind);
+    let question = match &plan.previous {
+        Some(standing) => format!("Re-consent and keep {}?", standing.display_id()),
+        None => format!("Enable {} on this node?", plan.kind),
+    };
     if !crate::tty::confirm(&question, crate::tty::stdin_is_tty(), args.yes)? {
         write_err("not enabled\n")?;
         return Ok(());
@@ -1947,8 +2031,12 @@ fn enable(args: EnableArgs) -> Result<(), Box<dyn std::error::Error>> {
     // instance id and nothing else; the prose goes to stderr.
     println!("{}", plan.grant.display_id());
     write_err(&format!(
-        "{} enabled {} · {}\n",
+        "{} {} {} · {}\n",
         paint(GREEN, ServiceState::Enabled.glyph()),
+        match plan.previous {
+            Some(_) => "grant updated",
+            None => "enabled",
+        },
         plan.grant.display_id(),
         announced_line(&chain_id, height),
     ))?;
@@ -1958,6 +2046,10 @@ fn enable(args: EnableArgs) -> Result<(), Box<dyn std::error::Error>> {
         // prints — and it read its grant once at startup, so the process that
         // is up right now still executes nothing. "start it with" was advice
         // for a situation that cannot occur on this line.
+        //
+        // It is printed on a re-consent too, and for the same reason: the
+        // SERVING half reads the grant at startup (`serve_kind`), so a widened
+        // grant is announced before the running process will execute it.
         write_err(&format!(
             "  restart the daemon to pick the grant up: ^C, then ducktape service run {}\n",
             plan.kind
@@ -2387,6 +2479,101 @@ mod tests {
         .expect("a union well under the cap plans fine");
         assert_eq!(plan.grant.kind, "compute");
         assert_eq!(plan.grant.capabilities, vec!["codex".to_string()]);
+    }
+
+    /// #1242's consent half. `agent install` widens what a host CAN run;
+    /// `announced_set` intersects the live hello with the GRANT, so the new tag
+    /// stays unannounced until the operator consents to it again. `enable` used
+    /// to refuse a kind that already had a grant ("disable first"), which made
+    /// that a revoke-and-regrant: a window with no consent on chain and a new
+    /// instance id for every added CLI.
+    #[test]
+    fn re_enabling_re_consents_in_place_and_keeps_the_instance_id() {
+        let (dir, service) = planning_workspace(&[("compute", &["claude"])]);
+        let standing = load(dir.path())
+            .expect("the fixture wrote a grant")
+            .grant("compute")
+            .cloned()
+            .expect("compute is granted");
+
+        let plan = plan_enable_from(
+            dir.path(),
+            "compute",
+            &service,
+            NODE_A,
+            // the operator has since installed codex, and removed nothing.
+            vec![hello_offering("compute", &["claude", "codex"])],
+        )
+        .expect("a second enable is a RE-CONSENT, not a refusal");
+
+        assert_eq!(
+            plan.previous.as_ref().map(|p| p.display_id()),
+            Some(standing.display_id()),
+            "the screen is a diff against the grant that already stands"
+        );
+        assert_eq!(
+            plan.grant.instance, standing.instance,
+            "the id is KEPT — work already placed on it still names a live grant"
+        );
+        assert_eq!(
+            plan.grant.nonce, standing.nonce,
+            "and so is the nonce the id is reproducible from"
+        );
+        assert_eq!(
+            plan.grant.capabilities,
+            vec!["claude".to_string(), "codex".to_string()],
+            "the newly installed executor is what the re-consent is FOR"
+        );
+    }
+
+    /// The diff is the question being asked, so it must name the new tag — and
+    /// the dropped one, which is the direction that strands a buyer's run.
+    #[test]
+    fn the_re_consent_screen_marks_what_changed_in_both_directions() {
+        let (dir, service) = planning_workspace(&[("compute", &["aider", "claude"])]);
+        let plan = plan_enable_from(
+            dir.path(),
+            "compute",
+            &service,
+            NODE_A,
+            vec![hello_offering("compute", &["claude", "codex"])],
+        )
+        .expect("re-consent plans");
+
+        // through the same adapter a pipe gets, so the asserts read the TEXT
+        // rather than tripping over the per-tag styling.
+        let screen = through_anstream(&render_enable_summary(&plan), anstream::ColorChoice::Never);
+        assert!(screen.contains("already enabled as"), "{screen}");
+        assert!(
+            screen.contains("+ codex  (new)"),
+            "the added tag is marked: {screen}"
+        );
+        assert!(
+            screen.contains("- aider  (no longer installed)"),
+            "the tag that went away is marked, and says why: {screen}"
+        );
+        assert!(
+            screen.contains("  claude\n"),
+            "an unchanged tag rides along unmarked: {screen}"
+        );
+    }
+
+    /// Re-running `enable` with nothing installed or removed must not read as a
+    /// change — the operator should see "nothing to do", not a diff of one.
+    #[test]
+    fn re_consenting_an_unchanged_set_says_so() {
+        let (dir, service) = planning_workspace(&[("compute", &["claude"])]);
+        let plan = plan_enable_from(
+            dir.path(),
+            "compute",
+            &service,
+            NODE_A,
+            vec![hello_offering("compute", &["claude"])],
+        )
+        .expect("re-consent plans");
+        let screen = through_anstream(&render_enable_summary(&plan), anstream::ColorChoice::Never);
+        assert!(screen.contains("unchanged"), "{screen}");
+        assert!(!screen.contains("CHANGED"), "{screen}");
     }
 
     /// A file the registry would refuse must not LOAD, which means it fails the
@@ -3013,12 +3200,29 @@ mod tests {
             node_id: NODE_A,
             grant: mint_grant("compute", NODE_A, &offered),
             capacity: Default::default(),
+            previous: None,
+            offered: Some(offered.clone()),
+        };
+        // the same screen on a RE-CONSENT: the diff is styled per tag, so it
+        // is the shape most likely to leak an escape into a pipe.
+        let reconsent = EnablePlan {
+            previous: Some(grant("compute", NODE_A)),
             offered: Some(offered),
+            ..EnablePlan {
+                kind: "compute".into(),
+                chain_id: "ducktape#a1b2c3d4".into(),
+                node_id: NODE_A,
+                grant: mint_grant("compute", NODE_A, &signaling("compute")),
+                capacity: Default::default(),
+                previous: None,
+                offered: None,
+            }
         };
         let rendered = [
             render_list(&rows),
             render_status(&rows, Some("node-build-1")),
             render_enable_summary(&plan),
+            render_enable_summary(&reconsent),
             render_list(&[]),
             render_status(&[], None),
         ];
