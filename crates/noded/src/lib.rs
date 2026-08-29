@@ -452,7 +452,7 @@ pub enum ModuleCategory {
 impl ModuleCategory {
     /// The category a module id belongs to. Ids not listed here —
     /// infrastructure and internal modules (files, saga, identity, kv,
-    /// valset, governance, directory, …) — fall to `System`, so a new
+    /// valset, governance, …) — fall to `System`, so a new
     /// or unknown module always groups sensibly rather than breaking the view.
     pub fn of(id: &str) -> Self {
         match id {
@@ -1069,7 +1069,7 @@ mod tests {
                 RootOp {
                     proposer: "bb".repeat(32),
                     disposition: BlockDisposition::Applied,
-                    target: "directory".into(),
+                    target: "tasks".into(),
                     operations: Vec::new(),
                     payload: "{}".into(),
                     op_hash: "ee".repeat(32),
@@ -1131,9 +1131,12 @@ mod tests {
             assert_eq!(ModuleCategory::of(id), Developer, "{id}");
         }
         assert_eq!(ModuleCategory::of("automations"), Automation);
-        // infra + internals fall to the System bucket — including ids only the
-        // full `node` binary registers (kv/valset/governance/directory)
-        // and anything unknown, so the view never breaks on a new module.
+        // infra + internals fall to the System bucket — including ids this
+        // daemon never composes at all: `valset`/`governance` are in
+        // `PRODUCTION` but not `SIM_BASE`, so only the full `node` binary
+        // registers them, and `kv` is in NEITHER — it reaches a composer only
+        // through simnode's opt-in `--with-valset` (`SIM_VALSET`). plus
+        // anything unknown, so the view never breaks on a new module.
         for id in [
             "files",
             "saga",
@@ -1142,7 +1145,6 @@ mod tests {
             "kv",
             "valset",
             "governance",
-            "directory",
             "totally-unknown",
         ] {
             assert_eq!(ModuleCategory::of(id), System, "{id}");

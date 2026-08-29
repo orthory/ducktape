@@ -49,7 +49,7 @@ and [What Is Left](/en/human/roadmap/what-is-left) keeps the open-work boundary.
 - Forge derives a 32-byte state root from git state and verifies object closure
   before install.
 - Snapshot-style modules use canonical bytes where that fits the module: valset,
-  saga, tasks, directory, governance, vaults, inbox, automations, files/duckfs,
+  saga, tasks, governance, vaults, inbox, automations, files/duckfs,
   jobs, identity, DuckDNS, agent, and runs.
 - System governance gates the validator set (member-only proposals, deterministic
   tally, follow-up membership ops); valset rejects external membership writes.
@@ -67,14 +67,13 @@ and [What Is Left](/en/human/roadmap/what-is-left) keeps the open-work boundary.
 ## Verification Surface
 
 - `cargo test --workspace` exercises the Rust workspace.
-- `cargo run -p demo` runs the in-process multi-module walkthrough.
-- `cargo test -p demo --test network_joiner_full` proves a joiner rebuilds every
+- `cargo test -p node-bin --test network_joiner_full` proves a joiner rebuilds every
   module purely over the state-sync wire protocol and matches the source
   root-hash.
 - `bin/node/examples/demo-invite.sh` drives a human-runnable onboarding ceremony
   over real sockets: founder `init`, invite, friend `join`, founder `admit`, a
   refreshed invite, then both nodes booting one network and converging an
-  RPC-submitted directory op.
+  RPC-submitted tasks op.
 - `cargo test -p node-bin --test cluster_e2e` is the automated real-socket node
   lifecycle gate: three-validator convergence, an RPC-submitted message crossing
   consensus, a cross-node governance vote, a live epoch cutover, and a sync-only

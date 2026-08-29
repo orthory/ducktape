@@ -106,6 +106,7 @@ The table is the GENESIS path: the flag day that moves the root hash.
 | `bin/node` | production set: native + wasm tenants | `crates/topology/src/lib.rs`: a `ModuleSpec` row in `MODULES` (`code`/`backing`/wiring) and the id in `PRODUCTION`; `host_state` composes genesis/restore/sync from that selection — nothing to mirror there. A native tenant also needs the `Cargo.toml` dep. The component is NOT embedded: `node init` hashes `<id>.component.wasm` out of `--modules <dir>` (default `$DUCKTAPE_MODULES_DIR`, else `~/.ducktape/modules`, filled by `make install-node`) into the descriptor, then copies those bytes into `<workspace>/modules/`. The kernel fixtures dir pins the same bytes. |
 | `bin/noded` | daemon, composes native instances | grep `"tasks"`: id list, `use`, construct, register |
 | `bin/simnode` | deterministic /v1 twin | same shape as noded |
+| the indexer | one index database per composed module | `open_index_store` opens a database for EVERY id in the selection, so joining or leaving `PRODUCTION` gains or loses one — nothing to touch for a module with no mapper. A module that ships one also needs its arm in `index_guest_wasm()` (`crates/noded/src/index.rs`, `include_bytes!` of the committed `index.wasm`) and its `INDEX_MODULES` entry in the `Makefile`. |
 
 noded/simnode run a SUBSET — a wasm-only tenant (e.g. `capability`) appears
 in `bin/node` alone. Decide whether the module belongs in the daemon/sim lanes;

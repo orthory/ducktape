@@ -32,7 +32,6 @@ consensus = { workspace = true }
 recovery = { workspace = true }
 sdk = { workspace = true }
 statesync = { workspace = true }
-directory = { workspace = true }
 # the production module set: system infrastructure + every product module.
 # (acl composes as a wasm tenant; its crate is embedded via component.wasm.)
 valset = { workspace = true }
@@ -181,6 +180,9 @@ nettest = { path = "../../crates/testing/nettest" }
 # moved here from bin/demo when that walkthrough crate was deleted.)
 greeter = { workspace = true }
 kv = { workspace = true }
+# `directory` left the production genesis set; the example crate survives only
+# as a test tenant (the cfg(test) query codec in main.rs, network_joiner_full).
+directory = { workspace = true }
 # the fs/mcp e2e harnesses drive noded's in-proc daemon testkit (was: each
 # hand-mirrored the NodeCommand actor). dev-only feature keeps it
 # out of the production `ducktape` binary build.

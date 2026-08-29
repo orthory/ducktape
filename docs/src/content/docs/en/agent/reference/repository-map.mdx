@@ -66,15 +66,13 @@ lists what is checked in and tested.
 - `crates/apps/files`: the duckfs module adapter; it owns the consensus
   filesystem surface and absorbed the old memory/workspace role as ordinary
   duckfs snapshots, paths, and `duck://files/...` evidence.
-- `crates/apps/jobs`: consensus-native work board.
 
 ## Examples and Binaries
 
-- `crates/examples/directory`: state-based directory module, registered in
-  `bin/node` as the production canary.
+- `crates/examples/directory`: state-based directory module — the first wasm
+  port, now a test tenant in no genesis set.
 - `crates/examples/greeter`: demo module emitting follow-up writes.
-- `crates/examples/evm`: experimental QMDB-backed EVM module, in the
-  `noded`/`simnode` genesis.
+- `crates/labs`: unwired experiments, registered by no genesis set.
 - `bin/node`: the p2p validator/mesh node and unified `ducktape` CLI. Its `fs`
   family owns the read and checkout/status/commit/pin loop over
   `crates/duckfs/client`; its `mcp` family runs the stdio tool server. There is

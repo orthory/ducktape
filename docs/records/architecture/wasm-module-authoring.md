@@ -8,8 +8,9 @@ the reference modules are `crates/guests/hello-wasm`,
 `crates/guests/sibling-wasm` (the cross-module-read reference) — kernel test
 fixtures, in no genesis set. The first wasm port of a native module is
 `crates/examples/directory` (`src/guest.rs`), bytes-compatible with the native
-implementation it replaced (same root, same snapshot encoding); it stays in
-`topology::PRODUCTION` as the e2e lane's write tenant. The node binary embeds
+implementation it replaced (same root, same snapshot encoding) — the template
+every later port followed. It is in no genesis set either: the crate is a test
+tenant the kernel suites construct directly. The node binary embeds
 no component: `node init` hashes every wasm tenant's `<id>.component.wasm` out
 of `--modules <dir>` (default `$DUCKTAPE_MODULES_DIR`, else `~/.ducktape/modules`,
 filled by `make install-node`) into the network descriptor, then copies those
