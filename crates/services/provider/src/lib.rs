@@ -186,6 +186,11 @@ mod spec;
 mod variants;
 #[cfg(unix)]
 pub use interactive::InteractiveSession;
+/// the executors directory's staleness clock, re-exported for the same reason
+/// the backend is: a host-side caller reaches the sandbox through this crate.
+/// The service daemon re-derives its hello on `newest_mtime`, which is the
+/// signal `ensure` rebuilds the guest image from.
+pub use sandbox_host::executor_image;
 pub use sandbox_host::{SandboxBackend, Vmm};
 pub use spec::{BrokerKind, CapabilitySpec, ContextLocation, IsolationSpec, OutputFormat, SpecSet};
 
@@ -5111,8 +5116,7 @@ printf '%s\n' "$PATH"
     /// Firecracker appends `_<port>` to it.
     #[test]
     fn two_runs_never_share_a_scratch_directory() {
-        let slots: std::collections::BTreeSet<String> =
-            (0..64).map(|_| run_slot()).collect();
+        let slots: std::collections::BTreeSet<String> = (0..64).map(|_| run_slot()).collect();
         assert_eq!(slots.len(), 64, "every run draws its own slot");
 
         for slot in &slots {

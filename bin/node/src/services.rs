@@ -1308,9 +1308,10 @@ fn run_service(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     // execution loop, so a long run never lets the node's catalog entry lapse
     // and report the daemon absent.
     let beat_base = base.clone();
+    let watch = HelloWatch::new(&kind, &service, node_key);
     std::thread::Builder::new()
         .name("service-hello".into())
-        .spawn(move || heartbeat(&beat_base, &hello, skew))?;
+        .spawn(move || heartbeat(&beat_base, hello, watch, skew))?;
 
     match serve_kind(&kind, &workspace, service, &base, node_key)? {
         // nothing to execute (an ungranted kind, or a kind with no first-party
@@ -1753,13 +1754,134 @@ fn offer_enable(
     }
 }
 
+/// What the heartbeat needs to re-derive its hello, and the clock it decides
+/// on: the executors directory's newest mtime — the SAME signal
+/// [`provider_host::executor_image::ensure`] rebuilds the guest image from, so
+/// what a node ANNOUNCES and what its guest can EXEC can never disagree about
+/// whether a CLI was installed.
+struct HelloWatch {
+    kind: String,
+    service: config::ServiceConfig,
+    node_key: [u8; 32],
+    clock: ExecutorsClock,
+}
+
+/// The staleness clock alone: a directory and the newest mtime last seen in it.
+///
+/// Separate from [`HelloWatch`] because THIS is the decision — "did the
+/// operator's executors change?" — and it is answerable without a sandbox
+/// backend, a node key, or a running daemon, which is what makes it testable.
+struct ExecutorsClock {
+    dir: Option<std::path::PathBuf>,
+    seen: Option<std::time::SystemTime>,
+}
+
+impl ExecutorsClock {
+    /// `dir` is `None` for a backend with no executors directory; the clock
+    /// then never reports a move.
+    fn new(dir: Option<std::path::PathBuf>) -> Self {
+        let seen = dir.as_deref().and_then(newest_mtime_of);
+        Self { dir, seen }
+    }
+
+    /// Has the directory changed since the last look? Marks the new state, so
+    /// one move is reported once.
+    fn moved(&mut self) -> bool {
+        let Some(dir) = self.dir.as_deref() else {
+            return false;
+        };
+        let newest = newest_mtime_of(dir);
+        let moved = newest != self.seen;
+        self.seen = newest;
+        moved
+    }
+}
+
+impl HelloWatch {
+    /// Build the watch beside the hello that was just derived, so the clock
+    /// starts at the mtime that hello was read at.
+    fn new(kind: &str, service: &config::ServiceConfig, node_key: [u8; 32]) -> Self {
+        let dir = match sandbox_backend(service) {
+            Ok(provider_host::SandboxBackend::MicroVm { executors, .. }) => Some(executors),
+            // no [sandbox] table and the bare test backend both mean there is
+            // no directory to watch. A daemon that got this far already has
+            // whatever set it will ever offer.
+            _ => None,
+        };
+        Self {
+            kind: kind.to_string(),
+            service: service.clone(),
+            node_key,
+            clock: ExecutorsClock::new(dir),
+        }
+    }
+
+    /// Re-derive `hello` IF the executors directory moved since the last look.
+    /// A plain `stat` of the directory's entries per beat; the probe and the
+    /// PATH walk behind `discover_hello` run only on a real change, which also
+    /// keeps `sandbox_backend_ready` a lifecycle event rather than a per-beat
+    /// log bomb.
+    fn refresh(&mut self, hello: &mut noded::services::Hello) {
+        if !self.clock.moved() {
+            return;
+        }
+        // a discovery that fails leaves the last good hello standing: the
+        // executors dir is mid-install, or the sandbox went unprobeable for a
+        // moment. Retracting on a transient read would flap the announce.
+        let derived = match discover_hello(&self.kind, &self.service, &self.node_key) {
+            Ok(derived) => derived,
+            Err(error) => {
+                tracing::warn!(
+                    target: "ducktape::service",
+                    kind = %self.kind,
+                    reason = "rediscover_failed",
+                    "executors changed but re-discovery failed; still offering the previous \
+                     set: {error}"
+                );
+                return;
+            }
+        };
+        if derived.capabilities == hello.capabilities {
+            return;
+        }
+        tracing::info!(
+            target: "ducktape::service",
+            kind = %self.kind,
+            offering = %summarize_capabilities(&self.kind, &derived.capabilities),
+            "the executors directory changed — offering a new set"
+        );
+        *hello = derived;
+    }
+}
+
+/// [`provider_host::executor_image::newest_mtime`], with a read error folded
+/// into `None`: an unreadable directory is not a reason to stop beating, and
+/// the next beat looks again.
+fn newest_mtime_of(dir: &std::path::Path) -> Option<std::time::SystemTime> {
+    provider_host::executor_image::newest_mtime(dir)
+        .ok()
+        .flatten()
+}
+
 /// Keep the signal alive until the process is stopped.
 ///
 /// A failed beat is not fatal: the node may be restarting, and the entry simply
 /// ages out and returns. Logged on the first failure and every 30th after it,
 /// carrying the attempt count — an unconditional warn here would be a log bomb
 /// on a node that stays down.
-fn heartbeat(base: &str, hello: &noded::services::Hello, initial: Skew) -> ! {
+///
+/// The hello is RE-DERIVED whenever the executors directory changes, so
+/// `ducktape agent install`/uninstall on a running node reaches the node's
+/// catalog within one beat. It used to be computed once at startup and re-sent
+/// verbatim forever, which left a daemon announcing an executor it no longer
+/// carries until someone restarted the process — the node lying about what it
+/// can run, in the direction that strands a buyer's run.
+fn heartbeat(
+    base: &str,
+    mut hello: noded::services::Hello,
+    mut watch: HelloWatch,
+    initial: Skew,
+) -> ! {
     const LOG_EVERY: u64 = 30;
     let mut failures: u64 = 0;
     // seeded from the startup beat, so skew is named once at startup and then
@@ -1768,7 +1890,8 @@ fn heartbeat(base: &str, hello: &noded::services::Hello, initial: Skew) -> ! {
     note_skew(&hello.kind, &mut skew, initial);
     loop {
         std::thread::sleep(HEARTBEAT);
-        match send_hello(base, hello) {
+        watch.refresh(&mut hello);
+        match send_hello(base, &hello) {
             Ok(observed) => {
                 if failures > 0 {
                     tracing::info!(target: "ducktape::service", kind = %hello.kind, "signal restored");
@@ -1923,6 +2046,49 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A daemon used to compute its hello ONCE and re-send it verbatim until
+    /// the process was restarted, so `ducktape agent install`/uninstall on a
+    /// running node never reached the node's catalog. This is the clock that
+    /// unfroze it — and the asserts avoid the wall clock entirely (an empty
+    /// directory and a populated one differ as `None` vs `Some`, whatever the
+    /// filesystem's mtime granularity is).
+    #[test]
+    fn the_executors_clock_reports_a_change_once_and_a_quiet_directory_never() {
+        let dir = std::env::temp_dir().join(format!("dt-exec-clock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let mut clock = ExecutorsClock::new(Some(dir.clone()));
+        assert!(
+            !clock.moved(),
+            "an unchanged directory is quiet — this runs every beat"
+        );
+
+        std::fs::write(dir.join("codex"), b"#!/bin/sh\n").expect("install an executor");
+        assert!(clock.moved(), "an install is a move");
+        assert!(
+            !clock.moved(),
+            "and it is reported ONCE — a re-derive per beat would re-probe forever"
+        );
+
+        std::fs::remove_file(dir.join("codex")).expect("uninstall it");
+        assert!(
+            clock.moved(),
+            "an uninstall is a move too: this is the direction that strands a buyer's run"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bare test backend has no executors directory. A clock with nothing
+    /// to watch must never claim a move, or the daemon would re-probe forever.
+    #[test]
+    fn a_clock_with_no_directory_never_moves() {
+        let mut clock = ExecutorsClock::new(None);
+        assert!(!clock.moved());
+        assert!(!clock.moved());
+    }
 
     fn row(kind: &str) -> ServiceRow {
         ServiceRow {
