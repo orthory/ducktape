@@ -316,6 +316,37 @@ wasm-modules-check:
 wasm-repro-check:
 	@bash ops/wasm-repro-check.sh
 
+INDEX_CHECK_DIR = $(CURDIR)/target/wasm-index-check
+
+## the drift gate the committed INDEX guests never had: rebuild each
+## index.wasm from its source on the pinned toolchain and compare it with the
+## committed bytes. `wasm-modules-check` cannot catch this — it only cmps
+## committed copies against each other, so an index guest could drift
+## arbitrarily far from the sources beside it and stay green, which is exactly
+## what happened (#1363), while noded include_bytes!s five of them. Needs the
+## wasm32 target (which `wasm-modules-check` deliberately does not), so like
+## `wasm-repro-check` it stands apart from the pre-push `test` gate.
+##
+## Component artifacts are deliberately NOT covered, and not because they are
+## fine: on this box a component does not reproduce even from an unchanged
+## lock (measured on crates/modules/system/saga). Gating those means first
+## finding what moves their bytes, and every refresh moves GENESIS_ROOT_HASH —
+## a consensus-visible change. Index guests reproduce and pin nothing, so
+## their drift was pure neglect, and this gate ends it.
+wasm-index-check:
+	@mkdir -p "$(INDEX_CHECK_DIR)"
+	@for m in $(INDEX_MODULES); do \
+	  id=$$(basename $$m) && \
+	  $(CARGO) run -q -p guest-builder -- --index $$m \
+	    --out "$(INDEX_CHECK_DIR)/$$id.wasm" >/dev/null || exit 1; \
+	  cmp $$m/index.wasm "$(INDEX_CHECK_DIR)/$$id.wasm" || { \
+	    echo "$$m/index.wasm does not match a rebuild of its source. Refresh it:"; \
+	    echo "    $(CARGO) run -p guest-builder -- --index $$m"; \
+	    echo "  and commit the result. (Not \`make wasm-modules\`: that also"; \
+	    echo "  rewrites every component.wasm and would move the genesis hash.)"; exit 1; }; \
+	done
+	@echo "committed index guests match a rebuild on this toolchain"
+
 ## the supply-chain tripwire: RustSec advisories and yanked crates against the
 ## committed Cargo.lock, under the policy in `deny.toml` — where every carried
 ## advisory is listed WITH the reason it is carried and what would clear it.
