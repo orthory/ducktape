@@ -505,7 +505,7 @@ pub struct InitArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct InviteArgs {
-    /// days until the token expires (default: 30)
+    /// days until the token expires (default: 7)
     #[arg(long, value_name = "N")]
     pub ttl_days: Option<u64>,
     #[command(flatten)]
