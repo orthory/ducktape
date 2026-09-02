@@ -57,7 +57,9 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
 - `coordinator/` — systemd unit, env example, and Dockerfile for the UDP
   coordinator (see `coordinator/README.md`).
 - `wg-smoke/` — WireGuard interop and bench harnesses (the `wg_interop`
-  probe binary in rootless podman; no node.toml involved).
+  probe binary in two rootless podman containers — podman is only this
+  harness's container runtime; the node itself has had no container sandbox
+  since #1176. No node.toml involved).
 - `huddle-lane.sh` — two real nodes in the dev shape with userspace
   WireGuard between them, one channel, one user key per side: the live
   arrangement a huddle (voice/camera/screen share) actually breaks in.
