@@ -37,8 +37,10 @@ Environment=DUCKTAPE_HOME=/var/lib/ducktape
 # required.
 EnvironmentFile=-/etc/ducktape/node.env
 ExecStart=/usr/local/bin/ducktape node run -n %I $DUCKTAPE_NODE_ARGS
-# SIGTERM takes the graceful path: a final checkpoint + journal barrier. Give
-# it time; a hard kill lands on WAL-forward recovery at the next boot.
+# SIGTERM: a validator takes the graceful path (a final checkpoint + journal
+# barrier, bin/node/src/validator/run.rs); a resident's park loop installs no
+# handler, dies by default action and re-syncs at the next boot. Give the
+# validator time; a hard kill lands on WAL-forward recovery at the next boot.
 KillSignal=SIGTERM
 TimeoutStopSec=120
 Restart=always
