@@ -6,6 +6,12 @@
 # a rename-and-signal rotation would leave the process writing into the
 # renamed file forever, and the "new" log empty.
 #
+# The node also rotates at OPEN, on its own: a log already past 64 MiB when
+# the process starts is renamed to `<name>.1` before the append
+# (`node::log_file::open_rotating`). That is the floor for a host with no
+# logrotate at all, and it is why a `.1` this config never made can appear —
+# there is only ever one, replaced at each such boot.
+#
 # The workspace root is DUCKTAPE_HOME: /var/lib/ducktape under the shipped
 # units (below), ~/.ducktape for a node run by hand — add that path if you
 # rotate one. `su` names the owner: logrotate refuses a directory it cannot
