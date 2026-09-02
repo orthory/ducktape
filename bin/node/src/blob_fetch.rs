@@ -387,12 +387,20 @@ impl<S: P2pSender<PublicKey = ed25519::PublicKey>> ServeLaneBlobClient<S> {
         }
     }
 
+    /// the source this request rides, SKIPPING this node's own key: the book
+    /// is the transport union (members ∪ residents), which contains us, and a
+    /// request to ourselves is never delivered — it would burn a whole
+    /// conversation (and, where the caller rotates only on failure, a whole
+    /// retry) on a guaranteed timeout. `None` = the book holds nobody else,
+    /// which the caller reports as an unreachable source.
     fn current_peer(&self) -> Option<ed25519::PublicKey> {
         let peers = self.peers.read().expect("blob peers lock");
-        if peers.is_empty() {
-            return None;
-        }
-        Some(peers[self.cursor.load(Ordering::Relaxed) % peers.len()].clone())
+        let start = self.cursor.load(Ordering::Relaxed);
+        (0..peers.len()).find_map(|step| {
+            let peer = &peers[(start + step) % peers.len()];
+            let is_me = peer.as_ref() == self.requester.as_slice();
+            (!is_me).then(|| peer.clone())
+        })
     }
 }
 

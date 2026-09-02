@@ -26,6 +26,19 @@ use sha2::{Digest as _, Sha256};
 use wasm_host::WasmModule;
 
 const FORGE: &str = "forge";
+
+/// forge's SYNC surface as the host publishes it at a boundary: one
+/// self-contained container, never a resolver lane. independent of the disk
+/// cohort (`block_durable_ids`), which forge is also in — the whole point of
+/// the recovery fix is that neither answer implies the other.
+fn sync_surface_is_snapshot_bytes(host: &Host) -> bool {
+    let (snapshot, _) = host.capture_current_snapshot(0, || std::time::Duration::ZERO);
+    snapshot
+        .module(FORGE)
+        .expect("forge is registered")
+        .state_sync
+        .has_snapshot_bytes()
+}
 const CHAT: &str = "chat";
 const REPO: &str = "demo";
 
@@ -372,10 +385,16 @@ fn full_matrix_roots_identical_block_by_block() {
     // namespace, so the roots are EQUAL (and ZERO).
     assert_eq!(forge_root(&native), StateRoot::ZERO);
     assert_lockstep(&native, &wasm, "at genesis");
-    // the host sees the wasm tenant exactly as it saw native forge: snapshot
-    // bytes (one self-contained container), never a resolver lane.
-    assert!(!native.resolver_backed_ids().contains(FORGE));
-    assert!(!wasm.resolver_backed_ids().contains(FORGE));
+    // the host sees the wasm tenant exactly as it saw native forge, on BOTH
+    // answers — which are independent, and conflating them is what left forge
+    // unplaceable at restart. SYNC SURFACE: snapshot bytes, one self-contained
+    // container, never a resolver lane.
+    assert!(sync_surface_is_snapshot_bytes(&native), "native forge");
+    assert!(sync_surface_is_snapshot_bytes(&wasm), "wasm forge");
+    // DURABILITY: per-block on its own disk, so it is in recovery's disk
+    // cohort on both sides despite that snapshot-shaped surface.
+    assert!(native.block_durable_ids().contains(FORGE));
+    assert!(wasm.block_durable_ids().contains(FORGE));
 
     // the accepted stream — every block here moves the forge root.
     let accepted: Vec<(u64, Origin, Msg)> = vec![

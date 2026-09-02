@@ -993,6 +993,19 @@ impl Module for WasmModule {
         Some(self.code_hash.clone())
     }
 
+    /// the disk cohort by BACKING KIND, which is the only honest source for it:
+    /// a Store tenant commits its own qmdb every block and an Odb tenant its own
+    /// refs image every block, while a Map tenant's whole state rides the
+    /// checkpoint snapshot. deriving this from the sync handle instead drops an
+    /// Odb tenant that ships one self-contained container (forge) out of the
+    /// cohort — see [`Module::block_durable`].
+    fn block_durable(&self) -> bool {
+        match &self.backing {
+            StateBacking::Map { .. } => false,
+            StateBacking::Store { .. } | StateBacking::Odb { .. } => true,
+        }
+    }
+
     /// only an ODB substrate tracks a durable-commit cursor (the native files
     /// recovery bookkeeping it inherits); delegating it lets recovery verify a
     /// trailing unsealed files block.

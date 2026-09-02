@@ -210,10 +210,11 @@ fn same_ops_identical_roots_block_by_block() {
         // EQUAL.
         assert_eq!(roots(&native), roots(&wasm), "genesis roots diverge");
 
-        // the host's snapshot orchestration sees the wasm tenant exactly as it
-        // saw the native module: resolver-backed, never snapshot bytes.
-        assert!(native.resolver_backed_ids().contains("pages"));
-        assert!(wasm.resolver_backed_ids().contains("pages"));
+        // recovery's disk cohort sees the wasm tenant exactly as it saw the
+        // native module: per-block durable on its own qmdb, so a root ahead of
+        // the last checkpoint is placeable rather than damage.
+        assert!(native.block_durable_ids().contains("pages"));
+        assert!(wasm.block_durable_ids().contains("pages"));
 
         // every op family, one block each: tree edits, page nesting, the
         // comment plane (which also emits the tagging follow-up), and subtree
