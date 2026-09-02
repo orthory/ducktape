@@ -1151,6 +1151,7 @@ version = "0.1.0"
 dependencies = [
  "sha2 0.10.9",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -3290,6 +3291,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.24.0",
  "tracing",
+ "tracing-subscriber 0.3.23",
  "ui-lang",
  "ui-lang-build",
  "ui-lang-components",
@@ -6178,6 +6180,7 @@ dependencies = [
  "sdk",
  "sdk-testkit",
  "statesync",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
 ]

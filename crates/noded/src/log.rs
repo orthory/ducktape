@@ -173,15 +173,12 @@ pub fn init(ring: Option<crate::LogRing>, log_file: Option<std::path::PathBuf>) 
     install_panic_hook();
 }
 
-/// append-open the daemon log, creating its parent. append (never truncate):
-/// the record across restarts is exactly what a crash post-mortem reads.
-// ponytail: unbounded growth at info cadence; rotation when a real workspace
-// shows a daemon.log worth rotating.
+/// append-open the daemon log, rotating it to `<name>.1` first when it has
+/// outgrown `node::log_file::ROTATE_BYTES`. the same opener serves every file
+/// this function is handed — `daemon.log` and each `service run <kind>.log` —
+/// so no log this process tees is unbounded.
 fn open_log_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::OpenOptions::new().create(true).append(true).open(path)
+    node::log_file::open_rotating(path)
 }
 
 /// a panic in a spawned task kills THAT TASK ONLY: the node stays "up" while one
