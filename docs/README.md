@@ -1,56 +1,20 @@
-# Ducktape Docs
+# docs
 
-This directory is the Nimbus/Astro project for the Ducktape documentation.
-Routed content lives under `src/content/docs`; the custom landing page lives at
-`src/pages/index.mdx`. Non-page records remain outside the content collection,
-so Nimbus never publishes them accidentally.
+What lives here, and only this:
 
-## Reader Tracks
+- `deploy/` — operator runbooks still executed by hand: the coordinator, sentry
+  fronts, the cross-machine zero-exposure procedure, the reachability
+  integration map, unified invite fronts.
+- `dogfood.md` — the dogfood ceremony: ducktape develops ducktape.
+- `sandbox-macos.md` — the vz sandbox stack on macOS.
+- `records/` — the references code or a skill cites by path:
+  `specs/capability-spec.md` (provider), `specs/indexable-spec.md` (indexer),
+  `protocols/wireguard-tunnel-upgrade.md` (wireguard crate),
+  `architecture/agent-collaboration-design.md` (runs, saga),
+  `architecture/wasm-module-authoring.md` (the module-dev skill), plus two
+  dated research notes under `research/`.
 
-- `src/content/docs/en/human` is for human readers.
-- `src/content/docs/en/agent` is for coding agents.
-
-Human pages explain product shape, architecture, operations, and status without
-assuming the reader is about to edit code. Agent pages are tighter implementation
-maps: invariants, verification commands, module boundaries, and open work that a
-coding agent can use before touching files.
-
-When adding a routed page, put it in the reader track whose audience it serves.
-Add a matching page to the other track only when both audiences need it.
-
-## Where Docs Belong
-
-- Put maintained reader documentation under `docs/src/content/docs` so Nimbus
-  can route, build, and index it.
-- Put accepted decision records under `docs/adr` when the decision boundary
-  should outlive an implementation branch.
-- Put maintained non-page records that are not ADRs or operator runbooks under
-  `docs/records`; keep them listed from the `reference/design-records` pages.
-- Keep operator runbooks as standalone Markdown only when an operator still
-  executes them directly.
-- Keep `docs/superpowers` small and reviewed: active design records, approved
-  specs, and execution plans may stay there until durable facts are folded into
-  Nimbus, ADRs, maintained runbooks, tests, or code comments. Do not prune a
-  document just because it lives under `docs/superpowers`; prune it only after a
-  content review identifies its replacement owner or shows it is obsolete.
-
-The Nimbus reference page `reference/design-records` in each track lists the
-non-page records that are still maintained and explains the current pruning
-policy.
-
-## Commands
-
-```sh
-bun install
-bun run docs:check
-bun run typecheck
-bun run lint:docs
-bun run dev
-```
-
-`bun run docs:check` runs the structure check before the Nimbus static build.
-`DOCS_SITE_URL` sets the canonical, Open Graph, and sitemap origin; local builds
-default to `http://localhost:4321`. Set it to the externally reachable origin for
-every non-local preview or deployment (for example,
-`DOCS_SITE_URL=https://docs.example.com bun run build`). Use the three checks
-before opening a docs PR.
+There is no docs site, no decision-record system, and no plan/spec archive.
+`docs/superpowers/` is gitignored working scratch for the brainstorming and
+planning skills. A document nothing cites is deleted, not archived; the rule
+is `AGENTS.md` § "Docs Are Not a Record".
