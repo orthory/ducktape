@@ -103,8 +103,9 @@ pub fn adopt_legacy(duck: &Path) -> Result<(), String> {
     set_active(duck, "default")
 }
 
-/// One listed wallet. `state` is `"encrypted"` for a parseable key file and
-/// `"unreadable"` for anything else (the app renders its refusal plate).
+/// One listed wallet. `state` is [`userkey::KeyFileState::as_str`] — the same
+/// classification the app's key-state rows show (the app renders its refusal
+/// plate for anything but `"encrypted"`).
 pub struct WalletRow {
     pub name: String,
     pub path: PathBuf,
@@ -135,8 +136,8 @@ pub fn list(duck: &Path) -> Result<Vec<WalletRow>, String> {
             continue;
         };
         let (pubkey, state) = match userkey::read_user_key_file(&path) {
-            Ok(enc) => (hex(&enc.pubkey), "encrypted"),
-            Err(_) => (String::new(), "unreadable"),
+            Ok(enc) => (hex(&enc.pubkey), userkey::KeyFileState::Encrypted.as_str()),
+            Err(_) => (String::new(), userkey::KeyFileState::Unreadable.as_str()),
         };
         rows.push(WalletRow {
             active: active.as_deref() == Some(name.as_str()),

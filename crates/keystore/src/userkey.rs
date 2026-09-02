@@ -343,6 +343,47 @@ pub fn read_user_key_file(path: &Path) -> Result<EncryptedUserKey, String> {
     parse_encrypted(&line).map_err(|error| format!("{path:?}: {error}"))
 }
 
+/// What a key file is to a reader WITHOUT a password. Anything that is not a
+/// parseable encrypted v1 line is [`Unreadable`](Self::Unreadable) — a
+/// plaintext seed, a truncated write, and the right prefix over a corrupt
+/// payload alike. Calling the last of those "encrypted" because its first
+/// bytes match is a promise the unlock cannot keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyFileState {
+    Absent,
+    Encrypted,
+    Unreadable,
+}
+
+impl KeyFileState {
+    /// The lowercase token a listing or a settings row shows. One vocabulary,
+    /// so the wallet list and the app's key-state rows cannot drift apart.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Encrypted => "encrypted",
+            Self::Unreadable => "unreadable",
+        }
+    }
+}
+
+/// Classify `path` without a password, through the same parse every unlock
+/// runs. Only a MISSING file is [`Absent`](KeyFileState::Absent): one that
+/// exists but will not read is `Unreadable`, never "no key here".
+pub fn key_file_state(path: &Path) -> KeyFileState {
+    let missing = matches!(
+        std::fs::metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    );
+    if missing {
+        return KeyFileState::Absent;
+    }
+    match read_user_key_file(path) {
+        Ok(_) => KeyFileState::Encrypted,
+        Err(_) => KeyFileState::Unreadable,
+    }
+}
+
 /// the 24-word BIP39 mnemonic encoding `seed`'s raw bytes as entropy (with
 /// its checksum) — NEVER the BIP39 `to_seed` PBKDF2 stretch, so this is a
 /// lossless, identity-preserving encoding: [`seed_of_mnemonic`] recovers the
@@ -672,6 +713,27 @@ mod tests {
         let path = dir.path().join("user.key");
         write_user_key_new(&path, "not a hex seed and not an encrypted line").unwrap();
         assert!(read_user_key_file(&path).is_err());
+    }
+
+    /// The classification every UI shows, in one place: the file that parses
+    /// is the ONLY "encrypted" one. A file carrying the right prefix over a
+    /// corrupt payload used to read "encrypted" in the app and "unreadable" in
+    /// the wallet listing one screen earlier — same file, two answers.
+    #[test]
+    fn key_file_state_calls_only_a_parseable_file_encrypted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user.key");
+        assert_eq!(key_file_state(&path), KeyFileState::Absent);
+
+        let line = seal_user_key(&[8u8; 32], "pw").unwrap();
+        write_user_key_new(&path, &line).unwrap();
+        assert_eq!(key_file_state(&path), KeyFileState::Encrypted);
+
+        std::fs::write(&path, format!("{USER_KEY_ENCRYPTED_PREFIX}not-base64!!")).unwrap();
+        assert_eq!(key_file_state(&path), KeyFileState::Unreadable);
+
+        std::fs::write(&path, "plaintext-key").unwrap();
+        assert_eq!(key_file_state(&path), KeyFileState::Unreadable);
     }
 
     #[test]
