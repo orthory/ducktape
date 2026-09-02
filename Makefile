@@ -181,7 +181,9 @@ test: wasm-modules-check
 # browser half of `crates/authpage`'s contract, dependency-free under node.
 	node ops/auth-page/test.mjs
 # demo-clear's refusal line against a stub admin surface: the reason token it
-# prints has to be the node's own, not one invented in the script.
+# prints has to be the node's own, not one invented in the script. Needs `bun`
+# (so does demo-clear itself); the script skips with a notice where there is
+# none, like the podman lines above.
 	bash ops/demo-clear-test.sh
 # the #[ignore]d tests are ignored ONLY because they must not share a process
 # with the parallel suite — they still have to run. `absolute_configs_resolve_

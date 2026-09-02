@@ -93,14 +93,24 @@ else
     -X POST "http://127.0.0.1:$HTTP_PORT/v1/admin/shutdown" \
     -H "x-ducktape-admin-token: $(cat "$WSDIR/admin.token")" 2>/dev/null)"
   CODE="${RESPONSE##*$'\n'}"
-  # a route the node never mounted (admin disabled) 404s with an empty body, and
-  # an unreachable port answers 000 with none — then the status is the whole
-  # diagnosis and the line carries no reason at all.
-  REASON="$(printf '%s' "${RESPONSE%$'\n'*}" \
-    | bun -e 'try { console.log((await Bun.stdin.json()).reason ?? "") } catch {}' 2>/dev/null)"
+  # BOTH fields the node sent: `reason` is the greppable token and `error` is
+  # `AdminRefusal::message()` — the operator-facing sentence that says what to do
+  # about it ("re-read admin.token from the node's workspace; a restart mints a
+  # new one"). A route the node never mounted (admin disabled) 404s with an empty
+  # body, and an unreachable port answers 000 with none — then the status is the
+  # whole diagnosis and the line carries neither.
+  DETAIL="$(printf '%s' "${RESPONSE%$'\n'*}" | bun -e '
+    try {
+      const body = await Bun.stdin.json();
+      const said = [];
+      if (body.reason) said.push("reason=" + body.reason);
+      if (body.error) said.push(body.error);
+      console.log(said.join(": "));
+    } catch {}
+  ' 2>/dev/null)"
   case "$CODE" in
     2*) : ;;
-    *) log "graceful shutdown did not succeed (http ${CODE:-none}${REASON:+, reason=$REASON}) — using the pid sweep" ;;
+    *) log "graceful shutdown did not succeed (http ${CODE:-none}${DETAIL:+, $DETAIL}) — using the pid sweep" ;;
   esac
 fi
 
