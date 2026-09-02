@@ -1,7 +1,8 @@
 use super::{
     BTreeMap, Block, BlockKind, Error, MAX_BLOCK_LEN, MAX_MOVE_SUBTREE_READS, MAX_PAGE_DEPTH,
-    MAX_PAGE_QUERY_BYTES, MAX_PAGE_QUERY_LIMIT, MAX_TRAVERSAL_WORK, MerkleStore, ModuleId,
-    PAGE_INDEX_KEY, PageBlockPage, PageError, Pages, StagedStore, to_page_err,
+    MAX_PAGE_QUERY_BYTES, MAX_PAGE_QUERY_LIMIT, MAX_PAGE_TITLE_LEN, MAX_TRAVERSAL_WORK,
+    MerkleStore, ModuleId, PAGE_INDEX_KEY, PageBlockPage, PageError, Pages, StagedStore,
+    to_page_err,
 };
 
 impl Pages {
@@ -50,8 +51,14 @@ impl Pages {
         Ok(())
     }
 
-    /// stage one block record.
+    /// stage one block record. every write path funnels here, so this is where
+    /// [`MAX_PAGE_TITLE_LEN`] binds: create, nested-page insert and rename all
+    /// set a title through this one guard.
     pub(super) fn store_block(&mut self, block: &Block) -> Result<(), PageError> {
+        let over_title_cap = block.kind == BlockKind::Page && block.text.len() > MAX_PAGE_TITLE_LEN;
+        if over_title_cap {
+            return Err(PageError::TitleTooLarge);
+        }
         let bytes = serde_json::to_vec(block).expect("Block is always serializable");
         self.stage(&block.id, bytes)
     }

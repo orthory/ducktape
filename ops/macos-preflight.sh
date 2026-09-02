@@ -90,14 +90,17 @@ fi
 # ---- rust -------------------------------------------------------------------
 if command -v rustup >/dev/null; then
   ok "rustup"
+  # rust-toolchain.toml lists this target, so installing the pinned toolchain
+  # from inside the checkout is what puts it there — the manual `target add` is
+  # only for a rustup too old to read `targets` out of that file.
   if rustup target list --installed 2>/dev/null | grep -q aarch64-unknown-linux-musl; then
     ok "aarch64-unknown-linux-musl target (guest init cross build)"
   else
-    miss "musl target for the guest init" "rustup target add aarch64-unknown-linux-musl" \
-      "rustup target add aarch64-unknown-linux-musl"
+    miss "musl target for the guest init" "rustup toolchain install (from the ducktape checkout)" \
+      "cd '$HERE' && rustup toolchain install"
   fi
 else
-  miss "rustup" "see https://rustup.rs — then: rustup target add aarch64-unknown-linux-musl"
+  miss "rustup" "see https://rustup.rs — then: rustup toolchain install (in the ducktape checkout)"
 fi
 
 # ---- the shim ---------------------------------------------------------------

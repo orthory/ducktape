@@ -33,8 +33,8 @@
 #                      the duckdns naming library it now consumes from
 #                      crates/duckdns)
 #   crates/modules/apps/   — application modules, the product features (forge,
-#                      chat, pages, agent, runs, tasks, vaults, automations,
-#                      inbox, files)
+#                      chat, pages, agent, runs, tasks, automations, inbox,
+#                      files)
 #   crates/services/ — off-chain service crates: the host-side executors that
 #                      serve a consensus module without being one (compute —
 #                      the dispatch WorkSpec pool/ledger/gate; sandbox — the
@@ -148,6 +148,9 @@ members = [
     # and the join ceremony that writes one. Split from bin/node because
     # joining is the one node operation with no running node to ask.
     "crates/workspace-config",
+    # THE ducktape home resolution, alone in a zero-dependency leaf so the
+    # light services can read it without workspace-config's graph behind it.
+    "crates/ducktape-home",
     "crates/duckfs/core",
     "crates/duckfs/disk",
     "crates/duckfs/client",
@@ -161,7 +164,6 @@ members = [
     "crates/modules/apps/agent",
     "crates/modules/apps/runs",
     "crates/modules/apps/tasks",
-    "crates/modules/apps/vaults",
     "crates/modules/apps/automations",
     "crates/modules/apps/inbox",
     "crates/modules/apps/files",
@@ -286,11 +288,11 @@ zeroize = "1"
 # default-features = false keeps the base dep lean; the indexer crate turns the
 # `wasm` feature on — the in-database WASM layer (wasmtime) runs the per-module
 # index guests (fold triggers + view queries).
-fluent31 = { git = "https://github.com/orthory/fluent31", default-features = false }
+fluent31 = { git = "https://github.com/orthory/fluent31", rev = "0a1fd768101deb69ee50817167b9aedd6c026c51", default-features = false }
 # fluent-guest — fluent31's wasm32 guest SDK. NEVER a host-side dependency:
 # only the index-guest crate's `guest` feature pulls it, and only guest-builder's
 # synthesized wasm32 workspaces ever enable that feature.
-fluent-guest = { git = "https://github.com/orthory/fluent31", default-features = false }
+fluent-guest = { git = "https://github.com/orthory/fluent31", rev = "0a1fd768101deb69ee50817167b9aedd6c026c51", default-features = false }
 # borsh — the deterministic op-row envelope on the derived tier's fold feed
 # (host encodes, index guests decode; one byte layout, no map ordering games).
 borsh = { version = "1", default-features = false, features = ["derive", "std"] }
@@ -299,7 +301,7 @@ borsh = { version = "1", default-features = false, features = ["derive", "std"] 
 # modules inside the host. pinned EXACTLY: the runtime IS the module execution
 # semantics, so it is consensus-affecting and every validator must run the
 # identical build; changing it is a binary upgrade, never a live module swap.
-wasmtime = "=46.0.1"
+wasmtime = "=46.0.3"
 # wit-bindgen — the guest-side binding generator for a crate's own component
 # port (the netstack machine's `guest` feature). Only ever compiled inside
 # guest-builder's synthesized wasm32 workspace.
@@ -345,7 +347,6 @@ chat = { path = "crates/modules/apps/chat" }
 agent = { path = "crates/modules/apps/agent" }
 runs = { path = "crates/modules/apps/runs" }
 tasks = { path = "crates/modules/apps/tasks" }
-vaults = { path = "crates/modules/apps/vaults" }
 automations = { path = "crates/modules/apps/automations" }
 inbox = { path = "crates/modules/apps/inbox" }
 files = { path = "crates/modules/apps/files" }
@@ -372,6 +373,8 @@ run-envelope = { path = "crates/run-envelope" }
 # a ducktape workspace on disk + the join ceremony, linked by the CLI and the
 # desktop app.
 workspace-config = { path = "crates/workspace-config" }
+# `$DUCKTAPE_HOME` else `~/.ducktape`, resolved once for every reader of it.
+ducktape-home = { path = "crates/ducktape-home" }
 # the module composition catalog (id universe + named genesis selections).
 topology = { path = "crates/topology" }
 duckfs-core = { path = "crates/duckfs/core" }

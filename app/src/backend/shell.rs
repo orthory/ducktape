@@ -276,12 +276,10 @@ pub(crate) fn registered_endpoint() -> Option<String> {
     Some(format!("http://127.0.0.1:{http}"))
 }
 
-/// `$DUCKTAPE_HOME`, else `~/.ducktape` — the same resolution the user key uses.
+/// `$DUCKTAPE_HOME`, else `~/.ducktape` — the same resolution the user key
+/// uses, because it IS that resolution: [`ducktape_home::root`].
 pub(crate) fn ducktape_home() -> Option<PathBuf> {
-    if let Some(root) = std::env::var_os("DUCKTAPE_HOME") {
-        return Some(PathBuf::from(root));
-    }
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".ducktape"))
+    ducktape_home::root().ok()
 }
 
 /// Every registered workspace as `(chain id, directory)` — the CLI's own
