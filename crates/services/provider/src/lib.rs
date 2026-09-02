@@ -1733,7 +1733,8 @@ fn guest_node_url(url: &str) -> Result<(u16, String), &'static str> {
     let host_is_v4_loopback = host
         .parse::<std::net::Ipv4Addr>()
         .is_ok_and(|ip| ip.is_loopback());
-    if !host_is_v4_loopback && host != "localhost" {
+    let host_is_loopback_name = host == "localhost";
+    if !(host_is_v4_loopback || host_is_loopback_name) {
         return Err("node_url_not_loopback");
     }
     Ok((port, format!("http://127.0.0.1:{port}{path}")))
