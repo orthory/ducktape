@@ -135,3 +135,25 @@ async fn hot_swap_keeps_state() {
     m.commit_block().await.expect("commit");
     assert_eq!(count(m.query(b"").await.expect("query")), 3);
 }
+
+/// THE READINESS PROBE MUST ACTUALLY LOAD. A validator signals `SwapReady` off
+/// this answer, and byte residency alone let a node on an older binary arm a
+/// swap it then rejected every op to (#1297) — so the check has to run the real
+/// compile + instantiate, not merely look at the bytes.
+#[test]
+fn check_loadable_accepts_a_real_component_and_refuses_garbage() {
+    WasmModule::check_loadable(HELLO).expect("the shipped fixture loads on this binary");
+
+    for (what, bytes) in [
+        ("empty", Vec::new()),
+        ("not wasm at all", b"this is not a component".to_vec()),
+        // a valid wasm preamble with a truncated body: passes the magic
+        // number, dies in validation — the shape a half-fetched blob has.
+        ("truncated", b"\0asm\x0d\0\x01\0\x01\x02".to_vec()),
+    ] {
+        assert!(
+            WasmModule::check_loadable(&bytes).is_err(),
+            "{what} bytes must never be reported loadable"
+        );
+    }
+}

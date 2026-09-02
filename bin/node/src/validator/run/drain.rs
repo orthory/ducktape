@@ -18,6 +18,7 @@ use crate::drain_actions::{
 };
 use crate::host_reads::{read_valset_members, read_valset_mesh_window, read_valset_residents};
 use crate::util::{fatal, hex, participant_bytes, resident_bytes};
+use crate::validator::code_announce::CodeVerdict;
 use crate::{join_gate, relay};
 use noded::projection::{BlockProjection, project_block};
 
@@ -1161,9 +1162,37 @@ impl ValidatorRuntime<'_> {
         else {
             return;
         };
-        // residency is a VERIFYING read (content re-hashed on the disk path):
-        // signing ready must mean sha256(local bytes) == committed hash.
-        let actions = code_signaller.decide(&modules, |digest| blobs.has_chunk(digest));
+        // residency is a VERIFYING read (content re-hashed on the disk path)
+        // AND a LOADABILITY read: signing ready must mean sha256(local bytes)
+        // == committed hash AND "this binary can instantiate them". Byte
+        // residency alone let a validator on an older build arm a swap at
+        // R = n and then deterministically reject every op to the module while
+        // its peers applied them — a silent fork on activation (#1297). The
+        // probe compiles the component, so it runs at most once per pending
+        // swap: `decide` latches both the signal and the refusal.
+        let actions = code_signaller.decide(&modules, |digest| {
+            let Some(bytes) = blobs.get_chunk(digest) else {
+                return CodeVerdict::Absent;
+            };
+            match wasm_host::WasmModule::check_loadable(&bytes) {
+                Ok(()) => CodeVerdict::Loadable,
+                Err(e) => CodeVerdict::Unloadable {
+                    detail: e.to_string(),
+                },
+            }
+        });
+        for (key, detail) in actions.refusals {
+            tracing::warn!(
+                target: "ducktape::modules",
+                node = %label,
+                module = %key.0,
+                swap = key.1,
+                reason = "code_not_loadable",
+                detail = %detail,
+                "pending-swap code refused: this binary cannot instantiate it, so \
+                 this node will not signal ready"
+            );
+        }
         for digest in actions.fetches {
             let client = blob_client.clone();
             let blobs = blobs.clone();
