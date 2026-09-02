@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use crate::{Latch, NodeKey, short_key};
+use crate::{Latch, NodeKey};
 
 /// One node's latest reflexive advertisement: the reflexive `SocketAddr` a node
 /// published and the monotonic `nonce` that orders it. The nonce is an ordering
@@ -126,11 +126,11 @@ impl AdvertBook {
         // Seniority belongs to the KEY and survives every refresh: a member
         // that re-advertises keeps the slot it earned instead of becoming the
         // newest arrival (and so the next victim).
-        let seniority = self.latest.get(&key).map(|prev| prev.admitted);
-        let admitted = match seniority {
-            Some(admitted) => admitted,
-            None => self.admit(now),
-        };
+        let admitted = self
+            .latest
+            .get(&key)
+            .map(|prev| prev.admitted)
+            .unwrap_or_else(|| self.admit(now));
         self.latest.insert(
             key,
             ReflexiveAdvert {
@@ -189,13 +189,15 @@ impl AdvertBook {
         // a full book of LIVE registrations is either a mesh past the cap or a
         // spray in progress; either way the operator wants to know that a
         // registration is being displaced, and the count says which it is.
+        // the evicted KEY is not named: under the spray this line exists to
+        // report, the victim is always the sprayer's own previous throwaway,
+        // so the number of displacements is the whole diagnosis.
         static BOOK_FULL: Latch = Latch::new();
         if let Some(occurrences) = BOOK_FULL.hit("book_full") {
             tracing::warn!(
                 target: "ducktape::reachability",
                 event = "advert_evicted",
                 reason = "book_full",
-                key = short_key(youngest),
                 capacity = MAX_ADVERTS,
                 occurrences,
                 "advert book at capacity — the newest registration lost its slot"
