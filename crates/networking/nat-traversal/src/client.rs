@@ -519,7 +519,7 @@ impl CoordinatorMetrics {
 /// is diagnosed here and nowhere else.
 fn note_malformed(from: SocketAddr, bytes: usize) {
     static MALFORMED: Latch = Latch::new();
-    if let Some(occurrences) = MALFORMED.hit() {
+    if let Some(occurrences) = MALFORMED.hit("malformed_request") {
         tracing::warn!(
             target: "ducktape::reachability",
             event = "coordinator_request_refused",
@@ -536,7 +536,7 @@ fn note_malformed(from: SocketAddr, bytes: usize) {
 /// retries), so without this the loss is invisible outside the counter.
 fn note_send_error(dst: SocketAddr) {
     static SEND_ERRORS: Latch = Latch::new();
-    if let Some(occurrences) = SEND_ERRORS.hit() {
+    if let Some(occurrences) = SEND_ERRORS.hit("send_failed") {
         tracing::warn!(
             target: "ducktape::reachability",
             event = "coordinator_reply_dropped",
@@ -553,7 +553,7 @@ fn note_send_error(dst: SocketAddr) {
 /// sees as "the coordinator went quiet", so it must be nameable.
 fn note_saturated() {
     static SATURATED: Latch = Latch::new();
-    if let Some(occurrences) = SATURATED.hit() {
+    if let Some(occurrences) = SATURATED.hit("auth_window_full") {
         tracing::warn!(
             target: "ducktape::reachability",
             event = "coordinator_saturated",

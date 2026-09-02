@@ -190,7 +190,7 @@ impl AdvertBook {
         // spray in progress; either way the operator wants to know that a
         // registration is being displaced, and the count says which it is.
         static BOOK_FULL: Latch = Latch::new();
-        if let Some(occurrences) = BOOK_FULL.hit() {
+        if let Some(occurrences) = BOOK_FULL.hit("book_full") {
             tracing::warn!(
                 target: "ducktape::reachability",
                 event = "advert_evicted",

@@ -700,16 +700,25 @@ impl Session {
     }
 }
 
+/// A `REASON_*` token as a latch key. The tokens are ASCII by construction;
+/// the fallback exists only so a future non-UTF8 token cannot silence the line.
+fn reason_key(reason: &'static [u8]) -> &'static str {
+    std::str::from_utf8(reason).unwrap_or("non_utf8")
+}
+
 /// One refused relay session, named. `reason` is the same stable token the
-/// peer gets back in its [`RelayFrame::Error`]; latched, because refusing
-/// strangers is this lane's steady state under abuse.
-fn note_refused(peer: SocketAddr, reason: &[u8]) {
+/// peer gets back in its [`RelayFrame::Error`]; latched PER REASON, because
+/// refusing strangers is this lane's steady state under abuse and a connection
+/// flood tripping `session_limit` must not swallow the first
+/// `target_unregistered` — the one an operator is actually hunting.
+fn note_refused(peer: SocketAddr, reason: &'static [u8]) {
     static REFUSALS: Latch = Latch::new();
-    if let Some(occurrences) = REFUSALS.hit() {
+    let reason = reason_key(reason);
+    if let Some(occurrences) = REFUSALS.hit(reason) {
         tracing::warn!(
             target: "ducktape::reachability",
             event = "relay_session_refused",
-            reason = %String::from_utf8_lossy(reason),
+            reason,
             peer = %peer,
             occurrences,
             "relay session refused"
@@ -849,6 +858,22 @@ mod tests {
             assert_eq!(&frame.encode_inline()[..], &bytes[..]);
             assert_eq!(RelayFrame::decode(&bytes).expect("decode"), frame);
         }
+    }
+
+    /// A session-limit flood is this lane's loudest refusal; the line an
+    /// operator came for is the first `target_unregistered`. One latch per lane
+    /// would swallow it 99 times out of 100, so the latch counts per reason.
+    #[test]
+    fn a_session_limit_flood_does_not_swallow_the_first_unregistered_refusal() {
+        let latch = Latch::new();
+        assert_eq!(latch.hit(reason_key(REASON_SESSION_LIMIT)), Some(1));
+        for _ in 0..1_000 {
+            let _ = latch.hit(reason_key(REASON_SESSION_LIMIT));
+        }
+        assert_eq!(latch.hit(reason_key(REASON_TARGET_UNREGISTERED)), Some(1));
+        // ... and each reason still latches down to first-and-every-Nth on its
+        // own count, rather than every occurrence.
+        assert_eq!(latch.hit(reason_key(REASON_TARGET_UNREGISTERED)), None);
     }
 
     #[test]

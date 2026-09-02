@@ -60,19 +60,27 @@ pub use wire::{AuthRequest, Msg, NodeKey, WireError};
 /// definition, so an unlatched line here is a flood that evicts the very
 /// evidence an operator came for — and the count IS the diagnosis. the same
 /// shape as `noded::log::Latch`, which this crate cannot link (the coordinator
-/// deliberately has no node-crate dependency), keyed by the static holding it.
-pub(crate) struct Latch(std::sync::atomic::AtomicU64);
+/// deliberately has no node-crate dependency).
+///
+/// counted per `reason` token, not per lane: one lane refuses for several
+/// distinct reasons, and a connection flood that trips `session_limit` a
+/// thousand times must not swallow the FIRST `target_unregistered` — the
+/// everyday "why won't my joiner connect" line.
+pub(crate) struct Latch(std::sync::Mutex<std::collections::BTreeMap<&'static str, u64>>);
 
 impl Latch {
     const EVERY: u64 = 100;
 
     pub(crate) const fn new() -> Self {
-        Self(std::sync::atomic::AtomicU64::new(0))
+        Self(std::sync::Mutex::new(std::collections::BTreeMap::new()))
     }
 
-    /// `Some(occurrences)` when this occurrence should be logged.
-    pub(crate) fn hit(&self) -> Option<u64> {
-        let n = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    /// `Some(occurrences)` when this occurrence of `reason` should be logged.
+    pub(crate) fn hit(&self, reason: &'static str) -> Option<u64> {
+        let mut counts = self.0.lock().expect("latch counts poisoned");
+        let count = counts.entry(reason).or_insert(0);
+        *count += 1;
+        let n = *count;
         (n == 1 || n.is_multiple_of(Self::EVERY)).then_some(n)
     }
 }

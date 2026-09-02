@@ -214,7 +214,7 @@ impl Coordinator {
     pub(crate) fn record_reject(&mut self) {
         self.rejects += 1;
         static REJECTS: Latch = Latch::new();
-        if let Some(occurrences) = REJECTS.hit() {
+        if let Some(occurrences) = REJECTS.hit("unauthenticated_request") {
             tracing::warn!(
                 target: "ducktape::reachability",
                 event = "coordinator_request_refused",
