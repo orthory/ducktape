@@ -80,13 +80,15 @@ fn chat_event_msg(channel: &str, seq: u64, author: AuthorRef) -> Msg {
 }
 
 async fn tasks_of(host: &Host) -> Vec<tasks::Task> {
-    let bytes = host
-        .query(TASKS, &tasks_encode_query(&TaskQuery::List))
-        .await
-        .expect("query");
-    match tasks_decode_reply(&bytes).expect("reply") {
-        TaskReply::Tasks(tasks) => tasks,
-    }
+    let req = tasks_encode_query(&TaskQuery::List {
+        limit: tasks::MAX_LIST_LIMIT,
+        after: None,
+    });
+    let bytes = host.query(TASKS, &req).await.expect("query");
+    let TaskReply::Tasks(tasks) = tasks_decode_reply(&bytes).expect("reply") else {
+        panic!("a list answers a page");
+    };
+    tasks
 }
 
 async fn run_history(host: &Host, rule_id: &str) -> Vec<RunRecord> {

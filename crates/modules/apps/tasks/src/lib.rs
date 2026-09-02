@@ -22,10 +22,10 @@
 //! | `w#` | the registered worker set (a json `BTreeSet<ModuleId>`) |
 //!
 //! the store hashes each logical key (`sdk::store_key`) and cannot enumerate,
-//! so the task board carries `t#`: [`TaskQuery::List`] is an unpaged read of
-//! the WHOLE board and something has to hold the id order. the job board needs
-//! no such index -- its only dispatch read is the by-id `Get`, and board
-//! enumeration is the index guest's job on the derived tier.
+//! so the task board carries `t#`: [`TaskQuery::List`] answers one PAGE of the
+//! id order and something has to hold that order. the job board needs no such
+//! index -- its only dispatch read is the by-id `Get`, and board enumeration is
+//! the index guest's job on the derived tier.
 //!
 //! ops and queries ride ONE wire envelope ([`WorkMsg`]/[`WorkQuery`]): the
 //! module's single `execute`/`query` decodes the envelope and routes to the
@@ -47,10 +47,10 @@ mod task_board;
 // re-export both boards' public caps so external callers keep referring to
 // `tasks::MAX_PAYLOAD` / `tasks::MAX_TASK_ID`.
 pub use job_board::{
-    MAX_ATTEMPTS, MAX_JOB_ID, MAX_JOBS, MAX_KIND, MAX_LEASE_VIEWS, MAX_LIST_LIMIT, MAX_PAYLOAD,
-    MAX_SPEC, MAX_WORKER_MODULE_ID, MAX_WORKERS, MIN_LEASE_VIEWS,
+    MAX_ATTEMPTS, MAX_JOB_ID, MAX_JOBS, MAX_KIND, MAX_LEASE_VIEWS, MAX_PAYLOAD, MAX_SPEC,
+    MAX_WORKER_MODULE_ID, MAX_WORKERS, MIN_LEASE_VIEWS,
 };
-pub use task_board::MAX_TASK_ID;
+pub use task_board::{MAX_LIST_LIMIT, MAX_TASK_ID, MAX_TASKS};
 
 // the derived-tier materialized view over the task board: the PURE decision
 // core (fold + view over index_guest::StateRead), compiled everywhere and
@@ -175,8 +175,8 @@ impl Module for Tasks {
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_work_query(req).map_err(Error::Module)? {
-            WorkQuery::Task(TaskQuery::List) => Ok(encode_work_reply(&WorkReply::Task(
-                task_board::query_list(&self.staged).await?,
+            WorkQuery::Task(task_query) => Ok(encode_work_reply(&WorkReply::Task(
+                task_board::query(&self.staged, task_query).await?,
             ))),
             WorkQuery::Job(job_query) => Ok(encode_work_reply(&WorkReply::Job(
                 job_board::query(&self.staged, job_query).await?,

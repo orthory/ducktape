@@ -98,12 +98,14 @@ fn files_read_all(cluster: &Cluster, idx: usize, path: &str, total: u64) -> Vec<
     out
 }
 
-/// `tasks` has no point read on the consensus tier (`TaskQuery::List` is its
-/// only variant), so a title lookup lists the board and finds the id.
 fn task_title(cluster: &Cluster, idx: usize, task_id: &str) -> Option<String> {
-    let reply = cluster.query(idx, "tasks", &encode_task_query(&TaskQuery::List))?;
+    let req = encode_task_query(&TaskQuery::Get {
+        task_id: task_id.into(),
+    });
+    let reply = cluster.query(idx, "tasks", &req)?;
     match decode_task_reply(&reply).ok()? {
-        TaskReply::Tasks(board) => board.into_iter().find(|t| t.id == task_id).map(|t| t.title),
+        TaskReply::Task(task) => task.map(|t| t.title),
+        TaskReply::Tasks(_) => None,
     }
 }
 

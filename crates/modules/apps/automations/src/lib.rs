@@ -775,17 +775,25 @@ impl Automations {
                 sdk::validate_id("task_id", &task_id, tasks::MAX_TASK_ID)
                     .map_err(|e| e.to_string())?;
                 // probe: the composed task id must be unused — tasks rejects
-                // duplicates, which would abort the block. the tasks wire surface only
-                // exposes List today, so this is an O(n) scan; switch to a Get
-                // query when the interface grows one.
-                let req = tasks_encode_query(&TaskQuery::List);
+                // duplicates, which would abort the block. ONE by-id read: the
+                // board walk this replaced cost a store read per task, so a
+                // matching chat post on a large board blew the wasm host's
+                // per-dispatch read budget and failed every rule from then on.
+                // the read is overlay-aware on the tasks side, so a task staged
+                // earlier in THIS block is seen (that visibility is why the
+                // probe works at all).
+                let req = tasks_encode_query(&TaskQuery::Get {
+                    task_id: task_id.clone(),
+                });
                 match ctx.query(&self.tasks, &req).await {
                     Err(e) => return Err(format!("tasks probe failed: {e}")),
                     Ok(bytes) => match tasks_decode_reply(&bytes) {
-                        Ok(TaskReply::Tasks(tasks)) => {
-                            if tasks.iter().any(|task| task.id == task_id) {
-                                return Err(format!("task id already exists: {task_id}"));
-                            }
+                        Ok(TaskReply::Task(Some(_))) => {
+                            return Err(format!("task id already exists: {task_id}"));
+                        }
+                        Ok(TaskReply::Task(None)) => {}
+                        Ok(TaskReply::Tasks(_)) => {
+                            return Err("tasks answered a page, not a task".into());
                         }
                         Err(_) => return Err("tasks probe returned an unexpected reply".into()),
                     },

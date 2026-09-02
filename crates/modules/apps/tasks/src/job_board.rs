@@ -67,8 +67,6 @@ pub const MIN_LEASE_VIEWS: u64 = 10;
 pub const MAX_LEASE_VIEWS: u64 = 10_000;
 /// after this many claims, an expired reclaim fails the job instead of requeuing.
 pub const MAX_ATTEMPTS: u64 = 8;
-/// hard clamp on a `List` query's `limit`.
-pub const MAX_LIST_LIMIT: u64 = 256;
 /// max registered worker modules notified on each successful submit.
 pub const MAX_WORKERS: usize = 16;
 /// max bytes of a worker module id.

@@ -99,13 +99,14 @@ fn proposal_status(cluster: &Cluster, idx: usize, id: &str) -> Option<(ProposalS
     }
 }
 
-/// `tasks` has no point read on the consensus tier (`TaskQuery::List` is its
-/// only variant), so a title lookup lists the board and finds the id.
 fn task_title(cluster: &Cluster, idx: usize, task_id: &str) -> Option<String> {
-    let reply = cluster.query(idx, "tasks", &tasks::encode_task_query(&TaskQuery::List))?;
+    let req = tasks::encode_task_query(&TaskQuery::Get {
+        task_id: task_id.into(),
+    });
+    let reply = cluster.query(idx, "tasks", &req)?;
     match tasks::decode_task_reply(&reply) {
-        Ok(TaskReply::Tasks(board)) => board.into_iter().find(|t| t.id == task_id).map(|t| t.title),
-        Err(_) => None,
+        Ok(TaskReply::Task(task)) => task.map(|t| t.title),
+        _ => None,
     }
 }
 

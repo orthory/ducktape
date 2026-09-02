@@ -881,14 +881,22 @@ impl ValidatorRuntime<'_> {
             // peer's seed can still be unproposed when this node latches — a
             // healthy `large_file_e2e` run can print `seeds=1/2`. `seeds=N/N`
             // proves the seeds landed; a short count means "not landed AT THIS
-            // INSTANT", never "never landed". ONE query: `List` is the board's
-            // only read, and it returns them all.
+            // INSTANT", never "never landed". ONE query: the demo seeds are a
+            // handful of tasks, so the board's first `List` page holds them all.
             let reply = node
                 .host()
-                .query("tasks", &encode_task_query(&TaskQuery::List))
+                .query(
+                    "tasks",
+                    &encode_task_query(&TaskQuery::List {
+                        limit: tasks::MAX_LIST_LIMIT,
+                        after: None,
+                    }),
+                )
                 .await
                 .expect("tasks query");
-            let TaskReply::Tasks(board) = decode_task_reply(&reply).expect("task reply");
+            let TaskReply::Tasks(board) = decode_task_reply(&reply).expect("task reply") else {
+                unreachable!("a list answers a page");
+            };
             // the count goes BEFORE the marker, and that is load-bearing: the
             // harness reads a marker as the REST OF ITS LINE
             // (`tests/common/mod.rs:1783-1788`) and `cluster_e2e.rs:154-155`

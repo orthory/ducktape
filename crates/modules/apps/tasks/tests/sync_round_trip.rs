@@ -55,10 +55,15 @@ async fn apply(module: &mut Tasks, height: u64, origin: Origin, payload: Vec<u8>
 
 async fn listed(module: &Tasks) -> Vec<Task> {
     let reply = module
-        .query(&encode_task_query(&TaskQuery::List))
+        .query(&encode_task_query(&TaskQuery::List {
+            limit: tasks::MAX_LIST_LIMIT,
+            after: None,
+        }))
         .await
         .expect("list");
-    let TaskReply::Tasks(tasks) = decode_task_reply(&reply).expect("decode");
+    let TaskReply::Tasks(tasks) = decode_task_reply(&reply).expect("decode") else {
+        panic!("a list answers a page");
+    };
     tasks
 }
 

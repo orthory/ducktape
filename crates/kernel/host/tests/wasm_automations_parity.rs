@@ -270,10 +270,18 @@ async fn run_details(h: &Host, rule_id: &str) -> Vec<String> {
 /// via the sibling roots; this is for spot checks).
 async fn task_ids(h: &Host) -> Vec<String> {
     let reply = h
-        .query("tasks", &tasks_encode_query(&TaskQuery::List))
+        .query(
+            "tasks",
+            &tasks_encode_query(&TaskQuery::List {
+                limit: tasks::MAX_LIST_LIMIT,
+                after: None,
+            }),
+        )
         .await
         .expect("tasks query");
-    let TaskReply::Tasks(tasks) = tasks_decode_reply(&reply).expect("decode");
+    let TaskReply::Tasks(tasks) = tasks_decode_reply(&reply).expect("decode") else {
+        panic!("a list answers a page");
+    };
     tasks.into_iter().map(|t| t.id).collect()
 }
 
