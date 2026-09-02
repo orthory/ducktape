@@ -13,7 +13,10 @@ use crate::objects::{
     verify_chunk_len_at, verify_file_shape,
 };
 use crate::paths::{canonical, check_authority};
-use crate::state::{PinEntry, Refs, Staged, decode_refs, encode_refs, root_bytes};
+use crate::state::{
+    PinEntry, Refs, Staged, decode_refs, encode_refs, encoded_refs_len, pin_entry_len, root_bytes,
+    staged_entry_len, watch_entry_len,
+};
 use crate::store::ObjectStore;
 use crate::tree::{ReadBudget, Store, TreeEdit, entry_at, snapshot_root_tree};
 use crate::wire::{
@@ -21,9 +24,9 @@ use crate::wire::{
     HISTORY_WINDOW, MAX_CHANGES_PER_COMMIT, MAX_CHUNKS_PER_FILE, MAX_GREP_SCAN_BYTES,
     MAX_INLINE_COMMIT_BYTES, MAX_MESSAGE_BYTES, MAX_META_ENTRIES, MAX_META_KEY_BYTES,
     MAX_META_VALUE_BYTES, MAX_OBJECT_READS_PER_OP, MAX_PIN_NAME_BYTES, MAX_PINS,
-    MAX_STAGING_ENTRIES, MAX_STAGING_ENTRIES_PER_OWNER, MAX_SYMLINK_TARGET_BYTES, MAX_SYNC_IDS,
-    MAX_SYNC_REPLY_BYTES, MAX_WATCH_MODULE_ID_BYTES, MAX_WATCHES, STAGING_QUOTA_BYTES,
-    STAGING_TTL_BLOCKS, SyncObject, from_hex_32, to_hex,
+    MAX_REFS_IMAGE_BYTES, MAX_STAGING_ENTRIES, MAX_STAGING_ENTRIES_PER_OWNER,
+    MAX_SYMLINK_TARGET_BYTES, MAX_SYNC_IDS, MAX_SYNC_REPLY_BYTES, MAX_WATCH_MODULE_ID_BYTES,
+    MAX_WATCHES, STAGING_QUOTA_BYTES, STAGING_TTL_BLOCKS, SyncObject, from_hex_32, to_hex,
 };
 
 pub struct Fs<S: ObjectStore> {
@@ -355,9 +358,7 @@ impl<S: ObjectStore> Fs<S> {
         // the root — across the set (finding #1). a durable-but-unstaged chunk is
         // therefore re-staged; its bytes ride the block (consensus input), so
         // every node lands the identical staging entry.
-        if pending.object_ids.contains_key(&digest)
-            || pending.refs.staging.contains_key(&digest)
-        {
+        if pending.object_ids.contains_key(&digest) || pending.refs.staging.contains_key(&digest) {
             return Ok(());
         }
 
@@ -395,6 +396,7 @@ impl<S: ObjectStore> Fs<S> {
         if used.saturating_add(len) > quota {
             return Err("files: staging quota exceeded".into());
         }
+        refuse_refs_growth(&pending.refs, staged_entry_len(actor))?;
 
         // stage: the entry makes the chunk gc-reachable (task 13 marks staging
         // digests as roots), and the bytes ride pending.objects so they are
@@ -527,6 +529,7 @@ impl<S: ObjectStore> Fs<S> {
         if !refs_contains_snapshot(&pending.refs, &id) {
             return Err("files: snapshot not resolvable".into());
         }
+        refuse_refs_growth(&pending.refs, pin_entry_len(&name, actor))?;
 
         pending.refs.pins.insert(
             name,
@@ -592,6 +595,7 @@ impl<S: ObjectStore> Fs<S> {
         if pending.refs.watches.contains(&key) {
             return Err("files: watch already registered".into());
         }
+        refuse_refs_growth(&pending.refs, watch_entry_len(&key.0, &key.1))?;
         pending.refs.watches.insert(key);
         Ok(())
     }
@@ -778,9 +782,18 @@ impl<S: ObjectStore> Fs<S> {
             // the refs image is the `root()` preimage — served over the same
             // resolver lane so a duckfs-odb joiner installs refs then walks
             // `missing_objects` without ever touching the snapshot/chunk lane.
-            FilesSyncReq::GetRefs => Ok(FilesSyncResp::Refs {
-                b64: STANDARD.encode(self.snapshot_refs()),
-            }),
+            FilesSyncReq::GetRefs => {
+                let b64 = STANDARD.encode(self.snapshot_refs());
+                // no cursor pages this reply, so a budget miss is a refusal —
+                // unreachable for an image every growth path kept under
+                // [`MAX_REFS_IMAGE_BYTES`], and an honest error if one ever
+                // is (the p2p sender asserts on the cap; it must not see it).
+                let fits_budget = b64.len() <= MAX_SYNC_REPLY_BYTES;
+                if !fits_budget {
+                    return Err("files: refs image exceeds the sync reply budget".into());
+                }
+                Ok(FilesSyncResp::Refs { b64 })
+            }
         }
     }
 
@@ -1005,13 +1018,8 @@ fn commit_apply(
                         if inline_bytes > MAX_INLINE_COMMIT_BYTES {
                             return Err("files: inline commit budget exceeded".into());
                         }
-                        let chunk_ids = chunk_bytes(
-                            &bytes,
-                            store,
-                            pending_ids,
-                            &mut objects,
-                            &mut staged_ids,
-                        )?;
+                        let chunk_ids =
+                            chunk_bytes(&bytes, store, pending_ids, &mut objects, &mut staged_ids)?;
                         let fileobj_id = stage_fileobj(
                             bytes.len() as u64,
                             &chunk_ids,
@@ -1290,6 +1298,18 @@ fn join_segs(segs: &[String]) -> String {
 /// module-origin only (external submitters cannot register), and a module may act
 /// only for itself. system (also `is_module`) may act for any module_id — it is
 /// the arbitrary-authority origin. one function so both ends enforce it identically.
+/// the refs image byte cap ([`MAX_REFS_IMAGE_BYTES`]) gates EVERY growth path
+/// (`putblob`, `pin`, `watch`) the way the count caps do: an entry that would
+/// push the encoded image past the cap is refused before the mutation, so
+/// every execute-produced refs stays decodable and shippable to a joiner.
+fn refuse_refs_growth(refs: &Refs, entry_len: usize) -> Result<(), String> {
+    let fits_image = encoded_refs_len(refs) + entry_len <= MAX_REFS_IMAGE_BYTES;
+    if fits_image {
+        return Ok(());
+    }
+    Err("files: refs image is full".into())
+}
+
 fn watch_origin_gate(actor: &str, is_module: bool, module_id: &str) -> Result<(), String> {
     if !is_module {
         return Err("files: watch registration is module-origin only".into());
@@ -1630,9 +1650,15 @@ mod object_read_budget {
                 Some(head),
                 "rm".into(),
                 vec![
-                    Change::Rm { path: "/d0/f0".into() },
-                    Change::Rm { path: "/d1/f1".into() },
-                    Change::Rm { path: "/d2/f2".into() },
+                    Change::Rm {
+                        path: "/d0/f0".into(),
+                    },
+                    Change::Rm {
+                        path: "/d1/f1".into(),
+                    },
+                    Change::Rm {
+                        path: "/d2/f2".into(),
+                    },
                 ],
             )
             .map(|_| ())
@@ -1665,9 +1691,15 @@ mod object_read_budget {
             Some(head),
             "rm".into(),
             vec![
-                Change::Rm { path: "/d0/f0".into() },
-                Change::Rm { path: "/d1/f1".into() },
-                Change::Rm { path: "/d2/f2".into() },
+                Change::Rm {
+                    path: "/d0/f0".into(),
+                },
+                Change::Rm {
+                    path: "/d1/f1".into(),
+                },
+                Change::Rm {
+                    path: "/d2/f2".into(),
+                },
             ],
         )
         .expect("within-budget commit must succeed");
@@ -1709,5 +1741,55 @@ mod object_read_budget {
             err.contains("object-read budget"),
             "reason must carry the shared needle, got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod refs_image_budget {
+    use crate::fs::Fs;
+    use crate::state::{Refs, encoded_refs_len};
+    use crate::store::MemStore;
+    use crate::wire::{FilesSyncReq, FilesSyncResp, MAX_REFS_IMAGE_BYTES, MAX_SYNC_REPLY_BYTES};
+
+    /// the `GetRefs` reply ships the whole image with no cursor, so the image
+    /// itself is what the budget bounds. watches carry the fattest entries
+    /// (a 4 KiB path prefix each), and at their COUNT ceiling alone they would
+    /// exceed the byte cap — the byte gate must refuse first, and the served
+    /// reply must still fit the sync budget the p2p sender asserts under.
+    #[test]
+    fn get_refs_stays_under_the_sync_reply_budget() {
+        let mut fs = Fs::new(MemStore::new(), Refs::default());
+        // a ~4 KiB canonical prefix (15 max-length segments plus a distinct
+        // 250-digit one) under a max-length module id: ~4.2 KiB per entry, so
+        // the byte cap trips near 248 entries, well inside the 256 count cap.
+        let segment = "a".repeat(255);
+        let module_id = "m".repeat(128);
+        let mut refused = None;
+        for i in 0..crate::wire::MAX_WATCHES {
+            let prefix = format!("{}/{i:0250}", format!("/{segment}").repeat(15));
+            match fs.watch("system", 1, true, prefix, module_id.clone()) {
+                Ok(()) => {}
+                Err(why) => {
+                    refused = Some(why);
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            refused.as_deref(),
+            Some("files: refs image is full"),
+            "the byte cap trips before the watch count cap"
+        );
+        if let Some((refs, _, _)) = fs.commit_block() {
+            fs.adopt_refs(refs);
+        }
+        assert!(encoded_refs_len(fs.refs_view()) <= MAX_REFS_IMAGE_BYTES);
+        match fs
+            .serve_sync(FilesSyncReq::GetRefs)
+            .expect("refs are servable")
+        {
+            FilesSyncResp::Refs { b64 } => assert!(b64.len() <= MAX_SYNC_REPLY_BYTES),
+            other => panic!("expected a refs reply, got {other:?}"),
+        }
     }
 }

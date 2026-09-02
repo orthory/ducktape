@@ -499,12 +499,11 @@ pub(super) fn wire_serve_lanes(
                         drive_sync_request(&mut server, &mut pager, &state_tx, req).await
                     }
                 };
-                let framed = statesync::encode_rpc(
-                    &[0u8; 32],
-                    &[0u8; 64],
-                    rpc_id,
-                    &statesync::encode_response(&resp),
-                );
+                // the mesh cap is enforced HERE, on every response kind: the
+                // sender asserts on it, so an over-cap reply becomes an
+                // `Error` the requester can act on, never a send.
+                let (resp, body) = crate::sync::serve::encode_bounded_response(resp);
+                let framed = statesync::encode_rpc(&[0u8; 32], &[0u8; 64], rpc_id, &body);
                 // the serve-lane observation (`ducktape_statesync_serve_*`):
                 // who pulled what, and the progression the response
                 // itself proves (served boundary / frame heights).

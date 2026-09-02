@@ -17,7 +17,7 @@
 
 use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 
-use commonware_codec::{Decode, DecodeExt as _, Encode, RangeCfg};
+use commonware_codec::{Decode, DecodeExt as _, Encode, EncodeSize as _, RangeCfg};
 use commonware_cryptography::{Hasher, Sha256};
 use commonware_parallel::Sequential;
 use commonware_runtime::{BufferPooler, buffer::paged::CacheRef};
@@ -68,6 +68,19 @@ const MAX_PROOF_DIGESTS: usize = 4096;
 /// ceiling on ops per fetched batch accepted from a peer — the engine asks for
 /// small batches (kv syncs at 64); this only bounds a malicious oversized reply.
 const MAX_OPS_PER_BATCH: u64 = 4096;
+
+/// ceiling on ONE encoded op-batch reply (proof + ops + pinned nodes) a
+/// module's `serve_sync` hands back. the reply rides the mesh as a
+/// `SyncResponse::Module` body, and the p2p sender ASSERTS on its 2 MiB
+/// message cap — an op COUNT cap alone let a batch of adjacent ~1 MiB records
+/// (tasks, pages) walk straight into that assert. [`serve`] trims a batch to
+/// the largest op prefix that fits; the sync engine resumes by location, so a
+/// shorter batch is progress, never an error. sized so one op carrying the
+/// largest value the journal codec admits (1 MiB) plus a proof and pinned
+/// nodes at their decode ceilings always fits. bin/node compile-asserts this
+/// stays under its `MAX_MESSAGE_SIZE` with rpc-envelope headroom.
+pub const MAX_MODULE_REPLY_BYTES: usize = (1 << 21) - (64 << 10);
+const _: () = assert!(MAX_MODULE_REPLY_BYTES >= (1 << 20) + 2 * MAX_PROOF_DIGESTS * 32 + 4096);
 
 // ============================================================================
 // the request body a module's `serve_sync` understands.
@@ -218,12 +231,8 @@ where
             max_ops,
             include_pinned,
         } => {
-            let max_ops = NonZeroU64::new((*max_ops).min(MAX_OPS_PER_BATCH))
+            let mut max_ops = NonZeroU64::new((*max_ops).min(MAX_OPS_PER_BATCH))
                 .ok_or_else(|| sdk::Error::Module("max_ops must be non-zero".into()))?;
-            let (proof, operations) = db
-                .historical_proof(Location::new(*op_count), Location::new(*start_loc), max_ops)
-                .await
-                .map_err(|e| sdk::Error::Module(format!("historical proof failed: {e}")))?;
             let pinned_nodes = if *include_pinned {
                 Some(
                     db.pinned_nodes_at(Location::new(*start_loc))
@@ -233,13 +242,66 @@ where
             } else {
                 None
             };
-            Ok(encode_ops_envelope(&OpsEnvelope {
-                proof,
-                operations,
-                pinned_nodes,
-            }))
+            // the BYTE budget ([`MAX_MODULE_REPLY_BYTES`]): a batch that encodes
+            // over it is re-proved over the largest op prefix that fits. the
+            // proof is a range proof over exactly the ops served, so a shorter
+            // batch is a fresh `historical_proof`, never a sliced envelope. the
+            // prefix is strictly shorter each round, so this settles in a
+            // couple of rounds at most.
+            loop {
+                let (proof, operations) = db
+                    .historical_proof(Location::new(*op_count), Location::new(*start_loc), max_ops)
+                    .await
+                    .map_err(|e| sdk::Error::Module(format!("historical proof failed: {e}")))?;
+                let envelope = OpsEnvelope {
+                    proof,
+                    operations,
+                    pinned_nodes: pinned_nodes.clone(),
+                };
+                let encoded = encode_ops_envelope(&envelope);
+                let fits_budget = encoded.len() <= MAX_MODULE_REPLY_BYTES;
+                if fits_budget {
+                    return Ok(encoded);
+                }
+                let Some(shorter) = NonZeroU64::new(fitting_op_prefix(&envelope, encoded.len()))
+                else {
+                    return Err(sdk::Error::Module(format!(
+                        "one op exceeds the {MAX_MODULE_REPLY_BYTES}-byte module reply budget"
+                    )));
+                };
+                debug_assert!(
+                    shorter < max_ops,
+                    "an over-budget batch shrinks every round"
+                );
+                max_ops = shorter;
+            }
         }
     }
+}
+
+/// how many leading ops of `envelope` fit [`MAX_MODULE_REPLY_BYTES`] once the
+/// envelope's non-op bytes (proof, pinned nodes, counts) are taken out.
+/// `encoded_len` is the whole envelope's encoded length. zero means the FIRST
+/// op alone does not fit (a codec-ceiling value under a ceiling-sized proof —
+/// precluded by the const assert on the budget, so an error, never a spin).
+fn fitting_op_prefix(envelope: &OpsEnvelope, encoded_len: usize) -> u64 {
+    // `put_bytes` = u64 length prefix + the op's own encoding.
+    let op_lens: Vec<usize> = envelope
+        .operations
+        .iter()
+        .map(|op| 8 + op.encode_size())
+        .collect();
+    let overhead = encoded_len - op_lens.iter().sum::<usize>();
+    let mut budget = MAX_MODULE_REPLY_BYTES.saturating_sub(overhead);
+    let mut fitting = 0u64;
+    for len in op_lens {
+        if len > budget {
+            break;
+        }
+        budget -= len;
+        fitting += 1;
+    }
+    fitting
 }
 
 /// describe the store's current sync target for manifest capture. this is not a
@@ -555,5 +617,63 @@ where
             env.operations,
             env.pinned_nodes,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
+    use sdk::MerkleStore as _;
+
+    /// the byte budget: three records at the tasks module's record ceiling
+    /// (~1 MiB each — two already exceed the mesh cap) do not ride one reply.
+    /// the server trims the batch to the prefix that fits, and the cursor
+    /// walk the sync engine performs still reaches every op.
+    #[test]
+    fn an_op_batch_is_trimmed_to_the_module_reply_budget_and_resumes_by_cursor() {
+        deterministic::Runner::default().start(|context| async move {
+            let mut store = QmdbStore::init(context.child("tasks"), "tasks").await;
+            let value = vec![0x5A; (1 << 20) - 4096];
+            for i in 0u8..3 {
+                store
+                    .commit_batch(vec![([i; sdk::ROOT_LEN], Some(value.clone()))])
+                    .await
+                    .expect("commit");
+            }
+            let target = resolver_sync_target(&store.db).await.expect("target");
+
+            let mut cursor = target.start;
+            let mut served = 0u64;
+            let mut pages = 0u32;
+            while cursor < target.op_count {
+                let req = QmdbSyncReq::Ops {
+                    op_count: target.op_count,
+                    start_loc: cursor,
+                    max_ops: 64,
+                    include_pinned: cursor == target.start,
+                };
+                let bytes = serve(&store.db, &req).await.expect("serve");
+                assert!(
+                    bytes.len() <= MAX_MODULE_REPLY_BYTES,
+                    "page {pages} encodes to {} bytes, over the {MAX_MODULE_REPLY_BYTES} budget",
+                    bytes.len()
+                );
+                let env = decode_ops_envelope(&bytes).expect("envelope decodes");
+                assert!(!env.operations.is_empty(), "a page always makes progress");
+                cursor += env.operations.len() as u64;
+                served += env.operations.len() as u64;
+                pages += 1;
+            }
+            assert_eq!(
+                served,
+                target.op_count - target.start,
+                "every op is served once"
+            );
+            assert!(
+                pages > 1,
+                "three ~1 MiB records cannot ride one 2 MiB reply"
+            );
+        });
     }
 }
