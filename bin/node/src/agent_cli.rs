@@ -20,9 +20,12 @@
 //!
 //! - an id inside the signing key's own saga namespace ([`saga::owns_id`]) is a
 //!   `sched` run, the one an operator can create here, so cancel/reassign are
-//!   `SagaMsg::Cancel`/`SagaMsg::Reassign`;
+//!   `SagaMsg::Cancel`/`SagaMsg::Reassign`. Cancel is the useful one: `agent
+//!   sched` PINS its saga to the target node (`pinned_assignee`), and saga
+//!   refuses to reassign a pinned saga outright — there is no other provider to
+//!   move it to. Reassign on this lane can only fence an attempt;
 //! - anything else is a `runs` turn claim from the chat- and jobs-driven lane,
-//!   so they are `RunsMsg::CancelRun`/`RunsMsg::ReassignRun`.
+//!   so they are `RunsMsg::CancelRun`/`RunsMsg::ReassignRun`. Both act there.
 //!
 //! The operator holding a run id has no reason to know which module minted it,
 //! and the two id spaces are disjoint, so the CLI asks the id rather than the
@@ -35,6 +38,11 @@
 //! not hold (`unknown run: …`); saga is deliberately SILENT for a finished,
 //! unknown or foreign saga, so a `sched` control op that lands prints
 //! "submitted", never "accepted".
+//!
+//! Which is also how the wrong `--key` reads: a `sched` id in ANOTHER key's
+//! namespace is not this key's to control, so it takes the runs lane and comes
+//! back `unknown run: ext:<hex>…`. That sentence means "not your run", not "no
+//! such run" — sign with the key that submitted the `agent sched`.
 //!
 //! `<provider>` is optional when `--cred` names a credential: the registry
 //! record's kind decides what to launch; an explicit provider contradicting the
@@ -89,7 +97,9 @@ pub(crate) enum AgentCmd {
     /// cancel a pending run — a `sched` run of your own, or a `runs` turn
     /// whose creator or agent owner you are
     Cancel(CancelArgs),
-    /// fence this attempt and move a pending run to another provider
+    /// fence this attempt and move a pending `runs` turn to another provider
+    /// (a `sched` run is PINNED to its node and cannot be moved — cancel it
+    /// and submit a new one instead)
     Reassign(ReassignArgs),
 }
 
@@ -114,10 +124,11 @@ pub(crate) struct ReassignArgs {
     #[arg(value_name = "RUN_ID")]
     run_id: String,
     /// the attempt to FENCE: the run's current attempt, 0 until it has been
-    /// reassigned once — and with `RUN_MAX_ATTEMPTS = 2` the only one a runs
-    /// turn can move. A stale number is a deterministic no-op by design (that
-    /// is what stops a delayed click from revoking a newer assignment), and a
-    /// no-op still commits, so the printed height names the fence, not a move.
+    /// reassigned once — and on the runs lane (`RUN_MAX_ATTEMPTS = 2`) the only
+    /// one a turn can move. A stale number is a deterministic no-op by design
+    /// (that is what stops a delayed click from revoking a newer assignment),
+    /// and a no-op still commits, so the printed height names the fence, not a
+    /// move.
     #[arg(long, value_name = "N", default_value_t = 0)]
     attempt: u32,
 }
@@ -676,12 +687,15 @@ fn control_frame(
 /// foreign saga with a SILENT no-op rather than an error, so a committed frame
 /// there proves the chain read the op, not that it moved anything. Reassign says
 /// which attempt it fenced for the same reason — a stale attempt commits and
-/// changes nothing on either lane.
+/// changes nothing on either lane, and a LIVE `sched` saga never reaches this
+/// sentence at all: it is pinned, so saga refuses the reassign outright and the
+/// operator reads that refusal instead.
 fn control_outcome(lane: ControlLane, verb: ControlVerb, run_id: &str, height: u64) -> String {
     match (lane, verb) {
-        (ControlLane::Runs, ControlVerb::Cancel) => {
-            format!("cancel accepted for run {run_id} at height {height}")
-        }
+        (ControlLane::Runs, ControlVerb::Cancel) => format!(
+            "cancel accepted for run {run_id} at height {height} \
+             (a run whose turn was already taken cancels nothing)"
+        ),
         (ControlLane::Runs, ControlVerb::Reassign { attempt }) => format!(
             "reassign accepted for run {run_id} at height {height}, fencing attempt {attempt} \
              (a stale attempt moves nothing)"
@@ -692,7 +706,7 @@ fn control_outcome(lane: ControlLane, verb: ControlVerb, run_id: &str, height: u
         ),
         (ControlLane::Sched, ControlVerb::Reassign { attempt }) => format!(
             "reassign submitted for sched run {run_id} at height {height}, fencing attempt \
-             {attempt} (a stale attempt moves nothing)"
+             {attempt} (a pinned, finished or stale run moves nothing)"
         ),
     }
 }
