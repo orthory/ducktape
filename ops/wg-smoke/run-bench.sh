@@ -6,8 +6,7 @@
 # STACK. numbers are rig-relative (both containers share this host's CPU).
 #
 # (history: the four-leg tun/socket matrix here is what retired the TUN
-# backend — see the phase-4 results table in
-# docs/adr/2026-07-07-userspace-overlay-net.mdx.)
+# backend.)
 #
 # one fresh container pair; the sender pushes BULK_BYTES (default 256 MiB)
 # at the receiver's sink; the receiver's first-byte→EOF rate is the number

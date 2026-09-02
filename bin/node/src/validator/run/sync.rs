@@ -211,7 +211,7 @@ impl ValidatorRuntime<'_> {
                 let _ = reply.send(answer);
             }
             SyncStateRequest::Standing { requester, reply } => {
-                // the fail-closed standing gate (ADR §5.1). read the COMMITTED
+                // the fail-closed standing gate. read the COMMITTED
                 // valset projection (updates at the Redeem block, unlike the
                 // orchestrator's transport set which lags to the cutover), so a
                 // freshly-admitted resident is servable the instant its grant

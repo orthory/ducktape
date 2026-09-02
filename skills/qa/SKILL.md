@@ -195,8 +195,8 @@ STALL lines name the stage the instant any span crosses `STALL_MS` (default
 (idle / scroll / switch / typing) read clean. A Layout stall that is
 per-interaction and size-independent means a busted/missing layout cache;
 an Interact stall means the cost is inside the event walk. This lane found
-the 2026-08-16 emoji-fallback row cost — the worked example lives in
-docs/superpowers/specs/2026-08-16-chat-lag-diagnosis-design.md.
+the 2026-08-16 emoji-fallback row cost (a semibold non-ASCII glyph walking the
+whole font DB on every layout).
 
 ## Process safety
 

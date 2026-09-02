@@ -10,8 +10,7 @@
 //! spans are also bucketed by message name.
 //!
 //! This is the tool that attributed the 2026-08-16 chat lag (550 ms Layout
-//! stall per channel switch → the emoji fallback scan) — see
-//! docs/superpowers/specs/2026-08-16-chat-lag-diagnosis-design.md.
+//! stall per channel switch → the emoji fallback scan).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};

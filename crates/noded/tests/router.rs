@@ -509,7 +509,7 @@ async fn shutdown_acknowledges_then_signals() {
     spawn_fake_actor(cmd_rx, None);
     let signal = handle.clone();
 
-    // shutdown moved to the owner-gated admin namespace (ADR A2). the default
+    // shutdown moved to the owner-gated admin namespace. the default
     // handle has no on-chain owner, so the operator credential is the gate; the
     // loopback check is FAIL-CLOSED on a missing ConnectInfo, so the test stamps
     // a loopback peer exactly as the connect-info make-service would.
@@ -544,7 +544,7 @@ fn with_peer(mut req: Request<Body>, addr: &str) -> Request<Body> {
     req
 }
 
-/// shutdown left the unauthenticated public surface entirely (ADR A2). the old
+/// shutdown left the unauthenticated public surface entirely. the old
 /// path is a 404 — flag-day, no alias.
 #[tokio::test]
 async fn the_old_public_shutdown_route_is_gone() {

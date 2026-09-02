@@ -1,6 +1,4 @@
-//! CI simulated-NAT suite — the private-cutover acceptance gate
-//! (`docs/superpowers/specs/2026-07-05-private-cutover-coordinator-design.md`
-//! §"Acceptance" item 1).
+//! CI simulated-NAT suite — the private-cutover acceptance gate.
 //!
 //! Every row drives the PRODUCTION rendezvous stack — [`NatResolver`] over a
 //! `NatClient` talking to the authenticated coordinator loop — across
@@ -10,7 +8,7 @@
 //! both instant and scheduling-deterministic: what passes here is the exact
 //! algorithm a node runs, not a stand-in driver.
 //!
-//! | Acceptance §1 item              | Test here                                 |
+//! | Acceptance item                 | Test here                                 |
 //! |---------------------------------|-------------------------------------------|
 //! | reflexive discovery             | `reflexive_discovery`                     |
 //! | hole-punch success              | `hole_punch_success_with_idle_passive_side` |

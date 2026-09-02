@@ -4,9 +4,7 @@
 //! its source: a compute daemon that booted ten microVMs and executed ten
 //! provider runs wrote a seven-line log, so a failed run's only evidence was
 //! on-chain state and whatever `ps` caught before the VMM exited. The backend's
-//! own plan had specified the handle
-//! (`docs/superpowers/plans/2026-08-22-firecracker-sandbox-backend.md`) and
-//! nothing held the code to it.
+//! own plan had specified the handle and nothing held the code to it.
 //!
 //! Two rules, both from `CLAUDE.md`'s Logging section, both cheap to check and
 //! impossible to keep by comment:

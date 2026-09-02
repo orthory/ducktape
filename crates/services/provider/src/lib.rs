@@ -62,7 +62,7 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 /// long agentic runs that keep streaming are never killed mid-work), and
 /// `idle × this` bounds even a continuously-chatty child, guarding the
 /// host's own resources. the RUN's committed outcome is bounded by the
-/// saga's consensus deadline regardless (ADR X3) — this factor only decides
+/// saga's consensus deadline regardless — this factor only decides
 /// how long this host keeps paying for one child.
 const HARD_TIMEOUT_FACTOR: u32 = 36;
 
@@ -2430,7 +2430,7 @@ impl CliProvider {
         // semantics: its silence budget is the spec's timeout. the hard
         // ceiling ([`HARD_TIMEOUT_FACTOR`] × idle) guards this host's
         // resources against a chatty-forever child; the RUN's outcome is
-        // bounded by the saga's consensus deadline regardless (ADR X3).
+        // bounded by the saga's consensus deadline regardless.
         let mut explicit_deadline = broker_invocation
             .as_ref()
             .map(|invocation| invocation.idle_deadline.clone());

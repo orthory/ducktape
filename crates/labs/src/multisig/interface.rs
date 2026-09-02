@@ -19,8 +19,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Which signing backend produces the finished transaction. THE MPC SEAM
-/// (design §3): the ops above are already backend-agnostic — propose an intent,
+/// Which signing backend produces the finished transaction. THE MPC SEAM:
+/// the ops above are already backend-agnostic — propose an intent,
 /// collect contributions, emit a finished transaction. Under `ThresholdEcdsa` a
 /// "contribution" becomes a signing round rather than a signature, and the
 /// finished transaction carries one signature instead of M.
@@ -86,7 +86,7 @@ pub enum MultisigMsg {
         signature: Vec<u8>,
     },
 
-    /// Chain facts, submitted by the oracle (design §5). Validator-gated.
+    /// Chain facts, submitted by the oracle. Validator-gated.
     ///
     /// `owners`/`threshold` are compared against the mirror: any divergence
     /// marks the vault DRIFTED and freezes new proposals. The Safe is
@@ -177,7 +177,7 @@ pub enum MultisigReply {
 }
 
 /// The event emitted the moment a proposal reaches its threshold — the oracle's
-/// cue to broadcast (design §5).
+/// cue to broadcast.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MultisigEvent {

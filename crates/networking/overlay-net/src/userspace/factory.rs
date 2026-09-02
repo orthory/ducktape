@@ -1,4 +1,4 @@
-//! the userspace arm of data-plane's socket seam — ADR phase 2: a
+//! the userspace arm of data-plane's socket seam: a
 //! [`SocketFactory`] whose sockets terminate in the [`VirtualStack`] instead
 //! of the kernel, so `OverlaySockets` (statesync's per-use plane, and every
 //! future plane) rides the in-process tunnel with no change in the plane or

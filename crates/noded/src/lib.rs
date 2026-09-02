@@ -19,7 +19,7 @@
 //! asks the process to exit gracefully — the managing app has no pid, only
 //! this port.
 
-// the owner-gated control namespace (ADR A2/A5): `/v1/admin/*` on the same
+// the owner-gated control namespace: `/v1/admin/*` on the same
 // listener, PoP-gated to the node owner. shutdown + module-code moved here off
 // the unauthenticated public surface.
 pub mod admin;
@@ -548,7 +548,7 @@ fn actor_gone() -> Response {
 pub fn router(handle: NodeHandle) -> Router {
     // the PUBLIC (data) surface — query/submit + reads, any account with
     // standing. control ops (shutdown, module-code staging) are NOT here: they
-    // live on the owner-gated `/v1/admin/*` namespace merged below (ADR A2).
+    // live on the owner-gated `/v1/admin/*` namespace merged below.
     let public = Router::new()
         .route("/v1/submit", post(submit))
         // the AUTHENTICATED submit lane: raw signed frame bytes in, the same
@@ -866,7 +866,7 @@ async fn peers(State(handle): State<NodeHandle>) -> Response {
 }
 
 /// POST /v1/admin/shutdown — ask the process to exit gracefully. lives on the
-/// owner-gated admin namespace (ADR A2): it was on the unauthenticated public
+/// owner-gated admin namespace: it was on the unauthenticated public
 /// surface, reachable by anything that could dial the port.
 pub(crate) async fn shutdown(State(handle): State<NodeHandle>) -> Response {
     // reply first, then signal — the connection closes before the process does.

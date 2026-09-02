@@ -122,7 +122,7 @@ pub struct P2pSyncClient<S: Sender> {
     sender: S,
     sources: Arc<Sources<S::PublicKey>>,
     shared: Arc<Shared>,
-    /// the caller's real-key standing proof (ADR §5.1), signed ONCE via
+    /// the caller's real-key standing proof, signed ONCE via
     /// [`crate::sign_sync_proof`] and attached to every request. the server
     /// verifies it against committed standing and fail-closes on a mismatch.
     requester: [u8; 32],

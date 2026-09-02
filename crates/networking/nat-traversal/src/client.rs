@@ -17,8 +17,8 @@ use commonware_cryptography::ed25519;
 /// hole punching only works when the punch and the tunnel share one
 /// 5-tuple: the pinhole a punch opens admits traffic to the ADDRESS AND
 /// PORT it originated from, so a punch sent from a socket the tunnel does
-/// not use vouches for nothing. `Shared` is that fix (the overlay-net
-/// ADR's phase 3): the client rides the node's own WireGuard underlay
+/// not use vouches for nothing. `Shared` is that fix: the client rides the
+/// node's own WireGuard underlay
 /// socket — sends go out through it directly, and receives are the
 /// underlay demux's non-WireGuard lane. `Owned` is the standalone posture
 /// (a socket of this client's own) — what [`NatClient::bind`] mints for a

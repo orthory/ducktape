@@ -1,5 +1,5 @@
 //! The `duck://` URI protocol (v1) — one grammar, one module table, one
-//! place to add a module. Normative text: `docs/adr/2026-07-14-duck-uri-protocol.mdx`.
+//! place to add a module.
 //!
 //! ```text
 //! duck-uri  = "duck://" authority path [ "@" rev ] [ "#" fragment ]

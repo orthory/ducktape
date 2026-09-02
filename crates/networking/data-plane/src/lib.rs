@@ -90,8 +90,8 @@ pub enum Service {
 }
 
 impl Service {
-    /// The well-known overlay port a service's STREAM listener binds (see
-    /// `docs/adr/2026-07-07-per-use-data-plane.mdx`): planes are per-use, so
+    /// The well-known overlay port a service's STREAM listener binds:
+    /// planes are per-use, so
     /// the service registry doubles as the port registry — two planes can
     /// never collide on a bind, and both ends derive the dial port with no
     /// signaling. Fixed ports are safe because every plane binds a specific

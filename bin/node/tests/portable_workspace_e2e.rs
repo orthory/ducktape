@@ -1,6 +1,6 @@
 //! live portable-runtime e2e: REAL `ducktape` validators, a REAL
 //! script-backed provider, and the REAL `NodedProvisioner` driving duckfs
-//! checkout/commit — the full ADR loop this repo's unit suites only mock:
+//! checkout/commit — the full loop this repo's unit suites only mock:
 //!
 //!   mention -> portable envelope (files module wired) -> lease on the providing
 //!   node -> duckfs checkout of the agent's pinned source at a per-run dir
