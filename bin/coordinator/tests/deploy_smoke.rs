@@ -196,3 +196,40 @@ async fn deployed_relay_lane_announces_and_serves_the_tcp_frame_protocol() {
 
     let _ = child.start_kill();
 }
+
+#[tokio::test]
+async fn metrics_rows_say_whether_the_relay_lane_bound() {
+    // `--relay-listen none` is the one relay state a test can produce
+    // hermetically; the row must say so on every tick, not only at boot.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_coordinator"))
+        .arg("--listen")
+        .arg("127.0.0.1:0")
+        .arg("--relay-listen")
+        .arg("none")
+        .arg("--metrics-interval")
+        .arg("1")
+        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn the compiled coordinator binary");
+
+    let stderr = child.stderr.take().expect("piped stderr");
+    let mut lines = BufReader::new(stderr).lines();
+    let row = timeout(Duration::from_secs(10), async {
+        while let Some(line) = lines.next_line().await.expect("read stderr") {
+            if line.starts_with("coordinator_metrics") {
+                return line;
+            }
+        }
+        panic!("coordinator exited before its first metrics row");
+    })
+    .await
+    .expect("a metrics row must arrive within the interval");
+
+    assert!(
+        row.contains("| relay=off sessions="),
+        "the metrics row must carry the relay lane state: {row}"
+    );
+    let _ = child.start_kill();
+}
