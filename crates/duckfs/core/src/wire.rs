@@ -92,6 +92,19 @@ pub const MAX_SYNC_IDS: usize = MAX_PAGE as usize;
 /// `landed >= 1` invariant intact. bin/node compile-asserts this stays under
 /// its `MAX_MESSAGE_SIZE` with rpc-envelope headroom.
 pub const MAX_SYNC_REPLY_BYTES: usize = 3 << 19;
+/// ceiling on the encoded refs image (1 MiB). the `GetRefs` sync reply ships it
+/// WHOLE, base64-wrapped, under the same [`MAX_SYNC_REPLY_BYTES`] budget
+/// `GetObjects` spends — and there is no cursor to page it. the count caps alone
+/// do not hold it: at their ceilings the image is ~8 MB (65,536 staging rows at
+/// ~124 B each), several times the p2p cap the sender ASSERTS on. so every refs
+/// growth path (`putblob`, `pin`, `watch`) refuses an entry that would push the
+/// image past this, `decode_refs` refuses a larger image outright, and
+/// `serve_sync` refuses to ship one — the same execute/decode pairing as
+/// [`MAX_STAGING_ENTRIES`], for the same reason (an agreed image must always
+/// re-decode on reboot and install on a joiner).
+pub const MAX_REFS_IMAGE_BYTES: usize = 1 << 20;
+// the base64 image plus its json envelope rides under the reply budget.
+const _: () = assert!(MAX_REFS_IMAGE_BYTES.div_ceil(3) * 4 + 64 <= MAX_SYNC_REPLY_BYTES);
 pub const MAX_READ_BYTES: u64 = 1024 * 1024;
 pub const MAX_GREP_SCAN_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_GREP_LINE_BYTES: usize = 256;

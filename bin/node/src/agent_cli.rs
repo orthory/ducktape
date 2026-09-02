@@ -1,6 +1,7 @@
-//! `ducktape agent` — remote/interactive sandboxed provider sessions.
+//! `ducktape agent` — remote/interactive sandboxed provider sessions, plus the
+//! two run-control verbs.
 //!
-//! Two verbs, one credential+targeting story:
+//! Two session verbs, one credential+targeting story:
 //!
 //! - `agent pty [<provider>] [--host-node <hex>] [--cred <name>] [--cpu <n>] [--mem <gb>]`
 //!   attaches THIS terminal to a provider running in a microVM on a host
@@ -13,6 +14,35 @@
 //!   the user key, so the lender attributes the run to the user's account
 //!   (`OfKey`) when the pinned node asks to draw on `--cred`. The target may be
 //!   offline now and execute on reconnect — that durability is the point.
+//!
+//! Two run-control verbs — `agent cancel <run-id>` and `agent reassign <run-id>
+//! [--attempt N]` — act on a run of EITHER lane, and the id itself picks which:
+//!
+//! - an id inside the signing key's own saga namespace ([`saga::owns_id`]) is a
+//!   `sched` run, the one an operator can create here, so cancel/reassign are
+//!   `SagaMsg::Cancel`/`SagaMsg::Reassign`. Cancel is the useful one: `agent
+//!   sched` PINS its saga to the target node (`pinned_assignee`), and saga
+//!   refuses to reassign a pinned saga outright — there is no other provider to
+//!   move it to. Reassign on this lane can only fence an attempt;
+//! - anything else is a `runs` turn claim from the chat- and jobs-driven lane,
+//!   so they are `RunsMsg::CancelRun`/`RunsMsg::ReassignRun`. Both act there.
+//!
+//! The operator holding a run id has no reason to know which module minted it,
+//! and the two id spaces are disjoint, so the CLI asks the id rather than the
+//! operator. Both ride the same user-signed frame lane `sched` uses, and neither
+//! pre-checks who may act: the module decides on every validator — runs admits
+//! the run's creator or the agent's owner, saga only the recorded trigger origin
+//! — and its refusal sentence is what comes back.
+//!
+//! What the lanes do NOT share is how a no-op reads. Runs REFUSES an id it does
+//! not hold (`unknown run: …`); saga is deliberately SILENT for a finished,
+//! unknown or foreign saga, so a `sched` control op that lands prints
+//! "submitted", never "accepted".
+//!
+//! Which is also how the wrong `--key` reads: a `sched` id in ANOTHER key's
+//! namespace is not this key's to control, so it takes the runs lane and comes
+//! back `unknown run: ext:<hex>…`. That sentence means "not your run", not "no
+//! such run" — sign with the key that submitted the `agent sched`.
 //!
 //! `<provider>` is optional when `--cred` names a credential: the registry
 //! record's kind decides what to launch; an explicit provider contradicting the
@@ -50,8 +80,8 @@ pub(crate) struct AgentArgs {
     cmd: AgentCmd,
     #[command(flatten)]
     addr: NodeAddr,
-    /// path to the user key file that signs a `sched` run (defaults to the
-    /// keystore's active wallet)
+    /// path to the user key file that signs a `sched`, `cancel` or `reassign`
+    /// submit (defaults to the keystore's active wallet)
     #[arg(long, value_name = "PATH", global = true)]
     key: Option<std::path::PathBuf>,
 }
@@ -64,6 +94,43 @@ pub(crate) enum AgentCmd {
     Sched(SchedArgs),
     /// install the agent CLIs this host's guest image lends to runs
     Install(crate::executors::InstallArgs),
+    /// cancel a pending run — a `sched` run of your own, or a `runs` turn
+    /// whose creator or agent owner you are
+    Cancel(CancelArgs),
+    /// fence this attempt and move a pending `runs` turn to another provider
+    /// (a `sched` run is PINNED to its node and cannot be moved — cancel it
+    /// and submit a new one instead)
+    Reassign(ReassignArgs),
+}
+
+// EVERY run id both control verbs take carries literal 0x1f separators, so it
+// is COPIED, never typed: a `sched` id is `ext:<hex>\x1fsched\x1f<hex>` (what
+// `agent sched` printed), a runs turn claim is
+// `chat\x1f<channel>\x1f<anchor>\x1f<agent>` or
+// `job\x1f<job>\x1f<agent>\x1f<height>` (what the app's run list and the
+// `pending_runs` query print). Typing one into bash needs `$'…\x1f…'` quoting.
+#[derive(Debug, clap::Args)]
+pub(crate) struct CancelArgs {
+    /// the run's id: the id `agent sched` printed, or a pending `runs` turn
+    /// claim — 0x1f-separated, so quote it: $'chat\x1fgeneral\x1f3\x1fbot'
+    #[arg(value_name = "RUN_ID")]
+    run_id: String,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct ReassignArgs {
+    /// the run's id: the id `agent sched` printed, or a pending `runs` turn
+    /// claim — 0x1f-separated, so quote it: $'chat\x1fgeneral\x1f3\x1fbot'
+    #[arg(value_name = "RUN_ID")]
+    run_id: String,
+    /// the attempt to FENCE: the run's current attempt, 0 until it has been
+    /// reassigned once — and on the runs lane (`RUN_MAX_ATTEMPTS = 2`) the only
+    /// one a turn can move. A stale number is a deterministic no-op by design
+    /// (that is what stops a delayed click from revoking a newer assignment),
+    /// and a no-op still commits, so the printed height names the fence, not a
+    /// move.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    attempt: u32,
 }
 
 #[derive(Debug, clap::Args)]
@@ -146,6 +213,8 @@ pub(crate) fn run(args: AgentArgs) -> AgentResult {
         AgentCmd::Pty(pty) => cmd_pty(pty, &ctx.http_base()?, &ctx.addr),
         AgentCmd::Sched(sched) => cmd_sched(sched, &ctx, &mut stdin),
         AgentCmd::Install(install) => crate::executors::run(install),
+        AgentCmd::Cancel(cancel) => cmd_cancel(cancel, &ctx, &mut stdin),
+        AgentCmd::Reassign(reassign) => cmd_reassign(reassign, &ctx, &mut stdin),
     }
 }
 
@@ -486,6 +555,161 @@ fn fresh_dispatch_id() -> String {
     let mut bytes = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
     hex_bytes(&bytes)
+}
+
+// ============================================================================
+// cancel / reassign — run control, on whichever module holds the id
+// ============================================================================
+
+/// Which module holds the run an operator named. The two id spaces are
+/// disjoint, so the ID decides and the operator never has to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlLane {
+    /// a `runs` turn claim — the chat- and jobs-driven agent turns.
+    Runs,
+    /// a saga the SIGNING key triggered: what `agent sched` printed. A saga id
+    /// in anyone else's namespace is not this key's to control, so it takes the
+    /// `runs` lane and earns that lane's honest `unknown run` refusal rather
+    /// than saga's silent foreign-origin no-op.
+    Sched,
+}
+
+/// The two run-control ops, before the lane names the module that takes them.
+#[derive(Debug, Clone, Copy)]
+enum ControlVerb {
+    Cancel,
+    Reassign { attempt: u32 },
+}
+
+fn cmd_cancel(args: CancelArgs, ctx: &VerbCtx, stdin: &mut impl BufRead) -> AgentResult {
+    println!(
+        "{}",
+        submit_control(ctx, stdin, ControlVerb::Cancel, &args.run_id)?
+    );
+    Ok(())
+}
+
+fn cmd_reassign(args: ReassignArgs, ctx: &VerbCtx, stdin: &mut impl BufRead) -> AgentResult {
+    let verb = ControlVerb::Reassign {
+        attempt: args.attempt,
+    };
+    println!("{}", submit_control(ctx, stdin, verb, &args.run_id)?);
+    Ok(())
+}
+
+/// Submit one run-control op as a frame the USER key signs, and answer with the
+/// sentence the operator reads.
+///
+/// The user key is the whole authorization: the frame's verified signer becomes
+/// the op's `Origin::External`, and the holding module admits only the right
+/// origins — runs the run's creator or the agent's owner
+/// (`crates/modules/apps/runs/src/admin.rs`, `controlled_dispatch_id`), saga the
+/// recorded trigger origin. This CLI deliberately pre-checks NEITHER — a second
+/// gate here could only drift from the one that actually decides, and the
+/// module's refusal sentence reaches the operator verbatim through the submit
+/// lane's error.
+fn submit_control(
+    ctx: &VerbCtx,
+    stdin: &mut impl BufRead,
+    verb: ControlVerb,
+    run_id: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let base = ctx.http_base()?;
+    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let origin = sdk::Origin::External(user.public_key().as_ref().to_vec());
+    let lane = control_lane(&origin, run_id);
+    let height = crate::node_http::submit_frame(&base, &control_frame(&user, lane, verb, run_id))?;
+    Ok(control_outcome(lane, verb, run_id, height))
+}
+
+/// The lane a run id belongs to, asked of the id and the key that signs for it.
+fn control_lane(origin: &sdk::Origin, run_id: &str) -> ControlLane {
+    let is_this_keys_saga = saga::owns_id(origin, run_id);
+    if is_this_keys_saga {
+        ControlLane::Sched
+    } else {
+        ControlLane::Runs
+    }
+}
+
+/// The frame one control verb submits: the lane names the module, the verb the
+/// op, and the USER key signs either way.
+fn control_frame(
+    user: &commonware_cryptography::ed25519::PrivateKey,
+    lane: ControlLane,
+    verb: ControlVerb,
+    run_id: &str,
+) -> Vec<u8> {
+    match (lane, verb) {
+        (ControlLane::Runs, ControlVerb::Cancel) => user_frame(
+            user,
+            "runs",
+            runs::encode_msg(&runs::RunsMsg::CancelRun {
+                run_id: run_id.to_string(),
+            }),
+        ),
+        (ControlLane::Runs, ControlVerb::Reassign { attempt }) => user_frame(
+            user,
+            "runs",
+            runs::encode_msg(&runs::RunsMsg::ReassignRun {
+                run_id: run_id.to_string(),
+                attempt,
+            }),
+        ),
+        (ControlLane::Sched, ControlVerb::Cancel) => user_frame(
+            user,
+            "saga",
+            saga::encode_msg(&saga::SagaMsg::Cancel {
+                saga_id: run_id.to_string(),
+            }),
+        ),
+        (ControlLane::Sched, ControlVerb::Reassign { attempt }) => user_frame(
+            user,
+            "saga",
+            saga::encode_msg(&saga::SagaMsg::Reassign {
+                saga_id: run_id.to_string(),
+                attempt,
+            }),
+        ),
+    }
+}
+
+/// What a committed run-control op prints — the sentence says exactly what the
+/// block agreed to and no more, which differs per lane and per verb.
+///
+/// "accepted", never "cancelled": this block is where the module TOOK the op and
+/// told the dispatch plane. The run ends a block later, when the plane's
+/// `Err("cancelled")` delivery prunes the entry and posts the agent's ⚠ reply —
+/// and an already-delivered run accepts the very same op as a deterministic
+/// no-op. Claiming the run is over here would be a sentence the chain has not
+/// agreed to yet.
+///
+/// A `sched` op only ever says "submitted": saga answers an unknown, finished or
+/// foreign saga with a SILENT no-op rather than an error, so a committed frame
+/// there proves the chain read the op, not that it moved anything. Reassign says
+/// which attempt it fenced for the same reason — a stale attempt commits and
+/// changes nothing on either lane, and a LIVE `sched` saga never reaches this
+/// sentence at all: it is pinned, so saga refuses the reassign outright and the
+/// operator reads that refusal instead.
+fn control_outcome(lane: ControlLane, verb: ControlVerb, run_id: &str, height: u64) -> String {
+    match (lane, verb) {
+        (ControlLane::Runs, ControlVerb::Cancel) => format!(
+            "cancel accepted for run {run_id} at height {height} \
+             (a run whose turn was already taken cancels nothing)"
+        ),
+        (ControlLane::Runs, ControlVerb::Reassign { attempt }) => format!(
+            "reassign accepted for run {run_id} at height {height}, fencing attempt {attempt} \
+             (a stale attempt moves nothing)"
+        ),
+        (ControlLane::Sched, ControlVerb::Cancel) => format!(
+            "cancel submitted for sched run {run_id} at height {height} \
+             (a finished or unknown run is a silent no-op)"
+        ),
+        (ControlLane::Sched, ControlVerb::Reassign { attempt }) => format!(
+            "reassign submitted for sched run {run_id} at height {height}, fencing attempt \
+             {attempt} (a pinned, finished or stale run moves nothing)"
+        ),
+    }
 }
 
 // ============================================================================
@@ -861,6 +1085,160 @@ mod tests {
         assert_eq!(resize["op"], "term_resize");
         assert_eq!(resize["cols"], 120);
         assert_eq!(resize["rows"], 40);
+    }
+
+    /// The RUN ID picks the module, and the USER key signs either way — the
+    /// authority check on both lanes IS the frame's verified origin. Getting the
+    /// lane wrong is not a cosmetic slip: `CancelRun` on a `sched` id walks
+    /// `controlled_dispatch_id` to an entry that was never minted and answers
+    /// "unknown run", which is exactly the hole this verb exists to close.
+    #[test]
+    fn the_run_id_picks_the_module_and_the_user_key_signs_the_op() {
+        use commonware_codec::DecodeExt as _;
+        let user = commonware_cryptography::ed25519::PrivateKey::decode([3u8; 32].as_slice())
+            .expect("a 32-byte seed");
+        let signer = sdk::Origin::External(user.public_key().as_ref().to_vec());
+        let turn_claim = "chat\u{1f}general\u{1f}3\u{1f}bot";
+        // exactly what `agent sched` printed: saga's namespaced id under the
+        // signing key's own actor string.
+        let sched_run = saga::namespaced_id(&signer, "sched\u{1f}deadbeef");
+
+        assert_eq!(control_lane(&signer, turn_claim), ControlLane::Runs);
+        assert_eq!(control_lane(&signer, &sched_run), ControlLane::Sched);
+        // another key's saga is not this key's to control: it takes the runs
+        // lane, where an id nobody holds is REFUSED rather than silently
+        // swallowed by saga's foreign-origin no-op.
+        let stranger = sdk::Origin::External(vec![9u8; 32]);
+        assert_eq!(
+            control_lane(&signer, &saga::namespaced_id(&stranger, "sched\u{1f}x")),
+            ControlLane::Runs
+        );
+
+        let submitted = |verb, run_id: &str| {
+            let lane = control_lane(&signer, run_id);
+            let frame = control_frame(&user, lane, verb, run_id);
+            let (origin, msg) = node::decode_frame(&frame).expect("the frame verifies");
+            assert_eq!(origin, signer, "the module admits by ORIGIN");
+            (msg.target, msg.payload)
+        };
+
+        let (target, payload) = submitted(ControlVerb::Cancel, turn_claim);
+        assert_eq!(target, "runs");
+        assert_eq!(
+            runs::decode_msg(&payload),
+            Ok(runs::RunsMsg::CancelRun {
+                run_id: turn_claim.to_string()
+            })
+        );
+        let (target, payload) = submitted(ControlVerb::Reassign { attempt: 2 }, turn_claim);
+        assert_eq!(target, "runs");
+        assert_eq!(
+            runs::decode_msg(&payload),
+            Ok(runs::RunsMsg::ReassignRun {
+                run_id: turn_claim.to_string(),
+                attempt: 2
+            })
+        );
+
+        let (target, payload) = submitted(ControlVerb::Cancel, &sched_run);
+        assert_eq!(target, "saga", "a sched run lives in saga, not runs");
+        assert_eq!(
+            saga::decode_msg(&payload),
+            Ok(saga::SagaMsg::Cancel {
+                saga_id: sched_run.clone()
+            })
+        );
+        let (target, payload) = submitted(ControlVerb::Reassign { attempt: 1 }, &sched_run);
+        assert_eq!(target, "saga");
+        assert_eq!(
+            saga::decode_msg(&payload),
+            Ok(saga::SagaMsg::Reassign {
+                saga_id: sched_run,
+                attempt: 1
+            })
+        );
+    }
+
+    /// What a COMMITTED control op is allowed to claim. Every sentence here
+    /// prints at a height the chain agreed to, and the failure mode is claiming
+    /// more than that height proves.
+    ///
+    /// "accepted", never "cancelled" — the run ends a block later, on the
+    /// dispatch plane's delivery. And every lane that can commit a no-op says
+    /// so: runs cancels nothing when the turn was already taken, saga is
+    /// deliberately silent for a finished, unknown or foreign saga, and a
+    /// pinned `sched` saga cannot be reassigned at all. The refusal path needs
+    /// no case here — the module's own sentence rides the submit lane's error
+    /// verbatim, which is `node_http::submit_frame`'s contract and its tests.
+    #[test]
+    fn a_committed_control_op_claims_only_what_its_height_proves() {
+        let run_id = "chat\u{1f}general\u{1f}3\u{1f}bot";
+
+        let cancel = control_outcome(ControlLane::Runs, ControlVerb::Cancel, run_id, 42);
+        assert!(
+            cancel.starts_with(&format!("cancel accepted for run {run_id} at height 42")),
+            "{cancel}"
+        );
+        assert!(cancel.contains("cancels nothing"), "{cancel}");
+        // saga swallows an unknown, finished or foreign cancel WITHOUT an
+        // error, so a committed sched frame proves the chain read the op and
+        // nothing more. Saying "accepted" there would be the CLI inventing a
+        // verdict the block never reached.
+        let sched = control_outcome(ControlLane::Sched, ControlVerb::Cancel, run_id, 42);
+        assert!(sched.contains("submitted"), "{sched}");
+        assert!(!sched.contains("accepted"), "{sched}");
+        // reassign names the attempt it fenced on either lane: a stale one
+        // commits and moves nothing, and the operator cannot tell from a bare
+        // height.
+        for lane in [ControlLane::Runs, ControlLane::Sched] {
+            let line = control_outcome(lane, ControlVerb::Reassign { attempt: 3 }, run_id, 42);
+            assert!(line.contains("attempt 3"), "{line}");
+        }
+        // a `sched` reassign must never promise a move: every `agent sched`
+        // saga is pinned, and saga refuses a pinned reassign outright.
+        let pinned = control_outcome(
+            ControlLane::Sched,
+            ControlVerb::Reassign { attempt: 0 },
+            run_id,
+            42,
+        );
+        assert!(pinned.contains("pinned"), "{pinned}");
+    }
+
+    /// a Parser wrapper so the tests exercise the derived verb SHAPE the same
+    /// way `main.rs`'s integrator will.
+    #[derive(clap::Parser)]
+    struct TestAgentCli {
+        #[command(flatten)]
+        args: AgentArgs,
+    }
+
+    /// `--attempt` defaults to 0 — the run's FIRST attempt, and the only one a
+    /// reassignment can move (`RUN_MAX_ATTEMPTS = 2`, so attempt 1 answers
+    /// "reassignment attempts exhausted"). A wrong default is the worst
+    /// failure this verb has: saga treats a stale attempt as a deterministic
+    /// no-op, so the operator would read "accepted" and watch the run carry on.
+    #[test]
+    fn reassign_fences_the_first_attempt_unless_told_otherwise() {
+        use clap::Parser as _;
+        let reassign = |argv: &[&str]| {
+            let cli = TestAgentCli::try_parse_from(argv).expect("the verb parses");
+            match cli.args.cmd {
+                AgentCmd::Reassign(args) => args,
+                other => panic!("expected reassign, got {other:?}"),
+            }
+        };
+        let default = reassign(&["agent", "reassign", "run-1"]);
+        assert_eq!(default.run_id, "run-1");
+        assert_eq!(default.attempt, 0);
+        assert_eq!(
+            reassign(&["agent", "reassign", "run-1", "--attempt", "1"]).attempt,
+            1
+        );
+
+        let cancel =
+            TestAgentCli::try_parse_from(["agent", "cancel", "run-1"]).expect("the verb parses");
+        assert!(matches!(cancel.args.cmd, AgentCmd::Cancel(args) if args.run_id == "run-1"));
     }
 
     #[test]

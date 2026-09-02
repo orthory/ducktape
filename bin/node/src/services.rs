@@ -859,7 +859,7 @@ pub(crate) struct ReadArgs {
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct KindArgs {
-    /// the service kind (`compute`)
+    /// the service kind (`compute`, `agent`, `airlock`)
     #[arg(value_name = "KIND")]
     kind: String,
     #[command(flatten)]
@@ -868,7 +868,7 @@ pub(crate) struct KindArgs {
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct RunArgs {
-    /// the service kind to run (`compute`)
+    /// the service kind to run (`compute`, `agent`, `airlock`)
     #[arg(value_name = "KIND")]
     kind: String,
     #[command(flatten)]
@@ -908,7 +908,7 @@ impl RunArgs {
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct EnableArgs {
-    /// the service kind (`compute`)
+    /// the service kind (`compute`, `agent`, `airlock`)
     #[arg(value_name = "KIND")]
     kind: String,
     #[command(flatten)]

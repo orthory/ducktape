@@ -171,18 +171,8 @@ install-coordinator:
 TEST_TMPDIR := $(CURDIR)/target/test-tmp
 
 test: wasm-modules-check
-# TWO passes, and the second is not optional.
-#
-# A run that reached the compute plane leaves podman rootless overlay dirs owned
-# by a SUBUID, which this user cannot remove: plain `rm -rf` prints a wall of
-# `Permission denied` and — with `&&` — aborted the whole gate before a single
-# test ran. `podman unshare` re-enters the user namespace where those uids map
-# to root, which is the only way to reclaim them without privileges.
-#
-# Neither pass may fail the gate: a first run has nothing to clean, and a host
-# without podman has no second pass to make.
+# The reclaim may not fail the gate: a first run has nothing to clean.
 	-rm -rf "$(TEST_TMPDIR)" 2>/dev/null
-	-command -v podman >/dev/null 2>&1 && podman unshare rm -rf "$(TEST_TMPDIR)" 2>/dev/null
 	mkdir -p "$(TEST_TMPDIR)"
 	TMPDIR="$(TEST_TMPDIR)" $(CARGO) test --workspace
 # the auth page's pure helpers (fragment parsing, DER→raw, SPKI→SEC1) — the
@@ -209,8 +199,8 @@ test: wasm-modules-check
 ## rebuild every wasm guest module into its componentized artifact and refresh
 ## EVERY committed copy in one sweep (the canonical node-embedded artifact +
 ## the kernel test fixtures), so the copies can never drift apart. requires
-## the wasm32-unknown-unknown target (rustup target add wasm32-unknown-unknown)
-## and wasm-tools (cargo install wasm-tools). component bytes are toolchain-
+## wasm-tools (cargo install wasm-tools); the wasm32-unknown-unknown target
+## comes from the pinned rust-toolchain.toml. component bytes are toolchain-
 ## dependent: a rebuild on a different rustc may legitimately differ from the
 ## committed bytes — commit the refreshed set TOGETHER; `wasm-modules-check`
 ## guards mutual consistency. bytes no longer depend on WHERE the checkout

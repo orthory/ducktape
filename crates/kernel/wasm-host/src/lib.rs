@@ -582,6 +582,28 @@ impl WasmModule {
         )
     }
 
+    /// Can THIS BINARY actually run these component bytes?
+    ///
+    /// [`Component::from_binary`] only validates and compiles. A component
+    /// importing a host function this build does not provide fails at
+    /// INSTANTIATE — which on the live path happens per dispatch, one block at
+    /// a time, and surfaces as [`SdkError::Module`]: a rejection documented as
+    /// deterministic because "the same code runs on every validator". That
+    /// premise is false under binary skew, so a validator must prove the bytes
+    /// load HERE before it votes a code swap ready; otherwise it arms a swap it
+    /// cannot run and forks the instant the swap activates (#1297).
+    ///
+    /// Instantiates against this build's real linker and throws the instance
+    /// away: no state is touched and the temporary engine dies with it.
+    pub fn check_loadable(component_bytes: &[u8]) -> Result<(), SdkError> {
+        let probe = Self::from_bytes("code-probe", component_bytes)?;
+        let mut store = Store::new(&probe.engine, HostData::default());
+        store.set_fuel(probe.fuel).map_err(module_err)?;
+        ModuleWorld::instantiate(&mut store, &probe.component, &probe.linker)
+            .map_err(module_err)?;
+        Ok(())
+    }
+
     /// Load a module from component bytes over a host-injected authenticated
     /// store — committed state lives in `store` (already opened, or already
     /// synced to a verified root), `root()` is the store's merkle root, and

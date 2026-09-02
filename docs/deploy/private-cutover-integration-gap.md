@@ -120,9 +120,8 @@ needs no gossip; one-sided resolution suffices because WireGuard roams on
 authenticated inbound) — and the dialer is seeded with the persisted control
 ULAs for peers without a configured hint. The restored mesh is purely a
 gossip carrier: the boot epoch's own live assembly replaces it at its apply.
-What it deliberately does NOT cover: the FIRST join on a coordinated-only
-config (nothing persisted yet — the throwaway fronted hint in the join
-recipe above remains required for the join window).
+What it deliberately does NOT cover: the FIRST join (nothing persisted yet) —
+that is the invite tunnel's job, per the join recipe above.
 
 ## Standby tunnel pre-warming (shipped)
 

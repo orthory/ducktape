@@ -146,7 +146,11 @@ use workspace_config::{DEFAULT_INVITE_TTL_DAYS, INVITE_TTL_DAYS};
 
 use crate::call::{call_ws, presence_ws};
 use crate::gateway_http::{gateway_browser_base, gateway_proxy};
-use crate::git_http::{GIT_PACK_BODY_LIMIT, git_info_refs, git_receive_pack, git_upload_pack};
+use crate::git_http::{git_info_refs, git_receive_pack, git_upload_pack};
+// the forge pack ceiling the smart-HTTP lane accepts — re-exported so the
+// node's relay fan-out cap DERIVES from it (a pack the door took in must be
+// one the relay can carry; two numbers here once drifted 8x apart).
+pub use crate::git_http::GIT_PACK_BODY_LIMIT;
 use crate::index::{blocks, index_ops, index_scan, index_status, index_view};
 use crate::metrics::metrics;
 

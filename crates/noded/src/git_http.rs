@@ -51,8 +51,16 @@ const GIT_RECEIVE_PACK_CAPS: &str =
 const GIT_UPLOAD_PACK_CAPS: &str =
     "multi_ack_detailed side-band-64k thin-pack ofs-delta agent=ducktape-forge/0.1";
 /// the body cap for a git packfile POST — push (whole-repo pack) and fetch
-/// (want/have negotiation). lifted far above the json/chunk defaults.
-pub(crate) const GIT_PACK_BODY_LIMIT: usize = 512 * 1024 * 1024;
+/// (want/have negotiation). sized to what the relay lane can DELIVER, not to
+/// the disk: a validator-bound pack fans out as 768 KiB chunks plus one offer
+/// into a 128-message inbound backlog that commonware DROPS on when full (the
+/// peer actor never blocks; bin/node's relay bridge is a 64-slot `try_send`
+/// on top), and nothing retransmits a dropped chunk — a pack past 127 chunks
+/// would not be refused but would hang its pusher for the whole transfer
+/// allowance with the pack pinned in memory. `bin/node/src/relay.rs` pins
+/// this under that backlog; this repository's own full-history pack (83 MiB)
+/// fits.
+pub const GIT_PACK_BODY_LIMIT: usize = 127 * 768 * 1024;
 /// max PACK bytes per side-band-64k data pkt-line: prefixed with the 1-byte band
 /// id, plus the 4-byte pkt length header, this yields a 65520-byte line — git's
 /// `LARGE_PACKET_MAX`, the ceiling a side-band-64k client accepts.
@@ -591,6 +599,38 @@ fn decode_git_body(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>, String> 
     Ok(out)
 }
 
+/// one refused push, on the forge plane. the http funnel already records the
+/// status at `debug`; this is the plane's own line, with a `reason` an
+/// operator greps and counts. never the pack, never a path.
+fn push_refused(repo: &str, reason: &'static str, detail: &str) {
+    tracing::warn!(
+        target: "ducktape::forge",
+        event = "forge_push_refused",
+        repo,
+        reason,
+        detail,
+        "push refused"
+    );
+}
+
+/// the `reason` behind a push refusal that arrived as prose: this bridge's
+/// own parse errors and forge's consensus rejections both come back as the
+/// sentence git prints per ref. the nonce messages also say "certificate",
+/// so they sit ahead of that catch-all.
+fn push_refusal_reason(message: &str) -> &'static str {
+    const KNOWN: &[(&str, &str)] = &[
+        ("non-fast-forward", "non_fast_forward"),
+        ("only the owner", "owner_mismatch"),
+        ("requires an authenticated external origin", "unsigned"),
+        ("offered no push-cert", "push_cert_unoffered"),
+        ("signature does not verify", "bad_cert_signature"),
+        ("nonce", "bad_cert_nonce"),
+        ("certificate", "bad_cert"),
+        ("too many ref updates", "too_many_refs"),
+    ];
+    crate::log::reason_of(message, KNOWN, "rejected")
+}
+
 /// POST /forge/{repo}/git-receive-pack — receive a push: parse the ref-update
 /// command list + packfile, stash the whole pack in the node-local blob store,
 /// and CAS every branch through ONE atomic forge `PushRefs` op (one submit ==
@@ -608,17 +648,30 @@ pub(crate) async fn git_receive_pack(
     let body = match body {
         Ok(bytes) => bytes,
         // the DefaultBodyLimit layer rejects an oversized pack with 413.
-        Err(rejection) => return error_response(rejection.status(), &rejection.body_text()),
+        Err(rejection) => {
+            let over_cap = rejection.status() == StatusCode::PAYLOAD_TOO_LARGE;
+            let reason = if over_cap {
+                "pack_over_cap"
+            } else {
+                "body_unreadable"
+            };
+            push_refused(&repo, reason, &rejection.body_text());
+            return error_response(rejection.status(), &rejection.body_text());
+        }
     };
     let body = match decode_git_body(&headers, &body) {
         Ok(bytes) => bytes,
-        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+        Err(msg) => {
+            push_refused(&repo, "bad_encoding", &msg);
+            return error_response(StatusCode::BAD_REQUEST, &msg);
+        }
     };
 
     // the body is a pkt-line command list, a flush-pkt, then the raw packfile.
     let (commands, pack) = match parse_pkt_lines(&body) {
         Ok(parsed) => parsed,
         Err(msg) => {
+            push_refused(&repo, "malformed_commands", &msg);
             return error_response(
                 StatusCode::BAD_REQUEST,
                 &format!("malformed git command stream: {msg}"),
@@ -652,7 +705,10 @@ pub(crate) async fn git_receive_pack(
     let nonce = push_cert_nonce(&handle, &repo);
     let PushCommands { cmds, cert } = match parse_push_commands(&commands, nonce.as_deref()) {
         Ok(parsed) => parsed,
-        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+        Err(msg) => {
+            push_refused(&repo, push_refusal_reason(&msg), &msg);
+            return error_response(StatusCode::BAD_REQUEST, &msg);
+        }
     };
 
     // only branches are pushable (no tags/notes). consume-and-refuse: the pack
@@ -662,6 +718,7 @@ pub(crate) async fn git_receive_pack(
         .iter()
         .any(|(_, _, r)| !r.starts_with(GIT_HEADS_PREFIX))
     {
+        push_refused(&repo, "ref_outside_heads", "only refs/heads/* is supported");
         let results: Vec<(String, Option<String>)> = cmds
             .into_iter()
             .map(|(_, _, r)| (r, Some(format!("only {GIT_HEADS_PREFIX}* is supported"))))
@@ -678,7 +735,10 @@ pub(crate) async fn git_receive_pack(
         } else {
             match hex_to_bytes(old).filter(|b| b.len() == GIT_OID_RAW_LEN) {
                 Some(bytes) => Some(bytes),
-                None => return error_response(StatusCode::BAD_REQUEST, "malformed old oid"),
+                None => {
+                    push_refused(&repo, "malformed_oid", "malformed old oid");
+                    return error_response(StatusCode::BAD_REQUEST, "malformed old oid");
+                }
             }
         };
         let new_oid = if new == GIT_ZERO_OID {
@@ -686,7 +746,10 @@ pub(crate) async fn git_receive_pack(
         } else {
             match hex_to_bytes(new).filter(|b| b.len() == GIT_OID_RAW_LEN) {
                 Some(bytes) => Some(bytes),
-                None => return error_response(StatusCode::BAD_REQUEST, "malformed new oid"),
+                None => {
+                    push_refused(&repo, "malformed_oid", "malformed new oid");
+                    return error_response(StatusCode::BAD_REQUEST, "malformed new oid");
+                }
             }
         };
         updates.push(forge::RefUpdate {
@@ -702,6 +765,7 @@ pub(crate) async fn git_receive_pack(
     if let Some(cert) = &cert
         && let Err(reason) = forge::pushcert::signer(cert, &repo, &updates)
     {
+        push_refused(&repo, push_refusal_reason(&reason), &reason);
         let results: Vec<(String, Option<String>)> = cmds
             .into_iter()
             .map(|(_, _, r)| (r, Some(reason.clone())))
@@ -712,6 +776,7 @@ pub(crate) async fn git_receive_pack(
     // stash the WHOLE packfile as one node-local blob, keyed by its sha256;
     // forge materializes it by this digest (the bytes never cross consensus).
     // a delete-only push carries no objects, so nothing is stashed.
+    let pack_bytes = pack.len();
     let pack_digest = if updates.iter().any(|u| u.new_oid.is_some()) {
         Some(handle.blobs.put_chunk(pack.to_vec()).to_vec())
     } else {
@@ -720,7 +785,7 @@ pub(crate) async fn git_receive_pack(
 
     // CAS every branch through ONE atomic PushRefs op and await the block.
     let payload = forge::encode_msg(&forge::ForgeMsg::PushRefs {
-        repo,
+        repo: repo.clone(),
         updates,
         pack_digest,
         cert,
@@ -739,12 +804,22 @@ pub(crate) async fn git_receive_pack(
     }
     let refnames: Vec<String> = cmds.into_iter().map(|(_, _, r)| r).collect();
     match rx.await {
-        Ok(Ok(_block)) => {
+        Ok(Ok(block)) => {
+            tracing::info!(
+                target: "ducktape::forge",
+                event = "forge_push_landed",
+                repo = %repo,
+                refs = refnames.len(),
+                pack_bytes,
+                height = block.height,
+                "push landed"
+            );
             let results: Vec<(String, Option<String>)> =
                 refnames.into_iter().map(|r| (r, None)).collect();
             git_report_status(&results)
         }
         Ok(Err(reason)) => {
+            push_refused(&repo, push_refusal_reason(&reason), &reason);
             // a CAS mismatch's rejection carries "non-fast-forward" — surface
             // exactly that token so git prints its standard "fetch first" hint.
             // any other rejection passes through as a single-line reason. the
@@ -842,6 +917,14 @@ pub(crate) async fn git_upload_pack(
                 );
             }
         };
+
+    tracing::debug!(
+        target: "ducktape::forge",
+        repo = %repo,
+        pack_bytes = pack.len(),
+        delta = common.is_some(),
+        "upload-pack served"
+    );
 
     let mut out = Vec::new();
     // the terminal negotiation line, valid in every v0 multi_ack mode: a bare

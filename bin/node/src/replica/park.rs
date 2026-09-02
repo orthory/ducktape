@@ -188,7 +188,7 @@ async fn publish_replica_status(
         None => (0, String::new(), Vec::new()),
     };
     status.publish(noded::NodeStatus {
-        version: env!("CARGO_PKG_VERSION").into(),
+        version: crate::build_version(),
         root_hash,
         height,
         modules,
@@ -231,6 +231,7 @@ pub(super) async fn park(
     session_manager: Option<noded::TerminalSessions>,
     session_requests: tokio::sync::mpsc::Receiver<noded::SessionJob>,
     local_gateway_via: String,
+    node_api_ports: Vec<u16>,
     stream_hub: &noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
     metrics: noded::NodeMetrics,
@@ -351,6 +352,7 @@ pub(super) async fn park(
                 planes: planes.clone(),
                 commands: gateway_commands,
                 workspace,
+                node_api_ports,
             },
             requests,
         );
@@ -510,6 +512,11 @@ pub(super) async fn park(
     // the last checkpoint's (height, oplog position) — the prune
     // anchor: the journal below it drops once the floor passes it.
     let mut replica_prev_ckpt: (Option<u64>, u64) = (None, 0);
+    // the composed root-hash recorded by the last manifest THIS loop wrote —
+    // the periodic checkpoint's change gate, the validator drain's exact
+    // discipline. `None` until the first write, so a restart or a freshly
+    // installed boundary re-anchors on its first cadence hit (#1308).
+    let mut replica_written_root: Option<StateRoot> = None;
     // the root-hash of the last boundary the derived tier followed:
     // the index feed (heal + explorer row + ws event) fires only when
     // the verified root-hash MOVED. an unchanged hash is an idle
@@ -1467,6 +1474,15 @@ pub(super) async fn park(
                         // an unpaid cooldown from the previous checkpoint would
                         // otherwise hold this one off for minutes.
                         checkpoint_not_before = context.current();
+                        // ...and the CHANGE GATE with it. A cutover moves the
+                        // manifest's epoch/view_base WITHOUT moving the state
+                        // root, so `state_moved` is false at exactly the moment
+                        // the new boundary must reach disk. `None` is the gate's
+                        // own "re-anchor on the first cadence hit", so the force
+                        // stays a force. The validator's post-cutover checkpoint
+                        // escapes the gate by living in its own branch; the
+                        // replica routes through the shared one, so it clears it.
+                        replica_written_root = None;
                         tracing::info!(
                             target: "ducktape::consensus",
                             node = %label,
@@ -1515,12 +1531,15 @@ pub(super) async fn park(
             // epoch coordinates describe). journal pruning stays the
             // validator's concern for now (a replica's journal prunes
             // at its next ascension checkpoint).
-            if crate::drain_actions::checkpoint_due(
-                blocks_since_checkpoint,
-                checkpoint_blocks,
-                context.current(),
-                checkpoint_not_before,
-            ) && let Some(f) = node_r.finalized()
+            if let Some(f) = node_r.finalized()
+                && crate::drain_actions::checkpoint_due(
+                    blocks_since_checkpoint,
+                    checkpoint_blocks,
+                    context.current(),
+                    checkpoint_not_before,
+                    f.root_hash,
+                    replica_written_root,
+                )
             {
                 let pos = node_r.sink_mut().oplog_pos().await;
                 let checkpoint_started = context.current();
@@ -1587,6 +1606,7 @@ pub(super) async fn park(
                                 );
                             }
                             replica_prev_ckpt = (ckpt.height, pos);
+                            replica_written_root = Some(ckpt.root_hash);
                             blocks_since_checkpoint = 0;
                             let since = |a: std::time::SystemTime, b: std::time::SystemTime| {
                                 b.duration_since(a).unwrap_or_default().as_millis()

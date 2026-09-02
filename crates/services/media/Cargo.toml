@@ -18,6 +18,9 @@ data-plane = { workspace = true }
 opus-rs = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "time", "sync", "macros"] }
+# `ducktape::voice`: a peer's speaker lane opening — once per peer per
+# engine, never per frame.
+tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "test-util"] }

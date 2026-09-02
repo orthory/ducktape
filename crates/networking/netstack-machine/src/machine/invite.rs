@@ -15,7 +15,10 @@ use crate::contract::{CmdToken, Effect, ReachabilityEvent, ReqId};
 use crate::epoch::EpochState;
 
 use super::pending::{PendingOp, WgCont};
-use super::{Driver, INTRO_ACK_TIMEOUT_MS, KEEPALIVE_SECONDS};
+use super::{
+    Driver, INTRO_ACK_TIMEOUT_MS, INVITE_PEERS_FULL, InvitePeer, KEEPALIVE_SECONDS,
+    MAX_INVITE_PEERS,
+};
 
 impl Driver {
     /// Install a join-window tunnel peer (node-authenticated; see the
@@ -62,23 +65,47 @@ impl Driver {
         if identity == self.me {
             return Err("refusing an invite tunnel to self".into());
         }
-        let allowed_ips = self.overlay.identity_allowed_ips(identity);
-        self.invite_peers.insert(
-            identity,
-            PeerTunnelConfig {
-                wireguard_public_key,
-                // the intro datagram's observed source — always concrete.
-                endpoint: Some(endpoint),
-                allowed_ips,
-                keepalive_seconds: Some(KEEPALIVE_SECONDS),
-            },
-        );
+        // the stronger layers decide what "covered" means before anything
+        // ages out: a promoted NAT'd member's entry is the only endpoint its
+        // endpoint-less record ever gets (see `merge_invite_layer`), so age
+        // alone must never prune it — and it never spends a join-window slot.
         let merged = match epoch {
             Some(state) => {
                 Self::epoch_layered_peers(state, self.base_peers.clone().unwrap_or_default())
             }
             None => self.base_peers.clone().unwrap_or_default(),
         };
+        // the join-window table is bounded over the UNCOVERED entries: the
+        // aged-out ones make room first, a re-intro refreshes its own slot,
+        // and a full table refuses the intro — the reply text IS the reason
+        // token the inviter logs.
+        let now_ms = self.now_ms;
+        self.invite_peers
+            .retain(|id, invite| merged.contains_key(id) || !invite.expired_at(now_ms));
+        let re_intro = self.invite_peers.contains_key(&identity);
+        let uncovered = self
+            .invite_peers
+            .keys()
+            .filter(|id| !merged.contains_key(id))
+            .count();
+        let table_full = uncovered >= MAX_INVITE_PEERS;
+        if table_full && !re_intro {
+            return Err(INVITE_PEERS_FULL.into());
+        }
+        let allowed_ips = self.overlay.identity_allowed_ips(identity);
+        self.invite_peers.insert(
+            identity,
+            InvitePeer {
+                config: PeerTunnelConfig {
+                    wireguard_public_key,
+                    // the intro datagram's observed source — always concrete.
+                    endpoint: Some(endpoint),
+                    allowed_ips,
+                    keepalive_seconds: Some(KEEPALIVE_SECONDS),
+                },
+                installed_at_ms: now_ms,
+            },
+        );
         let peers = self.assemble_peers(merged);
         self.start_wg_push(peers, cont);
         Ok(())

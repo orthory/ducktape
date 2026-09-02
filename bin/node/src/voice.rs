@@ -261,6 +261,7 @@ async fn hub_loop(
     planes: data_plane::PlaneMonitor,
 ) {
     let flows = Arc::new(ActiveFlows::default());
+    let started = Instant::now();
     let binding = crate::voice_plane::bind_media_planes(
         factory,
         peers,
@@ -289,6 +290,14 @@ async fn hub_loop(
             }
         },
     };
+    // the moment the "no session line at all" failure mode becomes
+    // impossible: from here every join is served, not refused.
+    tracing::info!(
+        target: "ducktape::voice",
+        event = "voice_hub_bound",
+        elapsed_s = started.elapsed().as_secs(),
+        "voice hub bound — huddle media planes up"
+    );
     // huddle media is the chat module's: both planes report under it.
     planes.register("chat", Service::Voice, voice_plane.watch());
     planes.register("chat", Service::Video, video_plane.watch());
@@ -296,6 +305,18 @@ async fn hub_loop(
 }
 
 fn refuse_request(request: noded::RealtimeSessionRequest) {
+    let kind = match &request {
+        noded::RealtimeSessionRequest::Call(_) => "call",
+        noded::RealtimeSessionRequest::Presence(_) => "presence",
+    };
+    // one line per refused join (a person clicking, not a loop): the
+    // client gets the prose, the log gets the reason.
+    tracing::warn!(
+        target: "ducktape::voice",
+        reason = "overlay_not_bound",
+        kind,
+        "join refused — the overlay is not up on this node yet"
+    );
     match request {
         noded::RealtimeSessionRequest::Call(request) => {
             let _ = request.reply.send(Err(OVERLAY_DOWN.to_string()));
@@ -753,6 +774,7 @@ async fn run_session<T: DataPlaneTransport>(
                         no_recipients_warned = true;
                         tracing::warn!(
                             target: "ducktape::voice",
+                            reason = "call_no_recipients",
                             channel_id,
                             elapsed_s = elapsed.as_secs(),
                             frames_discarded,

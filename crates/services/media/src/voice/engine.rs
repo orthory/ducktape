@@ -183,6 +183,12 @@ impl<T: DataPlaneTransport> VoiceEngine<T> {
     }
 }
 
+/// the first 8 hex chars of a peer's key: enough to match a roster entry in
+/// a log, never the key.
+fn peer_label(peer: &PeerId) -> String {
+    peer.0[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Drain the flow into per-speaker lanes. Runs for the engine's lifetime;
 /// admission and flow demux already happened at the plane.
 async fn pump<T: DataPlaneTransport>(
@@ -205,6 +211,15 @@ async fn pump<T: DataPlaneTransport>(
                     malformed.fetch_add(1, Ordering::Relaxed);
                     continue;
                 };
+                // the peer's first admitted frame: the plane authenticated
+                // it, the roster admitted it, and its speaker lane exists
+                // from here — once per peer per engine, never per frame.
+                tracing::info!(
+                    target: "ducktape::voice",
+                    event = "voice_peer_handshake_complete",
+                    peer = %peer_label(&peer),
+                    "first media frame from peer — speaker lane opened"
+                );
                 vacant.insert(Lane {
                     jitter: MinimalJitter::new(config.prefill_frames, config.max_depth_frames),
                     decoder,

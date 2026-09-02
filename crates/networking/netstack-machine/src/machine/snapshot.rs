@@ -17,8 +17,8 @@ use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
 use wireguard::effect::PeerTunnelConfig;
 use wireguard::{IdentitySigner, ValidatorIdentity};
 
-use super::Machine;
 use super::pending::{PendingAdopt, PendingOp, PendingRestore};
+use super::{InvitePeer, Machine};
 use crate::contract::{MachineConfig, ReqId};
 use crate::epoch::EpochState;
 use crate::wire::{self, SnapshotError, identity_socket_addrs};
@@ -37,7 +37,7 @@ pub(crate) struct MachineState {
     nudges: u64,
     interface_live: bool,
     base_peers: Option<BTreeMap<ValidatorIdentity, PeerTunnelConfig>>,
-    invite_peers: BTreeMap<ValidatorIdentity, PeerTunnelConfig>,
+    invite_peers: BTreeMap<ValidatorIdentity, InvitePeer>,
     #[borsh(schema(with_funcs(
         declaration = "identity_socket_addrs::declaration",
         definitions = "identity_socket_addrs::definitions"
