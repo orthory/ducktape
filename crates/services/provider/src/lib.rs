@@ -1647,11 +1647,16 @@ impl Drop for ContextGuard {
 /// Reachable from any process in the guest, with no credential:
 /// * the reads the plane exists for — `/v1/query`, `/v1/status`, `/v1/peers`,
 ///   `/v1/blocks`, `/v1/index/*`, the `/v1/files/*` duckfs reads, `/metrics`;
-/// * writes — `/v1/submit`, `/v1/submit/frame`, `/v1/invite` (mints an invite
-///   to this mesh), `/v1/files/` stage/commit/pin, `/v1/files/object/{path}`
-///   PUT and DELETE, `/v1/fs/workspaces` create + commit + delete,
-///   `/v1/services/hello`, `/v1/log-filter`, and the `/forge/{repo}` git
-///   receive-pack remote;
+/// * `/v1/submit` — NOT a scoped write: the handler discards the
+///   caller-supplied `origin` and the node re-signs the op with its OWN
+///   consensus key (`crates/noded/src/lib.rs:718`), so a guest can forge any
+///   module op under this node's identity, bypassing the per-run session
+///   signer that `crates/noded/src/agent_provision/session.rs` exists to
+///   provide. `/v1/submit/frame` needs a real signature and does not;
+/// * the routine writes — `/v1/invite` (mints an invite to this mesh),
+///   `/v1/files/` stage/commit/pin, `/v1/files/object/{path}` PUT and DELETE,
+///   `/v1/fs/workspaces` create + commit + delete, `/v1/services/hello`,
+///   `/v1/log-filter`, and the `/forge/{repo}` git receive-pack remote;
 /// * `/v1/term/sessions` — a guest can spawn an interactive terminal on this
 ///   node, and with a `cred` in the body one on ANOTHER node
 ///   (`term::create_remote`);
@@ -1698,7 +1703,9 @@ fn aim_node_at_guest(envs: &mut Vec<(String, String)>) -> Option<u16> {
             Some(port)
         }
         Err(reason) => {
-            // once per boot, and it costs the run its whole read plane.
+            // once per RUN boot — a node whose http base is not v4 loopback
+            // refuses this on every sandboxed run it ever starts — and it costs
+            // that run its whole read plane.
             tracing::warn!(
                 target: "ducktape::sandbox",
                 reason,
