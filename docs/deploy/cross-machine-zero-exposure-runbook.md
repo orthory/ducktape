@@ -8,18 +8,22 @@ the two real NATs being punchable.
 
 > **Legend.** `[WORKS TODAY]` — runs now with shipped binaries.
 > `[NAT-DEPENDENT]` — the node drives the mechanism, but success depends on the
-> two real NATs admitting a direct punched path. There is no relay fallback.
+> two real NATs admitting a direct punched path. The tunnel has no relay
+> fallback; the coordinator's TCP/443 lane relays only the joiner's sealed
+> first-contact intro (see [`coordinator.md`](coordinator.md)).
 >
 > **Status update (2026-07-08).** The node-side reachability plane is wired
 > behind `wireguard_listen`: `bin/node` constructs a `NatResolver` (reflexive
 > discovery, `register`, hole-punch), consumes unversioned `Coordinated` hints as
 > reachability routes, and desktop-created workspaces default to the public
-> coordinator at `relay.ducktape.industries:3478`. The DERP-style relay remains
-> removed; the coordinator is rendezvous-only (step 8 below).
+> coordinator at `relay.ducktape.industries:3478`. The DERP-style data relay
+> remains removed; the coordinator does rendezvous plus the first-contact-only
+> TCP/443 relay (step 8 below).
 >
-> **This runbook can still fail on specific NAT pairs.** The coordinator only
-> performs rendezvous; if the two NATs will not punch, resolution fails
-> honestly instead of routing traffic through the coordinator.
+> **This runbook can still fail on specific NAT pairs.** The coordinator
+> rendezvouses and relays first contact only; if the two NATs will not punch,
+> tunnel resolution fails honestly instead of routing peer traffic through
+> the coordinator.
 
 ## Topology
 
@@ -58,8 +62,8 @@ This extends the current v1 live-join rig (the NAT-hairpin gotcha and the
 4. **A and B boot dial-out-only against the coordinator's reflexive/rendezvous service.** `[WORKS TODAY]` — with `wireguard_listen` configured, the node constructs a `NatResolver`, sends `BindRequest`, registers, and keeps the mapping warm.
 5. **A `Coordinated` hint is consumed as a reachability path.** `[WORKS TODAY]` — `NetworkDescriptor::reach_entries()` returns `ReachDial::Coordinated`, and `bin/node` routes those entries into the reachability resolver instead of dialing the coordinator as a TCP mesh peer.
 6. **A and B publish their reflexive endpoints and rendezvous.** `[NAT-DEPENDENT]` — the node drives lookup and punch through `NatResolver`; success depends on the observed NAT mappings being punchable.
-7. **A and B hole-punch a direct WireGuard tunnel (coordinator-timed simultaneous open).** `[NAT-DEPENDENT]` — the library path is CI-proven and the node drives it, but a NAT pair that cannot punch fails honestly because there is no relay fallback.
-8. **On hole-punch failure, resolution fails honestly.** `[BY DESIGN]` — there is no relay fallback (the DERP-style relay was removed 2026-07-06; the coordinator is rendezvous-only). A pair that cannot punch surfaces a `PeerFailed` or falls back only to a real advertised endpoint if one exists; a symmetric↔symmetric pair with no routable endpoint needs a different entry path.
+7. **A and B hole-punch a direct WireGuard tunnel (coordinator-timed simultaneous open).** `[NAT-DEPENDENT]` — the library path is CI-proven and the node drives it, but a NAT pair that cannot punch fails honestly because the tunnel has no relay fallback.
+8. **On hole-punch failure, resolution fails honestly.** `[BY DESIGN]` — the tunnel has no relay fallback (the DERP-style data relay was removed 2026-07-06; the coordinator's TCP/443 lane carries only the sealed first-contact intro, so a non-punching joiner can redeem its invite through it and then has no tunnel). A pair that cannot punch surfaces a `PeerFailed` or falls back only to a real advertised endpoint if one exists; a symmetric↔symmetric pair with no routable endpoint needs a different entry path.
 9. **Real state-sync / root-hash flows over the tunnel.** `[NAT-DEPENDENT]` — depends on steps 6-7 establishing a direct path.
 
 ## What you CAN demo today vs. what proves the tunnel
