@@ -1251,11 +1251,43 @@ mod tests {
         let serving = std::thread::spawn(move || {
             use std::io::{Read as _, Write as _};
             let (mut conn, _) = listener.accept().expect("the client connects");
+            // Read the WHOLE request before answering. Closing a socket with
+            // unread data still queued makes Linux answer with an RST, which
+            // can destroy the response this test asserts on — and a request
+            // head and its body do arrive as separate segments.
+            let mut request = Vec::new();
             let mut scratch = [0u8; 4096];
-            let _ = conn.read(&mut scratch);
+            while !is_complete_request(&request) {
+                let read = conn
+                    .read(&mut scratch)
+                    .expect("the client sends its request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&scratch[..read]);
+            }
             let _ = conn.write_all(response.as_bytes());
         });
         OneShotNode { base, serving }
+    }
+
+    /// true once `request` holds a full HTTP head plus the `content-length`
+    /// bytes it declares — everything the client will send.
+    fn is_complete_request(request: &[u8]) -> bool {
+        let Some(head_end) = request
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|at| at + 4)
+        else {
+            return false;
+        };
+        let head = String::from_utf8_lossy(&request[..head_end]).to_lowercase();
+        let declared = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        request.len() >= head_end + declared
     }
 
     #[test]
