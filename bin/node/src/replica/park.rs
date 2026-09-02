@@ -1472,6 +1472,15 @@ pub(super) async fn park(
                         // an unpaid cooldown from the previous checkpoint would
                         // otherwise hold this one off for minutes.
                         checkpoint_not_before = context.current();
+                        // ...and the CHANGE GATE with it. A cutover moves the
+                        // manifest's epoch/view_base WITHOUT moving the state
+                        // root, so `state_moved` is false at exactly the moment
+                        // the new boundary must reach disk. `None` is the gate's
+                        // own "re-anchor on the first cadence hit", so the force
+                        // stays a force. The validator's post-cutover checkpoint
+                        // escapes the gate by living in its own branch; the
+                        // replica routes through the shared one, so it clears it.
+                        replica_written_root = None;
                         tracing::info!(
                             target: "ducktape::consensus",
                             node = %label,
