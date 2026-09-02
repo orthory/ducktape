@@ -9,7 +9,7 @@
 #   2. start the daemon      systemctl start ducktape-service@compute
 #      (it signals, prints "not enabled", and parks — consent is the
 #      operator's, never the unit's)
-#   3. consent, once         sudo -u ducktape DUCKTAPE_HOME=/var/lib/ducktape \
+#   3. consent, once         sudo -u ducktape env DUCKTAPE_HOME=/var/lib/ducktape \
 #                              ducktape service enable compute
 #   4. pick up the grant     systemctl restart ducktape-service@compute
 #
@@ -57,7 +57,7 @@ Restart=always
 RestartSec=5
 LimitNOFILE=65536
 
-# ---- least privilege (same posture as ducktape-node@) --------------------
+# ---- least privilege: ducktape-node@'s posture plus the microVM grants ----
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
@@ -67,6 +67,8 @@ ProtectHome=yes
 # /tmp private, and point TMPDIR at a disk with room via node.env if /tmp
 # is tmpfs.
 PrivateTmp=yes
+# NOT PrivateDevices: compute and agent open /dev/kvm per run. `closed` keeps
+# the standard pseudo devices (null, zero, urandom, ptmx) and nothing else.
 DevicePolicy=closed
 DeviceAllow=/dev/kvm rw
 ProtectProc=invisible

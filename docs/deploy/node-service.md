@@ -43,7 +43,7 @@ when set, else `~/.ducktape`. The units set
 Every operator verb you run against that tree needs the same view of it:
 
 ```sh
-alias dt='sudo -u ducktape DUCKTAPE_HOME=/var/lib/ducktape /usr/local/bin/ducktape'
+alias dt='sudo -u ducktape env DUCKTAPE_HOME=/var/lib/ducktape /usr/local/bin/ducktape'
 ```
 
 ## Install
@@ -54,7 +54,8 @@ alias dt='sudo -u ducktape DUCKTAPE_HOME=/var/lib/ducktape /usr/local/bin/duckta
 make install-node
 sudo install -m 0755 ~/.cargo/bin/ducktape /usr/local/bin/ducktape
 
-# 2. A dedicated user. The kvm group is what lets the sandbox open /dev/kvm.
+# 2. A dedicated user. The kvm group is for the service daemons: compute and
+#    agent open /dev/kvm per run; `node run` itself never does.
 sudo useradd --system --home-dir /var/lib/ducktape --shell /usr/sbin/nologin ducktape
 sudo usermod -aG kvm ducktape
 sudo install -d -o ducktape -g ducktape -m 0700 /var/lib/ducktape
@@ -86,7 +87,8 @@ searched (`crates/services/sandbox/src/host_tools.rs`).
 
 The instance name is the workspace selector `ducktape node run -n` takes:
 the chain id or any unique prefix. A chain id carries `#`, which a unit name
-cannot, so use the name half or escape it:
+cannot, so use the name half or escape it (the unit passes `%I`, the
+unescaped instance, to `-n`, so both forms select the workspace):
 
 ```sh
 sudo systemctl enable --now ducktape-node@mynet
