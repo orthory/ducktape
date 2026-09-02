@@ -624,11 +624,11 @@ fn a_multi_module_script_converges_logically_while_qmdb_roots_split_on_block_str
     // the timestamp-stamping modules converge once the block-dependent stamp is
     // stripped: the SAME entities exist in both runs, only their created_at differs.
     let tasks_a = strip(
-        &sim_a.query("tasks", serde_json::json!({ "task": "list" }))["task"]["tasks"],
+        &sim_a.query("tasks", serde_json::json!({ "task": { "list": { "limit": 256 } } }))["task"]["tasks"],
         &["created_at", "updated_at"],
     );
     let tasks_b = strip(
-        &sim_b.query("tasks", serde_json::json!({ "task": "list" }))["task"]["tasks"],
+        &sim_b.query("tasks", serde_json::json!({ "task": { "list": { "limit": 256 } } }))["task"]["tasks"],
         &["created_at", "updated_at"],
     );
     assert_eq!(

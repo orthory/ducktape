@@ -310,7 +310,7 @@ fn a_task_id_collision_aborts_the_entire_triggering_block() {
         message["message"].is_null(),
         "the aborted post left no message: {message}"
     );
-    let tasks = sim.query("tasks", serde_json::json!({ "task": "list" }));
+    let tasks = sim.query("tasks", serde_json::json!({ "task": { "list": { "limit": 256 } } }));
     assert_eq!(
         tasks["task"]["tasks"].as_array().map(Vec::len),
         Some(0),

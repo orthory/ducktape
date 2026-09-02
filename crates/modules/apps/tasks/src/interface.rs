@@ -58,7 +58,16 @@ pub enum TaskQuery {
     /// one page in ascending id order: at most `limit` tasks (clamped into
     /// `1..=`[`crate::MAX_LIST_LIMIT`]) whose ids sort strictly after `after`.
     /// page by handing the last returned id back as the next `after`.
-    List { limit: u64, after: Option<String> },
+    ///
+    /// `limit` is REQUIRED — a caller that does not say how much of the board
+    /// it wants is the unbounded read this page exists to replace, and a
+    /// defaulted 0 would clamp to 1 and read as an empty board. `after` is the
+    /// continuation, absent on the first page.
+    List {
+        limit: u64,
+        #[serde(default)]
+        after: Option<String>,
+    },
 }
 
 /// replies to [`TaskQuery`].

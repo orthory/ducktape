@@ -150,7 +150,7 @@ fn a_matching_post_fires_its_rule_atomically_in_the_same_block() {
 
     // a non-matching post fires nothing.
     sim.submit_ok("chat", post_message("general", "m-1", "hello world"), None);
-    let tasks = sim.query("tasks", serde_json::json!({ "task": "list" }));
+    let tasks = sim.query("tasks", serde_json::json!({ "task": { "list": { "limit": 256 } } }));
     assert_eq!(
         tasks["task"]["tasks"].as_array().map(Vec::len),
         Some(0),
@@ -172,7 +172,7 @@ fn a_matching_post_fires_its_rule_atomically_in_the_same_block() {
     );
 
     // the task id is deterministic per (prefix, channel, seq) — m-2 is seq 2.
-    let tasks = sim.query("tasks", serde_json::json!({ "task": "list" }));
+    let tasks = sim.query("tasks", serde_json::json!({ "task": { "list": { "limit": 256 } } }));
     assert_eq!(
         tasks["task"]["tasks"][0]["id"], "auto-general-2",
         "tasks: {tasks}"
