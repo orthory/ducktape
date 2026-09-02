@@ -361,6 +361,16 @@ impl IndexStore {
         Ok(&self.module(module)?.db)
     }
 
+    /// the ONE place the store poisons. every write path hands its outcome
+    /// through here: from then on writes refuse, reads keep serving, and the
+    /// remedy is the crate's — delete the index directory and replay.
+    fn poison_on_err(&self, out: Result<()>) -> Result<()> {
+        if out.is_err() {
+            self.poisoned.store(true, Ordering::Relaxed);
+        }
+        out
+    }
+
     /// the watermark: every block at or below this height is fully in the
     /// module's op feed. 0 for a fresh index. says NOTHING about the derived
     /// view, which trails by [`IndexStore::fold_status`]'s backlog.
@@ -410,11 +420,7 @@ impl IndexStore {
     /// the backfill floor: when present, the module was stamped at a boundary
     /// — its op feed (and everything derived) visibly begins above it.
     pub fn backfill_height(&self, module: &str) -> Result<Option<u64>> {
-        let db = self.db(module)?;
-        Ok(db
-            .get(META_BACKFILL.as_bytes())?
-            .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
-            .map(u64::from_be_bytes))
+        Ok(read_backfill(self.db(module)?)?)
     }
 
     /// the fold trigger's backlog + last drain error, `None` for a module
@@ -444,11 +450,7 @@ impl IndexStore {
         if self.is_poisoned() {
             return Err(Error::Poisoned);
         }
-        let out = self.apply_inner(block);
-        if out.is_err() {
-            self.poisoned.store(true, Ordering::Relaxed);
-        }
-        out
+        self.poison_on_err(self.apply_inner(block))
     }
 
     fn apply_inner(&self, block: &BlockOps) -> Result<()> {
@@ -541,10 +543,7 @@ impl IndexStore {
             }
             Ok(())
         })();
-        if out.is_err() {
-            self.poisoned.store(true, Ordering::Relaxed);
-        }
-        out
+        self.poison_on_err(out)
     }
 
     /// the newest `limit` explorer rows, oldest-first — the durable equivalent
@@ -604,10 +603,7 @@ impl IndexStore {
             }
             Ok(())
         })();
-        if out.is_err() {
-            self.poisoned.store(true, Ordering::Relaxed);
-        }
-        out
+        self.poison_on_err(out)
     }
 
     /// write verbatim op rows into a module's feed WITHOUT touching the
@@ -655,10 +651,7 @@ impl IndexStore {
             }
             Ok(())
         })();
-        if out.is_err() {
-            self.poisoned.store(true, Ordering::Relaxed);
-        }
-        out
+        self.poison_on_err(out)
     }
 
     /// set (or clear) a module's backfill floor and NOTHING else — no wipe, no
@@ -676,10 +669,7 @@ impl IndexStore {
             Some(height) => db.put(META_BACKFILL, height.to_be_bytes()),
             None => db.delete(META_BACKFILL),
         };
-        if out.is_err() {
-            self.poisoned.store(true, Ordering::Relaxed);
-        }
-        Ok(out?)
+        self.poison_on_err(out.map_err(Error::from))
     }
 
     /// re-derive a module's read model from the op feed it already holds:
@@ -721,20 +711,16 @@ impl IndexStore {
             m.db.delete_trigger(FOLD_TRIGGER)?;
             clear_derived(&m.db)?;
             create_fold_trigger(&m.db)?;
-            replay_op_feed(&m.db)?;
             // AND WAIT FOR IT, for `converge_guest`'s reason: returning over a
             // cleared keyspace serves "no such page" for every page, which is
             // indistinguishable from a workspace that lost its documents.
-            drain_fold(&m.db, module)?;
+            refold_feed(&m.db, module)?;
             if let Some(marker) = marker {
                 m.db.put(META_GUEST, marker)?;
             }
             Ok(())
         })();
-        if out.is_err() {
-            self.poisoned.store(true, Ordering::Relaxed);
-        }
-        out
+        self.poison_on_err(out)
     }
 
     /// advance a module's feed watermark to `height` and NOTHING else — the
@@ -756,10 +742,7 @@ impl IndexStore {
             db.put(META_HEIGHT, height.to_be_bytes())?;
             Ok(())
         })();
-        if out.is_err() {
-            self.poisoned.store(true, Ordering::Relaxed);
-        }
-        out
+        self.poison_on_err(out)
     }
 
     /// point read of one stored key at the current snapshot.
@@ -910,7 +893,6 @@ fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
     if has_fold {
         clear_derived(db)?;
         create_fold_trigger(db)?;
-        replay_op_feed(db)?;
         // AND WAIT FOR IT. `replay_op_feed` only STAGES the re-writes; the
         // trigger runner folds them behind it. Returning here would hand the
         // node an open store whose read model is the freshly CLEARED keyspace
@@ -924,7 +906,7 @@ fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
         // does at `wasm_entries` above: a guest that cannot fold its own feed
         // has no read model to serve, and saying so beats serving nothing
         // quietly.
-        drain_fold(db, spec.id)?;
+        refold_feed(db, spec.id)?;
     }
     // written LAST, so an interrupted refold re-runs whole at the next open
     // instead of leaving a marker that vouches for a half-derived read model.
@@ -1015,6 +997,14 @@ fn clear_derived(db: &Db) -> Result<()> {
     if staged > 0 {
         db.write(batch)?;
     }
+    Ok(())
+}
+
+/// re-drive the fold over the whole op feed and WAIT for it — the shared tail
+/// of a mapper converge and a backfill's closing refold.
+fn refold_feed(db: &Db, module: &str) -> Result<()> {
+    replay_op_feed(db)?;
+    drain_fold(db, module)?;
     Ok(())
 }
 
@@ -1129,6 +1119,14 @@ fn read_height(db: &Db) -> fluent31::Result<u64> {
         .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
         .map(u64::from_be_bytes)
         .unwrap_or(0))
+}
+
+/// the backfill floor, when a boundary stamp set one.
+fn read_backfill(db: &Db) -> fluent31::Result<Option<u64>> {
+    Ok(db
+        .get(META_BACKFILL.as_bytes())?
+        .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+        .map(u64::from_be_bytes))
 }
 
 /// the smallest byte string greater than every key with `prefix`: increment
