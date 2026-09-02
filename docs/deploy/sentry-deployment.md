@@ -161,7 +161,9 @@ Phase 1 ships **no consensus/production behavior change** — it converts an
 already-working, configuration-only capability into a regression-guarded,
 documented one (`bin/node/tests/sentry_e2e.rs`). The typed reach hints
 (`Direct`/`Coordinated` — `crates/workspace-config/src/lib.rs` `Reach`; a
-`Fronted` variant survives in `Reach` and its codec — `Reach::parse` reads a
-`fronted:` hint and `invite.rs` round-trips it — but no verb emits one), coordinator/STUN
+`Fronted` variant still sits in `Reach` and its codec — `Reach::parse` reads a
+`fronted:` hint and `invite.rs` round-trips it — but no verb emits one: it is
+dead code under the repo's no-legacy rule, left for a deletion of its own, not
+a supported hint), coordinator/STUN
 rendezvous, and the private (WireGuard) cutover are later phases; a sentry is
 addressed through a plain `Direct` hint naming its public address.
