@@ -19,6 +19,9 @@ sim = []
 
 [dependencies]
 sha2 = { workspace = true }
+# `ducktape::blobstore`: a persist failure and a content-hash mismatch are the
+# two faults this store can see, and an `eprintln!` reached neither sink.
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

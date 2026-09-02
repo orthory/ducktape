@@ -1,7 +1,7 @@
 # Authoring wasm modules
 
 How to write, build, and live-update a Ducktape wasm module. The runtime is
-`crates/kernel/wasm-host` (wasmtime, pinned `=46.0.1`); the authoring contract is
+`crates/kernel/wasm-host` (wasmtime, pinned `=46.0.3`); the authoring contract is
 the `ducktape:module` WIT world (`crates/kernel/module-guest/wit/module.wit`);
 the reference modules are `crates/guests/hello-wasm`,
 `crates/guests/hello-wasm-replacement` (its live-update target), and

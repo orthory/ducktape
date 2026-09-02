@@ -102,11 +102,24 @@ impl BlobStore {
                     self.cache(digest, bytes);
                     return digest;
                 }
-                Err(why) => eprintln!(
-                    "[blobstore] cannot persist blob {} under {}: {why}; kept in memory only",
-                    hex(&digest),
-                    root.display()
-                ),
+                // every put after a disk fault (a full disk, most likely)
+                // lands here, several per block under the explorer projection
+                // — latched, or the fault evicts the ring that explains it.
+                Err(why) => {
+                    static PERSIST_FAILURES: Latch = Latch::new();
+                    if let Some(occurrences) = PERSIST_FAILURES.hit() {
+                        tracing::error!(
+                            target: "ducktape::blobstore",
+                            reason = "blob_persist_failed",
+                            digest = digest_prefix(&digest),
+                            root = %root.display(),
+                            bytes = bytes.len(),
+                            occurrences,
+                            error = %why,
+                            "cannot persist blob — kept in memory only"
+                        );
+                    }
+                }
             }
         }
         // no disk copy exists (pure in-memory store, or the write just
@@ -229,13 +242,48 @@ impl BlobStore {
         let path = self.root.as_ref()?.join(hex(digest));
         let bytes = std::fs::read(&path).ok()?;
         if sha256(&bytes) != *digest {
-            eprintln!(
-                "[blobstore] blob file {} fails its content hash; treating it as absent",
-                path.display()
-            );
+            // a corrupt file is re-read on every miss for it, so a hot blob
+            // would repeat this per request — latched, like the persist fault.
+            static HASH_MISMATCHES: Latch = Latch::new();
+            if let Some(occurrences) = HASH_MISMATCHES.hit() {
+                tracing::warn!(
+                    target: "ducktape::blobstore",
+                    reason = "blob_hash_mismatch",
+                    digest = digest_prefix(digest),
+                    bytes = bytes.len(),
+                    occurrences,
+                    "blob file fails its content hash — treated as absent"
+                );
+            }
             return None;
         }
         Some(bytes)
+    }
+}
+
+/// the first 16 hex chars of a digest: enough to find the file, never the
+/// bytes it names.
+fn digest_prefix(digest: &[u8; 32]) -> String {
+    hex(digest)[..16].to_string()
+}
+
+/// a first-and-every-Nth counter for a fault that REPEATS: the first sighting
+/// logs immediately, then every [`Latch::EVERY`]th, carrying the count. the
+/// same shape as `noded::log::Latch`, which this crate cannot link (it sits
+/// below the daemon library), keyed by the static that holds it.
+struct Latch(std::sync::atomic::AtomicU64);
+
+impl Latch {
+    const EVERY: u64 = 100;
+
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicU64::new(0))
+    }
+
+    /// `Some(occurrences)` when this occurrence should be logged.
+    fn hit(&self) -> Option<u64> {
+        let n = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        (n == 1 || n.is_multiple_of(Self::EVERY)).then_some(n)
     }
 }
 

@@ -288,11 +288,11 @@ zeroize = "1"
 # default-features = false keeps the base dep lean; the indexer crate turns the
 # `wasm` feature on — the in-database WASM layer (wasmtime) runs the per-module
 # index guests (fold triggers + view queries).
-fluent31 = { git = "https://github.com/orthory/fluent31", default-features = false }
+fluent31 = { git = "https://github.com/orthory/fluent31", rev = "0a1fd768101deb69ee50817167b9aedd6c026c51", default-features = false }
 # fluent-guest — fluent31's wasm32 guest SDK. NEVER a host-side dependency:
 # only the index-guest crate's `guest` feature pulls it, and only guest-builder's
 # synthesized wasm32 workspaces ever enable that feature.
-fluent-guest = { git = "https://github.com/orthory/fluent31", default-features = false }
+fluent-guest = { git = "https://github.com/orthory/fluent31", rev = "0a1fd768101deb69ee50817167b9aedd6c026c51", default-features = false }
 # borsh — the deterministic op-row envelope on the derived tier's fold feed
 # (host encodes, index guests decode; one byte layout, no map ordering games).
 borsh = { version = "1", default-features = false, features = ["derive", "std"] }
@@ -301,7 +301,7 @@ borsh = { version = "1", default-features = false, features = ["derive", "std"] 
 # modules inside the host. pinned EXACTLY: the runtime IS the module execution
 # semantics, so it is consensus-affecting and every validator must run the
 # identical build; changing it is a binary upgrade, never a live module swap.
-wasmtime = "=46.0.1"
+wasmtime = "=46.0.3"
 # wit-bindgen — the guest-side binding generator for a crate's own component
 # port (the netstack machine's `guest` feature). Only ever compiled inside
 # guest-builder's synthesized wasm32 workspace.
