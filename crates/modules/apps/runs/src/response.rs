@@ -141,7 +141,14 @@ fn normalize_response(mut response: AgentResponse, raw_text: &str, job_run: bool
     // the runner result. It is not a consensus-delivery facet, and retaining
     // it here could needlessly inflate a job's bounded finalize payload.
     response.commit_message = None;
-    response.actions.truncate(MAX_ACTIONS_PER_RUN);
+    // NOTHING is dropped from the action set here. normalization SHAPES a
+    // response (unknown block kinds, empty texts); the caps are the validator's
+    // to enforce, loudly — `validate_response` refuses an over-cap set by name
+    // and the run fails with that sentence in its reply. this used to
+    // `truncate(MAX_ACTIONS_PER_RUN)`, which silently dropped the tail (an
+    // agent closing a run with twelve actions lost four, with no line in the
+    // log, the run output or the reply) and made the validator's own count
+    // check unreachable from the provider path.
     response.reply_blocks = response
         .reply_blocks
         .into_iter()
