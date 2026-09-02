@@ -31,11 +31,13 @@ node invite ── one-line blob ─► node join <blob>
                                                                  PENDING JOIN REQUEST
 grant standing (app button, or
 `node resident accept <pubkey>`) ── governance ballot ────────► majority passes
-                                                                 → valset Join
-                                                                 → epoch cutover
+                                                                 → valset Grant (resident tier)
+                                                                 → membership generation advances
                                 joiner syncs state, reboots,
                                 serves as a resident
 seat it (`node member promote <pubkey>`) ── governance ballot ─► majority passes
+                                                                 → valset Join
+                                                                 → epoch cutover
                                                                  → quorum widens
 ```
 
