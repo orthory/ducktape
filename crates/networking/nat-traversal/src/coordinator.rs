@@ -272,6 +272,9 @@ impl Coordinator {
                 // The registered reflexive address IS the observed source: the
                 // coordinator never trusts a self-reported address.
                 adverts.observe(key, from, now);
+                // The book is done with; a log write (stderr, and a node's
+                // LogRing) must not happen under its lock.
+                drop(adverts);
                 tracing::debug!(
                     target: "ducktape::reachability",
                     event = "advert_registered",
@@ -288,7 +291,9 @@ impl Coordinator {
                 // `AdvertBook` staleness guard rejects an equal-or-lower nonce, so
                 // a replayed/reordered datagram cannot supersede a fresh mapping
                 // — nor extend its life.
-                match adverts.readvertise(key, from, nonce, now) {
+                let outcome = adverts.readvertise(key, from, nonce, now);
+                drop(adverts);
+                match outcome {
                     // the 25 s keepalive of every member: per-frame traffic.
                     AdvertOutcome::Superseded => tracing::trace!(
                         target: "ducktape::reachability",
