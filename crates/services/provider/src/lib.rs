@@ -32,7 +32,7 @@
 //! [`spec`] and `docs/records/specs/capability-spec.md`), not by Rust. the built-in
 //! executor support ships as embedded spec files parsed by the same code
 //! path as operator-provided specs under `$DUCKTAPE_CAPABILITY_DIR` (default
-//! `~/.ducktape/capabilities`). adding an executor — or retuning a built-in's
+//! `<ducktape home>/capabilities`). adding an executor — or retuning a built-in's
 //! flags, including which model it runs — is a config change on the
 //! operator's machine, never a code change here. dispatch is by EXPLICIT
 //! capability tag: [`ProviderSet::resolve`] takes the tag a job names,
@@ -2897,7 +2897,7 @@ fn excerpt(s: &str) -> String {
 ///
 /// spec sources: the embedded built-ins, then `$DUCKTAPE_CAPABILITY_DIR`
 /// (explicitly set and missing = hard error — the operator asked for a dir
-/// that is not there) or `~/.ducktape/capabilities` when it exists. a broken
+/// that is not there) or `<ducktape home>/capabilities` when it exists. a broken
 /// spec is a hard `Err`: an operator config error fails the boot loudly, it
 /// does not silently drop an executor.
 ///
@@ -2957,15 +2957,44 @@ pub fn discover(
     ))
 }
 
+/// everything this operator's node keeps on disk: `$DUCKTAPE_HOME` when the
+/// override is set to a non-empty value, else `$HOME/.ducktape`. an empty
+/// value means unset, which is how the shell's `${DUCKTAPE_HOME:-…}` readers
+/// treat it — the two must not disagree about a set-but-empty variable.
+///
+/// this is a deliberate small copy of the workspace-config resolver rather
+/// than a call into it: this crate is a dependency of agent-service and
+/// compute-service, which stay light on purpose, and linking workspace-config
+/// would pull the node's whole graph — the wasm runtime, the p2p stack,
+/// governance, the network planes — behind them. the copy is ~six lines and
+/// the lint below keeps it the crate's only reader of that root.
+fn ducktape_home() -> Option<PathBuf> {
+    ducktape_home_from(std::env::var_os("DUCKTAPE_HOME"), std::env::var_os("HOME"))
+}
+
+/// the resolution above with both variables passed in, so a test covers set /
+/// set-but-empty / unset without mutating this process's environment.
+fn ducktape_home_from(root: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    let overridden = root.filter(|root| !root.is_empty());
+    match overridden {
+        Some(root) => Some(PathBuf::from(root)),
+        None => Some(PathBuf::from(home?).join(".ducktape")),
+    }
+}
+
 /// the operator spec dir: an explicit `$DUCKTAPE_CAPABILITY_DIR` is returned
 /// even if absent (so the load errors loudly), the default location only when
 /// it actually exists (absent default = simply no operator specs).
+///
+/// the default hangs off [`ducktape_home`] — the same root that gives this
+/// node its keys, workspaces, executors and guest images. a node run under
+/// `DUCKTAPE_HOME=/srv/duck` must not find all of those there and then read
+/// its operator specs out of `$HOME`.
 fn operator_spec_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("DUCKTAPE_CAPABILITY_DIR") {
         return Some(PathBuf::from(dir));
     }
-    let home = std::env::var_os("HOME")?;
-    let dir = PathBuf::from(home).join(".ducktape").join("capabilities");
+    let dir = ducktape_home()?.join("capabilities");
     dir.is_dir().then_some(dir)
 }
 
@@ -3185,14 +3214,20 @@ mod tests {
         firecracker_backend_with(installed_executor_dir())
     }
 
-    /// this operator's own executors directory, resolved the way
-    /// `workspace-config` resolves it for a real node.
+    /// this operator's own executors directory: `$DUCKTAPE_EXECUTOR_DIR`, else
+    /// `<ducktape home>/executors` — resolved through [`ducktape_home`], which
+    /// is what a real node resolves it through too.
     fn installed_executor_dir() -> PathBuf {
-        let home = std::env::var("DUCKTAPE_HOME")
-            .unwrap_or_else(|_| format!("{}/.ducktape", std::env::var("HOME").unwrap()));
-        PathBuf::from(
-            std::env::var("DUCKTAPE_EXECUTOR_DIR").unwrap_or_else(|_| format!("{home}/executors")),
-        )
+        match std::env::var_os("DUCKTAPE_EXECUTOR_DIR") {
+            Some(dir) => PathBuf::from(dir),
+            None => home_for_tests().join("executors"),
+        }
+    }
+
+    /// the operator root a hardware test's artifacts sit under. `expect`
+    /// because a run with neither variable set has nowhere to look for them.
+    fn home_for_tests() -> PathBuf {
+        ducktape_home().expect("the test env resolves an operator root")
     }
 
     /// the live backend with an explicit executors directory — the one whose
@@ -3211,16 +3246,18 @@ mod tests {
         )
     }
 
+    /// the guest images the rootfs builder wrote: `$DUCKTAPE_GUEST_DIR` when a
+    /// hardware run points this at a build tree, else `<ducktape home>/guest`
+    /// — the same default the builder and the `[sandbox]` table use.
     fn live_backend(vmm: sandbox_host::Vmm, executors: PathBuf) -> SandboxBackend {
-        let dir = std::env::var("DUCKTAPE_GUEST_DIR").unwrap_or_else(|_| {
-            let home = std::env::var("DUCKTAPE_HOME")
-                .unwrap_or_else(|_| format!("{}/.ducktape", std::env::var("HOME").unwrap()));
-            format!("{home}/guest")
-        });
+        let dir = match std::env::var_os("DUCKTAPE_GUEST_DIR") {
+            Some(dir) => PathBuf::from(dir),
+            None => home_for_tests().join("guest"),
+        };
         SandboxBackend::MicroVm {
             vmm,
-            kernel: PathBuf::from(&dir).join("vmlinux"),
-            rootfs: PathBuf::from(&dir).join("rootfs.ext4"),
+            kernel: dir.join("vmlinux"),
+            rootfs: dir.join("rootfs.ext4"),
             executors,
         }
     }
@@ -4336,6 +4373,86 @@ format = "text"
         let specs = SpecSet::from_specs(vec![custom]);
         let set = discover_with(specs, Some(dir.into_os_string()), &no_env, None);
         assert_eq!(set.capabilities(), vec!["myllm"]);
+    }
+
+    /// The operator root: an override wins, a set-but-empty one does not.
+    ///
+    /// Empty-means-unset is the half that is easy to get wrong and the half a
+    /// shell reader gets for free: with `DUCKTAPE_HOME=` exported, a resolver
+    /// that only asks "is it set" hands back a relative `capabilities` in
+    /// whatever directory the node happened to start in.
+    #[test]
+    fn operator_spec_root_takes_an_override_and_reads_an_empty_one_as_unset() {
+        let home = Some(OsString::from("/home/duck"));
+        let default_root = Some(PathBuf::from("/home/duck/.ducktape"));
+        assert_eq!(
+            ducktape_home_from(Some(OsString::from("/srv/duck")), home.clone()),
+            Some(PathBuf::from("/srv/duck")),
+            "a non-empty override is the root"
+        );
+        assert_eq!(
+            ducktape_home_from(Some(OsString::new()), home.clone()),
+            default_root,
+            "set-but-empty is unset, the way the shell readers take it"
+        );
+        assert_eq!(ducktape_home_from(None, home), default_root, "the default");
+        assert_eq!(
+            ducktape_home_from(None, None),
+            None,
+            "no override and no home resolves to no root at all, not to a \
+             relative path in whatever directory the node started in"
+        );
+    }
+
+    /// One resolver reads the operator root, crate-wide.
+    ///
+    /// A source-parsing lint over every `src/*.rs` because the SHAPE is the
+    /// property and the seam reads process env, which this crate's discovery
+    /// path deliberately injects rather than mutates. Re-derive the root in a
+    /// second place and a node under `DUCKTAPE_HOME=/srv/duck` finds its keys,
+    /// workspaces, executors and images there while reading its capability
+    /// specs out of `$HOME` — silently, since an absent default dir just means
+    /// "no operator specs". The needles carry their own quotes, so the
+    /// escaped spellings on these lines are not themselves hits.
+    #[test]
+    fn operator_spec_root_has_exactly_one_reader_in_this_crate() {
+        const OVERRIDE_NEEDLE: &str = "\"DUCKTAPE_HOME\"";
+        const DEFAULT_NEEDLE: &str = "\".ducktape\"";
+        const RESOLVER: &str = "fn ducktape_home() -> Option<PathBuf> {";
+        const END_OF_FN: &str = "\n}\n";
+
+        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(&src_dir).expect("the crate's src directory") {
+            let path = entry.expect("a src directory entry").path();
+            let is_rust_source = path.extension().is_some_and(|ext| ext == "rs");
+            if !is_rust_source {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("a readable source file");
+            // Cut the two-function resolver out of the file that holds it;
+            // every other file is scanned whole.
+            let outside_the_resolver = match src.split_once(RESOLVER) {
+                None => src,
+                Some((before, rest)) => {
+                    let (_, rest) = rest.split_once(END_OF_FN).expect("ducktape_home's brace");
+                    let (_, after) = rest
+                        .split_once(END_OF_FN)
+                        .expect("ducktape_home_from's brace");
+                    format!("{before}{after}")
+                }
+            };
+            let reads_the_override = outside_the_resolver.contains(OVERRIDE_NEEDLE);
+            let spells_the_default = outside_the_resolver.contains(DEFAULT_NEEDLE);
+            if reads_the_override || spells_the_default {
+                offenders.push(path.display().to_string());
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these files resolve the operator root themselves instead of \
+             asking ducktape_home() for it: {offenders:?}"
+        );
     }
 
     // ---- resolve() ----------------------------------------------------------

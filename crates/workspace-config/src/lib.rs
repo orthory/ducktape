@@ -849,14 +849,32 @@ pub fn sync_source_candidates<A>(
 // ============================================================================
 
 /// everything this operator's node keeps on disk: `$DUCKTAPE_HOME` when the
-/// override is set (tests, portable setups), else `~/.ducktape`.
+/// override is set to a non-empty value (tests, portable setups), else
+/// `~/.ducktape`.
+///
+/// set-but-empty is unset. That is how the shell readers beside this one spell
+/// it (`${DUCKTAPE_HOME:-$HOME/.ducktape}`), and honouring an empty value here
+/// would resolve every root under it to a RELATIVE path in whatever directory
+/// the node happened to start in.
 pub fn ducktape_home() -> Result<PathBuf, String> {
-    if let Some(home) = std::env::var_os("DUCKTAPE_HOME") {
-        return Ok(PathBuf::from(home));
+    ducktape_home_from(std::env::var_os("DUCKTAPE_HOME"), std::env::var_os("HOME"))
+}
+
+/// the resolution above with both variables passed in, so a test covers set /
+/// set-but-empty / unset without mutating this process's environment.
+fn ducktape_home_from(
+    root: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Result<PathBuf, String> {
+    let overridden = root.filter(|root| !root.is_empty());
+    match overridden {
+        Some(root) => Ok(PathBuf::from(root)),
+        None => {
+            let home = home
+                .ok_or("cannot resolve $HOME — pass --config <node.toml> instead of --network")?;
+            Ok(PathBuf::from(home).join(".ducktape"))
+        }
     }
-    let home = std::env::var_os("HOME")
-        .ok_or("cannot resolve $HOME — pass --config <node.toml> instead of --network")?;
-    Ok(PathBuf::from(home).join(".ducktape"))
 }
 
 /// the registry root: `<ducktape_home>/workspaces`.
@@ -976,7 +994,7 @@ pub fn list_workspaces() -> Result<Vec<(String, PathBuf)>, String> {
     list_workspaces_in(&workspaces_root()?)
 }
 
-fn list_workspaces_in(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+pub fn list_workspaces_in(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1010,6 +1028,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create test dir");
         dir
+    }
+
+    /// `DUCKTAPE_HOME` wins when it says something; a set-but-empty one is
+    /// unset. The shell readers spell that with `${DUCKTAPE_HOME:-…}` and get
+    /// it for free — honouring an empty value here would put every root this
+    /// resolves under a RELATIVE path in whatever directory the node started
+    /// in, and the two halves of a run would disagree about where its home is.
+    #[test]
+    fn ducktape_home_takes_an_override_and_reads_an_empty_one_as_unset() {
+        use std::ffi::OsString;
+
+        let home = Some(OsString::from("/home/duck"));
+        let default_root = PathBuf::from("/home/duck/.ducktape");
+        assert_eq!(
+            ducktape_home_from(Some(OsString::from("/srv/duck")), home.clone()),
+            Ok(PathBuf::from("/srv/duck")),
+            "a non-empty override is the root"
+        );
+        assert_eq!(
+            ducktape_home_from(Some(OsString::new()), home.clone()),
+            Ok(default_root.clone()),
+            "set-but-empty is unset"
+        );
+        assert_eq!(
+            ducktape_home_from(None, home),
+            Ok(default_root),
+            "unset falls back to the home default"
+        );
+        assert!(
+            ducktape_home_from(None, None).is_err(),
+            "no override and no $HOME is an error, not a relative path"
+        );
     }
 
     #[test]
