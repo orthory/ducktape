@@ -60,18 +60,33 @@ pub(crate) async fn files_submit(
         Ok(Err(err)) => {
             // the module's refusal, on the files plane: the http funnel logs
             // the 400 at debug; this carries the reason a dashboard counts.
-            tracing::warn!(
-                target: "ducktape::files",
-                op,
-                origin = DEFAULT_ORIGIN,
-                reason = refusal_reason(&err),
-                error = %err,
-                "files op refused"
-            );
+            refused(op, refusal_reason(&err), &err);
             Err(error_response(StatusCode::BAD_REQUEST, &err))
         }
         Err(_) => Err(actor_gone()),
     }
+}
+
+/// every refusal on this lane, first-then-every-Nth per reason. a refused
+/// request is CLIENT-driven: one script polling an object it may not have
+/// would otherwise evict the 4096-line ring between two useful lines, and the
+/// count is the diagnosis anyway.
+static REFUSED: crate::log::Latch = crate::log::Latch::new(100);
+
+/// one refused files op on the plane, latched by reason.
+fn refused(op: &'static str, reason: &'static str, detail: &str) {
+    let Some(occurrences) = REFUSED.hit(reason) else {
+        return;
+    };
+    tracing::warn!(
+        target: "ducktape::files",
+        op,
+        origin = DEFAULT_ORIGIN,
+        reason,
+        detail,
+        occurrences,
+        "files op refused"
+    );
 }
 
 /// one refused body on the duckfs lane: the DefaultBodyLimit layer rejects
@@ -84,14 +99,7 @@ fn body_refused(op: &'static str, over_cap: &'static str, rejection: &BytesRejec
     } else {
         "body_unreadable"
     };
-    tracing::warn!(
-        target: "ducktape::files",
-        op,
-        origin = DEFAULT_ORIGIN,
-        reason,
-        detail = %rejection.body_text(),
-        "files op refused"
-    );
+    refused(op, reason, &rejection.body_text());
     error_response(rejection.status(), &rejection.body_text())
 }
 
@@ -715,14 +723,7 @@ pub(crate) async fn object_get(
                 return error_response(StatusCode::BAD_REQUEST, "not an object (not a file)");
             }
             if entry.size > MAX_OBJECT_BYTES as u64 {
-                tracing::warn!(
-                    target: "ducktape::files",
-                    op = "get",
-                    origin = DEFAULT_ORIGIN,
-                    reason = "object_over_cap",
-                    bytes = entry.size,
-                    "files op refused"
-                );
+                refused("get", "object_over_cap", &entry.size.to_string());
                 return error_response(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "object exceeds the facade cap; read it ranged via /v1/files/read",
