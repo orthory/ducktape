@@ -18,6 +18,9 @@ version.workspace = true
 # these files into a runnable daemon configuration. Reading and writing a
 # workspace is what two programs do; booting one is what the daemon does.
 [dependencies]
+# THE ducktape home resolution (`$DUCKTAPE_HOME` else `~/.ducktape`), in a
+# zero-dependency leaf so every reader of that root agrees about it.
+ducktape-home = { workspace = true }
 base64 = "0.22"
 commonware-codec = { workspace = true }
 commonware-cryptography = { workspace = true }

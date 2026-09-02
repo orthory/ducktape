@@ -180,20 +180,22 @@ pub(crate) fn parse_block_kind(kind: &str) -> Result<BlockKind, String> {
     }
 }
 
+/// What the pages MODULE accepts for one block's text, named for the error
+/// message. The app never invents its own cap: a tighter one refuses text the
+/// node would have taken, with no app-side way to shorten a block that some
+/// other signer already landed. A `Page` block's text is its title.
+fn block_text_bound(kind: BlockKind) -> (&'static str, usize) {
+    if kind == BlockKind::Page {
+        return ("page title", pages::MAX_PAGE_TITLE_LEN);
+    }
+    ("block text", pages::MAX_BLOCK_LEN)
+}
+
 pub(crate) fn bounded_new_block_text(kind: BlockKind, text: String) -> Result<String, String> {
     if kind == BlockKind::Divider {
         return Ok(String::new());
     }
-    let field = if kind == BlockKind::Page {
-        "page title"
-    } else {
-        "block text"
-    };
-    let limit = if kind == BlockKind::Page {
-        512
-    } else {
-        64 * 1024
-    };
+    let (field, limit) = block_text_bound(kind);
     // Only a page title must be non-empty. An empty BLOCK is a blank line —
     // the thing Enter-Enter makes — and the node accepts it; rejecting it here
     // put every save after a blank line into a permanent retry loop.
@@ -207,10 +209,8 @@ pub(crate) fn bounded_updated_block_text(kind: BlockKind, text: String) -> Resul
     if kind == BlockKind::Divider {
         return Ok(String::new());
     }
-    if kind == BlockKind::Page {
-        return bounded_exact_text(text, "page title", 512);
-    }
-    bounded_exact_text(text, "block text", 64 * 1024)
+    let (field, limit) = block_text_bound(kind);
+    bounded_exact_text(text, field, limit)
 }
 
 pub(crate) fn block_move(

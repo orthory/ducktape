@@ -169,6 +169,65 @@ fn oversized_block_is_rejected_before_staging() {
     });
 }
 
+// a page title is bounded on every path that sets one — create, nested-page
+// insert, and rename — because all three stage the Page block through the one
+// store guard. a title AT the cap still lands.
+#[test]
+fn oversized_page_title_is_rejected_on_every_write_path() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = pages_on!(context, "pages");
+        let at_cap = "t".repeat(MAX_PAGE_TITLE_LEN);
+        let over_cap = "t".repeat(MAX_PAGE_TITLE_LEN + 1);
+
+        apply_expect_err(
+            &mut p,
+            &PageMsg::CreatePage {
+                page_id: "p1".into(),
+                title: over_cap.clone(),
+            },
+            "page title too large",
+        )
+        .await;
+
+        apply_commit(
+            &mut p,
+            &PageMsg::CreatePage {
+                page_id: "p1".into(),
+                title: at_cap.clone(),
+            },
+        )
+        .await;
+
+        // the rename path: UpdateText on the page root.
+        apply_expect_err(
+            &mut p,
+            &PageMsg::UpdateText {
+                block_id: "p1".into(),
+                text: over_cap.clone(),
+                marks: None,
+            },
+            "page title too large",
+        )
+        .await;
+
+        // the nested-page path: an InsertBlock whose kind is Page.
+        apply_expect_err(
+            &mut p,
+            &PageMsg::InsertBlock {
+                parent: "p1".into(),
+                after: None,
+                block: page("p2", &over_cap),
+            },
+            "page title too large",
+        )
+        .await;
+
+        let blocks = get_page(&p, "p1").await.unwrap();
+        assert_eq!(ids(&blocks), ["p1"]);
+        assert_eq!(blocks[0].text, at_cap, "a title at the cap survives");
+    });
+}
+
 // corruption must surface as a DISTINCT error, never absence: mapping it
 // to "not found" would let CreatePage re-seed a root over the corrupt
 // bytes, silently destroying the data.

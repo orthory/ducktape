@@ -47,6 +47,10 @@ pub(super) enum PageError {
     /// [`MAX_BLOCK_LEN`] — rejected at write time so the oversized bytes never
     /// reach the panicking commit/read paths (the codec bound is decode-only).
     BlockTooLarge,
+    /// a `Page` block's text — its title — exceeded [`crate::MAX_PAGE_TITLE_LEN`].
+    /// bounded so a full page-list reply stays inside its query byte budget
+    /// whatever a client names its pages.
+    TitleTooLarge,
     /// stored state failed to decode or a tree invariant is broken (a listed
     /// child missing, a parent chain looping). distinct from absence:
     /// corruption must surface loudly, never masquerade as "not found".
@@ -110,6 +114,7 @@ impl core::fmt::Display for PageError {
             PageError::InvalidTextRange => "invalid text range",
             PageError::TooManySpanMarks => "too many inline marks",
             PageError::BlockTooLarge => "block too large",
+            PageError::TitleTooLarge => "page title too large",
             PageError::Corrupt => "stored page state is corrupt",
             PageError::ReservedId => "reserved block id",
             PageError::EmptyOrigin => "empty origin",

@@ -1,8 +1,8 @@
 //! M-of-N multisig coordination for external-chain (EVM) transactions.
 //!
-//! Named `multisig`, not `vault`: `crates/modules/apps/vaults` already exists and is a
-//! different thing (client-sealed team secrets). The product surface still
-//! calls this a Vault.
+//! Named `multisig`, not `vault`: this coordinates approvals over an external
+//! Safe and holds no secret of its own. The product surface still calls it a
+//! Vault.
 //!
 //! ## what consensus is FOR here (and what it is not)
 //!
@@ -31,7 +31,7 @@
 //! oracle, which re-enters through the validator-gated `RecordChainState` /
 //! `RecordExecution` ops.
 //!
-//! State model mirrors `vaults`/`governance`: `execute` STAGES whole-vault
+//! State model mirrors `governance`: `execute` STAGES whole-vault
 //! copies into a pending overlay, `commit_block` publishes, `abort_block`
 //! discards; `root()` is sha256 over the canonical encoding of COMMITTED
 //! vaults, and `snapshot`/`install` ship exactly that preimage.
@@ -128,7 +128,7 @@ impl Multisig {
 
     /// The AUTHENTICATED submitter. Module and system origins are refused so no
     /// module can quietly bind an owner address, and the pre-consensus empty
-    /// external default is refused so it cannot either (mirrors `vaults`).
+    /// external default is refused so it cannot either.
     fn external_origin(ctx: &dyn Ctx) -> Result<Vec<u8>, Error> {
         match &ctx.env().origin {
             Origin::External(key) if key.is_empty() => Err(Error::Module(
