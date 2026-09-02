@@ -17,6 +17,9 @@ version.workspace = true
 # The dependency set is the point: argon2 + AEAD + ed25519 + encoding, and
 # nothing else. A GUI can link this without a validator arriving behind it.
 [dependencies]
+# THE ducktape home resolution (`$DUCKTAPE_HOME` else `~/.ducktape`), in a
+# zero-dependency leaf so every reader of that root agrees about it.
+ducktape-home = { workspace = true }
 argon2 = { workspace = true }
 base64 = "0.22"
 # the 24-word recovery phrase a restore reads and a mint reveals.
