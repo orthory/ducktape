@@ -1048,7 +1048,7 @@ const ANTHROPIC_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"; 
 /// round-trip.
 const OAUTH_EXPIRY_SKEW_MS: u64 = 60_000;
 
-/// The Anthropic upstream credential — THE SWAPPABLE KNOB (design §ToS). The
+/// The Anthropic upstream credential — THE SWAPPABLE KNOB. The
 /// operator has chosen the subscription path; making the compliant Console
 /// API-key path the only one is a one-line change to which arm [`from_host`]
 /// returns, and nothing downstream changes. The child never sees any of this.

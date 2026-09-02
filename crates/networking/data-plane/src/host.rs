@@ -1,5 +1,5 @@
-//! Host-lifecycle helpers for per-use planes (per-use data-plane ADR,
-//! `docs/adr/2026-07-07-per-use-data-plane.mdx`): every service binds the
+//! Host-lifecycle helpers for per-use planes (the per-use data plane):
+//! every service binds the
 //! same way — compute its overlay addresses, retry the bind until the
 //! reachability plane's interface (and this node's `/128`) exists,
 //! construct the [`DataPlane`], and register its stream service. Only

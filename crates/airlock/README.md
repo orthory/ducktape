@@ -6,8 +6,7 @@ attested, session-scoped handshake — so the sandbox calls the Claude/Codex API
 using a credential it never holds, and the operator of the credential side
 cannot read the credential out of it.
 
-Promoted from a PoC into real workspace crates. Design:
-`docs/superpowers/specs/2026-07-18-execution-auth-separation-design.md`.
+Promoted from a PoC into real workspace crates.
 
 ## Crates
 
@@ -249,7 +248,6 @@ tdx) — all parsed once at the config boundary. The run's
 a scoped session token (re-minted on a gateway 401). The local path is exercised
 end-to-end by in-process tests (`cargo test -p broker-host airlock`),
 including a check that a sandbox child cannot inject the overlay routing header.
-See the design spec §graft.
 
 ## Deferred
 

@@ -1,8 +1,7 @@
 //! The wallet keystore: named encrypted user keys under `<duck>/keys/`,
 //! with ONE `active` pointer file naming the wallet every keyless verb
 //! signs with. The file name IS the wallet name (`<name>.key`) — there is
-//! no index to drift from the directory. See
-//! docs/superpowers/specs/2026-08-26-wallet-keystore-design.md.
+//! no index to drift from the directory.
 
 use std::path::{Path, PathBuf};
 

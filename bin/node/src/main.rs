@@ -471,7 +471,7 @@ fn run_node(
         // every run commit is authored by this node's signer (D2 — the author
         // is the agent).
         // the owner-gated admin namespace resolves ownership against this node's
-        // own key; exposure is the operator's `DUCKTAPE_ADMIN` choice (ADR A2/A4).
+        // own key; exposure is the operator's `DUCKTAPE_ADMIN` choice.
         node_key: signer.public_key().as_ref().to_vec(),
         admin_exposure: noded::AdminExposure::from_env(),
     })?;

@@ -3,7 +3,7 @@
 //! Twin of [`sim`](crate::sim) — where the sim arm is a deterministic
 //! in-memory network for the isolation proofs, this arm binds real sockets
 //! on the reachability plane's WireGuard overlay, minted by an injected
-//! [`SocketFactory`] (the overlay-net ADR's socket seam; [`OsSocketFactory`]
+//! [`SocketFactory`] (the overlay-net socket seam; [`OsSocketFactory`]
 //! is today's only arm — plain tokio sockets the kernel routes through the
 //! TUN interface):
 //! - **datagrams** = one [`DatagramSocket`] on the node's overlay `/128`,
@@ -41,8 +41,8 @@ use crate::wire::MAX_DATAGRAM;
 
 // ── The socket seam ─────────────────────────────────────
 //
-// where the plane's sockets come from is INJECTED (the overlay-net ADR's
-// socket-factory seam, docs/adr/2026-07-07-userspace-overlay-net.mdx): the
+// where the plane's sockets come from is INJECTED (the overlay-net
+// socket-factory seam): the
 // node passes a factory, and this arm never names an OS socket type in its
 // own signatures. today's only factory is [`OsSocketFactory`] (the TUN
 // backend: the kernel routes overlay ULAs through the WireGuard interface,

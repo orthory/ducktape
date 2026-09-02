@@ -53,9 +53,8 @@
 //! - The guarantee is bounded by `/v1`'s exposure. `POST /v1/submit` re-signs
 //!   as THIS node, so anything that can reach the node's HTTP or RPC port takes
 //!   the [`WorkCaller::ThisNode`] path by construction. Making un-tokened `/v1`
-//!   callers refused is its own campaign
-//!   (`docs/superpowers/plans/2026-07-26-wave3-scope-enforcement.md`); keeping
-//!   those ports loopback-bound is what makes this module mean anything.
+//!   callers refused is its own campaign; keeping those ports loopback-bound
+//!   is what makes this module mean anything.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

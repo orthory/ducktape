@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Measure Firecracker cold-boot time for the sandbox backend.
 #
-# Every boot-time number in
-#   docs/superpowers/plans/2026-08-22-firecracker-sandbox-backend.md
-# came out of this script. Re-run it after changing the kernel, the rootfs or
+# Every boot-time number ever quoted for the sandbox backend came out of this
+# script. Re-run it after changing the kernel, the rootfs or
 # the boot args — the two wins it found (the i8042 group, `quiet`) are silent
 # to lose: the run still works, it just gets slower.
 #

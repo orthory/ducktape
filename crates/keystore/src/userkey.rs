@@ -1,9 +1,7 @@
 //! the encrypted `user.key` codec: argon2id-derived KEK + XChaCha20-Poly1305 at rest,
 //! and the BIP39 mnemonic <-> 32-byte-seed encoding used to reveal/restore
 //! the user's ed25519 identity. Mirrors `config::load_or_generate_identity`'s
-//! file discipline (0600 and `create_new`) for the persisted file; see
-//! docs/superpowers/specs/2026-07-07-identity-onboarding-design.md
-//! ("The custody model" + "File format" sections) for the binding design.
+//! file discipline (0600 and `create_new`) for the persisted file.
 //!
 //! ## the custody model
 //! - **the mnemonic IS the identity.** [`mnemonic_of_seed`] /

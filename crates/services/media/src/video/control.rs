@@ -1,5 +1,5 @@
 //! Call control datagrams — on a separate flow over `Service::Voice`, so
-//! control keeps working in an audio-only build (ADR §2). One tiny tagged
+//! control keeps working in an audio-only build. One tiny tagged
 //! frame per message: `[tag][fields…]`, all integers BE. no version byte:
 //! the tag is the discriminant, and the frames are fixed shapes (flag-day
 //! rule — no in-band version).

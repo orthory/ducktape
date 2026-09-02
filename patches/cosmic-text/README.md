@@ -21,8 +21,7 @@ run asked for at 500/600/700:
   sets the `wght` axis correctly once the face is reached;
 - skipped every listed fallback family, so an emoji or CJK run fell into the
   third phase and re-shaped against hundreds of system faces — one emoji
-  paragraph went from 26us at 400 to 2,963us at 600 on the rig
-  (`docs/superpowers/specs/2026-08-16-chat-lag-diagnosis-design.md`);
+  paragraph went from 26us at 400 to 2,963us at 600 on the rig;
 - let a common-list family with a face at exactly that weight win a plain
   Latin run before the requested family was reached: DejaVu Sans Bold on
   Debian/Ubuntu, Menlo Bold on macOS ([pop-os/cosmic-text#416]).

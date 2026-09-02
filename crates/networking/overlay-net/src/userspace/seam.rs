@@ -1,4 +1,4 @@
-//! the commonware-runtime face of the virtual sockets — ADR phase 2's seam
+//! the commonware-runtime face of the virtual sockets — the seam
 //! wiring: what [`crate::OverlayContext`] routes overlay dials and binds to
 //! when the backend is userspace, as the `Virtual` arm of
 //! [`crate::OverlayListener`]/[`crate::OverlaySink`]/[`crate::OverlayStream`].
@@ -88,7 +88,7 @@ pub(crate) fn split(stream: VirtualTcpStream) -> (VirtualSink, VirtualStream) {
     )
 }
 
-/// the virtual half of socket mode's mesh listener (ADR phase 3): a lazy
+/// the virtual half of socket mode's mesh listener: a lazy
 /// TCP acceptor at the node's own ULA on a fixed port.
 ///
 /// the mesh binds its listener once, at node start, on the UNSPECIFIED

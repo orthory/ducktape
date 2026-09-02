@@ -3,7 +3,7 @@
 //! [`WgDevice`] + [`VirtualStack`]
 //! pair instead of a TUN.
 //!
-//! the ADR's rule is that the orchestration boundary does not move: the
+//! the rule is that the orchestration boundary does not move: the
 //! reachability executor, epoch cutover, standby pre-warm, and cold
 //! restart keep driving tunnels through `create_interface` / `apply` /
 //! `remove_interface` with the same `InterfaceConfig`. this adapter
@@ -136,7 +136,7 @@ pub struct UserspaceWireGuardEffect {
     /// `Some` between `create_interface` and `remove_interface`; the inner
     /// backend is `Some` from the first successful `apply`.
     live: Option<Option<Backend>>,
-    /// the seam's handle to the live stack (ADR phase 2): published on the
+    /// the seam's handle to the live stack: published on the
     /// `apply` that stands a backend up, cleared whenever the backend drops.
     slot: StackSlot,
     /// the handshake-probe seam: published on the `apply` that stands a backend
@@ -144,7 +144,7 @@ pub struct UserspaceWireGuardEffect {
     /// what lets the plane observe a COMPLETED handshake rather than an accepted
     /// config, which are different events and were previously indistinguishable.
     probes: ProbeSlot,
-    /// a node-owned underlay socket shared with the NAT punch (ADR phase 3),
+    /// a node-owned underlay socket shared with the NAT punch,
     /// reused across interface rebuilds instead of binding per backend;
     /// `None` = each backend binds its own (the standalone posture the
     /// loopback proofs and the interop probe use).
@@ -162,7 +162,7 @@ impl UserspaceWireGuardEffect {
         }
     }
 
-    /// the node wiring (ADR phase 3): the seam's slot is created by the node
+    /// the node wiring: the seam's slot is created by the node
     /// before the reachability plane's thread exists (the mesh context and
     /// the data-plane factory consume it), and the underlay socket is bound
     /// at plane start so the NAT client shares the tunnel's 5-tuple — this

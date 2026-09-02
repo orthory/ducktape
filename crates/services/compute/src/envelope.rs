@@ -447,7 +447,7 @@ mod tests {
     fn envelopes_are_accepted_without_activating_a_mount() {
         // the worker ACCEPTS the envelope, but it does NOT activate a workspace
         // mount: no consensus-supplied cwd override, no workspace env. the pool
-        // activates the plan iff a provisioner is wired (ADR ROL/M2 + W1).
+        // activates the plan iff a provisioner is wired.
         let Prepared {
             input,
             ctx,

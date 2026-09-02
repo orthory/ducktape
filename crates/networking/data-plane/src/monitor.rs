@@ -2,7 +2,7 @@
 //! process-wide [`PlaneMonitor`] that attributes every open plane to the
 //! module that created it.
 //!
-//! Planes are per-use and subsystem-owned (per-use data-plane ADR), so there
+//! Planes are per-use and subsystem-owned, so there
 //! is deliberately no central object that OWNS them — the monitor only
 //! watches. Each creator registers its plane right after bring-up with the
 //! module name that opened it; a [`PlaneWatch`] holds a weak reference, so

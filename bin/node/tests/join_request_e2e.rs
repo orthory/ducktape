@@ -120,7 +120,7 @@ fn a_spent_invite_is_refused_loudly_on_both_ends() {
     );
 
     // second redeemer: the SAME blob under a FRESH identity — the shared-blob
-    // mistake. a bearer invite (join ADR) mints the workspace locally without
+    // mistake. a bearer invite mints the workspace locally without
     // complaint — there is no targeted key for the CLI to check — and the
     // single-use invariant lands TERMINALLY at first contact: the founder's
     // gate sees the spent nonce and refuses permanently, and the joiner stops

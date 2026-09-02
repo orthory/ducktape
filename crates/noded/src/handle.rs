@@ -261,8 +261,8 @@ pub struct NodeHandle {
     /// the node's code-plane stage lane (module-code fan-out). `None` on a
     /// daemon without a mesh — the admin stage route answers 503 there.
     pub(crate) code_stage: Option<crate::module_code::CodeStageLane>,
-    /// the owner-gated control namespace's exposure + ownership config (ADR
-    /// A2/A5). the default (`Loopback`, no node key, NO operator token) FAILS
+    /// the owner-gated control namespace's exposure + ownership config.
+    /// the default (`Loopback`, no node key, NO operator token) FAILS
     /// CLOSED — it refuses every admin request; a real serve path mints a
     /// credential and passes it through [`Self::with_admin`].
     pub(crate) admin: crate::admin::AdminConfig,
@@ -368,7 +368,7 @@ impl NodeHandle {
         self
     }
 
-    /// configure the owner-gated control namespace (ADR A2/A5). the full node
+    /// configure the owner-gated control namespace. the full node
     /// passes its own consensus key (the salt every owner PoP is bound to),
     /// the operator's wallet key (whose account owns the plane) and the
     /// exposure the operator chose; a handle that leaves this at the default

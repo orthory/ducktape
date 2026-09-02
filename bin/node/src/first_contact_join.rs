@@ -5,7 +5,7 @@
 //! inviter meshes with (the invite's `fronts`). This module turns that set into
 //! ONE candidate list (`{inviter} ∪ {fronts}`), races first contact across the
 //! whole union, and stops at the first candidate whose doorbell SETTLES THE
-//! GATE (join ADR §4: the sealed intro is the gate request, and the acked
+//! GATE (the sealed intro is the gate request, and the acked
 //! `Admitted`/terminal `Rejected` is the authoritative outcome) — cancelling
 //! the rest. If every path is exhausted it returns an HONEST terminal (a
 //! distinct, mode-naming failure the caller surfaces loudly and exits on),
@@ -105,7 +105,7 @@ impl std::fmt::Display for ContactVia {
 }
 
 /// the outcome of a single candidate's attempt. the sealed intro IS the gate
-/// request (join ADR §4), so an attempt no longer succeeds at "tunnel up" — it
+/// request, so an attempt no longer succeeds at "tunnel up" — it
 /// resolves when the member's doorbell answers the GATE.
 #[derive(Debug, PartialEq)]
 pub enum AttemptResult {
@@ -114,7 +114,7 @@ pub enum AttemptResult {
     /// (private coordination) or `None`.
     Admitted { height: u64, cap: Option<Vec<u8>> },
     /// the gate refused TERMINALLY — this invite can never redeem; the whole
-    /// race stops and the joiner exits (ADR R2).
+    /// race stops and the joiner exits.
     Rejected {
         code: join_gate::RejectCode,
         detail: String,
@@ -141,7 +141,7 @@ pub enum FirstContactOutcome {
         cap: Option<Vec<u8>>,
     },
     /// a member answered a TERMINAL `Rejected` — this invite can never
-    /// redeem. the caller exits loudly instead of failing over (ADR R2).
+    /// redeem. the caller exits loudly instead of failing over.
     Rejected {
         code: join_gate::RejectCode,
         detail: String,
@@ -676,7 +676,7 @@ async fn direct_attempt(
 /// async runtime): re-send the intro every [`RETRY_INTERVAL`] until the gate
 /// resolves, the window is exhausted, or the stop flag trips. an `Installed`
 /// ack means "the gate is settling in consensus" — keep sending; a later
-/// retransmit's ack carries the settled outcome (join ADR §4).
+/// retransmit's ack carries the settled outcome.
 fn run_direct_announcer(
     intro: &[u8],
     token_nonce: &[u8],
@@ -1116,7 +1116,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_terminal_reject_stops_the_race_instead_of_failing_over() {
-        // ADR R2: a terminal refusal (spent nonce, bad token) is network-wide
+        // a terminal refusal (spent nonce, bad token) is network-wide
         // truth — the race must surface it, never churn the remaining
         // candidates toward the same answer.
         let candidates = vec![
