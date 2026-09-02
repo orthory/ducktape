@@ -165,12 +165,16 @@ pub const PRODUCTION: &[&str] = &[
     "runs",
 ];
 
-/// the DEFAULT set (14) simnode and the noded daemon compose at genesis, in
+/// the DEFAULT set (15) simnode and the noded daemon compose at genesis, in
 /// registry order — `bin/noded/tests/daemon_e2e.rs` pins the same `sim_base`
 /// against noded. Changing it means changing the daemon.
 pub const SIM_BASE: &[&str] = &[
     "chat",
     "saga",
+    // saga's guest is wired to `capability` (Strict lease over ANNOUNCED providers);
+    // without it every tagged saga degrades to accept-any and the sim cannot
+    // reproduce production's provider gate.
+    "capability",
     "dispatch",
     "tagging",
     "tasks",
@@ -224,7 +228,7 @@ mod tests {
     #[test]
     fn selections_pin_to_todays_sets() {
         assert_eq!(PRODUCTION.len(), 19, "production is the 19-module set");
-        assert_eq!(SIM_BASE.len(), 14, "sim_base is the default 14-module set");
+        assert_eq!(SIM_BASE.len(), 15, "sim_base is the default 15-module set");
         assert_eq!(SIM_VALSET.len(), 5, "sim_valset appends 5 system modules");
 
         // exact membership (sorted — registration order is not consensus-relevant)
@@ -239,8 +243,8 @@ mod tests {
         assert_eq!(
             sorted(SIM_BASE),
             sorted(&[
-                "agent", "automations", "chat", "dispatch", "files", "forge", "gateway",
-                "identity", "inbox", "pages", "runs", "saga", "tagging", "tasks",
+                "agent", "automations", "capability", "chat", "dispatch", "files", "forge",
+                "gateway", "identity", "inbox", "pages", "runs", "saga", "tagging", "tasks",
             ])
         );
         assert_eq!(

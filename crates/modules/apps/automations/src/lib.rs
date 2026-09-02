@@ -28,7 +28,7 @@
 //! records for its own owner. `SetEnabled` and `DeleteRule` are refused unless
 //! the submitter IS that owner, and [`rule_owner`] refuses every origin that
 //! cannot be one — the pre-consensus default `Origin::External(vec![])`, and
-//! `Origin::Module`/`Origin::System` outright (the `vaults` posture). so an
+//! `Origin::Module`/`Origin::System` outright. so an
 //! ownerless rule is not a shape this module can mint.
 //!
 //! that gate binds rule AUTHORSHIP only. a FIRING rule still emits its action

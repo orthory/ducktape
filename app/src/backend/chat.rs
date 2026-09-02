@@ -901,7 +901,7 @@ pub async fn create_page(
     title: String,
 ) -> Result<PagesData, AppError> {
     async {
-        let title = bounded_text(title, "page title", 512)?;
+        let title = bounded_text(title, "page title", pages::MAX_PAGE_TITLE_LEN)?;
         let page_id = fresh_id("page");
         let rpc = rpc_client(&rpc)?;
         let height = signed_write(
