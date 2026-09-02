@@ -180,15 +180,15 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                                 let (server_end, caller_end) = tokio::io::duplex(64 * 1024);
                                 let serve_commands = commands.clone();
                                 let serve_workspace = workspace.clone();
+                                let serve_ports = node_api_ports.clone();
                                 tokio::spawn(async move {
-                                    serve_ws(
-                                        &serve_commands,
-                                        &serve_workspace,
-                                        &own_node,
-                                        &head,
-                                        server_end,
-                                    )
-                                    .await;
+                                    let scope = LoopbackScope {
+                                        workspace: &serve_workspace,
+                                        node_api_ports: &serve_ports,
+                                        own_node: &own_node,
+                                    };
+                                    serve_ws(&serve_commands, &scope, &own_node, &head, server_end)
+                                        .await;
                                 });
                                 caller_ws_pump(caller_end, to_browser, from_browser).await;
                             } else {
@@ -280,7 +280,7 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                 // A WebSocket upgrade is long-lived; it owns the stream and
                 // writes its own responses, so it bypasses the one-shot timeout.
                 if head.upgrade {
-                    serve_ws(&commands, &workspace, &own_node, &head, stream).await;
+                    serve_ws(&commands, &scope, &requester.0, &head, stream).await;
                     return;
                 }
                 serve_proxy_stream(&commands, &scope, &requester.0, head, None, stream).await;
@@ -644,6 +644,40 @@ async fn revalidate_route_authority(
 /// the reply detail and the log reason alike.
 const ROUTE_TARGETS_NODE_API: &str = "route_targets_node_api";
 
+/// Resolve a loopback route's upstream port — the ONE seam both the HTTP
+/// proxy and the WebSocket upgrade dial through. A loopback route may name
+/// any local daemon EXCEPT this node's own surfaces: proxying the mesh into
+/// `/v1` (or upgrading into `/v1/ws/...`) hands every member this node's
+/// unauthenticated API (submit as this node, mint invites, log-filter).
+fn loopback_port(
+    scope: &LoopbackScope<'_>,
+    caller_node: &[u8; 32],
+    head: &gateway::ProxyRequestHead,
+) -> Result<u16, GatewayFailure> {
+    static REFUSED: noded::log::Latch = noded::log::Latch::new(100);
+    let routes =
+        crate::gateway_routes::load(scope.workspace).map_err(GatewayFailure::Unavailable)?;
+    let port = routes.port(&head.name).ok_or_else(|| {
+        GatewayFailure::NotFound("global gateway route has no local loopback upstream".into())
+    })?;
+    let targets_node_api = scope.node_api_ports.contains(&port);
+    if !targets_node_api {
+        return Ok(port);
+    }
+    if let Some(attempts) = REFUSED.hit(ROUTE_TARGETS_NODE_API) {
+        tracing::warn!(
+            target: "ducktape::gateway",
+            caller = %hex_bytes(caller_node),
+            route = %head.name.local_key(),
+            upgrade = head.upgrade,
+            reason = ROUTE_TARGETS_NODE_API,
+            attempts,
+            "gateway route REFUSED — its loopback upstream is this node's own API port"
+        );
+    }
+    Err(GatewayFailure::Forbidden(ROUTE_TARGETS_NODE_API.into()))
+}
+
 async fn proxy_loopback(
     scope: &LoopbackScope<'_>,
     caller_node: &[u8; 32],
@@ -652,34 +686,12 @@ async fn proxy_loopback(
     body: &[u8],
     record: &gateway::RouteRecord,
 ) -> Result<GatewayResponse, GatewayFailure> {
-    static REFUSED: noded::log::Latch = noded::log::Latch::new(100);
     let route = record
         .statement
         .route
         .as_ref()
         .expect("current route is live");
-    let routes =
-        crate::gateway_routes::load(scope.workspace).map_err(GatewayFailure::Unavailable)?;
-    let port = routes.port(&head.name).ok_or_else(|| {
-        GatewayFailure::NotFound("global gateway route has no local loopback upstream".into())
-    })?;
-    // a loopback route may name any local daemon EXCEPT this node's own
-    // surfaces: proxying the mesh into `/v1` hands every member this node's
-    // unauthenticated API (submit as this node, mint invites, log-filter).
-    let targets_node_api = scope.node_api_ports.contains(&port);
-    if targets_node_api {
-        if let Some(attempts) = REFUSED.hit(ROUTE_TARGETS_NODE_API) {
-            tracing::warn!(
-                target: "ducktape::gateway",
-                caller = %hex_bytes(caller_node),
-                route = %head.name.local_key(),
-                reason = ROUTE_TARGETS_NODE_API,
-                attempts,
-                "gateway route REFUSED — its loopback upstream is this node's own API port"
-            );
-        }
-        return Err(GatewayFailure::Forbidden(ROUTE_TARGETS_NODE_API.into()));
-    }
+    let port = loopback_port(scope, caller_node, head)?;
     // Connect + per-read deadlines only: a TOTAL timeout would kill long
     // streamed (SSE) bodies, but a silent-forever upstream must not pin its
     // accept permit — the idle read timeout reclaims it. The head is still
@@ -1094,8 +1106,8 @@ async fn query(
 /// routes cannot upgrade.
 async fn authorize_ws(
     commands: &mpsc::Sender<NodeCommand>,
-    workspace: &Path,
-    own_node: &[u8; 32],
+    scope: &LoopbackScope<'_>,
+    caller_node: &[u8; 32],
     head: &gateway::ProxyRequestHead,
 ) -> Result<String, GatewayFailure> {
     gateway::validate_proxy_request_head(head).map_err(GatewayFailure::Invalid)?;
@@ -1105,7 +1117,7 @@ async fn authorize_ws(
         ));
     }
     let record = resolve_route(commands, head.account_id, &head.name).await?;
-    if record.statement.publisher_node.as_slice() != own_node {
+    if record.statement.publisher_node.as_slice() != scope.own_node {
         return Err(GatewayFailure::Forbidden(
             "gateway request does not name this publisher".into(),
         ));
@@ -1132,10 +1144,7 @@ async fn authorize_ws(
             "route does not permit a WebSocket upgrade".into(),
         ));
     }
-    let routes = crate::gateway_routes::load(workspace).map_err(GatewayFailure::Unavailable)?;
-    let port = routes.port(&head.name).ok_or_else(|| {
-        GatewayFailure::NotFound("global gateway route has no local loopback upstream".into())
-    })?;
+    let port = loopback_port(scope, caller_node, head)?;
     Ok(format!("ws://127.0.0.1:{port}{}", head.path_and_query))
 }
 
@@ -1144,14 +1153,14 @@ async fn authorize_ws(
 /// `101` `ResponseHead` then pumps `WsFrame`/`WsClose` both ways until close.
 async fn serve_ws<S>(
     commands: &mpsc::Sender<NodeCommand>,
-    workspace: &Path,
-    own_node: &[u8; 32],
+    scope: &LoopbackScope<'_>,
+    caller_node: &[u8; 32],
     head: &gateway::ProxyRequestHead,
     mut stream: S,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let url = match authorize_ws(commands, workspace, own_node, head).await {
+    let url = match authorize_ws(commands, scope, caller_node, head).await {
         Ok(url) => url,
         Err(failure) => {
             let _ = write_frame(&mut stream, &failure_frame(&failure)).await;
@@ -1811,7 +1820,12 @@ mod tests {
         };
         let workspace_path = workspace.path().to_path_buf();
         tokio::spawn(async move {
-            serve_ws(&commands, &workspace_path, &publisher, &head, server).await;
+            let scope = LoopbackScope {
+                workspace: &workspace_path,
+                node_api_ports: &[],
+                own_node: &publisher,
+            };
+            serve_ws(&commands, &scope, &[3u8; 32], &head, server).await;
         });
 
         // The upgrade is acknowledged with a 101, then a frame round-trips
@@ -1961,7 +1975,12 @@ mod tests {
         };
         let workspace_path = workspace.path().to_path_buf();
         tokio::spawn(async move {
-            serve_ws(&commands, &workspace_path, &publisher, &head, server_end).await;
+            let scope = LoopbackScope {
+                workspace: &workspace_path,
+                node_api_ports: &[],
+                own_node: &publisher,
+            };
+            serve_ws(&commands, &scope, &[3u8; 32], &head, server_end).await;
         });
         let (to_browser_tx, mut to_browser_rx) = tokio::sync::mpsc::channel(8);
         let (from_browser_tx, from_browser_rx) = tokio::sync::mpsc::channel(8);
@@ -2422,6 +2441,72 @@ mod tests {
                 user_pop: None,
             },
             &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, GatewayFailure::Forbidden(ref why) if why == ROUTE_TARGETS_NODE_API),
+            "{error:?}"
+        );
+    }
+
+    /// The WebSocket upgrade resolves the same loopback port through the same
+    /// seam, so an `allow_upgrade` route aimed at the node's own port is
+    /// refused before the `ws://` dial — `/v1/ws/...` is not reachable either.
+    #[tokio::test]
+    async fn an_upgrade_route_to_the_nodes_own_api_port_is_refused() {
+        let node_http_port = 8844u16;
+        let workspace = tempfile::tempdir().unwrap();
+        let routes = crate::gateway_routes::LocalRoutes {
+            routes: vec![crate::gateway_routes::LocalRoute {
+                name: gateway::RouteName::named("api"),
+                port: node_http_port,
+            }],
+        };
+        std::fs::write(
+            workspace.path().join(crate::gateway_routes::FILE_NAME),
+            serde_json::to_vec_pretty(&routes).unwrap(),
+        )
+        .unwrap();
+
+        let publisher = [2u8; 32];
+        let caller = [3u8; 32];
+        let member = ed25519::PrivateKey::from_seed(44);
+        let route = signed_route(&member, publisher, gateway::RouteAudience::Network, true);
+        let (commands, mut requests) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                panic!("route query");
+            };
+            let _ = reply.send(Ok(gateway::encode_reply(&gateway::GatewayReply::Route(
+                Box::new(Some(route)),
+            ))));
+            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                panic!("publisher authority query");
+            };
+            let _ = reply.send(Ok(identity::encode_reply(
+                &identity::IdentityReply::Account(Some(account(1, &member))),
+            )));
+        });
+        let error = authorize_ws(
+            &commands,
+            &LoopbackScope {
+                workspace: workspace.path(),
+                node_api_ports: &[8845, node_http_port],
+                own_node: &publisher,
+            },
+            &caller,
+            &gateway::ProxyRequestHead {
+                account_id: 1,
+                name: gateway::RouteName::named("api"),
+                revision: 4,
+                method: gateway::RouteMethod::Get,
+                path_and_query: "/v1/ws/logs".into(),
+                headers: vec![],
+                body_len: 0,
+                upgrade: true,
+                user_pop: None,
+            },
         )
         .await
         .unwrap_err();
