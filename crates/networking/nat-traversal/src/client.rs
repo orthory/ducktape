@@ -9,7 +9,7 @@ use tokio::sync::{Mutex, mpsc};
 use crate::AuthRequest;
 use crate::auth::{AuthPolicy, CoordCap, now_secs, sign_authenticator};
 use crate::coordinator::{AuthVerifier, VerifiedRequest};
-use crate::{Coordinator, Msg, NodeKey};
+use crate::{Coordinator, Latch, Msg, NodeKey};
 use commonware_cryptography::ed25519;
 
 /// where a [`NatClient`]'s datagrams ride.
@@ -513,6 +513,57 @@ impl CoordinatorMetrics {
     }
 }
 
+/// One datagram that did not decode as an `AuthRequest`. Garbage on an
+/// untrusted control port is expected, so this is latched and never louder than
+/// a refusal — but a coordinator that answers nothing while `malformed` climbs
+/// is diagnosed here and nowhere else.
+fn note_malformed(from: SocketAddr, bytes: usize) {
+    static MALFORMED: Latch = Latch::new();
+    if let Some(occurrences) = MALFORMED.hit() {
+        tracing::warn!(
+            target: "ducktape::reachability",
+            event = "coordinator_request_refused",
+            reason = "malformed_request",
+            from = %from,
+            bytes,
+            occurrences,
+            "datagram is not a decodable coordinator request"
+        );
+    }
+}
+
+/// A reply the socket refused to send. The requester learns nothing (it just
+/// retries), so without this the loss is invisible outside the counter.
+fn note_send_error(dst: SocketAddr) {
+    static SEND_ERRORS: Latch = Latch::new();
+    if let Some(occurrences) = SEND_ERRORS.hit() {
+        tracing::warn!(
+            target: "ducktape::reachability",
+            event = "coordinator_reply_dropped",
+            reason = "send_failed",
+            dst = %dst,
+            occurrences,
+            "a coordinator reply could not be sent"
+        );
+    }
+}
+
+/// The bounded reorder window is full: the loop stops reading the socket until
+/// a worker result lands. Under a signature flood this is the shape an operator
+/// sees as "the coordinator went quiet", so it must be nameable.
+fn note_saturated() {
+    static SATURATED: Latch = Latch::new();
+    if let Some(occurrences) = SATURATED.hit() {
+        tracing::warn!(
+            target: "ducktape::reachability",
+            event = "coordinator_saturated",
+            reason = "auth_window_full",
+            occurrences,
+            "verification window full — pausing intake until a result lands"
+        );
+    }
+}
+
 const AUTH_QUEUE_DEPTH: usize = 64;
 const AUTH_WORKER_STACK_BYTES: usize = 512 * 1024;
 
@@ -724,6 +775,13 @@ pub async fn run_coordinator_workers_with_metrics_using(
     let auth = AuthWorkers::spawn(policy, workers, capacity, result_tx);
     let mut ordered = OrderedRequests::new(capacity);
     let mut buf = [0u8; AuthRequest::MAX_ENCODED_LEN];
+    tracing::info!(
+        target: "ducktape::reachability",
+        event = "coordinator_serving",
+        workers,
+        window = capacity,
+        "coordinator serving rendezvous on a verification worker pool"
+    );
 
     loop {
         if ordered.has_capacity() {
@@ -742,6 +800,7 @@ pub async fn run_coordinator_workers_with_metrics_using(
                         Ok(request) => auth.dispatch(AuthJob { sequence, from, now, request }),
                         Err(_) => {
                             CoordinatorMetrics::increment(&metrics.0.malformed);
+                            note_malformed(from, n);
                             ordered.insert(sequence, CompletedRequest::Malformed);
                         }
                     }
@@ -749,6 +808,7 @@ pub async fn run_coordinator_workers_with_metrics_using(
             }
         } else {
             CoordinatorMetrics::increment(&metrics.0.saturated);
+            note_saturated();
             let result = results
                 .recv()
                 .await
@@ -780,6 +840,7 @@ pub async fn run_coordinator_workers_with_metrics_using(
                     CoordinatorMetrics::increment(&metrics.0.replies);
                 } else {
                     CoordinatorMetrics::increment(&metrics.0.send_errors);
+                    note_send_error(dst);
                 }
             }
         }
@@ -801,6 +862,12 @@ async fn run_coordinator_with_metrics(
     // Big enough for the largest AuthRequest — the largest bare Msg plus the
     // caller field, authenticator, and cap.
     let mut buf = [0u8; AuthRequest::MAX_ENCODED_LEN];
+    tracing::info!(
+        target: "ducktape::reachability",
+        event = "coordinator_serving",
+        workers = 1,
+        "coordinator serving rendezvous on the inline verifier"
+    );
     loop {
         let (n, from) = match sock.recv_from(&mut buf).await {
             Ok(v) => v,
@@ -821,6 +888,7 @@ async fn run_coordinator_with_metrics(
             }
             Err(_) => {
                 CoordinatorMetrics::increment(&metrics.0.malformed);
+                note_malformed(from, n);
                 continue;
             }
         };
@@ -830,6 +898,7 @@ async fn run_coordinator_with_metrics(
                 CoordinatorMetrics::increment(&metrics.0.replies);
             } else {
                 CoordinatorMetrics::increment(&metrics.0.send_errors);
+                note_send_error(dst);
             }
         }
     }

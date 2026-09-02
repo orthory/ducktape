@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use crate::NodeKey;
+use crate::{Latch, NodeKey, short_key};
 
 /// One node's latest reflexive advertisement: the reflexive `SocketAddr` a node
 /// published and the monotonic `nonce` that orders it. The nonce is an ordering
@@ -182,8 +182,24 @@ impl AdvertBook {
             .iter()
             .max_by_key(|(_, a)| a.admitted)
             .map(|(k, _)| *k);
-        if let Some(youngest) = youngest {
-            self.latest.remove(&youngest);
+        let Some(youngest) = youngest else {
+            return;
+        };
+        self.latest.remove(&youngest);
+        // a full book of LIVE registrations is either a mesh past the cap or a
+        // spray in progress; either way the operator wants to know that a
+        // registration is being displaced, and the count says which it is.
+        static BOOK_FULL: Latch = Latch::new();
+        if let Some(occurrences) = BOOK_FULL.hit() {
+            tracing::warn!(
+                target: "ducktape::reachability",
+                event = "advert_evicted",
+                reason = "book_full",
+                key = short_key(youngest),
+                capacity = MAX_ADVERTS,
+                occurrences,
+                "advert book at capacity — the newest registration lost its slot"
+            );
         }
     }
 

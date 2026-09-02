@@ -53,3 +53,33 @@ pub use simnat::SimNat;
 #[cfg(all(feature = "runtime", any(test, feature = "simnat")))]
 pub use simnet::{SimHandle, SimNetwork, SimSocket};
 pub use wire::{AuthRequest, Msg, NodeKey, WireError};
+
+/// a first-and-every-Nth counter for a refusal a STRANGER can drive: the first
+/// occurrence logs immediately, then every [`Latch::EVERY`]th, carrying the
+/// count. everything this crate refuses is peer-driven and unauthenticated by
+/// definition, so an unlatched line here is a flood that evicts the very
+/// evidence an operator came for — and the count IS the diagnosis. the same
+/// shape as `noded::log::Latch`, which this crate cannot link (the coordinator
+/// deliberately has no node-crate dependency), keyed by the static holding it.
+pub(crate) struct Latch(std::sync::atomic::AtomicU64);
+
+impl Latch {
+    const EVERY: u64 = 100;
+
+    pub(crate) const fn new() -> Self {
+        Self(std::sync::atomic::AtomicU64::new(0))
+    }
+
+    /// `Some(occurrences)` when this occurrence should be logged.
+    pub(crate) fn hit(&self) -> Option<u64> {
+        let n = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        (n == 1 || n.is_multiple_of(Self::EVERY)).then_some(n)
+    }
+}
+
+/// the first four bytes of a node key, hex. a log line that names no key
+/// cannot be correlated across events; a full 32-byte identity on every line
+/// is unreadable. public identity only — never key material.
+pub(crate) fn short_key(key: NodeKey) -> String {
+    key.0[..4].iter().map(|b| format!("{b:02x}")).collect()
+}

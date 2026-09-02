@@ -18,8 +18,11 @@
 //! gate who may use the relay (anti-abuse), mirroring the UDP [`AuthPolicy`].
 //!
 //! Targets resolve from the SAME [`SharedAdverts`] book the UDP rendezvous
-//! maintains — never a second registry. The crate stays log-free: the relay's
-//! only telemetry is the [`RelayMetrics`] counters.
+//! maintains — never a second registry. Telemetry is the [`RelayMetrics`]
+//! counters plus `ducktape::reachability` events: a counter says how many
+//! sessions were refused, the events say which peer and for what reason. Every
+//! event on this lane is peer-driven, so refusals are latched and nothing here
+//! logs per forwarded frame.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,6 +43,7 @@ use crate::auth::{
     sign_authenticator, verify_request,
 };
 use crate::wire::{NodeKey, Reader, WireError, put, put_key, put_u16, put_u64};
+use crate::{Latch, short_key};
 
 // ---------------------------------------------------------------------------
 // Framing constants
@@ -597,6 +601,15 @@ impl Session {
         }
         RelayMetrics::increment(&self.metrics.0.sessions_opened);
         RelayMetrics::increment(&self.metrics.0.forwards);
+        tracing::debug!(
+            target: "ducktape::reachability",
+            event = "relay_session_opened",
+            caller = short_key(intro.caller),
+            member = short_key(intro.target),
+            member_reflexive = %target_addr,
+            bytes = intro.payload.len(),
+            "relaying a sealed intro to a member"
+        );
         let caller = intro.caller;
         let target = intro.target;
         let mut forwards: u32 = 1;
@@ -670,6 +683,16 @@ impl Session {
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     RelayMetrics::increment(&self.metrics.0.expired);
+                    tracing::debug!(
+                        target: "ducktape::reachability",
+                        event = "relay_session_expired",
+                        reason = "session_ttl",
+                        caller = short_key(caller),
+                        member = short_key(target),
+                        forwards,
+                        replies,
+                        "relay session hit its TTL"
+                    );
                     return SessionEnd::Closed;
                 }
             }
@@ -677,8 +700,26 @@ impl Session {
     }
 }
 
+/// One refused relay session, named. `reason` is the same stable token the
+/// peer gets back in its [`RelayFrame::Error`]; latched, because refusing
+/// strangers is this lane's steady state under abuse.
+fn note_refused(peer: SocketAddr, reason: &[u8]) {
+    static REFUSALS: Latch = Latch::new();
+    if let Some(occurrences) = REFUSALS.hit() {
+        tracing::warn!(
+            target: "ducktape::reachability",
+            event = "relay_session_refused",
+            reason = %String::from_utf8_lossy(reason),
+            peer = %peer,
+            occurrences,
+            "relay session refused"
+        );
+    }
+}
+
 async fn run_session(
     stream: TcpStream,
+    peer: SocketAddr,
     slot: SessionSlot,
     policy: Arc<AuthPolicy>,
     adverts: SharedAdverts,
@@ -697,6 +738,7 @@ async fn run_session(
         metrics,
     };
     if let SessionEnd::Refused(reason) = session.drive().await {
+        note_refused(peer, reason);
         // Best-effort refusal token; a stalled peer must not pin the task.
         let error = RelayFrame::Error {
             reason: reason.to_vec(),
@@ -728,6 +770,7 @@ pub async fn run_relay_listener(
         };
         let Some(slot) = SessionSlot::try_acquire(&sessions, peer.ip()) else {
             RelayMetrics::increment(&metrics.0.sessions_rejected);
+            note_refused(peer, REASON_SESSION_LIMIT);
             // Tell the joiner it was the cap, not a dead relay — but from a
             // spawned task with a bounded write, so a stalled peer can never
             // block the accept loop.
@@ -742,6 +785,7 @@ pub async fn run_relay_listener(
         };
         tokio::spawn(run_session(
             stream,
+            peer,
             slot,
             policy.clone(),
             adverts.clone(),

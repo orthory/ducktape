@@ -10,7 +10,7 @@ use lru::LruCache;
 use crate::AuthRequest;
 use crate::advert::{AdvertBook, AdvertOutcome, SharedAdverts};
 use crate::auth::{AuthPolicy, DEFAULT_FRESHNESS_WINDOW_SECS, verify_request_using};
-use crate::{Msg, NodeKey};
+use crate::{Latch, Msg, NodeKey, short_key};
 
 const AUTH_KEY_CACHE_SIZE: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 type AuthKeyCache = Option<LruCache<NodeKey, ed25519::PublicKey>>;
@@ -192,7 +192,7 @@ impl Coordinator {
         match self.auth.verify(req, now) {
             Some(req) => self.handle_verified_replies(from, req, now),
             None => {
-                self.rejects += 1;
+                self.record_reject();
                 CoordinatorReplies::new()
             }
         }
@@ -207,8 +207,22 @@ impl Coordinator {
         self.handle_replies(req.caller, from, req.inner, now)
     }
 
+    /// The auth gate dropped one request — the inline verifier's own refusal or
+    /// a worker's. Unauthenticated traffic is exactly what an untrusted control
+    /// port attracts, so this is latched: the count separates a misconfigured
+    /// member from a flood.
     pub(crate) fn record_reject(&mut self) {
         self.rejects += 1;
+        static REJECTS: Latch = Latch::new();
+        if let Some(occurrences) = REJECTS.hit() {
+            tracing::warn!(
+                target: "ducktape::reachability",
+                event = "coordinator_request_refused",
+                reason = "unauthenticated_request",
+                occurrences,
+                "request failed the coordinator auth gate"
+            );
+        }
     }
 
     /// Auth-bypassing seam for this module's own ordered-state tests, which
@@ -258,6 +272,13 @@ impl Coordinator {
                 // The registered reflexive address IS the observed source: the
                 // coordinator never trusts a self-reported address.
                 adverts.observe(key, from, now);
+                tracing::debug!(
+                    target: "ducktape::reachability",
+                    event = "advert_registered",
+                    key = short_key(key),
+                    reflexive = %from,
+                    "registered a member at its observed source"
+                );
                 CoordinatorReplies::new()
             }
             Msg::Readvertise { key, nonce } => {
@@ -267,7 +288,25 @@ impl Coordinator {
                 // `AdvertBook` staleness guard rejects an equal-or-lower nonce, so
                 // a replayed/reordered datagram cannot supersede a fresh mapping
                 // — nor extend its life.
-                adverts.readvertise(key, from, nonce, now);
+                match adverts.readvertise(key, from, nonce, now) {
+                    // the 25 s keepalive of every member: per-frame traffic.
+                    AdvertOutcome::Superseded => tracing::trace!(
+                        target: "ducktape::reachability",
+                        key = short_key(key),
+                        reflexive = %from,
+                        nonce,
+                        "re-advertisement superseded the stored mapping"
+                    ),
+                    AdvertOutcome::Stale => tracing::debug!(
+                        target: "ducktape::reachability",
+                        event = "advert_refused",
+                        reason = "stale_nonce",
+                        key = short_key(key),
+                        reflexive = %from,
+                        nonce,
+                        "re-advertisement did not beat the stored nonce"
+                    ),
+                }
                 CoordinatorReplies::new()
             }
             Msg::Lookup { key } => {
@@ -298,6 +337,16 @@ impl Coordinator {
                         ),
                     ])
                 } else {
+                    // the everyday reason a join stalls: the peer never
+                    // registered, or its registration aged out of the book.
+                    tracing::debug!(
+                        target: "ducktape::reachability",
+                        event = "lookup_unresolved",
+                        reason = "target_unregistered",
+                        key = short_key(key),
+                        caller = short_key(caller),
+                        "lookup answered None"
+                    );
                     CoordinatorReplies::from_iter([response])
                 }
             }
