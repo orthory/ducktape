@@ -3,10 +3,12 @@
 //! this lives in the noded LIB because the three binaries that install it —
 //! `bin/node`, `bin/noded`, `bin/simnode` — already depend on it (they serve
 //! `noded::router`). `bin/coordinator` deliberately does not (its Cargo.toml:
-//! "no node-crate dependency"); it emits no events yet, so it gets its own
-//! subscriber when it gets its first one, rather than inverting that boundary
-//! for a constructor. `bin/fs` and `bin/mcp` are CLIs whose stdout IS their wire
-//! (a duckfs command's output, JSON-RPC) — program output is not logging.
+//! "no node-crate dependency"), so it installs its OWN stderr subscriber
+//! (`bin/coordinator/src/main.rs::install_tracing`) rather than inverting that
+//! boundary for a constructor: it has no LogRing and no stream surface, so a
+//! shared one would buy it nothing. `bin/fs` and `bin/mcp` are CLIs whose
+//! stdout IS their wire (a duckfs command's output, JSON-RPC) — program output
+//! is not logging.
 //!
 //! events reach TWO places, both gated by the same filter:
 //!

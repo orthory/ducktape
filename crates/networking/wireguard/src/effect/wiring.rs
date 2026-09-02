@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
 
@@ -79,6 +80,20 @@ impl std::fmt::Debug for InterfaceConfig {
     }
 }
 
+/// First-and-every-100th gate for a backend refusal a PEER can drive. Every
+/// mesh change re-applies the peer set — an epoch apply, an adopted record, an
+/// invite install — so a wedged backend plus a peer that keeps re-advertising
+/// would warn on every one of them until the 4096-line ring holds nothing
+/// else, evicting the context the refusal was worth reading in. The count IS
+/// the diagnosis: `occurrences=3000` says wedged, not flaky. A free function
+/// over the caller's own counter rather than a type: this crate compiles into
+/// the netstack wasm guest and owes it no machinery.
+fn latched(counter: &AtomicU64) -> Option<u64> {
+    const EVERY: u64 = 100;
+    let occurrences = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    (occurrences == 1 || occurrences.is_multiple_of(EVERY)).then_some(occurrences)
+}
+
 /// The parts-level core both appliers share: ONE interface (own overlay
 /// addresses, listen port, private key) carrying every peer relationship.
 /// [`plan_peer_configs`] reduces validated plans to these parts; a mesh
@@ -93,7 +108,22 @@ pub fn apply_peer_tunnels<E: WireGuardEffect>(
     peers: &[PeerTunnelConfig],
 ) -> Result<(), E::Error> {
     let config = interface_config(ifname, private_key, listen_port, local_interface_ips, peers);
-    effect.create_interface()?;
+    if let Err(err) = effect.create_interface() {
+        static CREATE_FAILED: AtomicU64 = AtomicU64::new(0);
+        if let Some(occurrences) = latched(&CREATE_FAILED) {
+            tracing::warn!(
+                target: "ducktape::dataplane",
+                event = "overlay_interface_refused",
+                reason = "create_failed",
+                interface = %config.name,
+                listen_port,
+                error = ?err,
+                occurrences,
+                "the tunnel backend refused to create the overlay interface"
+            );
+        }
+        return Err(err);
+    }
     if let Err(err) = effect.apply(&config) {
         // `create_interface` already stood up the interface; don't leave it
         // behind just because this config was rejected (a listen port the
@@ -101,9 +131,44 @@ pub fn apply_peer_tunnels<E: WireGuardEffect>(
         // secondary to the `apply` failure that's actually being reported,
         // so it's intentionally dropped rather than allowed to shadow it.
         let _ = effect.remove_interface();
+        static APPLY_REJECTED: AtomicU64 = AtomicU64::new(0);
+        if let Some(occurrences) = latched(&APPLY_REJECTED) {
+            tracing::warn!(
+                target: "ducktape::dataplane",
+                event = "overlay_interface_refused",
+                reason = "apply_rejected",
+                interface = %config.name,
+                listen_port,
+                peers = config.peers.len(),
+                error = ?err,
+                occurrences,
+                "the tunnel backend refused the interface config — interface torn back down"
+            );
+        }
         return Err(err);
     }
+    // bring-up happens once per interface life; the peer census is the fact an
+    // operator needs when a member is unreachable — an endpoint-less peer
+    // cannot be dialed, it can only dial in.
+    tracing::info!(
+        target: "ducktape::dataplane",
+        event = "overlay_interface_up",
+        interface = %config.name,
+        listen_port,
+        addresses = config.addresses.len(),
+        peers = config.peers.len(),
+        endpointless = endpointless(&config.peers),
+        "overlay interface configured"
+    );
     Ok(())
+}
+
+/// Peers installed with no endpoint: WireGuard cannot dial them, it can only
+/// wait for their own initiation and roam to its source. The count is the
+/// difference between "the mesh is up" and "the mesh is up but half of it can
+/// never be reached from here".
+fn endpointless(peers: &[PeerTunnelConfig]) -> usize {
+    peers.iter().filter(|peer| peer.endpoint.is_none()).count()
 }
 
 /// Re-apply the full peer set to an interface that is ALREADY live — the
@@ -123,7 +188,34 @@ pub fn update_peer_tunnels<E: WireGuardEffect>(
     peers: &[PeerTunnelConfig],
 ) -> Result<(), E::Error> {
     let config = interface_config(ifname, private_key, listen_port, local_interface_ips, peers);
-    effect.apply(&config)
+    if let Err(err) = effect.apply(&config) {
+        // Unlike bring-up there is nothing to unwind: the interface stays live
+        // on its PREVIOUS peer set, so the delta this call carried (a new
+        // standby tunnel, a re-advertised endpoint) is silently not installed.
+        static PEERS_REJECTED: AtomicU64 = AtomicU64::new(0);
+        if let Some(occurrences) = latched(&PEERS_REJECTED) {
+            tracing::warn!(
+                target: "ducktape::dataplane",
+                event = "overlay_peers_refused",
+                reason = "apply_rejected",
+                interface = %config.name,
+                peers = config.peers.len(),
+                error = ?err,
+                occurrences,
+                "the tunnel backend refused a peer-set re-apply — the live interface keeps its previous peers"
+            );
+        }
+        return Err(err);
+    }
+    tracing::debug!(
+        target: "ducktape::dataplane",
+        event = "overlay_peers_applied",
+        interface = %config.name,
+        peers = config.peers.len(),
+        endpointless = endpointless(&config.peers),
+        "re-applied the peer set to the live interface"
+    );
+    Ok(())
 }
 
 /// The shared config assembly: ONE interface (own overlay addresses, listen
@@ -161,6 +253,16 @@ mod tests {
 
     fn id(sk: &PrivateKey) -> ValidatorIdentity {
         ValidatorIdentity::try_from(sk.public_key().as_ref()).unwrap()
+    }
+
+    /// A wedged backend refuses on every mesh change; the line must survive as
+    /// a first-and-every-100th sample carrying its own count, not as a flood.
+    #[test]
+    fn a_repeating_refusal_logs_first_then_every_hundredth() {
+        let counter = AtomicU64::new(0);
+        assert_eq!(latched(&counter), Some(1));
+        let loud: Vec<u64> = (2..=200).filter_map(|_| latched(&counter)).collect();
+        assert_eq!(loud, vec![100, 200]);
     }
 
     fn xkey(byte: u8) -> X25519PublicKey {

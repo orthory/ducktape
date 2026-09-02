@@ -45,13 +45,20 @@ Auth modes:
 
 Keep the relay on: every joiner derives its first-contact fallback as
 `<coordinator host>:443` and is never told otherwise. A failed 443 bind does
-not stop the coordinator — it prints `ERROR: relay lane DISABLED` at boot and
+not stop the coordinator — it logs `relay_lane_disabled` at ERROR on boot and
 every `coordinator_metrics` row carries `relay=off`.
 
 `coordinator_metrics` lines report request counters, bounded-window saturation,
 in-flight work, `relay=on|off` plus relay session counters, process CPU, and
 RSS. The cross-host/flood/24-hour probe commands are in
 `docs/deploy/coordinator.md`.
+
+Everything else the binary says is `tracing` on stderr (the journal): the
+bind announcements and the metrics rows stay bare parseable lines, and the
+diagnostics — refused requests and relay sessions, advert evictions,
+unresolved lookups — carry a `reason` on the `ducktape::reachability` plane.
+`RUST_LOG` ADDS to the `info` floor, so `RUST_LOG=ducktape::reachability=debug`
+turns the plane up without turning anything else off.
 
 A `--listen 0.0.0.0:3478` wildcard bind is fully functional on a single-IP
 host: every answer derives from the datagram's observed source. On a
