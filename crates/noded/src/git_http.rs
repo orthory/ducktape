@@ -52,7 +52,7 @@ const GIT_UPLOAD_PACK_CAPS: &str =
     "multi_ack_detailed side-band-64k thin-pack ofs-delta agent=ducktape-forge/0.1";
 /// the body cap for a git packfile POST — push (whole-repo pack) and fetch
 /// (want/have negotiation). lifted far above the json/chunk defaults.
-pub(crate) const GIT_PACK_BODY_LIMIT: usize = 512 * 1024 * 1024;
+pub const GIT_PACK_BODY_LIMIT: usize = 512 * 1024 * 1024;
 /// max PACK bytes per side-band-64k data pkt-line: prefixed with the 1-byte band
 /// id, plus the 4-byte pkt length header, this yields a 65520-byte line — git's
 /// `LARGE_PACKET_MAX`, the ceiling a side-band-64k client accepts.
