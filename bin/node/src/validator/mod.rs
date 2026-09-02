@@ -156,7 +156,9 @@ pub(crate) async fn run_validator(
         mesh_oracle,
         mesh_window,
         mesh_book,
-        channel_bank,
+        // mutable for the boot catch-up below: a re-bootstrap blackholes the
+        // bank below the boundary's epoch before the engine seats on it.
+        mut channel_bank,
         gateway_book,
         blob_peers,
         blob_client,
@@ -252,7 +254,6 @@ pub(crate) async fn run_validator(
     // checkpoint here and seats at that boundary instead. a validator inside
     // the window (and one nobody answered) keeps exactly the state `restore`
     // recovered. see `boot::catch_up`.
-    let mut channel_bank = channel_bank;
     let boot::Seat {
         host,
         resumed,
