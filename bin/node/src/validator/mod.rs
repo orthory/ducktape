@@ -156,7 +156,9 @@ pub(crate) async fn run_validator(
         mesh_oracle,
         mesh_window,
         mesh_book,
-        channel_bank,
+        // mutable for the boot catch-up below: a re-bootstrap blackholes the
+        // bank below the boundary's epoch before the engine seats on it.
+        mut channel_bank,
         gateway_book,
         blob_peers,
         blob_client,
@@ -244,6 +246,50 @@ pub(crate) async fn run_validator(
             code_stage_requests,
         );
     }
+
+    // THE BOOT CATCH-UP, over the co-client that rides this node's own serve
+    // lane: a validator whose floor fell out of every peer's retained journal
+    // window cannot be advanced by the engine — it would wait forever for
+    // payload bytes nobody holds — so it re-bootstraps from a peer's
+    // checkpoint here and seats at that boundary instead. a validator inside
+    // the window (and one nobody answered) keeps exactly the state `restore`
+    // recovered. see `boot::catch_up`.
+    let boot::Seat {
+        host,
+        resumed,
+        next_seq,
+        prev_ckpt,
+        member_keys,
+        participants,
+        resume_epoch,
+        pending_boot,
+    } = boot::catch_up(
+        boot::Seat {
+            host,
+            resumed,
+            next_seq,
+            prev_ckpt,
+            member_keys,
+            participants,
+            resume_epoch,
+            pending_boot,
+        },
+        &blob_client,
+        &blob_peers,
+        &context,
+        &index,
+        &mut recovery,
+        &mut channel_bank,
+        &metrics,
+        &signer,
+        &namespace,
+        &label,
+        &forge_repo,
+        &duckfs_dir,
+        blobs.clone(),
+        genesis,
+    )
+    .await;
 
     let mut epoch_spawner = engine::EpochSpawner::new(
         &context,

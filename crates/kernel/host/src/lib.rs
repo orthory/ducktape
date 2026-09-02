@@ -831,24 +831,23 @@ impl Host {
             .collect()
     }
 
-    /// the per-block-durable disk cohort: every registered module whose sync
-    /// surface is [`StateSyncHandle::ResolverBacked`] — a qmdb-like store that
-    /// commits to its OWN disk each block and recovers itself at boot rather than
-    /// riding a checkpoint snapshot. recovery uses this to tell a disk substrate
-    /// that legitimately raced N blocks ahead of the last checkpoint apart from a
-    /// rolled-back in-memory cohort module: only a disk-cohort module may be
-    /// trusted at a self-durable root ABOVE the checkpoint. a module whose
-    /// `state_sync_handle` errors is excluded (it cannot claim the disk cohort's
-    /// self-durability), falling through to the ordinary root-equality path.
-    pub fn resolver_backed_ids(&self) -> BTreeSet<ModuleId> {
+    /// the per-block-durable disk cohort: every registered module that declares
+    /// [`Module::block_durable`] — a substrate that commits to its OWN disk each
+    /// block and recovers itself at boot rather than riding a checkpoint
+    /// snapshot. recovery uses this to tell a disk substrate that legitimately
+    /// raced N blocks ahead of the last checkpoint apart from a rolled-back
+    /// in-memory cohort module: only a disk-cohort module may be trusted at a
+    /// self-durable root ABOVE the checkpoint.
+    ///
+    /// the question is DURABILITY, not sync surface. this used to read
+    /// [`StateSyncHandle::ResolverBacked`] off `state_sync_handle`, which dropped
+    /// forge — per-block durable on its own disk, but shipping one
+    /// self-contained container — out of the cohort and bricked any restart with
+    /// two forge blocks above the last checkpoint.
+    pub fn block_durable_ids(&self) -> BTreeSet<ModuleId> {
         self.registry
             .iter()
-            .filter(|(_, m)| {
-                matches!(
-                    m.state_sync_handle(),
-                    Ok(StateSyncHandle::ResolverBacked { .. })
-                )
-            })
+            .filter(|(_, m)| m.block_durable())
             .map(|(id, _)| id.clone())
             .collect()
     }

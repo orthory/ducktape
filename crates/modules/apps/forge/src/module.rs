@@ -880,6 +880,16 @@ impl Module for Forge {
         Ok(StateSyncHandle::SnapshotBytes(self.snapshot()?))
     }
 
+    /// forge's committed refs, packs and tracker land on its OWN disk at every
+    /// block boundary (`publish_block`) and reopen at that tip, so it belongs to
+    /// recovery's per-block-durable cohort — even though its sync surface is one
+    /// self-contained container rather than a resolver lane. the default
+    /// `block_durable` reads the sync handle and would answer `false`, leaving
+    /// forge unplaceable at any height but its last change.
+    fn block_durable(&self) -> bool {
+        true
+    }
+
     /// apply one write op through the shared consensus core. Git writes stage
     /// pure per-branch CAS updates; tracker ops mutate the block-scratch
     /// tracker and emit chat follow-ups that commit atomically with the block.

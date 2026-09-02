@@ -294,12 +294,12 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
         let ops = Origin::External(key(0xB2));
 
         // ROOT CONTINUITY from block zero: both sides commit to the SAME
-        // (empty) qmdb store — equal roots, and both ride the resolver sync
-        // lane (never the checkpoint-snapshot lane).
+        // (empty) qmdb store — equal roots, and both are per-block durable on
+        // it, so recovery's disk cohort holds them on either side.
         assert_ne!(root_of(&native), StateRoot::ZERO);
         assert_eq!(root_of(&native), root_of(&wasm), "genesis roots diverge");
-        assert!(native.resolver_backed_ids().contains("automations"));
-        assert!(wasm.resolver_backed_ids().contains("automations"));
+        assert!(native.block_durable_ids().contains("automations"));
+        assert!(wasm.block_durable_ids().contains("automations"));
         // the inbox sibling's empty root, for the delivery-landed claims below
         // (the inbox has no read surface — its module root is the whole
         // observable committed state).

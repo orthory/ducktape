@@ -50,25 +50,31 @@
 //!   a changed module at NEITHER pre nor post is genuine damage and still
 //!   fail-stops as [`Error::Torn`], and the recomposed-vs-sealed root-hash
 //!   check is the final backstop.
-//! - a block that touches several DISK substrates could in principle crash
-//!   BETWEEN their commits — the classic multi-store atomicity limit; today no
-//!   block commits to more than one disk substrate (ops target one module; the
-//!   only cross-module dispatch, governance -> valset, stays in the in-memory
-//!   cohort). recovery refuses this EXPLICITLY: only a per-block-durable disk
-//!   substrate can be at its post-root after a crash (the in-memory cohort
-//!   always rolls back to the checkpoint), so two-or-more changed modules at
-//!   post means two-or-more disk substrates committed — a changed set spanning
-//!   more than one disk substrate at mixed roots. selective replay's premise (only the
-//!   in-memory cohort rolled back) no longer holds and its single-frame
-//!   re-execution could read a partially-committed world, so boot fail-stops
-//!   with [`Error::Torn`] at the point it detects this rather than healing and
-//!   leaning on the after-the-fact per-module verify. (a residual case — two
-//!   disk substrates where exactly ONE committed, so only one is at post — is
-//!   indistinguishable by root alone from the healthy single-disk torn block;
-//!   selective replay reconciles it and the per-module post-root verify is the
-//!   backstop that fail-stops rather than forks if the re-execution diverges.)
-//!   the exact fix if a block ever legitimately commits >1 disk substrate: a
-//!   per-commit height cursor in qmdb's commit metadata slot.
+//! - a block that touches several DISK substrates crashing BETWEEN their
+//!   commits — the classic multi-store atomicity limit. an ORDINARY block
+//!   touches several: every store-backed module keeps its own qmdb instance
+//!   and the odb modules their own duckfs/forge disks, so one agent-run settle
+//!   commits the in-memory `runs` plus chat, tasks and dispatch. what bounds
+//!   the window is the SEAL, not a count of substrates: [`Record::Seal`] is
+//!   fsync'd only after the block's apply RETURNED, and a per-block-durable
+//!   substrate's commit is durable when it returns inside that apply — so for
+//!   any SEALED block every disk substrate it changed is durable at (or
+//!   beyond) its post-root. the partial-commit window lies strictly ABOVE the
+//!   last seal, in the single unsealed WAL block, which `trailing.rs` bounds
+//!   and verifies on its own terms — fail-CLOSED terms: it admits only a
+//!   claimant carrying a per-commit height cursor, so a trailing qmdb store
+//!   commit (no cursor) and more than one claimant BOTH still refuse. inside
+//!   the sealed window the NUMBER of durable substrates is evidence of nothing
+//!   but how many disk modules the block touched, and the at-pre set is
+//!   exactly the cohort the checkpoint rolled back — so selective replay
+//!   handles one and many identically. the fail-stops that DO carry evidence
+//!   stay: a changed module at neither its pre- nor its post-root (nor ahead)
+//!   is damage ([`Error::Torn`]), a torn block with nothing left to re-commit
+//!   is damage, and the per-module post-root verify plus the tip root-hash
+//!   recompose fail-stop rather than fork if the re-execution diverges. the
+//!   residual — the re-execution can read a durable sibling's POST state
+//!   where the original read its pre state — is the one the single-substrate
+//!   heal always had, with the same backstop.
 //! - crash between the engine journaling a finalization and the drain: the
 //!   frame's bytes are already durable here — locally-submitted frames are
 //!   pinned at submit time ([`Record::Pinned`]), before the engine can ever
@@ -1250,8 +1256,8 @@ where
         }
 
         // forward pre-scan — seed each per-block-durable disk substrate's
-        // "durable floor". a disk-cohort (ResolverBacked) module commits to its
-        // OWN disk every block, but the checkpoint only persists on a cadence
+        // "durable floor". a disk-cohort (`block_durable`) module commits to
+        // its OWN disk every block, but the checkpoint only persists on a cadence
         // (default 32 blocks), so at boot a disk module can legitimately sit N
         // blocks AHEAD of the checkpoint: its live root equals a recorded
         // post-root well above the last checkpoint, matching NEITHER the
@@ -1267,7 +1273,7 @@ where
         // recovery never heals from a nearest/approximate record. a mis-read
         // root could only mis-seed a floor and trip the final root-hash
         // recompose (fail-stop), never fork.
-        let disk_cohort = host.resolver_backed_ids();
+        let disk_cohort = host.block_durable_ids();
         let mut disk_floor: BTreeMap<ModuleId, u64> = BTreeMap::new();
         if !disk_cohort.is_empty() {
             for record in &records {
@@ -1471,32 +1477,18 @@ where
                                 }
                                 // else: neither — genuine damage, caught below.
                             }
-                            // MULTI-DISK atomicity limit — fail-stop EXPLICITLY.
-                            // only a per-block-durable disk substrate can be
-                            // durable after a crash (the in-memory cohort always
-                            // rolls back to the checkpoint pre-root), so `durable`
-                            // counts exactly the disk substrates that committed
-                            // this block. two or more of them is a changed set
-                            // spanning >1 disk substrate at mixed roots: the classic
-                            // multi-store atomicity zone whose sealed state may not
-                            // be internally consistent and whose single-frame
-                            // re-execution can read a partially-committed world.
-                            // selective replay's assumption (only the in-memory
-                            // cohort was rolled back) no longer holds, so we refuse
-                            // it up front rather than heal-and-hope the per-module
-                            // verify catches a divergence. no block commits to >1
-                            // disk substrate today, so this is unreachable in prod;
-                            // the real fix if that changes is a per-commit height
-                            // cursor in the disk substrate's commit metadata.
-                            if durable >= 2 {
-                                return Err(Error::Torn(format!(
-                                    "block {height}: changed set spans {durable} \
-                                     per-block-durable disk substrates at mixed roots — the \
-                                     multi-store atomicity limit; single-frame selective replay \
-                                     cannot safely reconcile this. wipe app state and re-sync \
-                                     (keep the consensus journal)"
-                                )));
-                            }
+                            // `durable` is NOT capped here, and that is the
+                            // point: this block is SEALED, and the seal is
+                            // fsync'd only after the apply returned, so every
+                            // per-block-durable substrate the block changed
+                            // committed durably before the seal existed. the
+                            // count is just how many disk modules the block
+                            // touched — an agent-run settle touches several —
+                            // and the at-pre set is exactly the checkpoint's
+                            // rolled-back cohort. the crash-between-commits
+                            // window lives strictly above the last seal, where
+                            // `trailing.rs` bounds it. (see the crate docblock.)
+                            //
                             // a changed module at NEITHER pre nor durable is
                             // genuine damage — still fail-stop. so is a torn
                             // block with nothing left to re-commit (it should
