@@ -1,6 +1,7 @@
-//! `ducktape agent` — remote/interactive sandboxed provider sessions.
+//! `ducktape agent` — remote/interactive sandboxed provider sessions, plus the
+//! two run-control verbs.
 //!
-//! Two verbs, one credential+targeting story:
+//! Two session verbs, one credential+targeting story:
 //!
 //! - `agent pty [<provider>] [--host-node <hex>] [--cred <name>] [--cpu <n>] [--mem <gb>]`
 //!   attaches THIS terminal to a provider running in a microVM on a host
@@ -13,6 +14,16 @@
 //!   the user key, so the lender attributes the run to the user's account
 //!   (`OfKey`) when the pinned node asks to draw on `--cred`. The target may be
 //!   offline now and execute on reconnect — that durability is the point.
+//!
+//! Two run-control verbs act on a run the RUNS MODULE holds — the chat- and
+//! jobs-driven agent turns, not a `sched` saga:
+//!
+//! - `agent cancel <run-id>` submits `RunsMsg::CancelRun`;
+//! - `agent reassign <run-id> [--attempt N]` submits `RunsMsg::ReassignRun`.
+//!
+//! Both ride the same user-signed frame lane `sched` uses, and neither
+//! pre-checks who may act: the module decides (the run's creator or the agent's
+//! owner) on every validator, and its refusal sentence is what comes back.
 //!
 //! `<provider>` is optional when `--cred` names a credential: the registry
 //! record's kind decides what to launch; an explicit provider contradicting the
@@ -64,6 +75,34 @@ pub(crate) enum AgentCmd {
     Sched(SchedArgs),
     /// install the agent CLIs this host's guest image lends to runs
     Install(crate::executors::InstallArgs),
+    /// cancel a pending run (the run's creator or the agent's owner may)
+    Cancel(CancelArgs),
+    /// fence this attempt and move a pending run to another provider
+    Reassign(ReassignArgs),
+}
+
+// The run id both control verbs take is the runs module's turn-claim key —
+// `chat\x1f<channel>\x1f<anchor>\x1f<agent>` or
+// `job\x1f<job>\x1f<agent>\x1f<height>` — so it carries literal 0x1f separators
+// and is COPIED, not typed: the `pending_runs` query and the app's run list both
+// print it.
+#[derive(Debug, clap::Args)]
+pub(crate) struct CancelArgs {
+    /// the pending run's id, from `runs`' `pending_runs` query
+    #[arg(value_name = "RUN_ID")]
+    run_id: String,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct ReassignArgs {
+    /// the pending run's id, from `runs`' `pending_runs` query
+    #[arg(value_name = "RUN_ID")]
+    run_id: String,
+    /// the attempt to FENCE: the run's current attempt, 0 until it has been
+    /// reassigned once. A stale number is a deterministic no-op by design —
+    /// that is what stops a delayed click from revoking a newer assignment.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    attempt: u32,
 }
 
 #[derive(Debug, clap::Args)]
@@ -146,6 +185,8 @@ pub(crate) fn run(args: AgentArgs) -> AgentResult {
         AgentCmd::Pty(pty) => cmd_pty(pty, &ctx.http_base()?, &ctx.addr),
         AgentCmd::Sched(sched) => cmd_sched(sched, &ctx, &mut stdin),
         AgentCmd::Install(install) => crate::executors::run(install),
+        AgentCmd::Cancel(cancel) => cmd_cancel(cancel, &ctx, &mut stdin),
+        AgentCmd::Reassign(reassign) => cmd_reassign(reassign, &ctx, &mut stdin),
     }
 }
 
@@ -486,6 +527,67 @@ fn fresh_dispatch_id() -> String {
     let mut bytes = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
     hex_bytes(&bytes)
+}
+
+// ============================================================================
+// cancel / reassign — run control through the runs module
+// ============================================================================
+
+fn cmd_cancel(args: CancelArgs, ctx: &VerbCtx, stdin: &mut impl BufRead) -> AgentResult {
+    let height = submit_runs_op(
+        ctx,
+        stdin,
+        &runs::RunsMsg::CancelRun {
+            run_id: args.run_id.clone(),
+        },
+    )?;
+    println!("{}", control_accepted("cancel", &args.run_id, height));
+    Ok(())
+}
+
+fn cmd_reassign(args: ReassignArgs, ctx: &VerbCtx, stdin: &mut impl BufRead) -> AgentResult {
+    let height = submit_runs_op(
+        ctx,
+        stdin,
+        &runs::RunsMsg::ReassignRun {
+            run_id: args.run_id.clone(),
+            attempt: args.attempt,
+        },
+    )?;
+    println!("{}", control_accepted("reassign", &args.run_id, height));
+    Ok(())
+}
+
+/// Submit one `runs` op as a frame the USER key signs, and answer with the
+/// commit height.
+///
+/// The user key is the whole authorization: the frame's verified signer becomes
+/// the op's `Origin::External`, and the runs module admits only the run's
+/// creator or the agent's owner (`crates/modules/apps/runs/src/admin.rs`,
+/// `controlled_dispatch_id`). This CLI deliberately pre-checks NEITHER — a
+/// second gate here could only drift from the one that actually decides, and
+/// the module's refusal sentence reaches the operator verbatim through the
+/// submit lane's error.
+fn submit_runs_op(
+    ctx: &VerbCtx,
+    stdin: &mut impl BufRead,
+    message: &runs::RunsMsg,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let base = ctx.http_base()?;
+    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    crate::node_http::submit_frame(&base, &user_frame(&user, "runs", runs::encode_msg(message)))
+}
+
+/// What an admitted run-control op prints.
+///
+/// "accepted", never "cancelled": this block is where the runs module TOOK the
+/// op and told the dispatch plane. The run ends a block later, when the plane's
+/// `Err("cancelled")` delivery prunes the entry and posts the agent's ⚠ reply —
+/// and an already-delivered run accepts the very same op as a deterministic
+/// no-op. Claiming the run is over here would be a sentence the chain has not
+/// agreed to yet.
+fn control_accepted(verb: &str, run_id: &str, height: u64) -> String {
+    format!("{verb} accepted for run {run_id} at height {height}")
 }
 
 // ============================================================================
@@ -861,6 +963,139 @@ mod tests {
         assert_eq!(resize["op"], "term_resize");
         assert_eq!(resize["cols"], 120);
         assert_eq!(resize["rows"], 40);
+    }
+
+    /// Both control verbs must build a frame the runs module will honour: the
+    /// USER key signs it (the module's authority check IS the frame's verified
+    /// origin), it targets `runs`, and the payload is the exact op — a
+    /// `RequestRun`-shaped or mis-targeted frame would be refused by a module
+    /// that never sees who meant what.
+    #[test]
+    fn the_control_verbs_sign_the_runs_op_with_the_user_key() {
+        use commonware_codec::DecodeExt as _;
+        let user = commonware_cryptography::ed25519::PrivateKey::decode([3u8; 32].as_slice())
+            .expect("a 32-byte seed");
+        let run_id = "chat\u{1f}general\u{1f}3\u{1f}bot".to_string();
+
+        for op in [
+            runs::RunsMsg::CancelRun {
+                run_id: run_id.clone(),
+            },
+            runs::RunsMsg::ReassignRun {
+                run_id: run_id.clone(),
+                attempt: 0,
+            },
+        ] {
+            let frame = user_frame(&user, "runs", runs::encode_msg(&op));
+            let (origin, msg) = node::decode_frame(&frame).expect("the frame verifies");
+            assert_eq!(
+                origin,
+                sdk::Origin::External(user.public_key().as_ref().to_vec()),
+                "the module admits the run creator or the agent owner by ORIGIN"
+            );
+            assert_eq!(msg.target, "runs", "the ops live in the runs module");
+            assert_eq!(runs::decode_msg(&msg.payload), Ok(op));
+        }
+    }
+
+    /// The two ways the node can answer a control submit, through the exact
+    /// lane the verbs use.
+    ///
+    /// Accepted is a HEIGHT, and the sentence says "accepted" rather than
+    /// "cancelled" — the run ends a block later, on the dispatch plane's
+    /// delivery. Rejected must carry the MODULE's own sentence: "only the run
+    /// creator or the agent owner may cancel a run" is the entire answer to
+    /// "why did nothing happen", and a generic "rejected (400)" throws it away.
+    #[test]
+    fn a_control_submit_reports_the_height_or_the_modules_own_refusal() {
+        let refusal = "only the run creator or the agent owner may cancel a run";
+        let run_id = "chat\u{1f}general\u{1f}3\u{1f}bot";
+
+        let accepted = one_shot_node(200, r#"{"height":42,"root_hash":"ab","op_hash":"cd"}"#);
+        let height = crate::node_http::submit_frame(&accepted.base, b"frame").expect("accepted");
+        accepted.join();
+        assert_eq!(height, 42);
+        assert_eq!(
+            control_accepted("cancel", run_id, height),
+            format!("cancel accepted for run {run_id} at height 42"),
+        );
+
+        let rejected = one_shot_node(400, &format!(r#"{{"error":"{refusal}"}}"#));
+        let error = crate::node_http::submit_frame(&rejected.base, b"frame")
+            .expect_err("the module refused")
+            .to_string();
+        rejected.join();
+        assert!(
+            error.contains(refusal),
+            "the module's sentence is the whole answer: {error}"
+        );
+    }
+
+    /// a Parser wrapper so the tests exercise the derived verb SHAPE the same
+    /// way `main.rs`'s integrator will.
+    #[derive(clap::Parser)]
+    struct TestAgentCli {
+        #[command(flatten)]
+        args: AgentArgs,
+    }
+
+    /// `--attempt` defaults to 0 — the run's FIRST attempt, and the only one a
+    /// reassignment can move (`RUN_MAX_ATTEMPTS = 2`, so attempt 1 answers
+    /// "reassignment attempts exhausted"). A wrong default is the worst
+    /// failure this verb has: saga treats a stale attempt as a deterministic
+    /// no-op, so the operator would read "accepted" and watch the run carry on.
+    #[test]
+    fn reassign_fences_the_first_attempt_unless_told_otherwise() {
+        use clap::Parser as _;
+        let reassign = |argv: &[&str]| {
+            let cli = TestAgentCli::try_parse_from(argv).expect("the verb parses");
+            match cli.args.cmd {
+                AgentCmd::Reassign(args) => args,
+                other => panic!("expected reassign, got {other:?}"),
+            }
+        };
+        let default = reassign(&["agent", "reassign", "run-1"]);
+        assert_eq!(default.run_id, "run-1");
+        assert_eq!(default.attempt, 0);
+        assert_eq!(
+            reassign(&["agent", "reassign", "run-1", "--attempt", "1"]).attempt,
+            1
+        );
+
+        let cancel =
+            TestAgentCli::try_parse_from(["agent", "cancel", "run-1"]).expect("the verb parses");
+        assert!(matches!(cancel.args.cmd, AgentCmd::Cancel(args) if args.run_id == "run-1"));
+    }
+
+    /// a loopback listener that answers exactly one request with `status` and
+    /// `body`, then closes. The accept IS the synchronization — no sleep, no
+    /// retry loop.
+    struct OneShotNode {
+        base: String,
+        serving: std::thread::JoinHandle<()>,
+    }
+
+    impl OneShotNode {
+        fn join(self) {
+            self.serving.join().expect("the serve thread finishes");
+        }
+    }
+
+    fn one_shot_node(status: u16, body: &str) -> OneShotNode {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let response = format!(
+            "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let serving = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut conn, _) = listener.accept().expect("the client connects");
+            let mut scratch = [0u8; 4096];
+            let _ = conn.read(&mut scratch);
+            let _ = conn.write_all(response.as_bytes());
+        });
+        OneShotNode { base, serving }
     }
 
     #[test]
