@@ -61,7 +61,7 @@ const localUrl = (value) => {
 };
 
 const rememberedUrl = () => {
-  if (process.env.DUCKTAPE_URL) return process.env.DUCKTAPE_URL;
+  if (process.env.DUCKTAPE_NODE) return process.env.DUCKTAPE_NODE;
   try {
     return fs.readFileSync(stateFile, "utf8").trim();
   } catch {
