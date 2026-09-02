@@ -33,11 +33,6 @@ toml = "0.8"
 # interactive session's pty master (see src/interactive.rs).
 tokio = { workspace = true, features = ["process", "io-util", "net"] }
 tracing = { workspace = true }
-# `ducktape_home()` — the ONE resolver for this operator's on-disk root, so
-# the operator spec dir follows $DUCKTAPE_HOME like the keys, workspaces,
-# executors and guest images beside it. Re-deriving that root here is what
-# left a node under DUCKTAPE_HOME=/srv/duck reading its specs out of $HOME.
-workspace-config = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -81,8 +81,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let wasm_ids = TOPOLOGY.wasm_ids(MODULE_IDS);
     let (code, code_hashes) = DirCodeSource::open(&modules_dir, &wasm_ids).map_err(|err| {
         format!(
-            "{err} — fill `~/.ducktape/modules` (`make install-node`), or pass \
-             --modules <dir> holding every <id>.component.wasm"
+            "{err} — fill `{}` (`make install-node`), or pass \
+             --modules <dir> holding every <id>.component.wasm",
+            modules_dir.display()
         )
     })?;
     let storage = storage.unwrap_or_else(|| {
