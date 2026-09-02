@@ -28,14 +28,17 @@ const PLANES: &[&str] = &[
     "agent",        // agent sessions: provisioning, run output, the telemetry socket
     "app",          // the desktop app's own backend
     "auth",         // account ceremonies: the auth page, sign-in, key association
+    "blobstore",    // the node-local op-receipt byte store: persist faults, hash mismatches
     "boot",         // node startup, before the running planes exist: genesis seeding
     "broker",       // the run-scoped model broker's proxied requests
     "compute",      // provider compute: pools, credentials, interactive runs
     "consensus",    // the kernel: blocks, votes, finalization
     "dataplane",    // the WireGuard data path: overlay device, sockets, binds
+    "files",        // the files module and the duckfs http lane: stage, commit, pin
     "forge",        // the forge module and its blob/ref plumbing
     "gateway",      // the http gateway and the airlock in front of it
     "http",         // the node's own http listeners
+    "index",        // the indexer: store open, refold, poison
     "join",         // invitations, first contact, admission
     "modules",      // the module set: registry, code plane, wasm workers
     "node",         // whole-node lifecycle and identity

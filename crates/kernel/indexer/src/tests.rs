@@ -938,7 +938,9 @@ fn the_refold_drops_its_guest_marker_before_clearing_and_writes_it_back_last() {
     let cleared = body
         .find("clear_derived(")
         .expect("the refold clears the derived keyspace");
-    let drained = body.find("drain_fold(").expect("the refold drains");
+    // `refold_feed` is the replay AND the drain — the shared tail with
+    // `converge_guest`.
+    let drained = body.find("refold_feed(").expect("the refold drains");
     let written = body
         .find("put(META_GUEST")
         .expect("the refold writes the marker back");
