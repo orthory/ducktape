@@ -57,19 +57,19 @@ impl host::Host for HostState {
     fn log(&mut self, level: host::Level, target: String, message: String) {
         match level {
             host::Level::Trace => {
-                tracing::trace!(target: "ducktape::dataplane", guest_target = %target, "{message}")
+                tracing::trace!(target: "ducktape::reachability", guest_target = %target, "{message}")
             }
             host::Level::Debug => {
-                tracing::debug!(target: "ducktape::dataplane", guest_target = %target, "{message}")
+                tracing::debug!(target: "ducktape::reachability", guest_target = %target, "{message}")
             }
             host::Level::Info => {
-                tracing::info!(target: "ducktape::dataplane", guest_target = %target, "{message}")
+                tracing::info!(target: "ducktape::reachability", guest_target = %target, "{message}")
             }
             host::Level::Warn => {
-                tracing::warn!(target: "ducktape::dataplane", guest_target = %target, "{message}")
+                tracing::warn!(target: "ducktape::reachability", guest_target = %target, "{message}")
             }
             host::Level::Error => {
-                tracing::error!(target: "ducktape::dataplane", guest_target = %target, "{message}")
+                tracing::error!(target: "ducktape::reachability", guest_target = %target, "{message}")
             }
         }
     }

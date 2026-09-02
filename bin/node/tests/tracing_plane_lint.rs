@@ -12,6 +12,13 @@
 //! plane means adding a line here that says what it covers; a plane nothing logs
 //! to any more loses its line. Both directions are asserted, so the const cannot
 //! rot into fiction.
+//!
+//! It lives here, in the node binary's tests, because the set it guards is
+//! tree-wide and node-bin is the crate that links the whole tree: there is no
+//! workspace-level test crate to hold it, and a copy per crate would be the
+//! same drift in a new place. The cost is real and accepted — deleting the last
+//! event of a thin plane (`broker`, `stream`) from some other crate turns
+//! node-bin red, and the fix is a line in `PLANES` here.
 
 use std::path::{Path, PathBuf};
 
@@ -25,7 +32,7 @@ const PLANES: &[&str] = &[
     "broker",       // the run-scoped model broker's proxied requests
     "compute",      // provider compute: pools, credentials, interactive runs
     "consensus",    // the kernel: blocks, votes, finalization
-    "dataplane",    // the WireGuard data path: overlay device, sockets, netstack guest
+    "dataplane",    // the WireGuard data path: overlay device, sockets, binds
     "forge",        // the forge module and its blob/ref plumbing
     "gateway",      // the http gateway and the airlock in front of it
     "http",         // the node's own http listeners
@@ -33,7 +40,7 @@ const PLANES: &[&str] = &[
     "modules",      // the module set: registry, code plane, wasm workers
     "node",         // whole-node lifecycle and identity
     "provider",     // the provider host: a run's own files and their cleanup
-    "reachability", // NAT traversal: rendezvous, handshakes, the netstack machine
+    "reachability", // NAT traversal: rendezvous, handshakes, the netstack machine on either backend
     "recovery",     // restart, replay, checkpoint restore
     "saga",         // multi-step orchestration runs
     "sandbox",      // microVM runs: images, boot, guest lifecycle
@@ -73,17 +80,22 @@ fn scan(dir: &Path, sites: &mut Vec<Site>) {
         }
         let src = std::fs::read_to_string(&path).expect("read source file");
         for (n, line) in src.lines().enumerate() {
-            let Some(after) = line.find(PREFIX).map(|at| at + PREFIX.len()) else {
-                continue;
-            };
-            let Some(end) = line[after..].find('"') else {
-                continue;
-            };
-            sites.push(Site {
-                plane: line[after..after + end].to_string(),
-                file: path.clone(),
-                line: n + 1,
-            });
+            // every site on the line, not just the first: the lint's whole
+            // value is exhaustiveness, and one-site-per-line is rustfmt's
+            // habit, not a property anything here asserts.
+            let mut rest = line;
+            while let Some(at) = rest.find(PREFIX) {
+                let after = &rest[at + PREFIX.len()..];
+                let Some(end) = after.find('"') else {
+                    break;
+                };
+                sites.push(Site {
+                    plane: after[..end].to_string(),
+                    file: path.clone(),
+                    line: n + 1,
+                });
+                rest = &after[end + 1..];
+            }
         }
     }
 }
