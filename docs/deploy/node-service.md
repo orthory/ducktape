@@ -174,6 +174,21 @@ on a three-validator network the restart halts the chain for its duration.
 runs (`<cargo version>+<git short sha>[-<dirty digest>]`), which is how two
 hosts confirm they run the same binary.
 
+`dt node peers` (and `GET /v1/peers`) carries that same stamp per peer as
+`build=`, and a node warns once per `(peer, stamp)` with
+`reason = "build_stamp_mismatch"` when a peer's stamp differs from its own.
+Nothing refuses, disconnects or gates admission on a stamp — two builds whose
+consensus logic has drifted still finalize together, and this only makes the
+drift nameable. **Know the column's reach before you trust it.** A node learns
+a peer's stamp only by POLLING that peer on the state-sync detection lane, and
+only a RESIDENT polls: the column is filled on a resident, for the source it
+happens to be polling, and reads `build=unknown` everywhere else — on every
+peer of a validator, and on a resident for every peer it does not poll. So
+`build=unknown` means "never asked", never "agrees with us", and on an
+all-validator network (the three-seat shape below) nothing fills the column at
+all and the mismatch warn cannot fire. Reading `/v1/status | jq .version` on
+each host is the check that always works.
+
 ## Validator count: three seats tolerate nothing
 
 Consensus is BFT: `f = (n - 1) / 3` faults tolerated, `quorum = n - f`. The
@@ -221,8 +236,8 @@ residents.
 
 ### Recovery is manual
 
-There is nothing to run on the surviving nodes. **The only fix is to bring the
-missing validator back**, and under these units that means starting its node
+Nothing you can run on the surviving nodes repairs the chain. **The only fix is
+to bring the missing validator back**, and under these units that means starting its node
 again (a node that crashed on a supervised host is already being restarted
 every 3 s by `Restart=always`; a hand-run node has no supervisor at all):
 
