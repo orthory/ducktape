@@ -1666,15 +1666,9 @@ mod object_read_budget {
                 Some(head),
                 "rm".into(),
                 vec![
-                    Change::Rm {
-                        path: "/d0/f0".into(),
-                    },
-                    Change::Rm {
-                        path: "/d1/f1".into(),
-                    },
-                    Change::Rm {
-                        path: "/d2/f2".into(),
-                    },
+                    Change::Rm { path: "/d0/f0".into() },
+                    Change::Rm { path: "/d1/f1".into() },
+                    Change::Rm { path: "/d2/f2".into() },
                 ],
             )
             .map(|_| ())
@@ -1707,15 +1701,9 @@ mod object_read_budget {
             Some(head),
             "rm".into(),
             vec![
-                Change::Rm {
-                    path: "/d0/f0".into(),
-                },
-                Change::Rm {
-                    path: "/d1/f1".into(),
-                },
-                Change::Rm {
-                    path: "/d2/f2".into(),
-                },
+                Change::Rm { path: "/d0/f0".into() },
+                Change::Rm { path: "/d1/f1".into() },
+                Change::Rm { path: "/d2/f2".into() },
             ],
         )
         .expect("within-budget commit must succeed");

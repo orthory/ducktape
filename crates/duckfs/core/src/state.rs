@@ -332,10 +332,7 @@ mod block_objects_tests {
     fn block_objects_round_trip_empty_and_multi_entry() {
         // empty index: a lone count of 0, decodes back to the empty map.
         let empty = BTreeMap::new();
-        assert_eq!(
-            decode_block_objects(&encode_block_objects(&empty)).unwrap(),
-            empty
-        );
+        assert_eq!(decode_block_objects(&encode_block_objects(&empty)).unwrap(), empty);
 
         // multi-entry across kinds; decode re-canonicalizes into the same map.
         let mut index = BTreeMap::new();
@@ -353,20 +350,12 @@ mod block_objects_tests {
         let mut bytes = encode_block_objects(&index);
         // corrupt the kind tag byte (right after the 32-byte id, after the u32 count).
         bytes[4 + 32] = 0xEE;
-        assert!(
-            decode_block_objects(&bytes)
-                .unwrap_err()
-                .contains("unknown kind tag")
-        );
+        assert!(decode_block_objects(&bytes).unwrap_err().contains("unknown kind tag"));
 
         // trailing bytes reject at finish.
         let mut trailing = encode_block_objects(&index);
         trailing.push(0);
-        assert!(
-            decode_block_objects(&trailing)
-                .unwrap_err()
-                .contains("trailing bytes")
-        );
+        assert!(decode_block_objects(&trailing).unwrap_err().contains("trailing bytes"));
     }
 }
 
