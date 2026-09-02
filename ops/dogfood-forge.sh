@@ -17,8 +17,9 @@
 #
 # Resolution of the node's forge base URL, in order:
 #   1. $DUCKTAPE_DEV_FORGE_URL           — explicit base, e.g. http://127.0.0.1:8844
-#   2. the ACTIVE workspace's http_listen — ~/.ducktape/registry.json (.active)
-#                                            -> ~/.ducktape/workspaces/<active>/node.toml
+#   2. the ACTIVE workspace's http_listen — <home>/registry.json (.active)
+#                                            -> <home>/workspaces/<active>/node.toml
+#      where <home> is $DUCKTAPE_HOME when set, else ~/.ducktape
 #      (the workspace flow assigns a RANDOM http port, so this is not a fixed :8844)
 #
 # Env knobs:

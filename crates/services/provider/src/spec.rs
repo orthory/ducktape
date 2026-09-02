@@ -801,7 +801,7 @@ format = "text"
 
     /// A RETIRED section is an unknown one: a stale operator spec that still
     /// declares it fails loud at load rather than parsing into a block nothing
-    /// would ever read. (`~/.ducktape/capabilities` is operator-writable, so
+    /// would ever read. (`<ducktape home>/capabilities` is operator-writable, so
     /// this is the door a leftover file comes in.)
     #[test]
     fn retired_sections_fail_loud_at_load() {

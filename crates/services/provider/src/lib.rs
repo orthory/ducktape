@@ -3211,16 +3211,21 @@ mod tests {
         )
     }
 
+    /// the guest images `ops/build-guest-rootfs.sh` wrote: `$DUCKTAPE_GUEST_DIR`
+    /// when a hardware run points this at a build tree, else the same default
+    /// the builder and the `[sandbox]` table use. `default_guest_dir` does not
+    /// read that env var itself, so the override stays here.
     fn live_backend(vmm: sandbox_host::Vmm, executors: PathBuf) -> SandboxBackend {
-        let dir = std::env::var("DUCKTAPE_GUEST_DIR").unwrap_or_else(|_| {
-            let home = std::env::var("DUCKTAPE_HOME")
-                .unwrap_or_else(|_| format!("{}/.ducktape", std::env::var("HOME").unwrap()));
-            format!("{home}/guest")
-        });
+        let dir = match std::env::var_os("DUCKTAPE_GUEST_DIR") {
+            Some(dir) => PathBuf::from(dir),
+            None => {
+                workspace_config::default_guest_dir().expect("the test env resolves a guest dir")
+            }
+        };
         SandboxBackend::MicroVm {
             vmm,
-            kernel: PathBuf::from(&dir).join("vmlinux"),
-            rootfs: PathBuf::from(&dir).join("rootfs.ext4"),
+            kernel: dir.join("vmlinux"),
+            rootfs: dir.join("rootfs.ext4"),
             executors,
         }
     }
@@ -4359,10 +4364,14 @@ format = "text"
             "operator_spec_dir must take its default from \
              workspace_config::ducktape_home()"
         );
+        // The second half: nothing here reads the override itself. Resolving it
+        // is `ducktape_home`'s one job, and a reader that re-reads the env var
+        // is how the second copy gets written. The needle is the quoted env-var
+        // name, which this line does NOT contain — its own quotes are escaped.
         assert!(
-            !src.contains(".join(\".ducktape\")"),
-            "this crate re-derives the operator root instead of asking \
-             workspace_config::ducktape_home() for it"
+            !src.contains("\"DUCKTAPE_HOME\""),
+            "this crate reads the operator-root env var directly; ask \
+             workspace_config::ducktape_home() for the resolved root instead"
         );
     }
 
