@@ -99,9 +99,10 @@ dt node status                            # height + root hash, once it serves
 ```
 
 Service daemons: the instance is the kind (`compute`, `agent`, `airlock`).
-A daemon needs the node up and publishing its mesh identity; it exits loudly
-otherwise and the unit's `Restart=always` retries every 5 s, so co-starting
-both at boot converges on its own. Consent is a separate act — the daemon
+A daemon needs the node up and publishing its mesh identity at ITS boot; it
+exits loudly otherwise and the unit's `Restart=always` retries every 5 s, so
+co-starting both at boot converges on its own (once serving, it rides out a
+node restart — see below). Consent is a separate act — the daemon
 signals and parks until you grant it, and it reads the grant at boot:
 
 ```sh
@@ -152,8 +153,16 @@ sudo install -m 0755 target/release/ducktape /usr/local/bin/ducktape && \
   sudo systemctl restart ducktape-node@mynet ducktape-service@compute
 ```
 
-A restart of the node drops the daemons' link; they exit and the supervisor
-brings them back once the node publishes again. Read
+A running daemon survives a node restart, so do not restart it for one: its
+link task re-dials forever (`bin/node/src/compute/link.rs`,
+`bin/node/src/agent/link.rs`; the agent link re-reads `service-link.token`
+on every attach, since a node restart mints a fresh one), and its hello
+heartbeat keeps signaling — `warn` `hello_failed` at attempt 1, then every
+30th, carrying `attempts` (`bin/node/src/services.rs`, `heartbeat`). Restart
+`ducktape-service@<kind>` only for a new binary or a new grant. The one
+daemon that exits is one that BOOTS while the node is down: the first hello
+must land (`services.rs`, `send_hello` in `run`), and `Restart=always`
+retries it until it does. Read
 `docs/records/admission/validator-onboarding.md` before stopping a
 validator: below four validators every seat must be live to finalize, so a
 restart of one of three halts the chain for the restart's duration.

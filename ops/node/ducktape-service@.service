@@ -17,11 +17,14 @@
 # /etc/ducktape/node.env and skip steps 3–4: `--enable` mints the grant
 # without asking.
 #
-# `service run` exits loudly when the node is down or has not yet published
-# its mesh identity (`ducktape node status` shows it) — it never spins. The
-# restart policy below is what turns that into "wait for the node": a boot
-# that co-starts both units converges within a few RestartSec. To order it
-# after one node, add a drop-in:
+# At boot, `service run` exits loudly when the node is down or has not yet
+# published its mesh identity (`ducktape node status` shows it) — the first
+# hello never spins. The restart policy below is what turns that into "wait
+# for the node": a boot that co-starts both units converges within a few
+# RestartSec. Once serving, the daemon rides out a node restart on its own
+# (its link re-dials forever and its hello heartbeat keeps signaling), so
+# restart it only for a new binary or a new grant. To order it after one
+# node, add a drop-in:
 #   systemctl edit ducktape-service@compute
 #   [Unit]
 #   After=ducktape-node@mynet.service
