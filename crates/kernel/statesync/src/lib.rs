@@ -1906,18 +1906,6 @@ pub async fn fetch_manifest<C: SyncClient>(client: &C) -> Result<Manifest, SyncE
     }
 }
 
-/// fetch the serving peer's tip coordinates — the detection lane: membership,
-/// epoch, and height without capturing a boundary. action taken on the answer
-/// (ascension, promotion) re-fetches a full [`Manifest`] and verifies its
-/// floor certificate.
-pub async fn fetch_tip_coords<C: SyncClient>(client: &C) -> Result<TipCoords, SyncError> {
-    match client.request(SyncRequest::TipCoords).await? {
-        SyncResponse::TipCoords(c) => Ok(c),
-        SyncResponse::Error(e) => Err(SyncError::Server(e)),
-        other => Err(SyncError::UnexpectedResponse(other.kind_name())),
-    }
-}
-
 /// fetch a captured module's full snapshot payload, chunk by chunk.
 pub async fn fetch_snapshot<C: SyncClient>(
     client: &C,

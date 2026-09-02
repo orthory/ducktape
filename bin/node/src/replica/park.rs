@@ -40,8 +40,8 @@ use super::wiring::ReplicaChannels;
 use crate::validator::PromotionBaton;
 
 use sdk::StateRoot;
+use statesync::fetch_manifest;
 use statesync::p2p::P2pSyncClient;
-use statesync::{fetch_manifest, fetch_tip_coords};
 use std::time::Duration;
 
 /// one direct-peer sample off this lane's registry: the exposition parse
@@ -87,9 +87,11 @@ fn note_source_build(
     builds: &mut std::collections::BTreeMap<String, String>,
     warned: &mut std::collections::BTreeSet<(String, String)>,
 ) {
-    let Some(theirs) = reported else {
-        // a server that cannot identify its own build said nothing, which is
-        // not a disagreement: leave the surface's `unknown` standing.
+    // the same filter the skew rule applies, so the map and the rule agree on
+    // what a stamp IS: a server that could not identify its own build — by
+    // saying nothing, or by naming the literal `unknown` — said nothing, and
+    // that is not a disagreement. leave the surface's `unknown` standing.
+    let Some(theirs) = reported.filter(|it| *it != noded::services::UNKNOWN_BUILD) else {
         return;
     };
     builds.insert(peer.to_string(), theirs.to_string());
@@ -472,7 +474,9 @@ pub(super) async fn park(
     // peer key hex -> the build stamp that peer reported about ITSELF on the
     // detection lane, and the (peer, stamp) pairs already warned about. the
     // mesh gossips no stamp, so this only ever holds sources this lane
-    // polled; see `note_source_build`.
+    // polled; see `note_source_build`. both die with `park()`: a promoted
+    // node polls nobody, so the `build=` column an operator saw on a joiner
+    // is empty again once it holds a seat.
     let mut peer_builds: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     let mut warned_builds: std::collections::BTreeSet<(String, String)> =
@@ -1853,8 +1857,13 @@ pub(super) async fn park(
             continue;
         }
         next_manifest_fetch = std::time::Instant::now() + RESIDENT_FALLBACK_POLL;
-        let tip = match fetch_tip_coords(&client).await {
-            Ok(tip) => tip,
+        // the answering peer comes back WITH the answer: the client's source
+        // cursor is shared with every lane holding a clone of it (the pack
+        // sweeper rotates it on its own failures), so a read taken after the
+        // await could name a peer that answered nothing — and this poll puts
+        // that name on a build stamp and in a warn.
+        let (tip, source) = match client.fetch_tip_coords().await {
+            Ok(answered) => answered,
             Err(e) => {
                 // this poll runs POST-admission (the gate already granted
                 // standing, or this is the manual/restore path); a fetch miss
@@ -1875,7 +1884,7 @@ pub(super) async fn park(
         // record it for the peers surface and name a disagreement once.
         note_source_build(
             noded::services::build_identity_or_unknown(),
-            &hex_bytes(client.current_source().as_ref()),
+            &hex_bytes(source.as_ref()),
             tip.build.as_deref(),
             &mut peer_builds,
             &mut warned_builds,
