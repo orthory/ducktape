@@ -108,9 +108,13 @@ The table is the GENESIS path: the flag day that moves the root hash.
 | `bin/simnode` | deterministic /v1 twin | same shape as noded |
 | the indexer | one index database per composed module | `open_index_store` opens a database for EVERY id in the selection, so joining or leaving `PRODUCTION` gains or loses one — nothing to touch for a module with no mapper. A module that ships one also needs its arm in `index_guest_wasm()` (`crates/noded/src/index.rs`, `include_bytes!` of the committed `index.wasm`) and its `INDEX_MODULES` entry in the `Makefile`. |
 
-noded/simnode run a SUBSET — a wasm-only tenant (e.g. `capability`) appears
-in `bin/node` alone. Decide whether the module belongs in the daemon/sim lanes;
-if it should be testable in sim-lane or visible in the app, it does.
+noded/simnode run a SUBSET: `SIM_BASE` is 15 of production's 19, and the four
+it leaves out — `acl`, `governance`, `lifecycle`, `valset` — are exactly what
+simnode's `--with-valset` appends (with native `kv`). So no production tenant
+is `bin/node`-only today; the two wasm ones outside the default set (`acl`,
+`governance`) compose in the sim under that flag. Decide which selection a new
+module joins: `SIM_BASE` if it should boot by default (testable in sim-lane,
+visible in the app), `SIM_VALSET` if it is governance-shaped.
 
 A new module joins `topology::PRODUCTION`; update the topology's count and
 membership pins and `host_state.rs`'s `GENESIS_ROOT_HASH` in the SAME commit
