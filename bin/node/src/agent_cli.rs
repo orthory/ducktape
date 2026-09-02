@@ -625,9 +625,10 @@ fn submit_control(
 /// The lane a run id belongs to, asked of the id and the key that signs for it.
 fn control_lane(origin: &sdk::Origin, run_id: &str) -> ControlLane {
     let is_this_keys_saga = saga::owns_id(origin, run_id);
-    match is_this_keys_saga {
-        true => ControlLane::Sched,
-        false => ControlLane::Runs,
+    if is_this_keys_saga {
+        ControlLane::Sched
+    } else {
+        ControlLane::Runs
     }
 }
 
@@ -1158,51 +1159,50 @@ mod tests {
         );
     }
 
-    /// The two ways the node can answer a control submit, through the exact
-    /// lane the verbs use.
+    /// What a COMMITTED control op is allowed to claim. Every sentence here
+    /// prints at a height the chain agreed to, and the failure mode is claiming
+    /// more than that height proves.
     ///
-    /// Accepted is a HEIGHT, and the sentence says "accepted" rather than
-    /// "cancelled" — the run ends a block later, on the dispatch plane's
-    /// delivery. Rejected must carry the MODULE's own sentence: "only the run
-    /// creator or the agent owner may cancel a run" is the entire answer to
-    /// "why did nothing happen", and a generic "rejected (400)" throws it away.
+    /// "accepted", never "cancelled" — the run ends a block later, on the
+    /// dispatch plane's delivery. And every lane that can commit a no-op says
+    /// so: runs cancels nothing when the turn was already taken, saga is
+    /// deliberately silent for a finished, unknown or foreign saga, and a
+    /// pinned `sched` saga cannot be reassigned at all. The refusal path needs
+    /// no case here — the module's own sentence rides the submit lane's error
+    /// verbatim, which is `node_http::submit_frame`'s contract and its tests.
     #[test]
-    fn a_control_submit_reports_the_height_or_the_modules_own_refusal() {
-        let refusal = "only the run creator or the agent owner may cancel a run";
+    fn a_committed_control_op_claims_only_what_its_height_proves() {
         let run_id = "chat\u{1f}general\u{1f}3\u{1f}bot";
 
-        let accepted = one_shot_node(200, r#"{"height":42,"root_hash":"ab","op_hash":"cd"}"#);
-        let height = crate::node_http::submit_frame(&accepted.base, b"frame").expect("accepted");
-        accepted.join();
-        assert_eq!(height, 42);
-        assert_eq!(
-            control_outcome(ControlLane::Runs, ControlVerb::Cancel, run_id, height),
-            format!("cancel accepted for run {run_id} at height 42"),
+        let cancel = control_outcome(ControlLane::Runs, ControlVerb::Cancel, run_id, 42);
+        assert!(
+            cancel.starts_with(&format!("cancel accepted for run {run_id} at height 42")),
+            "{cancel}"
         );
+        assert!(cancel.contains("cancels nothing"), "{cancel}");
         // saga swallows an unknown, finished or foreign cancel WITHOUT an
         // error, so a committed sched frame proves the chain read the op and
         // nothing more. Saying "accepted" there would be the CLI inventing a
         // verdict the block never reached.
-        let sched = control_outcome(ControlLane::Sched, ControlVerb::Cancel, run_id, height);
+        let sched = control_outcome(ControlLane::Sched, ControlVerb::Cancel, run_id, 42);
         assert!(sched.contains("submitted"), "{sched}");
         assert!(!sched.contains("accepted"), "{sched}");
         // reassign names the attempt it fenced on either lane: a stale one
         // commits and moves nothing, and the operator cannot tell from a bare
         // height.
         for lane in [ControlLane::Runs, ControlLane::Sched] {
-            let line = control_outcome(lane, ControlVerb::Reassign { attempt: 3 }, run_id, height);
+            let line = control_outcome(lane, ControlVerb::Reassign { attempt: 3 }, run_id, 42);
             assert!(line.contains("attempt 3"), "{line}");
         }
-
-        let rejected = one_shot_node(400, &format!(r#"{{"error":"{refusal}"}}"#));
-        let error = crate::node_http::submit_frame(&rejected.base, b"frame")
-            .expect_err("the module refused")
-            .to_string();
-        rejected.join();
-        assert!(
-            error.contains(refusal),
-            "the module's sentence is the whole answer: {error}"
+        // a `sched` reassign must never promise a move: every `agent sched`
+        // saga is pinned, and saga refuses a pinned reassign outright.
+        let pinned = control_outcome(
+            ControlLane::Sched,
+            ControlVerb::Reassign { attempt: 0 },
+            run_id,
+            42,
         );
+        assert!(pinned.contains("pinned"), "{pinned}");
     }
 
     /// a Parser wrapper so the tests exercise the derived verb SHAPE the same
@@ -1239,69 +1239,6 @@ mod tests {
         let cancel =
             TestAgentCli::try_parse_from(["agent", "cancel", "run-1"]).expect("the verb parses");
         assert!(matches!(cancel.args.cmd, AgentCmd::Cancel(args) if args.run_id == "run-1"));
-    }
-
-    /// a loopback listener that answers exactly one request with `status` and
-    /// `body`, then closes. The accept IS the synchronization — no sleep, no
-    /// retry loop.
-    struct OneShotNode {
-        base: String,
-        serving: std::thread::JoinHandle<()>,
-    }
-
-    impl OneShotNode {
-        fn join(self) {
-            self.serving.join().expect("the serve thread finishes");
-        }
-    }
-
-    fn one_shot_node(status: u16, body: &str) -> OneShotNode {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-        let base = format!("http://{}", listener.local_addr().expect("addr"));
-        let response = format!(
-            "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
-            body.len()
-        );
-        let serving = std::thread::spawn(move || {
-            use std::io::{Read as _, Write as _};
-            let (mut conn, _) = listener.accept().expect("the client connects");
-            // Read the WHOLE request before answering. Closing a socket with
-            // unread data still queued makes Linux answer with an RST, which
-            // can destroy the response this test asserts on — and a request
-            // head and its body do arrive as separate segments.
-            let mut request = Vec::new();
-            let mut scratch = [0u8; 4096];
-            while !is_complete_request(&request) {
-                let read = conn
-                    .read(&mut scratch)
-                    .expect("the client sends its request");
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&scratch[..read]);
-            }
-            let _ = conn.write_all(response.as_bytes());
-        });
-        OneShotNode { base, serving }
-    }
-
-    /// true once `request` holds a full HTTP head plus the `content-length`
-    /// bytes it declares — everything the client will send.
-    fn is_complete_request(request: &[u8]) -> bool {
-        let Some(head_end) = request
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-            .map(|at| at + 4)
-        else {
-            return false;
-        };
-        let head = String::from_utf8_lossy(&request[..head_end]).to_lowercase();
-        let declared = head
-            .lines()
-            .find_map(|line| line.strip_prefix("content-length:"))
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .unwrap_or(0);
-        request.len() >= head_end + declared
     }
 
     #[test]
