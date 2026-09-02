@@ -393,7 +393,7 @@ pub(crate) enum SyncStateRequest {
     TipCoords {
         reply: tokio::sync::oneshot::Sender<Result<statesync::TipCoords, String>>,
     },
-    /// the fail-closed standing check (ADR §5.1): is `requester` in committed
+    /// the fail-closed standing check: is `requester` in committed
     /// standing (validators ∪ residents)? answered from the loop's own
     /// committed host reads, FRESH per request — a just-committed Redeem grant
     /// is seen immediately (a cached snapshot would starve a fresh resident

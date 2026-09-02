@@ -1,7 +1,7 @@
 //! The video call media wire: fragmentation of encoded (VP8) frames onto
 //! data-plane datagrams, per-sender reassembly, and the call-control
-//! datagram codec. See `docs/adr/2026-07-06-video-call-module.md` for the
-//! full design — node WebRTC gateway (str0m, localhost-only SDP) on one
+//! datagram codec. The full design: a node WebRTC gateway (str0m,
+//! localhost-only SDP) on one
 //! side, `Service::Video` on the data plane on the other, and the roster
 //! (`CallJoin`/`CallLeave`) as the only piece that ever touches consensus.
 //!

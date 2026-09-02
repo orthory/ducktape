@@ -158,7 +158,7 @@ impl ValidatorRuntime<'_> {
             if d.disposition == node::Disposition::Discarded {
                 continue;
             }
-            // resolve a HELD JOIN GATE (ADR §3.2 / join ADR §4): the joiner's
+            // resolve a HELD JOIN GATE: the joiner's
             // outcome was held against this Redeem frame — now the drain knows
             // its consensus fate. Applied ⇒ the AUTHORITATIVE Admitted at the
             // committed height (carrying the coord cap); Rejected ⇒ map the
@@ -354,7 +354,7 @@ impl ValidatorRuntime<'_> {
             }
         }
         // held join gates that never settled within GATE_SETTLE_TIMEOUT: write
-        // Busy (NON-terminal, §3.2) into the outcome map so the joiner's next
+        // Busy (NON-terminal) into the outcome map so the joiner's next
         // retransmit reads it and fails over to another member rather than
         // exiting. the Redeem may still land later — a re-forward then hits
         // the V9 idempotent Admitted.

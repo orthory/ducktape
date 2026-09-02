@@ -32,8 +32,8 @@ rm -rf "$work"
 # the copy is a DIFFERENT absolute path, which is the whole point. It carries
 # the TRACKED file set — exactly what guest-builder snapshots (`snapshot` in
 # bin/guest-builder/src/main.rs), so the two builds see the same source and the
-# gitignored bulk of a working checkout (docs/node_modules is 834 MB after
-# `bun install`) costs nothing here.
+# gitignored bulk of a working checkout (node_modules, targets) costs nothing
+# here.
 copy="$work/checkout-at-another-path"
 mkdir -p "$copy"
 git -C "$repo" ls-files -z | tar -cf - -C "$repo" --null -T - | tar -xf - -C "$copy"

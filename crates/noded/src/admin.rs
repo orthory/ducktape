@@ -1,5 +1,5 @@
-//! the owner-gated control namespace — the node's PRIVATE RPC surface (ADR
-//! A2/A5). everything under `/v1/admin/*` is CONTROL, not data: lifecycle,
+//! the owner-gated control namespace — the node's PRIVATE RPC surface.
+//! everything under `/v1/admin/*` is CONTROL, not data: lifecycle,
 //! code/upgrade staging, diagnostics. it is a NAMESPACE on the SAME listener
 //! (geth `admin_` spirit), never a second port, gated as a unit by one
 //! middleware ([`admin_guard`]) layered onto the admin sub-router alone.
@@ -10,7 +10,7 @@
 //!   (`router` never merges them), a 404, not a gated-but-present 403.
 //! - `Loopback` (the default): reachable only from loopback peers, AND the peer
 //!   must present the operator credential ([`ADMIN_TOKEN_HEADER`]).
-//! - `Public`: reachable off-box, so the OWNER gate (A5) is the ONLY thing
+//! - `Public`: reachable off-box, so the OWNER gate is the ONLY thing
 //!   standing between a remote caller and node control — enforced for every
 //!   peer. this is the new capability W2 adds, and the case PoP exists for.
 //!
@@ -550,7 +550,7 @@ async fn admit(handle: &NodeHandle, presented: &Presented) -> Result<(), AdminRe
         // LOOPBACK exposure: on-box AND holding the operator credential.
         AdminExposure::Loopback => admit_operator(cfg, presented),
         // PUBLIC exposure: the surface is reachable off-box, so the OWNER PoP is
-        // the gate that matters (ADR A5) — enforced for every peer, loopback or
+        // the gate that matters — enforced for every peer, loopback or
         // not. a node with no owner to authenticate against (no consensus, or
         // the pre-bind bootstrap window) falls back to the operator credential:
         // it must not be drivable with no check at all.

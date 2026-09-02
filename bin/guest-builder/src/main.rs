@@ -379,13 +379,12 @@ blst = {{ path = "{blst}" }}
 /// The list comes from `git ls-files`, never from walking the directory: the
 /// tracked set IS the build input set — the committed artifacts rebuild
 /// byte-identically from it, which is the proof that nothing gitignored is an
-/// input — while the directory around it is mostly not. A checkout that
-/// followed the documented docs setup (`cd docs && bun install`) carries ~950 MB
-/// of gitignored bulk (docs/node_modules alone is 834 MB), and a
+/// input — while the directory around it is mostly not: gitignored bulk (a
+/// `node_modules/`, a stray `target/`) runs to hundreds of MB, and a
 /// `make wasm-modules` sweep would tar all of it into each of its 22 scratch
-/// dirs. Walking is also unstable: a live writer (`bun run dev` rewriting
-/// docs/.astro) makes GNU tar exit 1 with "file changed as we read it" and
-/// aborts the sweep half-refreshed.
+/// dirs. Walking is also unstable: a live writer rewriting a cache dir makes
+/// GNU tar exit 1 with "file changed as we read it" and aborts the sweep
+/// half-refreshed.
 ///
 /// tar rather than a hand-rolled walk: it carries symlinks (`CLAUDE.md`,
 /// `.claude/skills`) and mtimes over verbatim, and the mtimes are what keep the

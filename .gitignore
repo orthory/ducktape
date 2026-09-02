@@ -16,9 +16,9 @@
 .claude/worktrees/
 .codex/worktrees/
 node_modules
-docs/dist/
-docs/.astro/
-docs/.nimbus/
+# Brainstorm specs and implementation plans are per-PR working files, never a
+# record: they stay local and die with their worktree.
+docs/superpowers/
 app/dist/
 ops/wg-smoke/*.log
 ops/wg-smoke/node*/

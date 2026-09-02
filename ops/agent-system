@@ -45,23 +45,36 @@ const json = (value) => {
     die("invalid JSON");
   }
 };
-const localUrl = (value) => {
+const loopbackUrl = (value) => {
   let selected;
   try {
     selected = new URL(value);
   } catch {
-    die("node URL is invalid");
+    return null;
   }
-  if (
-    selected.protocol !== "http:" ||
-    !["127.0.0.1", "localhost", "[::1]"].includes(selected.hostname)
-  )
-    die("the local-trust node URL must be loopback HTTP");
+  const isLoopbackHost = ["127.0.0.1", "localhost", "[::1]"].includes(selected.hostname);
+  if (selected.protocol !== "http:" || !isLoopbackHost) return null;
   return selected.toString().replace(/\/$/, "");
+};
+const localUrl = (value) => {
+  const selected = loopbackUrl(value);
+  if (!selected) die("the local-trust node URL must be loopback HTTP");
+  return selected;
 };
 
 const rememberedUrl = () => {
-  if (process.env.DUCKTAPE_URL) return process.env.DUCKTAPE_URL;
+  const fromEnv = process.env.DUCKTAPE_NODE;
+  if (fromEnv) {
+    // DUCKTAPE_NODE is commonly a remote node for the CLI and the app; this tool
+    // only ever talks to a loopback one, so name the source instead of refusing
+    // blankly, and never fall through — a silent fallback would hide it.
+    const selected = loopbackUrl(fromEnv);
+    if (!selected)
+      die(
+        `DUCKTAPE_NODE is ${fromEnv}; this tool talks to a loopback node only — unset DUCKTAPE_NODE or set it to http://127.0.0.1:<port>`,
+      );
+    return selected;
+  }
   try {
     return fs.readFileSync(stateFile, "utf8").trim();
   } catch {
@@ -79,12 +92,15 @@ const rememberedUrl = () => {
   die("no node selected; run `ops/agent-system use URL` or start an active workspace");
 };
 
-let base = localUrl(rememberedUrl());
+// Resolved on first use, so a verb that needs no node (`use`, `help`, `cgroup`)
+// never consults the environment and never fails on it.
+let base;
+const nodeUrl = () => (base ??= localUrl(rememberedUrl()));
 
 const request = async (pathname, options = {}) => {
   let response;
   try {
-    response = await fetch(`${base}${pathname}`, options);
+    response = await fetch(`${nodeUrl()}${pathname}`, options);
   } catch (error) {
     die(error instanceof Error ? error.message : String(error));
   }
@@ -148,7 +164,7 @@ switch (command) {
     break;
   }
   case "url":
-    console.log(base);
+    console.log(nodeUrl());
     break;
   case "status": {
     const value = await request("/v1/status");

@@ -21,19 +21,13 @@ WSDIR="$DUCK/workspaces/$ID"
 log(){ printf '\033[36m[dev-clear]\033[0m %s\n' "$*"; }
 die(){ printf '\033[31m[dev-clear] %s\033[0m\n' "$*" >&2; exit 1; }
 
-# Candidate discovery is broad enough to find a process left by a seed or an
-# older dev loop with no pidfile. Admission is deliberately narrow: mentioning
-# this workspace in an editor, shell, or diagnostic command is not enough.
-candidate_pids(){
-  {
-    [ -f "$WSDIR/node.pid" ] && printf '%s\n' "$(<"$WSDIR/node.pid")"
-    pgrep -f "$WSDIR" 2>/dev/null || true
-  } | sort -un 2>/dev/null
-}
-
+# Candidate discovery is a `pgrep -f` sweep for the workspace path: nothing
+# writes a pidfile, so the sweep is what finds a node left by a seed or an older
+# dev loop. Admission is deliberately narrow: mentioning this workspace in an
+# editor, shell, or diagnostic command is not enough.
 managed_pids(){
   local pid executable command
-  candidate_pids | while read -r pid; do
+  pgrep -f "$WSDIR" 2>/dev/null | while read -r pid; do
     [ -n "$pid" ] && [ "$pid" != "$$" ] || continue
     executable="$(ps -ww -p "$pid" -o comm= 2>/dev/null)"
     case "${executable##*/}" in

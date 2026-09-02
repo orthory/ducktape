@@ -1,4 +1,4 @@
-//! statesync fail-closed (ADR §5.1, the server half of R4): a validator refuses
+//! statesync fail-closed — the server half: a validator refuses
 //! statesync/manifest service to any key WITHOUT committed standing (validators ∪
 //! residents), so a valid targeted invite alone leaks ZERO chain state.
 //!
@@ -74,7 +74,7 @@ fn a_non_standing_peer_is_refused_statesync() {
     let (ok, log) = cluster.run_sync_only(1, Duration::from_secs(35));
     assert!(
         !ok,
-        "a NON-STANDING peer must be REFUSED statesync (fail-closed, ADR §5.1); it \
+        "a NON-STANDING peer must be REFUSED statesync (fail-closed); it \
          instead synced:\n{log}"
     );
     assert!(

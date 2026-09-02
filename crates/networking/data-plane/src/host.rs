@@ -1,5 +1,5 @@
-//! Host-lifecycle helpers for per-use planes (per-use data-plane ADR,
-//! `docs/adr/2026-07-07-per-use-data-plane.mdx`): every service binds the
+//! Host-lifecycle helpers for per-use planes (the per-use data plane):
+//! every service binds the
 //! same way — compute its overlay addresses, retry the bind until the
 //! reachability plane's interface (and this node's `/128`) exists,
 //! construct the [`DataPlane`], and register its stream service. Only
@@ -65,7 +65,7 @@ pub async fn bind_overlay_sockets(
             Ok(sockets) => {
                 if attempts > 0 {
                     tracing::info!(
-                        target: "ducktape::plane",
+                        target: "ducktape::dataplane",
                         ?service,
                         attempts,
                         elapsed_s = started.elapsed().as_secs(),
@@ -78,7 +78,7 @@ pub async fn bind_overlay_sockets(
                 attempts += 1;
                 if attempts == 1 || attempts.is_multiple_of(20) {
                     tracing::warn!(
-                        target: "ducktape::plane",
+                        target: "ducktape::dataplane",
                         reason = "overlay_bind_retry",
                         ?service,
                         %datagram_bind,

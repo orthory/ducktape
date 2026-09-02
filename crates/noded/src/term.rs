@@ -1268,6 +1268,7 @@ fn answer(reply: Option<oneshot::Sender<Result<(), TermError>>>, refusal: TermEr
 /// unchanged when the cross-node fields are absent; a `node` (or a bare `cred`
 /// on this node) routes the create over the mesh to a host peer.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateSessionBody {
     /// provider tag (`claude`|`codex`|a test provider); required.
     pub agent: String,

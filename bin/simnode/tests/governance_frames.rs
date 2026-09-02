@@ -1,5 +1,5 @@
-//! signed governance FRAMES over the sim's real `/v1/submit/frame` wire (ADR
-//! A1, the signed governance lane): admit/promote/demote/leave leave the
+//! signed governance FRAMES over the sim's real `/v1/submit/frame` wire (the
+//! signed governance lane): admit/promote/demote/leave leave the
 //! bespoke node-local re-signing lane and arrive as frames a key signs. In
 //! validator mode the governance module seats the verified frame origin ONLY
 //! if it is itself a validator-set member node — no identity read: a node key

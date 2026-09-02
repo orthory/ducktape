@@ -1,8 +1,7 @@
 //! the overlay-net seam — overlay reachability as an abstraction the node
 //! routes through, not an assumption that overlay ULAs are OS-routable.
 //!
-//! phase 0 of the userspace-overlay ADR
-//! (docs/adr/2026-07-07-userspace-overlay-net.mdx): the p2p stack is generic
+//! the p2p stack is generic
 //! over its runtime context (`commonware_runtime`), so the seam is a WRAPPER
 //! CONTEXT — [`OverlayContext`] delegates every runtime trait to the inner
 //! context verbatim except [`commonware_runtime::Network`], whose
@@ -15,7 +14,7 @@
 //! - the OS pass-through (`passthrough`): no reachability plane, no
 //!   overlay — the backend's answer IS the OS socket, and overlay dials
 //!   fail like a downed interface.
-//! - the userspace backend (ADR phases 1–2, [`userspace`]): overlay
+//! - the userspace backend ([`userspace`]): overlay
 //!   connections terminate in the in-process smoltcp host, carried as the
 //!   `Virtual` arm of the [`OverlayListener`]/[`OverlaySink`]/
 //!   [`OverlayStream`] wrappers — no TUN, no privilege, no consumer changes.
@@ -281,7 +280,7 @@ impl<E: Network + Clock> Network for OverlayContext<E> {
     type Listener = OverlayListener<E::Listener>;
 
     async fn bind(&self, socket: SocketAddr) -> Result<Self::Listener, Error> {
-        // socket mode's mesh listener (ADR phase 3): a tunnel-carried inbound
+        // socket mode's mesh listener: a tunnel-carried inbound
         // connection terminates in the virtual stack, which an OS listener can
         // never see. so an UNDERLAY bind carries BOTH: the OS socket for the
         // underlay, plus a lazy virtual leg at the node's own ULA on the same

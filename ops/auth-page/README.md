@@ -8,9 +8,7 @@ against a Map. The app/CLI opens the system browser to the page with the
 request in the URL fragment — or shows the same URL as a QR for a phone —
 the page runs the ceremony, and the result goes to a one-shot loopback
 listener in the app/CLI (the `gh auth login` shape) or, from a phone, to the
-relay the app polls. Design: `docs/superpowers/specs/2026-08-27-identity-rework-design.md`
-§WebAuthn and `docs/superpowers/specs/2026-08-28-first-signin-passkey-design.md`;
-the verifier it must satisfy: `crates/kernel/keyscheme`.
+relay the app polls. The verifier it must satisfy: `crates/kernel/keyscheme`.
 
 The RP ID is the page's own host, never a parameter. The same file served by
 the node at `http://localhost:<port>/.duck/auth` gives RP ID `localhost` —

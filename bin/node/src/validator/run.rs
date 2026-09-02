@@ -25,11 +25,11 @@ pub(super) type ValidatorNode = node::OrderedNode<
     recovery::Recovery<commonware_runtime::tokio::Context>,
 >;
 
-/// a join gate held open awaiting its `Redeem` frame's consensus fate (ADR
-/// §3.2). the member submitted the redemption and holds the joiner's outcome
+/// a join gate held open awaiting its `Redeem` frame's consensus fate. the
+/// member submitted the redemption and holds the joiner's outcome
 /// keyed by the frame id until `on_drain` resolves it into `gate_outcomes` —
 /// the settle-then-answer seam, mirroring `pending_relays`. no mesh `peer`
-/// rides here any more (join ADR §4): the answer goes back over the tunnel
+/// rides here any more: the answer goes back over the tunnel
 /// doorbell, read from the shared map on the joiner's next retransmit.
 struct GatePending {
     /// the joiner key: clears the `gating` in-flight index and keys the
@@ -37,12 +37,12 @@ struct GatePending {
     joiner: Vec<u8>,
     /// the packed coord cap to deliver on `Admitted` (private coordination).
     cap: Option<Vec<u8>>,
-    /// answer `Busy` (non-terminal) once past this instant (§3.2 timeout).
+    /// answer `Busy` (non-terminal) once past this instant (the settle timeout).
     deadline: std::time::SystemTime,
 }
 
 /// write a resolved gate outcome where the intro doorbell reads it — the
-/// shared map the joiner's next retransmit is answered from (join ADR §4).
+/// shared map the joiner's next retransmit is answered from.
 fn settle_gate(outcomes: &GateOutcomes, joiner: Vec<u8>, reply: join_gate::IntroReply) {
     outcomes
         .lock()
@@ -108,7 +108,7 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
     pub(super) relay_tx: super::MeshSender,
     pub(super) sync_state_rx: futures::channel::mpsc::Receiver<SyncStateRequest>,
-    /// the join GATE's forward lane from the intro doorbell (join ADR §4):
+    /// the join GATE's forward lane from the intro doorbell:
     /// verified gate requests the reachability plane rang through.
     pub(super) gate_fwd_rx: tokio::sync::mpsc::Receiver<join_gate::GateForward>,
     /// a never-sending clone of the forward lane's sender, held so the select
@@ -535,7 +535,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
                 }
             }
             fwd = gate_fwd_rx.recv().fuse() => {
-                // the intro doorbell rang the GATE through the tunnel (§4).
+                // the intro doorbell rang the GATE through the tunnel.
                 // `None` cannot spin here: `gate_fwd_keepalive` holds the
                 // channel open even when no plane was wired.
                 if let Some(fwd) = fwd {

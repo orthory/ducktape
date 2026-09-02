@@ -166,12 +166,11 @@ pub(super) fn run(cmd: UserCmd) -> CommandResult {
 }
 
 // ============================================================================
-// user-key lifecycle verbs (init/restore/unlock/reveal/encrypt/status) — see
-// docs/superpowers/specs/2026-07-07-identity-onboarding-design.md's "CLI
-// verbs" section for the binding stdin/stdout contract. every secret
-// (password, mnemonic) crosses the process boundary via STDIN ONLY, one
-// newline-delimited field per line in the documented order — never argv/env,
-// which would leak into shell history / `ps`. each verb below is split into
+// user-key lifecycle verbs (init/restore/unlock/reveal/encrypt/status). the
+// binding stdin/stdout contract: every secret (password, mnemonic) crosses
+// the process boundary via STDIN ONLY, one newline-delimited field per line
+// in the order each verb documents — never argv/env, which would leak into
+// shell history / `ps`. each verb below is split into
 // a `user_key_*` core (takes the parsed stdin, returns the value to print —
 // directly unit-testable without capturing stdout) and a thin `cmd_user_key_*`
 // wrapper that prints it; the wrapper is what `run()`'s dispatch calls.
@@ -552,7 +551,7 @@ fn cmd_user_sign_frame(args: FrameArgs, stdin: &mut impl std::io::BufRead) -> Co
 
 /// `user-sign-admin` core — see [`cmd_user_sign_admin`].
 ///
-/// signs one owner control-plane request (ADR A5): the per-request PoP the
+/// signs one owner control-plane request: the per-request PoP the
 /// node's `/v1/admin/*` gate checks under `Public` exposure. the signed bytes
 /// are `noded::admin::sign_admin`'s — the SAME function the verifier uses, so
 /// the two can never drift. the freshness timestamp is minted here and returned

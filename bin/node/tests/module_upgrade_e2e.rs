@@ -1,6 +1,6 @@
-//! spec §5: a module registered after genesis, live-swapped, then carried
-//! across a crash restart and to a statesynced joiner — the acceptance test
-//! for §1's "admitted modules across restart and statesync".
+//! a module registered after genesis, live-swapped, then carried across a
+//! crash restart and to a statesynced joiner — the acceptance test for
+//! "admitted modules across restart and statesync".
 mod common;
 
 use std::time::Duration;

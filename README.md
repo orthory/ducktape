@@ -40,7 +40,7 @@ The tree groups by function into three layers — module / kernel / networking:
 | `crates/labs/` | Quarantined experimental modules (`evm`, `multisig`): in-tree and tested but registered by NO genesis set, kept as a standalone crate EXCLUDED from the workspace so its heavy deps (revm, alloy) never tax the shipping build — gated via `make labs-gate` |
 | `bin/` | Runnable binaries: `node` (the unified `ducktape` CLI: validator plus `fs`/`mcp` families), `noded` (app-facing daemon), `simnode` (deterministic /v1 twin), `demo` (in-process walkthrough), `coordinator` (STUN rendezvous), `airlock-gateway` (the TEE enclave lender; the non-TEE lender is `ducktape service run airlock`), `guest-builder` (module → wasm component packaging tool) |
 | `app/` | `ducktape-app`, the native Iced desktop client (Chat + Pages), UI declared in `src/ui/*.ice`; `crates/design` is its design system |
-| `docs/` | Nimbus documentation site (human and agent tracks) |
+| `docs/` | Operator runbooks (`deploy/`, `dogfood.md`, `sandbox-macos.md`) and the few records code cites by path (`records/`) |
 
 Each module publishes its wire surface — types-only payload/query/reply shapes
 and codecs — at its own crate root; those wire types plus host-routed queries
@@ -53,16 +53,10 @@ Every layer boundary is a small trait, and each obeys the same three rules: the
 contract lives at its crate root (opening the crate shows it first); every trait
 ships a sim/test arm in the same crate — behind feature `sim` where the double
 carries a build cost; and this table is the map from each boundary to its real
-and swappable arms. Rationale and the full seam designs are in
-[`docs/superpowers/specs/2026-07-21-layer-contract-standardization-design.md`](docs/superpowers/specs/2026-07-21-layer-contract-standardization-design.md)
-(lands with PR #718). Rows tagged "(this campaign)" are the seams being added
-now; their PRs are open and unmerged. Rows tagged "(C-stage)" come from the
-block-apply reassembly campaign
-([`docs/superpowers/specs/2026-07-22-c-stage-simnode-reassembly-design.md`](docs/superpowers/specs/2026-07-22-c-stage-simnode-reassembly-design.md)):
-not swappable-arm traits but single shared paths that replace the old
-validator/noded/simnode triplication (block projection, worker reactor, genesis
-topology) plus the scripted-stepping ordering arm; their stacked PRs #724–#728
-are open and unmerged.
+and swappable arms. The last four rows are not swappable-arm traits but single
+shared paths that replaced the old validator/noded/simnode triplication (block
+projection, worker reactor, genesis topology) plus the scripted-stepping
+ordering arm.
 
 | Contract (trait · crate) | Real arm(s) | Sim / test arm | Consumers |
 | --- | --- | --- | --- |
@@ -74,15 +68,15 @@ are open and unmerged.
 | `WireGuardEffect` · `crates/networking/wireguard` | userspace | `FakeWireGuardEffect` | mesh bring-up (bin/node boot) |
 | commonware runtime `E` (`Clock` / `Storage` / `Rng`) | `tokio::Context` | `deterministic::Runner` | host, node, statesync |
 | `ObjectStore` · `crates/duckfs/core` | `DiskStore` | `MemStore` | `files` module, duckfs client |
-| `Blobs` · `blobstore` — (this campaign, PR #716 — unmerged) | `BlobHandle` (disk) | `MemBlobs` | bin/node blob_fetch/relay_runtime/explorer, statesync serve |
-| `RefsStore` · `crates/duckfs/core` — (this campaign, PR #715 — unmerged) | `DiskRefs` | `MemRefs` | `files` module (`Files<S, R>`) |
-| `MeshCarrier` · `crates/kernel/consensus` — (this campaign, PR #719 — unmerged) | `DiscoveryMesh` (wraps the `authenticated::discovery` Network) | `SimMesh` (feature `sim`, wraps `simulated::Network`) | bin/node validator engine, in-process cluster test |
-| commonware `Clock` seam (`context.current()`) + source-parsing lint · bin/node, statesync — (this campaign, PR #720 — unmerged) | `tokio::Context` | `deterministic::Runner` | validator run/drain/ingress, statesync monitor |
-| `TestCtx` (`sdk::Ctx`) + `MemStore` (`sdk::MerkleStore`) · `crates/kernel/sdk-testkit` — (this campaign, PR #718/#721 — unmerged) | host runtime `Ctx`, `QmdbStore` | `TestCtx`, `MemStore` | module unit tests (runs, automations, files, governance, …) |
-| `projection::project_block` · `noded` — (C-stage, PR #724 — unmerged) | one shared block-projection path (RootOp assembly + `block_row` bytes + index feed + stream publish) | golden test pins `block_row` bytes across old/new paths | validator drain, replica park, noded submit lane, simnode — **flag day (PR #728): a rejected op now journals a block, validator parity** |
-| `Orderer` — scripted-stepping seam · `crates/kernel/node` — (C-stage, PR #725 — unmerged) | — (sim-only arm) | `StepOrderer` + `StepHandle` (FIFO; release-one / release-all) | simnode actor (`OrderedNode<StepOrderer>`) |
-| `worker::drive` · `crates/kernel/host` — (C-stage, PR #726 — unmerged) | one shared reactor loop (offer events, budget rounds, follow-up `Msg`s + Nudge tail) | unit test on budget / Nudge behavior | validator drain, noded submit lane, simnode auto mode |
-| `ModuleTopology` · `crates/kernel/host` — (C-stage, PR #727 — unmerged) | one genesis topology (ordered id set, wiring edges, genesis-config values; subsets `production` / `sim_base` / `sim_valset` / `demo`) | `genesis_registry_matches_module_ids` + subset derivation tests | node `ProductionModules` (wasm), simnode (native), demo |
+| `Blobs` · `blobstore` | `BlobHandle` (disk) | `MemBlobs` | bin/node blob_fetch/relay_runtime/explorer, statesync serve |
+| `RefsStore` · `crates/duckfs/core` | `DiskRefs` | `MemRefs` | `files` module (`Files<S, R>`) |
+| `MeshCarrier` · `crates/kernel/consensus` | `DiscoveryMesh` (wraps the `authenticated::discovery` Network) | `SimMesh` (feature `sim`, wraps `simulated::Network`) | bin/node validator engine, in-process cluster test |
+| commonware `Clock` seam (`context.current()`) + source-parsing lint · bin/node, statesync | `tokio::Context` | `deterministic::Runner` | validator run/drain/ingress, statesync monitor |
+| `TestCtx` (`sdk::Ctx`) + `MemStore` (`sdk::MerkleStore`) · `crates/kernel/sdk-testkit` | host runtime `Ctx`, `QmdbStore` | `TestCtx`, `MemStore` | module unit tests (runs, automations, files, governance, …) |
+| `projection::project_block` · `noded` | one shared block-projection path (RootOp assembly + `block_row` bytes + index feed + stream publish) | golden test pins `block_row` bytes across old/new paths | validator drain, replica park, noded submit lane, simnode (a rejected op journals a block: validator parity) |
+| `Orderer` — scripted-stepping seam · `crates/kernel/node` | — (sim-only arm) | `StepOrderer` + `StepHandle` (FIFO; release-one / release-all) | simnode actor (`OrderedNode<StepOrderer>`) |
+| `worker::drive` · `crates/kernel/host` | one shared reactor loop (offer events, budget rounds, follow-up `Msg`s + Nudge tail) | unit test on budget / Nudge behavior | validator drain, noded submit lane, simnode auto mode |
+| `ModuleTopology` · `crates/kernel/host` | one genesis topology (ordered id set, module shape, genesis-config keys; subsets `production` / `sim_base` / `sim_valset` / `demo`) | `genesis_registry_matches_module_ids` + subset derivation tests | node `ProductionModules` (wasm), simnode (native), demo |
 
 ## Quick Start
 
@@ -193,8 +187,8 @@ Three binaries plus the desktop app are runnable:
   above).
 
 - **`ducktape-app`** (`app/`) — the native Iced desktop client for Chat and
-  Pages, its UI declared in `app/src/ui/*.ice`. `cargo run -p ducktape-app`; it
-  dials `DUCKTAPE_NODE`, else `http://127.0.0.1:8844`. See `app/README.md`.
+  Pages, its UI declared in `app/src/ui/*.ice`. `cargo run -p ducktape-app`;
+  `app/README.md` states which node it dials and which key it signs with.
 
 Install the `ducktape` operator CLI into `~/.cargo/bin`; on macOS this also
 builds the Ice `.app`/`.dmg` and installs `Ducktape.app` into `~/Applications`:
@@ -214,28 +208,7 @@ make demo-seed
 
 ## Documentation
 
-The docs are a separate Nimbus project under `docs/` (package manager: Bun), so
-Rust verification and docs verification stay decoupled:
-
-```sh
-cd docs
-bun install
-bun run docs:check   # docs gate
-bun run dev          # local preview
-```
-
-Pages are split by reader (human vs. coding agent) under
-`docs/src/content/docs/en`.
-
-## Status
-
-The platform spine is checked in and verified: the module contract, host
-registry, global root-hash, ordered node path, commonware Simplex orderer,
-the saga async seam, and several root-backed product modules, plus state
-sync for QMDB-backed, forge, and snapshot-style modules.
-
-Still open — mostly live orchestration: network-backed module sync from a
-running node, dynamic valset wiring around epoch cutover, snapshot-at-height
-serving, and product depth for chat, agent, and tasks. See
-[implementation status](docs/src/content/docs/en/human/reference/implementation-status.mdx)
-and [what is left](docs/src/content/docs/en/human/roadmap/what-is-left.mdx).
+`docs/` holds operator runbooks (`deploy/`, `dogfood.md`, `sandbox-macos.md`)
+and the few records code cites by path (`records/`); `docs/README.md` is the
+index. There is no docs site and no decision-record system: the code and its
+comments are the record.

@@ -21,7 +21,7 @@
 //!   honestly (this is the piece Safe's centralized Transaction Service
 //!   provides, and the piece we get for free);
 //! - deterministic, byte-exact `execTransaction` calldata as COMMITTED state,
-//!   so the oracle that broadcasts it (design §5) transmits bytes it did not
+//!   so the oracle that broadcasts it transmits bytes it did not
 //!   choose.
 //!
 //! ## determinism

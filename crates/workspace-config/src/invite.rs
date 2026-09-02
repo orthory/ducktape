@@ -42,7 +42,7 @@ pub use governance::invite::{
 /// mint a BEARER invite token binding an invite to `binding` (the genesis
 /// namespace) with `expires_unix_secs`: fresh OS randomness for the
 /// nonce, signed by this member's identity. minting IS the admission decision —
-/// there is no target (the targeted form was dropped — see the join ADR); whoever presents a
+/// there is no target (the targeted form was dropped); whoever presents a
 /// valid join proof for the nonce first redeems it, single-use.
 pub fn mint_invite_token(
     signer: &ed25519::PrivateKey,
@@ -121,7 +121,7 @@ pub fn save_invite_token(dir: &Path, token: &InviteToken) -> Result<(), String> 
 }
 
 /// delete the stored invite token — a CONSUMED credential must not survive to
-/// confuse a later boot (ADR §6). called once the join gate reports `Admitted`:
+/// confuse a later boot. called once the join gate reports `Admitted`:
 /// the invite has done its one job. best-effort; a missing file is success.
 pub fn delete_invite_token(dir: &Path) {
     let path = dir.join(INVITE_TOKEN_FILE);
@@ -330,7 +330,7 @@ pub struct InviteWireGuard {
 
 /// one member the inviter offers as an ADDITIONAL first-contact path: the
 /// joiner may bring its tunnel up against this member instead of the inviter
-/// (the unified all-paths invite — `docs/superpowers/specs/2026-07-08-fully-nated-inviter-design.md`).
+/// (the unified all-paths invite).
 /// Only PUBLIC keys ever ride the wire; the WireGuard private key never leaves
 /// the node. `endpoint` is the member's routable WireGuard UNDERLAY endpoint
 /// (`host:wg_port`) when it is host-capable — the joiner dials it directly and
