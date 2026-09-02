@@ -1,6 +1,6 @@
 # Proves the "buildable on mac" half of the guest wasm toolchain claim on real
 # Apple hardware: a blst-carrying guest builds to wasm32-unknown-unknown and
-# componentizes on stock rustup, with NO wasm-capable clang involved. The
+# componentizes with nothing but rustup, and NO wasm-capable clang. The
 # mechanism under test is patches/blst (build.rs early-returns on wasm32, so no
 # C is compiled at all — see patches/blst/PATCH.md) plus the getrandom stubs
 # guest-builder patches into every synthesized packaging workspace. CC for the
@@ -41,17 +41,17 @@ jobs:
           clang --version | head -1
           brew list --versions llvm 2>/dev/null || echo "no brew llvm installed"
 
-      - name: stock rustup + wasm32 target
+      - name: rustup (the checkout pins the channel and the wasm32 target)
         run: |
           if ! command -v rustup >/dev/null 2>&1; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-              | sh -s -- -y --default-toolchain stable --profile minimal
+              | sh -s -- -y --default-toolchain none --profile minimal
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
             export PATH="$HOME/.cargo/bin:$PATH"
           fi
-          rustup update stable --no-self-update
-          rustup default stable
-          rustup target add wasm32-unknown-unknown
+          # No `rustup default` / `rustup target add`: rust-toolchain.toml
+          # overrides both inside the checkout. This first call installs the
+          # pinned channel and its targets; -vV is the evidence of which.
           rustc -vV
 
       - name: install wasm-tools

@@ -201,8 +201,8 @@ test: wasm-modules-check
 ## rebuild every wasm guest module into its componentized artifact and refresh
 ## EVERY committed copy in one sweep (the canonical node-embedded artifact +
 ## the kernel test fixtures), so the copies can never drift apart. requires
-## the wasm32-unknown-unknown target (rustup target add wasm32-unknown-unknown)
-## and wasm-tools (cargo install wasm-tools). component bytes are toolchain-
+## wasm-tools (cargo install wasm-tools); the wasm32-unknown-unknown target
+## comes from the pinned rust-toolchain.toml. component bytes are toolchain-
 ## dependent: a rebuild on a different rustc may legitimately differ from the
 ## committed bytes — commit the refreshed set TOGETHER; `wasm-modules-check`
 ## guards mutual consistency. bytes no longer depend on WHERE the checkout

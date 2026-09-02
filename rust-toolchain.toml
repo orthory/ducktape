@@ -1,0 +1,28 @@
+# The one toolchain this tree builds with. The committed wasm component bytes
+# are rustc-dependent (see the Makefile's `wasm-modules` block), so a floating
+# channel means two operators hash different module bundles into the same
+# descriptor and a lifecycle swap no validator will activate. Pinned exactly,
+# for the same reason `wasmtime` is.
+#
+# `targets` lists every triple something in this tree passes to `--target`:
+#   wasm32-unknown-unknown — guest-builder and each `crates/guests` workspace
+#     compile module guests for it. No WASI guest exists, so no wasm32-wasip1.
+#   {x86_64,aarch64}-unknown-linux-musl — `ops/build-guest-rootfs.sh` builds
+#     the sandbox guest's static PID 1 (`duck-guest-init`) for the host's arch.
+#     One arch per host, but a toolchain file cannot be host-conditional, so
+#     both are listed; dropping them breaks that build under this pin.
+#
+# Caveat on the reproducibility this buys: guest-builder compiles in a
+# `tempfile::tempdir()` scratch workspace, outside this file's directory
+# search. It inherits the pin only because rustup exports RUSTUP_TOOLCHAIN to
+# proxied children — run `target/debug/guest-builder` with no rustup proxy in
+# its ancestry and the bytes come from whatever toolchain is default there.
+[toolchain]
+channel = "1.96.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = [
+  "wasm32-unknown-unknown",
+  "x86_64-unknown-linux-musl",
+  "aarch64-unknown-linux-musl",
+]
