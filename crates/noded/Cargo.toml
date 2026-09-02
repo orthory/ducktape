@@ -78,6 +78,9 @@ blobstore = { workspace = true }
 indexer = { workspace = true }
 # decoding the borsh op-row envelopes for the /v1/index/*/ops json projection.
 borsh = { workspace = true }
+# the ONE invite TTL policy (default + bounds) `/v1/invite` shares with the
+# `ducktape node invite` verb — two doors, one number.
+workspace-config = { workspace = true }
 # the duckfs checkout/commit engine: the workspace RPC (/v1/fs/workspaces) drives
 # it over an actor-lane `NodeApi` adapter, so the daemon manages checkouts with
 # no self-dial. NOT a consensus-path crate — a client engine, OS-side only.

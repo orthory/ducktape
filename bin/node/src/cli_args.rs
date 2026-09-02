@@ -505,9 +505,14 @@ pub struct InitArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct InviteArgs {
-    /// days until the token expires (default: 30)
-    #[arg(long, value_name = "N")]
-    pub ttl_days: Option<u64>,
+    /// days until the token expires
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = config::DEFAULT_INVITE_TTL_DAYS,
+        value_parser = clap::value_parser!(u64).range(config::INVITE_TTL_DAYS),
+    )]
+    pub ttl_days: u64,
     #[command(flatten)]
     pub selector: Selector,
 }
@@ -592,6 +597,31 @@ mod tests {
             node: node.map(str::to_string),
             network: network.map(str::to_string),
         }
+    }
+
+    /// `invite` without `--ttl-days` mints the ONE default every door shares,
+    /// and the flag is refused outside the ONE validated range — at parse
+    /// time, before any workspace file is touched.
+    #[test]
+    fn invite_ttl_days_defaults_and_bounds_come_from_workspace_config() {
+        #[derive(clap::Parser)]
+        struct Probe {
+            #[command(subcommand)]
+            op: OpCmd,
+        }
+        let parse = |argv: &[&str]| <Probe as clap::Parser>::try_parse_from(argv);
+        let ttl_of = |argv: &[&str]| match parse(argv).expect("parses").op {
+            OpCmd::Invite(args) => args.ttl_days,
+            other => panic!("not an invite: {other:?}"),
+        };
+
+        assert_eq!(
+            ttl_of(&["probe", "invite"]),
+            config::DEFAULT_INVITE_TTL_DAYS
+        );
+        assert_eq!(ttl_of(&["probe", "invite", "--ttl-days", "365"]), 365);
+        assert!(parse(&["probe", "invite", "--ttl-days", "0"]).is_err());
+        assert!(parse(&["probe", "invite", "--ttl-days", "366"]).is_err());
     }
 
     /// the precedence, pinned rung by rung and hermetically: only the `Flag`,

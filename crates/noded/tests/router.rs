@@ -1597,9 +1597,10 @@ async fn the_invite_route_mints_refuses_and_says_when_it_cannot() {
         assert!(body_of(response).await.contains("ttl_days"));
     }
 
-    // no body at all is the shortest TTL, not an error: a caller that does not
-    // care gets the least dangerous invite.
+    // no body at all is the ONE default the CLI verb mints too, not an error:
+    // `curl -XPOST /v1/invite` and `ducktape node invite` hand out the same invite.
     let defaulted = post(app, "{}").await;
     assert_eq!(defaulted.status(), StatusCode::OK);
-    assert!(body_of(defaulted).await.contains("for-1-days"));
+    let expected = format!("for-{}-days", workspace_config::DEFAULT_INVITE_TTL_DAYS);
+    assert!(body_of(defaulted).await.contains(&expected));
 }

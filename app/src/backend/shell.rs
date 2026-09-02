@@ -413,10 +413,14 @@ pub async fn join_network(blob: ui_lang_runtime::Secret) -> Result<WorkspaceInit
 /// The cost of that choice, stated: a workspace whose node is stopped can no
 /// longer mint from here. An invite names paths a joiner must be able to reach,
 /// so a network nobody is serving has nothing useful to hand out anyway.
-pub async fn mint_invite(workspace: String, ttl_days: i64) -> Result<String, AppError> {
+///
+/// The app takes no TTL: it mints the ONE default every other door mints
+/// (`workspace_config::DEFAULT_INVITE_TTL_DAYS`). Ice cannot read a Rust
+/// constant, so the constant is applied here rather than passed from a handler.
+pub async fn mint_invite(workspace: String) -> Result<String, AppError> {
     let minted: Result<String, String> = async {
         let endpoint = workspace_rpc(&workspace)?;
-        let ttl = ttl_days.clamp(1, 365) as u64;
+        let ttl = workspace_config::DEFAULT_INVITE_TTL_DAYS;
         Ok(rpc_client(&endpoint)?.mint_invite(ttl).await?)
     }
     .await;

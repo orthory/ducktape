@@ -592,7 +592,9 @@ on provision_stepped(step)
   provision_steps = [step]
   return if provision_index != 5 || !settled
   hub_step = HubStep.live
-  run every mint_invite(onboarding_name, 7) -> onboarding_invite_minted _ | onboarding_failed _
+  // the TTL is the node's default (`workspace_config::DEFAULT_INVITE_TTL_DAYS`),
+  // applied in the backend: Ice cannot import a Rust constant.
+  run every mint_invite(onboarding_name) -> onboarding_invite_minted _ | onboarding_failed _
 
 on onboarding_invite_minted(blob)
   invite_link = blob
