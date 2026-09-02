@@ -29,6 +29,12 @@ pub(crate) struct Surfaces {
     /// the host's own browser-gateway base URL — the `via` a resolved credential
     /// routes through. Empty when no browser gateway is bound.
     pub(crate) local_gateway_via: String,
+    /// the ports THIS node's own surfaces answer on (operator rpc, browser
+    /// gateway, app-surface http), as actually bound. The gateway plane
+    /// refuses a loopback route aimed at any of them: a member mapping a
+    /// route to its own `/v1` would hand the whole mesh its unauthenticated
+    /// node API.
+    pub(crate) node_api_ports: Vec<u16>,
 }
 
 pub(crate) struct BindConfig<'a> {
@@ -111,6 +117,10 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         Some(addr) if !sync_only => Some(bind_listener("operator rpc", "rpc_listen", addr)?),
         _ => None,
     };
+    let rpc_port = rpc_listener
+        .as_ref()
+        .and_then(|listener| listener.local_addr().ok())
+        .map(|address| address.port());
     // the http/ws app surface: same bind-early rule. the server itself runs on
     // its OWN plain-tokio OS thread (noded's exact split — the host never
     // leaves the commonware runner thread; http handlers only send
@@ -137,6 +147,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         }
         _ => None,
     };
+    let gateway_port = gateway_listener.as_ref().map(|(_, actual)| actual.port());
     let (gateway_lane, gateway_requests) = tokio::sync::mpsc::channel::<noded::GatewayJob>(32);
     // the guest-side remote-session lane: /v1/term/sessions with a `node` hands a
     // SessionJob here, drained by the term plane's client half (mirrors the
@@ -279,10 +290,12 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     };
     // (like the rpc surface above, a joiner binds and the park loop pumps —
     // reads only until promotion re-execs this process into a validator.)
+    let mut http_port = None;
     match http_listen.as_deref() {
         Some(addr) if !sync_only => {
             let listener = bind_listener("node HTTP API", "http_listen", addr)?;
             listener.set_nonblocking(true)?;
+            http_port = listener.local_addr().ok().map(|address| address.port());
             tracing::info!(
                 target: "ducktape::http",
                 node = %label,
@@ -355,6 +368,10 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         terminals,
         session_requests,
         local_gateway_via,
+        node_api_ports: [rpc_port, gateway_port, http_port]
+            .into_iter()
+            .flatten()
+            .collect(),
     })
 }
 

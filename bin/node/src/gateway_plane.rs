@@ -46,6 +46,11 @@ pub struct SpawnConfig {
     pub planes: data_plane::PlaneMonitor,
     pub commands: mpsc::Sender<NodeCommand>,
     pub workspace: PathBuf,
+    /// The ports this node's OWN surfaces answer on (rpc, browser gateway,
+    /// app-surface http), as bound at boot. A loopback route aimed at one of
+    /// them is refused: it would proxy the mesh into this node's
+    /// unauthenticated `/v1`.
+    pub node_api_ports: Vec<u16>,
 }
 
 fn proxy_flow() -> FlowId {
@@ -80,6 +85,7 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
         planes,
         commands,
         workspace,
+        node_api_ports,
     } = config;
     let slot: PlaneSlot = Arc::new(OnceLock::new());
     let own_node: [u8; 32] = me.as_ref().try_into().expect("ed25519 keys are 32 bytes");
@@ -90,6 +96,7 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
         let slot = Arc::clone(&slot);
         let commands = commands.clone();
         let client_workspace = workspace.clone();
+        let client_ports = node_api_ports.clone();
         let permits = Arc::new(tokio::sync::Semaphore::new(16));
         tokio::spawn(async move {
             while let Some(job) = jobs.recv().await {
@@ -99,6 +106,7 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                 let slot = Arc::clone(&slot);
                 let commands = commands.clone();
                 let workspace = client_workspace.clone();
+                let node_api_ports = client_ports.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     match job {
@@ -119,12 +127,14 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                                     let (server_end, caller_end) = tokio::io::duplex(64 * 1024);
                                     let serve_commands = commands.clone();
                                     let serve_workspace = workspace.clone();
+                                    let serve_ports = node_api_ports.clone();
                                     let head_for_server = head.clone();
                                     let body_for_server = body.clone();
                                     tokio::spawn(async move {
                                         serve_proxy_stream(
                                             &serve_commands,
                                             &serve_workspace,
+                                            &serve_ports,
                                             &own_node,
                                             &own_node,
                                             head_for_server,
@@ -237,6 +247,7 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
             };
             let commands = commands.clone();
             let workspace = workspace.clone();
+            let node_api_ports = node_api_ports.clone();
             tokio::spawn(async move {
                 let _permit = permit;
                 if hello.intent != gateway::PROXY_INTENT {
@@ -267,6 +278,7 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                 serve_proxy_stream(
                     &commands,
                     &workspace,
+                    &node_api_ports,
                     &own_node,
                     &requester.0,
                     head,
@@ -321,9 +333,11 @@ async fn proxy_remote(
 /// request body (self-serve); `None` reads `head.body_len` bytes off the
 /// stream (overlay). The deadline covers the body read + serve up to the
 /// response HEAD; the body drain streams beyond it.
+#[allow(clippy::too_many_arguments)]
 async fn serve_proxy_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     commands: &mpsc::Sender<NodeCommand>,
     workspace: &Path,
+    node_api_ports: &[u16],
     own_node: &[u8; 32],
     caller_node: &[u8; 32],
     head: gateway::ProxyRequestHead,
@@ -345,7 +359,16 @@ async fn serve_proxy_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 body
             }
         };
-        serve_current(commands, workspace, own_node, caller_node, &head, &body).await
+        serve_current(
+            commands,
+            workspace,
+            node_api_ports,
+            own_node,
+            caller_node,
+            &head,
+            &body,
+        )
+        .await
     })
     .await
     .unwrap_or_else(|_| {
@@ -410,6 +433,7 @@ async fn proxy_remote_ws(
 async fn serve_current(
     commands: &mpsc::Sender<NodeCommand>,
     workspace: &Path,
+    node_api_ports: &[u16],
     own_node: &[u8; 32],
     caller_node: &[u8; 32],
     head: &gateway::ProxyRequestHead,
@@ -449,7 +473,16 @@ async fn serve_current(
             serve_duckfs(commands, own_node, head, &record).await
         }
         gateway::RouteTarget::LoopbackHttp => {
-            proxy_loopback(workspace, caller_node, caller, head, body, &record).await
+            proxy_loopback(
+                workspace,
+                node_api_ports,
+                caller_node,
+                caller,
+                head,
+                body,
+                &record,
+            )
+            .await
         }
     }
 }
@@ -623,14 +656,21 @@ async fn revalidate_route_authority(
     Ok(())
 }
 
+/// the refusal a route aimed at this node's own API earns — a stable token,
+/// the reply detail and the log reason alike.
+const ROUTE_TARGETS_NODE_API: &str = "route_targets_node_api";
+
+#[allow(clippy::too_many_arguments)]
 async fn proxy_loopback(
     workspace: &Path,
+    node_api_ports: &[u16],
     caller_node: &[u8; 32],
     caller_account: Option<u64>,
     head: &gateway::ProxyRequestHead,
     body: &[u8],
     record: &gateway::RouteRecord,
 ) -> Result<GatewayResponse, GatewayFailure> {
+    static REFUSED: noded::log::Latch = noded::log::Latch::new(100);
     let route = record
         .statement
         .route
@@ -640,6 +680,23 @@ async fn proxy_loopback(
     let port = routes.port(&head.name).ok_or_else(|| {
         GatewayFailure::NotFound("global gateway route has no local loopback upstream".into())
     })?;
+    // a loopback route may name any local daemon EXCEPT this node's own
+    // surfaces: proxying the mesh into `/v1` hands every member this node's
+    // unauthenticated API (submit as this node, mint invites, log-filter).
+    let targets_node_api = node_api_ports.contains(&port);
+    if targets_node_api {
+        if let Some(attempts) = REFUSED.hit(ROUTE_TARGETS_NODE_API) {
+            tracing::warn!(
+                target: "ducktape::gateway",
+                caller = %hex_bytes(caller_node),
+                route = %head.name.local_key(),
+                reason = ROUTE_TARGETS_NODE_API,
+                attempts,
+                "gateway route REFUSED — its loopback upstream is this node's own API port"
+            );
+        }
+        return Err(GatewayFailure::Forbidden(ROUTE_TARGETS_NODE_API.into()));
+    }
     // Connect + per-read deadlines only: a TOTAL timeout would kill long
     // streamed (SSE) bodies, but a silent-forever upstream must not pin its
     // accept permit — the idle read timeout reclaims it. The head is still
@@ -2110,6 +2167,7 @@ mod tests {
         let response = serve_current(
             &commands,
             workspace.path(),
+            &[],
             &publisher,
             &caller,
             &gateway::ProxyRequestHead {
@@ -2231,6 +2289,7 @@ mod tests {
         let response = serve_current(
             &commands,
             workspace.path(),
+            &[],
             &publisher,
             &caller_node,
             &gateway::ProxyRequestHead {
@@ -2291,6 +2350,7 @@ mod tests {
         let error = serve_current(
             &commands,
             workspace.path(),
+            &[],
             &publisher,
             &[3u8; 32],
             &gateway::ProxyRequestHead {
@@ -2310,6 +2370,72 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(error, GatewayFailure::Forbidden(ref why) if why.contains("proof does not verify")),
+            "{error:?}"
+        );
+    }
+
+    /// A member may map a loopback route to any local daemon — except this
+    /// node's own surfaces. A route to the node's http/rpc port would proxy
+    /// the whole mesh into the unauthenticated `/v1`, so it is refused before
+    /// a single upstream byte moves, with the reason token as the detail.
+    #[tokio::test]
+    async fn a_route_to_the_nodes_own_api_port_is_refused() {
+        let node_http_port = 8844u16;
+        let workspace = tempfile::tempdir().unwrap();
+        let routes = crate::gateway_routes::LocalRoutes {
+            routes: vec![crate::gateway_routes::LocalRoute {
+                name: gateway::RouteName::named("api"),
+                port: node_http_port,
+            }],
+        };
+        std::fs::write(
+            workspace.path().join(crate::gateway_routes::FILE_NAME),
+            serde_json::to_vec_pretty(&routes).unwrap(),
+        )
+        .unwrap();
+
+        let publisher = [2u8; 32];
+        let caller = [3u8; 32];
+        let member = ed25519::PrivateKey::from_seed(44);
+        let route = signed_route(&member, publisher, gateway::RouteAudience::Network, false);
+        let (commands, mut requests) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                panic!("route query");
+            };
+            let _ = reply.send(Ok(gateway::encode_reply(&gateway::GatewayReply::Route(
+                Box::new(Some(route)),
+            ))));
+            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                panic!("publisher authority query");
+            };
+            let _ = reply.send(Ok(identity::encode_reply(
+                &identity::IdentityReply::Account(Some(account(1, &member))),
+            )));
+        });
+        let error = serve_current(
+            &commands,
+            workspace.path(),
+            &[8845, node_http_port],
+            &publisher,
+            &caller,
+            &gateway::ProxyRequestHead {
+                account_id: 1,
+                name: gateway::RouteName::named("api"),
+                revision: 4,
+                method: gateway::RouteMethod::Get,
+                path_and_query: "/v1/status".into(),
+                headers: vec![],
+                body_len: 0,
+                upgrade: false,
+                user_pop: None,
+            },
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, GatewayFailure::Forbidden(ref why) if why == ROUTE_TARGETS_NODE_API),
             "{error:?}"
         );
     }
@@ -2339,6 +2465,7 @@ mod tests {
         let error = serve_current(
             &commands,
             workspace.path(),
+            &[],
             &publisher,
             &caller,
             &gateway::ProxyRequestHead {
@@ -2463,6 +2590,7 @@ mod tests {
         serve_current(
             &commands,
             Path::new("."),
+            &[],
             &publisher,
             &publisher,
             &gateway::ProxyRequestHead {

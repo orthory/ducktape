@@ -90,6 +90,7 @@ pub(super) async fn finish(
     gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
     gateway_workspace: std::path::PathBuf,
+    node_api_ports: Vec<u16>,
     // forge's git substrate — the serve lane builds a peer's catch-up objects
     // straight off it (see `blob_fetch::serve_forge_objects`).
     forge_repo: std::path::PathBuf,
@@ -180,6 +181,7 @@ pub(super) async fn finish(
                 planes,
                 commands: gateway_commands,
                 workspace: gateway_workspace,
+                node_api_ports,
             },
             requests,
         );
