@@ -112,6 +112,11 @@ pub enum Error {
     /// sealed — the recovered node would fork, so it must not start.
     #[error("recovery verification failed: {0}")]
     Verify(String),
+    /// a checkpoint manifest carries a field longer than this crate's own
+    /// reader accepts — writing it would replace a restorable checkpoint with
+    /// one that can never be read back.
+    #[error("recovery checkpoint field over cap: {0}")]
+    FieldOverCap(String),
     /// the caller asked for records below the retained checkpoint/journal
     /// suffix boundary. a statesync joiner must refetch a fresher manifest.
     #[error("recovery journal range pruned after {after_height}; retained from {retained_start}")]
@@ -400,6 +405,39 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// the WRITE-SIDE twin of [`Manifest::decode`]'s per-field cap.
+    ///
+    /// `decode` opens its cursor `with_cap(MAX_CHECKPOINT_FIELD_LEN)` and
+    /// REFUSES any field over it, so encoding one produces a checkpoint this
+    /// node can never restore from — and writing it replaces the previous,
+    /// still-restorable manifest and re-anchors the journal prune below a
+    /// boundary nothing can recover. The realistic overflow is a module
+    /// snapshot (forge's manifest embeds its whole git pack closure, #1308);
+    /// the key lists are checked because the same cursor bounds them.
+    ///
+    /// Refusing keeps the PREVIOUS checkpoint plus the journal, which still
+    /// restores — the same all-or-nothing stance `capture_timed` takes for a
+    /// module that could not prepare a snapshot at all.
+    fn check_field_caps(&self) -> Result<(), Error> {
+        let over_cap = |len: usize| len > MAX_CHECKPOINT_FIELD_LEN;
+        if let Some((id, bytes)) = self.snapshots.iter().find(|(_, b)| over_cap(b.len())) {
+            return Err(Error::FieldOverCap(format!(
+                "module {id}'s snapshot is {} bytes, over the {MAX_CHECKPOINT_FIELD_LEN}-byte \
+                 checkpoint field cap this crate's own reader enforces",
+                bytes.len()
+            )));
+        }
+        let mut keys = self.participants.iter().chain(self.residents.iter());
+        match keys.find(|k| over_cap(k.len())) {
+            Some(k) => Err(Error::FieldOverCap(format!(
+                "a validator key field is {} bytes, over the {MAX_CHECKPOINT_FIELD_LEN}-byte \
+                 checkpoint field cap this crate's own reader enforces",
+                k.len()
+            ))),
+            None => Ok(()),
+        }
+    }
+
     fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self.height {
@@ -760,7 +798,23 @@ where
 
     /// atomically persist a checkpoint manifest. syncs the op journal first
     /// so the manifest can never be newer than the journal it summarizes.
+    ///
+    /// REFUSES a manifest this crate's own reader would reject (see
+    /// [`Manifest::check_field_caps`]) BEFORE the journal sync and the store
+    /// write, so nothing partial or unreadable ever reaches disk and the
+    /// previous checkpoint stays exactly where it is.
     pub async fn write_manifest(&mut self, manifest: &Manifest) -> Result<(), Error> {
+        if let Err(e) = manifest.check_field_caps() {
+            tracing::error!(
+                target: "ducktape::recovery",
+                reason = "checkpoint_field_over_cap",
+                height = manifest.height.unwrap_or_default(),
+                error = %e,
+                "checkpoint refused: this node cannot restore from a manifest it \
+                 cannot read back, so the previous one stays on disk"
+            );
+            return Err(e);
+        }
         self.journal.sync().await.map_err(storage_err)?;
         self.manifest_store
             .put_sync(U64::new(KEY), manifest.encode())
@@ -2027,6 +2081,43 @@ mod tests {
         let decoded = Manifest::decode(&manifest.encode()).expect("large checkpoint decodes");
         assert_eq!(decoded.snapshot("forge"), Some(snapshot.as_slice()));
         assert_eq!(decoded, manifest);
+    }
+
+    /// THE WRITER MUST NOT PRODUCE WHAT THE READER REFUSES. A forge snapshot
+    /// grows with the repo, and past the field cap the old code wrote a
+    /// checkpoint the next boot could never decode — while pruning the journal
+    /// below it (#1308).
+    #[test]
+    fn a_field_over_the_checkpoint_cap_is_refused_at_write_time() {
+        let mut manifest = sample_manifest();
+        assert!(
+            manifest.check_field_caps().is_ok(),
+            "the sample is writable"
+        );
+
+        // zero-filled: only the length is read, so this never touches a page.
+        manifest.snapshots = vec![("forge".into(), vec![0u8; MAX_CHECKPOINT_FIELD_LEN + 1])];
+        let refused = manifest
+            .check_field_caps()
+            .expect_err("an over-cap snapshot must be refused");
+        assert!(
+            matches!(&refused, Error::FieldOverCap(what) if what.contains("forge")),
+            "the refusal must name the module whose snapshot outgrew the cap: {refused}"
+        );
+        // (deliberately NOT encode+decode'd here: proving the reader refuses it
+        // would copy a gigabyte through this test for a bound
+        // `manifest_roundtrips_a_module_snapshot_above_the_operation_cap`
+        // already pins from the other side.)
+
+        let over_cap_key = Manifest {
+            snapshots: Vec::new(),
+            residents: vec![vec![0u8; MAX_CHECKPOINT_FIELD_LEN + 1]],
+            ..sample_manifest()
+        };
+        assert!(matches!(
+            over_cap_key.check_field_caps(),
+            Err(Error::FieldOverCap(_))
+        ));
     }
 
     #[test]
