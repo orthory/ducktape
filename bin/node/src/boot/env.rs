@@ -314,6 +314,9 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
             config::coordinator_ingress(primary_coordinator.as_deref()),
             Ok(Some(_))
         );
+        // `coordinated` is the coordinated reach TARGET list, not the ambient
+        // coordinator: a non-empty one still proves some coordinator is
+        // configured, which is all the dark-shape predicate asks.
         let coordinator_configured = ambient_coordinator || !coordinated.is_empty();
         let dark = wireguard_endpoint_dark(
             endpoint_less,

@@ -70,6 +70,12 @@ pub(crate) const INTRO_ACK_TIMEOUT_MS: u64 = 2_000;
 /// entry older than this that nothing covers is a stranger's self-minted
 /// intro or a join that failed over elsewhere, and it is pruned at the next
 /// apply. One clock for both, so the two can never disagree.
+///
+/// Assumption: an admitted joiner's epoch plan covers its invite entry
+/// within this window of its LAST intro. A plan that lands later finds the
+/// entry already pruned; a NAT'd member's endpoint-less plan record then
+/// waits for the next observed-endpoint graft instead of inheriting the
+/// intro's endpoint (that one pair stays dark until it does).
 pub const INVITE_JOIN_WINDOW_MS: u64 = 90_000;
 
 /// Ceiling on join-window tunnel peers installed at once. An intro is
