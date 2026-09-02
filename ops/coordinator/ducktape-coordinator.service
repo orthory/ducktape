@@ -2,9 +2,7 @@
 #
 # Runs bin/coordinator (STUN reflexive + rendezvous; never carries peer
 # traffic). It is NOT a validator, holds NO key material, serves NO state, and
-# NEVER decrypts —
-# see docs/superpowers/specs/2026-07-05-private-cutover-coordinator-design.md.
-# The hardening below makes those invariants structural: a dynamic throwaway
+# NEVER decrypts. The hardening below makes those invariants structural: a dynamic throwaway
 # user, one capability (binding the 443 relay lane), a read-only filesystem,
 # and no secrets on disk.
 [Unit]

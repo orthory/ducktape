@@ -156,7 +156,7 @@ needs both sides to resolve simultaneously: the pump answers
 coordinator-vouched `PunchSync` fan-outs while the node is otherwise idle, and
 the active side re-`Lookup`s on every punch retry (each one re-fans the sync),
 so one-sided resolution completes against an idle-but-alive peer. What still
-moves with the userspace-overlay ADR's phase 3 is the punched-pinhole ↔
+moves with the userspace overlay's phase 3 is the punched-pinhole ↔
 WireGuard-socket alignment (the punch must originate from the plane's own UDP
 socket) and reflexive-bearing endpoint advertisements.
 

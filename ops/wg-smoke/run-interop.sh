@@ -1,6 +1,5 @@
 #!/bin/bash
-# overlay wire-compat container smoke
-# (docs/adr/2026-07-07-userspace-overlay-net.mdx): two fully unprivileged
+# overlay wire-compat container smoke: two fully unprivileged
 # containers running the userspace overlay backend (the node's only backend)
 # on ONE WireGuard network, proving the Noise handshake, wire format, and
 # cryptokey routing over a real container network.

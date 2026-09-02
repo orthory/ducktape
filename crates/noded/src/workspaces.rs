@@ -109,6 +109,7 @@ fn unconfigured() -> Response {
 
 /// the POST /v1/fs/workspaces body.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateBody {
     /// the duckfs subtree to check out. omitted/empty/`/workspace` means the
     /// daemon chooses an id-scoped managed namespace for this local workspace.
@@ -164,6 +165,7 @@ pub(crate) async fn create_workspace(
 
 /// the POST /v1/fs/workspaces/{id}/commit body.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommitWsBody {
     #[serde(default)]
     pub message: String,

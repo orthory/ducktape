@@ -2,8 +2,7 @@
 
 The step-by-step for standing up two validators behind **real, distinct NATs**
 (neither exposing an inbound port) plus a public coordinator, using the **real
-binaries**. This is the procedure for the design's §"Acceptance" item 2. It is
-written so it is unambiguous which steps run today and which remain dependent on
+binaries**. It is written so it is unambiguous which steps run today and which remain dependent on
 the two real NATs being punchable.
 
 > **Legend.** `[WORKS TODAY]` — runs now with shipped binaries.

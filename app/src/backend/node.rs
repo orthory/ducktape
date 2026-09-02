@@ -27,15 +27,13 @@ pub async fn load_settings_facts(
     generation: i64,
 ) -> Result<SettingsFacts, HydrationError> {
     async {
+        // the launch window's `user_key_state` reading, on the same file: one
+        // classifier, so Settings and the wallet list cannot disagree about it.
         let (key_path, key_state) = match user_key_path() {
             Err(_) => ("(unset)".to_string(), "unlocatable".to_string()),
             Ok(path) => {
-                let state = match std::fs::read(&path) {
-                    Err(_) => "absent",
-                    Ok(bytes) if bytes.starts_with(ENCRYPTED_KEY_PREFIX.as_bytes()) => "encrypted",
-                    Ok(_) => "PLAINTEXT — secure it",
-                };
-                (path.display().to_string(), state.to_string())
+                let state = keystore::userkey::key_file_state(&path);
+                (path.display().to_string(), state.as_str().to_string())
             }
         };
         let tabs = load_doc_tabs(rpc.clone()).await;

@@ -68,7 +68,7 @@ pub(crate) fn spawn(
             Ok(bound) => bound,
             Err(error) => {
                 tracing::error!(
-                    target: "ducktape::dataplane",
+                    target: "ducktape::agent",
                     node = %label,
                     service = "agent_telemetry",
                     error = %error,
@@ -78,7 +78,7 @@ pub(crate) fn spawn(
             }
         };
         tracing::info!(
-            target: "ducktape::dataplane",
+            target: "ducktape::agent",
             node = %label,
             service = "agent_telemetry",
             own = %own,

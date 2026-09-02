@@ -48,8 +48,12 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
 ## Node operator CLI
 
 - `agent-system` — a compact operator CLI over a running node's module surface
-  (raw query/submit, agent list/pause/resume); reads the selected node from
-  `~/.ducktape/agent-system-url`.
+  (raw query/submit, agent list/pause/resume); takes the node from
+  `DUCKTAPE_NODE` (the same variable the `ducktape` CLI, the app, and every run
+  read), else `~/.ducktape/agent-system-url`, else the active workspace in
+  `~/.ducktape/registry.json`. It talks to a loopback node only, so a
+  `DUCKTAPE_NODE` pointing at a remote one is refused by name rather than
+  silently ignored; `use`, `help` and `cgroup` need no node and never read it.
 - `completions/` — shell completions for the `ducktape` CLI.
 
 ## Networking and media harnesses

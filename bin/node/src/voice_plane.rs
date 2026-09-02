@@ -1,13 +1,12 @@
 //! The huddle media planes — voice and camera video over the WireGuard
-//! overlay, one per-use [`DataPlane`] per service (the per-use data-plane ADR,
-//! `docs/adr/2026-07-07-per-use-data-plane.mdx`).
+//! overlay, one per-use [`DataPlane`] per service.
 //!
 //! Media used to ride the authenticated TCP mesh through a datagram
-//! `ChannelTransport` (the video-call ADR's stated interim shortcut). That
-//! defeated the plane's headline isolation guarantee: every mesh channel to a
-//! peer funnels through ONE per-peer priority relay, so a multi-megabit video
-//! burst and the 32 kbps voice stream shared a single send queue and voice
-//! starved behind video under load. This module retires that arm: voice binds
+//! `ChannelTransport` (an interim shortcut). That defeated the plane's
+//! headline isolation guarantee: every mesh channel to a peer funnels through
+//! ONE per-peer priority relay, so a multi-megabit video burst and the 32 kbps
+//! voice stream shared a single send queue and voice starved behind video
+//! under load. This module retires that arm: voice binds
 //! `Service::Voice`'s overlay datagram port and video binds `Service::Video`'s,
 //! so the two streams never share a socket, a queue, or a byte of head-of-line.
 //!

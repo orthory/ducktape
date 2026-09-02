@@ -101,9 +101,9 @@ nat-traversal = { workspace = true, features = ["runtime"] }
 wireguard = { workspace = true }
 # the voice hub's transport seam: huddle media rides data-plane datagrams over
 # the per-service overlay sockets (src/voice_plane.rs binds them); the mesh arm
-# it replaced is retired — see docs/adr/2026-07-07-per-use-data-plane.mdx.
+# it replaced is retired.
 data-plane = { workspace = true }
-# the overlay routing seam (ADR 2026-07-07-userspace-overlay-net): the mesh's
+# the userspace overlay routing seam: the mesh's
 # runtime context is wrapped so dial/bind route overlay ULAs by address.
 overlay-net = { workspace = true }
 futures = "0.3"

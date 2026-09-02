@@ -45,9 +45,9 @@ pub(crate) struct BindConfig<'a> {
     pub(crate) gateway_enabled: bool,
     pub(crate) log_ring: noded::LogRing,
     /// this node's consensus public key — the salt every owner PoP on the
-    /// admin namespace is bound to (ADR A5).
+    /// admin namespace is bound to.
     pub(crate) node_key: Vec<u8>,
-    /// how the owner-gated admin namespace is exposed (ADR A2/A4).
+    /// how the owner-gated admin namespace is exposed.
     pub(crate) admin_exposure: noded::AdminExposure,
 }
 
@@ -189,7 +189,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         // the duckfs workspace RPC's managed-checkout root (disk state, separate
         // from the module's own `<storage>/duckfs` dir).
         .with_duckfs_workspaces(storage.join("duckfs-workspaces"))
-        // the owner-gated control namespace (ADR A2/A5): this node's own key
+        // the owner-gated control namespace: this node's own key
         // salts the owner PoP, and the operator's active wallet key names the
         // account that may present one (identity binds no node to anyone);
         // the exposure is the operator's choice (default loopback). shutdown +

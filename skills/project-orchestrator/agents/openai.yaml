@@ -1,4 +1,0 @@
-interface:
-  display_name: "Project Orchestrator"
-  short_description: "Delegate one bounded Ducktape agent wave"
-  default_prompt: "Use $project-orchestrator to split this project task into one bounded delegation wave and report observable results."

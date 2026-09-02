@@ -4,7 +4,7 @@ edition.workspace = true
 version.workspace = true
 
 # the module composition catalog: ONE source for the module id universe, its
-# logical wiring, its genesis-config schema, and the named genesis selections
+# shape (code/backing), its genesis-config schema, and the named genesis selections
 # every composer (node, noded, simnode, demo) draws from. Pure `&'static str`
 # data with no dependencies — a plan, never a root-hash: each backend still
 # instantiates its selection itself.

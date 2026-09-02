@@ -167,9 +167,7 @@ heartbeat keeps signaling — `warn` `hello_failed` at attempt 1, then every
 `ducktape-service@<kind>` only for a new binary or a new grant. The one
 daemon that exits is one that BOOTS while the node is down: the first hello
 must land (`services.rs`, `send_hello` in `run`), and `Restart=always`
-retries it until it does. Read
-`docs/records/admission/validator-onboarding.md` before stopping a
-validator: below four validators every seat must be live to finalize, so a
+retries it until it does. Before stopping a validator, remember: below four validators every seat must be live to finalize, so a
 restart of one of three halts the chain for the restart's duration.
 
 `curl 127.0.0.1:8844/v1/status | jq .version` prints the build the node

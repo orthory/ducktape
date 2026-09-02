@@ -382,10 +382,11 @@ fn detect_platform_sandbox() -> Option<config::SandboxToml> {
 /// seed the genesis validator set with this identity, and PIN the genesis wasm
 /// set — every component in `--modules` is hashed into the descriptor and
 /// copied into `<workspace>/modules`. Every flag is optional:
-/// the generated config defaults to a WORKING node (mesh `[::]:52200`,
-/// overlay advertise, HTTP 8844, RPC 8845, gateway, WireGuard 51820) and
-/// prints every key, so the file itself documents what to change. without
-/// `--dir` the workspace lands in the registry
+/// the generated config defaults to a WORKING node — overlay advertise, and
+/// every listener at its `config::DEFAULT_*_LISTEN` constant (mesh, HTTP,
+/// RPC, gateway, WireGuard), which is the one place those ports are written
+/// down — and prints every key, so the file itself documents what to change.
+/// without `--dir` the workspace lands in the registry
 /// (`~/.ducktape/workspaces/<chain-id>/`), where `-n <chain-id>` finds it.
 fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let name = &args.name;
@@ -599,10 +600,10 @@ fn bundle_member_genesis(dir: &std::path::Path) -> Result<(), Box<dyn std::error
 /// (governance `Redeem`) — no member approval step follows. an invite grants
 /// RESIDENT standing only; submitting ops needs no invite at all.
 fn cmd_invite(args: InviteArgs) -> Result<(), Box<dyn std::error::Error>> {
-    // every invite is BEARER (the targeted form was dropped — see the join
-    // ADR): there is no `--target` — whoever redeems the single-use token
-    // first wins. the invite is the admission credential itself, kept off the
-    // wire by the sealed first-contact intro.
+    // every invite is BEARER (the targeted form was dropped): there is no
+    // `--target` — whoever redeems the single-use token first wins. the
+    // invite is the admission credential itself, kept off the wire by the
+    // sealed first-contact intro.
     let ttl_days: u64 = match args.ttl_days {
         Some(v) => v,
         // the operator-friendly onboarding default (a LOST blob is the residual
@@ -1746,8 +1747,7 @@ fn collect_blob_lines(reader: impl std::io::BufRead) -> std::io::Result<String> 
 /// With no blob argv the blob is read from stdin (interactive paste prompt,
 /// or a pipe). prints this identity for the inviter's pre-genesis `admit`.
 /// `--primary-coordinator` is node-local plumbing ONLY — it never touches
-/// the invite or the joined descriptor (the coordinator is always ambient,
-/// per docs/superpowers/specs/2026-07-08-fully-nated-inviter-design.md).
+/// the invite or the joined descriptor (the coordinator is always ambient).
 fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
     // argv words are rejoined (a blob pasted unquoted splits on its wrapped
     // spaces); no argv at all reads the blob from stdin. decode strips ALL

@@ -287,7 +287,7 @@ pub struct DataPlane<T: DataPlaneTransport> {
 
 /// A process-wide stream-class byte budget that can be injected into multiple
 /// per-use planes. Planes keep separate sockets/queues/admission, while bulk
-/// consumers share the one link-headroom ceiling required by the per-use ADR.
+/// consumers share the one link-headroom ceiling.
 #[derive(Clone)]
 pub struct BulkPacer {
     bucket: Arc<TokenBucket>,

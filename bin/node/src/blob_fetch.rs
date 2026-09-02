@@ -347,7 +347,7 @@ pub struct ServeLaneBlobClient<S: P2pSender<PublicKey = ed25519::PublicKey>> {
     peers: Arc<RwLock<Vec<ed25519::PublicKey>>>,
     cursor: Arc<AtomicUsize>,
     next_id: Arc<AtomicU64>,
-    /// this node's real key + standing proof (ADR §5.1): every request rides
+    /// this node's real key + standing proof: every request rides
     /// the authed rpc envelope, and a validator's key is in committed
     /// standing, so the serving peer admits its blob lanes.
     requester: [u8; 32],

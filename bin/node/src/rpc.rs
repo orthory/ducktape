@@ -15,7 +15,7 @@ pub(crate) enum RpcRequest {
     /// the verified join requests parked joiners announced to THIS member —
     /// the queue the approve button (or `node resident accept`) settles.
     JoinRequests,
-    /// the node-owned join state (ADR §6): the ONE authoritative source the
+    /// the node-owned join state: the ONE authoritative source the
     /// app renders instead of parsing daemon.log markers. derived from gate
     /// progress + committed chain state, never a scattered guess.
     JoinState,
@@ -26,7 +26,7 @@ pub(crate) enum RpcRequest {
     Shutdown,
 }
 
-/// the node-owned join-state projection (ADR §6). `phase` uses the app's
+/// the node-owned join-state projection. `phase` uses the app's
 /// onboarding vocabulary so the console renders it verbatim:
 /// `parked | admitted | synced | promoted`.
 #[derive(serde::Serialize)]

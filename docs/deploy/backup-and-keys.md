@@ -15,7 +15,7 @@ expected shape, not as a promise.
 
 | File | Written by | Secret? | Lose it and… |
 | --- | --- | --- | --- |
-| `workspaces/<chain-id>/identity.key` | `node init` / `node join` (`crates/workspace-config/src/identity.rs`: hex ed25519 seed, `create_new`, mode 0600, read without a password so unattended boot works) | **yes** | **This node's seat is gone.** It is the mesh identity, the frame-signing key and the validator-set key. A resident replica rejoins from a new invite with a fresh key. A **validator** cannot: the set still counts the old key, and below four validators every seat must be live to finalize (`docs/records/admission/validator-onboarding.md`, "Consensus reality"), so losing one seat key on an n≤3 network **halts the chain** until a quorum votes the seat out — which at n=3 no longer exists. |
+| `workspaces/<chain-id>/identity.key` | `node init` / `node join` (`crates/workspace-config/src/identity.rs`: hex ed25519 seed, `create_new`, mode 0600, read without a password so unattended boot works) | **yes** | **This node's seat is gone.** It is the mesh identity, the frame-signing key and the validator-set key. A resident replica rejoins from a new invite with a fresh key. A **validator** cannot: the set still counts the old key, and below four validators every seat must be live to finalize, so losing one seat key on an n≤3 network **halts the chain** until a quorum votes the seat out — which at n=3 no longer exists. |
 | `workspaces/<chain-id>/node.toml`, `network.toml` | `node init` / `node join` | no | Regenerable from another member: `node join` a fresh invite into the same directory rewrites both (`crates/workspace-config/src/join.rs`, idempotent on an existing `identity.key`). Back them up anyway — they carry the listeners, `[sandbox]` table and reach hints you tuned. |
 | `workspaces/<chain-id>/storage/` | the node at runtime | no (see airlock below) | Consensus state, checkpoints, the blob store, `mesh-state.json`, forge repos. **Regenerable by state sync** from any current validator — for a resident. For a validator this is the part nobody has rehearsed (below). |
 | `workspaces/<chain-id>/storage/airlock-creds/seal.key` | `ducktape service run airlock` on first boot (`crates/services/airlock/src/lib.rs`, `load_or_create_seal_keypair`, 0600) | **yes** | The seal keypair every credential this node lends is sealed to; its public half is what `user cred add` publishes on chain and borrowers pin. Lose it and every credential in `airlock-creds/` is unreadable and every published seal is stale: re-add every credential (`ducktape user cred add`). |
@@ -128,8 +128,7 @@ existing key followed by removing the old one — see `ducktape account
 ## Halt recovery after a bad module swap, binary rollback
 
 Both are governance-driven, not file-driven: a module swap is proposed,
-voted and executed on chain (`ducktape module --help`,
-`docs/superpowers/specs/2026-08-27-live-upgrade-design.md`); rolling a
+voted and executed on chain (`ducktape module --help`); rolling a
 **binary** back is reinstalling the previous build on every host and
 restarting (`node-service.md`, "Restart, stop, upgrade") — the chain has no
 binary version and admits nothing on it. Neither has a rehearsed

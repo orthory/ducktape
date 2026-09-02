@@ -470,8 +470,8 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     }
     // mesh = validators ∪ every reach identity (direct + coordinated). A
     // fresh network-shape joiner may be outside this set at genesis; it parks
-    // until governance admits it (join ADR §4: the gate rides the WireGuard-
-    // tunnel doorbell, so a pre-admission joiner needs no mesh door — its
+    // until governance admits it (the gate rides the WireGuard-tunnel
+    // doorbell, so a pre-admission joiner needs no mesh door — its
     // REAL key is re-tracked onto every member's mesh at its Redeem grant).
     let mut mesh = validators.clone();
     for (k, _) in &bootstrap {
@@ -982,7 +982,7 @@ mod tests {
 
     #[test]
     fn the_mesh_carries_no_derived_lobby_identity() {
-        // join ADR §4: the derived lobby transport identity is RETIRED — the
+        // the derived lobby transport identity is RETIRED — the
         // tracked mesh is exactly the descriptor's real identities, nothing
         // derivable from the namespace alone.
         let dir = tmp("lobbymesh");
@@ -1073,7 +1073,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&r.namespace).starts_with("net#11223344@"));
         assert_eq!(r.validators.len(), 2);
         // exactly the validators — no derived lobby identity any more (the
-        // join gate rides the tunnel doorbell, join ADR §4).
+        // join gate rides the tunnel doorbell).
         assert_eq!(r.mesh.len(), 2);
         // self never appears in dial_hints; the other member does.
         assert_eq!(r.dial_hints.len(), 1);
@@ -1290,7 +1290,7 @@ mod tests {
         assert_eq!(r.signer.public_key(), me.public_key());
         assert!(!r.validators.contains(&me.public_key()));
         assert_eq!(r.validators, vec![other.clone()]);
-        // no derived lobby door any more (join ADR §4): the joiner's own key
+        // no derived lobby door any more: the joiner's own key
         // enters the mesh at its Redeem grant, not at resolve time.
         assert_eq!(r.mesh, vec![other]);
     }
@@ -1618,7 +1618,7 @@ mod tests {
         );
     }
 
-    /// `coordinator_relay` (join ADR item 2) rides resolve exactly like
+    /// `coordinator_relay` rides resolve exactly like
     /// `primary_coordinator`: the key ABSENT resolves to `None` — the
     /// zero-config joiner default, deriving the relay from the ambient
     /// coordinator at the wiring site; the disable sentinel and an explicit

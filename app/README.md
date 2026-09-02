@@ -8,13 +8,17 @@ cargo build -p node-bin
 cargo run -p ducktape-app
 ```
 
-The RPC defaults to `DUCKTAPE_NODE`, then `http://127.0.0.1:8844`, and remains
-editable in the app. Chat + Pages hydrate over HTTP after the resumable
+The RPC endpoint stays editable in the app and wins whenever it is set; left
+empty it resolves `DUCKTAPE_NODE`, else the active workspace's http port from
+the CLI registry (`<ducktape home>/registry.json`), else
+`http://127.0.0.1:8844`. Chat + Pages hydrate over HTTP after the resumable
 `module:chat` and `module:pages` WebSocket topics are active, then rehydrate on
-committed changes. Writes require an encrypted v1 user key from
-`DUCKTAPE_USER_KEY`, then `$DUCKTAPE_HOME/user.key`, then
-`~/.ducktape/user.key`. Set `DUCKTAPE_BIN` when the `ducktape` CLI is neither
-beside the app binary nor on `PATH`.
+committed changes. Writes sign with the encrypted key at `DUCKTAPE_USER_KEY`,
+else the keystore's active wallet (`<ducktape home>/keys/<name>.key`); no
+active wallet is a refusal, not a guess — pick one in the launch window.
+`<ducktape home>` is `$DUCKTAPE_HOME` when set, else `~/.ducktape`. Set
+`DUCKTAPE_BIN` when the `ducktape` CLI is neither beside the app binary nor on
+`PATH`.
 
 ## Visual language
 

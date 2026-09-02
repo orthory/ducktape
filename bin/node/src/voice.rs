@@ -77,7 +77,7 @@ fn video_flow(channel_id: &str) -> FlowId {
 }
 
 /// the call-control flow (Service::Voice — control must work in an
-/// audio-only build, ADR §2).
+/// audio-only build).
 fn ctl_flow(channel_id: &str) -> FlowId {
     FlowId::derive(format!("callctl-channel:{channel_id}").as_bytes())
 }

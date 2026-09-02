@@ -34,7 +34,7 @@ use tracing_subscriber::{EnvFilter, Layer as _, reload};
 /// defguard_boringtun is pinned off: its rekey timers WARN every ~5 s per
 /// unreachable peer — with no peer field, so the lines diagnose nothing while
 /// evicting the ring. the replacement is peer-labeled and edge-triggered on
-/// `ducktape::overlay` (overlay-net's `device.rs` logs expiry/recovery from
+/// `ducktape::dataplane` (overlay-net's `device.rs` logs expiry/recovery from
 /// `ConnectionExpired` return values, where the peer IS known). RUST_LOG
 /// appends after this, so `RUST_LOG=defguard_boringtun=warn` re-arms the raw
 /// crate lines.

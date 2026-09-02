@@ -46,7 +46,7 @@ The tree groups by function into three layers — module / kernel / networking:
 | `bin/` | Runnable binaries: `node` (the unified `ducktape` CLI: `node run` plus every operator family — `node`, `user`, `account`, `wallet`, `gateway`, `fs`, `service`, `agent`, `module`, `mcp`), `noded` (`noded-bin`: the throwaway dev daemon with temp storage), `simnode` (deterministic /v1 twin), `coordinator` (STUN rendezvous + the TCP first-contact relay), `airlock-gateway` (the TEE enclave lender; the non-TEE lender is `ducktape service run airlock`), `guest-builder` (module → wasm component packaging tool), `duck-guest-init` (PID 1 inside a run's microVM), `duck-vz-shim` (the macOS Virtualization.framework VMM shim, Swift) |
 | `app/` | `ducktape-app`, the native Iced desktop client (Chat + Pages), UI declared in `src/ui/*.ice`; `crates/design` is its design system |
 | `ops/` | Operator scripts, the node and coordinator systemd units, the sandbox guest image builder, the hosted auth page — see `ops/README.md` |
-| `docs/` | Nimbus documentation site (human and agent tracks); `docs/deploy/` holds the operator runbooks (node service, backup and keys, coordinator, sentry) |
+| `docs/` | Operator runbooks (`deploy/`, `dogfood.md`, `sandbox-macos.md`) and the few records code cites by path (`records/`) |
 
 Each module publishes its wire surface — types-only payload/query/reply shapes
 and codecs — at its own crate root; those wire types plus host-routed queries
@@ -59,14 +59,10 @@ Every layer boundary is a small trait, and each obeys the same three rules: the
 contract lives at its crate root (opening the crate shows it first); every trait
 ships a sim/test arm in the same crate — behind feature `sim` where the double
 carries a build cost; and this table is the map from each boundary to its real
-and swappable arms. Rationale and the full seam designs are in
-[`docs/superpowers/specs/2026-07-21-layer-contract-standardization-design.md`](docs/superpowers/specs/2026-07-21-layer-contract-standardization-design.md).
-The last rows are not swappable-arm traits but single shared paths that
-replaced the old validator/noded/simnode triplication (block projection,
-worker reactor, genesis topology) plus the scripted-stepping ordering arm —
-the block-apply reassembly design is
-[`docs/superpowers/specs/2026-07-22-c-stage-simnode-reassembly-design.md`](docs/superpowers/specs/2026-07-22-c-stage-simnode-reassembly-design.md).
-Every row is landed on `dev`.
+and swappable arms. The last four rows are not swappable-arm traits but single
+shared paths that replaced the old validator/noded/simnode triplication (block
+projection, worker reactor, genesis topology) plus the scripted-stepping
+ordering arm.
 
 | Contract (trait · crate) | Real arm(s) | Sim / test arm | Consumers |
 | --- | --- | --- | --- |
@@ -218,8 +214,8 @@ Also runnable:
   (see the operator path above and `docs/deploy/coordinator.md`).
 
 - **`ducktape-app`** (`app/`) — the native Iced desktop client for Chat and
-  Pages, its UI declared in `app/src/ui/*.ice`. `cargo run -p ducktape-app`; it
-  dials `DUCKTAPE_NODE`, else `http://127.0.0.1:8844`. See `app/README.md`.
+  Pages, its UI declared in `app/src/ui/*.ice`. `cargo run -p ducktape-app`;
+  `app/README.md` states which node it dials and which key it signs with.
 
 Seed a local "demo" network preloaded with sample data — chat channels and
 messages, a tasks board, pages, a registered agent, an inbox note, an
@@ -232,28 +228,7 @@ make demo-seed
 
 ## Documentation
 
-The docs are a separate Nimbus project under `docs/` (package manager: Bun), so
-Rust verification and docs verification stay decoupled:
-
-```sh
-cd docs
-bun install
-bun run docs:check   # docs gate
-bun run dev          # local preview
-```
-
-Pages are split by reader (human vs. coding agent) under
-`docs/src/content/docs/en`.
-
-## Status
-
-The platform spine is checked in and verified: the module contract, host
-registry, global root-hash, ordered node path, commonware Simplex orderer,
-the saga async seam, and several root-backed product modules, plus state
-sync for QMDB-backed, forge, and snapshot-style modules.
-
-Still open — mostly live orchestration: network-backed module sync from a
-running node, dynamic valset wiring around epoch cutover, snapshot-at-height
-serving, and product depth for chat, agent, and tasks. See
-[implementation status](docs/src/content/docs/en/human/reference/implementation-status.mdx)
-and [what is left](docs/src/content/docs/en/human/roadmap/what-is-left.mdx).
+`docs/` holds operator runbooks (`deploy/`, `dogfood.md`, `sandbox-macos.md`)
+and the few records code cites by path (`records/`); `docs/README.md` is the
+index. There is no docs site and no decision-record system: the code and its
+comments are the record.

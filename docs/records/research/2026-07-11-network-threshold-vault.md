@@ -1,22 +1,22 @@
 # Network-Wide Threshold Key Custody ("Vault" / MPC Keybase) — Research
 
-Date: 2026-07-11. Method: full repo map (consensus/governance, identity/custody, prior-art grep) + external survey of threshold-crypto systems (FROST/ROAST, Ferveo/Penumbra, Lit, drand, CHURP/DPSS, threshold-ECDSA, Fireblocks TAP). This is a research record, not a decision. If it hardens into one, promote to `docs/adr/`.
+Date: 2026-07-11. Method: full repo map (consensus/governance, identity/custody, prior-art grep) + external survey of threshold-crypto systems (FROST/ROAST, Ferveo/Penumbra, Lit, drand, CHURP/DPSS, threshold-ECDSA, Fireblocks TAP). This is a research record, not a decision.
 
 ## Executive summary
 
 1. **Greenfield, but not blank.** No threshold / DKG / MPC / secret-sharing code exists anywhere in the tree (hard grep: zero hits for `shamir|frost|dkg|vss|feldman|pedersen|mpc|threshold-share`). The only multi-party crypto is **BLS12-381 MinPk *multisig aggregation*** for V2 consensus certs — and the consensus code deliberately keeps it non-threshold.
 
-2. **The one hard constraint drives the whole design.** Consensus explicitly *rejected* threshold-BLS because "those need DKG/resharing, which fights the epoch teardown-respawn contract" (`crates/kernel/consensus/src/lib.rs:100-101`; echoed in `docs/superpowers/specs/2026-07-04-no-downtime-node-upgrade-design.md:440`). Every membership change tears down and respawns the consensus engine with a fresh valset (`crates/kernel/consensus/src/valset_orchestrator.rs`). A distributed key held *by the validator set* would have to be reshared on every one of those respawns. **That rejection is correct, and it dictates the answer below.**
+2. **The one hard constraint drives the whole design.** Consensus explicitly *rejected* threshold-BLS because "those need DKG/resharing, which fights the epoch teardown-respawn contract" (`crates/kernel/consensus/src/lib.rs:100-101`). Every membership change tears down and respawns the consensus engine with a fresh valset (`crates/kernel/consensus/src/valset_orchestrator.rs`). A distributed key held *by the validator set* would have to be reshared on every one of those respawns. **That rejection is correct, and it dictates the answer below.**
 
 3. **Resolution: decouple the key-holding committee from the validator set.** Consensus + governance become the **control plane** (order ceremonies, record commitments, enforce policy). The threshold shares live in a **custody committee** whose membership is *governed by* consensus but is **not** the consensus engine — so shares persist across epoch respawns and reshare only on deliberate governance events, not on every epoch cutover. This is the single load-bearing architectural decision.
 
 4. **Two capabilities are conflated under one name.** "MPC keybase / vault" means either (A) **threshold decryption / secret custody** — the network holds decryption shares; a threshold reads — or (B) **threshold signing** — the network holds a signing key and signs on behalf of the network/an account. (A) is a light upgrade of the existing `vaults` module; (B) is a heavier interactive ceremony (FROST+ROAST for native ed25519, threshold-ECDSA for external chains). **Recommend (A) first.**
 
-5. **Everything except the threshold-crypto core already exists and is reusable.** Governance proposals/ballots, valset two-tier membership, invite PoP, genesis-issued `CoordCap` delegation, the `vaults` ciphertext-on-consensus precedent, the sealed-lanes ADR's planned node `/v1/crypto/{pubkey,seal,open}` routes, and the module SDK are all directly reusable as the control plane. The genuinely new code is: DKG, threshold sign/decrypt, and resharing.
+5. **Everything except the threshold-crypto core already exists and is reusable.** Governance proposals/ballots, valset two-tier membership, invite PoP, genesis-issued `CoordCap` delegation, the `vaults` ciphertext-on-consensus precedent, the sealed-lanes design's planned node `/v1/crypto/{pubkey,seal,open}` routes, and the module SDK are all directly reusable as the control plane. The genuinely new code is: DKG, threshold sign/decrypt, and resharing.
 
 6. **The crypto is buildable from in-tree deps.** BLS12-381 (blst + ark-bls12-381, already linked transitively) for threshold decryption; `frost-ed25519` (RFC 9591) for native Schnorr signing that verifies under the *existing* ed25519 verifiers; `cggmp21` (audited) only if external-chain ECDSA is needed. Resharing via drand-style Feldman/Desmedt-Jajodia or CHURP/DPSS, governance-triggered.
 
-7. **Bonus unlock: network/social recovery of the user key.** User-key custody is mnemonic-only today and social recovery is explicitly out of scope (`docs/superpowers/specs/2026-07-07-user-node-identity-split-design.md:242`). A network custody committee is exactly the primitive that unlocks threshold recovery of a lost user key — arguably the highest-value product feature the vault enables.
+7. **Bonus unlock: network/social recovery of the user key.** User-key custody is mnemonic-only today and social recovery is explicitly out of scope. A network custody committee is exactly the primitive that unlocks threshold recovery of a lost user key — arguably the highest-value product feature the vault enables.
 
 ---
 
@@ -48,7 +48,6 @@ The decoupled model is the only one that respects the teardown-respawn contract 
 | Admit a member with a single-use proof | invite `InviteToken` + joiner PoP, re-verified on `Redeem` | `crates/modules/system/governance/src/invite.rs` |
 | Delegate a capability off a genesis root, TTL-bounded | keyless-coordinator `CoordCap{issuer∈genesis_set, not_after, sig}` | `crates/networking/nat-traversal/src/auth.rs` |
 | Ciphertext-on-consensus + reader ACL (the vault precedent) | `vaults` module — opaque ciphertext, client-side X25519 envelopes, ACL = write-integrity + reader bookkeeping | `crates/modules/apps/vaults/`, registered `bin/node/src/host_state.rs:135` |
-| Node-side crypto that keeps keys out of the webview | sealed-lanes ADR plans `/v1/crypto/{pubkey,seal,open}` and notes they'd "also finally serve vaults" | `docs/adr/2026-07-06-private-team-messaging.mdx` |
 | Rich single-key custody to model share custody on | mnemonic=seed, argon2id → XChaCha20-Poly1305, zeroized session cache | `bin/node/src/userkey.rs` |
 | Snapshot/install so a new committee member syncs shares | statesync `serve_sync` (committed-state-only, root-verified) | `crates/kernel/sdk/src/lib.rs:356` |
 | A place to register the new module | canonical genesis registry | `bin/node/src/host_state.rs:97-188` |
@@ -128,7 +127,7 @@ Lazy read: **BLS12-381 for decryption reuses a curve consensus already links; FR
 - **Phase 3 — FROST signing.** Native ed25519 threshold signatures + ROAST robustness. Enables "the network/account signs on behalf of an absent member."
 - **Phase 4 (only on demand):** external-chain threshold ECDSA; **network/social recovery of the user key** (high product value, folds into the identity module).
 
-**Do NOT build up front:** external-chain ECDSA (heaviest dep, no stated use case), a TEE trust story (Lit's model; consensus is our enforcement boundary instead), forward secrecy / ratcheting (sealed-lanes ADR already scoped this out), a bespoke resharing scheme before Phase 1 even has a key to reshare.
+**Do NOT build up front:** external-chain ECDSA (heaviest dep, no stated use case), a TEE trust story (Lit's model; consensus is our enforcement boundary instead), forward secrecy / ratcheting (the sealed-lanes design already scoped this out), a bespoke resharing scheme before Phase 1 even has a key to reshare.
 
 ---
 
@@ -144,11 +143,11 @@ Lazy read: **BLS12-381 for decryption reuses a curve consensus already links; FR
 ## References
 
 Codebase (authoritative):
-- Consensus rejection of threshold-BLS: `crates/kernel/consensus/src/lib.rs:100-101`; `docs/superpowers/specs/2026-07-04-no-downtime-node-upgrade-design.md:440`
+- Consensus rejection of threshold-BLS: `crates/kernel/consensus/src/lib.rs:100-101`
 - Epoch teardown-respawn: `crates/kernel/consensus/src/valset_orchestrator.rs`
 - Governance: `crates/modules/system/governance/src/{lib.rs,interface.rs,invite.rs}`; valset tiers `crates/modules/system/valset/src/interface.rs:15`
 - CoordCap delegation: `crates/networking/nat-traversal/src/auth.rs`
-- Existing `vaults`: `crates/modules/apps/vaults/`; sealed-lanes ADR: `docs/adr/2026-07-06-private-team-messaging.mdx`
+- Existing `vaults`: `crates/modules/apps/vaults/`
 - Custody / keys: `bin/node/src/userkey.rs`; identity registry: `crates/modules/system/identity/src/lib.rs`; module SDK: `crates/kernel/sdk/src/lib.rs:320`
 
 External:
