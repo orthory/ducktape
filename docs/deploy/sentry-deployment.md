@@ -19,8 +19,9 @@ validator, and never serves state — it is pure path.
 
 Concretely, a bootstrap hint is `pubkey@addr` and the validator's `advertised`
 address is fully independent of its real `listen` address
-(`bin/node/src/config.rs`). Fronting is therefore *configuration only*: point
-`advertised` (and joiners' hints) at the sentry, keep `listen` private.
+(`bin/node/src/config/resolve.rs`, `resolve_advertised`). Fronting is
+therefore *configuration only*: point `advertised` (and joiners' hints) at the
+sentry, keep `listen` private.
 
 ## (A) Forward sentry (Cosmos-style)
 
@@ -132,9 +133,10 @@ identical ("dial this address, expect this key").
   peer.
 
 - **State-sync still terminates at a validator.** The sentry is pure path — it
-  never serves state. A joiner's `--sync-only` source is chosen **by key**, and
-  only a validator (never the sentry, which has no key in the descriptor) can be
-  selected (`choose_sync_source` in `bin/node/src/config.rs`). State-sync flows
+  never serves state. A joiner's `--sync-only` sources are the descriptor's
+  validator **keys** (`sync_sources` in `bin/node/src/boot/mesh.rs`, rotated
+  by `bin/node/src/boot/sync_only.rs`), so only a validator — never the
+  sentry, which has no key in the descriptor — can serve it. State-sync flows
   *through* the sentry pipe but *terminates at* the validator behind it.
 
 - **Availability dependency — an in-path sentry is a SPOF, not just a
@@ -157,6 +159,8 @@ identical ("dial this address, expect this key").
 
 Phase 1 ships **no consensus/production behavior change** — it converts an
 already-working, configuration-only capability into a regression-guarded,
-documented one (`bin/node/tests/sentry_e2e.rs`). The typed reach hint
-(`Direct`/`Fronted`), coordinator/STUN rendezvous, and the private (WireGuard)
-cutover are later phases.
+documented one (`bin/node/tests/sentry_e2e.rs`). The typed reach hints
+(`Direct`/`Coordinated` — `crates/workspace-config/src/lib.rs` `Reach`; a
+`Fronted` variant survives in the enum but nothing mints one), coordinator/STUN
+rendezvous, and the private (WireGuard) cutover are later phases; a sentry is
+addressed through a plain `Direct` hint naming its public address.
