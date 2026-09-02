@@ -487,7 +487,8 @@ fn a_disk_substrate_two_blocks_ahead_of_the_checkpoint_recovers_cleanly() {
             vec![],
             None,
             pos,
-            1,)
+            1,
+        )
         .expect("capture");
         node.sink_mut()
             .write_manifest(&manifest)
@@ -529,8 +530,7 @@ fn a_disk_substrate_two_blocks_ahead_of_the_checkpoint_recovers_cleanly() {
         let mut fanout = Fanout::new("fanout");
         fanout.install(manifest.snapshot("fanout").expect("fanout snapshot"));
         let diskish = Diskish::reopen("diskish", cell.clone());
-        let mut host =
-            Host::genesis(vec![Box::new(fanout), Box::new(diskish)]).expect("genesis");
+        let mut host = Host::genesis(vec![Box::new(fanout), Box::new(diskish)]).expect("genesis");
 
         // the disk's live root matches NEITHER the checkpoint root NOR block 1's
         // post-root — it is TWO blocks past the checkpoint.
@@ -556,9 +556,18 @@ fn a_disk_substrate_two_blocks_ahead_of_the_checkpoint_recovers_cleanly() {
             "the ahead disk was left alone (no re-commit)"
         );
         // the in-memory cohort rolled forward from the WAL to the tip.
-        assert_eq!(host.query("fanout", b"k0").await.expect("q"), b"v0".to_vec());
-        assert_eq!(host.query("fanout", b"k1").await.expect("q"), b"v1".to_vec());
-        assert_eq!(host.query("fanout", b"k2").await.expect("q"), b"v2".to_vec());
+        assert_eq!(
+            host.query("fanout", b"k0").await.expect("q"),
+            b"v0".to_vec()
+        );
+        assert_eq!(
+            host.query("fanout", b"k1").await.expect("q"),
+            b"v1".to_vec()
+        );
+        assert_eq!(
+            host.query("fanout", b"k2").await.expect("q"),
+            b"v2".to_vec()
+        );
     });
 }
 
@@ -584,9 +593,8 @@ fn pure_disk_blocks_ahead_of_the_checkpoint_skip_cleanly() {
 
         // GENESIS checkpoint only (height None) — nothing checkpointed after.
         let pos = node.sink_mut().oplog_pos().await;
-        let manifest0 =
-            Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, pos, 1)
-                .expect("capture");
+        let manifest0 = Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, pos, 1)
+            .expect("capture");
         node.sink_mut()
             .write_manifest(&manifest0)
             .await
@@ -622,8 +630,7 @@ fn pure_disk_blocks_ahead_of_the_checkpoint_skip_cleanly() {
         let mut fanout = Fanout::new("fanout");
         fanout.install(manifest.snapshot("fanout").expect("fanout snapshot"));
         let diskish = Diskish::reopen("diskish", cell.clone());
-        let mut host =
-            Host::genesis(vec![Box::new(fanout), Box::new(diskish)]).expect("genesis");
+        let mut host = Host::genesis(vec![Box::new(fanout), Box::new(diskish)]).expect("genesis");
 
         let recovered = recovery
             .recover(&mut host, &manifest)
@@ -636,7 +643,10 @@ fn pure_disk_blocks_ahead_of_the_checkpoint_skip_cleanly() {
         assert_eq!(recovered.applied, 0, "no in-memory cohort to re-commit");
         assert_eq!(recovered.skipped, 3, "every ahead-disk block was skipped");
         assert_eq!(cell.borrow().counter, 3, "the disk was never re-committed");
-        assert_eq!(host.query("diskish", b"k2").await.expect("q"), b"v2".to_vec());
+        assert_eq!(
+            host.query("diskish", b"k2").await.expect("q"),
+            b"v2".to_vec()
+        );
     });
 }
 
@@ -661,9 +671,8 @@ fn a_disk_root_matching_no_record_still_fail_stops() {
         .expect("genesis");
         let mut node = OrderedNode::with_sink(host, RoundOrderer::new(), recovery);
         let pos = node.sink_mut().oplog_pos().await;
-        let manifest0 =
-            Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, pos, 1)
-                .expect("capture");
+        let manifest0 = Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, pos, 1)
+            .expect("capture");
         node.sink_mut()
             .write_manifest(&manifest0)
             .await
@@ -691,8 +700,7 @@ fn a_disk_root_matching_no_record_still_fail_stops() {
         let mut fanout = Fanout::new("fanout");
         fanout.install(manifest.snapshot("fanout").expect("fanout snapshot"));
         let diskish = Diskish::reopen("diskish", cell.clone());
-        let mut host =
-            Host::genesis(vec![Box::new(fanout), Box::new(diskish)]).expect("genesis");
+        let mut host = Host::genesis(vec![Box::new(fanout), Box::new(diskish)]).expect("genesis");
 
         // the disk root matches NOTHING recorded.
         assert_ne!(host.module_root("diskish"), manifest.root("diskish"));
@@ -706,7 +714,11 @@ fn a_disk_root_matching_no_record_still_fail_stops() {
             "expected Error::Torn (genuine corruption), got {err:?}"
         );
         // the corrupt disk was NOT re-committed by the refused replay.
-        assert_eq!(cell.borrow().counter, 99, "the refused replay touched nothing");
+        assert_eq!(
+            cell.borrow().counter,
+            99,
+            "the refused replay touched nothing"
+        );
     });
 }
 
@@ -907,6 +919,10 @@ struct Containerish {
     id: ModuleId,
     cell: Cell,
     pending: Vec<(String, String)>,
+    /// what [`Module::block_durable`] answers — the DECLARATION under test.
+    /// `false` is what the sync-handle-derived default would have said for
+    /// this shape, and what bricked forge.
+    declared_durable: bool,
 }
 
 impl Containerish {
@@ -915,6 +931,15 @@ impl Containerish {
             id: id.into(),
             cell,
             pending: Vec::new(),
+            declared_durable: true,
+        }
+    }
+
+    /// the same substrate, silent about its durability.
+    fn undeclared(id: &str, cell: Cell) -> Self {
+        Self {
+            declared_durable: false,
+            ..Self::open(id, cell)
         }
     }
 }
@@ -941,9 +966,10 @@ impl Module for Containerish {
         )))
     }
 
-    /// ...and yet it is durable on its own disk every block.
+    /// ...and yet it is durable on its own disk every block — which only this
+    /// declaration can say, since the sync surface above denies it.
     fn block_durable(&self) -> bool {
-        true
+        self.declared_durable
     }
 
     async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
@@ -987,7 +1013,9 @@ impl Module for Containerish {
 /// block 1 finds it at NEITHER its pre- nor its post-root: only a durable floor
 /// seeded from the disk cohort places it. before `Module::block_durable` the
 /// cohort was read off the sync handle, this module was not in it, and boot
-/// fail-stopped with `Error::Torn`.
+/// fail-stopped with `Error::Torn` — which
+/// [`an_undeclared_container_substrate_still_fail_stops`] pins, by running this
+/// same shape with the declaration withdrawn.
 #[test]
 fn a_container_shaped_disk_substrate_two_blocks_ahead_recovers_cleanly() {
     let executor = deterministic::Runner::default();
@@ -1076,6 +1104,88 @@ fn a_container_shaped_disk_substrate_two_blocks_ahead_recovers_cleanly() {
         assert_eq!(
             host.query("containerish", b"k2").await.expect("q"),
             b"v2".to_vec()
+        );
+    });
+}
+
+/// the SAME shape with the declaration withdrawn: the substrate is still
+/// per-block durable on its own disk, but a cohort that cannot see that (which
+/// is exactly what reading it off the sync handle produced for forge) has no
+/// floor to place it by, finds it at neither block 1's pre- nor its post-root,
+/// and REFUSES the boot. this is the fail-stop the fix must not have softened —
+/// recovery never waves through a state it cannot place.
+#[test]
+fn an_undeclared_container_substrate_still_fail_stops() {
+    let executor = deterministic::Runner::default();
+    executor.start(|context| async move {
+        let cell: Cell = Rc::new(RefCell::new(DiskCell::default()));
+
+        let recovery = Recovery::open(context.child("r1"))
+            .await
+            .expect("open recovery");
+        let host = Host::genesis(vec![
+            Box::new(Fanout::new("fanout")),
+            Box::new(Containerish::undeclared("containerish", cell.clone())),
+        ])
+        .expect("genesis");
+        let mut node = OrderedNode::with_sink(host, RoundOrderer::new(), recovery);
+        let signer = sk(1);
+
+        node.submit(&signer, 0, set("containerish", "k0", "v0"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        assert_eq!(node.drain_delivered().await.expect("drain"), 1);
+        let checkpoint_height = node.finalized().expect("boundary").height;
+        let pos = node.sink_mut().oplog_pos().await;
+        let manifest = Manifest::capture(
+            node.host(),
+            Some(checkpoint_height),
+            0,
+            0,
+            vec![],
+            vec![],
+            None,
+            pos,
+            1,
+        )
+        .expect("capture");
+        node.sink_mut()
+            .write_manifest(&manifest)
+            .await
+            .expect("write checkpoint");
+
+        // the same two uncheckpointed blocks.
+        node.submit(&signer, 1, set("containerish", "k1", "v1"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        node.submit(&signer, 2, set("containerish", "k2", "v2"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        assert_eq!(node.drain_delivered().await.expect("drain"), 2);
+        drop(node);
+
+        let mut recovery = Recovery::open(context.child("r2"))
+            .await
+            .expect("reopen recovery");
+        let manifest = recovery.manifest().expect("decodes").expect("present");
+        let mut fanout = Fanout::new("fanout");
+        fanout.install(manifest.snapshot("fanout").expect("fanout snapshot"));
+        let mut host = Host::genesis(vec![
+            Box::new(fanout),
+            Box::new(Containerish::undeclared("containerish", cell.clone())),
+        ])
+        .expect("genesis");
+
+        let err = recovery
+            .recover(&mut host, &manifest)
+            .await
+            .expect_err("an unplaceable substrate must refuse the boot");
+        assert!(
+            matches!(err, recovery::Error::Torn(_)),
+            "expected a torn fail-stop, got {err:?}"
         );
     });
 }

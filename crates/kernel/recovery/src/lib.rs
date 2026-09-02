@@ -61,19 +61,20 @@
 //!   any SEALED block every disk substrate it changed is durable at (or
 //!   beyond) its post-root. the partial-commit window lies strictly ABOVE the
 //!   last seal, in the single unsealed WAL block, which `trailing.rs` bounds
-//!   and verifies on its own terms (and still refuses more than one claimant,
-//!   having no sealed roots to check a heal against). inside the sealed window
-//!   the NUMBER of durable substrates is therefore evidence of nothing but how
-//!   many disk modules the block touched, and the at-pre set is exactly the
-//!   cohort the checkpoint rolled back — so selective replay handles one and
-//!   many identically. the fail-stops that DO carry evidence stay: a changed
-//!   module at neither its pre- nor its post-root (nor ahead) is damage
-//!   ([`Error::Torn`]), a torn block with nothing left to re-commit is damage,
-//!   and the per-module post-root verify plus the tip root-hash recompose
-//!   fail-stop rather than fork if the re-execution diverges. the residual —
-//!   the re-execution can read a durable sibling's POST state where the
-//!   original read its pre state — is the one the single-substrate heal always
-//!   had, with the same backstop.
+//!   and verifies on its own terms — fail-CLOSED terms: it admits only a
+//!   claimant carrying a per-commit height cursor, so a trailing qmdb store
+//!   commit (no cursor) and more than one claimant BOTH still refuse. inside
+//!   the sealed window the NUMBER of durable substrates is evidence of nothing
+//!   but how many disk modules the block touched, and the at-pre set is
+//!   exactly the cohort the checkpoint rolled back — so selective replay
+//!   handles one and many identically. the fail-stops that DO carry evidence
+//!   stay: a changed module at neither its pre- nor its post-root (nor ahead)
+//!   is damage ([`Error::Torn`]), a torn block with nothing left to re-commit
+//!   is damage, and the per-module post-root verify plus the tip root-hash
+//!   recompose fail-stop rather than fork if the re-execution diverges. the
+//!   residual — the re-execution can read a durable sibling's POST state
+//!   where the original read its pre state — is the one the single-substrate
+//!   heal always had, with the same backstop.
 //! - crash between the engine journaling a finalization and the drain: the
 //!   frame's bytes are already durable here — locally-submitted frames are
 //!   pinned at submit time ([`Record::Pinned`]), before the engine can ever
@@ -1255,8 +1256,8 @@ where
         }
 
         // forward pre-scan — seed each per-block-durable disk substrate's
-        // "durable floor". a disk-cohort (ResolverBacked) module commits to its
-        // OWN disk every block, but the checkpoint only persists on a cadence
+        // "durable floor". a disk-cohort (`block_durable`) module commits to
+        // its OWN disk every block, but the checkpoint only persists on a cadence
         // (default 32 blocks), so at boot a disk module can legitimately sit N
         // blocks AHEAD of the checkpoint: its live root equals a recorded
         // post-root well above the last checkpoint, matching NEITHER the

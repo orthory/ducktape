@@ -340,8 +340,8 @@ fn happy_path_matrix_roots_identical_block_by_block() {
         all_roots(&wasm),
         "genesis roots diverge"
     );
-    // the host sees the wasm tenant exactly as it saw native files: resolver-backed
-    // (the duckfs-odb object-possession lane), never snapshot bytes.
+    // recovery's disk cohort sees the wasm tenant exactly as it saw native
+    // files: the duckfs-odb lane commits its own objects per block.
     assert!(native.block_durable_ids().contains(FILES));
     assert!(wasm.block_durable_ids().contains(FILES));
 
