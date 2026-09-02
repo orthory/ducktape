@@ -302,8 +302,37 @@ pub fn load_invite_fronts(dir: &Path) -> Result<Vec<Front>, String> {
 pub const INVITE_ENVELOPE_NAMESPACE: &[u8] = b"ducktape-invite-envelope";
 /// how long a minted invite stays redeemable unless `--ttl-days` says
 /// otherwise. single-use bounds the damage of a leaked blob; expiry bounds a
-/// LOST one.
+/// LOST one. THE default: the CLI verb, `POST /v1/invite` and the app all
+/// resolve "no TTL given" to this one number.
 pub const DEFAULT_INVITE_TTL_DAYS: u64 = 7;
+
+/// the invite TTL bounds, in days, every minting door validates against. a
+/// zero-day invite is expired the moment it is pasted; a decade-long bearer
+/// credential is not an invite, it is a key left under the mat.
+pub const INVITE_TTL_DAYS: std::ops::RangeInclusive<u64> = 1..=365;
+
+const _: () = assert!(
+    *INVITE_TTL_DAYS.start() <= DEFAULT_INVITE_TTL_DAYS
+        && DEFAULT_INVITE_TTL_DAYS <= *INVITE_TTL_DAYS.end(),
+    "the default invite TTL must sit inside the validated range"
+);
+
+/// the unix-seconds expiry of an invite minted at `now_unix_secs` for
+/// `ttl_days`: refuses a TTL outside [`INVITE_TTL_DAYS`] and never wraps —
+/// a wrapped expiry is an already-past one that only ever reads as "expired".
+pub fn invite_expiry(now_unix_secs: u64, ttl_days: u64) -> Result<u64, String> {
+    if !INVITE_TTL_DAYS.contains(&ttl_days) {
+        return Err(format!(
+            "ttl_days must be between {} and {}",
+            INVITE_TTL_DAYS.start(),
+            INVITE_TTL_DAYS.end()
+        ));
+    }
+    ttl_days
+        .checked_mul(24 * 60 * 60)
+        .and_then(|secs| now_unix_secs.checked_add(secs))
+        .ok_or_else(|| "invite expiry overflows the clock".to_string())
+}
 
 const INVITE_B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -1421,6 +1450,18 @@ mod tests {
             invite.fronts, fronts,
             "fronts roundtrip through the envelope"
         );
+    }
+
+    #[test]
+    fn invite_expiry_adds_the_ttl_and_refuses_the_out_of_range() {
+        assert_eq!(
+            invite_expiry(1_000, DEFAULT_INVITE_TTL_DAYS).expect("default"),
+            1_000 + 7 * 24 * 60 * 60
+        );
+        assert_eq!(invite_expiry(0, 365).expect("the ceiling"), 365 * 86_400);
+        assert!(invite_expiry(1_000, 0).is_err(), "expired on paste");
+        assert!(invite_expiry(1_000, 366).is_err(), "a key under the mat");
+        assert!(invite_expiry(u64::MAX, 1).is_err(), "never wraps");
     }
 
     #[test]

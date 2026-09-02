@@ -140,7 +140,7 @@ extern crate::backend
   sync canonical_endpoint(input:str) -> str
   WorkspaceInit(chain_id:str, workspace:str, rpc:str)
   join_network(blob:secret) -> WorkspaceInit ! AppError
-  mint_invite(workspace:str, ttl_days:i64) -> str ! AppError
+  mint_invite(workspace:str) -> str ! AppError
   ProvisionStep(index:i64, label:str, state:str, settled:bool)
   stream provision_progress(workspace:str, rpc:str) -> ProvisionStep
   HubNetwork(id:str, chain_id:str, name:str, endpoint:str, kind:str, last_used:i64, probed:bool, live:bool, height:i64)

@@ -1540,7 +1540,9 @@ component LiveScreen(name:str, invite:str, height:i64, peers_live:i64, peers_tot
       // that whoever redeems it first spends automatically through the join gate —
       // no member approval follows, so promising one made a forwardable credential
       // read as gated. The window is the other half of the terms: the handler mints
-      // with `mint_invite(.., 7)` and the TTL is signed INSIDE the blob, so a holder
+      // with the node's default TTL (`DEFAULT_INVITE_TTL_DAYS`, 7 days — the "7"
+      // below restates it; `mint_invite` takes no TTL) and the TTL is signed
+      // INSIDE the blob, so a holder
       // on day 8 is refused with nothing here left to re-open it.
       text "Whoever holds this invite can join — it is single-use and expires 7 days from minting, so send it to one device."
         with
