@@ -156,6 +156,12 @@ const MAX_RECORD_FIELD_LEN: usize = 1 << 21; // 2 MiB: > the p2p frame cap + fra
 /// keep their per-field decoder bound aligned with the smart-HTTP pack ceiling.
 const MAX_CHECKPOINT_FIELD_LEN: usize = 512 * 1024 * 1024;
 
+/// the sanity cap every count-prefixed list in this codec is read under: a
+/// corrupt count must not make the reader pre-allocate the world. One number,
+/// so the write-side refusal ([`Manifest::check_field_caps`]) and the three
+/// readers below cannot drift apart.
+const MAX_LIST_LEN: usize = 4096;
+
 // WRITE side: raw fixed-width ints stay inline one-liners; the length-prefixed
 // byte writer IS `sdk::codec::push_bytes` (verbatim `u64`-LE length + bytes), so
 // it delegates rather than keep a byte-for-byte duplicate.
@@ -189,7 +195,7 @@ fn put_roots(out: &mut Vec<u8>, roots: &[(ModuleId, StateRoot)]) {
 
 fn get_roots(c: &mut sdk::codec::Cursor) -> Result<Vec<(ModuleId, StateRoot)>, Error> {
     let n = c.u64("module roots count")? as usize;
-    if n > 4096 {
+    if n > MAX_LIST_LEN {
         return Err(Error::Corrupt(format!(
             "{n} module roots exceeds sanity cap"
         )));
@@ -211,7 +217,7 @@ fn put_keys(out: &mut Vec<u8>, keys: &[Vec<u8>]) {
 
 fn get_keys(c: &mut sdk::codec::Cursor) -> Result<Vec<Vec<u8>>, Error> {
     let n = c.u64("participant keys count")? as usize;
-    if n > 4096 {
+    if n > MAX_LIST_LEN {
         return Err(Error::Corrupt(format!(
             "{n} participant keys exceeds sanity cap"
         )));
@@ -413,12 +419,26 @@ impl Manifest {
     /// still-restorable manifest and re-anchors the journal prune below a
     /// boundary nothing can recover. The realistic overflow is a module
     /// snapshot (forge's manifest embeds its whole git pack closure, #1308);
-    /// the key lists are checked because the same cursor bounds them.
+    /// the key lists and the list COUNTS are checked because the same reader
+    /// refuses those too, and a refusal the writer cannot reach is a rule
+    /// nobody keeps.
     ///
     /// Refusing keeps the PREVIOUS checkpoint plus the journal, which still
     /// restores — the same all-or-nothing stance `capture_timed` takes for a
     /// module that could not prepare a snapshot at all.
     fn check_field_caps(&self) -> Result<(), Error> {
+        let counts = [
+            ("module roots", self.roots.len()),
+            ("participant keys", self.participants.len()),
+            ("resident keys", self.residents.len()),
+            ("snapshots", self.snapshots.len()),
+        ];
+        if let Some((what, n)) = counts.iter().find(|(_, n)| *n > MAX_LIST_LEN) {
+            return Err(Error::FieldOverCap(format!(
+                "{n} {what} is over the {MAX_LIST_LEN}-entry list cap this crate's own reader \
+                 enforces"
+            )));
+        }
         let over_cap = |len: usize| len > MAX_CHECKPOINT_FIELD_LEN;
         if let Some((id, bytes)) = self.snapshots.iter().find(|(_, b)| over_cap(b.len())) {
             return Err(Error::FieldOverCap(format!(
@@ -427,15 +447,19 @@ impl Manifest {
                 bytes.len()
             )));
         }
-        let mut keys = self.participants.iter().chain(self.residents.iter());
-        match keys.find(|k| over_cap(k.len())) {
-            Some(k) => Err(Error::FieldOverCap(format!(
+        if let Some(k) = self
+            .participants
+            .iter()
+            .chain(self.residents.iter())
+            .find(|k| over_cap(k.len()))
+        {
+            return Err(Error::FieldOverCap(format!(
                 "a validator key field is {} bytes, over the {MAX_CHECKPOINT_FIELD_LEN}-byte \
                  checkpoint field cap this crate's own reader enforces",
                 k.len()
-            ))),
-            None => Ok(()),
+            )));
         }
+        Ok(())
     }
 
     fn encode(&self) -> Vec<u8> {
@@ -488,7 +512,7 @@ impl Manifest {
         let root_hash = read_root(&mut c, "root hash")?;
         let roots = get_roots(&mut c)?;
         let n = c.u64("snapshots count")? as usize;
-        if n > 4096 {
+        if n > MAX_LIST_LEN {
             return Err(Error::Corrupt(format!("{n} snapshots exceeds sanity cap")));
         }
         let mut snapshots = Vec::with_capacity(n);
@@ -800,10 +824,13 @@ where
     /// so the manifest can never be newer than the journal it summarizes.
     ///
     /// REFUSES a manifest this crate's own reader would reject (see
-    /// [`Manifest::check_field_caps`]) BEFORE the journal sync and the store
-    /// write, so nothing partial or unreadable ever reaches disk and the
-    /// previous checkpoint stays exactly where it is.
+    /// [`Manifest::check_field_caps`]) before the store write, so nothing
+    /// unreadable ever reaches disk and the previous checkpoint stays exactly
+    /// where it is. The journal sync happens FIRST and unconditionally: it is
+    /// the shutdown barrier `graceful_checkpoint` leans on, and a refused
+    /// manifest must not leave buffered journal appends unflushed.
     pub async fn write_manifest(&mut self, manifest: &Manifest) -> Result<(), Error> {
+        self.journal.sync().await.map_err(storage_err)?;
         if let Err(e) = manifest.check_field_caps() {
             tracing::error!(
                 target: "ducktape::recovery",
@@ -815,7 +842,6 @@ where
             );
             return Err(e);
         }
-        self.journal.sync().await.map_err(storage_err)?;
         self.manifest_store
             .put_sync(U64::new(KEY), manifest.encode())
             .await
@@ -1349,7 +1375,7 @@ where
                                     disposition,
                                     root_hash,
                                     dispatches: &[],
-                                                                    }),
+                                }),
                                 // an applied block whose ops moved no root:
                                 // its trace existed at runtime but is not
                                 // re-executed here — unreproducible.
@@ -1412,7 +1438,7 @@ where
                                     disposition,
                                     root_hash,
                                     dispatches: &dispatches,
-                                                                    });
+                                });
                             }
                             for (id, root) in &changed {
                                 let live = host.module_root(id);
@@ -1504,7 +1530,7 @@ where
                                     disposition,
                                     root_hash,
                                     dispatches: &dispatches,
-                                                                    });
+                                });
                             }
                             // every re-committed and exact-post module must now
                             // stand at its sealed post-root. a disk substrate that
@@ -1561,7 +1587,7 @@ where
                         // below; this is that same post-block boundary.
                         root_hash: host.root_hash(),
                         dispatches: &dispatches,
-                                            });
+                    });
                 }
                 disposition
             } else {
@@ -1629,7 +1655,7 @@ where
                             disposition,
                             root_hash: host.root_hash(),
                             dispatches: &dispatches,
-                                                    });
+                        });
                     }
                     disposition
                 }
@@ -2117,6 +2143,23 @@ mod tests {
         assert!(matches!(
             over_cap_key.check_field_caps(),
             Err(Error::FieldOverCap(_))
+        ));
+
+        // the same rule for the list COUNTS the reader caps: an over-long list
+        // decodes no better than an over-long field.
+        let too_many_roots = Manifest {
+            roots: (0..=MAX_LIST_LEN)
+                .map(|i| (format!("m{i}"), StateRoot([0; 32])))
+                .collect(),
+            ..sample_manifest()
+        };
+        assert!(matches!(
+            too_many_roots.check_field_caps(),
+            Err(Error::FieldOverCap(_))
+        ));
+        assert!(matches!(
+            Manifest::decode(&too_many_roots.encode()),
+            Err(Error::Corrupt(_)),
         ));
     }
 
