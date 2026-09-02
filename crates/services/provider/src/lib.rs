@@ -32,7 +32,7 @@
 //! [`spec`] and `docs/records/specs/capability-spec.md`), not by Rust. the built-in
 //! executor support ships as embedded spec files parsed by the same code
 //! path as operator-provided specs under `$DUCKTAPE_CAPABILITY_DIR` (default
-//! `~/.ducktape/capabilities`). adding an executor — or retuning a built-in's
+//! `<ducktape home>/capabilities`). adding an executor — or retuning a built-in's
 //! flags, including which model it runs — is a config change on the
 //! operator's machine, never a code change here. dispatch is by EXPLICIT
 //! capability tag: [`ProviderSet::resolve`] takes the tag a job names,
@@ -2897,7 +2897,7 @@ fn excerpt(s: &str) -> String {
 ///
 /// spec sources: the embedded built-ins, then `$DUCKTAPE_CAPABILITY_DIR`
 /// (explicitly set and missing = hard error — the operator asked for a dir
-/// that is not there) or `~/.ducktape/capabilities` when it exists. a broken
+/// that is not there) or `<ducktape home>/capabilities` when it exists. a broken
 /// spec is a hard `Err`: an operator config error fails the boot loudly, it
 /// does not silently drop an executor.
 ///
@@ -2960,12 +2960,16 @@ pub fn discover(
 /// the operator spec dir: an explicit `$DUCKTAPE_CAPABILITY_DIR` is returned
 /// even if absent (so the load errors loudly), the default location only when
 /// it actually exists (absent default = simply no operator specs).
+///
+/// the default hangs off [`workspace_config::ducktape_home`] — the same root
+/// that gives this node its keys, workspaces, executors and guest images. a
+/// node run under `DUCKTAPE_HOME=/srv/duck` must not find all of those there
+/// and then read its operator specs out of `$HOME`.
 fn operator_spec_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("DUCKTAPE_CAPABILITY_DIR") {
         return Some(PathBuf::from(dir));
     }
-    let home = std::env::var_os("HOME")?;
-    let dir = PathBuf::from(home).join(".ducktape").join("capabilities");
+    let dir = workspace_config::ducktape_home().ok()?.join("capabilities");
     dir.is_dir().then_some(dir)
 }
 
@@ -3185,14 +3189,10 @@ mod tests {
         firecracker_backend_with(installed_executor_dir())
     }
 
-    /// this operator's own executors directory, resolved the way
-    /// `workspace-config` resolves it for a real node.
+    /// this operator's own executors directory — the resolver a real node
+    /// uses, not a second copy of it.
     fn installed_executor_dir() -> PathBuf {
-        let home = std::env::var("DUCKTAPE_HOME")
-            .unwrap_or_else(|_| format!("{}/.ducktape", std::env::var("HOME").unwrap()));
-        PathBuf::from(
-            std::env::var("DUCKTAPE_EXECUTOR_DIR").unwrap_or_else(|_| format!("{home}/executors")),
-        )
+        workspace_config::executor_dir().expect("the test env resolves an executors dir")
     }
 
     /// the live backend with an explicit executors directory — the one whose
@@ -4336,6 +4336,34 @@ format = "text"
         let specs = SpecSet::from_specs(vec![custom]);
         let set = discover_with(specs, Some(dir.into_os_string()), &no_env, None);
         assert_eq!(set.capabilities(), vec!["myllm"]);
+    }
+
+    /// The operator spec dir hangs off the ONE home resolver.
+    ///
+    /// A source-parsing lint because the seam reads process env and this
+    /// crate's discovery path deliberately injects env rather than mutating
+    /// the process. The SHAPE is the property: re-derive the operator root
+    /// here and a node under `DUCKTAPE_HOME=/srv/duck` finds its keys,
+    /// workspaces, executors and images there while reading its capability
+    /// specs out of `$HOME` — silently, since an absent default dir just means
+    /// "no operator specs".
+    #[test]
+    fn operator_spec_dir_defers_to_the_shared_home_resolver() {
+        let src = include_str!("lib.rs");
+        let (_, after) = src
+            .split_once("fn operator_spec_dir() -> Option<PathBuf> {")
+            .expect("operator_spec_dir");
+        let (body, _) = after.split_once("\n}\n").expect("its closing brace");
+        assert!(
+            body.contains("workspace_config::ducktape_home()"),
+            "operator_spec_dir must take its default from \
+             workspace_config::ducktape_home()"
+        );
+        assert!(
+            !src.contains(".join(\".ducktape\")"),
+            "this crate re-derives the operator root instead of asking \
+             workspace_config::ducktape_home() for it"
+        );
     }
 
     // ---- resolve() ----------------------------------------------------------

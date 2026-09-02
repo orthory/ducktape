@@ -59,12 +59,16 @@ resolve_base_url() {
     printf '%s' "${DUCKTAPE_DEV_FORGE_URL%/}"
     return
   fi
-  local reg="$HOME/.ducktape/registry.json"
+  # the operator root every other reader resolves: $DUCKTAPE_HOME when set,
+  # else ~/.ducktape. A node started under an override keeps its registry
+  # there, and reading $HOME's instead dies with "no node selected" beside it.
+  local duck="${DUCKTAPE_HOME:-$HOME/.ducktape}"
+  local reg="$duck/registry.json"
   if [ -f "$reg" ]; then
     local active
     active=$(sed -n 's/.*"active"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$reg" | head -1)
     if [ -n "$active" ]; then
-      local toml="$HOME/.ducktape/workspaces/$active/node.toml"
+      local toml="$duck/workspaces/$active/node.toml"
       if [ -f "$toml" ]; then
         local listen
         listen=$(sed -n 's/^[[:space:]]*http_listen[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$toml" | head -1)
