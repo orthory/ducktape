@@ -36,7 +36,8 @@ make dogfood-forge
 
 `ops/dogfood-forge.sh` resolves the node's HTTP base
 (`DUCKTAPE_DEV_FORGE_URL` → the active workspace's `http_listen` from
-`~/.ducktape/registry.json` + `node.toml` → `http://127.0.0.1:8844`),
+`<ducktape home>/registry.json` + `node.toml` → `http://127.0.0.1:8844`;
+the home is `$DUCKTAPE_HOME` when set, else `~/.ducktape`),
 registers a normal git remote `ducktape-dev` at `<base>/forge/ducktape`, and
 fetches `origin/dev`, pushes that exact commit to `refs/heads/main`, then reads
 the Forge ref back and requires exact OID equality. Repo creation *is* the first

@@ -153,6 +153,29 @@ pub fn frame_id(bytes: &[u8]) -> FrameId {
 /// compile-time assert there pins the relationship.
 pub const MAX_FRAME_BYTES: usize = (1 << 20) + (16 << 10);
 
+/// the widest `target` a submitter may count on inside [`MAX_PAYLOAD_BYTES`]:
+/// a module id is a handful of ASCII bytes, so this is headroom, not a limit
+/// the decoder enforces.
+pub const MAX_TARGET_BYTES: usize = 64;
+
+/// the bytes [`encode_frame`] wraps around a payload: scheme tag 1, origin
+/// length prefix 8 + 32-byte ed25519 pubkey, seq 8, target length prefix 8 +
+/// up to [`MAX_TARGET_BYTES`] of target, payload length prefix 8, 64-byte
+/// signature. the `max_payload_frame_fits_the_cap_exactly` frame-size guard
+/// test pins the arithmetic against a real `encode_frame`.
+const ED25519_FRAME_ENVELOPE_BYTES: usize = 1 + 8 + 32 + 8 + 8 + MAX_TARGET_BYTES + 8 + 64;
+
+/// the largest payload a device-signed op ([`encode_frame`]) can carry and
+/// still fit [`MAX_FRAME_BYTES`] — the cap a client checks BEFORE signing.
+/// the envelope budgets a full [`MAX_TARGET_BYTES`] of target, so this is
+/// exact only at the widest target; under a shorter one it is conservative by
+/// that target's slack (a 5-byte target leaves 59 bytes a client refuses and
+/// the node would have taken).
+pub const MAX_PAYLOAD_BYTES: usize = MAX_FRAME_BYTES - ED25519_FRAME_ENVELOPE_BYTES;
+
+/// [`MAX_FRAME_BYTES`] as a hex string: two digits per byte.
+pub const MAX_FRAME_HEX_BYTES: usize = 2 * MAX_FRAME_BYTES;
+
 /// read a little-endian u64 off the front of `buf`.
 fn take_u64(buf: &mut &[u8]) -> Option<u64> {
     let (head, rest) = buf.split_at_checked(8)?;

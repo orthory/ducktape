@@ -30,6 +30,9 @@ gateway.workspace = true
 # http on loopback/LAN; probed against a live node before adoption).
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 governance.workspace = true
+# THE ducktape home resolution (`$DUCKTAPE_HOME` else `~/.ducktape`), in a
+# zero-dependency leaf so every reader of that root agrees about it.
+ducktape-home.workspace = true
 identity.workspace = true
 inbox.workspace = true
 # THE device keystore, linked rather than spawned. Opening your own key is the

@@ -603,14 +603,10 @@ fn cmd_invite(args: InviteArgs) -> Result<(), Box<dyn std::error::Error>> {
     // every invite is BEARER (the targeted form was dropped): there is no
     // `--target` — whoever redeems the single-use token first wins. the
     // invite is the admission credential itself, kept off the wire by the
-    // sealed first-contact intro.
-    let ttl_days: u64 = match args.ttl_days {
-        Some(v) => v,
-        // the operator-friendly onboarding default (a LOST blob is the residual
-        // risk — single-use + sealing cover interception).
-        None => config::DEFAULT_INVITE_TTL_DAYS,
-    };
-    let (blob, notes) = mint_invite_blob(&args.selector.config_path()?, ttl_days)?;
+    // sealed first-contact intro. `--ttl-days` defaults to and is bounded by
+    // `config::{DEFAULT_INVITE_TTL_DAYS, INVITE_TTL_DAYS}` in clap (the same
+    // numbers `/v1/invite` resolves), so the value arrives settled.
+    let (blob, notes) = mint_invite_blob(&args.selector.config_path()?, args.ttl_days)?;
     for note in notes {
         eprintln!("[invite] {note}");
     }
@@ -680,9 +676,13 @@ pub(crate) fn mint_invite_blob(
     cfg_path: &std::path::Path,
     ttl_days: u64,
 ) -> Result<(String, Vec<InviteNote>), Box<dyn std::error::Error>> {
-    if ttl_days == 0 {
-        return Err("--ttl-days must be at least 1".into());
-    }
+    // the expiry is settled FIRST: a TTL outside the range is refused before
+    // the descriptor below is rewritten for a mint that was never going to happen.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock is past the epoch")
+        .as_secs();
+    let expires = config::invite_expiry(now, ttl_days)?;
     let mut notes = Vec::new();
     let cfg_path = cfg_path.to_path_buf();
     let (raw, base) = config::load_node_toml(&cfg_path)?;
@@ -803,11 +803,6 @@ pub(crate) fn mint_invite_blob(
         .reach
         .retain(|hint| !hint.trim_start().starts_with("coordinated:"));
 
-    let expires = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock is past the epoch")
-        .as_secs()
-        + ttl_days * 24 * 60 * 60;
     // the expiry lives INSIDE the token (signed), not as a separate blob field.
     // every invite is bearer.
     let token = config::mint_invite_token(&key, descriptor.genesis_namespace().as_bytes(), expires);

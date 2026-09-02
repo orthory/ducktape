@@ -1,10 +1,11 @@
 use super::*;
 
 /// One row of the launch window's network list. `id` is the row's stable
-/// device-local key: the workspace DIRECTORY name for a materialized network,
-/// the canonical endpoint for a saved remote. `chain_id` is the network's own
-/// identity out of `network.toml` (empty for a remote the device holds no
-/// descriptor for) — it is also the exact `-n` selector later CLI calls need.
+/// device-local key: the chain id for a materialized network (the same id the
+/// CLI registry lists), the canonical endpoint for a saved remote. `chain_id`
+/// is the network's own identity out of `network.toml` (empty for a remote the
+/// device holds no descriptor for) — it is also the exact `-n` selector later
+/// CLI calls need.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct HubNetwork {
     pub id: String,
@@ -117,17 +118,16 @@ pub(crate) fn known_networks() -> Vec<HubNetwork> {
     let stamps = &prefs["network_last_used"];
     let mut rows: Vec<HubNetwork> = registered_workspaces()
         .into_iter()
-        .filter(|(dir_name, _)| !forgotten.contains(dir_name))
-        .map(|(dir_name, dir)| {
-            let chain_id = node_dir_value(&dir, "network.toml", "chain_id").unwrap_or_default();
+        .filter(|(chain_id, _)| !forgotten.contains(chain_id))
+        .map(|(chain_id, dir)| {
             let endpoint = workspace_endpoint(&dir).unwrap_or_default();
             HubNetwork {
-                name: display_name(&chain_id, &dir_name),
-                chain_id,
+                name: display_name(&chain_id, &chain_id),
                 endpoint,
                 kind: "local".into(),
-                last_used: stamps[&dir_name].as_i64().unwrap_or(0),
-                id: dir_name,
+                last_used: stamps[&chain_id].as_i64().unwrap_or(0),
+                id: chain_id.clone(),
+                chain_id,
                 probed: false,
                 live: false,
                 height: -1,
@@ -383,7 +383,7 @@ pub async fn hub_state() -> HubState {
     let forgotten = forgotten_workspaces();
     let hidden = registered_workspaces()
         .into_iter()
-        .filter(|(dir_name, _)| forgotten.contains(dir_name))
+        .filter(|(chain_id, _)| forgotten.contains(chain_id))
         .count() as i64;
     HubState {
         wallets,
@@ -475,7 +475,7 @@ pub async fn remember_network(rpc: String) -> bool {
     let now = unix_now();
     let mut prefs = read_prefs();
     let key = match workspace_at(&endpoint) {
-        Some((dir_name, _)) => dir_name,
+        Some((chain_id, _)) => chain_id,
         None => {
             let mut remotes = prefs["saved_remotes"]
                 .as_array()

@@ -9,6 +9,9 @@ version.workspace = true
 # which replicates WHO provides what; this crate is the machine-local half
 # that actually provides it.
 [dependencies]
+# THE ducktape home resolution (`$DUCKTAPE_HOME` else `~/.ducktape`), in a
+# zero-dependency leaf so every reader of that root agrees about it.
+ducktape-home = { workspace = true }
 async-trait = { workspace = true }
 # the shared capability-tag shape rule: a tag that validates at spec-parse
 # time can never bounce off the consensus registry's Announce validation.
