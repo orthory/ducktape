@@ -1302,12 +1302,28 @@ fn join_segs(segs: &[String]) -> String {
 /// (`putblob`, `pin`, `watch`) the way the count caps do: an entry that would
 /// push the encoded image past the cap is refused before the mutation, so
 /// every execute-produced refs stays decodable and shippable to a joiner.
+/// the commit path grows refs UNGATED — a head the first time, then one
+/// window entry per commit until the window is full — so the gate reserves
+/// that headroom too: a run of ordinary commits after a gated image reached
+/// the cap must never carry it past what [`decode_refs`](crate::state::decode_refs)
+/// accepts (that would brick every node's load and every joiner's install).
 fn refuse_refs_growth(refs: &Refs, entry_len: usize) -> Result<(), String> {
-    let fits_image = encoded_refs_len(refs) + entry_len <= MAX_REFS_IMAGE_BYTES;
+    let fits_image =
+        encoded_refs_len(refs) + entry_len + refs_commit_headroom(refs) <= MAX_REFS_IMAGE_BYTES;
     if fits_image {
         return Ok(());
     }
     Err("files: refs image is full".into())
+}
+
+/// the bytes the commit path can still add to `refs` with no gate of its own:
+/// 32 for the head the first time it is set, 32 per window slot not yet
+/// filled (the window is bounded at [`HISTORY_WINDOW`]; a shrunk test window
+/// only makes this reservation conservative).
+fn refs_commit_headroom(refs: &Refs) -> usize {
+    let head = if refs.head.is_none() { 32 } else { 0 };
+    let window = 32 * HISTORY_WINDOW.saturating_sub(refs.window.len());
+    head + window
 }
 
 fn watch_origin_gate(actor: &str, is_module: bool, module_id: &str) -> Result<(), String> {
@@ -1748,7 +1764,7 @@ mod object_read_budget {
 mod refs_image_budget {
     use crate::fs::Fs;
     use crate::state::{Refs, encoded_refs_len};
-    use crate::store::MemStore;
+    use crate::store::{MemStore, ObjectStore};
     use crate::wire::{FilesSyncReq, FilesSyncResp, MAX_REFS_IMAGE_BYTES, MAX_SYNC_REPLY_BYTES};
 
     /// the `GetRefs` reply ships the whole image with no cursor, so the image
@@ -1791,5 +1807,61 @@ mod refs_image_budget {
             FilesSyncResp::Refs { b64 } => assert!(b64.len() <= MAX_SYNC_REPLY_BYTES),
             other => panic!("expected a refs reply, got {other:?}"),
         }
+    }
+
+    /// the commit path sets the head and pushes into the window with no gate
+    /// of its own, so the growth gate reserves that headroom: refs filled to
+    /// the gate's refusal, then commits past a full window, still encode
+    /// under the cap and re-decode — an honest network can never brick the
+    /// module's load with ordinary commits.
+    #[test]
+    fn commits_after_a_full_refs_image_stay_decodable() {
+        use crate::state::{decode_refs, encode_refs};
+        use crate::wire::{Change, Content, HISTORY_WINDOW};
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+        let mut fs = Fs::new(MemStore::new(), Refs::default());
+        let segment = "a".repeat(255);
+        let module_id = "m".repeat(128);
+        let mut refused = false;
+        for i in 0..crate::wire::MAX_WATCHES {
+            let prefix = format!("{}/{i:0250}", format!("/{segment}").repeat(15));
+            if fs
+                .watch("system", 1, true, prefix, module_id.clone())
+                .is_err()
+            {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "the byte gate trips before the watch count cap");
+        for i in 0..=HISTORY_WINDOW {
+            let height = 2 + i as u64;
+            fs.commit(
+                "system",
+                height,
+                height,
+                None,
+                "c".into(),
+                vec![Change::Put {
+                    path: format!("/f{i}"),
+                    exec: false,
+                    meta: Default::default(),
+                    content: Content::Inline {
+                        b64: STANDARD.encode(b"x"),
+                    },
+                }],
+            )
+            .unwrap();
+            let (refs, _height, objects) = fs.commit_block().expect("the commit is pending");
+            for (kind, body) in &objects {
+                fs.store_mut().put(*kind, body).unwrap();
+            }
+            fs.adopt_refs(refs);
+        }
+        let refs = fs.refs_view();
+        assert_eq!(refs.window.len(), HISTORY_WINDOW);
+        assert!(encoded_refs_len(refs) <= MAX_REFS_IMAGE_BYTES);
+        decode_refs(&encode_refs(refs)).expect("a commit-grown image re-decodes");
     }
 }
