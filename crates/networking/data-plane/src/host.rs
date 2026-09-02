@@ -65,7 +65,7 @@ pub async fn bind_overlay_sockets(
             Ok(sockets) => {
                 if attempts > 0 {
                     tracing::info!(
-                        target: "ducktape::plane",
+                        target: "ducktape::dataplane",
                         ?service,
                         attempts,
                         elapsed_s = started.elapsed().as_secs(),
@@ -78,7 +78,7 @@ pub async fn bind_overlay_sockets(
                 attempts += 1;
                 if attempts == 1 || attempts.is_multiple_of(20) {
                     tracing::warn!(
-                        target: "ducktape::plane",
+                        target: "ducktape::dataplane",
                         reason = "overlay_bind_retry",
                         ?service,
                         %datagram_bind,
