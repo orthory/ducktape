@@ -110,6 +110,58 @@ fn parse_metrics_interval(raw: &str) -> std::io::Result<u64> {
     })
 }
 
+/// Install the process log sink: `tracing` events to stderr, which the unit
+/// captures into the journal.
+///
+/// The coordinator has no LogRing and no node-crate dependency, so this is the
+/// only place its events can go. Two lines deliberately do NOT come through it
+/// — the two bind announcements and the `coordinator_metrics` rows are parsed
+/// by tooling and by `tests/deploy_smoke.rs`, and a subscriber would prefix
+/// them with a timestamp and a level.
+///
+/// RUST_LOG *adds to* the `info` floor rather than replacing it: with
+/// `EnvFilter`'s own default, a bare `RUST_LOG=ducktape::reachability=debug`
+/// would turn every other event OFF while appearing to turn one plane UP.
+///
+/// The directives are parsed STRICTLY. `EnvFilter::new` SKIPS a malformed
+/// directive and carries on, so a typo'd `ducktape:reachability=debug` would
+/// look like it worked: no plane, no error, no clue — and this binary has no
+/// `/v1/log-filter` reload seam, so a restart is the only retry. A bad
+/// RUST_LOG falls back to the default filter and says so, once there is a
+/// subscriber to say it through.
+fn install_tracing() {
+    let env = std::env::var("RUST_LOG").unwrap_or_default();
+    let directives = if env.is_empty() {
+        "info".to_string()
+    } else {
+        format!("info,{env}")
+    };
+    let (filter, bad_env) = match tracing_subscriber::EnvFilter::builder().parse(&directives) {
+        Ok(filter) => (filter, None),
+        Err(error) => (
+            tracing_subscriber::EnvFilter::new("info"),
+            Some(error.to_string()),
+        ),
+    };
+    // colour only for a human at a terminal: the deployed sink is the journal,
+    // where escape codes are noise in every grep.
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(interactive)
+        .with_env_filter(filter)
+        .init();
+    if let Some(error) = bad_env {
+        tracing::warn!(
+            target: "ducktape::reachability",
+            event = "coordinator_log_filter_refused",
+            reason = "malformed_rust_log",
+            error,
+            "RUST_LOG is malformed — ignored, running at the default filter"
+        );
+    }
+}
+
 /// Whether the TCP relay lane bound — carried on every metrics row so a
 /// coordinator whose 443 bind failed at boot (the one-time line scrolled
 /// away long ago) keeps saying so for as long as it runs.
@@ -190,6 +242,8 @@ async fn main() -> std::io::Result<()> {
         return Ok(());
     }
 
+    install_tracing();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     validate_args(&args)?;
 
@@ -255,12 +309,17 @@ async fn main() -> std::io::Result<()> {
                 // 443 as non-root is the everyday dev case) must not take the
                 // UDP rendezvous down with it. Say exactly what is now dark
                 // and keep serving; every metrics row repeats `relay=off`.
-                eprintln!(
-                    "ERROR: relay lane DISABLED — binding tcp/{relay_addr} failed: {error}\n\
-                     ERROR: every joiner derives its first-contact fallback as <this host>:443; \
-                     a member whose NAT cannot hole-punch cannot join through this coordinator.\n\
-                     ERROR: fix: run with CAP_NET_BIND_SERVICE (ops/coordinator/ducktape-coordinator.service), \
-                     bind an unprivileged port behind a 443 forward, or pass --relay-listen none to run without it on purpose."
+                tracing::error!(
+                    target: "ducktape::reachability",
+                    event = "relay_lane_disabled",
+                    reason = "bind_failed",
+                    relay_listen = %relay_addr,
+                    error = %error,
+                    "relay lane DISABLED: every joiner derives its first-contact fallback as \
+                     <this host>:443, so a member whose NAT cannot hole-punch cannot join through \
+                     this coordinator. Fix: run with CAP_NET_BIND_SERVICE \
+                     (ops/coordinator/ducktape-coordinator.service), bind an unprivileged port \
+                     behind a 443 forward, or pass --relay-listen none to run without it on purpose."
                 );
                 RelayLane::Off
             }
