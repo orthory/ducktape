@@ -33,6 +33,7 @@ const PLANES: &[&str] = &[
     "compute",      // provider compute: pools, credentials, interactive runs
     "consensus",    // the kernel: blocks, votes, finalization
     "dataplane",    // the WireGuard data path: overlay device, sockets, binds
+    "files",        // the files module and the duckfs http lane: stage, commit, pin
     "forge",        // the forge module and its blob/ref plumbing
     "gateway",      // the http gateway and the airlock in front of it
     "http",         // the node's own http listeners
