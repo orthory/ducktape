@@ -45,10 +45,13 @@ fn default_genesis_composes_topology_sim_base() {
         "sim default genesis composes topology sim_base, in registry order"
     );
     // the module a capability-tagged saga draws its Strict-lease pool from
-    // ANSWERS here — an empty set, because nobody announced — instead of
-    // erroring `UnknownModule`. That is the whole point of composing it: a
-    // scenario can announce providers and exercise the production gate, where
-    // before every tagged saga silently degraded to accept-any.
+    // ANSWERS here — an empty set — instead of erroring `UnknownModule`. That
+    // is the precondition composing it buys, and the whole of what the DEFAULT
+    // set can show: the registry's WRITE path is member-gated on valset, which
+    // `sim_base` does not carry, so every announce here is refused and the pool
+    // is empty by construction. Populating it (and so making the Strict lease
+    // bind instead of degrading to accept-any) needs `--with-valset` — see
+    // `with_valset_announce_populates_the_capability_provider_pool` below.
     let providers = sim.query(
         "capability",
         serde_json::json!({ "providers": { "capability": "echo" } }),
@@ -56,7 +59,7 @@ fn default_genesis_composes_topology_sim_base() {
     assert_eq!(
         providers,
         serde_json::json!({ "providers": [] }),
-        "the default sim composes capability: {providers}"
+        "the default sim composes capability, with nothing announced"
     );
     let root = status["root_hash"].as_str().expect("root_hash is a string");
     assert_eq!(
@@ -141,5 +144,40 @@ fn with_valset_genesis_appends_topology_sim_valset_and_wires_the_code_registry()
     assert_eq!(
         proposal["proposal"]["action"]["update_module"]["module_id"], "chat",
         "the open ballot carries the proposed swap: {proposal}"
+    );
+}
+
+/// The capability WRITE path, which only `--with-valset` can reach: the
+/// registry gates every announce on valset standing (`members_and_residents`),
+/// so it is here — not in the default set — that a scenario can populate the
+/// provider pool a Strict-lease saga draws from. Without this the sim composes
+/// capability but can never hold a provider, and the lease still degrades to
+/// accept-any everywhere.
+#[test]
+fn with_valset_announce_populates_the_capability_provider_pool() {
+    // the announcer IS the seeded genesis validator: the `hex:` origin escape
+    // resolves to the same raw 32 bytes `--with-valset` seeds valset with, so
+    // the member gate admits it.
+    let node = vec![0x22u8; 32];
+    let key = "22".repeat(32);
+    let storage = tempfile::tempdir().expect("storage dir");
+    let sim = Sim::spawn(storage.path(), &["--auto", "--with-valset", &key]);
+
+    // --auto commits each submit, so the read below sees the announce with no
+    // step and nothing to wait on.
+    sim.submit_ok(
+        "capability",
+        serde_json::json!({ "announce": { "capabilities": ["echo"], "resources": {} } }),
+        Some(&format!("hex:{key}")),
+    );
+
+    let providers = sim.query(
+        "capability",
+        serde_json::json!({ "providers": { "capability": "echo" } }),
+    );
+    assert_eq!(
+        providers,
+        serde_json::json!({ "providers": [node] }),
+        "the announcing validator is the echo provider pool"
     );
 }
