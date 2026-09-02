@@ -67,6 +67,7 @@ impl ValidatorRuntime<'_> {
             last_published,
             blocks_since_checkpoint,
             checkpoint_not_before,
+            last_written_root,
             last_reach_view,
             pending_retarget,
             next_drain,
@@ -449,12 +450,19 @@ impl ValidatorRuntime<'_> {
         // The cadence is therefore gated on BOTH: enough blocks, and enough
         // recovery time since the last attempt to keep the loop's occupancy
         // under one part in `CHECKPOINT_DUTY_LIMIT`.
-        if checkpoint_due(
-            *blocks_since_checkpoint,
-            checkpoint_blocks,
-            context.current(),
-            *checkpoint_not_before,
-        ) && let Some(f) = node.finalized()
+        // ...and on the state having MOVED. The sealed boundary's root-hash is
+        // free here (the drain already stamped it), so an idle chain's nop
+        // blocks no longer buy a full re-encode of the same manifest every 32
+        // blocks — see `checkpoint_due` and `IDLE_CHECKPOINT_BLOCKS`.
+        if let Some(f) = node.finalized()
+            && checkpoint_due(
+                *blocks_since_checkpoint,
+                checkpoint_blocks,
+                context.current(),
+                *checkpoint_not_before,
+                f.root_hash,
+                *last_written_root,
+            )
         {
             // EVERY STAGE BELOW RUNS ON THE SELECT LOOP, so its duration is
             // time the `http_ingress` arm is not polled and `/v1/query` is
@@ -489,6 +497,7 @@ impl ValidatorRuntime<'_> {
                     Ok(()) => {
                         let written_at = context.current();
                         *blocks_since_checkpoint = 0;
+                        *last_written_root = Some(m.root_hash);
                         let floor_passed = matches!(
                             node.sink_mut().floor_cert(),
                             Ok(Some(fc))
@@ -768,6 +777,7 @@ impl ValidatorRuntime<'_> {
                         Ok(()) => {
                             *blocks_since_checkpoint = 0;
                             *prev_ckpt = (m.height, pos);
+                            *last_written_root = Some(m.root_hash);
                         }
                         Err(e) => tracing::warn!(
                             target: "ducktape::recovery",
@@ -1512,6 +1522,9 @@ mod block_cadence_tests {
         let finished = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
         let owed =
             crate::drain_actions::cooldown_until(finished, std::time::Duration::from_secs(60));
+        // real work sealed since the last manifest, so the change gate is open
+        // throughout and the cooldown is the ONLY thing under test here.
+        let moved = sdk::StateRoot([9; sdk::ROOT_LEN]);
 
         // 32 blocks have sealed — the ENTIRE old trigger — but only ~30s of
         // chain has passed, which is exactly the shape that had the node
@@ -1521,7 +1534,9 @@ mod block_cadence_tests {
                 32,
                 32,
                 finished + std::time::Duration::from_secs(30),
-                owed
+                owed,
+                moved,
+                None
             ),
             "a 60s checkpoint must not be re-authorized 30s later just because 32 blocks sealed"
         );
@@ -1530,7 +1545,9 @@ mod block_cadence_tests {
             32,
             32,
             finished + std::time::Duration::from_secs(420),
-            owed
+            owed,
+            moved,
+            None
         ));
         // A CHEAP CHECKPOINT IS NEVER DELAYED: 25ms owes 175ms of quiet, long
         // gone by the time 32 blocks seal, so the configured cadence governs.
@@ -1540,7 +1557,9 @@ mod block_cadence_tests {
             32,
             32,
             finished + std::time::Duration::from_secs(30),
-            cheap
+            cheap,
+            moved,
+            None
         ));
         // The cooldown never SUBSTITUTES for the cadence: quiet is necessary,
         // not sufficient.
@@ -1548,7 +1567,9 @@ mod block_cadence_tests {
             31,
             32,
             finished + std::time::Duration::from_secs(420),
-            owed
+            owed,
+            moved,
+            None
         ));
     }
 

@@ -21,21 +21,47 @@ use consensus::{ObservationOutcome, RespawnPlan, ScheduledCutover, ValsetOrchest
 /// SIGTERM are unanswerable (#1018).
 pub(crate) const CHECKPOINT_DUTY_LIMIT: u32 = 8;
 
-/// enough blocks have sealed AND the last attempt has paid for itself.
+/// the periodic FLOOR for a chain whose state has NOT moved: a manifest still
+/// gets rewritten this often even when every block since the last one was a
+/// nop. A manifest carries more than the root — the oplog position the journal
+/// prune anchors on, the epoch coordinates, this node's next submit sequence —
+/// so an untouched node must still refresh it eventually; it just must not do
+/// so every `checkpoint_blocks`. ~1800 blocks is ~30 min of the 1s idle
+/// heartbeat.
+pub(crate) const IDLE_CHECKPOINT_BLOCKS: u64 = 1800;
+
+/// enough blocks have sealed, the last attempt has paid for itself, AND the
+/// state those blocks left behind is not the one already on disk.
 ///
 /// The block count alone was the whole trigger, and it cannot express cost —
 /// 32 blocks is ~30s of chain while one capture measured 59-70s, so the trigger
 /// kept re-firing before the previous one had finished and the node lived
 /// inside the branch.
+///
+/// It cannot express whether anything HAPPENED either. An idle chain seals a
+/// nop block a second, so the cadence is reached every ~32s and the node
+/// re-encoded and re-fsynced the WHOLE manifest — forge's entire pack closure
+/// included — for a root that had not moved, ~2,700 times a day (#1308/#1286).
+/// So the periodic checkpoint fires when the sealed root has moved away from
+/// the last manifest this loop wrote, with [`IDLE_CHECKPOINT_BLOCKS`] as the
+/// floor that still refreshes an untouched node's manifest.
+///
+/// `written_root` is `None` until this loop writes its first manifest, which
+/// reads as "moved": a fresh boot always re-anchors the checkpoint (and with
+/// it the prune position) on its first cadence hit.
 pub(crate) fn checkpoint_due(
     blocks_since: u64,
     checkpoint_blocks: u64,
     now: std::time::SystemTime,
     not_before: std::time::SystemTime,
+    sealed_root: sdk::StateRoot,
+    written_root: Option<sdk::StateRoot>,
 ) -> bool {
     let cadence_reached = blocks_since >= checkpoint_blocks;
     let cooled_down = now >= not_before;
-    cadence_reached && cooled_down
+    let state_moved = written_root != Some(sealed_root);
+    let idle_floor_reached = blocks_since >= IDLE_CHECKPOINT_BLOCKS;
+    cadence_reached && cooled_down && (state_moved || idle_floor_reached)
 }
 
 /// when the next checkpoint may START, given when this one finished and what
@@ -141,6 +167,42 @@ mod tests {
             "forge=60245,chat=12,valset=0",
             "reading the field IS the attribution; the module that spent the \
              loop's time must be the first thing in it",
+        );
+    }
+
+    /// AN IDLE CHAIN MUST NOT REWRITE A MANIFEST IT ALREADY HAS. The nop
+    /// heartbeat seals a block a second, so the block cadence alone re-encoded
+    /// and re-fsynced the entire checkpoint — forge's pack closure included —
+    /// every ~32s forever (#1308/#1286).
+    #[test]
+    fn an_unmoved_root_does_not_re_checkpoint_until_the_idle_floor() {
+        let quiet = std::time::UNIX_EPOCH;
+        let root = sdk::StateRoot([7; sdk::ROOT_LEN]);
+
+        assert!(
+            !checkpoint_due(32, 32, quiet, quiet, root, Some(root)),
+            "the cadence is reached and the cooldown paid, but the state on \
+             disk IS this state — rewriting it is pure write amplification"
+        );
+        assert!(
+            checkpoint_due(
+                32,
+                32,
+                quiet,
+                quiet,
+                sdk::StateRoot([8; sdk::ROOT_LEN]),
+                Some(root)
+            ),
+            "a moved root is exactly what a checkpoint exists to record"
+        );
+        assert!(
+            checkpoint_due(IDLE_CHECKPOINT_BLOCKS, 32, quiet, quiet, root, Some(root)),
+            "the floor still refreshes an untouched node's manifest — it \
+             carries the prune anchor and the submit sequence, not just the root"
+        );
+        assert!(
+            checkpoint_due(32, 32, quiet, quiet, root, None),
+            "no manifest written by this loop yet: a fresh boot re-anchors"
         );
     }
 

@@ -210,6 +210,12 @@ struct ValidatorRuntime<'a> {
     /// blocks alone cannot express what a checkpoint COSTS the loop, and
     /// the loop is what answers `/v1/query` and SIGTERM (#1018).
     checkpoint_not_before: std::time::SystemTime,
+    /// the composed root-hash recorded by the last manifest THIS loop wrote —
+    /// the change gate for the periodic checkpoint. `None` until the first
+    /// write, so a fresh boot re-anchors on its first cadence hit. See
+    /// `checkpoint_due`: an idle chain's nop blocks must not buy a full
+    /// re-encode of the manifest already on disk (#1308).
+    last_written_root: Option<sdk::StateRoot>,
     last_reach_view: Option<u64>,
     last_flush: std::time::SystemTime,
     pending_retarget: Option<reachability::MeshEpochEvent>,
@@ -471,6 +477,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         join_requests,
         blocks_since_checkpoint,
         checkpoint_not_before,
+        last_written_root: None,
         last_reach_view,
         last_flush,
         pending_retarget,
