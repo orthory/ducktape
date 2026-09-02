@@ -284,57 +284,28 @@ pub(crate) fn ducktape_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".ducktape"))
 }
 
-/// The CLI's workspace registry: `<ducktape home>/workspaces`. `node init` and
-/// `node join` materialize one directory per network in here, so the directory
-/// listing IS the registry — there is no index file to keep in sync.
-fn workspaces_root() -> Option<PathBuf> {
-    ducktape_home().map(|home| home.join("workspaces"))
-}
-
-/// Every registered workspace as `(chain id, directory)`: a directory holding
-/// a `node.toml` is a workspace, whatever else it contains.
+/// Every registered workspace as `(chain id, directory)` — the CLI's own
+/// registry walk (`workspace_config::list_workspaces`), so membership and the
+/// id agree with what `node init`/`node join` wrote and what `-n` resolves.
 pub(crate) fn registered_workspaces() -> Vec<(String, PathBuf)> {
-    let Some(root) = workspaces_root() else {
+    let Ok(root) = workspace_config::workspaces_root() else {
         return Vec::new();
     };
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return Vec::new();
-    };
-    let mut workspaces: Vec<(String, PathBuf)> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|dir| dir.join("node.toml").is_file())
-        .filter_map(|dir| {
-            let name = dir.file_name()?.to_str()?.to_string();
-            Some((name, dir))
-        })
-        .collect();
-    workspaces.sort();
-    workspaces
+    registered_workspaces_in(&root)
 }
 
-/// One top-level value out of a workspace file (`key = "value"`). `node.toml`
-/// and `network.toml` are both written key-per-line by the CLI, so this reads
-/// them without a toml parser the app would otherwise not need.
-pub(crate) fn node_dir_value(dir: &Path, file: &str, key: &str) -> Option<String> {
-    let text = std::fs::read_to_string(dir.join(file)).ok()?;
-    text.lines()
-        .filter_map(|line| line.split_once('='))
-        .find(|(name, _)| name.trim() == key)
-        .map(|(_, value)| {
-            value
-                .split('#')
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .trim_matches(['"', '\''])
-                .to_string()
-        })
+pub(crate) fn registered_workspaces_in(root: &Path) -> Vec<(String, PathBuf)> {
+    workspace_config::list_workspaces_in(root)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(chain_id, node_toml)| Some((chain_id, node_toml.parent()?.to_path_buf())))
+        .collect()
 }
 
-/// This workspace's app endpoint, from its `http_listen`.
+/// This workspace's app endpoint, from its `http_listen` — a wildcard bind is
+/// rewritten to loopback, the same as the CLI dials it.
 pub(crate) fn workspace_endpoint(dir: &Path) -> Option<String> {
-    node_dir_value(dir, "node.toml", "http_listen").map(|listen| format!("http://{listen}"))
+    workspace_config::http_base_in(dir).ok()
 }
 
 /// The registered workspace this app is pointed at, matched on the endpoint it
@@ -432,13 +403,12 @@ pub async fn mint_invite(workspace: String) -> Result<String, AppError> {
 /// used to pass one to `-n` now need a URL instead.
 fn workspace_rpc(selector: &str) -> Result<String, String> {
     let selector = selector.trim();
-    let matches_selector = |dir_name: &str, dir: &Path| {
-        dir_name == selector
-            || node_dir_value(dir, "network.toml", "chain_id").as_deref() == Some(selector)
+    let matches_selector = |chain_id: &str, dir: &Path| {
+        chain_id == selector || dir.file_name().is_some_and(|name| name == selector)
     };
     registered_workspaces()
         .into_iter()
-        .find(|(dir_name, dir)| matches_selector(dir_name, dir))
+        .find(|(chain_id, dir)| matches_selector(chain_id, dir))
         .and_then(|(_, dir)| workspace_endpoint(&dir))
         .ok_or_else(|| format!("no local workspace named {selector:?} to mint an invite from"))
 }
@@ -564,7 +534,7 @@ pub fn provision_progress(
                     let listen = state
                         .dir
                         .as_deref()
-                        .and_then(|dir| node_dir_value(dir, "node.toml", "http_listen"))
+                        .and_then(workspace_endpoint)
                         .unwrap_or_else(|| state.rpc.clone());
                     state.step = 5;
                     Some((
@@ -599,12 +569,9 @@ fn registered_step(index: i64, label: &str, established: bool) -> ProvisionStep 
 
 /// The workspace's own node identity, short — `network.toml` seats it as the
 /// founding validator, so a fresh network's admin key is readable there.
-fn workspace_identity(dir: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(dir.join("network.toml")).ok()?;
-    let line = text
-        .lines()
-        .find(|line| line.trim_start().starts_with("validators"))?;
-    let key = line.split('"').nth(1)?;
+pub(crate) fn workspace_identity(dir: &Path) -> Option<String> {
+    let descriptor = workspace_config::NetworkDescriptor::load(&dir.join("network.toml")).ok()?;
+    let key = descriptor.validators.first()?;
     Some(short_label(key))
 }
 
@@ -634,11 +601,10 @@ pub async fn forget_workspace(rpc: String) -> Result<bool, AppError> {
 /// `active` cannot answer), then the demo registry's name, then the bound
 /// account, then the endpoint's host, then the product name.
 pub fn network_label(account_name: impl AsRef<str>, rpc: impl AsRef<str>) -> String {
-    let connected = workspace_at(rpc.as_ref()).map(|(dir_name, dir)| {
-        let chain_id = node_dir_value(&dir, "network.toml", "chain_id").unwrap_or_default();
+    let connected = workspace_at(rpc.as_ref()).map(|(chain_id, _)| {
         let named = chain_id.split('#').next().unwrap_or_default();
         match named.is_empty() {
-            true => dir_name,
+            true => chain_id,
             false => named.to_string(),
         }
     });

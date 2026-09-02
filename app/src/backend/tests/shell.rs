@@ -838,3 +838,60 @@ fn a_tab_move_only_refetches_what_its_destination_draws() {
         assert_eq!(readers, drawn, "exactly these tabs draw {plane}");
     }
 }
+
+/// The launch window reads the workspace files through the crate that wrote
+/// them, never a line parser: the chain id keeps its `#hex` half, a
+/// two-validator descriptor (the multi-line array `node admit` writes) still
+/// yields the founding key, and a wildcard `http_listen` dials loopback.
+#[test]
+fn workspace_facts_come_from_the_crate_that_wrote_them() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("mynet-dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    let founder = "aa".repeat(32);
+    let admitted = "bb".repeat(32);
+    workspace_config::NetworkDescriptor {
+        chain_id: "mynet#a1b2c3d4".into(),
+        validators: vec![founder.clone(), admitted],
+        bootstrap: vec![],
+        reach: vec![],
+        coordination: None,
+        modules: vec![],
+    }
+    .save(&dir.join("network.toml"))
+    .unwrap();
+    let descriptor = std::fs::read_to_string(dir.join("network.toml")).unwrap();
+    assert!(
+        descriptor.contains("validators = [\n"),
+        "two validators serialize as a multi-line array:\n{descriptor}"
+    );
+    std::fs::write(
+        dir.join("node.toml"),
+        r#"network = "network.toml"
+key_file = "node.key"
+listen = "0.0.0.0:52200"
+advertised = "overlay"
+storage_dir = "data"
+http_listen = "0.0.0.0:8844"
+gateway_listen = "127.0.0.1:0"
+rpc_listen = "127.0.0.1:8845"
+wireguard_listen = "0.0.0.0:51820"
+invite_listen = "0.0.0.0:51821"
+wireguard_advertised = "auto"
+primary_coordinator = "none"
+coordinator_relay = "none"
+checkpoint_blocks = 32
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        registered_workspaces_in(root.path()),
+        vec![("mynet#a1b2c3d4".to_string(), dir.clone())]
+    );
+    assert_eq!(workspace_identity(&dir), Some(short_label(&founder)));
+    assert_eq!(
+        workspace_endpoint(&dir).as_deref(),
+        Some("http://127.0.0.1:8844")
+    );
+}

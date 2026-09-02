@@ -994,7 +994,7 @@ pub fn list_workspaces() -> Result<Vec<(String, PathBuf)>, String> {
     list_workspaces_in(&workspaces_root()?)
 }
 
-fn list_workspaces_in(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+pub fn list_workspaces_in(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
