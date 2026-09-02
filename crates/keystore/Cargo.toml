@@ -14,8 +14,9 @@ version.workspace = true
 # precondition for a person opening their own key. Both the CLI and the app
 # link it now.
 #
-# The dependency set is the point: argon2 + AEAD + ed25519 + encoding, and
-# nothing else. A GUI can link this without a validator arriving behind it.
+# The dependency set is the point: argon2 + AEAD + ed25519 + encoding, plus the
+# zero-dependency home resolver every surface shares, and nothing else. A GUI
+# can link this without a validator arriving behind it.
 [dependencies]
 # THE ducktape home resolution (`$DUCKTAPE_HOME` else `~/.ducktape`), in a
 # zero-dependency leaf so every reader of that root agrees about it.
