@@ -331,12 +331,22 @@ impl IndexStore {
             );
         }
         let blocks = Arc::new(Db::open(base.join(BLOCKS_DB_ID), opts)?);
-        Ok(Self {
+        let store = Self {
             base,
             modules: open,
             blocks,
             poisoned: AtomicBool::new(false),
-        })
+        };
+        // the height the node resumes above — read here, not inside the
+        // macro, so a read failure refuses the open at every filter level.
+        let height = store.resume_height()?;
+        tracing::info!(
+            target: "ducktape::index",
+            height,
+            modules = store.modules.len(),
+            "index store opened"
+        );
+        Ok(store)
     }
 
     pub fn base(&self) -> &Path {
@@ -362,11 +372,19 @@ impl IndexStore {
     }
 
     /// the ONE place the store poisons. every write path hands its outcome
-    /// through here: from then on writes refuse, reads keep serving, and the
-    /// remedy is the crate's — delete the index directory and replay.
-    fn poison_on_err(&self, out: Result<()>) -> Result<()> {
-        if out.is_err() {
+    /// through here, so a poison is never silent: from this line on writes
+    /// refuse, reads keep serving, and the remedy is the crate's — delete the
+    /// index directory and replay.
+    fn poison_on_err(&self, op: &'static str, out: Result<()>) -> Result<()> {
+        if let Err(err) = &out {
             self.poisoned.store(true, Ordering::Relaxed);
+            tracing::warn!(
+                target: "ducktape::index",
+                reason = "index_poisoned",
+                op,
+                error = %err,
+                "index store poisoned — writes refuse until the index directory is deleted and replayed"
+            );
         }
         out
     }
@@ -450,7 +468,7 @@ impl IndexStore {
         if self.is_poisoned() {
             return Err(Error::Poisoned);
         }
-        self.poison_on_err(self.apply_inner(block))
+        self.poison_on_err("apply_block", self.apply_inner(block))
     }
 
     fn apply_inner(&self, block: &BlockOps) -> Result<()> {
@@ -543,7 +561,7 @@ impl IndexStore {
             }
             Ok(())
         })();
-        self.poison_on_err(out)
+        self.poison_on_err("apply_block_record", out)
     }
 
     /// the newest `limit` explorer rows, oldest-first — the durable equivalent
@@ -603,7 +621,7 @@ impl IndexStore {
             }
             Ok(())
         })();
-        self.poison_on_err(out)
+        self.poison_on_err("mark_backfilled", out)
     }
 
     /// write verbatim op rows into a module's feed WITHOUT touching the
@@ -651,7 +669,7 @@ impl IndexStore {
             }
             Ok(())
         })();
-        self.poison_on_err(out)
+        self.poison_on_err("write_backfill_rows", out)
     }
 
     /// set (or clear) a module's backfill floor and NOTHING else — no wipe, no
@@ -669,7 +687,7 @@ impl IndexStore {
             Some(height) => db.put(META_BACKFILL, height.to_be_bytes()),
             None => db.delete(META_BACKFILL),
         };
-        self.poison_on_err(out.map_err(Error::from))
+        self.poison_on_err("set_backfill_floor", out.map_err(Error::from))
     }
 
     /// re-derive a module's read model from the op feed it already holds:
@@ -720,7 +738,7 @@ impl IndexStore {
             }
             Ok(())
         })();
-        self.poison_on_err(out)
+        self.poison_on_err("refold", out)
     }
 
     /// advance a module's feed watermark to `height` and NOTHING else — the
@@ -742,7 +760,7 @@ impl IndexStore {
             db.put(META_HEIGHT, height.to_be_bytes())?;
             Ok(())
         })();
-        self.poison_on_err(out)
+        self.poison_on_err("advance_watermark", out)
     }
 
     /// point read of one stored key at the current snapshot.
@@ -1001,30 +1019,54 @@ fn clear_derived(db: &Db) -> Result<()> {
 }
 
 /// re-drive the fold over the whole op feed and WAIT for it — the shared tail
-/// of a mapper converge and a backfill's closing refold.
+/// of a mapper converge and a backfill's closing refold. two lines per refold
+/// and none per row: a boot that replays a chain's history used to do so in
+/// silence, from the last `open` line until it returned.
 fn refold_feed(db: &Db, module: &str) -> Result<()> {
-    replay_op_feed(db)?;
+    let from_height = read_backfill(db)?.unwrap_or(0);
+    let to_height = read_height(db)?;
+    tracing::info!(
+        target: "ducktape::index",
+        module,
+        from_height,
+        to_height,
+        "refold started"
+    );
+    let started = std::time::Instant::now();
+    let rows = replay_op_feed(db)?;
     drain_fold(db, module)?;
+    tracing::info!(
+        target: "ducktape::index",
+        module,
+        from_height,
+        to_height,
+        rows,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "refold complete"
+    );
     Ok(())
 }
 
-/// re-drive the fold over every op row the database already holds.
+/// re-drive the fold over every op row the database already holds, answering
+/// how many rows were re-staged.
 ///
 /// a changes-mode trigger delivers writes COMMITTED AFTER its registration, so
 /// re-registering one over a populated range replays nothing. re-writing each
 /// row does: an identical put is still a committed change, and capture happens
 /// inside the commit critical section, so the guest receives the feed in key
 /// order — which for `op/{height:016x}/{seq:04x}` IS block-and-drain order.
-fn replay_op_feed(db: &Db) -> Result<()> {
+fn replay_op_feed(db: &Db) -> Result<u64> {
     let lo = OP_PREFIX.as_bytes();
     let hi = prefix_successor(lo);
     let snap = db.snapshot();
     let iter = db.iter_at(Some(lo), hi.as_deref(), false, &snap)?;
     let mut batch = WriteBatch::new();
     let mut staged = 0usize;
+    let mut rows = 0u64;
     for kv in iter {
         let (key, value) = kv?;
         staged += key.len() + value.len();
+        rows += 1;
         batch.put(key, value);
         if staged >= REPLAY_FLUSH_BYTES {
             db.write(std::mem::replace(&mut batch, WriteBatch::new()))?;
@@ -1034,7 +1076,7 @@ fn replay_op_feed(db: &Db) -> Result<()> {
     if staged > 0 {
         db.write(batch)?;
     }
-    Ok(())
+    Ok(rows)
 }
 
 /// register the fold feed: [`GUEST_NAME`]'s `on_apply` over exactly the
