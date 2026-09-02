@@ -32,6 +32,8 @@ keyscheme = { workspace = true }
 commonware-cryptography = { workspace = true }
 
 [dev-dependencies]
+# the `log_file` rotation tests open real files in an isolated dir.
+tempfile = { workspace = true }
 # non-ed25519 frame proofs in tests/frame_schemes.rs.
 keyscheme = { workspace = true, features = ["testkit"] }
 # a SELF dev-dependency (the `data-plane` pattern): `tests/submit_decoded.rs`

@@ -1,7 +1,7 @@
 # Authoring wasm modules
 
 How to write, build, and live-update a Ducktape wasm module. The runtime is
-`crates/kernel/wasm-host` (wasmtime, pinned `=46.0.1`); the authoring contract is
+`crates/kernel/wasm-host` (wasmtime, pinned `=46.0.3`); the authoring contract is
 the `ducktape:module` WIT world (`crates/kernel/module-guest/wit/module.wit`);
 the reference modules are `crates/guests/hello-wasm`,
 `crates/guests/hello-wasm-replacement` (its live-update target), and
@@ -12,7 +12,7 @@ implementation it replaced (same root, same snapshot encoding) — the template
 every later port followed. It is in no genesis set either: the crate is a test
 tenant the kernel suites construct directly. The node binary embeds
 no component: `node init` hashes every wasm tenant's `<id>.component.wasm` out
-of `--modules <dir>` (default `$DUCKTAPE_MODULES_DIR`, else `~/.ducktape/modules`,
+of `--modules <dir>` (default `$DUCKTAPE_MODULES_DIR`, else `<ducktape home>/modules`,
 filled by `make install-node`) into the network descriptor, then copies those
 same bytes into the workspace's `modules/` dir.
 

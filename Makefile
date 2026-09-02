@@ -124,16 +124,24 @@ install-app:
 	@exit 2
 endif
 
+# where install-node WRITES the module components, spelled exactly as
+# workspace_config::modules_dir() READS them: $DUCKTAPE_MODULES_DIR, else
+# <ducktape home>/modules, where the home is $DUCKTAPE_HOME when set and
+# ~/.ducktape otherwise. A writer that stopped at $HOME put the components
+# where a node under an override never looks — one expression, so the two
+# halves cannot drift apart again.
+MODULES_DEST = $${DUCKTAPE_MODULES_DIR:-$${DUCKTAPE_HOME:-$$HOME/.ducktape}/modules}
+
 ## the binary embeds no wasm: `node init` founds a network from a directory of
 ## <id>.component.wasm, so installing the node also installs that set.
 install-node:
 	$(CARGO) install --path bin/node --locked
-	mkdir -p "$${DUCKTAPE_MODULES_DIR:-$$HOME/.ducktape/modules}"
+	mkdir -p "$(MODULES_DEST)"
 	@for m in $(BUILDER_MODULES); do \
 	  id=$$(basename $$m) && \
-	  cp $$m/component.wasm "$${DUCKTAPE_MODULES_DIR:-$$HOME/.ducktape/modules}/$$id.component.wasm" || exit 1; \
+	  cp $$m/component.wasm "$(MODULES_DEST)/$$id.component.wasm" || exit 1; \
 	done
-	@echo "installed module components into $${DUCKTAPE_MODULES_DIR:-$$HOME/.ducktape/modules}"
+	@echo "installed module components into $(MODULES_DEST)"
 
 ## coordinator -> ~/.cargo/bin/ducktape-coordinator
 install-coordinator:
@@ -163,18 +171,8 @@ install-coordinator:
 TEST_TMPDIR := $(CURDIR)/target/test-tmp
 
 test: wasm-modules-check
-# TWO passes, and the second is not optional.
-#
-# A run that reached the compute plane leaves podman rootless overlay dirs owned
-# by a SUBUID, which this user cannot remove: plain `rm -rf` prints a wall of
-# `Permission denied` and — with `&&` — aborted the whole gate before a single
-# test ran. `podman unshare` re-enters the user namespace where those uids map
-# to root, which is the only way to reclaim them without privileges.
-#
-# Neither pass may fail the gate: a first run has nothing to clean, and a host
-# without podman has no second pass to make.
+# The reclaim may not fail the gate: a first run has nothing to clean.
 	-rm -rf "$(TEST_TMPDIR)" 2>/dev/null
-	-command -v podman >/dev/null 2>&1 && podman unshare rm -rf "$(TEST_TMPDIR)" 2>/dev/null
 	mkdir -p "$(TEST_TMPDIR)"
 	TMPDIR="$(TEST_TMPDIR)" $(CARGO) test --workspace
 # the auth page's pure helpers (fragment parsing, DER→raw, SPKI→SEC1) — the
@@ -201,8 +199,8 @@ test: wasm-modules-check
 ## rebuild every wasm guest module into its componentized artifact and refresh
 ## EVERY committed copy in one sweep (the canonical node-embedded artifact +
 ## the kernel test fixtures), so the copies can never drift apart. requires
-## the wasm32-unknown-unknown target (rustup target add wasm32-unknown-unknown)
-## and wasm-tools (cargo install wasm-tools). component bytes are toolchain-
+## wasm-tools (cargo install wasm-tools); the wasm32-unknown-unknown target
+## comes from the pinned rust-toolchain.toml. component bytes are toolchain-
 ## dependent: a rebuild on a different rustc may legitimately differ from the
 ## committed bytes — commit the refreshed set TOGETHER; `wasm-modules-check`
 ## guards mutual consistency. bytes no longer depend on WHERE the checkout
@@ -222,7 +220,7 @@ BUILDER_MODULES := \
   crates/modules/apps/inbox crates/modules/apps/pages crates/modules/apps/agent \
   crates/modules/apps/automations crates/modules/apps/runs \
   crates/modules/apps/tasks crates/modules/apps/chat crates/modules/apps/files \
-  crates/modules/apps/vaults crates/modules/apps/forge \
+  crates/modules/apps/forge \
   crates/modules/system/tagging crates/modules/system/dispatch \
   crates/modules/system/capability crates/modules/system/identity \
   crates/modules/system/gateway crates/modules/system/governance \

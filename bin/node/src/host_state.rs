@@ -153,7 +153,8 @@ fn seed_complete_bundle(
     Err(format!(
         "genesis bundle {} has no component for {missing:?} (expected <id>.component.wasm) — fail-closed. \
          a genesis member boots from its own bundle: re-join with `ducktape node join <invite>`, \
-         or fill `~/.ducktape/modules` (`make install-node`) and re-found with `node init --modules`",
+         or fill the installed module dir — `$DUCKTAPE_MODULES_DIR`, else `<ducktape home>/modules` — \
+         with `make install-node` and re-found with `node init --modules`",
         genesis.bundle_dir.display()
     ))
 }
@@ -978,15 +979,15 @@ mod tests {
     ///
     /// It is the only ABSOLUTE one in the tree, and until it existed every claim
     /// that "the root hash did not move" was relative and therefore weak.
-    /// `bin/simnode/tests/topology_set.rs` pins the 14-module sim composition
-    /// — which excludes `acl`, `capability`, `governance`, `lifecycle` and
-    /// `valset`, and is not what a node runs. (Not a NATIVE composition, as
-    /// this said for a while: simnode opens a `DirCodeSource` over the host
-    /// fixtures and composes through `noded::compose`, so every `SIM_BASE` id
-    /// loads as a wasm component — which is why a rebuilt fixture moves that
-    /// root.) And `git diff crates/modules/`
-    /// on a committed tree is EMPTY BY CONSTRUCTION, so quoting it proves
-    /// nothing at all. Neither would have noticed a module's bytes changing.
+    /// `bin/simnode/tests/topology_set.rs` pins the 15-module sim composition —
+    /// which excludes `acl`, `governance`, `lifecycle` and `valset`, and is not
+    /// what a node runs. (Not a NATIVE composition, as this said for a while:
+    /// simnode opens a `DirCodeSource` over the host fixtures and composes
+    /// through `noded::compose`, so every `SIM_BASE` id loads as a wasm
+    /// component — which is why a rebuilt fixture moves that root.) And `git
+    /// diff crates/modules/` on a committed tree is EMPTY BY CONSTRUCTION, so
+    /// quoting it proves nothing at all. Neither would have noticed a module's
+    /// bytes changing.
     ///
     /// ## the mechanism, because it surprises everyone once
     ///

@@ -4,7 +4,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const stateFile = path.join(os.homedir(), ".ducktape", "agent-system-url");
+// the operator root every other reader resolves ($DUCKTAPE_HOME when set,
+// else ~/.ducktape) — a node under an override keeps its registry and this
+// script's remembered url there, not in $HOME.
+const duckHome = process.env.DUCKTAPE_HOME || path.join(os.homedir(), ".ducktape");
+const stateFile = path.join(duckHome, "agent-system-url");
 const usage = `usage: ops/agent-system <command> [args]
 
   use URL                         remember one local node
@@ -82,7 +86,7 @@ const rememberedUrl = () => {
   }
   try {
     const registry = JSON.parse(
-      fs.readFileSync(path.join(os.homedir(), ".ducktape", "registry.json"), "utf8"),
+      fs.readFileSync(path.join(duckHome, "registry.json"), "utf8"),
     );
     const active = registry.workspaces?.find((workspace) => workspace.id === registry.active);
     if (active?.ports?.http) return `http://127.0.0.1:${active.ports.http}`;

@@ -37,10 +37,10 @@
 //! — the same trust class as a shell profile or systemd unit. they load from
 //! exactly two places, both local and operator-controlled: the specs embedded
 //! in this crate at compile time, and `$DUCKTAPE_CAPABILITY_DIR` (default
-//! `~/.ducktape/capabilities`). specs are NEVER fetched from the network, and
-//! nothing consensus-side may ever read one (host-local files are
-//! non-deterministic input; the consensus capability module sees only the
-//! announced TAGS, never the specs behind them).
+//! `<ducktape home>/capabilities`, so `$DUCKTAPE_HOME` moves it). specs are
+//! NEVER fetched from the network, and nothing consensus-side may ever read
+//! one (host-local files are non-deterministic input; the consensus capability
+//! module sees only the announced TAGS, never the specs behind them).
 //!
 //! ## how an executor authenticates — two paths, never both
 //!
@@ -801,7 +801,7 @@ format = "text"
 
     /// A RETIRED section is an unknown one: a stale operator spec that still
     /// declares it fails loud at load rather than parsing into a block nothing
-    /// would ever read. (`~/.ducktape/capabilities` is operator-writable, so
+    /// would ever read. (`<ducktape home>/capabilities` is operator-writable, so
     /// this is the door a leftover file comes in.)
     #[test]
     fn retired_sections_fail_loud_at_load() {

@@ -7,9 +7,10 @@ runnable surfaces are the node daemon (`node-bin`/`noded`), the deterministic
 `demo-seed.sh` seeds a workspace the app can then open. Most scripts back a
 `make` target; see the repository `Makefile`.
 
-## Demo network
+## Dev and demo network
 
 ```bash
+make dev         # ops/dev.sh        — the app dev loop: seed "demo" once, start its node + forge, keep it up
 make demo-seed   # ops/demo-seed.sh  — seed a solo "demo" workspace with sample data
 make demo-app    # ops/demo-app.sh   — serve the user-hosted app behind its gateway route
 make dev-clear   # ops/dev-clear.sh  — stop make dev's background runtime; preserve state
@@ -18,6 +19,25 @@ make demo-clear  # ops/demo-clear.sh — stop and delete the demo workspace
 
 `demo-gateway.mjs` and `demo-kanban.mjs` publish the demo's gateway web-app
 routes (a network-hosted DuckFS site and a user-hosted loopback app).
+
+## Running a node as a service
+
+- `node/` — `ducktape-node@.service` (instance = workspace selector for
+  `ducktape node run -n`), `ducktape-service@.service` (instance = kind for
+  `ducktape service run compute|agent|airlock`) and the `copytruncate`
+  logrotate drop-in for `daemon.log` / `<kind>.log`. The install, port and
+  log recipe is `docs/deploy/node-service.md`; what to back up is
+  `docs/deploy/backup-and-keys.md`.
+
+## Sandbox (microVM) hosts
+
+- `build-guest-rootfs.sh` — builds the guest kernel + rootfs image a Linux
+  host's Firecracker sandbox boots each run from.
+- `macos-preflight.sh` — checks a macOS host for the vz backend (the
+  Virtualization.framework shim in `bin/duck-vz-shim`, the Kata kernel, the
+  file-descriptor limit the app lane needs).
+- `firecracker/` — `boot-bench.sh` and `snapshot-bench.sh`, the cold-boot and
+  snapshot-restore timing lanes for the microVM sandbox.
 
 ## Forge
 
@@ -30,8 +50,9 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
 - `agent-system` — a compact operator CLI over a running node's module surface
   (raw query/submit, agent list/pause/resume); takes the node from
   `DUCKTAPE_NODE` (the same variable the `ducktape` CLI, the app, and every run
-  read), else `~/.ducktape/agent-system-url`, else the active workspace in
-  `~/.ducktape/registry.json`. It talks to a loopback node only, so a
+  read), else `<ducktape home>/agent-system-url`, else the active workspace in
+  `<ducktape home>/registry.json` — the home being `$DUCKTAPE_HOME` when set,
+  else `~/.ducktape`. It talks to a loopback node only, so a
   `DUCKTAPE_NODE` pointing at a remote one is refused by name rather than
   silently ignored; `use`, `help` and `cgroup` need no node and never read it.
 - `completions/` — shell completions for the `ducktape` CLI.
@@ -41,7 +62,21 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
 - `coordinator/` — systemd unit, env example, and Dockerfile for the UDP
   coordinator (see `coordinator/README.md`).
 - `wg-smoke/` — WireGuard interop and bench harnesses (the `wg_interop`
-  probe binary in rootless podman; no node.toml involved).
+  probe binary in two rootless podman containers — podman is only this
+  harness's container runtime; the node itself has had no container sandbox
+  since #1176. No node.toml involved).
+- `huddle-lane.sh` — two real nodes in the dev shape with userspace
+  WireGuard between them, one channel, one user key per side: the live
+  arrangement a huddle (voice/camera/screen share) actually breaks in.
+- `beacon-collect/` — a standalone headless consumer for iced's frame
+  telemetry (`cargo run -p ducktape-app --features iced/debug`), for QA rigs
+  where the upstream GUI is useless; own `Cargo.toml`, not a workspace member.
+
+## Hosted auth page
+
+- `auth-page/` — the `auth.ducktape.industries` WebAuthn relying-party page
+  (`index.html`), its result-relay Worker (`worker.js`, `wrangler.toml`) and
+  the dependency-free gate `node ops/auth-page/test.mjs`; see its README.
 
 ## Wasm guests
 

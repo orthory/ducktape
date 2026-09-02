@@ -142,6 +142,7 @@ use duckfs_core::CHUNK_SIZE;
 use futures::channel::oneshot;
 use sdk::StateRoot;
 use serde::{Deserialize, Serialize};
+use workspace_config::{DEFAULT_INVITE_TTL_DAYS, INVITE_TTL_DAYS};
 
 use crate::call::{call_ws, presence_ws};
 use crate::gateway_http::{gateway_browser_base, gateway_proxy};
@@ -896,13 +897,11 @@ async fn log_filter(body: String) -> Response {
     }
 }
 
-/// The invite TTL bounds, in days. A zero-day invite is expired the moment it
-/// is pasted; a decade-long bearer credential is not an invite, it is a key
-/// left under the mat.
-const INVITE_TTL_DAYS: std::ops::RangeInclusive<u64> = 1..=365;
-
 /// POST /v1/invite `{"ttl_days": N}` — mint one bearer invite and answer
-/// `{"invite": "🦆…"}`.
+/// `{"invite": "🦆…"}`. `ttl_days` defaults to and is bounded by the ONE
+/// policy every door shares (`workspace_config::{DEFAULT_INVITE_TTL_DAYS,
+/// INVITE_TTL_DAYS}`), so this route and `ducktape node invite` mint the same
+/// invite for the same request.
 ///
 /// The RUNNING node mints it because minting is a write to the node's OWN
 /// files: it folds this member's dial hint into the network descriptor and
@@ -930,7 +929,7 @@ async fn mint_invite(
     let requested = body
         .as_ref()
         .and_then(|Json(value)| value["ttl_days"].as_u64())
-        .unwrap_or(*INVITE_TTL_DAYS.start());
+        .unwrap_or(DEFAULT_INVITE_TTL_DAYS);
     if !INVITE_TTL_DAYS.contains(&requested) {
         return error_response(
             StatusCode::BAD_REQUEST,

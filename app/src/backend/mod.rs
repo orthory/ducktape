@@ -43,8 +43,6 @@ pub use ::forge::client::{
 pub use inbox::client::{BellDelta, BellItem, apply_bell_items as fold_bell_items};
 pub use pages::client::PagesDelta;
 const DEFAULT_RPC: &str = "http://127.0.0.1:8844";
-const MAX_SIGNED_PAYLOAD_BYTES: usize = 23 * 1024;
-const MAX_FRAME_HEX_BYTES: usize = 3 * 1024 * 1024;
 /// How many one-second polls the provisioning screen waits before it says the
 /// node is not running and names the command that starts it.
 const PROVISION_PATIENCE: u32 = 8;
