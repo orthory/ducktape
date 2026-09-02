@@ -61,6 +61,13 @@ pub enum AdvertOutcome {
 /// Seniority is the coordinator's own stamp, so no wire value decides who
 /// stays. Generous for any real validator mesh; a DoS backstop, not a working
 /// limit.
+///
+/// The honest consequence of youngest-eviction: past the cap the book is
+/// strict first-come-first-served. While keepalives run nothing expires, so a
+/// mesh larger than the cap never rotates and member 4097 holds no slot at
+/// all. That is the deliberate trade — a last-seen LRU would rotate, but it
+/// hands the choice back to whoever refreshes fastest, which is the attacker
+/// (an honest keepalive is 25 s apart; a sprayer picks its own rate).
 const MAX_ADVERTS: usize = 4096;
 
 pub struct AdvertBook {
@@ -164,6 +171,12 @@ impl AdvertBook {
     /// newcomer: a sprayer's next key can only displace the sprayer's own last
     /// one. It does NOT make a full book admit strangers forever — capacity is
     /// finite by design — but capacity now goes to whoever was here first.
+    ///
+    /// The case it does not cover: a key registering for the FIRST time during
+    /// a sustained spray (a fresh join, or a member whose corpse was already
+    /// reclaimed after a >TTL outage) takes the revolving newest slot and the
+    /// next spray packet displaces it, so that join retries until the flood
+    /// stops. Everyone already in the book rides it out.
     fn evict_if_full(&mut self, now: u64) {
         if self.latest.len() < MAX_ADVERTS {
             return;
