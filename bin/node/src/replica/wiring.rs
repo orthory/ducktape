@@ -403,7 +403,11 @@ pub(super) async fn wire(
                                 token_nonce.clone(),
                                 keypair.clone(),
                                 race_label.clone(),
-                                std::time::Duration::from_secs(90),
+                                // THE join window — the same clock the inviter
+                                // prunes an uncovered invite peer on.
+                                std::time::Duration::from_millis(
+                                    reachability::INVITE_JOIN_WINDOW_MS,
+                                ),
                                 race_relay.clone(),
                             )
                             .await;

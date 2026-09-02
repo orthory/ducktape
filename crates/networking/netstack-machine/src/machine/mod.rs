@@ -61,6 +61,45 @@ pub const KEEPALIVE_SECONDS: u16 = 25;
 /// ack over the punched underlay socket before the bootstrap reply fails.
 pub(crate) const INTRO_ACK_TIMEOUT_MS: u64 = 2_000;
 
+/// THE join window: how long a joiner races its invite candidates before a
+/// round is called failed (the node's first-contact race runs on it), and
+/// therefore how long an installed join-window tunnel peer that no stronger
+/// layer has covered — no plan, no standby record — stays on the interface
+/// past its last intro. An honest joiner re-introduces every poll while it
+/// races and is covered by its epoch plan within seconds of admission; an
+/// entry older than this that nothing covers is a stranger's self-minted
+/// intro or a join that failed over elsewhere, and it is pruned at the next
+/// apply. One clock for both, so the two can never disagree.
+pub const INVITE_JOIN_WINDOW_MS: u64 = 90_000;
+
+/// Ceiling on join-window tunnel peers installed at once. An intro is
+/// node-authenticated but NOT membership-checked (that needs committed
+/// state, which runs at the loop), so anyone holding a leaked invite can
+/// mint intros from fresh keypairs; without a cap every exposed member's
+/// WireGuard peer table grew at the attacker's pace until the userspace
+/// device's peer-index assert. Sized for every concurrent honest joiner a
+/// member could plausibly gate at once, not for a flood.
+pub const MAX_INVITE_PEERS: usize = 64;
+
+/// The refusal an intro earns when the join-window table is full — the
+/// reply text the inviter sends back, and the reason token it logs.
+pub const INVITE_PEERS_FULL: &str = "invite_peers_full";
+
+/// One join-window tunnel peer: its interface entry plus the step clock at
+/// its (last) intro, which is what the join-window prune counts from.
+#[derive(Debug, Clone, borsh::BorshSerialize, borsh::BorshDeserialize, borsh::BorshSchema)]
+pub(crate) struct InvitePeer {
+    pub(crate) config: PeerTunnelConfig,
+    pub(crate) installed_at_ms: u64,
+}
+
+impl InvitePeer {
+    /// Past the join window since its last intro.
+    pub(crate) fn expired_at(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.installed_at_ms) > INVITE_JOIN_WINDOW_MS
+    }
+}
+
 /// For each unordered member pair exactly ONE side runs the handshake, and
 /// both sides agree which from public data alone: the lexicographically
 /// lower identity initiates.
@@ -132,8 +171,10 @@ pub(crate) struct Driver {
     /// JOIN-WINDOW peers (see [`Event::InstallInvitePeer`]):
     /// epoch-independent, merged into every apply as the weakest layer (an
     /// entry never overrides a validated plan or a pre-warm record for the
-    /// same identity, and dissolves once one exists).
-    pub(crate) invite_peers: BTreeMap<ValidatorIdentity, PeerTunnelConfig>,
+    /// same identity, and dissolves once one exists). Bounded at
+    /// [`MAX_INVITE_PEERS`]; an uncovered entry outlives its last intro by
+    /// [`INVITE_JOIN_WINDOW_MS`] at most.
+    pub(crate) invite_peers: BTreeMap<ValidatorIdentity, InvitePeer>,
     /// the last CONTROL endpoint observed per identity — the only-on-change
     /// ledger behind [`ReachabilityEvent::ControlEndpointObserved`].
     /// deliberately epoch-independent: a cutover must not re-announce
@@ -609,23 +650,27 @@ impl Driver {
     /// live sessions outright, and a changed one can re-initiate
     /// immediately instead of deadlocking endpoint-less.
     fn merge_invite_layer(&mut self, merged: &mut BTreeMap<ValidatorIdentity, PeerTunnelConfig>) {
+        let now_ms = self.now_ms;
         self.invite_peers
             .retain(|id, invite| match merged.get_mut(id) {
                 Some(entry) => {
                     let graft = entry.endpoint.is_none()
-                        && entry.wireguard_public_key == invite.wireguard_public_key;
+                        && entry.wireguard_public_key == invite.config.wireguard_public_key;
                     if graft {
-                        entry.endpoint = invite.endpoint;
+                        entry.endpoint = invite.config.endpoint;
                     }
                     // grafting keeps the invite entry (later re-merges rebuild
                     // `merged` from the still-endpoint-less records); a concrete
                     // or re-keyed stronger entry retires it.
                     graft
                 }
-                None => true,
+                // uncovered: a joiner inside its join window keeps its tunnel
+                // (it re-introduces every poll, refreshing the clock); one no
+                // layer ever covered is pruned once the window has passed.
+                None => !invite.expired_at(now_ms),
             });
-        for (id, cfg) in &self.invite_peers {
-            merged.entry(*id).or_insert_with(|| cfg.clone());
+        for (id, invite) in &self.invite_peers {
+            merged.entry(*id).or_insert_with(|| invite.config.clone());
         }
     }
 
@@ -944,5 +989,202 @@ mod tests {
         // self-pairs never occur (a node has no tunnel to itself), and the
         // rule is strict either way.
         assert!(!initiates(low, low));
+    }
+}
+
+#[cfg(test)]
+mod invite_layer_tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use commonware_cryptography::Signer as _;
+    use commonware_cryptography::ed25519::PrivateKey;
+    use wireguard::{Endpoint, PortPolicy, Transport, X25519PublicKey};
+
+    use super::*;
+    use crate::contract::{CmdToken, Event, MachineConfig};
+
+    fn machine() -> Machine {
+        let policy = PortPolicy::production();
+        let ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 1));
+        let endpoint = |port, transport| Endpoint::new(ip, port, transport, &policy).unwrap();
+        let config = MachineConfig {
+            chain_id: "net#invite".into(),
+            wireguard_public: X25519PublicKey([1; 32]),
+            wireguard_advertised: Some(endpoint(51_820, Transport::Udp)),
+            control_endpoint: endpoint(443, Transport::Tcp),
+            coordinators: Vec::new(),
+            port_policy: policy,
+            persist: false,
+            gossip_ingress: None,
+        };
+        Machine::new(Box::new(PrivateKey::from_seed(1)), config)
+    }
+
+    fn joiner(seed: u64) -> ed25519::PublicKey {
+        PrivateKey::from_seed(seed).public_key()
+    }
+
+    /// Step one intro and, when it pushed the interface, round-trip the
+    /// push so the next event may be stepped. Returns the intro's effects.
+    fn intro(machine: &mut Machine, seed: u64, now_ms: u64) -> Vec<Effect> {
+        let octet = u8::try_from(seed % 250 + 1).unwrap();
+        let effects = machine
+            .step(
+                Event::InstallInvitePeer {
+                    token: CmdToken(seed),
+                    peer: joiner(seed),
+                    wireguard_public_key: X25519PublicKey([octet; 32]),
+                    endpoint: SocketAddr::from(([8, 8, 8, octet], 51_820)),
+                },
+                now_ms,
+            )
+            .unwrap();
+        let pushed = effects.iter().find_map(|effect| match effect {
+            Effect::WgApply { req, .. } => Some(*req),
+            _ => None,
+        });
+        if let Some(req) = pushed {
+            machine
+                .step(
+                    Event::WgApplied {
+                        req,
+                        outcome: Ok(()),
+                    },
+                    now_ms,
+                )
+                .unwrap();
+        }
+        effects
+    }
+
+    fn refusal(effects: &[Effect]) -> Option<&str> {
+        effects.iter().find_map(|effect| match effect {
+            Effect::ReplyInstall {
+                outcome: Err(reason),
+                ..
+            } => Some(reason.as_str()),
+            _ => None,
+        })
+    }
+
+    fn pushed_peers(effects: &[Effect]) -> Vec<X25519PublicKey> {
+        effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::WgApply { peers, .. } => {
+                    Some(peers.iter().map(|p| p.wireguard_public_key).collect())
+                }
+                _ => None,
+            })
+            .expect("the intro pushed the interface")
+    }
+
+    /// A full join-window table refuses the next stranger with the reason
+    /// token and pushes nothing; a peer already in the table may re-introduce.
+    #[test]
+    fn a_full_invite_table_refuses_the_next_intro() {
+        let mut machine = machine();
+        for seed in 2..2 + MAX_INVITE_PEERS as u64 {
+            assert_eq!(refusal(&intro(&mut machine, seed, 1_000)), None);
+        }
+        assert_eq!(machine.driver.invite_peers.len(), MAX_INVITE_PEERS);
+
+        let overflow = intro(&mut machine, 200, 1_000);
+        assert_eq!(refusal(&overflow), Some(INVITE_PEERS_FULL));
+        assert!(
+            !overflow
+                .iter()
+                .any(|effect| matches!(effect, Effect::WgApply { .. })),
+            "a refused intro never touches the interface"
+        );
+        assert_eq!(machine.driver.invite_peers.len(), MAX_INVITE_PEERS);
+
+        // a re-intro from an installed joiner is not a new slot.
+        assert_eq!(refusal(&intro(&mut machine, 2, 1_500)), None);
+    }
+
+    /// An uncovered entry outlives its last intro by the join window: the
+    /// next apply past it drops the peer, while a re-intro inside the window
+    /// keeps it alive.
+    #[test]
+    fn an_uncovered_invite_peer_is_pruned_after_the_join_window() {
+        let mut machine = machine();
+        intro(&mut machine, 2, 0);
+        intro(&mut machine, 3, 0);
+        // seed 3 re-introduces late in the window; seed 2 goes silent.
+        intro(&mut machine, 3, INVITE_JOIN_WINDOW_MS - 1_000);
+
+        let effects = intro(&mut machine, 4, INVITE_JOIN_WINDOW_MS + 1);
+        let peers = pushed_peers(&effects);
+        assert!(
+            !peers.contains(&X25519PublicKey([3; 32])),
+            "seed 2 aged out"
+        );
+        assert!(
+            peers.contains(&X25519PublicKey([4; 32])),
+            "seed 3 refreshed"
+        );
+        assert!(peers.contains(&X25519PublicKey([5; 32])), "seed 4 is fresh");
+        assert_eq!(machine.driver.invite_peers.len(), 2);
+    }
+
+    /// The prune is for entries NOTHING covers: a promoted member's invite
+    /// entry is grafted onto its endpoint-less record exactly as before,
+    /// however old its intro is.
+    #[test]
+    fn a_covered_invite_peer_is_never_pruned() {
+        let mut machine = machine();
+        let now_ms = 10 * INVITE_JOIN_WINDOW_MS;
+        machine.driver.now_ms = now_ms;
+        let member = ValidatorIdentity([7; 32]);
+        let stranger = ValidatorIdentity([8; 32]);
+        let fresh = ValidatorIdentity([9; 32]);
+        let invite = |octet: u8, installed_at_ms: u64| InvitePeer {
+            config: PeerTunnelConfig {
+                wireguard_public_key: X25519PublicKey([octet; 32]),
+                endpoint: Some(SocketAddr::from(([8, 8, 8, octet], 51_820))),
+                allowed_ips: Vec::new(),
+                keepalive_seconds: Some(KEEPALIVE_SECONDS),
+            },
+            installed_at_ms,
+        };
+        machine.driver.invite_peers.insert(member, invite(7, 0));
+        machine.driver.invite_peers.insert(stranger, invite(8, 0));
+        machine.driver.invite_peers.insert(fresh, invite(9, now_ms));
+
+        // the member's stronger entry: its record, endpoint-less (NAT'd).
+        let mut merged = BTreeMap::from([(
+            member,
+            PeerTunnelConfig {
+                wireguard_public_key: X25519PublicKey([7; 32]),
+                endpoint: None,
+                allowed_ips: Vec::new(),
+                keepalive_seconds: Some(KEEPALIVE_SECONDS),
+            },
+        )]);
+        machine.driver.merge_invite_layer(&mut merged);
+
+        assert_eq!(
+            merged[&member].endpoint,
+            Some(SocketAddr::from(([8, 8, 8, 7], 51_820))),
+            "the member's record is grafted with the observed intro endpoint"
+        );
+        assert!(
+            merged.contains_key(&fresh),
+            "an in-window stranger still rides"
+        );
+        assert!(
+            !merged.contains_key(&stranger),
+            "an aged-out stranger is gone"
+        );
+        assert_eq!(
+            machine
+                .driver
+                .invite_peers
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![member, fresh]
+        );
     }
 }

@@ -15,7 +15,10 @@ use crate::contract::{CmdToken, Effect, ReachabilityEvent, ReqId};
 use crate::epoch::EpochState;
 
 use super::pending::{PendingOp, WgCont};
-use super::{Driver, INTRO_ACK_TIMEOUT_MS, KEEPALIVE_SECONDS};
+use super::{
+    Driver, INTRO_ACK_TIMEOUT_MS, INVITE_PEERS_FULL, InvitePeer, KEEPALIVE_SECONDS,
+    MAX_INVITE_PEERS,
+};
 
 impl Driver {
     /// Install a join-window tunnel peer (node-authenticated; see the
@@ -62,15 +65,29 @@ impl Driver {
         if identity == self.me {
             return Err("refusing an invite tunnel to self".into());
         }
+        // the join-window table is bounded: entries past the window make room
+        // first, a re-intro refreshes its own slot, and a full table refuses
+        // the intro — the reply text IS the reason token the inviter logs.
+        let now_ms = self.now_ms;
+        self.invite_peers
+            .retain(|_, invite| !invite.expired_at(now_ms));
+        let re_intro = self.invite_peers.contains_key(&identity);
+        let table_full = self.invite_peers.len() >= MAX_INVITE_PEERS;
+        if table_full && !re_intro {
+            return Err(INVITE_PEERS_FULL.into());
+        }
         let allowed_ips = self.overlay.identity_allowed_ips(identity);
         self.invite_peers.insert(
             identity,
-            PeerTunnelConfig {
-                wireguard_public_key,
-                // the intro datagram's observed source — always concrete.
-                endpoint: Some(endpoint),
-                allowed_ips,
-                keepalive_seconds: Some(KEEPALIVE_SECONDS),
+            InvitePeer {
+                config: PeerTunnelConfig {
+                    wireguard_public_key,
+                    // the intro datagram's observed source — always concrete.
+                    endpoint: Some(endpoint),
+                    allowed_ips,
+                    keepalive_seconds: Some(KEEPALIVE_SECONDS),
+                },
+                installed_at_ms: now_ms,
             },
         );
         let merged = match epoch {
