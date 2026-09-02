@@ -51,8 +51,16 @@ const GIT_RECEIVE_PACK_CAPS: &str =
 const GIT_UPLOAD_PACK_CAPS: &str =
     "multi_ack_detailed side-band-64k thin-pack ofs-delta agent=ducktape-forge/0.1";
 /// the body cap for a git packfile POST — push (whole-repo pack) and fetch
-/// (want/have negotiation). lifted far above the json/chunk defaults.
-pub const GIT_PACK_BODY_LIMIT: usize = 512 * 1024 * 1024;
+/// (want/have negotiation). sized to what the relay lane can DELIVER, not to
+/// the disk: a validator-bound pack fans out as 768 KiB chunks plus one offer
+/// into a 128-message inbound backlog that commonware DROPS on when full (the
+/// peer actor never blocks; bin/node's relay bridge is a 64-slot `try_send`
+/// on top), and nothing retransmits a dropped chunk — a pack past 127 chunks
+/// would not be refused but would hang its pusher for the whole transfer
+/// allowance with the pack pinned in memory. `bin/node/src/relay.rs` pins
+/// this under that backlog; this repository's own full-history pack (83 MiB)
+/// fits.
+pub const GIT_PACK_BODY_LIMIT: usize = 127 * 768 * 1024;
 /// max PACK bytes per side-band-64k data pkt-line: prefixed with the 1-byte band
 /// id, plus the 4-byte pkt length header, this yields a 65520-byte line — git's
 /// `LARGE_PACKET_MAX`, the ceiling a side-band-64k client accepts.

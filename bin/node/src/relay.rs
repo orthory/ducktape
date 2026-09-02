@@ -29,17 +29,26 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 /// Forge packs relayed by a resident or fanned out by a validator are bounded
-/// at exactly the smart-HTTP lane's ceiling: a pack the door accepted, hashed
-/// and stored is one the relay carries. The two were separate numbers once
-/// (64 MiB here, 512 MiB there) and this repository's own full-history pack —
-/// 83 MiB — was refused by the relay after the door had taken it in. The wire
-/// is chunked (`RELAY_BLOB_CHUNK_BYTES`), so the cap is a per-pack policy
-/// number, not a transport limit.
+/// at exactly the smart-HTTP lane's ceiling (`noded::GIT_PACK_BODY_LIMIT`):
+/// a pack the door accepted, hashed and stored is one the relay carries. The
+/// two were separate numbers once (64 MiB here, 512 MiB there) and this
+/// repository's own 83 MiB pack was refused by the relay after the door had
+/// taken it in. The shared number is sized by THIS lane: every chunk of a
+/// pack crosses a 128-message inbound backlog (`constants::MAX_BACKLOG`)
+/// that the p2p peer actor DROPS on when full, with no chunk retransmit —
+/// the pins below keep one offer plus a max-size pack's chunks inside it.
 pub const MAX_RELAY_BLOB_BYTES: usize = noded::GIT_PACK_BODY_LIMIT;
 
 /// 768 KiB raw -> 1.5 MiB hex plus a small JSON envelope, safely below the
 /// process-wide 2 MiB commonware message cap.
 pub const RELAY_BLOB_CHUNK_BYTES: usize = 768 * 1024;
+
+// every chunk of a max-size pack plus its one offer fits the inbound backlog
+// the chunks are delivered through — a DROP boundary, not a backpressure one.
+const RELAY_MESSAGES_PER_PACK: usize = MAX_RELAY_BLOB_BYTES.div_ceil(RELAY_BLOB_CHUNK_BYTES) + 1;
+const _: () = assert!(RELAY_MESSAGES_PER_PACK <= crate::constants::MAX_BACKLOG);
+// this repository's own full-history pack (83 MiB) fits.
+const _: () = assert!(MAX_RELAY_BLOB_BYTES >= 83 * 1024 * 1024);
 
 /// The extra hold a forge pack transfer earns on top of `SUBMIT_HOLD`,
 /// budgeted at a 1 MiB/s floor over the bytes that actually cross the wire:
@@ -289,16 +298,10 @@ mod tests {
         );
         assert_eq!(
             blob_transfer_allowance(MAX_RELAY_BLOB_BYTES as u64, 1),
-            Duration::from_secs(1024),
-            "the relay cap bounds a single-target allowance"
+            Duration::from_secs(191),
+            "the relay cap (95.25 MiB, 190.5 MiB of hex) bounds a single-target allowance"
         );
     }
-
-    /// The relay cap IS the smart-HTTP body limit: the door and the fan-out
-    /// can never again disagree about how large a pack the forge takes.
-    const _: () = assert!(MAX_RELAY_BLOB_BYTES == noded::GIT_PACK_BODY_LIMIT);
-    // this repository's own full-history pack (83 MiB) fits.
-    const _: () = assert!(MAX_RELAY_BLOB_BYTES >= 83 * 1024 * 1024);
 
     /// A pack the door accepts is a pack the assembly accepts, right up to
     /// the shared limit — and not one byte past it.
