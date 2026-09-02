@@ -1,0 +1,87 @@
+# ducktape-service@<kind> — one first-party service daemon, supervised.
+#
+# The instance is the kind `ducktape service run` takes: compute, agent or
+# airlock. The daemon signals to the node over its loopback HTTP surface,
+# offers to enable itself, and serves the plane the kind names. It reads the
+# grant (`services.toml`) once at boot:
+#
+#   1. start the node        systemctl start ducktape-node@mynet
+#   2. start the daemon      systemctl start ducktape-service@compute
+#      (it signals, prints "not enabled", and parks — consent is the
+#      operator's, never the unit's)
+#   3. consent, once         sudo -u ducktape DUCKTAPE_HOME=/var/lib/ducktape \
+#                              ducktape service enable compute
+#   4. pick up the grant     systemctl restart ducktape-service@compute
+#
+# For unattended provisioning put `DUCKTAPE_SERVICE_ARGS=--enable` in
+# /etc/ducktape/node.env and skip steps 3–4: `--enable` mints the grant
+# without asking.
+#
+# `service run` exits loudly when the node is down or has not yet published
+# its mesh identity (`ducktape node status` shows it) — it never spins. The
+# restart policy below is what turns that into "wait for the node": a boot
+# that co-starts both units converges within a few RestartSec. To order it
+# after one node, add a drop-in:
+#   systemctl edit ducktape-service@compute
+#   [Unit]
+#   After=ducktape-node@mynet.service
+#   BindsTo=ducktape-node@mynet.service
+#
+# With exactly one workspace registered under DUCKTAPE_HOME no selector is
+# needed; with several, put `-n <chain-id>` in DUCKTAPE_SERVICE_ARGS.
+# The daemon logs to <workspace>/<kind>.log (tee'd from stderr).
+[Unit]
+Description=Ducktape service daemon (%i)
+Documentation=https://github.com/orthory/ducktape/blob/dev/docs/deploy/node-service.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ducktape
+Group=ducktape
+# compute and agent boot a Firecracker microVM per run over /dev/kvm.
+SupplementaryGroups=kvm
+StateDirectory=ducktape
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/ducktape
+# the per-run vsock socket dir — short on purpose (SUN_LEN).
+RuntimeDirectory=ducktape-service/%i
+Environment=DUCKTAPE_HOME=/var/lib/ducktape
+Environment=XDG_RUNTIME_DIR=/run/ducktape-service/%i
+EnvironmentFile=-/etc/ducktape/node.env
+ExecStart=/usr/local/bin/ducktape service run %i $DUCKTAPE_SERVICE_ARGS
+# SIGTERM is the daemon's teardown path (it retracts its gateway route).
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+# ---- least privilege (same posture as ducktape-node@) --------------------
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+# Run images live under TMPDIR and are as large as a run's inputs; keep
+# /tmp private, and point TMPDIR at a disk with room via node.env if /tmp
+# is tmpfs.
+PrivateTmp=yes
+DevicePolicy=closed
+DeviceAllow=/dev/kvm rw
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

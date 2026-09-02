@@ -1,0 +1,88 @@
+# ducktape-node@<network> — one workspace's node, supervised.
+#
+# The instance is the workspace selector `ducktape node run -n` takes: a
+# registered chain id or any unique prefix of it (`ducktape node list`). A
+# chain id carries `#`, which a unit name cannot, so either use the name
+# prefix (`ducktape-node@mynet`) or escape the full id
+# (`systemctl start "ducktape-node@$(systemd-escape 'mynet#d0cdf950')"`).
+#
+# Everything the node keeps lives under DUCKTAPE_HOME (/var/lib/ducktape, the
+# StateDirectory): workspaces/<chain-id>/{node.toml,network.toml,identity.key,
+# storage/,daemon.log}, modules/, executors/, keys/. See
+# docs/deploy/node-service.md for install, ports, logs and backup.
+#
+# Hardening mirrors ops/coordinator/ducktape-coordinator.service where the
+# node can bear it. The differences are deliberate, and each is named below:
+# the node holds a key and writes state, runs wasm through a JIT, and the
+# compute plane needs /dev/kvm and a unix socket per microVM.
+[Unit]
+Description=Ducktape node (%i)
+Documentation=https://github.com/orthory/ducktape/blob/dev/docs/deploy/node-service.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ducktape
+Group=ducktape
+# /dev/kvm is group-owned by kvm on every mainstream distro; the sandbox
+# probe opens it read-write at boot and refuses the compute plane otherwise.
+SupplementaryGroups=kvm
+# /var/lib/ducktape, created and chowned by systemd; DUCKTAPE_HOME points the
+# registry, the module set and the executor dir at it.
+StateDirectory=ducktape
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/ducktape
+# /run/ducktape-node/<instance>: the per-run microVM vsock socket goes here
+# (a unix socket path is capped near 108 bytes, and the state dir is too long).
+RuntimeDirectory=ducktape-node/%i
+Environment=DUCKTAPE_HOME=/var/lib/ducktape
+Environment=XDG_RUNTIME_DIR=/run/ducktape-node/%i
+# Optional: RUST_LOG, a TMPDIR on a disk with room for run images, extra
+# flags in DUCKTAPE_NODE_ARGS. The file is not required.
+EnvironmentFile=-/etc/ducktape/node.env
+ExecStart=/usr/local/bin/ducktape node run -n %i $DUCKTAPE_NODE_ARGS
+# SIGTERM takes the graceful path: a final checkpoint + journal barrier. Give
+# it time; a hard kill lands on WAL-forward recovery at the next boot.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+Restart=always
+RestartSec=3
+# The node raises its own soft limit to 65536; the hard limit must allow it.
+LimitNOFILE=65536
+
+# ---- least privilege ----------------------------------------------------
+NoNewPrivileges=yes
+# The node needs no capability: every listener is above 1024
+# (8844/8845/8846/51820/51821) and the WireGuard plane is userspace.
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Writable: the state and runtime dirs only (systemd adds both).
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# NOT PrivateDevices: the Firecracker sandbox opens /dev/kvm. `closed` keeps
+# the standard pseudo devices (null, zero, urandom, ptmx) and nothing else.
+DevicePolicy=closed
+DeviceAllow=/dev/kvm rw
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+# NOT MemoryDenyWriteExecute: wasmtime JIT-compiles module code.
+# AF_UNIX for the microVM vsock backend and the local rpc; AF_NETLINK for
+# interface enumeration (getifaddrs) the reachability plane needs.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+# No SystemCallFilter / RestrictNamespaces: the node execs a VMM (firecracker)
+# per run and neither was ever exercised under a filter. Add them only after
+# a run has been observed under them.
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
