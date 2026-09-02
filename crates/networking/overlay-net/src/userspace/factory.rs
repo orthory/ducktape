@@ -142,7 +142,7 @@ impl DatagramSocket for RebindingVirtualDatagramSocket {
                         stalled += 1;
                         if stalled == 1 || stalled.is_multiple_of(30) {
                             tracing::warn!(
-                                target: "ducktape::overlay",
+                                target: "ducktape::dataplane",
                                 reason = "datagram_send_stalled",
                                 attempts = stalled,
                                 "overlay datagram send has not completed"

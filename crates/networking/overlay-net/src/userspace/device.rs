@@ -62,7 +62,7 @@ pub(super) fn note_drop(counter: &AtomicU64, reason: &'static str) {
     let dropped = counter.fetch_add(1, Ordering::Relaxed) + 1;
     if dropped == 1 || dropped.is_multiple_of(1024) {
         tracing::warn!(
-            target: "ducktape::overlay",
+            target: "ducktape::dataplane",
             reason,
             dropped,
             "overlay packet dropped"
@@ -390,7 +390,7 @@ impl PeerState {
         }
         let endpoint = *self.endpoint.read().expect("endpoint lock poisoned");
         tracing::warn!(
-            target: "ducktape::overlay",
+            target: "ducktape::dataplane",
             peer = %self.overlay_ip(),
             endpoint = ?endpoint,
             reason = "handshake_unanswered",
@@ -406,7 +406,7 @@ impl PeerState {
         }
         let endpoint = *self.endpoint.read().expect("endpoint lock poisoned");
         tracing::info!(
-            target: "ducktape::overlay",
+            target: "ducktape::dataplane",
             peer = %self.overlay_ip(),
             endpoint = ?endpoint,
             "wg session RE-ESTABLISHED"

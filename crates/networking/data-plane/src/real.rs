@@ -264,7 +264,7 @@ impl OverlaySockets {
         let dropped = self.unknown_sources.fetch_add(1, Ordering::Relaxed) + 1;
         if dropped == 1 || dropped.is_multiple_of(1000) {
             tracing::warn!(
-                target: "ducktape::plane",
+                target: "ducktape::dataplane",
                 %src,
                 dropped,
                 reason = "unknown_source",
