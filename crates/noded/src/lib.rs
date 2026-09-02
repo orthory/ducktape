@@ -465,6 +465,7 @@ impl ModuleCategory {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubmitRequest {
     pub target: String,
     /// the module's `*Msg` enum as a json value — encoded verbatim into `Msg.payload`.
@@ -480,6 +481,7 @@ pub struct SubmitRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryRequest {
     pub target: String,
     /// the module's `*Query` enum as a json value.
