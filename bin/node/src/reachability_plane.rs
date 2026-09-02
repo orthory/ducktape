@@ -148,16 +148,24 @@ where
             ack(sealed_reply(reply)).await;
         }
         Ok(Err(e)) => {
-            if let Some(attempts) = INSTALL_REFUSED.hit("invite_peer_install_refused") {
+            // a full join-window table is its own reason (the machine's reply
+            // text IS the token); every other refusal shares one — so the
+            // latch, and the count it carries, are per cause.
+            let table_full = e == reachability::INVITE_PEERS_FULL;
+            let reason = if table_full {
+                reachability::INVITE_PEERS_FULL
+            } else {
+                "invite_peer_install_refused"
+            };
+            if let Some(attempts) = INSTALL_REFUSED.hit(reason) {
                 tracing::warn!(
                     target: "ducktape::join",
                     node = %label,
                     peer = %config::hex_bytes(&verified.joiner.as_ref()[..4]),
-                    reason = "invite_peer_install_refused",
+                    reason,
                     detail = %e,
                     attempts,
-                    "invite intro tunnel peer REFUSED — the plane would not install it \
-                     (a full join-window table says `invite_peers_full`)"
+                    "invite intro tunnel peer REFUSED — the plane would not install it"
                 );
             }
             ack(sealed_reply(join_gate::IntroReply::Refused { detail: e })).await;
