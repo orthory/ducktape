@@ -43,6 +43,7 @@ pub(crate) const FILES_MODULE: &str = "files";
 /// /v1/submit.
 pub(crate) async fn files_submit(
     handle: &NodeHandle,
+    op: &'static str,
     payload: Vec<u8>,
 ) -> Result<BlockSummary, Response> {
     let (reply, rx) = oneshot::channel();
@@ -56,9 +57,72 @@ pub(crate) async fn files_submit(
         .await?;
     match rx.await {
         Ok(Ok(block)) => Ok(block),
-        Ok(Err(err)) => Err(error_response(StatusCode::BAD_REQUEST, &err)),
+        Ok(Err(err)) => {
+            // the module's refusal, on the files plane: the http funnel logs
+            // the 400 at debug; this carries the reason a dashboard counts.
+            tracing::warn!(
+                target: "ducktape::files",
+                op,
+                origin = DEFAULT_ORIGIN,
+                reason = refusal_reason(&err),
+                error = %err,
+                "files op refused"
+            );
+            Err(error_response(StatusCode::BAD_REQUEST, &err))
+        }
         Err(_) => Err(actor_gone()),
     }
+}
+
+/// one refused body on the duckfs lane: the DefaultBodyLimit layer rejects
+/// past the route's cap with 413 before any handler runs, and that refusal
+/// gets the plane's reason too (`over_cap` names which cap).
+fn body_refused(op: &'static str, over_cap: &'static str, rejection: &BytesRejection) -> Response {
+    let is_over_cap = rejection.status() == StatusCode::PAYLOAD_TOO_LARGE;
+    let reason = if is_over_cap {
+        over_cap
+    } else {
+        "body_unreadable"
+    };
+    tracing::warn!(
+        target: "ducktape::files",
+        op,
+        origin = DEFAULT_ORIGIN,
+        reason,
+        detail = %rejection.body_text(),
+        "files op refused"
+    );
+    error_response(rejection.status(), &rejection.body_text())
+}
+
+/// the `reason` behind a files-module rejection: the module answers in prose
+/// (`files: staging quota exceeded`), the plane counts tokens.
+fn refusal_reason(message: &str) -> &'static str {
+    const KNOWN: &[(&str, &str)] = &[
+        ("quota exceeded", "quota_exceeded"),
+        ("exceeds the change cap", "too_many_changes"),
+        ("chunk exceeds", "chunk_over_size"),
+        ("is not the home owner", "bad_owner"),
+        ("root is not writable", "bad_owner"),
+        ("only the pin owner", "bad_owner"),
+        ("module-origin only", "bad_owner"),
+        ("outside /home and /shared", "path_outside_roots"),
+        ("changed since base", "cas_conflict"),
+        ("not resolvable", "snapshot_not_resolvable"),
+    ];
+    crate::log::reason_of(message, KNOWN, "rejected")
+}
+
+/// one landed commit — the lane's lifecycle fact. the snapshot id is minted
+/// module-side and the submit reply is the block, so the block names it here.
+fn commit_landed(block: &BlockSummary, changes: usize) {
+    tracing::info!(
+        target: "ducktape::files",
+        event = "files_commit_landed",
+        height = block.height,
+        changes,
+        "files commit landed"
+    );
 }
 
 /// run a files query over the actor seam and decode the typed reply. a module
@@ -121,10 +185,17 @@ pub(crate) async fn files_stage(
         Ok(bytes) => bytes,
         // the DefaultBodyLimit layer stops reading past CHUNK_SIZE and rejects
         // with 413 — re-wrap it in the json envelope.
-        Err(rejection) => return error_response(rejection.status(), &rejection.body_text()),
+        Err(rejection) => return body_refused("stage", "chunk_over_size", &rejection),
     };
+    tracing::debug!(
+        target: "ducktape::files",
+        op = "stage",
+        origin = DEFAULT_ORIGIN,
+        bytes = bytes.len(),
+        "files op"
+    );
     let digest = to_hex(&object_id(Kind::Chunk, &bytes));
-    match files_submit(&handle, encode_putblob(&bytes)).await {
+    match files_submit(&handle, "stage", encode_putblob(&bytes)).await {
         Ok(_) => Json(serde_json::json!({ "digest": digest })).into_response(),
         Err(resp) => resp,
     }
@@ -150,13 +221,25 @@ pub(crate) async fn files_commit(
     State(handle): State<NodeHandle>,
     Json(body): Json<CommitBody>,
 ) -> Response {
+    let changes = body.changes.len();
     let payload = encode_msg(&FilesMsg::Commit {
         base_snapshot: body.base_snapshot,
         message: body.message,
         changes: body.changes,
     });
-    match files_submit(&handle, payload).await {
-        Ok(block) => Json(block).into_response(),
+    tracing::debug!(
+        target: "ducktape::files",
+        op = "commit",
+        origin = DEFAULT_ORIGIN,
+        paths = changes,
+        bytes = payload.len(),
+        "files op"
+    );
+    match files_submit(&handle, "commit", payload).await {
+        Ok(block) => {
+            commit_landed(&block, changes);
+            Json(block).into_response()
+        }
         Err(resp) => resp,
     }
 }
@@ -177,7 +260,14 @@ pub(crate) async fn files_pin(
         snapshot: body.snapshot,
         name: body.name,
     });
-    match files_submit(&handle, payload).await {
+    tracing::debug!(
+        target: "ducktape::files",
+        op = "pin",
+        origin = DEFAULT_ORIGIN,
+        bytes = payload.len(),
+        "files op"
+    );
+    match files_submit(&handle, "pin", payload).await {
         Ok(block) => Json(block).into_response(),
         Err(resp) => resp,
     }
@@ -202,7 +292,7 @@ pub(crate) async fn files_watch(
         prefix: body.prefix,
         module_id: body.module_id,
     });
-    match files_submit(&handle, payload).await {
+    match files_submit(&handle, "watch", payload).await {
         Ok(block) => Json(block).into_response(),
         Err(resp) => resp,
     }
@@ -529,9 +619,17 @@ pub(crate) async fn object_put(
 ) -> Response {
     let bytes = match body {
         Ok(bytes) => bytes,
-        Err(rejection) => return error_response(rejection.status(), &rejection.body_text()),
+        Err(rejection) => return body_refused("put", "object_over_cap", &rejection),
     };
     let path = object_path(&rest);
+    tracing::debug!(
+        target: "ducktape::files",
+        op = "put",
+        origin = DEFAULT_ORIGIN,
+        paths = 1,
+        bytes = bytes.len(),
+        "files op"
+    );
     let base_snapshot = match head_snapshot(&handle).await {
         Ok(head) => head,
         Err(resp) => return resp,
@@ -546,7 +644,7 @@ pub(crate) async fn object_put(
         let mut chunks = Vec::with_capacity(bytes.len().div_ceil(duckfs_core::CHUNK_SIZE as usize));
         for chunk in bytes.chunks(duckfs_core::CHUNK_SIZE as usize) {
             let digest = to_hex(&object_id(Kind::Chunk, chunk));
-            if let Err(resp) = files_submit(&handle, encode_putblob(chunk)).await {
+            if let Err(resp) = files_submit(&handle, "stage", encode_putblob(chunk)).await {
                 return resp;
             }
             chunks.push(digest);
@@ -567,8 +665,11 @@ pub(crate) async fn object_put(
             content,
         }],
     });
-    match files_submit(&handle, payload).await {
-        Ok(block) => Json(block).into_response(),
+    match files_submit(&handle, "commit", payload).await {
+        Ok(block) => {
+            commit_landed(&block, 1);
+            Json(block).into_response()
+        }
         Err(resp) => resp,
     }
 }
@@ -611,6 +712,14 @@ pub(crate) async fn object_get(
                 return error_response(StatusCode::BAD_REQUEST, "not an object (not a file)");
             }
             if entry.size > MAX_OBJECT_BYTES as u64 {
+                tracing::warn!(
+                    target: "ducktape::files",
+                    op = "get",
+                    origin = DEFAULT_ORIGIN,
+                    reason = "object_over_cap",
+                    bytes = entry.size,
+                    "files op refused"
+                );
                 return error_response(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "object exceeds the facade cap; read it ranged via /v1/files/read",
@@ -683,8 +792,11 @@ pub(crate) async fn object_delete(
         message: format!("rm {path}"),
         changes: vec![Change::Rm { path }],
     });
-    match files_submit(&handle, payload).await {
-        Ok(block) => Json(block).into_response(),
+    match files_submit(&handle, "commit", payload).await {
+        Ok(block) => {
+            commit_landed(&block, 1);
+            Json(block).into_response()
+        }
         Err(resp) => resp,
     }
 }
