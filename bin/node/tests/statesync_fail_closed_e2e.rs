@@ -52,17 +52,15 @@ fn a_non_standing_peer_is_refused_statesync() {
         "the founder's write to finalize",
         Duration::from_secs(30),
         || {
-            // `tasks` has no point read on the consensus tier (`TaskQuery::List`
-            // is its only variant), so the write is confirmed by listing the
-            // board and finding the id.
+            let req = encode_task_query(&TaskQuery::Get {
+                task_id: "secret".into(),
+            });
             cluster
-                .query(0, "tasks", &encode_task_query(&TaskQuery::List))
+                .query(0, "tasks", &req)
                 .and_then(|raw| decode_task_reply(&raw).ok())
                 .and_then(|r| match r {
-                    TaskReply::Tasks(board) => board
-                        .iter()
-                        .any(|t| t.id == "secret" && t.title == "chain-state")
-                        .then_some(()),
+                    TaskReply::Task(task) => task.filter(|t| t.title == "chain-state").map(|_| ()),
+                    TaskReply::Tasks(_) => None,
                 })
         },
     );

@@ -44,13 +44,14 @@ fn task_create(task_id: &str, title: &str) -> Vec<u8> {
     })
 }
 
-/// `tasks` has no point read on the consensus tier (`TaskQuery::List` is its
-/// only variant), so a title lookup lists the board and finds the id.
 fn task_title(cluster: &Cluster, idx: usize, task_id: &str) -> Option<String> {
-    let reply = cluster.query(idx, "tasks", &encode_task_query(&TaskQuery::List))?;
+    let req = encode_task_query(&TaskQuery::Get {
+        task_id: task_id.into(),
+    });
+    let reply = cluster.query(idx, "tasks", &req)?;
     match decode_task_reply(&reply) {
-        Ok(TaskReply::Tasks(board)) => board.into_iter().find(|t| t.id == task_id).map(|t| t.title),
-        Err(_) => None,
+        Ok(TaskReply::Task(task)) => task.map(|t| t.title),
+        _ => None,
     }
 }
 

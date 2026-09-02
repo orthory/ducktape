@@ -46,15 +46,35 @@ pub enum TaskMsg {
     UpdateStatus { task_id: String, status: TaskStatus },
 }
 
+/// the task board's reads. BOTH are bounded: `Get` is one record, `List` one
+/// page — an unpaged board walk on a consensus caller's execute path is what
+/// the wasm store-read budget kills.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskQuery {
-    List,
+    /// one task by id — the existence/point read another module's `execute`
+    /// path wants. an absent id answers `Task(None)`.
+    Get { task_id: String },
+    /// one page in ascending id order: at most `limit` tasks (clamped into
+    /// `1..=`[`crate::MAX_LIST_LIMIT`]) whose ids sort strictly after `after`.
+    /// page by handing the last returned id back as the next `after`.
+    ///
+    /// `limit` is REQUIRED — a caller that does not say how much of the board
+    /// it wants is the unbounded read this page exists to replace, and a
+    /// defaulted 0 would clamp to 1 and read as an empty board. `after` is the
+    /// continuation, absent on the first page.
+    List {
+        limit: u64,
+        #[serde(default)]
+        after: Option<String>,
+    },
 }
 
+/// replies to [`TaskQuery`].
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskReply {
+    Task(Option<Task>),
     Tasks(Vec<Task>),
 }
 

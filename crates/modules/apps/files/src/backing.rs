@@ -78,6 +78,9 @@ pub struct FilesOdbBacking {
     /// gc watermark (per-node bookkeeping); persisted in the refs envelope,
     /// threaded through [`commit_refs`] identically to native.
     gc_watermark: u64,
+    /// latch for the skipped-sweep warn, threaded through [`commit_refs`]
+    /// identically to native. per-node observability only.
+    gc_faulted: bool,
     /// objects staged this block via [`HostOdb::stage_put`], flushed at
     /// [`OdbBacking::publish_block`]. the kernel-side twin of native's
     /// `Pending::objects`; nothing here reaches disk until publish.
@@ -113,6 +116,7 @@ impl FilesOdbBacking {
             refs_store,
             durable_height,
             gc_watermark,
+            gc_faulted: false,
             pending_objects: Vec::new(),
             pending_height: 0,
         })
@@ -187,6 +191,7 @@ impl OdbBacking for FilesOdbBacking {
             refs,
             self.pending_height,
             self.gc_watermark,
+            &mut self.gc_faulted,
         )?;
         self.durable_height = Some(self.pending_height);
         Ok(())

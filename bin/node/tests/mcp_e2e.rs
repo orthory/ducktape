@@ -346,7 +346,7 @@ fn a_run_with_no_agent_can_read_but_never_write() {
     let (is_error, text) = content(&refused);
     assert!(is_error, "an agentless write must refuse: {text}");
 
-    let reply = h.query("tasks", json!({"task": "list"}));
+    let reply = h.query("tasks", json!({"task": {"list": {"limit": 256}}}));
     assert_eq!(
         reply["task"]["tasks"].as_array().unwrap().len(),
         1,

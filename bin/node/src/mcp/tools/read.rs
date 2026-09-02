@@ -95,9 +95,10 @@ pub(super) fn tools() -> Vec<Tool> {
         },
         Tool {
             name: "ducktape_tasks",
-            description: "List every task with its id, title and status (open, in_progress, \
-                          done).",
-            schema: || schema(&[]),
+            description: "Read one bounded page of tasks — id, title and status (open, \
+                          in_progress, done) — in ascending id order. Pass the last id you saw \
+                          as after to continue.",
+            schema: tasks_list_schema,
             handler: tasks_list,
         },
         Tool {
@@ -261,9 +262,15 @@ fn chat_messages(run: &Run, args: &Value) -> Result<Value> {
     run.node.view(TARGET_CHAT, query)
 }
 
-fn tasks_list(run: &Run, _args: &Value) -> Result<Value> {
-    run.node
-        .query(TARGET_TASKS, encode(&WorkQuery::Task(TaskQuery::List))?)
+fn tasks_list(run: &Run, args: &Value) -> Result<Value> {
+    // the board's page bound is its own (`tasks::MAX_LIST_LIMIT`, 256) and it
+    // clamps whatever arrives; the pages cursor/limit parsing carries the same
+    // shape and the same 1..=256 range, so it is reused verbatim.
+    let query = WorkQuery::Task(TaskQuery::List {
+        limit: u64::from(page_limit(args)?),
+        after: page_cursor(args)?,
+    });
+    run.node.query(TARGET_TASKS, encode(&query)?)
 }
 
 fn pages_list(run: &Run, args: &Value) -> Result<Value> {
@@ -378,6 +385,31 @@ fn bounded_list_schema() -> Value {
 
 fn page_list_schema() -> Value {
     page_read_schema(&[])
+}
+
+/// the task board's page args. same shape and same 1..=256 bound as the pages
+/// reader, but the cursor is a task ID (the last one of the previous page), not
+/// a `next_after` the reply carries.
+fn tasks_list_schema() -> Value {
+    let mut value = schema(&[
+        (
+            "after",
+            "string",
+            false,
+            "Exclusive cursor: the last task id of the previous page.",
+        ),
+        (
+            "limit",
+            "integer",
+            false,
+            "Tasks to return (default and maximum 256).",
+        ),
+    ]);
+    value["properties"]["limit"]["minimum"] = json!(1);
+    value["properties"]["limit"]["maximum"] = json!(tasks::MAX_LIST_LIMIT);
+    value["properties"]["limit"]["default"] = json!(tasks::MAX_LIST_LIMIT);
+    value["additionalProperties"] = Value::Bool(false);
+    value
 }
 
 fn page_get_schema() -> Value {
@@ -513,8 +545,12 @@ mod tests {
             json!({"pr_diff": {"repo": "app", "number": 8}})
         );
         assert_eq!(
-            encode(&WorkQuery::Task(TaskQuery::List)).unwrap(),
-            json!({"task": "list"})
+            encode(&WorkQuery::Task(TaskQuery::List {
+                limit: 8,
+                after: Some("t-3".into()),
+            }))
+            .unwrap(),
+            json!({"task": {"list": {"limit": 8, "after": "t-3"}}})
         );
         serde_json::from_value::<pages::index::PagesViewQuery>(
             json!({"list_pages": {"after": "page-8", "limit": 8}}),

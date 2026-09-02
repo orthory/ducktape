@@ -38,30 +38,37 @@ fn update(task_id: &str, status: TaskStatus) -> Msg {
     })
 }
 
-async fn module_tasks(tasks: &Tasks) -> Vec<tasks::Task> {
-    match decode_reply(
-        &tasks
-            .query(&encode_query(&TaskQuery::List))
-            .await
-            .expect("query tasks"),
-    )
-    .expect("decode reply")
-    {
-        TaskReply::Tasks(tasks) => tasks,
+/// the whole board as ONE page — every test board here is far under the clamp.
+fn whole_board() -> TaskQuery {
+    TaskQuery::List {
+        limit: tasks::MAX_LIST_LIMIT,
+        after: None,
     }
 }
 
-async fn host_tasks(host: &Host) -> Vec<tasks::Task> {
-    match decode_reply(
-        &host
-            .query(TASKS, &encode_query(&TaskQuery::List))
+fn page_of(reply: &[u8]) -> Vec<tasks::Task> {
+    let TaskReply::Tasks(tasks) = decode_reply(reply).expect("decode reply") else {
+        panic!("a list answers a page");
+    };
+    tasks
+}
+
+async fn module_tasks(tasks: &Tasks) -> Vec<tasks::Task> {
+    page_of(
+        &tasks
+            .query(&encode_query(&whole_board()))
             .await
             .expect("query tasks"),
     )
-    .expect("decode reply")
-    {
-        TaskReply::Tasks(tasks) => tasks,
-    }
+}
+
+async fn host_tasks(host: &Host) -> Vec<tasks::Task> {
+    page_of(
+        &host
+            .query(TASKS, &encode_query(&whole_board()))
+            .await
+            .expect("query tasks"),
+    )
 }
 
 // tasks' execute reads only env (consensus_time); me/height are cosmetic, so

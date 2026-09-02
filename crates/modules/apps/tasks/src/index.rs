@@ -1,9 +1,9 @@
 //! tasks' read model: task-board columns AND the job board's enumeration —
 //! by-status listing, kind-filtered job pages, and the per-status census.
 //!
-//! canonical tasks state serves dispatch point reads (the unpaged task
-//! `List` other modules' execute() paths consume, and `JobsQuery::Get`);
-//! everything a human enumerates folds here.
+//! canonical tasks state serves dispatch POINT reads (`TaskQuery::Get` and
+//! `JobsQuery::Get`, plus the bounded `TaskQuery::List` page); everything a
+//! human enumerates folds here.
 //!
 //! key spaces (inside tasks' per-module index database):
 //! - `task/{task_id}`             — the current [`TaskRow`].

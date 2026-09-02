@@ -191,7 +191,23 @@ impl Ctx for CaptureCtx {
                     )))
                 }
             },
-            TASKS => Ok(tasks_encode_reply(&TaskReply::Tasks(self.tasks.clone()))),
+            // the board answers the SAME two reads the real module does; the
+            // duplicate probe uses the by-id `Get`.
+            TASKS => match tasks::decode_task_query(req).map_err(Error::Module)? {
+                TaskQuery::Get { task_id } => Ok(tasks_encode_reply(&TaskReply::Task(
+                    self.tasks.iter().find(|t| t.id == task_id).cloned(),
+                ))),
+                TaskQuery::List { limit, after } => {
+                    let page = self
+                        .tasks
+                        .iter()
+                        .filter(|t| after.as_deref().is_none_or(|cursor| t.id.as_str() > cursor))
+                        .take(limit.clamp(1, tasks::MAX_LIST_LIMIT) as usize)
+                        .cloned()
+                        .collect();
+                    Ok(tasks_encode_reply(&TaskReply::Tasks(page)))
+                }
+            },
             other => Err(Error::UnknownModule(other.into())),
         }
     }
