@@ -496,7 +496,7 @@ pub struct InitArgs {
     #[arg(long, value_name = "DIR")]
     pub dir: Option<PathBuf>,
     /// directory of `<id>.component.wasm` files to found the network's genesis
-    /// wasm set from (default: $DUCKTAPE_MODULES_DIR, else ~/.ducktape/modules)
+    /// wasm set from (default: $DUCKTAPE_MODULES_DIR, else <ducktape home>/modules)
     #[arg(long, value_name = "DIR")]
     pub modules: Option<PathBuf>,
     #[command(flatten)]
