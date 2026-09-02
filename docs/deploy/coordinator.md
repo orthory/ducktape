@@ -262,24 +262,26 @@ hole-punch.
 ```sh
 docker build -f ops/coordinator/Dockerfile -t ducktape-coordinator .
 
-# This deployment explicitly disables the TCP fallback, so one published UDP
-# port is enough. Harden the container to match the systemd unit.
+# Harden the container to match the systemd unit. The relay lane binds an
+# unprivileged port inside the container and the host maps TCP 443 onto it,
+# so the non-root container needs no capability at all.
 docker run \
   --cap-drop=ALL \
   --security-opt no-new-privileges \
   --read-only \
   --restart unless-stopped \
   -p 3478:3478/udp \
-  ducktape-coordinator --listen 0.0.0.0:3478 --relay-listen none --workers 4
+  -p 443:8443/tcp \
+  ducktape-coordinator --listen 0.0.0.0:3478 --relay-listen 0.0.0.0:8443 --workers 4
 ```
 
 For private mode in Docker, append the auth args after the image name:
 
 ```sh
 docker run --cap-drop=ALL --security-opt no-new-privileges --read-only \
-  -p 3478:3478/udp \
+  -p 3478:3478/udp -p 443:8443/tcp \
   -v /etc/ducktape/network.toml:/etc/ducktape/network.toml:ro \
-  ducktape-coordinator --listen 0.0.0.0:3478 --relay-listen none --workers 4 \
+  ducktape-coordinator --listen 0.0.0.0:3478 --relay-listen 0.0.0.0:8443 --workers 4 \
     --genesis-set /etc/ducktape/network.toml
 ```
 
@@ -289,11 +291,12 @@ The image is multi-stage: a `rust:1.96-bookworm` build stage compiles exactly
 dynamically-linked binary, **no shell, no package manager**, running as the
 built-in non-root uid `65532`. The `docker run` flags above are not optional
 decoration — they mirror the systemd unit's posture and are the container-side
-equivalent of its empty capability set and read-only root:
+equivalent of its single-capability set and read-only root:
 
-- `--cap-drop=ALL` — the binary needs **no** Linux capabilities (3478 > 1024, so
-  no privileged-port capability), the same as the unit's empty
-  `CapabilityBoundingSet=`/`AmbientCapabilities=`.
+- `--cap-drop=ALL` — the container needs **no** Linux capability. The unit
+  holds `CAP_NET_BIND_SERVICE` for exactly one reason, binding the relay lane
+  on 443; in Docker the relay binds unprivileged 8443 and the host's
+  `443:8443` map exposes the standard port, so even that one is dropped.
 - `--security-opt no-new-privileges` — mirrors `NoNewPrivileges=yes`.
 - `--read-only` — the coordinator keeps **no** state, so its root filesystem can
   be immutable, mirroring `ProtectSystem=strict` + `ReadOnlyPaths=/`.
@@ -302,11 +305,12 @@ equivalent of its empty capability set and read-only root:
   throwaway smoke run.
 
 Keep these: the whole premise is that a compromised coordinator has nothing to
-steal and nowhere to write. Publishing **only** `-p 3478:3478/udp` (not
-`--network host`) is sufficient for the explicit `--relay-listen none`
-deployment above. To enable the sealed-intro fallback, add
-`-p 443:8443/tcp` and `--relay-listen 0.0.0.0:8443`; the host mapping exposes
-the standard port without granting the container a privileged bind.
+steal and nowhere to write. Publish exactly the two ports (not
+`--network host`). The `-p 443:8443/tcp` map is load-bearing: a joiner
+derives the relay as `<coordinator host>:443` and is never told otherwise, so
+a container without it (or run with `--relay-listen none`) is the `relay=off`
+outage the systemd section describes — every member behind a non-punching
+NAT is locked out.
 
 ## DNS + firewall
 

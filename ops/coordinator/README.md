@@ -28,16 +28,11 @@ sudo systemctl daemon-reload && sudo systemctl enable --now ducktape-coordinator
 
 ## Docker / OCI
 
+The relay lane binds an unprivileged port inside the container and the host
+maps TCP 443 onto it, so the non-root container needs no privileged bind:
+
 ```sh
 docker build -f ops/coordinator/Dockerfile -t ducktape-coordinator .
-docker run --rm -p 3478:3478/udp ducktape-coordinator \
-  --listen 0.0.0.0:3478 --relay-listen none
-```
-
-To expose the sealed-intro fallback without granting the non-root container a
-privileged bind, map host TCP 443 to an unprivileged container port:
-
-```sh
 docker run --rm -p 3478:3478/udp -p 443:8443/tcp ducktape-coordinator \
   --listen 0.0.0.0:3478 --relay-listen 0.0.0.0:8443
 ```
