@@ -443,6 +443,18 @@ pub struct TipCoords {
     /// snapshots the server derives from committed valset state, so a parked
     /// joiner tracks the identical window every member tracks.
     pub mesh_window: Vec<MeshWindowEntry>,
+    /// the SERVING node's build stamp — the same string it reports as
+    /// `/v1/status .version`'s stamp half. `None` when that node could not
+    /// identify its own build (a source tarball, a checkout without `.git`),
+    /// which is a silence, never a claim.
+    ///
+    /// a DIAGNOSTIC, and it rides this lane precisely because the lane is
+    /// unauthenticated by construction: the poller renders it on its peers
+    /// view and may warn that the two builds differ, and NOTHING admits,
+    /// refuses, gates or votes on it. two ducktape builds whose consensus
+    /// logic has drifted still finalize together and their roots still
+    /// silently diverge — this only makes the drift nameable.
+    pub build: Option<String>,
 }
 
 /// one mesh-generation snapshot as carried on the sync wire. statesync-local
@@ -860,6 +872,13 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
                     wire::put_bytes(&mut out, r);
                 }
             }
+            match &c.build {
+                Some(build) => {
+                    out.push(1);
+                    wire::put_str(&mut out, build);
+                }
+                None => out.push(0),
+            }
         }
     }
     out
@@ -1154,6 +1173,11 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                     residents,
                 });
             }
+            let build = match wire::take_u8(&mut buf)? {
+                0 => None,
+                1 => Some(wire::take_str(&mut buf)?),
+                t => return Err(WireError::BadTag("tip build presence", t)),
+            };
             SyncResponse::TipCoords(TipCoords {
                 height,
                 root_hash,
@@ -1164,6 +1188,7 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 has_floor,
                 generation,
                 mesh_window,
+                build,
             })
         }
         8 => SyncResponse::Blob {
@@ -1789,6 +1814,10 @@ impl SyncServer {
                     has_floor: coords.floor_cert.is_some(),
                     generation: coords.generation,
                     mesh_window: coords.mesh_window.clone(),
+                    // this crate is not a node and holds no build stamp: the
+                    // node's own state owner answers the detection lane (and
+                    // fills the stamp) before a request reaches here.
+                    build: None,
                 }))
             }
         }

@@ -55,10 +55,61 @@ async fn peers_sample(
     host: Option<&host::Host>,
     announce_targets: &[ed25519::PublicKey],
     height: u64,
+    builds: &std::collections::BTreeMap<String, String>,
 ) -> noded::peers::PeersView {
     let (validators, residents) = replica_roles(host, announce_targets).await;
     noded::peers::peers_from_exposition(&exposition, crate::util::unix_ms(), height, None)
         .with_roles(&validators, &residents)
+        .with_builds(builds)
+}
+
+/// Record the build stamp a polled sync source just reported, and name a
+/// disagreement ONCE.
+///
+/// Detection only, by ruling: nothing here refuses a peer, drops a
+/// connection, re-routes a source or gates admission — two builds whose
+/// consensus logic has drifted still finalize together, and this only makes
+/// the drift visible on `node peers` and greppable in the log.
+///
+/// The latch is keyed on `(peer, stamp)`, so a peer stuck on a foreign build
+/// warns once however long it stays wrong, and a peer flapping between two
+/// builds warns twice rather than once per poll — the detection cadence is
+/// `RESIDENT_FALLBACK_POLL`, which an unlatched warn would turn into a slow
+/// drip that evicts the ring.
+/// `mine` is passed rather than read here so the decision is a function of its
+/// arguments: this node's own stamp is an `option_env!` fixed at compile time,
+/// and a rule that read it directly could only be exercised on a build that
+/// happened to have one.
+fn note_source_build(
+    mine: &str,
+    peer: &str,
+    reported: Option<&str>,
+    builds: &mut std::collections::BTreeMap<String, String>,
+    warned: &mut std::collections::BTreeSet<(String, String)>,
+) {
+    let Some(theirs) = reported else {
+        // a server that cannot identify its own build said nothing, which is
+        // not a disagreement: leave the surface's `unknown` standing.
+        return;
+    };
+    builds.insert(peer.to_string(), theirs.to_string());
+    match crate::services::Skew::between(mine, Some(theirs)) {
+        crate::services::Skew::Matched | crate::services::Skew::Unknown => {}
+        crate::services::Skew::Skewed => {
+            let first_sighting = warned.insert((peer.to_string(), theirs.to_string()));
+            if !first_sighting {
+                return;
+            }
+            tracing::warn!(
+                target: "ducktape::node",
+                peer = %peer,
+                ours = %mine,
+                theirs = %theirs,
+                reason = "build_stamp_mismatch",
+                "sync source is running a different build — roots can diverge silently"
+            );
+        }
+    }
 }
 
 /// the replica's valset standing, hex-keyed: the serving host's committed
@@ -153,6 +204,7 @@ async fn shutdown_reach_plane(
 /// section rides along so index watermarks stay current with the boundary,
 /// and the peers standing rides too (the off-lane /v1/peers composition
 /// reads it beside the live exposition).
+#[allow(clippy::too_many_arguments)]
 async fn publish_replica_status(
     status: &noded::StatusCell,
     metrics: &noded::NodeMetrics,
@@ -161,6 +213,7 @@ async fn publish_replica_status(
     status_public_key: &str,
     announce_targets: &[ed25519::PublicKey],
     serving: Option<(u64, &host::Host)>,
+    builds: &std::collections::BTreeMap<String, String>,
 ) {
     metrics.update_storage(
         ckpt_height.unwrap_or_default(),
@@ -205,6 +258,9 @@ async fn publish_replica_status(
         residents,
         height,
         epoch: None,
+        // the stamps this lane's detection polls have heard so far; see
+        // `note_source_build`.
+        builds: builds.clone(),
     });
 }
 
@@ -413,6 +469,14 @@ pub(super) async fn park(
     // (awaiting a deliberate promote) — the not-admitted bail below
     // must never fire.
     let mut resident_standing = false;
+    // peer key hex -> the build stamp that peer reported about ITSELF on the
+    // detection lane, and the (peer, stamp) pairs already warned about. the
+    // mesh gossips no stamp, so this only ever holds sources this lane
+    // polled; see `note_source_build`.
+    let mut peer_builds: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    let mut warned_builds: std::collections::BTreeSet<(String, String)> =
+        std::collections::BTreeSet::new();
 
     // ---- the RESIDENT's serving lanes ------------------------------
     //
@@ -659,6 +723,7 @@ pub(super) async fn park(
             &status_public_key,
             &announce_targets,
             serving.as_ref().map(|(h, node_r)| (*h, node_r.host())),
+            &peer_builds,
         )
         .await;
         tracing::info!(
@@ -921,6 +986,7 @@ pub(super) async fn park(
                                         serving.as_ref().map(|(_, node_r)| node_r.host()),
                                         &announce_targets,
                                         serving.as_ref().map(|(h, _)| *h).unwrap_or(0),
+                                        &peer_builds,
                                     )
                                     .await,
                                 ),
@@ -1102,6 +1168,7 @@ pub(super) async fn park(
                                         &status_public_key,
                                         &announce_targets,
                                         None,
+                                        &peer_builds,
                                     ).await;
                                     metrics.record_sync_failure(e.detail.clone());
                                     replica_scheme = None;
@@ -1192,6 +1259,7 @@ pub(super) async fn park(
                                             &status_public_key,
                                             &announce_targets,
                                             None,
+                                            &peer_builds,
                                         ).await;
                                         metrics.record_sync_failure(e.detail.clone());
                                         metrics.set_role_phase(
@@ -1358,6 +1426,7 @@ pub(super) async fn park(
                     &status_public_key,
                     &announce_targets,
                     Some((*served_height, node_r.host())),
+                    &peer_builds,
                 )
                 .await;
             }
@@ -1802,6 +1871,15 @@ pub(super) async fn park(
                 continue;
             }
         };
+        // the source's own build stamp rode along with the coordinates.
+        // record it for the peers surface and name a disagreement once.
+        note_source_build(
+            noded::services::build_identity_or_unknown(),
+            &hex_bytes(client.current_source().as_ref()),
+            tip.build.as_deref(),
+            &mut peer_builds,
+            &mut warned_builds,
+        );
         // follow the mesh rotation while parked: track the tip's
         // REPLICATED generation window — the identical snapshots every
         // member tracks, so a parked joiner's tracked sets can never
@@ -1911,6 +1989,7 @@ pub(super) async fn park(
                 &status_public_key,
                 &announce_targets,
                 None,
+                &peer_builds,
             )
             .await;
             metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Syncing);
@@ -2195,6 +2274,7 @@ pub(super) async fn park(
                                 &status_public_key,
                                 &announce_targets,
                                 serving.as_ref().map(|(h, node_r)| (*h, node_r.host())),
+                                &peer_builds,
                             )
                             .await;
                             tracing::info!(
@@ -2483,5 +2563,51 @@ pub(super) async fn park(
         prev_ckpt: (Some(boundary.height), pos),
         mesh_window,
         mesh_book,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::note_source_build;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// the whole detection rule in one pass: a stamp is recorded for the peer
+    /// that reported it, a disagreement is named ONCE per (peer, stamp), and
+    /// an unknown on either side is never a disagreement.
+    #[test]
+    fn a_skewed_source_is_named_once_and_an_unknown_one_never() {
+        let mut builds = BTreeMap::new();
+        let mut warned = BTreeSet::new();
+
+        // agreeing: recorded for the surface, nothing warned.
+        note_source_build("abc1234", "aa", Some("abc1234"), &mut builds, &mut warned);
+        assert_eq!(builds.get("aa").map(String::as_str), Some("abc1234"));
+        assert!(warned.is_empty());
+
+        // disagreeing: recorded, and named exactly once however often the
+        // detection poll re-observes it.
+        for _ in 0..5 {
+            note_source_build("abc1234", "bb", Some("def5678"), &mut builds, &mut warned);
+        }
+        assert_eq!(builds.get("bb").map(String::as_str), Some("def5678"));
+        assert_eq!(
+            warned.iter().collect::<Vec<_>>(),
+            vec![&("bb".to_string(), "def5678".to_string())]
+        );
+
+        // a source that named no build is not a mismatch, and mints no entry:
+        // the surface shows it as unknown rather than as agreeing with us.
+        note_source_build("abc1234", "cc", None, &mut builds, &mut warned);
+        assert!(!builds.contains_key("cc"));
+        // neither is a source that named one while WE cannot name ours.
+        note_source_build(
+            noded::services::UNKNOWN_BUILD,
+            "dd",
+            Some("def5678"),
+            &mut builds,
+            &mut warned,
+        );
+        assert_eq!(builds.get("dd").map(String::as_str), Some("def5678"));
+        assert_eq!(warned.len(), 1, "only the real disagreement was named");
     }
 }

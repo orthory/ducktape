@@ -3568,6 +3568,7 @@ mod tests {
                 residents: Default::default(),
                 height: 42,
                 epoch: Some(3),
+                builds: Default::default(),
             });
 
         let (mut state, _) = prepare_topic("peers", NO_SECRET, None, None).expect("topic");

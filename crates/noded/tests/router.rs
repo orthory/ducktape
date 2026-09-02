@@ -431,6 +431,7 @@ async fn peers_reports_the_direct_peer_sample() {
         residents: Default::default(),
         height: 41,
         epoch: Some(7),
+        builds: [("ab".to_string(), "abc1234".to_string())].into(),
     });
 
     let response = noded::router(handle)
@@ -453,6 +454,10 @@ async fn peers_reports_the_direct_peer_sample() {
     assert_eq!(
         body["peers"][0]["role"], "validator",
         "the published standing stamps roles onto the live sample"
+    );
+    assert_eq!(
+        body["peers"][0]["build"], "abc1234",
+        "and the build stamp the peer reported about itself, where one was heard"
     );
 }
 

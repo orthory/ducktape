@@ -1701,10 +1701,11 @@ fn send_hello(base: &str, hello: &noded::services::Hello) -> Result<Skew, String
     ))
 }
 
-/// Whether the daemon and the node it signals to are the same build. ONE
-/// discriminant so the latch below compares states rather than juggling flags.
+/// Whether two build stamps are the same build. ONE discriminant so the
+/// latches that compare them (the service heartbeat below; the mesh peer's
+/// stamp in `replica::park`) compare states rather than juggling flags.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Skew {
+pub(crate) enum Skew {
     /// same stamp on both sides.
     Matched,
     /// the two stamps differ — the ordinary dev loop (rebuild the node, leave
@@ -1716,7 +1717,7 @@ enum Skew {
 }
 
 impl Skew {
-    fn between(mine: &str, theirs: Option<&str>) -> Skew {
+    pub(crate) fn between(mine: &str, theirs: Option<&str>) -> Skew {
         let unknown = noded::services::UNKNOWN_BUILD;
         let Some(theirs) = theirs.filter(|it| *it != unknown) else {
             return Skew::Unknown;
