@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # make demo-clear — remove the "demo" workspace that demo-seed created.
 #
-# Stops any node still serving the workspace (graceful /v1/admin/shutdown first, then
-# a pidfile + pgrep sweep where every candidate's command line is verified
-# against the workspace dir before it may be killed — a recycled pid must never
-# take an innocent process down), deletes ~/.ducktape/workspaces/<id>, and
+# Stops any node still serving the workspace (graceful /v1/admin/shutdown first,
+# then a pgrep sweep where every candidate's command line is verified against
+# the workspace dir before it may be killed — a recycled pid must never take an
+# innocent process down), deletes ~/.ducktape/workspaces/<id>, and
 # drops the entry from ~/.ducktape/registry.json, handing "active" to another
 # workspace when the demo held it. Other workspaces are untouched.
 #
@@ -26,15 +26,13 @@ die(){ printf '\033[31m[demo-clear] %s\033[0m\n' "$*" >&2; exit 1; }
 
 command -v bun >/dev/null || die "bun is required"
 
-# pids of LIVE processes verifiably serving THIS workspace: the pidfile pid the
-# app records on spawn plus a `pgrep -f` sweep for the workspace dir (a seed
-# run's node leaves no pidfile; the sweep still finds it). Every candidate's
-# command line is checked before it may be killed.
+# pids of LIVE processes verifiably serving THIS workspace: a `pgrep -f` sweep
+# for the workspace dir. Nothing writes a pidfile — a node is started by hand
+# (`ducktape node run`) or by a seed run, and the app only ever PRINTS that
+# command — so the sweep is the whole discovery. Every candidate's command line
+# is checked before it may be killed.
 node_pids(){
-  {
-    [ -f "$WSDIR/node.pid" ] && printf '%s\n' "$(cat "$WSDIR/node.pid")"
-    pgrep -f "$WSDIR" 2>/dev/null || true
-  } | sort -un 2>/dev/null | while read -r pid; do
+  pgrep -f "$WSDIR" 2>/dev/null | while read -r pid; do
     [ -n "$pid" ] && [ "$pid" != "$$" ] || continue
     case "$(ps -p "$pid" -o command= 2>/dev/null)" in
       *"$WSDIR"*) printf '%s\n' "$pid" ;;
@@ -72,32 +70,47 @@ JS
 )"
 # SAY SO on every path that does not gracefully stop the node. Falling silently
 # through to the SIGTERM sweep looks EXACTLY like a graceful stop that worked,
-# and hides which of three quite different things happened: no token on disk
-# (DUCKTAPE_ADMIN=off mints none; another uid's node writes one we cannot read),
-# or a node under DUCKTAPE_ADMIN=public, where the operator token is not the
-# credential at all — that wants an owner PoP from `ducktape user sign-admin`,
-# which needs the user key's password and is more than this script should carry.
+# and hides which of these happened: no token on disk (DUCKTAPE_ADMIN=off mints
+# none; another uid's node writes one we cannot read), or a node under
+# DUCKTAPE_ADMIN=public, where the operator token is not the credential at all
+# — that wants an owner PoP from `ducktape user sign-admin`, which needs the
+# user key's password and is more than this script should carry.
 # The sweep below still stops the node either way; these lines are why it took a
 # signal to do it.
 if [ -z "$HTTP_PORT" ]; then
   log "no http port in the registry for '$ID' — using the pid sweep"
 elif [ ! -r "$WSDIR/admin.token" ]; then
-  log "no readable $WSDIR/admin.token — reason=operator_token_unreadable, using the pid sweep"
+  log "no readable $WSDIR/admin.token — using the pid sweep"
 else
   # /v1/admin/* is the OPERATOR's plane under the default loopback exposure:
   # loopback presence is not authority (a service daemon is a loopback peer
   # too), so the request carries the credential the node minted 0600 into its
-  # own workspace. Capture the STATUS — discarding it is what made a refusal
-  # indistinguishable from a stop.
-  CODE="$(curl -s -o /dev/null -w '%{http_code}' -m 2 \
+  # own workspace. Capture the STATUS and the BODY — discarding them is what
+  # made a refusal indistinguishable from a stop, and the node NAMES its own
+  # refusal in that body (`{"error":…,"reason":…}`, crates/noded/src/admin.rs).
+  # Print that token verbatim: a reason invented here greps to nothing.
+  RESPONSE="$(curl -s -m 2 -w '\n%{http_code}' \
     -X POST "http://127.0.0.1:$HTTP_PORT/v1/admin/shutdown" \
     -H "x-ducktape-admin-token: $(cat "$WSDIR/admin.token")" 2>/dev/null)"
+  CODE="${RESPONSE##*$'\n'}"
+  # BOTH fields the node sent: `reason` is the greppable token and `error` is
+  # `AdminRefusal::message()` — the operator-facing sentence that says what to do
+  # about it ("re-read admin.token from the node's workspace; a restart mints a
+  # new one"). A route the node never mounted (admin disabled) 404s with an empty
+  # body, and an unreachable port answers 000 with none — then the status is the
+  # whole diagnosis and the line carries neither.
+  DETAIL="$(printf '%s' "${RESPONSE%$'\n'*}" | bun -e '
+    try {
+      const body = await Bun.stdin.json();
+      const said = [];
+      if (body.reason) said.push("reason=" + body.reason);
+      if (body.error) said.push(body.error);
+      console.log(said.join(": "));
+    } catch {}
+  ' 2>/dev/null)"
   case "$CODE" in
     2*) : ;;
-    401) log "admin refused the operator token (401) — reason=wrong_credential_type, this node wants an owner PoP (DUCKTAPE_ADMIN=public); using the pid sweep" ;;
-    403) log "admin refused the operator token (403) — reason=operator_token_mismatch, the node restarted since this token was written; using the pid sweep" ;;
-    404) log "no admin namespace on this node (404) — reason=admin_disabled, using the pid sweep" ;;
-    *)   log "graceful shutdown did not succeed (http ${CODE:-none}) — using the pid sweep" ;;
+    *) log "graceful shutdown did not succeed (http ${CODE:-none}${DETAIL:+, $DETAIL}) — using the pid sweep" ;;
   esac
 fi
 
