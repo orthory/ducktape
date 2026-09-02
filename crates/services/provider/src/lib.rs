@@ -809,8 +809,15 @@ impl CliProvider {
             vcpus,
             mem_mib,
             vsock_uds: microvm_socket(&slot)?,
-            // no tap: the guest reaches this node's broker over vsock and needs
-            // no interface. See the spec's egress section.
+            // no tap: the guest has no NIC, so its whole reach is the vsock
+            // tunnels above. That is no longer the same as "no egress" — those
+            // tunnels now carry this node's ENTIRE http listener, not just the
+            // broker, and `/v1/gateway/proxy` on it dispatches a
+            // `GatewayJob::Http` over the overlay to a publisher node. Its only
+            // gate (`gateway_http::gateway_api_origin_allowed`) is a header
+            // check a plain `curl` passes by sending no headers, so a run CAN
+            // reach off this host. See [`guest_tunnel_ports`] for the full
+            // reach and the open question of narrowing it (#1317).
             tap: None,
         };
 
@@ -1631,6 +1638,35 @@ impl Drop for ContextGuard {
 /// socket the guest cannot open, so [`aim_node_at_guest`] takes the variable
 /// away rather than leave the run half-planed — writes landing over the
 /// run-action lane while every read dies on the guest's own loopback.
+///
+/// **The node entry is a whole http listener, not a read lane.** The VM has no
+/// NIC, so these tunnels ARE the guest's attack surface, and this one is wide.
+/// Reachable from any process in the guest, with no credential:
+/// * the reads the plane exists for — `/v1/query`, `/v1/status`, `/v1/peers`,
+///   `/v1/blocks`, `/v1/index/*`, the `/v1/files/*` duckfs reads, `/metrics`;
+/// * writes — `/v1/submit`, `/v1/submit/frame`, `/v1/invite` (mints an invite
+///   to this mesh), `/v1/files/` stage/commit/pin, `/v1/files/object/{path}`
+///   PUT and DELETE, `/v1/fs/workspaces` create + commit + delete,
+///   `/v1/services/hello`, `/v1/log-filter`, and the `/forge/{repo}` git
+///   receive-pack remote;
+/// * `/v1/term/sessions` — a guest can spawn an interactive terminal on this
+///   node, and with a `cred` in the body one on ANOTHER node
+///   (`term::create_remote`);
+/// * `/v1/ws` — no credential of any kind, and it carries the `logs` topic, so
+///   a guest can read this operator's log ring;
+/// * EGRESS OFF THIS HOST — `/v1/gateway/proxy` dispatches a `GatewayJob::Http`
+///   over the overlay to a publisher node, and its only gate,
+///   `gateway_http::gateway_api_origin_allowed`, is a header check a native
+///   caller passes by sending no headers. `/v1/gateway/browser` likewise.
+///
+/// Out of reach: every other port and every other address on this host (no
+/// listener is bound for them, with or without a NIC), and `/v1/admin/*` —
+/// which rides this same listener by design but whose own middleware wants the
+/// operator credential or an owner PoP, and a run's env is an allowlist that
+/// carries neither.
+///
+/// Narrowing this to a scoped read lane is the open half of #1317, and this
+/// function is the one place such a lane would replace.
 fn guest_tunnel_ports(envs: &mut Vec<(String, String)>, broker_base: Option<&str>) -> Vec<u16> {
     let mut ports = Vec::new();
     ports.extend(broker_base.and_then(url_port));
