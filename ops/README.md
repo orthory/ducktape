@@ -84,6 +84,9 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
   from this checkout and from a copy of the tree at a different absolute path
   and asserts the bytes are identical, so a committed artifact never depends on
   the builder's `/home/...`. Needs the wasm32 target and `wasm-tools`.
+- `make wasm-index-check` — the other reproducibility gate, a Makefile target
+  with no script here: it rebuilds each committed `index.wasm` from its source
+  and cmps it against the bytes in the tree. Also needs the wasm32 target.
 
 ## Worktree cleanup
 

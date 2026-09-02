@@ -319,20 +319,11 @@ wasm-repro-check:
 INDEX_CHECK_DIR = $(CURDIR)/target/wasm-index-check
 
 ## the drift gate the committed INDEX guests never had: rebuild each
-## index.wasm from its source on the pinned toolchain and compare it with the
-## committed bytes. `wasm-modules-check` cannot catch this — it only cmps
-## committed copies against each other, so an index guest could drift
-## arbitrarily far from the sources beside it and stay green, which is exactly
-## what happened (#1363), while noded include_bytes!s five of them. Needs the
-## wasm32 target (which `wasm-modules-check` deliberately does not), so like
-## `wasm-repro-check` it stands apart from the pre-push `test` gate.
-##
-## Component artifacts are deliberately NOT covered, and not because they are
-## fine: on this box a component does not reproduce even from an unchanged
-## lock (measured on crates/modules/system/saga). Gating those means first
-## finding what moves their bytes, and every refresh moves GENESIS_ROOT_HASH —
-## a consensus-visible change. Index guests reproduce and pin nothing, so
-## their drift was pure neglect, and this gate ends it.
+## index.wasm from its source and compare it with the committed bytes.
+## `wasm-modules-check` only cmps committed copies against each other, so an
+## index guest could drift arbitrarily far from the sources beside it and stay
+## green, which is exactly what happened (#1363). Needs the wasm32 target, so
+## like `wasm-repro-check` it stands apart from the pre-push `test` gate.
 wasm-index-check:
 	@mkdir -p "$(INDEX_CHECK_DIR)"
 	@for m in $(INDEX_MODULES); do \
@@ -348,13 +339,11 @@ wasm-index-check:
 	@echo "committed index guests match a rebuild on this toolchain"
 
 ## the supply-chain tripwire: RustSec advisories and yanked crates against the
-## committed Cargo.lock, under the policy in `deny.toml` — where every carried
-## advisory is listed WITH the reason it is carried and what would clear it.
-## Needs `cargo deny` (cargo install cargo-deny) and network for the advisory
-## database, so it is not part of the offline `test` gate; run it when the lock
-## moves. `cargo audit` is deliberately not also run: same database, and a
-## second ignore list in `.cargo/audit.toml` is a second place for a reason to
-## go stale.
+## committed Cargo.lock, under `deny.toml` — where every carried advisory is
+## listed WITH the reason it is carried and what would clear it. Needs
+## `cargo deny` and network, so it is not part of the offline `test` gate; run
+## it when the lock moves. `cargo audit` is not also run: same database, and a
+## second ignore list in `.cargo/audit.toml` is a second place to go stale.
 audit:
 	$(CARGO) deny check advisories
 
