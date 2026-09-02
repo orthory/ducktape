@@ -4,7 +4,6 @@
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer, ed25519};
-use commonware_runtime::Clock as _;
 use commonware_utils::ordered::Set;
 
 use host::Host;
@@ -164,12 +163,18 @@ pub(super) async fn restore(
 // and never consumed it.
 //
 // The fix gives the validator the same escape, over the co-client that already
-// rides its own serve lane: probe once for the frame above the recovered
-// floor, and when a peer answers that it PRUNED past us, rebuild the app state
-// from that peer's checkpoint and seat this key at that boundary — the shape
-// the promotion seat (`run_promoted`) already uses. The seat is never
-// downgraded: if the boundary no longer names this key as a participant, boot
-// halts loudly rather than continuing as a resident.
+// rides its own serve lane: ask each member in turn for the frame above the
+// recovered floor, and when one answers that it PRUNED past us, rebuild the
+// app state from that peer's checkpoint and seat this key at that boundary —
+// the shape the promotion seat (`run_promoted`) already uses. Unlike the
+// resident's loop this probe is BOUNDED (`BOOT_PROBE_BUDGET`): it runs before
+// the engine and before the loop that answers other nodes' probes, so a whole
+// cluster restarting at once has nobody to answer it and an unbounded wait
+// would deadlock that restart. An expired budget keeps the local state and
+// says so at `warn` — it is not evidence of a gap, but it IS the node
+// admitting it never checked. The seat is never downgraded: if the boundary
+// no longer names this key as a participant, boot halts loudly rather than
+// continuing as a resident.
 
 /// what the boot probe decided about this validator's local floor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,23 +256,47 @@ pub(super) struct Seat {
     pub(super) pending_boot: Option<u64>,
 }
 
-/// one probe for the frame above `floor`, retried ONLY while the answer is a
-/// transport failure — the mesh started moments ago and a send to a peer whose
-/// link is not up yet fails immediately (no recipients), so an unformed mesh
-/// costs the interval, never a request timeout. any other answer ends it.
-async fn probe_peer_frames<C: statesync::SyncClient>(
-    context: &commonware_runtime::tokio::Context,
+/// one probe for the frame above `floor`, re-asked — at a DIFFERENT source
+/// every time — only while the answer is a transport failure: the mesh started
+/// moments ago and a send to a peer whose link is not up yet fails immediately
+/// (no recipients), while a peer that is up but not yet serving costs a
+/// request timeout. any other answer ends it.
+///
+/// [`crate::constants::BOOT_PROBE_BUDGET`] expiring also ends it, on the local
+/// state — and says so at `warn`, because from there on this node is running a
+/// floor no peer ever confirmed, which is exactly the wedge this probe exists
+/// to catch.
+async fn probe_peer_frames<C>(
+    clock: &impl commonware_runtime::Clock,
     client: &C,
     floor: u64,
     label: &str,
-) -> Result<Vec<statesync::FinalizedFrame>, statesync::SyncError> {
+) -> Result<Vec<statesync::FinalizedFrame>, statesync::SyncError>
+where
+    C: statesync::SyncClient + crate::blob_fetch::SourceRotate,
+{
+    let deadline = clock.current() + crate::constants::BOOT_PROBE_BUDGET;
     let mut attempts = 0u32;
     loop {
         let answer = statesync::fetch_frames(client, floor, floor + 1).await;
         attempts += 1;
         let mesh_not_up_yet = matches!(answer, Err(statesync::SyncError::Transport(_)));
-        let budget_left = attempts < crate::constants::BOOT_PROBE_ATTEMPTS;
-        if !mesh_not_up_yet || !budget_left {
+        if !mesh_not_up_yet {
+            return answer;
+        }
+        let budget_left = clock.current() < deadline;
+        if !budget_left {
+            tracing::warn!(
+                target: "ducktape::statesync",
+                node = %label,
+                reason = "catch_up_probe_unanswered",
+                attempts,
+                floor,
+                "no peer answered the boot catch-up probe within its budget; \
+                 proceeding on LOCAL state without having checked this floor \
+                 against any peer — if height then never moves, this node fell \
+                 out of the retained journal window and must be re-synced"
+            );
             return answer;
         }
         if attempts == 1 || attempts.is_multiple_of(8) {
@@ -279,7 +308,10 @@ async fn probe_peer_frames<C: statesync::SyncClient>(
                 "boot catch-up probe: no peer has answered yet"
             );
         }
-        context.sleep(crate::constants::BOOT_PROBE_INTERVAL).await;
+        // the NEXT member, not the same one again: the book is ordered, so
+        // without this every retry re-asks the one peer that is down.
+        client.rotate_source();
+        clock.sleep(crate::constants::BOOT_PROBE_INTERVAL).await;
     }
 }
 
@@ -289,6 +321,7 @@ async fn probe_peer_frames<C: statesync::SyncClient>(
 pub(super) async fn catch_up<C>(
     seat: Seat,
     client: &C,
+    blob_peers: &std::sync::RwLock<Vec<ed25519::PublicKey>>,
     context: &commonware_runtime::tokio::Context,
     index: &indexer::IndexStore,
     recovery: &mut Recovery<commonware_runtime::tokio::Context>,
@@ -312,6 +345,18 @@ where
     let Some(local_height) = seat.resumed.as_ref().and_then(|rec| rec.height) else {
         return seat;
     };
+    // and a validator with nobody to ask has nothing to probe: a solo chain's
+    // peer book holds only this key, and the client skips itself, so every
+    // attempt would fail identically until the budget ran out. absence of a
+    // peer is not evidence of a gap — keep the local state and boot.
+    let me = signer.public_key();
+    let somebody_to_ask = {
+        let peers = blob_peers.read().expect("blob peers lock");
+        peers.iter().any(|peer| peer != &me)
+    };
+    if !somebody_to_ask {
+        return seat;
+    }
     let probe = probe_peer_frames(context, client, local_height, label).await;
     let CatchUp::Rebootstrap { retained_from } = decide_catch_up(&probe) else {
         return seat;
@@ -332,6 +377,7 @@ where
     drop(seat);
     rebootstrap(
         client,
+        blob_peers,
         context,
         index,
         recovery,
@@ -358,6 +404,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn rebootstrap<C>(
     client: &C,
+    blob_peers: &std::sync::RwLock<Vec<ed25519::PublicKey>>,
     context: &commonware_runtime::tokio::Context,
     index: &indexer::IndexStore,
     recovery: &mut Recovery<commonware_runtime::tokio::Context>,
@@ -494,6 +541,23 @@ where
     }
     let participants: Set<ed25519::PublicKey> =
         Set::try_from(member_keys.clone()).expect("valset membership has no duplicates");
+    // the blob lane's source book follows the boundary this node just seated
+    // on. the run loop re-syncs that book only at an epoch CUTOVER
+    // (`run::drain`), so a valset that moved while this node was down would
+    // otherwise leave every code-blob and forge-pack fetch asking the members
+    // the stale checkpoint named. the mesh window re-tracks from the synced
+    // host on the loop's first pass; the gateway and media books, seeded from
+    // the same stale set, still follow at the next cutover.
+    *blob_peers.write().expect("blob peers lock") = member_keys
+        .iter()
+        .cloned()
+        .chain(
+            boundary
+                .residents
+                .iter()
+                .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok()),
+        )
+        .collect();
     metrics.record_sync_progress(boundary.height);
     tracing::info!(
         target: "ducktape::statesync",
@@ -523,7 +587,56 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use statesync::{FinalizedFrame, SyncError};
+    use commonware_runtime::{Clock as _, Runner as _};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use statesync::{FinalizedFrame, SyncError, SyncRequest, SyncResponse};
+
+    /// a peer that fails the first `transport_failures` requests at the
+    /// transport (the shape of a link that is not up yet), then answers. it
+    /// counts its own rotations, which is what the probe must do BETWEEN
+    /// retries — a probe that never rotates re-asks one peer forever.
+    #[derive(Clone)]
+    struct StubPeer {
+        transport_failures: u32,
+        asked: Arc<AtomicU32>,
+        rotations: Arc<AtomicU32>,
+    }
+
+    impl StubPeer {
+        fn failing(transport_failures: u32) -> Self {
+            Self {
+                transport_failures,
+                asked: Arc::new(AtomicU32::new(0)),
+                rotations: Arc::new(AtomicU32::new(0)),
+            }
+        }
+    }
+
+    impl statesync::SyncClient for StubPeer {
+        fn request(
+            &self,
+            _req: SyncRequest,
+        ) -> impl std::future::Future<Output = Result<SyncResponse, SyncError>> + Send {
+            let asked = self.asked.fetch_add(1, Ordering::Relaxed);
+            let still_dark = asked < self.transport_failures;
+            async move {
+                if still_dark {
+                    return Err(SyncError::Transport("no recipients".into()));
+                }
+                // the answer a peer gives when we are already at its tip —
+                // decisive, so the loop must stop here.
+                Ok(SyncResponse::Error("empty frame batch".into()))
+            }
+        }
+    }
+
+    impl crate::blob_fetch::SourceRotate for StubPeer {
+        fn rotate_source(&self) {
+            self.rotations.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     fn pruned(requested_after: u64, retained_from: u64) -> Result<Vec<FinalizedFrame>, SyncError> {
         Err(SyncError::RangePruned {
@@ -575,6 +688,50 @@ mod tests {
             })),
             CatchUp::Local
         );
+    }
+
+    /// every RETRY asks the next source: the peer book is ordered and shared
+    /// with every other fetch on this lane, so a probe that did not rotate
+    /// would spend its whole budget on `peers[0]` — deterministically the same
+    /// unreachable (or downed) node on every boot.
+    #[test]
+    fn the_probe_rotates_its_source_between_retries() {
+        let executor = commonware_runtime::deterministic::Runner::default();
+        executor.start(|context| async move {
+            let peer = StubPeer::failing(3);
+            let answer = probe_peer_frames(&context, &peer, 1_000, "t").await;
+            // the 4th ask answered, so the loop stopped there.
+            assert_eq!(peer.asked.load(Ordering::Relaxed), 4);
+            // one rotation per transport failure, none after the answer.
+            assert_eq!(peer.rotations.load(Ordering::Relaxed), 3);
+            assert!(matches!(answer, Err(SyncError::Server(_))));
+            assert_eq!(decide_catch_up(&answer), CatchUp::Local);
+        });
+    }
+
+    /// nobody ever answers: the probe gives up on its wall-clock budget (it
+    /// runs BEFORE the loop that answers other nodes' probes, so an unbounded
+    /// wait would deadlock a whole-cluster restart), keeps the local state,
+    /// and — the part an operator needs — the budget is what ended it, not a
+    /// fixed number of asks.
+    #[test]
+    fn an_unanswered_probe_gives_up_on_its_budget_and_stays_local() {
+        let executor = commonware_runtime::deterministic::Runner::default();
+        executor.start(|context| async move {
+            let peer = StubPeer::failing(u32::MAX);
+            let started = context.current();
+            let answer = probe_peer_frames(&context, &peer, 1_000, "t").await;
+            let spent = context
+                .current()
+                .duration_since(started)
+                .expect("the clock does not run backwards");
+            assert!(
+                spent >= crate::constants::BOOT_PROBE_BUDGET,
+                "gave up after {spent:?}, before the budget"
+            );
+            assert!(matches!(answer, Err(SyncError::Transport(_))));
+            assert_eq!(decide_catch_up(&answer), CatchUp::Local);
+        });
     }
 
     /// the TRANSITION: the seat a re-bootstrapped validator resumes on is the

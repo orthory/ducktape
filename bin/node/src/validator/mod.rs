@@ -274,6 +274,7 @@ pub(crate) async fn run_validator(
             pending_boot,
         },
         &blob_client,
+        &blob_peers,
         &context,
         &index,
         &mut recovery,

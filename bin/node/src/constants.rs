@@ -156,15 +156,22 @@ pub(crate) fn engine_channels(epoch: u64) -> (u64, u64, u64, u64, u64) {
     (base, base + 1, base + 2, base + 3, base + 4)
 }
 
-/// how many times a booting validator re-asks a peer for the frame above its
-/// recovered floor while the mesh is still forming. a send to a peer whose
-/// link is not up yet fails IMMEDIATELY (no recipients), so this budget is
-/// spent in `BOOT_PROBE_INTERVAL` steps and never waits out a request timeout;
-/// the first answer of any other kind ends it. the probe runs only for a
-/// validator that recovered a real height, so a cold genesis start pays
-/// nothing; a WHOLE cluster restarting at once pays this budget flat, because
-/// no node answers until it has finished its own probe and entered its loop.
-pub(crate) const BOOT_PROBE_ATTEMPTS: u32 = 20;
+/// how long a booting validator keeps re-asking peers for the frame above its
+/// recovered floor while the mesh is still forming. a WALL-CLOCK budget, not
+/// an attempt count: one attempt costs nothing when the link is not up yet
+/// (the send fails immediately with no recipients) but a full request timeout
+/// when it is up and the peer does not answer, so only a deadline bounds the
+/// wait either way. it has to cover a returning node re-forming its p2p and
+/// overlay links, which is seconds, not milliseconds.
+///
+/// bounded ON PURPOSE, unlike the resident's re-bootstrap loop: this runs
+/// BEFORE the engine and before the loop that answers other nodes' probes, so
+/// a whole cluster restarting at once has nobody to answer it. an unbounded
+/// wait here would deadlock that restart forever; a budget makes it cost this
+/// much, once, and the expiry says so at `warn`. the probe runs only for a
+/// validator that recovered a real height and only when some OTHER key is in
+/// its peer book, so a cold genesis start and a solo validator pay nothing.
+pub(crate) const BOOT_PROBE_BUDGET: Duration = Duration::from_secs(30);
 
-/// the pause between boot catch-up probes (see [`BOOT_PROBE_ATTEMPTS`]).
+/// the pause between boot catch-up probes (see [`BOOT_PROBE_BUDGET`]).
 pub(crate) const BOOT_PROBE_INTERVAL: Duration = Duration::from_millis(250);
