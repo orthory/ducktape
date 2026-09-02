@@ -167,12 +167,85 @@ heartbeat keeps signaling — `warn` `hello_failed` at attempt 1, then every
 `ducktape-service@<kind>` only for a new binary or a new grant. The one
 daemon that exits is one that BOOTS while the node is down: the first hello
 must land (`services.rs`, `send_hello` in `run`), and `Restart=always`
-retries it until it does. Before stopping a validator, remember: below four validators every seat must be live to finalize, so a
-restart of one of three halts the chain for the restart's duration.
+retries it until it does. Before stopping a validator, read the next section:
+on a three-validator network the restart halts the chain for its duration.
 
 `curl 127.0.0.1:8844/v1/status | jq .version` prints the build the node
 runs (`<cargo version>+<git short sha>[-<dirty digest>]`), which is how two
 hosts confirm they run the same binary.
+
+## Validator count: three seats tolerate nothing
+
+Consensus is BFT: `f = (n - 1) / 3` faults tolerated, `quorum = n - f`. The
+arithmetic is commonware's (`commonware_utils::faults`, baked into
+`Finalization::verify` — see `verify_finalization` in
+`crates/kernel/consensus/src/lib.rs`); the node reports the same number on
+`/v1/status` and `/metrics` (`fn quorum`, `crates/noded/src/metrics.rs`).
+
+| validators `n` | tolerated faults `f` | quorum |
+| --- | --- | --- |
+| 3 | **0** | 3 |
+| 4 | 1 | 3 |
+| 5 | 1 | 4 |
+| 7 | 2 | 5 |
+
+**At n = 3 the fault tolerance is zero.** Every seat must vote every block, so
+one validator that is down, unreachable or wedged HALTS block production.
+Rebooting one of three halts the chain for the reboot. A sleeping host is a
+down validator — and the mesh does not even notice until a socket's
+read/write deadline expires (`MESH_IO_TIMEOUT`,
+`bin/node/src/constants.rs`), so a closed laptop lid is a halt plus a
+detection delay. n = 4 is the first count with any slack at all.
+
+This is accepted rather than fixed — no code warns about it and nothing refuses
+to run at n = 3. If you want a network that survives one host rebooting, seat
+five validators on always-on hosts and keep the sometimes-on machines as
+residents.
+
+### What the halt looks like
+
+- Writes fail after ten seconds with **`timed out awaiting finalization — re-query
+  on the next block`** (`SUBMIT_HOLD`, `bin/node/src/validator/run/drain.rs`).
+  The desktop app shows the same sentence.
+- Reads keep answering from committed state, so every node still looks alive:
+  `dt node status` prints a height, and that height simply stops advancing.
+- `curl 127.0.0.1:8844/v1/status | jq .operations.consensus` shows
+  `reachable_validators` below `quorum`; the same pair is on `/metrics` as
+  `ducktape_consensus_reachable_validators` and `ducktape_consensus_quorum`.
+- `dt node peers` names the seat that stopped talking (`connected=no`, or no
+  row at all).
+
+### Recovery is manual
+
+There is nothing to run on the surviving nodes. **The only fix is to bring the
+missing validator back**, and under these units that means starting its node
+again (a node that crashed on a supervised host is already being restarted
+every 3 s by `Restart=always`; a hand-run node has no supervisor at all):
+
+```sh
+dt node status                                   # height stopped advancing?
+dt node member status                            # in-set=<bool> validators=<n>
+dt node peers                                    # which seat stopped talking
+
+# on the missing host:
+sudo systemctl start ducktape-node@mynet
+journalctl -fu ducktape-node@mynet               # watch it re-mesh and finalize
+
+dt node status                                   # the height moves again
+```
+
+Voting the dead seat out is **not** a recovery step: `ducktape node member
+remove <pubkey>` (and `ducktape node member leave`, which is the same path
+aimed at self) opens a governance proposal that has to be proposed, voted and
+executed *through the halted engine*, and the ballot counts the dead seat.
+`ducktape node member promote` and `ducktape node resident accept` are the same
+ceremony. Every membership change needs a live chain, so grow the set BEFORE
+you need to.
+
+If the seat is gone for good — the host is dead and `identity.key` was not
+backed up — no verb helps, and there is no key-rotation verb to reach for
+either: `ducktape node member` is `promote | remove | leave | status`, so the
+key IS the seat. See `backup-and-keys.md`.
 
 ## Listen ports
 
