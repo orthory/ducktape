@@ -481,8 +481,8 @@ fn unreachable_coordinator_degrades_the_plane_instead_of_killing_it() {
 
     // a socket-mode network whose only coordinator is an unroutable blackhole
     // (RFC5737 TEST-NET-3 — guaranteed never to answer). every surface gets
-    // an explicit ephemeral-range port: init's working defaults (52200,
-    // 8844/8845, 51820) would collide with a real node on this host.
+    // an explicit ephemeral-range port: init's working defaults (the
+    // `DEFAULT_*_LISTEN` ports) would collide with a real node on this host.
     let ports = alloc_ports(4);
     let wg_port = ports[3];
     let init = Command::new(env!("CARGO_BIN_EXE_ducktape"))

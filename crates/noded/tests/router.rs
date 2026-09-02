@@ -325,6 +325,31 @@ async fn submit_maps_a_module_error_to_bad_request() {
     assert_eq!(body["error"], "module error: channel already exists");
 }
 
+/// The ws surface's policy (`stream.rs` `ClientMsg`) on the HTTP bodies: a
+/// field this build does not know is refused BY NAME, never dropped on the
+/// floor while the rest of the body is served (#1325). No actor is spawned on
+/// purpose — the refusal happens in the extractor, before dispatch.
+#[tokio::test]
+async fn submit_refuses_an_unknown_field_by_name() {
+    let (handle, _cmd_rx, _events) = NodeHandle::channel();
+
+    let response = noded::router(handle)
+        .oneshot(post(
+            "/v1/submit",
+            serde_json::json!({ "target": "chat", "payload": {}, "orgin": "jess" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        text.contains("unknown field `orgin`"),
+        "the refusal names the field: {text}"
+    );
+}
+
 #[tokio::test]
 async fn query_returns_the_decoded_module_reply() {
     let (handle, cmd_rx, _events) = NodeHandle::channel();
@@ -509,7 +534,7 @@ async fn shutdown_acknowledges_then_signals() {
     spawn_fake_actor(cmd_rx, None);
     let signal = handle.clone();
 
-    // shutdown moved to the owner-gated admin namespace (ADR A2). the default
+    // shutdown moved to the owner-gated admin namespace. the default
     // handle has no on-chain owner, so the operator credential is the gate; the
     // loopback check is FAIL-CLOSED on a missing ConnectInfo, so the test stamps
     // a loopback peer exactly as the connect-info make-service would.
@@ -544,7 +569,7 @@ fn with_peer(mut req: Request<Body>, addr: &str) -> Request<Body> {
     req
 }
 
-/// shutdown left the unauthenticated public surface entirely (ADR A2). the old
+/// shutdown left the unauthenticated public surface entirely. the old
 /// path is a 404 — flag-day, no alias.
 #[tokio::test]
 async fn the_old_public_shutdown_route_is_gone() {

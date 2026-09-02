@@ -1200,12 +1200,12 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
     Ok(resp)
 }
 
-/// the ed25519 signing namespace for the statesync standing proof (ADR §5.1).
+/// the ed25519 signing namespace for the statesync standing proof.
 /// a client signs this namespace over the network's genesis namespace bytes
 /// ONCE at construction; every request carries the result as its proof.
 pub const SYNC_AUTH_NAMESPACE: &[u8] = b"ducktape-statesync-auth-v1";
 
-/// the AUTHENTICATED rpc envelope (ADR §5.1 fail-closed):
+/// the AUTHENTICATED rpc envelope (fail-closed):
 /// `requester(32) ‖ proof(64) ‖
 /// id(8 LE) ‖ body`. the codec only FRAMES bytes; the caller produces the
 /// proof ([`sign_sync_proof`]) and the server verifies it ([`verify_sync_proof`])

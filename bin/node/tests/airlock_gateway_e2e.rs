@@ -7,8 +7,8 @@
 //! CLIENT then drives the full protocol — attest, session-key handshake, and a
 //! proxied `/v1/messages` — through BOB's browser-gateway door and over the
 //! authenticated WireGuard overlay to Alice's enclave, and gets the swapped
-//! credential's reply back. This proves the remote topology the design's §graft
-//! calls out, minus silicon-backed quote GENERATION and the real Anthropic
+//! credential's reply back. This proves the remote topology, minus
+//! silicon-backed quote GENERATION and the real Anthropic
 //! upstream (a testkit-minted SNP quote — checked by the REAL chain verifier
 //! under the test enclave's roots — and a mock upstream stand in, so the test
 //! is deterministic and spends no quota).

@@ -289,7 +289,7 @@ async fn a_dead_plane_channel_stops_the_loop() {
 
 #[tokio::test]
 async fn a_gated_intro_forwards_once_and_answers_settled_outcomes() {
-    // the member-side gate seam (join ADR §4): the FIRST verified intro
+    // the member-side gate seam: the FIRST verified intro
     // forwards a GateForward to the run loop and acks sealed `Installed`;
     // once the loop writes an outcome into the shared map, a retransmit is
     // answered with THAT (sealed), without forwarding again.

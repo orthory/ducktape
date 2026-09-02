@@ -5,11 +5,6 @@ own forge, register an agent over it, open an issue that references a Pages
 spec, mention the agent, and review the resulting PR, block-anchored spec
 commentary, and usage — all in the app.
 
-Background: the design spec
-([agent dogfooding loop](superpowers/specs/2026-07-10-agent-dogfooding-loop-design.md))
-and the runtime contract
-([deterministic agent runtime ADR](adr/2026-07-09-deterministic-agent-runtime.mdx)).
-
 ## 0. Prereqs
 
 - **A running node.** The dev app (`make dev`) runs a single-node workspace

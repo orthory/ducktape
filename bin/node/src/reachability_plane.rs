@@ -24,7 +24,7 @@ pub(crate) enum IntroPath {
 /// verify → install → ack, in that order — the ack is only emitted after the
 /// `InstallInvitePeer` reply settles, so "acked" can never outrun
 /// "installed". The datagram arrives SEALED to this member's WireGuard X25519
-/// key (join ADR, item 5): a bearer token never crosses the wire in
+/// key: a bearer token never crosses the wire in
 /// the clear, so `open` decrypts it with the member's secret before anything
 /// else. `ack` abstracts the reply transport (the direct listener answers on
 /// its own socket, the coordinated receiver via `SendResolverDatagram`).
@@ -45,7 +45,7 @@ pub(crate) type ReachLaneHandback = (
 );
 
 /// The member side's link from the intro doorbell (reachability-plane thread)
-/// to its validator run loop (§4). The doorbell FORWARDS a verified gate request
+/// to its validator run loop. The doorbell FORWARDS a verified gate request
 /// to the loop, which submits `Redeem` and settles; the loop's drain writes the
 /// resolved outcome into `outcomes`, which the doorbell reads on the joiner's
 /// next retransmit and seals back. A joiner's own plane carries `None`.
@@ -140,7 +140,7 @@ where
                 via,
                 "invite intro tunnel peer installed"
             );
-            // THE GATE (§4): the sealed intro IS the gate request. Forward it to
+            // THE GATE: the sealed intro IS the gate request. Forward it to
             // the run loop and ack the CURRENT outcome — `Installed` while it
             // settles, or the resolved `Admitted`/`Rejected` a later retransmit
             // picks up from the shared map.
@@ -257,7 +257,7 @@ pub(crate) fn wire_reachability_plane<S, R>(
     // request (private coordination); `None` for a genesis validator, a public
     // coordinator, or the dev shape.
     coord_cap: Option<nat_traversal::CoordCap>,
-    // the member side's gate hook (§4): the intro doorbells forward verified
+    // the member side's gate hook: the intro doorbells forward verified
     // gate requests to the validator run loop through it and answer settled
     // outcomes from its shared map. a joiner's own plane passes `None`.
     gate: Option<GateHook>,
@@ -616,7 +616,7 @@ async fn reachability_plane(
     // request (private coordination); `None` for a genesis validator, a public
     // coordinator, or the dev shape.
     coord_cap: Option<nat_traversal::CoordCap>,
-    // the member side's gate hook (§4), cloned into both intro doorbells;
+    // the member side's gate hook, cloned into both intro doorbells;
     // `None` on a joiner's plane.
     gate: Option<GateHook>,
     commands: tokio::sync::mpsc::Receiver<reachability::ReachabilityCommand>,
@@ -902,7 +902,7 @@ async fn reachability_plane(
         coordinators: coords,
         port_policy: policy,
         persist_file: Some(mesh_state_file),
-        // the derived lobby transport identity is RETIRED (join ADR §4): a
+        // the derived lobby transport identity is RETIRED: a
         // joiner's gossip arrives under its REAL key — the mesh re-track at
         // its Redeem grant is what admits it.
         gossip_ingress: None,

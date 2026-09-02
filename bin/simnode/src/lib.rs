@@ -102,10 +102,11 @@
 //! noded's, but reused module state defeats the same-script reproducibility
 //! this tool exists for).
 //!
-//! run: `cargo run -p simnode -- [--listen 127.0.0.1:8845] [--storage <dir>]
+//! run: `cargo run -p simnode -- [--listen <addr>] [--storage <dir>]
 //!       [--auto] [--persona local|networked] [--echo-oracle]
 //!       [--with-valset <hex>[,<hex>...]] [--invite-binding <string>]
 //!       [--node-key <64-hex>] [--modules <dir>]`
+//! — `--listen` defaults to [`DEFAULT_LISTEN`].
 //!
 //! block-on-reject (validator parity): a rejected SINGLE op JOURNALS a block
 //! here, exactly like the ordered validator — the op rides the drain, seals its
@@ -151,6 +152,17 @@ use topology::TOPOLOGY;
 // re-pins here and at node/demo. the composer below builds exactly those ids,
 // the same way bin/node does.
 const PEER_ORIGIN: &[u8] = b"peer";
+
+/// where the binary serves `/v1` when `--listen` is absent — the ONE spelling
+/// of the sim's default port.
+///
+/// It sits outside the real node's operator block (HTTP 8844, admin RPC 8845,
+/// mesh 8846) on purpose, and that is a correctness property rather than
+/// tidiness: the sim is a dev tool run BESIDE a node, so a shared port makes
+/// the second process to boot die on its bind, and makes a client on that port
+/// reach whichever daemon won — answering an admin-RPC caller with `/v1` http.
+/// Keep any new default out of 8844..=8846; a test below pins it.
+pub const DEFAULT_LISTEN: &str = "127.0.0.1:8850";
 
 /// the logical clock: `consensus_time = SIM_EPOCH_MS + height * SIM_BLOCK_MS`.
 /// a fixed epoch keeps module timestamps (message sent_at, task created_at)
@@ -1070,10 +1082,11 @@ impl Sim {
             .iter()
             .filter_map(|d| {
                 let op = d.op.as_ref()?;
+                let disposition = block_disposition(d.disposition)?;
                 Some(MemberInfo {
                     target: op.target.clone(),
                     proposer: proposer_hex(&op.origin),
-                    disposition: block_disposition(d.disposition),
+                    disposition,
                     rejection: d.reason.clone(),
                 })
             })
@@ -1266,7 +1279,12 @@ impl Sim {
         };
         match frame.disposition {
             node::Disposition::Applied => Ok(block),
-            _ => Err(frame.reason.clone().unwrap_or_default()),
+            node::Disposition::Rejected => Err(frame.reason.clone().unwrap_or_default()),
+            // a discarded frame carries no `reason`, so the rejected arm would
+            // hand the submitter an EMPTY error. it cannot happen in the sim
+            // (no cutover ceiling), and the arm exists so a fourth variant
+            // fails the build rather than inheriting that empty string.
+            node::Disposition::Discarded => Err("discarded at the cutover ceiling".into()),
         }
     }
 
@@ -1403,13 +1421,20 @@ impl worker::Lane for AutoLane<'_> {
     }
 }
 
-/// the disposition of a drained frame as its explorer wire twin (`Discarded`
-/// can never reach the sim — it sets no cutover ceiling — so it folds to
-/// rejected).
-fn block_disposition(disposition: node::Disposition) -> BlockDisposition {
+/// the disposition of a drained frame as its explorer wire twin, or `None` for
+/// a frame that owns no explorer row. `Discarded` is that `None`: it never ran
+/// and is re-proposed under the same id at cutover, so publishing it as
+/// `Rejected` would lie in the `/v1/blocks` twin the sim exists to make
+/// trustworthy — both sibling mappers drop it the same way
+/// (`noded::projection::project_block` skips the member, `bin/node`'s
+/// sealed-frame row drops the block). it cannot reach the sim today
+/// (`StepOrderer` sets no cutover ceiling); every arm is named anyway, so a
+/// fourth variant fails the build here as it already does in the siblings.
+fn block_disposition(disposition: node::Disposition) -> Option<BlockDisposition> {
     match disposition {
-        node::Disposition::Applied => BlockDisposition::Applied,
-        _ => BlockDisposition::Rejected,
+        node::Disposition::Applied => Some(BlockDisposition::Applied),
+        node::Disposition::Rejected => Some(BlockDisposition::Rejected),
+        node::Disposition::Discarded => None,
     }
 }
 
@@ -1632,6 +1657,42 @@ async fn strip_receipt_op_hash(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// the sim's `/v1/blocks` twin must map every disposition the way the two
+    /// production mappers do — applied and rejected publish a member row, and a
+    /// discarded frame publishes NONE (it never ran). the arm this pins used to
+    /// be a `_ =>` that read `Discarded` as `Rejected`.
+    #[test]
+    fn a_discarded_frame_publishes_no_member_row() {
+        assert_eq!(
+            block_disposition(node::Disposition::Applied),
+            Some(BlockDisposition::Applied)
+        );
+        assert_eq!(
+            block_disposition(node::Disposition::Rejected),
+            Some(BlockDisposition::Rejected)
+        );
+        assert_eq!(block_disposition(node::Disposition::Discarded), None);
+    }
+
+    /// the sim binary and a real node are run side by side all day, so their
+    /// eagerly-bound defaults must not overlap. `workspace-config` owns the
+    /// node's operator block — HTTP 8844, admin RPC 8845, mesh 8846 — and this
+    /// crate deliberately does not link it, so the block is restated here as
+    /// the thing [`DEFAULT_LISTEN`] must stay clear of. A default back inside
+    /// it means the second process to boot dies on its bind, and a client on
+    /// that port reaches whichever daemon won, speaking the wrong protocol.
+    #[test]
+    fn the_default_listen_avoids_the_nodes_operator_ports() {
+        let node_operator_ports = 8844..=8846;
+        let addr: SocketAddr = DEFAULT_LISTEN.parse().expect("DEFAULT_LISTEN parses");
+        let clear_of_the_node = !node_operator_ports.contains(&addr.port());
+        assert!(
+            clear_of_the_node,
+            "the sim default {addr} is inside the node's operator block \
+             {node_operator_ports:?} — it will fight a real node for the bind"
+        );
+    }
 
     /// WHERE the status snapshot is published is load-bearing, and the bug it
     /// replaced was a race — so this pins the SHAPE, which is deterministic,

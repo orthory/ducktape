@@ -2,8 +2,8 @@
 //! the mesh BEFORE `network.start()` — the per-epoch engine-channel bank
 //! (cert/payload/black-holed lanes), the statesync channel pair, the
 //! reachability plane's STANDBY wiring (+ the tunnel-first join race, which
-//! since join ADR §4 carries the GATE itself: the raced sealed intro is the
-//! gate request and the acked `Admitted` is the authoritative admission),
+//! carries the GATE itself: the raced sealed intro is the gate request and
+//! the acked `Admitted` is the authoritative admission),
 //! and the relay lane, ending with the `network.start()` call itself. `park`
 //! (phase 6b–6d) picks up everything this phase produced via
 //! [`ReplicaChannels`].
@@ -50,7 +50,7 @@ pub(super) struct ReplicaChannels {
     pub(super) reach_reclaim: Option<ReachLaneHandback>,
     pub(super) relay_tx: lookup::Sender<ed25519::PublicKey, OverlayCtx>,
     pub(super) relay_rx: lookup::Receiver<ed25519::PublicKey>,
-    /// the joiner's admission signal (join ADR §4): set by the first-contact
+    /// the joiner's admission signal: set by the first-contact
     /// task the moment a member's doorbell answers the gate with the
     /// AUTHORITATIVE `Admitted` — the park loop reads it directly.
     pub(super) admitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -230,7 +230,7 @@ pub(super) async fn wire(
     // promotion reboot via the persisted mesh, start connected
     // instead of assembling. Without `wireguard_listen` the channel
     // just stays legal — black-hole.
-    // the joiner's TCP relay fallback endpoints (join ADR item 2), derived
+    // the joiner's TCP relay fallback endpoints, derived
     // from the SAME ambient coordinator set before it moves into the plane
     // below. empty = fallback off.
     let mut relay_endpoints: Vec<String> = Vec::new();
@@ -246,8 +246,7 @@ pub(super) async fn wire(
                 // AMBIENT coordinator: the joiner resolves coordinated
                 // rendezvous through its OWN configured/default
                 // coordinator, NEVER one baked into the invite (the
-                // unified invite carries no coordinator address). See
-                // docs/superpowers/specs/2026-07-08-fully-nated-inviter-design.md.
+                // unified invite carries no coordinator address).
                 let coordinators: Vec<Ingress> =
                     match config::coordinator_ingress(primary_coordinator.as_deref()) {
                         Ok(Some(ingress)) => vec![ingress],
@@ -304,7 +303,7 @@ pub(super) async fn wire(
             }
         }
     };
-    // the TUNNEL-FIRST join window, which since join ADR §4 IS the join GATE:
+    // the TUNNEL-FIRST join window, which IS the join GATE:
     // an invite that carried a WireGuard bootstrap makes the tunnel the
     // join's carrier — before any p2p, (a) this node's interface gains the
     // INVITER as a peer (endpoint straight from the blob), and (b) an intro
@@ -315,7 +314,7 @@ pub(super) async fn wire(
     // candidate whose doorbell settles the gate wins and the rest are
     // cancelled. `Admitted` ⇒ standing is COMMITTED — persist the delivered
     // coord cap, delete the consumed token, and wake the park loop (the
-    // `admitted` flag). a terminal `Rejected` ⇒ exit loudly (R2). If every
+    // `admitted` flag). a terminal `Rejected` ⇒ exit loudly. If every
     // offered path is exhausted the race is HONEST-terminal (a distinct
     // exit, never a silent success). The mechanics live in
     // `first_contact_join`; this is just the glue.
@@ -459,7 +458,7 @@ pub(super) async fn wire(
                                         }
                                     }
                                     // a CONSUMED credential must not survive to
-                                    // confuse a later boot (ADR §6): the invite
+                                    // confuse a later boot: the invite
                                     // did its one job.
                                     config::delete_invite_token(&cap_dir);
                                     race_admitted.store(
@@ -558,7 +557,7 @@ pub(super) async fn wire(
 }
 
 /// TCP/443: the relay lane's deployed port — the one port every network
-/// forwards, which is the whole reason the lane exists (join ADR item 2).
+/// forwards, which is the whole reason the lane exists.
 const RELAY_FALLBACK_PORT: u16 = 443;
 
 /// the relay endpoint derived from one coordinator ingress: SAME host,

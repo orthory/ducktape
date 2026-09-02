@@ -162,7 +162,7 @@ pub(crate) fn build(
     // deterministic clock.
     //
     // TRANSPORT IDENTITY: every node — a parked joiner included — connects
-    // under its REAL key (join ADR §4; the derived lobby identity is retired).
+    // under its REAL key (the derived lobby identity is retired).
     // a fresh joiner's key is untracked on every member until its `Redeem`
     // grant advances the membership generation, which the members' drains
     // track immediately — pre-admission it needs no mesh at all: the join
@@ -184,7 +184,7 @@ pub(crate) fn build(
     // pre-handshake IP allowlist (a cheap DoS filter); the handshake rate
     // limits stay on.
     p2p_cfg.bypass_ip_check = true;
-    // the overlay-net seam (ADR 2026-07-07): the mesh dials/binds through
+    // the overlay-net seam: the mesh dials/binds through
     // a wrapper context whose Network routes BY ADDRESS — sockets on this
     // chain's ULA /48 go to the active overlay backend (today: the TUN
     // pass-through, i.e. the same OS socket the kernel routes through the
@@ -195,11 +195,10 @@ pub(crate) fn build(
     // OverlayBook and the reachability plane use, so all three agree on
     // what "overlay" means.
     let overlay_router = overlay_router_for(&namespace);
-    // ADR phase 3: the backend follows the reachability plane. a
-    // configured plane routes overlay dials/binds into the in-process
-    // virtual stack (and gives the wildcard mesh listener its virtual
-    // leg); no plane keeps the OS pass-through, so overlay dials just fail
-    // like a downed interface.
+    // the backend follows the reachability plane. a configured plane routes
+    // overlay dials/binds into the in-process virtual stack (and gives the
+    // wildcard mesh listener its virtual leg); no plane keeps the OS
+    // pass-through, so overlay dials just fail like a downed interface.
     //
     // socket mode's wildcard mesh bind normally carries the kernel OS leg
     // beside the virtual one — but a node that advertises ONLY its overlay

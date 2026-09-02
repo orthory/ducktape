@@ -3,10 +3,10 @@
 //! pool + optional replica-restart recovery-by-replay), then the park
 //! `loop` itself (serve window, drain pass, detection lane, ascension), and
 //! finally the promotion checkpoint + [`reboot_self`]. one function on
-//! purpose (decision 2 in the plan): the join gate phase (ADR §3.3), the
-//! loop's `not_serving` closure, and its mountain of loop-scoped state never
-//! leave it, so splitting sub-phases into separate functions would just turn
-//! them back into a carrier struct with more steps.
+//! purpose: the join gate phase, the loop's `not_serving` closure, and its
+//! mountain of loop-scoped state never leave it, so splitting sub-phases into
+//! separate functions would just turn them back into a carrier struct with
+//! more steps.
 
 use commonware_codec::DecodeExt as _;
 use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
@@ -375,7 +375,7 @@ pub(super) async fn park(
     // the joiner's sync client: the mesh path, ROTATING across every
     // validator that can serve. no unmatched-frame hook: drop-on-miss
     // (the blob fetch lane that consumed those frames is retired). the
-    // real-key standing proof (ADR §5.1) is signed ONCE here with the same
+    // real-key standing proof is signed ONCE here with the same
     // `signer` the join proof uses: pre-admission the server refuses it (key
     // not in standing), once admitted (key in residents) it serves — the
     // client is oblivious to its own standing; the server decides.
@@ -395,7 +395,7 @@ pub(super) async fn park(
         Some(sync_reclaim),
     );
 
-    // the CANDIDATE members the join gate (ADR §3.3) targets — the descriptor's
+    // the CANDIDATE members the join gate targets — the descriptor's
     // validators (inviter ∪ fronts, as discovered). also the resident relay's
     // targets once standing lands; the manifest poll refreshes it to the tip's
     // current members.
@@ -758,12 +758,12 @@ pub(super) async fn park(
     // (`crate::announce`) retracts it, both over that same /v1 surface. A
     // resident therefore runs no announce pump at all.
 
-    // ── THE JOIN GATE rides first contact now (join ADR §4) ────────────────
+    // ── THE JOIN GATE rides first contact now ──────────────────────────────
     // a fresh TOKENED joiner's sealed intro IS its gate request: the wiring
     // phase's first-contact race announces it to every candidate member's
     // doorbell, and the settled outcome comes back over the same tunnel —
     // `Admitted` sets the shared `admitted` flag (cap persisted, token
-    // deleted, by that task), a terminal `Rejected` exits there (R2). the
+    // deleted, by that task), a terminal `Rejected` exits there. the
     // loop below just picks the flag up; the RESTORE path (persisted
     // standing) and the token-less MANUAL path (out-of-band pubkey, admitted
     // by `node resident accept`/`node member promote`) keep their existing detection.
@@ -883,7 +883,7 @@ pub(super) async fn park(
                                 "this node is not a member — join requests queue on \
                                  validators",
                             ),
-                            // the node-owned join state (ADR §6): derived from
+                            // the node-owned join state: derived from
                             // the gate outcome + committed chain progress this
                             // loop already holds — never a scattered guess. a
                             // TERMINAL reject exits the process before the loop,

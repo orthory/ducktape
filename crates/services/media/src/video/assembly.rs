@@ -1,7 +1,7 @@
 //! Frame reassembly for one sender: fragments arrive unordered and lossy;
 //! a frame completes when all fragments land. A NEWER frame starting while
 //! one is in progress abandons the old one (any missing fragment drops the
-//! whole frame — the ADR's contract); frames at-or-below the last emitted
+//! whole frame — that is the contract); frames at-or-below the last emitted
 //! frame_no are stale and ignored. `dropped_frames` feeds the keyframe-
 //! request path.
 

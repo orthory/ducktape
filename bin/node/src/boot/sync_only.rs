@@ -119,7 +119,7 @@ pub(crate) async fn run(
     }
     // rotate across every validator that can serve — the payloads
     // verify against consensus roots, so source choice is pure
-    // availability. carry this node's real-key standing proof (ADR §5.1):
+    // availability. carry this node's real-key standing proof:
     // a sync-only node WITH committed standing (a resident observing) is
     // served; a standing-less observer is now refused, by design.
     let (sync_requester, sync_proof) = statesync::sign_sync_proof(signer, &namespace);

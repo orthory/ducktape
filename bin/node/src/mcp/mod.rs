@@ -116,7 +116,7 @@ fn initialize() -> Value {
         "serverInfo": {"name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION")},
         // where the "how to work in Ducktape" guide lives — it ships with the
         // binary, so it can never describe a tool this binary does not have.
-        "instructions": guide::GUIDE,
+        "instructions": guide::GUIDE.as_str(),
     })
 }
 

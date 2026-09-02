@@ -3,7 +3,7 @@
 //!
 //! ## why this file is its own thing
 //!
-//! This is the ONLY Safe-aware code in the module (design §3: the MPC seam is
+//! This is the ONLY Safe-aware code in the module (the MPC seam is
 //! this file boundary plus the `backend` field — not a trait with one impl).
 //! Everything else in `multisig` is backend-agnostic: propose an intent,
 //! collect contributions, emit a finished transaction.
@@ -96,8 +96,8 @@ impl SafeTx {
     ///   one approved proposal could rewrite owners and threshold.
     /// - A non-zero `gasPrice`/`gasToken`/`refundReceiver` makes the Safe pay
     ///   the executor an attacker-chosen amount out of vault funds — the
-    ///   documented Safe gas-refund griefing vector. Design §8 has the executor
-    ///   pay their own gas precisely so these can stay pinned at zero.
+    ///   documented Safe gas-refund griefing vector. The executor pays their
+    ///   own gas precisely so these can stay pinned at zero.
     pub fn validate(&self) -> Result<(), String> {
         if self.operation != Operation::Call {
             return Err("multisig: DELEGATECALL proposals are refused (it can rewrite the Safe's own owners and threshold)".into());
@@ -159,8 +159,8 @@ pub fn safe_tx_hash(chain_id: u64, safe: Address, tx: &SafeTx) -> B256 {
 
 /// Recover the owner address that produced `sig` over `hash`.
 ///
-/// Ethereum's `ecrecover` is the verifier of record for Safe owner signatures
-/// (design §1), so this is the whole of our signature checking — no curve is
+/// Ethereum's `ecrecover` is the verifier of record for Safe owner signatures,
+/// so this is the whole of our signature checking — no curve is
 /// re-implemented anywhere in the tree.
 ///
 /// The signature is rejected unless S is in the lower half of the curve order
@@ -198,7 +198,7 @@ pub fn pack_signatures(mut approvals: Vec<(Address, [u8; 65])>) -> Vec<u8> {
 /// ABI-encoded `execTransaction(...)` calldata — the exact bytes broadcast.
 ///
 /// Built in consensus so the finished transaction is committed state: the
-/// oracle that broadcasts it (design §5) transmits bytes it did not choose.
+/// oracle that broadcasts it transmits bytes it did not choose.
 pub fn exec_transaction_calldata(tx: &SafeTx, signatures: &[u8]) -> Vec<u8> {
     // 10 head words; `data` and `signatures` are dynamic and live in the tail.
     const HEAD_WORDS: usize = 10;

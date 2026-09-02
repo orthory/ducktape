@@ -1,14 +1,14 @@
-//! the ADR phase-1 loopback pair proof: two (three, for the replace case)
+//! the loopback pair proof: two (three, for the replace case)
 //! userspace backends on 127.0.0.1-class loopback underlay, driven ONLY
 //! through the `WireGuardEffect` boundary — handshake, datagram echo through
 //! the virtual stack, TCP dial/listen through the tunnel, forced rekey,
 //! session preservation across an identical re-apply, and the atomic peer
-//! replace. plus the phase-2 consumer faces over the same pair: the overlay
+//! replace. plus the consumer faces over the same pair: the overlay
 //! seam's `Virtual` arm (a commonware `Network` dial/bind terminating in the
 //! virtual stacks) and data-plane's `VirtualSocketFactory`.
 //!
 //! everything here runs unprivileged: no TUN, no CAP_NET_ADMIN, no external
-//! binaries — the property the whole ADR exists to win.
+//! binaries — the property the userspace backend exists to win.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
@@ -141,7 +141,7 @@ async fn udp_round_trip(a: &Node, b: &Node, payload: &[u8]) {
     assert_eq!(from.ip(), IpAddr::V6(b.ula), "echo source is b's /128");
 }
 
-/// the ADR's core loopback proof: handshake + datagram echo, with the
+/// the core loopback proof: handshake + datagram echo, with the
 /// passive side learning the initiator's endpoint from the wire.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn handshake_and_datagram_echo() {
@@ -473,7 +473,7 @@ async fn one_node_carries_two_concurrent_tunnels() {
     );
 }
 
-// ── ADR phase 3: the shared underlay + the mesh listener's virtual leg ──
+// ── the shared underlay + the mesh listener's virtual leg ───────────────
 
 /// the node wiring's shared underlay socket: WireGuard traffic and the NAT
 /// bypass lane demux off ONE socket — tunnel datagrams reach the device
@@ -587,7 +587,7 @@ async fn shared_underlay_demuxes_nat_bypass_alongside_tunnel_traffic() {
         .expect("echo after the rebuild");
 }
 
-/// the mesh listener's virtual leg (the seam's `Dual` bind, ADR phase 3):
+/// the mesh listener's virtual leg (the seam's `Dual` bind):
 /// lazily binds at the node's own ULA once a stack exists, accepts
 /// tunnel-carried connections, and re-binds across an interface rebuild —
 /// the inbound path an OS listener on `[::]` can never see in socket mode.
@@ -661,7 +661,7 @@ async fn lazy_virtual_leg_accepts_across_rebuilds() {
     .expect("second accept within deadline — the leg re-bound on the new stack");
 }
 
-// ── ADR phase 2: the consumer faces over the pair ───────
+// ── the consumer faces over the pair ────────────────────
 
 /// the overlay seam's `Virtual` arm: a commonware `Network` bind and dial on
 /// overlay ULAs terminate in the virtual stacks and carry bytes both ways

@@ -171,7 +171,8 @@ fn the_identity_reads_without_the_password_and_a_non_v1_file_does_not() {
 
     std::fs::write(&key, "plaintext-key").unwrap();
     assert!(keystore::userkey::read_user_key_file(&key).is_err());
-    std::fs::write(&key, format!("{ENCRYPTED_KEY_PREFIX}not-base64!!")).unwrap();
+    let prefix = keystore::userkey::USER_KEY_ENCRYPTED_PREFIX;
+    std::fs::write(&key, format!("{prefix}not-base64!!")).unwrap();
     assert!(keystore::userkey::read_user_key_file(&key).is_err());
 }
 

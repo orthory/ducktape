@@ -42,7 +42,7 @@ pub(super) struct PreWiring {
     pub(super) relay_rx: super::MeshReceiver,
     pub(super) media_peers: Option<Arc<overlay_book::OverlayPeers>>,
     pub(super) reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
-    /// the join GATE's loop end (join ADR §4): forwarded requests arrive here…
+    /// the join GATE's loop end: forwarded requests arrive here…
     pub(super) gate_fwd_rx: tokio::sync::mpsc::Receiver<join_gate::GateForward>,
     /// …kept open by this never-sending clone even when no plane was wired…
     pub(super) gate_fwd_keepalive: tokio::sync::mpsc::Sender<join_gate::GateForward>,
@@ -327,7 +327,7 @@ pub(super) fn wire_serve_lanes(
     let sync_lease_serve = sync_lease.clone();
     let mut sync_tx = sync_tx;
     let mut ingress = sync_ingress;
-    // the genesis namespace the standing proof is bound to (ADR §5.1).
+    // the genesis namespace the standing proof is bound to.
     let serve_namespace = namespace.to_vec();
     context
         .child("statesync_serve")
@@ -373,7 +373,7 @@ pub(super) fn wire_serve_lanes(
                     }
                     continue; // ours — never a request to serve.
                 }
-                // FAIL-CLOSED (ADR §5.1). a transport-key standing gate is
+                // FAIL-CLOSED. a transport-key standing gate is
                 // IMPOSSIBLE at this seam: a pre-admission joiner and an
                 // admitted resident share the derived LOBBY key on this
                 // channel (boot/mesh.rs), so their peer identity is the
@@ -387,7 +387,7 @@ pub(super) fn wire_serve_lanes(
                 //  (2) that key must be in COMMITTED standing (validators ∪
                 //      residents), read fresh per request through the loop
                 //      seam. a valid targeted invite alone yields no standing
-                //      key ⇒ leaks ZERO chain state (R4). the restore path
+                //      key ⇒ leaks ZERO chain state. the restore path
                 //      and validator backfill dial under their real keys —
                 //      which ARE in the valset — so they still sync; an
                 //      admitted resident's key enters residents at its Redeem
@@ -662,10 +662,10 @@ pub(super) async fn wire(
     // the ingress select arm and the drain-resolution/expiry code.
     let (relay_tx, relay_rx) = network.register(CHANNEL_SUBMIT_RELAY, quota, MAX_BACKLOG);
 
-    // the voice + video hub: huddle media between members. per the
-    // per-use data-plane ADR (docs/adr/2026-07-07-per-use-data-plane.mdx),
-    // media rides the OVERLAY — audio+control on Service::Voice's overlay
-    // socket (45902), camera on Service::Video's (45903) — never the mesh.
+    // the voice + video hub: huddle media between members. one per-use data
+    // plane per service: media rides the OVERLAY — audio+control on
+    // Service::Voice's overlay socket (45902), camera on Service::Video's
+    // (45903) — never the mesh.
     let media_peers = {
         // media needs the overlay: with no overlay (fake effect, or the
         // reachability plane unconfigured) there is no media transport at
@@ -719,7 +719,7 @@ pub(super) async fn wire(
     let (reach_p2p_tx, mut reach_p2p_rx) =
         network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
     // the join GATE's two connectors between the intro doorbell (the plane's
-    // thread) and the validator run loop (join ADR §4): verified gate requests
+    // thread) and the validator run loop: verified gate requests
     // forward in over the channel; resolved outcomes ride back through the
     // shared map. created whether or not the plane runs — the loop's select
     // arm stays wired either way (the keepalive sender keeps it pending, not
@@ -770,7 +770,7 @@ pub(super) async fn wire(
                     invite_listen,
                     coord_cap.clone(),
                     // MEMBER side: the doorbells ring the join gate through
-                    // to this validator's run loop (§4).
+                    // to this validator's run loop.
                     Some(GateHook {
                         forward: gate_fwd_tx.clone(),
                         outcomes: gate_outcomes.clone(),

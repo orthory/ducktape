@@ -158,7 +158,7 @@ impl ValidatorRuntime<'_> {
             }
             RpcRequest::JoinState => {
                 // a validator is a full member — the terminal join state. the
-                // node-owned source (ADR §6): no log-marker parsing.
+                // node-owned source: no log-marker parsing.
                 RpcReply {
                     join_state: Some(JoinStateView {
                         phase: "promoted".into(),
@@ -190,7 +190,7 @@ impl ValidatorRuntime<'_> {
         let _ = reply.send(resp);
     }
 
-    /// the join gate (join ADR §4), arriving over the WireGuard-tunnel
+    /// the join gate, arriving over the WireGuard-tunnel
     /// doorbell: the reachability plane already OPENED and VERIFIED the sealed
     /// intro (V1–V5 crypto, V4 expiry) and installed the tunnel —
     /// what reaches this loop is a verified request. this runs the
@@ -252,7 +252,7 @@ impl ValidatorRuntime<'_> {
         // view cannot distinguish a REMOVED issuer (invite dead) from a
         // just-admitted one it has not applied yet; a terminal answer here
         // would let one lagging validator kill a healthy join. the joiner
-        // fails over to another member (§3.1 V7, PR #538 ruling).
+        // fails over to another member (V7, PR #538 ruling).
         if !members.contains(&issuer_bytes) {
             super::settle_gate(
                 gate_outcomes,
@@ -281,7 +281,7 @@ impl ValidatorRuntime<'_> {
             return;
         }
 
-        // V6/V7/V9 pass. ONE in-flight gate per joiner key (§3.2): a duplicate
+        // V6/V7/V9 pass. ONE in-flight gate per joiner key: a duplicate
         // forward while settling (the joiner's retransmit cadence outpacing
         // consensus) re-arms nothing — no double-submit (the nonce set would
         // collapse racing submits to one grant anyway, but a second
@@ -315,7 +315,7 @@ impl ValidatorRuntime<'_> {
             None
         };
 
-        // SETTLE-THEN-ANSWER (§3.2): submit the Redeem and hold the joiner's
+        // SETTLE-THEN-ANSWER: submit the Redeem and hold the joiner's
         // outcome against the frame id. `submit` returns the FrameId; the drain
         // reports its consensus fate on `pending_gates` (Applied → Admitted,
         // Rejected → mapped code, timeout → Busy) — this handler never blocks.
@@ -378,7 +378,7 @@ impl ValidatorRuntime<'_> {
                 );
             }
             Err(e) => {
-                // submit failure is transient (§3.2): the joiner tries another
+                // submit failure is transient: the joiner tries another
                 // member rather than exiting.
                 super::settle_gate(
                     gate_outcomes,

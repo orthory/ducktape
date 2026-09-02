@@ -144,7 +144,7 @@ pub enum GovMsg {
     /// via the redeemed-nonce set in consensus state. success emits
     /// `ValsetMsg::Grant` in the same block (full node RESIDENT standing —
     /// mesh + statesync, no quorum seat). EVERY invite is bearer (the
-    /// targeted form was dropped — see the join ADR): no `target` — the
+    /// targeted form was dropped): no `target` — the
     /// `proof` binds the redemption to whichever key presents it and the
     /// nonce set makes that exactly-once.
     Redeem {

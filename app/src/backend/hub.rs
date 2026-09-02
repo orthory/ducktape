@@ -85,17 +85,15 @@ pub struct HubState {
     pub hidden: i64,
 }
 
-/// `absent` | `encrypted` | `plaintext` | `unlocatable` — the same probe
-/// Settings runs, computed in-process (no subprocess, no password).
+/// `unlocatable` when this device has no key path to read at all, else the
+/// keystore's own reading of that file (`absent` | `encrypted` | `unreadable`)
+/// — the same classification the wallet listing shows, computed in-process (no
+/// subprocess, no password).
 pub(crate) fn user_key_state() -> String {
     let Ok(path) = user_key_path() else {
         return "unlocatable".into();
     };
-    match std::fs::read(&path) {
-        Err(_) => "absent".into(),
-        Ok(bytes) if bytes.starts_with(ENCRYPTED_KEY_PREFIX.as_bytes()) => "encrypted".into(),
-        Ok(_) => "plaintext".into(),
-    }
+    keystore::userkey::key_file_state(&path).as_str().into()
 }
 
 /// A network's display name is the human half of its chain id: `demo#a1b2`

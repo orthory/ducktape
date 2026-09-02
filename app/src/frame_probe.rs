@@ -2375,7 +2375,7 @@ fn probe() {
         //
         // It goes through the REDUCER, not a field poke. Since ui #783 the
         // timeline's `lazy` keys on the compiler-owned revision of `messages`,
-        // and only generated code ticks one (ADR 0009): a probe that wrote
+        // and only generated code ticks one: a probe that wrote
         // `app.messages[i].rev` by hand would leave the revision where it was,
         // the memo would hand back its cached subtree, and this phase would
         // quietly measure an unchanged frame instead of a one-row rebuild.

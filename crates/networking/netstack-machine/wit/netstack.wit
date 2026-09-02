@@ -14,8 +14,9 @@ interface host {
   /// The identity's public key, 32 bytes.
   identity: func() -> list<u8>;
   /// Forward one tracing event. `target` is the guest's own target; the
-  /// host re-emits the line under its netstack plane and keeps the target
-  /// as a field.
+  /// host re-emits the line under `ducktape::reachability` — the same plane
+  /// the native machine logs to, so the trace reads identically whichever
+  /// backend produced it — and keeps the guest's target as a field.
   log: func(level: level, target: string, message: string);
 }
 

@@ -101,7 +101,7 @@ pub(crate) const CHANNEL_STATE_SYNC: u64 = 4;
 /// the sender's connection — and black-holed where the plane does not run.
 pub(crate) const CHANNEL_REACHABILITY: u64 = 5;
 /// the park loop's poll cadence while the joiner has standing but no served
-/// boundary yet, and the join gate's per-candidate re-send tick (ADR §3.3):
+/// boundary yet, and the join gate's per-candidate re-send tick:
 /// fast, because this tick paces the first sync and the gate's warm-up resend.
 pub(crate) const JOINER_POLL: Duration = Duration::from_secs(2);
 /// a standing, SERVING resident's fallback poll. head-following is wake-driven
@@ -137,7 +137,7 @@ pub(crate) const MODULE_IDS: &[&str] = topology::PRODUCTION;
 /// block events). mirrors the rpc bridge's stuck-node budget.
 pub(crate) const SUBMIT_HOLD: Duration = Duration::from_secs(10);
 
-/// the join gate's settle budget (ADR §3.2): a gating member holds the joiner's
+/// the join gate's settle budget: a gating member holds the joiner's
 /// pending `Admitted`/`Rejected` outcome against its submitted `Redeem` frame
 /// for this long. if the frame has not drained by then the member writes
 /// `Rejected{ Busy, terminal: false }` into the gate-outcome map and the joiner

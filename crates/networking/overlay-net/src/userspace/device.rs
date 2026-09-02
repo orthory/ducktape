@@ -2,7 +2,7 @@
 //! `Tunn`s (one per peer, keyed by allowed-ip `/128`) pumped over ONE
 //! process-owned underlay UDP socket.
 //!
-//! this is the sans-io half of the ADR's `UserspaceOverlayNet`: it never sees
+//! this is the sans-io half of `UserspaceOverlayNet`: it never sees
 //! a TCP stream or a virtual socket — it moves raw IP packets between the
 //! underlay (encrypted WireGuard datagrams on the UDP socket) and the
 //! [`stack`](super::stack) (plaintext IP packets over a channel pair), and it
@@ -15,7 +15,7 @@
 //! every pump copies the packets a `Tunn` call produces out of the lock, then
 //! sends. the peer table itself is an `RwLock` written only by
 //! [`WgDevice::replace_peers`] (the effect's `apply`), which swaps the whole
-//! table in one write — the atomic peer-set replace the ADR requires.
+//! table in one write — the peer-set replace must be atomic.
 
 use std::collections::HashMap;
 use std::io;
@@ -62,7 +62,7 @@ pub(super) fn note_drop(counter: &AtomicU64, reason: &'static str) {
     let dropped = counter.fetch_add(1, Ordering::Relaxed) + 1;
     if dropped == 1 || dropped.is_multiple_of(1024) {
         tracing::warn!(
-            target: "ducktape::overlay",
+            target: "ducktape::dataplane",
             reason,
             dropped,
             "overlay packet dropped"
@@ -72,11 +72,11 @@ pub(super) fn note_drop(counter: &AtomicU64, reason: &'static str) {
 
 // ── the underlay socket ─────────────────────────────────
 
-/// the ADR's "one process-owned underlay UDP socket per node": the bound WG
+/// one process-owned underlay UDP socket per node: the bound WG
 /// listen socket plus its single receive pump, demuxing inbound datagrams
 /// between the WireGuard device and a BYPASS lane.
 ///
-/// the bypass lane is why this exists as its own object (ADR phase 3): the
+/// the bypass lane is why this exists as its own object: the
 /// NAT punch must originate from the same 5-tuple the tunnel runs on, so the
 /// nat-traversal client sends through [`send_to`](Self::send_to) and
 /// receives whatever the pump classifies as not-WireGuard. classification is
@@ -390,7 +390,7 @@ impl PeerState {
         }
         let endpoint = *self.endpoint.read().expect("endpoint lock poisoned");
         tracing::warn!(
-            target: "ducktape::overlay",
+            target: "ducktape::dataplane",
             peer = %self.overlay_ip(),
             endpoint = ?endpoint,
             reason = "handshake_unanswered",
@@ -406,7 +406,7 @@ impl PeerState {
         }
         let endpoint = *self.endpoint.read().expect("endpoint lock poisoned");
         tracing::info!(
-            target: "ducktape::overlay",
+            target: "ducktape::dataplane",
             peer = %self.overlay_ip(),
             endpoint = ?endpoint,
             "wg session RE-ESTABLISHED"
@@ -769,8 +769,8 @@ async fn outbound_pump(inner: Arc<DeviceInner>, mut from_stack: mpsc::Receiver<V
 
 /// drive every peer's timer machinery: handshake retransmission, persistent
 /// keepalive, rekey-after-time, session expiry. this loop is what makes the
-/// `Tunn`s live objects rather than passive codecs — the "new moving part"
-/// the ADR calls out.
+/// `Tunn`s live objects rather than passive codecs — the new moving part the
+/// userspace backend adds.
 async fn timer_pump(inner: Arc<DeviceInner>) {
     let mut tick = tokio::time::interval(TIMER_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

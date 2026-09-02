@@ -1,4 +1,4 @@
-//! the join-gate wire format (the join protocol, ADR §4) — how a not-yet-
+//! the join-gate wire format (the join protocol) — how a not-yet-
 //! admitted joiner asks to join, and how a gating member answers
 //! AUTHORITATIVELY.
 //!
@@ -21,11 +21,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{INVITE_NONCE_LEN, InviteToken};
 
-/// why a gate refused, per ADR §4. wire-stable identifiers (the `detail` prose
+/// why a gate refused. wire-stable identifiers (the `detail` prose
 /// is free to change; these are not). the terminal bit — whether the joiner
-/// stops (exits) rather than failing over — is set by the member per the §3.1
-/// checklist, not baked into the code, since `IssuerUnknown` is non-terminal
-/// while every other code is terminal.
+/// stops (exits) rather than failing over — is set by the member per its
+/// verification checklist, not baked into the code, since `IssuerUnknown` is
+/// non-terminal while every other code is terminal.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RejectCode {
@@ -43,12 +43,12 @@ pub enum RejectCode {
     /// a lagging view cannot tell removed from not-yet-seen; the joiner fails
     /// over to another member.
     IssuerUnknown,
-    /// §3.2: the member could not settle the gate in time (timeout / submit
+    /// the member could not settle the gate in time (timeout / submit
     /// failure). NON-TERMINAL — the joiner tries another member.
     Busy,
 }
 
-/// map a governance `Redeem` consensus-reject reason (ADR §3.2) to a gate
+/// map a governance `Redeem` consensus-reject reason to a gate
 /// reject code + terminal bit. these fire only on a race that slips past the
 /// member's verification filter (chiefly a nonce another joiner redeemed first).
 /// an unrecognized reason is a transient `Busy` (non-terminal) rather than a
@@ -141,7 +141,7 @@ pub fn verify_join_request(
 }
 
 // ============================================================================
-// the UDP intro — the joiner's first contact AND its gate request (§4): a
+// the UDP intro — the joiner's first contact AND its gate request: a
 // fresh joiner has NO path to the mesh yet (that is what the tunnel is for),
 // so it announces its keys in a single sealed datagram to the inviter's intro
 // listener. the token authenticates the request (mint was the admission
@@ -176,8 +176,8 @@ pub struct IntroRequest {
     pub wg_sig: Vec<u8>,
 }
 
-/// what a member tells a joiner in answer to a first-contact intro (the join
-/// ADR §4): the sealed intro IS the gate request, so a member installs
+/// what a member tells a joiner in answer to a first-contact intro: the
+/// sealed intro IS the gate request, so a member installs
 /// the tunnel and forwards the request into consensus. The first ack reports
 /// the tunnel is up while the gate settles (`Installed`); a later ack — once
 /// `Redeem` commits or is refused — carries the AUTHORITATIVE outcome.
@@ -190,7 +190,7 @@ pub enum IntroReply {
     /// terminal for this candidate; carries no secret.
     Refused { detail: String },
     /// the AUTHORITATIVE admission: `Redeem` committed at `height` — the
-    /// joiner now holds standing (ADR R3).
+    /// joiner now holds standing.
     ///
     /// `cap` carries an OPAQUE genesis-issued coordinator capability (packed
     /// `CoordCap` bytes) minted for the joiner when this network coordinates
@@ -219,7 +219,7 @@ pub struct IntroAck {
 }
 
 /// a verified gate request a member's doorbell forwards to its validator run
-/// loop (§4): exactly the fields `governance::Redeem` needs, lifted from the
+/// loop: exactly the fields `governance::Redeem` needs, lifted from the
 /// opened intro. The loop runs the committed-state checks (V6/V7/V9), submits
 /// `Redeem`, settles; the outcome returns via the shared gate-outcome map.
 #[derive(Debug, Clone, PartialEq)]
@@ -377,7 +377,7 @@ mod tests {
 
     #[test]
     fn an_admitted_intro_ack_roundtrips() {
-        // the gate outcome rides the intro-ack wire now (join ADR §4).
+        // the gate outcome rides the intro-ack wire now.
         let ack = IntroAck {
             nonce: vec![7u8; INVITE_NONCE_LEN],
             reply: IntroReply::Admitted {
@@ -419,7 +419,7 @@ mod tests {
 
     #[test]
     fn reject_codes_are_wire_stable() {
-        // the code identifiers are wire-stable (ADR §4): pin the snake_case
+        // the code identifiers are wire-stable: pin the snake_case
         // strings so a rename cannot silently break a deployed joiner.
         let cases = [
             (RejectCode::BadEncoding, "bad_encoding"),
