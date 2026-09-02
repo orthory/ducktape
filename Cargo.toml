@@ -299,7 +299,7 @@ borsh = { version = "1", default-features = false, features = ["derive", "std"] 
 # modules inside the host. pinned EXACTLY: the runtime IS the module execution
 # semantics, so it is consensus-affecting and every validator must run the
 # identical build; changing it is a binary upgrade, never a live module swap.
-wasmtime = "=46.0.1"
+wasmtime = "=46.0.3"
 # wit-bindgen — the guest-side binding generator for a crate's own component
 # port (the netstack machine's `guest` feature). Only ever compiled inside
 # guest-builder's synthesized wasm32 workspace.
