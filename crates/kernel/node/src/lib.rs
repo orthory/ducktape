@@ -11,6 +11,8 @@
 use host::{BlockContext, Host, MemberOutcome};
 use sdk::{Event, Msg, StateRoot};
 
+pub mod log_file;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("host error: {0}")]

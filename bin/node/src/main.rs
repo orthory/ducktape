@@ -142,7 +142,24 @@ fn main() {
     // reason immediately instead of inferring death. (Onboarding subcommands
     // still surface their own stderr via run_verb; the prefix is harmless there.)
     if let Err(err) = run() {
-        eprintln!("FATAL: {err}");
+        // `node run` (and `service run`) installs its subscriber BEFORE it
+        // resolves the config and binds, so a bad field or a port conflict
+        // propagates back here with a perfectly good sink open — and used to
+        // leave daemon.log ending at the previous run's last line. that
+        // subscriber tees stderr, so the one event IS the CLI's last word
+        // there too; a one-shot verb installs none, and for it stderr is the
+        // whole record.
+        let sink_installed = tracing::dispatcher::has_been_set();
+        if sink_installed {
+            tracing::error!(
+                target: "ducktape::boot",
+                event = "boot_fatal",
+                error = %err,
+                "FATAL: {err}"
+            );
+        } else {
+            eprintln!("FATAL: {err}");
+        }
         std::process::exit(1);
     }
 }
@@ -260,7 +277,8 @@ enum Family {
     /// offchain service daemons: what is signaling, and what you have enabled
     #[command(subcommand)]
     Service(services::ServiceCmd),
-    /// remote/interactive sandboxed provider sessions (pty attach, sched runs)
+    /// sandboxed provider sessions (pty attach, sched runs) and run control
+    /// (cancel, reassign)
     Agent(agent_cli::AgentArgs),
     /// live code swaps: update, register, status
     #[command(subcommand)]

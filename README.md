@@ -127,8 +127,9 @@ target/release/coordinator --listen 0.0.0.0:3478
 
 ### Build wasm module components (guest-builder)
 
-Prerequisites (same as always): `rustup target add wasm32-unknown-unknown` and
-`cargo install wasm-tools`.
+Prerequisite: `cargo install wasm-tools`. The wasm32 target is not one of them
+— `rust-toolchain.toml` lists it, so rustup installs it with the pinned
+channel.
 
 Day to day you don't invoke the tool — `make wasm-modules` rebuilds every
 module component (and refreshes the kernel test fixtures), and
