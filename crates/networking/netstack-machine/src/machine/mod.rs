@@ -177,9 +177,10 @@ pub(crate) struct Driver {
     /// JOIN-WINDOW peers (see [`Event::InstallInvitePeer`]):
     /// epoch-independent, merged into every apply as the weakest layer (an
     /// entry never overrides a validated plan or a pre-warm record for the
-    /// same identity, and dissolves once one exists). Bounded at
-    /// [`MAX_INVITE_PEERS`]; an uncovered entry outlives its last intro by
-    /// [`INVITE_JOIN_WINDOW_MS`] at most.
+    /// same identity, and dissolves once one exists). The UNCOVERED entries
+    /// are bounded at [`MAX_INVITE_PEERS`] and outlive their last intro by
+    /// [`INVITE_JOIN_WINDOW_MS`] at most; a covered one (grafted onto an
+    /// endpoint-less record) spends no slot and never ages out.
     pub(crate) invite_peers: BTreeMap<ValidatorIdentity, InvitePeer>,
     /// the last CONTROL endpoint observed per identity — the only-on-change
     /// ledger behind [`ReachabilityEvent::ControlEndpointObserved`].
@@ -1192,5 +1193,76 @@ mod invite_layer_tests {
                 .collect::<Vec<_>>(),
             vec![member, fresh]
         );
+    }
+
+    /// The intro path itself prunes and counts by coverage, never by age
+    /// alone: a table of NAT'd members promoted long ago (endpoint-less
+    /// records, entries far older than the window) keeps every grafted
+    /// endpoint through a stranger's late intro — and, being covered, spends
+    /// no join-window slot, so a full table of members still admits it.
+    #[test]
+    fn covered_members_survive_a_late_stranger_and_spend_no_slot() {
+        let mut machine = machine();
+        let member_key = |octet: u8| X25519PublicKey([octet; 32]);
+        let member_endpoint = |octet: u8| SocketAddr::from(([9, 9, 9, octet], 51_820));
+        let octets = 100..100 + MAX_INVITE_PEERS as u8;
+        let mut base = BTreeMap::new();
+        for octet in octets.clone() {
+            let member = ValidatorIdentity([octet; 32]);
+            base.insert(
+                member,
+                PeerTunnelConfig {
+                    wireguard_public_key: member_key(octet),
+                    endpoint: None,
+                    allowed_ips: Vec::new(),
+                    keepalive_seconds: Some(KEEPALIVE_SECONDS),
+                },
+            );
+            machine.driver.invite_peers.insert(
+                member,
+                InvitePeer {
+                    config: PeerTunnelConfig {
+                        wireguard_public_key: member_key(octet),
+                        endpoint: Some(member_endpoint(octet)),
+                        allowed_ips: Vec::new(),
+                        keepalive_seconds: Some(KEEPALIVE_SECONDS),
+                    },
+                    installed_at_ms: 0,
+                },
+            );
+        }
+        machine.driver.base_peers = Some(base);
+
+        let effects = intro(&mut machine, 2, INVITE_JOIN_WINDOW_MS + 1);
+        assert_eq!(
+            refusal(&effects),
+            None,
+            "covered entries spend no join-window slot"
+        );
+        let pushed = effects
+            .iter()
+            .find_map(|effect| match effect {
+                Effect::WgApply { peers, .. } => Some(peers.clone()),
+                _ => None,
+            })
+            .expect("the intro pushed the interface");
+        for octet in octets {
+            let member = pushed
+                .iter()
+                .find(|peer| peer.wireguard_public_key == member_key(octet))
+                .expect("every member rides the push");
+            assert_eq!(
+                member.endpoint,
+                Some(member_endpoint(octet)),
+                "the member's grafted intro endpoint survives the late intro"
+            );
+        }
+        assert!(
+            pushed
+                .iter()
+                .any(|peer| peer.wireguard_public_key == X25519PublicKey([3; 32])),
+            "the stranger is installed"
+        );
+        assert_eq!(machine.driver.invite_peers.len(), MAX_INVITE_PEERS + 1);
     }
 }

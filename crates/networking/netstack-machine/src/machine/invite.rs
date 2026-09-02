@@ -65,14 +65,30 @@ impl Driver {
         if identity == self.me {
             return Err("refusing an invite tunnel to self".into());
         }
-        // the join-window table is bounded: entries past the window make room
-        // first, a re-intro refreshes its own slot, and a full table refuses
-        // the intro — the reply text IS the reason token the inviter logs.
+        // the stronger layers decide what "covered" means before anything
+        // ages out: a promoted NAT'd member's entry is the only endpoint its
+        // endpoint-less record ever gets (see `merge_invite_layer`), so age
+        // alone must never prune it — and it never spends a join-window slot.
+        let merged = match epoch {
+            Some(state) => {
+                Self::epoch_layered_peers(state, self.base_peers.clone().unwrap_or_default())
+            }
+            None => self.base_peers.clone().unwrap_or_default(),
+        };
+        // the join-window table is bounded over the UNCOVERED entries: the
+        // aged-out ones make room first, a re-intro refreshes its own slot,
+        // and a full table refuses the intro — the reply text IS the reason
+        // token the inviter logs.
         let now_ms = self.now_ms;
         self.invite_peers
-            .retain(|_, invite| !invite.expired_at(now_ms));
+            .retain(|id, invite| merged.contains_key(id) || !invite.expired_at(now_ms));
         let re_intro = self.invite_peers.contains_key(&identity);
-        let table_full = self.invite_peers.len() >= MAX_INVITE_PEERS;
+        let uncovered = self
+            .invite_peers
+            .keys()
+            .filter(|id| !merged.contains_key(id))
+            .count();
+        let table_full = uncovered >= MAX_INVITE_PEERS;
         if table_full && !re_intro {
             return Err(INVITE_PEERS_FULL.into());
         }
@@ -90,12 +106,6 @@ impl Driver {
                 installed_at_ms: now_ms,
             },
         );
-        let merged = match epoch {
-            Some(state) => {
-                Self::epoch_layered_peers(state, self.base_peers.clone().unwrap_or_default())
-            }
-            None => self.base_peers.clone().unwrap_or_default(),
-        };
         let peers = self.assemble_peers(merged);
         self.start_wg_push(peers, cont);
         Ok(())
