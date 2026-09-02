@@ -396,7 +396,7 @@ impl<S: ObjectStore> Fs<S> {
         if used.saturating_add(len) > quota {
             return Err("files: staging quota exceeded".into());
         }
-        refuse_refs_growth(&pending.refs, staged_entry_len(actor))?;
+        refuse_refs_growth(&pending.refs, staged_entry_len(actor), self.window_cap)?;
 
         // stage: the entry makes the chunk gc-reachable (task 13 marks staging
         // digests as roots), and the bytes ride pending.objects so they are
@@ -529,7 +529,7 @@ impl<S: ObjectStore> Fs<S> {
         if !refs_contains_snapshot(&pending.refs, &id) {
             return Err("files: snapshot not resolvable".into());
         }
-        refuse_refs_growth(&pending.refs, pin_entry_len(&name, actor))?;
+        refuse_refs_growth(&pending.refs, pin_entry_len(&name, actor), self.window_cap)?;
 
         pending.refs.pins.insert(
             name,
@@ -595,7 +595,7 @@ impl<S: ObjectStore> Fs<S> {
         if pending.refs.watches.contains(&key) {
             return Err("files: watch already registered".into());
         }
-        refuse_refs_growth(&pending.refs, watch_entry_len(&key.0, &key.1))?;
+        refuse_refs_growth(&pending.refs, watch_entry_len(&key.0, &key.1), self.window_cap)?;
         pending.refs.watches.insert(key);
         Ok(())
     }
@@ -1307,9 +1307,9 @@ fn join_segs(segs: &[String]) -> String {
 /// that headroom too: a run of ordinary commits after a gated image reached
 /// the cap must never carry it past what [`decode_refs`](crate::state::decode_refs)
 /// accepts (that would brick every node's load and every joiner's install).
-fn refuse_refs_growth(refs: &Refs, entry_len: usize) -> Result<(), String> {
-    let fits_image =
-        encoded_refs_len(refs) + entry_len + refs_commit_headroom(refs) <= MAX_REFS_IMAGE_BYTES;
+fn refuse_refs_growth(refs: &Refs, entry_len: usize, window_cap: usize) -> Result<(), String> {
+    let fits_image = encoded_refs_len(refs) + entry_len + refs_commit_headroom(refs, window_cap)
+        <= MAX_REFS_IMAGE_BYTES;
     if fits_image {
         return Ok(());
     }
@@ -1318,11 +1318,12 @@ fn refuse_refs_growth(refs: &Refs, entry_len: usize) -> Result<(), String> {
 
 /// the bytes the commit path can still add to `refs` with no gate of its own:
 /// 32 for the head the first time it is set, 32 per window slot not yet
-/// filled (the window is bounded at [`HISTORY_WINDOW`]; a shrunk test window
-/// only makes this reservation conservative).
-fn refs_commit_headroom(refs: &Refs) -> usize {
+/// filled — counted against the LIVE window cap the commit path trims to
+/// ([`HISTORY_WINDOW`] in production, whatever a test set), so the
+/// reservation is exact for any cap rather than assumed.
+fn refs_commit_headroom(refs: &Refs, window_cap: usize) -> usize {
     let head = if refs.head.is_none() { 32 } else { 0 };
-    let window = 32 * HISTORY_WINDOW.saturating_sub(refs.window.len());
+    let window = 32 * window_cap.saturating_sub(refs.window.len());
     head + window
 }
 
