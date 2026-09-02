@@ -205,8 +205,12 @@ residents.
 ### What the halt looks like
 
 - Writes fail after ten seconds with **`timed out awaiting finalization — re-query
-  on the next block`** (`SUBMIT_HOLD`, `bin/node/src/validator/run/drain.rs`).
-  The desktop app shows the same sentence.
+  on the next block`** (the budget is `SUBMIT_HOLD` in
+  `bin/node/src/constants.rs`, the sentence is in
+  `bin/node/src/validator/run/drain.rs`). The desktop app does **not** show that
+  sentence — it rewrites any "timed out" to **`The node did not answer in time.
+  Retry in a moment.`** (`user_error`, `app/src/backend/rpc.rs`), so on the app
+  the halt looks like a slow node.
 - Reads keep answering from committed state, so every node still looks alive:
   `dt node status` prints a height, and that height simply stops advancing.
 - `curl 127.0.0.1:8844/v1/status | jq .operations.consensus` shows
@@ -237,8 +241,10 @@ dt node status                                   # the height moves again
 Voting the dead seat out is **not** a recovery step: `ducktape node member
 remove <pubkey>` (and `ducktape node member leave`, which is the same path
 aimed at self) opens a governance proposal that has to be proposed, voted and
-executed *through the halted engine*, and the ballot counts the dead seat.
-`ducktape node member promote` and `ducktape node resident accept` are the same
+executed *through the halted engine*. The ballot itself is fine — validator-mode
+governance needs `total / 2 + 1` votes (`crates/modules/system/governance`), so
+2 of 3 live seats carry it. It is the transaction that cannot land, not the vote
+count. `ducktape node member promote` and `ducktape node resident accept` are the same
 ceremony. Every membership change needs a live chain, so grow the set BEFORE
 you need to.
 
