@@ -372,10 +372,14 @@ fn full_matrix_roots_identical_block_by_block() {
     // namespace, so the roots are EQUAL (and ZERO).
     assert_eq!(forge_root(&native), StateRoot::ZERO);
     assert_lockstep(&native, &wasm, "at genesis");
-    // the host sees the wasm tenant exactly as it saw native forge: snapshot
-    // bytes (one self-contained container), never a resolver lane.
-    assert!(!native.resolver_backed_ids().contains(FORGE));
-    assert!(!wasm.resolver_backed_ids().contains(FORGE));
+    // the host sees the wasm tenant exactly as it saw native forge: its SYNC
+    // surface is snapshot bytes (one self-contained container), never a
+    // resolver lane — while its DURABILITY is per-block on its own disk, so it
+    // is in recovery's disk cohort on both sides. the two answers are
+    // independent, and reading the cohort off the sync handle is what left
+    // forge unplaceable at restart.
+    assert!(native.block_durable_ids().contains(FORGE));
+    assert!(wasm.block_durable_ids().contains(FORGE));
 
     // the accepted stream — every block here moves the forge root.
     let accepted: Vec<(u64, Origin, Msg)> = vec![

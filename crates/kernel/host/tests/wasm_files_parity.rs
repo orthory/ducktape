@@ -342,8 +342,8 @@ fn happy_path_matrix_roots_identical_block_by_block() {
     );
     // the host sees the wasm tenant exactly as it saw native files: resolver-backed
     // (the duckfs-odb object-possession lane), never snapshot bytes.
-    assert!(native.resolver_backed_ids().contains(FILES));
-    assert!(wasm.resolver_backed_ids().contains(FILES));
+    assert!(native.block_durable_ids().contains(FILES));
+    assert!(wasm.block_durable_ids().contains(FILES));
 
     let c0 = vec![0x11u8; 1000];
     let c1 = vec![0x22u8; 2000];

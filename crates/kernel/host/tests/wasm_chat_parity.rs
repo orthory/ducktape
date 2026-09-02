@@ -192,8 +192,8 @@ fn same_ops_identical_roots_block_by_block() {
         // ROOT CONTINUITY from block zero: both sides commit to the SAME
         // (empty) qmdb store — equal roots.
         assert_eq!(roots(&native), roots(&wasm), "genesis roots diverge");
-        assert!(native.resolver_backed_ids().contains("chat"));
-        assert!(wasm.resolver_backed_ids().contains("chat"));
+        assert!(native.block_durable_ids().contains("chat"));
+        assert!(wasm.block_durable_ids().contains("chat"));
 
         // every op family, one block each. `moves` = false marks the
         // idempotent no-op blocks whose op log must stay UNTOUCHED — the

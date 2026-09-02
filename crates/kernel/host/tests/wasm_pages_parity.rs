@@ -212,8 +212,8 @@ fn same_ops_identical_roots_block_by_block() {
 
         // the host's snapshot orchestration sees the wasm tenant exactly as it
         // saw the native module: resolver-backed, never snapshot bytes.
-        assert!(native.resolver_backed_ids().contains("pages"));
-        assert!(wasm.resolver_backed_ids().contains("pages"));
+        assert!(native.block_durable_ids().contains("pages"));
+        assert!(wasm.block_durable_ids().contains("pages"));
 
         // every op family, one block each: tree edits, page nesting, the
         // comment plane (which also emits the tagging follow-up), and subtree

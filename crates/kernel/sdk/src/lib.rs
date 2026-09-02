@@ -490,6 +490,32 @@ pub trait Module {
         Ok(())
     }
 
+    /// whether this module's committed state is DURABLE ON ITS OWN DISK at
+    /// every block boundary — recovery's "disk cohort". such a module is NOT
+    /// restored from a checkpoint snapshot: it reopens its own substrate at
+    /// whatever height it last committed, and the checkpoint cadence lets that
+    /// sit arbitrarily far AHEAD of the checkpoint. recovery needs the fact to
+    /// tell a legitimately-ahead disk root from a rolled-back in-memory one.
+    ///
+    /// this is a DURABILITY property, not a sync one, and conflating the two
+    /// bricked restarts: forge commits its refs image to disk every block yet
+    /// ships one self-contained container ([`StateSyncHandle::SnapshotBytes`]),
+    /// so a cohort read off the sync handle alone left it out. the default
+    /// still answers for every resolver-backed module — a qmdb store and the
+    /// duckfs object lane are per-block durable by construction — and a module
+    /// that is per-block durable behind a snapshot-shaped sync surface MUST
+    /// override this. `false` is the FAIL-CLOSED answer (recovery refuses a
+    /// state it cannot place instead of trusting it), so the default can only
+    /// ever under-claim, never wave damage through.
+    ///
+    /// NEVER a consensus input: per-node recovery bookkeeping only.
+    fn block_durable(&self) -> bool {
+        matches!(
+            self.state_sync_handle(),
+            Ok(StateSyncHandle::ResolverBacked { .. })
+        )
+    }
+
     /// the PER-COMMIT HEIGHT CURSOR of a per-block-durable (disk-cohort)
     /// module: the block height of its most recent durable commit, persisted
     /// ATOMICALLY with that commit — inside the same fsync'd durability unit
