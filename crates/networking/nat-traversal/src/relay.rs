@@ -774,8 +774,27 @@ pub async fn run_relay_listener(
 ) {
     let sessions: Arc<Mutex<SessionTable>> = Arc::default();
     loop {
-        let Ok((stream, peer)) = listener.accept().await else {
-            continue;
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            // A persistent accept error (EMFILE, and every other exhaustion
+            // that does not clear by itself) otherwise spins this loop
+            // forever emitting nothing at all. Latched because the failure
+            // repeats once per poll: unlatched it would be its own outage.
+            // The errno is the whole diagnosis, so it rides the line.
+            Err(err) => {
+                static ACCEPT_FAILED: Latch = Latch::new();
+                if let Some(occurrences) = ACCEPT_FAILED.hit("accept_failed") {
+                    tracing::warn!(
+                        target: "ducktape::reachability",
+                        event = "relay_accept_failed",
+                        reason = "accept_failed",
+                        error = %err,
+                        occurrences,
+                        "relay accept failed"
+                    );
+                }
+                continue;
+            }
         };
         let Some(slot) = SessionSlot::try_acquire(&sessions, peer.ip()) else {
             RelayMetrics::increment(&metrics.0.sessions_rejected);
