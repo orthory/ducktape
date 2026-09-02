@@ -3,6 +3,17 @@
 version = 4
 
 [[package]]
+name = "acl"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "borsh",
+ "sdk",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "aead"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -142,7 +153,7 @@ dependencies = [
  "rustc-hash",
  "secp256k1",
  "serde",
- "sha3",
+ "sha3 0.11.0",
 ]
 
 [[package]]
@@ -914,10 +925,9 @@ name = "capability"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "borsh",
  "sdk",
  "serde",
- "serde_json",
- "sha2",
  "valset",
 ]
 
@@ -1641,6 +1651,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1650,6 +1661,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
 dependencies = [
  "const-oid",
+ "pem-rfc7468",
  "zeroize",
 ]
 
@@ -1748,7 +1760,6 @@ dependencies = [
  "sdk",
  "serde",
  "serde_json",
- "sha2",
 ]
 
 [[package]]
@@ -1795,6 +1806,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "ed25519"
+version = "2.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
+dependencies = [
+ "pkcs8",
+ "signature",
+]
+
+[[package]]
+name = "ed25519-dalek"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
+dependencies = [
+ "curve25519-dalek",
+ "ed25519",
+ "serde",
+ "sha2",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "educe"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1824,6 +1859,7 @@ dependencies = [
  "ff",
  "generic-array",
  "group",
+ "pem-rfc7468",
  "pkcs8",
  "rand_core 0.6.4",
  "sec1",
@@ -2252,12 +2288,15 @@ dependencies = [
 name = "host"
 version = "0.1.0"
 dependencies = [
+ "acl",
  "async-trait",
  "dispatch",
+ "identity",
  "lifecycle",
  "sdk",
  "sha2",
  "tracing",
+ "valset",
 ]
 
 [[package]]
@@ -2471,6 +2510,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
+name = "identity"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "borsh",
+ "commonware-cryptography",
+ "keyscheme",
+ "sdk",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "idna"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2627,6 +2679,15 @@ dependencies = [
 
 [[package]]
 name = "keccak"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb26cec98cce3a3d96cbb7bced3c4b16e3d13f27ec56dbd62cbc8f39cfb9d653"
+dependencies = [
+ "cpufeatures 0.2.17",
+]
+
+[[package]]
+name = "keccak"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e24a010dd405bd7ed803e5253182815b41bf2e6a80cc3bfc066658e03a198aa"
@@ -2643,6 +2704,24 @@ checksum = "dd5dc2c0d691cbf7595cde551ced329cca99c2387c2cbc97754c5d0cd045d3ee"
 dependencies = [
  "digest 0.10.7",
  "sha3-asm",
+]
+
+[[package]]
+name = "keyscheme"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "borsh",
+ "commonware-codec",
+ "commonware-cryptography",
+ "commonware-utils",
+ "ed25519-dalek",
+ "k256",
+ "p256",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sha3 0.10.9",
 ]
 
 [[package]]
@@ -2667,7 +2746,6 @@ dependencies = [
  "async-trait",
  "sdk",
  "serde",
- "serde_json",
  "sha2",
 ]
 
@@ -2719,10 +2797,9 @@ name = "lifecycle"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "borsh",
  "sdk",
  "serde",
- "serde_json",
- "sha2",
  "valset",
 ]
 
@@ -3089,6 +3166,15 @@ name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
+name = "pem-rfc7468"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88b39c9bfcfc231068454382784bb460aae594343fb030d46e9f50a645418412"
+dependencies = [
+ "base64ct",
+]
 
 [[package]]
 name = "percent-encoding"
@@ -3928,6 +4014,7 @@ name = "saga"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "borsh",
  "capability",
  "index-guest",
  "sdk",
@@ -4174,12 +4261,22 @@ dependencies = [
 
 [[package]]
 name = "sha3"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77fd7028345d415a4034cf8777cd4f8ab1851274233b45f84e3d955502d93874"
+dependencies = [
+ "digest 0.10.7",
+ "keccak 0.1.6",
+]
+
+[[package]]
+name = "sha3"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be176f1a57ce4e3d31c1a166222d9768de5954f811601fb7ca06fc8203905ce1"
 dependencies = [
  "digest 0.11.3",
- "keccak",
+ "keccak 0.2.0",
 ]
 
 [[package]]
@@ -4291,6 +4388,7 @@ name = "statesync"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "borsh",
  "commonware-codec",
  "commonware-cryptography",
  "commonware-p2p",
@@ -4301,6 +4399,7 @@ dependencies = [
  "data-plane",
  "futures",
  "host",
+ "index-guest",
  "sdk",
  "thiserror",
  "tokio",
@@ -4883,12 +4982,12 @@ name = "valset"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "borsh",
  "commonware-codec",
  "commonware-cryptography",
  "sdk",
  "serde",
  "serde_json",
- "sha2",
 ]
 
 [[package]]

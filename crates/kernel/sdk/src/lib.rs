@@ -181,7 +181,7 @@ impl Origin {
 }
 
 /// reject an empty required string field with the uniform module error
-/// message — the op-validation guard shared by tasks/automations/vaults.
+/// message — the op-validation guard shared by tasks/automations.
 pub fn require_non_empty(field: &str, value: &str) -> Result<(), Error> {
     if value.is_empty() {
         return Err(Error::Module(format!("{field} must not be empty")));
