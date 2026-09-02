@@ -235,7 +235,7 @@ sudo systemctl enable --now ducktape-coordinator
 systemctl status ducktape-coordinator
 ss -lunp 'sport = :3478'     # the fixed control socket, owned by the dynamic user
 ss -ltnp 'sport = :443'      # the relay lane; absent = the bind failed
-journalctl -u ducktape-coordinator | grep -E 'relay listening|relay lane DISABLED'
+journalctl -u ducktape-coordinator | grep -E 'relay listening|relay_lane_disabled'
 journalctl -u ducktape-coordinator | grep coordinator_metrics | tail -1   # carries relay=on|off
 ```
 
@@ -251,8 +251,8 @@ steal and no state to corrupt**, so the box can be treated as disposable and
 replaced at will.
 
 A relay bind failure does **not** stop the unit: the coordinator keeps
-serving UDP, prints a three-line `ERROR: relay lane DISABLED` at boot, and
-every `coordinator_metrics` row thereafter says `relay=off`. Joiners derive
+serving UDP, logs `relay_lane_disabled` at ERROR on boot (with the fix in the
+message), and every `coordinator_metrics` row thereafter says `relay=off`. Joiners derive
 their fallback as `<this host>:443` regardless, so treat `relay=off` on a
 public coordinator as an outage for every member behind a NAT that cannot
 hole-punch.

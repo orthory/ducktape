@@ -20,6 +20,11 @@ commonware-cryptography = { workspace = true }
 commonware-codec = { workspace = true }
 serde = { workspace = true }
 toml = "0.8"
+# The coordinator's whole log sink. It has no LogRing and no node-crate
+# dependency, so it installs its own stderr subscriber rather than inverting
+# that boundary to reuse `noded::log`.
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "process", "io-util"] }
