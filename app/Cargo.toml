@@ -91,12 +91,13 @@ usvg = "0.45"
 # the workspace's reqwest is already in the binary under rpc-client.
 reqwest.workspace = true
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
-# The app's own diagnostics. NOTHING CONSUMES THEM YET: this binary installs no
-# tracing subscriber, so today these events go nowhere at all — every failure a
-# person must act on is a plate on screen, and that is deliberate. The events
-# are emitted anyway because `println!` is not logging and a subscriber is the
-# only missing half; when one is installed they light up without a rewrite.
+# The app's own diagnostics: `main.rs` installs ONE subscriber over
+# `<DUCKTAPE_HOME>/app.log` (rotated at open by `node::log_file`, the same
+# opener as the node's daemon.log) plus a panic hook that lands there. Every
+# failure a person must act on is still a plate on screen; the file is what a
+# member attaches to an issue when the plate is not enough.
 tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # the device key's name is the host's (`device_key_name`); a kernel call
 # works on every OS the app runs on.
 gethostname = "1"
