@@ -309,13 +309,39 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
     }
     if let Some(wg) = &wireguard_listen {
         // the backend is always the userspace socket stack now — no field.
-        tracing::info!(
-            target: "ducktape::reachability",
-            node = %label,
-            listen = %wg,
-            endpoint_less = wg.ip().is_unspecified(),
-            "reachability plane configured"
+        let endpoint_less = wg.ip().is_unspecified();
+        let ambient_coordinator = matches!(
+            config::coordinator_ingress(primary_coordinator.as_deref()),
+            Ok(Some(_))
         );
+        // `coordinated` is the coordinated reach TARGET list, not the ambient
+        // coordinator: a non-empty one still proves some coordinator is
+        // configured, which is all the dark-shape predicate asks.
+        let coordinator_configured = ambient_coordinator || !coordinated.is_empty();
+        let dark = wireguard_endpoint_dark(
+            endpoint_less,
+            wireguard_advertised.is_some(),
+            coordinator_configured,
+        );
+        if dark {
+            tracing::warn!(
+                target: "ducktape::reachability",
+                node = %label,
+                listen = %wg,
+                reason = "wireguard_endpoint_less_no_coordinator",
+                "WireGuard bind is unspecified with no `wireguard_advertised` and no \
+                 coordinator — this node's mesh record carries no endpoint, so peers \
+                 cannot dial its tunnel; only tunnels it dials itself will come up"
+            );
+        } else {
+            tracing::info!(
+                target: "ducktape::reachability",
+                node = %label,
+                listen = %wg,
+                endpoint_less,
+                "reachability plane configured"
+            );
+        }
     }
 
     BootEnv {
@@ -354,5 +380,35 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         compute_backend,
         sandbox_capacity,
         genesis,
+    }
+}
+
+/// The DARK WireGuard shape: an unspecified bind advertises no endpoint in
+/// this node's mesh record, and without `wireguard_advertised` or a
+/// coordinator to learn a reflexive endpoint through, no peer can ever
+/// initiate a tunnel to it — joiner↔joiner tunnels stay dark while the LAN
+/// p2p mesh and the chain look healthy. Every example config binds 0.0.0.0,
+/// so this is a config-surface trap, not an operator mistake; boot says so.
+fn wireguard_endpoint_dark(
+    bind_unspecified: bool,
+    advertised: bool,
+    coordinator_configured: bool,
+) -> bool {
+    bind_unspecified && !advertised && !coordinator_configured
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wireguard_endpoint_dark;
+
+    #[test]
+    fn the_dark_shape_is_unspecified_bind_without_advertised_or_coordinator() {
+        assert!(wireguard_endpoint_dark(true, false, false), "the LXC trap");
+        // the desktop shape: unspecified bind, endpoint learned via the coordinator.
+        assert!(!wireguard_endpoint_dark(true, false, true));
+        // an advertised host is dialable regardless of the bind.
+        assert!(!wireguard_endpoint_dark(true, true, false));
+        // a concrete bind advertises itself.
+        assert!(!wireguard_endpoint_dark(false, false, false));
     }
 }

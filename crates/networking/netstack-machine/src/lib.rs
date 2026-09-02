@@ -32,6 +32,9 @@ pub use contract::{
     COORD_STEP_TIMEOUT, CmdToken, Effect, Event, MachineConfig, MeshEpochEvent, NetstackMachine,
     PUNCH_STEP_TIMEOUT, PUNCH_TRIES, ReachabilityEvent, ReqId, Resolution, StepError,
 };
-pub use machine::{HANDSHAKE_TTL_VIEWS, KEEPALIVE_SECONDS, Machine, initiates};
+pub use machine::{
+    HANDSHAKE_TTL_VIEWS, INVITE_JOIN_WINDOW_MS, INVITE_PEERS_FULL, KEEPALIVE_SECONDS,
+    MAX_INVITE_PEERS, Machine, initiates,
+};
 pub use store::PersistedMesh;
 pub use wire::SnapshotError;

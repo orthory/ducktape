@@ -231,6 +231,7 @@ pub(super) async fn park(
     session_manager: Option<noded::TerminalSessions>,
     session_requests: tokio::sync::mpsc::Receiver<noded::SessionJob>,
     local_gateway_via: String,
+    node_api_ports: Vec<u16>,
     stream_hub: &noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
     metrics: noded::NodeMetrics,
@@ -351,6 +352,7 @@ pub(super) async fn park(
                 planes: planes.clone(),
                 commands: gateway_commands,
                 workspace,
+                node_api_ports,
             },
             requests,
         );

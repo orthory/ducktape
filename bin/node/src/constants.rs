@@ -51,7 +51,16 @@ pub(crate) const SUFFIX_CATCHUP_MAX_ITERS: usize = 8;
 pub(crate) const MAX_MESSAGE_SIZE: u32 = 1 << 21;
 const _: () = assert!(MAX_MESSAGE_SIZE as usize >= node::MAX_FRAME_BYTES + 1024);
 const _: () = assert!(MAX_MESSAGE_SIZE as usize >= duckfs_core::MAX_SYNC_REPLY_BYTES + 1024);
-/// inbound backlog before a channel applies receive backpressure.
+// (c) a qmdb module's op-batch reply (`SyncResponse::Module`), trimmed to
+// `statesync::qmdb::MAX_MODULE_REPLY_BYTES` by the serve side. the serve task
+// additionally refuses ANY over-cap response with an `Error` reply
+// (`sync::serve::encode_bounded_response`) — that is the last line; this pin
+// keeps the honest path from ever needing it.
+const _: () = assert!(MAX_MESSAGE_SIZE as usize >= statesync::qmdb::MAX_MODULE_REPLY_BYTES + 1024);
+/// inbound backlog per channel. NOT backpressure: commonware's peer actor
+/// DROPS an inbound message when the application buffer is full (it never
+/// blocks a peer), so this is a drop boundary — `relay::MAX_RELAY_BLOB_BYTES`
+/// is pinned so one offer plus every chunk of a max-size pack fits inside it.
 pub(crate) const MAX_BACKLOG: usize = 128;
 /// per-read/write deadline for every mesh socket — the OS arm gets it via
 /// `with_read_write_timeout` at boot, and it IS the overlay seam's own

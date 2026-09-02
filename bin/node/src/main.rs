@@ -493,6 +493,7 @@ fn run_node(
         terminals,
         session_requests,
         local_gateway_via,
+        node_api_ports,
     } = boot::surfaces::bind(boot::surfaces::BindConfig {
         sync_only,
         label: &label,
@@ -743,6 +744,7 @@ fn run_node(
                 terminals,
                 session_requests,
                 local_gateway_via,
+                node_api_ports,
                 &stream_hub,
                 index.clone(),
                 metrics.clone(),
@@ -834,6 +836,7 @@ fn run_node(
             terminals,
             session_requests,
             local_gateway_via,
+            node_api_ports,
             stream_hub,
             index,
             voice_requests,

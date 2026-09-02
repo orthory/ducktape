@@ -121,13 +121,19 @@ where
     if cmds.send(install).await.is_err() {
         return false;
     }
+    // a refused install fires once per intro, and an honest joiner
+    // re-introduces every poll — so the refusal is latched: the count IS
+    // the diagnosis (a full join-window table under a flood reads as
+    // `attempts` climbing, never as a 4096-line ring of the same line).
+    static INSTALL_REFUSED: noded::log::Latch = noded::log::Latch::new(100);
     match reply_rx.await {
         Ok(Ok(())) => {
             let via = match path {
                 IntroPath::Direct => "direct",
                 IntroPath::Coordinated => "coordinated",
             };
-            tracing::info!(
+            // per intro, and a racing joiner re-sends one every poll: debug.
+            tracing::debug!(
                 target: "ducktape::join",
                 node = %label,
                 peer = %config::hex_bytes(&verified.joiner.as_ref()[..4]),
@@ -141,7 +147,29 @@ where
             let reply = gate_reply(gate, &verified.joiner, &msg).await;
             ack(sealed_reply(reply)).await;
         }
-        Ok(Err(e)) => ack(sealed_reply(join_gate::IntroReply::Refused { detail: e })).await,
+        Ok(Err(e)) => {
+            // a full join-window table is its own reason (the machine's reply
+            // text IS the token); every other refusal shares one — so the
+            // latch, and the count it carries, are per cause.
+            let table_full = e == reachability::INVITE_PEERS_FULL;
+            let reason = if table_full {
+                reachability::INVITE_PEERS_FULL
+            } else {
+                "invite_peer_install_refused"
+            };
+            if let Some(attempts) = INSTALL_REFUSED.hit(reason) {
+                tracing::warn!(
+                    target: "ducktape::join",
+                    node = %label,
+                    peer = %config::hex_bytes(&verified.joiner.as_ref()[..4]),
+                    reason,
+                    detail = %e,
+                    attempts,
+                    "invite intro tunnel peer REFUSED — the plane would not install it"
+                );
+            }
+            ack(sealed_reply(join_gate::IntroReply::Refused { detail: e })).await;
+        }
         Err(_) => {
             ack(sealed_reply(join_gate::IntroReply::Refused {
                 detail: "plane exited".into(),

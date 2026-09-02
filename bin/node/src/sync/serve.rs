@@ -427,6 +427,44 @@ pub(crate) struct SyncIndexOps {
 const MAX_SYNC_RESPONSE_BODY_LEN: usize = MAX_MESSAGE_SIZE as usize - statesync::RPC_HEADER_LEN;
 const _: () = assert!(MAX_SYNC_RESPONSE_BODY_LEN >= 9);
 
+/// the `Error` reply body a requester sees when its answer could not ride the
+/// mesh: a stable token, greppable on both sides.
+pub(crate) const SYNC_REPLY_OVER_CAP: &str = "sync_reply_over_cap";
+
+/// Encode `resp` for the mesh — or, when its body would exceed the message cap
+/// commonware's sender ASSERTS on, the `Error` reply that says so. The ONE
+/// guard between every response and the send: the frame and index-op pages
+/// bound themselves above, but a module's own `serve_sync` bytes
+/// (`SyncResponse::Module`) arrive unmeasured, and an honest batch of adjacent
+/// ~1 MiB records used to walk straight into the assert and abort the serving
+/// validator. Latched: one refusal per hundred is the diagnosis, not a log
+/// bomb per request.
+pub(crate) fn encode_bounded_response(
+    resp: statesync::SyncResponse,
+) -> (statesync::SyncResponse, Vec<u8>) {
+    static OVER_CAP: noded::log::Latch = noded::log::Latch::new(100);
+    let body = statesync::encode_response(&resp);
+    let fits_transport = body.len() <= MAX_SYNC_RESPONSE_BODY_LEN;
+    if fits_transport {
+        return (resp, body);
+    }
+    if let Some(attempts) = OVER_CAP.hit(SYNC_REPLY_OVER_CAP) {
+        tracing::warn!(
+            target: "ducktape::statesync",
+            kind = resp.kind_name(),
+            body_len = body.len(),
+            cap = MAX_SYNC_RESPONSE_BODY_LEN,
+            reason = SYNC_REPLY_OVER_CAP,
+            attempts,
+            "statesync reply REFUSED — the response body exceeds the mesh message cap the \
+             sender asserts on; the requester gets an error instead of this node aborting"
+        );
+    }
+    let refusal = statesync::SyncResponse::Error(SYNC_REPLY_OVER_CAP.into());
+    let body = statesync::encode_response(&refusal);
+    (refusal, body)
+}
+
 /// Return the largest non-empty prefix that fits the mesh's configured message
 /// cap. An available frame that cannot fit alone is an explicit error: an empty
 /// successful batch would make suffix catch-up retry without advancing.
@@ -781,6 +819,30 @@ mod tests {
     fn encoded_mesh_len(resp: &statesync::SyncResponse) -> usize {
         let body = statesync::encode_response(resp);
         statesync::encode_rpc(&[0; 32], &[0; 64], 7, &body).len()
+    }
+
+    /// The Module lane is the one reply nothing else measures: a module's
+    /// `serve_sync` bytes go straight to the sender, which ASSERTS on the mesh
+    /// cap. An over-cap body must leave here as an `Error` the requester can
+    /// read, framed under the cap; a fitting one passes through untouched.
+    #[test]
+    fn an_over_cap_module_reply_becomes_an_error_not_a_send() {
+        let over = statesync::SyncResponse::Module(vec![0xEE; MAX_SYNC_RESPONSE_BODY_LEN]);
+        let (resp, body) = encode_bounded_response(over);
+        assert!(
+            matches!(resp, statesync::SyncResponse::Error(ref why) if why == SYNC_REPLY_OVER_CAP),
+            "an over-cap module reply is refused with the reason token"
+        );
+        assert!(
+            statesync::encode_rpc(&[0; 32], &[0; 64], 7, &body).len() <= MAX_MESSAGE_SIZE as usize,
+            "the refusal itself rides under the cap"
+        );
+        assert_eq!(body, statesync::encode_response(&resp));
+
+        let fitting = statesync::SyncResponse::Module(vec![0xEE; 64]);
+        let (resp, body) = encode_bounded_response(fitting);
+        assert!(matches!(resp, statesync::SyncResponse::Module(ref bytes) if bytes.len() == 64));
+        assert_eq!(body, statesync::encode_response(&resp));
     }
 
     /// N WIRE PAGES MUST NOT COST N CONSENSUS-LOOP ROUND TRIPS. The joiner

@@ -30,7 +30,9 @@ use sha2::{Digest as _, Sha256};
 
 use crate::codec::{Reader, push_string, push_u32};
 use crate::objects::{Kind, ObjectId};
-use crate::wire::{HISTORY_WINDOW, MAX_PINS, MAX_STAGING_ENTRIES, MAX_WATCHES};
+use crate::wire::{
+    HISTORY_WINDOW, MAX_PINS, MAX_REFS_IMAGE_BYTES, MAX_STAGING_ENTRIES, MAX_WATCHES,
+};
 
 /// a named pin: the snapshot it protects from gc and the owner allowed to remove
 /// it (owner-gated unpin).
@@ -124,8 +126,52 @@ pub fn encode_refs(r: &Refs) -> Vec<u8> {
     out
 }
 
+/// the byte layout's per-entry costs, one per growable section. the growth
+/// gates in `fs.rs` and [`encoded_refs_len`] count with these, so the image cap
+/// ([`MAX_REFS_IMAGE_BYTES`]) is enforced without encoding the whole image on
+/// every op — and the layout has exactly one description: [`encode_refs`].
+pub fn pin_entry_len(name: &str, owner: &str) -> usize {
+    8 + name.len() + 32 + 8 + owner.len()
+}
+
+pub fn staged_entry_len(owner: &str) -> usize {
+    32 + 8 + owner.len() + 8 + 8
+}
+
+pub fn watch_entry_len(prefix: &str, module_id: &str) -> usize {
+    8 + prefix.len() + 8 + module_id.len()
+}
+
+/// `encode_refs(r).len()` without the allocation — the arithmetic twin of the
+/// encoder, kept next to it (a test pins the two equal).
+pub fn encoded_refs_len(r: &Refs) -> usize {
+    let head = 1 + r.head.map_or(0, |_| 32);
+    let window = 4 + 32 * r.window.len();
+    let pins = 4 + r
+        .pins
+        .iter()
+        .map(|(name, pin)| pin_entry_len(name, &pin.owner))
+        .sum::<usize>();
+    let staging = 4 + r
+        .staging
+        .values()
+        .map(|staged| staged_entry_len(&staged.owner))
+        .sum::<usize>();
+    let watches = 4 + r
+        .watches
+        .iter()
+        .map(|(prefix, module_id)| watch_entry_len(prefix, module_id))
+        .sum::<usize>();
+    head + window + pins + staging + watches
+}
+
 /// strict decode of an [`encode_refs`] image; anything non-canonical rejects.
 pub fn decode_refs(bytes: &[u8]) -> Result<Refs, String> {
+    // the byte cap first: no honest image is larger (every growth path
+    // refuses past it), and a larger one could not be served to a joiner.
+    if bytes.len() > MAX_REFS_IMAGE_BYTES {
+        return Err("files: refs image exceeds the byte cap".into());
+    }
     let mut r = Reader::new("refs image", bytes);
 
     let head = if r.boolean()? {
@@ -310,5 +356,52 @@ mod block_objects_tests {
         let mut trailing = encode_block_objects(&index);
         trailing.push(0);
         assert!(decode_block_objects(&trailing).unwrap_err().contains("trailing bytes"));
+    }
+}
+
+#[cfg(test)]
+mod refs_image_tests {
+    use super::{PinEntry, Refs, Staged, decode_refs, encode_refs, encoded_refs_len};
+    use crate::wire::MAX_REFS_IMAGE_BYTES;
+
+    /// the arithmetic twin must never drift from the encoder: the growth gates
+    /// count with it, so a byte it misses is a byte past the cap on the wire.
+    #[test]
+    fn encoded_refs_len_matches_the_encoder() {
+        let mut r = Refs {
+            head: Some([1; 32]),
+            ..Refs::default()
+        };
+        r.window.push_back([2; 32]);
+        r.window.push_back([3; 32]);
+        r.pins.insert(
+            "release".into(),
+            PinEntry {
+                snapshot: [4; 32],
+                owner: "ext:aabb".into(),
+            },
+        );
+        r.staging.insert(
+            [5; 32],
+            Staged {
+                owner: "ext:ccdd".into(),
+                len: 7,
+                expires_at: 9,
+            },
+        );
+        r.watches.insert(("/shared".into(), "chat".into()));
+        assert_eq!(encoded_refs_len(&r), encode_refs(&r).len());
+        let empty = Refs::default();
+        assert_eq!(encoded_refs_len(&empty), encode_refs(&empty).len());
+    }
+
+    /// an image past the cap is refused before a single field is read.
+    #[test]
+    fn an_oversized_refs_image_is_refused_by_decode() {
+        let oversized = vec![0u8; MAX_REFS_IMAGE_BYTES + 1];
+        assert_eq!(
+            decode_refs(&oversized).unwrap_err(),
+            "files: refs image exceeds the byte cap"
+        );
     }
 }

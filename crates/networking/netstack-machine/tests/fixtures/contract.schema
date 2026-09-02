@@ -9,6 +9,7 @@ root snapshot = Snapshot
 (ValidatorIdentity, (u64, u32)) = Tuple { elements: ["ValidatorIdentity", "(u64, u32)"] }
 (ValidatorIdentity, Ed25519PublicKey) = Tuple { elements: ["ValidatorIdentity", "Ed25519PublicKey"] }
 (ValidatorIdentity, EndpointAdvertisement) = Tuple { elements: ["ValidatorIdentity", "EndpointAdvertisement"] }
+(ValidatorIdentity, InvitePeer) = Tuple { elements: ["ValidatorIdentity", "InvitePeer"] }
 (ValidatorIdentity, Option<SocketAddr>) = Tuple { elements: ["ValidatorIdentity", "Option<SocketAddr>"] }
 (ValidatorIdentity, PeerHandshake) = Tuple { elements: ["ValidatorIdentity", "PeerHandshake"] }
 (ValidatorIdentity, PeerTunnelConfig) = Tuple { elements: ["ValidatorIdentity", "PeerTunnelConfig"] }
@@ -28,6 +29,7 @@ BTreeMap<ReqId, PendingOp> = Sequence { length_width: 4, length_range: 0..=42949
 BTreeMap<ValidatorIdentity, (u64, u32)> = Sequence { length_width: 4, length_range: 0..=4294967295, elements: "(ValidatorIdentity, (u64, u32))" }
 BTreeMap<ValidatorIdentity, Ed25519PublicKey> = Sequence { length_width: 4, length_range: 0..=4294967295, elements: "(ValidatorIdentity, Ed25519PublicKey)" }
 BTreeMap<ValidatorIdentity, EndpointAdvertisement> = Sequence { length_width: 4, length_range: 0..=4294967295, elements: "(ValidatorIdentity, EndpointAdvertisement)" }
+BTreeMap<ValidatorIdentity, InvitePeer> = Sequence { length_width: 4, length_range: 0..=4294967295, elements: "(ValidatorIdentity, InvitePeer)" }
 BTreeMap<ValidatorIdentity, Option<SocketAddr>> = Sequence { length_width: 4, length_range: 0..=4294967295, elements: "(ValidatorIdentity, Option<SocketAddr>)" }
 BTreeMap<ValidatorIdentity, PeerHandshake> = Sequence { length_width: 4, length_range: 0..=4294967295, elements: "(ValidatorIdentity, PeerHandshake)" }
 BTreeMap<ValidatorIdentity, PeerTunnelConfig> = Sequence { length_width: 4, length_range: 0..=4294967295, elements: "(ValidatorIdentity, PeerTunnelConfig)" }
@@ -74,13 +76,14 @@ HandshakeStage = Enum { tag_width: 1, variants: [(0, "Request", "HandshakeStage_
 HandshakeStage__Ack = Struct { fields: Empty }
 HandshakeStage__Request = Struct { fields: Empty }
 HandshakeStage__Response = Struct { fields: Empty }
+InvitePeer = Struct { fields: NamedFields([("config", "PeerTunnelConfig"), ("installed_at_ms", "u64")]) }
 IpAddr = Enum { tag_width: 1, variants: [(0, "V4", "IpAddr__V4"), (1, "V6", "IpAddr__V6")] }
 IpAddr__V4 = Struct { fields: UnnamedFields(["Ipv4Addr"]) }
 IpAddr__V6 = Struct { fields: UnnamedFields(["Ipv6Addr"]) }
 Ipv4Addr = Struct { fields: NamedFields([("octets", "[u8; 4]")]) }
 Ipv6Addr = Struct { fields: NamedFields([("octets", "[u8; 16]")]) }
 MachineConfig = Struct { fields: NamedFields([("chain_id", "String"), ("wireguard_public", "X25519PublicKey"), ("wireguard_advertised", "Option<Endpoint>"), ("control_endpoint", "Endpoint"), ("coordinators", "Vec<SocketAddr>"), ("port_policy", "PortPolicy"), ("persist", "bool"), ("gossip_ingress", "Option<Ed25519PublicKey>")]) }
-MachineState = Struct { fields: NamedFields([("me", "ValidatorIdentity"), ("now_ms", "u64"), ("view", "u64"), ("untargeted_nudges", "u64"), ("nudges", "u64"), ("interface_live", "bool"), ("base_peers", "Option<BTreeMap<ValidatorIdentity, PeerTunnelConfig>>"), ("invite_peers", "BTreeMap<ValidatorIdentity, PeerTunnelConfig>"), ("control_endpoints", "BTreeMap<ValidatorIdentity, SocketAddr>"), ("next_req", "u64"), ("pending", "BTreeMap<ReqId, PendingOp>"), ("pending_restore", "Option<PendingRestore>"), ("pending_adopt", "Option<PendingAdopt>"), ("epoch", "Option<EpochState>")]) }
+MachineState = Struct { fields: NamedFields([("me", "ValidatorIdentity"), ("now_ms", "u64"), ("view", "u64"), ("untargeted_nudges", "u64"), ("nudges", "u64"), ("interface_live", "bool"), ("base_peers", "Option<BTreeMap<ValidatorIdentity, PeerTunnelConfig>>"), ("invite_peers", "BTreeMap<ValidatorIdentity, InvitePeer>"), ("control_endpoints", "BTreeMap<ValidatorIdentity, SocketAddr>"), ("next_req", "u64"), ("pending", "BTreeMap<ReqId, PendingOp>"), ("pending_restore", "Option<PendingRestore>"), ("pending_adopt", "Option<PendingAdopt>"), ("epoch", "Option<EpochState>")]) }
 MeshEpochEvent = Struct { fields: NamedFields([("epoch", "u64"), ("members", "Vec<Ed25519PublicKey>"), ("standbys", "Vec<Ed25519PublicKey>"), ("current_view", "u64")]) }
 MeshVersion = Struct { fields: UnnamedFields(["[u8; 32]"]) }
 MeshView = Struct { fields: NamedFields([("active_set", "ActiveValidatorSet"), ("mesh_version", "MeshVersion"), ("records", "Vec<EndpointRecord>")]) }
