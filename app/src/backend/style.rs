@@ -302,7 +302,7 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
 
 pub(crate) fn hex_decode(value: &str) -> Result<Vec<u8>, String> {
     let valid = !value.is_empty()
-        && value.len() <= MAX_FRAME_HEX_BYTES
+        && value.len() <= ::node::MAX_FRAME_HEX_BYTES
         && value.len().is_multiple_of(2)
         && value.bytes().all(|byte| byte.is_ascii_hexdigit());
     if !valid {
