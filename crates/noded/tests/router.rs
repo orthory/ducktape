@@ -325,6 +325,31 @@ async fn submit_maps_a_module_error_to_bad_request() {
     assert_eq!(body["error"], "module error: channel already exists");
 }
 
+/// The ws surface's policy (`stream.rs` `ClientMsg`) on the HTTP bodies: a
+/// field this build does not know is refused BY NAME, never dropped on the
+/// floor while the rest of the body is served (#1325). No actor is spawned on
+/// purpose — the refusal happens in the extractor, before dispatch.
+#[tokio::test]
+async fn submit_refuses_an_unknown_field_by_name() {
+    let (handle, _cmd_rx, _events) = NodeHandle::channel();
+
+    let response = noded::router(handle)
+        .oneshot(post(
+            "/v1/submit",
+            serde_json::json!({ "target": "chat", "payload": {}, "orgin": "jess" }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        text.contains("unknown field `orgin`"),
+        "the refusal names the field: {text}"
+    );
+}
+
 #[tokio::test]
 async fn query_returns_the_decoded_module_reply() {
     let (handle, cmd_rx, _events) = NodeHandle::channel();

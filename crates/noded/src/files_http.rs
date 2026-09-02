@@ -134,6 +134,7 @@ pub(crate) async fn files_stage(
 /// like the module wire (`changes` carries `Change`/`Content`, both snake), so
 /// the whole body reads as one duckfs document.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommitBody {
     /// the base snapshot the per-path CAS checks against; omitted/`null` means
     /// the empty tree (a first commit).
@@ -163,6 +164,7 @@ pub(crate) async fn files_commit(
 
 /// the json body of POST /v1/files/pin.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PinBody {
     pub snapshot: String,
     pub name: String,
@@ -185,6 +187,7 @@ pub(crate) async fn files_pin(
 
 /// the json body of POST /v1/files/watch.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WatchBody {
     pub prefix: String,
     pub module_id: String,

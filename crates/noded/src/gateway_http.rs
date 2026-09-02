@@ -695,6 +695,7 @@ fn gateway_failure_response(failure: GatewayFailure) -> Response {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WsTokenRequest {
     authority: String,
     origin: String,
