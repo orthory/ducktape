@@ -114,7 +114,7 @@ const RUN_ACTION_URL_ENV: &str = "DUCKTAPE_RUN_ACTION_URL";
 /// the node this run's tool plane dials — the READ half of it, since every
 /// `ducktape mcp` read tool queries this base while writes ride
 /// [`RUN_ACTION_URL_ENV`] and the broker. A sandbox backend must tunnel its
-/// port, or unset it: see [`guest_tunnel_ports`].
+/// port, or unset it: see [`wire_guest_tunnels`].
 const NODE_URL_ENV: &str = "DUCKTAPE_NODE";
 
 /// the opaque per-run bearer the broker hands the child. NOT a credential: it
@@ -721,10 +721,9 @@ impl CliProvider {
         };
 
         let mut envs = self.sandbox_env(ctx, auth)?;
-        // decided HERE, before the env is translated and frozen into the
-        // manifest: this both picks the allowlist and rewrites (or removes)
-        // the node URL the guest is handed. See [`guest_tunnel_ports`].
-        let tunnel_ports = guest_tunnel_ports(
+        // wired HERE, before the env is translated and frozen into the
+        // manifest — the name is the warning: it rewrites `envs`.
+        let tunnel_ports = wire_guest_tunnels(
             &mut envs,
             auth.broker.map(|broker| broker.base_url.as_str()),
         );
@@ -816,7 +815,7 @@ impl CliProvider {
             // `GatewayJob::Http` over the overlay to a publisher node. Its only
             // gate (`gateway_http::gateway_api_origin_allowed`) is a header
             // check a plain `curl` passes by sending no headers, so a run CAN
-            // reach off this host. See [`guest_tunnel_ports`] for the full
+            // reach off this host. See [`wire_guest_tunnels`] for the full
             // reach and the open question of narrowing it (#1317).
             tap: None,
         };
@@ -1623,6 +1622,10 @@ impl Drop for ContextGuard {
     }
 }
 
+/// Pick the guest's tunnel allowlist AND point `envs` at it — `DUCKTAPE_NODE`
+/// is rewritten to the tunnel's own end, or removed when there is no tunnel to
+/// carry it. Both halves are one decision, so they are one call.
+///
 /// The loopback services the guest may reach, tunnelled over vsock: this run's
 /// credential broker, the node's run-action RPC when the run has one, and the
 /// node's own http surface — the READ plane every `ducktape mcp` tool dials
@@ -1667,15 +1670,16 @@ impl Drop for ContextGuard {
 ///
 /// Narrowing this to a scoped read lane is the open half of #1317, and this
 /// function is the one place such a lane would replace.
-fn guest_tunnel_ports(envs: &mut Vec<(String, String)>, broker_base: Option<&str>) -> Vec<u16> {
+fn wire_guest_tunnels(envs: &mut Vec<(String, String)>, broker_base: Option<&str>) -> Vec<u16> {
     let mut ports = Vec::new();
     ports.extend(broker_base.and_then(url_port));
     if let Some((_, run_action)) = envs.iter().find(|(key, _)| key == RUN_ACTION_URL_ENV) {
         ports.extend(url_port(run_action));
     }
-    // last, so a node URL that shares the run-action port dedups against it.
+    // three distinct listeners on one host, so three distinct ports: nothing to
+    // dedup, and a duplicate would be a bug upstream rather than a collision to
+    // absorb here.
     ports.extend(aim_node_at_guest(envs));
-    ports.dedup();
     ports
 }
 
@@ -1728,8 +1732,8 @@ fn guest_node_url(url: &str) -> Result<(u16, String), &'static str> {
     Ok((port, format!("http://127.0.0.1:{port}{path}")))
 }
 
-/// the TCP port in an `http://host:port/...` URL, if any — the egress firewall
-/// needs the broker + node-RPC ports as bare numbers.
+/// the TCP port in an `http://host:port/...` URL, if any — the tunnel
+/// allowlist needs the broker, run-action and node http ports as bare numbers.
 fn url_port(url: &str) -> Option<u16> {
     authority_port(split_authority(url).0)
 }
@@ -5534,7 +5538,7 @@ format = "text"
                 "http://127.0.0.1:41111/v1/run-action".into(),
             ),
         ];
-        let ports = guest_tunnel_ports(&mut envs, Some("http://127.0.0.1:54321/v1"));
+        let ports = wire_guest_tunnels(&mut envs, Some("http://127.0.0.1:54321/v1"));
         assert_eq!(ports, vec![54321, 41111, 8844]);
         assert_eq!(
             env_of(&envs, NODE_URL_ENV).as_deref(),
@@ -5554,7 +5558,7 @@ format = "text"
             "http://node.local",       // no port to bind either end on
         ] {
             let mut envs = vec![(NODE_URL_ENV.into(), base.to_string())];
-            let ports = guest_tunnel_ports(&mut envs, None);
+            let ports = wire_guest_tunnels(&mut envs, None);
             assert!(ports.is_empty(), "{base} was tunnelled: {ports:?}");
             assert_eq!(
                 env_of(&envs, NODE_URL_ENV),
@@ -5571,7 +5575,7 @@ format = "text"
     #[test]
     fn a_named_loopback_node_url_is_rewritten_for_the_guest() {
         let mut envs = vec![(NODE_URL_ENV.into(), "http://localhost:8844/base".into())];
-        let ports = guest_tunnel_ports(&mut envs, None);
+        let ports = wire_guest_tunnels(&mut envs, None);
         assert_eq!(ports, vec![8844]);
         assert_eq!(
             env_of(&envs, NODE_URL_ENV).as_deref(),
@@ -5584,7 +5588,7 @@ format = "text"
     #[test]
     fn a_run_with_no_node_url_tunnels_only_its_broker() {
         let mut envs = vec![("HOME".into(), "/home/duck".into())];
-        let ports = guest_tunnel_ports(&mut envs, Some("http://127.0.0.1:54321/v1"));
+        let ports = wire_guest_tunnels(&mut envs, Some("http://127.0.0.1:54321/v1"));
         assert_eq!(ports, vec![54321]);
         assert_eq!(envs.len(), 1);
     }
