@@ -76,7 +76,7 @@ ordering arm.
 | `projection::project_block` · `noded` | one shared block-projection path (RootOp assembly + `block_row` bytes + index feed + stream publish) | golden test pins `block_row` bytes across old/new paths | validator drain, replica park, noded submit lane, simnode (a rejected op journals a block: validator parity) |
 | `Orderer` — scripted-stepping seam · `crates/kernel/node` | — (sim-only arm) | `StepOrderer` + `StepHandle` (FIFO; release-one / release-all) | simnode actor (`OrderedNode<StepOrderer>`) |
 | `worker::drive` · `crates/kernel/host` | one shared reactor loop (offer events, budget rounds, follow-up `Msg`s + Nudge tail) | unit test on budget / Nudge behavior | validator drain, noded submit lane, simnode auto mode |
-| `ModuleTopology` · `crates/kernel/host` | one genesis topology (ordered id set, wiring edges, genesis-config values; subsets `production` / `sim_base` / `sim_valset` / `demo`) | `genesis_registry_matches_module_ids` + subset derivation tests | node `ProductionModules` (wasm), simnode (native), demo |
+| `ModuleTopology` · `crates/kernel/host` | one genesis topology (ordered id set, module shape, genesis-config keys; subsets `production` / `sim_base` / `sim_valset` / `demo`) | `genesis_registry_matches_module_ids` + subset derivation tests | node `ProductionModules` (wasm), simnode (native), demo |
 
 ## Quick Start
 
