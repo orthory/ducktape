@@ -205,6 +205,25 @@ fn an_empty_block_is_writable_but_an_empty_page_title_is_not() {
 }
 
 #[test]
+fn block_text_is_bounded_by_the_modules_own_caps() {
+    // An app-side cap tighter than the module's refuses text the node accepts
+    // — and leaves no way to shorten a block another signer already landed.
+    let at_cap = "x".repeat(pages::MAX_BLOCK_LEN);
+    assert!(bounded_new_block_text(BlockKind::Paragraph, at_cap.clone()).is_ok());
+    assert!(bounded_updated_block_text(BlockKind::Paragraph, at_cap).is_ok());
+    let over_cap = "x".repeat(pages::MAX_BLOCK_LEN + 1);
+    assert!(bounded_new_block_text(BlockKind::Paragraph, over_cap.clone()).is_err());
+    assert!(bounded_updated_block_text(BlockKind::Paragraph, over_cap).is_err());
+
+    let title_at_cap = "t".repeat(pages::MAX_PAGE_TITLE_LEN);
+    assert!(bounded_new_block_text(BlockKind::Page, title_at_cap.clone()).is_ok());
+    assert!(bounded_updated_block_text(BlockKind::Page, title_at_cap).is_ok());
+    let title_over_cap = "t".repeat(pages::MAX_PAGE_TITLE_LEN + 1);
+    assert!(bounded_new_block_text(BlockKind::Page, title_over_cap.clone()).is_err());
+    assert!(bounded_updated_block_text(BlockKind::Page, title_over_cap).is_err());
+}
+
+#[test]
 fn a_write_adopts_the_nodes_text_and_a_noop_adopts_the_submitted_text() {
     // Written: the canonical baseline keeps a one-step-per-tick depth change
     // ticking until buffer and node agree.
@@ -231,7 +250,7 @@ fn page_updates_preserve_exact_text() {
         ""
     );
     assert_eq!(
-        bounded_exact_text(String::new(), "page title", 512).unwrap(),
+        bounded_exact_text(String::new(), "page title", pages::MAX_PAGE_TITLE_LEN).unwrap(),
         ""
     );
 }
