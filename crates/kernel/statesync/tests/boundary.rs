@@ -240,7 +240,7 @@ fn tip_coords_roundtrip_over_the_wire() {
                 residents: vec![vec![3u8; 32]],
             },
         ],
-        build: Some("e6352411a-1f4c9d".into()),
+        build: Some("test-build-dirty".into()),
     };
     let bytes = encode_response(&SyncResponse::TipCoords(coords.clone()));
     let SyncResponse::TipCoords(back) = decode_response(&bytes).unwrap() else {

@@ -2072,7 +2072,7 @@ mod tests {
             connected: true,
             connected_since_ms: Some(1_000),
             role: Some("validator".into()),
-            build: Some("e6352411a".into()),
+            build: Some("test-build".into()),
             msgs_sent: sent,
             msgs_received: 0,
             statesync: Some(noded::peers::StatesyncServeView {
@@ -2102,7 +2102,7 @@ mod tests {
         assert_eq!(
             with_baseline,
             format!(
-                "peer={} role=validator build=e6352411a connected=11s msgs_tx=150 msgs_rx=0 \
+                "peer={} role=validator build=test-build connected=11s msgs_tx=150 msgs_rx=0 \
                  tx/s=25.0 rx/s=0.0 sync_bytes=3000 sync_B/s=1000 sync_height=230 \
                  sync_boundary=230 sync_idle=4s sync_last=tip_coords",
                 "ab".repeat(32)

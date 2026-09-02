@@ -199,7 +199,7 @@ fn canned_response(req: &SyncRequest) -> SyncResponse {
                 validators: vec![vec![9u8; 32]],
                 residents: vec![],
             }],
-            build: Some("e6352411a".into()),
+            build: Some("test-build".into()),
         }),
         SyncRequest::Blob { digest } => SyncResponse::Blob {
             bytes: Some(digest.to_vec()),
