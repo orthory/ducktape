@@ -163,18 +163,8 @@ install-coordinator:
 TEST_TMPDIR := $(CURDIR)/target/test-tmp
 
 test: wasm-modules-check
-# TWO passes, and the second is not optional.
-#
-# A run that reached the compute plane leaves podman rootless overlay dirs owned
-# by a SUBUID, which this user cannot remove: plain `rm -rf` prints a wall of
-# `Permission denied` and — with `&&` — aborted the whole gate before a single
-# test ran. `podman unshare` re-enters the user namespace where those uids map
-# to root, which is the only way to reclaim them without privileges.
-#
-# Neither pass may fail the gate: a first run has nothing to clean, and a host
-# without podman has no second pass to make.
+# The reclaim may not fail the gate: a first run has nothing to clean.
 	-rm -rf "$(TEST_TMPDIR)" 2>/dev/null
-	-command -v podman >/dev/null 2>&1 && podman unshare rm -rf "$(TEST_TMPDIR)" 2>/dev/null
 	mkdir -p "$(TEST_TMPDIR)"
 	TMPDIR="$(TEST_TMPDIR)" $(CARGO) test --workspace
 # the auth page's pure helpers (fragment parsing, DER→raw, SPKI→SEC1) — the
