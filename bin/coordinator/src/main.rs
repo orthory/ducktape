@@ -122,6 +122,13 @@ fn parse_metrics_interval(raw: &str) -> std::io::Result<u64> {
 /// RUST_LOG *adds to* the `info` floor rather than replacing it: with
 /// `EnvFilter`'s own default, a bare `RUST_LOG=ducktape::reachability=debug`
 /// would turn every other event OFF while appearing to turn one plane UP.
+///
+/// The directives are parsed STRICTLY. `EnvFilter::new` SKIPS a malformed
+/// directive and carries on, so a typo'd `ducktape:reachability=debug` would
+/// look like it worked: no plane, no error, no clue — and this binary has no
+/// `/v1/log-filter` reload seam, so a restart is the only retry. A bad
+/// RUST_LOG falls back to the default filter and says so, once there is a
+/// subscriber to say it through.
 fn install_tracing() {
     let env = std::env::var("RUST_LOG").unwrap_or_default();
     let directives = if env.is_empty() {
@@ -129,14 +136,30 @@ fn install_tracing() {
     } else {
         format!("info,{env}")
     };
+    let (filter, bad_env) = match tracing_subscriber::EnvFilter::builder().parse(&directives) {
+        Ok(filter) => (filter, None),
+        Err(error) => (
+            tracing_subscriber::EnvFilter::new("info"),
+            Some(error.to_string()),
+        ),
+    };
     // colour only for a human at a terminal: the deployed sink is the journal,
     // where escape codes are noise in every grep.
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr());
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_ansi(interactive)
-        .with_env_filter(tracing_subscriber::EnvFilter::new(directives))
+        .with_env_filter(filter)
         .init();
+    if let Some(error) = bad_env {
+        tracing::warn!(
+            target: "ducktape::reachability",
+            event = "coordinator_log_filter_refused",
+            reason = "malformed_rust_log",
+            error,
+            "RUST_LOG is malformed — ignored, running at the default filter"
+        );
+    }
 }
 
 /// Whether the TCP relay lane bound — carried on every metrics row so a
