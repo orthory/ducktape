@@ -316,7 +316,7 @@ wasm-modules-check:
 wasm-repro-check:
 	@bash ops/wasm-repro-check.sh
 
-INDEX_CHECK_DIR = $(CURDIR)/target/wasm-index-check
+INDEX_CHECK_DIR := $(CURDIR)/target/wasm-index-check
 
 ## the drift gate the committed INDEX guests never had: rebuild each
 ## index.wasm from its source and compare it with the committed bytes.
