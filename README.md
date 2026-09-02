@@ -187,8 +187,8 @@ Three binaries plus the desktop app are runnable:
   above).
 
 - **`ducktape-app`** (`app/`) — the native Iced desktop client for Chat and
-  Pages, its UI declared in `app/src/ui/*.ice`. `cargo run -p ducktape-app`; it
-  dials `DUCKTAPE_NODE`, else `http://127.0.0.1:8844`. See `app/README.md`.
+  Pages, its UI declared in `app/src/ui/*.ice`. `cargo run -p ducktape-app`;
+  `app/README.md` states which node it dials and which key it signs with.
 
 Install the `ducktape` operator CLI into `~/.cargo/bin`; on macOS this also
 builds the Ice `.app`/`.dmg` and installs `Ducktape.app` into `~/Applications`:
