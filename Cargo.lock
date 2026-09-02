@@ -5129,6 +5129,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -5806,6 +5807,7 @@ dependencies = [
  "opus-rs",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
