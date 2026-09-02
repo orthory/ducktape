@@ -257,7 +257,8 @@ enum Family {
     /// offchain service daemons: what is signaling, and what you have enabled
     #[command(subcommand)]
     Service(services::ServiceCmd),
-    /// remote/interactive sandboxed provider sessions (pty attach, sched runs)
+    /// sandboxed provider sessions (pty attach, sched runs) and run control
+    /// (cancel, reassign)
     Agent(agent_cli::AgentArgs),
     /// live code swaps: update, register, status
     #[command(subcommand)]
