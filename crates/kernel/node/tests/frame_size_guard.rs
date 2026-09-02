@@ -17,7 +17,9 @@ use commonware_runtime::{Runner as _, deterministic};
 use directory::Directory;
 use directory::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
 use host::Host;
-use node::{MAX_FRAME_BYTES, OrderedNode, RoundOrderer, encode_frame};
+use node::{
+    MAX_FRAME_BYTES, MAX_PAYLOAD_BYTES, MAX_TARGET_BYTES, OrderedNode, RoundOrderer, encode_frame,
+};
 use sdk::Msg;
 
 /// a deterministic dev signer for test frames.
@@ -47,6 +49,36 @@ fn full_chunk_putblob_frame_fits_the_cap() {
          frame is {} bytes, cap is {} — the wire codec is expanding the payload",
         frame.len(),
         MAX_FRAME_BYTES,
+    );
+}
+
+/// the client-side cap is exact: a payload of `MAX_PAYLOAD_BYTES` under the
+/// widest target still fits the frame cap, and one more byte does not — so a
+/// client checking the payload refuses exactly what the node would refuse.
+#[test]
+fn max_payload_frame_fits_the_cap_exactly() {
+    let widest_target = "t".repeat(MAX_TARGET_BYTES);
+    let frame_of = |payload_len: usize| {
+        encode_frame(
+            &sk(1),
+            0,
+            &Msg {
+                target: widest_target.clone(),
+                payload: vec![0xAB; payload_len],
+            },
+        )
+        .len()
+    };
+    assert!(
+        frame_of(MAX_PAYLOAD_BYTES) <= MAX_FRAME_BYTES,
+        "a MAX_PAYLOAD_BYTES payload must encode within MAX_FRAME_BYTES: \
+         frame is {} bytes, cap is {}",
+        frame_of(MAX_PAYLOAD_BYTES),
+        MAX_FRAME_BYTES,
+    );
+    assert!(
+        frame_of(MAX_PAYLOAD_BYTES + 1) > MAX_FRAME_BYTES,
+        "MAX_PAYLOAD_BYTES is slack: one more payload byte still fits the frame cap",
     );
 }
 
