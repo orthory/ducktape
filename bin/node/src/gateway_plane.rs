@@ -131,11 +131,14 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                                     let head_for_server = head.clone();
                                     let body_for_server = body.clone();
                                     tokio::spawn(async move {
+                                        let scope = LoopbackScope {
+                                            workspace: &serve_workspace,
+                                            node_api_ports: &serve_ports,
+                                            own_node: &own_node,
+                                        };
                                         serve_proxy_stream(
                                             &serve_commands,
-                                            &serve_workspace,
-                                            &serve_ports,
-                                            &own_node,
+                                            &scope,
                                             &own_node,
                                             head_for_server,
                                             Some(body_for_server),
@@ -269,23 +272,18 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                         return;
                     }
                 };
+                let scope = LoopbackScope {
+                    workspace: &workspace,
+                    node_api_ports: &node_api_ports,
+                    own_node: &own_node,
+                };
                 // A WebSocket upgrade is long-lived; it owns the stream and
                 // writes its own responses, so it bypasses the one-shot timeout.
                 if head.upgrade {
                     serve_ws(&commands, &workspace, &own_node, &head, stream).await;
                     return;
                 }
-                serve_proxy_stream(
-                    &commands,
-                    &workspace,
-                    &node_api_ports,
-                    &own_node,
-                    &requester.0,
-                    head,
-                    None,
-                    stream,
-                )
-                .await;
+                serve_proxy_stream(&commands, &scope, &requester.0, head, None, stream).await;
             });
         }
     });
@@ -328,17 +326,23 @@ async fn proxy_remote(
     .map_err(|_| GatewayFailure::Unavailable("gateway publisher timed out".into()))?
 }
 
+/// What serving a route needs of THIS node, shared by the HTTP proxy and the
+/// WebSocket upgrade: the workspace the loopback route map lives in, the
+/// ports this node's own surfaces answer on, and this node's key.
+struct LoopbackScope<'a> {
+    workspace: &'a Path,
+    node_api_ports: &'a [u16],
+    own_node: &'a [u8; 32],
+}
+
 /// One proxied HTTP exchange over a frame-capable stream (the overlay socket
 /// or the self-serve duplex). `body`: `Some` when the caller already holds the
 /// request body (self-serve); `None` reads `head.body_len` bytes off the
 /// stream (overlay). The deadline covers the body read + serve up to the
 /// response HEAD; the body drain streams beyond it.
-#[allow(clippy::too_many_arguments)]
 async fn serve_proxy_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     commands: &mpsc::Sender<NodeCommand>,
-    workspace: &Path,
-    node_api_ports: &[u16],
-    own_node: &[u8; 32],
+    scope: &LoopbackScope<'_>,
     caller_node: &[u8; 32],
     head: gateway::ProxyRequestHead,
     body: Option<Vec<u8>>,
@@ -359,16 +363,7 @@ async fn serve_proxy_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 body
             }
         };
-        serve_current(
-            commands,
-            workspace,
-            node_api_ports,
-            own_node,
-            caller_node,
-            &head,
-            &body,
-        )
-        .await
+        serve_current(commands, scope, caller_node, &head, &body).await
     })
     .await
     .unwrap_or_else(|_| {
@@ -432,9 +427,7 @@ async fn proxy_remote_ws(
 
 async fn serve_current(
     commands: &mpsc::Sender<NodeCommand>,
-    workspace: &Path,
-    node_api_ports: &[u16],
-    own_node: &[u8; 32],
+    scope: &LoopbackScope<'_>,
     caller_node: &[u8; 32],
     head: &gateway::ProxyRequestHead,
     body: &[u8],
@@ -446,7 +439,7 @@ async fn serve_current(
         ));
     }
     let record = resolve_route(commands, head.account_id, &head.name).await?;
-    if record.statement.publisher_node.as_slice() != own_node {
+    if record.statement.publisher_node.as_slice() != scope.own_node {
         return Err(GatewayFailure::Forbidden(
             "gateway request does not name this publisher".into(),
         ));
@@ -470,19 +463,10 @@ async fn serve_current(
     }
     match &route.target {
         gateway::RouteTarget::DuckFs { .. } => {
-            serve_duckfs(commands, own_node, head, &record).await
+            serve_duckfs(commands, scope.own_node, head, &record).await
         }
         gateway::RouteTarget::LoopbackHttp => {
-            proxy_loopback(
-                workspace,
-                node_api_ports,
-                caller_node,
-                caller,
-                head,
-                body,
-                &record,
-            )
-            .await
+            proxy_loopback(scope, caller_node, caller, head, body, &record).await
         }
     }
 }
@@ -660,10 +644,8 @@ async fn revalidate_route_authority(
 /// the reply detail and the log reason alike.
 const ROUTE_TARGETS_NODE_API: &str = "route_targets_node_api";
 
-#[allow(clippy::too_many_arguments)]
 async fn proxy_loopback(
-    workspace: &Path,
-    node_api_ports: &[u16],
+    scope: &LoopbackScope<'_>,
     caller_node: &[u8; 32],
     caller_account: Option<u64>,
     head: &gateway::ProxyRequestHead,
@@ -676,14 +658,15 @@ async fn proxy_loopback(
         .route
         .as_ref()
         .expect("current route is live");
-    let routes = crate::gateway_routes::load(workspace).map_err(GatewayFailure::Unavailable)?;
+    let routes =
+        crate::gateway_routes::load(scope.workspace).map_err(GatewayFailure::Unavailable)?;
     let port = routes.port(&head.name).ok_or_else(|| {
         GatewayFailure::NotFound("global gateway route has no local loopback upstream".into())
     })?;
     // a loopback route may name any local daemon EXCEPT this node's own
     // surfaces: proxying the mesh into `/v1` hands every member this node's
     // unauthenticated API (submit as this node, mint invites, log-filter).
-    let targets_node_api = node_api_ports.contains(&port);
+    let targets_node_api = scope.node_api_ports.contains(&port);
     if targets_node_api {
         if let Some(attempts) = REFUSED.hit(ROUTE_TARGETS_NODE_API) {
             tracing::warn!(
@@ -2166,9 +2149,11 @@ mod tests {
         let body = br#"{"name":"quack"}"#;
         let response = serve_current(
             &commands,
-            workspace.path(),
-            &[],
-            &publisher,
+            &LoopbackScope {
+                workspace: workspace.path(),
+                node_api_ports: &[],
+                own_node: &publisher,
+            },
             &caller,
             &gateway::ProxyRequestHead {
                 account_id: 1,
@@ -2288,9 +2273,11 @@ mod tests {
         });
         let response = serve_current(
             &commands,
-            workspace.path(),
-            &[],
-            &publisher,
+            &LoopbackScope {
+                workspace: workspace.path(),
+                node_api_ports: &[],
+                own_node: &publisher,
+            },
             &caller_node,
             &gateway::ProxyRequestHead {
                 account_id: 1,
@@ -2349,9 +2336,11 @@ mod tests {
         });
         let error = serve_current(
             &commands,
-            workspace.path(),
-            &[],
-            &publisher,
+            &LoopbackScope {
+                workspace: workspace.path(),
+                node_api_ports: &[],
+                own_node: &publisher,
+            },
             &[3u8; 32],
             &gateway::ProxyRequestHead {
                 account_id: 1,
@@ -2415,9 +2404,11 @@ mod tests {
         });
         let error = serve_current(
             &commands,
-            workspace.path(),
-            &[8845, node_http_port],
-            &publisher,
+            &LoopbackScope {
+                workspace: workspace.path(),
+                node_api_ports: &[8845, node_http_port],
+                own_node: &publisher,
+            },
             &caller,
             &gateway::ProxyRequestHead {
                 account_id: 1,
@@ -2464,9 +2455,11 @@ mod tests {
         });
         let error = serve_current(
             &commands,
-            workspace.path(),
-            &[],
-            &publisher,
+            &LoopbackScope {
+                workspace: workspace.path(),
+                node_api_ports: &[],
+                own_node: &publisher,
+            },
             &caller,
             &gateway::ProxyRequestHead {
                 account_id: 1,
@@ -2589,9 +2582,11 @@ mod tests {
         });
         serve_current(
             &commands,
-            Path::new("."),
-            &[],
-            &publisher,
+            &LoopbackScope {
+                workspace: Path::new("."),
+                node_api_ports: &[],
+                own_node: &publisher,
+            },
             &publisher,
             &gateway::ProxyRequestHead {
                 account_id: 1,
