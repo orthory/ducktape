@@ -21,15 +21,12 @@ fn hex(bytes: &[u8]) -> String {
 
 const MAX_NAME_LEN: usize = 41;
 
-/// `$DUCKTAPE_HOME` when set (tests, portable setups, huddle lanes), else
-/// `~/.ducktape` — the directory `keys/` lives under.
+/// the directory `keys/` lives under — [`ducktape_home::root`], the same
+/// resolution the node, the app and `provider-host` reach that root through.
+/// A keystore that answered differently would mint into one home while the
+/// node read the other.
 pub fn duck_root() -> Result<PathBuf, String> {
-    if let Some(home) = std::env::var_os("DUCKTAPE_HOME") {
-        return Ok(PathBuf::from(home));
-    }
-    let home = std::env::var_os("HOME")
-        .ok_or("cannot resolve $HOME — set DUCKTAPE_HOME or pass --key")?;
-    Ok(PathBuf::from(home).join(".ducktape"))
+    ducktape_home::root()
 }
 
 pub fn keys_dir(duck: &Path) -> PathBuf {

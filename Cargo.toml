@@ -148,6 +148,9 @@ members = [
     # and the join ceremony that writes one. Split from bin/node because
     # joining is the one node operation with no running node to ask.
     "crates/workspace-config",
+    # THE ducktape home resolution, alone in a zero-dependency leaf so the
+    # light services can read it without workspace-config's graph behind it.
+    "crates/ducktape-home",
     "crates/duckfs/core",
     "crates/duckfs/disk",
     "crates/duckfs/client",
@@ -372,6 +375,8 @@ run-envelope = { path = "crates/run-envelope" }
 # a ducktape workspace on disk + the join ceremony, linked by the CLI and the
 # desktop app.
 workspace-config = { path = "crates/workspace-config" }
+# `$DUCKTAPE_HOME` else `~/.ducktape`, resolved once for every reader of it.
+ducktape-home = { path = "crates/ducktape-home" }
 # the module composition catalog (id universe + named genesis selections).
 topology = { path = "crates/topology" }
 duckfs-core = { path = "crates/duckfs/core" }

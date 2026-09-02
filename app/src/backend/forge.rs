@@ -528,19 +528,13 @@ fn sync_forge_mirror(endpoint: &str, repo: &str) -> Result<git2::Repository, Str
     Ok(mirror)
 }
 
-/// `<key-root>/forge-remote/<endpoint-slug>/<repo>` — the key root is the same
-/// resolution order the user key uses (`DUCKTAPE_HOME`, then `~/.ducktape`).
+/// `<key-root>/forge-remote/<endpoint-slug>/<repo>` — the key root IS the root
+/// the user key resolves through, [`ducktape_home::root`].
 fn forge_mirror_dir(endpoint: &str, repo: &str) -> Result<PathBuf, String> {
     if repo.is_empty() || repo.contains('/') || repo.contains('\\') || repo.starts_with('.') {
         return Err(format!("invalid forge repo name {repo:?}"));
     }
-    let root = match std::env::var_os("DUCKTAPE_HOME") {
-        Some(home) => PathBuf::from(home),
-        None => std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|home| home.join(".ducktape"))
-            .ok_or_else(|| "cannot locate a home for the forge mirror".to_string())?,
-    };
+    let root = ducktape_home::root()?;
     let slug: String = endpoint
         .chars()
         .map(|character| match character.is_ascii_alphanumeric() {
