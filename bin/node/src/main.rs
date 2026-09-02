@@ -209,10 +209,9 @@ fn build_version() -> String {
     )
 }
 
-/// clap's `version` wants a `&'static str`; one leak per process buys it.
-fn build_version_static() -> &'static str {
-    build_version().leak()
-}
+/// clap's `version` wants a `&'static str`; built once, however many times
+/// the command is (completions, docs generation).
+static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(build_version);
 
 // clap owns parsing, help, usage errors (exit 2) and `-V/--version`; the
 // `FATAL:` wrapper in `main` stays for runtime death.
@@ -223,7 +222,7 @@ fn build_version_static() -> &'static str {
     // clap prints "<name> <version>", so the version string must not repeat
     // the binary name. Same stamp as `/v1/status`, so `ducktape -V` on two
     // hosts is the same comparison.
-    version = build_version_static(),
+    version = VERSION.as_str(),
     arg_required_else_help = true,
     // `arg_required_else_help` means a bare `ducktape` lands HERE, so this is
     // the one screen every new operator sees. A list of eight families does
