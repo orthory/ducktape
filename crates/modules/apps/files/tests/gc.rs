@@ -550,3 +550,86 @@ fn commit_block_triggers_gc_and_persists_watermark_across_reopen() {
         "the watermark persisted across a reopen"
     );
 }
+
+// ---- 6. a lost object skips the sweep, it does not brick the node ------------
+
+/// delete an object straight out of the odb — the bad-sector case, reproduced
+/// the way the issue's validation step does (no test seam: the store must see
+/// exactly what a lost disk block leaves behind).
+fn lose_object(d: &tempfile::TempDir, id: &[u8; 32]) {
+    let hex = to_hex(id);
+    let path = d.path().join("objects").join(&hex[..2]).join(&hex[2..]);
+    std::fs::remove_file(&path).expect("the odb holds the object");
+}
+
+#[test]
+fn a_lost_object_skips_the_sweep_and_the_block_still_commits() {
+    let d = tempfile::tempdir().unwrap();
+    let mut f = open_files(&d);
+    // a size-1 window, so the FIRST version's chunk is unreachable by the
+    // second commit — a healthy sweep at the boundary would remove it, which is
+    // what makes "nothing was swept" a real assertion below.
+    f.set_history_window_for_tests(1);
+    commit(
+        &mut f,
+        Origin::System,
+        1,
+        None,
+        vec![put_inline("/shared/f", b"one")],
+    )
+    .expect("first commit");
+    commit_block(&mut f);
+    let head = f.committed_head_for_test();
+    commit(
+        &mut f,
+        Origin::System,
+        2,
+        head.as_deref(),
+        vec![put_inline("/shared/f", b"two")],
+    )
+    .expect("second commit");
+    commit_block(&mut f);
+
+    let evicted = chunk_id(b"one");
+    let reachable = chunk_id(b"two");
+    assert!(f.odb_has_for_test(&evicted), "the evicted chunk is present");
+    assert!(f.odb_has_for_test(&reachable), "head's chunk is present");
+
+    // lose a REACHABLE object: the mark can no longer complete.
+    lose_object(&d, &reachable);
+
+    // drive a block across a gc period boundary. this used to be a FATAL
+    // block-boundary fault — one lost blob stopped every node holding it — and
+    // must now be a skipped sweep: the block commits (the helper unwraps), the
+    // boundary is consumed, and NOT ONE object was removed.
+    f.set_gc_watermark_for_tests(files::GC_PERIOD_BLOCKS);
+    let head = f.committed_head_for_test();
+    let root_before = f.root();
+    let before = f.odb_len_for_test();
+    commit(
+        &mut f,
+        Origin::System,
+        2 * files::GC_PERIOD_BLOCKS,
+        head.as_deref(),
+        vec![put_inline("/shared/g", b"three")],
+    )
+    .expect("commit at the boundary");
+    commit_block(&mut f);
+
+    assert_eq!(
+        f.gc_watermark_for_test(),
+        2 * files::GC_PERIOD_BLOCKS,
+        "a skipped sweep still consumes its boundary — the retry is the next period"
+    );
+    assert!(
+        f.odb_has_for_test(&evicted),
+        "a skipped sweep removes NOTHING, not even the unreachable chunk"
+    );
+    assert!(
+        f.odb_len_for_test() > before,
+        "the block's own objects landed"
+    );
+    assert_ne!(f.root(), root_before, "the block committed");
+    // and the store stays usable: every file whose bytes are intact still reads.
+    assert_eq!(read_all(&f, "/shared/g"), b"three");
+}
