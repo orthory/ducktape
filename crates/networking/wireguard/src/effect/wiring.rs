@@ -93,7 +93,18 @@ pub fn apply_peer_tunnels<E: WireGuardEffect>(
     peers: &[PeerTunnelConfig],
 ) -> Result<(), E::Error> {
     let config = interface_config(ifname, private_key, listen_port, local_interface_ips, peers);
-    effect.create_interface()?;
+    if let Err(err) = effect.create_interface() {
+        tracing::warn!(
+            target: "ducktape::dataplane",
+            event = "overlay_interface_refused",
+            reason = "create_failed",
+            interface = %config.name,
+            listen_port,
+            error = ?err,
+            "the tunnel backend refused to create the overlay interface"
+        );
+        return Err(err);
+    }
     if let Err(err) = effect.apply(&config) {
         // `create_interface` already stood up the interface; don't leave it
         // behind just because this config was rejected (a listen port the
@@ -101,9 +112,40 @@ pub fn apply_peer_tunnels<E: WireGuardEffect>(
         // secondary to the `apply` failure that's actually being reported,
         // so it's intentionally dropped rather than allowed to shadow it.
         let _ = effect.remove_interface();
+        tracing::warn!(
+            target: "ducktape::dataplane",
+            event = "overlay_interface_refused",
+            reason = "apply_rejected",
+            interface = %config.name,
+            listen_port,
+            peers = config.peers.len(),
+            error = ?err,
+            "the tunnel backend refused the interface config — interface torn back down"
+        );
         return Err(err);
     }
+    // bring-up happens once per interface life; the peer census is the fact an
+    // operator needs when a member is unreachable — an endpoint-less peer
+    // cannot be dialed, it can only dial in.
+    tracing::info!(
+        target: "ducktape::dataplane",
+        event = "overlay_interface_up",
+        interface = %config.name,
+        listen_port,
+        addresses = config.addresses.len(),
+        peers = config.peers.len(),
+        endpointless = endpointless(&config.peers),
+        "overlay interface configured"
+    );
     Ok(())
+}
+
+/// Peers installed with no endpoint: WireGuard cannot dial them, it can only
+/// wait for their own initiation and roam to its source. The count is the
+/// difference between "the mesh is up" and "the mesh is up but half of it can
+/// never be reached from here".
+fn endpointless(peers: &[PeerTunnelConfig]) -> usize {
+    peers.iter().filter(|peer| peer.endpoint.is_none()).count()
 }
 
 /// Re-apply the full peer set to an interface that is ALREADY live — the
@@ -123,7 +165,30 @@ pub fn update_peer_tunnels<E: WireGuardEffect>(
     peers: &[PeerTunnelConfig],
 ) -> Result<(), E::Error> {
     let config = interface_config(ifname, private_key, listen_port, local_interface_ips, peers);
-    effect.apply(&config)
+    if let Err(err) = effect.apply(&config) {
+        // Unlike bring-up there is nothing to unwind: the interface stays live
+        // on its PREVIOUS peer set, so the delta this call carried (a new
+        // standby tunnel, a re-advertised endpoint) is silently not installed.
+        tracing::warn!(
+            target: "ducktape::dataplane",
+            event = "overlay_peers_refused",
+            reason = "apply_rejected",
+            interface = %config.name,
+            peers = config.peers.len(),
+            error = ?err,
+            "the tunnel backend refused a peer-set re-apply — the live interface keeps its previous peers"
+        );
+        return Err(err);
+    }
+    tracing::debug!(
+        target: "ducktape::dataplane",
+        event = "overlay_peers_applied",
+        interface = %config.name,
+        peers = config.peers.len(),
+        endpointless = endpointless(&config.peers),
+        "re-applied the peer set to the live interface"
+    );
+    Ok(())
 }
 
 /// The shared config assembly: ONE interface (own overlay addresses, listen
