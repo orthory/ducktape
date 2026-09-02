@@ -8,10 +8,10 @@ use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use simnode::{Persona, SimOpts};
+use simnode::{DEFAULT_LISTEN, Persona, SimOpts};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut listen: SocketAddr = "127.0.0.1:8845".parse()?;
+    let mut listen: SocketAddr = DEFAULT_LISTEN.parse()?;
     let mut storage: Option<PathBuf> = None;
     let mut auto = false;
     let mut persona = Persona::Local;
