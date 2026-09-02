@@ -188,7 +188,7 @@ async fn publish_replica_status(
         None => (0, String::new(), Vec::new()),
     };
     status.publish(noded::NodeStatus {
-        version: env!("CARGO_PKG_VERSION").into(),
+        version: crate::build_version(),
         root_hash,
         height,
         modules,

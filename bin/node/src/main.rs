@@ -211,6 +211,25 @@ Each verb's own --help carries the rest. `ducktape node list` shows every
 network this machine is registered on; -n <chain-id> picks one when there is
 more than one.";
 
+/// What `/v1/status` and `ducktape -V` report as `version`:
+/// `<cargo version>+<build stamp>`, e.g. `0.1.0+e6352411a` or
+/// `0.1.0+e6352411a-<dirty digest>`. The package version alone is pinned at
+/// v1 forever and could never tell two hosts' builds apart; the stamp is
+/// `noded`'s `DUCKTAPE_BUILD` (short sha, plus a working-tree digest when
+/// dirty) or `unknown` for a git-less build. Display only — nothing admits or
+/// refuses on it.
+fn build_version() -> String {
+    format!(
+        "{}+{}",
+        env!("CARGO_PKG_VERSION"),
+        noded::services::build_identity_or_unknown()
+    )
+}
+
+/// clap's `version` wants a `&'static str`; built once, however many times
+/// the command is (completions, docs generation).
+static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(build_version);
+
 // clap owns parsing, help, usage errors (exit 2) and `-V/--version`; the
 // `FATAL:` wrapper in `main` stays for runtime death.
 #[derive(clap::Parser)]
@@ -218,8 +237,9 @@ more than one.";
     name = "ducktape",
     about = "one workspace-network node and its operator tools",
     // clap prints "<name> <version>", so the version string must not repeat
-    // the binary name.
-    version = env!("CARGO_PKG_VERSION"),
+    // the binary name. Same stamp as `/v1/status`, so `ducktape -V` on two
+    // hosts is the same comparison.
+    version = VERSION.as_str(),
     arg_required_else_help = true,
     // `arg_required_else_help` means a bare `ducktape` lands HERE, so this is
     // the one screen every new operator sees. A list of eight families does
@@ -588,7 +608,7 @@ fn run_node(
             Ok(blob)
         });
         status.publish(noded::NodeStatus {
-            version: env!("CARGO_PKG_VERSION").into(),
+            version: build_version(),
             public_key: status_public_key.clone(),
             ..Default::default()
         });

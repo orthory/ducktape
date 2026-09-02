@@ -110,7 +110,30 @@ fn parse_metrics_interval(raw: &str) -> std::io::Result<u64> {
     })
 }
 
-async fn log_metrics(metrics: CoordinatorMetrics, relay_metrics: RelayMetrics, seconds: u64) {
+/// Whether the TCP relay lane bound — carried on every metrics row so a
+/// coordinator whose 443 bind failed at boot (the one-time line scrolled
+/// away long ago) keeps saying so for as long as it runs.
+#[derive(Clone, Copy)]
+enum RelayLane {
+    On,
+    Off,
+}
+
+impl RelayLane {
+    fn as_str(self) -> &'static str {
+        match self {
+            RelayLane::On => "on",
+            RelayLane::Off => "off",
+        }
+    }
+}
+
+async fn log_metrics(
+    metrics: CoordinatorMetrics,
+    relay_metrics: RelayMetrics,
+    relay_lane: RelayLane,
+    seconds: u64,
+) {
     let mut ticker = tokio::time::interval(Duration::from_secs(seconds));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     ticker.tick().await;
@@ -138,7 +161,7 @@ async fn log_metrics(metrics: CoordinatorMetrics, relay_metrics: RelayMetrics, s
             .map(|rss| format!("{:.2}", rss as f64 / 1_048_576.0))
             .unwrap_or_else(|| "na".into());
         eprintln!(
-            "coordinator_metrics | traffic received={} authenticated={} rejected={} malformed={} replies={} send_errors={} | queue inflight={} inflight_max={} saturated={} | relay sessions={} rejected={} forwards={} replies={} expired={} | host cpu_pct={cpu_pct} rss_mib={rss_mib}",
+            "coordinator_metrics | traffic received={} authenticated={} rejected={} malformed={} replies={} send_errors={} | queue inflight={} inflight_max={} saturated={} | relay={} sessions={} rejected={} forwards={} replies={} expired={} | host cpu_pct={cpu_pct} rss_mib={rss_mib}",
             m.received,
             m.authenticated,
             m.rejected,
@@ -148,6 +171,7 @@ async fn log_metrics(metrics: CoordinatorMetrics, relay_metrics: RelayMetrics, s
             m.inflight,
             m.inflight_max,
             m.saturated,
+            relay_lane.as_str(),
             r.sessions_opened,
             r.sessions_rejected,
             r.forwards,
@@ -209,8 +233,9 @@ async fn main() -> std::io::Result<()> {
     // rendezvous keepalives maintain.
     let coord = Coordinator::with_shared_policy(policy.clone());
     let relay_metrics = RelayMetrics::default();
-    if let Some(relay_addr) = relay_listen {
-        match TcpListener::bind(relay_addr).await {
+    let relay_lane = match relay_listen {
+        None => RelayLane::Off,
+        Some(relay_addr) => match TcpListener::bind(relay_addr).await {
             Ok(listener) => {
                 // parseable like the UDP line above (tooling/tests read its tail).
                 eprintln!(
@@ -223,21 +248,31 @@ async fn main() -> std::io::Result<()> {
                     coord.adverts(),
                     relay_metrics.clone(),
                 ));
+                RelayLane::On
             }
             Err(error) => {
                 // The relay is a FALLBACK lane: failing to bind it (EACCES on
                 // 443 as non-root is the everyday dev case) must not take the
-                // UDP rendezvous down with it. Warn loudly and keep serving.
-                eprintln!("WARNING: relay lane disabled: binding tcp/{relay_addr} failed: {error}");
+                // UDP rendezvous down with it. Say exactly what is now dark
+                // and keep serving; every metrics row repeats `relay=off`.
+                eprintln!(
+                    "ERROR: relay lane DISABLED — binding tcp/{relay_addr} failed: {error}\n\
+                     ERROR: every joiner derives its first-contact fallback as <this host>:443; \
+                     a member whose NAT cannot hole-punch cannot join through this coordinator.\n\
+                     ERROR: fix: run with CAP_NET_BIND_SERVICE (ops/coordinator/ducktape-coordinator.service), \
+                     bind an unprivileged port behind a 443 forward, or pass --relay-listen none to run without it on purpose."
+                );
+                RelayLane::Off
             }
-        }
-    }
+        },
+    };
 
     let metrics = CoordinatorMetrics::default();
     if metrics_interval != 0 {
         tokio::spawn(log_metrics(
             metrics.clone(),
             relay_metrics.clone(),
+            relay_lane,
             metrics_interval,
         ));
     }
