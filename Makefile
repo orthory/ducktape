@@ -10,7 +10,7 @@ APP_DEST ?= $(HOME)/Applications
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all app dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-repro-check labs-gate
+.PHONY: all app dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-repro-check wasm-index-check labs-gate audit
 
 ## build every workspace crate (the default target)
 all:
@@ -315,6 +315,17 @@ wasm-modules-check:
 ## apart from the pre-push `test` gate. See ops/wasm-repro-check.sh.
 wasm-repro-check:
 	@bash ops/wasm-repro-check.sh
+
+## the supply-chain tripwire: RustSec advisories and yanked crates against the
+## committed Cargo.lock, under the policy in `deny.toml` — where every carried
+## advisory is listed WITH the reason it is carried and what would clear it.
+## Needs `cargo deny` (cargo install cargo-deny) and network for the advisory
+## database, so it is not part of the offline `test` gate; run it when the lock
+## moves. `cargo audit` is deliberately not also run: same database, and a
+## second ignore list in `.cargo/audit.toml` is a second place for a reason to
+## go stale.
+audit:
+	$(CARGO) deny check advisories
 
 clean:
 	$(CARGO) clean
