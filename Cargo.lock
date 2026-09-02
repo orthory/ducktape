@@ -4567,7 +4567,6 @@ dependencies = [
  "tempfile",
  "tracing",
  "valset",
- "vaults",
  "wasm-host",
 ]
 
@@ -10590,22 +10589,6 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
-
-[[package]]
-name = "vaults"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "commonware-codec",
- "commonware-cryptography",
- "futures",
- "guest-adapter",
- "host",
- "sdk",
- "serde",
- "serde_json",
- "sha2 0.10.9",
-]
 
 [[package]]
 name = "vcpkg"
