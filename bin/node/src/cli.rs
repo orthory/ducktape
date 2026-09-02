@@ -382,10 +382,11 @@ fn detect_platform_sandbox() -> Option<config::SandboxToml> {
 /// seed the genesis validator set with this identity, and PIN the genesis wasm
 /// set — every component in `--modules` is hashed into the descriptor and
 /// copied into `<workspace>/modules`. Every flag is optional:
-/// the generated config defaults to a WORKING node (mesh `[::]:52200`,
-/// overlay advertise, HTTP 8844, RPC 8845, gateway, WireGuard 51820) and
-/// prints every key, so the file itself documents what to change. without
-/// `--dir` the workspace lands in the registry
+/// the generated config defaults to a WORKING node — overlay advertise, and
+/// every listener at its `config::DEFAULT_*_LISTEN` constant (mesh, HTTP,
+/// RPC, gateway, WireGuard), which is the one place those ports are written
+/// down — and prints every key, so the file itself documents what to change.
+/// without `--dir` the workspace lands in the registry
 /// (`~/.ducktape/workspaces/<chain-id>/`), where `-n <chain-id>` finds it.
 fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let name = &args.name;
