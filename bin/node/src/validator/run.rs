@@ -76,7 +76,7 @@ pub(super) fn publish_boundary_status(
         })
         .collect();
     status.publish(noded::NodeStatus {
-        version: env!("CARGO_PKG_VERSION").into(),
+        version: crate::build_version(),
         root_hash: crate::util::hex(&node.root_hash()),
         height: node.finalized().map(|f| f.height).unwrap_or(0),
         modules,
