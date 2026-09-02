@@ -1,11 +1,16 @@
 //! The module composition topology — ONE source for the module id universe,
-//! its logical wiring, its genesis-config schema, and the named genesis
-//! selections every composer draws from.
+//! its shape, its genesis-config schema, and the named genesis selections
+//! every composer draws from.
 //!
-//! No composer keeps a hand-counted id list of its own: the id universe,
-//! wiring, and config live in one [`ModuleTopology`] value, and each
+//! No composer keeps a hand-counted id list of its own: the id universe, its
+//! shape and its config schema live in one [`ModuleTopology`] value, and each
 //! backend's genesis set is a NAMED SELECTION validated against it —
 //! [`PRODUCTION`] for the node, [`SIM_BASE`] and [`SIM_VALSET`] for simnode.
+//!
+//! Inter-module wiring is NOT here and must not come back: a module's guest
+//! compiles in the siblings it reads, so the guest is the wiring. A table of
+//! edges nothing loads is a second source of truth that cannot be caught
+//! being wrong.
 //!
 //! This is a plan, NOT a root-hash. Every backend instantiates it through the
 //! ONE composer (`noded::compose`) — each spec's `code` decides wasm component
@@ -42,13 +47,6 @@ pub enum Backing {
 pub struct ModuleSpec {
     /// The consensus-visible module id (the key in the host registry / root-hash).
     pub id: &'static str,
-    /// The NATIVE sibling wiring the native composers (noded/simnode) pass
-    /// as constructor args — the concrete duplication this topology absorbs.
-    /// A backend realizes an edge only when it also composes the target module.
-    /// The wasm production guests compile in their OWN wiring, which can be
-    /// richer than the native args (e.g. saga reads valset/capability inside
-    /// the guest); that guest-internal wiring is not represented here.
-    pub wiring: &'static [&'static str],
     /// The per-network genesis-config keys this module needs (empty = none).
     /// The VALUES are runtime (a `NetworkBindings`: the invite namespace + the
     /// identity chain id), delivered per-backend (a native constructor arg, or
@@ -64,10 +62,10 @@ pub struct ModuleSpec {
     pub committed_queries: bool,
 }
 
-/// The module composition topology: the id universe (with per-module wiring +
+/// The module composition topology: the id universe (with per-module shape +
 /// config) and the three named genesis selections drawn from it.
 pub struct ModuleTopology {
-    /// Every module that appears in ANY selection, each with its wiring/config.
+    /// Every module that appears in ANY selection, each with its shape/config.
     pub modules: &'static [ModuleSpec],
     /// node's production genesis set (wasm backend), in status-report order.
     pub production: &'static [&'static str],
@@ -81,11 +79,6 @@ impl ModuleTopology {
     /// The spec for `id`, if it is in the universe.
     pub fn spec(&self, id: &str) -> Option<&ModuleSpec> {
         self.modules.iter().find(|m| m.id == id)
-    }
-
-    /// `id`'s native sibling wiring (empty if `id` is unknown or unwired).
-    pub fn wiring(&self, id: &str) -> &'static [&'static str] {
-        self.spec(id).map(|m| m.wiring).unwrap_or(&[])
     }
 
     /// `id`'s genesis-config keys (empty if `id` is unknown or not network-bound).
@@ -114,33 +107,33 @@ const CHAIN_ID: &[&str] = &[CONFIG_CHAIN_ID];
 const INVITE: &[&str] = &[CONFIG_INVITE];
 const NONE: &[&str] = &[];
 
-const fn store(id: &'static str, wiring: &'static [&'static str], config: &'static [&'static str]) -> ModuleSpec {
-    ModuleSpec { id, wiring, config, code: Code::Wasm, backing: Backing::Store, committed_queries: false }
+const fn store(id: &'static str, config: &'static [&'static str]) -> ModuleSpec {
+    ModuleSpec { id, config, code: Code::Wasm, backing: Backing::Store, committed_queries: false }
 }
 
-/// The module id universe with per-module wiring + config. Alphabetical by id
+/// The module id universe with per-module shape + config. Alphabetical by id
 /// (order here is documentation only — selections carry the composer orders).
 const MODULES: &[ModuleSpec] = &[
-    store("acl", NONE, NONE),
-    store("agent", &["saga", "runs"], NONE),
-    store("automations", &["chat", "tasks", "inbox"], NONE),
-    store("capability", NONE, NONE),
-    store("chat", &["tagging"], NONE),
-    ModuleSpec { id: "dispatch", wiring: &["saga"], config: NONE, code: Code::Wasm, backing: Backing::Store, committed_queries: true },
-    ModuleSpec { id: "files", wiring: NONE, config: NONE, code: Code::Wasm, backing: Backing::Odb, committed_queries: false },
-    ModuleSpec { id: "forge", wiring: &["chat"], config: NONE, code: Code::Wasm, backing: Backing::Odb, committed_queries: false },
-    store("gateway", &["identity"], CHAIN_ID),
-    store("governance", &["valset", "lifecycle", "identity"], INVITE),
-    store("identity", NONE, CHAIN_ID),
-    store("inbox", NONE, NONE),
-    ModuleSpec { id: "kv", wiring: NONE, config: NONE, code: Code::Native, backing: Backing::Store, committed_queries: false },
-    ModuleSpec { id: "lifecycle", wiring: &["valset"], config: NONE, code: Code::Native, backing: Backing::Store, committed_queries: false },
-    store("pages", &["tagging"], NONE),
-    ModuleSpec { id: "runs", wiring: &["chat", "saga", "tagging", "dispatch", "agent", "tasks", "files", "pages"], config: NONE, code: Code::Wasm, backing: Backing::Map, committed_queries: false },
-    store("saga", NONE, NONE),
-    store("tagging", &["runs"], NONE),
-    store("tasks", NONE, NONE),
-    ModuleSpec { id: "valset", wiring: NONE, config: NONE, code: Code::Native, backing: Backing::Store, committed_queries: false },
+    store("acl", NONE),
+    store("agent", NONE),
+    store("automations", NONE),
+    store("capability", NONE),
+    store("chat", NONE),
+    ModuleSpec { id: "dispatch", config: NONE, code: Code::Wasm, backing: Backing::Store, committed_queries: true },
+    ModuleSpec { id: "files", config: NONE, code: Code::Wasm, backing: Backing::Odb, committed_queries: false },
+    ModuleSpec { id: "forge", config: NONE, code: Code::Wasm, backing: Backing::Odb, committed_queries: false },
+    store("gateway", CHAIN_ID),
+    store("governance", INVITE),
+    store("identity", CHAIN_ID),
+    store("inbox", NONE),
+    ModuleSpec { id: "kv", config: NONE, code: Code::Native, backing: Backing::Store, committed_queries: false },
+    ModuleSpec { id: "lifecycle", config: NONE, code: Code::Native, backing: Backing::Store, committed_queries: false },
+    store("pages", NONE),
+    ModuleSpec { id: "runs", config: NONE, code: Code::Wasm, backing: Backing::Map, committed_queries: false },
+    store("saga", NONE),
+    store("tagging", NONE),
+    store("tasks", NONE),
+    ModuleSpec { id: "valset", config: NONE, code: Code::Native, backing: Backing::Store, committed_queries: false },
 ];
 
 /// node's production genesis set (19), in status-report order — every node runs
@@ -278,7 +271,7 @@ mod tests {
     }
 
     /// Every selection id has a spec, and every spec is used by some selection —
-    /// so the universe and the selections cannot drift apart, and wiring/config
+    /// so the universe and the selections cannot drift apart, and shape/config
     /// metadata exists for exactly the composed modules.
     #[test]
     fn universe_and_selections_cover_each_other() {
@@ -297,20 +290,11 @@ mod tests {
         );
     }
 
-    /// Wiring targets and config keys reference only real ids / known keys — a
-    /// typo or a removed sibling fails the build's test gate, not a live node.
+    /// Config keys reference only known keys — a typo fails the build's test
+    /// gate, not a live node whose module reads an absent `__config` entry.
     #[test]
-    fn wiring_and_config_are_referential() {
-        let universe: BTreeSet<&str> = MODULES.iter().map(|m| m.id).collect();
+    fn config_keys_are_referential() {
         for spec in MODULES {
-            for target in spec.wiring {
-                assert!(
-                    universe.contains(target),
-                    "{}'s wiring target {target} is not a known module",
-                    spec.id
-                );
-                assert_ne!(target, &spec.id, "{} wires to itself", spec.id);
-            }
             for key in spec.config {
                 assert!(
                     *key == CONFIG_CHAIN_ID || *key == CONFIG_INVITE,
@@ -340,11 +324,9 @@ mod tests {
 
     #[test]
     fn accessors_resolve_specs() {
-        assert_eq!(TOPOLOGY.wiring("chat"), &["tagging"]);
-        assert_eq!(TOPOLOGY.wiring("kv"), NONE);
         assert!(TOPOLOGY.spec("chat").is_some());
         assert!(TOPOLOGY.spec("not-a-module").is_none());
-        assert_eq!(TOPOLOGY.wiring("not-a-module"), NONE);
+        assert_eq!(TOPOLOGY.config("not-a-module"), NONE);
     }
 
     /// The shape table is consensus-adjacent: a wrong `backing` composes the
