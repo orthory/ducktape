@@ -654,6 +654,9 @@ fn loopback_port(
     caller_node: &[u8; 32],
     head: &gateway::ProxyRequestHead,
 ) -> Result<u16, GatewayFailure> {
+    // one process-wide latch keyed on the cause: a flood from one route hides
+    // another route's FIRST refusal until the next Nth hit. the logged line
+    // carries route + caller, so the count reads per cause, not per route.
     static REFUSED: noded::log::Latch = noded::log::Latch::new(100);
     let routes =
         crate::gateway_routes::load(scope.workspace).map_err(GatewayFailure::Unavailable)?;
@@ -2388,58 +2391,16 @@ mod tests {
     /// a single upstream byte moves, with the reason token as the detail.
     #[tokio::test]
     async fn a_route_to_the_nodes_own_api_port_is_refused() {
-        let node_http_port = 8844u16;
-        let workspace = tempfile::tempdir().unwrap();
-        let routes = crate::gateway_routes::LocalRoutes {
-            routes: vec![crate::gateway_routes::LocalRoute {
-                name: gateway::RouteName::named("api"),
-                port: node_http_port,
-            }],
-        };
-        std::fs::write(
-            workspace.path().join(crate::gateway_routes::FILE_NAME),
-            serde_json::to_vec_pretty(&routes).unwrap(),
-        )
-        .unwrap();
-
-        let publisher = [2u8; 32];
-        let caller = [3u8; 32];
-        let member = ed25519::PrivateKey::from_seed(44);
-        let route = signed_route(&member, publisher, gateway::RouteAudience::Network, false);
-        let (commands, mut requests) = mpsc::channel(4);
-        tokio::spawn(async move {
-            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
-                panic!("route query");
-            };
-            let _ = reply.send(Ok(gateway::encode_reply(&gateway::GatewayReply::Route(
-                Box::new(Some(route)),
-            ))));
-            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
-                panic!("publisher authority query");
-            };
-            let _ = reply.send(Ok(identity::encode_reply(
-                &identity::IdentityReply::Account(Some(account(1, &member))),
-            )));
-        });
+        let (workspace, commands, publisher, head) = own_api_port_fixture(false, "/v1/status");
         let error = serve_current(
             &commands,
             &LoopbackScope {
                 workspace: workspace.path(),
-                node_api_ports: &[8845, node_http_port],
+                node_api_ports: &[8845, NODE_HTTP_PORT],
                 own_node: &publisher,
             },
-            &caller,
-            &gateway::ProxyRequestHead {
-                account_id: 1,
-                name: gateway::RouteName::named("api"),
-                revision: 4,
-                method: gateway::RouteMethod::Get,
-                path_and_query: "/v1/status".into(),
-                headers: vec![],
-                body_len: 0,
-                upgrade: false,
-                user_pop: None,
-            },
+            &[3u8; 32],
+            &head,
             &[],
         )
         .await
@@ -2455,12 +2416,47 @@ mod tests {
     /// refused before the `ws://` dial — `/v1/ws/...` is not reachable either.
     #[tokio::test]
     async fn an_upgrade_route_to_the_nodes_own_api_port_is_refused() {
-        let node_http_port = 8844u16;
+        let (workspace, commands, publisher, head) = own_api_port_fixture(true, "/v1/ws/logs");
+        let error = authorize_ws(
+            &commands,
+            &LoopbackScope {
+                workspace: workspace.path(),
+                node_api_ports: &[8845, NODE_HTTP_PORT],
+                own_node: &publisher,
+            },
+            &[3u8; 32],
+            &head,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, GatewayFailure::Forbidden(ref why) if why == ROUTE_TARGETS_NODE_API),
+            "{error:?}"
+        );
+    }
+
+    /// the node's own http port in the own-port refusal tests.
+    const NODE_HTTP_PORT: u16 = 8844;
+
+    /// The shared setup of every own-port refusal test: a workspace whose one
+    /// loopback route ("api") aims at [`NODE_HTTP_PORT`], a signed
+    /// network-audience route record, a query stub answering the route then
+    /// the publisher's authority, and the request head the test dials with —
+    /// so a refusal test is its scope, its call, and its assertion.
+    fn own_api_port_fixture(
+        upgrade: bool,
+        path_and_query: &str,
+    ) -> (
+        tempfile::TempDir,
+        mpsc::Sender<NodeCommand>,
+        [u8; 32],
+        gateway::ProxyRequestHead,
+    ) {
         let workspace = tempfile::tempdir().unwrap();
         let routes = crate::gateway_routes::LocalRoutes {
             routes: vec![crate::gateway_routes::LocalRoute {
                 name: gateway::RouteName::named("api"),
-                port: node_http_port,
+                port: NODE_HTTP_PORT,
             }],
         };
         std::fs::write(
@@ -2470,9 +2466,8 @@ mod tests {
         .unwrap();
 
         let publisher = [2u8; 32];
-        let caller = [3u8; 32];
         let member = ed25519::PrivateKey::from_seed(44);
-        let route = signed_route(&member, publisher, gateway::RouteAudience::Network, true);
+        let route = signed_route(&member, publisher, gateway::RouteAudience::Network, upgrade);
         let (commands, mut requests) = mpsc::channel(4);
         tokio::spawn(async move {
             let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
@@ -2488,32 +2483,18 @@ mod tests {
                 &identity::IdentityReply::Account(Some(account(1, &member))),
             )));
         });
-        let error = authorize_ws(
-            &commands,
-            &LoopbackScope {
-                workspace: workspace.path(),
-                node_api_ports: &[8845, node_http_port],
-                own_node: &publisher,
-            },
-            &caller,
-            &gateway::ProxyRequestHead {
-                account_id: 1,
-                name: gateway::RouteName::named("api"),
-                revision: 4,
-                method: gateway::RouteMethod::Get,
-                path_and_query: "/v1/ws/logs".into(),
-                headers: vec![],
-                body_len: 0,
-                upgrade: true,
-                user_pop: None,
-            },
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(error, GatewayFailure::Forbidden(ref why) if why == ROUTE_TARGETS_NODE_API),
-            "{error:?}"
-        );
+        let head = gateway::ProxyRequestHead {
+            account_id: 1,
+            name: gateway::RouteName::named("api"),
+            revision: 4,
+            method: gateway::RouteMethod::Get,
+            path_and_query: path_and_query.into(),
+            headers: vec![],
+            body_len: 0,
+            upgrade,
+            user_pop: None,
+        };
+        (workspace, commands, publisher, head)
     }
 
     #[tokio::test]
