@@ -17,8 +17,9 @@
 #
 # Resolution of the node's forge base URL, in order:
 #   1. $DUCKTAPE_DEV_FORGE_URL           — explicit base, e.g. http://127.0.0.1:8844
-#   2. the ACTIVE workspace's http_listen — ~/.ducktape/registry.json (.active)
-#                                            -> ~/.ducktape/workspaces/<active>/node.toml
+#   2. the ACTIVE workspace's http_listen — <home>/registry.json (.active)
+#                                            -> <home>/workspaces/<active>/node.toml
+#      where <home> is $DUCKTAPE_HOME when set, else ~/.ducktape
 #      (the workspace flow assigns a RANDOM http port, so this is not a fixed :8844)
 #
 # Env knobs:
@@ -59,12 +60,16 @@ resolve_base_url() {
     printf '%s' "${DUCKTAPE_DEV_FORGE_URL%/}"
     return
   fi
-  local reg="$HOME/.ducktape/registry.json"
+  # the operator root every other reader resolves: $DUCKTAPE_HOME when set,
+  # else ~/.ducktape. A node started under an override keeps its registry
+  # there, and reading $HOME's instead dies with "no node selected" beside it.
+  local duck="${DUCKTAPE_HOME:-$HOME/.ducktape}"
+  local reg="$duck/registry.json"
   if [ -f "$reg" ]; then
     local active
     active=$(sed -n 's/.*"active"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$reg" | head -1)
     if [ -n "$active" ]; then
-      local toml="$HOME/.ducktape/workspaces/$active/node.toml"
+      local toml="$duck/workspaces/$active/node.toml"
       if [ -f "$toml" ]; then
         local listen
         listen=$(sed -n 's/^[[:space:]]*http_listen[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$toml" | head -1)
@@ -102,7 +107,7 @@ if ! curl -fsS -m 5 "$BASE_URL/v1/status" >/dev/null 2>&1; then
   # NOTE: no backticks in this string — it is double-quoted, so they would be
   # command substitution, and the die message would RUN whatever it names.
   die "no node responding at $BASE_URL — start a node first \
-(make install-node, once, to fill ~/.ducktape/modules with the components its \
+(make install-node, once, to fill <home>/modules with the components its \
 genesis composes from; then cargo run -p noded-bin), or set \
 DUCKTAPE_DEV_FORGE_URL to a running node."
 fi

@@ -15,7 +15,7 @@ pub(crate) async fn signed_write(
     payload: Vec<u8>,
     password: String,
 ) -> Result<u64, String> {
-    if payload.is_empty() || payload.len() > MAX_SIGNED_PAYLOAD_BYTES {
+    if payload.is_empty() || payload.len() > ::node::MAX_PAYLOAD_BYTES {
         return Err(format!(
             "{target} transaction exceeds the signed payload limit"
         ));

@@ -167,13 +167,14 @@ Three binaries plus the desktop app are runnable:
   throwaway dev daemon with temporary storage:
 
   ```sh
-  make install-node                           # fill ~/.ducktape/modules once
+  make install-node                           # fill <ducktape home>/modules once
   cargo run -p noded-bin                      # http://127.0.0.1:8844, temp storage
   # add -- --storage <dir> for persistent module state
   # add -- --modules <dir> to compose genesis from another component bundle
   ```
 
-  Genesis reads each module's `<id>.component.wasm` from `~/.ducktape/modules`
+  Genesis reads each module's `<id>.component.wasm` from `$DUCKTAPE_MODULES_DIR`,
+  else `<ducktape home>/modules` — `$DUCKTAPE_HOME` when set, else `~/.ducktape`
   (or `--modules <dir>`); an incomplete bundle is refused by name at startup.
 
   A browser or any HTTP client dials `http://127.0.0.1:8844` by default; the

@@ -153,7 +153,8 @@ fn seed_complete_bundle(
     Err(format!(
         "genesis bundle {} has no component for {missing:?} (expected <id>.component.wasm) — fail-closed. \
          a genesis member boots from its own bundle: re-join with `ducktape node join <invite>`, \
-         or fill `~/.ducktape/modules` (`make install-node`) and re-found with `node init --modules`",
+         or fill the installed module dir — `$DUCKTAPE_MODULES_DIR`, else `<ducktape home>/modules` — \
+         with `make install-node` and re-found with `node init --modules`",
         genesis.bundle_dir.display()
     ))
 }
