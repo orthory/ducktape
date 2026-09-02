@@ -1167,17 +1167,26 @@ impl ValidatorRuntime<'_> {
         // == committed hash AND "this binary can instantiate them". Byte
         // residency alone let a validator on an older build arm a swap at
         // R = n and then deterministically reject every op to the module while
-        // its peers applied them — a silent fork on activation (#1297). The
-        // probe compiles the component, so it runs at most once per pending
-        // swap: `decide` latches both the signal and the refusal.
+        // its peers applied them — a silent fork on activation (#1297).
+        //
+        // WHAT IT COSTS: the probe COMPILES the component synchronously on
+        // this select loop — a few hundred ms for a 1.8 MB module, during
+        // which `http_ingress` is unpolled, the same occupancy the checkpoint
+        // branch carries a duty cooldown for (#1018). It is paid at most once
+        // per pending swap per boot — `decide` latches the verdict, loadable
+        // and unloadable alike — and every validator pays it at the same
+        // moment, right after the swap commits.
         let actions = code_signaller.decide(&modules, |digest| {
             let Some(bytes) = blobs.get_chunk(digest) else {
                 return CodeVerdict::Absent;
             };
             match wasm_host::WasmModule::check_loadable(&bytes) {
                 Ok(()) => CodeVerdict::Loadable,
+                // the loader's first line only: a wasmtime error carries a
+                // multi-line trace, and the whole thing would evict the ring
+                // it is evidence in.
                 Err(e) => CodeVerdict::Unloadable {
-                    detail: e.to_string(),
+                    detail: e.to_string().lines().next().unwrap_or_default().to_string(),
                 },
             }
         });

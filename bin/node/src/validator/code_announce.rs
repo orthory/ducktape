@@ -55,6 +55,11 @@ pub(crate) struct CodeReadinessSignaller {
     /// component compiles it, and the answer cannot change while this process
     /// lives — so the refusal is decided, reported, and never re-paid.
     unloadable: BTreeSet<[u8; 32]>,
+    /// the other half of that latch: digests that already compiled here. The
+    /// signal latch is keyed by swap and `unlatch`ed when a submit fails, so
+    /// without this a failed submit would re-read and RE-COMPILE the same
+    /// bytes on the next tick. A digest names its bytes, so one answer holds.
+    loadable: BTreeSet<[u8; 32]>,
 }
 
 /// what one pump tick should do: signals to submit, fetches to spawn, refusals
@@ -75,6 +80,7 @@ impl CodeReadinessSignaller {
             signaled: BTreeSet::new(),
             fetching: BTreeSet::new(),
             unloadable: BTreeSet::new(),
+            loadable: BTreeSet::new(),
         }
     }
 
@@ -114,8 +120,15 @@ impl CodeReadinessSignaller {
             if self.unloadable.contains(&digest) {
                 continue;
             }
-            match verdict(&digest) {
+            // the compile is paid ONCE per digest, in either direction: a
+            // digest already known to load here skips the probe entirely.
+            let answer = match self.loadable.contains(&digest) {
+                true => CodeVerdict::Loadable,
+                false => verdict(&digest),
+            };
+            match answer {
                 CodeVerdict::Loadable => {
+                    self.loadable.insert(digest);
                     self.signaled.insert(key.clone());
                     let msg = Msg {
                         target: host::LIFECYCLE_MODULE_ID.into(),
@@ -281,8 +294,15 @@ mod tests {
             "latched"
         );
         s.unlatch(&("a".into(), "replacement".into()));
+        // ...and the retry does NOT re-compile: the digest already answered
+        // once, so the probe is paid once per pending swap however many
+        // submits fail.
         assert_eq!(
-            s.decide(&modules, |_| CodeVerdict::Loadable).signals.len(),
+            s.decide(&modules, |_| panic!(
+                "a digest that already loaded must not be re-probed"
+            ))
+            .signals
+            .len(),
             1,
             "retries"
         );
