@@ -88,6 +88,7 @@ impl Latch {
 /// the first four bytes of a node key, hex. a log line that names no key
 /// cannot be correlated across events; a full 32-byte identity on every line
 /// is unreadable. public identity only — never key material.
+#[cfg(feature = "runtime")]
 pub(crate) fn short_key(key: NodeKey) -> String {
     key.0[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
