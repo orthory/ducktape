@@ -10,18 +10,18 @@ mod harness;
 
 use harness::Sim;
 
-/// The default 14-module sim genesis root-hash.
+/// The default 15-module sim genesis root-hash.
 ///
-/// This is the SIM's number and only the sim's: `sim_base` excludes all five
-/// of `acl`, `capability`, `governance`, `lifecycle` and `valset`, so it is NOT
-/// what a node runs and it is NOT the consensus pin. That one is
+/// This is the SIM's number and only the sim's: `sim_base` excludes all four of
+/// `acl`, `governance`, `lifecycle` and `valset`, so it is NOT what a node runs
+/// and it is NOT the consensus pin. That one is
 /// `bin/node/src/host_state.rs`'s `GENESIS_ROOT_HASH`, over the production
 /// module set — moving THAT is the flag day that matters. This constant guards
 /// something narrower and still worth guarding: that composing the sim's
 /// genesis is a pure function of the topology selection, so a change in how the
 /// sim builds its host shows up here instead of silently under a scenario.
 const DEFAULT_GENESIS_ROOT_HASH: &str =
-    "49f49b10f7ee255509a02943c846cfb077d4a1081bf26d9f8e80716a9f4a323e";
+    "4baa8a6d6053fe97c5b9d2aacb3445cfe93a8689f5e9fda7a3dbe3e013b8c9b3";
 
 fn module_ids(status: &serde_json::Value) -> Vec<String> {
     status["modules"]
@@ -44,6 +44,20 @@ fn default_genesis_composes_topology_sim_base() {
         want,
         "sim default genesis composes topology sim_base, in registry order"
     );
+    // the module a capability-tagged saga draws its Strict-lease pool from
+    // ANSWERS here — an empty set, because nobody announced — instead of
+    // erroring `UnknownModule`. That is the whole point of composing it: a
+    // scenario can announce providers and exercise the production gate, where
+    // before every tagged saga silently degraded to accept-any.
+    let providers = sim.query(
+        "capability",
+        serde_json::json!({ "providers": { "capability": "echo" } }),
+    );
+    assert_eq!(
+        providers,
+        serde_json::json!({ "providers": [] }),
+        "the default sim composes capability: {providers}"
+    );
     let root = status["root_hash"].as_str().expect("root_hash is a string");
     assert_eq!(
         root, DEFAULT_GENESIS_ROOT_HASH,
@@ -60,8 +74,8 @@ fn default_genesis_composes_topology_sim_base() {
          list is already pinned by the assertion above).\n\
          \n\
          EITHER WAY this is NOT the consensus pin, and updating it proves \
-         nothing about production: `sim_base` is 14 modules and excludes \
-         capability/hello/governance/lifecycle. The number a network forks on is \
+         nothing about production: `sim_base` is 15 modules and excludes \
+         acl/valset/governance/lifecycle. The number a network forks on is \
          GENESIS_ROOT_HASH in bin/node/src/host_state.rs — if that moved too, go \
          read its message instead."
     );

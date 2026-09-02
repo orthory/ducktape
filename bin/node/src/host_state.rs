@@ -979,9 +979,9 @@ mod tests {
     ///
     /// It is the only ABSOLUTE one in the tree, and until it existed every claim
     /// that "the root hash did not move" was relative and therefore weak.
-    /// `bin/simnode/tests/topology_set.rs` pins the 14-module sim composition
-    /// — which excludes `acl`, `capability`, `governance`, `lifecycle` and
-    /// `valset`, and is not what a node runs. (Not a NATIVE composition, as
+    /// `bin/simnode/tests/topology_set.rs` pins the 15-module sim composition —
+    /// which excludes `acl`, `governance`, `lifecycle` and `valset`, and is not
+    /// what a node runs. (Not a NATIVE composition, as
     /// this said for a while: simnode opens a `DirCodeSource` over the host
     /// fixtures and composes through `noded::compose`, so every `SIM_BASE` id
     /// loads as a wasm component — which is why a rebuilt fixture moves that

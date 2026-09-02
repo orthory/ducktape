@@ -53,7 +53,7 @@ tenant's `<id>.component.wasm`. Leave it `None`: the default is the repo's
 `crates/kernel/host/tests/fixtures`, resolved from `CARGO_MANIFEST_DIR`, so a
 bare checkout boots with no `make install-node` and no installed module dir
 (`<ducktape home>/modules`, i.e. `$DUCKTAPE_HOME` when set, else `~/.ducktape`).
-All 14 default tenants ARE wasm components (`--with-valset` adds acl and
+All 15 default tenants ARE wasm components (`--with-valset` adds acl and
 governance as components too; only kv/valset/lifecycle stay native), so a sim
 boot cranelift-compiles the set — seconds, and paid per boot, per test.
 After a host fatal the control surface fails closed (every call errs with
