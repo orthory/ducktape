@@ -15,7 +15,7 @@ pub(crate) async fn signed_write(
     payload: Vec<u8>,
     password: String,
 ) -> Result<u64, String> {
-    if payload.is_empty() || payload.len() > MAX_SIGNED_PAYLOAD_BYTES {
+    if payload.is_empty() || payload.len() > ::node::MAX_PAYLOAD_BYTES {
         return Err(format!(
             "{target} transaction exceeds the signed payload limit"
         ));
@@ -469,15 +469,10 @@ pub fn next_doc_tab(tabs: Vec<String>, closed: String, active: String) -> String
         .unwrap_or_default()
 }
 
-/// `$DUCKTAPE_HOME` else `~/.ducktape` — where the keystore and the prefs live.
+/// where the keystore and the prefs live — [`ducktape_home::root`], the same
+/// resolution the node resolves its own workspaces through.
 pub(crate) fn duck_home() -> Result<PathBuf, String> {
-    if let Some(root) = std::env::var_os("DUCKTAPE_HOME") {
-        return Ok(PathBuf::from(root));
-    }
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".ducktape"))
-        .ok_or_else(|| "cannot locate ~/.ducktape; set DUCKTAPE_USER_KEY".to_string())
+    ducktape_home::root()
 }
 
 /// One named wallet's key file inside the keystore — THE join, so the charset

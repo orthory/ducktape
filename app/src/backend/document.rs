@@ -303,7 +303,9 @@ pub async fn save_page_document(
     let title = document_title(&text);
     let title_moved = title_write_owed(&title, &saved, &current.active_page_title);
     if title_moved {
-        let bounded = bounded_exact_text(title, "page title", 512).map_err(app_error)?;
+        // The same UpdateText the block path takes, so the title rides the one
+        // module-derived bound instead of a second literal.
+        let bounded = bounded_updated_block_text(BlockKind::Page, title).map_err(app_error)?;
         write(
             &client,
             &password,

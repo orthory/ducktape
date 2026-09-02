@@ -30,7 +30,7 @@ The tree groups by function into three layers — module / kernel / networking:
 | `crates/networking/` | The netstack: host-side transport infra only — `wireguard`, `nat-traversal`, `reachability`, `data-plane`, `overlay-net`, plus the sans-I/O reachability core `netstack-machine` (pure event-in/effects-out state machine), `netstack-scenarios` (its frozen golden lifecycle traces) and `netstack-wasm` (the wasmtime embedding of the `ducktape:netstack` world). Owns no consensus module |
 | `crates/modules/` | **Consensus modules and nothing else** — every crate under `system/` or `apps/` implements `sdk::Module`. Module = onchain, service = offchain; a crate that holds no consensus state belongs in `kernel/`, `services/`, or beside `airlock`/`duckdns` |
 | `crates/modules/system/` | System modules: `kv` (byte-KV), `valset` (ed25519 validator membership), `governance`, `identity`, `lifecycle` (module code registry), `saga` (deterministic async continuations), `capability`, `dispatch`, `tagging`, `acl` (the submit-policy federation: which standing a target module requires of an external submitter), `gateway` (the merged name→AccountId→route module, which absorbed the on-chain half of `duckdns`) |
-| `crates/modules/apps/` | Product modules: `forge` (git-backed project state), `pages` (documents), `chat`, `agent` (LLM-run orchestrator), `runs`, `tasks`, `vaults`, `inbox` (per-member notification queues), `automations` (rules over chat hooks), `files` (consensus manifests, node-local bytes; wraps `duckfs`) |
+| `crates/modules/apps/` | Product modules: `forge` (git-backed project state), `pages` (documents), `chat`, `agent` (LLM-run orchestrator), `runs`, `tasks`, `inbox` (per-member notification queues), `automations` (rules over chat hooks), `files` (consensus manifests, node-local bytes; wraps `duckfs`) |
 | `crates/services/` | Off-chain service crates — the host-side executors that serve a consensus module without being one: `compute` (the dispatch WorkSpec pool/ledger/gate), `provider` (executor spec layer + the `CliProvider` run loop), `sandbox` (the per-run microVM, egress firewall, backend probe), `broker` (run-scoped credential loopback + airlock client), `agent` (interactive pty daemon), `airlock` (the credential-LENDING gateway: node-local store + router, no TEE), `media` (the huddle voice/video/screen-share planes, off consensus, riding the overlay) |
 | `crates/airlock/` | The two-party execution/auth contract (`client`/`server`/`verify`/`testkit` features). Not a module and not one party's crate: the lender service, the borrower broker and the enclave binary all consume it |
 | `crates/duckdns/` | The `.duck` account naming library — hostname grammar, handle registry, wire types, canonical state codec. Not a module: the `gateway` module embeds it for the on-chain half, and `node`/`noded`/`simnode` validate names host-side |
@@ -50,8 +50,8 @@ The tree groups by function into three layers — module / kernel / networking:
 
 Each module publishes its wire surface — types-only payload/query/reply shapes
 and codecs — at its own crate root; those wire types plus host-routed queries
-are the only legal cross-module surface. `kv` and `vaults` remain as crates but
-are no longer registered in the production genesis module set.
+are the only legal cross-module surface. `kv` remains as a crate but is no
+longer registered in the production genesis module set.
 
 ### Layer contracts
 
@@ -187,6 +187,10 @@ ducktape account create --name <you>
                                     # found your account on it (signed by that key)
 ducktape node status                # height + root hash of the running node
 ```
+
+Genesis reads each module's `<id>.component.wasm` from `$DUCKTAPE_MODULES_DIR`,
+else `<ducktape home>/modules` — `$DUCKTAPE_HOME` when set, else `~/.ducktape`
+(or `--modules <dir>`); an incomplete bundle is refused by name at startup.
 
 Then, to run agents on it: `ducktape service run compute` offers this host's
 sandbox, `ducktape user cred add claude` logs a provider in, and

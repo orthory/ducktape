@@ -10,8 +10,11 @@
 # like `operator_token_mismatch`, a script that hardcoded that string for 403
 # would pass — which is precisely the defect this guards against.
 #
-# Drives the real script against a stub admin surface under a throwaway HOME
-# and a workspace id no human uses, so the only state it can delete is its own.
+# Drives the real script against a stub admin surface under a throwaway ducktape
+# home and a workspace id no human uses, so the only state it can delete is its
+# own. Both roots are pinned: demo-clear.sh resolves $DUCKTAPE_HOME first, so
+# isolating $HOME alone would let an ambient override aim the real script at the
+# operator's own registry — and this gate would go red on a box that exports it.
 set -uo pipefail
 
 OPS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -59,7 +62,8 @@ run_case(){
   read -r -t 10 port < "$TMP/ready" || fail "the stub never reported a port"
   printf '{"active":"%s","workspaces":[{"id":"%s","ports":{"http":%s}}]}\n' "$ID" "$ID" "$port" \
     > "$TMP/.ducktape/registry.json"
-  out="$(HOME="$TMP" DEMO_WORKSPACE_ID="$ID" bash "$OPS/demo-clear.sh" 2>&1)"
+  out="$(HOME="$TMP" DUCKTAPE_HOME="$TMP/.ducktape" DEMO_WORKSPACE_ID="$ID" \
+    bash "$OPS/demo-clear.sh" 2>&1)"
   kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -f "$TMP/stub.pid"
   printf '%s\n' "$out"
 }

@@ -4,9 +4,10 @@
 # Stops any node still serving the workspace (graceful /v1/admin/shutdown first,
 # then a pgrep sweep where every candidate's command line is verified against
 # the workspace dir before it may be killed — a recycled pid must never take an
-# innocent process down), deletes ~/.ducktape/workspaces/<id>, and
-# drops the entry from ~/.ducktape/registry.json, handing "active" to another
-# workspace when the demo held it. Other workspaces are untouched.
+# innocent process down), deletes <ducktape home>/workspaces/<id>, and
+# drops the entry from <ducktape home>/registry.json, handing "active" to
+# another workspace when the demo held it. Other workspaces are untouched.
+# The home is $DUCKTAPE_HOME when set, else ~/.ducktape.
 #
 # If `make demo-app` is still running it keeps serving its loopback port — it's
 # a plain foreground process you own; Ctrl-C it yourself. The route it served
@@ -15,9 +16,12 @@ set -uo pipefail
 
 ID="${DEMO_WORKSPACE_ID:-demo}"
 # this script kills by path match and rm -rfs the workspace dir — refuse an id
-# that could walk WSDIR out of ~/.ducktape/workspaces (e.g. "../..").
+# that could walk WSDIR out of the workspaces root (e.g. "../..").
 case "$ID" in ""|*/*|*..*|.*) printf '\033[31m[demo-clear] unsafe workspace id: %s\033[0m\n' "$ID" >&2; exit 1;; esac
-DUCK="$HOME/.ducktape"
+# the SAME root demo-seed wrote into. Hardcoding $HOME here made the
+# documented inverse of `make demo-seed` report "no demo workspace" and
+# aim its rm -rf at a root the seed never touched.
+DUCK="${DUCKTAPE_HOME:-$HOME/.ducktape}"
 WSDIR="$DUCK/workspaces/$ID"
 REG="$DUCK/registry.json"
 

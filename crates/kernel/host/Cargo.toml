@@ -79,9 +79,6 @@ automations = { workspace = true }
 # its wasm port side by side. files needs an on-disk odb dir (tempfile).
 runs = { workspace = true }
 files = { workspace = true }
-# the vaults whole-state parity proof stands the native module beside its
-# wasm port and cross-installs snapshots between the runtimes.
-vaults = { workspace = true }
 # the forge root-continuity proof stands the native module beside its wasm port
 # over the git substrate; `testkit` builds the real git history + packs the
 # push ops need.

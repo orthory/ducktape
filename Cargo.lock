@@ -3261,6 +3261,7 @@ dependencies = [
  "cpal",
  "design",
  "dispatch 0.1.0",
+ "ducktape-home",
  "ducktape-rpc",
  "forge",
  "gateway",
@@ -3300,6 +3301,10 @@ dependencies = [
  "zeroize",
  "zune-jpeg 0.4.21",
 ]
+
+[[package]]
+name = "ducktape-home"
+version = "0.1.0"
 
 [[package]]
 name = "ducktape-rpc"
@@ -4562,7 +4567,6 @@ dependencies = [
  "tempfile",
  "tracing",
  "valset",
- "vaults",
  "wasm-host",
 ]
 
@@ -5434,6 +5438,7 @@ dependencies = [
  "chacha20poly1305",
  "commonware-codec",
  "commonware-cryptography",
+ "ducktape-home",
  "rand 0.8.6",
  "tempfile",
  "zeroize",
@@ -6334,6 +6339,7 @@ dependencies = [
  "tracing-subscriber 0.3.23",
  "valset",
  "wasm-host",
+ "workspace-config",
 ]
 
 [[package]]
@@ -7694,6 +7700,7 @@ dependencies = [
  "async-trait",
  "broker-host",
  "capability",
+ "ducktape-home",
  "libc",
  "nettest",
  "provider-host",
@@ -10584,22 +10591,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
-name = "vaults"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "commonware-codec",
- "commonware-cryptography",
- "futures",
- "guest-adapter",
- "host",
- "sdk",
- "serde",
- "serde_json",
- "sha2 0.10.9",
-]
-
-[[package]]
 name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12041,6 +12032,7 @@ dependencies = [
  "commonware-p2p",
  "commonware-utils",
  "duckfs-core",
+ "ducktape-home",
  "governance",
  "identity",
  "nat-traversal",

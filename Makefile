@@ -124,16 +124,24 @@ install-app:
 	@exit 2
 endif
 
+# where install-node WRITES the module components, spelled exactly as
+# workspace_config::modules_dir() READS them: $DUCKTAPE_MODULES_DIR, else
+# <ducktape home>/modules, where the home is $DUCKTAPE_HOME when set and
+# ~/.ducktape otherwise. A writer that stopped at $HOME put the components
+# where a node under an override never looks — one expression, so the two
+# halves cannot drift apart again.
+MODULES_DEST = $${DUCKTAPE_MODULES_DIR:-$${DUCKTAPE_HOME:-$$HOME/.ducktape}/modules}
+
 ## the binary embeds no wasm: `node init` founds a network from a directory of
 ## <id>.component.wasm, so installing the node also installs that set.
 install-node:
 	$(CARGO) install --path bin/node --locked
-	mkdir -p "$${DUCKTAPE_MODULES_DIR:-$$HOME/.ducktape/modules}"
+	mkdir -p "$(MODULES_DEST)"
 	@for m in $(BUILDER_MODULES); do \
 	  id=$$(basename $$m) && \
-	  cp $$m/component.wasm "$${DUCKTAPE_MODULES_DIR:-$$HOME/.ducktape/modules}/$$id.component.wasm" || exit 1; \
+	  cp $$m/component.wasm "$(MODULES_DEST)/$$id.component.wasm" || exit 1; \
 	done
-	@echo "installed module components into $${DUCKTAPE_MODULES_DIR:-$$HOME/.ducktape/modules}"
+	@echo "installed module components into $(MODULES_DEST)"
 
 ## coordinator -> ~/.cargo/bin/ducktape-coordinator
 install-coordinator:
@@ -212,7 +220,7 @@ BUILDER_MODULES := \
   crates/modules/apps/inbox crates/modules/apps/pages crates/modules/apps/agent \
   crates/modules/apps/automations crates/modules/apps/runs \
   crates/modules/apps/tasks crates/modules/apps/chat crates/modules/apps/files \
-  crates/modules/apps/vaults crates/modules/apps/forge \
+  crates/modules/apps/forge \
   crates/modules/system/tagging crates/modules/system/dispatch \
   crates/modules/system/capability crates/modules/system/identity \
   crates/modules/system/gateway crates/modules/system/governance \

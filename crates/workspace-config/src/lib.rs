@@ -848,15 +848,13 @@ pub fn sync_source_candidates<A>(
 // address a node by the name humans actually know.
 // ============================================================================
 
-/// everything this operator's node keeps on disk: `$DUCKTAPE_HOME` when the
-/// override is set (tests, portable setups), else `~/.ducktape`.
+/// everything this operator's node keeps on disk — [`ducktape_home::root`],
+/// re-exported under the name this crate's callers already use. The rule and
+/// its test live in that zero-dependency leaf, because the keystore, the
+/// desktop app and `provider-host` resolve the same root and must not disagree
+/// about it.
 pub fn ducktape_home() -> Result<PathBuf, String> {
-    if let Some(home) = std::env::var_os("DUCKTAPE_HOME") {
-        return Ok(PathBuf::from(home));
-    }
-    let home = std::env::var_os("HOME")
-        .ok_or("cannot resolve $HOME — pass --config <node.toml> instead of --network")?;
-    Ok(PathBuf::from(home).join(".ducktape"))
+    ducktape_home::root()
 }
 
 /// the registry root: `<ducktape_home>/workspaces`.
@@ -976,7 +974,7 @@ pub fn list_workspaces() -> Result<Vec<(String, PathBuf)>, String> {
     list_workspaces_in(&workspaces_root()?)
 }
 
-fn list_workspaces_in(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+pub fn list_workspaces_in(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),

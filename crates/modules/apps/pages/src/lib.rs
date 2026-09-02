@@ -99,6 +99,14 @@ use error::{PageError, to_page_err};
 /// bounds a single parent to tens of thousands of children.
 pub const MAX_BLOCK_LEN: usize = 768 * 1024;
 
+/// write-time cap on a page TITLE — the text of a `Page` block. a page title
+/// is one sidebar line, and the page list serves up to `MAX_PAGE_LIMIT` (256)
+/// rows carrying it in a single reply; capping it here keeps a full list far
+/// below [`MAX_PAGE_QUERY_BYTES`] instead of letting one client-chosen title
+/// refuse the whole sidebar read. rejected deterministically at write time,
+/// like every other bound the store guard enforces.
+pub const MAX_PAGE_TITLE_LEN: usize = 512;
+
 /// Maximum number of block edges below one page root. Nested `Page` blocks
 /// are leaves in the containing document and start their own depth budget.
 /// This keeps every valid preorder cursor page comfortably below the wasm

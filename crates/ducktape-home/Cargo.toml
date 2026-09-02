@@ -1,0 +1,16 @@
+[package]
+name = "ducktape-home"
+edition.workspace = true
+version.workspace = true
+
+# ONE resolution of this operator's on-disk root, and nothing else.
+#
+# A leaf with ZERO dependencies on purpose. Its readers are workspace-config,
+# keystore, provider-host and the desktop app, and provider-host is a
+# dependency of agent-service and compute-service, whose manifests say they
+# must stay light. Anything added here lands in those graphs, so nothing is.
+#
+# Per-purpose subdirectories (keys/, modules/, executors/, capabilities/,
+# workspaces/) stay with the crate that owns that purpose — this one knows
+# only the root they hang off.
+[dependencies]
