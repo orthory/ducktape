@@ -38,7 +38,7 @@ pub const MAX_REVIEWS_PER_ITEM: usize = 256;
 
 /// an item's lifecycle state. `Merged` is PR-only and terminal.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ItemState {
     Open,
     Closed,
@@ -48,7 +48,7 @@ pub enum ItemState {
 /// what an item IS — issues and PRs share the number space, so listings carry
 /// the kind explicitly.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ItemKind {
     Issue,
     Pr,
@@ -58,7 +58,7 @@ pub enum ItemKind {
 /// are ADVISORY: they render in the merge box but never gate `MergePr` (branch
 /// protection is future work).
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReviewVerdict {
     Approve,
     RequestChanges,
@@ -67,7 +67,7 @@ pub enum ReviewVerdict {
 
 /// which side of the diff a line comment anchors to.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum DiffSide {
     /// the deletion (base) side.
     Old,
@@ -80,6 +80,7 @@ pub enum DiffSide {
 /// past that commit the comment renders as "outdated" (no position tracking
 /// across force-pushes; early-GitHub semantics).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewComment {
     pub path: String,
     pub line: u32,
@@ -89,6 +90,7 @@ pub struct ReviewComment {
 
 /// one submitted review, immutable once staged.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewView {
     pub author: AuthorRef,
     pub verdict: ReviewVerdict,
@@ -102,6 +104,7 @@ pub struct ReviewView {
 
 /// one item row in a listing.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ItemSummary {
     pub number: u64,
     pub kind: ItemKind,
@@ -114,7 +117,13 @@ pub struct ItemSummary {
 
 /// the full item: the summary row plus body, discussion channel, and — for a
 /// PR — branches, merge oid, and reviews.
+///
+/// `deny_unknown_fields` composes with the flattened summary: the flat-map
+/// buffer only hands [`ItemSummary`] the keys IT names, and the leftovers are
+/// what the deny checks — so an unknown key is refused at whichever level it
+/// belongs to, not silently absorbed by the flatten.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ItemDetail {
     #[serde(flatten)]
     pub summary: ItemSummary,
@@ -132,6 +141,7 @@ pub struct ItemDetail {
 
 /// one born branch in a [`crate::ForgeReply::Refs`] listing.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RefHead {
     /// the branch SHORT name ("main", "feature/x").
     pub name: String,
@@ -143,6 +153,7 @@ pub struct RefHead {
 /// compare-and-swap. `new_oid: None` deletes the branch (never "main");
 /// `prev_oid: None` requires the branch to be unborn. raw 20-byte sha1 oids.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RefUpdate {
     /// the branch SHORT name ("main", "feature/x") — never a full refname.
     pub ref_name: String,
@@ -156,4 +167,94 @@ pub struct RefUpdate {
 /// forge can rely on the id being unsquattable.
 pub fn channel_id_for(repo: &str, number: u64) -> String {
     format!("forge:{repo}:{number}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    /// one detail record carrying every nested wire type on this surface.
+    fn detail() -> ItemDetail {
+        ItemDetail {
+            summary: ItemSummary {
+                number: 7,
+                kind: ItemKind::Pr,
+                title: "t".into(),
+                state: ItemState::Open,
+                author: AuthorRef::User(vec![1; 4]),
+                created_at: 10,
+                updated_at: 11,
+            },
+            body: "b".into(),
+            channel_id: channel_id_for("demo", 7),
+            source_branch: Some("feat".into()),
+            target_branch: Some("main".into()),
+            merge_oid: None,
+            reviews: vec![ReviewView {
+                author: AuthorRef::User(vec![2; 4]),
+                verdict: ReviewVerdict::Approve,
+                body: "lgtm".into(),
+                commit_oid: "a".repeat(40),
+                comments: vec![ReviewComment {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: DiffSide::New,
+                    body: "nit".into(),
+                }],
+                created_at: 12,
+            }],
+        }
+    }
+
+    /// the detail's json with one unknown key spliced into the object at
+    /// `pointer` (`""` is the record itself — the level the summary flattens
+    /// onto).
+    fn junked(pointer: &str) -> Value {
+        let mut v = serde_json::to_value(detail()).expect("detail serializes");
+        let obj = v
+            .pointer_mut(pointer)
+            .and_then(Value::as_object_mut)
+            .expect("pointer names an object");
+        obj.insert("junk".into(), json!(1));
+        v
+    }
+
+    #[test]
+    fn detail_refuses_unknown_fields_at_every_level() {
+        let clean = serde_json::to_value(detail()).expect("detail serializes");
+        assert_eq!(
+            serde_json::from_value::<ItemDetail>(clean).expect("clean detail decodes"),
+            detail(),
+            "the record round-trips unchanged"
+        );
+        // "" is the flatten level: the summary claims only the keys it names,
+        // and the leftover is what the record's deny refuses.
+        for pointer in ["", "/reviews/0", "/reviews/0/comments/0"] {
+            let decoded = serde_json::from_value::<ItemDetail>(junked(pointer));
+            assert!(
+                decoded.is_err(),
+                "unknown field at {pointer:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn ref_records_refuse_unknown_fields() {
+        let update = json!({
+            "ref_name": "main",
+            "prev_oid": null,
+            "new_oid": [1],
+            "junk": 1,
+        });
+        assert!(
+            serde_json::from_value::<RefUpdate>(update).is_err(),
+            "a push's per-ref record is strict"
+        );
+        let head = json!({ "name": "main", "head": "a".repeat(40), "junk": 1 });
+        assert!(
+            serde_json::from_value::<RefHead>(head).is_err(),
+            "a refs listing row is strict"
+        );
+    }
 }
