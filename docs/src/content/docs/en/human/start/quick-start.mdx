@@ -26,8 +26,15 @@ identity's key material, so restoring from it reproduces the same identity
 byte-for-byte and brings its on-chain display name back automatically once a
 workspace connects (the `identity` module's user record — see [Product
 Modules](/en/human/modules/product-modules)). It does **not** recover this
-device's node key: node keys are deliberately disposable, so a lost device
-simply unbinds and rejoins with a fresh one.
+device's node key (`<workspace>/identity.key`). For a node that only follows
+the network — a resident replica — that key is disposable: a lost device
+rejoins from a fresh invite with a fresh one. For a node that holds a
+**validator seat** it is not: below four validators every seat must be live
+to finalize, so losing a seat key halts the chain until the seat is restored
+or voted out. Back a validator's `identity.key` up off the host before it
+is promoted — see the
+[backup and keys](https://github.com/orthory/ducktape/blob/dev/docs/deploy/backup-and-keys.md)
+runbook.
 
 **Forgot your password?** There is no password reset — restore from the
 24-word phrase and set a new password. The phrase is the only backup that
