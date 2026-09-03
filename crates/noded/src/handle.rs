@@ -29,7 +29,11 @@ pub enum NodeCommand {
     Submit {
         target: String,
         payload: Vec<u8>,
-        /// `Origin::External` bytes for this block (see [`SubmitRequest::origin`]).
+        /// `Origin::External` bytes for this block: the key a request's
+        /// signature proved possession of on a gated route
+        /// ([`crate::signed_req::SignedBy`]), or — on the frameless
+        /// `/v1/submit` lane only — the caller's CLAIMED string
+        /// (see [`crate::SubmitRequest::origin`], an open finding).
         origin: Vec<u8>,
         reply: oneshot::Sender<Result<BlockSummary, String>>,
     },
@@ -210,10 +214,7 @@ impl StatusCell {
             status.chain_id = chain_id.clone();
         }
         if let Some(operations) = self.inner.operations.get() {
-            status.operations = operations
-                .read()
-                .expect("operations lock poisoned")
-                .clone();
+            status.operations = operations.read().expect("operations lock poisoned").clone();
         }
         status
     }

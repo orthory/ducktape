@@ -25,6 +25,11 @@
 pub mod admin;
 pub use admin::{AdminConfig, AdminExposure};
 
+// the per-request signature every MUTATING `/v1` route now carries, and the
+// verifier both it and `/v1/admin/*` share. reads stay open.
+pub mod signed_req;
+pub use signed_req::{SignedBy, WriteRefusal};
+
 pub mod blobs;
 // the pieces every process needs AROUND the composer: the on-disk component
 // bundle (naming, hashing, a code source over it), the qmdb store source, and
@@ -475,12 +480,22 @@ pub struct SubmitRequest {
     pub target: String,
     /// the module's `*Msg` enum as a json value — encoded verbatim into `Msg.payload`.
     pub payload: serde_json::Value,
-    /// the submitter identity stamped into `Origin::External` — modules that
-    /// derive authorship from origin (chat's `AuthorRef::User`) see these
-    /// bytes. optional; the daemon's own name is the fallback. this is a
-    /// TRUSTED-CLIENT convention, not authentication: anything that can reach
-    /// the port can claim any origin. fine for a local daemon; a public
-    /// deployment needs real submitter auth here.
+    /// the submitter identity stamped into `Origin::External` on a daemon that
+    /// honours it (the embedded one, and simnode).
+    ///
+    /// THIS IS A CLAIM, NOT AUTHENTICATION, and it is a known open finding
+    /// (#1304, #1312, #1292): anything that can reach the port can name any
+    /// origin, and `bin/node` throws the claim away and re-signs with the node
+    /// key, so nothing submitted here carries authorship a module can check.
+    /// The lane that can is `/v1/submit/frame`, whose origin IS its verified
+    /// signer.
+    ///
+    /// Deleting the field is a small change HERE and a large one everywhere
+    /// else: the simnode, embedded-daemon and MCP harnesses use it to model
+    /// distinct external authors across ~270 call sites, and their replacement
+    /// is a per-persona key signing a frame (simnode's harness already has
+    /// `submit_frame`). That migration is the work; the field is only its
+    /// symptom.
     #[serde(default)]
     pub origin: Option<String>,
 }
@@ -512,7 +527,7 @@ pub fn hex_bytes(bytes: &[u8]) -> String {
 /// 4xx is `debug` ON PURPOSE: `gateway_http.rs`'s duck:// browse fallback proxies
 /// UNTRUSTED pages' fetches through this same funnel, so an unconditional `warn!`
 /// here is a log-ring DoS any page could drive. Turn it on when you care:
-///     curl -XPOST localhost:$PORT/v1/log-filter -d 'info,ducktape::http=debug'
+///     ducktape node log-filter 'info,ducktape::http=debug'
 ///
 /// 5xx is LATCHED for the same reason, and it is not hypothetical: the gateway
 /// browse proxy maps a slow/dead publisher to a 502 (`gateway_failure_response`),
@@ -673,6 +688,15 @@ pub fn router(handle: NodeHandle) -> Router {
             "/forge/{repo}/git-upload-pack",
             post(git_upload_pack).layer(DefaultBodyLimit::max(GIT_PACK_BODY_LIMIT)),
         );
+    // EVERY mutating route above carries a user signature; the reads do not.
+    // `route_layer`, NOT `layer`: a layer would also wrap the fallback, and an
+    // unmatched path must 404 rather than be told it needs a signature.
+    // `signed_req::needs_signature` is the whole table — a new mutating route
+    // is added THERE, never gated at its own call site.
+    let public = public.route_layer(axum::middleware::from_fn_with_state(
+        handle.clone(),
+        signed_req::signed_write_guard,
+    ));
     // the owner-gated `/v1/admin/*` namespace — merged only when exposure is
     // enabled, so `Disabled` leaves the control surface simply ABSENT (a 404),
     // not a gated-but-present route. its own PoP middleware is baked in.
@@ -715,6 +739,18 @@ pub const ORACLE_ORIGIN: &[u8] = b"oracle";
 /// disagreeing with the bindings would mint signatures nothing accepts.
 pub const LOCAL_CHAIN_ID: &str = "local";
 
+/// POST /v1/submit — the FRAMELESS lane, and the one route the signed-write
+/// gate does not cover.
+///
+/// Not an oversight: it is how the node's own local daemons submit ops that
+/// must carry the NODE's identity — a capability announce (`capability` keys
+/// the registry on the submitting node), a compute lease heartbeat and bid
+/// (the lease-holder IS the node), an agent run bind (`runs` checks the
+/// committed assignee). None of those has a user key that would be right, and
+/// a user-signed frame there would name the WRONG actor rather than an
+/// unauthenticated one. Requiring a signature here therefore needs a decision
+/// about how a node's own daemons authenticate AS the node — see
+/// [`SubmitRequest::origin`] and `signed_req::Lane`.
 async fn submit(State(handle): State<NodeHandle>, Json(req): Json<SubmitRequest>) -> Response {
     let payload = serde_json::to_vec(&req.payload).expect("a decoded json value re-serializes");
     // empty string falls back too — chat rejects empty external authors
@@ -885,12 +921,18 @@ pub(crate) async fn shutdown(State(handle): State<NodeHandle>) -> Response {
 /// POST /v1/log-filter — retune the log level of a RUNNING node.
 ///
 /// ```text
-/// curl -XPOST localhost:$PORT/v1/log-filter -d 'info,ducktape::join=debug'
+/// ducktape node log-filter 'info,ducktape::join=debug'
 /// ```
 ///
 /// RUST_LOG is read once at boot, so without this route every `debug!` in the
 /// tree is unreachable without a restart — and restarting a wedged node destroys
-/// the state you restarted it to look at. NOTE: unlike /v1/admin/shutdown this stays on the public surface (see log_filter caveat below).
+/// the state you restarted it to look at.
+///
+/// AUTH: it MUTATES the running process, so it carries a user signature like
+/// every other mutating route ([`signed_req`]). turning `ducktape::x=trace` on
+/// is a real denial-of-service against the node's own disk — `daemon.log` has
+/// no rate limit — and a bare `curl` from anything that could dial the port
+/// used to be enough. the operator verb signs for you.
 async fn log_filter(body: String) -> Response {
     match crate::log::set_filter(body.trim()) {
         Ok(()) => (StatusCode::OK, body).into_response(),
@@ -913,16 +955,11 @@ async fn log_filter(body: String) -> Response {
 /// 503 when the embedder wired no minter — a daemon with no workspace has no
 /// descriptor to fold a hint into.
 ///
-/// AUTH: the same trusted-local gate as every other mutating `/v1/` route —
-/// `origin_guard::guard` plus its CORS allowlist, and no bearer token (see the
-/// AUTH note in `term.rs` and the `origin_guard` module doc). A bearer invite
-/// is a real capability, so state the comparison rather than leave it implied:
-/// this route is strictly WEAKER than `/v1/submit`, which sits on the same
-/// surface and forges arbitrary consensus ops under this node's own key.
-/// Anything that can reach one can reach the other, and neither is a boundary
-/// this daemon can hold against a local process that can read its key off disk.
-/// Exposing the http listener past loopback is what widens this, for every
-/// route at once.
+/// AUTH: STILL NONE, and it should not stay that way — a bearer invite is a
+/// real capability, a 365-day right to join this mesh. it belongs behind the
+/// signed-write gate ([`signed_req`]); what holds it open is its only in-tree
+/// writer, the desktop app's shell backend, which mints from a UI action with
+/// no unlocked signer in scope. see the inventory on `signed_req::Lane`.
 async fn mint_invite(
     State(handle): State<NodeHandle>,
     body: Option<Json<serde_json::Value>>,
@@ -1119,7 +1156,10 @@ mod tests {
         let binary = vec![0xffu8; 8 * 1024];
         let preview = payload_preview(&binary);
         assert_eq!(preview.chars().count(), PAYLOAD_PREVIEW_MAX + 1);
-        assert!(preview.ends_with('…'), "byte-clipped previews carry the mark");
+        assert!(
+            preview.ends_with('…'),
+            "byte-clipped previews carry the mark"
+        );
         // multi-byte text still fills its full char budget: 4 bytes/char is
         // the decode ceiling, so 1024 chars always fit the prefix.
         let wide = "😀".repeat(PAYLOAD_PREVIEW_MAX + 10);

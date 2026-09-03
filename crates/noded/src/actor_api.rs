@@ -22,21 +22,26 @@ use duckfs_core::{
 use futures::channel::oneshot;
 
 use crate::files_http::FILES_MODULE;
-use crate::{BlockSummary, DEFAULT_ORIGIN, NodeCommand, NodeHandle};
+use crate::{BlockSummary, NodeCommand, NodeHandle};
 
 /// a `NodeApi` bound to one node's actor lane. cheap to clone (holds only the
 /// command-channel handle); a fresh one is made per workspace request.
 pub(crate) struct ActorNodeApi {
     handle: NodeHandle,
+    /// the ACTING identity every op this adapter submits is authored by — the
+    /// key the workspace request's signature proved possession of. carried
+    /// rather than defaulted so a managed checkout's commits are charged to the
+    /// person who asked for them, not to the daemon.
+    origin: Vec<u8>,
 }
 
 impl ActorNodeApi {
-    pub(crate) fn new(handle: NodeHandle) -> Self {
-        ActorNodeApi { handle }
+    pub(crate) fn new(handle: NodeHandle, origin: Vec<u8>) -> Self {
+        ActorNodeApi { handle, origin }
     }
 
     /// submit an already-encoded files op (putblob frame or `FilesMsg`) as one
-    /// block over the actor lane, all writes riding the daemon's own origin.
+    /// block over the actor lane, authored by the acting key.
     fn submit(&self, payload: Vec<u8>) -> Result<BlockSummary, ApiError> {
         futures::executor::block_on(async {
             let (reply, rx) = oneshot::channel();
@@ -44,7 +49,7 @@ impl ActorNodeApi {
                 .send(NodeCommand::Submit {
                     target: FILES_MODULE.into(),
                     payload,
-                    origin: DEFAULT_ORIGIN.as_bytes().to_vec(),
+                    origin: self.origin.clone(),
                     reply,
                 })
                 .await

@@ -88,6 +88,27 @@ fn post(uri: &str, body: serde_json::Value) -> Request<Body> {
         .unwrap()
 }
 
+/// the acting key a test signs as. ANY ed25519 key may act — the gate proves
+/// possession, not membership — so a test mints one exactly like a client.
+fn caller() -> commonware_cryptography::ed25519::PrivateKey {
+    commonware_cryptography::ed25519::PrivateKey::from_seed(77)
+}
+
+/// one SIGNED mutating request, built the way every in-tree client builds one:
+/// through `noded::signed_req::request_headers`, never a hand-rolled trio.
+/// `NodeHandle::channel()` carries no node key, so the salt is empty here.
+fn signed(method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
+    let bytes = serde_json::to_vec(&body).unwrap();
+    let mut req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json");
+    for (name, value) in noded::signed_req::request_headers(&caller(), method, uri, &[], &bytes) {
+        req = req.header(name, value);
+    }
+    req.body(Body::from(bytes)).unwrap()
+}
+
 async fn body_json(response: axum::response::Response) -> serde_json::Value {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).expect("response body is json")
@@ -137,6 +158,103 @@ async fn submit_stamps_the_client_origin() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
     assert_eq!(body["root_hash"], "jess");
+}
+
+// ---- the signed-write gate over the mutating routes -------------------------
+
+/// an UNSIGNED mutation is refused before the handler runs — and the refusal
+/// names one stable reason, which is what a dashboard counts.
+#[tokio::test]
+async fn an_unsigned_mutation_is_refused_and_never_reaches_the_actor() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    // an actor that would PANIC if a command crossed: the gate must refuse
+    // before anything reaches the lane.
+    tokio::spawn(async move {
+        let mut cmds = cmd_rx;
+        if cmds.next().await.is_some() {
+            panic!("an unsigned mutation reached the node actor");
+        }
+    });
+    let app = noded::router(handle);
+
+    for (method, uri) in [
+        ("POST", "/v1/log-filter"),
+        ("POST", "/v1/fs/workspaces"),
+        ("POST", "/v1/fs/workspaces/abc/commit"),
+        ("DELETE", "/v1/fs/workspaces/abc"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri} must refuse an unsigned request"
+        );
+        let body = body_json(response).await;
+        assert_eq!(body["reason"], "signature_missing");
+    }
+}
+
+/// a signature that does not bind THIS body is not a signature for THIS
+/// request: the gate hashes the body precisely so an authenticated caller's
+/// bytes cannot be swapped in flight.
+#[tokio::test]
+async fn a_swapped_body_defeats_the_signature() {
+    let (handle, _cmds, _events) = NodeHandle::channel();
+    let app = noded::router(handle);
+
+    let signed_for = serde_json::json!({ "prefix": "/shared/mine" });
+    let mut request = signed("POST", "/v1/fs/workspaces", signed_for);
+    *request.body_mut() = Body::from(r#"{"prefix":"/shared/yours"}"#);
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(response).await["reason"], "signature_invalid");
+}
+
+/// reads are NOT gated: the ruling is about mutation, and a status probe with
+/// no key must keep working.
+#[tokio::test]
+async fn reads_stay_open() {
+    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    spawn_fake_actor(cmd_rx, None);
+    let app = noded::router(handle);
+
+    let status = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+
+    // the object facade shares its path with a gated PUT/DELETE — the GET half
+    // must not inherit the gate. (what it answers depends on the actor; that it
+    // is not a 401 is the property.)
+    let read = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/files/object/shared/x.txt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(read.status(), StatusCode::UNAUTHORIZED);
 }
 
 // ---- the signed-frame lane (`POST /v1/submit/frame`) -----------------------
@@ -795,7 +913,10 @@ fn spawn_owner_actor(mut cmds: mpsc::Receiver<NodeCommand>, owner_key: Vec<u8>) 
                 else {
                     panic!("the admin owner path asks only OfKey");
                 };
-                assert_eq!(key, owner_key, "the owner path resolves the operator's own key");
+                assert_eq!(
+                    key, owner_key,
+                    "the owner path resolves the operator's own key"
+                );
                 let view = identity::AccountView {
                     number: 1,
                     name: "owner".into(),
@@ -1517,7 +1638,8 @@ async fn fs_workspaces_is_503_when_unconfigured() {
     let (handle, _cmd_rx, _events) = NodeHandle::channel();
 
     let response = noded::router(handle)
-        .oneshot(post(
+        .oneshot(signed(
+            "POST",
             "/v1/fs/workspaces",
             serde_json::json!({ "prefix": "/shared/x" }),
         ))
@@ -1536,7 +1658,8 @@ async fn fs_workspace_commit_rejects_a_bad_slug() {
     let handle = handle.with_duckfs_workspaces(root.path().to_path_buf());
 
     let response = noded::router(handle)
-        .oneshot(post(
+        .oneshot(signed(
+            "POST",
             "/v1/fs/workspaces/BAD/commit",
             serde_json::json!({ "message": "m" }),
         ))

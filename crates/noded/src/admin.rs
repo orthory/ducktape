@@ -96,17 +96,26 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use commonware_codec::DecodeExt as _;
-use commonware_cryptography::{Signer as _, Verifier as _, ed25519};
+use commonware_cryptography::{Signer as _, ed25519};
 use serde::Deserialize;
 
 use crate::NodeHandle;
 use crate::handle::NodeCommand;
+use crate::signed_req::{self, PopError, PopHeaders, header_str, now_secs};
 
 /// PoP signing namespace: `sign(ADMIN_REQ_NS, method ‖ 0x1f ‖ path ‖ 0x1f ‖ ts)`.
 pub const ADMIN_REQ_NS: &[u8] = b"ducktape-admin-req-v1";
-/// max clock skew (seconds) between a request timestamp and this node.
-pub const ADMIN_FRESHNESS_SECS: u64 = 30;
+/// max clock skew (seconds) between a request timestamp and this node. ONE
+/// window for both PoP namespaces (see [`crate::signed_req::FRESHNESS_SECS`]).
+pub const ADMIN_FRESHNESS_SECS: u64 = crate::signed_req::FRESHNESS_SECS;
+
+/// the control plane's header trio. distinct names from the data plane's so a
+/// control credential can never be replayed onto a data route.
+const ADMIN_HEADERS: PopHeaders = PopHeaders {
+    key: ADMIN_KEY_HEADER,
+    ts: ADMIN_TS_HEADER,
+    sig: ADMIN_SIG_HEADER,
+};
 
 /// hex ed25519 owner-account public key (32 bytes).
 pub const ADMIN_KEY_HEADER: &str = "x-ducktape-admin-key";
@@ -254,8 +263,7 @@ impl AdminConfig {
 /// owner); the fixed-width tail (32-byte key, 8-byte ts) keeps the layout
 /// unambiguous even though the key is raw bytes.
 fn pop_message(method: &str, path_and_query: &str, node_key: &[u8], ts: u64) -> Vec<u8> {
-    let mut m =
-        Vec::with_capacity(method.len() + path_and_query.len() + node_key.len() + 11);
+    let mut m = Vec::with_capacity(method.len() + path_and_query.len() + node_key.len() + 11);
     m.extend_from_slice(method.as_bytes());
     m.push(0x1f);
     m.extend_from_slice(path_and_query.as_bytes());
@@ -276,32 +284,20 @@ pub fn sign_admin(
     node_key: &[u8],
     ts: u64,
 ) -> ed25519::Signature {
-    signer.sign(ADMIN_REQ_NS, &pop_message(method, path_and_query, node_key, ts))
+    signer.sign(
+        ADMIN_REQ_NS,
+        &pop_message(method, path_and_query, node_key, ts),
+    )
 }
 
-/// wall-clock seconds since the Unix epoch (saturating before 1970).
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum PopError {
-    /// a required header is missing or malformed.
-    MissingAuth,
-    /// timestamp outside the freshness window.
-    Stale,
-    /// the account key or signature bytes are not valid ed25519.
-    BadKey,
-    /// the signature did not verify against the account key.
-    BadSig,
-}
-
-/// the account key that a well-formed, fresh, correctly-signed request proves
-/// possession of — or why it failed. does NOT decide ownership; that is a
-/// separate chain read in [`resolve_owner`].
+/// the account key that a well-formed, fresh, correctly-signed CONTROL request
+/// proves possession of — or why it failed. does NOT decide ownership; that is
+/// a separate chain read in [`resolve_owner`].
+///
+/// the verifier itself is [`crate::signed_req::verify_pop`], shared with the
+/// data plane: two copies of a signature check is exactly the shape where one
+/// gets a fix and the other does not. only the MESSAGE differs, and it differs
+/// on purpose — see [`pop_message`].
 fn verify_pop(
     headers: &HeaderMap,
     method: &str,
@@ -309,44 +305,9 @@ fn verify_pop(
     node_key: &[u8],
     now: u64,
 ) -> Result<Vec<u8>, PopError> {
-    let key_hex = header_str(headers, ADMIN_KEY_HEADER).ok_or(PopError::MissingAuth)?;
-    let ts_str = header_str(headers, ADMIN_TS_HEADER).ok_or(PopError::MissingAuth)?;
-    let sig_hex = header_str(headers, ADMIN_SIG_HEADER).ok_or(PopError::MissingAuth)?;
-
-    let ts: u64 = ts_str.parse().map_err(|_| PopError::MissingAuth)?;
-    if now.abs_diff(ts) > ADMIN_FRESHNESS_SECS {
-        return Err(PopError::Stale);
-    }
-
-    let key_bytes = from_hex(key_hex).ok_or(PopError::BadKey)?;
-    let sig_bytes = from_hex(sig_hex).ok_or(PopError::BadKey)?;
-    let pubkey = ed25519::PublicKey::decode(key_bytes.as_slice()).map_err(|_| PopError::BadKey)?;
-    let sig = ed25519::Signature::decode(sig_bytes.as_slice()).map_err(|_| PopError::BadKey)?;
-
-    if pubkey.verify(
-        ADMIN_REQ_NS,
-        &pop_message(method, path_and_query, node_key, ts),
-        &sig,
-    ) {
-        Ok(key_bytes)
-    } else {
-        Err(PopError::BadSig)
-    }
-}
-
-fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers.get(name)?.to_str().ok()
-}
-
-/// decode an even-length lowercase/uppercase hex string to bytes.
-pub(crate) fn from_hex(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
-        .collect()
+    signed_req::verify_pop(headers, ADMIN_HEADERS, ADMIN_REQ_NS, now, |ts| {
+        pop_message(method, path_and_query, node_key, ts)
+    })
 }
 
 /// the outcome of resolving this node's owning account.
@@ -362,7 +323,11 @@ enum OwnerResolve {
 /// resolve the account the operator's `owner_key` belongs to from committed
 /// state, over the same actor query lane every read uses. NEVER trusts the
 /// connection — membership is read from `identity` `OfKey`.
-async fn resolve_owner(handle: &NodeHandle, identity_module: &str, owner_key: &[u8]) -> OwnerResolve {
+async fn resolve_owner(
+    handle: &NodeHandle,
+    identity_module: &str,
+    owner_key: &[u8],
+) -> OwnerResolve {
     let req = identity::encode_query(&identity::IdentityQuery::OfKey {
         key: owner_key.to_vec(),
     });
@@ -686,9 +651,7 @@ pub fn admin_router(handle: NodeHandle) -> Router<NodeHandle> {
         .route(
             "/v1/admin/module-code/stage",
             post(crate::module_code::stage_module_code).layer(
-                axum::extract::DefaultBodyLimit::max(
-                    crate::module_code::MAX_MODULE_ARTIFACT_BYTES,
-                ),
+                axum::extract::DefaultBodyLimit::max(crate::module_code::MAX_MODULE_ARTIFACT_BYTES),
             ),
         )
         .route(
@@ -903,7 +866,10 @@ mod tests {
     fn exposure_flag_parses_and_defaults_safe() {
         assert_eq!(AdminExposure::from_flag("off"), AdminExposure::Disabled);
         assert_eq!(AdminExposure::from_flag("public"), AdminExposure::Public);
-        assert_eq!(AdminExposure::from_flag("loopback"), AdminExposure::Loopback);
+        assert_eq!(
+            AdminExposure::from_flag("loopback"),
+            AdminExposure::Loopback
+        );
         // unknown / empty ⇒ the safe default.
         assert_eq!(AdminExposure::from_flag("garbage"), AdminExposure::Loopback);
         assert_eq!(AdminExposure::from_flag(""), AdminExposure::Loopback);
@@ -920,7 +886,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().expect("tempdir");
         let minted = mint_operator_token(dir.path()).expect("mint");
-        assert_eq!(read_operator_token(dir.path()).as_deref(), Ok(minted.as_str()));
+        assert_eq!(
+            read_operator_token(dir.path()).as_deref(),
+            Ok(minted.as_str())
+        );
         let mode = std::fs::metadata(dir.path().join(ADMIN_TOKEN_FILE))
             .expect("token file")
             .permissions()
@@ -956,13 +925,5 @@ mod tests {
         assert_eq!(reasons.len(), unique, "two refusals share a reason token");
         // nothing is a 2xx, and nothing leaks prose that could carry a secret.
         assert!(all.iter().all(|r| !r.status().is_success()));
-    }
-
-    #[test]
-    fn hex_roundtrips_and_rejects_malformed() {
-        assert_eq!(from_hex("00ff10"), Some(vec![0, 255, 16]));
-        assert_eq!(from_hex(""), Some(vec![]));
-        assert_eq!(from_hex("abc"), None); // odd length
-        assert_eq!(from_hex("zz"), None); // non-hex
     }
 }
