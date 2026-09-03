@@ -49,6 +49,27 @@ pub enum OpCmd {
     Work(WorkCmd),
     /// whether this node isolates provider runs, and turn it on
     Sandbox(SandboxArgs),
+    /// retune a RUNNING node's tracing filter (the 3am verb)
+    LogFilter(LogFilterArgs),
+}
+
+/// `ducktape node log-filter <FILTER>` — the signed client for
+/// `POST /v1/log-filter`.
+///
+/// The route MUTATES the running process (a `trace` filter writes into an
+/// unrotated `daemon.log` as fast as the disk takes it), so it requires a
+/// user-signed request like every other mutating route. `curl` cannot mint one;
+/// this verb can.
+#[derive(Debug, clap::Args)]
+pub struct LogFilterArgs {
+    /// the tracing filter to install, e.g. `info,ducktape::join=debug`
+    #[arg(value_name = "FILTER")]
+    pub filter: String,
+    #[command(flatten)]
+    pub addr: NodeAddr,
+    /// the user key that signs the request (default: the active wallet)
+    #[arg(long, value_name = "PATH")]
+    pub key: Option<PathBuf>,
 }
 
 /// `ducktape node sandbox` — reconcile "can this HOST isolate a run" with
@@ -181,7 +202,7 @@ impl Selector {
 /// `--node` is an http base here and means nothing else anywhere: the `agent`
 /// family's host targeting — which PEER runs the work, a raw 64-hex node key —
 /// is `--host-node`, because it is a different type of input.
-#[derive(Debug, Default, clap::Args)]
+#[derive(Debug, Default, Clone, clap::Args)]
 pub struct NodeAddr {
     /// the node's http base url (wins over -n/--network and DUCKTAPE_NODE)
     #[arg(long, value_name = "HTTP-URL", global = true)]

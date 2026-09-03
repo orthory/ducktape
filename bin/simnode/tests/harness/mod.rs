@@ -17,6 +17,10 @@ pub struct Sim {
     child: Child,
     stdout: BufReader<ChildStdout>,
     port: u16,
+    /// this sim's operator credential, minted 0600 into its storage dir at
+    /// boot. EVERY mutating `/v1` route wants either it or a user signature,
+    /// and a harness driving a sim it spawned IS that sim's local operator.
+    operator: String,
 }
 
 impl Drop for Sim {
@@ -52,9 +56,20 @@ impl Sim {
             child,
             stdout,
             port: 0,
+            operator: String::new(),
         };
         sim.port = sim.read_listen_port();
+        // the credential is written before the listener binds, so a sim that
+        // announced its port has already minted it.
+        sim.operator = noded::admin::read_operator_token(storage)
+            .expect("the sim minted an operator credential");
         sim
+    }
+
+    /// this sim's operator credential — for a route the helpers below do not
+    /// wrap.
+    pub fn operator_token(&self) -> &str {
+        &self.operator
     }
 
     /// Wait on the child's listener-bound event and return its OS-selected port.
@@ -102,7 +117,7 @@ impl Sim {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> (u16, serde_json::Value) {
-        try_request(self.port, method, path, body).expect("sim reachable")
+        credentialed_request(self.port, &self.operator, method, path, body).expect("sim reachable")
     }
 
     pub fn status(&self) -> serde_json::Value {
@@ -174,7 +189,8 @@ impl Sim {
         if let Some(origin) = origin {
             body["origin"] = serde_json::json!(origin);
         }
-        try_request(self.port, "POST", "/v1/submit", Some(&body)).expect("submit reachable")
+        credentialed_request(self.port, &self.operator, "POST", "/v1/submit", Some(&body))
+            .expect("submit reachable")
     }
 
     /// inline submit that must COMMIT — returns the receipt.
@@ -213,13 +229,15 @@ impl Sim {
         origin: Option<&str>,
     ) -> std::thread::JoinHandle<(u16, serde_json::Value)> {
         let port = self.port;
+        let operator = self.operator.clone();
         let target = target.to_string();
         let mut body = serde_json::json!({ "target": target, "payload": payload });
         if let Some(origin) = origin {
             body["origin"] = serde_json::json!(origin);
         }
         std::thread::spawn(move || {
-            try_request(port, "POST", "/v1/submit", Some(&body)).expect("held submit reachable")
+            credentialed_request(port, &operator, "POST", "/v1/submit", Some(&body))
+                .expect("held submit reachable")
         })
     }
 
@@ -296,7 +314,36 @@ impl Sim {
 /// json request/response against the sim's /v1 + /sim wires — the shared raw
 /// http/1.1 client, `io::Result` so `await_status` can poll a not-yet-up sim.
 /// `embed.rs` drives the embedded server through this directly.
+// each tests/*.rs is its own crate, so a suite that only makes CREDENTIALED
+// requests never names this one.
+#[allow(unused_imports)]
 pub use nettest::try_http_json as try_request;
+
+/// [`try_request`] carrying the sim's operator credential — what a MUTATING
+/// `/v1` route wants from a caller acting as the node's own operator.
+pub fn credentialed_request(
+    port: u16,
+    operator: &str,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> std::io::Result<(u16, serde_json::Value)> {
+    let bytes = body
+        .map(|b| serde_json::to_vec(b).expect("request body serializes"))
+        .unwrap_or_default();
+    let (status, raw) = nettest::try_http_bytes_with(
+        port,
+        method,
+        path,
+        "application/json",
+        &[(noded::admin::ADMIN_TOKEN_HEADER, operator)],
+        &bytes,
+    )?;
+    Ok((
+        status,
+        serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null),
+    ))
+}
 
 /// POST arbitrary body bytes with an explicit content-type — the raw-bytes
 /// twin of [`try_request`] (which is json-only), for the octet-stream frame

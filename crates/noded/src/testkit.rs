@@ -152,6 +152,29 @@ impl InProcDaemon {
         format!("http://127.0.0.1:{}", self.port)
     }
 
+    /// this harness's operator credential — what a real node writes 0600 into
+    /// its workspace, and what every MUTATING `/v1` route wants from a caller
+    /// that is not signing as a person ([`crate::signed_req`]).
+    pub fn operator_token(&self) -> &str {
+        &self.operator_token
+    }
+
+    /// the header pair a write carries, ready to set on a request.
+    pub fn write_header(&self) -> (&'static str, &str) {
+        (crate::admin::ADMIN_TOKEN_HEADER, &self.operator_token)
+    }
+
+    /// a duckfs transport whose writes this node admits — the harness twin of
+    /// what `NodeLink::files()` builds for a real daemon.
+    pub fn files(&self) -> duckfs_client::http::HttpNode {
+        let token = self.operator_token.clone();
+        duckfs_client::http::HttpNode::new(self.node_url()).with_write_auth(std::sync::Arc::new(
+            move |_method, _path, _body| {
+                vec![(crate::admin::ADMIN_TOKEN_HEADER.to_string(), token.clone())]
+            },
+        ))
+    }
+
     /// Block until the server thread's runtime is actually accepting.
     ///
     /// Liveness FIRST, then the probe — the same order `bin/simnode`'s harness
@@ -240,9 +263,13 @@ pub fn run_actor(
                     origin,
                     reply,
                 } => {
-                    let result =
-                        commit(&mut host, &mut height, Origin::External(origin), Msg { target, payload })
-                            .await;
+                    let result = commit(
+                        &mut host,
+                        &mut height,
+                        Origin::External(origin),
+                        Msg { target, payload },
+                    )
+                    .await;
                     publish_status(&status, &host, &status_modules, height);
                     let _ = reply.send(result);
                 }
@@ -268,17 +295,15 @@ pub fn run_actor(
 
 /// assemble + publish the harness's `/v1/status` snapshot (each module's root
 /// read straight from the host) into the shared cell.
-fn publish_status(
-    status: &crate::StatusCell,
-    host: &Host,
-    status_modules: &[String],
-    height: u64,
-) {
+fn publish_status(status: &crate::StatusCell, host: &Host, status_modules: &[String], height: u64) {
     let modules = status_modules
         .iter()
         .map(|id| ModuleStatus {
             id: id.clone(),
-            root: host.module_root(id).map(|r| hex_root(&r)).unwrap_or_default(),
+            root: host
+                .module_root(id)
+                .map(|r| hex_root(&r))
+                .unwrap_or_default(),
             category: ModuleCategory::of(id),
         })
         .collect();

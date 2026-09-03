@@ -1291,7 +1291,7 @@ pub(crate) fn commit_enable(
     )
     .map_err(|refusal| format!("{} was not enabled: {refusal}", plan.kind))?;
     save(workspace, &services)?;
-    let height = crate::announce::submit(base, &announce).map_err(|error| {
+    let height = crate::announce::submit(base, workspace, &announce).map_err(|error| {
         format!(
             "{} is granted but NOT announced, so nothing will be placed on it yet — this node \
              retries every {}s until it lands: {error}",
@@ -2102,7 +2102,7 @@ fn disable(args: KindArgs) -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(|refusal| format!("{kind} was not disabled: {refusal}"))?;
     save(&workspace, &services)?;
-    let height = crate::announce::submit(&base, &announce).map_err(|error| {
+    let height = crate::announce::submit(&base, &workspace, &announce).map_err(|error| {
         format!(
             "{kind}'s grant is revoked but the announce was NOT retracted — this node retries \
              every {}s until it lands: {error}",

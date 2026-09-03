@@ -162,8 +162,13 @@ journalctl -fu ducktape-node@mynet
 tail -f /var/lib/ducktape/workspaces/<chain-id>/daemon.log
 tail -f /var/lib/ducktape/workspaces/<chain-id>/compute.log
 
-# turn one plane up on the LIVE node — never restart to look at a wedged state
-curl -XPOST 127.0.0.1:8844/v1/log-filter -d 'info,ducktape::join=debug'
+# turn one plane up on the LIVE node — never restart to look at a wedged state.
+# the route mutates the process, so it takes a credential: the verb signs with
+# the active wallet key, and on a server with no wallet the node's own operator
+# credential does (an uncredentialed curl is refused 401).
+ducktape node log-filter 'info,ducktape::join=debug' -n <chain-id>
+curl -XPOST 127.0.0.1:8844/v1/log-filter -d 'info,ducktape::join=debug' \
+  -H "x-ducktape-admin-token: $(cat /var/lib/ducktape/workspaces/<chain-id>/admin.token)"
 ```
 
 The tee files are opened append-only once and never reopened, which is why

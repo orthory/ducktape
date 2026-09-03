@@ -158,13 +158,21 @@ else
 fi
 
 # ── 5. seed ops ────────────────────────────────────────────────
+# Every mutating /v1 route wants a credential: either a per-request user
+# signature or this node's own operator credential, minted 0600 into the
+# workspace at boot. The seeder acts as the node's operator, so it presents
+# that one — a bare curl is no longer a way in.
+OPERATOR="$(cat "$WSDIR/admin.token" 2>/dev/null)" \
+  || die "the node minted no operator credential at $WSDIR/admin.token"
+[ -n "$OPERATOR" ] || die "the node minted no operator credential at $WSDIR/admin.token"
 N=0
 submit(){ # submit <module> <payload-json>
   N=$((N+1))
   local body resp code
   body=$(bun -e 'const [target,payload,origin]=process.argv.slice(1);console.log(JSON.stringify({target,payload:JSON.parse(payload),origin}))' "$1" "$2" "$ORIGIN") \
     || die "op #$N ($1): payload is not valid json"
-  resp=$(curl -s -w $'\n%{http_code}' "$URL/v1/submit" -H 'content-type: application/json' -d "$body")
+  resp=$(curl -s -w $'\n%{http_code}' "$URL/v1/submit" -H 'content-type: application/json' \
+    -H "x-ducktape-admin-token: $OPERATOR" -d "$body")
   code=${resp##*$'\n'}
   [ "$code" = "200" ] || die "op #$N ($1) rejected [$code]: ${resp%$'\n'*}"
 }

@@ -8,6 +8,13 @@ fn loopback0() -> SocketAddr {
     "127.0.0.1:0".parse().expect("addr")
 }
 
+/// the credential the embedded sim minted into `storage` at boot. A submit
+/// MUTATES, and a mutating `/v1` route wants either this or a user signature —
+/// an embedder driving a sim it booted is that sim's local operator.
+fn operator(storage: &std::path::Path) -> String {
+    noded::admin::read_operator_token(storage).expect("the sim minted an operator credential")
+}
+
 fn boot_auto(storage: &std::path::Path) -> simnode::SimHandle {
     simnode::boot(
         storage,
@@ -62,8 +69,9 @@ fn embedded_boot_serves_and_commits() {
 
     // Auto-mode submit commits inline; query reads it back — the whole
     // round-trip in one process.
-    let (status, reply) = harness::try_request(
+    let (status, reply) = harness::credentialed_request(
         port,
+        &operator(storage.path()),
         "POST",
         "/v1/submit",
         Some(&serde_json::json!({
@@ -106,12 +114,15 @@ fn two_embedded_instances_are_independent() {
     let b = boot_auto(dir_b.path());
     assert_ne!(a.addr(), b.addr());
 
-    let (status, _) = harness::try_request(
+    let (status, _) = harness::credentialed_request(
         a.addr().port(),
+        &operator(dir_a.path()),
         "POST",
         "/v1/submit",
-        Some(&serde_json::json!({ "target": "chat", "payload": { "create_channel": {
-            "channel_id": "only-a", "name": "only-a", "post_policy": "open" } } })),
+        Some(
+            &serde_json::json!({ "target": "chat", "payload": { "create_channel": {
+            "channel_id": "only-a", "name": "only-a", "post_policy": "open" } } }),
+        ),
     )
     .expect("submit a");
     assert_eq!(status, 200);
@@ -147,13 +158,17 @@ fn held_mode_step_via_handle() {
     // Held mode: a submit parks until step. Submit from a thread (its HTTP
     // reply hangs until the step), then step via the handle.
     let port = sim.addr().port();
+    let credential = operator(storage.path());
     let submitter = std::thread::spawn(move || {
-        harness::try_request(
+        harness::credentialed_request(
             port,
+            &credential,
             "POST",
             "/v1/submit",
-            Some(&serde_json::json!({ "target": "chat", "payload": { "create_channel": {
-                "channel_id": "held", "name": "held", "post_policy": "open" } } })),
+            Some(
+                &serde_json::json!({ "target": "chat", "payload": { "create_channel": {
+                "channel_id": "held", "name": "held", "post_policy": "open" } } }),
+            ),
         )
     });
     // Poll sim state until the op is parked, then commit it.

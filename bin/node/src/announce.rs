@@ -207,13 +207,18 @@ pub(crate) fn widest(grants: &[ServiceGrant]) -> Vec<noded::services::Signaling>
 /// (`capability` takes the announcing node from the verified submit origin,
 /// never from payload data). That is why no caller here holds a signing key —
 /// and why a user-signed announce could never have worked.
-pub(crate) fn submit(base: &str, set: &AnnounceSet) -> Result<u64, String> {
+pub(crate) fn submit(
+    base: &str,
+    workspace: &std::path::Path,
+    set: &AnnounceSet,
+) -> Result<u64, String> {
     let msg = capability::CapabilityMsg::Announce {
         capabilities: set.capabilities.clone(),
         resources: set.resources.clone(),
     };
     let payload = serde_json::to_value(&msg).map_err(|error| error.to_string())?;
-    crate::node_http::submit(base, "capability", &payload).map_err(|error| error.to_string())
+    crate::node_http::submit(base, workspace, "capability", &payload)
+        .map_err(|error| error.to_string())
 }
 
 /// This node's committed announce.
@@ -396,7 +401,7 @@ fn run(watch: Watch) {
                 report(failures, &reason);
             }
             Tick::Quiet => failures = 0,
-            Tick::Announce(want) => match submit(&watch.base, &want) {
+            Tick::Announce(want) => match submit(&watch.base, &watch.workspace, &want) {
                 Ok(height) => {
                     failures = 0;
                     tracing::info!(

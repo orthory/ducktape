@@ -3,7 +3,8 @@
 //! shared [`crate::cli_args::NodeAddr`] ladder, which for verbs running inside a
 //! checkout takes the index's recorded node url as its context rung.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use duckfs_client::checkout::{CheckoutError, CheckoutOptions, checkout_with};
 use duckfs_client::commit::{CommitError, CommitOptions, commit_with};
@@ -18,11 +19,46 @@ use crate::fs_cli::{CheckoutArgs, CommitArgs, PinArgs, StatusArgs};
 /// below what the operator stated, above the registry inference. A checkout
 /// records the node it came FROM, which beats "the one workspace registered on
 /// this box".
-fn node_for_dir(addr: &NodeAddr, dir: &Path) -> Result<HttpNode, CliError> {
+fn url_for_dir(addr: &NodeAddr, dir: &Path) -> Result<String, CliError> {
     let recorded = || Index::load(dir).ok().map(|index| index.node);
-    addr.resolve_with(recorded)
-        .map(HttpNode::new)
-        .map_err(CliError::usage)
+    addr.resolve_with(recorded).map_err(CliError::usage)
+}
+
+/// a node whose WRITES carry the acting person's signature.
+///
+/// Every mutating duckfs route refuses a request that proves nothing, and this
+/// verb is a person's: what it stages and commits is charged to the key signing
+/// here — the commit's author, the `/home/<owner>/**` authority, and the
+/// staging quota (#1312). Opening the key costs one password prompt per verb,
+/// which is why it happens ONCE, before the walk, and the closure reuses the
+/// opened key for every chunk.
+///
+/// CEILING: on a validator this authorship stops at the node's ingress, which
+/// re-signs an unframed submit with the NODE's key. Carrying it into consensus
+/// needs the client to sign the FRAME (`/v1/submit/frame`), which is a wire
+/// decision, not this seam's.
+fn signing_node(addr: &NodeAddr, dir: &Path, key: Option<PathBuf>) -> Result<HttpNode, CliError> {
+    let url = url_for_dir(addr, dir)?;
+    let node_key = crate::node_http::node_public_key(&url)
+        .map_err(|error| CliError::failed(error.to_string()))?;
+    let ctx = crate::cred_cli::VerbCtx {
+        addr: addr.clone(),
+        key,
+    };
+    let key_path = ctx
+        .key_path()
+        .map_err(|e| CliError::failed(e.to_string()))?;
+    let mut stdin = std::io::BufReader::new(std::io::stdin());
+    let signer = crate::userkey_cli::load_user_signer(&key_path, &mut stdin)
+        .map_err(|e| CliError::failed(e.to_string()))?;
+    Ok(
+        HttpNode::new(url).with_write_auth(Arc::new(move |method, path, body| {
+            noded::signed_req::request_headers(&signer, method, path, &node_key, body)
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value))
+                .collect()
+        })),
+    )
 }
 
 fn checkout_err(e: CheckoutError) -> CliError {
@@ -88,7 +124,7 @@ pub fn status(args: StatusArgs) -> Result<(), CliError> {
 pub fn commit(args: CommitArgs) -> Result<(), CliError> {
     let dir = args.dir.as_deref().unwrap_or(".");
     let dirp = Path::new(dir);
-    let node = node_for_dir(&args.addr, dirp)?;
+    let node = signing_node(&args.addr, dirp, args.key)?;
     let opts = CommitOptions {
         auto_rebase: !args.no_rebase,
         paths: args.paths,
@@ -127,7 +163,7 @@ pub fn pin(args: PinArgs) -> Result<(), CliError> {
 
     // pin runs against a node directly (default `.` so a checkout's index can
     // supply the node, but `--node`/env win).
-    let node = node_for_dir(&args.addr, Path::new("."))?;
+    let node = signing_node(&args.addr, Path::new("."), args.key)?;
     node.pin(&args.snapshot, &args.name).map_err(|e| match e {
         ApiError::NotFound => CliError::failed("snapshot not found"),
         ApiError::Rejected(m) => CliError::failed(m),

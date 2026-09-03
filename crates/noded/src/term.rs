@@ -1253,16 +1253,20 @@ fn answer(reply: Option<oneshot::Sender<Result<(), TermError>>>, refusal: TermEr
 // HTTP routes
 // ---------------------------------------------------------------------------
 //
-// AUTH: these two mutating routes are registered on the daemon's `public`
-// router, so they inherit the SAME gate as `/v1/submit`, `/v1/fs/workspaces` and
-// every other mutating `/v1/` RPC: `origin_guard::guard` + its CORS allowlist.
-// That surface is trusted-local by design (see `origin_guard`) — a non-browser
-// local client (the app, the CLI) sends no `Origin` and is allowed; a browser
-// must present an allowlisted origin. There is no bearer token because a local
-// process can already read the node's key off disk, so a token would guard no
-// boundary this daemon can hold. Session creation is therefore gated exactly the
-// way the run/dispatch path (`/v1/submit`) is, per the design (authorization
-// rides the existing trusted-local surface, no new ACL).
+// AUTH: these two routes MUTATE — they spawn and kill a process, a container or
+// a guest VM on this host — so they carry a credential like every other mutating
+// `/v1` route (`crate::signed_req`): a per-request user signature, or this
+// node's operator credential from a local process that can read its workspace.
+// `ducktape agent pty` presents the second, out of the same 0600 directory the
+// ws topic's link token already comes from.
+//
+// The bar this raises is not theoretical: the node's http listener is tunnelled
+// into every sandbox GUEST (`provider-host`'s `wire_guest_tunnels`), so before
+// this gate any process inside an untrusted run could spawn an interactive
+// terminal on its host — and with a `cred` in the body, one on ANOTHER node.
+// A guest holds no workspace and no key, so it now holds neither credential.
+// The browser `origin_guard` + CORS allowlist still runs in front of this, and
+// still does its own, different job (a page must not drive a local daemon).
 
 /// the `POST /v1/term/sessions` body. The `{agent, mode}` local path is
 /// unchanged when the cross-node fields are absent; a `node` (or a bare `cred`

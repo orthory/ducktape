@@ -11,6 +11,7 @@
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 
 // Consensus rejects these handles — a seed that asks for one aborts the demo.
 // Mirrors RESERVED_ROOT_LABELS in crates/duckdns/src/wire.rs (the source
@@ -58,11 +59,20 @@ async function main() {
     throw new Error("usage: demo-gateway.mjs <http-url> <node-bin> <workdir> <chain-id> [handle] <user-key> [password]");
   }
   const userKey = userKeyArg;
+  // This boot's operator credential. `/v1/files/commit` is a MUTATING route
+  // and the write gate (crates/noded/src/signed_req.rs) refuses it without
+  // one; `/v1/query` below is a read and does not need it, but one helper
+  // serves both. Read once — the file is minted per boot and demo-seed.sh
+  // has already failed fatally if it is missing.
+  const operator = readFileSync(`${workdir}/admin.token`, "utf8").trim();
 
   async function post(path, body) {
     const response = await fetch(`${url}${path}`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        "x-ducktape-admin-token": operator,
+      },
       body: JSON.stringify(body),
     });
     const text = await response.text();

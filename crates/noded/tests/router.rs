@@ -79,13 +79,53 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
     });
 }
 
+/// a fake node that carries an operator credential, the way every real serve
+/// path does ([`AdminConfig::minted`]). The mutating routes admit EITHER a user
+/// signature or that credential, so a test node without one could not model a
+/// local daemon's write at all.
+fn local_node() -> (NodeHandle, mpsc::Receiver<NodeCommand>, noded::StreamHub) {
+    let (handle, cmd_rx, events) = NodeHandle::channel();
+    let handle = handle.with_admin(AdminConfig {
+        operator_token: Some(OPERATOR.to_string()),
+        ..Default::default()
+    });
+    (handle, cmd_rx, events)
+}
+
+/// one request from a LOCAL DAEMON: the operator credential and a loopback
+/// peer, which is what `into_make_service_with_connect_info` puts there on a
+/// real node. `/v1/submit` and the duckfs writes are its lane.
 fn post(uri: &str, body: serde_json::Value) -> Request<Body> {
-    Request::builder()
-        .method("POST")
+    with_operator(with_peer(
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+        "127.0.0.1:40000",
+    ))
+}
+
+/// the acting key a test signs as. ANY ed25519 key may act — the gate proves
+/// possession, not membership — so a test mints one exactly like a client.
+fn caller() -> commonware_cryptography::ed25519::PrivateKey {
+    commonware_cryptography::ed25519::PrivateKey::from_seed(77)
+}
+
+/// one SIGNED mutating request, built the way every in-tree client builds one:
+/// through `noded::signed_req::request_headers`, never a hand-rolled trio.
+/// `local_node()` carries no node key, so the salt is empty here.
+fn signed(method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
+    let bytes = serde_json::to_vec(&body).unwrap();
+    let mut req = Request::builder()
+        .method(method)
         .uri(uri)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap()
+        .header(header::CONTENT_TYPE, "application/json");
+    for (name, value) in noded::signed_req::request_headers(&caller(), method, uri, &[], &bytes) {
+        req = req.header(name, value);
+    }
+    req.body(Body::from(bytes)).unwrap()
 }
 
 async fn body_json(response: axum::response::Response) -> serde_json::Value {
@@ -95,7 +135,7 @@ async fn body_json(response: axum::response::Response) -> serde_json::Value {
 
 #[tokio::test]
 async fn submit_forwards_the_payload_and_returns_the_block() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    let (handle, cmd_rx, _events) = local_node();
     spawn_fake_actor(cmd_rx, None);
 
     let response = noded::router(handle)
@@ -119,7 +159,7 @@ async fn submit_forwards_the_payload_and_returns_the_block() {
 
 #[tokio::test]
 async fn submit_stamps_the_client_origin() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    let (handle, cmd_rx, _events) = local_node();
     spawn_fake_actor(cmd_rx, None);
 
     let response = noded::router(handle)
@@ -137,6 +177,271 @@ async fn submit_stamps_the_client_origin() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
     assert_eq!(body["root_hash"], "jess");
+}
+
+// ---- the signed-write gate over the mutating routes -------------------------
+
+/// an UNSIGNED mutation is refused before the handler runs — and the refusal
+/// names one stable reason, which is what a dashboard counts.
+#[tokio::test]
+async fn an_unsigned_mutation_is_refused_and_never_reaches_the_actor() {
+    let (handle, cmd_rx, _events) = local_node();
+    // an actor that would PANIC if a command crossed: the gate must refuse
+    // before anything reaches the lane.
+    tokio::spawn(async move {
+        let mut cmds = cmd_rx;
+        if cmds.next().await.is_some() {
+            panic!("an unsigned mutation reached the node actor");
+        }
+    });
+    let app = noded::router(handle);
+
+    for (method, uri) in [
+        ("POST", "/v1/log-filter"),
+        ("POST", "/v1/invite"),
+        ("POST", "/v1/submit"),
+        ("POST", "/v1/fs/workspaces"),
+        ("POST", "/v1/fs/workspaces/abc/commit"),
+        ("DELETE", "/v1/fs/workspaces/abc"),
+        ("POST", "/v1/files/blob"),
+        ("POST", "/v1/files/stage"),
+        ("POST", "/v1/files/commit"),
+        ("POST", "/v1/files/pin"),
+        ("POST", "/v1/files/watch"),
+        ("PUT", "/v1/files/object/shared/a.txt"),
+        ("DELETE", "/v1/files/object/shared/a.txt"),
+        ("POST", "/v1/term/sessions"),
+        ("POST", "/v1/term/sessions/abc/close"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri} must refuse an unsigned request"
+        );
+        let body = body_json(response).await;
+        assert_eq!(body["reason"], "signature_missing");
+    }
+}
+
+/// the node's OWN daemons have no user key, so they present the credential
+/// `/v1/admin/*` already asks of a local process — and the acting origin stays
+/// the node's own name, because a daemon's write IS the node's.
+#[tokio::test]
+async fn the_operator_credential_admits_a_daemons_write() {
+    let (handle, cmd_rx, _events) = local_node();
+    spawn_fake_actor(cmd_rx, None);
+
+    let response = noded::router(handle)
+        .oneshot(post(
+            "/v1/submit",
+            serde_json::json!({
+                "target": "chat",
+                "payload": { "create_channel": { "channel_id": "general", "name": "General" } },
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await["root_hash"], "noded");
+}
+
+/// the credential is loopback-AND-secret, conjunctively: a remote peer holding
+/// a leaked token is still refused, exactly as on `/v1/admin/*`.
+#[tokio::test]
+async fn the_operator_credential_does_not_travel_off_box() {
+    let (handle, cmd_rx, _events) = local_node();
+    tokio::spawn(async move {
+        let mut cmds = cmd_rx;
+        if cmds.next().await.is_some() {
+            panic!("an off-box write reached the node actor");
+        }
+    });
+
+    let request = with_operator(with_peer(
+        Request::builder()
+            .method("POST")
+            .uri("/v1/submit")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{}"))
+            .unwrap(),
+        "203.0.113.7:40000",
+    ));
+    let response = noded::router(handle).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(response).await["reason"], "signature_missing");
+}
+
+/// a SIGNED submit acts as its key: the verified signer overrides the
+/// caller-supplied `origin`, which is only ever a claim (#1312).
+#[tokio::test]
+async fn a_signed_submit_is_authored_by_the_signer_not_the_claim() {
+    let (handle, cmd_rx, _events) = local_node();
+    spawn_fake_actor(cmd_rx, None);
+
+    let response = noded::router(handle)
+        .oneshot(signed(
+            "POST",
+            "/v1/submit",
+            serde_json::json!({
+                "target": "chat",
+                "payload": { "create_channel": { "channel_id": "general", "name": "General" } },
+                "origin": "somebody-else",
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // the fake actor echoes the stamped origin through `from_utf8_lossy`, so
+    // the comparison is made on the same terms: what landed is the acting key,
+    // not the string the body claimed.
+    let stamped = body_json(response).await["root_hash"]
+        .as_str()
+        .expect("origin echo")
+        .to_string();
+    let acting = String::from_utf8_lossy(caller().public_key().as_ref()).into_owned();
+    assert_eq!(stamped, acting);
+}
+
+/// one git pkt-line: a 4-hex length prefix over the payload INCLUDING itself.
+fn pkt(payload: &str) -> String {
+    format!("{:04x}{payload}", payload.len() + 4)
+}
+
+/// a stock (UNSIGNED) receive-pack body: one ref-update command, the flush that
+/// ends the command list, and an empty pack.
+fn unsigned_push_body() -> String {
+    let zero = "0".repeat(40);
+    let one = "1".repeat(40);
+    format!(
+        "{}0000",
+        pkt(&format!("{zero} {one} refs/heads/main\0report-status\n"))
+    )
+}
+
+/// A PUSH MUST PROVE ITSELF. An unsigned push used to be accepted and re-signed
+/// with the node's key, so the first one to a new repo made this node's raw
+/// pubkey the permanent owner (#1292).
+#[tokio::test]
+async fn an_unproven_push_is_refused() {
+    let (handle, cmd_rx, _events) = local_node();
+    tokio::spawn(async move {
+        let mut cmds = cmd_rx;
+        if cmds.next().await.is_some() {
+            panic!("an unproven push reached the node actor");
+        }
+    });
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/forge/lab/git-receive-pack")
+        .header(
+            header::CONTENT_TYPE,
+            "application/x-git-receive-pack-request",
+        )
+        .body(Body::from(unsigned_push_body()))
+        .unwrap();
+    let response = noded::router(handle).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        body_json(response).await["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("git push --signed")),
+        "the refusal names the two proofs a push can carry"
+    );
+}
+
+/// The node's own operator credential is the OTHER proof: it is what
+/// `make dogfood-forge` and the agent-run lane present, and it makes the NODE
+/// the repo's owner — right for a node publishing its own mirror.
+#[tokio::test]
+async fn an_operator_credentialed_push_is_admitted() {
+    let (handle, cmd_rx, _events) = local_node();
+    spawn_fake_actor(cmd_rx, None);
+
+    let request = with_operator(with_peer(
+        Request::builder()
+            .method("POST")
+            .uri("/forge/lab/git-receive-pack")
+            .header(
+                header::CONTENT_TYPE,
+                "application/x-git-receive-pack-request",
+            )
+            .body(Body::from(unsigned_push_body()))
+            .unwrap(),
+        "127.0.0.1:40000",
+    ));
+    let response = noded::router(handle).oneshot(request).await.unwrap();
+    assert_ne!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "the operator credential is a proof this route accepts"
+    );
+}
+
+/// a signature that does not bind THIS body is not a signature for THIS
+/// request: the gate hashes the body precisely so an authenticated caller's
+/// bytes cannot be swapped in flight.
+#[tokio::test]
+async fn a_swapped_body_defeats_the_signature() {
+    let (handle, _cmds, _events) = local_node();
+    let app = noded::router(handle);
+
+    let signed_for = serde_json::json!({ "prefix": "/shared/mine" });
+    let mut request = signed("POST", "/v1/fs/workspaces", signed_for);
+    *request.body_mut() = Body::from(r#"{"prefix":"/shared/yours"}"#);
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(response).await["reason"], "signature_invalid");
+}
+
+/// reads are NOT gated: the ruling is about mutation, and a status probe with
+/// no key must keep working.
+#[tokio::test]
+async fn reads_stay_open() {
+    let (handle, cmd_rx, _events) = local_node();
+    spawn_fake_actor(cmd_rx, None);
+    let app = noded::router(handle);
+
+    let status = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+
+    // the object facade shares its path with a gated PUT/DELETE — the GET half
+    // must not inherit the gate. (what it answers depends on the actor; that it
+    // is not a 401 is the property.)
+    let read = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/files/object/shared/x.txt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(read.status(), StatusCode::UNAUTHORIZED);
 }
 
 // ---- the signed-frame lane (`POST /v1/submit/frame`) -----------------------
@@ -169,7 +474,7 @@ fn chat_op() -> sdk::Msg {
 
 #[tokio::test]
 async fn a_signed_frame_lands_with_the_signers_key_as_the_origin() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    let (handle, cmd_rx, _events) = local_node();
     spawn_fake_actor(cmd_rx, None);
 
     let signer = commonware_cryptography::ed25519::PrivateKey::from_seed(42);
@@ -198,7 +503,7 @@ async fn a_signed_frame_lands_with_the_signers_key_as_the_origin() {
 
 #[tokio::test]
 async fn a_tampered_frame_is_refused_before_it_reaches_the_actor() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    let (handle, cmd_rx, _events) = local_node();
     spawn_fake_actor(cmd_rx, None);
 
     let signer = commonware_cryptography::ed25519::PrivateKey::from_seed(42);
@@ -233,7 +538,7 @@ async fn a_tampered_frame_is_refused_before_it_reaches_the_actor() {
 
 #[tokio::test]
 async fn a_frame_cannot_claim_another_keys_origin() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    let (handle, cmd_rx, _events) = local_node();
     spawn_fake_actor(cmd_rx, None);
 
     // key A signs; the frame is then re-stamped to claim key B's origin — the
@@ -261,7 +566,7 @@ async fn a_frame_cannot_claim_another_keys_origin() {
 
 #[tokio::test]
 async fn submit_receipt_op_hash_addresses_the_committed_payload() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    let (handle, cmd_rx, _events) = local_node();
     spawn_fake_actor(cmd_rx, None);
     let app = noded::router(handle);
 
@@ -309,7 +614,7 @@ async fn submit_receipt_op_hash_addresses_the_committed_payload() {
 
 #[tokio::test]
 async fn submit_maps_a_module_error_to_bad_request() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    let (handle, cmd_rx, _events) = local_node();
     spawn_fake_actor(cmd_rx, Some("module error: channel already exists"));
 
     let response = noded::router(handle)
@@ -331,7 +636,7 @@ async fn submit_maps_a_module_error_to_bad_request() {
 /// purpose — the refusal happens in the extractor, before dispatch.
 #[tokio::test]
 async fn submit_refuses_an_unknown_field_by_name() {
-    let (handle, _cmd_rx, _events) = NodeHandle::channel();
+    let (handle, _cmd_rx, _events) = local_node();
 
     let response = noded::router(handle)
         .oneshot(post(
@@ -352,7 +657,7 @@ async fn submit_refuses_an_unknown_field_by_name() {
 
 #[tokio::test]
 async fn query_returns_the_decoded_module_reply() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    let (handle, cmd_rx, _events) = local_node();
     spawn_fake_actor(cmd_rx, None);
 
     let response = noded::router(handle)
@@ -374,7 +679,7 @@ async fn status_reports_root_hash_height_and_module_roots() {
     // straight off the handle's cell, so it must answer even when nothing
     // drains the command lane — the wedged-behind-sync regression this cell
     // exists to prevent.
-    let (handle, _cmd_rx, _events) = NodeHandle::channel();
+    let (handle, _cmd_rx, _events) = local_node();
     handle.status_cell().publish(NodeStatus {
         version: "9.9.9".into(),
         root_hash: "cd".repeat(32),
@@ -423,7 +728,7 @@ async fn peers_reports_the_direct_peer_sample() {
     // NO actor: the sample parses from the wired exposition source and the
     // published standing — like status, peers must answer while a sync
     // stage has the pump busy.
-    let (handle, _cmd_rx, _events) = NodeHandle::channel();
+    let (handle, _cmd_rx, _events) = local_node();
     let cell = handle.status_cell();
     cell.wire_exposition(|| "network_tracker_directory_connected{peer=\"ab\"} 1000\n".to_string());
     cell.publish_peers(noded::PeersStanding {
@@ -464,7 +769,7 @@ async fn peers_reports_the_direct_peer_sample() {
 #[tokio::test]
 async fn metrics_forwards_the_encoded_registry_as_openmetrics_text() {
     // NO actor: the scrape reads the wired exposition source directly.
-    let (handle, _cmd_rx, _events) = NodeHandle::channel();
+    let (handle, _cmd_rx, _events) = local_node();
     handle.status_cell().wire_exposition(|| {
         "# HELP ducktape_blocks_total blocks\nducktape_blocks_total 3\n# EOF\n".to_string()
     });
@@ -504,7 +809,7 @@ const OPERATOR: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4
 
 /// a handle whose admin namespace is gated on [`OPERATOR`], default exposure.
 fn operator_handle() -> (NodeHandle, mpsc::Receiver<NodeCommand>) {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    let (handle, cmd_rx, _events) = local_node();
     let handle = handle.with_admin(AdminConfig {
         operator_token: Some(OPERATOR.to_string()),
         ..Default::default()
@@ -578,7 +883,7 @@ fn with_peer(mut req: Request<Body>, addr: &str) -> Request<Body> {
 /// path is a 404 — flag-day, no alias.
 #[tokio::test]
 async fn the_old_public_shutdown_route_is_gone() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    let (handle, cmd_rx, _events) = local_node();
     spawn_fake_actor(cmd_rx, None);
     let response = noded::router(handle)
         .oneshot(post("/v1/shutdown", serde_json::json!({})))
@@ -595,7 +900,7 @@ async fn the_old_public_shutdown_route_is_gone() {
 /// routes are never registered, so they 404 (not a gated-but-present 403).
 #[tokio::test]
 async fn a_disabled_admin_namespace_is_absent() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    let (handle, cmd_rx, _events) = local_node();
     spawn_fake_actor(cmd_rx, None);
     let handle = handle.with_admin(AdminConfig {
         exposure: AdminExposure::Disabled,
@@ -617,7 +922,7 @@ async fn a_disabled_admin_namespace_is_absent() {
 /// any owner check — the exposure gate is the outer wall.
 #[tokio::test]
 async fn a_non_loopback_peer_is_refused_under_loopback_exposure() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    let (handle, cmd_rx, _events) = local_node();
     spawn_fake_actor(cmd_rx, None);
     let request = with_peer(
         post("/v1/admin/shutdown", serde_json::json!({})),
@@ -763,6 +1068,8 @@ async fn the_module_stage_body_cap_is_explicit_and_its_refusal_is_named() {
 /// that fallback IS the hole this gate closes.
 #[tokio::test]
 async fn a_node_with_no_minted_credential_refuses_every_admin_request() {
+    // NOT `local_node()`: this is the node whose mint FAILED, so it carries the
+    // bare default config and has nothing to verify against.
     let (handle, cmd_rx, _events) = NodeHandle::channel();
     spawn_fake_actor(cmd_rx, None);
     // the default config carries no token, and the default exposure is Loopback.
@@ -795,7 +1102,10 @@ fn spawn_owner_actor(mut cmds: mpsc::Receiver<NodeCommand>, owner_key: Vec<u8>) 
                 else {
                     panic!("the admin owner path asks only OfKey");
                 };
-                assert_eq!(key, owner_key, "the owner path resolves the operator's own key");
+                assert_eq!(
+                    key, owner_key,
+                    "the owner path resolves the operator's own key"
+                );
                 let view = identity::AccountView {
                     number: 1,
                     name: "owner".into(),
@@ -856,7 +1166,7 @@ async fn public_admin_enforces_the_committed_owner_pop() {
     // with a committed owner must be on the owner path and nothing else, so
     // every assertion below is made against a node that HAS the other secret.
     let mk_handle = || {
-        let (handle, cmd_rx, _e) = NodeHandle::channel();
+        let (handle, cmd_rx, _e) = local_node();
         spawn_owner_actor(cmd_rx, owner_key.clone());
         handle.with_admin(AdminConfig {
             exposure: AdminExposure::Public,
@@ -967,10 +1277,12 @@ async fn public_admin_enforces_the_committed_owner_pop() {
 /// granted local trust.
 #[tokio::test]
 async fn a_peer_without_connect_info_is_refused() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    let (handle, cmd_rx, _events) = local_node();
     spawn_fake_actor(cmd_rx, None);
     let response = noded::router(handle)
-        .oneshot(post("/v1/admin/shutdown", serde_json::json!({})))
+        // `post()` stamps a loopback peer, which is exactly what this test must
+        // NOT have: the request arrives with no ConnectInfo at all.
+        .oneshot(with_operator(admin_request("POST", "/v1/admin/shutdown")))
         .await
         .unwrap();
     assert_eq!(
@@ -982,7 +1294,7 @@ async fn a_peer_without_connect_info_is_refused() {
 
 #[tokio::test]
 async fn a_dead_actor_maps_to_service_unavailable() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    let (handle, cmd_rx, _events) = local_node();
     drop(cmd_rx); // no actor at all
 
     let response = noded::router(handle)
@@ -1074,7 +1386,7 @@ fn spawn_gateway_actor(mut cmds: mpsc::Receiver<NodeCommand>, replies: usize) {
 #[tokio::test]
 async fn gateway_proxy_resolves_the_signed_route_and_forwards_post_body() {
     use base64::Engine as _;
-    let (handle, cmds, _events) = NodeHandle::channel();
+    let (handle, cmds, _events) = local_node();
     spawn_gateway_actor(cmds, 1);
     let (lane, mut jobs) = tokio::sync::mpsc::channel::<noded::GatewayJob>(1);
     tokio::spawn(async move {
@@ -1145,7 +1457,7 @@ async fn gateway_proxy_resolves_the_signed_route_and_forwards_post_body() {
 
 #[tokio::test]
 async fn gateway_api_rejects_untrusted_browser_origins_before_network_work() {
-    let (handle, _cmds, _events) = NodeHandle::channel();
+    let (handle, _cmds, _events) = local_node();
     for origin in ["https://evil.example", "http://app.demo.duck"] {
         let mut request = Request::builder()
             .method("GET")
@@ -1172,7 +1484,7 @@ async fn gateway_api_rejects_untrusted_browser_origins_before_network_work() {
 
 #[tokio::test]
 async fn gateway_browser_proxy_is_duck_origin_scoped_and_cross_origin_safe() {
-    let (handle, cmds, _events) = NodeHandle::channel();
+    let (handle, cmds, _events) = local_node();
     // One proxy request resolves once via duckdns and twice via gateway
     // (the revision pre-check plus proxy_current's own resolution).
     spawn_duck_actor(cmds, 3);
@@ -1287,7 +1599,7 @@ fn ws_upgrade(uri: &str) -> Request<Body> {
 
 #[tokio::test]
 async fn call_ws_route_is_wired() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    let (handle, cmd_rx, _events) = local_node();
     spawn_fake_actor(cmd_rx, None);
 
     let response = noded::router(handle)
@@ -1302,7 +1614,7 @@ async fn call_ws_route_is_wired() {
 
 #[tokio::test]
 async fn pages_presence_ws_route_is_wired() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    let (handle, cmd_rx, _events) = local_node();
     spawn_fake_actor(cmd_rx, None);
 
     let response = noded::router(handle)
@@ -1317,7 +1629,7 @@ async fn pages_presence_ws_route_is_wired() {
 async fn the_old_voice_ws_route_is_gone() {
     // app and node ship lockstep: `/v1/voice/ws` was replaced by `/v1/call/ws`,
     // so the old path is simply unrouted now — a 404, not a refusal.
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    let (handle, cmd_rx, _events) = local_node();
     spawn_fake_actor(cmd_rx, None);
 
     let response = noded::router(handle)
@@ -1399,7 +1711,7 @@ fn get(uri: &str) -> Request<Body> {
 
 #[tokio::test]
 async fn files_refs_route_returns_head() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    let (handle, cmd_rx, _events) = local_node();
     spawn_files_actor(cmd_rx, None);
 
     let response = noded::router(handle)
@@ -1415,7 +1727,7 @@ async fn files_refs_route_returns_head() {
 
 #[tokio::test]
 async fn files_diff_route_returns_entries() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    let (handle, cmd_rx, _events) = local_node();
     spawn_files_actor(cmd_rx, None);
 
     let response = noded::router(handle)
@@ -1431,7 +1743,7 @@ async fn files_diff_route_returns_entries() {
 
 #[tokio::test]
 async fn files_has_chunks_route_preserves_request_order() {
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    let (handle, cmd_rx, _events) = local_node();
     spawn_files_actor(cmd_rx, None);
 
     let present = "aa".repeat(32);
@@ -1450,7 +1762,7 @@ async fn files_has_chunks_route_preserves_request_order() {
 async fn files_module_rejection_is_a_verbatim_400_envelope() {
     // the engine's conflict taxonomy keys on the module error string arriving
     // untouched inside a 400 {"error": "files: ..."} — pin the envelope here.
-    let (handle, cmd_rx, _events) = NodeHandle::channel();
+    let (handle, cmd_rx, _events) = local_node();
     spawn_files_actor(cmd_rx, Some("files: conflict: /x changed since base"));
 
     let response = noded::router(handle)
@@ -1481,7 +1793,7 @@ async fn upload_pack_have_round_returns_only_plain_nak() {
     request_body.extend_from_slice(b"0000");
 
     let forge_root = tempfile::tempdir().expect("forge root");
-    let (handle, _cmd_rx, _events) = NodeHandle::channel();
+    let (handle, _cmd_rx, _events) = local_node();
     let response = noded::router(handle.with_forge_repo(forge_root.path()))
         .oneshot(
             Request::builder()
@@ -1514,10 +1826,11 @@ async fn fs_workspaces_is_503_when_unconfigured() {
     // a handle that never injected the workspace root (the fake actor's) answers
     // the seam with a clean 503, not a panic. no actor needed: the config guard
     // returns before any command crosses the lane.
-    let (handle, _cmd_rx, _events) = NodeHandle::channel();
+    let (handle, _cmd_rx, _events) = local_node();
 
     let response = noded::router(handle)
-        .oneshot(post(
+        .oneshot(signed(
+            "POST",
             "/v1/fs/workspaces",
             serde_json::json!({ "prefix": "/shared/x" }),
         ))
@@ -1532,11 +1845,12 @@ async fn fs_workspace_commit_rejects_a_bad_slug() {
     // a non-`[a-z0-9]` id (here uppercase) is refused BEFORE any disk touch —
     // the slug guard is the traversal defense on the path param.
     let root = tempfile::tempdir().expect("workspace root");
-    let (handle, _cmd_rx, _events) = NodeHandle::channel();
+    let (handle, _cmd_rx, _events) = local_node();
     let handle = handle.with_duckfs_workspaces(root.path().to_path_buf());
 
     let response = noded::router(handle)
-        .oneshot(post(
+        .oneshot(signed(
+            "POST",
             "/v1/fs/workspaces/BAD/commit",
             serde_json::json!({ "message": "m" }),
         ))
@@ -1564,27 +1878,31 @@ async fn the_invite_route_mints_refuses_and_says_when_it_cannot() {
             .expect("a bounded body");
         String::from_utf8(bytes.to_vec()).expect("utf-8")
     };
+    // minting is a mutation, so the caller presents a credential: here the
+    // operator one, which is what the desktop app (the only in-tree minter)
+    // reads out of the node's workspace.
     let post = |app: axum::Router, body: &'static str| async move {
-        app.oneshot(
+        app.oneshot(with_operator(with_peer(
             Request::builder()
                 .method("POST")
                 .uri("/v1/invite")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(body))
                 .expect("a request"),
-        )
+            "127.0.0.1:40000",
+        )))
         .await
         .expect("a response")
     };
 
     // no minter wired: the honest answer is "this daemon does not do that".
-    let (handle, _cmds, _events) = NodeHandle::channel();
+    let (handle, _cmds, _events) = local_node();
     let unwired = post(noded::router(handle), r#"{"ttl_days":7}"#).await;
     assert_eq!(unwired.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(body_of(unwired).await.contains("no invite minter"));
 
     // wired: the TTL reaches the minter, and the blob comes back whole.
-    let (handle, _cmds, _events) = NodeHandle::channel();
+    let (handle, _cmds, _events) = local_node();
     handle
         .status_cell()
         .wire_invite_minter(|ttl_days| Ok(format!("duck-invite-for-{ttl_days}-days")));

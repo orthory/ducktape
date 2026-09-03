@@ -112,7 +112,11 @@
   countable.
 - Turn one plane up on a LIVE node rather than restarting it — a restart destroys
   the wedged state you restarted to look at:
-  `curl -XPOST localhost:$PORT/v1/log-filter -d 'info,ducktape::join=debug'`
+  `ducktape node log-filter 'info,ducktape::join=debug' -n <chain-id>`
+  (the route MUTATES the process — a `trace` filter fills the disk — so it takes
+  a credential like every other mutating `/v1` route: the verb signs with the
+  active wallet key, and a bare `curl` needs
+  `-H "x-ducktape-admin-token: $(cat <workspace>/admin.token)"`.)
 - The index engine (fluent31) and the index guests running inside it log
   through the same subscriber, under the engine's crate-path targets
   (`fluent31::db`, `fluent31::compaction`, `fluent31::trigger`, `fluent31::wasm`),

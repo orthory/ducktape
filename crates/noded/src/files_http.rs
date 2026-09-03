@@ -2,16 +2,29 @@
 //!
 //! every handler is encode → existing-seam → decode → json: it builds the duckfs
 //! wire (the binary putblob frame or a `FilesMsg`/`FilesQuery` json) and threads
-//! it through the SAME `NodeCommand::Submit`/`Query` lane the generic /v1/submit
-//! and /v1/query use, so there is no new consensus path and no per-module
-//! plumbing beyond the wire encode. all writes ride the daemon's own external
-//! origin (like an unnamed /v1/submit) — this is the LOCAL-TRUST convenience
-//! lane (the CLI's write path, origin-guarded, loopback). authenticated
-//! per-user authorship does not thread through here: the desktop app signs a
-//! `FilesMsg` into an op frame with the user key (`user-sign-frame`) and
-//! POSTs it to `/v1/submit/frame`, whose verified signer becomes the commit's
-//! author. a public deployment gates or disables THIS lane; the frame lane is
-//! the one that survives untrusted callers.
+//! it through the SAME `NodeCommand::Submit`/`Query` lane `/v1/query` uses, so
+//! there is no new consensus path and no per-module plumbing beyond the wire
+//! encode.
+//!
+//! AUTHORSHIP. every write here submits under the ACTING key — whatever the
+//! request's signature proved possession of ([`crate::signed_req::SignedBy`]) —
+//! and never a caller-supplied string. duckfs charges the commit author, the
+//! `/home/<owner>/**` authority and the staging quota to it, so it is the one
+//! thing here that must not be a default (#1312). A write admitted by the
+//! node's OPERATOR CREDENTIAL instead carries the node's own name, which is
+//! true: the writer there is a daemon acting for the node (`ducktape fs`
+//! signs, so a person's commit is a person's).
+//!
+//! THE CEILING, stated rather than implied: `bin/node`'s validator ingress
+//! re-signs an unframed submit with the NODE's key
+//! (`validator/run/ingress.rs`), because a frame's origin IS its signer and the
+//! codec has no on-behalf-of field. So on a validator the acting key threaded
+//! here reaches the actor and stops; the embedded daemon and the sim, which
+//! honour the origin they are handed, record it. Carrying user authorship all
+//! the way to consensus needs the CLIENT to sign the frame
+//! (`/v1/submit/frame`, which duckfs already speaks —
+//! `bin/node/tests/fs_signed_frame_e2e.rs`), or a codec that can carry a
+//! delegation. Either is a wire decision, not a plumbing one.
 //!
 //! extracted from `lib.rs` (which is already over the file-size cap) so the
 //! duckfs surface grows in its own module; the workspace rpc (task 9) reuses the
@@ -31,7 +44,10 @@ use duckfs_core::{
 use futures::channel::oneshot;
 use serde::Deserialize;
 
-use crate::{BlockSummary, DEFAULT_ORIGIN, NodeCommand, NodeHandle, actor_gone, error_response};
+use axum::Extension;
+
+use crate::signed_req::{SignedBy, acting_origin};
+use crate::{BlockSummary, NodeCommand, NodeHandle, actor_gone, error_response};
 
 /// the target module every duckfs endpoint encodes for.
 pub(crate) const FILES_MODULE: &str = "files";
@@ -39,11 +55,16 @@ pub(crate) const FILES_MODULE: &str = "files";
 /// submit raw op bytes to the files module over the actor seam, returning the
 /// committed block or the module's rejection as a 400. the ONE submit path —
 /// the duckfs write endpoints just encode their wire (putblob frame or
-/// `FilesMsg` json) first, so nothing here touches consensus differently from
-/// /v1/submit.
+/// `FilesMsg` json) first.
+///
+/// `origin` is the ACTING identity: the key the request's signature proved
+/// possession of. duckfs charges authorship (`SnapshotObj.author`), the home
+/// authority (`/home/<owner>/**`) and the staging quota to it, so it is the one
+/// thing here that must never be a default.
 pub(crate) async fn files_submit(
     handle: &NodeHandle,
     op: &'static str,
+    origin: Vec<u8>,
     payload: Vec<u8>,
 ) -> Result<BlockSummary, Response> {
     let (reply, rx) = oneshot::channel();
@@ -51,7 +72,7 @@ pub(crate) async fn files_submit(
         .send(NodeCommand::Submit {
             target: FILES_MODULE.into(),
             payload,
-            origin: DEFAULT_ORIGIN.as_bytes().to_vec(),
+            origin,
             reply,
         })
         .await?;
@@ -81,7 +102,6 @@ fn refused(op: &'static str, reason: &'static str, detail: &str) {
     tracing::warn!(
         target: "ducktape::files",
         op,
-        origin = DEFAULT_ORIGIN,
         reason,
         detail,
         occurrences,
@@ -187,8 +207,10 @@ pub(crate) fn wrong_reply() -> Response {
 /// without a round-trip, and byte-identical to what the module stages under.
 pub(crate) async fn files_stage(
     State(handle): State<NodeHandle>,
+    signed: Option<Extension<SignedBy>>,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
+    let origin = acting_origin(signed.as_deref());
     let bytes = match body {
         Ok(bytes) => bytes,
         // the DefaultBodyLimit layer stops reading past CHUNK_SIZE and rejects
@@ -198,12 +220,12 @@ pub(crate) async fn files_stage(
     tracing::debug!(
         target: "ducktape::files",
         op = "stage",
-        origin = DEFAULT_ORIGIN,
+        origin = to_hex(&origin),
         bytes = bytes.len(),
         "files op"
     );
     let digest = to_hex(&object_id(Kind::Chunk, &bytes));
-    match files_submit(&handle, "stage", encode_putblob(&bytes)).await {
+    match files_submit(&handle, "stage", origin, encode_putblob(&bytes)).await {
         Ok(_) => Json(serde_json::json!({ "digest": digest })).into_response(),
         Err(resp) => resp,
     }
@@ -228,8 +250,10 @@ pub struct CommitBody {
 /// and submits it; the reply is the block that included it.
 pub(crate) async fn files_commit(
     State(handle): State<NodeHandle>,
+    signed: Option<Extension<SignedBy>>,
     Json(body): Json<CommitBody>,
 ) -> Response {
+    let origin = acting_origin(signed.as_deref());
     let changes = body.changes.len();
     let payload = encode_msg(&FilesMsg::Commit {
         base_snapshot: body.base_snapshot,
@@ -239,12 +263,12 @@ pub(crate) async fn files_commit(
     tracing::debug!(
         target: "ducktape::files",
         op = "commit",
-        origin = DEFAULT_ORIGIN,
+        origin = to_hex(&origin),
         paths = changes,
         bytes = payload.len(),
         "files op"
     );
-    match files_submit(&handle, "commit", payload).await {
+    match files_submit(&handle, "commit", origin, payload).await {
         Ok(block) => {
             commit_landed(&block, changes);
             Json(block).into_response()
@@ -264,8 +288,10 @@ pub struct PinBody {
 /// POST /v1/files/pin — pin a snapshot by name so gc keeps it reachable.
 pub(crate) async fn files_pin(
     State(handle): State<NodeHandle>,
+    signed: Option<Extension<SignedBy>>,
     Json(body): Json<PinBody>,
 ) -> Response {
+    let origin = acting_origin(signed.as_deref());
     let payload = encode_msg(&FilesMsg::Pin {
         snapshot: body.snapshot,
         name: body.name,
@@ -273,11 +299,11 @@ pub(crate) async fn files_pin(
     tracing::debug!(
         target: "ducktape::files",
         op = "pin",
-        origin = DEFAULT_ORIGIN,
+        origin = to_hex(&origin),
         bytes = payload.len(),
         "files op"
     );
-    match files_submit(&handle, "pin", payload).await {
+    match files_submit(&handle, "pin", origin, payload).await {
         Ok(block) => Json(block).into_response(),
         Err(resp) => resp,
     }
@@ -297,13 +323,15 @@ pub struct WatchBody {
 /// emitting the op inside a block instead.
 pub(crate) async fn files_watch(
     State(handle): State<NodeHandle>,
+    signed: Option<Extension<SignedBy>>,
     Json(body): Json<WatchBody>,
 ) -> Response {
+    let origin = acting_origin(signed.as_deref());
     let payload = encode_msg(&FilesMsg::Watch {
         prefix: body.prefix,
         module_id: body.module_id,
     });
-    match files_submit(&handle, "watch", payload).await {
+    match files_submit(&handle, "watch", origin, payload).await {
         Ok(block) => Json(block).into_response(),
         Err(resp) => resp,
     }
@@ -624,10 +652,12 @@ async fn head_snapshot(handle: &NodeHandle) -> Result<Option<String>, Response> 
 /// references the digests. replies with the committing block.
 pub(crate) async fn object_put(
     State(handle): State<NodeHandle>,
+    signed: Option<Extension<SignedBy>>,
     axum::extract::Path(rest): axum::extract::Path<String>,
     Query(p): Query<ObjectPutParams>,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
+    let origin = acting_origin(signed.as_deref());
     let bytes = match body {
         Ok(bytes) => bytes,
         Err(rejection) => return body_refused("put", "object_over_cap", &rejection),
@@ -636,7 +666,7 @@ pub(crate) async fn object_put(
     tracing::debug!(
         target: "ducktape::files",
         op = "put",
-        origin = DEFAULT_ORIGIN,
+        origin = to_hex(&origin),
         paths = 1,
         bytes = bytes.len(),
         "files op"
@@ -655,7 +685,9 @@ pub(crate) async fn object_put(
         let mut chunks = Vec::with_capacity(bytes.len().div_ceil(duckfs_core::CHUNK_SIZE as usize));
         for chunk in bytes.chunks(duckfs_core::CHUNK_SIZE as usize) {
             let digest = to_hex(&object_id(Kind::Chunk, chunk));
-            if let Err(resp) = files_submit(&handle, "stage", encode_putblob(chunk)).await {
+            if let Err(resp) =
+                files_submit(&handle, "stage", origin.clone(), encode_putblob(chunk)).await
+            {
                 return resp;
             }
             chunks.push(digest);
@@ -676,7 +708,7 @@ pub(crate) async fn object_put(
             content,
         }],
     });
-    match files_submit(&handle, "commit", payload).await {
+    match files_submit(&handle, "commit", origin, payload).await {
         Ok(block) => {
             commit_landed(&block, 1);
             Json(block).into_response()
@@ -768,8 +800,10 @@ pub(crate) async fn object_get(
 /// still surface the module's 400 — narrow, and honest about the conflict.)
 pub(crate) async fn object_delete(
     State(handle): State<NodeHandle>,
+    signed: Option<Extension<SignedBy>>,
     axum::extract::Path(rest): axum::extract::Path<String>,
 ) -> Response {
+    let origin = acting_origin(signed.as_deref());
     let path = object_path(&rest);
     match files_query(
         &handle,
@@ -796,7 +830,7 @@ pub(crate) async fn object_delete(
         message: format!("rm {path}"),
         changes: vec![Change::Rm { path }],
     });
-    match files_submit(&handle, "commit", payload).await {
+    match files_submit(&handle, "commit", origin, payload).await {
         Ok(block) => {
             commit_landed(&block, 1);
             Json(block).into_response()

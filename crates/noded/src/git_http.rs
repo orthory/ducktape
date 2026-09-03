@@ -506,6 +506,16 @@ fn push_cert_nonce(handle: &NodeHandle, repo: &str) -> Option<String> {
 /// receive-pack (push) and upload-pack (fetch) are served — the v0 banner we
 /// send makes git speak the classic protocol for the follow-up POST even when it
 /// probed with `Git-Protocol: version=2`.
+///
+/// AUTH: a READ, for BOTH services, and it has to be. The receive-pack
+/// advertisement is what a client fetches to learn the head it is fast-forwarding
+/// from and the `push-cert` nonce it must sign over — so requiring a credential
+/// HERE would make `git push --signed` impossible for exactly the person whose
+/// certificate is the credential [`git_receive_pack`] wants. It gives nothing
+/// away either: the nonce is a pure function of chain id and repo name
+/// ([`push_cert_nonce`]) and mints no state, and the refs it lists are the same
+/// refs the open upload-pack advertisement hands any clone. The proof is
+/// demanded where the mutation is — on the receive-pack POST.
 pub(crate) async fn git_info_refs(
     State(handle): State<NodeHandle>,
     Path(repo): Path<String>,
@@ -639,6 +649,7 @@ fn push_refusal_reason(message: &str) -> &'static str {
 pub(crate) async fn git_receive_pack(
     State(handle): State<NodeHandle>,
     Path(repo): Path<String>,
+    operator: Option<axum::Extension<crate::signed_req::OperatorCredential>>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
@@ -710,6 +721,28 @@ pub(crate) async fn git_receive_pack(
             return error_response(StatusCode::BAD_REQUEST, &msg);
         }
     };
+
+    // A PUSH MUST PROVE ITSELF, exactly like every other mutating route — and
+    // it proves itself one of the two ways git can carry:
+    //
+    // * git's OWN push certificate (`git push --signed`), whose signer becomes
+    //   the acting principal on chain, or
+    // * this node's operator credential in a header, which a local operator
+    //   sets with git's `http.extraHeader` and which makes the NODE the
+    //   principal — right for a node seeding or republishing its own repo,
+    //   and what the agent-run lane pushing back into this node presents.
+    //
+    // A push with neither used to be accepted and RE-SIGNED WITH THE NODE'S
+    // KEY, so the first unsigned push to a new repo made this node's raw
+    // pubkey the permanent owner and every later signed push was refused as
+    // "only the owner" (#1292). The data-plane signature is NOT a third way:
+    // it covers a body digest, and `git push` computes the packfile itself.
+    if cert.is_none() && operator.is_none() {
+        const REFUSAL: &str = "this push carries no proof: sign it (`git push --signed`) \
+                               or present this node's operator credential";
+        push_refused(&repo, "push_unauthenticated", REFUSAL);
+        return error_response(StatusCode::UNAUTHORIZED, REFUSAL);
+    }
 
     // only branches are pushable (no tags/notes). consume-and-refuse: the pack
     // was fully received; reporting `ng` (not an http error) lets git print a

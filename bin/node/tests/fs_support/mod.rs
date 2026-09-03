@@ -13,6 +13,10 @@ use std::process::Command;
 use host::Host;
 use noded::testkit::InProcDaemon;
 
+/// the password this harness's wallet is minted under. `ducktape fs commit`
+/// SIGNS, so it opens that wallet and asks for this on stdin.
+const WALLET_PASSWORD: &str = "harness-wallet";
+
 /// a running in-process node plus the CLI-under-test's path.
 pub struct Harness {
     // dropped BEFORE `dir` (fields drop in declaration order): the daemon's Drop
@@ -37,7 +41,40 @@ impl Harness {
             },
             vec!["files".into()],
         );
-        Harness { daemon, dir }
+        let harness = Harness { daemon, dir };
+        harness.mint_wallet();
+        harness
+    }
+
+    /// Mint the wallet `ducktape fs commit`/`pin` signs with.
+    ///
+    /// A duckfs write is charged to the key that signed the request — the
+    /// commit's author, the `/home/<owner>/**` authority, the staging quota —
+    /// so the verb has an identity or it has nothing to write as. A REAL
+    /// `ducktape wallet new` rather than a hand-written key file: the format is
+    /// the wallet verb's to define, and a fixture that hand-rolls it tests the
+    /// fixture.
+    fn mint_wallet(&self) {
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+            .args(["wallet", "new", "harness"])
+            .env("DUCKTAPE_HOME", self.dir.path())
+            .stdin(self.password_pipe())
+            .output()
+            .expect("mint the harness wallet");
+        assert!(
+            out.status.success(),
+            "the harness wallet must mint: {out:?}"
+        );
+    }
+
+    /// stdin for one CLI run: the wallet password, on a file rather than a pipe
+    /// so `.output()` (which does not write stdin) still answers the prompt.
+    fn password_pipe(&self) -> std::fs::File {
+        let path = self.dir.path().join("wallet-password");
+        if !path.exists() {
+            std::fs::write(&path, format!("{WALLET_PASSWORD}\n")).expect("write the password");
+        }
+        std::fs::File::open(&path).expect("open the password")
     }
 
     /// the http base the CLI's `--node` flag takes.
@@ -45,10 +82,27 @@ impl Harness {
         self.daemon.node_url()
     }
 
+    /// the header a mutating request carries — the harness owns this node, so
+    /// it presents the operator credential the daemon minted.
+    pub fn write_header(&self) -> (&'static str, &str) {
+        self.daemon.write_header()
+    }
+
+    /// a duckfs transport whose writes this node admits: the harness owns the
+    /// node, so it presents the operator credential the daemon minted.
+    pub fn files(&self) -> duckfs_client::http::HttpNode {
+        self.daemon.files()
+    }
+
     /// a `ducktape fs` invocation pre-pointed at this node via `--node`.
     pub fn cli(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape"));
-        cmd.arg("fs").args(args).arg("--node").arg(self.node_url());
+        cmd.arg("fs")
+            .args(args)
+            .arg("--node")
+            .arg(self.node_url())
+            .env("DUCKTAPE_HOME", self.dir.path())
+            .stdin(self.password_pipe());
         cmd
     }
 
@@ -63,7 +117,8 @@ impl Harness {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape"));
         cmd.arg("fs")
             .args(args)
-            .env("DUCKTAPE_HOME", self.dir.path());
+            .env("DUCKTAPE_HOME", self.dir.path())
+            .stdin(self.password_pipe());
         cmd
     }
 }

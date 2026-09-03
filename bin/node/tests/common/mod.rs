@@ -23,7 +23,7 @@
 
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -275,6 +275,50 @@ impl NetworkShapeCluster {
             nodes: vec![None, None],
             dir,
         }
+    }
+
+    /// this shape's per-node workspace — the directory holding `node.toml`, and
+    /// the credential the node mints beside it.
+    pub fn workspace(&self, idx: usize) -> PathBuf {
+        match idx {
+            0 => self.founder_dir.clone(),
+            _ => self.friend_dir.clone(),
+        }
+    }
+
+    /// the `GIT_CONFIG_*` environment a push at node `idx` must carry — the
+    /// shape-cluster twin of [`Cluster::git_push_env`].
+    pub fn git_push_env(&self, idx: usize) -> [(String, String); 3] {
+        git_push_env_for(&self.workspace(idx))
+    }
+
+    /// one request against node `idx`'s app surface, carrying that node's
+    /// operator credential — the shape-cluster twin of [`Cluster::http`].
+    pub fn http(
+        &self,
+        idx: usize,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> (u16, serde_json::Value) {
+        let token = noded::admin::read_operator_token(&self.workspace(idx))
+            .expect("the node minted an operator credential");
+        let bytes = body
+            .map(|b| serde_json::to_vec(b).expect("request body serializes"))
+            .unwrap_or_default();
+        let (status, raw) = nettest::try_http_bytes_with(
+            self.http_ports[idx],
+            method,
+            path,
+            "application/json",
+            &[(noded::admin::ADMIN_TOKEN_HEADER, &token)],
+            &bytes,
+        )
+        .expect("app-surface request");
+        (
+            status,
+            serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null),
+        )
     }
 
     pub fn init_founder(&self, name: &str) -> String {
@@ -1534,7 +1578,67 @@ impl Cluster {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> (u16, serde_json::Value) {
-        http_request(self.http_ports[idx], method, path, body)
+        let bytes = body
+            .map(|b| serde_json::to_vec(b).expect("request body serializes"))
+            .unwrap_or_default();
+        let (status, raw) = self.http_bytes(idx, method, path, "application/json", &bytes);
+        (
+            status,
+            serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// the raw-bytes twin of [`Self::http`], carrying this node's operator
+    /// credential. EVERY mutating `/v1` route refuses a caller that presents
+    /// neither that nor a user signature, and a harness driving a node it owns
+    /// is exactly the local operator the credential names.
+    pub fn http_bytes(
+        &self,
+        idx: usize,
+        method: &str,
+        path: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> (u16, Vec<u8>) {
+        let token = self.operator_token(idx);
+        nettest::try_http_bytes_with(
+            self.http_ports[idx],
+            method,
+            path,
+            content_type,
+            &[(noded::admin::ADMIN_TOKEN_HEADER, &token)],
+            body,
+        )
+        .expect("app-surface request")
+    }
+
+    /// node `idx`'s operator credential, read out of the workspace the node
+    /// minted it into at boot — the same file a real local daemon reads.
+    pub fn operator_token(&self, idx: usize) -> String {
+        noded::admin::read_operator_token(&self.workspace(idx))
+            .expect("the node minted an operator credential")
+    }
+
+    /// the `GIT_CONFIG_*` environment a push at node `idx`'s smart-HTTP
+    /// surface must carry.
+    ///
+    /// `git-receive-pack` refuses a push that proves nothing (#1292): it takes
+    /// git's own push certificate, or this node's operator credential. A
+    /// harness pushing at a node it spawned IS its operator. `GIT_CONFIG_*`
+    /// rather than `git -c`, exactly as `ops/dogfood-forge.sh` sets it — an
+    /// argv is world-readable through /proc, and this is a secret.
+    pub fn git_push_env(&self, idx: usize) -> [(String, String); 3] {
+        git_push_env_for(&self.workspace(idx))
+    }
+
+    /// a duckfs transport for node `idx` whose writes it admits.
+    pub fn files(&self, idx: usize) -> duckfs_client::http::HttpNode {
+        let token = self.operator_token(idx);
+        duckfs_client::http::HttpNode::new(self.http_base(idx)).with_write_auth(
+            std::sync::Arc::new(move |_method, _path, _body| {
+                vec![(noded::admin::ADMIN_TOKEN_HEADER.to_string(), token.clone())]
+            }),
+        )
     }
 
     /// GET a raw TEXT body from node `idx`'s app surface — for non-json
@@ -1550,20 +1654,41 @@ impl Cluster {
         format!("http://127.0.0.1:{}", self.http_ports[idx])
     }
 
-    /// every running node's log tail — the panic payload that makes a stalled
-    /// mesh diagnosable from a CI failure alone.
+    /// Every log this cluster owns: each node's, AND each service daemon's —
+    /// the panic payload that makes a stalled mesh diagnosable from a CI
+    /// failure alone.
+    ///
+    /// The daemons are not decoration. A dispatch/agent e2e fails on a
+    /// PREDICATE the node's own log cannot explain — "no provider announced its
+    /// tags", "nobody bid" — because the decision was the daemon's and the node
+    /// only ever saw its silence. Those logs live in a `TempDir` that Drop
+    /// removes as the panic unwinds, so a tail that skips them throws away the
+    /// only copy.
     pub fn all_log_tails(&self, lines: usize) -> String {
-        self.nodes
-            .iter()
-            .flatten()
-            .map(|n| {
-                let text = std::fs::read_to_string(&n.log).unwrap_or_default();
-                format!(
-                    "--- node #{} log tail ---\n{}",
-                    n.id,
-                    log_tail(&text, lines)
-                )
-            })
+        let nodes = self.nodes.iter().flatten().map(|n| {
+            let text = std::fs::read_to_string(&n.log).unwrap_or_default();
+            format!("--- node #{} log tail ---\n{}", n.id, log_tail(&text, lines))
+        });
+        let riding = self.daemons.iter().flatten().map(|d| {
+            let text = std::fs::read_to_string(&d.log).unwrap_or_default();
+            format!(
+                "--- node #{} compute daemon log tail ---\n{}",
+                d.id,
+                log_tail(&text, lines)
+            )
+        });
+        let explicit = self.services.iter().flatten().map(|s| {
+            let text = std::fs::read_to_string(&s.proc.log).unwrap_or_default();
+            format!(
+                "--- node #{} {} daemon log tail ---\n{}",
+                s.proc.id,
+                s.kind,
+                log_tail(&text, lines)
+            )
+        });
+        nodes
+            .chain(riding)
+            .chain(explicit)
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -1577,6 +1702,24 @@ impl Cluster {
         );
         reply["status"].clone()
     }
+}
+
+/// the `GIT_CONFIG_*` environment carrying the operator credential minted into
+/// `workspace` — one implementation for both cluster shapes.
+fn git_push_env_for(workspace: &Path) -> [(String, String); 3] {
+    let token = noded::admin::read_operator_token(workspace)
+        .expect("the node minted an operator credential");
+    [
+        ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+        (
+            "GIT_CONFIG_KEY_0".to_string(),
+            "http.extraHeader".to_string(),
+        ),
+        (
+            "GIT_CONFIG_VALUE_0".to_string(),
+            format!("{}: {token}", noded::admin::ADMIN_TOKEN_HEADER),
+        ),
+    ]
 }
 
 fn command_output(out: &std::process::Output) -> String {

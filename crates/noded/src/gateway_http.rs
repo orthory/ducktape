@@ -437,12 +437,12 @@ fn user_pop_headers(headers: &HeaderMap) -> Result<Option<gateway::UserPop>, Str
     match (key, ts, sig) {
         (None, None, None) => Ok(None),
         (Some(key), Some(ts), Some(sig)) => Ok(Some(gateway::UserPop {
-            key: crate::admin::from_hex(&key)
+            key: crate::signed_req::from_hex(&key)
                 .ok_or_else(|| "x-duck-user-key is not hex".to_string())?,
             ts: ts
                 .parse()
                 .map_err(|_| "x-duck-user-ts is not a unix timestamp".to_string())?,
-            sig: crate::admin::from_hex(&sig)
+            sig: crate::signed_req::from_hex(&sig)
                 .ok_or_else(|| "x-duck-user-sig is not hex".to_string())?,
         })),
         _partial => Err("x-duck-user-key, -ts and -sig travel together".into()),

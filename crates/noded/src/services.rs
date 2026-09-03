@@ -471,14 +471,15 @@ fn expire(entries: &mut HashMap<String, Entry>, now: Instant) {
     });
 }
 
-// AUTH: both routes are registered on the daemon's `public` router, so they
-// inherit the SAME gate as `/v1/submit` and `/v1/term/sessions`:
-// `origin_guard::guard` + its CORS allowlist. That surface is trusted-local by
-// design (see `origin_guard`) — the CLI sends no `Origin` and is allowed; a
-// browser must present an allowlisted one. There is no bearer token because a
-// local process can already read the node's key off disk. Signaling is
-// deliberately unprivileged: an entry grants NOTHING, so the weakest gate on
-// the surface is the right one. Consent happens in `ducktape service enable`.
+// AUTH: a hello is DELIBERATELY the one write-shaped route with no credential —
+// it is not in the signed-write table (`crate::signed_req`) that `/v1/submit`
+// and `/v1/term/sessions` are, and it should not be. An entry grants NOTHING
+// (it is volatile presence that ages out on its own TTL; consent happens in
+// `ducktape service enable`), so the weakest gate on the surface is the right
+// one, and a daemon that has not yet read the node's workspace must still be
+// able to say it is up. What DOES run in front of it is the browser
+// `origin_guard` + CORS allowlist: the CLI sends no `Origin` and is allowed, a
+// browser must present an allowlisted one.
 //
 // NOTE the transport assumption: unlike `/v1/submit`, which carries a signed
 // frame and is therefore safe wherever it is reachable, a hello is

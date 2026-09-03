@@ -88,12 +88,11 @@ impl Harness {
                         Box::new(sdk_testkit::MemStore::new()),
                     )),
                     Box::new(tagging::TaggingModule::new(
-            "tagging",
-            Box::new(sdk_testkit::MemStore::new()),
-        )),
+                        "tagging",
+                        Box::new(sdk_testkit::MemStore::new()),
+                    )),
                     Box::new(
-                        forge::Forge::with_blobs("forge", forge_base, blobs)
-                            .expect("forge module"),
+                        forge::Forge::with_blobs("forge", forge_base, blobs).expect("forge module"),
                     ),
                     Box::new(runs::RunsModule::new(
                         "runs",
@@ -303,13 +302,16 @@ impl Harness {
     /// wants a computable PR diff has to put real ones here rather than
     /// fabricating an oid.
     pub fn put_blob(&self, bytes: &[u8]) -> String {
-        let (status, body) = nettest::http_bytes(
+        let (name, token) = self.daemon.write_header();
+        let (status, body) = nettest::try_http_bytes_with(
             self.daemon.port(),
             "POST",
             "/v1/files/blob",
             "application/octet-stream",
+            &[(name, token)],
             bytes,
-        );
+        )
+        .expect("node reachable");
         assert_eq!(
             status,
             200,
@@ -323,15 +325,32 @@ impl Harness {
             .to_string()
     }
 
+    /// Every seeding POST carries the node's operator credential: the harness
+    /// owns this node, and a mutating route refuses a caller that holds neither
+    /// that nor a user signature.
     fn post(&self, path: &str, body: &Value) -> Value {
-        nettest::http_json(self.daemon.port(), "POST", path, Some(body)).1
+        let (name, token) = self.daemon.write_header();
+        let bytes = serde_json::to_vec(body).expect("request body serializes");
+        let (_status, raw) = nettest::try_http_bytes_with(
+            self.daemon.port(),
+            "POST",
+            path,
+            "application/json",
+            &[(name, token)],
+            &bytes,
+        )
+        .expect("node reachable");
+        serde_json::from_slice(&raw).unwrap_or(Value::Null)
     }
 }
 
 /// the text a `tools/call` result carries, and whether it was a refusal.
 pub fn content(result: &Value) -> (bool, String) {
     let is_error = result["isError"].as_bool().unwrap_or(false);
-    let text = result["content"][0]["text"].as_str().unwrap_or("").to_string();
+    let text = result["content"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
     (is_error, text)
 }
 

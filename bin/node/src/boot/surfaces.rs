@@ -167,11 +167,13 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // is fatal-with-remedy rather than a silent no-index run: the tier is
     // rebuildable, so the fix is always "delete <storage>/index".
     let index = noded::open_index_store(storage, MODULE_IDS)?;
-    // the admin namespace's operator credential: minted fresh each boot and
-    // written 0600 beside node.toml, exactly like the service link token — and
-    // NOT minted at all under `DUCKTAPE_ADMIN=off`, where the routes do not
-    // exist to present it to. The node key goes on below; everything else is
-    // decided here.
+    // this node's operator credential: minted fresh each boot and written 0600
+    // beside node.toml, exactly like the service link token. Minted on EVERY
+    // boot, `DUCKTAPE_ADMIN=off` included — it is no longer the admin
+    // namespace's alone, it is what this node's own daemons present to the
+    // mutating `/v1` write gate (`noded::signed_req`), and turning the control
+    // surface off must not leave the announce and lease writes with nothing to
+    // show. The node key goes on below; everything else is decided here.
     let admin = noded::AdminConfig::minted(admin_exposure, workspace);
     stream_hub.prime(index.resume_height()?, String::new());
     // the realtime hub's session lane: /v1/call/ws and /v1/presence/ws ask for

@@ -471,8 +471,10 @@ fn a_parked_joiner_serves_the_terminal_plane() {
     // never appeared and every create answered the plane-missing 503.
     cluster.wait_marker(1, "terminal_plane_ready", READY);
 
-    let (status, body) = common::http_request(
-        cluster.http_ports[1],
+    // creating a session MUTATES this node, so the request carries the node's
+    // own operator credential — the harness spawned it, so it is its operator.
+    let (status, body) = cluster.http(
+        1,
         "POST",
         "/v1/term/sessions",
         Some(&json!({ "agent": "echo" })),

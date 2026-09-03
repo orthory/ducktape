@@ -10,12 +10,15 @@ use support::Harness;
 
 /// seed `/shared` with a small file, a >1 MiB file, and a nested file. returns
 /// the big file's bytes so `cat` can be checked byte-exact.
-fn seed(node_url: &str) -> Vec<u8> {
+fn seed(h: &Harness) -> Vec<u8> {
     use duckfs_client::checkout::{CheckoutOptions, checkout_with};
     use duckfs_client::commit::commit;
-    use duckfs_client::http::HttpNode;
 
-    let node = HttpNode::new(node_url.to_string());
+    let node_url = h.node_url();
+    let node_url = node_url.as_str();
+    // seeding WRITES, and a write carries the node's credential: the harness
+    // owns this node, so it presents the operator one its own daemon minted.
+    let node = h.files();
     let dir = tempfile::tempdir().expect("seed dir");
     let opts = CheckoutOptions {
         node_url: node_url.to_string(),
@@ -38,7 +41,7 @@ fn seed(node_url: &str) -> Vec<u8> {
 #[test]
 fn ls_lists_the_seeded_entries() {
     let h = Harness::start();
-    seed(&h.node_url());
+    seed(&h);
 
     let out = h.cli(&["ls", "/shared"]).output().expect("run ls");
     assert!(out.status.success(), "ls exits 0: {:?}", out);
@@ -51,7 +54,7 @@ fn ls_lists_the_seeded_entries() {
 #[test]
 fn cat_streams_bytes_exactly_including_a_large_file() {
     let h = Harness::start();
-    let big = seed(&h.node_url());
+    let big = seed(&h);
 
     let small = h
         .cli(&["cat", "/shared/note.txt"])
@@ -71,7 +74,7 @@ fn cat_streams_bytes_exactly_including_a_large_file() {
 #[test]
 fn stat_reports_the_entry_facts() {
     let h = Harness::start();
-    seed(&h.node_url());
+    seed(&h);
 
     let out = h.cli(&["stat", "/shared/note.txt"]).output().expect("stat");
     assert!(out.status.success(), "stat exits 0: {:?}", out);
@@ -83,7 +86,7 @@ fn stat_reports_the_entry_facts() {
 #[test]
 fn history_lists_the_commit() {
     let h = Harness::start();
-    seed(&h.node_url());
+    seed(&h);
 
     let out = h.cli(&["history"]).output().expect("history");
     assert!(out.status.success(), "history exits 0: {:?}", out);
@@ -116,7 +119,7 @@ fn missing_node_address_is_a_clear_error() {
 #[test]
 fn checkout_status_commit_loop() {
     let h = Harness::start();
-    seed(&h.node_url());
+    seed(&h);
 
     let work = tempfile::tempdir().expect("work dir");
     let wd = work.path().to_str().unwrap();
@@ -198,7 +201,7 @@ fn checkout_status_commit_loop() {
 #[test]
 fn commit_conflict_exits_2_and_names_the_path() {
     let h = Harness::start();
-    seed(&h.node_url());
+    seed(&h);
 
     let a = tempfile::tempdir().expect("a");
     let b = tempfile::tempdir().expect("b");

@@ -126,15 +126,17 @@ pub struct CreateBody {
 /// files before committing over the id.
 pub(crate) async fn create_workspace(
     State(handle): State<NodeHandle>,
+    signed: Option<axum::Extension<crate::SignedBy>>,
     Json(body): Json<CreateBody>,
 ) -> Response {
+    let origin = crate::signed_req::acting_origin(signed.as_deref());
     let Some(root) = handle.duckfs_workspaces.clone() else {
         return unconfigured();
     };
     let id = new_slug();
     let dir = root.join(&id);
     let path_str = dir.display().to_string();
-    let api = ActorNodeApi::new(handle.clone());
+    let api = ActorNodeApi::new(handle.clone(), origin);
     let prefix = match checkout_prefix(&id, body.prefix.as_deref().unwrap_or("/workspace")) {
         Ok(prefix) => prefix,
         Err(err) => return error_response(StatusCode::BAD_REQUEST, &err),
@@ -176,9 +178,11 @@ pub struct CommitWsBody {
 /// carrying the serialized `ConflictReport` (clashing paths and a remedy).
 pub(crate) async fn commit_workspace(
     State(handle): State<NodeHandle>,
+    signed: Option<axum::Extension<crate::SignedBy>>,
     Path(id): Path<String>,
     Json(body): Json<CommitWsBody>,
 ) -> Response {
+    let origin = crate::signed_req::acting_origin(signed.as_deref());
     let Some(root) = handle.duckfs_workspaces.clone() else {
         return unconfigured();
     };
@@ -186,7 +190,7 @@ pub(crate) async fn commit_workspace(
         return error_response(StatusCode::BAD_REQUEST, "invalid workspace id");
     }
     let dir = root.join(&id);
-    let api = ActorNodeApi::new(handle.clone());
+    let api = ActorNodeApi::new(handle.clone(), origin);
     let lock = workspace_lock(&id);
     let message = body.message;
     let result = tokio::task::spawn_blocking(move || {

@@ -115,8 +115,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_duckfs_workspaces(storage.join("duckfs-workspaces"))
         // the single-writer daemon has no consensus and no on-chain owner, so
         // admin is operator-gated: the credential minted into
-        // <storage>/admin.token 0600 is what a client presents. `DUCKTAPE_ADMIN=off`
-        // removes the control surface entirely, and mints nothing.
+        // <storage>/admin.token 0600 is what a client presents — and what the
+        // mutating `/v1` write gate takes from a local daemon that has no user
+        // key. `DUCKTAPE_ADMIN=off` removes the control surface entirely; the
+        // credential is still minted, because the write gate still wants it.
         .with_admin(noded::AdminConfig::minted(
             noded::AdminExposure::from_env(),
             &storage,
