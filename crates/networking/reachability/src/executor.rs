@@ -395,7 +395,7 @@ async fn host_loop<E: WireGuardEffect>(
     loop {
         let input = tokio::select! {
             biased;
-            Some(done) = done_rx.recv() => Input::Step { event: completion_event(done), exit: false },
+            Some(done) = done_rx.recv() => Input::Step { event: Box::new(completion_event(done)), exit: false },
             cmd = commands.recv() => match cmd {
                 Some(cmd) => host.input(cmd).await?,
                 None => return Err(ReachabilityError::ChannelClosed),
@@ -403,7 +403,7 @@ async fn host_loop<E: WireGuardEffect>(
         };
         match input {
             Input::Step { event, exit } => {
-                machine = host.step(&factory, machine, event).await?;
+                machine = host.step(&factory, machine, *event).await?;
                 if exit {
                     return Ok(());
                 }
@@ -418,7 +418,7 @@ async fn host_loop<E: WireGuardEffect>(
 /// What one turn of the loop does: step the machine, or swap it.
 enum Input {
     Step {
-        event: Event,
+        event: Box<Event>,
         exit: bool,
     },
     Swap {
@@ -612,7 +612,12 @@ impl<E: WireGuardEffect> Host<E> {
     /// later, reading the persisted mesh once for the boot retarget), or
     /// the one command that swaps the machine instead of stepping it.
     async fn input(&mut self, cmd: ReachabilityCommand) -> Result<Input, ReachabilityError> {
-        let step = |event: Event, exit: bool| Ok(Input::Step { event, exit });
+        let step = |event: Event, exit: bool| {
+            Ok(Input::Step {
+                event: Box::new(event),
+                exit,
+            })
+        };
         match cmd {
             ReachabilityCommand::Retarget(event) => {
                 let persisted = self.read_restore_file().await?;

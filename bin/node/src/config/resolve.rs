@@ -14,9 +14,9 @@ use workspace_config::node_toml::{
     DevSeedToml, NodeToml, RawNodeToml, SandboxToml, load_raw_node_toml,
 };
 use workspace_config::{
-    Coordination, DEFAULT_CHECKPOINT_BLOCKS, Front, InviteToken, NetworkDescriptor, ReachDial,
-    StoredInviteWireGuard, dialable, hex_bytes, ingress_of, load_coord_cap, load_invite_fronts,
-    load_invite_token, load_invite_wireguard,
+    Coordination, DEFAULT_BLOCK_TIME_MS, DEFAULT_CHECKPOINT_BLOCKS, Front, InviteToken,
+    NetworkDescriptor, ReachDial, StoredInviteWireGuard, dialable, hex_bytes, ingress_of,
+    load_coord_cap, load_invite_fronts, load_invite_token, load_invite_wireguard,
 };
 
 /// everything `run_node` needs, shape-independent.
@@ -85,6 +85,8 @@ pub struct Resolved {
     pub dev_demo: bool,
     /// sealed blocks between recovery checkpoints.
     pub checkpoint_blocks: u64,
+    /// the idle block cadence, and the view timers scaled from it.
+    pub cadence: consensus::Cadence,
     /// the invite token a `join` stored beside the descriptor, if any — what a
     /// parked joiner announces in its first-contact intro. always `None` for
     /// the dev shape and for manual (token-less) joins.
@@ -536,6 +538,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         invite_listen,
         dev_demo: false,
         checkpoint_blocks: raw.checkpoint_blocks,
+        cadence: consensus::Cadence::from_millis(raw.block_time_ms),
         invite_token: load_invite_token(base)?,
         invite_wireguard: load_invite_wireguard(base)?,
         invite_fronts: load_invite_fronts(base)?,
@@ -875,6 +878,9 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
         invite_listen,
         dev_demo: true,
         checkpoint_blocks: raw.checkpoint_blocks.unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
+        cadence: consensus::Cadence::from_millis(
+            raw.block_time_ms.unwrap_or(DEFAULT_BLOCK_TIME_MS),
+        ),
         invite_token: None,
         invite_wireguard: None,
         invite_fronts: Vec::new(),
@@ -1722,6 +1728,7 @@ mod tests {
             ("primary_coordinator", "\"none\""),
             ("coordinator_relay", "\"none\""),
             ("checkpoint_blocks", "32"),
+            ("block_time_ms", "1000"),
         ];
         defaults
             .iter()

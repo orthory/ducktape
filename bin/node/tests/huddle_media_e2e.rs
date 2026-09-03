@@ -28,10 +28,10 @@ mod common;
 
 use std::time::Duration;
 
-use media_service::call_wire::{self, CapturedFrame};
 use chat::{Channel, ChatMsg, ChatQuery, ChatReply, PostPolicy};
-use common::{Cluster, hex, poll_until, serial, unhex};
+use common::{Cluster, hex, unhex};
 use futures::{SinkExt as _, StreamExt as _};
+use media_service::call_wire::{self, CapturedFrame};
 use tokio::net::TcpStream;
 use tokio::runtime::Runtime;
 use tokio_tungstenite::tungstenite::Message;
@@ -226,7 +226,6 @@ async fn hear_and_see(inbound: &mut CallStream, peer: &str, video: &[u8]) {
 
 #[test]
 fn a_late_joiner_is_heard_and_seen_once_the_roster_re_steers_the_fan_out() {
-    let _serial = serial();
     let rt = Runtime::new().expect("runtime");
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
     // media rides the OVERLAY and nothing else: with no `wireguard_listen`
@@ -268,7 +267,7 @@ fn a_late_joiner_is_heard_and_seen_once_the_roster_re_steers_the_fan_out() {
             node: unhex(&node_a),
         }),
     );
-    poll_until("A alone in the huddle", FINALIZE, || {
+    cluster.await_committed(0, "A alone in the huddle", FINALIZE, || {
         (roster_nodes(&cluster, 0, CHANNEL) == [node_a.clone()]).then_some(())
     });
 
@@ -290,7 +289,7 @@ fn a_late_joiner_is_heard_and_seen_once_the_roster_re_steers_the_fan_out() {
         }),
     );
     for idx in 0..2 {
-        poll_until("both nodes read a two-person roster", FINALIZE, || {
+        cluster.await_committed(idx, "both nodes read a two-person roster", FINALIZE, || {
             let roster = roster_nodes(&cluster, idx, CHANNEL);
             (roster == [node_a.clone(), node_b.clone()]).then_some(())
         });
@@ -315,7 +314,7 @@ fn a_late_joiner_is_heard_and_seen_once_the_roster_re_steers_the_fan_out() {
     // admission is gated on the set A was steered to, and B is not in it.
     // This is a refusal the node itself reports — not an absence we waited
     // out.
-    poll_until("node A refuses the late joiner's media", CROSSES, || {
+    cluster.await_committed(0, "node A refuses the late joiner's media", CROSSES, || {
         (refused_voice_datagrams(&cluster, 0) > 0).then_some(())
     });
 

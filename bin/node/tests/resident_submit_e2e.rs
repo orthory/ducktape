@@ -18,7 +18,7 @@ use chat::{
     AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, PostPolicy, decode_reply, encode_msg,
     encode_query,
 };
-use common::{Cluster, NetworkShapeCluster, poll_until, serial};
+use common::{Cluster, NetworkShapeCluster};
 
 /// generous like the sibling live-admission legs: standing → follow-arm sync →
 /// first pre-synced boundary is several blocks of slack.
@@ -26,7 +26,6 @@ const CONVERGE: Duration = Duration::from_secs(180);
 
 #[test]
 fn resident_posts_to_chat_with_its_own_authorship() {
-    let _serial = serial();
     let mut cluster = NetworkShapeCluster::new();
 
     let chain_id = cluster.init_founder("resident-submit");
@@ -51,16 +50,21 @@ fn resident_posts_to_chat_with_its_own_authorship() {
     // the create is only ACCEPTED above; wait for it to FINALIZE so the later
     // relayed post can never race an un-created channel (a missing channel
     // would come back Rejected and mask the authorship assertion).
-    poll_until("the channel to finalize on the founder", CONVERGE, || {
-        let raw = cluster.query(
-            0,
-            "chat",
-            &encode_query(&ChatQuery::Channel {
-                channel_id: "general".into(),
-            }),
-        )?;
-        matches!(decode_reply(&raw).ok()?, ChatReply::Channel(Some(_))).then_some(())
-    });
+    cluster.await_committed(
+        0,
+        "the channel to finalize on the founder",
+        CONVERGE,
+        || {
+            let raw = cluster.query(
+                0,
+                "chat",
+                &encode_query(&ChatQuery::Channel {
+                    channel_id: "general".into(),
+                }),
+            )?;
+            matches!(decode_reply(&raw).ok()?, ChatReply::Channel(Some(_))).then_some(())
+        },
+    );
 
     // invite + join a fresh identity, spawn it; it parks with NO standing.
     let invite = cluster.invite();
@@ -117,7 +121,8 @@ fn resident_posts_to_chat_with_its_own_authorship() {
 
     // (3) the founder's view of the message carries the RESIDENT's authorship —
     //     authorship rides the frame signature, not the injecting validator.
-    let author = poll_until(
+    let author = cluster.await_committed(
+        0,
         "the relayed post to finalize into the founder's channel",
         CONVERGE,
         || {
@@ -172,7 +177,8 @@ fn resident_posts_to_chat_with_its_own_authorship() {
     );
 
     for (idx, role) in [(0, "validator"), (1, "resident")] {
-        let head = poll_until(
+        let head = cluster.await_committed(
+            idx,
             &format!("the Forge head to finalize on the {role}"),
             CONVERGE,
             || {
@@ -244,7 +250,6 @@ fn resident_posts_to_chat_with_its_own_authorship() {
 
 #[test]
 fn validator_push_fans_pack_to_every_validator_before_consensus() {
-    let _serial = serial();
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
     cluster.spawn(0);
     cluster.spawn(1);
@@ -274,7 +279,8 @@ fn validator_push_fans_pack_to_every_validator_before_consensus() {
         &["push", "validator", "main"],
     );
 
-    poll_until(
+    cluster.await_committed(
+        1,
         "the peer validator to finalize the pushed Forge head",
         CONVERGE,
         || {

@@ -30,10 +30,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use common::{
-    Cluster, create_account, hex, poll_until, sandbox_toml, serial, skip_unless_sandboxed,
-    submit_frame,
-};
+use common::{Cluster, create_account, hex, sandbox_toml, skip_unless_sandboxed, submit_frame};
 use commonware_cryptography::{Signer as _, ed25519};
 use futures::{SinkExt as _, StreamExt as _};
 use gateway::{
@@ -232,7 +229,6 @@ async fn await_term_ended(port: u16, topic: &str, secret: &str) -> bool {
 /// topic, then close + host-side reap.
 #[test]
 fn guest_drives_a_scripted_child_on_the_host_over_the_forwarded_lane() {
-    let _serial = serial();
     if skip_unless_sandboxed("guest_drives_a_scripted_child_on_the_host_over_the_forwarded_lane")
         .is_some()
     {
@@ -291,7 +287,7 @@ fn guest_drives_a_scripted_child_on_the_host_over_the_forwarded_lane() {
     // it does prove is the half that survives: a peer-created session spawns,
     // streams, and is input-gated to its creator node.
     let guest_account = create_account(&cluster, 0, &guest, "guest");
-    poll_until("the guest account to reach the host", FINALIZE, || {
+    cluster.await_committed(1, "the guest account to reach the host", FINALIZE, || {
         common::account_of_key(&cluster, 1, guest.public_key().as_ref())
     });
 
@@ -307,7 +303,7 @@ fn guest_drives_a_scripted_child_on_the_host_over_the_forwarded_lane() {
             handle: Some("guest".into()),
         }),
     );
-    poll_until("guest handle resolves", FINALIZE, || {
+    cluster.await_committed(1, "guest handle resolves", FINALIZE, || {
         resolve_handle(&cluster, 1, "guest").filter(|account| *account == guest_account)
     });
 
@@ -329,7 +325,7 @@ fn guest_drives_a_scripted_child_on_the_host_over_the_forwarded_lane() {
         "gateway",
         &gateway::encode_msg(&credential),
     );
-    poll_until("credential is committed", FINALIZE, || {
+    cluster.await_committed(1, "credential is committed", FINALIZE, || {
         credential_present(&cluster, 1, "guest-fable-1")
     });
 
@@ -449,7 +445,6 @@ fn guest_drives_a_scripted_child_on_the_host_over_the_forwarded_lane() {
 /// are not enabled" 503 that a joiner used to answer.
 #[test]
 fn a_parked_joiner_serves_the_terminal_plane() {
-    let _serial = serial();
     let mut cluster = common::NetworkShapeCluster::new();
     let chain_id = cluster.init_founder("term-parked-joiner");
     assert!(

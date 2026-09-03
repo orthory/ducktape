@@ -4,12 +4,14 @@
 [net]
 git-fetch-with-cli = true
 
-# tokio's unstable taskdump API (`Handle::dump()`, the SIGUSR1 task-dump —
-# see bin/node/src/validator/run.rs) needs this cfg. Excluded for wasm32:
-# a guest module's committed bytes must not move on a host rustflags change
-# — `make wasm-modules-check` and `ops/wasm-repro-check.sh` are the proof
-# that they don't.
-[target.'cfg(not(target_arch = "wasm32"))']
+# tokio's unstable taskdump API (`Handle::dump()`, the SIGUSR1 task dump in
+# bin/node/src/task_dump.rs) needs this cfg. Linux only, matching the target
+# table in bin/node/Cargo.toml that turns the `taskdump` feature on: tokio
+# refuses that feature on any other OS, and a macOS build must stay a plain
+# stable-tokio build. wasm32 guests are outside `target_os = "linux"` too, so
+# a guest module's committed bytes never see this flag — `make
+# wasm-modules-check` and `ops/wasm-repro-check.sh` are the proof.
+[target.'cfg(target_os = "linux")']
 rustflags = ["--cfg", "tokio_unstable"]
 
 # Do NOT try -Zincremental-ignore-spans (via RUSTC_BOOTSTRAP=1) to speed up

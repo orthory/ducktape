@@ -17,6 +17,10 @@ pub mod scenarios;
 use netstack_machine::{Machine, MachineConfig, NetstackMachine};
 use wireguard::IdentitySigner;
 
+/// A machine restored from a snapshot another machine took: identity,
+/// config, and the snapshot bytes in, a running machine out.
+type RestoreFn = fn(Box<dyn IdentitySigner>, MachineConfig, &[u8]) -> Box<dyn NetstackMachine>;
+
 /// How a lane builds a node's machine: fresh from its identity and config,
 /// or continuing from a snapshot another machine took. Two functions
 /// because a swap crosses backends — the machine that steps down and the
@@ -25,7 +29,7 @@ use wireguard::IdentitySigner;
 #[derive(Clone, Copy)]
 pub struct Backend {
     pub build: fn(Box<dyn IdentitySigner>, MachineConfig) -> Box<dyn NetstackMachine>,
-    pub restore: fn(Box<dyn IdentitySigner>, MachineConfig, &[u8]) -> Box<dyn NetstackMachine>,
+    pub restore: RestoreFn,
 }
 
 /// The native machine, building and restoring.

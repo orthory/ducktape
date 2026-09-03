@@ -31,7 +31,7 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::{Cluster, create_account, poll_until, serial, submit_frame};
+use common::{Cluster, create_account, submit_frame};
 use commonware_cryptography::{Signer as _, ed25519};
 use gateway::{
     CredentialGrantStatement, CredentialKind, CredentialRecord, DuckDnsName, GATEWAY_CREDENTIAL_NS,
@@ -324,7 +324,8 @@ fn saga_view(cluster: &Cluster, reader: usize, saga_id: &str) -> Option<SagaView
 /// pointer it has not committed yet is undecidable rather than refused, and this
 /// is the event the delegated assertions below wait on.
 fn wait_leased(cluster: &Cluster, saga_id: &str, assignee: &[u8]) {
-    poll_until(
+    cluster.await_committed(
+        0,
         "the lender to commit the pinned saga's lease",
         FINALIZE,
         || saga_view(cluster, 0, saga_id).filter(|view| view.assignee.as_deref() == Some(assignee)),
@@ -403,7 +404,6 @@ async fn bind_and_serve(app: Router) -> String {
 
 #[test]
 fn granted_credential_resolves_and_round_trips_across_nodes() {
-    let _serial = serial();
     let rt = Runtime::new().unwrap();
 
     // The owner's mock Anthropic upstream lives in THIS process; the owner node
@@ -472,7 +472,7 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
         }),
     );
     for reader in 0..2 {
-        poll_until("owner.duck resolution", FINALIZE, || {
+        cluster.await_committed(reader, "owner.duck resolution", FINALIZE, || {
             resolve_handle(&cluster, reader, "owner").filter(|id| *id == owner_account)
         });
     }
@@ -492,7 +492,7 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
             1,
         )),
     );
-    poll_until("airlock route revision 1", FINALIZE, || {
+    cluster.await_committed(1, "airlock route revision 1", FINALIZE, || {
         (airlock_route_revision(&cluster, 1, owner_account) == Some(1)).then_some(())
     });
 
@@ -513,7 +513,7 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
             seal_pk,
         )),
     );
-    poll_until("credential record committed", FINALIZE, || {
+    cluster.await_committed(1, "credential record committed", FINALIZE, || {
         query_credential(&cluster, 1, "owner-claude-1")
     });
 
@@ -636,7 +636,8 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
     // permanent, unmetered draw the owner has nothing to revoke: the executor
     // holds no grant, so `user cred revoke` has no subject.
     cancel_saga(&cluster, 0, &owner, delegated);
-    poll_until(
+    cluster.await_committed(
+        0,
         "the delegated saga to reach a terminal status",
         FINALIZE,
         || saga_view(&cluster, 0, delegated).filter(|view| view.status.is_terminal()),
@@ -713,7 +714,7 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
             compute_account,
         )),
     );
-    poll_until("grant committed", FINALIZE, || {
+    cluster.await_committed(1, "grant committed", FINALIZE, || {
         query_credential(&cluster, 1, "owner-claude-1")
             .filter(|record| credential_use_allowed(record, compute_account))
             .map(|_| ())

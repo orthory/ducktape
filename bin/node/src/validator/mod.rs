@@ -46,6 +46,7 @@ pub(crate) async fn run_validator(
     chain_id: String,
     mesh_state_file: std::path::PathBuf,
     checkpoint_blocks: u64,
+    cadence: consensus::Cadence,
     dev_demo: bool,
     rpc_listener: Option<std::net::TcpListener>,
     http_cmds: futures::channel::mpsc::Receiver<noded::NodeCommand>,
@@ -298,6 +299,7 @@ pub(crate) async fn run_validator(
         namespace.clone(),
         label.clone(),
         channel_bank,
+        cadence,
     );
     // with the serve lane wired, realize code-registry swaps through the
     // FETCHING source for the rest of this validator's life: a committed
@@ -396,6 +398,7 @@ pub(crate) async fn run_validator(
         validators,
         dev_demo,
         checkpoint_blocks,
+        cadence,
         sync_lease,
         rpc_ingress,
         http_cmds,
@@ -440,6 +443,7 @@ pub(crate) async fn run_promoted(
     mesh_state_file: std::path::PathBuf,
     advertised_reach: Ingress,
     checkpoint_blocks: u64,
+    cadence: consensus::Cadence,
     dev_demo: bool,
     stream_hub: noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
@@ -703,6 +707,7 @@ pub(crate) async fn run_promoted(
         namespace.clone(),
         label.clone(),
         lane_bank,
+        cadence,
     );
     let floor_bytes = floor
         .as_ref()
@@ -778,6 +783,7 @@ pub(crate) async fn run_promoted(
         validators,
         dev_demo,
         checkpoint_blocks,
+        cadence,
         sync_lease,
         rpc_ingress,
         http_cmds: http_ingress,

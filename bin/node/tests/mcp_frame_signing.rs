@@ -5,7 +5,7 @@ use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -21,42 +21,25 @@ struct Captured {
 
 fn capture_action(tool: &str, arguments: Value) -> (Value, Captured) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind scoped action stub");
-    listener
-        .set_nonblocking(true)
-        .expect("nonblocking listener");
     let address = listener.local_addr().unwrap();
     let (tx, rx) = mpsc::channel();
+    // the stub blocks on the connection itself; the receive below bounds the
+    // failure, and a stub still waiting then dies with the test process.
     let stub = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let (path, headers, body) = read_request(&mut stream);
-                    let request: Value = serde_json::from_slice(&body).expect("json request");
-                    let message =
-                        serde_json::from_value(request["message"].clone()).expect("typed RunsMsg");
-                    tx.send(Captured {
-                        path,
-                        token: headers
-                            .into_iter()
-                            .find(|(name, _)| name == "x-ducktape-run-action")
-                            .map(|(_, value)| value),
-                        message,
-                    })
-                    .unwrap();
-                    write_json(&mut stream, 200, &json!({"message":"ok"}));
-                    return;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "MCP never called the action endpoint"
-                    );
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => panic!("accept action request: {error}"),
-            }
-        }
+        let (mut stream, _) = listener.accept().expect("accept action request");
+        let (path, headers, body) = read_request(&mut stream);
+        let request: Value = serde_json::from_slice(&body).expect("json request");
+        let message = serde_json::from_value(request["message"].clone()).expect("typed RunsMsg");
+        tx.send(Captured {
+            path,
+            token: headers
+                .into_iter()
+                .find(|(name, _)| name == "x-ducktape-run-action")
+                .map(|(_, value)| value),
+            message,
+        })
+        .unwrap();
+        write_json(&mut stream, 200, &json!({"message":"ok"}));
     });
 
     let result = call_tool(
@@ -66,7 +49,7 @@ fn capture_action(tool: &str, arguments: Value) -> (Value, Captured) {
     );
     let captured = rx
         .recv_timeout(Duration::from_secs(15))
-        .expect("captured action");
+        .expect("MCP never called the action endpoint");
     stub.join().expect("action stub");
     (result, captured)
 }

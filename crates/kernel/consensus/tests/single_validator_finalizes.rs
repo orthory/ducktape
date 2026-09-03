@@ -16,7 +16,10 @@ use commonware_p2p::simulated;
 use commonware_runtime::{Clock as _, Quota, Runner as _, Supervisor as _, deterministic};
 use commonware_utils::{NZU32, NZUsize};
 
-use consensus::{ContentStore, Digest, SimplexOrderer};
+use consensus::{Cadence, ContentStore, Digest, SimplexOrderer};
+
+/// the beat the sim runs at — simulated time, so its size is not wall-clock.
+const CADENCE: Cadence = Cadence::from_millis(1_000);
 use directory::Directory;
 use directory::{DirMsg, encode_msg};
 use host::Host;
@@ -76,6 +79,7 @@ fn a_single_validator_finalizes_sequential_blocks() {
             epoch,
             genesis_floor,
             ContentStore::new(),
+            CADENCE,
             vote,
             certificate,
             resolver,

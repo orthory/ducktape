@@ -12,9 +12,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{
-    Cluster, account_of_key, add_key, create_account, key_gen, poll_until, serial, submit_frame,
-};
+use common::{Cluster, account_of_key, add_key, create_account, key_gen, submit_frame};
 use commonware_cryptography::{Signer as _, ed25519};
 use identity::{
     AccountView, IdentityMsg, IdentityQuery, IdentityReply, decode_reply, encode_query,
@@ -68,7 +66,7 @@ fn identity_roots(cluster: &Cluster) -> [serde_json::Value; 2] {
 }
 
 fn assert_roots_converge(cluster: &Cluster, what: &str) {
-    poll_until(what, FINALIZE, || {
+    cluster.await_committed(0, what, FINALIZE, || {
         let roots = identity_roots(cluster);
         (!roots[0].is_null() && roots[0] == roots[1]).then_some(())
     });
@@ -76,7 +74,6 @@ fn assert_roots_converge(cluster: &Cluster, what: &str) {
 
 #[test]
 fn identity_two_nodes_one_account() {
-    let _serial = serial();
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
     boot(&mut cluster);
 
@@ -92,9 +89,12 @@ fn identity_two_nodes_one_account() {
     let number = create_account(&cluster, 0, &founder, "alice");
     assert_eq!(number, 1, "the first account a chain founds is 1");
     for reader in [0usize, 1] {
-        let view = poll_until(&format!("Get(1) on node {reader}"), FINALIZE, || {
-            account(&cluster, reader, 1)
-        });
+        let view = cluster.await_committed(
+            reader,
+            &format!("Get(1) on node {reader}"),
+            FINALIZE,
+            || account(&cluster, reader, 1),
+        );
         assert_eq!(view.name, "alice", "node {reader}: name");
         assert_eq!(
             pubkeys(&view),
@@ -113,7 +113,8 @@ fn identity_two_nodes_one_account() {
     let sees_both = |view: &AccountView| view.number == 1 && pubkeys(view) == both;
     for reader in [0usize, 1] {
         for (who, key) in [("founder", &founder_pub), ("joiner", &joiner_pub)] {
-            poll_until(
+            cluster.await_committed(
+                reader,
                 &format!("OfKey({who}) to show both keys on node {reader}"),
                 FINALIZE,
                 || account_of_key(&cluster, reader, key).filter(&sees_both),
@@ -134,7 +135,8 @@ fn identity_two_nodes_one_account() {
         }),
     );
     for reader in [0usize, 1] {
-        poll_until(
+        cluster.await_committed(
+            reader,
             &format!("OfKey(founder) to clear on node {reader}"),
             FINALIZE,
             || {
@@ -143,9 +145,12 @@ fn identity_two_nodes_one_account() {
                     .then_some(())
             },
         );
-        let view = poll_until(&format!("OfKey(joiner) on node {reader}"), FINALIZE, || {
-            account_of_key(&cluster, reader, &joiner_pub)
-        });
+        let view = cluster.await_committed(
+            reader,
+            &format!("OfKey(joiner) on node {reader}"),
+            FINALIZE,
+            || account_of_key(&cluster, reader, &joiner_pub),
+        );
         assert_eq!(view.number, 1, "node {reader}: the joiner keeps account 1");
         assert_eq!(
             pubkeys(&view),

@@ -21,7 +21,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Cluster, poll_until, serial};
+use common::Cluster;
 use tasks::{TaskMsg, TaskQuery, TaskReply, decode_task_reply, encode_task_msg, encode_task_query};
 
 /// convergence budget: mesh formation + leader rotation are real-time on a
@@ -61,7 +61,6 @@ fn hex(bytes: &[u8]) -> String {
 
 #[test]
 fn solo_founder_invites_a_friend() {
-    let _serial = serial();
     // a network of ONE: the founder is mesh and quorum all by itself.
     let mut cluster = Cluster::new(&[0], &[0]);
     cluster.spawn(0);
@@ -112,25 +111,33 @@ fn solo_founder_invites_a_friend() {
     // votes — a 2-validator simplex finalizes nothing without both. an op
     // submitted via the FOUNDER must become readable via the FRIEND...
     cluster.submit(0, "tasks", &task_create("from-founder", "hello"));
-    let value = poll_until("founder's op to read on the friend", FINALIZE, || {
-        task_title(&cluster, joiner, "from-founder")
-    });
+    let value = cluster.await_committed(
+        joiner,
+        "founder's op to read on the friend",
+        FINALIZE,
+        || task_title(&cluster, joiner, "from-founder"),
+    );
     assert_eq!(value, "hello");
 
     // ...and an op submitted via the FRIEND (whose bytes only the friend
     // holds until the relay lane gossips them) must read on the founder.
     cluster.submit(joiner, "tasks", &task_create("from-friend", "hi back"));
-    let value = poll_until("friend's op to read on the founder", FINALIZE, || {
+    let value = cluster.await_committed(0, "friend's op to read on the founder", FINALIZE, || {
         task_title(&cluster, 0, "from-friend")
     });
     assert_eq!(value, "hi back");
 
-    // no fork: identical status root-hashes once both sides quiesce.
-    std::thread::sleep(Duration::from_secs(2));
-    assert_eq!(
-        cluster.status(0)["root_hash"],
-        cluster.status(joiner)["root_hash"],
-        "founder and promoted friend disagree on state"
+    // no fork: identical status root-hashes once both sides quiesce. a real
+    // fork never reconciles, so it fails this wait's budget.
+    cluster.await_committed(
+        0,
+        "founder and promoted friend to agree on state",
+        FINALIZE,
+        || {
+            let founder = cluster.status(0)["root_hash"].clone();
+            let agreed = !founder.is_null() && founder == cluster.status(joiner)["root_hash"];
+            agreed.then_some(())
+        },
     );
 }
 
@@ -152,7 +159,6 @@ fn solo_founder_invites_a_friend() {
 /// this one, which is the same flow with the plane turned on.
 #[test]
 fn a_promoted_validator_converges_the_overlay_mesh() {
-    let _serial = serial();
     // two founding validators, so the promoted joiner has to mesh with a set
     // it never met — the live shape, and the one a single founder cannot test.
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
@@ -204,7 +210,6 @@ fn a_promoted_validator_converges_the_overlay_mesh() {
 
 #[test]
 fn live_quorum_admits_a_fourth_validator() {
-    let _serial = serial();
     // three validators — enough that the mesh KEEPS finalizing through the
     // whole admission (quorum(4) = 3), forcing the mid-epoch joiner path.
     let mut cluster = Cluster::new(&[0, 1, 2], &[0, 1, 2]);
@@ -246,7 +251,7 @@ fn live_quorum_admits_a_fourth_validator() {
     // finalization floor.
     for n in 0..5 {
         cluster.submit(0, "tasks", &task_create(&format!("epoch2-op-{n}"), "x"));
-        let _ = poll_until("epoch-2 filler to finalize", FINALIZE, || {
+        let _ = cluster.await_committed(1, "epoch-2 filler to finalize", FINALIZE, || {
             task_title(&cluster, 1, &format!("epoch2-op-{n}"))
         });
     }
@@ -260,7 +265,8 @@ fn live_quorum_admits_a_fourth_validator() {
     // its frame bytes start out ONLY in its store, so this proves the joiner
     // is wired into the payload relay and the vote lanes of the live epoch.
     cluster.submit(joiner, "tasks", &task_create("from-the-fourth", "present"));
-    let value = poll_until(
+    let value = cluster.await_committed(
+        2,
         "the fourth validator's op to read on node 2",
         FINALIZE,
         || task_title(&cluster, 2, "from-the-fourth"),
@@ -268,10 +274,14 @@ fn live_quorum_admits_a_fourth_validator() {
     assert_eq!(value, "present");
 
     // and it holds the full replicated state (no fork after quiesce).
-    std::thread::sleep(Duration::from_secs(2));
-    assert_eq!(
-        cluster.status(0)["root_hash"],
-        cluster.status(joiner)["root_hash"],
-        "incumbent and promoted validator disagree on state"
+    cluster.await_committed(
+        0,
+        "incumbent and promoted validator to agree on state",
+        FINALIZE,
+        || {
+            let incumbent = cluster.status(0)["root_hash"].clone();
+            let agreed = !incumbent.is_null() && incumbent == cluster.status(joiner)["root_hash"];
+            agreed.then_some(())
+        },
     );
 }

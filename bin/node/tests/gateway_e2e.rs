@@ -17,7 +17,7 @@ use std::thread;
 use std::time::Duration;
 
 use base64::Engine as _;
-use common::{Cluster, create_account, hex, poll_until, serial, submit_frame};
+use common::{Cluster, create_account, hex, submit_frame};
 use commonware_cryptography::{Signer as _, ed25519};
 use gateway::{
     DuckDnsName, GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization, RouteAudience,
@@ -245,7 +245,6 @@ fn raw_browser_request(port: u16, authority: &str, extra: &str) -> (u16, String,
 
 #[test]
 fn gateway_runs_over_inline_wireguard_and_fails_closed() {
-    let _serial = serial();
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
     cluster.wireguard = true;
     for index in 0..2 {
@@ -275,7 +274,7 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
         }),
     );
     for reader in 0..2 {
-        let resolved = poll_until("alice.duck resolution", FINALIZE, || {
+        let resolved = cluster.await_committed(reader, "alice.duck resolution", FINALIZE, || {
             resolve_alice(&cluster, reader)
         });
         assert_eq!(resolved, alice_account);
@@ -310,7 +309,7 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
             RouteAudience::Network,
         )),
     );
-    poll_until("gateway route revision 1", FINALIZE, || {
+    cluster.await_committed(1, "gateway route revision 1", FINALIZE, || {
         (route_revision(&cluster, 1, alice_account) == Some(1)).then_some(())
     });
 
@@ -417,7 +416,7 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
             RouteAudience::Owner,
         )),
     );
-    poll_until("gateway route revision 2", FINALIZE, || {
+    cluster.await_committed(1, "gateway route revision 2", FINALIZE, || {
         (route_revision(&cluster, 1, alice_account) == Some(2)).then_some(())
     });
     let (status, _) = proxy_request(

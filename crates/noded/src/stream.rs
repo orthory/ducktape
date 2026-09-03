@@ -26,7 +26,7 @@ pub const HEARTBEAT_INTERVAL_MS: u64 = 3_000;
 /// such miss, known or not, to one period.
 ///
 /// It REPLACES a sweep that ran once per block — 1 Hz on an idle chain, since
-/// the nop filler publishes every `BLOCK_TIME` — so it is 30x less work than
+/// the nop filler publishes every block time — so it is 30x less work than
 /// what it stands in for, not new work.
 pub const INDEX_BACKSTOP_INTERVAL: Duration = Duration::from_secs(30);
 pub const STREAM_CATCHUP_BUDGET: usize = 256;
@@ -419,7 +419,7 @@ pub enum RunStream {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockWake {
     /// the tip moved and nothing else. An idle chain nop-fills once per
-    /// `BLOCK_TIME` (`bin/node/src/constants.rs`) and that filler appends no
+    /// block time (node.toml `block_time_ms`) and that filler appends no
     /// per-module op row, so every scan it used to trigger returned empty.
     TipOnly,
     /// op rows were appended under the subscribers.
@@ -2723,7 +2723,7 @@ mod tests {
 
     /// A BLOCK THAT APPENDED NOTHING MUST NOT SEND ANYONE BACK TO THE STORE.
     ///
-    /// An idle chain nop-fills once per `BLOCK_TIME`, and that filler dispatches
+    /// An idle chain nop-fills once per block time, and that filler dispatches
     /// nothing, so every scan it used to trigger read the index and found
     /// nothing — per subscribed topic, per session, once a second, forever.
     #[test]

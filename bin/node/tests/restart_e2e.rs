@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use common::{Cluster, poll_until};
+use common::Cluster;
 use files::{
     Change, Content, EntryInfo, FilesMsg, FilesQuery, FilesReply, Kind, RefsInfo,
     decode_reply as files_decode_reply, encode_msg as files_encode_msg, encode_putblob,
@@ -53,7 +53,8 @@ fn task_title(cluster: &Cluster, idx: usize, task_id: &str) -> Option<String> {
 /// end-to-end "the engine is live and finalizing" probe.
 fn write_and_confirm(cluster: &Cluster, idx: usize, task_id: &str, title: &str) {
     cluster.submit(idx, "tasks", &task_create(task_id, title));
-    poll_until(
+    cluster.await_committed(
+        idx,
         &format!("tasks {task_id}={title} to finalize"),
         Duration::from_secs(30),
         || (task_title(cluster, idx, task_id).as_deref() == Some(title)).then_some(()),
@@ -111,7 +112,6 @@ fn block_rows(cluster: &Cluster, idx: usize) -> Vec<(u64, serde_json::Value)> {
 
 #[test]
 fn solo_validator_survives_crash_and_graceful_restart() {
-    let _guard = common::serial();
     // a network of ONE: the sharpest recovery case — no peer holds the state,
     // so local recovery is the only path back.
     let mut cluster = Cluster::new(&[0], &[0]);
@@ -144,7 +144,8 @@ fn solo_validator_survives_crash_and_graceful_restart() {
     // rows must be visible (the row lands in the same drain pass that
     // finalized the op, but the confirm reads canonical state — poll the
     // tiny gap away).
-    let rows_before = poll_until(
+    let rows_before = cluster.await_committed(
+        0,
         "both drain rows visible in /v1/blocks",
         Duration::from_secs(30),
         || {
@@ -170,7 +171,8 @@ fn solo_validator_survives_crash_and_graceful_restart() {
     // PAST the block that carried the last write — idle views finalize empty
     // proposals, so a solo validator advances on its own, and that next
     // pre-apply is what makes the pending seal durable.
-    poll_until(
+    cluster.await_committed(
+        0,
         "the node to apply past the block that carried the last write",
         Duration::from_secs(30),
         || {
@@ -200,10 +202,11 @@ fn solo_validator_survives_crash_and_graceful_restart() {
     // monotone, not frozen: idle views finalize empty proposals that drain
     // as deterministic rejections, so a view may seal between the status
     // read and the kill — state-identical, height +n.)
-    let after = poll_until("status after recovery", Duration::from_secs(30), || {
-        let s = cluster.status(0);
-        (s["root_hash"] == before["root_hash"]).then_some(s)
-    });
+    let after =
+        cluster.await_committed(0, "status after recovery", Duration::from_secs(30), || {
+            let s = cluster.status(0);
+            (s["root_hash"] == before["root_hash"]).then_some(s)
+        });
     assert!(after["height"].as_u64().expect("height") >= height_before);
     assert_eq!(task_title(&cluster, 0, "who").as_deref(), Some("ducktape"));
     assert_eq!(
@@ -215,7 +218,8 @@ fn solo_validator_survives_crash_and_graceful_restart() {
     // beat the index's periodic fsync, so the boot fold must have REBUILT the
     // lost rows from the journaled frames — byte-identical to what the drain
     // wrote (same shared row seam), never merely "some row at that height".
-    let rows_after = poll_until(
+    let rows_after = cluster.await_committed(
+        0,
         "explorer rows to reappear after recovery",
         Duration::from_secs(30),
         || {
@@ -287,7 +291,8 @@ fn solo_validator_survives_crash_and_graceful_restart() {
         "the second restart must not re-run genesis either"
     );
     // everything from BOTH earlier lives is present...
-    poll_until(
+    cluster.await_committed(
+        0,
         "post-shutdown state to answer",
         Duration::from_secs(30),
         || (task_title(&cluster, 0, "after-crash").as_deref() == Some("still-here")).then_some(()),
@@ -309,7 +314,6 @@ fn solo_validator_survives_crash_and_graceful_restart() {
 /// under load, so the timeouts are deliberately generous.)
 #[test]
 fn solo_validator_survives_sigterm_restart() {
-    let _guard = common::serial();
     let mut cluster = Cluster::new(&[0], &[0]);
     cluster.spawn(0);
     cluster.wait_marker(0, "genesis root_hash=", Duration::from_secs(30));
@@ -347,7 +351,8 @@ fn solo_validator_survives_sigterm_restart() {
         "a SIGTERM restart must not re-run genesis (no brick)"
     );
 
-    let after = poll_until(
+    let after = cluster.await_committed(
+        0,
         "status after sigterm recovery",
         Duration::from_secs(30),
         || {
@@ -452,7 +457,6 @@ fn files_head(cluster: &Cluster, idx: usize) -> Option<String> {
 
 #[test]
 fn solo_validator_duckfs_bytes_survive_crash() {
-    let _guard = common::serial();
     // a network of ONE — no peer holds the duckfs objects, so local disk
     // recovery is the only path back to the bytes.
     let mut cluster = Cluster::new(&[0], &[0]);
@@ -481,12 +485,14 @@ fn solo_validator_duckfs_bytes_survive_crash() {
             ],
         }),
     );
-    poll_until(
+    cluster.await_committed(
+        0,
         "inline duckfs files to finalize",
         Duration::from_secs(30),
         || files_stat(&cluster, 0, "/shared/a").map(|_| ()),
     );
-    let s1 = poll_until(
+    let s1 = cluster.await_committed(
+        0,
         "head after the inline commit",
         Duration::from_secs(30),
         || files_head(&cluster, 0),
@@ -519,7 +525,8 @@ fn solo_validator_duckfs_bytes_survive_crash() {
             }],
         }),
     );
-    poll_until(
+    cluster.await_committed(
+        0,
         "chunked duckfs file to finalize",
         Duration::from_secs(30),
         || {
@@ -528,7 +535,8 @@ fn solo_validator_duckfs_bytes_survive_crash() {
                 .map(|_| ())
         },
     );
-    let s2 = poll_until(
+    let s2 = cluster.await_committed(
+        0,
         "head after the chunked commit",
         Duration::from_secs(30),
         || files_head(&cluster, 0),
@@ -543,7 +551,7 @@ fn solo_validator_duckfs_bytes_survive_crash() {
             name: "release".into(),
         }),
     );
-    poll_until("duckfs pin to finalize", Duration::from_secs(30), || {
+    cluster.await_committed(0, "duckfs pin to finalize", Duration::from_secs(30), || {
         files_refs(&cluster, 0)
             .filter(|r| r.pins.contains_key("release"))
             .map(|_| ())
@@ -580,7 +588,8 @@ fn solo_validator_duckfs_bytes_survive_crash() {
     // the odb objects + the refs envelope came back from disk via `Files::open`;
     // an empty or torn odb would error on Read, and a lost refs file would drop
     // the head/pin. this is exactly what the old cas module could not survive.
-    let chunk_after = poll_until(
+    let chunk_after = cluster.await_committed(
+        0,
         "chunked duckfs bytes after recovery",
         Duration::from_secs(30),
         || files_read(&cluster, 0, "/shared/big", 0, chunk_size),
@@ -627,7 +636,8 @@ fn solo_validator_duckfs_bytes_survive_crash() {
             changes: vec![put_inline("/shared/c", b"gamma")],
         }),
     );
-    poll_until(
+    cluster.await_committed(
+        0,
         "post-crash duckfs commit to finalize",
         Duration::from_secs(30),
         || files_stat(&cluster, 0, "/shared/c").map(|_| ()),
@@ -636,7 +646,6 @@ fn solo_validator_duckfs_bytes_survive_crash() {
 
 #[test]
 fn solo_validator_duckfs_survives_multi_block_history_crash_at_default_cadence() {
-    let _guard = common::serial();
     // the sibling to `solo_validator_duckfs_bytes_survive_crash`, at the SHIPPED
     // checkpoint cadence instead of the `checkpoint_blocks = 1` workaround. duckfs
     // commits to disk per block while the checkpoint persists only periodically
@@ -662,7 +671,7 @@ fn solo_validator_duckfs_survives_multi_block_history_crash_at_default_cadence()
             changes: vec![put_inline("/shared/hist/a", b"one")],
         }),
     );
-    let s1 = poll_until("commit 1 head", Duration::from_secs(30), || {
+    let s1 = cluster.await_committed(0, "commit 1 head", Duration::from_secs(30), || {
         files_stat(&cluster, 0, "/shared/hist/a").and_then(|_| files_head(&cluster, 0))
     });
     cluster.submit(
@@ -674,7 +683,7 @@ fn solo_validator_duckfs_survives_multi_block_history_crash_at_default_cadence()
             changes: vec![put_inline("/shared/hist/b", b"two")],
         }),
     );
-    let s2 = poll_until("commit 2 head", Duration::from_secs(30), || {
+    let s2 = cluster.await_committed(0, "commit 2 head", Duration::from_secs(30), || {
         files_stat(&cluster, 0, "/shared/hist/b").and_then(|_| files_head(&cluster, 0))
     });
     cluster.submit(
@@ -686,7 +695,7 @@ fn solo_validator_duckfs_survives_multi_block_history_crash_at_default_cadence()
             changes: vec![put_inline("/shared/hist/c", b"three")],
         }),
     );
-    poll_until("commit 3 to finalize", Duration::from_secs(30), || {
+    cluster.await_committed(0, "commit 3 to finalize", Duration::from_secs(30), || {
         files_stat(&cluster, 0, "/shared/hist/c").map(|_| ())
     });
 
@@ -734,7 +743,10 @@ fn solo_validator_duckfs_survives_multi_block_history_crash_at_default_cadence()
             changes: vec![put_inline("/shared/hist/d", b"four")],
         }),
     );
-    poll_until("post-crash commit to finalize", Duration::from_secs(30), || {
-        files_stat(&cluster, 0, "/shared/hist/d").map(|_| ())
-    });
+    cluster.await_committed(
+        0,
+        "post-crash commit to finalize",
+        Duration::from_secs(30),
+        || files_stat(&cluster, 0, "/shared/hist/d").map(|_| ()),
+    );
 }

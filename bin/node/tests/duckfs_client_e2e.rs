@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use common::{Cluster, poll_until};
+use common::Cluster;
 use duckfs_client::api::NodeApi;
 use duckfs_client::checkout::{CheckoutOptions, checkout_with};
 use duckfs_client::commit::{CommitError, commit};
@@ -48,7 +48,8 @@ fn engine(cluster: &Cluster, idx: usize) -> (HttpNode, CheckoutOptions) {
     // credential — the same file a local daemon reads (`cluster.files`).
     let node = cluster.files(idx);
     // wait for the app surface to actually answer before driving the engine.
-    poll_until(
+    cluster.await_committed(
+        idx,
         &format!("node {idx} http surface up"),
         Duration::from_secs(30),
         || node.refs().ok().map(|_| ()),
@@ -63,7 +64,8 @@ fn engine(cluster: &Cluster, idx: usize) -> (HttpNode, CheckoutOptions) {
 /// block until node `idx` has finalized `snapshot` as its head.
 fn wait_head(cluster: &Cluster, idx: usize, snapshot: &str) {
     let node = cluster.files(idx);
-    poll_until(
+    cluster.await_committed(
+        idx,
         &format!("node {idx} finalizes head {snapshot}"),
         Duration::from_secs(60),
         || {
@@ -78,7 +80,6 @@ fn wait_head(cluster: &Cluster, idx: usize, snapshot: &str) {
 
 #[test]
 fn duckfs_engine_round_trips_across_two_nodes() {
-    let _guard = common::serial();
     let cluster = two_validators();
     let (node0, opts0) = engine(&cluster, 0);
     let (node1, opts1) = engine(&cluster, 1);
@@ -189,7 +190,6 @@ fn duckfs_engine_round_trips_across_two_nodes() {
 
 #[test]
 fn duckfs_workspace_rpc_over_the_cluster() {
-    let _guard = common::serial();
     let cluster = two_validators();
 
     // create a managed workspace on node 0.
@@ -247,7 +247,8 @@ fn duckfs_workspace_rpc_over_the_cluster() {
     }
 
     // node 1 reads the committed file (poll until it finalizes there).
-    let bytes = poll_until(
+    let bytes = cluster.await_committed(
+        1,
         "node 1 reads the workspace file",
         Duration::from_secs(60),
         || {

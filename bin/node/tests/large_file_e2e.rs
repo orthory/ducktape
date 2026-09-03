@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use common::{Cluster, poll_until};
+use common::Cluster;
 use files::{
     CHUNK_SIZE, Change, Content, EntryInfo, FilesMsg, FilesQuery, FilesReply, Kind,
     decode_reply as files_decode_reply, encode_msg as files_encode_msg, encode_putblob,
@@ -83,7 +83,8 @@ fn files_read_all(cluster: &Cluster, idx: usize, path: &str, total: u64) -> Vec<
     let mut offset = 0;
     while offset < total {
         let len = PAGE.min(total - offset);
-        let page = poll_until(
+        let page = cluster.await_committed(
+            idx,
             &format!("read {path} @{offset}+{len} on node {idx}"),
             Duration::from_secs(30),
             || files_read(cluster, idx, path, offset, len),
@@ -111,7 +112,6 @@ fn task_title(cluster: &Cluster, idx: usize, task_id: &str) -> Option<String> {
 
 #[test]
 fn multi_chunk_file_commits_and_reads_across_the_cluster() {
-    let _guard = common::serial();
     // TWO validators: the proposer must gossip the full frame bytes to a real
     // peer, and the read-back on the other node proves the bytes crossed
     // consensus — not a local shortcut.
@@ -156,12 +156,12 @@ fn multi_chunk_file_commits_and_reads_across_the_cluster() {
 
     // the SUBMITTING validator applies the commit (narrows a failure: local
     // apply vs cross-node propagation)...
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut blocks = cluster.block_feed(0, Duration::from_secs(60));
     let local = loop {
         if let Some(s) = files_stat(&cluster, 0, "/shared/big") {
             break s;
         }
-        if std::time::Instant::now() >= deadline {
+        if blocks.next_block().is_err() {
             for idx in [0, 1] {
                 let (code, body) = cluster.http(idx, "GET", "/v1/blocks", None);
                 eprintln!("node {idx} /v1/blocks ({code}): {body}");
@@ -171,19 +171,19 @@ fn multi_chunk_file_commits_and_reads_across_the_cluster() {
                 cluster.all_log_tails(80)
             );
         }
-        std::thread::sleep(Duration::from_millis(300));
     };
     assert_eq!(local.size, bytes.len() as u64, "committed size matches");
 
     // ...and the NON-submitting validator sees the committed file at full size
-    // (hand-rolled poll: on timeout, dump both explorers + log tails so a
-    // cross-node propagation failure is diagnosable from the test output).
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    // (a hand-rolled wait on its block feed: on timeout, dump both explorers +
+    // log tails so a cross-node propagation failure is diagnosable from the
+    // test output).
+    let mut blocks = cluster.block_feed(1, Duration::from_secs(60));
     let stat = loop {
         if let Some(s) = files_stat(&cluster, 1, "/shared/big") {
             break s;
         }
-        if std::time::Instant::now() >= deadline {
+        if blocks.next_block().is_err() {
             for idx in [0, 1] {
                 let (code, body) = cluster.http(idx, "GET", "/v1/blocks", None);
                 eprintln!("node {idx} /v1/blocks ({code}): {body}");
@@ -193,7 +193,6 @@ fn multi_chunk_file_commits_and_reads_across_the_cluster() {
                 cluster.all_log_tails(80)
             );
         }
-        std::thread::sleep(Duration::from_millis(300));
     };
     assert_eq!(stat.size, bytes.len() as u64, "committed size matches");
 
@@ -211,7 +210,6 @@ fn multi_chunk_file_commits_and_reads_across_the_cluster() {
 
 #[test]
 fn oversized_op_rejects_cleanly_and_the_cluster_stays_live() {
-    let _guard = common::serial();
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
     cluster.spawn(0);
     cluster.spawn(1);
@@ -238,7 +236,8 @@ fn oversized_op_rejects_cleanly_and_the_cluster_stays_live() {
         }),
     );
     for idx in [0, 1] {
-        poll_until(
+        cluster.await_committed(
+            idx,
             &format!("post-rejection finalization visible on node {idx}"),
             Duration::from_secs(60),
             || (task_title(&cluster, idx, "alive").as_deref() == Some("yes")).then_some(()),

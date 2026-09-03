@@ -53,11 +53,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use agent::{ACTION_CHAT_POST, AgentMsg};
-use runs::{RunsMsg, RunsQuery, RunsReply, TurnPolicy};
 use capability::{CapabilityQuery, CapabilityReply};
 use chat::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, Mark, PostPolicy, Span};
-use common::{Cluster, sandbox_toml, serial, skip_unless_sandboxed};
+use common::{Cluster, sandbox_toml, skip_unless_sandboxed};
 use dispatch::{DispatchQuery, DispatchReply, DispatchStatus};
+use runs::{RunsMsg, RunsQuery, RunsReply, TurnPolicy};
 
 /// convergence budget: mesh formation + leader rotation are real-time on a
 /// possibly-loaded CI core; polls exit early, so generosity is free.
@@ -463,7 +463,6 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
     if skip_unless_sandboxed("mention_routes_to_the_announced_provider_across_nodes").is_some() {
         return;
     }
-    let _serial = serial();
     let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
     // heterogeneous REAL providers: a `text` executor on node 1 and a
     // `json-result` executor on node 2 — two different output-format parse
@@ -625,7 +624,6 @@ fn unannounced_capable_nodes_race_accept_and_execute_once() {
     if skip_unless_sandboxed("unannounced_capable_nodes_race_accept_and_execute_once").is_some() {
         return;
     }
-    let _serial = serial();
     let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
     // the SAME tag on two nodes, both accept-lane-only: the rendezvous pool
     // stays empty, so the dispatch goes out unassigned and both race to
