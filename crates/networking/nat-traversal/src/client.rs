@@ -238,9 +238,16 @@ impl NatClient {
         // conflict with repointing `self.coord` on success.
         let coords = self.coords.clone();
         for (i, c) in coords.iter().copied().enumerate() {
+            // a send that the OS refuses names its endpoints: EINVAL here
+            // is a destination the socket's family cannot carry, and the
+            // bare errno hid which address (and whose resolver) produced it.
             self.sock
                 .send_to(&self.authed(Msg::BindRequest { from: self.key }), c)
-                .await?;
+                .await
+                .map_err(|e| {
+                    let local = self.sock.local_addr().ok();
+                    std::io::Error::new(e.kind(), format!("{e} (send to {c} from {local:?})"))
+                })?;
             let attempt = async {
                 let mut buf = [0u8; 64];
                 loop {
