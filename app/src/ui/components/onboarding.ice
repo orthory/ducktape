@@ -1232,32 +1232,34 @@ component NetworksScreen(networks:[HubNetwork], selected:str, hidden:i64, busy:b
               active bg=transparent text=muted r=7.0
               hovered bg=fg/9 text=fg
               pressed bg=fg/14
-        // A remote node this device holds no workspace for — Enter connects,
-        // and a successful connect is what saves it as a remote row.
-        box w=fill pt=10.0
-          box
-            with
-              w=fill
-              px=14.0
-              py=10.0
-              bg=surface
-              border=border
-              border-w=1.0
-              r=10.0
-            input "" #remote-endpoint <-> remote
-              with
-                label="Remote node endpoint"
-                hint="connect a remote node… (http://host:port)"
-                disabled=busy
-                submit=emit(connect_remote_submit, remote)
-                w=fill
-                p=0.0
-                text-size=12.0
-                line-h=1.2
-                font=code
-                @control
-              active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
-              disabled value=hint
+    // A remote node this device holds no workspace for — Enter connects,
+    // and a successful connect is what saves it as a remote row. Lives
+    // OUTSIDE the empty/non-empty branch: a device with no local network
+    // is exactly the one that reaches a node this way.
+    box w=fill pt=10.0
+      box
+        with
+          w=fill
+          px=14.0
+          py=10.0
+          bg=surface
+          border=border
+          border-w=1.0
+          r=10.0
+        input "" #remote-endpoint <-> remote
+          with
+            label="Remote node endpoint"
+            hint="connect a remote node… (http://host:port)"
+            disabled=busy
+            submit=emit(connect_remote_submit, remote)
+            w=fill
+            p=0.0
+            text-size=12.0
+            line-h=1.2
+            font=code
+            @control
+          active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
+          disabled value=hint
     // Forgetting is not a one-way door: every hidden local network comes
     // back with one click. Lives OUTSIDE the empty/non-empty branch —
     // forgetting the ONLY network empties the list, and that is exactly

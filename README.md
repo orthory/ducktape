@@ -204,8 +204,9 @@ sandbox, `ducktape user cred add claude` logs a provider in, and
 `ducktape agent pty claude` attaches a terminal to a sandboxed agent. Each
 verb's own `--help` carries the rest; `ducktape node list` shows every network
 this machine is registered on and `-n <chain-id>` picks one when there is more
-than one. The node serves `http://127.0.0.1:8844` (`/v1`, loopback only) and
-the listeners in `docs/deploy/node-service.md`, which is also the systemd
+than one. The node serves `/v1` on `0.0.0.0:8844` (`http://127.0.0.1:8844`
+from its own box; reads are open, writes are signed) and the listeners in
+`docs/deploy/node-service.md`, which is also the systemd
 recipe for keeping it up; `docs/deploy/backup-and-keys.md` says which files to
 copy before a node is promoted to a validator seat.
 

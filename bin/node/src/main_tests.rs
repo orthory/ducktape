@@ -7,18 +7,13 @@ use sdk::{Ctx, Error, Module, StateSyncHandle};
 use std::sync::{Arc, Mutex};
 
 #[test]
-fn gateway_requires_a_loopback_node_api_and_real_overlay() {
+fn gateway_requires_a_running_node_and_a_real_overlay() {
     let wireguard = Some("127.0.0.1:51820".parse().unwrap());
-    assert!(gateway_can_start(
-        false,
-        Some("127.0.0.1:0"),
-        Some("127.0.0.1:8844"),
-        wireguard,
-    ));
+    assert!(gateway_can_start(false, Some("127.0.0.1:0"), wireguard));
     for allowed in [
-        gateway_can_start(false, Some("127.0.0.1:0"), Some("0.0.0.0:8844"), wireguard),
-        gateway_can_start(true, Some("127.0.0.1:0"), Some("127.0.0.1:8844"), wireguard),
-        gateway_can_start(false, Some("127.0.0.1:0"), Some("127.0.0.1:8844"), None),
+        gateway_can_start(true, Some("127.0.0.1:0"), wireguard),
+        gateway_can_start(false, None, wireguard),
+        gateway_can_start(false, Some("127.0.0.1:0"), None),
     ] {
         assert!(!allowed);
     }

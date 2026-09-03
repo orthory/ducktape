@@ -35,15 +35,11 @@ ORIGIN="demo"   # external author stamped on seeded ops (chat rejects an empty a
 USERKEY="$DUCK/keys/demo.key"     # the app signs writes with THIS local key
 DEMO_PASSWORD="${DEMO_KEY_PASSWORD:-ducktape}"  # unlock password for the demo identity
 
-# DEV_LISTEN widens the p2p mesh + WireGuard bind so a second machine can
-# reach this node (#1241): default stays 127.0.0.1 (localhost-only, today's
-# behavior); DEV_LISTEN=0.0.0.0 (or [::]) binds wide. http_listen is a
-# SEPARATE knob (DEV_HTTP_LISTEN) — a --cred run needs a loopback
-# http_listen, the browser gateway dies on a wide bind (see
-# cred-runs-need-a-loopback-http-listen), so widening it is never implied by
-# DEV_LISTEN.
+# DEV_LISTEN widens the p2p mesh + HTTP API binds so a second machine can
+# reach this node: default stays 127.0.0.1 (a localhost-only dev loop);
+# DEV_LISTEN=0.0.0.0 (or [::]) binds wide. The WireGuard plane is bound wide
+# regardless (see --wireguard-listen below).
 DEV_LISTEN="${DEV_LISTEN:-127.0.0.1}"
-DEV_HTTP_LISTEN="${DEV_HTTP_LISTEN:-127.0.0.1}"
 # advertised is the dial-hint peers actually use, so widening `listen` alone
 # leaves a second machine learning a loopback address it cannot dial (#1240
 # half of #1241) — reaching this node from box B needs
@@ -88,14 +84,14 @@ WGP="$(bun -e 'const s=await Bun.udpSocket({port:0});process.stdout.write(String
 #                        hint it cannot use, so reaching this node from a
 #                        second machine needs BOTH DEV_LISTEN=0.0.0.0 and
 #                        DEV_ADVERTISED=<this box's LAN ip>
-#   --http               a --cred run needs http_listen on loopback (the
-#     $DEV_HTTP_LISTEN   isolated browser gateway dies on a wide bind) — a
-#                        SEPARATE knob (DEV_HTTP_LISTEN) from DEV_LISTEN
+#   --http               the HTTP app API, widened with the mesh: reads are
+#     $DEV_LISTEN        open to any peer and writes are signed, so a second
+#                        machine's app can point straight at this node
 #   --rpc                127.0.0.1     local operator rpc — the CLI on THIS
 #                        box only, no peer or huddle plane reads it, stays
 #                        loopback always
 #   --gateway             binds the isolated browser plane that serves the routes;
-#     127.0.0.1:0         stays loopback with http_listen, same #1379 constraint
+#     127.0.0.1:0         the node refuses any bind but 127.0.0.1 for it
 #   --wireguard-listen   a CONCRETE UDP port, already bound wide (0.0.0.0 =
 #     0.0.0.0:$WGP       endpoint-less/roaming, like the app) regardless of
 #                        DEV_LISTEN, so the overlay a peer join/huddle needs
@@ -106,7 +102,7 @@ WGP="$(bun -e 'const s=await Bun.udpSocket({port:0});process.stdout.write(String
 INIT_ERR="$(mktemp)"
 if ! CHAIN="$("$NODE_BIN" node init --name "$ID" --dir "$WSDIR" \
   --listen "$DEV_LISTEN:$P1" --advertised "$DEV_ADVERTISED:$P1" \
-  --http "$DEV_HTTP_LISTEN:$P2" --rpc "127.0.0.1:$P3" --gateway 127.0.0.1:0 \
+  --http "$DEV_LISTEN:$P2" --rpc "127.0.0.1:$P3" --gateway 127.0.0.1:0 \
   --primary-coordinator none \
   --wireguard-listen "0.0.0.0:$WGP" 2>"$INIT_ERR" | tail -1)"; then
   sed -n '1,120p' "$INIT_ERR" >&2
@@ -153,13 +149,13 @@ else
 fi
 
 # ── 4. start the node, wait for its http surface ───────────────
-log "starting node (http $DEV_HTTP_LISTEN:$P2)…"
+log "starting node (http $DEV_LISTEN:$P2)…"
 "$NODE_BIN" node run --config "$WSDIR/node.toml" >"$WSDIR/seed.log" 2>&1 &
 NODE_PID=$!
 trap 'kill "$NODE_PID" 2>/dev/null; wait "$NODE_PID" 2>/dev/null' EXIT
 # This script always talks to the node it just started, from THIS box — a
 # wildcard bind still accepts loopback, so the seeder's own curl calls stay
-# on 127.0.0.1 regardless of DEV_HTTP_LISTEN.
+# on 127.0.0.1 regardless of DEV_LISTEN.
 URL="http://127.0.0.1:$P2"
 for _ in $(seq 1 80); do
   curl -sf "$URL/v1/status" >/dev/null 2>&1 && break

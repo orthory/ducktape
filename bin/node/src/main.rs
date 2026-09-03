@@ -341,6 +341,20 @@ fn run_node_verb(args: cli_args::RunArgs) -> Result<(), Box<dyn std::error::Erro
     run_node(config::resolve(&cfg_path)?, cfg_path, sync_only, log_ring)
 }
 
+/// the browser gateway serves on a running node (never under `--sync-only`)
+/// that configures it and has a real overlay to route through. The app API's
+/// bind address is not a condition: the gateway is its own listener pinned to
+/// 127.0.0.1, refuses loopback routes aimed at this node's API ports by port,
+/// and its CSP excludes the API port — none of which depends on where `/v1`
+/// is bound.
+fn gateway_can_start(
+    sync_only: bool,
+    gateway_listen: Option<&str>,
+    wireguard_listen: Option<std::net::SocketAddr>,
+) -> bool {
+    !sync_only && gateway_listen.is_some() && wireguard_listen.is_some()
+}
+
 /// stand up the real-socket node from `cfg` and run it until killed (validator)
 /// or until state sync completes (`--sync-only`).
 ///
@@ -348,29 +362,6 @@ fn run_node_verb(args: cli_args::RunArgs) -> Result<(), Box<dyn std::error::Erro
 /// and you cannot start a runtime from inside one. so `main` is sync and hands
 /// off to `Runner::start`, which drives everything (including the engine's spawned
 /// tasks) on the runtime it owns.
-fn gateway_can_start(
-    sync_only: bool,
-    gateway_listen: Option<&str>,
-    http_listen: Option<&str>,
-    wireguard_listen: Option<std::net::SocketAddr>,
-) -> bool {
-    let api_is_loopback = http_listen
-        .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
-        .is_some_and(|address| address.ip().is_loopback());
-    // a configured gateway suppressed ONLY by a non-loopback app surface is a
-    // silent degradation — say why, or the operator debugs a dead listener.
-    if !sync_only && gateway_listen.is_some() && !api_is_loopback && http_listen.is_some() {
-        tracing::warn!(
-            target: "ducktape::gateway",
-            http_listen = http_listen.unwrap_or_default(),
-            reason = "api_not_loopback",
-            "gateway disabled; the browser gateway only starts when the node API binds a \
-             loopback address"
-        );
-    }
-    !sync_only && gateway_listen.is_some() && api_is_loopback && wireguard_listen.is_some()
-}
-
 fn run_node(
     resolved: Resolved,
     // this daemon's own `node.toml` — kept whole rather than re-derived from
@@ -473,12 +464,7 @@ fn run_node(
         boot::mesh::preflight_mesh_listen(listen)?;
     }
 
-    let gateway_enabled = gateway_can_start(
-        sync_only,
-        gateway_listen.as_deref(),
-        http_listen.as_deref(),
-        wireguard_listen,
-    );
+    let gateway_enabled = gateway_can_start(sync_only, gateway_listen.as_deref(), wireguard_listen);
 
     // the announce's own base, kept before `http_listen` moves into the bind.
     let announce_base = http_listen.as_deref().map(config::http_base_of);

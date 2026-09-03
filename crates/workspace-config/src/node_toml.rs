@@ -32,7 +32,13 @@ use super::{DEFAULT_BLOCK_TIME_MS, DEFAULT_CHECKPOINT_BLOCKS};
 /// losing that race is an unwinding panic ten seconds into boot. It now sits
 /// beside the two operator surfaces, which were never at risk.
 pub const DEFAULT_MESH_LISTEN: &str = "[::]:8846";
-pub const DEFAULT_HTTP_LISTEN: &str = "127.0.0.1:8844";
+/// every interface: the app API is a network peer's surface, not a localhost
+/// service. Its access rules do not depend on the bind — reads are open, a
+/// mutation carries a per-request user signature, the operator credential is
+/// honored only from a loopback peer, `/v1/admin/*` follows `DUCKTAPE_ADMIN` —
+/// and every co-located process dials it over loopback whatever it is bound
+/// to (`http_base_of`).
+pub const DEFAULT_HTTP_LISTEN: &str = "0.0.0.0:8844";
 pub const DEFAULT_RPC_LISTEN: &str = "127.0.0.1:8845";
 /// port 0 on purpose: the browser gateway prints its bound port and its
 /// consumers re-read it per session; a fixed port would only collide.
@@ -406,7 +412,7 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
         &mut s,
         "http_listen",
         format_args!("\"{}\"", p.http_listen),
-        "HTTP app API (keep loopback)",
+        "HTTP app API; reads open to any peer, writes signed",
     );
     keyline(
         &mut s,
