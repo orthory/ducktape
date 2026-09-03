@@ -533,9 +533,23 @@ pub fn chat_sidebar_rooms(
         .map(|peer| peer.channel_id.as_str())
         .filter(|id| !id.is_empty())
         .collect();
+    // NO DM IS A CHANNEL — not mine, and least of all somebody else's.
+    //
+    // A DM record is an ordinary channel row and the chat index serves every
+    // channel to every member, so the two-party room a COLLABORATOR opened
+    // between their own two accounts arrived in this list. Being in no peer's
+    // `channel_id` it fell through the directory exclusion and drew under
+    // CHANNELS with a `#` glyph and that person's name, beside their real
+    // DIRECT row — it reads as "clicking a DM created a channel". Mine belong
+    // in DIRECT, which `chat_sidebar_dms` builds from the peer directory; a
+    // DM of theirs belongs nowhere on my screen, so the derived SHAPE is the
+    // second half of the rule.
+    let is_a_dm_room = |channel: &ChatChannel| {
+        dm_ids.contains(channel.id.as_str()) || ::chat::client::is_derived_dm_channel(&channel.id)
+    };
     channels
         .into_iter()
-        .filter(|channel| !dm_ids.contains(channel.id.as_str()))
+        .filter(|channel| !is_a_dm_room(channel))
         .map(|channel| ChatSidebarRow {
             unread: channel.head_seq
                 > read_seqs

@@ -3285,6 +3285,7 @@ name = "ducktape-app"
 version = "0.1.0"
 dependencies = [
  "authpage",
+ "block2 0.5.1",
  "capability",
  "chat",
  "commonware-cryptography",
@@ -3308,6 +3309,10 @@ dependencies = [
  "media-service",
  "node",
  "nokhwa",
+ "objc2 0.5.2",
+ "objc2-app-kit 0.2.2",
+ "objc2-foundation 0.2.2",
+ "objc2-user-notifications",
  "pages",
  "rand 0.8.6",
  "reqwest 0.12.28",

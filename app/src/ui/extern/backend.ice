@@ -407,6 +407,8 @@ extern crate::backend
   load_doc_tabs(rpc:str) -> [str]
   load_appearance() -> Appearance
   save_appearance(mode:Appearance) -> bool
+  load_desktop_notifications() -> bool
+  save_desktop_notifications(enabled:bool) -> bool
   save_doc_tabs(rpc:str, tabs:[str]) -> bool
   pure retain_for_endpoint(value:str, current:str, next:str) -> str
   pure mutation_failure_phase(committed:bool) -> MutationPhase

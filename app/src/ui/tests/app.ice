@@ -984,6 +984,7 @@ test settings_keyboard_scroll_contract
             account_busy
             account_ticket
             appearance
+            desktop_notifications
             password
             status
             loading
@@ -1015,6 +1016,7 @@ test settings_keyboard_scroll_contract
             forget_workspace_submit -> forget_workspace_submit
             set_appearance_light -> set_appearance_light
             set_appearance_dark -> set_appearance_dark
+            set_desktop_notifications -> set_desktop_notifications _
       explorer:
         space w=1.0 h=1.0
       palette:

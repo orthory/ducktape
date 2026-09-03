@@ -30,6 +30,17 @@ on set_appearance_dark
 
 on appearance_saved(_written)
 
+// The banner preference, the same arrangement: pin the reading, persist it
+// last, and treat a failed write as costing the NEXT boot's default.
+on desktop_notifications_loaded(enabled)
+  desktop_notifications = enabled
+
+on set_desktop_notifications(enabled)
+  desktop_notifications = enabled
+  run replace lane=notify_save save_desktop_notifications(enabled) -> desktop_notifications_saved _
+
+on desktop_notifications_saved(_written)
+
 // A SAME-ENDPOINT retry: the launch window's picker owns which network, so
 // reconnect no longer changes endpoints — the per-endpoint draft retention
 // that lived here collapsed to identity calls and is gone. Typed drafts

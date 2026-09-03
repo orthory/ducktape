@@ -117,6 +117,19 @@ ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git",
 ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "b5a2c7e7a0133c4f31ef47f569389b3c2342a122" }
 ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "b5a2c7e7a0133c4f31ef47f569389b3c2342a122", version = "=0.1.0", default-features = false, features = ["full-runtime"] }
 
+# The native notification leg (`src/backend/notify.rs`): being @mentioned or
+# DM'd raises a real macOS banner, not just the in-app bell. objc2 0.5 and
+# objc2-app-kit 0.2 are already in this binary's graph under winit — these
+# only turn on the classes this file names. UNUserNotificationCenter TERMINATES
+# a process with no bundle identifier, so `notify` reads NSBundle first and a
+# bare binary (every `cargo test`) degrades to a debug! line.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.5"
+objc2 = "0.5"
+objc2-app-kit = { version = "0.2", default-features = false, features = ["std", "NSRunningApplication"] }
+objc2-foundation = { version = "0.2", default-features = false, features = ["std", "NSBundle", "NSString", "NSError"] }
+objc2-user-notifications = { version = "0.2", default-features = false, features = ["std", "block2", "UNUserNotificationCenter", "UNNotificationRequest", "UNNotificationContent", "UNNotificationSound", "UNNotificationTrigger"] }
+
 [dev-dependencies]
 commonware-cryptography.workspace = true
 # `src/frame_probe.rs` needs a headless `UserInterface` to measure a whole
