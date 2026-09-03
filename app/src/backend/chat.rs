@@ -288,7 +288,11 @@ pub(crate) async fn huddle_fanout_nodes(
 ) -> Result<Vec<String>, String> {
     let client = rpc_client(rpc)?;
     let facts = ReaderFacts::current().await;
-    let (_channel, roster) = load_channel_facts(&client, channel_id, facts.reader()).await?;
+    // A huddle in a room this node cannot see has no fan-out set — an empty
+    // one, not a failure: the poll re-reads on its own cadence and picks the
+    // roster up as soon as the index answers for the room.
+    let room = load_channel_facts(&client, channel_id, facts.reader()).await?;
+    let roster = room.map_or_else(Vec::new, |(_channel, roster)| roster);
     Ok(huddle_recipient_nodes(roster))
 }
 
@@ -742,10 +746,11 @@ pub async fn load_page_threads(
         let rpc = rpc_client(&rpc)?;
         let blocks = load_page_blocks(&rpc, &page_id).await?;
         let block_ids: Vec<String> = blocks.into_iter().map(|block| block.id).collect();
+        let names = names();
         let threads: Vec<PageCommentThread> = query_page_thread_rows(&rpc, &page_id, &block_ids)
             .await?
             .into_iter()
-            .map(page_comment_thread)
+            .map(|thread| page_comment_thread(thread, &names))
             .collect();
         let total = count_i64(threads.len());
         Ok(BlockThreadListData {

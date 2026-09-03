@@ -104,9 +104,10 @@ on settings_loaded(next)
   settings_key_path = next.key_path
   settings_key_state = next.key_state
   settings_user_key = next.user_key
-  // THIS DEVICE'S KEY DECIDES whether it is seated in a members-only room.
-  // The facts load lands after the first chat load, so without this the
-  // composer stayed refused until the next delta.
+  // THIS DEVICE'S KEY — and the account it is bound to — DECIDES whether it
+  // is seated in a members-only room. The facts load lands after the first
+  // chat load, so without this the composer stayed refused until the next
+  // delta.
   post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   settings_open_tabs = next.open_tabs
 

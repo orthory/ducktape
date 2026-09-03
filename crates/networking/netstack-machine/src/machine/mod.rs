@@ -569,6 +569,62 @@ impl Driver {
         });
     }
 
+    /// A by-identity rendezvous came back empty. It is a REACHABILITY
+    /// failure only when no layer can dial the peer: with a live dial
+    /// endpoint — a resolved override, an advertised record, or the invite
+    /// layer's OBSERVED address grafted onto an endpoint-less record (the
+    /// address a relay-fallback join left behind, carrying a completed
+    /// WireGuard handshake) — the punch was an OPTIMIZATION, and reporting
+    /// `PeerFailed` for it tells the operator traffic goes nowhere while
+    /// the tunnel is carrying it.
+    pub(crate) fn fail_rendezvous_fallback(
+        &mut self,
+        state: &EpochState,
+        peer: ValidatorIdentity,
+        reason: &str,
+    ) {
+        if let Some(endpoint) = self.dial_endpoint(state, peer) {
+            tracing::debug!(
+                target: "ducktape::reachability",
+                peer = %short(peer), %endpoint, reason,
+                "rendezvous fallback failed; the peer stays dialable on its current endpoint"
+            );
+            return;
+        }
+        self.fail_peer(state, peer, &format!("rendezvous fallback: {reason}"));
+    }
+
+    /// The endpoint the interface WOULD dial for `peer` right now, layered
+    /// exactly as the push layers it ([`Self::epoch_layered_peers`] then
+    /// [`Self::merge_invite_layer`]): a resolved override wins, then the
+    /// pre-warm / re-advertised / base entry, and an endpoint-less result
+    /// takes the invite layer's endpoint by the same graft rule. `None` is
+    /// the ONLY state a rendezvous fallback exists for — neither side can
+    /// initiate — so it is what the sweeps filter on.
+    pub(crate) fn dial_endpoint(
+        &self,
+        state: &EpochState,
+        peer: ValidatorIdentity,
+    ) -> Option<SocketAddr> {
+        if let Some(addr) = state.overrides.get(&peer) {
+            return Some(*addr);
+        }
+        let invite = self.invite_peers.get(&peer);
+        let layered = state
+            .prewarm_peers
+            .get(&peer)
+            .or_else(|| state.readvertised_peers.get(&peer))
+            .or_else(|| self.base_peers.as_ref().and_then(|base| base.get(&peer)));
+        let Some(entry) = layered else {
+            return invite.and_then(|invite| invite.config.endpoint);
+        };
+        entry.endpoint.or_else(|| {
+            invite
+                .filter(|invite| invite.config.wireguard_public_key == entry.wireguard_public_key)
+                .and_then(|invite| invite.config.endpoint)
+        })
+    }
+
     /// announce an accepted CONTROL endpoint to the node, only when it
     /// differs from the last one observed for that identity. one ledger for
     /// every acceptance path (member/standby role, records, adverts, the
@@ -1267,5 +1323,228 @@ mod invite_layer_tests {
             "the stranger is installed"
         );
         assert_eq!(machine.driver.invite_peers.len(), MAX_INVITE_PEERS + 1);
+    }
+}
+
+#[cfg(test)]
+mod rendezvous_sweep_tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use commonware_cryptography::Signer as _;
+    use commonware_cryptography::ed25519::PrivateKey;
+    use nat_traversal::NodeKey;
+    use wireguard::{Endpoint, PortPolicy, Transport, X25519PublicKey};
+
+    use super::*;
+    use crate::contract::{CmdToken, Event, MachineConfig, MeshEpochEvent};
+
+    /// The member's WireGuard key, shared by its endpoint-less pre-warm
+    /// entry and the invite entry that grafts onto it — the graft is
+    /// key-matched, so the two must agree.
+    const MEMBER_WG: X25519PublicKey = X25519PublicKey([9; 32]);
+
+    /// The address a relay-fallback join left behind: OBSERVED, not
+    /// advertised, and carrying the live handshake.
+    fn invite_endpoint() -> SocketAddr {
+        SocketAddr::from(([203, 0, 113, 7], 51_820))
+    }
+
+    /// A fully-NATed STANDBY (the admitted resident's shape) with a
+    /// coordinator configured and one member peer, its epoch live.
+    fn standby() -> (Machine, ed25519::PublicKey) {
+        let policy = PortPolicy::production();
+        let ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 1));
+        let config = MachineConfig {
+            chain_id: "net#sweep".into(),
+            wireguard_public: X25519PublicKey([1; 32]),
+            // fully NATed: this node advertises nothing.
+            wireguard_advertised: None,
+            control_endpoint: Endpoint::new(ip, 443, Transport::Tcp, &policy).unwrap(),
+            coordinators: vec!["203.0.113.53:3478".parse().unwrap()],
+            port_policy: policy,
+            persist: false,
+            gossip_ingress: None,
+        };
+        let me = PrivateKey::from_seed(1);
+        let member = PrivateKey::from_seed(2).public_key();
+        let mut machine = Machine::new(Box::new(me.clone()), config);
+        machine
+            .step(
+                Event::Retarget {
+                    event: MeshEpochEvent {
+                        epoch: 1,
+                        members: vec![member.clone()],
+                        standbys: vec![me.public_key()],
+                        current_view: 1,
+                    },
+                    persisted: None,
+                },
+                1_000,
+            )
+            .unwrap();
+        (machine, member)
+    }
+
+    /// The member as the standby's pre-warm layer holds it after accepting
+    /// an endpoint-less record: installed, keyed, and undialable on its own.
+    fn prewarm_endpointless(machine: &mut Machine, member: ValidatorIdentity) {
+        let allowed_ips = machine.driver.overlay.identity_allowed_ips(member);
+        machine
+            .epoch
+            .as_mut()
+            .expect("the standby's epoch is live")
+            .prewarm_peers
+            .insert(
+                member,
+                PeerTunnelConfig {
+                    wireguard_public_key: MEMBER_WG,
+                    endpoint: None,
+                    allowed_ips,
+                    keepalive_seconds: Some(KEEPALIVE_SECONDS),
+                },
+            );
+    }
+
+    /// Install the join's invite peer and round-trip its interface push.
+    fn install_invite(machine: &mut Machine, member: &ed25519::PublicKey, now_ms: u64) {
+        let effects = machine
+            .step(
+                Event::InstallInvitePeer {
+                    token: CmdToken(1),
+                    peer: member.clone(),
+                    wireguard_public_key: MEMBER_WG,
+                    endpoint: invite_endpoint(),
+                },
+                now_ms,
+            )
+            .unwrap();
+        let pushed = effects.iter().find_map(|effect| match effect {
+            Effect::WgApply { req, .. } => Some(*req),
+            _ => None,
+        });
+        if let Some(req) = pushed {
+            machine
+                .step(
+                    Event::WgApplied {
+                        req,
+                        outcome: Ok(()),
+                    },
+                    now_ms,
+                )
+                .unwrap();
+        }
+    }
+
+    fn rendezvous_starts(effects: &[Effect]) -> Vec<(ReqId, NodeKey)> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::RendezvousStart { req, peer } => Some((*req, *peer)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn peer_failures(effects: &[Effect]) -> Vec<String> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Observe(ReachabilityEvent::PeerFailed { reason, .. }) => {
+                    Some(reason.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The baseline the fix must not break: a member the standby cannot
+    /// dial at all is still swept through the coordinator.
+    #[test]
+    fn an_undialable_prewarm_member_is_swept() {
+        let (mut machine, member) = standby();
+        prewarm_endpointless(&mut machine, binding::identity_of(&member));
+
+        let effects = machine.step(Event::Nudge, 2_000).unwrap();
+        assert_eq!(
+            rendezvous_starts(&effects).len(),
+            1,
+            "nothing can dial the member — the sweep owes it a punch"
+        );
+    }
+
+    /// The admitted resident's member IS dialable: the invite layer's
+    /// observed endpoint grafts onto the endpoint-less pre-warm entry on
+    /// every push, and the tunnel is carrying traffic on it. The sweep must
+    /// not punch for it, and so must never report it dark.
+    #[test]
+    fn an_invite_grafted_member_is_never_swept() {
+        let (mut machine, member) = standby();
+        install_invite(&mut machine, &member, 1_500);
+        prewarm_endpointless(&mut machine, binding::identity_of(&member));
+
+        for tick in 0..4u64 {
+            let effects = machine.step(Event::Nudge, 2_000 + tick * 6_000).unwrap();
+            assert!(
+                rendezvous_starts(&effects).is_empty(),
+                "tick {tick}: the member is dialable through the invite graft"
+            );
+            assert!(
+                peer_failures(&effects).is_empty(),
+                "tick {tick}: a dialable peer is never reported unreachable"
+            );
+        }
+    }
+
+    /// The race the sweep filter cannot cover: the punch was started while
+    /// nothing could dial the member, and the invite endpoint landed while
+    /// it was in flight. The failure settles against the CURRENT dial
+    /// state, not the one the attempt started in.
+    #[test]
+    fn a_failed_punch_does_not_report_a_now_dialable_peer_dark() {
+        let (mut machine, member) = standby();
+        prewarm_endpointless(&mut machine, binding::identity_of(&member));
+        let started = machine.step(Event::Nudge, 2_000).unwrap();
+        let (req, _) = rendezvous_starts(&started)[0];
+
+        install_invite(&mut machine, &member, 2_500);
+        let settled = machine
+            .step(
+                Event::RendezvousResolved {
+                    req,
+                    outcome: Err("hole-punch failed after 3 tries".into()),
+                },
+                3_000,
+            )
+            .unwrap();
+        assert!(
+            peer_failures(&settled).is_empty(),
+            "the tunnel is carrying traffic on the invite endpoint: {:?}",
+            peer_failures(&settled)
+        );
+    }
+
+    /// The other half of the contract: with nothing to dial, the failed
+    /// punch IS the reachability failure it always was.
+    #[test]
+    fn a_failed_punch_still_reports_an_undialable_peer_dark() {
+        let (mut machine, member) = standby();
+        prewarm_endpointless(&mut machine, binding::identity_of(&member));
+        let started = machine.step(Event::Nudge, 2_000).unwrap();
+        let (req, _) = rendezvous_starts(&started)[0];
+
+        let settled = machine
+            .step(
+                Event::RendezvousResolved {
+                    req,
+                    outcome: Err("hole-punch failed after 3 tries".into()),
+                },
+                3_000,
+            )
+            .unwrap();
+        assert_eq!(
+            peer_failures(&settled),
+            vec!["rendezvous fallback: hole-punch failed after 3 tries".to_string()],
+            "no layer can dial the member — the operator must hear it"
+        );
     }
 }

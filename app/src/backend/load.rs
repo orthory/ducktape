@@ -177,11 +177,19 @@ pub(crate) enum MessageWindow {
 
 /// One channel's row and its huddle roster, read from the index view. The
 /// roster length is not derivable from an op, so the row still has to be read.
+///
+/// `None` IS AN ANSWER, NOT A FAILURE. A room this node cannot see is the
+/// ordinary state of three things: a resident whose chat index has not folded
+/// yet (a fresh join spends minutes in `joining` with every `Channel` query
+/// answering `null`), a room id remembered from a network this session has
+/// since left, and a landing id that never existed here. None of those is a
+/// broken node, so none of them may reach the reader as a red banner over the
+/// timeline — each caller decides what an unseen room means for it.
 pub(crate) async fn load_channel_facts(
     rpc: &RpcClient,
     channel_id: &str,
     reader: ChatReader<'_>,
-) -> Result<(ChatChannel, Vec<HuddleParticipant>), String> {
+) -> Result<Option<(ChatChannel, Vec<HuddleParticipant>)>, String> {
     let reply: ChatViewReply = rpc
         .view(
             "chat",
@@ -190,11 +198,18 @@ pub(crate) async fn load_channel_facts(
             },
         )
         .await?;
-    let ChatViewReply::Channel(Some(info)) = reply else {
-        return Err("channel record was not found".into());
+    let ChatViewReply::Channel(record) = reply else {
+        return Err("node returned an invalid channel record".into());
     };
+    let Some(info) = record else {
+        return Ok(None);
+    };
+    // The roster is named through the reader handed in — the directory as
+    // last read, never a filling query: `load_channel_row` awaits this inside
+    // the live stream's decoder fold, where a `/v1/query` would freeze every
+    // subscriber for as long as the node's select loop is busy.
     let roster = huddle_roster(&info.channel.huddle, reader);
-    Ok((
+    Ok(Some((
         ChatChannel {
             id: info.channel.id,
             name: info.channel.name,
@@ -204,7 +219,7 @@ pub(crate) async fn load_channel_facts(
             head_seq: number_i64(info.head_seq),
         },
         roster,
-    ))
+    )))
 }
 
 /// One channel's window, WITHOUT re-paging the channel list.
@@ -227,11 +242,15 @@ pub(crate) async fn load_channel_facts(
 /// `upsert_channel_rows`, which folds this row into the list on screen instead
 /// of replacing it.
 ///
-/// The window is authoritative about where it landed: it names the channel it
-/// was asked for or it fails. `load_chat_data`'s "requested id I cannot see
-/// falls back to the landing channel" rule is right for a refresh and wrong
-/// here — the reducer drops a reply for another room, so a silent fallback
-/// would leave the pane loading forever.
+/// The window is authoritative about WHERE IT LANDED, which is not the same as
+/// always landing where it was asked. A room this node cannot see is not an
+/// error the reader can act on — it is a resident whose index has not folded
+/// yet, or an id remembered from a network this session has left — so it falls
+/// through to the cold load, which names the landing channel it settles on (or
+/// no channel at all, on a workspace with nothing to read yet) and carries the
+/// whole list back with it. Every reducer downstream lands on
+/// `next.active_channel`, so the answer stays truthful either way; what it must
+/// never do is put "channel record was not found" over the timeline.
 pub(crate) async fn load_channel_window_data(
     rpc: &RpcClient,
     channel_id: &str,
@@ -246,16 +265,20 @@ pub(crate) async fn load_channel_window_data(
             MessageWindow::Tail => load_messages(rpc, channel_id).await,
             MessageWindow::Around(seq) => {
                 let messages = load_messages_around(rpc, channel_id, seq).await?;
-                let has_more = history_has_older(messages.clone());
+                let floor = oldest_committed(&messages).map_or(0, |message| message.seq);
+                let has_more = older_roots_exist(rpc, channel_id, floor).await?;
                 Ok(RootPage { messages, has_more })
             }
         }
     };
-    let ((channel, huddle_roster), channel_members, message_page) = tokio::try_join!(
+    let (room, channel_members, message_page) = tokio::try_join!(
         load_channel_facts(rpc, channel_id, facts.reader()),
         load_channel_members(rpc, channel_id, facts.names()),
         messages_leg
     )?;
+    let Some((channel, huddle_roster)) = room else {
+        return load_chat_data(rpc, None).await;
+    };
     Ok(ChatData {
         generation: 0,
         channels: vec![channel.clone()],
@@ -417,6 +440,42 @@ struct RootRows {
     has_more: bool,
 }
 
+/// IS THERE ANY ROOT OLDER THAN `floor` — the server's answer, for a window the
+/// server was never asked to page.
+///
+/// The tail and older-page loads carry the index's own `has_more` back with
+/// them. A search-hit window does not: `MessagesAround` is a slice centred on
+/// one message and says nothing about what lies before it, and the guess that
+/// stood in for it — "the oldest row's seq is greater than 1" — is wrong on
+/// every real channel. Root sequences have HOLES: a thread reply consumes a seq
+/// without ever becoming a root, so the first message in a busy channel can sit
+/// at seq 40 and "Load older messages" stood forever over a timeline with
+/// nothing older, paging an empty answer on every click.
+///
+/// One root before the floor is the whole question, so the page is one row.
+async fn older_roots_exist(rpc: &RpcClient, channel_id: &str, floor: i64) -> Result<bool, String> {
+    let Ok(floor) = u64::try_from(floor) else {
+        return Ok(false);
+    };
+    if floor == 0 {
+        return Ok(false);
+    }
+    let reply: ChatViewReply = rpc
+        .view(
+            "chat",
+            &ChatViewQuery::Roots {
+                channel_id: channel_id.to_string(),
+                before_seq: Some(floor),
+                limit: Some(1),
+            },
+        )
+        .await?;
+    let ChatViewReply::Roots { roots, .. } = reply else {
+        return Err("node returned an invalid root page".into());
+    };
+    Ok(!roots.is_empty())
+}
+
 async fn query_roots(
     rpc: &RpcClient,
     channel_id: &str,
@@ -491,17 +550,10 @@ pub struct HistoryPageData {
 ///
 /// A pending optimistic row carries a negative seq, which sorts ahead of every
 /// real message. Reading `first()` blindly made an in-flight send answer for
-/// the top of the timeline: `history_has_older` saw `-1 > 1` and hid "Load
-/// older" outright, while `oldest_message_seq` handed the loader a `-1` that
+/// the top of the timeline: `oldest_message_seq` handed the loader a `-1` that
 /// floors to an empty server cursor.
 fn oldest_committed(messages: &[ChatMessage]) -> Option<&ChatMessage> {
     messages.iter().find(|message| !message.pending)
-}
-
-/// True when the oldest loaded root is not the channel's first message, i.e.
-/// there is older history to page in.
-pub fn history_has_older(messages: Vec<ChatMessage>) -> bool {
-    oldest_committed(&messages).is_some_and(|message| message.seq > 1)
 }
 
 /// The seq of the oldest loaded root (the ceiling for the next older page).
@@ -691,6 +743,7 @@ pub(crate) async fn query_block_comment_page(
             },
         )
         .await?;
+    let names = names();
     let PageReply::CommentThread(thread) = reply else {
         return Err("node returned an invalid comment page".into());
     };
@@ -708,7 +761,7 @@ pub(crate) async fn query_block_comment_page(
         .into_iter()
         .enumerate()
         .skip(from as usize)
-        .map(|(index, comment)| page_comment(index + 1, comment))
+        .map(|(index, comment)| page_comment(index + 1, comment, &names))
         .collect();
     Ok(Some(BlockCommentData {
         generation,
@@ -721,7 +774,7 @@ pub(crate) async fn query_block_comment_page(
     }))
 }
 
-pub(crate) fn page_comment_thread(thread: ThreadRow) -> PageCommentThread {
+pub(crate) fn page_comment_thread(thread: ThreadRow, names: &NameDirectory) -> PageCommentThread {
     let comment_count = count_i64(thread.comments.iter().filter(|c| !c.deleted).count());
     let count_label = if comment_count == 1 {
         "1 comment".to_string()
@@ -731,7 +784,7 @@ pub(crate) fn page_comment_thread(thread: ThreadRow) -> PageCommentThread {
     PageCommentThread {
         id: thread.id,
         target: thread.target,
-        author: author_display(&thread.opener, &names()),
+        author: author_display(&thread.opener, names),
         meta: if thread.resolved {
             format!("{count_label} · resolved")
         } else {
@@ -742,13 +795,13 @@ pub(crate) fn page_comment_thread(thread: ThreadRow) -> PageCommentThread {
     }
 }
 
-fn page_comment(ordinal: usize, comment: pages::Comment) -> PageComment {
+fn page_comment(ordinal: usize, comment: pages::Comment, names: &NameDirectory) -> PageComment {
     let edited = comment.edited_at.is_some();
     let ordinal = count_i64(ordinal);
     PageComment {
         id: comment.id,
         ordinal,
-        author: page_author_name(&comment.author),
+        author: page_author_name(&comment.author, names),
         meta: if edited {
             format!("#{ordinal} · edited")
         } else {
@@ -760,11 +813,9 @@ fn page_comment(ordinal: usize, comment: pages::Comment) -> PageComment {
 
 /// A page comment's author, named the way every other surface names one: a
 /// person by the account the directory binds to their key, else by handle.
-fn page_author_name(author: &pages::AuthorRef) -> String {
+fn page_author_name(author: &pages::AuthorRef, names: &NameDirectory) -> String {
     match author {
-        pages::AuthorRef::User(key) => {
-            author_display(&format!("user:{}", hex_encode(key)), &names())
-        }
+        pages::AuthorRef::User(key) => author_display(&format!("user:{}", hex_encode(key)), names),
         pages::AuthorRef::Agent { agent_id, .. } => format!("@{agent_id}"),
         pages::AuthorRef::Module(module) => module.clone(),
         pages::AuthorRef::System => "system".into(),

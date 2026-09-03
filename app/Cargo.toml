@@ -10,8 +10,15 @@ authors = ["Ducktape contributors"]
 icon = "assets/icon.svg"
 category = "public.app-category.productivity"
 
+# macOS terminates the process the instant a huddle opens a device whose reason
+# the bundle does not state; these are the sentences its prompt shows. Screen
+# capture has no usage key — macOS grants it through Screen Recording instead.
+[package.metadata.ice.bundle.usage]
+camera = "Ducktape uses the camera for video in huddles."
+microphone = "Ducktape uses the microphone for voice in huddles."
+
 [build-dependencies]
-ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "1334f31274e97dcdc43c5d6ba43a0a645a6eed8a", version = "=0.1.0" }
+ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "b5a2c7e7a0133c4f31ef47f569389b3c2342a122", version = "=0.1.0" }
 
 [dependencies]
 # the network's node -> announced-provider registry, behind the Shell's host
@@ -119,9 +126,9 @@ zeroize.workspace = true
 # fractional scale and the text-input-v3 protocol every Wayland input method
 # speaks. winit picks Wayland when `WAYLAND_DISPLAY` is set, X11 otherwise.
 iced = { version = "=0.14.0", default-features = false, features = ["advanced", "highlighter", "image-without-codecs", "lazy", "markdown", "svg", "tokio", "wgpu", "wayland", "x11"] }
-ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "1334f31274e97dcdc43c5d6ba43a0a645a6eed8a", default-features = false, features = ["log-timeline", "terminal"] }
-ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "1334f31274e97dcdc43c5d6ba43a0a645a6eed8a" }
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "1334f31274e97dcdc43c5d6ba43a0a645a6eed8a", version = "=0.1.0", default-features = false, features = ["full-runtime"] }
+ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "b5a2c7e7a0133c4f31ef47f569389b3c2342a122", default-features = false, features = ["log-timeline", "terminal"] }
+ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "b5a2c7e7a0133c4f31ef47f569389b3c2342a122" }
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "b5a2c7e7a0133c4f31ef47f569389b3c2342a122", version = "=0.1.0", default-features = false, features = ["full-runtime"] }
 
 [dev-dependencies]
 commonware-cryptography.workspace = true
@@ -132,4 +139,4 @@ commonware-cryptography.workspace = true
 iced_test = "=0.14.0"
 simnode = { path = "../bin/simnode" }
 tempfile.workspace = true
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "1334f31274e97dcdc43c5d6ba43a0a645a6eed8a", version = "=0.1.0", default-features = false, features = ["test-runtime"] }
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "b5a2c7e7a0133c4f31ef47f569389b3c2342a122", version = "=0.1.0", default-features = false, features = ["test-runtime"] }

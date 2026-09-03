@@ -380,7 +380,10 @@ where
         // per checkpoint — so the history below it is reachable only from a
         // peer, and only here. Every module keeps its floor when no source
         // holds that history, and the boot never aborts on it (#1309).
-        crate::explorer::heal_and_backfill_index(index, client, local_height, label).await;
+        // the validator lane has no retry pump: a walk refused here is owed
+        // to the next boot seam, not to a poll this loop does not run.
+        let _owed =
+            crate::explorer::heal_and_backfill_index(index, client, local_height, label).await;
         return seat;
     };
     tracing::warn!(
@@ -527,7 +530,10 @@ where
     // one moment a sync client exists on the validator lane, exactly as the
     // promotion seat backfills before `run_promoted` heals against the same
     // boundary.
-    crate::explorer::heal_and_backfill_index(index, client, boundary.height, label).await;
+    // same as the restart arm above: no retry pump on this tier, so a refused
+    // walk stands until the next boot seam asks again.
+    let _owed =
+        crate::explorer::heal_and_backfill_index(index, client, boundary.height, label).await;
     let pos = crate::sync::serve::write_boundary_checkpoint(
         recovery,
         &host,

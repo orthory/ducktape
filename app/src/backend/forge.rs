@@ -120,7 +120,7 @@ pub async fn load_forge_repo(
             generation,
             repo,
             branches,
-            items: forge::client::item_rows(&summaries),
+            items: forge::client::item_rows(&summaries, &names()),
         })
     }
     .await
@@ -166,7 +166,7 @@ pub async fn load_forge_item(
                 .ok()
                 .and_then(|reply| serde_json::from_value(reply["pr_diff"].clone()).ok()),
         };
-        let view = forge::client::item_view(&detail, diff.as_ref());
+        let view = forge::client::item_view(&detail, diff.as_ref(), &names());
         let branches = match view.source_branch.is_empty() {
             true => String::new(),
             false => format!("{} → {}", view.source_branch, view.target_branch),

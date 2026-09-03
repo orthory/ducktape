@@ -104,7 +104,9 @@ impl NameDirectory {
 
     /// The account name bound to a user key (hex), if any.
     pub fn name_of(&self, key_hex: &str) -> Option<&str> {
-        self.accounts.get(key_hex).map(|account| account.name.as_str())
+        self.accounts
+            .get(key_hex)
+            .map(|account| account.name.as_str())
     }
 
     /// The account number a user key (hex) is bound to, if any.
@@ -2151,6 +2153,33 @@ mod tests {
         // Two keys the directory does not know are two people.
         let cold = ChatReader::new(Some(&me), ChatReader::nobody().names);
         assert!(!reacted_by_reader(&[my_passkey], cold));
+    }
+
+    /// A KEY IS NOT A NAME, AND THE READER NEVER ASKED FOR ONE. `user:{hex}` is
+    /// everything a chat row carries; the account name behind that key lives in
+    /// the identity module, so a timeline read without its directory prints hex
+    /// at people who are named one pane away in the DIRECT list.
+    #[test]
+    fn a_registered_account_renders_by_name() {
+        let key = vec![0xbf; 32];
+        let handle = format!("user:{}", hex_encode(&key));
+        let names = NameDirectory::new(BTreeMap::from([(
+            hex_encode(&key),
+            BoundAccount {
+                number: 2,
+                name: "orthory".into(),
+            },
+        )]));
+
+        assert_eq!(author_display(&handle, &names), "orthory");
+        // The avatar follows the name — an "O", not the first hex nibble.
+        assert_eq!(avatar_initial(&handle, &names), "O");
+        // A key with no account is still honestly its short hex.
+        let stranger = format!("user:{}", hex_encode(&[0x11; 32]));
+        assert_eq!(author_display(&stranger, &names), "user 11111111…");
+        // A module or agent names itself; the directory has no say.
+        assert_eq!(author_display("agent:demo/quackbot", &names), "@quackbot");
+        assert_eq!(author_display("module:runs", &names), "runs");
     }
 
     #[test]

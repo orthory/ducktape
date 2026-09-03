@@ -296,7 +296,8 @@ async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
     let names = NameDirectory::default();
     let (_channel, roster) = load_channel_facts(&rpc, "eng", ChatReader::new(Some(&mine), &names))
         .await
-        .expect("the huddle's channel reads back");
+        .expect("the huddle's channel reads back")
+        .expect("the huddle's channel is on this node");
     assert_eq!(roster.len(), 2, "both people are on the roster");
     assert_eq!(
         roster.iter().filter(|row| row.is_you).count(),
@@ -321,6 +322,83 @@ async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
     );
     // `shutdown`, not a drop: the handle's last executor reference cannot be
     // dropped on this async thread (see `SimHandle::shutdown`).
+    sim.shutdown();
+}
+
+/// A ROOM THIS NODE CANNOT SEE IS A LANDING, NOT A RED BANNER.
+///
+/// Both halves of it were reported by one resident in one session: she joined a
+/// second network in an app that was still holding the first one's room id, and
+/// the node she joined spent minutes in `joining` with an unfolded chat index
+/// answering `{"channel": null}` for every id there is. Either way the switch
+/// loader read a channel record that is not there, and either way the console
+/// put "channel record was not found" over the timeline — a node-broken reading
+/// of two states that are neither broken nor hers to fix.
+///
+/// So the walk here is the second state THEN the first: an index with nothing
+/// in it answers with no room at all, and an index that has folded answers with
+/// the room there is to read.
+#[tokio::test(flavor = "current_thread")]
+async fn a_window_on_an_unseen_room_lands_instead_of_failing() {
+    let storage = tempfile::tempdir().unwrap();
+    let sim = simnode::boot(
+        storage.path(),
+        "127.0.0.1:0".parse().unwrap(),
+        simnode::SimOpts {
+            auto: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let rpc = RpcClient::new(&format!("http://{}", sim.addr())).unwrap();
+    let me = ed25519::PrivateKey::from_seed(11);
+
+    // The joining resident: nothing folded yet, so no id resolves — including
+    // the one the sidebar is asking for.
+    let unfolded = load_channel_window_data(&rpc, "dm-from-the-old-network", MessageWindow::Tail)
+        .await
+        .expect("an unseen room is an empty console, not a failed load");
+    assert!(
+        unfolded.active_channel.is_empty() && unfolded.channels.is_empty(),
+        "a workspace with no rooms to see lands on no room, honestly empty"
+    );
+
+    submit_test(
+        &rpc,
+        &me,
+        1,
+        "chat",
+        chat::encode_msg(&ChatMsg::CreateChannel {
+            channel_id: "eng".into(),
+            name: "Engineering".into(),
+            post_policy: PostPolicy::Open,
+        }),
+    )
+    .await;
+    submit_test(
+        &rpc,
+        &me,
+        2,
+        "chat",
+        chat::encode_msg(&ChatMsg::PostMessage {
+            channel_id: "eng".into(),
+            message_id: "message-1".into(),
+            blocks: vec![chat::Block::paragraph("first")],
+            thread: None,
+            as_agent: None,
+        }),
+    )
+    .await;
+
+    let landed = load_channel_window_data(&rpc, "dm-from-the-old-network", MessageWindow::Tail)
+        .await
+        .expect("an unseen room is a landing, not a failed load");
+    assert_eq!(
+        landed.active_channel, "eng",
+        "the id nothing answers for resolves to the landing channel"
+    );
+    assert_eq!(landed.active_channel_name, "Engineering");
+    assert_eq!(landed.messages.len(), 1, "and it lands with its timeline");
     sim.shutdown();
 }
 

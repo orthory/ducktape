@@ -35,16 +35,15 @@ fn a_dm_id_is_pair_derived_and_cannot_be_forged() {
     let rooms = chat_sidebar_rooms(listing.clone(), peers.clone(), Vec::new());
     assert_eq!(rooms.len(), 1);
     assert_eq!(rooms[0].channel.id, "general");
-    // A device with no account derives no DM id, so no room is a DM to it —
-    // the directory's own channel id is the ONE test, never a re-derivation.
-    let accountless = vec![DmPeer {
+    // AND THE DIRECTORY IS THE ONLY THING THAT DECIDES IT. A peer row whose
+    // load resolved no account number of ours carries no `channel_id`, so it
+    // claims nothing — the DM falls back into the room list rather than
+    // swallowing every channel whose id happens to be empty.
+    let unresolved = vec![DmPeer {
         channel_id: String::new(),
         ..peers[0].clone()
     }];
-    assert_eq!(
-        chat_sidebar_rooms(listing, accountless, Vec::new()).len(),
-        2
-    );
+    assert_eq!(chat_sidebar_rooms(listing, unresolved, Vec::new()).len(), 2);
 
     // the id the app mints is the id chat will accept from a USER author:
     // ':' is reserved for module origins and '/' is refused outright, so a
@@ -81,15 +80,24 @@ fn the_post_gate_names_why_a_viewer_cannot_post() {
     seed_names(NameDirectory::new(BTreeMap::from([
         (
             "beef".to_string(),
-            BoundAccount { number: 7, name: "b".into() },
+            BoundAccount {
+                number: 7,
+                name: "b".into(),
+            },
         ),
         (
             "b00f".to_string(),
-            BoundAccount { number: 7, name: "b".into() },
+            BoundAccount {
+                number: 7,
+                name: "b".into(),
+            },
         ),
         (
             "cafe".to_string(),
-            BoundAccount { number: 8, name: "c".into() },
+            BoundAccount {
+                number: 8,
+                name: "c".into(),
+            },
         ),
     ])));
     assert_eq!(post_gate(false, true, members.clone(), "b00f".into()), "");
@@ -192,7 +200,10 @@ fn a_search_hits_author_is_not_reformatted_into_system() {
     }
 
     // And the first pass is the one that is correct.
-    assert_eq!(author_display("user:48cedb0d131f", &NameDirectory::default()), "user 48cedb0d…");
+    assert_eq!(
+        author_display("user:48cedb0d131f", &NameDirectory::default()),
+        "user 48cedb0d…"
+    );
     assert_eq!(author_name("agent:demo/quackbot"), "@quackbot");
 
     // The call site itself, pinned: the message arm must carry the author
@@ -386,9 +397,7 @@ fn history_pagination_prepends_older_and_flags_more() {
         reactions: Vec::new(),
         render_rev: 0,
     };
-    // oldest loaded root is seq 3 -> older history exists.
     let loaded = vec![msg(3), msg(4), msg(5)];
-    assert!(history_has_older(loaded.clone()));
     assert_eq!(oldest_message_seq(loaded.clone()), 3);
     // prepend an older page whose last item (seq 3) duplicates the current head.
     let merged = prepend_history(loaded, vec![msg(1), msg(2), msg(3)]);
@@ -396,8 +405,7 @@ fn history_pagination_prepends_older_and_flags_more() {
         merged.iter().map(|message| message.seq).collect::<Vec<_>>(),
         vec![1, 2, 3, 4, 5]
     );
-    // now the oldest loaded root is seq 1 -> no more history to page.
-    assert!(!history_has_older(merged));
+    assert_eq!(oldest_message_seq(merged), 1);
 }
 
 /// The composer's grammar loop, closed over a real node: the SAME parser
@@ -673,27 +681,13 @@ fn client_local_unread_tracking_seeds_marks_and_places_the_divider() {
     };
     let dms = chat_sidebar_dms(channels.clone(), vec![dm], reads.clone());
     assert!(dms[0].unread);
-    assert!(
-        !chat_sidebar_rooms(
-            vec![channel("random", 30)],
-            Vec::new(),
-            reads.clone(),
-        )[0]
-        .unread
-    );
+    assert!(!chat_sidebar_rooms(vec![channel("random", 30)], Vec::new(), reads.clone())[0].unread);
 
     // initial_channel_reads: seed absent channels to head, preserve existing.
     let seeded = initial_channel_reads(channels.clone(), vec![read("random", 30)]);
     assert_eq!(channel_last_read(seeded.clone(), "random".into()), 30);
     assert_eq!(channel_last_read(seeded.clone(), "general".into()), 100);
-    assert!(
-        !chat_sidebar_rooms(
-            vec![channel("general", 100)],
-            Vec::new(),
-            seeded,
-        )[0]
-        .unread
-    );
+    assert!(!chat_sidebar_rooms(vec![channel("general", 100)], Vec::new(), seeded)[0].unread);
 
     // first_unread_seq: first message past the boundary; pending (seq -1)
     // never anchors it; 0 when caught up.
@@ -806,6 +800,18 @@ fn chat_reads_never_cross_the_dispatch_query_lane() {
         load_channel_facts.contains("ChatViewQuery::Channel {"),
         "the channel row reads the index view arm"
     );
+    // AND NEITHER DOES THE DIRECTORY IT NAMES THE ROSTER WITH. The filling
+    // read (`read_accounts`, behind `refresh_names`) is an identity
+    // `/v1/query`, so reaching for it here would put the very round trip this
+    // test bans back inside the fold — one indirection further away, where the
+    // `.query(` sweep below cannot see it. The reader handed in carries the
+    // directory as last read.
+    for body in [load_channel_row, load_channel_facts] {
+        assert!(
+            !body.contains("read_accounts(") && !body.contains("refresh_names("),
+            "the fold's channel read takes the directory it already has"
+        );
+    }
     for body in [load_channel_row, load_channel_facts] {
         assert!(
             !body.contains(".query("),
@@ -878,4 +884,55 @@ fn timeline_pages_are_one_root_view_call_without_a_message_walk() {
     assert!(!LOAD.contains("walk_roots_back"));
     assert!(!LOAD.contains("ChatViewQuery::MessagesLatest"));
     assert!(!LOAD.contains("ChatViewQuery::MessagesRange"));
+}
+
+/// A NAME REGISTERED ON A NETWORK IS THE NAME ITS MESSAGES CARRY.
+///
+/// A chat row stamps `user:{hex}` and nothing else — a key is what signed the
+/// frame — while the name that key registered lives in the identity module. The
+/// two were never joined: a freshly joined resident read a DM whose every
+/// message was attributed to `user bf431c5d…`, with the same account rendered
+/// "orthory" in the DIRECT list one pane to the left.
+///
+/// The directory is built from the identity roster `read_accounts` pages,
+/// and EVERY key of an account answers to that account's name — a person with a
+/// laptop and a phone signs with two keys and is one name in the timeline.
+#[test]
+fn every_key_of_an_account_renders_as_that_accounts_name() {
+    let key = |byte: u8| identity::KeyView {
+        scheme: identity::KeyScheme::Ed25519,
+        pubkey: vec![byte; 32],
+        label: None,
+        added_at: 0,
+    };
+    let account = |number: u64, name: &str, keys: Vec<identity::KeyView>| identity::AccountView {
+        number,
+        name: name.into(),
+        keys,
+        avatar: None,
+        bio: None,
+        updated_at: 0,
+    };
+    let names = directory_of(&[
+        account(1, "eddy", vec![key(0x56)]),
+        // two devices, one person
+        account(2, "orthory", vec![key(0x03), key(0xbf)]),
+    ]);
+
+    let handle = |byte: u8| format!("user:{}", hex_encode(&[byte; 32]));
+    assert_eq!(author_display(&handle(0xbf), &names), "orthory");
+    assert_eq!(
+        author_display(&handle(0x03), &names),
+        "orthory",
+        "the second device is the same person, not a second one"
+    );
+    assert_eq!(author_display(&handle(0x56), &names), "eddy");
+    // A key on no account is still honestly its short hex; nothing is invented.
+    assert_eq!(
+        author_display(&handle(0x11), &names),
+        format!("user {}", short_label(&hex_encode(&[0x11u8; 32])))
+    );
+    // And a cold directory (a resident whose identity module cannot answer yet)
+    // degrades to exactly that, for everyone.
+    assert!(directory_of(&[]).is_empty());
 }

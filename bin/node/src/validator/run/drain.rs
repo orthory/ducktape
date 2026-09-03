@@ -12,7 +12,7 @@ use sdk::Msg;
 use tasks::{TaskQuery, TaskReply, decode_task_reply, encode_task_query};
 
 use super::ValidatorRuntime;
-use crate::constants::{DRAIN_TICK, NOP_TARGET};
+use crate::constants::{DRAIN_TICK, NOP_TARGET, WORKSPACE_CHECK_INTERVAL};
 use crate::drain_actions::{
     CutoverTrigger, EpochActions, capture_breakdown, checkpoint_due, cooldown_until,
 };
@@ -28,8 +28,43 @@ impl ValidatorRuntime<'_> {
     /// the cell the moment the turn ends, and `publish_status` owns the
     /// (throttled) operations refresh, so the pass itself stays free of it.
     pub(super) async fn on_drain(&mut self) {
+        self.guard_workspace();
         self.drain_pass().await;
         self.publish_status().await;
+    }
+
+    /// FAIL-STOP on a workspace deleted underneath a running node.
+    ///
+    /// Deleting it (an `rm -rf` of the ducktape home, a disk unmount) leaves
+    /// consensus writing into a tree that no longer exists, and the first
+    /// journal prune that misses a blob PANICS inside the consensus voter —
+    /// a task panic in a dependency, with no `FATAL:` line, no reason token,
+    /// and no way for the app's log reader to classify the death. This is the
+    /// last place OUR code stands between the deletion and that panic, so it
+    /// takes the stop: one stat per `WORKSPACE_CHECK_INTERVAL`, and the node
+    /// exits through the same marker as every other fatal path.
+    ///
+    /// It exits WITHOUT a checkpoint on purpose: a checkpoint writes, and a
+    /// write re-creates the very directory tree that was just deleted —
+    /// leaving a half-born workspace behind as the node's last act.
+    fn guard_workspace(&mut self) {
+        let due = self.context.current() >= self.next_workspace_check;
+        if !due {
+            return;
+        }
+        self.next_workspace_check = self.context.current() + WORKSPACE_CHECK_INTERVAL;
+        let Some(mark) = self.workspace_mark else {
+            return;
+        };
+        if mark.still_at(&self.workspace) {
+            return;
+        }
+        fatal!(
+            self.label,
+            reason = "storage_vanished",
+            "the workspace directory {} was deleted underneath this node — halting without a checkpoint",
+            self.workspace.display()
+        );
     }
 
     async fn drain_pass(&mut self) {

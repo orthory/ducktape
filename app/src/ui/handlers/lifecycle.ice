@@ -61,6 +61,8 @@ on reconnect
   dm_rows = []
   messages = []
   has_older_history = false
+  // A reconnect mounts a fresh timeline at its tail — see `state/chat.ice`.
+  chat_at_tail = true
   // The history lane was invalidated above, so its old socket and button state
   // end together even when that socket would never have answered.
   history_loading = false
@@ -158,6 +160,8 @@ on workspace_connected(next)
   status = next.status
   block_height = next.height
   channels = next.channels
+  // The chain this list was learned from — see `live_resynced`.
+  chat_chain_id = network_chain_id
   channel_reads = initial_channel_reads(next.channels, channel_reads)
   rooms = chat_sidebar_rooms(channels, dm_peers, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
@@ -167,7 +171,12 @@ on workspace_connected(next)
   // `chat_hit_loaded`.
   history_view = false
   messages = merge_landing_messages(next.messages, messages, active_channel, next.active_channel)
-  has_older_history = next.has_older_history || history_has_older(messages)
+  // THE SERVER'S `has_more`, ALONE. The `|| history_has_older(messages)` that
+  // used to ride here read "the oldest loaded root has seq > 1", and root
+  // sequences have holes (a thread reply consumes one without becoming a
+  // root), so it stood true at the real beginning of every busy channel and
+  // pinned "Load older messages" on forever.
+  has_older_history = next.has_older_history
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   active_channel = next.active_channel
   // THE LANDING ROOM'S COMPOSER IS THE LANDING ROOM'S by construction now:
@@ -176,7 +185,7 @@ on workspace_connected(next)
   // (ducktape-ui#697).
   // A reconnect lands on `channels.first()`, which is nobody's DM unless the
   // derivation says so — see `dm_peer_of_channel`.
-  active_dm_peer = dm_peer_of_channel(active_dm_peer, account_number, active_channel)
+  active_dm_peer = dm_peer_of_channel(active_dm_peer, dm_peers, active_channel)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
@@ -267,7 +276,7 @@ on live_updated(next)
         run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(next.load_chat, next.load_pages), next.debounce, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
         run replace lane=forge_live forge_live_refresh(connected_rpc, forge_repo, forge_item_number, next.kind, next.module, next.forge, (shell_tab == ShellTab.forge), forge_generation) -> forge_refreshed _ | forge_live_failed _
     LiveKind.chat
-      let folded_chat = fold_live_chat(next.chat, channels, messages, thread_messages, channel_members, channel_reads, dm_peers, settings_user_key, active_channel, active_thread_seq, history_view, shell_tab == ShellTab.chat, unread_boundary, active_channel_name, active_channel_archived, active_channel_members_only, forge_discussion, forge_item_channel, selected_message_seq, selected_message_rev, message_action, message_edit_draft, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
+      let folded_chat = fold_live_chat(next.chat, channels, messages, thread_messages, channel_members, channel_reads, dm_peers, settings_user_key, active_channel, active_thread_seq, history_view, shell_tab == ShellTab.chat, has_older_history, unread_boundary, active_channel_name, active_channel_archived, active_channel_members_only, forge_discussion, forge_item_channel, selected_message_seq, selected_message_rev, message_action, message_edit_draft, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
       channels = folded_chat.channels
       messages = folded_chat.messages
       has_older_history = folded_chat.has_older_history
@@ -367,6 +376,15 @@ on live_updated(next)
 on live_resynced(next)
   return if next.generation != hydration_generation
   hydration_retry_attempt = 0
+  // HAS THE NETWORK ITSELF MOVED UNDER THIS CONSOLE? A workspace switch keeps
+  // the endpoint (the node comes back on the same loopback port), so nothing
+  // reconnects: the websocket drops, resyncs, and every fold below only ever
+  // ADDS — which is how the previous workspace's `#general` went on standing in
+  // the sidebar of a network that has no such room, clickable, with nothing
+  // behind it. `network_chain_id` is the node's own pushed status document
+  // (`node_status_pushed`), so this costs no round trip; `chat_chain_id` is the
+  // chain the rows on screen were learned from.
+  let chain_left_behind = chain_moved(chat_chain_id, network_chain_id)
   // FOLD, DO NOT REPLACE — the same rule `chat_updated` states, for the same
   // reason. This read left the node several queries ago, and `channel_reads` is
   // NOT reverted with it, so a flat assignment walked a third room's `head_seq`
@@ -375,13 +393,9 @@ on live_resynced(next)
   // message. `upsert_channel_rows` — which `keep_channels` runs BEHIND its
   // loaded pick, so a plane-only resync never pays for the fold — keeps
   // `head_seq` monotonic and keeps a row the answer does not carry at all: a
-  // channel created while it was in flight.
-  //
-  // IT IS NOT A FULL MERGE, and the rest of the row is the snapshot's: a rename
-  // or an archive folded during the round trip is overwritten here. That one
-  // self-heals — the next chat-carrying resync re-reads the renamed row — where
-  // the badge did not, which is why only the cursor's invariant is enforced.
-  channels = keep_channels(next.chat_loaded, next.channels, channels)
+  // channel created while it was in flight. Across a chain there is no such
+  // race to protect and no such row to keep, and the answer replaces outright.
+  channels = keep_channels(next.chat_loaded, chain_left_behind, next.channels, channels)
   channel_reads = initial_channel_reads(channels, channel_reads)
   // SAME FOLD, ONE LINE ABOVE THE BANNER, because it reads `history_view` while
   // it is still the window's own answer. `load_chat_data` replies with the
@@ -395,12 +409,20 @@ on live_resynced(next)
   // a merge across a gap leaves a hole nothing can page in. It takes
   // `chat_loaded` itself rather than sitting under an outer loaded-pick: most
   // resyncs are plane-only, and the merge is a full copy of the window.
-  messages = resynced_messages(next.chat_loaded, next.messages, messages, active_channel, next.active_channel)
+  messages = resynced_messages(next.chat_loaded, chain_left_behind, next.messages, messages, active_channel, next.active_channel)
+  // The rows on screen now belong to the chain this answer came from.
+  chat_chain_id = keep_str(next.chat_loaded && !empty(network_chain_id), network_chain_id, chat_chain_id)
   // A resync that replaced the window left the banner describing rows that are
   // no longer on screen — see `chat_hit_loaded`. One that carried no chat kept
   // the window and keeps the banner with it.
   history_view = history_view && !next.chat_loaded
-  has_older_history = keep_bool(next.chat_loaded, next.has_older_history || history_has_older(messages), has_older_history)
+  // TWO SERVER ANSWERS, NEVER A LOCAL GUESS. This reply's `has_more` describes
+  // the floor of the CANONICAL TAIL PAGE, and `resynced_messages` above may have
+  // spliced that page onto older pages the reader had loaded — whose own floor
+  // the last `history_loaded` already answered for. So the two are OR'd, and the
+  // reader at the true beginning of a channel (both false) keeps her button
+  // down, which is the whole point of taking the index's word for it.
+  has_older_history = keep_bool(next.chat_loaded, next.has_older_history || has_older_history, has_older_history)
   // A resync can move the room WITHOUT a launch that abandoned the request, so
   // this is the one dropper that must ask. Conditional, not a flat clear: a
   // same-channel resync leaves a legitimate page in flight, and `history_loaded`
@@ -449,7 +471,7 @@ on live_resynced(next)
   // today's `active_channel`), so `chat_loaded` alone still blanks him.
   // `loading` is true for precisely the `choose_dm` -> `chat_updated`/`failed`
   // window, and the landing it names re-derives the peer itself.
-  active_dm_peer = keep_str(next.chat_loaded && !loading, dm_peer_of_channel(active_dm_peer, account_number, active_channel), active_dm_peer)
+  active_dm_peer = keep_str(next.chat_loaded && !loading, dm_peer_of_channel(active_dm_peer, dm_peers, active_channel), active_dm_peer)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = keep_str(next.chat_loaded, next.active_channel_name, active_channel_name)
   active_channel_archived = keep_bool(next.chat_loaded, next.active_channel_archived, active_channel_archived)
@@ -661,7 +683,6 @@ on select_shell_tab(next)
   // cannot repaint a screen the reader already left.
   shell_credentials_generation = shell_credentials_generation + 1
   shell_credentials_loading = connected && shell_tab == ShellTab.shell
-  has_older_history = history_has_older(messages)
   // A RETURN TO THE CHAT TAB IS A CHANNEL ENTRY, and it is the other half of
   // `live_updated`'s tab gate: the cursor stood still while the pane was
   // unmounted, so this is where the room she is coming back to is caught up —

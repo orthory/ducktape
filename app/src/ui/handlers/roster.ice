@@ -4,6 +4,11 @@
 on account_loaded(next)
   return if next.generation != account_generation
   account_exists = next.exists
+  // SETTINGS' READING ONLY. The DM derivation does NOT hang off this field any
+  // more: `load_dm_peers` resolves the account number it needs for itself and
+  // stamps each row's `channel_id`, and all three DM decisions read that one id
+  // — so a late or failed account load can no longer scatter DMs into the room
+  // list.
   account_number = next.number
   account_name = next.name
   account_bio = next.bio
